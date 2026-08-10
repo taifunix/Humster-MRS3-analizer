@@ -54,7 +54,7 @@ def write_real_package(
     points["event_mode"] = "real_independent_events"
     points["point_event_count"] = 3
     points["event_ids_hash"] = hashes
-    points["metric_status"] = "VERIFIED"
+    points["window_metrics_status"] = "DERIVED_FROM_VERIFIED_SOURCE"
     directory.mkdir(parents=True)
     points.to_csv(directory / "points.csv", index=False, lineterminator="\n")
     event_rows = [
@@ -65,17 +65,70 @@ def write_real_package(
     pd.DataFrame(event_rows).sort_values(["point_id", "event_id"], kind="mergesort").to_csv(
         directory / "point_events.csv", index=False, lineterminator="\n"
     )
-    pd.DataFrame([{"status": "ACCEPTED"}]).to_csv(
-        directory / "source_audit.csv", index=False, lineterminator="\n"
+    source_summary_samples = []
+    verification_rows = []
+    audit_rows = []
+    metrics = {
+        "PnL": "1", "DD": "1", "TotalTrades": "3", "WinRate": "100", "ProfitFactor": "3",
+    }
+    for index in range(1, 4):
+        report_id = f"R{index}"
+        source_file = f"report-{index}.html"
+        source_sha256 = sha256(report_id.encode("utf-8")).hexdigest()
+        source_summary_samples.append(
+            {
+                "report_id": report_id,
+                "source_file": source_file,
+                "source_sha256": source_sha256,
+                "source_range_start": "2026-07-15T00:00:00+00:00",
+                "source_range_end": "2026-08-06T00:00:00+00:00",
+            }
+        )
+        verification_rows.extend(
+            {
+                "report_id": report_id,
+                "source_file": source_file,
+                "source_sha256": source_sha256,
+                "metric": metric,
+                "source_raw": value,
+                "source_value": value,
+                "calculated_value": value,
+                "comparison": "EQUAL",
+                "cause": "",
+            }
+            for metric, value in metrics.items()
+        )
+        audit_rows.append(
+            {
+                "report_id": report_id,
+                "source_file": source_file,
+                "source_sha256": source_sha256,
+                "raw_action_count": 6,
+                "reconstructed_cycles": 3,
+                "included_cycles": 3,
+                "source_total_trades": 3,
+                "source_win_rate": 100,
+                "source_profit_factor": 3,
+            }
+        )
+    pd.DataFrame(audit_rows).to_csv(directory / "source_audit.csv", index=False, lineterminator="\n")
+    pd.DataFrame(verification_rows).to_csv(
+        directory / "metric_verification.csv", index=False, lineterminator="\n"
     )
     (directory / "package_manifest.json").write_text(
         json.dumps(
             {
-                "package_version": 1,
+                "package_version": 2,
                 "event_mode": "real_independent_events",
                 "window_start": "2026-07-15T00:00:00+00:00",
                 "window_end": "2026-08-06T00:00:00+00:00",
+                "source_database_sha256": sha256(b"source database").hexdigest(),
                 "point_count": len(points),
+                "source_summary_status": "VERIFIED",
+                "source_summary_cause": "",
+                "source_summary_sample_count": 3,
+                "source_summary_samples": source_summary_samples,
+                "window_metrics_status": "DERIVED_FROM_VERIFIED_SOURCE",
             },
             indent=2,
             sort_keys=True,
@@ -128,10 +181,30 @@ def test_load_package_accepts_verified_real_mapping(tmp_path: Path) -> None:
     ) == events_by_point
 
 
+def test_load_package_rejects_fabricated_v2_without_source_summary_evidence(
+    tmp_path: Path,
+) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, _ = write_real_package(tmp_path / "package", paths)
+    manifest_path = package / "package_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("source_summary_samples")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_summary_samples"):
+        _load_package(
+            package,
+            paths["dates"],
+            Side.LONG,
+            AlgorithmConfig.from_json(paths["config"]),
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("package_version", 2, "package_version"),
+        ("package_version", 1, "package_version"),
+        ("package_version", True, "package_version"),
         ("event_mode", "unknown", "event_mode"),
         ("window_end", "2026-07-15T00:00:00+00:00", "window"),
     ],
@@ -147,6 +220,120 @@ def test_load_package_rejects_invalid_manifest(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
+        _load_package(
+            package,
+            paths["dates"],
+            Side.LONG,
+            AlgorithmConfig.from_json(paths["config"]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("sample_count", "source_summary_samples"),
+        ("summary_cause_missing", "source_summary_cause"),
+        ("summary_cause_present", "source_summary_cause"),
+        ("identity", "identity or range"),
+        ("range", "identity or range"),
+        ("verification_schema", "metric_verification.csv schema"),
+        ("verification_result", "only EQUAL"),
+        ("verification_rows", "five rows per sample"),
+        ("impossible_cycles", "action reconciliation"),
+        ("trade_undercount", "numeric evidence|action reconciliation"),
+        ("audit_reconciliation", "action metrics do not reconcile"),
+    ],
+)
+def test_load_package_rejects_invalid_real_v2_evidence_chain(
+    tmp_path: Path, fault: str, message: str
+) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, _ = write_real_package(tmp_path / "package", paths)
+    manifest_path = package / "package_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    verification_path = package / "metric_verification.csv"
+    verification = pd.read_csv(verification_path, keep_default_na=False)
+    audit_path = package / "source_audit.csv"
+    audit = pd.read_csv(audit_path, keep_default_na=False)
+    if fault == "sample_count":
+        manifest["source_summary_samples"] = manifest["source_summary_samples"][:2]
+    elif fault == "summary_cause_missing":
+        manifest.pop("source_summary_cause", None)
+    elif fault == "summary_cause_present":
+        manifest["source_summary_cause"] = "VALUE_MISMATCH"
+    elif fault == "identity":
+        manifest["source_summary_samples"][0]["source_sha256"] = "not-a-hash"
+    elif fault == "range":
+        manifest["source_summary_samples"][0]["source_range_start"] = "2026-07-15T00:00:01+00:00"
+    elif fault == "verification_schema":
+        verification = verification.drop(columns=["cause"])
+    elif fault == "verification_result":
+        verification.loc[0, "comparison"] = "MISMATCH"
+    elif fault == "verification_rows":
+        verification = verification.iloc[1:]
+    elif fault == "impossible_cycles":
+        audit.loc[0, ["raw_action_count", "reconstructed_cycles", "included_cycles"]] = [3, 3, 3]
+    elif fault == "trade_undercount":
+        audit.loc[0, "source_total_trades"] = 2
+        verification.loc[
+            (verification["report_id"] == "R1") & (verification["metric"] == "TotalTrades"),
+            "calculated_value",
+        ] = 2
+    else:
+        audit.loc[0, "source_total_trades"] = 4
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    verification.to_csv(verification_path, index=False)
+    audit.to_csv(audit_path, index=False)
+
+    with pytest.raises(ValueError, match=message):
+        _load_package(
+            package,
+            paths["dates"],
+            Side.LONG,
+            AlgorithmConfig.from_json(paths["config"]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("metric", "field", "value", "message"),
+    [
+        ("PnL", "source_value", 2, "numeric evidence"),
+        ("DD", "calculated_value", 2, "numeric evidence"),
+        ("PnL", "comparison", 2, "numeric evidence"),
+    ],
+)
+def test_load_package_rejects_tampered_real_v2_metric_evidence(
+    tmp_path: Path, metric: str, field: str, value: int, message: str
+) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, _ = write_real_package(tmp_path / "package", paths)
+    verification_path = package / "metric_verification.csv"
+    verification = pd.read_csv(verification_path, keep_default_na=False)
+    rows = (verification["report_id"] == "R1") & (verification["metric"] == metric)
+    if field == "comparison":
+        verification.loc[rows, "source_raw"] = value
+    else:
+        verification.loc[rows, field] = value
+    verification.to_csv(verification_path, index=False)
+
+    with pytest.raises(ValueError, match=message):
+        _load_package(
+            package,
+            paths["dates"],
+            Side.LONG,
+            AlgorithmConfig.from_json(paths["config"]),
+        )
+
+
+def test_load_package_rejects_real_v2_database_hash_with_invalid_shape(tmp_path: Path) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, _ = write_real_package(tmp_path / "package", paths)
+    manifest_path = package / "package_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_database_sha256"] = "not-a-sha256"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_database_sha256"):
         _load_package(
             package,
             paths["dates"],
@@ -171,14 +358,57 @@ def test_load_package_rejects_mixed_point_modes(tmp_path: Path) -> None:
         )
 
 
-def test_load_package_rejects_unverified_real_point(tmp_path: Path) -> None:
+def test_load_package_rejects_real_v1_as_audit_only(tmp_path: Path) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, _ = write_real_package(tmp_path / "package", paths)
+    manifest_path = package / "package_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["package_version"] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="v2"):
+        _load_package(
+            package,
+            paths["dates"],
+            Side.LONG,
+            AlgorithmConfig.from_json(paths["config"]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_summary_status", "UNVERIFIED"),
+        ("window_metrics_status", "UNVERIFIED"),
+    ],
+)
+def test_load_package_rejects_real_v2_without_verified_manifest_conjunction(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, _ = write_real_package(tmp_path / "package", paths)
+    manifest_path = package / "package_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_summary_status|window_metrics_status"):
+        _load_package(
+            package,
+            paths["dates"],
+            Side.LONG,
+            AlgorithmConfig.from_json(paths["config"]),
+        )
+
+
+def test_load_package_rejects_real_v2_with_non_derived_point(tmp_path: Path) -> None:
     paths = write_selection_inputs(tmp_path / "inputs")
     package, _ = write_real_package(tmp_path / "package", paths)
     points = pd.read_csv(package / "points.csv")
-    points.loc[0, "metric_status"] = "UNVERIFIED"
+    points.loc[0, "window_metrics_status"] = "UNVERIFIED"
     points.to_csv(package / "points.csv", index=False)
 
-    with pytest.raises(ValueError, match="VERIFIED"):
+    with pytest.raises(ValueError, match="window_metrics_status"):
         _load_package(
             package,
             paths["dates"],

@@ -47,6 +47,11 @@ def _write_inputs(tmp_path: Path, rows: list[dict[str, object]]) -> tuple[Path, 
     return csv_path, dates_path
 
 
+def _write_csv_dates(path: Path, rows: list[dict[str, object]]) -> Path:
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
 def test_long_and_short_shifts_use_integer_basis_points() -> None:
     assert normalize_shift(Side.LONG, "0.973") == 270
     assert normalize_shift(Side.SHORT, "1.027") == 270
@@ -76,6 +81,39 @@ def test_load_points_creates_stable_normalized_key(tmp_path: Path) -> None:
     assert point["point_id"] == "AAAUSDT|LONG|2h|270|3|4"
     assert audit.source_rows == 1
     assert audit.service_rows == 0
+
+
+def test_load_points_accepts_bybit_csv_listing_dates(tmp_path: Path) -> None:
+    csv_path, _ = _write_inputs(tmp_path, [_source_row()])
+    dates_path = _write_csv_dates(
+        tmp_path / "bybit dates_volume.csv",
+        [{"ticker": "AAAUSDT", "launch": "2026-07-01", "volume": 123.0}],
+    )
+
+    points, _ = load_points(csv_path, dates_path, Side.LONG, _config())
+
+    assert points.iloc[0]["listing_date"] == pd.Timestamp("2026-07-01")
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{"ticker": "", "launch": "2026-07-01"}],
+        [{"ticker": "AAAUSDT", "launch": "not-a-date"}],
+        [
+            {"ticker": "AAAUSDT", "launch": "2026-07-01"},
+            {"ticker": "AAAUSDT", "launch": "2026-07-02"},
+        ],
+    ],
+)
+def test_load_points_rejects_invalid_bybit_csv_listing_dates(
+    tmp_path: Path, rows: list[dict[str, object]]
+) -> None:
+    csv_path, _ = _write_inputs(tmp_path, [_source_row()])
+    dates_path = _write_csv_dates(tmp_path / "dates.csv", rows)
+
+    with pytest.raises(InputError, match="listing dates|duplicate"):
+        load_points(csv_path, dates_path, Side.LONG, _config())
 
 
 def test_service_rows_are_excluded_and_counted(tmp_path: Path) -> None:

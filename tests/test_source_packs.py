@@ -13,6 +13,8 @@ import pytest
 import mrs3.duckdb_events as duckdb_events
 import mrs3.source_packs as source_packs
 from mrs3.config import AlgorithmConfig
+from mrs3.models import Side
+from mrs3.package_loader import load_package
 from mrs3.source_packs import SourcePackError, build_csv_package, require_single_event_mode
 from mrs3.duckdb_events import (
     build_duckdb_package,
@@ -222,7 +224,13 @@ def _v4_database(tmp_path: Path, report_count: int = 3, *, duplicate_point: bool
     return database
 
 
-def _verification_html(root: Path, report_count: int, *, mismatch_report: int | None = None) -> Path:
+def _verification_html(
+    root: Path,
+    report_count: int,
+    *,
+    database: Path | None = None,
+    mismatch_report: int | None = None,
+) -> Path:
     root.mkdir()
     for index in range(1, report_count + 1):
         pnl = "6.00" if index == mismatch_report else "5.00"
@@ -236,6 +244,17 @@ def _verification_html(root: Path, report_count: int, *, mismatch_report: int | 
             "</table></body></html>",
             encoding="utf-8",
         )
+    if database is not None:
+        import duckdb
+
+        con = duckdb.connect(str(database))
+        for index in range(1, report_count + 1):
+            source = root / f"report-{index}.html"
+            con.execute(
+                "update report_runs set source_sha256=? where report_id=?",
+                [sha256(source.read_bytes()).hexdigest(), f"R{index}"],
+            )
+        con.close()
     return root
 
 
@@ -243,7 +262,8 @@ def test_html_summary_reads_actual_profit_factor_label_and_absolute_drawdown(tmp
     report = tmp_path / "report.html"
     report.write_text(
         "<html><body><table>"
-        "<tr><th>Profit / Loss</th><td>5.00</td></tr>"
+        "<tr><th>Total PnL</th><td>5.00</td></tr>"
+        "<tr><th>Total PnL, %</th><td>0.50%</td></tr>"
         "<tr><th>Max Drawdown</th><td>5.00</td></tr>"
         "<tr><th>Max Drawdown, %</th><td>0.50%</td></tr>"
         "<tr><th>Total Trades</th><td>2</td></tr>"
@@ -263,6 +283,85 @@ def test_html_summary_reads_actual_profit_factor_label_and_absolute_drawdown(tmp
         "ProfitFactor": Decimal("2.1234"),
     }
     assert summary["ProfitFactor"][2] == 4
+
+
+def test_full_horizon_html_evidence_does_not_compare_the_selected_window(tmp_path: Path) -> None:
+    report = tmp_path / "report.html"
+    report.write_text(
+        "<table><tr><th>Total PnL</th><td>12</td></tr>"
+        "<tr><th>Max Drawdown</th><td>5</td></tr>"
+        "<tr><th>Total Trades</th><td>3</td></tr>"
+        "<tr><th>Win Rate</th><td>66.67%</td></tr>"
+        "<tr><th>Profit Factor</th><td>3</td></tr></table>",
+        encoding="utf-8",
+    )
+    source_metrics = {
+        "TotalPnL": 12, "MaxDrawdown": 5, "TotalTrades": 3,
+        "WinRate": 66.666666, "ProfitFactor": 3,
+    }
+    window_metrics = {
+        "TotalPnL": 5, "MaxDrawdown": 2, "TotalTrades": 2,
+        "WinRate": 50.0, "ProfitFactor": 2,
+    }
+
+    rows, status, cause = duckdb_events._verification(
+        [
+            {
+                "report_id": f"R{index}", "source_file": "report.html",
+                "source_sha256": sha256(report.read_bytes()).hexdigest(),
+                "source_metrics": source_metrics, "metrics": window_metrics,
+            }
+            for index in range(1, 4)
+        ],
+        tmp_path,
+        3,
+    )
+
+    assert status == "VERIFIED"
+    assert cause == ""
+    assert {row["calculated_value"] for row in rows if row["metric"] == "PnL"} == {12}
+
+
+@pytest.mark.parametrize(
+    ("source_sha256", "source_range_start", "cause"),
+    [
+        ("0" * 64, WINDOW_START, "SOURCE_IDENTITY_MISMATCH"),
+        (None, "2026-07-15T00:00:01Z", "SOURCE_RANGE_DOES_NOT_CONTAIN_WINDOW"),
+    ],
+)
+def test_full_horizon_html_evidence_fails_closed_on_identity_or_window_range(
+    tmp_path: Path, source_sha256: str | None, source_range_start: str, cause: str
+) -> None:
+    report = tmp_path / "report.html"
+    report.write_text(
+        "<table><tr><th>Total PnL</th><td>5</td></tr>"
+        "<tr><th>Max Drawdown</th><td>5</td></tr>"
+        "<tr><th>Total Trades</th><td>2</td></tr>"
+        "<tr><th>Win Rate</th><td>50%</td></tr>"
+        "<tr><th>Profit Factor</th><td>2</td></tr></table>",
+        encoding="utf-8",
+    )
+    metrics = {"TotalPnL": 5, "MaxDrawdown": 5, "TotalTrades": 2, "WinRate": 50, "ProfitFactor": 2}
+    rows, status, actual_cause = duckdb_events._verification(
+        [
+            {
+                "report_id": f"R{index}", "source_file": "report.html",
+                "source_sha256": source_sha256 or sha256(report.read_bytes()).hexdigest(),
+                "source_metrics": metrics,
+                "source_range_start": source_range_start,
+                "source_range_end": WINDOW_END,
+            }
+            for index in range(1, 4)
+        ],
+        tmp_path,
+        3,
+        pd.Timestamp(WINDOW_START),
+        pd.Timestamp(WINDOW_END),
+    )
+
+    assert status == "UNVERIFIED"
+    assert actual_cause == cause
+    assert {row["cause"] for row in rows} == {cause}
 
 
 def test_duckdb_metric_materializer_decodes_series_and_counts_realised_actions() -> None:
@@ -403,13 +502,13 @@ def test_duckdb_package_is_selector_complete_and_keeps_sorted_event_mapping(tmp_
         "event_mode",
         "point_event_count",
         "event_ids_hash",
-        "metric_status",
+        "window_metrics_status",
     }
     assert expected_columns.issubset(points.columns)
-    assert points[["event_mode", "point_event_count", "metric_status"]].to_dict("records") == [
-        {"event_mode": "real_independent_events", "point_event_count": 2, "metric_status": "UNVERIFIED"},
-        {"event_mode": "real_independent_events", "point_event_count": 2, "metric_status": "UNVERIFIED"},
-        {"event_mode": "real_independent_events", "point_event_count": 2, "metric_status": "UNVERIFIED"},
+    assert points[["event_mode", "point_event_count", "window_metrics_status"]].to_dict("records") == [
+        {"event_mode": "real_independent_events", "point_event_count": 2, "window_metrics_status": "UNVERIFIED_SOURCE_SUMMARY"},
+        {"event_mode": "real_independent_events", "point_event_count": 2, "window_metrics_status": "UNVERIFIED_SOURCE_SUMMARY"},
+        {"event_mode": "real_independent_events", "point_event_count": 2, "window_metrics_status": "UNVERIFIED_SOURCE_SUMMARY"},
     ]
     events = pd.read_csv(package.directory / "point_events.csv")
     assert events.to_records(index=False).tolist() == sorted(events.to_records(index=False).tolist())
@@ -418,7 +517,9 @@ def test_duckdb_package_is_selector_complete_and_keeps_sorted_event_mapping(tmp_
     assert audit["included_cycles"].tolist() == [2, 2, 2]
     assert audit["flat_trades"].tolist() == [0, 0, 0]
     assert package.manifest["included_cycles"] == 6
-    assert package.manifest["verification_status"] == "UNVERIFIED"
+    assert package.manifest["package_version"] == 2
+    assert package.manifest["source_summary_status"] == "UNVERIFIED"
+    assert package.manifest["window_metrics_status"] == "UNVERIFIED_SOURCE_SUMMARY"
     assert sha256(database.read_bytes()).hexdigest() == before
 
 
@@ -464,7 +565,7 @@ def test_duckdb_package_audits_noncovering_reports_without_decoding_their_series
 
     package = build_duckdb_package(database, WINDOW_START, WINDOW_END, tmp_path / "package")
 
-    expected_points = pd.read_csv(baseline.points_csv).query("point_id != 'P2'").reset_index(drop=True)
+    expected_points = pd.read_csv(baseline.points_csv).query("point_id != 'A02USDT|LONG|15m|100|5|9'").reset_index(drop=True)
     actual_points = pd.read_csv(package.points_csv).reset_index(drop=True)
     pd.testing.assert_frame_equal(actual_points, expected_points)
     audit = pd.read_csv(package.audit_csv).set_index("report_id")
@@ -490,9 +591,9 @@ def test_duckdb_package_audits_every_report_across_action_batches(tmp_path: Path
     assert package.manifest["included_cycles"] == 1002
 
 
-def test_duckdb_package_marks_all_points_verified_after_three_matching_html_reports(tmp_path: Path) -> None:
+def test_duckdb_package_marks_window_points_derived_after_three_matching_html_reports(tmp_path: Path) -> None:
     database = _v4_database(tmp_path)
-    html_root = _verification_html(tmp_path / "html", 3)
+    html_root = _verification_html(tmp_path / "html", 3, database=database)
 
     package = build_duckdb_package(
         database,
@@ -503,8 +604,10 @@ def test_duckdb_package_marks_all_points_verified_after_three_matching_html_repo
         verification_sample_count=3,
     )
 
-    assert package.manifest["verification_status"] == "VERIFIED"
-    assert pd.read_csv(package.points_csv)["metric_status"].tolist() == ["VERIFIED"] * 3
+    assert package.manifest["package_version"] == 2
+    assert package.manifest["source_summary_status"] == "VERIFIED"
+    assert package.manifest["window_metrics_status"] == "DERIVED_FROM_VERIFIED_SOURCE"
+    assert pd.read_csv(package.points_csv)["window_metrics_status"].tolist() == ["DERIVED_FROM_VERIFIED_SOURCE"] * 3
     verification = pd.read_csv(package.directory / "metric_verification.csv")
     assert verification["report_id"].drop_duplicates().tolist() == ["R1", "R2", "R3"]
     assert verification["metric"].unique().tolist() == ["PnL", "DD", "TotalTrades", "WinRate", "ProfitFactor"]
@@ -512,9 +615,33 @@ def test_duckdb_package_marks_all_points_verified_after_three_matching_html_repo
     assert str(html_root) not in package.manifest_path.read_text(encoding="utf-8")
 
 
+def test_real_v2_materializer_output_passes_the_selector_evidence_gate(tmp_path: Path) -> None:
+    database = _v4_database(tmp_path)
+    html_root = _verification_html(tmp_path / "html", 3, database=database)
+    package = build_duckdb_package(
+        database,
+        WINDOW_START,
+        WINDOW_END,
+        tmp_path / "package",
+        verification_html_root=html_root,
+        verification_sample_count=3,
+    )
+    dates = tmp_path / "bybit_dates.csv"
+    pd.DataFrame(
+        [{"ticker": f"A{index:02d}USDT", "launch": "2026-07-01"} for index in range(1, 4)]
+    ).to_csv(dates, index=False)
+
+    loaded = load_package(package.directory, dates, Side.LONG, AlgorithmConfig.defaults())
+
+    assert loaded.event_mode == "real_independent_events"
+    assert len(loaded.points) == 3
+
+
 def test_duckdb_package_marks_every_point_unverified_when_one_html_metric_mismatches(tmp_path: Path) -> None:
     database = _v4_database(tmp_path)
-    html_root = _verification_html(tmp_path / "html", 3, mismatch_report=2)
+    html_root = _verification_html(
+        tmp_path / "html", 3, database=database, mismatch_report=2
+    )
 
     package = build_duckdb_package(
         database,
@@ -525,8 +652,8 @@ def test_duckdb_package_marks_every_point_unverified_when_one_html_metric_mismat
         verification_sample_count=3,
     )
 
-    assert package.manifest["verification_status"] == "UNVERIFIED"
-    assert pd.read_csv(package.points_csv)["metric_status"].tolist() == ["UNVERIFIED"] * 3
+    assert package.manifest["source_summary_status"] == "UNVERIFIED"
+    assert pd.read_csv(package.points_csv)["window_metrics_status"].tolist() == ["UNVERIFIED_SOURCE_SUMMARY"] * 3
     verification = pd.read_csv(package.directory / "metric_verification.csv")
     mismatch = verification.loc[verification["comparison"] == "MISMATCH"]
     assert mismatch[["report_id", "metric", "cause"]].to_dict("records") == [
@@ -536,7 +663,7 @@ def test_duckdb_package_marks_every_point_unverified_when_one_html_metric_mismat
 
 def test_duckdb_package_marks_every_point_unverified_when_requested_html_is_absent(tmp_path: Path) -> None:
     database = _v4_database(tmp_path)
-    html_root = _verification_html(tmp_path / "html", 3)
+    html_root = _verification_html(tmp_path / "html", 3, database=database)
     (html_root / "report-3.html").unlink()
 
     package = build_duckdb_package(
@@ -548,8 +675,8 @@ def test_duckdb_package_marks_every_point_unverified_when_requested_html_is_abse
         verification_sample_count=3,
     )
 
-    assert package.manifest["verification_status"] == "UNVERIFIED"
-    assert set(pd.read_csv(package.points_csv)["metric_status"]) == {"UNVERIFIED"}
+    assert package.manifest["source_summary_status"] == "UNVERIFIED"
+    assert set(pd.read_csv(package.points_csv)["window_metrics_status"]) == {"UNVERIFIED_SOURCE_SUMMARY"}
     verification = pd.read_csv(package.directory / "metric_verification.csv")
     assert verification.loc[verification["cause"] == "SOURCE_HTML_MISSING", "report_id"].tolist() == ["R3"]
 
@@ -559,7 +686,7 @@ def test_duckdb_package_rejects_verification_sample_counts_outside_three_to_five
     tmp_path: Path, sample_count: int, report_count: int
 ) -> None:
     database = _v4_database(tmp_path, report_count)
-    html_root = _verification_html(tmp_path / "html", report_count)
+    html_root = _verification_html(tmp_path / "html", report_count, database=database)
 
     package = build_duckdb_package(
         database,
@@ -570,9 +697,9 @@ def test_duckdb_package_rejects_verification_sample_counts_outside_three_to_five
         verification_sample_count=sample_count,
     )
 
-    assert package.manifest["verification_status"] == "UNVERIFIED"
-    assert package.manifest["verification_cause"] == "SAMPLE_COUNT_OUT_OF_RANGE"
-    assert set(pd.read_csv(package.points_csv)["metric_status"]) == {"UNVERIFIED"}
+    assert package.manifest["source_summary_status"] == "UNVERIFIED"
+    assert package.manifest["source_summary_cause"] == "SAMPLE_COUNT_OUT_OF_RANGE"
+    assert set(pd.read_csv(package.points_csv)["window_metrics_status"]) == {"UNVERIFIED_SOURCE_SUMMARY"}
 
 
 def test_duckdb_package_rejects_duplicate_point_ids(tmp_path: Path) -> None:

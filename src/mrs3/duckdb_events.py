@@ -34,7 +34,7 @@ VERIFICATION_METRICS = {
     "ProfitFactor": "ProfitFactor",
 }
 VERIFICATION_COLUMNS = [
-    "report_id", "source_file", "metric", "source_raw", "source_value",
+    "report_id", "source_file", "source_sha256", "metric", "source_raw", "source_value",
     "calculated_value", "comparison", "cause",
 ]
 POINT_COLUMNS = [
@@ -44,7 +44,7 @@ POINT_COLUMNS = [
     "settings[*].mrs2.ma_long.len", "settings[*].mrs2.ma_close_long.len",
     "settings[*].mrs2.ma_long.multiplier", "settings[*].mrs2.ma_short.len",
     "settings[*].mrs2.ma_close_short.len", "settings[*].mrs2.ma_short.multiplier",
-    "event_mode", "point_event_count", "event_ids_hash", "metric_status",
+    "event_mode", "point_event_count", "event_ids_hash", "window_metrics_status",
 ]
 
 
@@ -343,8 +343,20 @@ def _selector_row(
     end: pd.Timestamp,
 ) -> dict[str, object]:
     settings = json.loads(str(report["settings_json"]))
+    side = str(report["side"]).upper()
+    multiplier_path = "mrs2.ma_long.multiplier" if side == "LONG" else "mrs2.ma_short.multiplier"
+    multiplier = Decimal(str(_setting(settings, multiplier_path)))
+    shift = (Decimal("1") - multiplier) if side == "LONG" else (multiplier - Decimal("1"))
+    shift_bp = int((shift * Decimal("10000")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    point_id = "|".join(
+        (
+            str(report["symbol"]), side, str(report["timeframe"]), str(shift_bp),
+            str(_setting(settings, "mrs2.ma_long.len" if side == "LONG" else "mrs2.ma_short.len")),
+            str(_setting(settings, "mrs2.ma_close_long.len" if side == "LONG" else "mrs2.ma_close_short.len")),
+        )
+    )
     point = {
-        "point_id": report["point_id"],
+        "point_id": point_id,
         "Run id": report_number,
         "settings[*].basic.symbol": report["symbol"],
         "settings[*].basic.time_frame": report["timeframe"],
@@ -369,7 +381,7 @@ def _selector_row(
         "point_event_count": len(event_ids),
         "event_ids_hash": sha256("|".join(event_ids).encode("utf-8")).hexdigest(),
     }
-    point["metric_status"] = "UNVERIFIED"
+    point["window_metrics_status"] = "UNVERIFIED"
     return point
 
 
@@ -406,8 +418,12 @@ def _html_summary(path: Path) -> dict[str, tuple[str, Decimal, int]]:
         cells = [" ".join(" ".join(cell.itertext()).split()) for cell in row.xpath("./th|./td")]
         if len(cells) < 2:
             continue
-        label = re.sub(r"[^a-z0-9]", "", cells[0].casefold())
-        if label in {"maxdrawdown", "maximumdrawdown"} and "%" in cells[0]:
+        source_label = cells[0].casefold()
+        label = re.sub(r"[^a-z0-9]", "", source_label)
+        if "%" in source_label and label in {
+            "pnl", "totalpnl", "profitloss", "profitandloss",
+            "dd", "drawdown", "maxdrawdown", "maximumdrawdown",
+        }:
             continue
         metric = aliases.get(label)
         if metric:
@@ -423,6 +439,8 @@ def _verification(
     reports: Sequence[Mapping[str, object]],
     html_root: Path | None,
     sample_count: int,
+    window_start: pd.Timestamp | None = None,
+    window_end: pd.Timestamp | None = None,
 ) -> tuple[list[dict[str, object]], str, str]:
     if html_root is None:
         return [], "UNVERIFIED", "HTML_ROOT_ABSENT"
@@ -435,21 +453,40 @@ def _verification(
     for report in reports[:sample_count]:
         source_file = Path(str(report["source_file"])).name
         path = html_root / source_file
+        source_sha256 = str(report.get("source_sha256", ""))
+        identity = sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+        if window_start is not None and window_end is not None:
+            source_start = _utc(str(report["source_range_start"]))
+            source_end = _utc(str(report["source_range_end"]))
+            if source_start > window_start or source_end < window_end:
+                rows.append({"report_id": report["report_id"], "source_file": source_file,
+                             "source_sha256": source_sha256, "metric": "ALL",
+                             "source_raw": "", "source_value": "", "calculated_value": "",
+                             "comparison": "MISMATCH", "cause": "SOURCE_RANGE_DOES_NOT_CONTAIN_WINDOW"})
+                cause = cause or "SOURCE_RANGE_DOES_NOT_CONTAIN_WINDOW"
+                continue
         if not path.is_file():
             rows.append({"report_id": report["report_id"], "source_file": source_file, "metric": "ALL",
-                         "source_raw": "", "source_value": "", "calculated_value": "",
+                         "source_sha256": source_sha256, "source_raw": "", "source_value": "", "calculated_value": "",
                          "comparison": "MISMATCH", "cause": "SOURCE_HTML_MISSING"})
             cause = cause or "SOURCE_HTML_MISSING"
+            continue
+        if not source_sha256 or identity != source_sha256:
+            rows.append({"report_id": report["report_id"], "source_file": source_file,
+                         "source_sha256": source_sha256, "metric": "ALL",
+                         "source_raw": "", "source_value": "", "calculated_value": "",
+                         "comparison": "MISMATCH", "cause": "SOURCE_IDENTITY_MISMATCH"})
+            cause = cause or "SOURCE_IDENTITY_MISMATCH"
             continue
         try:
             parsed = _html_summary(path)
         except SourcePackError as error:
             rows.append({"report_id": report["report_id"], "source_file": source_file, "metric": "ALL",
-                         "source_raw": "", "source_value": "", "calculated_value": "",
+                         "source_sha256": source_sha256, "source_raw": "", "source_value": "", "calculated_value": "",
                          "comparison": "MISMATCH", "cause": str(error)})
             cause = cause or "HTML_PARSE_ERROR"
             continue
-        metrics = report["metrics"]
+        metrics = report["source_metrics"]
         assert isinstance(metrics, Mapping)
         for metric, calculated_name in VERIFICATION_METRICS.items():
             source_raw, source_value, precision = parsed[metric]
@@ -460,7 +497,8 @@ def _verification(
             comparison = "EQUAL" if equal else "MISMATCH"
             row_cause = "" if equal else "VALUE_MISMATCH"
             cause = cause or row_cause
-            rows.append({"report_id": report["report_id"], "source_file": source_file, "metric": metric,
+            rows.append({"report_id": report["report_id"], "source_file": source_file,
+                         "source_sha256": source_sha256, "metric": metric,
                          "source_raw": source_raw, "source_value": source_value,
                          "calculated_value": calculated, "comparison": comparison, "cause": row_cause})
     return rows, ("VERIFIED" if not cause else "UNVERIFIED"), cause
@@ -488,7 +526,7 @@ def build_duckdb_package(
             report
             for batch in _query_batches(
                 con,
-                """select r.report_id,r.source_file,r.settings_json,r.raw_action_count,
+                """select r.report_id,r.source_file,r.source_sha256,r.settings_json,r.raw_action_count,
                           r.equity_sample_count,r.wallet_change_count,p.series_codec,p.actions_codec,
                           c.point_id,c.symbol,c.side,c.timeframe,g.sample_count,
                           g.start_timestamp_ms,g.end_timestamp_ms
@@ -546,6 +584,7 @@ def build_duckdb_package(
                 audit: dict[str, object] = {
                     "report_id": report["report_id"], "point_id": report["point_id"],
                     "source_file": Path(str(report["source_file"])).name,
+                    "source_sha256": report["source_sha256"],
                     "coverage_status": "REJECTED", "coverage_reason": "GRID_NOT_COVERED",
                     "raw_action_count": report["raw_action_count"], "reconstructed_cycles": reconstructed,
                     "included_cycles": len(reconstruction.included), **reconstruction.exclusions,
@@ -581,35 +620,68 @@ def build_duckdb_package(
                     bytes(series["timestamps_zlib"]), int(report["sample_count"]), codec=str(report["series_codec"])
                 )
                 grid = pd.to_datetime(timestamps_ms, unit="ms", utc=True)
-                raw_metrics = calculate_point_metrics(
-                    grid,
-                    decode_compact_deltas(bytes(series["equity_zlib"]), int(report["equity_sample_count"]), codec=str(report["series_codec"])),
-                    decode_wallet_changes(bytes(series["wallet_zlib"]), int(report["wallet_change_count"]), codec=str(report["series_codec"])),
-                    actions,
-                    window_start,
-                    window_end,
+                equity = decode_compact_deltas(
+                    bytes(series["equity_zlib"]), int(report["equity_sample_count"]), codec=str(report["series_codec"])
                 )
+                wallet_changes = decode_wallet_changes(
+                    bytes(series["wallet_zlib"]), int(report["wallet_change_count"]), codec=str(report["series_codec"])
+                )
+                raw_metrics = calculate_point_metrics(grid, equity, wallet_changes, actions, window_start, window_end)
                 metrics = dict(raw_metrics)
                 metrics["TotalPnL"] = _unscale(raw_metrics["TotalPnL"])
                 metrics["MaxDrawdown"] = _unscale(raw_metrics["MaxDrawdown"])
-                audit.update({"coverage_status": "ACCEPTED", "coverage_reason": "", **metrics})
+                full_horizon_grid = grid.append(
+                    pd.DatetimeIndex([pd.Timestamp(grid[-1].value + 1, tz="UTC")])
+                )
+                source_raw_metrics = calculate_point_metrics(
+                    full_horizon_grid,
+                    (*equity, equity[-1]),
+                    wallet_changes,
+                    actions,
+                    grid[0].isoformat(),
+                    full_horizon_grid[-1].isoformat(),
+                )
+                source_metrics = dict(source_raw_metrics)
+                source_metrics["TotalPnL"] = _unscale(source_raw_metrics["TotalPnL"])
+                source_metrics["MaxDrawdown"] = _unscale(source_raw_metrics["MaxDrawdown"])
+                audit.update(
+                    {
+                        "coverage_status": "ACCEPTED",
+                        "coverage_reason": "",
+                        **metrics,
+                        "source_total_trades": source_metrics["TotalTrades"],
+                        "source_win_rate": source_metrics["WinRate"],
+                        "source_profit_factor": source_metrics["ProfitFactor"],
+                    }
+                )
                 report["metrics"] = metrics
+                report["source_metrics"] = source_metrics
+                report["source_range_start"] = grid[0].isoformat()
+                report["source_range_end"] = full_horizon_grid[-1].isoformat()
                 report["event_ids"] = event_ids
                 report["point"] = _selector_row(report_numbers[report_id], report, metrics, event_ids, start, end)
                 accepted_reports.append(report)
-                event_rows.extend({"point_id": str(report["point_id"]), "event_id": event_id} for event_id in event_ids)
+                event_rows.extend({"point_id": str(report["point"]["point_id"]), "event_id": event_id} for event_id in event_ids)
     finally:
         con.close()
 
-    verification_rows, verification_status, verification_cause = _verification(
-        accepted_reports, verification_html_root, verification_sample_count
+    verification_rows, source_summary_status, source_summary_cause = _verification(
+        accepted_reports, verification_html_root, verification_sample_count, start, end
     )
-    point_rows = [dict(report["point"], metric_status=verification_status) for report in accepted_reports]
+    window_metrics_status = (
+        "DERIVED_FROM_VERIFIED_SOURCE"
+        if source_summary_status == "VERIFIED"
+        else "UNVERIFIED_SOURCE_SUMMARY"
+    )
+    point_rows = [
+        dict(report["point"], window_metrics_status=window_metrics_status)
+        for report in accepted_reports
+    ]
     point_rows.sort(key=lambda row: str(row["point_id"]))
     event_rows.sort(key=lambda row: (row["point_id"], row["event_id"]))
     audit_rows.sort(key=lambda row: str(row["report_id"]))
     manifest = {
-        "package_version": 1,
+        "package_version": 2,
         "event_mode": REAL_INDEPENDENT_EVENTS,
         "window_start": start.isoformat(),
         "window_end": end.isoformat(),
@@ -623,9 +695,20 @@ def build_duckdb_package(
         "included_cycles": sum(int(row["included_cycles"]) for row in audit_rows),
         "flat_trades": sum(int(row.get("flat_trades", 0)) for row in audit_rows),
         "exclusions": dict(sorted(exclusion_totals.items())),
-        "verification_sample_count": verification_sample_count,
-        "verification_status": verification_status,
-        "verification_cause": verification_cause,
+        "source_summary_sample_count": verification_sample_count,
+        "source_summary_status": source_summary_status,
+        "source_summary_cause": source_summary_cause,
+        "source_summary_samples": [
+            {
+                "report_id": report["report_id"],
+                "source_file": Path(str(report["source_file"])).name,
+                "source_sha256": report["source_sha256"],
+                "source_range_start": report["source_range_start"],
+                "source_range_end": report["source_range_end"],
+            }
+            for report in accepted_reports[:verification_sample_count]
+        ],
+        "window_metrics_status": window_metrics_status,
     }
     target = output_dir.resolve()
     if target.exists() and any(target.iterdir()):

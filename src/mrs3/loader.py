@@ -43,10 +43,31 @@ def normalize_shift(
 
 
 def _load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
-    frame = pd.read_excel(path, header=None, usecols=[0, 1], names=["symbol", "listing_date"])
-    frame = frame.dropna(subset=["symbol", "listing_date"]).copy()
-    frame["symbol"] = frame["symbol"].astype(str).str.strip()
-    frame["listing_date"] = pd.to_datetime(frame["listing_date"], errors="raise")
+    try:
+        if path.suffix.casefold() == ".csv":
+            raw = pd.read_csv(path, dtype=str)
+            required = {"ticker", "launch"}
+            missing = sorted(required.difference(raw.columns))
+            if missing:
+                raise InputError(f"CSV listing dates are missing columns: {missing}")
+            frame = raw.loc[:, ["ticker", "launch"]].rename(
+                columns={"ticker": "symbol", "launch": "listing_date"}
+            )
+            if frame.empty or frame.isna().any().any() or frame["symbol"].str.strip().eq("").any():
+                raise InputError("CSV listing dates require non-empty ticker and launch values")
+        else:
+            frame = pd.read_excel(
+                path, header=None, usecols=[0, 1], names=["symbol", "listing_date"]
+            ).dropna(subset=["symbol", "listing_date"])
+        frame = frame.copy()
+        frame["symbol"] = frame["symbol"].astype(str).str.strip()
+        frame["listing_date"] = pd.to_datetime(frame["listing_date"], errors="raise")
+    except (OSError, ValueError, TypeError) as exc:
+        if isinstance(exc, InputError):
+            raise
+        raise InputError(f"invalid listing dates: {exc}") from exc
+    if frame.empty or frame["symbol"].eq("").any():
+        raise InputError("listing dates require non-empty symbols")
     if frame["symbol"].duplicated().any():
         symbols = sorted(frame.loc[frame["symbol"].duplicated(False), "symbol"].unique())
         raise InputError(f"duplicate listing dates: {symbols}")
