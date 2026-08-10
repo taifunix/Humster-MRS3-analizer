@@ -18,7 +18,7 @@ Humster MRS3 Analyzer — локальный, детерминированный
 
 ## Текущий этап: v0.7 event source packs
 
-Цель ближайшего этапа — подготовить два проверяемых, взаимно исключающих source pack на окне `[2026-07-15T00:00:00, 2026-08-06T00:00:00)`: CSV `legacy_trades_proxy` с `point_event_count=TotalTrades` и DuckDB `real_independent_events` с `point_event_count=unique(event_id)`. Экспорт реальных событий из DuckDB сохраняет исходный event mode и не превращается в proxy. Real-пакет v2 отдельно доказывает full-horizon source summary и происхождение windowed metrics; HTML summary не является проверкой равенства метрик окна. Контракт и порядок поставки зафиксированы в [спецификации event source packs](docs/specs/2026-08-10-v07-event-source-packs.md) и [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md).
+Цель ближайшего этапа — подготовить два проверяемых, взаимно исключающих source pack на окне `[2026-07-15T00:00:00, 2026-08-06T00:00:00)`: CSV `legacy_trades_proxy` с `point_event_count=TotalTrades` и DuckDB `real_independent_events` с `point_event_count=unique(event_id)`. Экспорт реальных событий из DuckDB сохраняет исходный event mode и не превращается в proxy. Real-пакет v2 отдельно доказывает full-horizon source summary и происхождение windowed metrics; HTML summary не является проверкой равенства метрик окна. Контракт и порядок поставки зафиксированы в [спецификации event source packs](docs/specs/2026-08-10-v07-event-source-packs.md), [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) и [ADR-0003](docs/decisions/0003-source-integrity-action-metrics.md).
 
 ### Этапы поставки
 

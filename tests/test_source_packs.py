@@ -230,15 +230,17 @@ def _verification_html(
     *,
     database: Path | None = None,
     mismatch_report: int | None = None,
+    mismatch_metric: str = "PnL",
 ) -> Path:
     root.mkdir()
     for index in range(1, report_count + 1):
-        pnl = "6.00" if index == mismatch_report else "5.00"
+        pnl = "6.00" if index == mismatch_report and mismatch_metric == "PnL" else "5.00"
+        total_trades = "3" if index == mismatch_report and mismatch_metric == "TotalTrades" else "2"
         (root / f"report-{index}.html").write_text(
             "<html><body><table>"
             f"<tr><th>PnL</th><td>{pnl}</td></tr>"
             "<tr><th>DD</th><td>5.00</td></tr>"
-            "<tr><th>TotalTrades</th><td>2</td></tr>"
+            f"<tr><th>TotalTrades</th><td>{total_trades}</td></tr>"
             "<tr><th>WinRate</th><td>50.00%</td></tr>"
             "<tr><th>ProfitFactor</th><td>2.00</td></tr>"
             "</table></body></html>",
@@ -322,6 +324,44 @@ def test_full_horizon_html_evidence_does_not_compare_the_selected_window(tmp_pat
     assert {row["calculated_value"] for row in rows if row["metric"] == "PnL"} == {12}
 
 
+def test_full_horizon_html_evidence_only_gates_action_metrics_and_marks_pnl_dd_non_comparable(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "report.html"
+    report.write_text(
+        "<table><tr><th>Total PnL</th><td>12</td></tr>"
+        "<tr><th>Max Drawdown</th><td>5</td></tr>"
+        "<tr><th>Total Trades</th><td>3</td></tr>"
+        "<tr><th>Win Rate</th><td>66.67%</td></tr>"
+        "<tr><th>Profit Factor</th><td>3</td></tr></table>",
+        encoding="utf-8",
+    )
+    metrics = {
+        "TotalPnL": 4, "MaxDrawdown": 2, "TotalTrades": 3,
+        "WinRate": 66.666666, "ProfitFactor": 3,
+    }
+
+    rows, status, cause = duckdb_events._verification(
+        [
+            {
+                "report_id": f"R{index}", "source_file": "report.html",
+                "source_sha256": sha256(report.read_bytes()).hexdigest(),
+                "source_metrics": metrics,
+            }
+            for index in range(1, 4)
+        ],
+        tmp_path,
+        3,
+    )
+
+    assert (status, cause) == ("VERIFIED", "")
+    non_comparable = [row for row in rows if row["metric"] in {"PnL", "DD"}]
+    assert {(row["comparison"], row["cause"]) for row in non_comparable} == {
+        ("NOT_COMPARABLE_WINDOW_SCOPE", "NOT_COMPARABLE_WINDOW_SCOPE")
+    }
+    assert {row["comparison"] for row in rows if row["metric"] in {"TotalTrades", "WinRate", "ProfitFactor"}} == {"EQUAL"}
+
+
 def test_full_horizon_html_evidence_uses_importer_text_identity_for_crlf_source(tmp_path: Path) -> None:
     report = tmp_path / "report.html"
     source_text = (
@@ -349,7 +389,7 @@ def test_full_horizon_html_evidence_uses_importer_text_identity_for_crlf_source(
 
     assert status == "VERIFIED"
     assert cause == ""
-    assert {row["comparison"] for row in rows} == {"EQUAL"}
+    assert {row["comparison"] for row in rows} == {"EQUAL", "NOT_COMPARABLE_WINDOW_SCOPE"}
 
 
 def test_full_horizon_html_evidence_rejects_different_normalized_source_text(tmp_path: Path) -> None:
@@ -672,7 +712,8 @@ def test_duckdb_package_marks_window_points_derived_after_three_matching_html_re
     verification = pd.read_csv(package.directory / "metric_verification.csv")
     assert verification["report_id"].drop_duplicates().tolist() == ["R1", "R2", "R3"]
     assert verification["metric"].unique().tolist() == ["PnL", "DD", "TotalTrades", "WinRate", "ProfitFactor"]
-    assert set(verification["comparison"]) == {"EQUAL"}
+    assert set(verification.loc[verification["metric"].isin({"TotalTrades", "WinRate", "ProfitFactor"}), "comparison"]) == {"EQUAL"}
+    assert set(verification.loc[verification["metric"].isin({"PnL", "DD"}), "comparison"]) == {"NOT_COMPARABLE_WINDOW_SCOPE"}
     assert str(html_root) not in package.manifest_path.read_text(encoding="utf-8")
 
 
@@ -698,10 +739,10 @@ def test_real_v2_materializer_output_passes_the_selector_evidence_gate(tmp_path:
     assert len(loaded.points) == 3
 
 
-def test_duckdb_package_marks_every_point_unverified_when_one_html_metric_mismatches(tmp_path: Path) -> None:
+def test_duckdb_package_marks_every_point_unverified_when_one_html_action_metric_mismatches(tmp_path: Path) -> None:
     database = _v4_database(tmp_path)
     html_root = _verification_html(
-        tmp_path / "html", 3, database=database, mismatch_report=2
+        tmp_path / "html", 3, database=database, mismatch_report=2, mismatch_metric="TotalTrades"
     )
 
     package = build_duckdb_package(
@@ -718,7 +759,7 @@ def test_duckdb_package_marks_every_point_unverified_when_one_html_metric_mismat
     verification = pd.read_csv(package.directory / "metric_verification.csv")
     mismatch = verification.loc[verification["comparison"] == "MISMATCH"]
     assert mismatch[["report_id", "metric", "cause"]].to_dict("records") == [
-        {"report_id": "R2", "metric": "PnL", "cause": "VALUE_MISMATCH"}
+        {"report_id": "R2", "metric": "TotalTrades", "cause": "VALUE_MISMATCH"}
     ]
 
 

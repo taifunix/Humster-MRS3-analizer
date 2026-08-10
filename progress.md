@@ -64,9 +64,16 @@ samples, run `select --source-package` with the externally supplied listing
 dates and strategy template, retain the local audit, and decide whether Phase
 2 is needed only from the resulting candidate/event distributions.
 
+ADR-0003 narrows the full-horizon source gate to action-derived
+`TotalTrades`, `WinRate` and `ProfitFactor`; PnL/DD are retained only as
+`NOT_COMPARABLE_WINDOW_SCOPE` diagnostics. The implementation is awaiting
+independent review, then the same real read-only package will be rebuilt.
+
 ## Blockers
 
-- The required user-provided listing-date and strategy-template inputs for a full selector run remain external inputs; package construction and its audit can proceed independently.
+- Before the real package rebuild, close the fail-closed validation finding for
+  `NOT_COMPARABLE_WINDOW_SCOPE` PnL/DD diagnostics; exact continuation is in
+  [source-integrity handoff](docs/handoffs/2026-08-10-source-integrity-finalization.md).
 
 ## Queued module hook
 

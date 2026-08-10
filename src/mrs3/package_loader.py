@@ -22,6 +22,8 @@ from .source_packs import (
 
 
 SUMMARY_METRICS = frozenset({"PnL", "DD", "TotalTrades", "WinRate", "ProfitFactor"})
+ACTION_SUMMARY_METRICS = frozenset({"TotalTrades", "WinRate", "ProfitFactor"})
+NOT_COMPARABLE_WINDOW_SCOPE = "NOT_COMPARABLE_WINDOW_SCOPE"
 VERIFICATION_COLUMNS = [
     "report_id", "source_file", "source_sha256", "metric", "source_raw",
     "source_value", "calculated_value", "comparison", "cause",
@@ -155,12 +157,17 @@ def _decimal_token(raw: object) -> tuple[Decimal, int]:
 
 def _validate_real_v2_numeric_evidence(verification: pd.DataFrame) -> None:
     for row in verification.itertuples(index=False):
+        if row.metric not in SUMMARY_METRICS:
+            continue
         source_raw, precision = _decimal_token(row.source_raw)
         source_value, _ = _decimal_token(row.source_value)
         calculated, _ = _decimal_token(row.calculated_value)
-        rounded = calculated.quantize(Decimal(1).scaleb(-precision), rounding=ROUND_HALF_UP)
-        if source_value != source_raw or rounded != source_raw:
+        if source_value != source_raw:
             raise PackageInputError("real v2 metric_verification.csv numeric evidence does not reconcile")
+        if row.metric in ACTION_SUMMARY_METRICS:
+            rounded = calculated.quantize(Decimal(1).scaleb(-precision), rounding=ROUND_HALF_UP)
+            if rounded != source_raw:
+                raise PackageInputError("real v2 metric_verification.csv numeric evidence does not reconcile")
 
 
 def _validate_real_v2_evidence(
@@ -225,8 +232,18 @@ def _validate_real_v2_evidence(
     ]
     if any(verification[column].str.strip().eq("").any() for column in evidence_values):
         raise PackageInputError("real v2 metric_verification.csv must not contain empty evidence")
-    if not verification["cause"].str.strip().eq("").all() or not verification["comparison"].eq("EQUAL").all():
-        raise PackageInputError("real v2 metric_verification.csv must contain only EQUAL rows without causes")
+    action_rows = verification["metric"].isin(ACTION_SUMMARY_METRICS)
+    non_comparable_rows = verification["metric"].isin({"PnL", "DD"})
+    if (
+        not verification.loc[action_rows, "cause"].str.strip().eq("").all()
+        or not verification.loc[action_rows, "comparison"].eq("EQUAL").all()
+        or not verification.loc[non_comparable_rows, "comparison"].eq(NOT_COMPARABLE_WINDOW_SCOPE).all()
+        or not verification.loc[non_comparable_rows, "cause"].eq(NOT_COMPARABLE_WINDOW_SCOPE).all()
+    ):
+        raise PackageInputError(
+            "real v2 metric_verification.csv must mark PnL/DD as NOT_COMPARABLE_WINDOW_SCOPE "
+            "and contain only EQUAL action-metric rows without causes"
+        )
     _validate_real_v2_numeric_evidence(verification)
 
     for report_id, identity in sample_by_report.items():

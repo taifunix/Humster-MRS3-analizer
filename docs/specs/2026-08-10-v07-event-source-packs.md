@@ -85,13 +85,20 @@ the manifest's `source_summary_status=VERIFIED` **and** its
 the latter status. Real package v1 is audit-only and is rejected by the
 selector because it cannot state this two-horizon contract.
 
+The exact v2 source-summary metric contract is defined by
+[ADR-0003](../decisions/0003-source-integrity-action-metrics.md): only the
+action-derived `TotalTrades`, `WinRate` and `ProfitFactor` are equality-gate
+metrics. PnL/DD values remain mandatory audit diagnostics with
+`NOT_COMPARABLE_WINDOW_SCOPE`; they cannot cause or satisfy `VERIFIED`.
+
 HTML parsing keeps absolute and percentage values separate: `Total PnL` is
 absolute `TotalPnL`, while `Total PnL, %` is `TotalPnLPercent`; `Max Drawdown`
 is absolute `MaxDrawdown`, while `Max Drawdown, %` is
-`MaxDrawdownPercent`. The full-horizon source-summary comparison uses only the
-absolute PnL/DD fields plus `TotalTrades`, `WinRate` and `ProfitFactor`, with
-the source's rounding. A `%` label must never satisfy an absolute-metric
-lookup, or conversely.
+`MaxDrawdownPercent`. Full-horizon source integrity requires only
+`TotalTrades`, `WinRate` and `ProfitFactor`, with the source's rounding.
+Absolute PnL/DD remain audited as `NOT_COMPARABLE_WINDOW_SCOPE`, not equality
+evidence. A `%` label must never satisfy an absolute-metric lookup, or
+conversely.
 
 `legacy_trades_proxy` package v1 remains valid under its existing contract:
 one legacy mode, an exact window, `point_event_count=TotalTrades`, and the

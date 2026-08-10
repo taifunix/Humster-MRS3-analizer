@@ -33,6 +33,8 @@ VERIFICATION_METRICS = {
     "WinRate": "WinRate",
     "ProfitFactor": "ProfitFactor",
 }
+ACTION_SUMMARY_METRICS = frozenset({"TotalTrades", "WinRate", "ProfitFactor"})
+NOT_COMPARABLE_WINDOW_SCOPE = "NOT_COMPARABLE_WINDOW_SCOPE"
 VERIFICATION_COLUMNS = [
     "report_id", "source_file", "source_sha256", "metric", "source_raw", "source_value",
     "calculated_value", "comparison", "cause",
@@ -494,6 +496,14 @@ def _verification(
         for metric, calculated_name in VERIFICATION_METRICS.items():
             source_raw, source_value, precision = parsed[metric]
             calculated = metrics[calculated_name]
+            if metric not in ACTION_SUMMARY_METRICS:
+                rows.append({"report_id": report["report_id"], "source_file": source_file,
+                             "source_sha256": source_sha256, "metric": metric,
+                             "source_raw": source_raw, "source_value": source_value,
+                             "calculated_value": calculated,
+                             "comparison": NOT_COMPARABLE_WINDOW_SCOPE,
+                             "cause": NOT_COMPARABLE_WINDOW_SCOPE})
+                continue
             equal = calculated is not None and Decimal(str(calculated)).quantize(
                 Decimal(1).scaleb(-precision), rounding=ROUND_HALF_UP
             ) == source_value

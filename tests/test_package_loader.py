@@ -93,8 +93,8 @@ def write_real_package(
                 "source_raw": value,
                 "source_value": value,
                 "calculated_value": value,
-                "comparison": "EQUAL",
-                "cause": "",
+                "comparison": "NOT_COMPARABLE_WINDOW_SCOPE" if metric in {"PnL", "DD"} else "EQUAL",
+                "cause": "NOT_COMPARABLE_WINDOW_SCOPE" if metric in {"PnL", "DD"} else "",
             }
             for metric, value in metrics.items()
         )
@@ -181,6 +181,25 @@ def test_load_package_accepts_verified_real_mapping(tmp_path: Path) -> None:
     ) == events_by_point
 
 
+def test_load_package_accepts_different_pnl_dd_values_marked_not_comparable(tmp_path: Path) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, _ = write_real_package(tmp_path / "package", paths)
+    verification_path = package / "metric_verification.csv"
+    verification = pd.read_csv(verification_path, dtype=str, keep_default_na=False)
+    verification.loc[verification["metric"].eq("PnL"), "calculated_value"] = "999"
+    verification.loc[verification["metric"].eq("DD"), "calculated_value"] = "888"
+    verification.to_csv(verification_path, index=False)
+
+    loaded = _load_package(
+        package,
+        paths["dates"],
+        Side.LONG,
+        AlgorithmConfig.from_json(paths["config"]),
+    )
+
+    assert loaded.event_mode == "real_independent_events"
+
+
 def test_load_package_rejects_fabricated_v2_without_source_summary_evidence(
     tmp_path: Path,
 ) -> None:
@@ -238,6 +257,7 @@ def test_load_package_rejects_invalid_manifest(
         ("range", "identity or range"),
         ("verification_schema", "metric_verification.csv schema"),
         ("verification_result", "only EQUAL"),
+        ("pnl_false_equal", "NOT_COMPARABLE_WINDOW_SCOPE"),
         ("verification_rows", "five rows per sample"),
         ("impossible_cycles", "action reconciliation"),
         ("trade_undercount", "numeric evidence|action reconciliation"),
@@ -268,7 +288,10 @@ def test_load_package_rejects_invalid_real_v2_evidence_chain(
     elif fault == "verification_schema":
         verification = verification.drop(columns=["cause"])
     elif fault == "verification_result":
-        verification.loc[0, "comparison"] = "MISMATCH"
+        verification.loc[(verification["report_id"] == "R1") & (verification["metric"] == "TotalTrades"), "comparison"] = "MISMATCH"
+    elif fault == "pnl_false_equal":
+        rows = (verification["report_id"] == "R1") & (verification["metric"] == "PnL")
+        verification.loc[rows, ["comparison", "cause"]] = ["EQUAL", ""]
     elif fault == "verification_rows":
         verification = verification.iloc[1:]
     elif fault == "impossible_cycles":
@@ -297,9 +320,9 @@ def test_load_package_rejects_invalid_real_v2_evidence_chain(
 @pytest.mark.parametrize(
     ("metric", "field", "value", "message"),
     [
-        ("PnL", "source_value", 2, "numeric evidence"),
-        ("DD", "calculated_value", 2, "numeric evidence"),
-        ("PnL", "comparison", 2, "numeric evidence"),
+        ("TotalTrades", "source_value", 2, "numeric evidence"),
+        ("WinRate", "calculated_value", 2, "numeric evidence"),
+        ("ProfitFactor", "comparison", 2, "numeric evidence"),
     ],
 )
 def test_load_package_rejects_tampered_real_v2_metric_evidence(
@@ -317,6 +340,26 @@ def test_load_package_rejects_tampered_real_v2_metric_evidence(
     verification.to_csv(verification_path, index=False)
 
     with pytest.raises(ValueError, match=message):
+        _load_package(
+            package,
+            paths["dates"],
+            Side.LONG,
+            AlgorithmConfig.from_json(paths["config"]),
+        )
+
+
+@pytest.mark.parametrize("field", ["source_raw", "source_value", "calculated_value"])
+def test_load_package_rejects_non_numeric_pnl_dd_diagnostics(tmp_path: Path, field: str) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, _ = write_real_package(tmp_path / "package", paths)
+    verification_path = package / "metric_verification.csv"
+    verification = pd.read_csv(verification_path, keep_default_na=False)
+    rows = (verification["report_id"] == "R1") & verification["metric"].isin(["PnL", "DD"])
+    verification[field] = verification[field].astype(str)
+    verification.loc[rows, field] = "not-a-number"
+    verification.to_csv(verification_path, index=False)
+
+    with pytest.raises(ValueError, match="numeric evidence"):
         _load_package(
             package,
             paths["dates"],
