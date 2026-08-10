@@ -1,22 +1,33 @@
 # Progress
 
 **Updated:** 2026-08-10
+**Current branch:** `main`
+**Current feature:** [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md)
 
-## Current feature
+## Verified repository baseline
 
-[v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md)
+- Root package: `src/mrs3`; tests: `tests`; project version: `0.7.0`.
+- Full test suite: `162 passed` (`.venv\\Scripts\\python.exe -m pytest -q`, 2026-08-10).
+- DuckDB v3/v4 importer pair is preserved in `programs/Обработчик HTML-DuckDB/`; v4 requires adjacent v3 codec.
+- Local tester configuration exists outside Git as ignored `config.local.json`.
+- Repository foundation, documentation model, importer/source preservation and Claude Code instructions are committed on `main`.
 
-## Last verified state
+## Next required evidence
 
-- Root v0.7 package/test migration committed as `e58a4fc`.
-- `.venv` created and `python -m pytest -q` completed successfully with `162 passed` during the elevated setup run.
-- The local tester configuration is present and ignored by Git.
+Collect the v4 import outcome before implementing the materializer:
 
-## Next action
-
-Obtain and verify v4 import evidence: `schema_info.schema_version`, `import_manifest.json`, quarantine count, and `html_delete_checklist.csv`. Do not implement the materializer or delete HTML before this evidence exists.
+1. `schema_info.schema_version` must be `4`.
+2. `import_manifest.json` must report the expected worker run and quarantine count.
+3. Confirm compact schema has no row-per-sample tables.
+4. Review `html_delete_checklist.csv`; do not delete any HTML before its row is `safe_to_delete=YES`.
+5. Record actual database size and payload statistics in the import audit.
 
 ## Blockers
 
-- No v4 import result, manifest, or DuckDB file is present in this repository.
-- The intended GitHub remote is configured locally but has not been created or pushed by this session.
+- The repository contains no v4 database, manifest, checklist or import console output.
+- Therefore materializer, unified input and selector-v0.7 changes are intentionally not started.
+- The local remote URL is configured, but no GitHub repository creation or push was requested/performed.
+
+## Update protocol
+
+Replace this file’s verified-state and next-action sections whenever a commit changes the operational state. Keep only the present blocker set; durable decisions belong in ADRs and feature requirements belong in specs.

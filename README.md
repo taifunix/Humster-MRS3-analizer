@@ -1,42 +1,66 @@
 # Humster MRS3 Analyzer
 
-Deterministic tooling for selecting, generating, testing, and auditing MRS3 mean-reversion strategy candidates.
+Инструменты для воспроизводимого отбора, генерации, тестирования и аудита кандидатов MRS3 mean-reversion strategy.
 
-## Status
+> Статус: идёт переход к v0.7. Код уже запускается и покрыт тестами, но production legacy-run ещё ожидает подтверждённые результаты v4 DuckDB-импорта.
 
-The repository is being upgraded to v0.7. The current code is a migrated v0.6 baseline; v0.7 behavior is delivered through the active specifications in [PRD.md](PRD.md).
+## Что делает проект
 
-## Setup
+```text
+MRS2 reports → нормализованные точки → plateaus / structures → JSON кандидатов
+           → Hamster Bot Tester → raw results → DD5 retest → individual comparison
+```
 
-Requires Python 3.11 or newer.
+Pipeline сохраняет traceability от каждого JSON до MRS2-точек и не выдаёт source-метрики за фактическую доходность MRS3 до реального теста.
+
+## Быстрый старт
+
+Нужен Python 3.11+ и локальный Hamster Bot Tester.
 
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 Copy-Item config.local.json.example config.local.json
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Set `tester_runner.bot_root` in `config.local.json` to your local Hamster Bot Tester directory. This file is intentionally ignored by Git.
+В `config.local.json` задайте локальный `tester_runner.bot_root`. Файл игнорируется Git и не должен публиковаться.
 
-## Commands
+## Основные команды
 
 ```powershell
-# Run automated tests
-.\.venv\Scripts\python.exe -m pytest -q
+# Справка по доступным командам
+.\.venv\Scripts\python.exe -m mrs3.cli --help
 
-# Start the local control panel
+# Локальная панель управления
 .\scripts\start_panel.bat
 
-# Show CLI commands
-.\.venv\Scripts\python.exe -m mrs3.cli --help
+# Построение кандидатов
+.\.venv\Scripts\python.exe -m mrs3.cli select --help
+
+# Проверка batch без изменения тестера / запуск batch
+.\.venv\Scripts\python.exe -m mrs3.cli tester-plan --help
+.\.venv\Scripts\python.exe -m mrs3.cli tester-run --help
+
+# Post-test DD5 comparison
+.\.venv\Scripts\python.exe -m mrs3.cli posttest --help
 ```
 
-The selector, tester runner and post-test comparison require their respective validated input files. See [PRD.md](PRD.md) and the active feature specification before running production data.
+Перед запуском на production данных прочитайте активную спецификацию: [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md).
 
-## Documentation
+## Важные ограничения
 
-- [Project requirements and feature registry](PRD.md)
-- [Current verified state](progress.md)
-- [Contributor/session rules](AGENTS.md)
+- Не удаляйте HTML до успешного v4 import audit.
+- Не смешивайте `legacy_trades_proxy` и real independent events.
+- Сумма PnL исходных MRS2-ордеров не равна PnL готовой MRS3-стратегии.
+- Реальное сравнение финалистов требует tick-test и DD5 retest.
+- Портфельная симуляция пока вне scope: ей нужны временные ряды equity, drawdown, occupancy и margin.
 
-Do not delete raw HTML until the v4 DuckDB import audit confirms each file is safe to delete.
+## Документация и участие
+
+- [PRD и реестр фич](PRD.md)
+- [Текущая проверенная точка](progress.md)
+- [Правила для агентов и Claude Code](AGENTS.md), [CLAUDE.md](CLAUDE.md)
+- [Навигация по документации](docs/README.md)
+
+Внутренние правила требуют отдельного agent-review перед каждым коммитом. Не добавляйте raw HTML, DuckDB, локальную конфигурацию или результаты тестера в Git.
