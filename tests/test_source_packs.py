@@ -322,6 +322,67 @@ def test_full_horizon_html_evidence_does_not_compare_the_selected_window(tmp_pat
     assert {row["calculated_value"] for row in rows if row["metric"] == "PnL"} == {12}
 
 
+def test_full_horizon_html_evidence_uses_importer_text_identity_for_crlf_source(tmp_path: Path) -> None:
+    report = tmp_path / "report.html"
+    source_text = (
+        "<table>\n<tr><th>Total PnL</th><td>5</td></tr>\n"
+        "<tr><th>Max Drawdown</th><td>5</td></tr>\n"
+        "<tr><th>Total Trades</th><td>2</td></tr>\n"
+        "<tr><th>Win Rate</th><td>50%</td></tr>\n"
+        "<tr><th>Profit Factor</th><td>2</td></tr>\n</table>"
+    )
+    report.write_bytes(source_text.replace("\n", "\r\n").encode("utf-8"))
+    metrics = {"TotalPnL": 5, "MaxDrawdown": 5, "TotalTrades": 2, "WinRate": 50, "ProfitFactor": 2}
+
+    rows, status, cause = duckdb_events._verification(
+        [
+            {
+                "report_id": f"R{index}", "source_file": "report.html",
+                "source_sha256": sha256(source_text.encode("utf-8")).hexdigest(),
+                "source_metrics": metrics,
+            }
+            for index in range(1, 4)
+        ],
+        tmp_path,
+        3,
+    )
+
+    assert status == "VERIFIED"
+    assert cause == ""
+    assert {row["comparison"] for row in rows} == {"EQUAL"}
+
+
+def test_full_horizon_html_evidence_rejects_different_normalized_source_text(tmp_path: Path) -> None:
+    report = tmp_path / "report.html"
+    source_text = (
+        "<table>\n<tr><th>Total PnL</th><td>5</td></tr>\n"
+        "<tr><th>Max Drawdown</th><td>5</td></tr>\n"
+        "<tr><th>Total Trades</th><td>2</td></tr>\n"
+        "<tr><th>Win Rate</th><td>50%</td></tr>\n"
+        "<tr><th>Profit Factor</th><td>2</td></tr>\n</table>"
+    )
+    report.write_bytes(source_text.replace("\n", "\r\n").encode("utf-8"))
+    different_source_text = source_text.replace("<td>5</td>", "<td>6</td>", 1)
+    metrics = {"TotalPnL": 5, "MaxDrawdown": 5, "TotalTrades": 2, "WinRate": 50, "ProfitFactor": 2}
+
+    rows, status, cause = duckdb_events._verification(
+        [
+            {
+                "report_id": f"R{index}", "source_file": "report.html",
+                "source_sha256": sha256(different_source_text.encode("utf-8")).hexdigest(),
+                "source_metrics": metrics,
+            }
+            for index in range(1, 4)
+        ],
+        tmp_path,
+        3,
+    )
+
+    assert status == "UNVERIFIED"
+    assert cause == "SOURCE_IDENTITY_MISMATCH"
+    assert {row["cause"] for row in rows} == {"SOURCE_IDENTITY_MISMATCH"}
+
+
 @pytest.mark.parametrize(
     ("source_sha256", "source_range_start", "cause"),
     [

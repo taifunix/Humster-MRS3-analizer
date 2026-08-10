@@ -454,7 +454,10 @@ def _verification(
         source_file = Path(str(report["source_file"])).name
         path = html_root / source_file
         source_sha256 = str(report.get("source_sha256", ""))
-        identity = sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+        try:
+            identity = sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest() if path.is_file() else ""
+        except (OSError, UnicodeDecodeError):
+            identity = ""
         if window_start is not None and window_end is not None:
             source_start = _utc(str(report["source_range_start"]))
             source_end = _utc(str(report["source_range_end"]))
