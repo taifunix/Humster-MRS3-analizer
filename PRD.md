@@ -16,9 +16,11 @@ Humster MRS3 Analyzer — локальный, детерминированный
 4. результаты реального tick-test, DD5-retest и individual ranking;
 5. только после накопления результатов — калиброванный безопасный pre-test potential filter.
 
-## Текущий этап: v0.7 event source packs
+## Текущий этап: v0.7 DuckDB analysis storage and importer
 
-Цель ближайшего этапа — подготовить два проверяемых, взаимно исключающих source pack на окне `[2026-07-15T00:00:00, 2026-08-06T00:00:00)`: CSV `legacy_trades_proxy` с `point_event_count=TotalTrades` и DuckDB `real_independent_events` с `point_event_count=unique(event_id)`. Экспорт реальных событий из DuckDB сохраняет исходный event mode и не превращается в proxy. Real-пакет v2 отдельно доказывает full-horizon source summary и происхождение windowed metrics; HTML summary не является проверкой равенства метрик окна. Контракт и порядок поставки зафиксированы в [спецификации event source packs](docs/specs/2026-08-10-v07-event-source-packs.md), [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) и [ADR-0003](docs/decisions/0003-source-integrity-action-metrics.md).
+Цель ближайшего этапа — сохранить source DuckDB единым пополняемым lossless-хранилищем HTML-отчётов, перенести управление импортом в веб-панель и материализовывать воспроизводимые поверхности для анализа плато в отдельную append-only analysis DuckDB. Анализ напрямую из source DuckDB сначала публикует неизменяемую поверхность, а затем запускает общий plateau pipeline. Контракт зафиксирован в [спецификации DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
+
+Соединение CSV с DuckDB не входит в обязательную поставку и не блокирует этот этап. Оно вынесено в отдельное [необязательное ТЗ CSV-DuckDB overlay](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md) со статусом **Optional / Deferred**. Существующие [event source packs](docs/specs/2026-08-10-v07-event-source-packs.md), [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) и [ADR-0003](docs/decisions/0003-source-integrity-action-metrics.md) остаются диагностическими зависимостями.
 
 ### Этапы поставки
 
@@ -62,6 +64,8 @@ Humster MRS3 Analyzer — локальный, детерминированный
 | Active prerequisite | [Safe runner smoke-test](docs/specs/2026-08-10-v06-runner-safe-root-json-smoke.md) | безопасная проверка панели и одного реального прогона | локальный tester; до v0.7 implementation |
 | Active | [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md) | последовательность import → materializer → unified input → selector | v4 evidence, event-filter spec |
 | Active | [v0.7 event source packs](docs/specs/2026-08-10-v07-event-source-packs.md) | CSV/DuckDB пакеты, event modes и closed-cycle audit | v4 evidence, event-filter spec |
+| Proposed | [v0.7 DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md) | единый source DuckDB, импорт из панели, analysis DuckDB и plateau lineage | event source packs, event-filter spec |
+| Optional / Deferred | [v0.7 CSV-DuckDB overlay](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md) | необязательное объединение CSV coarse-grid и DuckDB fine-grid | DuckDB analysis storage, event-filter spec |
 | Accepted | [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) | раздельная full-horizon/windowed verification для real packages v2 | event source packs |
 | Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
 | Planned | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | empirical cap без leakage | завершённые tick-tests |

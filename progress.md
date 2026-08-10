@@ -1,13 +1,15 @@
 # Progress
 
-**Updated:** 2026-08-10
+**Updated:** 2026-08-11
 **Current branch:** `main`
-**Current feature:** [v0.7 event source packs](docs/specs/2026-08-10-v07-event-source-packs.md)
+**Current feature:** [v0.7 DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
 
 ## Verified repository baseline
 
 - Root package: `src/mrs3`; tests: `tests`; project version: `0.7.0`.
-- Full test suite: `214 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -q`, 2026-08-10). The skip is the Windows symlink-permission test, not a product failure.
+- Latest committed source-integrity suite: `292 passed, 1 skipped`
+  (`.venv\\Scripts\\python.exe -m pytest -q -p no:cacheprovider`, 2026-08-10).
+  The skip is the Windows symlink-permission test, not a product failure.
 - DuckDB v3/v4 importer pair is preserved in `programs/Обработчик HTML-DuckDB/`; v4 requires adjacent v3 codec.
 - Local tester configuration exists outside Git as ignored `config.local.json`.
 - Repository foundation, documentation model, importer/source preservation and Claude Code instructions are committed on `main`.
@@ -20,60 +22,47 @@
 - The panel starts locally and answers HTTP 200. A one-strategy `tester-plan` succeeds when the JSON is supplied through a directory.
 - Two approved real one-strategy smoke-runs completed. The second run completed the full runner lifecycle through `CSV_COMMITTED` and `COMPLETED` after the transient state-file lock fix; its result CSV is retained locally, while the configured report directory and both wizard logs were absent after cleanup. Only the root strategy JSON was changed; nested strategy folders were not touched.
 
-## Next required evidence
+## Current verified state
 
-CSV and DuckDB source-package builders are implemented and tested. CSV produces
-`legacy_trades_proxy`; DuckDB reconstructs closed
-`real_independent_events` with an exclusion audit and fail-closed HTML-sample
-verification. Package loading now rejects missing, mixed, unknown or unverified
-event metadata and requires exact real-event mappings. The selector accepts
-exactly one `--source-package` or compatibility `--input-csv`; for real packages
-each plateau's event union includes every geometric plateau point, even one that
-is not eligible for selection. The local panel exposes these source packages
-as an explicit candidate-input choice; it submits exactly one verified package
-or compatibility raw CSV, and keeps Portfolio Analyzer controls noninteractive.
-DuckDB HTML verification is available from both `source-duckdb` and its panel
-tab through an explicit optional local root and a fail-closed 3–5 sample count;
-no local path is stored in the package manifest.
+CSV and DuckDB source-package builders, v2 source verification, package loading,
+the selector event gate and the panel source-package controls are implemented.
+ADR-0003 makes `TotalTrades`, `WinRate` and `ProfitFactor` the fail-closed
+full-horizon source gate; PnL/DD remain mandatory
+`NOT_COMPARABLE_WINDOW_SCOPE` diagnostics. The DuckDB materializer uses bounded
+reads and retains the complete cycle/exclusion audit.
 
-The DuckDB materializer now streams database reads in bounded batches. It
-still decodes every report's actions to preserve the complete cycle/exclusion
-audit, but reads timestamp/equity/wallet blobs only for grids whose stored
-bounds cover the requested window and validates the decoded grid before metric
-calculation. Regression coverage proves that a non-covering report with invalid
-heavy series remains audited while covered-point output is unchanged. Full
-suite evidence: `251 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -q
--p no:cacheprovider`, 2026-08-10); the skip is the Windows symlink permission
-case.
+Read-only v2 materialization then completed: `96,767` reports, `8,050`
+coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
+included cycles. The package has `source_summary_status=VERIFIED` and
+`window_metrics_status=DERIVED_FROM_VERIFIED_SOURCE`. An exploratory real LONG
+selector run then completed with the still-uncommitted package-side and
+UTC-normalization integration slice:
+`3,730` normalized points, all with 24-346 events, but `0` economic/event-
+eligible points, `0` plateaus and `0` READY structures under the current
+economic thresholds. This is a result, not a source-verification failure.
+It is not directly comparable to the separately supplied LONG CSV grid: that CSV has
+`36,288` points on the same window and produces `3,432` economic-pass points
+under the same thresholds, whereas the imported DuckDB LONG slice has `3,730`
+points. Core v0.7 will therefore publish direct DuckDB surfaces into a separate
+analysis DuckDB. A possible CSV-base overlay is isolated in the
+[optional/deferred specification](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md)
+and does not block the core delivery.
 
-Read-only materialization of the full local v4 database reached the
-source-summary comparison stage. That evidence established a necessary
-contract correction: source HTML summaries cover each report's full test
-horizon, while v0.7 points/events cover the selected `[start, end)` window.
-The parser must also distinguish absolute `Total PnL`/`Max Drawdown` from
-their `%` forms. The old single real-package verification label cannot prove
-both facts and is not selector evidence for a real package.
+## Next required work
 
-The next implementation step is to publish/load real source packages in v2:
-fail-closed full-horizon `source_summary_status=VERIFIED` from 3–5 HTML
-comparisons, followed by `window_metrics_status=DERIVED_FROM_VERIFIED_SOURCE`
-for `[start, end)` metrics/events. The real selector gate requires their
-conjunction; legacy v1 proxy packages retain their existing contract. Then
-build one real read-only DuckDB package with the approved window and HTML
-samples, run `select --source-package` with the externally supplied listing
-dates and strategy template, retain the local audit, and decide whether Phase
-2 is needed only from the resulting candidate/event distributions.
-
-ADR-0003 narrows the full-horizon source gate to action-derived
-`TotalTrades`, `WinRate` and `ProfitFactor`; PnL/DD are retained only as
-`NOT_COMPARABLE_WINDOW_SCOPE` diagnostics. The implementation is awaiting
-independent review, then the same real read-only package will be rebuilt.
+1. Close and independently review the existing package-side/UTC-normalization
+   working-tree changes before mixing in new implementation.
+2. Apply the confirmed external-review remediation tasks listed in the
+   [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
+3. Implement the approved source-DuckDB migration/importer and direct analysis
+   surface storage in independently reviewed TDD slices.
+4. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
 
 ## Blockers
 
-- Before the real package rebuild, close the fail-closed validation finding for
-  `NOT_COMPARABLE_WINDOW_SCOPE` PnL/DD diagnostics; exact continuation is in
-  [source-integrity handoff](docs/handoffs/2026-08-10-source-integrity-finalization.md).
+- No external data blocker is known for the core storage/importer work. The
+  current dirty package-side changes must be closed first. CSV/DuckDB overlay
+  is explicitly deferred and no economic threshold changes implicitly.
 
 ## Queued module hook
 
