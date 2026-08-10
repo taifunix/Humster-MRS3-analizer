@@ -1,6 +1,6 @@
 # v0.7 DuckDB Analysis Storage and Importer
 
-**Status:** Proposed for implementation
+**Status:** Active / Approved for implementation
 
 **Depends on:** [v0.7 event source packs](2026-08-10-v07-event-source-packs.md),
 [event filter and shortlist](v07-event-filter-and-shortlist.md),

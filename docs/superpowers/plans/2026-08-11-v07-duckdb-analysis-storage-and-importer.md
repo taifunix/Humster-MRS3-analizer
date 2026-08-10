@@ -2,6 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Approved for execution. No implementation task has started; Task 0
+is the mandatory first action in the next coding session.
+
 **Goal:** Add a safely appendable source DuckDB, panel-managed HTML import,
 immutable `DUCKDB_DIRECT` analysis surfaces and persistent plateau/candidate
 lineage without changing legacy selection semantics.

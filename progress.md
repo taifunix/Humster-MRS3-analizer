@@ -50,6 +50,9 @@ and does not block the core delivery.
 
 ## Next required work
 
+The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
+approved. No implementation from that plan has started.
+
 1. Close and independently review the existing package-side/UTC-normalization
    working-tree changes before mixing in new implementation.
 2. Apply the confirmed external-review remediation tasks listed in the
