@@ -61,6 +61,17 @@ def test_controller_builds_shell_free_tester_command_and_captures_log(
     ]
 
 
+def test_controller_builds_source_csv_command_without_tester_config(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+
+    controller.start("source-csv", {"config": "config.json", "input_csv": "a.csv;b.csv", "start": "2026-07-15T00:00:00Z", "end": "2026-08-06T00:00:00Z", "output_dir": "package"})
+    job = _wait_finished(controller)["job"]
+
+    assert job["command"][1:4] == ["-m", "mrs3.cli", "source-csv"]
+    assert job["command"].count("--input-csv") == 2
+    assert "--config" in job["command"]
+
+
 def test_controller_rejects_parallel_jobs(tmp_path: Path) -> None:
     class WaitingProcess(_FakeProcess):
         def wait(self) -> int:
@@ -130,6 +141,7 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert response.status == 200
         assert "MRS3 Control Panel" in html
         assert "Каталог JSON-стратегий" in html
+        assert "Подготовить источник v0.7" in html
 
         body = json.dumps(
             {

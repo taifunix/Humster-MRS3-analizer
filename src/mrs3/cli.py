@@ -6,12 +6,14 @@ from pathlib import Path
 from typing import Sequence
 
 from .config import AlgorithmConfig
+from .duckdb_events import build_duckdb_package
 from .models import Side
 from .panel import serve_panel
 from .pipeline import SelectionInputs, run_selection
 from .posttest import run_posttest
 from .runner.config import RunnerConfig
 from .runner.workflow import plan_batch, run_batch
+from .source_packs import build_csv_package
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -24,6 +26,18 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("--side", choices=[side.value for side in Side], required=True)
     select.add_argument("--config", type=Path, required=True)
     select.add_argument("--output-dir", type=Path, required=True)
+    source_csv = subparsers.add_parser("source-csv", help="build an auditable legacy CSV source package")
+    source_csv.add_argument("--input-csv", type=Path, action="append", required=True)
+    source_csv.add_argument("--start", required=True)
+    source_csv.add_argument("--end", required=True)
+    source_csv.add_argument("--output-dir", type=Path, required=True)
+    source_csv.add_argument("--config", type=Path, required=True)
+    source_duckdb = subparsers.add_parser("source-duckdb", help="build an auditable DuckDB event source package")
+    source_duckdb.add_argument("--database", type=Path, required=True)
+    source_duckdb.add_argument("--start", required=True)
+    source_duckdb.add_argument("--end", required=True)
+    source_duckdb.add_argument("--output-dir", type=Path, required=True)
+    source_duckdb.add_argument("--config", type=Path, required=True)
     tester_plan = subparsers.add_parser(
         "tester-plan", help="validate and print a read-only Hamster Bot batch plan"
     )
@@ -72,6 +86,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             config,
         )
         print(json.dumps(result.manifest, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "source-csv":
+        _validate_source_output(args.output_dir, args.config)
+        package = build_csv_package(args.input_csv, args.start, args.end, args.output_dir)
+        print(json.dumps(package.manifest, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "source-duckdb":
+        _validate_source_output(args.output_dir, args.config)
+        package = build_duckdb_package(args.database, args.start, args.end, args.output_dir)
+        print(json.dumps(package.manifest, ensure_ascii=False, indent=2))
         return 0
     if args.command == "tester-plan":
         config = RunnerConfig.from_json(args.config)
@@ -140,6 +164,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     return 2
+
+
+def _validate_source_output(output_dir: Path, config_path: Path) -> None:
+    bot_root = RunnerConfig.from_json(config_path).bot_root.resolve()
+    try:
+        output_dir.resolve().relative_to(bot_root)
+    except ValueError:
+        return
+    raise ValueError("source package output must be outside bot_root")
 
 
 if __name__ == "__main__":

@@ -37,6 +37,36 @@ def test_select_cli_writes_manifest_and_returns_zero(tmp_path: Path) -> None:
     assert manifest["ready_json_count"] == 5
 
 
+def test_source_csv_cli_builds_legacy_package(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "input.csv"
+    source.write_text("StartDate,EndDate,TotalTrades\n2026-07-15 00:00:00,2026-08-06 00:00:00,3\n", encoding="utf-8")
+    output = tmp_path / "package"
+
+    code = main(["source-csv", "--input-csv", str(source), "--start", "2026-07-15T00:00:00Z", "--end", "2026-08-06T00:00:00Z", "--output-dir", str(output), "--config", str(_write_runner_config(tmp_path))])
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["event_mode"] == "legacy_trades_proxy"
+    assert (output / "points.csv").is_file()
+
+
+def test_source_duckdb_cli_dispatches_package_builder(tmp_path: Path, monkeypatch, capsys) -> None:
+    called: dict[str, object] = {}
+
+    def fake_builder(database, start, end, output):
+        called.update(database=database, start=start, end=end, output=output)
+        return SimpleNamespace(manifest={"event_mode": "real_independent_events"})
+
+    monkeypatch.setattr(cli, "build_duckdb_package", fake_builder)
+    database = tmp_path / "source.duckdb"
+    output = tmp_path / "package"
+
+    code = main(["source-duckdb", "--database", str(database), "--start", "2026-07-15T00:00:00Z", "--end", "2026-08-06T00:00:00Z", "--output-dir", str(output), "--config", str(_write_runner_config(tmp_path))])
+
+    assert code == 0
+    assert called["database"] == database
+    assert json.loads(capsys.readouterr().out)["event_mode"] == "real_independent_events"
+
+
 def _write_runner_config(tmp_path: Path) -> Path:
     bot = tmp_path / "hb"
     bot.mkdir(parents=True)

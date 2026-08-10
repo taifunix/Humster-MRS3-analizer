@@ -108,6 +108,19 @@ PANEL_HTML = r"""<!doctype html>
         <button id="runButton" class="primary" onclick="startAction('tester-run')">Запустить тесты</button>
       </div>
       <details>
+        <summary>Подготовить источник v0.7</summary>
+        <div class="stack">
+          <label>CSV-файлы (через ;)<input id="source_csv_files" value="reports_history_bybit_long_day2.csv" type="text"></label>
+          <label>DuckDB-файл<input id="source_duckdb" value="mrs3_parallel_compact_v4.duckdb" type="text"></label>
+          <div class="row">
+            <label>Начало UTC<input id="source_start" value="2026-07-15T00:00:00Z" type="text"></label>
+            <label>Конец UTC<input id="source_end" value="2026-08-06T00:00:00Z" type="text"></label>
+          </div>
+          <label>Каталог source-pack<input id="source_output_dir" value="source_package" type="text"></label>
+          <div class="buttons"><button onclick="startAction('source-csv')">CSV: Trades proxy</button><button onclick="startAction('source-duckdb')">DuckDB: реальные события</button></div>
+        </div>
+      </details>
+      <details>
         <summary>Создать стратегии</summary>
         <div class="stack">
           <label>Исходный CSV<input id="input_csv" value="reports_history_bybit_long_day2.csv" type="text"></label>
@@ -156,7 +169,7 @@ PANEL_HTML = r"""<!doctype html>
 </main>
 <script>
 const labels = {
-  'tester-plan':'Проверка плана', 'tester-run':'Пакетное тестирование', 'select':'Создание стратегий', 'posttest':'DD5-анализ',
+  'tester-plan':'Проверка плана', 'tester-run':'Пакетное тестирование', 'select':'Создание стратегий', 'posttest':'DD5-анализ', 'source-csv':'CSV source-pack', 'source-duckdb':'DuckDB source-pack',
   'PRECHECK':'Предварительная проверка', 'STOPPED':'Бот остановлен', 'CLEAN':'Отчёты очищены', 'INSTALLED':'Стратегии установлены',
   'STARTED':'Бот запущен', 'VISIBLE':'Стратегии появились', 'SUBMITTED':'Все тесты отправлены', 'MONITORING':'Идёт тестирование',
   'RECONCILED':'Результаты сверены', 'CSV_COMMITTED':'CSV сохранён', 'STOPPED_FOR_CLEANUP':'Бот остановлен для очистки',
@@ -168,6 +181,8 @@ function payload(action) {
   const base = {action, config:value('config')};
   if (action === 'tester-plan') return {...base, strategies:value('strategies')};
   if (action === 'tester-run') return {...base, strategies:value('strategies'), output_csv:value('output_csv')};
+  if (action === 'source-csv') return {...base, input_csv:value('source_csv_files'), start:value('source_start'), end:value('source_end'), output_dir:value('source_output_dir')};
+  if (action === 'source-duckdb') return {...base, database:value('source_duckdb'), start:value('source_start'), end:value('source_end'), output_dir:value('source_output_dir')};
   if (action === 'select') return {...base, input_csv:value('input_csv'), dates:value('dates'), template:value('template'), side:value('side'), output_dir:value('select_output_dir')};
   return {...base, results_csv:value('results_csv'), audit_xlsx:value('audit_xlsx'), strategies:value('posttest_strategies'), output_dir:value('posttest_output_dir')};
 }
@@ -282,9 +297,27 @@ class PanelController:
     def _build_command(
         self, action: str, payload: Mapping[str, object]
     ) -> tuple[tuple[str, ...], dict[str, Path]]:
-        config = self._path(self._required(payload, "config"))
-        command = [sys.executable, "-m", "mrs3.cli", action, "--config", str(config)]
+        command = [sys.executable, "-m", "mrs3.cli", action]
         artifacts: dict[str, Path] = {}
+        if action in {"source-csv", "source-duckdb"}:
+            start = self._required(payload, "start")
+            end = self._required(payload, "end")
+            output_dir = self._path(self._required(payload, "output_dir"))
+            if action == "source-csv":
+                source_paths = [item.strip() for item in self._required(payload, "input_csv").split(";") if item.strip()]
+                if not source_paths:
+                    raise ValueError("input_csv must contain at least one path")
+                for source in source_paths:
+                    command.extend(["--input-csv", str(self._path(source))])
+            else:
+                command.extend(["--database", str(self._path(self._required(payload, "database")))])
+            config = self._path(self._required(payload, "config"))
+            command.extend(["--start", start, "--end", end, "--output-dir", str(output_dir), "--config", str(config)])
+            artifacts = {"manifest": output_dir / "package_manifest.json", "points": output_dir / "points.csv", "audit": output_dir / "source_audit.csv"}
+            return tuple(command), artifacts
+        else:
+            config = self._path(self._required(payload, "config"))
+            command.extend(["--config", str(config)])
         if action in {"tester-plan", "tester-run"}:
             strategies = self._path(self._required(payload, "strategies"))
             command.extend(["--strategies", str(strategies)])
