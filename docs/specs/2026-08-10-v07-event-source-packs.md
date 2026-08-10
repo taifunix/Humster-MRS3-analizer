@@ -1,7 +1,8 @@
 # v0.7 Event Source Packs
 
-**Status:** Active  
-**Depends on:** [v0.7 legacy selection](2026-08-10-v07-legacy-selection.md), [event filter](v07-event-filter-and-shortlist.md)  
+**Status:** Active
+
+**Depends on:** [v0.7 legacy selection](2026-08-10-v07-legacy-selection.md), [event filter](v07-event-filter-and-shortlist.md)
 **Supersedes:** the `legacy_trades_proxy`-only limitation in the active legacy-selection specification.
 
 ## Goal

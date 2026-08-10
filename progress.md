@@ -7,7 +7,7 @@
 ## Verified repository baseline
 
 - Root package: `src/mrs3`; tests: `tests`; project version: `0.7.0`.
-- Full test suite: `170 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -q`, 2026-08-10). The skip is the Windows symlink-permission test, not a product failure.
+- Full test suite: `177 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -q`, 2026-08-10). The skip is the Windows symlink-permission test, not a product failure.
 - DuckDB v3/v4 importer pair is preserved in `programs/Обработчик HTML-DuckDB/`; v4 requires adjacent v3 codec.
 - Local tester configuration exists outside Git as ignored `config.local.json`.
 - Repository foundation, documentation model, importer/source preservation and Claude Code instructions are committed on `main`.
