@@ -5,6 +5,7 @@ from decimal import Decimal
 import hashlib
 from pathlib import Path
 
+import pandas as pd
 from openpyxl import load_workbook
 
 from mrs3.config import AlgorithmConfig
@@ -76,6 +77,21 @@ def test_pipeline_builds_two_plateaus_and_validated_json(tmp_path: Path) -> None
         "16_Point_Events",
         "17_Plateau_Events",
     ]
+
+
+def test_pipeline_manifest_keeps_real_event_mode_from_source_package(tmp_path: Path) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    source = pd.read_csv(paths["csv"])
+    source["event_mode"] = "real_independent_events"
+    source["point_event_count"] = 3
+    source["event_ids_hash"] = "sha256:sample"
+    source.to_csv(paths["csv"], index=False)
+    config = AlgorithmConfig.from_json(paths["config"])
+    inputs = SelectionInputs(paths["csv"], paths["dates"], paths["template"], Side.LONG, tmp_path / "output")
+
+    result = run_selection(inputs, config)
+
+    assert result.manifest["event_mode"] == "real_independent_events"
 
 
 def test_same_inputs_produce_identical_digest_rows_and_json(tmp_path: Path) -> None:

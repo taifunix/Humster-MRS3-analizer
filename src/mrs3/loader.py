@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -11,6 +12,10 @@ from .models import InputAudit, Side
 
 class InputError(ValueError):
     """Raised when source files cannot produce an auditable point grid."""
+
+
+EVENT_MODES = frozenset({"legacy_trades_proxy", "real_independent_events"})
+LEGACY_EVENT_IDS_HASH = "LEGACY_PROXY_NO_EVENT_IDS"
 
 
 def normalize_shift(
@@ -120,9 +125,57 @@ def load_points(
         raise InputError(f"duplicate parameter cell: {sample}")
 
     points["point_id"] = points[key_columns].astype(str).agg("|".join, axis=1)
-    points["event_mode"] = "legacy_trades_proxy"
-    points["point_event_count"] = points["trades"]
-    points["event_ids_hash"] = "LEGACY_PROXY_NO_EVENT_IDS"
+    metadata_columns = {"event_mode", "point_event_count", "event_ids_hash"}
+    declared_metadata = "event_mode" in data
+    if declared_metadata:
+        event_modes = data["event_mode"]
+        normalized_modes = event_modes.astype(str).str.strip()
+        modes = sorted(set(normalized_modes))
+        if (
+            event_modes.isna().any()
+            or normalized_modes.eq("").any()
+            or len(modes) != 1
+            or modes[0] not in EVENT_MODES
+        ):
+            raise InputError(f"input must declare exactly one known event_mode: {modes}")
+        points["event_mode"] = modes[0]
+    else:
+        partial_metadata = sorted(metadata_columns.intersection(data.columns))
+        if partial_metadata:
+            raise InputError("event_mode is required when event metadata is present")
+        points["event_mode"] = "legacy_trades_proxy"
+
+    if not declared_metadata:
+        points["point_event_count"] = points["trades"]
+        points["event_ids_hash"] = LEGACY_EVENT_IDS_HASH
+    else:
+        if "point_event_count" not in data:
+            raise InputError("point_event_count is required with event_mode")
+        event_counts = pd.to_numeric(data["point_event_count"], errors="raise")
+        valid_event_counts = event_counts.map(
+            lambda value: math.isfinite(float(value))
+            and float(value) >= 0
+            and float(value).is_integer()
+        )
+        if not valid_event_counts.all():
+            raise InputError("point_event_count must be finite non-negative integers")
+        points["point_event_count"] = event_counts.astype("int64")
+        if points["event_mode"].iloc[0] == "legacy_trades_proxy" and not points[
+            "point_event_count"
+        ].eq(points["trades"]).all():
+            raise InputError("legacy point_event_count must equal TotalTrades")
+
+        if "event_ids_hash" not in data:
+            raise InputError("event_ids_hash is required with event_mode")
+        event_ids_hash = data["event_ids_hash"]
+        normalized_hashes = event_ids_hash.astype(str).str.strip()
+        if event_ids_hash.isna().any() or normalized_hashes.eq("").any():
+            raise InputError("event_ids_hash must be non-empty")
+        if points["event_mode"].iloc[0] == "legacy_trades_proxy" and not normalized_hashes.eq(
+            LEGACY_EVENT_IDS_HASH
+        ).all():
+            raise InputError(f"legacy_trades_proxy requires {LEGACY_EVENT_IDS_HASH}")
+        points["event_ids_hash"] = normalized_hashes
     ordered_columns = [
         "point_id",
         "run_id",

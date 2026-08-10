@@ -7,7 +7,7 @@
 ## Verified repository baseline
 
 - Root package: `src/mrs3`; tests: `tests`; project version: `0.7.0`.
-- Full test suite: `187 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -q`, 2026-08-10). The skip is the Windows symlink-permission test, not a product failure.
+- Full test suite: `201 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -q`, 2026-08-10). The skip is the Windows symlink-permission test, not a product failure.
 - DuckDB v3/v4 importer pair is preserved in `programs/Обработчик HTML-DuckDB/`; v4 requires adjacent v3 codec.
 - Local tester configuration exists outside Git as ignored `config.local.json`.
 - Repository foundation, documentation model, importer/source preservation and Claude Code instructions are committed on `main`.
@@ -21,12 +21,18 @@
 
 ## Next required evidence
 
-Implement v0.7 event source packs in the order fixed by the active spec:
+The two source-package builders are implemented and tested: CSV produces
+`legacy_trades_proxy`; DuckDB reconstructs closed
+`real_independent_events` with an exclusion audit. The loader now preserves a
+declared source metadata (`event_mode`, `PointEventCount` and event-set hash),
+while rejecting unknown or mixed modes. The current raw-CSV selector remains a
+compatibility path; package-directory input is the next implementation step.
 
-1. Define and test the CSV `legacy_trades_proxy` package, including exact-window validation.
-2. Define and test the DuckDB `real_independent_events` package, closed-cycle reconstruction and exclusion audit.
-3. Make the selector accept exactly one declared package and apply `PointEventCount` without mixed modes.
-4. Rebuild the universe and emit the before/after event audit; consider Phase 2 redundancy only after its actual count is available.
+Next, make the selector consume one package directory rather than an arbitrary
+CSV. Before a DuckDB package can feed that selector, add and reconcile the
+per-point economic metrics required by the existing selection contract. Then
+rebuild the universe, emit its before/after event audit and consider Phase 2
+redundancy only if its actual candidate count calls for it.
 
 ## Blockers
 

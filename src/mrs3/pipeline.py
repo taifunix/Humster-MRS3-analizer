@@ -456,7 +456,7 @@ def _run_selection_unlocked(inputs: SelectionInputs, config: AlgorithmConfig) ->
         "template_sha256": _sha256_file(inputs.template_path),
         "source_rows": input_audit.source_rows,
         "normalized_rows": len(plateau_points),
-        "event_mode": "legacy_trades_proxy",
+        "event_mode": str(plateau_points["event_mode"].iloc[0]),
         "event_eligible_point_count": int(plateau_points["event_eligible"].sum()),
         "event_ineligible_point_count": int((~plateau_points["event_eligible"]).sum()),
         "economic_pass_count": int(plateau_points["economic_pass"].sum()),

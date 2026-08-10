@@ -115,3 +115,103 @@ def test_short_uses_short_specific_columns(tmp_path: Path) -> None:
     assert points.iloc[0]["open_ma"] == 6
     assert points.iloc[0]["close_ma"] == 7
     assert points.iloc[0]["shift_bp"] == 270
+
+
+def test_source_package_metadata_is_preserved_for_real_events(tmp_path: Path) -> None:
+    csv_path, dates_path = _write_inputs(
+        tmp_path,
+        [
+            _source_row(
+                event_mode="real_independent_events",
+                point_event_count=3,
+                event_ids_hash="sha256:abc",
+            )
+        ],
+    )
+
+    points, _ = load_points(csv_path, dates_path, Side.LONG, _config())
+
+    assert points[["event_mode", "point_event_count", "event_ids_hash"]].to_dict("records") == [
+        {
+            "event_mode": "real_independent_events",
+            "point_event_count": 3,
+            "event_ids_hash": "sha256:abc",
+        }
+    ]
+
+
+@pytest.mark.parametrize("mode", [None, "", "unknown_mode"])
+def test_source_package_rejects_missing_or_unknown_event_mode(tmp_path: Path, mode: object) -> None:
+    csv_path, dates_path = _write_inputs(tmp_path, [_source_row(event_mode=mode)])
+
+    with pytest.raises(InputError, match="exactly one known event_mode"):
+        load_points(csv_path, dates_path, Side.LONG, _config())
+
+
+def test_source_package_rejects_mixed_event_modes(tmp_path: Path) -> None:
+    csv_path, dates_path = _write_inputs(
+        tmp_path,
+        [
+            _source_row(event_mode="legacy_trades_proxy"),
+            _source_row(
+                **{
+                    "Run id": 2,
+                    "settings[*].mrs2.ma_long.multiplier": 0.974,
+                    "event_mode": "real_independent_events",
+                }
+            ),
+        ],
+    )
+
+    with pytest.raises(InputError, match="exactly one known event_mode"):
+        load_points(csv_path, dates_path, Side.LONG, _config())
+
+
+@pytest.mark.parametrize("count", [3.5, -1, float("inf")])
+def test_declared_event_mode_rejects_invalid_point_event_count(tmp_path: Path, count: object) -> None:
+    csv_path, dates_path = _write_inputs(
+        tmp_path,
+        [_source_row(event_mode="real_independent_events", point_event_count=count, event_ids_hash="sha256:abc")],
+    )
+
+    with pytest.raises(InputError, match="point_event_count"):
+        load_points(csv_path, dates_path, Side.LONG, _config())
+
+
+@pytest.mark.parametrize("event_ids_hash", [None, "", "   "])
+def test_declared_event_mode_rejects_missing_event_ids_hash(
+    tmp_path: Path, event_ids_hash: object
+) -> None:
+    csv_path, dates_path = _write_inputs(
+        tmp_path,
+        [_source_row(event_mode="real_independent_events", point_event_count=3, event_ids_hash=event_ids_hash)],
+    )
+
+    with pytest.raises(InputError, match="event_ids_hash"):
+        load_points(csv_path, dates_path, Side.LONG, _config())
+
+
+def test_legacy_package_requires_explicit_no_event_ids_sentinel(tmp_path: Path) -> None:
+    csv_path, dates_path = _write_inputs(
+        tmp_path,
+        [_source_row(event_mode="legacy_trades_proxy", point_event_count=20, event_ids_hash="sha256:abc")],
+    )
+
+    with pytest.raises(InputError, match="LEGACY_PROXY_NO_EVENT_IDS"):
+        load_points(csv_path, dates_path, Side.LONG, _config())
+
+
+def test_legacy_package_requires_event_count_to_match_total_trades(tmp_path: Path) -> None:
+    csv_path, dates_path = _write_inputs(
+        tmp_path,
+        [
+            _source_row(
+                event_mode="legacy_trades_proxy",
+                point_event_count=3,
+                event_ids_hash="LEGACY_PROXY_NO_EVENT_IDS",
+            )
+        ],
+    )
+
+    with pytest.raises(InputError, match="point_event_count must equal TotalTrades"):
+        load_points(csv_path, dates_path, Side.LONG, _config())
