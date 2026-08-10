@@ -44,7 +44,8 @@ PANEL_HTML = r"""<!doctype html>
       margin: 0;
       background: radial-gradient(circle at top right, #17244a 0, var(--bg) 34rem);
       color: var(--text);
-      font: 14px/1.45 Inter, Segoe UI, Arial, sans-serif;
+      font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-optical-sizing: auto;
     }
     main { width: min(1180px, calc(100% - 28px)); margin: 26px auto 50px; }
     header { display: flex; justify-content: space-between; gap: 20px; align-items: end; margin-bottom: 18px; }
@@ -52,6 +53,16 @@ PANEL_HTML = r"""<!doctype html>
     h2, h3 { margin: 0 0 12px; }
     .subtitle, .muted { color: var(--muted); }
     .badge { padding: 7px 11px; border: 1px solid var(--line); border-radius: 999px; background: #10172a; }
+    .toolbar { display: flex; align-items: end; gap: 1rem; margin-bottom: 1rem; }
+    .toolbar label { flex: 1; }
+    .tablist { display: flex; gap: .35rem; overflow-x: auto; padding: .3rem; margin-bottom: 1rem; border-radius: 12px; background: rgba(10, 17, 33, .72); }
+    [role="tab"] { flex: 1 0 max-content; background: transparent; color: var(--text); }
+    [role="tab"][aria-selected="true"] { background: var(--blue); color: #081126; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #bcd0ff; outline-offset: 2px; }
+    [role="tabpanel"] { animation: panel-in .16s ease-out; }
+    .source-note { margin: 0; color: var(--muted); }
+    .workflow-card + .workflow-card { margin-top: 1rem; }
+    .queued { color: var(--amber); font-weight: 800; }
     .grid { display: grid; grid-template-columns: 1.12fr .88fr; gap: 16px; }
     .card { background: rgba(20, 27, 45, .94); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; box-shadow: 0 18px 50px rgba(0,0,0,.18); }
     .stack { display: grid; gap: 13px; }
@@ -87,6 +98,10 @@ PANEL_HTML = r"""<!doctype html>
     th, td { border-bottom: 1px solid var(--line); text-align: left; padding: 7px 5px; }
     .artifacts { display: flex; flex-wrap: wrap; gap: 8px; }
     .artifacts a { color: #bcd0ff; background: #111b34; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; text-decoration: none; }
+    @keyframes panel-in { from { opacity: .55; } to { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+    @media (prefers-reduced-transparency: reduce) { .card, .tablist { background: var(--panel); backdrop-filter: none; } }
+    @media (prefers-contrast: more) { .card, .tablist, input, select { border-color: #fff; } }
     @media (max-width: 850px) { .grid { grid-template-columns: 1fr; } .stats { grid-template-columns: 1fr 1fr; } }
   </style>
 </head>
@@ -96,63 +111,53 @@ PANEL_HTML = r"""<!doctype html>
     <div><h1>MRS3 Control Panel</h1><div class="subtitle">Локальное управление селектором и Hamster Bot Tester</div></div>
     <div class="badge">127.0.0.1 · отдельный процесс</div>
   </header>
+  <div class="toolbar">
+    <label>Конфигурация<input id="config" type="text"></label>
+  </div>
+  <div class="tablist" role="tablist" aria-label="Рабочие разделы MRS3">
+    <button role="tab" id="tab-csv-source" aria-selected="true" aria-controls="panel-csv-source" tabindex="0">MRS2 · CSV</button>
+    <button role="tab" id="tab-duckdb-source" aria-selected="false" aria-controls="panel-duckdb-source" tabindex="-1">MRS2 · DuckDB</button>
+    <button role="tab" id="tab-candidates" aria-selected="false" aria-controls="panel-candidates" tabindex="-1">Кандидаты стратегий</button>
+    <button role="tab" id="tab-portfolio" aria-selected="false" aria-controls="panel-portfolio" tabindex="-1">Анализатор портфелей</button>
+  </div>
   <div class="grid">
     <section class="card stack">
-      <h2>Управление</h2>
-      <label>Файл конфигурации<input id="config" type="text"></label>
-      <h3>Пакетный тестер</h3>
-      <label>Каталог JSON-стратегий<input id="strategies" value="output_long\strategies" type="text"></label>
-      <label>Итоговый CSV<input id="output_csv" value="results\mrs3_long_results.csv" type="text"></label>
-      <div class="buttons">
-        <button id="planButton" onclick="startAction('tester-plan')">Проверить план</button>
-        <button id="runButton" class="primary" onclick="startAction('tester-run')">Запустить тесты</button>
-      </div>
-      <details>
-        <summary>Подготовить источник v0.7</summary>
-        <div class="stack">
+      <section role="tabpanel" id="panel-csv-source" aria-labelledby="tab-csv-source">
+        <h2>MRS2 · CSV</h2><p class="source-note">Точный UTC-интервал; PointEventCount = TotalTrades. Этот пакет нельзя смешивать с DuckDB-пакетом.</p>
+        <div class="stack workflow-card">
           <label>CSV-файлы (через ;)<input id="source_csv_files" value="reports_history_bybit_long_day2.csv" type="text"></label>
-          <label>DuckDB-файл<input id="source_duckdb" value="mrs3_parallel_compact_v4.duckdb" type="text"></label>
-          <div class="row">
-            <label>Начало UTC<input id="source_start" value="2026-07-15T00:00:00Z" type="text"></label>
-            <label>Конец UTC<input id="source_end" value="2026-08-06T00:00:00Z" type="text"></label>
-          </div>
-          <label>Каталог source-pack<input id="source_output_dir" value="source_package" type="text"></label>
-          <div class="buttons"><button onclick="startAction('source-csv')">CSV: Trades proxy</button><button onclick="startAction('source-duckdb')">DuckDB: реальные события</button></div>
+          <fieldset class="row"><legend>Окно UTC</legend><label>Начало<input id="csv_start" value="2026-07-15T00:00:00Z" type="text"></label><label>Конец<input id="csv_end" value="2026-08-06T00:00:00Z" type="text"></label></fieldset>
+          <label>Каталог source-pack<input id="csv_output_dir" value="source_package" type="text"></label>
+          <div class="buttons"><button data-runnable="true" class="primary" onclick="startAction('source-csv')">Собрать CSV-пакет</button><span class="badge">legacy_trades_proxy</span></div>
         </div>
-      </details>
-      <details>
-        <summary>Создать стратегии</summary>
-        <div class="stack">
-          <label>Исходный CSV<input id="input_csv" value="reports_history_bybit_long_day2.csv" type="text"></label>
-          <div class="row">
-            <label>Даты листинга<input id="dates" value="dates.xlsx" type="text"></label>
-            <label>Шаблон JSON<input id="template" value="ADM_3_LONG_SHORT.json" type="text"></label>
-          </div>
-          <div class="row">
-            <label>Сторона<select id="side"><option>LONG</option><option>SHORT</option></select></label>
-            <label>Каталог результата<input id="select_output_dir" value="output_long" type="text"></label>
-          </div>
-          <button onclick="startAction('select')">Запустить селектор</button>
+      </section>
+      <section role="tabpanel" id="panel-duckdb-source" aria-labelledby="tab-duckdb-source" hidden>
+        <h2>MRS2 · DuckDB</h2><p class="source-note">Данные read-only: учитываются только полностью закрытые циклы в [start, end), audit фиксирует исключения.</p>
+        <div class="stack workflow-card">
+          <label>DuckDB v4<input id="source_duckdb" value="mrs3_parallel_compact_v4.duckdb" type="text"></label>
+          <fieldset class="row"><legend>Окно UTC</legend><label>Начало<input id="duckdb_start" value="2026-07-15T00:00:00Z" type="text"></label><label>Конец<input id="duckdb_end" value="2026-08-06T00:00:00Z" type="text"></label></fieldset>
+          <label>Каталог source-pack<input id="duckdb_output_dir" value="source_package" type="text"></label>
+          <div class="buttons"><button data-runnable="true" class="primary" onclick="startAction('source-duckdb')">Собрать DuckDB-пакет</button><span class="badge">real_independent_events</span></div>
         </div>
-      </details>
-      <details>
-        <summary>DD5 после теста</summary>
-        <div class="stack">
-          <label>CSV результатов<input id="results_csv" value="results\mrs3_long_results.csv" type="text"></label>
-          <label>Audit XLSX<input id="audit_xlsx" value="output_long\audit.xlsx" type="text"></label>
-          <label>Каталог исходных стратегий<input id="posttest_strategies" value="output_long\strategies" type="text"></label>
-          <label>Каталог DD5<input id="posttest_output_dir" value="posttest_long" type="text"></label>
-          <button onclick="startAction('posttest')">Собрать DD5</button>
-        </div>
-      </details>
-      <div id="notice" class="notice"></div>
+      </section>
+      <section role="tabpanel" id="panel-candidates" aria-labelledby="tab-candidates" hidden>
+        <h2>Кандидаты стратегий</h2><p class="source-note">Source-метрики — диагностика, а не результат готовой MRS3-стратегии.</p>
+        <div class="stack workflow-card"><h3>1. Собрать кандидатов</h3><label>Источник точек<select id="select_source_mode" onchange="syncCandidateSource()"><option value="csv">Совместимый CSV-вход</option><option value="package">Проверенный source-pack</option></select></label><label id="raw_csv_source">Совместимый CSV-вход (текущий путь)<input id="input_csv" value="reports_history_bybit_long_day2.csv" type="text"></label><label id="package_source" hidden>Каталог проверенного source-pack<input id="source_package" value="source_package" type="text"></label><div class="row"><label>Даты листинга<input id="dates" value="dates.xlsx" type="text"></label><label>Шаблон JSON<input id="template" value="ADM_3_LONG_SHORT.json" type="text"></label></div><div class="row"><label>Сторона<select id="side"><option>LONG</option><option>SHORT</option></select></label><label>Каталог результата<input id="select_output_dir" value="output_long" type="text"></label></div><button data-runnable="true" onclick="startAction('select')">Запустить селектор</button></div>
+        <div class="stack workflow-card"><h3>2. Проверить и тестировать</h3><label>Каталог JSON-стратегий<input id="strategies" value="output_long\strategies" type="text"></label><label>Итоговый CSV<input id="output_csv" value="results\mrs3_long_results.csv" type="text"></label><div class="buttons"><button data-runnable="true" id="planButton" onclick="startAction('tester-plan')">Проверить план</button><button data-runnable="true" id="runButton" class="primary" onclick="startAction('tester-run')">Запустить тесты</button></div></div>
+        <div class="stack workflow-card"><h3>3. DD5 после теста</h3><p class="source-note">Финальные выводы требуют реального tick-test и DD5 retest.</p><label>CSV результатов<input id="results_csv" value="results\mrs3_long_results.csv" type="text"></label><label>Audit XLSX<input id="audit_xlsx" value="output_long\audit.xlsx" type="text"></label><label>Каталог исходных стратегий<input id="posttest_strategies" value="output_long\strategies" type="text"></label><label>Каталог DD5<input id="posttest_output_dir" value="posttest_long" type="text"></label><button data-runnable="true" onclick="startAction('posttest')">Собрать DD5</button></div>
+      </section>
+      <section role="tabpanel" id="panel-portfolio" aria-labelledby="tab-portfolio" hidden>
+        <h2>Анализатор портфелей</h2><p id="portfolio-prerequisites" class="source-note"><span class="queued">Queued — Layer A only after input-contract check.</span> Нужны: формат individual results, timestamps входа/выхода, limiter contract (positions vs orders; LONG/SHORT; hedge/one-way), L2 и margin data/rules. Анализатор не превращает source-метрики или individual ranking в портфельный результат.</p>
+        <div class="buttons"><button disabled aria-describedby="portfolio-prerequisites">Симулятор сетов недоступен</button><button disabled aria-describedby="portfolio-prerequisites">Рекомендации недоступны</button></div><p class="source-note">Layer A возможен после проверки входного контракта.</p>
+      </section>
+      <div id="notice" class="notice" aria-live="polite"></div>
     </section>
     <section class="card">
       <div class="status-head">
         <div><div class="muted">Текущая операция</div><div id="operation" class="status-name">Нет задачи</div></div>
         <div id="state" class="state">IDLE</div>
       </div>
-      <div class="bar"><div id="barFill"></div></div>
+      <div id="progressBar" class="bar" role="progressbar" aria-label="Прогресс операции" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="barFill"></div></div>
       <div id="progressText" class="muted">Ожидание запуска</div>
       <div class="stats">
         <div class="stat"><b id="submitted">0</b><span>отправлено</span></div>
@@ -181,9 +186,14 @@ function payload(action) {
   const base = {action, config:value('config')};
   if (action === 'tester-plan') return {...base, strategies:value('strategies')};
   if (action === 'tester-run') return {...base, strategies:value('strategies'), output_csv:value('output_csv')};
-  if (action === 'source-csv') return {...base, input_csv:value('source_csv_files'), start:value('source_start'), end:value('source_end'), output_dir:value('source_output_dir')};
-  if (action === 'source-duckdb') return {...base, database:value('source_duckdb'), start:value('source_start'), end:value('source_end'), output_dir:value('source_output_dir')};
-  if (action === 'select') return {...base, input_csv:value('input_csv'), dates:value('dates'), template:value('template'), side:value('side'), output_dir:value('select_output_dir')};
+  if (action === 'source-csv') return {...base, input_csv:value('source_csv_files'), start:value('csv_start'), end:value('csv_end'), output_dir:value('csv_output_dir')};
+  if (action === 'source-duckdb') return {...base, database:value('source_duckdb'), start:value('duckdb_start'), end:value('duckdb_end'), output_dir:value('duckdb_output_dir')};
+  if (action === 'select') {
+    const source = value('select_source_mode') === 'package'
+      ? {source_package:value('source_package')}
+      : {input_csv:value('input_csv')};
+    return {...base, ...source, dates:value('dates'), template:value('template'), side:value('side'), output_dir:value('select_output_dir')};
+  }
   return {...base, results_csv:value('results_csv'), audit_xlsx:value('audit_xlsx'), strategies:value('posttest_strategies'), output_dir:value('posttest_output_dir')};
 }
 async function startAction(action) {
@@ -198,7 +208,7 @@ async function startAction(action) {
 function render(data) {
   if (!defaultsLoaded && data.defaults) { document.getElementById('config').value = data.defaults.config; defaultsLoaded = true; }
   const job = data.job;
-  const buttons = document.querySelectorAll('button'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
+  const buttons = document.querySelectorAll('[data-runnable]'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
   if (!job) return;
   const workflow = job.workflow || {}; const progress = job.progress || {};
   const phase = workflow.state || progress.workflow_state || job.status;
@@ -210,6 +220,7 @@ function render(data) {
   const monitoring = Number(progress.polls || 0) > 0;
   const shown = monitoring ? complete : submitted; const percent = expected ? Math.min(100, shown * 100 / expected) : (job.running ? 3 : 100);
   document.getElementById('barFill').style.width = percent + '%';
+  document.getElementById('progressBar').setAttribute('aria-valuenow', String(Math.round(percent)));
   document.getElementById('progressText').textContent = expected ? (monitoring ? `${complete} завершено из ${expected} · ${percent.toFixed(1)}%` : `${submitted} отправлено из ${expected} · ${percent.toFixed(1)}%`) : (job.error || labels[phase] || phase);
   document.getElementById('submitted').textContent = submitted;
   document.getElementById('running').textContent = progress.running_count || 0;
@@ -227,6 +238,35 @@ function render(data) {
   for (const [name, filename] of Object.entries(artifacts)) { const link=document.createElement('a'); link.href='/api/artifact?name='+encodeURIComponent(name); link.textContent=filename; artifactBox.appendChild(link); }
   document.getElementById('logs').textContent = (job.logs || []).join('\n') || 'Ожидание вывода…';
 }
+const tabs = [...document.querySelectorAll('[role="tab"]')];
+function syncCandidateSource() {
+  const packageSelected = value('select_source_mode') === 'package';
+  document.getElementById('raw_csv_source').hidden = packageSelected;
+  document.getElementById('package_source').hidden = !packageSelected;
+}
+function activateTab(tab) {
+  for (const item of tabs) {
+    const selected = item === tab;
+    item.setAttribute('aria-selected', String(selected));
+    item.tabIndex = selected ? 0 : -1;
+    document.getElementById(item.getAttribute('aria-controls')).hidden = !selected;
+  }
+  tab.focus();
+}
+for (const tab of tabs) {
+  tab.addEventListener('click', () => activateTab(tab));
+  tab.addEventListener('keydown', event => {
+    const index = tabs.indexOf(tab);
+    let next = null;
+    if (event.key === 'ArrowRight') next = tabs[(index + 1) % tabs.length];
+    if (event.key === 'ArrowLeft') next = tabs[(index + tabs.length - 1) % tabs.length];
+    if (event.key === 'Home') next = tabs[0];
+    if (event.key === 'End') next = tabs[tabs.length - 1];
+    if (next) { event.preventDefault(); activateTab(next); }
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activateTab(tab); }
+  });
+}
+syncCandidateSource();
 async function refresh() { try { const response=await fetch('/api/status', {cache:'no-store'}); render(await response.json()); } catch (_) {} }
 refresh(); setInterval(refresh, 1200);
 </script>
@@ -294,6 +334,11 @@ class PanelController:
             raise ValueError(f"required field is empty: {name}")
         return value
 
+    @staticmethod
+    def _optional_string(payload: Mapping[str, object], name: str) -> str:
+        value = payload.get(name)
+        return value.strip() if isinstance(value, str) else ""
+
     def _build_command(
         self, action: str, payload: Mapping[str, object]
     ) -> tuple[tuple[str, ...], dict[str, Path]]:
@@ -330,17 +375,26 @@ class PanelController:
                     "progress": output.with_name(f"{output.stem}.progress.json"),
                 }
         elif action == "select":
-            input_csv = self._path(self._required(payload, "input_csv"))
+            input_csv_value = self._optional_string(payload, "input_csv")
+            source_package_value = self._optional_string(payload, "source_package")
+            if bool(input_csv_value) == bool(source_package_value):
+                raise ValueError(
+                    "select requires exactly one input_csv or source_package"
+                )
             dates = self._path(self._required(payload, "dates"))
             template = self._path(self._required(payload, "template"))
             side = self._required(payload, "side").upper()
             if side not in {"LONG", "SHORT"}:
                 raise ValueError("side must be LONG or SHORT")
             output_dir = self._path(self._required(payload, "output_dir"))
+            if input_csv_value:
+                command.extend(["--input-csv", str(self._path(input_csv_value))])
+            else:
+                command.extend(
+                    ["--source-package", str(self._path(source_package_value))]
+                )
             command.extend(
                 [
-                    "--input-csv",
-                    str(input_csv),
                     "--dates",
                     str(dates),
                     "--template",

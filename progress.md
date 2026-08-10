@@ -29,7 +29,9 @@ verification. Package loading now rejects missing, mixed, unknown or unverified
 event metadata and requires exact real-event mappings. The selector accepts
 exactly one `--source-package` or compatibility `--input-csv`; for real packages
 each plateau's event union includes every geometric plateau point, even one that
-is not eligible for selection.
+is not eligible for selection. The local panel exposes these source packages
+as an explicit candidate-input choice; it submits exactly one verified package
+or compatibility raw CSV, and keeps Portfolio Analyzer controls noninteractive.
 
 The next operational step is to build one real read-only DuckDB package with
 the approved window and HTML samples, then run `select --source-package` with

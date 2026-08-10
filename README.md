@@ -46,6 +46,11 @@ Copy-Item config.local.json.example config.local.json
 .\.venv\Scripts\python.exe -m mrs3.cli posttest --help
 ```
 
+В панели источники MRS2 разделены на CSV и DuckDB. На вкладке «Кандидаты
+стратегий» выберите ровно один вход: проверенный `source-pack` или
+совместимый raw CSV. Портфельный раздел пока информационный: симулятор и
+рекомендации недоступны до подтверждения входных контрактов.
+
 Перед запуском на production данных прочитайте активную спецификацию: [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md).
 
 ## Важные ограничения

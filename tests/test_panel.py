@@ -72,6 +72,90 @@ def test_controller_builds_source_csv_command_without_tester_config(tmp_path: Pa
     assert "--config" in job["command"]
 
 
+def test_controller_selects_verified_source_package_without_raw_csv(
+    tmp_path: Path,
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+
+    command, _ = controller._build_command(
+        "select",
+        {
+            "config": "config.json",
+            "source_package": "verified-package",
+            "dates": "dates.xlsx",
+            "template": "template.json",
+            "side": "LONG",
+            "output_dir": "output",
+        },
+    )
+
+    assert "--source-package" in command
+    assert str((tmp_path / "verified-package").resolve()) in command
+    assert "--input-csv" not in command
+
+
+def test_controller_keeps_compatibility_raw_csv_selection(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+
+    command, _ = controller._build_command(
+        "select",
+        {
+            "config": "config.json",
+            "input_csv": "input.csv",
+            "dates": "dates.xlsx",
+            "template": "template.json",
+            "side": "LONG",
+            "output_dir": "output",
+        },
+    )
+
+    assert "--input-csv" in command
+    assert "--source-package" not in command
+
+
+@pytest.mark.parametrize(
+    "source_payload",
+    [{}, {"input_csv": "input.csv", "source_package": "package"}],
+)
+def test_controller_rejects_select_without_exactly_one_source(
+    tmp_path: Path, source_payload: dict[str, str]
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        controller._build_command(
+            "select",
+            {
+                "config": "config.json",
+                "dates": "dates.xlsx",
+                "template": "template.json",
+                "side": "LONG",
+                "output_dir": "output",
+                **source_payload,
+            },
+        )
+
+
+@pytest.mark.parametrize("invalid_source", [None, "   "])
+def test_controller_rejects_null_or_blank_select_source(
+    tmp_path: Path, invalid_source: str | None
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        controller._build_command(
+            "select",
+            {
+                "config": "config.json",
+                "input_csv": invalid_source,
+                "dates": "dates.xlsx",
+                "template": "template.json",
+                "side": "LONG",
+                "output_dir": "output",
+            },
+        )
+
+
 def test_controller_rejects_parallel_jobs(tmp_path: Path) -> None:
     class WaitingProcess(_FakeProcess):
         def wait(self) -> int:
@@ -141,7 +225,25 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert response.status == 200
         assert "MRS3 Control Panel" in html
         assert "Каталог JSON-стратегий" in html
-        assert "Подготовить источник v0.7" in html
+        assert "MRS2 · CSV" in html
+        assert html.count('<button role="tab"') == 4
+        assert html.count('<section role="tabpanel"') == 4
+        assert "MRS2 · CSV" in html
+        assert "MRS2 · DuckDB" in html
+        assert "Кандидаты стратегий" in html
+        assert "Анализатор портфелей" in html
+        assert "legacy_trades_proxy" in html
+        assert "real_independent_events" in html
+        assert "Совместимый CSV-вход (текущий путь)" in html
+        assert "Симулятор сетов недоступен" in html
+        assert "Рекомендации недоступны" in html
+        assert 'data-runnable="true"' in html
+        assert "document.querySelectorAll('[data-runnable]')" in html
+        assert 'aria-live="polite"' in html
+        assert "prefers-reduced-motion: reduce" in html
+        assert "prefers-reduced-transparency: reduce" in html
+        assert "prefers-contrast: more" in html
+        assert "function activateTab" in html
 
         body = json.dumps(
             {
