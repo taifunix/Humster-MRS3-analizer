@@ -72,6 +72,49 @@ def test_controller_builds_source_csv_command_without_tester_config(tmp_path: Pa
     assert "--config" in job["command"]
 
 
+def test_controller_builds_duckdb_command_with_optional_html_verification(
+    tmp_path: Path,
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+
+    command, _ = controller._build_command(
+        "source-duckdb",
+        {
+            "config": "config.json",
+            "database": "source.duckdb",
+            "start": "2026-07-15T00:00:00Z",
+            "end": "2026-08-06T00:00:00Z",
+            "output_dir": "package",
+            "verify_html_root": "html",
+            "verification_sample_count": "4",
+        },
+    )
+
+    assert command[command.index("--verify-html-root") + 1] == str((tmp_path / "html").resolve())
+    assert command[command.index("--verification-sample-count") + 1] == "4"
+
+
+@pytest.mark.parametrize("sample_count", ["", "two", "2", "6", 3.5, None])
+def test_controller_rejects_invalid_duckdb_verification_sample_count_before_launch(
+    tmp_path: Path, sample_count: object
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+
+    with pytest.raises(ValueError, match="verification_sample_count"):
+        controller._build_command(
+            "source-duckdb",
+            {
+                "config": "config.json",
+                "database": "source.duckdb",
+                "start": "2026-07-15T00:00:00Z",
+                "end": "2026-08-06T00:00:00Z",
+                "output_dir": "package",
+                "verify_html_root": "html",
+                "verification_sample_count": sample_count,
+            },
+        )
+
+
 def test_controller_selects_verified_source_package_without_raw_csv(
     tmp_path: Path,
 ) -> None:
@@ -234,6 +277,8 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert "Анализатор портфелей" in html
         assert "legacy_trades_proxy" in html
         assert "real_independent_events" in html
+        assert 'id="verify_html_root"' in html
+        assert 'id="verification_sample_count"' in html
         assert "Совместимый CSV-вход (текущий путь)" in html
         assert "Симулятор сетов недоступен" in html
         assert "Рекомендации недоступны" in html

@@ -39,6 +39,10 @@ def _parser() -> argparse.ArgumentParser:
     source_duckdb.add_argument("--start", required=True)
     source_duckdb.add_argument("--end", required=True)
     source_duckdb.add_argument("--output-dir", type=Path, required=True)
+    source_duckdb.add_argument("--verify-html-root", type=Path)
+    source_duckdb.add_argument(
+        "--verification-sample-count", type=int, choices=range(3, 6), default=3
+    )
     source_duckdb.add_argument("--config", type=Path, required=True)
     tester_plan = subparsers.add_parser(
         "tester-plan", help="validate and print a read-only Hamster Bot batch plan"
@@ -97,7 +101,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "source-duckdb":
         _validate_source_output(args.output_dir, args.config)
-        package = build_duckdb_package(args.database, args.start, args.end, args.output_dir)
+        package = build_duckdb_package(
+            args.database,
+            args.start,
+            args.end,
+            args.output_dir,
+            verification_html_root=args.verify_html_root,
+            verification_sample_count=args.verification_sample_count,
+        )
         print(json.dumps(package.manifest, ensure_ascii=False, indent=2))
         return 0
     if args.command == "tester-plan":

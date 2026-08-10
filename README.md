@@ -38,6 +38,9 @@ Copy-Item config.local.json.example config.local.json
 # Построение кандидатов
 .\.venv\Scripts\python.exe -m mrs3.cli select --help
 
+# Read-only DuckDB source-pack с опциональной HTML-верификацией (3–5 образцов)
+.\.venv\Scripts\python.exe -m mrs3.cli source-duckdb --database <reports.duckdb> --start <UTC_START> --end <UTC_END> --output-dir <source-package> --verify-html-root <html-root> --verification-sample-count 3 --config config.local.json
+
 # Проверка batch без изменения тестера / запуск batch
 .\.venv\Scripts\python.exe -m mrs3.cli tester-plan --help
 .\.venv\Scripts\python.exe -m mrs3.cli tester-run --help
@@ -50,6 +53,11 @@ Copy-Item config.local.json.example config.local.json
 стратегий» выберите ровно один вход: проверенный `source-pack` или
 совместимый raw CSV. Портфельный раздел пока информационный: симулятор и
 рекомендации недоступны до подтверждения входных контрактов.
+
+Во вкладке DuckDB HTML-каталог верификации необязателен: без него пакет
+остаётся audit-only и не может быть передан селектору. При указанном каталоге
+выберите от 3 до 5 HTML-образцов; путь используется только во время локального
+запуска и не сохраняется в package manifest.
 
 Перед запуском на production данных прочитайте активную спецификацию: [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md).
 

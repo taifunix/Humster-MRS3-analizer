@@ -123,8 +123,8 @@ def test_source_csv_cli_builds_legacy_package(tmp_path: Path, capsys) -> None:
 def test_source_duckdb_cli_dispatches_package_builder(tmp_path: Path, monkeypatch, capsys) -> None:
     called: dict[str, object] = {}
 
-    def fake_builder(database, start, end, output):
-        called.update(database=database, start=start, end=end, output=output)
+    def fake_builder(database, start, end, output, **kwargs):
+        called.update(database=database, start=start, end=end, output=output, **kwargs)
         return SimpleNamespace(manifest={"event_mode": "real_independent_events"})
 
     monkeypatch.setattr(cli, "build_duckdb_package", fake_builder)
@@ -135,7 +135,91 @@ def test_source_duckdb_cli_dispatches_package_builder(tmp_path: Path, monkeypatc
 
     assert code == 0
     assert called["database"] == database
+    assert called["verification_html_root"] is None
+    assert called["verification_sample_count"] == 3
     assert json.loads(capsys.readouterr().out)["event_mode"] == "real_independent_events"
+
+
+def test_source_duckdb_cli_passes_optional_html_verification_controls(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    called: dict[str, object] = {}
+
+    def fake_builder(database, start, end, output, **kwargs):
+        called.update(
+            database=database,
+            start=start,
+            end=end,
+            output=output,
+            **kwargs,
+        )
+        return SimpleNamespace(manifest={"event_mode": "real_independent_events"})
+
+    monkeypatch.setattr(cli, "build_duckdb_package", fake_builder)
+    database = tmp_path / "source.duckdb"
+    html_root = tmp_path / "html"
+    output = tmp_path / "package"
+
+    code = main(
+        [
+            "source-duckdb",
+            "--database",
+            str(database),
+            "--start",
+            "2026-07-15T00:00:00Z",
+            "--end",
+            "2026-08-06T00:00:00Z",
+            "--output-dir",
+            str(output),
+            "--verify-html-root",
+            str(html_root),
+            "--verification-sample-count",
+            "4",
+            "--config",
+            str(_write_runner_config(tmp_path)),
+        ]
+    )
+
+    assert code == 0
+    assert called["verification_html_root"] == html_root
+    assert called["verification_sample_count"] == 4
+    assert json.loads(capsys.readouterr().out)["event_mode"] == "real_independent_events"
+
+
+@pytest.mark.parametrize("sample_count", ["2", "6"])
+def test_source_duckdb_cli_rejects_out_of_range_verification_count_before_builder(
+    tmp_path: Path, monkeypatch, sample_count: str
+) -> None:
+    called = False
+
+    def fake_builder(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("builder must not run")
+
+    monkeypatch.setattr(cli, "build_duckdb_package", fake_builder)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "source-duckdb",
+                "--database",
+                str(tmp_path / "source.duckdb"),
+                "--start",
+                "2026-07-15T00:00:00Z",
+                "--end",
+                "2026-08-06T00:00:00Z",
+                "--output-dir",
+                str(tmp_path / "package"),
+                "--verification-sample-count",
+                sample_count,
+                "--config",
+                str(_write_runner_config(tmp_path)),
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert called is False
 
 
 def _write_runner_config(tmp_path: Path) -> Path:

@@ -32,6 +32,9 @@ each plateau's event union includes every geometric plateau point, even one that
 is not eligible for selection. The local panel exposes these source packages
 as an explicit candidate-input choice; it submits exactly one verified package
 or compatibility raw CSV, and keeps Portfolio Analyzer controls noninteractive.
+DuckDB HTML verification is available from both `source-duckdb` and its panel
+tab through an explicit optional local root and a fail-closed 3–5 sample count;
+no local path is stored in the package manifest.
 
 The next operational step is to build one real read-only DuckDB package with
 the approved window and HTML samples, then run `select --source-package` with

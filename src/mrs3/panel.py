@@ -137,6 +137,8 @@ PANEL_HTML = r"""<!doctype html>
           <label>DuckDB v4<input id="source_duckdb" value="mrs3_parallel_compact_v4.duckdb" type="text"></label>
           <fieldset class="row"><legend>Окно UTC</legend><label>Начало<input id="duckdb_start" value="2026-07-15T00:00:00Z" type="text"></label><label>Конец<input id="duckdb_end" value="2026-08-06T00:00:00Z" type="text"></label></fieldset>
           <label>Каталог source-pack<input id="duckdb_output_dir" value="source_package" type="text"></label>
+          <label>HTML-каталог для верификации (необязательно)<input id="verify_html_root" value="" type="text"></label>
+          <label>HTML-выборка (3–5)<input id="verification_sample_count" value="3" type="number" min="3" max="5" step="1"></label>
           <div class="buttons"><button data-runnable="true" class="primary" onclick="startAction('source-duckdb')">Собрать DuckDB-пакет</button><span class="badge">real_independent_events</span></div>
         </div>
       </section>
@@ -187,7 +189,7 @@ function payload(action) {
   if (action === 'tester-plan') return {...base, strategies:value('strategies')};
   if (action === 'tester-run') return {...base, strategies:value('strategies'), output_csv:value('output_csv')};
   if (action === 'source-csv') return {...base, input_csv:value('source_csv_files'), start:value('csv_start'), end:value('csv_end'), output_dir:value('csv_output_dir')};
-  if (action === 'source-duckdb') return {...base, database:value('source_duckdb'), start:value('duckdb_start'), end:value('duckdb_end'), output_dir:value('duckdb_output_dir')};
+  if (action === 'source-duckdb') return {...base, database:value('source_duckdb'), start:value('duckdb_start'), end:value('duckdb_end'), output_dir:value('duckdb_output_dir'), verify_html_root:value('verify_html_root'), verification_sample_count:value('verification_sample_count')};
   if (action === 'select') {
     const source = value('select_source_mode') === 'package'
       ? {source_package:value('source_package')}
@@ -339,6 +341,19 @@ class PanelController:
         value = payload.get(name)
         return value.strip() if isinstance(value, str) else ""
 
+    @staticmethod
+    def _verification_sample_count(payload: Mapping[str, object]) -> int:
+        value = payload.get("verification_sample_count", 3)
+        if isinstance(value, bool):
+            raise ValueError("verification_sample_count must be an integer from 3 to 5")
+        try:
+            count = int(str(value).strip())
+        except (TypeError, ValueError):
+            raise ValueError("verification_sample_count must be an integer from 3 to 5") from None
+        if str(value).strip() != str(count) or not 3 <= count <= 5:
+            raise ValueError("verification_sample_count must be an integer from 3 to 5")
+        return count
+
     def _build_command(
         self, action: str, payload: Mapping[str, object]
     ) -> tuple[tuple[str, ...], dict[str, Path]]:
@@ -358,6 +373,12 @@ class PanelController:
                 command.extend(["--database", str(self._path(self._required(payload, "database")))])
             config = self._path(self._required(payload, "config"))
             command.extend(["--start", start, "--end", end, "--output-dir", str(output_dir), "--config", str(config)])
+            if action == "source-duckdb":
+                verification_root = self._optional_string(payload, "verify_html_root")
+                sample_count = self._verification_sample_count(payload)
+                if verification_root:
+                    command.extend(["--verify-html-root", str(self._path(verification_root))])
+                    command.extend(["--verification-sample-count", str(sample_count)])
             artifacts = {"manifest": output_dir / "package_manifest.json", "points": output_dir / "points.csv", "audit": output_dir / "source_audit.csv"}
             return tuple(command), artifacts
         else:
