@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +16,52 @@ from typing import Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 import uuid
 import webbrowser
+
+
+_BROWSE_FILE_TYPES: dict[str, tuple[tuple[str, str], ...]] = {
+    "csv": (("CSV files", "*.csv"),),
+    "duckdb": (("DuckDB files", "*.duckdb;*.db"),),
+    "dates": (("Listing dates", "*.csv;*.xlsx"),),
+    "template": (("Strategy template", "*.json"),),
+    "config": (("Configuration", "*.json"),),
+    "results_csv": (("Result CSV", "*.csv"),),
+    "audit_xlsx": (("Audit workbook", "*.xlsx"),),
+}
+
+
+def _native_browse(kind: str, multiple: bool) -> tuple[Path, ...]:
+    """Show a native chooser only after an explicit loopback UI request."""
+    if kind == "directory":
+        multiple = False
+    elif kind not in _BROWSE_FILE_TYPES:
+        raise ValueError(f"unsupported browse kind: {kind}")
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        window = tk.Tk()
+        window.withdraw()
+        window.attributes("-topmost", True)
+        try:
+            if kind == "directory":
+                selected = filedialog.askdirectory(parent=window, mustexist=True)
+                values = (selected,) if selected else ()
+            elif multiple:
+                values = tuple(
+                    filedialog.askopenfilenames(
+                        parent=window, filetypes=_BROWSE_FILE_TYPES[kind]
+                    )
+                )
+            else:
+                selected = filedialog.askopenfilename(
+                    parent=window, filetypes=_BROWSE_FILE_TYPES[kind]
+                )
+                values = (selected,) if selected else ()
+        finally:
+            window.destroy()
+    except Exception as error:
+        raise ValueError(f"native file chooser is unavailable: {error}") from error
+    return tuple(Path(value).resolve() for value in values)
 
 
 PANEL_HTML = r"""<!doctype html>
@@ -53,8 +100,9 @@ PANEL_HTML = r"""<!doctype html>
     h2, h3 { margin: 0 0 12px; }
     .subtitle, .muted { color: var(--muted); }
     .badge { padding: 7px 11px; border: 1px solid var(--line); border-radius: 999px; background: #10172a; }
-    .toolbar { display: flex; align-items: end; gap: 1rem; margin-bottom: 1rem; }
-    .toolbar label { flex: 1; }
+    .path-control { display: flex; gap: .45rem; align-items: center; }
+    .path-control input { min-width: 0; flex: 1; }
+    .secondary { background: #243452; color: var(--text); }
     .tablist { display: flex; gap: .35rem; overflow-x: auto; padding: .3rem; margin-bottom: 1rem; border-radius: 12px; background: rgba(10, 17, 33, .72); }
     [role="tab"] { flex: 1 0 max-content; background: transparent; color: var(--text); }
     [role="tab"][aria-selected="true"] { background: var(--blue); color: #081126; }
@@ -98,11 +146,21 @@ PANEL_HTML = r"""<!doctype html>
     th, td { border-bottom: 1px solid var(--line); text-align: left; padding: 7px 5px; }
     .artifacts { display: flex; flex-wrap: wrap; gap: 8px; }
     .artifacts a { color: #bcd0ff; background: #111b34; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; text-decoration: none; }
+    .decision-dashboard { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+    .decision-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .7rem; }
+    .decision-card { background: #111a2e; border: 1px solid var(--line); border-radius: 11px; padding: .8rem; }
+    .decision-card h4 { margin: 0; font-size: .92rem; }
+    .decision-state { margin: .3rem 0 .55rem; color: var(--amber); font-size: .76rem; font-weight: 800; letter-spacing: .04em; }
+    .decision-state.good { color: var(--green); } .decision-state.bad { color: var(--red); }
+    .decision-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: .35rem; }
+    .decision-metric { color: var(--muted); font-size: .72rem; }
+    .decision-metric b { display: block; color: var(--text); font-size: 1rem; }
+    .decision-details { margin: .55rem 0 0; padding-left: 1rem; color: var(--muted); font-size: .76rem; }
     @keyframes panel-in { from { opacity: .55; } to { opacity: 1; } }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
     @media (prefers-reduced-transparency: reduce) { .card, .tablist { background: var(--panel); backdrop-filter: none; } }
     @media (prefers-contrast: more) { .card, .tablist, input, select { border-color: #fff; } }
-    @media (max-width: 850px) { .grid { grid-template-columns: 1fr; } .stats { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 850px) { .grid { grid-template-columns: 1fr; } .stats, .decision-grid { grid-template-columns: 1fr 1fr; } }
   </style>
 </head>
 <body>
@@ -111,46 +169,51 @@ PANEL_HTML = r"""<!doctype html>
     <div><h1>MRS3 Control Panel</h1><div class="subtitle">Локальное управление селектором и Hamster Bot Tester</div></div>
     <div class="badge">127.0.0.1 · отдельный процесс</div>
   </header>
-  <div class="toolbar">
-    <label>Конфигурация<input id="config" type="text"></label>
-  </div>
   <div class="tablist" role="tablist" aria-label="Рабочие разделы MRS3">
     <button role="tab" id="tab-csv-source" aria-selected="true" aria-controls="panel-csv-source" tabindex="0">MRS2 · CSV</button>
     <button role="tab" id="tab-duckdb-source" aria-selected="false" aria-controls="panel-duckdb-source" tabindex="-1">MRS2 · DuckDB</button>
     <button role="tab" id="tab-candidates" aria-selected="false" aria-controls="panel-candidates" tabindex="-1">Кандидаты стратегий</button>
     <button role="tab" id="tab-portfolio" aria-selected="false" aria-controls="panel-portfolio" tabindex="-1">Анализатор портфелей</button>
+    <button role="tab" id="tab-settings" aria-selected="false" aria-controls="panel-settings" tabindex="-1">Настройки</button>
   </div>
   <div class="grid">
     <section class="card stack">
       <section role="tabpanel" id="panel-csv-source" aria-labelledby="tab-csv-source">
         <h2>MRS2 · CSV</h2><p class="source-note">Точный UTC-интервал; PointEventCount = TotalTrades. Этот пакет нельзя смешивать с DuckDB-пакетом.</p>
         <div class="stack workflow-card">
-          <label>CSV-файлы (через ;)<input id="source_csv_files" value="reports_history_bybit_long_day2.csv" type="text"></label>
+          <label>CSV-файлы (через ;)<div class="path-control"><input id="source_csv_files" value="reports_history_bybit_long_day2.csv" type="text"><button type="button" class="secondary" onclick="browse('source_csv_files','csv',true)">Выбрать…</button></div></label>
           <fieldset class="row"><legend>Окно UTC</legend><label>Начало<input id="csv_start" value="2026-07-15T00:00:00Z" type="text"></label><label>Конец<input id="csv_end" value="2026-08-06T00:00:00Z" type="text"></label></fieldset>
-          <label>Каталог source-pack<input id="csv_output_dir" value="source_package" type="text"></label>
           <div class="buttons"><button data-runnable="true" class="primary" onclick="startAction('source-csv')">Собрать CSV-пакет</button><span class="badge">legacy_trades_proxy</span></div>
         </div>
       </section>
       <section role="tabpanel" id="panel-duckdb-source" aria-labelledby="tab-duckdb-source" hidden>
         <h2>MRS2 · DuckDB</h2><p class="source-note">Данные read-only: учитываются только полностью закрытые циклы в [start, end), audit фиксирует исключения.</p>
         <div class="stack workflow-card">
-          <label>DuckDB v4<input id="source_duckdb" value="mrs3_parallel_compact_v4.duckdb" type="text"></label>
+          <label>DuckDB v4<div class="path-control"><input id="source_duckdb" value="mrs3_parallel_compact_v4.duckdb" type="text"><button type="button" class="secondary" onclick="browse('source_duckdb','duckdb',false)">Выбрать…</button></div></label>
           <fieldset class="row"><legend>Окно UTC</legend><label>Начало<input id="duckdb_start" value="2026-07-15T00:00:00Z" type="text"></label><label>Конец<input id="duckdb_end" value="2026-08-06T00:00:00Z" type="text"></label></fieldset>
-          <label>Каталог source-pack<input id="duckdb_output_dir" value="source_package" type="text"></label>
-          <label>HTML-каталог для верификации (необязательно)<input id="verify_html_root" value="" type="text"></label>
+          <label>HTML-каталог для верификации (необязательно)<div class="path-control"><input id="verify_html_root" value="" type="text"><button type="button" class="secondary" onclick="browse('verify_html_root','directory',false)">Выбрать…</button></div></label>
           <label>HTML-выборка (3–5)<input id="verification_sample_count" value="3" type="number" min="3" max="5" step="1"></label>
           <div class="buttons"><button data-runnable="true" class="primary" onclick="startAction('source-duckdb')">Собрать DuckDB-пакет</button><span class="badge">real_independent_events</span></div>
         </div>
       </section>
       <section role="tabpanel" id="panel-candidates" aria-labelledby="tab-candidates" hidden>
         <h2>Кандидаты стратегий</h2><p class="source-note">Source-метрики — диагностика, а не результат готовой MRS3-стратегии.</p>
-        <div class="stack workflow-card"><h3>1. Собрать кандидатов</h3><label>Источник точек<select id="select_source_mode" onchange="syncCandidateSource()"><option value="csv">Совместимый CSV-вход</option><option value="package">Проверенный source-pack</option></select></label><label id="raw_csv_source">Совместимый CSV-вход (текущий путь)<input id="input_csv" value="reports_history_bybit_long_day2.csv" type="text"></label><label id="package_source" hidden>Каталог проверенного source-pack<input id="source_package" value="source_package" type="text"></label><div class="row"><label>Даты листинга<input id="dates" value="dates.xlsx" type="text"></label><label>Шаблон JSON<input id="template" value="ADM_3_LONG_SHORT.json" type="text"></label></div><div class="row"><label>Сторона<select id="side"><option>LONG</option><option>SHORT</option></select></label><label>Каталог результата<input id="select_output_dir" value="output_long" type="text"></label></div><button data-runnable="true" onclick="startAction('select')">Запустить селектор</button></div>
-        <div class="stack workflow-card"><h3>2. Проверить и тестировать</h3><label>Каталог JSON-стратегий<input id="strategies" value="output_long\strategies" type="text"></label><label>Итоговый CSV<input id="output_csv" value="results\mrs3_long_results.csv" type="text"></label><div class="buttons"><button data-runnable="true" id="planButton" onclick="startAction('tester-plan')">Проверить план</button><button data-runnable="true" id="runButton" class="primary" onclick="startAction('tester-run')">Запустить тесты</button></div></div>
-        <div class="stack workflow-card"><h3>3. DD5 после теста</h3><p class="source-note">Финальные выводы требуют реального tick-test и DD5 retest.</p><label>CSV результатов<input id="results_csv" value="results\mrs3_long_results.csv" type="text"></label><label>Audit XLSX<input id="audit_xlsx" value="output_long\audit.xlsx" type="text"></label><label>Каталог исходных стратегий<input id="posttest_strategies" value="output_long\strategies" type="text"></label><label>Каталог DD5<input id="posttest_output_dir" value="posttest_long" type="text"></label><button data-runnable="true" onclick="startAction('posttest')">Собрать DD5</button></div>
+        <div class="stack workflow-card"><h3>1. Собрать кандидатов</h3><label>Источник точек<select id="select_source_mode" onchange="syncCandidateSource()"><option value="csv">Совместимый CSV-вход</option><option value="package">Проверенный source-pack</option></select></label><label id="raw_csv_source">Совместимый CSV-вход (текущий путь)<div class="path-control"><input id="input_csv" value="reports_history_bybit_long_day2.csv" type="text"><button type="button" class="secondary" onclick="browse('input_csv','csv',false)">Выбрать…</button></div></label><label id="package_source" hidden>Каталог проверенного source-pack<div class="path-control"><input id="source_package" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('source_package','directory',false)">Выбрать…</button></div></label><div class="row"><label>Даты листинга<div class="path-control"><input id="dates" value="dates.xlsx" type="text"><button type="button" class="secondary" onclick="browse('dates','dates',false)">Выбрать…</button></div></label><label>Шаблон JSON<div class="path-control"><input id="template" value="ADM_3_LONG_SHORT.json" type="text"><button type="button" class="secondary" onclick="browse('template','template',false)">Выбрать…</button></div></label></div><label>Сторона<select id="side"><option>LONG</option><option>SHORT</option></select></label><button data-runnable="true" onclick="startAction('select')">Запустить селектор</button></div>
+        <div class="stack workflow-card"><h3>2. Проверить и тестировать</h3><label>Каталог JSON-стратегий<div class="path-control"><input id="strategies" value="output_long\strategies" type="text"><button type="button" class="secondary" onclick="browse('strategies','directory',false)">Выбрать…</button></div></label><div class="buttons"><button data-runnable="true" id="planButton" onclick="startAction('tester-plan')">Проверить план</button><button data-runnable="true" id="runButton" class="primary" onclick="startAction('tester-run')">Запустить тесты</button></div></div>
+        <div class="stack workflow-card"><h3>3. DD5 после теста</h3><p class="source-note">Финальные выводы требуют реального tick-test и DD5 retest.</p><label>CSV результатов<div class="path-control"><input id="results_csv" value="results\mrs3_long_results.csv" type="text"><button type="button" class="secondary" onclick="browse('results_csv','results_csv',false)">Выбрать…</button></div></label><label>Audit XLSX<div class="path-control"><input id="audit_xlsx" value="output_long\audit.xlsx" type="text"><button type="button" class="secondary" onclick="browse('audit_xlsx','audit_xlsx',false)">Выбрать…</button></div></label><label>Каталог исходных стратегий<div class="path-control"><input id="posttest_strategies" value="output_long\strategies" type="text"><button type="button" class="secondary" onclick="browse('posttest_strategies','directory',false)">Выбрать…</button></div></label><button data-runnable="true" onclick="startAction('posttest')">Собрать DD5</button></div>
       </section>
       <section role="tabpanel" id="panel-portfolio" aria-labelledby="tab-portfolio" hidden>
         <h2>Анализатор портфелей</h2><p id="portfolio-prerequisites" class="source-note"><span class="queued">Queued — Layer A only after input-contract check.</span> Нужны: формат individual results, timestamps входа/выхода, limiter contract (positions vs orders; LONG/SHORT; hedge/one-way), L2 и margin data/rules. Анализатор не превращает source-метрики или individual ranking в портфельный результат.</p>
         <div class="buttons"><button disabled aria-describedby="portfolio-prerequisites">Симулятор сетов недоступен</button><button disabled aria-describedby="portfolio-prerequisites">Рекомендации недоступны</button></div><p class="source-note">Layer A возможен после проверки входного контракта.</p>
+      </section>
+      <section role="tabpanel" id="panel-settings" aria-labelledby="tab-settings" hidden>
+        <h2>Настройки</h2><p class="source-note">Постоянные локальные пути. Выбор открывает системный диалог только по вашему действию; ручной ввод сохраняется.</p>
+        <div class="stack workflow-card">
+          <label>Конфигурация runner<div class="path-control"><input id="config" type="text"><button type="button" class="secondary" onclick="browse('config','config',false)">Выбрать…</button></div></label>
+          <div class="row"><label>Каталог CSV source-pack<div class="path-control"><input id="csv_output_dir" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('csv_output_dir','directory',false)">Выбрать…</button></div></label><label>Каталог DuckDB source-pack<div class="path-control"><input id="duckdb_output_dir" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('duckdb_output_dir','directory',false)">Выбрать…</button></div></label></div>
+          <div class="row"><label>Каталог результата selection<div class="path-control"><input id="select_output_dir" value="output_long" type="text"><button type="button" class="secondary" onclick="browse('select_output_dir','directory',false)">Выбрать…</button></div></label><label>Итоговый CSV тестера<div class="path-control"><input id="output_csv" value="results\mrs3_long_results.csv" type="text"><button type="button" class="secondary" onclick="browse('output_csv','results_csv',false)">Выбрать…</button></div></label></div>
+          <label>Каталог DD5<div class="path-control"><input id="posttest_output_dir" value="posttest_long" type="text"><button type="button" class="secondary" onclick="browse('posttest_output_dir','directory',false)">Выбрать…</button></div></label>
+        </div>
       </section>
       <div id="notice" class="notice" aria-live="polite"></div>
     </section>
@@ -171,6 +234,10 @@ PANEL_HTML = r"""<!doctype html>
       <div style="max-height:220px;overflow:auto"><table><thead><tr><th>Имя</th><th>Статус</th><th>%</th></tr></thead><tbody id="activeRows"></tbody></table></div>
       <h3 style="margin-top:15px">Готовые файлы</h3><div id="artifacts" class="artifacts muted">Пока нет</div>
       <h3 style="margin-top:15px">Журнал</h3><pre id="logs">Панель готова.</pre>
+      <section class="decision-dashboard" aria-live="polite" aria-label="Статистика для решений">
+        <h3>Статистика для решений</h3><p class="source-note">Только артефакты, созданные текущим процессом панели.</p>
+        <div id="decisionDashboard" class="decision-grid"></div>
+      </section>
     </section>
   </div>
 </main>
@@ -207,8 +274,35 @@ async function startAction(action) {
     notice.textContent = 'Задача запущена.'; render(body);
   } catch (error) { notice.textContent = error.message; }
 }
+async function browse(id, kind, multiple) {
+  const notice = document.getElementById('notice'); notice.textContent = 'Открываю системный выбор…';
+  try {
+    const response = await fetch('/api/browse', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({kind, multiple})});
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || 'Выбор недоступен');
+    if (body.paths.length) { document.getElementById(id).value = body.paths.join(';'); notice.textContent = 'Путь выбран.'; }
+    else { notice.textContent = 'Выбор отменён.'; }
+  } catch (error) { notice.textContent = error.message; }
+}
+function renderDashboard(dashboard) {
+  const target = document.getElementById('decisionDashboard'); target.replaceChildren();
+  const order = ['csv', 'duckdb', 'candidates', 'tester', 'posttest'];
+  for (const key of order) {
+    const item = dashboard?.[key]; if (!item) continue;
+    const card = document.createElement('section'); card.className = 'decision-card';
+    const heading = document.createElement('h4'); heading.textContent = item.title; card.appendChild(heading);
+    const state = document.createElement('div'); const positive=['SELECTABLE','PACKAGE_COMPLETE','READY_FOR_TEST','COMPLETED']; const failed=['FAILED']; state.className = 'decision-state ' + (positive.includes(item.state) ? 'good' : (failed.includes(item.state) ? 'bad' : '')); state.textContent = item.state; card.appendChild(state);
+    const metrics = document.createElement('div'); metrics.className = 'decision-metrics';
+    for (const metric of (item.metrics || [])) { const block=document.createElement('div'); block.className='decision-metric'; const number=document.createElement('b'); number.textContent=metric.value; block.append(number, document.createTextNode(metric.label)); metrics.appendChild(block); }
+    card.appendChild(metrics);
+    const details = item.details || [];
+    if (details.length) { const list=document.createElement('ul'); list.className='decision-details'; for (const detail of details) { const row=document.createElement('li'); row.textContent=detail; list.appendChild(row); } card.appendChild(list); }
+    target.appendChild(card);
+  }
+}
 function render(data) {
   if (!defaultsLoaded && data.defaults) { document.getElementById('config').value = data.defaults.config; defaultsLoaded = true; }
+  renderDashboard(data.dashboard);
   const job = data.job;
   const buttons = document.querySelectorAll('[data-runnable]'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
   if (!job) return;
@@ -308,12 +402,28 @@ class PanelController:
         root: Path,
         default_config: Path,
         process_factory: Callable[..., object] = subprocess.Popen,
+        browse_factory: Callable[[str, bool], tuple[Path, ...]] = _native_browse,
     ) -> None:
         self.root = root.resolve()
         self.default_config = self._path(default_config)
         self._process_factory = process_factory
+        self._browse_factory = browse_factory
         self._lock = threading.RLock()
         self._job: _Job | None = None
+        # Keep only artifact paths created by this controller instance.  The
+        # dashboard must never discover data by scanning user directories.
+        self._section_jobs: dict[str, _Job] = {}
+
+    @staticmethod
+    def _section(action: str) -> str:
+        return {
+            "source-csv": "csv",
+            "source-duckdb": "duckdb",
+            "select": "candidates",
+            "tester-plan": "tester",
+            "tester-run": "tester",
+            "posttest": "posttest",
+        }[action]
 
     def _path(self, value: str | Path) -> Path:
         candidate = Path(value).expanduser()
@@ -455,6 +565,14 @@ class PanelController:
             raise ValueError(f"unsupported action: {action}")
         return tuple(command), artifacts
 
+    def browse(self, kind: str, multiple: bool) -> tuple[str, ...]:
+        if not isinstance(multiple, bool):
+            raise ValueError("multiple must be a boolean")
+        if kind != "directory" and kind not in _BROWSE_FILE_TYPES:
+            raise ValueError(f"unsupported browse kind: {kind}")
+        paths = self._browse_factory(kind, multiple)
+        return tuple(str(path.resolve()) for path in paths)
+
     def start(self, action: str, payload: Mapping[str, object]) -> dict[str, object]:
         command, artifacts = self._build_command(action, payload)
         with self._lock:
@@ -522,6 +640,8 @@ class PanelController:
         finally:
             with self._lock:
                 job.finished_at = _utc_now()
+                if self._artifact_paths(job):
+                    self._section_jobs[self._section(job.action)] = job
 
     @staticmethod
     def _read_json(path: Path | None) -> dict[str, object] | None:
@@ -533,18 +653,225 @@ class PanelController:
             return None
         return value if isinstance(value, dict) else None
 
+    @staticmethod
+    def _artifact_paths(job: _Job) -> dict[str, Path]:
+        return {
+            name: path
+            for name, path in job.artifacts.items()
+            if PanelController._signature(path) != job.artifact_baseline.get(name)
+            and path.is_file()
+        }
+
+    @staticmethod
+    def _integer(value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return number if number >= 0 else None
+
+    @staticmethod
+    def _number_text(value: object) -> str | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if not number == number or number in {float("inf"), float("-inf")}:
+            return None
+        return f"{number:.6g}"
+
+    @staticmethod
+    def _empty_dashboard(title: str) -> dict[str, object]:
+        return {
+            "title": title,
+            "available": False,
+            "state": "NOT_AVAILABLE",
+            "metrics": [],
+            "details": ["Артефакты этого раздела пока недоступны."],
+        }
+
+    def _source_dashboard(self, job: _Job, artifacts: Mapping[str, Path]) -> dict[str, object]:
+        title = "CSV · MRS2" if job.action == "source-csv" else "DuckDB · MRS2"
+        manifest = self._read_json(artifacts.get("manifest"))
+        if manifest is None:
+            result = self._empty_dashboard(title)
+            result["state"] = job.status
+            return result
+        is_duckdb = job.action == "source-duckdb"
+        report_count = self._integer(manifest.get("report_count" if is_duckdb else "source_rows"))
+        point_count = self._integer(manifest.get("point_count" if is_duckdb else "accepted_rows"))
+        accepted = self._integer(manifest.get("coverage_accepted_reports" if is_duckdb else "accepted_rows"))
+        rejected = self._integer(manifest.get("coverage_rejected_reports" if is_duckdb else "rejected_rows"))
+        exclusions = manifest.get("exclusions")
+        cycle_exclusions: int | None = None
+        if is_duckdb and isinstance(exclusions, dict):
+            values = [self._integer(value) for value in exclusions.values()]
+            cycle_exclusions = sum(value for value in values if value is not None)
+        included = self._integer(manifest.get("included_cycles")) if is_duckdb else None
+        if is_duckdb:
+            metrics = [
+                {"label": "Отчёты", "value": report_count if report_count is not None else "—"},
+                {"label": "Точки", "value": point_count if point_count is not None else "—"},
+                {"label": "Покрытие: принято", "value": accepted if accepted is not None else "—"},
+                {"label": "Покрытие: отклонено", "value": rejected if rejected is not None else "—"},
+                {"label": "Включено (циклы)", "value": included if included is not None else "—"},
+                {"label": "Исключено (циклы)", "value": cycle_exclusions if cycle_exclusions is not None else "—"},
+            ]
+        else:
+            metrics = [
+                {"label": "Строки источника", "value": report_count if report_count is not None else "—"},
+                {"label": "Точки", "value": point_count if point_count is not None else "—"},
+                {"label": "Строки приняты", "value": accepted if accepted is not None else "—"},
+                {"label": "Строки отклонены", "value": rejected if rejected is not None else "—"},
+            ]
+        mode = str(manifest.get("event_mode", "не указан"))
+        version = self._integer(manifest.get("package_version"))
+        details = [f"{mode} · пакет v{version}" if version is not None else mode]
+        start, end = manifest.get("window_start"), manifest.get("window_end")
+        if isinstance(start, str) and isinstance(end, str):
+            details.append(f"Окно UTC: {start} — {end}")
+        if is_duckdb:
+            source_status = str(manifest.get("source_summary_status", "NOT_AVAILABLE"))
+            window_status = str(manifest.get("window_metrics_status", "NOT_AVAILABLE"))
+            details.extend((f"Source summary: {source_status}", f"Window metrics: {window_status}"))
+            state = (
+                "VERIFICATION_STATUSES_PRESENT"
+                if source_status == "VERIFIED"
+                and window_status == "DERIVED_FROM_VERIFIED_SOURCE"
+                else "AUDIT_ONLY"
+            )
+        else:
+            state = "PACKAGE_COMPLETE" if job.status == "SUCCEEDED" else job.status
+        return {"title": title, "available": True, "state": state, "metrics": metrics, "details": details}
+
+    def _candidate_dashboard(self, job: _Job, artifacts: Mapping[str, Path]) -> dict[str, object]:
+        manifest = self._read_json(artifacts.get("manifest"))
+        if manifest is None:
+            result = self._empty_dashboard("Кандидаты стратегий")
+            result["state"] = job.status
+            return result
+        values = (
+            ("Event-eligible", "event_eligible_point_count"),
+            ("Плато", "geometric_plateau_count"),
+            ("Готовые плато", "ready_plateau_count"),
+            ("Готовые структуры", "ready_structure_count"),
+            ("JSON для теста", "ready_json_count"),
+        )
+        metrics = [
+            {"label": label, "value": self._integer(manifest.get(key)) if self._integer(manifest.get(key)) is not None else "—"}
+            for label, key in values
+        ]
+        ready = self._integer(manifest.get("ready_json_count"))
+        state = "READY_FOR_TEST" if ready and ready > 0 else "NO_READY_CANDIDATES"
+        return {
+            "title": "Кандидаты стратегий",
+            "available": True,
+            "state": state,
+            "metrics": metrics,
+            "details": [f"Режим событий: {manifest.get('event_mode', 'не указан')}"],
+        }
+
+    def _tester_dashboard(self, job: _Job, artifacts: Mapping[str, Path]) -> dict[str, object]:
+        progress = self._read_json(artifacts.get("progress")) or {}
+        output = artifacts.get("output_csv")
+        rows: list[dict[str, str]] = []
+        if output is not None:
+            try:
+                with output.open("r", encoding="utf-8", newline="") as handle:
+                    rows = list(csv.DictReader(handle))
+            except (OSError, UnicodeDecodeError, csv.Error):
+                rows = []
+        if not progress and not rows:
+            result = self._empty_dashboard("Тестер")
+            result["state"] = job.status
+            return result
+        expected = self._integer(progress.get("expected_count"))
+        completed = self._integer(progress.get("completed_count"))
+        error_count = 0
+        best: dict[str, str] | None = None
+        for row in rows:
+            pnl = self._number_text(row.get("total_pnl_pct"))
+            if pnl is None:
+                error_count += 1
+                continue
+            if best is None or float(pnl) > float(best["total_pnl_pct"]):
+                best = {"total_pnl_pct": pnl, "max_drawdown_pct": row.get("max_drawdown_pct", "")}
+        metrics = [
+            {"label": "Результаты", "value": len(rows) if rows else (completed if completed is not None else "—")},
+            {"label": "Лучший PnL, %", "value": best["total_pnl_pct"] if best else "—"},
+            {"label": "DD лучшего, %", "value": self._number_text(best["max_drawdown_pct"]) if best else "—"},
+            {"label": "Ошибки", "value": error_count},
+        ]
+        state = str((self._read_json(artifacts.get("state")) or {}).get("state", job.status))
+        if state == "SUCCEEDED" and rows:
+            state = "COMPLETED"
+        details = []
+        if expected is not None:
+            details.append(f"Прогресс: {completed or 0} из {expected}")
+        if best is not None:
+            details.append("Финальные метрики — результат реального tick-test.")
+        return {"title": "Тестер", "available": True, "state": state, "metrics": metrics, "details": details}
+
+    def _posttest_dashboard(self, job: _Job, artifacts: Mapping[str, Path]) -> dict[str, object]:
+        manifest = self._read_json(artifacts.get("manifest"))
+        if manifest is None:
+            result = self._empty_dashboard("DD5 после теста")
+            result["state"] = job.status
+            return result
+        values = (
+            ("Реальные результаты", "raw_result_count"),
+            ("Pareto", "pareto_count"),
+            ("Целевой DD, %", "target_dd_pct"),
+            ("DD5 JSON", "scaled_strategy_count"),
+        )
+        metrics = [
+            {"label": label, "value": self._integer(manifest.get(key)) if key != "target_dd_pct" else (self._number_text(manifest.get(key)) or "—")}
+            for label, key in values
+        ]
+        return {
+            "title": "DD5 после теста",
+            "available": True,
+            "state": "RETEST_REQUIRED" if manifest.get("scaled_strategies_require_retest") is not False else "COMPLETED",
+            "metrics": metrics,
+            "details": ["DD5 JSON требуют отдельного повторного tick-test."],
+        }
+
+    def _dashboard(self, jobs: Mapping[str, _Job]) -> dict[str, object]:
+        titles = {
+            "csv": "CSV · MRS2",
+            "duckdb": "DuckDB · MRS2",
+            "candidates": "Кандидаты стратегий",
+            "tester": "Тестер",
+            "posttest": "DD5 после теста",
+        }
+        dashboard: dict[str, object] = {key: self._empty_dashboard(title) for key, title in titles.items()}
+        for section, job in jobs.items():
+            artifacts = self._artifact_paths(job)
+            if section in {"csv", "duckdb"}:
+                dashboard[section] = self._source_dashboard(job, artifacts)
+            elif section == "candidates":
+                dashboard[section] = self._candidate_dashboard(job, artifacts)
+            elif section == "tester":
+                dashboard[section] = self._tester_dashboard(job, artifacts)
+            elif section == "posttest":
+                dashboard[section] = self._posttest_dashboard(job, artifacts)
+        return dashboard
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             job = self._job
+            dashboard_jobs = dict(self._section_jobs)
+            if job is not None and (job.running or self._artifact_paths(job)):
+                dashboard_jobs[self._section(job.action)] = job
+            dashboard = self._dashboard(dashboard_jobs)
             if job is None:
                 job_document = None
             else:
-                current_artifacts = {
-                    name: path
-                    for name, path in job.artifacts.items()
-                    if self._signature(path) != job.artifact_baseline.get(name)
-                    and path.is_file()
-                }
+                current_artifacts = self._artifact_paths(job)
                 state_path = current_artifacts.get("state")
                 progress_path = current_artifacts.get("progress")
                 job_document = {
@@ -573,6 +900,7 @@ class PanelController:
                 "config": str(self.default_config),
             },
             "job": job_document,
+            "dashboard": dashboard,
         }
 
     def artifact(self, name: str) -> Path | None:
@@ -673,7 +1001,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if not self._has_local_host():
             self._json(403, {"error": "local Host header required"})
             return
-        if urlparse(self.path).path != "/api/start":
+        endpoint = urlparse(self.path).path
+        if endpoint not in {"/api/start", "/api/browse"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -692,15 +1021,22 @@ class _PanelHandler(BaseHTTPRequestHandler):
             document = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(document, dict):
                 raise ValueError("JSON body must be an object")
-            action = str(document.get("action", ""))
-            result = self.server.controller.start(action, document)
+            if endpoint == "/api/browse":
+                kind = document.get("kind")
+                multiple = document.get("multiple", False)
+                if not isinstance(kind, str):
+                    raise ValueError("browse kind must be a string")
+                result = {"paths": self.server.controller.browse(kind, multiple)}
+            else:
+                action = str(document.get("action", ""))
+                result = self.server.controller.start(action, document)
         except RuntimeError as error:
             self._json(409, {"error": str(error)})
             return
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             self._json(400, {"error": str(error)})
             return
-        self._json(202, result)
+        self._json(200 if endpoint == "/api/browse" else 202, result)
 
 
 def create_panel_server(

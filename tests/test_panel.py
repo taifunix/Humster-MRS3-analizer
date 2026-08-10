@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from mrs3.panel import PanelController, create_panel_server
+from mrs3.panel import PanelController, _Job, create_panel_server
 
 
 class _FakeProcess:
@@ -244,6 +244,140 @@ def test_controller_hides_artifacts_left_by_an_older_job(tmp_path: Path) -> None
     assert snapshot["job"]["artifacts"] == {}
 
 
+def test_dashboard_reports_manifest_counts_but_never_claims_v2_selectable(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    manifest = package / "package_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "package_version": 2,
+                "event_mode": "real_independent_events",
+                "window_start": "2026-07-15T00:00:00+00:00",
+                "window_end": "2026-08-06T00:00:00+00:00",
+                "report_count": 12,
+                "coverage_accepted_reports": 10,
+                "coverage_rejected_reports": 2,
+                "point_count": 10,
+                "included_cycles": 45,
+                "exclusions": {"OPEN_BEFORE_WINDOW": 3, "CLOSE_ON_OR_AFTER_WINDOW": 4},
+                "source_summary_status": "VERIFIED",
+                "window_metrics_status": "DERIVED_FROM_VERIFIED_SOURCE",
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller = PanelController(tmp_path, tmp_path / "config.json")
+    controller._section_jobs["duckdb"] = _Job(
+        job_id="complete-duckdb",
+        action="source-duckdb",
+        command=(),
+        artifacts={"manifest": manifest},
+        artifact_baseline={"manifest": None},
+        status="SUCCEEDED",
+    )
+
+    dashboard = controller.snapshot()["dashboard"]["duckdb"]
+
+    assert dashboard["available"] is True
+    assert dashboard["state"] == "VERIFICATION_STATUSES_PRESENT"
+    # This deliberately lacks source_summary_samples and the verification CSV.
+    # The dashboard is not the package verifier and must never overrule it.
+    assert dashboard["state"] != "SELECTABLE"
+    assert dashboard["metrics"] == [
+        {"label": "Отчёты", "value": 12},
+        {"label": "Точки", "value": 10},
+        {"label": "Покрытие: принято", "value": 10},
+        {"label": "Покрытие: отклонено", "value": 2},
+        {"label": "Включено (циклы)", "value": 45},
+        {"label": "Исключено (циклы)", "value": 7},
+    ]
+    assert dashboard["details"] == [
+        "real_independent_events · пакет v2",
+        "Окно UTC: 2026-07-15T00:00:00+00:00 — 2026-08-06T00:00:00+00:00",
+        "Source summary: VERIFIED",
+        "Window metrics: DERIVED_FROM_VERIFIED_SOURCE",
+    ]
+    assert str(package) not in json.dumps(dashboard)
+
+
+def test_dashboard_reports_candidate_tester_and_posttest_final_artifacts(
+    tmp_path: Path,
+) -> None:
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    (selected / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "event_mode": "real_independent_events",
+                "event_eligible_point_count": 11,
+                "geometric_plateau_count": 4,
+                "ready_plateau_count": 3,
+                "ready_structure_count": 2,
+                "ready_json_count": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+    results = tmp_path / "results.csv"
+    results.write_text(
+        "strategy_name,total_pnl_pct,max_drawdown_pct\na,2.5,1.2\nb,3.0,2.0\n",
+        encoding="utf-8",
+    )
+    posttest = tmp_path / "posttest"
+    posttest.mkdir()
+    (posttest / "posttest_manifest.json").write_text(
+        json.dumps(
+            {"raw_result_count": 2, "pareto_count": 1, "scaled_strategy_count": 1, "target_dd_pct": "5"}
+        ),
+        encoding="utf-8",
+    )
+    controller = PanelController(tmp_path, tmp_path / "config.json")
+    controller._section_jobs = {
+        "candidates": _Job("selected", "select", (), {"manifest": selected / "run_manifest.json"}, {"manifest": None}, status="SUCCEEDED"),
+        "tester": _Job("tested", "tester-run", (), {"output_csv": results}, {"output_csv": None}, status="SUCCEEDED"),
+        "posttest": _Job("dd5", "posttest", (), {"manifest": posttest / "posttest_manifest.json"}, {"manifest": None}, status="SUCCEEDED"),
+    }
+
+    dashboard = controller.snapshot()["dashboard"]
+
+    assert dashboard["candidates"]["state"] == "READY_FOR_TEST"
+    assert dashboard["candidates"]["metrics"][-1] == {"label": "JSON для теста", "value": 5}
+    assert dashboard["tester"]["state"] == "COMPLETED"
+    assert dashboard["tester"]["metrics"] == [
+        {"label": "Результаты", "value": 2},
+        {"label": "Лучший PnL, %", "value": "3"},
+        {"label": "DD лучшего, %", "value": "2"},
+        {"label": "Ошибки", "value": 0},
+    ]
+    assert dashboard["posttest"]["state"] == "RETEST_REQUIRED"
+    assert dashboard["posttest"]["metrics"][-1] == {"label": "DD5 JSON", "value": 1}
+
+
+def test_dashboard_keeps_last_artifact_when_a_later_job_has_none(tmp_path: Path) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    manifest = package / "package_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {"event_mode": "legacy_trades_proxy", "source_rows": 3, "accepted_rows": 2, "rejected_rows": 1}
+        ),
+        encoding="utf-8",
+    )
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+    controller._section_jobs["csv"] = _Job(
+        "old", "source-csv", (), {"manifest": manifest}, {"manifest": None}, status="SUCCEEDED"
+    )
+
+    controller.start("tester-plan", {"config": "config.json", "strategies": "strategies"})
+    dashboard = _wait_finished(controller)["dashboard"]
+
+    assert dashboard["csv"]["available"] is True
+    assert dashboard["csv"]["metrics"][1] == {"label": "Точки", "value": 2}
+
+
 def test_panel_rejects_non_loopback_bind(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.json")
 
@@ -269,12 +403,13 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert "MRS3 Control Panel" in html
         assert "Каталог JSON-стратегий" in html
         assert "MRS2 · CSV" in html
-        assert html.count('<button role="tab"') == 4
-        assert html.count('<section role="tabpanel"') == 4
+        assert html.count('<button role="tab"') == 5
+        assert html.count('<section role="tabpanel"') == 5
         assert "MRS2 · CSV" in html
         assert "MRS2 · DuckDB" in html
         assert "Кандидаты стратегий" in html
         assert "Анализатор портфелей" in html
+        assert "Настройки" in html
         assert "legacy_trades_proxy" in html
         assert "real_independent_events" in html
         assert 'id="verify_html_root"' in html
@@ -289,6 +424,9 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert "prefers-reduced-transparency: reduce" in html
         assert "prefers-contrast: more" in html
         assert "function activateTab" in html
+        assert "function browse" in html
+        assert "/api/browse" in html
+        assert "CSV-файлы" in html
 
         body = json.dumps(
             {
@@ -325,6 +463,44 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         unsupported = connection.getresponse()
         unsupported.read()
         assert unsupported.status == 415
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_panel_browse_returns_only_explicit_native_selection(tmp_path: Path) -> None:
+    selected = (tmp_path / "one.csv", tmp_path / "two.csv")
+    calls: list[tuple[str, bool]] = []
+
+    def chooser(kind: str, multiple: bool) -> tuple[Path, ...]:
+        calls.append((kind, multiple))
+        return selected
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.json",
+        browse_factory=chooser,
+    )
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        body = json.dumps({"kind": "csv", "multiple": True}).encode("utf-8")
+        connection.request("POST", "/api/browse", body=body, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        document = json.loads(response.read().decode("utf-8"))
+        assert response.status == 200
+        assert calls == [("csv", True)]
+        assert document == {"paths": [str(path.resolve()) for path in selected]}
+
+        body = json.dumps({"kind": "unknown", "multiple": False}).encode("utf-8")
+        connection.request("POST", "/api/browse", body=body, headers={"Content-Type": "application/json"})
+        rejected = connection.getresponse()
+        rejected.read()
+        assert rejected.status == 400
     finally:
         connection.close()
         server.shutdown()
