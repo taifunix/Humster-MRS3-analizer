@@ -13,7 +13,11 @@
 - Read v4 DuckDB and source HTML only; never mutate reports, HTML or raw payloads.
 - A run consumes exactly one declared package; CSV proxy and real events never mix.
 - Real-event metrics are diagnostic source metrics, never MRS3 PnL claims.
-- Selector input requires `metric_status=VERIFIED`; verification is 3–5 HTML samples.
+- Real selector input requires v2's conjunction of
+  `source_summary_status=VERIFIED` (3–5 full-horizon HTML samples) and
+  `window_metrics_status=DERIVED_FROM_VERIFIED_SOURCE`; a full-horizon HTML
+  summary is never an equality check for the selected window. Legacy v1 proxy
+  input retains its existing rules.
 - Stream v4 data in bounded batches: decode actions for every report's audit,
   but decode timestamp/equity/wallet payloads only after stored grid bounds
   show complete window coverage; the decoded grid remains the final check.
@@ -60,11 +64,15 @@ Expected: FAIL because the series decoder and metric API do not exist.
 
 **Consumes:** Task 1 metrics, complete v4 report rows and optional local HTML verification root.
 
-**Produces:** `points.csv` with selector columns, `point_events.csv`, `source_audit.csv`, `metric_verification.csv`, and manifest counters for coverage/exclusions/verification.
+**Produces:** v2 `points.csv` with selector columns and a per-point
+`window_metrics_status`, `point_events.csv`, `source_audit.csv`,
+full-horizon `metric_verification.csv`, and manifest counters for
+coverage/exclusions plus `source_summary_status` and
+`window_metrics_status`.
 
-- [ ] **Step 1: Write failing tests** proving: events are written as sorted `(point_id,event_id)` rows; a point aggregates verified reports deterministically; HTML summary mismatch marks `MISMATCH`; fewer than three or more than five requested samples is rejected; an unverified point cannot become package `VERIFIED`.
+- [ ] **Step 1: Write failing tests** proving: events are written as sorted `(point_id,event_id)` rows; a point aggregates deterministically; 3–5 full-horizon HTML samples establish only `source_summary_status`; a full-horizon summary is not compared with a selected window; mismatch, missing HTML or invalid sample count fail closed; only after source verification does every derived window point receive `window_metrics_status=DERIVED_FROM_VERIFIED_SOURCE`; real v1 is audit-only and rejected by selector loading.
 - [ ] **Step 2: Run the focused test** and observe the expected failure.
-- [ ] **Step 3: Implement staging publication** with source DB hash, source report hashes, all metric/exclusion counters and one `metric_status` per point. Resolve each verification file under the explicit local root and compare the five parsed source-summary values using documented summary rounding.
+- [ ] **Step 3: Implement staging publication** with source DB hash, source report hashes, all metric/exclusion counters, v2's manifest-level `source_summary_status`, and one derived-window status per point. Resolve only the sampled verification files under the explicit local root and compare the five parsed full-horizon source-summary values using documented summary rounding. Record this sample integrity evidence separately from all selected-window metrics/events, which are derived from immutable v4 records and are never asserted equal to a full-horizon summary.
 - [ ] **Step 4: Re-run focused source-package tests** and require PASS.
 - [ ] **Step 5: Commit** `feat: materialize verified DuckDB source packages`.
 
@@ -111,7 +119,16 @@ Expected: FAIL because the series decoder and metric API do not exist.
 
 **Produces:** retained local audit plus documented before/after candidate count; an explicit Phase-2 go/no-go decision.
 
+**v2 verification prerequisite:** migrate real package publication and loading
+to the two-horizon contract in [ADR-0002](../../decisions/0002-source-summary-and-window-metrics-verification.md).
+The retained audit must show full-horizon source-summary evidence separately
+from `DERIVED_FROM_VERIFIED_SOURCE` window metrics; it must not label the
+latter as a direct HTML equality match.
+
 - [ ] **Step 1: Run `source-duckdb` read-only** against the approved v4 database with the common window and 3–5 HTML samples.
 - [ ] **Step 2: Run `select --source-package`** with external listing-date/template inputs and retain its manifest/workbook locally.
-- [ ] **Step 3: Record evidence**: report/point/exclusion counts, `metric_status`, event-count distributions, JSON count and whether Phase 2 is needed. Do not implement Phase 2 unless the count demonstrates it.
+- [ ] **Step 3: Record evidence**: report/point/exclusion counts,
+  `source_summary_status`, `window_metrics_status`, event-count distributions,
+  JSON count and whether Phase 2 is needed. Do not implement Phase 2 unless
+  the count demonstrates it.
 - [ ] **Step 4: Run full pytest, `git diff --check`, independent review and commit** `docs: record v07 source package evidence`.

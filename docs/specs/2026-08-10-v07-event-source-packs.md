@@ -58,12 +58,47 @@ fully inside the window. `TotalTrades` is its count; `Win`, `Los` and
 absolute negative realised `PnL`; a zero gross loss is reported explicitly,
 never as an implicit infinity.
 
-Each output row records `metric_status`. The selector accepts only
-`VERIFIED` rows. Verification reads 3–5 source HTML reports, compares all five
-metrics (`PnL`, `DD`, `TotalTrades`, `WinRate`, `ProfitFactor`) after the same
-rounding as the source summary and records EQUAL/MISMATCH evidence. The HTML
-root is an explicit local input, never a tracked path; without it the package
-may be materialized for audit but cannot be selected.
+## Verification horizons and package versions
+
+The source HTML summary is a complete-report-horizon document. It is not a
+summary of the selected package window and must never be compared directly to
+`[start, end)` metrics as proof that those window values are equal.
+
+A `real_independent_events` package uses **format v2** and has two explicit
+statuses:
+
+- `source_summary_status=VERIFIED` only after 3–5 source HTML samples match
+  independently reconstructed metrics over each sample's **full report
+  horizon**. Missing HTML, an invalid count, parse error or mismatch is
+  fail-closed. This is a sample-based source-integrity gate; it does not claim
+  that every immutable input record has an individually compared HTML summary.
+- `window_metrics_status=DERIVED_FROM_VERIFIED_SOURCE` only after the selected
+  `[start, end)` points and event mapping have been calculated from all
+  immutable v4 source records in the package after the source-integrity gate
+  passed. This status proves derivation and provenance; it does not assert
+  equality with the HTML summary.
+
+The manifest records both statuses, causes and sample evidence; every v2 point
+records its `window_metrics_status`. A real package is selectable only when
+the manifest's `source_summary_status=VERIFIED` **and** its
+`window_metrics_status=DERIVED_FROM_VERIFIED_SOURCE`, and all point rows carry
+the latter status. Real package v1 is audit-only and is rejected by the
+selector because it cannot state this two-horizon contract.
+
+HTML parsing keeps absolute and percentage values separate: `Total PnL` is
+absolute `TotalPnL`, while `Total PnL, %` is `TotalPnLPercent`; `Max Drawdown`
+is absolute `MaxDrawdown`, while `Max Drawdown, %` is
+`MaxDrawdownPercent`. The full-horizon source-summary comparison uses only the
+absolute PnL/DD fields plus `TotalTrades`, `WinRate` and `ProfitFactor`, with
+the source's rounding. A `%` label must never satisfy an absolute-metric
+lookup, or conversely.
+
+`legacy_trades_proxy` package v1 remains valid under its existing contract:
+one legacy mode, an exact window, `point_event_count=TotalTrades`, and the
+`LEGACY_PROXY_NO_EVENT_IDS` sentinel. Legacy v1 and real v2 data never mix.
+The HTML root is an explicit local input, never a tracked path; without
+full-horizon source-summary evidence a real package may be materialized for
+audit but cannot be selected.
 
 ## Selector contract
 
@@ -81,5 +116,10 @@ may be materialized for audit but cannot be selected.
 ## Acceptance evidence
 
 - Tests cover exact-window CSV acceptance/rejection, event-mode mixing rejection, closed/open/incomplete DuckDB cycles and deterministic event IDs.
-- A package manifest contains source hashes, window, event mode, counts and exclusions.
+- Tests prove that a full-horizon HTML summary cannot be used as a window
+  equality check, that v2 selector loading requires the conjunction of both
+  statuses, and that legacy v1 proxy loading remains valid.
+- Tests distinguish absolute from percentage PnL/DD source-summary labels.
+- A package manifest contains source hashes, window, event mode, counts,
+  exclusions and the two-horizon verification evidence.
 - A real database read is read-only and produces an audit; no source reports, HTML or raw payloads are modified.

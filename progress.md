@@ -46,11 +46,23 @@ suite evidence: `251 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -
 -p no:cacheprovider`, 2026-08-10); the skip is the Windows symlink permission
 case.
 
-The next operational step is to build one real read-only DuckDB package with
-the approved window and HTML samples, then run `select --source-package` with
-the externally supplied listing dates and strategy template. Retain the local
-audit, record candidate and event distributions, and decide whether Phase 2
-redundancy reduction is needed only from that evidence.
+Read-only materialization of the full local v4 database reached the
+source-summary comparison stage. That evidence established a necessary
+contract correction: source HTML summaries cover each report's full test
+horizon, while v0.7 points/events cover the selected `[start, end)` window.
+The parser must also distinguish absolute `Total PnL`/`Max Drawdown` from
+their `%` forms. The old single real-package verification label cannot prove
+both facts and is not selector evidence for a real package.
+
+The next implementation step is to publish/load real source packages in v2:
+fail-closed full-horizon `source_summary_status=VERIFIED` from 3–5 HTML
+comparisons, followed by `window_metrics_status=DERIVED_FROM_VERIFIED_SOURCE`
+for `[start, end)` metrics/events. The real selector gate requires their
+conjunction; legacy v1 proxy packages retain their existing contract. Then
+build one real read-only DuckDB package with the approved window and HTML
+samples, run `select --source-package` with the externally supplied listing
+dates and strategy template, retain the local audit, and decide whether Phase
+2 is needed only from the resulting candidate/event distributions.
 
 ## Blockers
 

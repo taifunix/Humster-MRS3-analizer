@@ -18,7 +18,7 @@ Humster MRS3 Analyzer — локальный, детерминированный
 
 ## Текущий этап: v0.7 event source packs
 
-Цель ближайшего этапа — подготовить два проверяемых, взаимно исключающих source pack на окне `[2026-07-15T00:00:00, 2026-08-06T00:00:00)`: CSV `legacy_trades_proxy` с `point_event_count=TotalTrades` и DuckDB `real_independent_events` с `point_event_count=unique(event_id)`. Экспорт реальных событий из DuckDB сохраняет исходный event mode и не превращается в proxy. Контракт и порядок поставки зафиксированы в [спецификации event source packs](docs/specs/2026-08-10-v07-event-source-packs.md).
+Цель ближайшего этапа — подготовить два проверяемых, взаимно исключающих source pack на окне `[2026-07-15T00:00:00, 2026-08-06T00:00:00)`: CSV `legacy_trades_proxy` с `point_event_count=TotalTrades` и DuckDB `real_independent_events` с `point_event_count=unique(event_id)`. Экспорт реальных событий из DuckDB сохраняет исходный event mode и не превращается в proxy. Real-пакет v2 отдельно доказывает full-horizon source summary и происхождение windowed metrics; HTML summary не является проверкой равенства метрик окна. Контракт и порядок поставки зафиксированы в [спецификации event source packs](docs/specs/2026-08-10-v07-event-source-packs.md) и [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md).
 
 ### Этапы поставки
 
@@ -62,6 +62,7 @@ Humster MRS3 Analyzer — локальный, детерминированный
 | Active prerequisite | [Safe runner smoke-test](docs/specs/2026-08-10-v06-runner-safe-root-json-smoke.md) | безопасная проверка панели и одного реального прогона | локальный tester; до v0.7 implementation |
 | Active | [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md) | последовательность import → materializer → unified input → selector | v4 evidence, event-filter spec |
 | Active | [v0.7 event source packs](docs/specs/2026-08-10-v07-event-source-packs.md) | CSV/DuckDB пакеты, event modes и closed-cycle audit | v4 evidence, event-filter spec |
+| Accepted | [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) | раздельная full-horizon/windowed verification для real packages v2 | event source packs |
 | Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
 | Planned | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | empirical cap без leakage | завершённые tick-tests |
 | Queued — hook «Анализатор Портфеля» | [Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) | отдельный анализ готовых MRS3-стратегий и сетов | individual results, trade timestamps, limiter/L2/margin contract |

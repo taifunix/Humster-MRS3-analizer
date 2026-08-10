@@ -12,9 +12,10 @@
 | Оперативный статус | [Progress](../progress.md) | всегда после PRD |
 | Текущая поставка | [v0.7 legacy selection](specs/2026-08-10-v07-legacy-selection.md) | для работы над v0.7 |
 | Event rules | [Event filter and shortlist](specs/v07-event-filter-and-shortlist.md) | при selector/event-filter изменениях |
+| Source verification | [Event source packs](specs/2026-08-10-v07-event-source-packs.md) | при CSV/DuckDB package, materializer или selector изменениях |
 | Post-test calibration | [Source-potential calibration](specs/v07-posttest-calibration-source-potential.md) | только после накопления results |
 | Анализатор Портфеля — Queued | [Portfolio Analyzer v0.4](specs/2026-08-09-portfolio-analyzer-v04.md) | отдельной команде после проверки входных данных |
-| Решения | [ADR-0001](decisions/0001-repository-and-documentation-model.md) | при вопросах структуры/workflow |
+| Решения | [ADR-0001](decisions/0001-repository-and-documentation-model.md), [ADR-0002](decisions/0002-source-summary-and-window-metrics-verification.md) | при вопросах структуры/workflow и source verification |
 
 ## Правила обновления
 
