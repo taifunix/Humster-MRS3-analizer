@@ -14,6 +14,12 @@
 
 Не читать `docs/archive/` по умолчанию. Архив открывается только по прямой ссылке из active-spec/ADR: он сохраняет происхождение правил, но не является текущим контрактом.
 
+## Hooks по имени модуля
+
+Если пользователь пишет **«работаем над Анализатором Портфеля»** (или `Portfolio Analyzer`), это означает: после шагов 1–3 минимального контекста обязательно прочитать `docs/specs/2026-08-09-portfolio-analyzer-v04.md`, затем `docs/decisions/0001-repository-and-documentation-model.md`, затем только разделы 9–10 `docs/archive/sources/MRS3_v07_MASTER_HANDOFF_LEGACY_DUCKDB_2026-08-10.md`.
+
+Для этого hook не читать всю legacy-spec или весь архив. Не менять v0.7 legacy selection. До подтверждения trade timestamps, limiter contract, L2 и margin data разрешён только Layer A; сетовый симулятор и рекомендации не реализовывать.
+
 ## Карта источников истины
 
 | Документ | Что в нём хранить | Чего в нём не хранить |
