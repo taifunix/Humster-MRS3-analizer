@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from mrs3.runner.config import RunnerConfig, RunnerConfigError, UnsafePathError, validate_report_directory
+
+
+def test_accepts_exact_my_test_under_configured_bot_root(tmp_path: Path) -> None:
+    bot = tmp_path / "hb"
+    target = bot / "tester" / "report" / "my_test"
+
+    assert validate_report_directory(target, bot) == target.resolve()
+
+
+@pytest.mark.parametrize("relative", [".", "tester", "tester/report", "other/my_test"])
+def test_rejects_broad_or_wrong_cleanup_target(tmp_path: Path, relative: str) -> None:
+    bot = tmp_path / "hb"
+
+    with pytest.raises(UnsafePathError):
+        validate_report_directory(bot / relative, bot)
+
+
+def test_runner_config_resolves_paths_and_runtime_values(tmp_path: Path) -> None:
+    bot = tmp_path / "hamster"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "tester_runner": {
+                    "bot_root": "hamster",
+                    "executable": "hb_c.exe",
+                    "base_url": "http://127.0.0.1:8087",
+                    "port": 8087,
+                    "strategy_dir": "settings_strategy",
+                    "report_dir": "tester/report/my_test",
+                    "wizard_result": "tester/wizard_result.json",
+                    "wizard_progress": "tester/wizard_progress.json",
+                    "bot_args": ["--port", "8087"],
+                    "poll_interval_seconds": 0.25,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = RunnerConfig.from_json(config_path)
+
+    assert config.bot_root == bot.resolve()
+    assert config.executable_path == (bot / "hb_c.exe").resolve()
+    assert config.strategy_dir == (bot / "settings_strategy").resolve()
+    assert config.report_dir == (bot / "tester" / "report" / "my_test").resolve()
+    assert config.bot_args == ("--port", "8087")
+    assert config.poll_interval_seconds == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "port"),
+    [
+        ("https://127.0.0.1:8087", 8087),
+        ("http://example.com:8087", 8087),
+        ("http://127.0.0.1:8088", 8087),
+    ],
+)
+def test_runner_config_rejects_nonlocal_or_mismatched_endpoint(
+    tmp_path: Path, base_url: str, port: int
+) -> None:
+    raw = {
+        "tester_runner": {
+            "bot_root": str(tmp_path / "hb"),
+            "executable": "hb_c.exe",
+            "base_url": base_url,
+            "port": port,
+            "strategy_dir": "strategies",
+            "report_dir": "tester/report/my_test",
+            "wizard_result": "tester/wizard_result.json",
+            "wizard_progress": "tester/wizard_progress.json",
+        }
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(RunnerConfigError):
+        RunnerConfig.from_json(path)
+
+
+def test_runner_config_rejects_nonstandard_strategy_directory(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "tester_runner": {
+                    "bot_root": str(tmp_path / "hb"),
+                    "executable": "hb_c.exe",
+                    "base_url": "http://127.0.0.1:8087",
+                    "port": 8087,
+                    "strategy_dir": "tester",
+                    "report_dir": "tester/report/my_test",
+                    "wizard_result": "tester/wizard_result.json",
+                    "wizard_progress": "tester/wizard_progress.json",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UnsafePathError, match="settings_strategy"):
+        RunnerConfig.from_json(path)

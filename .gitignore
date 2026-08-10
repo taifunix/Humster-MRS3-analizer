@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Local runtime configuration and artifacts
+config.local.json
+output/
+results/
+audit_csv/
+strategies/
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+*.xlsx
+
+# Raw tester exports and temporary files
+*.html
+*.log
+*.tmp
+
+# Agent workspaces
+.superpowers/
+.worktrees/

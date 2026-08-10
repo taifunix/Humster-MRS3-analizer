@@ -1,0 +1,103 @@
+{
+  "history_min_days": 7,
+  "base_rate_tf": {
+    "5m": 2.27,
+    "15m": 1.82,
+    "30m": 1.59,
+    "45m": 1.36,
+    "1h": 1.36,
+    "2h": 1.14,
+    "3h": 0.91,
+    "4h": 0.91
+  },
+  "shift_factors": [
+    {"max_bp": 150, "value": 1.0},
+    {"max_bp": 200, "value": 0.9},
+    {"max_bp": 310, "value": 0.3},
+    {"max_bp": 470, "value": 0.2}
+  ],
+  "absolute_floor_boundary_bp": 200,
+  "absolute_floor_at_or_below": 10,
+  "absolute_floor_above": 5,
+  "economic_min_pnl_pct": 0,
+  "economic_min_win_rate_pct": 70,
+  "economic_max_dd_pct": 11,
+  "economic_min_efficiency": 3,
+  "shift_domain": {"min_bp": 30, "max_bp": 470},
+  "refine": {
+    "fine_zone_max_exclusive_bp": 150,
+    "boundary_zone_max_bp": 170,
+    "fine_step_bp": 10,
+    "fine_radius_bp": 30,
+    "boundary_down_radius_bp": 30,
+    "boundary_up_radius_bp": 50,
+    "coarse_radius_bp": 50,
+    "ma_neighbor_radius": 1
+  },
+  "plateau": {
+    "core_link_min": 0.9,
+    "envelope_min": 0.75,
+    "supported_link_min": 0.75,
+    "isolated_peak_relative": 0.9,
+    "equivalent_tolerance": 0.05
+  },
+  "close_support": {"core_min": 0.9, "supported_min": 0.75},
+  "gap": {
+    "middle_zone_start_bp": 150,
+    "lower_shift_lt_1_5_bp": 60,
+    "lower_shift_1_5_to_4_bp": 80,
+    "deep_gap_boundary_bp": 400
+  },
+  "max_orders": 4,
+  "lot_rounding_decimals": 12,
+  "numeric_tolerance": 0.000000001,
+  "initial_lot_sum": 1,
+  "target_dd": 5,
+  "close_multiplier": {"long": 1.003, "short": 0.997},
+  "columns": {
+    "base": {
+      "symbol": "settings[*].basic.symbol",
+      "timeframe": "settings[*].basic.time_frame",
+      "report_start": "StartDate",
+      "report_end": "EndDate",
+      "pnl_pct": "TotalPnLPercent",
+      "trades": "TotalTrades",
+      "wins": "Win",
+      "losses": "Los",
+      "win_rate_pct": "WinRate",
+      "dd_pct": "MaxDrawdownPercent",
+      "profit_factor": "ProfitFactor",
+      "run_id": "Run id"
+    },
+    "long": {
+      "open_ma": "settings[*].mrs2.ma_long.len",
+      "close_ma": "settings[*].mrs2.ma_close_long.len",
+      "multiplier": "settings[*].mrs2.ma_long.multiplier"
+    },
+    "short": {
+      "open_ma": "settings[*].mrs2.ma_short.len",
+      "close_ma": "settings[*].mrs2.ma_close_short.len",
+      "multiplier": "settings[*].mrs2.ma_short.multiplier"
+    }
+  },
+  "tester_runner": {
+    "bot_root": "C:\\path\\to\\hamster\\hb",
+    "executable": "hb_c.exe",
+    "base_url": "http://127.0.0.1:80",
+    "port": 80,
+    "strategy_dir": "settings_strategy",
+    "report_dir": "tester/report/my_test",
+    "wizard_result": "tester/wizard_result.json",
+    "wizard_progress": "tester/wizard_progress.json",
+    "bot_args": [],
+    "request_timeout_seconds": 15,
+    "startup_timeout_seconds": 60,
+    "shutdown_timeout_seconds": 30,
+    "poll_interval_seconds": 1,
+    "batch_timeout_seconds": 86400,
+    "stall_timeout_seconds": 1800,
+    "report_stability_polls": 2,
+    "metric_tolerance": 0.01
+  }
+}
+

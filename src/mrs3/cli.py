@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Sequence
+
+from .config import AlgorithmConfig
+from .models import Side
+from .panel import serve_panel
+from .pipeline import SelectionInputs, run_selection
+from .posttest import run_posttest
+from .runner.config import RunnerConfig
+from .runner.workflow import plan_batch, run_batch
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="mrs3")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    select = subparsers.add_parser("select", help="build deterministic MRS3 candidates")
+    select.add_argument("--input-csv", type=Path, required=True)
+    select.add_argument("--dates", type=Path, required=True)
+    select.add_argument("--template", type=Path, required=True)
+    select.add_argument("--side", choices=[side.value for side in Side], required=True)
+    select.add_argument("--config", type=Path, required=True)
+    select.add_argument("--output-dir", type=Path, required=True)
+    tester_plan = subparsers.add_parser(
+        "tester-plan", help="validate and print a read-only Hamster Bot batch plan"
+    )
+    tester_plan.add_argument("--config", type=Path, required=True)
+    tester_plan.add_argument("--strategies", type=Path, required=True)
+    tester_run = subparsers.add_parser(
+        "tester-run", help="run every strategy through the Hamster Bot tester"
+    )
+    tester_run.add_argument("--config", type=Path, required=True)
+    tester_run.add_argument("--strategies", type=Path, required=True)
+    tester_run.add_argument("--output-csv", type=Path, required=True)
+    posttest = subparsers.add_parser(
+        "posttest", help="normalize tester results to DD5 and build retest JSON files"
+    )
+    posttest.add_argument("--results-csv", type=Path, required=True)
+    posttest.add_argument("--audit-xlsx", type=Path, required=True)
+    posttest.add_argument("--strategies-dir", type=Path, required=True)
+    posttest.add_argument("--config", type=Path, required=True)
+    posttest.add_argument("--output-dir", type=Path, required=True)
+    panel = subparsers.add_parser(
+        "panel", help="run the local MRS3 control panel"
+    )
+    panel.add_argument(
+        "--host",
+        default="127.0.0.1",
+        choices=("127.0.0.1", "localhost"),
+    )
+    panel.add_argument("--port", type=int, default=8765)
+    panel.add_argument("--config", type=Path, default=Path("config.example.json"))
+    panel.add_argument("--no-browser", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.command == "select":
+        config = AlgorithmConfig.from_json(args.config)
+        result = run_selection(
+            SelectionInputs(
+                csv_path=args.input_csv,
+                dates_path=args.dates,
+                template_path=args.template,
+                side=Side(args.side),
+                output_dir=args.output_dir,
+            ),
+            config,
+        )
+        print(json.dumps(result.manifest, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "tester-plan":
+        config = RunnerConfig.from_json(args.config)
+        plan = plan_batch(config, args.strategies)
+        print(
+            json.dumps(
+                {
+                    "strategy_source": str(plan.strategy_source),
+                    "expected_count": len(plan.expected_names),
+                    "expected_names": plan.expected_names,
+                    "filenames": plan.filenames,
+                    "file_hashes": dict(plan.file_hashes),
+                    "actions": plan.actions,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "tester-run":
+        config = RunnerConfig.from_json(args.config)
+        result = run_batch(config, args.strategies, args.output_csv)
+        print(
+            json.dumps(
+                {
+                    "output_csv": str(result.output_csv),
+                    "state_file": str(result.state_file),
+                    "progress_file": str(result.progress_file),
+                    "result_rows": result.result_rows,
+                    "events": result.events,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "posttest":
+        config = AlgorithmConfig.from_json(args.config)
+        result = run_posttest(
+            args.results_csv,
+            args.audit_xlsx,
+            args.strategies_dir,
+            args.output_dir,
+            config,
+        )
+        print(
+            json.dumps(
+                {
+                    "workbook": str(result.workbook),
+                    "csv_directory": str(result.csv_directory),
+                    "scaled_strategies_dir": str(result.scaled_strategies_dir),
+                    "manifest": str(result.manifest),
+                    "scaled_count": result.scaled_count,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "panel":
+        serve_panel(
+            args.host,
+            args.port,
+            args.config,
+            open_browser=not args.no_browser,
+        )
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

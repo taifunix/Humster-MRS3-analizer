@@ -1,0 +1,21 @@
+[
+  {
+    "runId": "9f44746f",
+    "timestamp": "2026-08-08T20:47:06.0962490Z",
+    "strategies": ["ADM1"],
+    "stats": {
+      "InitialBalance": 1000.0,
+      "FinalBalance": -5825.6651944,
+      "TotalPnL": -6825.6651944,
+      "TotalPnLPercent": -682.5665194400,
+      "TotalTrades": 2,
+      "WinRate": 50.0,
+      "MaxDrawdown": 6891.000000,
+      "MaxDrawdownPercent": 646.09589229783433101096410384,
+      "TotalFees": 9.6289444
+    },
+    "chartUrl": "/tester-report/my_test/my_test_run_001_of_001_ADMSTOCK_USDT_2h_2026-07-01_3.html",
+    "period": "2026-07-01 .. 2026-08-02",
+    "elapsed": "00:00:03"
+  }
+]
