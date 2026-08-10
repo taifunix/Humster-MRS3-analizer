@@ -129,6 +129,7 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         html = response.read().decode("utf-8")
         assert response.status == 200
         assert "MRS3 Control Panel" in html
+        assert "Каталог JSON-стратегий" in html
 
         body = json.dumps(
             {

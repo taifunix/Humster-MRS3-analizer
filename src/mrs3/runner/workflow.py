@@ -11,6 +11,9 @@ from typing import Callable, Protocol
 
 from .config import RunnerConfig
 from .files import (
+    BatchPreparationError,
+    _root_json_files,
+    _source_is_inside_strategy_dir,
     cleanup_completed_batch,
     inspect_strategy_batch,
     prepare_batch_files,
@@ -47,6 +50,7 @@ class BatchPlan:
     expected_names: tuple[str, ...]
     filenames: tuple[str, ...]
     file_hashes: tuple[tuple[str, str], ...]
+    root_json_to_replace: tuple[str, ...]
     actions: tuple[str, ...]
 
 
@@ -76,12 +80,24 @@ def validate_runtime_preflight(config: RunnerConfig) -> None:
 
 def plan_batch(config: RunnerConfig, strategy_source: Path) -> BatchPlan:
     validate_runtime_preflight(config)
+    if _source_is_inside_strategy_dir(strategy_source, config.strategy_dir):
+        raise BatchPreparationError(
+            f"strategy source cannot be inside strategy_dir: {strategy_source.resolve()}"
+        )
     inspection = inspect_strategy_batch(strategy_source)
     names = inspection.expected_names
+    root_json_to_replace = (
+        tuple(path.name for path in _root_json_files(config.strategy_dir))
+        if config.strategy_dir.exists()
+        else ()
+    )
     actions = (
         "POST /htmx/system/shutdown; fallback terminate only the verified listener PID",
         f"delete exact report tree {config.report_dir} and the two wizard JSON logs",
-        f"replace {config.strategy_dir} with {len(names)} validated strategy JSON files",
+        "replace "
+        f"{len(root_json_to_replace)} root-level strategy JSON files "
+        f"({', '.join(root_json_to_replace) or 'none'}) in {config.strategy_dir} "
+        f"with {len(names)} validated strategy JSON files",
         f"start {config.executable_path} and wait for local port {config.port}",
         "GET /htmx/tester/strategies-table until the exact strategy batch is visible",
         "for each strategy: GET its Base64 single wizard, then POST /htmx/tester/wizard/run",
@@ -94,6 +110,7 @@ def plan_batch(config: RunnerConfig, strategy_source: Path) -> BatchPlan:
         expected_names=names,
         filenames=inspection.filenames,
         file_hashes=inspection.file_hashes,
+        root_json_to_replace=root_json_to_replace,
         actions=actions,
     )
 
@@ -145,6 +162,12 @@ def _write_state(
 
 def _output_is_safe(output_csv: Path, config: RunnerConfig) -> None:
     output = output_csv.resolve()
+    try:
+        output.relative_to(config.bot_root.resolve())
+    except ValueError:
+        pass
+    else:
+        raise ValueError("output CSV must be outside bot_root")
     report_dir = config.report_dir.resolve()
     try:
         output.relative_to(report_dir)

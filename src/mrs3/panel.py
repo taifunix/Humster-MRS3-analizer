@@ -101,7 +101,7 @@ PANEL_HTML = r"""<!doctype html>
       <h2>Управление</h2>
       <label>Файл конфигурации<input id="config" type="text"></label>
       <h3>Пакетный тестер</h3>
-      <label>Каталог готовых стратегий<input id="strategies" value="output_long\strategies" type="text"></label>
+      <label>Каталог JSON-стратегий<input id="strategies" value="output_long\strategies" type="text"></label>
       <label>Итоговый CSV<input id="output_csv" value="results\mrs3_long_results.csv" type="text"></label>
       <div class="buttons">
         <button id="planButton" onclick="startAction('tester-plan')">Проверить план</button>

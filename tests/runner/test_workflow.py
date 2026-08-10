@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from mrs3.runner.config import RunnerConfig
+from mrs3.runner.files import BatchPreparationError
 from mrs3.runner.http import RowState, StrategyRow
 from mrs3.runner.results import ResultMismatchError
 from mrs3.runner.workflow import WorkflowDependencies, plan_batch, run_batch
@@ -122,6 +123,46 @@ def test_dry_run_reports_actions_without_mutating_bot_tree(tmp_path: Path) -> No
     assert after == before
     assert "POST /htmx/system/shutdown" in plan.actions[0]
     assert all("/htmx/tester/run" not in action for action in plan.actions)
+
+
+def test_plan_lists_only_root_level_json_to_replace(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _strategy(config.strategy_dir, "OLD")
+    _strategy(config.strategy_dir / "Bybit", "PROTECTED")
+    source = tmp_path / "generated"
+    _strategy(source, "NEW")
+
+    plan = plan_batch(config, source)
+
+    assert plan.root_json_to_replace == ("OLD.json",)
+    assert "1 root-level strategy JSON" in plan.actions[2]
+    assert "Bybit" not in "\n".join(plan.actions)
+
+
+def test_run_rejects_output_inside_bot_root(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    source = tmp_path / "generated"
+    _strategy(source, "A")
+
+    with pytest.raises(ValueError, match="outside bot_root"):
+        run_batch(config, source, config.bot_root / "results.csv")
+
+
+def test_nested_strategy_source_fails_before_bot_stop(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    source = config.strategy_dir / "Bybit"
+    _strategy(source, "A")
+    stop_calls: list[str] = []
+    dependencies = WorkflowDependencies(
+        stop=lambda _: stop_calls.append("stop"),
+        start=lambda _: pytest.fail("bot must not start"),
+        client_factory=lambda _: pytest.fail("client must not be created"),
+    )
+
+    with pytest.raises(BatchPreparationError, match="inside strategy_dir"):
+        run_batch(config, source, tmp_path / "results.csv", dependencies=dependencies)
+
+    assert stop_calls == []
 
 
 def test_missing_executable_fails_before_stop_or_file_mutation(tmp_path: Path) -> None:
