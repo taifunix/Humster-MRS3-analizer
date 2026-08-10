@@ -164,6 +164,64 @@ def test_load_package_accepts_valid_legacy_package(tmp_path: Path) -> None:
     assert loaded.points["_event_ids"].tolist() == [()] * len(loaded.points)
 
 
+def test_load_real_package_filters_opposite_side_before_normalization(tmp_path: Path) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, _ = write_real_package(tmp_path / "package", paths)
+    points_path = package / "points.csv"
+    points = pd.read_csv(points_path)
+    short = points.iloc[0].copy()
+    long_id = str(short["point_id"])
+    short_id = long_id.replace("|LONG|", "|SHORT|", 1)
+    short["point_id"] = short_id
+    short["Run id"] = 999
+    short["settings[*].mrs2.ma_short.len"] = short["settings[*].mrs2.ma_long.len"]
+    short["settings[*].mrs2.ma_close_short.len"] = short["settings[*].mrs2.ma_close_long.len"]
+    short["settings[*].mrs2.ma_short.multiplier"] = 1 + (1 - short["settings[*].mrs2.ma_long.multiplier"])
+    short_events = ("short-close", "short-open", "short-shift")
+    short["point_event_count"] = len(short_events)
+    short["event_ids_hash"] = sha256("|".join(short_events).encode("utf-8")).hexdigest()
+    points = pd.concat([points, pd.DataFrame([short])], ignore_index=True)
+    points.to_csv(points_path, index=False, lineterminator="\n")
+
+    events_path = package / "point_events.csv"
+    events = pd.read_csv(events_path)
+    events = pd.concat(
+        [events, pd.DataFrame({"point_id": short_id, "event_id": short_events})],
+        ignore_index=True,
+    ).sort_values(["point_id", "event_id"], kind="mergesort")
+    events.to_csv(events_path, index=False, lineterminator="\n")
+    manifest_path = package / "package_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["point_count"] = len(points)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    loaded = _load_package(
+        package, paths["dates"], Side.LONG, AlgorithmConfig.from_json(paths["config"])
+    )
+
+    assert len(loaded.points) == len(points) - 1
+    assert loaded.points["side"].eq("LONG").all()
+    assert short_id not in set(loaded.points["point_id"])
+
+
+def test_real_side_filter_rejects_noncanonical_opposite_side_identity(tmp_path: Path) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, _ = write_real_package(tmp_path / "package", paths)
+    raw_points = pd.read_csv(package / "points.csv")
+    opposite = raw_points.iloc[0].copy()
+    opposite["point_id"] = "BAD|SHORT|not-a-timeframe|no-shift|x|y"
+    opposite["settings[*].mrs2.ma_short.len"] = 2
+    opposite["settings[*].mrs2.ma_close_short.len"] = 3
+    opposite["settings[*].mrs2.ma_short.multiplier"] = 1.019
+    raw_points = pd.concat([raw_points, pd.DataFrame([opposite])], ignore_index=True)
+
+    module = importlib.import_module("mrs3.package_loader")
+    with pytest.raises(ValueError, match="point_id"):
+        module._real_points_for_side(
+            raw_points, Side.LONG, AlgorithmConfig.from_json(paths["config"])
+        )
+
+
 def test_load_package_accepts_verified_real_mapping(tmp_path: Path) -> None:
     paths = write_selection_inputs(tmp_path / "inputs")
     package, events_by_point = write_real_package(tmp_path / "package", paths)

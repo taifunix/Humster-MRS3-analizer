@@ -61,7 +61,7 @@ def _load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
             ).dropna(subset=["symbol", "listing_date"])
         frame = frame.copy()
         frame["symbol"] = frame["symbol"].astype(str).str.strip()
-        frame["listing_date"] = pd.to_datetime(frame["listing_date"], errors="raise")
+        frame["listing_date"] = pd.to_datetime(frame["listing_date"], errors="raise", utc=True)
     except (OSError, ValueError, TypeError) as exc:
         if isinstance(exc, InputError):
             raise
@@ -75,12 +75,12 @@ def _load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
 
 
 def load_points(
-    csv_path: Path,
+    csv_path: Path | pd.DataFrame,
     dates_path: Path,
     side: Side,
     config: AlgorithmConfig,
 ) -> tuple[pd.DataFrame, InputAudit]:
-    raw = pd.read_csv(csv_path)
+    raw = pd.read_csv(csv_path) if isinstance(csv_path, Path) else csv_path.copy()
     columns = {**config.base_columns, **config.side_columns[side]}
     missing_columns = [column for column in columns.values() if column not in raw.columns]
     if missing_columns:
@@ -114,8 +114,8 @@ def load_points(
             "open_ma": pd.to_numeric(data[columns["open_ma"]], errors="raise").astype("int64"),
             "close_ma": pd.to_numeric(data[columns["close_ma"]], errors="raise").astype("int64"),
             "multiplier": pd.to_numeric(data[columns["multiplier"]], errors="raise").astype(float),
-            "report_start": pd.to_datetime(data[columns["report_start"]], errors="raise"),
-            "report_end": pd.to_datetime(data[columns["report_end"]], errors="raise"),
+            "report_start": pd.to_datetime(data[columns["report_start"]], errors="raise", utc=True),
+            "report_end": pd.to_datetime(data[columns["report_end"]], errors="raise", utc=True),
             "pnl_pct": pd.to_numeric(data[columns["pnl_pct"]], errors="raise").astype(float),
             "trades": pd.to_numeric(data[columns["trades"]], errors="raise").astype("int64"),
             "wins": pd.to_numeric(data[columns["wins"]], errors="coerce").fillna(0).astype("int64"),

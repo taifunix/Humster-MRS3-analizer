@@ -18,9 +18,20 @@ Provide two reproducible input packages for v0.7 selection. A selection run cons
 
 The UI must let the user prepare either package. A DuckDB export preserves `real_independent_events`; converting it to a CSV file never changes its declared mode. The selector rejects a package with missing, unknown or mixed modes.
 
+A real DuckDB package may contain both `LONG` and `SHORT` points. Its `point_id`
+is the authoritative six-part identity and includes the side. A selection run
+accepts exactly one `--side`, filters the package to that side before
+normalization, and validates only that side's point/event mappings. It must
+reject an invalid point identity or an empty requested-side slice; it must not
+normalize one side's MRS2 fields as the other side or call the other side a
+duplicate.
+
 ## Window contract
 
 - The package window is UTC `[start, end)` and must be within the source coverage.
+- Listing dates without an explicit timezone mean `00:00:00 UTC`; report
+  timestamps and listing dates are normalized to UTC before eligibility
+  comparisons.
 - CSV rows enter only when their start and end exactly equal the package window. Every rejection is recorded.
 - DuckDB cycles enter only when both the opening and closing actions occur inside the window. An action at `end` is outside the window.
 

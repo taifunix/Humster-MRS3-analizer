@@ -7,8 +7,8 @@
 ## Verified repository baseline
 
 - Root package: `src/mrs3`; tests: `tests`; project version: `0.7.0`.
-- Latest committed source-integrity suite: `292 passed, 1 skipped`
-  (`.venv\\Scripts\\python.exe -m pytest -q -p no:cacheprovider`, 2026-08-10).
+- Latest committed source-package suite: `295 passed, 1 skipped`
+  (`.venv\\Scripts\\python.exe -m pytest -q -p no:cacheprovider`, 2026-08-11).
   The skip is the Windows symlink-permission test, not a product failure.
 - DuckDB v3/v4 importer pair is preserved in `programs/Обработчик HTML-DuckDB/`; v4 requires adjacent v3 codec.
 - Local tester configuration exists outside Git as ignored `config.local.json`.
@@ -35,8 +35,8 @@ Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
 included cycles. The package has `source_summary_status=VERIFIED` and
 `window_metrics_status=DERIVED_FROM_VERIFIED_SOURCE`. An exploratory real LONG
-selector run then completed with the still-uncommitted package-side and
-UTC-normalization integration slice:
+selector run then completed after the package-side and UTC-normalization
+integration slice:
 `3,730` normalized points, all with 24-346 events, but `0` economic/event-
 eligible points, `0` plateaus and `0` READY structures under the current
 economic thresholds. This is a result, not a source-verification failure.
@@ -53,8 +53,8 @@ and does not block the core delivery.
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. No implementation from that plan has started.
 
-1. Close and independently review the existing package-side/UTC-normalization
-   working-tree changes before mixing in new implementation.
+1. Start with mandatory Task 0 from the
+   [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 2. Apply the confirmed external-review remediation tasks listed in the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 3. Implement the approved source-DuckDB migration/importer and direct analysis
@@ -63,9 +63,9 @@ approved. No implementation from that plan has started.
 
 ## Blockers
 
-- No external data blocker is known for the core storage/importer work. The
-  current dirty package-side changes must be closed first. CSV/DuckDB overlay
-  is explicitly deferred and no economic threshold changes implicitly.
+- No external data blocker is known for the core storage/importer work.
+  CSV/DuckDB overlay is explicitly deferred and no economic threshold changes
+  are implied.
 
 ## Queued module hook
 

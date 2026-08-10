@@ -92,7 +92,25 @@ def test_load_points_accepts_bybit_csv_listing_dates(tmp_path: Path) -> None:
 
     points, _ = load_points(csv_path, dates_path, Side.LONG, _config())
 
-    assert points.iloc[0]["listing_date"] == pd.Timestamp("2026-07-01")
+    assert points.iloc[0]["listing_date"] == pd.Timestamp("2026-07-01", tz="UTC")
+
+
+def test_load_points_normalizes_date_only_listing_and_report_times_to_utc(tmp_path: Path) -> None:
+    row = _source_row(
+        **{
+            "StartDate": "2026-07-15T00:00:00+00:00",
+            "EndDate": "2026-08-06T00:00:00+00:00",
+        }
+    )
+    csv_path, _ = _write_inputs(tmp_path, [row])
+    dates_path = _write_csv_dates(
+        tmp_path / "bybit dates_volume.csv", [{"ticker": "AAAUSDT", "launch": "2026-07-01"}]
+    )
+
+    points, _ = load_points(csv_path, dates_path, Side.LONG, _config())
+
+    assert str(points.iloc[0]["listing_date"].tz) == "UTC"
+    assert str(points.iloc[0]["report_start"].tz) == "UTC"
 
 
 @pytest.mark.parametrize(

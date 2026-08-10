@@ -11,7 +11,7 @@ import re
 import pandas as pd
 
 from .config import AlgorithmConfig
-from .loader import load_points
+from .loader import InputError, load_points, normalize_shift
 from .models import InputAudit, Side
 from .source_packs import (
     EVENT_MODES,
@@ -91,7 +91,7 @@ def _required_file(directory: Path, name: str) -> Path:
 
 
 def _validate_real_events(
-    points: pd.DataFrame, events_path: Path
+    points: pd.DataFrame, events_path: Path, package_point_ids: set[str]
 ) -> dict[str, tuple[str, ...]]:
     events = pd.read_csv(events_path, dtype=str)
     if list(events.columns) != ["point_id", "event_id"]:
@@ -105,10 +105,11 @@ def _validate_real_events(
     if events.duplicated(["point_id", "event_id"]).any():
         raise PackageInputError("point_events.csv entries must be unique")
 
-    point_ids = set(points["point_id"].astype(str))
     mapped_ids = set(events["point_id"])
-    if not mapped_ids.issubset(point_ids):
+    if not mapped_ids.issubset(package_point_ids):
         raise PackageInputError("point_events.csv contains an unknown point mapping")
+    point_ids = set(points["point_id"].astype(str))
+    events = events.loc[events["point_id"].isin(point_ids)]
     grouped = {
         str(point_id): tuple(group["event_id"])
         for point_id, group in events.groupby("point_id", sort=False)
@@ -124,6 +125,50 @@ def _validate_real_events(
             raise PackageInputError(f"point event hash mismatch: {point_id}")
         result[point_id] = event_ids
     return result
+
+
+def _real_points_for_side(
+    raw_points: pd.DataFrame, side: Side, config: AlgorithmConfig
+) -> pd.DataFrame:
+    if "point_id" not in raw_points:
+        raise PackageInputError("real package points.csv requires point_id")
+    raw_ids = raw_points["point_id"]
+    if (
+        raw_ids.isna().any()
+        or raw_ids.astype(str).str.strip().eq("").any()
+        or raw_ids.duplicated().any()
+    ):
+        raise PackageInputError("real package point_id values must be non-empty and unique")
+    parts = raw_ids.astype(str).str.split("|", expand=True)
+    if (
+        parts.shape[1] != 6
+        or not parts[1].isin({"LONG", "SHORT"}).all()
+        or parts.eq("").any().any()
+    ):
+        raise PackageInputError("real package point_id must be a six-part identity with LONG or SHORT side")
+    for row, identity in zip(raw_points.to_dict("records"), parts.itertuples(index=False, name=None), strict=True):
+        symbol, declared_side, timeframe, shift_text, open_text, close_text = (str(value) for value in identity)
+        declared = Side(declared_side)
+        columns = {**config.base_columns, **config.side_columns[declared]}
+        try:
+            expected = "|".join(
+                (
+                    str(row[columns["symbol"]]).strip(),
+                    declared.value,
+                    str(row[columns["timeframe"]]).strip(),
+                    str(normalize_shift(declared, row[columns["multiplier"]], config.grid_tolerance_bp)),
+                    str(int(row[columns["open_ma"]])),
+                    str(int(row[columns["close_ma"]])),
+                )
+            )
+        except (KeyError, TypeError, ValueError, InputError) as exc:
+            raise PackageInputError("real package point_id cannot be validated against source fields") from exc
+        if "|".join((symbol, declared_side, timeframe, shift_text, open_text, close_text)) != expected:
+            raise PackageInputError("real package point_id is not canonical for its source fields")
+    selected = raw_points.loc[parts[1].eq(side.value)].copy()
+    if selected.empty:
+        raise PackageInputError(f"real package has no points for requested side {side.value}")
+    return selected
 
 
 def _same_number(left: object, right: object) -> bool:
@@ -319,7 +364,10 @@ def load_package(
     if manifest.get(count_key) != len(raw_points):
         raise PackageInputError(f"manifest {count_key} does not match points.csv")
 
-    points, input_audit = load_points(points_csv, dates_path, side, config)
+    selected_raw_points = raw_points
+    if mode == REAL_INDEPENDENT_EVENTS:
+        selected_raw_points = _real_points_for_side(raw_points, side, config)
+    points, input_audit = load_points(selected_raw_points, dates_path, side, config)
     starts = pd.to_datetime(points["report_start"], utc=True)
     ends = pd.to_datetime(points["report_end"], utc=True)
     if not starts.eq(window_start).all() or not ends.eq(window_end).all():
@@ -349,19 +397,13 @@ def load_package(
                 "every real package point must have window_metrics_status=DERIVED_FROM_VERIFIED_SOURCE"
             )
         _validate_real_v2_evidence(directory, manifest, window_start, window_end)
-        if "point_id" not in raw_points:
-            raise PackageInputError("real package points.csv requires point_id")
-        raw_ids = raw_points["point_id"]
-        if (
-            raw_ids.isna().any()
-            or raw_ids.astype(str).str.strip().eq("").any()
-            or raw_ids.duplicated().any()
-        ):
-            raise PackageInputError("real package point_id values must be non-empty and unique")
+        raw_ids = selected_raw_points["point_id"]
         if set(raw_ids.astype(str)) != set(points["point_id"]):
             raise PackageInputError("points.csv point_id values do not match normalized points")
         events_by_point = _validate_real_events(
-            points, _required_file(directory, "point_events.csv")
+            points,
+            _required_file(directory, "point_events.csv"),
+            set(raw_points["point_id"].astype(str)),
         )
         points["_event_ids"] = points["point_id"].map(events_by_point)
 

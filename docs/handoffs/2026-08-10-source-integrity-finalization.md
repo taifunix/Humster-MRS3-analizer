@@ -1,8 +1,9 @@
 # Handoff: завершение v2 source-integrity
 
 **Дата:** 2026-08-10
-**Статус:** узкая доработка проверена и готова к scoped commit; следующий
-операционный шаг после commit — read-only реальный package rebuild.
+**Статус:** source-integrity доработка закоммичена; real read-only package и
+LONG selector уже выполнены. Текущая следующая развилка — product decision по
+economic gates либо отдельный SHORT selector run.
 
 ## Цель
 
@@ -93,27 +94,28 @@ read-only materialization с HTML samples и `select --source-package`. Это �
 - Попытка root запустить full suite была прервана пользователем; не заявлять
   свежий full-green до повторного запуска.
 
+## Фактический результат после handoff
+
+- Commit `69ba253` добавил fail-closed validation PnL/DD diagnostics и ADR-0003.
+- Реальный v2 package прошёл оба gate: `source_summary_status=VERIFIED` и
+  `window_metrics_status=DERIVED_FROM_VERIFIED_SOURCE`.
+- LONG selector завершился: 3,730 normalized points, 0 economic/event-eligible
+  points, 0 plateaus and 0 READY structures. Point events не являются
+  причиной: диапазон на этой стороне 24-346. Менять экономические пороги без
+  отдельного решения нельзя.
+
 ## Продолжение в новой сессии
 
-1. Прочитать `AGENTS.md`, `PRD.md`, `progress.md`,
-   `docs/specs/2026-08-10-v07-event-source-packs.md`, ADR-0002, ADR-0003 и
-   этот handoff.
-2. Реализовать четыре пункта из review finding с TDD.
-3. Проверить focused и full pytest. В обычной Windows sandbox pytest может
-   падать на ACL temp; в таком случае запускать с уникальным writable
-   `--basetemp` через approved elevated command.
-4. Выполнить `git diff --check`, staged diff review независимым Terra agent и
-   re-review после исправлений.
-5. Создать один scoped commit, например
-   `fix: validate source-integrity diagnostics`, и push в `origin/main`.
-6. Только после этого повторно materialize реальный package read-only с
-   3 samples. При `source_summary_status=VERIFIED` выполнить selector с уже
-   предоставленными listing-date CSV и strategy template. Артефакты остаются
-   ignored/local; локальные абсолютные пути не записывать в tracked docs.
+Source-integrity work завершён коммитом `69ba253`; этот handoff остаётся
+историческим evidence. Текущую работу начинать с `AGENTS.md`, `PRD.md`,
+`progress.md` и Task 0 из
+`docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md`.
+Не повторять закрытые шаги materialization/import без нового основания.
 
 ## Быстрый промпт для новой сессии
 
-> Продолжи по `docs/handoffs/2026-08-10-source-integrity-finalization.md`.
-> Работай только над v2 source-integrity review finding, соблюдай AGENTS.md,
+> Прочитай `docs/handoffs/2026-08-10-source-integrity-finalization.md` и
+> `progress.md`. Verified DuckDB package path завершён; обсуди следующий шаг:
+> анализ economic gates или отдельный SHORT selector run. Соблюдай AGENTS.md,
 > TDD и обязательный независимый Terra review перед коммитом. Не переимпортируй
 > HTML в DuckDB и не записывай локальные пути в документацию.
