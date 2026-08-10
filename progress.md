@@ -2,12 +2,12 @@
 
 **Updated:** 2026-08-10
 **Current branch:** `main`
-**Current feature:** [Safe runner smoke-test](docs/specs/2026-08-10-v06-runner-safe-root-json-smoke.md)
+**Current feature:** [v0.7 event source packs](docs/specs/2026-08-10-v07-event-source-packs.md)
 
 ## Verified repository baseline
 
 - Root package: `src/mrs3`; tests: `tests`; project version: `0.7.0`.
-- Full test suite: `162 passed` (`.venv\\Scripts\\python.exe -m pytest -q`, 2026-08-10); this is not a real panel/bot end-to-end check.
+- Full test suite: `170 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -q`, 2026-08-10). The skip is the Windows symlink-permission test, not a product failure.
 - DuckDB v3/v4 importer pair is preserved in `programs/Обработчик HTML-DuckDB/`; v4 requires adjacent v3 codec.
 - Local tester configuration exists outside Git as ignored `config.local.json`.
 - Repository foundation, documentation model, importer/source preservation and Claude Code instructions are committed on `main`.
@@ -17,20 +17,21 @@
 - The local v4 DuckDB was checked read-only: schema version `4`, compact payload schema and referential integrity are confirmed. Two malformed HTML reports are quarantined; the user accepted their exclusion from the current universe.
 - The common UTC window is `[2026-07-15T00:00:00, 2026-08-06T00:00:00)`. The long CSV fully matches it; the short CSV contains one row with a shorter period and must be excluded by exact-period filtering.
 - The panel starts locally and answers HTTP 200. A one-strategy `tester-plan` succeeds when the JSON is supplied through a directory.
+- Two approved real one-strategy smoke-runs completed. The second run completed the full runner lifecycle through `CSV_COMMITTED` and `COMPLETED` after the transient state-file lock fix; its result CSV is retained locally, while the configured report directory and both wizard logs were absent after cleanup. Only the root strategy JSON was changed; nested strategy folders were not touched.
 
 ## Next required evidence
 
-Complete the safe runner smoke-test before any v0.7 implementation:
+Implement v0.7 event source packs in the order fixed by the active spec:
 
-1. Implement the root-level-JSON-only runner contract.
-2. Run its focused tests and an independent review.
-3. Execute `tester-plan` for one staged JSON and review the plan.
-4. Only after explicit confirmation, run one real test and preserve the resulting evidence.
+1. Define and test the CSV `legacy_trades_proxy` package, including exact-window validation.
+2. Define and test the DuckDB `real_independent_events` package, closed-cycle reconstruction and exclusion audit.
+3. Make the selector accept exactly one declared package and apply `PointEventCount` without mixed modes.
+4. Rebuild the universe and emit the before/after event audit; consider Phase 2 redundancy only after its actual count is available.
 
 ## Blockers
 
-- Current runner replaces the whole strategy directory, which is unsafe because the bot uses only root-level JSON while protected strategies live in nested directories. The smoke-test spec must be implemented first.
-- Materializer, unified input and selector-v0.7 changes are not started.
+- The DuckDB implementation must first confirm the actual v4 raw-payload schema and report-to-point mapping; no raw HTML or database data may be changed.
+- The required user-provided listing-date and strategy-template inputs for a full selector run remain external inputs; package construction and its audit can proceed independently.
 
 ## Queued module hook
 

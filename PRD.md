@@ -16,9 +16,9 @@ Humster MRS3 Analyzer — локальный, детерминированный
 4. результаты реального tick-test, DD5-retest и individual ranking;
 5. только после накопления результатов — калиброванный безопасный pre-test potential filter.
 
-## Текущий этап: v0.7 legacy selection
+## Текущий этап: v0.7 event source packs
 
-Цель ближайшего этапа — проверяемый `legacy_trades_proxy` run на окне `[2026-07-15T00:00:00, 2026-08-06T00:00:00)`. Fine HTML после materialization и coarse CSV должны иметь одинаковый window contract. Для всех строк этого запуска `point_event_count=TotalTrades`; real independent events в него не входят.
+Цель ближайшего этапа — подготовить два проверяемых, взаимно исключающих source pack на окне `[2026-07-15T00:00:00, 2026-08-06T00:00:00)`: CSV `legacy_trades_proxy` с `point_event_count=TotalTrades` и DuckDB `real_independent_events` с `point_event_count=unique(event_id)`. Экспорт реальных событий из DuckDB сохраняет исходный event mode и не превращается в proxy. Контракт и порядок поставки зафиксированы в [спецификации event source packs](docs/specs/2026-08-10-v07-event-source-packs.md).
 
 ### Этапы поставки
 
@@ -26,9 +26,9 @@ Humster MRS3 Analyzer — локальный, детерминированный
 | --- | --- | --- | --- |
 | 0 | Репозиторий v0.7 | перенесён baseline | root package, tests, docs и Git готовы |
 | 1 | Проверенный v4 import | база и audit доступны | schema v4, manifest, quarantine/checklist проверены |
-| 2 | Materializer | raw payloads v4 | `point_period_metrics` + reconciliation samples |
-| 3 | Unified legacy input | verified fine + compatible coarse | deterministic dedup/shadow/conflict audit |
-| 4 | Selector v0.7 | unified input | event gate, full rebuild, audit и JSON |
+| 2 | Source packages | CSV и raw payloads v4 | один declared event mode, window и audit на пакет |
+| 3 | DuckDB materializer | raw payloads v4 | closed cycles, exclusions и `point_period_metrics` |
+| 4 | Selector v0.7 | ровно один source package | event gate, full rebuild, audit и JSON |
 | 5 | Реальные MRS3 results | READY JSON | raw + DD5 retests и individual ranking |
 | 6 | Source-potential calibration | достаточная пачка results | LOPO-validated optional cap |
 
@@ -43,7 +43,7 @@ Humster MRS3 Analyzer — локальный, детерминированный
 
 ## Не входит в текущий scope
 
-- real event-aware run до достаточного raw HTML coverage всей сетки;
+- портфельная симуляция и смешивание независимых событий с legacy proxy;
 - реализация портфельного модуля до появления его обязательных входных данных;
 - ML, regression score или per-pair/per-TF production thresholds;
 - GitHub push, PR или публикация результатов без отдельного разрешения.
@@ -61,6 +61,7 @@ Humster MRS3 Analyzer — локальный, детерминированный
 | Accepted | [Repository foundation](docs/specs/2026-08-10-mrs3-v07-repository-foundation.md) | структура репозитория и workflow | — |
 | Active prerequisite | [Safe runner smoke-test](docs/specs/2026-08-10-v06-runner-safe-root-json-smoke.md) | безопасная проверка панели и одного реального прогона | локальный tester; до v0.7 implementation |
 | Active | [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md) | последовательность import → materializer → unified input → selector | v4 evidence, event-filter spec |
+| Active | [v0.7 event source packs](docs/specs/2026-08-10-v07-event-source-packs.md) | CSV/DuckDB пакеты, event modes и closed-cycle audit | v4 evidence, event-filter spec |
 | Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
 | Planned | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | empirical cap без leakage | завершённые tick-tests |
 | Queued — hook «Анализатор Портфеля» | [Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) | отдельный анализ готовых MRS3-стратегий и сетов | individual results, trade timestamps, limiter/L2/margin contract |
