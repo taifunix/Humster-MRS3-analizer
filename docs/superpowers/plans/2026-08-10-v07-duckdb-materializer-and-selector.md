@@ -14,6 +14,9 @@
 - A run consumes exactly one declared package; CSV proxy and real events never mix.
 - Real-event metrics are diagnostic source metrics, never MRS3 PnL claims.
 - Selector input requires `metric_status=VERIFIED`; verification is 3–5 HTML samples.
+- Stream v4 data in bounded batches: decode actions for every report's audit,
+  but decode timestamp/equity/wallet payloads only after stored grid bounds
+  show complete window coverage; the decoded grid remains the final check.
 - Use TDD: observe each new test fail before production code, then run focused and full suites.
 - Update `progress.md`, run `git diff --check`, obtain independent review and make one scoped conventional commit per task.
 

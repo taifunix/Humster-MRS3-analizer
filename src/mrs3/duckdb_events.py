@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -10,7 +11,7 @@ import re
 import shutil
 import struct
 import tempfile
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 import zlib
 
 import duckdb
@@ -123,6 +124,15 @@ def decode_wallet_changes(
     return changes
 
 
+def _query_batches(
+    con: duckdb.DuckDBPyConnection, query: str, parameters: Sequence[object] = (), *, batch_size: int = 500
+) -> Iterator[list[dict[str, object]]]:
+    cursor = con.execute(query, parameters)
+    columns = [description[0] for description in cursor.description]
+    while rows := cursor.fetchmany(batch_size):
+        yield [dict(zip(columns, row, strict=True)) for row in rows]
+
+
 def _position_side(action: Mapping[str, str]) -> str | None:
     post_side = str(action.get("Post Side", "")).strip().casefold()
     if post_side in {"long", "short"}:
@@ -186,27 +196,33 @@ def calculate_point_metrics(
 ) -> dict[str, int | float | None]:
     """Calculate source metrics for a fully covered UTC half-open interval."""
     start, end = _utc(window_start), _utc(window_end)
-    timestamps = tuple(_utc(str(value)) for value in grid)
+    timestamps = grid if isinstance(grid, pd.DatetimeIndex) else pd.to_datetime(grid, utc=True)
     if end <= start:
         raise SourcePackError("window end must be later than start")
-    if len(timestamps) != len(equity) or not timestamps or timestamps[0] > start or timestamps[-1] < end:
+    if len(timestamps) != len(equity) or not len(timestamps) or timestamps[0] > start or timestamps[-1] < end:
         raise SourcePackError("grid does not cover requested window")
     if any(current <= previous for previous, current in zip(timestamps, timestamps[1:])):
         raise SourcePackError("grid timestamps must be strictly increasing")
-    wallet: list[int | None] = [None] * len(timestamps)
+    wallet_indexes: list[int] = []
+    wallet_values: list[int] = []
     for index, value in wallet_changes:
-        if index >= len(wallet):
+        if not 0 <= index < len(timestamps):
             raise SourcePackError("wallet change index is outside the grid")
-        wallet[index:] = [value] * (len(wallet) - index)
-    before_start = [index for index, timestamp in enumerate(timestamps) if timestamp < start]
-    start_index = before_start[-1] if before_start else 0
-    before_end = [index for index, timestamp in enumerate(timestamps) if timestamp < end]
-    if wallet[start_index] is None or not before_end or wallet[before_end[-1]] is None:
+        if wallet_indexes and index <= wallet_indexes[-1]:
+            raise SourcePackError("wallet changes must have strictly increasing grid indexes")
+        wallet_indexes.append(index)
+        wallet_values.append(value)
+    start_index = max(int(timestamps.searchsorted(start, side="left")) - 1, 0)
+    end_index = int(timestamps.searchsorted(end, side="left")) - 1
+    starting_change = bisect_right(wallet_indexes, start_index) - 1
+    ending_change = bisect_right(wallet_indexes, end_index) - 1
+    if starting_change < 0 or ending_change < 0:
         raise SourcePackError("wallet changes do not cover requested window")
-    starting_wallet = wallet[start_index]
-    ending_wallet = wallet[before_end[-1]]
-    assert starting_wallet is not None and ending_wallet is not None
-    window_equity = [value for timestamp, value in zip(timestamps, equity) if start <= timestamp < end]
+    starting_wallet = wallet_values[starting_change]
+    ending_wallet = wallet_values[ending_change]
+    window_start_index = int(timestamps.searchsorted(start, side="left"))
+    window_end_index = int(timestamps.searchsorted(end, side="left"))
+    window_equity = equity[window_start_index:window_end_index]
     peak = window_equity[0]
     max_drawdown = 0
     max_drawdown_percent = 0.0
@@ -466,76 +482,122 @@ def build_duckdb_package(
         schema = con.execute("select value from schema_info where key='schema_version'").fetchone()
         if not schema or str(schema[0]) != "4":
             raise SourcePackError("DuckDB schema_version must be 4")
-        columns = [description[0] for description in con.execute(
-            """select r.report_id,r.source_file,r.settings_json,r.raw_action_count,
-                      r.equity_sample_count,r.wallet_change_count,p.series_codec,
-                      p.actions_codec,p.actions_zlib,p.equity_zlib,p.wallet_zlib,
-                      c.point_id,c.symbol,c.side,c.timeframe,g.sample_count,
-                      g.timestamps_zlib
-                 from report_runs r join report_payloads p using(report_id)
-                 join point_configs c using(point_id) join time_grids g using(grid_id)
-                order by r.report_id"""
-        ).description]
-        reports = [dict(zip(columns, row, strict=True)) for row in con.fetchall()]
+        reports = [
+            report
+            for batch in _query_batches(
+                con,
+                """select r.report_id,r.source_file,r.settings_json,r.raw_action_count,
+                          r.equity_sample_count,r.wallet_change_count,p.series_codec,p.actions_codec,
+                          c.point_id,c.symbol,c.side,c.timeframe,g.sample_count,
+                          g.start_timestamp_ms,g.end_timestamp_ms
+                     from report_runs r join report_payloads p using(report_id)
+                     join point_configs c using(point_id) join time_grids g using(grid_id)
+                    order by r.report_id""",
+            )
+            for report in batch
+        ]
+        duplicates = sorted(
+            point_id for point_id, count in Counter(str(report["point_id"]) for report in reports).items() if count > 1
+        )
+        if duplicates:
+            raise SourcePackError(f"duplicate point_id reports are not supported: {duplicates}")
+        for report in reports:
+            if report["actions_codec"] != ACTION_CODEC:
+                raise SourcePackError(f"unsupported actions codec: {report['actions_codec']}")
+            if report["series_codec"] != EQUITY_CODEC:
+                raise SourcePackError(f"unsupported series codec: {report['series_codec']}")
+        report_numbers = {str(report["report_id"]): number for number, report in enumerate(reports, start=1)}
+        reports_by_id = {str(report["report_id"]): report for report in reports}
+        start_ns, end_ns = start.value, end.value
+
+        audit_rows: list[dict[str, object]] = []
+        accepted_reports: list[dict[str, object]] = []
+        event_rows: list[dict[str, str]] = []
+        exclusion_totals: Counter[str] = Counter()
+        for batch_start in range(0, len(reports), 500):
+            report_batch = reports[batch_start:batch_start + 500]
+            action_placeholders = ",".join("?" for _ in report_batch)
+            actions_by_id = {
+                str(action["report_id"]): action
+                for actions_batch in _query_batches(
+                    con,
+                    f"""select r.report_id,p.actions_zlib from report_runs r
+                         join report_payloads p using(report_id)
+                        where r.report_id in ({action_placeholders}) order by r.report_id""",
+                    tuple(str(report["report_id"]) for report in report_batch),
+                )
+                for action in actions_batch
+            }
+            covering: dict[str, tuple[tuple[dict[str, str], ...], list[str], dict[str, object]]] = {}
+            for report in report_batch:
+                report_id = str(report["report_id"])
+                action_payload = actions_by_id[report_id]
+                actions = decode_compact_actions(bytes(action_payload["actions_zlib"]), int(report["raw_action_count"]))
+                reconstruction = reconstruct_closed_cycles(
+                    report_id, str(report["symbol"]), str(report["timeframe"]), actions, window_start, window_end
+                )
+                event_ids = sorted({cycle.event_id for cycle in reconstruction.included})
+                reconstructed = len(reconstruction.included) + sum(
+                    reconstruction.exclusions.get(reason, 0)
+                    for reason in ("OPEN_BEFORE_WINDOW", "CLOSE_ON_OR_AFTER_WINDOW")
+                )
+                audit: dict[str, object] = {
+                    "report_id": report["report_id"], "point_id": report["point_id"],
+                    "source_file": Path(str(report["source_file"])).name,
+                    "coverage_status": "REJECTED", "coverage_reason": "GRID_NOT_COVERED",
+                    "raw_action_count": report["raw_action_count"], "reconstructed_cycles": reconstructed,
+                    "included_cycles": len(reconstruction.included), **reconstruction.exclusions,
+                }
+                audit_rows.append(audit)
+                for reason, count in reconstruction.exclusions.items():
+                    exclusion_totals[reason] += count
+                if (
+                    int(report["sample_count"]) > 0
+                    and int(report["start_timestamp_ms"]) * 1_000_000 <= start_ns
+                    and int(report["end_timestamp_ms"]) * 1_000_000 >= end_ns
+                ):
+                    covering[report_id] = (actions, event_ids, audit)
+            if not covering:
+                continue
+            placeholders = ",".join("?" for _ in covering)
+            series_by_id = {
+                str(series["report_id"]): series
+                for series_batch in _query_batches(
+                    con,
+                    f"""select r.report_id,p.equity_zlib,p.wallet_zlib,g.timestamps_zlib
+                           from report_runs r join report_payloads p using(report_id)
+                           join time_grids g using(grid_id)
+                          where r.report_id in ({placeholders}) order by r.report_id""",
+                    tuple(covering),
+                )
+                for series in series_batch
+            }
+            for report_id, (actions, event_ids, audit) in covering.items():
+                report = reports_by_id[report_id]
+                series = series_by_id[report_id]
+                timestamps_ms = decode_compact_deltas(
+                    bytes(series["timestamps_zlib"]), int(report["sample_count"]), codec=str(report["series_codec"])
+                )
+                grid = pd.to_datetime(timestamps_ms, unit="ms", utc=True)
+                raw_metrics = calculate_point_metrics(
+                    grid,
+                    decode_compact_deltas(bytes(series["equity_zlib"]), int(report["equity_sample_count"]), codec=str(report["series_codec"])),
+                    decode_wallet_changes(bytes(series["wallet_zlib"]), int(report["wallet_change_count"]), codec=str(report["series_codec"])),
+                    actions,
+                    window_start,
+                    window_end,
+                )
+                metrics = dict(raw_metrics)
+                metrics["TotalPnL"] = _unscale(raw_metrics["TotalPnL"])
+                metrics["MaxDrawdown"] = _unscale(raw_metrics["MaxDrawdown"])
+                audit.update({"coverage_status": "ACCEPTED", "coverage_reason": "", **metrics})
+                report["metrics"] = metrics
+                report["event_ids"] = event_ids
+                report["point"] = _selector_row(report_numbers[report_id], report, metrics, event_ids, start, end)
+                accepted_reports.append(report)
+                event_rows.extend({"point_id": str(report["point_id"]), "event_id": event_id} for event_id in event_ids)
     finally:
         con.close()
-    duplicates = sorted(point_id for point_id, count in Counter(str(report["point_id"]) for report in reports).items() if count > 1)
-    if duplicates:
-        raise SourcePackError(f"duplicate point_id reports are not supported: {duplicates}")
-
-    audit_rows: list[dict[str, object]] = []
-    accepted_reports: list[dict[str, object]] = []
-    event_rows: list[dict[str, str]] = []
-    exclusion_totals: Counter[str] = Counter()
-    for report_number, report in enumerate(reports, start=1):
-        if report["actions_codec"] != ACTION_CODEC:
-            raise SourcePackError(f"unsupported actions codec: {report['actions_codec']}")
-        if report["series_codec"] != EQUITY_CODEC:
-            raise SourcePackError(f"unsupported series codec: {report['series_codec']}")
-        actions = decode_compact_actions(bytes(report["actions_zlib"]), int(report["raw_action_count"]))
-        reconstruction = reconstruct_closed_cycles(
-            str(report["report_id"]), str(report["symbol"]), str(report["timeframe"]),
-            actions, window_start, window_end,
-        )
-        event_ids = sorted({cycle.event_id for cycle in reconstruction.included})
-        reconstructed = len(reconstruction.included) + sum(
-            reconstruction.exclusions.get(reason, 0)
-            for reason in ("OPEN_BEFORE_WINDOW", "CLOSE_ON_OR_AFTER_WINDOW")
-        )
-        audit: dict[str, object] = {
-            "report_id": report["report_id"], "point_id": report["point_id"],
-            "source_file": Path(str(report["source_file"])).name,
-            "coverage_status": "REJECTED", "coverage_reason": "GRID_NOT_COVERED",
-            "raw_action_count": report["raw_action_count"], "reconstructed_cycles": reconstructed,
-            "included_cycles": len(reconstruction.included), **reconstruction.exclusions,
-        }
-        for reason, count in reconstruction.exclusions.items():
-            exclusion_totals[reason] += count
-        timestamps_ms = decode_compact_deltas(
-            bytes(report["timestamps_zlib"]), int(report["sample_count"]), codec=str(report["series_codec"])
-        )
-        grid = pd.to_datetime(timestamps_ms, unit="ms", utc=True)
-        if not len(grid) or grid[0] > start or grid[-1] < end:
-            audit_rows.append(audit)
-            continue
-        raw_metrics = calculate_point_metrics(
-            grid,
-            decode_compact_deltas(bytes(report["equity_zlib"]), int(report["equity_sample_count"]), codec=str(report["series_codec"])),
-            decode_wallet_changes(bytes(report["wallet_zlib"]), int(report["wallet_change_count"]), codec=str(report["series_codec"])),
-            actions,
-            window_start,
-            window_end,
-        )
-        metrics = dict(raw_metrics)
-        metrics["TotalPnL"] = _unscale(raw_metrics["TotalPnL"])
-        metrics["MaxDrawdown"] = _unscale(raw_metrics["MaxDrawdown"])
-        audit.update({"coverage_status": "ACCEPTED", "coverage_reason": "", **metrics})
-        audit_rows.append(audit)
-        report["metrics"] = metrics
-        report["event_ids"] = event_ids
-        report["point"] = _selector_row(report_number, report, metrics, event_ids, start, end)
-        accepted_reports.append(report)
-        event_rows.extend({"point_id": str(report["point_id"]), "event_id": event_id} for event_id in event_ids)
 
     verification_rows, verification_status, verification_cause = _verification(
         accepted_reports, verification_html_root, verification_sample_count

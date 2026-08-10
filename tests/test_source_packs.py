@@ -416,6 +416,52 @@ def test_duckdb_package_excludes_non_covering_reports_and_keeps_empty_points_sch
     assert package.manifest["coverage_rejected_reports"] == 3
 
 
+def test_duckdb_package_audits_noncovering_reports_without_decoding_their_series(tmp_path: Path) -> None:
+    import duckdb
+
+    database = _v4_database(tmp_path)
+    baseline = build_duckdb_package(database, WINDOW_START, WINDOW_END, tmp_path / "baseline")
+    start = pd.Timestamp(WINDOW_START).value // 1_000_000
+    end = pd.Timestamp(WINDOW_END).value // 1_000_000
+    con = duckdb.connect(str(database))
+    con.execute(
+        "update time_grids set start_timestamp_ms=?, end_timestamp_ms=?, timestamps_zlib=? where grid_id='G2'",
+        [start + 1, end - 1, b"not a compressed timestamp series"],
+    )
+    con.execute(
+        "update report_payloads set equity_zlib=?, wallet_zlib=? where report_id='R2'",
+        [b"not a compressed equity series", b"not a compressed wallet series"],
+    )
+    con.close()
+
+    package = build_duckdb_package(database, WINDOW_START, WINDOW_END, tmp_path / "package")
+
+    expected_points = pd.read_csv(baseline.points_csv).query("point_id != 'P2'").reset_index(drop=True)
+    actual_points = pd.read_csv(package.points_csv).reset_index(drop=True)
+    pd.testing.assert_frame_equal(actual_points, expected_points)
+    audit = pd.read_csv(package.audit_csv).set_index("report_id")
+    assert audit.loc["R2", ["coverage_status", "coverage_reason", "raw_action_count", "reconstructed_cycles", "included_cycles"]].to_dict() == {
+        "coverage_status": "REJECTED",
+        "coverage_reason": "GRID_NOT_COVERED",
+        "raw_action_count": 4,
+        "reconstructed_cycles": 2,
+        "included_cycles": 2,
+    }
+
+
+def test_duckdb_package_audits_every_report_across_action_batches(tmp_path: Path) -> None:
+    database = _v4_database(tmp_path, report_count=501)
+
+    package = build_duckdb_package(database, WINDOW_START, WINDOW_END, tmp_path / "package")
+
+    audit = pd.read_csv(package.audit_csv)
+    assert len(audit) == 501
+    assert audit["report_id"].tolist() == sorted(f"R{index}" for index in range(1, 502))
+    assert package.manifest["report_count"] == 501
+    assert package.manifest["coverage_accepted_reports"] == 501
+    assert package.manifest["included_cycles"] == 1002
+
+
 def test_duckdb_package_marks_all_points_verified_after_three_matching_html_reports(tmp_path: Path) -> None:
     database = _v4_database(tmp_path)
     html_root = _verification_html(tmp_path / "html", 3)

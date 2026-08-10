@@ -41,6 +41,13 @@ reconstructs it from the first action when the grid starts at `start`) and the
 last snapshot before `end`. It calculates `TotalPnL` and `TotalPnLPercent` from
 their difference and that starting wallet.
 
+For a bounded read of a large v4 database, the materializer reads report/grid
+identity and decodes actions for every report first, so every report retains a
+cycle/exclusion audit. It loads and decodes timestamp, equity and wallet series
+only for a grid whose stored bounds cover the requested window, then validates
+that decoded grid again before calculating metrics. This optimization cannot
+turn a non-covering report into a point or omit its action audit.
+
 `MaxDrawdown` and `MaxDrawdownPercent` are the greatest fall of the in-window
 equity series from its preceding in-window peak. A realised trade action is an
 `Action=closed` or `Action=decreased` action belonging to a cycle which is

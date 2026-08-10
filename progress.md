@@ -36,6 +36,16 @@ DuckDB HTML verification is available from both `source-duckdb` and its panel
 tab through an explicit optional local root and a fail-closed 3–5 sample count;
 no local path is stored in the package manifest.
 
+The DuckDB materializer now streams database reads in bounded batches. It
+still decodes every report's actions to preserve the complete cycle/exclusion
+audit, but reads timestamp/equity/wallet blobs only for grids whose stored
+bounds cover the requested window and validates the decoded grid before metric
+calculation. Regression coverage proves that a non-covering report with invalid
+heavy series remains audited while covered-point output is unchanged. Full
+suite evidence: `251 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -q
+-p no:cacheprovider`, 2026-08-10); the skip is the Windows symlink permission
+case.
+
 The next operational step is to build one real read-only DuckDB package with
 the approved window and HTML samples, then run `select --source-package` with
 the externally supplied listing dates and strategy template. Retain the local
