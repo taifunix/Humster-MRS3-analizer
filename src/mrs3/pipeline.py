@@ -18,6 +18,7 @@ from .loader import load_points
 from .lots import LotMethod, allocate_lots
 from .locking import OutputDirectoryLock
 from .models import InputAudit, Side
+from .package_loader import PackageInput, load_package
 from .plateau import build_plateaus, find_isolated_peaks
 from .refine import annotate_refine
 from .selection import (
@@ -37,11 +38,12 @@ ALGORITHM_VERSION = "0.6"
 
 @dataclass(frozen=True, slots=True)
 class SelectionInputs:
-    csv_path: Path
+    csv_path: Path | None
     dates_path: Path
     template_path: Path
     side: Side
     output_dir: Path
+    source_package_dir: Path | None = None
 
 
 @dataclass(slots=True)
@@ -362,17 +364,64 @@ def _recalibration_table(config: AlgorithmConfig) -> pd.DataFrame:
     )
 
 
+def _apply_package_event_unions(
+    points: pd.DataFrame, plateaus: pd.DataFrame
+) -> pd.DataFrame:
+    if plateaus.empty:
+        return plateaus
+    output = plateaus.copy()
+    mode = str(points["event_mode"].iloc[0])
+    if mode == "legacy_trades_proxy":
+        output["plateau_event_count"] = "N/A_LEGACY_PROXY"
+        output["plateau_event_ids_hash"] = "N/A_LEGACY_PROXY"
+        return output
+    if "_event_ids" not in points:
+        return output
+    point_events = dict(
+        zip(points["point_id"].astype(str), points["_event_ids"], strict=True)
+    )
+    unions = [
+        sorted(
+            {
+                event_id
+                for point_id in point_ids
+                for event_id in point_events.get(str(point_id), ())
+            }
+        )
+        for point_ids in output["all_point_ids"]
+    ]
+    output["plateau_event_count"] = [len(event_ids) for event_ids in unions]
+    output["plateau_event_ids_hash"] = [
+        hashlib.sha256("|".join(event_ids).encode("utf-8")).hexdigest()
+        for event_ids in unions
+    ]
+    return output
+
+
 def _run_selection_unlocked(inputs: SelectionInputs, config: AlgorithmConfig) -> RunArtifacts:
     output_dir = inputs.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    loaded, input_audit = load_points(
-        inputs.csv_path, inputs.dates_path, inputs.side, config
-    )
+    if (inputs.csv_path is None) == (inputs.source_package_dir is None):
+        raise ValueError("selection requires exactly one raw CSV or source package")
+    package: PackageInput | None = None
+    if inputs.source_package_dir is not None:
+        package = load_package(
+            inputs.source_package_dir, inputs.dates_path, inputs.side, config
+        )
+        loaded, input_audit = package.points, package.input_audit
+        input_path = package.points_csv
+    else:
+        assert inputs.csv_path is not None
+        loaded, input_audit = load_points(
+            inputs.csv_path, inputs.dates_path, inputs.side, config
+        )
+        input_path = inputs.csv_path
     eligible = annotate_eligibility(loaded, config)
     refined, raw_missing = annotate_refine(eligible, config)
     refine_requests = _aggregate_refine_requests(raw_missing)
     plateau_points, plateaus = build_plateaus(refined, config)
+    plateaus = _apply_package_event_unions(plateau_points, plateaus)
     isolated = find_isolated_peaks(plateau_points, config)
     plateaus, close_profiles = build_close_profiles(plateau_points, plateaus, config)
     base_one_order = select_base_one_order(plateau_points, plateaus, config)
@@ -397,12 +446,13 @@ def _run_selection_unlocked(inputs: SelectionInputs, config: AlgorithmConfig) ->
         deep_gap = structure_diagnostics.loc[
             structure_diagnostics["status"].eq("DEEP_GAP_RESEARCH")
         ].copy()
+    audit_points = plateau_points.drop(columns=["_event_ids"], errors="ignore")
     tables = {
         "00_Input_Audit": input_audit_frame,
         "01_Pair_History": _pair_history(plateau_points),
-        "02_Filtering": plateau_points,
+        "02_Filtering": audit_points,
         "03_Refine_Required": refine_requests,
-        "04_Plateau_Points": plateau_points.loc[plateau_points["plateau_id"].notna()].copy(),
+        "04_Plateau_Points": audit_points.loc[audit_points["plateau_id"].notna()].copy(),
         "05_Plateau_Library": plateaus,
         "06_CloseMA_Profile": close_profiles,
         "07_Isolated_Peaks": isolated,
@@ -450,8 +500,8 @@ def _run_selection_unlocked(inputs: SelectionInputs, config: AlgorithmConfig) ->
     manifest: dict[str, object] = {
         "algorithm_version": ALGORITHM_VERSION,
         "side": inputs.side.value,
-        "input_file": inputs.csv_path.name,
-        "input_sha256": _sha256_file(inputs.csv_path),
+        "input_file": input_path.name,
+        "input_sha256": _sha256_file(input_path),
         "dates_sha256": _sha256_file(inputs.dates_path),
         "template_sha256": _sha256_file(inputs.template_path),
         "source_rows": input_audit.source_rows,
@@ -473,6 +523,8 @@ def _run_selection_unlocked(inputs: SelectionInputs, config: AlgorithmConfig) ->
         "ready_json_count": len(generated),
         "deterministic_digest": digest.hexdigest(),
     }
+    if package is not None:
+        manifest["source_package_manifest_sha256"] = package.manifest_sha256
     _write_json_atomic(output_dir / "run_manifest.json", manifest)
     return RunArtifacts(
         points=plateau_points,

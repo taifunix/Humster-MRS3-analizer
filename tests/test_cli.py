@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import mrs3.cli as cli
+import pytest
 from mrs3.cli import main
 from tests.factories import write_selection_inputs
 
@@ -35,6 +36,76 @@ def test_select_cli_writes_manifest_and_returns_zero(tmp_path: Path) -> None:
     assert code == 0
     assert manifest["algorithm_version"] == "0.6"
     assert manifest["ready_json_count"] == 5
+
+
+@pytest.mark.parametrize(
+    "source_args",
+    [
+        [],
+        ["--input-csv", "input.csv", "--source-package", "package"],
+    ],
+)
+def test_select_cli_requires_exactly_one_input_source(
+    tmp_path: Path, source_args: list[str]
+) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "select",
+                *source_args,
+                "--dates",
+                str(paths["dates"]),
+                "--template",
+                str(paths["template"]),
+                "--side",
+                "LONG",
+                "--config",
+                str(paths["config"]),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def test_select_cli_passes_source_package_without_raw_csv(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package = tmp_path / "package"
+    called = {}
+
+    def fake_selection(inputs, config):
+        called["inputs"] = inputs
+        return SimpleNamespace(manifest={"event_mode": "real_independent_events"})
+
+    monkeypatch.setattr(cli, "run_selection", fake_selection)
+
+    code = main(
+        [
+            "select",
+            "--source-package",
+            str(package),
+            "--dates",
+            str(paths["dates"]),
+            "--template",
+            str(paths["template"]),
+            "--side",
+            "LONG",
+            "--config",
+            str(paths["config"]),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+
+    assert code == 0
+    assert called["inputs"].csv_path is None
+    assert called["inputs"].source_package_dir == package
+    assert json.loads(capsys.readouterr().out)["event_mode"] == "real_independent_events"
 
 
 def test_source_csv_cli_builds_legacy_package(tmp_path: Path, capsys) -> None:

@@ -20,7 +20,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mrs3")
     subparsers = parser.add_subparsers(dest="command", required=True)
     select = subparsers.add_parser("select", help="build deterministic MRS3 candidates")
-    select.add_argument("--input-csv", type=Path, required=True)
+    source = select.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input-csv", type=Path)
+    source.add_argument("--source-package", type=Path)
     select.add_argument("--dates", type=Path, required=True)
     select.add_argument("--template", type=Path, required=True)
     select.add_argument("--side", choices=[side.value for side in Side], required=True)
@@ -82,6 +84,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 template_path=args.template,
                 side=Side(args.side),
                 output_dir=args.output_dir,
+                source_package_dir=args.source_package,
             ),
             config,
         )

@@ -12,6 +12,7 @@ from mrs3.config import AlgorithmConfig
 from mrs3.models import Side
 from mrs3.pipeline import SelectionInputs, run_selection
 from tests.factories import write_selection_inputs
+from tests.test_package_loader import write_real_package
 
 
 def _digest_files(directory: Path, pattern: str) -> str:
@@ -54,6 +55,8 @@ def test_pipeline_builds_two_plateaus_and_validated_json(tmp_path: Path) -> None
         "ready_structure_count"
     ]
     assert result.manifest["event_mode"] == "legacy_trades_proxy"
+    assert set(result.plateaus["plateau_event_count"]) == {"N/A_LEGACY_PROXY"}
+    assert set(result.plateaus["plateau_event_ids_hash"]) == {"N/A_LEGACY_PROXY"}
     assert result.manifest["event_eligible_point_count"] == int(result.points["event_eligible"].sum())
     assert (inputs.output_dir / "audit.xlsx").exists()
     workbook = load_workbook(inputs.output_dir / "audit.xlsx", read_only=True)
@@ -92,6 +95,100 @@ def test_pipeline_manifest_keeps_real_event_mode_from_source_package(tmp_path: P
     result = run_selection(inputs, config)
 
     assert result.manifest["event_mode"] == "real_independent_events"
+
+
+def test_pipeline_package_manifest_and_plateaus_use_distinct_real_events(
+    tmp_path: Path,
+) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, events_by_point = write_real_package(tmp_path / "package", paths)
+    config = AlgorithmConfig.from_json(paths["config"])
+    inputs = SelectionInputs(
+        csv_path=None,
+        dates_path=paths["dates"],
+        template_path=paths["template"],
+        side=Side.LONG,
+        output_dir=tmp_path / "output",
+        source_package_dir=package,
+    )
+
+    result = run_selection(inputs, config)
+
+    assert result.manifest["event_mode"] == "real_independent_events"
+    assert result.manifest["source_package_manifest_sha256"] == hashlib.sha256(
+        (package / "package_manifest.json").read_bytes()
+    ).hexdigest()
+    for plateau in result.plateaus.itertuples(index=False):
+        event_ids = sorted(
+            {
+                event_id
+                for point_id in plateau.all_point_ids
+                for event_id in events_by_point[point_id]
+            }
+        )
+        assert plateau.plateau_event_count == len(event_ids)
+        assert plateau.plateau_event_ids_hash == hashlib.sha256(
+            "|".join(event_ids).encode("utf-8")
+        ).hexdigest()
+
+
+def test_pipeline_real_plateau_union_includes_event_ineligible_geometry_point(
+    tmp_path: Path,
+) -> None:
+    paths = write_selection_inputs(tmp_path / "inputs")
+    package, events_by_point = write_real_package(tmp_path / "package", paths)
+    ineligible_point = next(
+        point_id for point_id in events_by_point if "|190|" in point_id
+    )
+    events_by_point[ineligible_point] = ("ineligible-unique-a", "ineligible-unique-b")
+    points = pd.read_csv(package / "points.csv")
+    points.loc[points["point_id"].eq(ineligible_point), "point_event_count"] = 2
+    points.loc[points["point_id"].eq(ineligible_point), "event_ids_hash"] = (
+        hashlib.sha256("|".join(events_by_point[ineligible_point]).encode("utf-8")).hexdigest()
+    )
+    points.to_csv(package / "points.csv", index=False, lineterminator="\n")
+    pd.DataFrame(
+        [
+            {"point_id": point_id, "event_id": event_id}
+            for point_id, event_ids in events_by_point.items()
+            for event_id in event_ids
+        ]
+    ).sort_values(["point_id", "event_id"], kind="mergesort").to_csv(
+        package / "point_events.csv", index=False, lineterminator="\n"
+    )
+    config = AlgorithmConfig.from_json(paths["config"])
+    inputs = SelectionInputs(
+        csv_path=None,
+        dates_path=paths["dates"],
+        template_path=paths["template"],
+        side=Side.LONG,
+        output_dir=tmp_path / "output",
+        source_package_dir=package,
+    )
+
+    result = run_selection(inputs, config)
+
+    plateau = next(
+        row
+        for row in result.plateaus.itertuples(index=False)
+        if ineligible_point in row.all_point_ids
+    )
+    assert not bool(
+        result.points.loc[
+            result.points["point_id"].eq(ineligible_point), "event_eligible"
+        ].iloc[0]
+    )
+    expected_events = sorted(
+        {
+            event_id
+            for point_id in plateau.all_point_ids
+            for event_id in events_by_point[point_id]
+        }
+    )
+    assert plateau.plateau_event_count == len(expected_events)
+    assert plateau.plateau_event_ids_hash == hashlib.sha256(
+        "|".join(expected_events).encode("utf-8")
+    ).hexdigest()
 
 
 def test_same_inputs_produce_identical_digest_rows_and_json(tmp_path: Path) -> None:

@@ -22,28 +22,23 @@
 
 ## Next required evidence
 
-The two source-package builders are implemented and tested: CSV produces
+CSV and DuckDB source-package builders are implemented and tested. CSV produces
 `legacy_trades_proxy`; DuckDB reconstructs closed
-`real_independent_events` with an exclusion audit. The loader now preserves a
-declared source metadata (`event_mode`, `PointEventCount` and event-set hash),
-while rejecting unknown or mixed modes. The current raw-CSV selector remains a
-compatibility path; package-directory input is the next implementation step.
+`real_independent_events` with an exclusion audit and fail-closed HTML-sample
+verification. Package loading now rejects missing, mixed, unknown or unverified
+event metadata and requires exact real-event mappings. The selector accepts
+exactly one `--source-package` or compatibility `--input-csv`; for real packages
+each plateau's event union includes every geometric plateau point, even one that
+is not eligible for selection.
 
-DuckDB compact series decoders and pure, windowed source-metric calculation
-are implemented and unit-tested. The DuckDB builder now publishes a
-package with fail-closed verification, selector-compatible metric rows, sorted event
-mappings and HTML sample audit. The next task is the package-directory loader
-and selector integration; no real local package has been built yet.
-
-Next, make the selector consume one package directory rather than an arbitrary
-CSV. Before a DuckDB package can feed that selector, add and reconcile the
-per-point economic metrics required by the existing selection contract. Then
-rebuild the universe, emit its before/after event audit and consider Phase 2
-redundancy only if its actual candidate count calls for it.
+The next operational step is to build one real read-only DuckDB package with
+the approved window and HTML samples, then run `select --source-package` with
+the externally supplied listing dates and strategy template. Retain the local
+audit, record candidate and event distributions, and decide whether Phase 2
+redundancy reduction is needed only from that evidence.
 
 ## Blockers
 
-- The DuckDB implementation must first confirm the actual v4 raw-payload schema and report-to-point mapping; no raw HTML or database data may be changed.
 - The required user-provided listing-date and strategy-template inputs for a full selector run remain external inputs; package construction and its audit can proceed independently.
 
 ## Queued module hook
