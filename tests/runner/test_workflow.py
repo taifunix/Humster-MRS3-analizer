@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import mrs3.runner.workflow as runner_workflow
 from mrs3.runner.config import RunnerConfig
 from mrs3.runner.files import BatchPreparationError
 from mrs3.runner.http import RowState, StrategyRow
@@ -250,3 +251,26 @@ def test_failed_reconciliation_preserves_reports_and_logs(tmp_path: Path) -> Non
     assert not output.exists()
     state = json.loads((output.parent / "results.state.json").read_text(encoding="utf-8"))
     assert state["state"] == "FAILED"
+
+
+def test_atomic_state_write_retries_transient_windows_file_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "run.state.json"
+    real_replace = Path.replace
+    attempts = 0
+
+    def fail_once(source: Path, destination: Path) -> Path:
+        nonlocal attempts
+        if destination == target and attempts == 0:
+            attempts += 1
+            raise PermissionError("state file is temporarily locked")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(Path, "replace", fail_once)
+    monkeypatch.setattr(runner_workflow.time, "sleep", lambda _: None)
+
+    runner_workflow._write_json_atomic(target, {"state": "CSV_COMMITTED"})
+
+    assert attempts == 1
+    assert json.loads(target.read_text(encoding="utf-8")) == {"state": "CSV_COMMITTED"}

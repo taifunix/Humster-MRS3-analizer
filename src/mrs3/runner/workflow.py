@@ -134,7 +134,14 @@ def _write_json_atomic(path: Path, document: dict[str, object]) -> None:
             json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        temporary.replace(path)
+        for attempt in range(5):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.1)
     finally:
         temporary.unlink(missing_ok=True)
 
