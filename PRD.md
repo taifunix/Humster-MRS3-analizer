@@ -59,6 +59,7 @@ Humster MRS3 Analyzer — локальный, детерминированный
 | Статус | Документ | Назначение | Зависимости |
 | --- | --- | --- | --- |
 | Accepted | [Repository foundation](docs/specs/2026-08-10-mrs3-v07-repository-foundation.md) | структура репозитория и workflow | — |
+| Active prerequisite | [Safe runner smoke-test](docs/specs/2026-08-10-v06-runner-safe-root-json-smoke.md) | безопасная проверка панели и одного реального прогона | локальный tester; до v0.7 implementation |
 | Active | [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md) | последовательность import → materializer → unified input → selector | v4 evidence, event-filter spec |
 | Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
 | Planned | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | empirical cap без leakage | завершённые tick-tests |
