@@ -28,7 +28,7 @@ unresolved quarantine remains.
 
 ---
 
-### Task 1: Lossless series and realised-action metrics
+### Task 1: Lossless series and realised-action metrics — complete (`pending review commit`)
 
 **Files:**
 - Modify: `src/mrs3/duckdb_events.py`

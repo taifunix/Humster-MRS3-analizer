@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 from pathlib import Path
+import struct
 import zlib
 
 import pandas as pd
@@ -10,7 +11,13 @@ import pytest
 
 import mrs3.source_packs as source_packs
 from mrs3.source_packs import SourcePackError, build_csv_package, require_single_event_mode
-from mrs3.duckdb_events import decode_compact_actions, reconstruct_closed_cycles
+from mrs3.duckdb_events import (
+    calculate_point_metrics,
+    decode_compact_actions,
+    decode_compact_deltas,
+    decode_wallet_changes,
+    reconstruct_closed_cycles,
+)
 
 
 WINDOW_START = "2026-07-15T00:00:00Z"
@@ -115,6 +122,110 @@ def _actions_blob(rows: list[dict[str, str]]) -> bytes:
             row["Side"] = "buy" if row["Action"] == "opened" else "sell"
     headers = list(rows[0])
     return zlib.compress(json.dumps({"headers": headers, "rows": [[row[header] for header in headers] for row in rows]}).encode("utf-8"))
+
+
+def _compact_delta_blob(deltas: list[int]) -> bytes:
+    return zlib.compress(struct.pack(f"<{len(deltas)}q", *deltas))
+
+
+def _wallet_changes_blob(changes: list[tuple[int, int]]) -> bytes:
+    return zlib.compress(b"".join(struct.pack("<Iq", index, value) for index, value in changes))
+
+
+def test_duckdb_metric_materializer_decodes_series_and_counts_realised_actions() -> None:
+    grid = [
+        "2026-07-15T00:00:00Z",
+        "2026-07-15T01:00:00Z",
+        "2026-07-15T02:00:00Z",
+        "2026-07-15T03:00:00Z",
+        "2026-07-15T04:00:00Z",
+    ]
+    actions = (
+        {"Timestamp": "2026-07-15T01:00:00Z", "Symbol": "AAAUSDT", "Action": "opened", "Post Side": "long", "Side": "buy"},
+        {"Timestamp": "2026-07-15T02:00:00Z", "Symbol": "AAAUSDT", "Action": "decreased", "Post Side": "long", "Side": "sell", "PnL": "5"},
+        {"Timestamp": "2026-07-15T03:00:00Z", "Symbol": "AAAUSDT", "Action": "closed", "Post Side": "", "Side": "sell", "PnL": "0"},
+        {"Timestamp": "2026-07-15T03:30:00Z", "Symbol": "AAAUSDT", "Action": "opened", "Post Side": "long", "Side": "buy"},
+        {"Timestamp": "2026-07-15T04:00:00Z", "Symbol": "AAAUSDT", "Action": "closed", "Post Side": "", "Side": "sell", "PnL": "100"},
+    )
+
+    equity = decode_compact_deltas(_compact_delta_blob([1000, 10, -6, 1, 0]), expected_count=5)
+    wallet_changes = decode_wallet_changes(_wallet_changes_blob([(0, 1000), (2, 1005)]), expected_count=2)
+
+    metrics = calculate_point_metrics(
+        grid, equity, wallet_changes, actions, "2026-07-15T01:00:00Z", "2026-07-15T04:00:00Z"
+    )
+
+    assert equity == (1000, 1010, 1004, 1005, 1005)
+    assert metrics == {
+        "TotalPnL": 5,
+        "TotalPnLPercent": 0.5,
+        "MaxDrawdown": 6,
+        "MaxDrawdownPercent": pytest.approx(0.594059405940594),
+        "TotalTrades": 2,
+        "Win": 1,
+        "Los": 0,
+        "WinRate": 50.0,
+        "ProfitFactor": None,
+        "flat_trades": 1,
+    }
+
+
+def test_duckdb_metric_materializer_rejects_a_non_covering_grid() -> None:
+    with pytest.raises(SourcePackError, match="grid does not cover"):
+        calculate_point_metrics(
+            ["2026-07-15T01:00:00Z", "2026-07-15T02:00:00Z"],
+            [1000, 1001],
+            [(0, 1000)],
+            (),
+            "2026-07-15T00:00:00Z",
+            "2026-07-15T02:00:00Z",
+        )
+
+
+def test_duckdb_metric_materializer_rejects_unknown_series_codecs() -> None:
+    with pytest.raises(SourcePackError, match="unsupported equity codec"):
+        decode_compact_deltas(b"", expected_count=0, codec="unknown")
+    with pytest.raises(SourcePackError, match="unsupported wallet codec"):
+        decode_wallet_changes(b"", expected_count=0, codec="unknown")
+
+
+def test_duckdb_metric_materializer_keeps_same_side_cycles_separate_by_symbol() -> None:
+    metrics = calculate_point_metrics(
+        [
+            "2026-07-15T00:00:00Z",
+            "2026-07-15T01:00:00Z",
+            "2026-07-15T02:00:00Z",
+            "2026-07-15T03:00:00Z",
+            "2026-07-15T04:00:00Z",
+        ],
+        [1000, 1000, 1000, 1000, 1000],
+        [(0, 1000)],
+        (
+            {"Timestamp": "2026-07-15T00:30:00Z", "Symbol": "AAAUSDT", "Action": "opened", "Post Side": "long", "Side": "buy"},
+            {"Timestamp": "2026-07-15T01:00:00Z", "Symbol": "BBBUSDT", "Action": "opened", "Post Side": "long", "Side": "buy"},
+            {"Timestamp": "2026-07-15T02:00:00Z", "Symbol": "BBBUSDT", "Action": "closed", "Post Side": "", "Side": "sell", "PnL": "-5"},
+            {"Timestamp": "2026-07-15T03:00:00Z", "Symbol": "AAAUSDT", "Action": "closed", "Post Side": "", "Side": "sell", "PnL": "100"},
+        ),
+        "2026-07-15T01:00:00Z",
+        "2026-07-15T04:00:00Z",
+    )
+
+    assert metrics["TotalTrades"] == 1
+    assert metrics["Win"] == 0
+    assert metrics["Los"] == 1
+    assert metrics["ProfitFactor"] == 0.0
+
+
+def test_duckdb_metric_materializer_requires_action_identity_fields() -> None:
+    with pytest.raises(SourcePackError, match="required action columns"):
+        calculate_point_metrics(
+            ["2026-07-15T00:00:00Z", "2026-07-15T01:00:00Z", "2026-07-15T02:00:00Z"],
+            [1000, 1000, 1000],
+            [(0, 1000)],
+            ({"Timestamp": "2026-07-15T01:00:00Z", "Action": "opened", "Post Side": "long", "Side": "buy"},),
+            "2026-07-15T01:00:00Z",
+            "2026-07-15T02:00:00Z",
+        )
 
 
 def test_duckdb_cycles_count_only_closed_events_inside_half_open_window() -> None:

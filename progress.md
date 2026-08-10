@@ -7,7 +7,7 @@
 ## Verified repository baseline
 
 - Root package: `src/mrs3`; tests: `tests`; project version: `0.7.0`.
-- Full test suite: `201 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -q`, 2026-08-10). The skip is the Windows symlink-permission test, not a product failure.
+- Full test suite: `206 passed, 1 skipped` (`.venv\\Scripts\\python.exe -m pytest -q`, 2026-08-10). The skip is the Windows symlink-permission test, not a product failure.
 - DuckDB v3/v4 importer pair is preserved in `programs/Обработчик HTML-DuckDB/`; v4 requires adjacent v3 codec.
 - Local tester configuration exists outside Git as ignored `config.local.json`.
 - Repository foundation, documentation model, importer/source preservation and Claude Code instructions are committed on `main`.
@@ -28,6 +28,11 @@ The two source-package builders are implemented and tested: CSV produces
 declared source metadata (`event_mode`, `PointEventCount` and event-set hash),
 while rejecting unknown or mixed modes. The current raw-CSV selector remains a
 compatibility path; package-directory input is the next implementation step.
+
+DuckDB compact series decoders and pure, windowed source-metric calculation
+are implemented and unit-tested. They are not yet wired into package output:
+the next task persists verified per-point metrics and event mappings, then the
+selector can consume a package directory.
 
 Next, make the selector consume one package directory rather than an arbitrary
 CSV. Before a DuckDB package can feed that selector, add and reconcile the

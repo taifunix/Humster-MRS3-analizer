@@ -6,6 +6,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import shutil
+import struct
 import tempfile
 from typing import Mapping, Sequence
 import zlib
@@ -17,6 +18,8 @@ from .source_packs import REAL_INDEPENDENT_EVENTS, SourcePackError, SourcePackag
 
 
 ACTION_CODEC = "zlib-columnar-json-v1"
+EQUITY_CODEC = "zlib-int64-delta-v1"
+WALLET_CODEC = "zlib-int64-delta-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +57,158 @@ def decode_compact_actions(blob: bytes, expected_count: int) -> tuple[dict[str, 
     if any(not isinstance(row, list) or len(row) != len(headers) for row in rows):
         raise SourcePackError("invalid compact action rows")
     return tuple({header: str(value) for header, value in zip(headers, row, strict=True)} for row in rows)
+
+
+def decode_compact_deltas(
+    blob: bytes, expected_count: int, *, codec: str = EQUITY_CODEC
+) -> tuple[int, ...]:
+    """Decompress signed int64 deltas into the original value series."""
+    if codec != EQUITY_CODEC:
+        raise SourcePackError(f"unsupported equity codec: {codec}")
+    try:
+        payload = zlib.decompress(blob)
+    except zlib.error as error:
+        raise SourcePackError("invalid compact delta payload") from error
+    if len(payload) != expected_count * 8:
+        raise SourcePackError("compressed delta count does not match report metadata")
+    deltas = struct.unpack(f"<{expected_count}q", payload)
+    value = 0
+    series = []
+    for delta in deltas:
+        value += delta
+        series.append(value)
+    return tuple(series)
+
+
+def decode_wallet_changes(
+    blob: bytes, expected_count: int, *, codec: str = WALLET_CODEC
+) -> tuple[tuple[int, int], ...]:
+    """Decompress indexed wallet snapshots stored as little-endian records."""
+    if codec != WALLET_CODEC:
+        raise SourcePackError(f"unsupported wallet codec: {codec}")
+    try:
+        payload = zlib.decompress(blob)
+    except zlib.error as error:
+        raise SourcePackError("invalid compact wallet payload") from error
+    if len(payload) != expected_count * 12:
+        raise SourcePackError("compressed wallet count does not match report metadata")
+    changes = tuple(struct.iter_unpack("<Iq", payload))
+    if any(current[0] <= previous[0] for previous, current in zip(changes, changes[1:])):
+        raise SourcePackError("wallet changes must have strictly increasing grid indexes")
+    return changes
+
+
+def _position_side(action: Mapping[str, str]) -> str | None:
+    post_side = str(action.get("Post Side", "")).strip().casefold()
+    if post_side in {"long", "short"}:
+        return post_side
+    return {"sell": "long", "buy": "short"}.get(str(action.get("Side", "")).strip().casefold())
+
+
+def _number(value: object) -> int | float:
+    number = float(str(value))
+    return int(number) if number.is_integer() else number
+
+
+def _realised_pnls(
+    actions: Sequence[Mapping[str, str]], start: pd.Timestamp, end: pd.Timestamp
+) -> tuple[int | float, ...]:
+    indexed: list[tuple[pd.Timestamp, int, Mapping[str, str]]] = []
+    required = {"Timestamp", "Symbol", "Action", "Side"}
+    for index, action in enumerate(actions):
+        if missing := sorted(required.difference(action)):
+            raise SourcePackError(f"required action columns missing: {missing}")
+        if not str(action["Symbol"]).strip():
+            raise SourcePackError("action symbol is required")
+        indexed.append((_utc(str(action["Timestamp"])), index, action))
+    indexed.sort(key=lambda item: (item[0], item[1]))
+    open_cycles: dict[tuple[str, str], deque[list[tuple[pd.Timestamp, Mapping[str, str]]]]] = defaultdict(deque)
+    realised: list[int | float] = []
+    for timestamp, _, action in indexed:
+        kind = str(action.get("Action", "")).casefold()
+        side = _position_side(action)
+        if kind == "opened":
+            if side is not None:
+                open_cycles[(str(action["Symbol"]), side)].append([(timestamp, action)])
+            continue
+        cycle_key = (str(action["Symbol"]), side) if side is not None else None
+        if kind not in {"decreased", "closed"} or cycle_key is None or not open_cycles[cycle_key]:
+            continue
+        cycle = open_cycles[cycle_key][0]
+        cycle.append((timestamp, action))
+        if kind != "closed":
+            continue
+        open_cycles[cycle_key].popleft()
+        opened_at = cycle[0][0]
+        if opened_at < start or timestamp >= end or timestamp < opened_at:
+            continue
+        realised.extend(
+            _number(cycle_action.get("PnL", 0))
+            for action_time, cycle_action in cycle[1:]
+            if str(cycle_action.get("Action", "")).casefold() in {"decreased", "closed"}
+            and start <= action_time < end
+        )
+    return tuple(realised)
+
+
+def calculate_point_metrics(
+    grid: Sequence[str | pd.Timestamp],
+    equity: Sequence[int],
+    wallet_changes: Sequence[tuple[int, int]],
+    actions: Sequence[Mapping[str, str]],
+    window_start: str,
+    window_end: str,
+) -> dict[str, int | float | None]:
+    """Calculate source metrics for a fully covered UTC half-open interval."""
+    start, end = _utc(window_start), _utc(window_end)
+    timestamps = tuple(_utc(str(value)) for value in grid)
+    if end <= start:
+        raise SourcePackError("window end must be later than start")
+    if len(timestamps) != len(equity) or not timestamps or timestamps[0] > start or timestamps[-1] < end:
+        raise SourcePackError("grid does not cover requested window")
+    if any(current <= previous for previous, current in zip(timestamps, timestamps[1:])):
+        raise SourcePackError("grid timestamps must be strictly increasing")
+    wallet: list[int | None] = [None] * len(timestamps)
+    for index, value in wallet_changes:
+        if index >= len(wallet):
+            raise SourcePackError("wallet change index is outside the grid")
+        wallet[index:] = [value] * (len(wallet) - index)
+    before_start = [index for index, timestamp in enumerate(timestamps) if timestamp < start]
+    start_index = before_start[-1] if before_start else 0
+    before_end = [index for index, timestamp in enumerate(timestamps) if timestamp < end]
+    if wallet[start_index] is None or not before_end or wallet[before_end[-1]] is None:
+        raise SourcePackError("wallet changes do not cover requested window")
+    starting_wallet = wallet[start_index]
+    ending_wallet = wallet[before_end[-1]]
+    assert starting_wallet is not None and ending_wallet is not None
+    window_equity = [value for timestamp, value in zip(timestamps, equity) if start <= timestamp < end]
+    peak = window_equity[0]
+    max_drawdown = 0
+    max_drawdown_percent = 0.0
+    for value in window_equity:
+        peak = max(peak, value)
+        drawdown = peak - value
+        max_drawdown = max(max_drawdown, drawdown)
+        if peak:
+            max_drawdown_percent = max(max_drawdown_percent, drawdown / peak * 100)
+    realised = _realised_pnls(actions, start, end)
+    wins = sum(value > 0 for value in realised)
+    losses = sum(value < 0 for value in realised)
+    gross_profit = sum(value for value in realised if value > 0)
+    gross_loss = -sum(value for value in realised if value < 0)
+    pnl = ending_wallet - starting_wallet
+    return {
+        "TotalPnL": pnl,
+        "TotalPnLPercent": pnl / starting_wallet * 100 if starting_wallet else None,
+        "MaxDrawdown": max_drawdown,
+        "MaxDrawdownPercent": max_drawdown_percent,
+        "TotalTrades": len(realised),
+        "Win": wins,
+        "Los": losses,
+        "WinRate": wins / len(realised) * 100 if realised else 0.0,
+        "ProfitFactor": gross_profit / gross_loss if gross_loss else None,
+        "flat_trades": sum(value == 0 for value in realised),
+    }
 
 
 def _event_id(symbol: str, position_side: str, timeframe: str, opened_at: pd.Timestamp) -> str:
