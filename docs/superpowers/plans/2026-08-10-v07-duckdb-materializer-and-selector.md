@@ -49,7 +49,7 @@ Expected: FAIL because the series decoder and metric API do not exist.
 - [ ] **Step 4: Re-run the focused test** and require PASS.
 - [ ] **Step 5: Commit** `feat: calculate DuckDB point metrics`.
 
-### Task 2: Verified real-event source package
+### Task 2: Verified real-event source package — complete (`pending review commit`)
 
 **Files:**
 - Modify: `src/mrs3/duckdb_events.py`, `src/mrs3/source_packs.py`

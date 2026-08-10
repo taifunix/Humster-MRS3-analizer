@@ -29,6 +29,8 @@ class SourcePackage:
     audit_csv: Path
     manifest_path: Path
     manifest: dict[str, object]
+    events_csv: Path | None = None
+    verification_csv: Path | None = None
 
 
 def _utc_timestamp(value: str) -> pd.Timestamp:

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 import shutil
 import struct
 import tempfile
@@ -12,6 +14,7 @@ from typing import Mapping, Sequence
 import zlib
 
 import duckdb
+from lxml import etree, html as lxml_html
 import pandas as pd
 
 from .source_packs import REAL_INDEPENDENT_EVENTS, SourcePackError, SourcePackage
@@ -20,6 +23,28 @@ from .source_packs import REAL_INDEPENDENT_EVENTS, SourcePackError, SourcePackag
 ACTION_CODEC = "zlib-columnar-json-v1"
 EQUITY_CODEC = "zlib-int64-delta-v1"
 WALLET_CODEC = "zlib-int64-delta-v1"
+SERIES_SCALE = Decimal("100000000")
+
+VERIFICATION_METRICS = {
+    "PnL": "TotalPnL",
+    "DD": "MaxDrawdown",
+    "TotalTrades": "TotalTrades",
+    "WinRate": "WinRate",
+    "ProfitFactor": "ProfitFactor",
+}
+VERIFICATION_COLUMNS = [
+    "report_id", "source_file", "metric", "source_raw", "source_value",
+    "calculated_value", "comparison", "cause",
+]
+POINT_COLUMNS = [
+    "point_id", "Run id", "settings[*].basic.symbol", "settings[*].basic.time_frame",
+    "StartDate", "EndDate", "TotalPnL", "TotalPnLPercent", "MaxDrawdown",
+    "MaxDrawdownPercent", "TotalTrades", "Win", "Los", "WinRate", "ProfitFactor",
+    "settings[*].mrs2.ma_long.len", "settings[*].mrs2.ma_close_long.len",
+    "settings[*].mrs2.ma_long.multiplier", "settings[*].mrs2.ma_short.len",
+    "settings[*].mrs2.ma_close_short.len", "settings[*].mrs2.ma_short.multiplier",
+    "event_mode", "point_event_count", "event_ids_hash", "metric_status",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,8 +304,158 @@ def reconstruct_closed_cycles(
     return CycleReconstruction(tuple(included), dict(sorted(exclusions.items())))
 
 
+def _unscale(value: int | float) -> int | float:
+    result = Decimal(str(value)) / SERIES_SCALE
+    return int(result) if result == result.to_integral() else float(result)
+
+
+def _setting(settings: Mapping[str, object], path: str) -> object:
+    value: object = settings
+    for part in path.split("."):
+        if not isinstance(value, Mapping) or part not in value:
+            return pd.NA
+        value = value[part]
+    return value
+
+
+def _selector_row(
+    report_number: int,
+    report: Mapping[str, object],
+    metrics: Mapping[str, int | float | None],
+    event_ids: Sequence[str],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> dict[str, object]:
+    settings = json.loads(str(report["settings_json"]))
+    point = {
+        "point_id": report["point_id"],
+        "Run id": report_number,
+        "settings[*].basic.symbol": report["symbol"],
+        "settings[*].basic.time_frame": report["timeframe"],
+        "StartDate": start.isoformat(),
+        "EndDate": end.isoformat(),
+        "TotalPnL": metrics["TotalPnL"],
+        "TotalPnLPercent": metrics["TotalPnLPercent"],
+        "MaxDrawdown": metrics["MaxDrawdown"],
+        "MaxDrawdownPercent": metrics["MaxDrawdownPercent"],
+        "TotalTrades": metrics["TotalTrades"],
+        "Win": metrics["Win"],
+        "Los": metrics["Los"],
+        "WinRate": metrics["WinRate"],
+        "ProfitFactor": metrics["ProfitFactor"],
+        "settings[*].mrs2.ma_long.len": _setting(settings, "mrs2.ma_long.len"),
+        "settings[*].mrs2.ma_close_long.len": _setting(settings, "mrs2.ma_close_long.len"),
+        "settings[*].mrs2.ma_long.multiplier": _setting(settings, "mrs2.ma_long.multiplier"),
+        "settings[*].mrs2.ma_short.len": _setting(settings, "mrs2.ma_short.len"),
+        "settings[*].mrs2.ma_close_short.len": _setting(settings, "mrs2.ma_close_short.len"),
+        "settings[*].mrs2.ma_short.multiplier": _setting(settings, "mrs2.ma_short.multiplier"),
+        "event_mode": REAL_INDEPENDENT_EVENTS,
+        "point_event_count": len(event_ids),
+        "event_ids_hash": sha256("|".join(event_ids).encode("utf-8")).hexdigest(),
+    }
+    point["metric_status"] = "UNVERIFIED"
+    return point
+
+
+def _decimal_token(raw: str) -> tuple[Decimal, int]:
+    match = re.search(r"[-+]?(?:\d{1,3}(?:[ ,]\d{3})+|\d+)(?:[.,]\d+)?", raw)
+    if not match:
+        raise SourcePackError(f"metric has no numeric value: {raw!r}")
+    token = match.group(0).replace(" ", "")
+    if "," in token and "." in token:
+        token = token.replace(",", "") if token.rfind(".") > token.rfind(",") else token.replace(".", "").replace(",", ".")
+    elif "," in token:
+        token = token.replace(",", ".")
+    try:
+        value = Decimal(token)
+    except InvalidOperation as error:
+        raise SourcePackError(f"invalid metric value: {raw!r}") from error
+    return value, len(token.partition(".")[2])
+
+
+def _html_summary(path: Path) -> dict[str, tuple[str, Decimal, int]]:
+    aliases = {
+        "pnl": "PnL", "totalpnl": "PnL", "profitloss": "PnL", "profitandloss": "PnL",
+        "dd": "DD", "drawdown": "DD", "maxdrawdown": "DD", "maximumdrawdown": "DD",
+        "totaltrades": "TotalTrades", "trades": "TotalTrades",
+        "winrate": "WinRate", "winningrate": "WinRate",
+        "profitfactor": "ProfitFactor",
+    }
+    try:
+        document = lxml_html.fromstring(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, etree.ParserError) as error:
+        raise SourcePackError(f"cannot parse verification HTML: {path.name}") from error
+    found: dict[str, tuple[str, Decimal, int]] = {}
+    for row in document.xpath("//tr"):
+        cells = [" ".join(" ".join(cell.itertext()).split()) for cell in row.xpath("./th|./td")]
+        if len(cells) < 2:
+            continue
+        label = re.sub(r"[^a-z0-9]", "", cells[0].casefold())
+        metric = aliases.get(label)
+        if metric:
+            value, precision = _decimal_token(cells[-1])
+            found[metric] = (cells[-1], value, precision)
+    missing = [metric for metric in VERIFICATION_METRICS if metric not in found]
+    if missing:
+        raise SourcePackError(f"verification HTML missing summary metrics: {missing}")
+    return found
+
+
+def _verification(
+    reports: Sequence[Mapping[str, object]],
+    html_root: Path | None,
+    sample_count: int,
+) -> tuple[list[dict[str, object]], str, str]:
+    if html_root is None:
+        return [], "UNVERIFIED", "HTML_ROOT_ABSENT"
+    if not 3 <= sample_count <= 5:
+        return [], "UNVERIFIED", "SAMPLE_COUNT_OUT_OF_RANGE"
+    if len(reports) < sample_count:
+        return [], "UNVERIFIED", "INSUFFICIENT_REPORTS"
+    rows: list[dict[str, object]] = []
+    cause = ""
+    for report in reports[:sample_count]:
+        source_file = Path(str(report["source_file"])).name
+        path = html_root / source_file
+        if not path.is_file():
+            rows.append({"report_id": report["report_id"], "source_file": source_file, "metric": "ALL",
+                         "source_raw": "", "source_value": "", "calculated_value": "",
+                         "comparison": "MISMATCH", "cause": "SOURCE_HTML_MISSING"})
+            cause = cause or "SOURCE_HTML_MISSING"
+            continue
+        try:
+            parsed = _html_summary(path)
+        except SourcePackError as error:
+            rows.append({"report_id": report["report_id"], "source_file": source_file, "metric": "ALL",
+                         "source_raw": "", "source_value": "", "calculated_value": "",
+                         "comparison": "MISMATCH", "cause": str(error)})
+            cause = cause or "HTML_PARSE_ERROR"
+            continue
+        metrics = report["metrics"]
+        assert isinstance(metrics, Mapping)
+        for metric, calculated_name in VERIFICATION_METRICS.items():
+            source_raw, source_value, precision = parsed[metric]
+            calculated = metrics[calculated_name]
+            equal = calculated is not None and Decimal(str(calculated)).quantize(
+                Decimal(1).scaleb(-precision), rounding=ROUND_HALF_UP
+            ) == source_value
+            comparison = "EQUAL" if equal else "MISMATCH"
+            row_cause = "" if equal else "VALUE_MISMATCH"
+            cause = cause or row_cause
+            rows.append({"report_id": report["report_id"], "source_file": source_file, "metric": metric,
+                         "source_raw": source_raw, "source_value": source_value,
+                         "calculated_value": calculated, "comparison": comparison, "cause": row_cause})
+    return rows, ("VERIFIED" if not cause else "UNVERIFIED"), cause
+
+
 def build_duckdb_package(
-    database_path: Path, window_start: str, window_end: str, output_dir: Path
+    database_path: Path,
+    window_start: str,
+    window_end: str,
+    output_dir: Path,
+    *,
+    verification_html_root: Path | None = None,
+    verification_sample_count: int = 3,
 ) -> SourcePackage:
     """Read v4 compact reports and publish one real-independent-events package."""
     start, end = _utc(window_start), _utc(window_end)
@@ -291,59 +466,132 @@ def build_duckdb_package(
         schema = con.execute("select value from schema_info where key='schema_version'").fetchone()
         if not schema or str(schema[0]) != "4":
             raise SourcePackError("DuckDB schema_version must be 4")
-        reports = con.execute(
-            """select r.report_id,r.raw_action_count,p.actions_codec,p.actions_zlib,
-                      c.point_id,c.symbol,c.side,c.timeframe
+        columns = [description[0] for description in con.execute(
+            """select r.report_id,r.source_file,r.settings_json,r.raw_action_count,
+                      r.equity_sample_count,r.wallet_change_count,p.series_codec,
+                      p.actions_codec,p.actions_zlib,p.equity_zlib,p.wallet_zlib,
+                      c.point_id,c.symbol,c.side,c.timeframe,g.sample_count,
+                      g.timestamps_zlib
                  from report_runs r join report_payloads p using(report_id)
-                 join point_configs c using(point_id) order by r.report_id"""
-        ).fetchall()
+                 join point_configs c using(point_id) join time_grids g using(grid_id)
+                order by r.report_id"""
+        ).description]
+        reports = [dict(zip(columns, row, strict=True)) for row in con.fetchall()]
     finally:
         con.close()
+    duplicates = sorted(point_id for point_id, count in Counter(str(report["point_id"]) for report in reports).items() if count > 1)
+    if duplicates:
+        raise SourcePackError(f"duplicate point_id reports are not supported: {duplicates}")
+
     audit_rows: list[dict[str, object]] = []
-    points: dict[str, dict[str, object]] = {}
-    for report_id, raw_count, codec, blob, point_id, symbol, side, timeframe in reports:
-        if codec != ACTION_CODEC:
-            raise SourcePackError(f"unsupported actions codec: {codec}")
+    accepted_reports: list[dict[str, object]] = []
+    event_rows: list[dict[str, str]] = []
+    exclusion_totals: Counter[str] = Counter()
+    for report_number, report in enumerate(reports, start=1):
+        if report["actions_codec"] != ACTION_CODEC:
+            raise SourcePackError(f"unsupported actions codec: {report['actions_codec']}")
+        if report["series_codec"] != EQUITY_CODEC:
+            raise SourcePackError(f"unsupported series codec: {report['series_codec']}")
+        actions = decode_compact_actions(bytes(report["actions_zlib"]), int(report["raw_action_count"]))
         reconstruction = reconstruct_closed_cycles(
-            str(report_id), str(symbol), str(timeframe),
-            decode_compact_actions(bytes(blob), int(raw_count)), window_start, window_end,
+            str(report["report_id"]), str(report["symbol"]), str(report["timeframe"]),
+            actions, window_start, window_end,
         )
-        audit = {"report_id": report_id, "point_id": point_id, "raw_action_count": raw_count,
-                 "included_cycles": len(reconstruction.included), **reconstruction.exclusions}
+        event_ids = sorted({cycle.event_id for cycle in reconstruction.included})
+        reconstructed = len(reconstruction.included) + sum(
+            reconstruction.exclusions.get(reason, 0)
+            for reason in ("OPEN_BEFORE_WINDOW", "CLOSE_ON_OR_AFTER_WINDOW")
+        )
+        audit: dict[str, object] = {
+            "report_id": report["report_id"], "point_id": report["point_id"],
+            "source_file": Path(str(report["source_file"])).name,
+            "coverage_status": "REJECTED", "coverage_reason": "GRID_NOT_COVERED",
+            "raw_action_count": report["raw_action_count"], "reconstructed_cycles": reconstructed,
+            "included_cycles": len(reconstruction.included), **reconstruction.exclusions,
+        }
+        for reason, count in reconstruction.exclusions.items():
+            exclusion_totals[reason] += count
+        timestamps_ms = decode_compact_deltas(
+            bytes(report["timestamps_zlib"]), int(report["sample_count"]), codec=str(report["series_codec"])
+        )
+        grid = pd.to_datetime(timestamps_ms, unit="ms", utc=True)
+        if not len(grid) or grid[0] > start or grid[-1] < end:
+            audit_rows.append(audit)
+            continue
+        raw_metrics = calculate_point_metrics(
+            grid,
+            decode_compact_deltas(bytes(report["equity_zlib"]), int(report["equity_sample_count"]), codec=str(report["series_codec"])),
+            decode_wallet_changes(bytes(report["wallet_zlib"]), int(report["wallet_change_count"]), codec=str(report["series_codec"])),
+            actions,
+            window_start,
+            window_end,
+        )
+        metrics = dict(raw_metrics)
+        metrics["TotalPnL"] = _unscale(raw_metrics["TotalPnL"])
+        metrics["MaxDrawdown"] = _unscale(raw_metrics["MaxDrawdown"])
+        audit.update({"coverage_status": "ACCEPTED", "coverage_reason": "", **metrics})
         audit_rows.append(audit)
-        entry = points.setdefault(str(point_id), {"point_id": point_id, "symbol": symbol, "side": side,
-            "timeframe": timeframe, "event_mode": REAL_INDEPENDENT_EVENTS, "event_ids": set()})
-        entry["event_ids"].update(cycle.event_id for cycle in reconstruction.included)
-    point_rows = []
-    for entry in points.values():
-        event_ids = sorted(entry.pop("event_ids"))
-        entry["point_event_count"] = len(event_ids)
-        entry["event_ids_hash"] = sha256("|".join(event_ids).encode()).hexdigest()
-        point_rows.append(entry)
+        report["metrics"] = metrics
+        report["event_ids"] = event_ids
+        report["point"] = _selector_row(report_number, report, metrics, event_ids, start, end)
+        accepted_reports.append(report)
+        event_rows.extend({"point_id": str(report["point_id"]), "event_id": event_id} for event_id in event_ids)
+
+    verification_rows, verification_status, verification_cause = _verification(
+        accepted_reports, verification_html_root, verification_sample_count
+    )
+    point_rows = [dict(report["point"], metric_status=verification_status) for report in accepted_reports]
+    point_rows.sort(key=lambda row: str(row["point_id"]))
+    event_rows.sort(key=lambda row: (row["point_id"], row["event_id"]))
+    audit_rows.sort(key=lambda row: str(row["report_id"]))
+    manifest = {
+        "package_version": 1,
+        "event_mode": REAL_INDEPENDENT_EVENTS,
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "source_database_sha256": sha256(database_path.read_bytes()).hexdigest(),
+        "report_count": len(reports),
+        "coverage_accepted_reports": len(accepted_reports),
+        "coverage_rejected_reports": len(reports) - len(accepted_reports),
+        "point_count": len(point_rows),
+        "raw_action_count": sum(int(row["raw_action_count"]) for row in audit_rows),
+        "reconstructed_cycles": sum(int(row["reconstructed_cycles"]) for row in audit_rows),
+        "included_cycles": sum(int(row["included_cycles"]) for row in audit_rows),
+        "flat_trades": sum(int(row.get("flat_trades", 0)) for row in audit_rows),
+        "exclusions": dict(sorted(exclusion_totals.items())),
+        "verification_sample_count": verification_sample_count,
+        "verification_status": verification_status,
+        "verification_cause": verification_cause,
+    }
     target = output_dir.resolve()
     if target.exists() and any(target.iterdir()):
         raise SourcePackError(f"package output directory is not empty: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=target.parent))
-    exclusion_totals: Counter[str] = Counter()
-    for audit in audit_rows:
-        for key, value in audit.items():
-            if key not in {"report_id", "point_id", "raw_action_count", "included_cycles"}:
-                exclusion_totals[key] += int(value)
-    manifest = {"package_version": 1, "event_mode": REAL_INDEPENDENT_EVENTS,
-                "window_start": start.isoformat(), "window_end": end.isoformat(),
-                "source_database_sha256": sha256(database_path.read_bytes()).hexdigest(),
-                "report_count": len(reports), "point_count": len(point_rows),
-                "included_cycles": sum(int(row["included_cycles"]) for row in audit_rows),
-                "exclusions": dict(sorted(exclusion_totals.items()))}
     try:
-        pd.DataFrame(point_rows).to_csv(stage / "points.csv", index=False, lineterminator="\n")
+        pd.DataFrame(point_rows, columns=POINT_COLUMNS).to_csv(
+            stage / "points.csv", index=False, lineterminator="\n"
+        )
+        pd.DataFrame(event_rows, columns=["point_id", "event_id"]).to_csv(stage / "point_events.csv", index=False, lineterminator="\n")
         pd.DataFrame(audit_rows).fillna(0).to_csv(stage / "source_audit.csv", index=False, lineterminator="\n")
-        (stage / "package_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        pd.DataFrame(verification_rows, columns=VERIFICATION_COLUMNS).to_csv(
+            stage / "metric_verification.csv", index=False, lineterminator="\n"
+        )
+        (stage / "package_manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         if target.exists():
             target.rmdir()
         stage.replace(target)
     finally:
         if stage.exists():
             shutil.rmtree(stage)
-    return SourcePackage(target, target / "points.csv", target / "source_audit.csv", target / "package_manifest.json", manifest)
+    return SourcePackage(
+        target,
+        target / "points.csv",
+        target / "source_audit.csv",
+        target / "package_manifest.json",
+        manifest,
+        target / "point_events.csv",
+        target / "metric_verification.csv",
+    )
