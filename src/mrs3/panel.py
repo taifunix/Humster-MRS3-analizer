@@ -246,8 +246,54 @@ PANEL_HTML = r"""<!doctype html>
         <div class="stack workflow-card"><h3>3. DD5 после теста</h3><p class="source-note">Финальные выводы требуют реального tick-test и DD5 retest.</p><label>CSV результатов<div class="path-control"><input id="results_csv" value="results\mrs3_long_results.csv" type="text"><button type="button" class="secondary" onclick="browse('results_csv','results_csv',false)">Выбрать…</button></div></label><label>Audit XLSX<div class="path-control"><input id="audit_xlsx" value="output_long\audit.xlsx" type="text"><button type="button" class="secondary" onclick="browse('audit_xlsx','audit_xlsx',false)">Выбрать…</button></div></label><label>Каталог исходных стратегий<div class="path-control"><input id="posttest_strategies" value="output_long\strategies" type="text"><button type="button" class="secondary" onclick="browse('posttest_strategies','directory',false)">Выбрать…</button></div></label><button data-runnable="true" onclick="startAction('posttest')">Собрать DD5</button></div>
       </section>
       <section role="tabpanel" id="panel-portfolio" aria-labelledby="tab-portfolio" hidden>
-        <h2>Анализатор портфелей</h2><p id="portfolio-prerequisites" class="source-note"><span class="queued">Queued — Layer A only after input-contract check.</span> Нужны: формат individual results, timestamps входа/выхода, limiter contract (positions vs orders; LONG/SHORT; hedge/one-way), L2 и margin data/rules. Анализатор не превращает source-метрики или individual ranking в портфельный результат.</p>
-        <div class="buttons"><button disabled aria-describedby="portfolio-prerequisites">Симулятор сетов недоступен</button><button disabled aria-describedby="portfolio-prerequisites">Рекомендации недоступны</button></div><p class="source-note">Layer A возможен после проверки входного контракта.</p>
+        <h2>Анализатор портфелей</h2>
+        <div class="stack workflow-card">
+          <h3>Слой A — отсев комбинаций</h3>
+          <p class="source-note">Занятость слотов, ёмкость, асимметрия таймфреймов. Симуляция сета, подбор лотов, маржа и рекомендации не входят: нужны trade timestamps, контракт ограничителя, L2 и margin data.</p>
+          <label>CSV результатов стратегий<input id="pf_candidates_csv" value="results\mrs3_long_results.csv" type="text"></label>
+          <label>Каталог результата<input id="pf_output_dir" value="portfolio_long" type="text"></label>
+          <details>
+            <summary>База сделок (второй этап входа)</summary>
+            <div class="stack">
+              <p class="source-note">DuckDB с журналами сделок по каждой стратегии. Если подана, median_hold_min и окно истории берутся из неё, а не из CSV, и дополнительно строится отчёт покрытия.</p>
+              <label>Файл DuckDB<input id="pf_trades_db" value="" type="text"></label>
+              <label>Таблица<input id="pf_trades_table" value="trades" type="text"></label>
+            </div>
+          </details>
+          <div class="row">
+            <label>Ограничители<input id="pf_limiters" value="2,3,4" type="text"></label>
+            <label>Максимальный размер сета<select id="pf_max_size_factor">
+              <option value="2">2 × лимит</option>
+              <option value="3" selected>3 × лимит</option>
+              <option value="4">4 × лимит</option>
+            </select></label>
+          </div>
+          <div class="buttons"><button data-runnable="true" onclick="startAction('portfolio-layer-a')">Только слой A</button></div>
+        </div>
+        <div class="stack workflow-card">
+          <h3>Полный прогон</h3>
+          <p class="source-note">Симуляция сета с ограничителем и маржой, подбор множителя лотов под целевую просадку, Парето и проверка на второй половине истории. Требует базу сделок.</p>
+          <div class="row">
+            <label>Депозит, USDT<input id="pf_deposit" value="1000" type="text"></label>
+            <label>Целевая просадка, %<input id="pf_dd_target" value="5" type="text"></label>
+          </div>
+          <div class="row">
+            <label>Предел занятой маржи<input id="pf_margin_limit" value="0.40" type="text"></label>
+            <label>Уровни весов<input id="pf_weight_levels" value="1" type="text"></label>
+          </div>
+          <p class="source-note">Уровни весов: «1» — равные лоты. «1,2,3» включает перебор соотношений между стратегиями, прогон дольше примерно вшестеро.</p>
+          <div class="row">
+            <label>Встречные заявки<select id="pf_cancel_opposite">
+              <option value="1" selected>снимать при открытии позиции</option>
+              <option value="0">оставлять висеть</option>
+            </select></label>
+            <label>LONG и SHORT по паре<select id="pf_same_slot">
+              <option value="0" selected>два слота</option>
+              <option value="1">один слот</option>
+            </select></label>
+          </div>
+          <div class="buttons"><button data-runnable="true" class="primary" onclick="startAction('portfolio-run')">Запустить полный прогон</button></div>
+        </div>
       </section>
       <section role="tabpanel" id="panel-settings" aria-labelledby="tab-settings" hidden>
         <h2>Настройки</h2><p class="source-note">Постоянные локальные пути. Выбор открывает системный диалог только по вашему действию; ручной ввод сохраняется.</p>
@@ -296,7 +342,7 @@ PANEL_HTML = r"""<!doctype html>
 </main>
 <script>
 const labels = {
-  'tester-plan':'Проверка плана', 'tester-run':'Пакетное тестирование', 'select':'Создание стратегий', 'posttest':'DD5-анализ', 'source-csv':'CSV source-pack', 'source-duckdb':'DuckDB source-pack',
+  'tester-plan':'Проверка плана', 'tester-run':'Пакетное тестирование', 'select':'Создание стратегий', 'posttest':'DD5-анализ', 'source-csv':'CSV source-pack', 'source-duckdb':'DuckDB source-pack', 'portfolio-layer-a':'Анализатор портфеля · слой A', 'portfolio-run':'Анализатор портфеля · полный прогон',
   'PRECHECK':'Предварительная проверка', 'STOPPED':'Бот остановлен', 'CLEAN':'Отчёты очищены', 'INSTALLED':'Стратегии установлены',
   'STARTED':'Бот запущен', 'VISIBLE':'Стратегии появились', 'SUBMITTED':'Все тесты отправлены', 'MONITORING':'Идёт тестирование',
   'RECONCILED':'Результаты сверены', 'CSV_COMMITTED':'CSV сохранён', 'STOPPED_FOR_CLEANUP':'Бот остановлен для очистки',
@@ -316,6 +362,17 @@ function payload(action) {
       : {input_csv:value('input_csv')};
     return {...base, ...source, dates:value('dates'), template:value('template'), side:value('side'), output_dir:value('select_output_dir')};
   }
+  if (action === 'portfolio-layer-a') return {...base,
+    candidates_csv:value('pf_candidates_csv'), output_dir:value('pf_output_dir'),
+    trades_db:value('pf_trades_db'), trades_table:value('pf_trades_table'),
+    limiters:value('pf_limiters'), max_size_factor:value('pf_max_size_factor')};
+  if (action === 'portfolio-run') return {...base,
+    strategies_csv:value('pf_candidates_csv'), output_dir:value('pf_output_dir'),
+    trades_db:value('pf_trades_db'), trades_table:value('pf_trades_table'),
+    limiters:value('pf_limiters'), max_size_factor:value('pf_max_size_factor'),
+    deposit:value('pf_deposit'), dd_target:value('pf_dd_target'),
+    margin_limit:value('pf_margin_limit'), weight_levels:value('pf_weight_levels'),
+    cancel_opposite:value('pf_cancel_opposite'), long_short_same_slot:value('pf_same_slot')};
   return {...base, results_csv:value('results_csv'), audit_xlsx:value('audit_xlsx'), strategies:value('posttest_strategies'), output_dir:value('posttest_output_dir')};
 }
 async function startAction(action) {
@@ -586,6 +643,8 @@ class PanelController:
             "tester-plan": "tester",
             "tester-run": "tester",
             "posttest": "posttest",
+            "portfolio-layer-a": "portfolio",
+            "portfolio-run": "portfolio",
         }[action]
 
     def _path(self, value: str | Path) -> Path:
@@ -653,6 +712,101 @@ class PanelController:
                     command.extend(["--verify-html-root", str(self._path(verification_root))])
                     command.extend(["--verification-sample-count", str(sample_count)])
             artifacts = {"manifest": output_dir / "package_manifest.json", "points": output_dir / "points.csv", "audit": output_dir / "source_audit.csv"}
+            return tuple(command), artifacts
+        elif action == "portfolio-layer-a":
+            candidates_csv = self._path(self._required(payload, "candidates_csv"))
+            output_dir = self._path(self._required(payload, "output_dir"))
+            command.extend(
+                [
+                    "--candidates-csv",
+                    str(candidates_csv),
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+            trades_db = self._optional_string(payload, "trades_db")
+            if trades_db:
+                command.extend(["--trades-db", str(self._path(trades_db))])
+                table = self._optional_string(payload, "trades_table") or "trades"
+                command.extend(["--trades-table", table])
+            limiters = self._optional_string(payload, "limiters") or "2,3,4"
+            for part in limiters.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if not part.isdigit() or int(part) < 1:
+                    raise ValueError(f"limiters must be positive integers: {limiters!r}")
+            command.extend(["--limiters", limiters])
+            factor = self._optional_string(payload, "max_size_factor") or "3"
+            if not factor.isdigit() or int(factor) < 1:
+                raise ValueError("max_size_factor must be a positive integer")
+            command.extend(["--max-size-factor", factor])
+            artifacts = {
+                "candidates": output_dir / "02_Candidates.csv",
+                "screen": output_dir / "03_Layer_A_Screen.csv",
+                "manifest": output_dir / "portfolio_manifest.json",
+            }
+            if trades_db:
+                artifacts["coverage"] = output_dir / "00_Trade_Log_Coverage.csv"
+            return tuple(command), artifacts
+        elif action == "portfolio-run":
+            strategies_csv = self._path(self._required(payload, "strategies_csv"))
+            trades_db = self._path(self._required(payload, "trades_db"))
+            output_dir = self._path(self._required(payload, "output_dir"))
+            command.extend(
+                [
+                    "--strategies-csv",
+                    str(strategies_csv),
+                    "--trades-db",
+                    str(trades_db),
+                    "--output-dir",
+                    str(output_dir),
+                    "--trades-table",
+                    self._optional_string(payload, "trades_table") or "trades",
+                ]
+            )
+            for flag, key, default in (
+                ("--deposit", "deposit", "1000"),
+                ("--dd-target", "dd_target", "5"),
+                ("--margin-limit", "margin_limit", "0.40"),
+            ):
+                raw = self._optional_string(payload, key) or default
+                try:
+                    if float(raw) <= 0:
+                        raise ValueError
+                except ValueError:
+                    raise ValueError(f"{key} must be a positive number") from None
+                command.extend([flag, raw])
+            limiters = self._optional_string(payload, "limiters") or "2,3,4"
+            for part in limiters.split(","):
+                part = part.strip()
+                if part and (not part.isdigit() or int(part) < 1):
+                    raise ValueError(f"limiters must be positive integers: {limiters!r}")
+            command.extend(["--limiters", limiters])
+            factor = self._optional_string(payload, "max_size_factor") or "3"
+            if not factor.isdigit() or int(factor) < 1:
+                raise ValueError("max_size_factor must be a positive integer")
+            command.extend(["--max-size-factor", factor])
+            levels = self._optional_string(payload, "weight_levels") or "1"
+            for part in levels.split(","):
+                part = part.strip()
+                if part and (not part.isdigit() or int(part) < 1):
+                    raise ValueError(f"weight_levels must be positive integers: {levels!r}")
+            command.extend(["--weight-levels", levels])
+            if self._optional_string(payload, "cancel_opposite") == "0":
+                command.append("--keep-opposite")
+            if self._optional_string(payload, "long_short_same_slot") == "1":
+                command.append("--long-short-same-slot")
+            artifacts = {
+                "coverage": output_dir / "00_Trade_Log_Coverage.csv",
+                "candidates": output_dir / "02_Candidates.csv",
+                "all_sets": output_dir / "05_All_Sets.csv",
+                "pareto": output_dir / "06_Pareto_Front.csv",
+                "contention": output_dir / "07_Contention.csv",
+                "correlation": output_dir / "09_Correlation.csv",
+                "oos": output_dir / "10_OOS_Validation.csv",
+                "manifest": output_dir / "portfolio_manifest.json",
+            }
             return tuple(command), artifacts
         else:
             config = self._path(self._required(payload, "config"))

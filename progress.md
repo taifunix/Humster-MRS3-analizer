@@ -210,9 +210,14 @@ slice; Tasks 1–15 are complete.
 - CSV/DuckDB overlay is explicitly deferred and no economic threshold changes
   are implied.
 
-## Queued module hook
+## Portfolio Analyzer
 
-**Анализатор Портфеля:** [спецификация v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) передана отдельной команде. Начинать с проверки входных контрактов; до trade timestamps и определённого limiter допускается только Layer A, без симулятора и рекомендаций по сету.
+Модуль реализован полностью: слой A и слой B ([спецификация v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md)).
+
+- `src/mrs3/portfolio/`, вкладка «Анализатор портфеля» в панели, подкоманды `mrs3.cli portfolio-layer-a` и `portfolio-run`. 74 теста.
+- Вход: CSV результатов стратегий + база сделок DuckDB (таблица `trades`, колонка `notional` обязательна — без неё пересчёт PnL под другой лот невозможен).
+- Не моделируется: очередь в стакане, нужен L2. Результат симуляции — верхняя граница исполнимости, помечено в `manifest.unverified`.
+- Параметрами, не блокерами: `long_short_same_slot` (по умолчанию два слота), `cancel_opposite` (по умолчанию включено), `mmr/imr` из CSV.
 
 ## Update protocol
 

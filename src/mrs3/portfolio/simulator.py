@@ -1,0 +1,236 @@
+"""Событийная симуляция сета — слой B, разделы 5 и 9 спецификации.
+
+Что моделируется:
+
+* единая временная линия сигналов всех стратегий сета;
+* ограничитель одновременных позиций — заблокированный сигнал теряется;
+* маржа: и позиции, и **висящие заявки**; нехватка маржи блокирует вход так же,
+  как занятый слот;
+* снятие встречных заявок по паре при открытии позиции;
+* потолок ёмкости: номинал не может превысить измеренный предел.
+
+Что НЕ моделируется и почему: очередь в стакане. Из журналов сделок она не
+видна, нужен L2. Поэтому результат — верхняя граница исполнимости.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Sequence
+
+from .models import RunConfig, SetResult, StrategyInput, StrategyOutcome, TradeRecord
+
+__all__ = ["simulate_set", "common_window"]
+
+
+@dataclass(slots=True)
+class _Open:
+    strategy_id: str
+    pair: str
+    side: str
+    notional: float
+    exit_ts: datetime
+    net_frac: float
+    mae_frac: float | None
+
+
+def common_window(members: Sequence[StrategyInput]) -> tuple[datetime, datetime]:
+    start = max(m.window_start for m in members)
+    end = min(m.window_end for m in members)
+    return start, end
+
+
+def _reserved_margin(
+    members: Sequence[StrategyInput],
+    lots: dict[str, float],
+    equity: float,
+    open_positions: list[_Open],
+    slots_free: bool,
+    cfg: RunConfig,
+) -> float:
+    """Занятая маржа: позиции плюс висящие заявки.
+
+    Стратегия резервирует маржу, если держит позицию либо если её заявки висят.
+    Заявки снимаются в двух случаях: слоты заняты (лимит достигнут) и встречная
+    сторона по паре уже в позиции при ``cancel_opposite``.
+    """
+    busy = {o.strategy_id: o for o in open_positions}
+    pairs_in_position = {(o.pair, o.side) for o in open_positions}
+    total = 0.0
+    for m in members:
+        position = busy.get(m.strategy_id)
+        if position is not None:
+            total += position.notional * m.imr
+            continue
+        if not slots_free:
+            continue  # заявки сняты по достижении лимита
+        if cfg.cancel_opposite and any(
+            p == m.pair and s != m.side for p, s in pairs_in_position
+        ):
+            continue  # встречные заявки сняты
+        total += min(lots[m.strategy_id] * equity, m.capacity) * m.imr
+    return total
+
+
+def _slots_used(open_positions: list[_Open], cfg: RunConfig) -> int:
+    if not cfg.long_short_same_slot:
+        return len(open_positions)
+    return len({(o.pair, o.side) if False else o.pair for o in open_positions})
+
+
+def simulate_set(
+    members: Sequence[StrategyInput],
+    limiter: int,
+    lots: dict[str, float],
+    cfg: RunConfig,
+    window: tuple[datetime, datetime] | None = None,
+) -> SetResult:
+    """Прогон сета. ``lots`` — доля депозита на стратегию (уже с множителем)."""
+    if not members:
+        raise ValueError("set must not be empty")
+    ordered = sorted(members, key=lambda m: m.strategy_id)
+    start, end = window or common_window(ordered)
+    d_eff = (end - start).total_seconds() / 86400.0
+    if d_eff <= 0:
+        raise ValueError("history windows do not overlap")
+
+    priority = {m.strategy_id: i for i, m in enumerate(ordered)}
+    by_id = {m.strategy_id: m for m in ordered}
+
+    signals: list[tuple[datetime, int, str, TradeRecord]] = []
+    for m in ordered:
+        for trade in m.trades:
+            if start <= trade.entry_ts and trade.exit_ts <= end:
+                signals.append((trade.entry_ts, priority[m.strategy_id], m.strategy_id, trade))
+    signals.sort(key=lambda s: (s[0], s[1]))
+
+    wallet = cfg.deposit
+    open_positions: list[_Open] = []
+    accepted: dict[str, int] = {m.strategy_id: 0 for m in ordered}
+    blocked_slot: dict[str, int] = {m.strategy_id: 0 for m in ordered}
+    blocked_margin: dict[str, int] = {m.strategy_id: 0 for m in ordered}
+    pnl_by_id: dict[str, float] = {m.strategy_id: 0.0 for m in ordered}
+
+    equity_points: list[float] = [wallet]
+    max_margin_ratio = 0.0
+    max_occupancy = 0.0
+    min_buffer = float("inf")
+    has_mae = any(t.mae_frac is not None for m in ordered for t in m.trades)
+
+    def close_due(now: datetime) -> None:
+        nonlocal wallet
+        still: list[_Open] = []
+        for pos in open_positions:
+            if pos.exit_ts <= now:
+                gain = pos.net_frac * pos.notional
+                wallet += gain
+                pnl_by_id[pos.strategy_id] += gain
+                equity_points.append(wallet)
+            else:
+                still.append(pos)
+        open_positions[:] = still
+
+    for entry_ts, _, sid, trade in signals:
+        close_due(entry_ts)
+        member = by_id[sid]
+
+        floating = 0.0
+        if has_mae:
+            floating = sum(
+                (p.mae_frac or 0.0) * p.notional for p in open_positions
+            )
+        equity = wallet + floating
+        equity_points.append(equity)
+
+        slots_free = _slots_used(open_positions, cfg) < limiter
+        occupied = _reserved_margin(ordered, lots, equity, open_positions, slots_free, cfg)
+        max_occupancy = max(max_occupancy, occupied / equity if equity > 0 else 0.0)
+
+        mm = sum(p.notional * by_id[p.strategy_id].mmr for p in open_positions)
+        notional_total = sum(p.notional for p in open_positions)
+        if equity > 0:
+            max_margin_ratio = max(max_margin_ratio, mm / equity)
+        if notional_total > 0 and equity > 0:
+            min_buffer = min(min_buffer, (equity - mm) / notional_total)
+
+        if not slots_free:
+            blocked_slot[sid] += 1
+            continue
+
+        if cfg.cancel_opposite and any(
+            p.pair == member.pair and p.side != member.side for p in open_positions
+        ):
+            blocked_slot[sid] += 1
+            continue
+
+        notional = min(lots[sid] * equity, member.capacity)
+        if notional <= 0:
+            blocked_margin[sid] += 1
+            continue
+        if (occupied + notional * member.imr) / equity > cfg.margin_limit:
+            blocked_margin[sid] += 1
+            continue
+
+        open_positions.append(
+            _Open(
+                strategy_id=sid,
+                pair=member.pair,
+                side=member.side,
+                notional=notional,
+                exit_ts=trade.exit_ts,
+                net_frac=trade.net_frac,
+                mae_frac=trade.mae_frac,
+            )
+        )
+        accepted[sid] += 1
+
+    close_due(end)
+
+    peak = equity_points[0]
+    max_dd = 0.0
+    for value in equity_points:
+        peak = max(peak, value)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - value) / peak)
+
+    pnl_abs = wallet - cfg.deposit
+    pnl_pct = pnl_abs / cfg.deposit * 100.0
+
+    flags: list[str] = []
+    if not has_mae:
+        flags.append("CLOSED_TRADE_DD_ONLY")
+    if any(m.target_share_source == "ESTIMATED" for m in ordered):
+        flags.append("TARGET_SHARE_ESTIMATED")
+    if any(
+        min(lots[m.strategy_id] * cfg.deposit, m.capacity) >= m.capacity
+        for m in ordered
+    ):
+        flags.append("CAPACITY_BOUND")
+
+    return SetResult(
+        strategy_ids=tuple(m.strategy_id for m in ordered),
+        limiter=limiter,
+        weights=(),
+        g=0.0,
+        lots=tuple(lots[m.strategy_id] for m in ordered),
+        pnl_abs=pnl_abs,
+        pnl_pct=pnl_pct,
+        pnl30_pct=pnl_pct * 30.0 / d_eff,
+        max_dd_pct=max_dd * 100.0,
+        max_margin_ratio=max_margin_ratio,
+        max_occupancy_margin=max_occupancy,
+        min_buffer=0.0 if min_buffer == float("inf") else min_buffer,
+        d_eff_common_days=d_eff,
+        outcomes=tuple(
+            StrategyOutcome(
+                strategy_id=m.strategy_id,
+                accepted=accepted[m.strategy_id],
+                blocked_slot=blocked_slot[m.strategy_id],
+                blocked_margin=blocked_margin[m.strategy_id],
+                pnl_abs=pnl_by_id[m.strategy_id],
+            )
+            for m in ordered
+        ),
+        flags=tuple(flags),
+    )
