@@ -52,6 +52,8 @@ def test_pipeline_builds_two_plateaus_and_validated_json(tmp_path: Path) -> None
     assert result.manifest["mrs3_json_count"] == 2 * result.manifest[
         "ready_structure_count"
     ]
+    assert result.manifest["event_mode"] == "legacy_trades_proxy"
+    assert result.manifest["event_eligible_point_count"] == int(result.points["event_eligible"].sum())
     assert (inputs.output_dir / "audit.xlsx").exists()
     workbook = load_workbook(inputs.output_dir / "audit.xlsx", read_only=True)
     assert workbook.sheetnames == [
@@ -71,6 +73,8 @@ def test_pipeline_builds_two_plateaus_and_validated_json(tmp_path: Path) -> None
         "13_Deep_Gap_Research",
         "14_Recalibration",
         "15_Config",
+        "16_Point_Events",
+        "17_Plateau_Events",
     ]
 
 

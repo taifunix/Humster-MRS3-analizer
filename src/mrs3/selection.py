@@ -35,6 +35,10 @@ STRUCTURE_COLUMNS = [
     "source_pnl_sum",
     "source_eff_mean",
     "low_sample_depth_count",
+    "Order1EventCount",
+    "Order2EventCount",
+    "Order3EventCount",
+    "Order4EventCount",
     "status",
 ]
 
@@ -99,9 +103,11 @@ def choose_equivalent_default(
     equivalents = _equivalent_rows(points, config)
     if equivalents.empty:
         raise ValueError("cannot choose representative from an empty point set")
+    if "point_event_count" not in equivalents:
+        equivalents["point_event_count"] = equivalents["trades"]
     return equivalents.sort_values(
-        ["shift_bp", "pnl_pct", "efficiency", "trades", "dd_pct", "point_id"],
-        ascending=[False, False, False, False, True, True],
+        ["point_event_count", "shift_bp", "pnl_pct", "efficiency", "trades", "dd_pct", "point_id"],
+        ascending=[False, False, False, False, False, True, True],
         kind="mergesort",
     ).iloc[0]
 
@@ -119,6 +125,7 @@ def _profile_alt(
     primary: pd.Series,
     close_ma: int,
     open_ma_radius: int,
+    config: AlgorithmConfig,
 ) -> pd.Series | None:
     candidates = plateau_points.loc[
         plateau_points["economic_pass"]
@@ -131,7 +138,9 @@ def _profile_alt(
     ]
     if candidates.empty:
         return None
-    return _reference_row(candidates)
+    equivalents = _equivalent_rows(candidates, config)
+    equivalents = equivalents.loc[equivalents["event_eligible"]]
+    return None if equivalents.empty else choose_equivalent_default(equivalents, config)
 
 
 def build_close_profiles(
@@ -139,6 +148,9 @@ def build_close_profiles(
     plateaus: pd.DataFrame,
     config: AlgorithmConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    points = points.copy()
+    if "event_eligible" not in points:
+        points["event_eligible"] = points["economic_pass"]
     updated = plateaus.copy()
     profile_rows: list[dict[str, object]] = []
     primary_by_plateau: dict[str, int] = {}
@@ -150,7 +162,11 @@ def build_close_profiles(
         plateau_points = plateau_points.loc[plateau_points["economic_pass"]]
         if plateau_points.empty:
             continue
-        primary = choose_equivalent_default(plateau_points, config)
+        equivalents = _equivalent_rows(plateau_points, config)
+        event_equivalents = equivalents.loc[equivalents["event_eligible"]]
+        if event_equivalents.empty:
+            continue
+        primary = choose_equivalent_default(event_equivalents, config)
         primary_close = int(primary["close_ma"])
         primary_by_plateau[str(plateau.plateau_id)] = primary_close
         refine_required = False
@@ -185,6 +201,7 @@ def build_close_profiles(
                     primary,
                     close_ma,
                     config.ma_neighbor_radius,
+                    config,
                 )
                 if alternative is None:
                     source_slice = points.loc[
@@ -350,6 +367,7 @@ def _order_from_point(point: pd.Series, close_support: float) -> dict[str, objec
         "source_dd_pct": float(point["dd_pct"]),
         "source_efficiency": float(point["efficiency"]),
         "trades": int(point["trades"]),
+        "point_event_count": int(point.get("point_event_count", point["trades"])),
         "close_support": float(close_support),
         "standalone_eligible": bool(point["standalone_eligible"]),
         "depth_eligible": bool(point["depth_eligible"]),
@@ -362,6 +380,9 @@ def build_structures(
     close_profiles: pd.DataFrame,
     config: AlgorithmConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    points = points.copy()
+    if "event_eligible" not in points:
+        points["event_eligible"] = points["economic_pass"]
     usable_status = {"PRIMARY_CLOSE", "CORE_CLOSE", "SUPPORTED_CLOSE"}
     usable = close_profiles.loc[
         close_profiles["status"].isin(usable_status)
@@ -388,6 +409,7 @@ def build_structures(
                 & points["economic_pass"]
             ].copy()
             equivalents = _equivalent_rows(candidates, config)
+            equivalents = equivalents.loc[equivalents["event_eligible"]]
             candidates_by_plateau[plateau_id] = [
                 row for _, row in equivalents.sort_values("point_id", kind="mergesort").iterrows()
             ]
@@ -482,6 +504,10 @@ def build_structures(
                             not bool(order["standalone_eligible"])
                             for order in numbered_orders[1:]
                         ),
+                        "Order1EventCount": int(numbered_orders[0]["point_event_count"]) if len(numbered_orders) >= 1 else None,
+                        "Order2EventCount": int(numbered_orders[1]["point_event_count"]) if len(numbered_orders) >= 2 else None,
+                        "Order3EventCount": int(numbered_orders[2]["point_event_count"]) if len(numbered_orders) >= 3 else None,
+                        "Order4EventCount": int(numbered_orders[3]["point_event_count"]) if len(numbered_orders) >= 4 else None,
                         "status": status,
                     }
                 )

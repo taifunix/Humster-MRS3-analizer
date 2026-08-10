@@ -98,6 +98,7 @@ class AlgorithmConfig:
     target_dd_pct: Decimal = Decimal("5")
     close_multiplier_long: Decimal = Decimal("1.003")
     close_multiplier_short: Decimal = Decimal("0.997")
+    min_point_events: int = 3
 
     def __post_init__(self) -> None:
         missing_base = sorted(set(DEFAULT_BASE_COLUMNS).difference(self.base_columns))
@@ -200,6 +201,8 @@ class AlgorithmConfig:
             raise ValueError("close_multiplier_long must be greater than one")
         if not Decimal("0") < self.close_multiplier_short < Decimal("1"):
             raise ValueError("close_multiplier_short must be between zero and one")
+        if self.min_point_events < 1:
+            raise ValueError("min_point_events must be at least one")
 
     @classmethod
     def defaults(cls) -> "AlgorithmConfig":
@@ -308,4 +311,5 @@ class AlgorithmConfig:
             close_multiplier_short=Decimal(
                 str(raw.get("close_multiplier", {}).get("short", 0.997))
             ),
+            min_point_events=int(raw.get("event_filter", {}).get("min_point_events", 3)),
         )

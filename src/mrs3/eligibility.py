@@ -62,11 +62,16 @@ def _reject_reasons(row: pd.Series, config: AlgorithmConfig) -> tuple[str, ...]:
         reasons.append("REJECT_SAMPLE_UNCALIBRATED")
     elif not bool(row["standalone_sample_pass"]):
         reasons.append("REJECT_SAMPLE")
+    if int(row["point_event_count"]) < config.min_point_events:
+        reasons.append("INSUFFICIENT_POINT_EVENTS")
     return tuple(reasons)
 
 
 def annotate_eligibility(points: pd.DataFrame, config: AlgorithmConfig) -> pd.DataFrame:
     out = points.copy()
+    if "point_event_count" not in out:
+        out["point_event_count"] = out["trades"]
+    out["point_event_count"] = pd.to_numeric(out["point_event_count"], errors="raise").astype("int64")
     out["effective_start"] = out[["report_start", "listing_date"]].max(axis=1)
     out["effective_days"] = (
         (out["report_end"] - out["effective_start"]).dt.total_seconds() / 86400.0
@@ -112,5 +117,6 @@ def annotate_eligibility(points: pd.DataFrame, config: AlgorithmConfig) -> pd.Da
         & (out["dd_pct"] <= float(config.economic_max_dd_pct))
         & (out["efficiency"] >= float(config.economic_min_efficiency))
     )
+    out["event_eligible"] = out["economic_pass"] & out["point_event_count"].ge(config.min_point_events)
     out["reject_reasons"] = out.apply(lambda row: _reject_reasons(row, config), axis=1)
     return out

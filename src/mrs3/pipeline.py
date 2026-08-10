@@ -414,6 +414,13 @@ def _run_selection_unlocked(inputs: SelectionInputs, config: AlgorithmConfig) ->
         "13_Deep_Gap_Research": deep_gap,
         "14_Recalibration": _recalibration_table(config),
         "15_Config": _flatten_config(config),
+        "16_Point_Events": plateau_points[[
+            "point_id", "plateau_id", "symbol", "side", "timeframe", "open_ma", "close_ma", "shift_bp",
+            "trades", "event_mode", "point_event_count", "event_eligible", "event_ids_hash",
+        ]].copy(),
+        "17_Plateau_Events": plateaus[[
+            "plateau_id", "symbol", "side", "timeframe", "core_size", "supported_size", "plateau_event_count", "plateau_event_ids_hash", "status", "ready",
+        ]].copy(),
     }
     write_audit_csvs(tables, output_dir / "audit_csv")
     write_audit_workbook(tables, output_dir / "audit.xlsx")
@@ -449,10 +456,15 @@ def _run_selection_unlocked(inputs: SelectionInputs, config: AlgorithmConfig) ->
         "template_sha256": _sha256_file(inputs.template_path),
         "source_rows": input_audit.source_rows,
         "normalized_rows": len(plateau_points),
+        "event_mode": "legacy_trades_proxy",
+        "event_eligible_point_count": int(plateau_points["event_eligible"].sum()),
+        "event_ineligible_point_count": int((~plateau_points["event_eligible"]).sum()),
         "economic_pass_count": int(plateau_points["economic_pass"].sum()),
         "refine_point_count": int(plateau_points["refine_required"].sum()),
         "refine_request_count": len(refine_requests),
-        "ready_plateau_count": len(plateaus),
+        "geometric_plateau_count": len(plateaus),
+        "ready_plateau_count": int(plateaus["ready"].sum()) if not plateaus.empty else 0,
+        "insufficient_event_plateau_count": int(plateaus["status"].eq("INSUFFICIENT_INDEPENDENT_EVENTS").sum()) if not plateaus.empty else 0,
         "base_1ord_count": len(base_one_order),
         "ready_structure_count": len(structures),
         "ready_structure_count_by_orders": structure_counts,

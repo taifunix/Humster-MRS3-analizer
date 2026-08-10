@@ -28,6 +28,7 @@ def _point(
     trades: int = 20,
     sample: bool = True,
     history: bool = True,
+    events: int = 3,
 ) -> dict[str, object]:
     return {
         "point_id": point_id,
@@ -48,6 +49,8 @@ def _point(
         "refine_required": False,
         "standalone_sample_pass": sample,
         "history_pass": history,
+        "point_event_count": events,
+        "event_eligible": events >= 3,
     }
 
 
@@ -127,6 +130,19 @@ def test_standalone_and_depth_eligibility_are_separate() -> None:
     p2 = annotated.loc[annotated["point_id"].eq("P2")].iloc[0]
     assert p1["standalone_eligible"] and p1["depth_eligible"]
     assert not p2["standalone_eligible"] and p2["depth_eligible"]
+
+
+def test_geometric_plateau_without_event_eligible_point_is_not_mrs3_usable() -> None:
+    points = pd.DataFrame([
+        _point("P1", shift_bp=230, open_ma=2, events=2),
+        _point("P2", shift_bp=230, open_ma=3, events=2),
+    ])
+
+    annotated, plateaus = build_plateaus(points, AlgorithmConfig.defaults())
+
+    assert not plateaus.iloc[0]["ready"]
+    assert plateaus.iloc[0]["status"] == "INSUFFICIENT_INDEPENDENT_EVENTS"
+    assert not annotated["depth_eligible"].any()
 
 
 def test_isolated_peak_is_audited_but_not_used_as_plateau() -> None:

@@ -33,6 +33,9 @@ PLATEAU_COLUMNS = [
     "standalone_eligible_point_ids",
     "depth_eligible_point_ids",
     "envelope",
+    "plateau_event_count",
+    "plateau_event_ids_hash",
+    "status",
     "ready",
 ]
 
@@ -270,6 +273,9 @@ def _build_group_plateaus(
             if bool(records[point_id]["standalone_sample_pass"])
             and bool(records[point_id]["history_pass"])
         )
+        event_mode = str(records[all_ids[0]].get("event_mode", "legacy_trades_proxy"))
+        event_ids = sorted(str(records[point_id].get("event_ids_hash", "")) for point_id in all_ids if bool(records[point_id].get("event_eligible", True)))
+        mrs3_usable = any(bool(records[point_id].get("event_eligible", True)) and bool(records[point_id].get("economic_pass", False)) for point_id in all_ids)
         output.append(
             {
                 "plateau_id": plateau["plateau_id"],
@@ -292,7 +298,10 @@ def _build_group_plateaus(
                 "standalone_eligible_point_ids": standalone_ids,
                 "depth_eligible_point_ids": all_ids,
                 "envelope": float(component_envelope(rows)),
-                "ready": True,
+                "plateau_event_count": None if event_mode == "legacy_trades_proxy" else len(event_ids),
+                "plateau_event_ids_hash": "N/A_LEGACY_PROXY" if event_mode == "legacy_trades_proxy" else (hashlib.sha256("|".join(event_ids).encode()).hexdigest() if event_ids else ""),
+                "status": "MRS3_USABLE" if mrs3_usable else "INSUFFICIENT_INDEPENDENT_EVENTS",
+                "ready": mrs3_usable,
             }
         )
     return output
@@ -302,6 +311,9 @@ def build_plateaus(
     points: pd.DataFrame,
     config: AlgorithmConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    points = points.copy()
+    if "event_eligible" not in points:
+        points["event_eligible"] = True
     required = {
         "point_id",
         "symbol",
@@ -349,8 +361,9 @@ def build_plateaus(
         & annotated["economic_pass"]
         & annotated["standalone_sample_pass"]
         & annotated["history_pass"]
+        & annotated["event_eligible"]
     )
-    annotated["depth_eligible"] = in_plateau & annotated["economic_pass"]
+    annotated["depth_eligible"] = in_plateau & annotated["economic_pass"] & annotated["event_eligible"]
     return annotated, plateaus
 
 

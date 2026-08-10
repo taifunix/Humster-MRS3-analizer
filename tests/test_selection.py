@@ -82,6 +82,17 @@ def test_equivalent_group_prefers_larger_shift_then_stable_ties() -> None:
     assert chosen["point_id"] == "HIGH"
 
 
+def test_equivalent_group_prefers_more_independent_events_before_shift() -> None:
+    rows = pd.DataFrame([
+        {**_point("MORE_EVENTS", "P1", shift_bp=190, pnl=100, efficiency=10), "point_event_count": 5},
+        {**_point("MORE_SHIFT", "P1", shift_bp=230, pnl=97, efficiency=9.7), "point_event_count": 3},
+    ])
+
+    chosen = choose_equivalent_default(rows, AlgorithmConfig.defaults())
+
+    assert chosen["point_id"] == "MORE_EVENTS"
+
+
 @pytest.mark.parametrize(
     ("support", "status"),
     [
@@ -170,6 +181,18 @@ def test_close_alternative_uses_configured_open_ma_radius() -> None:
     alternative = profile.loc[profile["close_ma"].eq(5)].iloc[0]
     assert alternative["status"] == "SUPPORTED_CLOSE"
     assert alternative["point_id"] == "C5"
+
+
+def test_close_alternative_rejects_event_ineligible_equivalent_group() -> None:
+    points = pd.DataFrame([
+        {**_point("C4", "P1", shift_bp=230, close_ma=4), "event_eligible": True},
+        {**_point("C5", "P1", shift_bp=230, close_ma=5, pnl=100, efficiency=10), "event_eligible": False},
+    ])
+    plateaus = pd.DataFrame([_plateau("P1", ("C4", "C5"))])
+
+    _, profile = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+    assert profile.query("close_ma == 5").iloc[0]["status"] == "UNSUPPORTED_CLOSE"
 
 
 def test_base_one_order_uses_dd5_after_plateau_local_equivalence() -> None:

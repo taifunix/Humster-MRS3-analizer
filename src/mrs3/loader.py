@@ -120,6 +120,9 @@ def load_points(
         raise InputError(f"duplicate parameter cell: {sample}")
 
     points["point_id"] = points[key_columns].astype(str).agg("|".join, axis=1)
+    points["event_mode"] = "legacy_trades_proxy"
+    points["point_event_count"] = points["trades"]
+    points["event_ids_hash"] = "LEGACY_PROXY_NO_EVENT_IDS"
     ordered_columns = [
         "point_id",
         "run_id",
@@ -138,6 +141,9 @@ def load_points(
         "trades",
         "wins",
         "losses",
+        "event_mode",
+        "point_event_count",
+        "event_ids_hash",
         "report_start",
         "report_end",
         "listing_date",
