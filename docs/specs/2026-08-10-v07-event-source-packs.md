@@ -32,6 +32,32 @@ For each report, actions are ordered by action timestamp and original row positi
 
 The materializer produces point metrics plus audit rows with raw action count, reconstructed cycle count, included count and exclusion counts by reason. It also emits the distinct event-ID hash per point. Raw DuckDB records and source HTML are never changed.
 
+## DuckDB metric materializer contract
+
+Only a report whose time grid covers the complete requested window can
+contribute a point. The materializer reconstructs the wallet and equity series
+losslessly, takes the wallet snapshot immediately before `start` (or
+reconstructs it from the first action when the grid starts at `start`) and the
+last snapshot before `end`. It calculates `TotalPnL` and `TotalPnLPercent` from
+their difference and that starting wallet.
+
+`MaxDrawdown` and `MaxDrawdownPercent` are the greatest fall of the in-window
+equity series from its preceding in-window peak. A realised trade action is an
+`Action=closed` or `Action=decreased` action belonging to a cycle which is
+fully inside the window. `TotalTrades` is its count; `Win`, `Los` and
+`WinRate` use respectively positive and negative realised `PnL` values; zero
+`PnL` actions remain in `TotalTrades` and are recorded separately as
+`flat_trades`. `ProfitFactor` is positive realised `PnL` divided by the
+absolute negative realised `PnL`; a zero gross loss is reported explicitly,
+never as an implicit infinity.
+
+Each output row records `metric_status`. The selector accepts only
+`VERIFIED` rows. Verification reads 3–5 source HTML reports, compares all five
+metrics (`PnL`, `DD`, `TotalTrades`, `WinRate`, `ProfitFactor`) after the same
+rounding as the source summary and records EQUAL/MISMATCH evidence. The HTML
+root is an explicit local input, never a tracked path; without it the package
+may be materialized for audit but cannot be selected.
+
 ## Selector contract
 
 - Attach `event_mode`, `point_event_count` and `event_ids_hash` to every normalized point. `legacy_trades_proxy` uses the explicit `LEGACY_PROXY_NO_EVENT_IDS` sentinel, because it has no independent-event identity.
