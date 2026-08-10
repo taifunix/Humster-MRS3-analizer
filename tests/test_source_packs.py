@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 import json
 from hashlib import sha256
 from pathlib import Path
@@ -9,6 +10,7 @@ import zlib
 import pandas as pd
 import pytest
 
+import mrs3.duckdb_events as duckdb_events
 import mrs3.source_packs as source_packs
 from mrs3.config import AlgorithmConfig
 from mrs3.source_packs import SourcePackError, build_csv_package, require_single_event_mode
@@ -235,6 +237,32 @@ def _verification_html(root: Path, report_count: int, *, mismatch_report: int | 
             encoding="utf-8",
         )
     return root
+
+
+def test_html_summary_reads_actual_profit_factor_label_and_absolute_drawdown(tmp_path: Path) -> None:
+    report = tmp_path / "report.html"
+    report.write_text(
+        "<html><body><table>"
+        "<tr><th>Profit / Loss</th><td>5.00</td></tr>"
+        "<tr><th>Max Drawdown</th><td>5.00</td></tr>"
+        "<tr><th>Max Drawdown, %</th><td>0.50%</td></tr>"
+        "<tr><th>Total Trades</th><td>2</td></tr>"
+        "<tr><th>Win Rate</th><td>50.00%</td></tr>"
+        "<tr><th>Profit Factor (gross profit/gross loss)</th><td>2.1234</td></tr>"
+        "</table></body></html>",
+        encoding="utf-8",
+    )
+
+    summary = duckdb_events._html_summary(report)
+
+    assert {metric: value for metric, (_, value, _) in summary.items()} == {
+        "PnL": 5,
+        "DD": 5,
+        "TotalTrades": 2,
+        "WinRate": 50,
+        "ProfitFactor": Decimal("2.1234"),
+    }
+    assert summary["ProfitFactor"][2] == 4
 
 
 def test_duckdb_metric_materializer_decodes_series_and_counts_realised_actions() -> None:

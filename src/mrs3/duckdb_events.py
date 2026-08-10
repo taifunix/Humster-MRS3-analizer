@@ -395,7 +395,7 @@ def _html_summary(path: Path) -> dict[str, tuple[str, Decimal, int]]:
         "dd": "DD", "drawdown": "DD", "maxdrawdown": "DD", "maximumdrawdown": "DD",
         "totaltrades": "TotalTrades", "trades": "TotalTrades",
         "winrate": "WinRate", "winningrate": "WinRate",
-        "profitfactor": "ProfitFactor",
+        "profitfactor": "ProfitFactor", "profitfactorgrossprofitgrossloss": "ProfitFactor",
     }
     try:
         document = lxml_html.fromstring(path.read_text(encoding="utf-8"))
@@ -407,6 +407,8 @@ def _html_summary(path: Path) -> dict[str, tuple[str, Decimal, int]]:
         if len(cells) < 2:
             continue
         label = re.sub(r"[^a-z0-9]", "", cells[0].casefold())
+        if label in {"maxdrawdown", "maximumdrawdown"} and "%" in cells[0]:
+            continue
         metric = aliases.get(label)
         if metric:
             value, precision = _decimal_token(cells[-1])
