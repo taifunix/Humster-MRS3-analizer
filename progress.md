@@ -28,6 +28,10 @@ Collect the v4 import outcome before implementing the materializer:
 - Therefore materializer, unified input and selector-v0.7 changes are intentionally not started.
 - The local remote URL is configured, but no GitHub repository creation or push was requested/performed.
 
+## Queued module hook
+
+**Анализатор Портфеля:** [спецификация v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) передана отдельной команде. Начинать с проверки входных контрактов; до trade timestamps и определённого limiter допускается только Layer A, без симулятора и рекомендаций по сету.
+
 ## Update protocol
 
 Replace this file’s verified-state and next-action sections whenever a commit changes the operational state. Keep only the present blocker set; durable decisions belong in ADRs and feature requirements belong in specs.

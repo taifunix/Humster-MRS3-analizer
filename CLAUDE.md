@@ -35,6 +35,7 @@
 - Не начинать materializer без v4 import evidence; не удалять HTML без `schema_version=4`, manifest, нулевого quarantine и `safe_to_delete=YES`.
 - В legacy-run разрешён только единый `event_mode=legacy_trades_proxy`: `point_event_count=TotalTrades` для каждой строки. Нельзя смешивать его с real independent events.
 - Не считать сумму MRS2 Source PnL фактическим PnL MRS3. Финальные выводы требуют реального tick-test и DD5 retest.
+- Hook `Анализатор Портфеля`: прежде чем менять portfolio module, читать `PRD.md` и `docs/specs/2026-08-09-portfolio-analyzer-v04.md`; реализовывать Layer A можно отдельно, но simulation требует trade timestamps, limiter contract, L2 и margin data.
 
 ## Документация по ходу работы
 

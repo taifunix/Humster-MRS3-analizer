@@ -44,11 +44,15 @@ Humster MRS3 Analyzer — локальный, детерминированный
 ## Не входит в текущий scope
 
 - real event-aware run до достаточного raw HTML coverage всей сетки;
-- оптимизация портфеля, L2 capacity и margin simulator;
+- реализация портфельного модуля до появления его обязательных входных данных;
 - ML, regression score или per-pair/per-TF production thresholds;
 - GitHub push, PR или публикация результатов без отдельного разрешения.
 
-Будущий портфельный контур описан в [архивной source-спецификации v0.4](docs/archive/sources/MRS3_Portfolio_Selector_v0_4.md). Он не активен, пока не появятся требуемые временные ряды и новая утверждённая спецификация.
+## Hook: Анализатор Портфеля
+
+Отдельная команда может начать модуль по [спецификации Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md). Статус модуля — **Queued**, он не блокирует текущий v0.7 legacy selection.
+
+Перед началом реализации команда должна подтвердить и записать в `progress.md` модуля: формат individual MRS3 results, журналы входов/выходов с timestamp, договорённости о limiter (позиции или заявки; LONG/SHORT; hedge/one-way), а также доступность/правила L2 и margin data. Без этого разрешён только аналитический Layer A; сетовый симулятор и финальные рекомендации не запускать.
 
 ## Реестр активной документации
 
@@ -58,6 +62,7 @@ Humster MRS3 Analyzer — локальный, детерминированный
 | Active | [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md) | последовательность import → materializer → unified input → selector | v4 evidence, event-filter spec |
 | Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
 | Planned | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | empirical cap без leakage | завершённые tick-tests |
+| Queued — hook «Анализатор Портфеля» | [Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) | отдельный анализ готовых MRS3-стратегий и сетов | individual results, trade timestamps, limiter/L2/margin contract |
 | Accepted | [ADR-0001](docs/decisions/0001-repository-and-documentation-model.md) | root v0.7 и модель документации | — |
 
 Полная навигация: [docs/README.md](docs/README.md). Оперативная точка: [progress.md](progress.md).
