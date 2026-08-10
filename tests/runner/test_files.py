@@ -160,6 +160,108 @@ def test_strategy_directory_cannot_replace_protected_tester_tree(
     assert protected.read_text(encoding="utf-8") == "keep"
 
 
+def test_preparation_replaces_only_root_json_and_preserves_nested_tree(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    _strategy(config.strategy_dir / "OLD.json", "OLD")
+    protected = config.strategy_dir / "Bybit"
+    _strategy(protected / "KEEP.json", "KEEP")
+    marker = protected / "marker.txt"
+    marker.write_text("keep", encoding="utf-8")
+    note = config.strategy_dir / "note.txt"
+    note.write_text("keep", encoding="utf-8")
+    source = tmp_path / "generated"
+    _strategy(source / "NEW.json", "NEW")
+
+    prepare_batch_files(config, source)
+
+    assert sorted(path.name for path in config.strategy_dir.glob("*.json")) == [
+        "NEW.json"
+    ]
+    assert (protected / "KEEP.json").is_file()
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert note.read_text(encoding="utf-8") == "keep"
+
+
+def test_preparation_rejects_source_inside_strategy_directory(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    source = config.strategy_dir / "Bybit"
+    _strategy(source / "A.json", "A")
+
+    with pytest.raises(BatchPreparationError, match="inside strategy_dir"):
+        prepare_batch_files(config, source)
+
+
+def test_failed_pre_run_cleanup_keeps_root_json_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    original = _strategy(config.strategy_dir / "OLD.json", "OLD")
+    source = tmp_path / "generated"
+    _strategy(source / "NEW.json", "NEW")
+
+    def fail_cleanup(*_args: object) -> None:
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(runner_files, "_remove_raw_artifacts", fail_cleanup)
+
+    with pytest.raises(BatchPreparationError, match="could not install"):
+        prepare_batch_files(config, source)
+
+    assert original.is_file()
+    assert not (config.strategy_dir / "NEW.json").exists()
+
+
+def test_failed_root_install_restores_root_json_and_preserves_nested_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    original = _strategy(config.strategy_dir / "OLD.json", "OLD")
+    protected = config.strategy_dir / "Bybit" / "KEEP.json"
+    _strategy(protected, "KEEP")
+    source = tmp_path / "generated"
+    _strategy(source / "NEW.json", "NEW")
+    real_copy = runner_files.shutil.copy2
+
+    def fail_root_copy(source_path: Path, destination: Path) -> Path:
+        if destination.parent == config.strategy_dir:
+            raise OSError("root copy failed")
+        return real_copy(source_path, destination)
+
+    monkeypatch.setattr(runner_files.shutil, "copy2", fail_root_copy)
+
+    with pytest.raises(BatchPreparationError, match="could not install"):
+        prepare_batch_files(config, source)
+
+    assert original.is_file()
+    assert protected.is_file()
+    assert not (config.strategy_dir / "NEW.json").exists()
+    assert not config.strategy_dir.with_name(
+        f".{config.strategy_dir.name}.mrs3-backup"
+    ).exists()
+
+
+def test_preparation_rejects_collision_with_root_json_symlink(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    protected_target = tmp_path / "protected.json"
+    protected_target.write_text("protected", encoding="utf-8")
+    root_link = config.strategy_dir / "NEW.json"
+    root_link.parent.mkdir(parents=True)
+    try:
+        root_link.symlink_to(protected_target)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+    source = tmp_path / "generated"
+    _strategy(source / "NEW.json", "NEW")
+
+    with pytest.raises(BatchPreparationError, match="protected root entry"):
+        prepare_batch_files(config, source)
+
+    assert root_link.is_symlink()
+    assert protected_target.read_text(encoding="utf-8") == "protected"
+
+
 def test_success_cleanup_removes_only_report_tree_and_two_logs(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config.report_dir.mkdir(parents=True)

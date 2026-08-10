@@ -101,6 +101,38 @@ def _file_hashes(
     return tuple((path.name, digest) for path, _, digest in validated)
 
 
+def _root_json_files(strategy_dir: Path) -> tuple[Path, ...]:
+    return tuple(
+        sorted(
+            (
+                path
+                for path in strategy_dir.iterdir()
+                if path.suffix.casefold() == ".json"
+                and path.is_file()
+                and not path.is_symlink()
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+    )
+
+
+def _protected_root_entry_names(strategy_dir: Path) -> set[str]:
+    return {
+        path.name
+        for path in strategy_dir.iterdir()
+        if path.is_symlink()
+        or not (path.suffix.casefold() == ".json" and path.is_file())
+    }
+
+
+def _source_is_inside_strategy_dir(source: Path, strategy_dir: Path) -> bool:
+    try:
+        source.resolve().relative_to(strategy_dir.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def inspect_strategy_batch(source_strategies: Path) -> BatchInspection:
     validated = _validate_source(source_strategies)
     return BatchInspection(
@@ -120,6 +152,16 @@ def _remove_raw_artifacts(report_dir: Path, result: Path, progress: Path) -> Non
     progress.unlink(missing_ok=True)
 
 
+def _restore_root_json(
+    strategy_dir: Path, backup: Path, installed: tuple[Path, ...]
+) -> None:
+    for path in installed:
+        path.unlink(missing_ok=True)
+    for path in _root_json_files(backup):
+        path.replace(strategy_dir / path.name)
+    backup.rmdir()
+
+
 def prepare_batch_files(
     config: RunnerConfig,
     source_strategies: Path,
@@ -127,13 +169,17 @@ def prepare_batch_files(
     expected_file_hashes: tuple[tuple[str, str], ...] | None = None,
 ) -> BatchFiles:
     strategy_dir, report_dir, result, progress = validate_runner_paths(config)
+    if _source_is_inside_strategy_dir(source_strategies, strategy_dir):
+        raise BatchPreparationError(
+            f"strategy source cannot be inside strategy_dir: {source_strategies.resolve()}"
+        )
     validated = _validate_source(source_strategies)
     source_hashes = _file_hashes(validated)
     if expected_file_hashes is not None and source_hashes != expected_file_hashes:
         raise BatchPreparationError(
             "strategy batch content changed after the read-only preflight"
         )
-    strategy_dir.parent.mkdir(parents=True, exist_ok=True)
+    strategy_dir.mkdir(parents=True, exist_ok=True)
     backup = strategy_dir.with_name(f".{strategy_dir.name}.mrs3-backup")
     if backup.exists():
         raise BatchPreparationError(
@@ -144,8 +190,8 @@ def prepare_batch_files(
             prefix=f".{strategy_dir.name}.mrs3-stage-", dir=strategy_dir.parent
         )
     )
-    installed = False
-    moved_existing = False
+    installed: list[Path] = []
+    backup_created = False
     try:
         for source, _, _ in validated:
             shutil.copy2(source, staging / source.name)
@@ -158,40 +204,43 @@ def prepare_batch_files(
             raise BatchPreparationError(
                 "strategy batch content changed while staged copies were being created"
             )
-        if strategy_dir.exists():
-            if not strategy_dir.is_dir():
-                raise BatchPreparationError(
-                    f"configured strategy_dir is not a directory: {strategy_dir}"
-                )
-            strategy_dir.replace(backup)
-            moved_existing = True
-        staging.replace(strategy_dir)
-        installed = True
-        try:
-            _remove_raw_artifacts(report_dir, result, progress)
-        except Exception:
-            failed = strategy_dir.with_name(f".{strategy_dir.name}.mrs3-failed")
-            if failed.exists():
-                shutil.rmtree(failed)
-            strategy_dir.replace(failed)
-            if moved_existing:
-                backup.replace(strategy_dir)
-            shutil.rmtree(failed)
-            installed = False
-            raise
-        if moved_existing:
-            shutil.rmtree(backup)
-    except BatchPreparationError:
-        raise
+        protected_collisions = sorted(
+            {path.name for path, _, _ in staged}.intersection(
+                _protected_root_entry_names(strategy_dir)
+            )
+        )
+        if protected_collisions:
+            raise BatchPreparationError(
+                "staged strategy collides with protected root entry: "
+                + ", ".join(protected_collisions)
+            )
+        _remove_raw_artifacts(report_dir, result, progress)
+        backup.mkdir()
+        backup_created = True
+        for existing in _root_json_files(strategy_dir):
+            existing.replace(backup / existing.name)
+        for source, _, _ in staged:
+            destination = strategy_dir / source.name
+            shutil.copy2(source, destination)
+            installed.append(destination)
+        if _file_hashes(_validate_source(strategy_dir)) != staged_hashes:
+            raise BatchPreparationError("installed strategy batch does not match staging")
+        shutil.rmtree(backup)
+        backup_created = False
     except Exception as error:
-        if moved_existing and backup.exists() and not strategy_dir.exists():
-            backup.replace(strategy_dir)
+        if backup_created:
+            try:
+                _restore_root_json(strategy_dir, backup, tuple(installed))
+            except Exception as rollback_error:
+                raise BatchPreparationError(
+                    f"root JSON rollback failed; recovery required at {backup}"
+                ) from rollback_error
+        if isinstance(error, BatchPreparationError):
+            raise
         raise BatchPreparationError("could not install tester strategy batch") from error
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-        if backup.exists() and installed:
-            shutil.rmtree(backup)
 
     names = tuple(name for _, name, _ in staged)
     filenames = tuple(source.name for source, _, _ in staged)
