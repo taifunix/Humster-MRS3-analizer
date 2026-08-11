@@ -133,13 +133,14 @@ deterministic facts, distinct source/analysis connections and no raw-data copy.
 Its 21 relevant tests pass and review was clean after one fix round. Panel/build
 orchestration is still outstanding.
 
-Task 12 atomic immutable publication is complete, pending commit
-`feat: publish immutable analysis surfaces`. All identity inputs, ordered source
-hashes and explicit-parent-only semantics are covered. Identical builds compare
-and return stored immutable facts; every publication table is written in one
-transaction with rollback, without a source connection or raw-data copy. The
-relevant suite passes `41` tests, and independent Terra review approved after
-two fix rounds.
+Task 12 atomic immutable publication is complete (`f72aae3`). All identity
+inputs and order-independent source hashes are covered. New same-period/scope
+surfaces form an immutable child chain; repeated older or newer inputs deduplicate
+without rewriting parentage. Every publication table is written in one
+transaction with rollback, without a source connection or raw-data copy. Current
+raw reproducibility is derived from persisted source hashes and the supplied
+active-hash set. The focused suite passes `29` tests, and independent Terra
+review approved after the fix rounds.
 
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`

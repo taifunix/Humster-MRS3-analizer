@@ -362,9 +362,10 @@ receives a source connection.
 
 - [x] RED-test deterministic digest inputs, identical-build deduplication,
   transaction rollback, immutable parent surfaces, raw-reproduction status
-  after source replacement and stable ordered reads. Source hashes are ordered,
-  parents are explicit only, and identical deduplication compares and returns
-  the stored immutable facts.
+  after source replacement and stable ordered reads. Source-hash ordering does
+  not affect identity; same-period/scope replacements form an automatic child
+  chain, while explicit parents must match period and scope. Identical inputs
+  return the stored immutable facts without changing parentage.
 - [x] Ensure plateau algorithm settings do not affect `surface_id`.
 - [x] Mutation-test every identity input: build mode, UTC period, side, selected
   symbols/timeframes, source hashes, grid/normalization contracts, materializer
@@ -372,8 +373,8 @@ receives a source connection.
 - [x] Publish all surface/source/pair/timeframe/point/coverage/dedup rows in one
   transaction after validation, with rollback and no source connection or raw
   source-data copy.
-- [x] Run GREEN (`41 passed`) and independent Terra review (approved after two
-  fix rounds). Pending commit message: `feat: publish immutable analysis surfaces`.
+- [x] Run GREEN (`29 passed`) and independent Terra review (approved after the
+  fix rounds). Commit: `f72aae3` (`feat: publish immutable analysis surfaces`).
 
 ### Task 13: Adapt published points to the common pipeline and persist lineage
 
