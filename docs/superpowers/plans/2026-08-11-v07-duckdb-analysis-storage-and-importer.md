@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Tasks 0–12 are complete; Task 13 is next. Task 6 was committed in `05369c2`; its
+**Status:** Tasks 0–13 are complete; Task 14 is next. Task 6 was committed in `05369c2`; its
 copied-real-HTML smoke established v3/v4/mrs3 adapter parity `PASS` and a
 temporary v3 DuckDB import with `1` scanned, `1` imported and `0` quarantined
 reports, `78` raw
@@ -395,15 +395,25 @@ load_published_surface(analysis_connection, surface_id) -> PipelineInput
 publish_analysis_run(analysis_connection, result) -> PublishedAnalysisRun
 ```
 
-- [ ] RED-test deterministic run identity from surface+algorithm version/config,
+- [x] RED-test deterministic run identity from surface+algorithm version/config,
   reuse of one point set across algorithm variants and complete candidate →
   plateau → member → surface → source lineage.
-- [ ] RED-test `CONTINUED`, `SPLIT`, `MERGED`, `NEW`, `DROPPED` without merging
-  metrics from different periods.
-- [ ] Prove the read-only adapter never opens the source DB or copies surface
+- [x] Upgrade analysis schema v1 → v2 transactionally: normalize multi-plateau
+  candidates through `candidate_plateaus`, preserve existing candidate links,
+  and leave surfaces/points byte-for-byte unchanged on success or rollback.
+- [x] Keep listing dates out of surface identity: resolve an explicit listing-date
+  input before eligibility, include its canonical snapshot/hash in run identity,
+  and fail closed instead of substituting the surface period start.
+- [x] RED-test `CONTINUED`, `SPLIT`, `MERGED`, `NEW`, `DROPPED` without merging
+  metrics from different periods; require an explicit comparison run rather than
+  choosing an implicit latest algorithm variant.
+- [x] Prove the read-only adapter never opens the source DB or copies surface
   points, and algorithm variants/repeated runs reuse the identical stored set.
-- [ ] Write each run and lineage atomically without copying surface points.
-- [ ] Run GREEN, review and commit: `feat: persist analysis runs and lineage`.
+- [x] Write each run and lineage atomically without copying surface points.
+- [x] Run GREEN: `115` focused tests and full suite `454 passed, 2 skipped`;
+  both skips require unavailable Windows symlink privilege. Independent Terra
+  review approved after two fix rounds. Commit message:
+  `feat: persist analysis runs and lineage`.
 
 ### Task 14: Expose library, statistics and deterministic exports
 

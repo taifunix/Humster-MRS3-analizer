@@ -144,6 +144,17 @@ raw reproducibility is derived from persisted source hashes and the supplied
 active-hash set. The focused suite passes `29` tests, and independent Terra
 review approved after the fix rounds.
 
+Task 13 common-pipeline adaptation and persistent lineage is complete. Analysis
+schema v2 transactionally migrates v1 candidates to explicit multi-plateau
+membership without changing published surfaces or points. Published surfaces
+are loaded from the analysis DB only; explicit listing dates are scoped and
+hashed into analysis-run identity. Runs, plateau members, 2–4ORD candidates and
+explicit cross-period lineage are atomic and deterministic; repeated comparison
+targets add idempotent lineage without copying points. Focused verification is
+`115 passed`; the full suite is `454 passed, 2 skipped`, with both skips limited
+to unavailable Windows symlink privilege. Independent Terra review approved
+after two fix rounds.
+
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
 included cycles. The package has `source_summary_status=VERIFIED` and
@@ -165,15 +176,14 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1–12 are complete.
+slice; Tasks 1–13 are complete.
 
-1. Implement Task 13 pipeline adaptation and lineage from the
+1. Implement Task 14 library, statistics and deterministic exports from the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
-   in an independently reviewed TDD slice.
-2. Implement Task 14 library/statistics/exports plus **Refine**, **Re-run analysis**
-   and **Compare periods**.
-3. Complete Task 15 verification and documentation.
-4. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
+   plus **Refine**, **Re-run analysis** and **Compare periods** in an
+   independently reviewed TDD slice.
+2. Complete Task 15 verification and documentation.
+3. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
 
 ## Blockers
 

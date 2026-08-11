@@ -247,10 +247,11 @@ def test_publication_rejects_unknown_mode_bad_hash_and_nonfinite_metrics(connect
         replace(surface, build_mode="OTHER_DIRECT"),
         replace(surface, request=replace(surface.request, point_materialization_config_hash="A" * 64)),
         replace(surface, points=(replace(surface.points[0], metrics={"TotalTrades": 0, "bad": float("nan")}),)),
+        replace(surface, points=(replace(surface.points[0], metrics={**surface.points[0].metrics, "WinRate": float("inf")}),)),
     ):
         with pytest.raises(ValueError):
             publish_surface(analysis, invalid)
-    assert analysis.execute("select count(*) from information_schema.tables").fetchone()[0] == 13
+    assert analysis.execute("select count(*) from information_schema.tables").fetchone()[0] == 14
     assert analysis.execute("select count(*) from surfaces").fetchone() == (0,)
 
 

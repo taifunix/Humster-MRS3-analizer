@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
+import math
 from typing import TYPE_CHECKING, Mapping
 
 import duckdb
@@ -12,10 +14,20 @@ if TYPE_CHECKING:
     from .duckdb_direct import DirectPoint, DirectSurface
 
 
-ANALYSIS_SCHEMA_VERSION = 1
+ANALYSIS_SCHEMA_VERSION = 2
 EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT = (
-    "f2a206838bdbe1483c11df88d6ebeb51f137fbc54f0c2a3d07453a6ffb364aa6"
+    "a61bf184df6377f5161e13ba4e542bb36b669c528af360ddbb9b62d666f6adba"
 )
+_V1_FINGERPRINT = "f2a206838bdbe1483c11df88d6ebeb51f137fbc54f0c2a3d07453a6ffb364aa6"
+_DIRECT_REQUIRED_METRICS = {
+    "TotalPnLPercent",
+    "MaxDrawdownPercent",
+    "TotalTrades",
+    "Win",
+    "Los",
+    "WinRate",
+    "ProfitFactor",
+}
 
 
 class AnalysisSchemaError(ValueError):
@@ -28,6 +40,13 @@ class PublishedSurface:
     parent_surface_id: str | None
     created: bool
     points: tuple[DirectPoint, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedAnalysisRun:
+    run_id: str
+    surface_id: str
+    created: bool
 
 
 _TABLES = {
@@ -43,8 +62,10 @@ _TABLES = {
     "plateaus",
     "plateau_members",
     "candidates",
+    "candidate_plateaus",
     "plateau_lineage",
 }
+_V1_TABLES = _TABLES - {"candidate_plateaus"}
 
 
 def _table_names(connection: duckdb.DuckDBPyConnection) -> set[str]:
@@ -90,21 +111,26 @@ def _schema_fingerprint(connection: duckdb.DuckDBPyConnection) -> str:
 
 def _verify_schema(connection: duckdb.DuckDBPyConnection) -> None:
     tables = _table_names(connection)
-    if tables != _TABLES:
-        raise AnalysisSchemaError("analysis database tables do not match the required schema")
     try:
         metadata = dict(connection.execute("select key, value from schema_info").fetchall())
     except duckdb.Error as error:
         raise AnalysisSchemaError("analysis database has no readable schema metadata") from error
+    if metadata.get("schema_version") == "1" and metadata.get("schema_fingerprint") == _V1_FINGERPRINT:
+        if tables != _V1_TABLES or _schema_fingerprint(connection) != _V1_FINGERPRINT:
+            raise AnalysisSchemaError("analysis database schema fingerprint does not match v1")
+        _migrate_v1_to_v2(connection)
+        return
+    if tables != _TABLES:
+        raise AnalysisSchemaError("analysis database tables do not match the required schema")
     if metadata.get("schema_version") != str(ANALYSIS_SCHEMA_VERSION):
         raise AnalysisSchemaError(
             f"analysis database schema version {metadata.get('schema_version', 'missing')} "
             f"is not v{ANALYSIS_SCHEMA_VERSION}"
         )
     if metadata.get("schema_fingerprint") != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
-        raise AnalysisSchemaError("analysis database stored schema fingerprint is not v1")
+        raise AnalysisSchemaError("analysis database stored schema fingerprint is not v2")
     if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
-        raise AnalysisSchemaError("analysis database schema fingerprint does not match v1")
+        raise AnalysisSchemaError("analysis database schema fingerprint does not match v2")
 
 
 def _create_tables(connection: duckdb.DuckDBPyConnection) -> None:
@@ -210,9 +236,19 @@ def _create_tables(connection: duckdb.DuckDBPyConnection) -> None:
         create table candidates(
             candidate_id varchar primary key,
             run_id varchar not null,
-            plateau_id varchar not null,
             surface_id varchar not null,
             candidate_json varchar,
+            unique(candidate_id, run_id, surface_id),
+            foreign key(run_id, surface_id) references analysis_runs(run_id, surface_id)
+        );
+        create table candidate_plateaus(
+            candidate_id varchar not null,
+            run_id varchar not null,
+            plateau_id varchar not null,
+            surface_id varchar not null,
+            primary key(candidate_id, plateau_id),
+            foreign key(candidate_id, run_id, surface_id)
+                references candidates(candidate_id, run_id, surface_id),
             foreign key(run_id, plateau_id, surface_id)
                 references plateaus(run_id, plateau_id, surface_id)
         );
@@ -238,9 +274,46 @@ def _create_tables(connection: duckdb.DuckDBPyConnection) -> None:
         create index surface_points_by_surface on surface_points(surface_id);
         create index analysis_runs_by_surface on analysis_runs(surface_id);
         create index plateaus_by_run on plateaus(run_id);
+        create index candidate_plateaus_by_run on candidate_plateaus(run_id, plateau_id);
         create index lineage_by_child on plateau_lineage(child_run_id, child_plateau_id);
         """
     )
+
+
+def _migrate_v1_to_v2(connection: duckdb.DuckDBPyConnection) -> None:
+    """Upgrade candidate ownership to a junction without touching published facts."""
+    connection.execute("begin transaction")
+    try:
+        legacy = connection.execute(
+            "select candidate_id, run_id, plateau_id, surface_id, candidate_json from candidates"
+        ).fetchall()
+        connection.execute("alter table candidates rename to candidates_v1")
+        connection.execute(
+            """create table candidates(
+                candidate_id varchar primary key, run_id varchar not null, surface_id varchar not null,
+                candidate_json varchar, unique(candidate_id, run_id, surface_id),
+                foreign key(run_id, surface_id) references analysis_runs(run_id, surface_id))"""
+        )
+        connection.execute(
+            """create table candidate_plateaus(
+                candidate_id varchar not null, run_id varchar not null, plateau_id varchar not null,
+                surface_id varchar not null, primary key(candidate_id, plateau_id),
+                foreign key(candidate_id, run_id, surface_id) references candidates(candidate_id, run_id, surface_id),
+                foreign key(run_id, plateau_id, surface_id) references plateaus(run_id, plateau_id, surface_id))"""
+        )
+        if legacy:
+            connection.executemany("insert into candidates values (?,?,?,?)", [(a,b,d,e) for a,b,c,d,e in legacy])
+            connection.executemany("insert into candidate_plateaus values (?,?,?,?)", [(a,b,c,d) for a,b,c,d,e in legacy])
+        connection.execute("drop table candidates_v1")
+        connection.execute("create index candidate_plateaus_by_run on candidate_plateaus(run_id, plateau_id)")
+        if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
+            raise AnalysisSchemaError("v1 migration DDL does not match the code-owned v2 fingerprint")
+        connection.execute("update schema_info set value=? where key='schema_version'", [str(ANALYSIS_SCHEMA_VERSION)])
+        connection.execute("update schema_info set value=? where key='schema_fingerprint'", [EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT])
+        connection.execute("commit")
+    except BaseException:
+        connection.execute("rollback")
+        raise
 
 
 def ensure_analysis_schema(connection: duckdb.DuckDBPyConnection) -> int:
@@ -253,7 +326,7 @@ def ensure_analysis_schema(connection: duckdb.DuckDBPyConnection) -> int:
     try:
         _create_tables(connection)
         if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
-            raise AnalysisSchemaError("analysis schema DDL does not match the code-owned v1 fingerprint")
+            raise AnalysisSchemaError("analysis schema DDL does not match the code-owned v2 fingerprint")
         connection.executemany(
             "insert into schema_info(key, value) values (?, ?)",
             [
@@ -272,11 +345,35 @@ def _canonical_json(value: object) -> str:
     def normalize(item: object) -> object:
         if isinstance(item, Mapping):
             return {str(key): normalize(value) for key, value in item.items()}
-        if isinstance(item, tuple | list):
+        if isinstance(item, (tuple, list)):
             return [normalize(value) for value in item]
+        if isinstance(item, set):
+            return [normalize(value) for value in sorted(item, key=str)]
+        if isinstance(item, datetime):
+            moment = item.replace(tzinfo=timezone.utc) if item.tzinfo is None else item.astimezone(timezone.utc)
+            return moment.isoformat().replace("+00:00", "Z")
+        if isinstance(item, Decimal):
+            return str(item)
+        if hasattr(item, "item") and callable(item.item):
+            return normalize(item.item())
         return item
 
     return json.dumps(normalize(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+
+
+def _analysis_json(value: object) -> str:
+    def clean(item: object) -> object:
+        if isinstance(item, Mapping):
+            return {str(key): clean(value) for key, value in item.items()}
+        if isinstance(item, (tuple, list, set)):
+            return [clean(value) for value in item]
+        if hasattr(item, "item") and callable(item.item):
+            return clean(item.item())
+        if isinstance(item, float) and not math.isfinite(item):
+            return None
+        return item
+
+    return _canonical_json(clean(value))
 
 
 def _utc(value: str) -> str:
@@ -317,6 +414,31 @@ def _point_parts(point: DirectPoint) -> tuple[str, str, str, int, int, int]:
         raise ValueError("canonical point key has non-integer grid fields") from error
 
 
+def _validate_direct_metrics(metrics: Mapping[str, object], event_count: int) -> None:
+    if _DIRECT_REQUIRED_METRICS.difference(metrics):
+        raise ValueError("point metrics are incomplete")
+
+    def number(name: str) -> Decimal:
+        try:
+            value = Decimal(str(metrics[name]))
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError(f"point metric {name} must be finite") from error
+        if not value.is_finite():
+            raise ValueError(f"point metric {name} must be finite")
+        return value
+
+    for name in ("TotalPnLPercent", "MaxDrawdownPercent", "WinRate"):
+        number(name)
+    for name in ("TotalTrades", "Win", "Los"):
+        value = number(name)
+        if value < 0 or value != value.to_integral_value():
+            raise ValueError(f"point metric {name} must be a non-negative integer")
+    if int(number("TotalTrades")) != event_count:
+        raise ValueError("point event count must equal materialized TotalTrades")
+    if metrics["ProfitFactor"] is not None:
+        number("ProfitFactor")
+
+
 def _validate_surface(surface: DirectSurface, identity: dict[str, object]) -> tuple[DirectPoint, ...]:
     if surface.build_mode != "DUCKDB_DIRECT" or surface.event_mode != "legacy_trades_proxy":
         raise ValueError("direct surface must use legacy_trades_proxy")
@@ -352,8 +474,9 @@ def _validate_surface(surface: DirectSurface, identity: dict[str, object]) -> tu
             raise ValueError("source hash must be a lowercase SHA-256 digest")
         if (point.source_report_id, point.source_hash) not in manifest or point.source_hash not in source_hashes:
             raise ValueError("point provenance is absent from materialized preflight")
-        if point.point_event_count < 0 or point.metrics.get("TotalTrades") != point.point_event_count:
-            raise ValueError("point event count must equal materialized TotalTrades")
+        if point.point_event_count < 0:
+            raise ValueError("point event count must be non-negative")
+        _validate_direct_metrics(point.metrics, point.point_event_count)
         try:
             _canonical_json(point.metrics)
         except (TypeError, ValueError) as error:
@@ -472,3 +595,178 @@ def surface_raw_reproduction_status(
     if not hashes:
         raise ValueError("unknown surface")
     return "REPRODUCIBLE" if hashes <= set(active_source_hashes) else "RAW_REPLACED"
+
+
+def _run_identity(surface_id: str, algorithm_version: str, algorithm_config_json: str) -> str:
+    return sha256(f"{surface_id}|{algorithm_version}|{algorithm_config_json}".encode()).hexdigest()
+
+
+def classify_plateau_lineage(
+    parent: Mapping[str, tuple[set[str], Mapping[str, object]]], child: Mapping[str, tuple[set[str], Mapping[str, object]]],
+) -> tuple[tuple[str | None, str | None, str, str], ...]:
+    """Classify overlap links only; metrics deliberately never cross this boundary."""
+    def linked(left: tuple[set[str], Mapping[str, object]], right: tuple[set[str], Mapping[str, object]]) -> bool:
+        left_points, left_geometry = left
+        right_points, right_geometry = right
+        if not left_points.intersection(right_points):
+            return False
+        if any(left_geometry.get(key) != right_geometry.get(key) for key in ("symbol", "side", "timeframe")):
+            return False
+        return (int(left_geometry["min_shift_bp"]) <= int(right_geometry["max_shift_bp"])
+                and int(right_geometry["min_shift_bp"]) <= int(left_geometry["max_shift_bp"])
+                and int(left_geometry["open_ma_min"]) <= int(right_geometry["open_ma_max"])
+                and int(right_geometry["open_ma_min"]) <= int(left_geometry["open_ma_max"])
+                and int(left_geometry["close_ma_min"]) <= int(right_geometry["close_ma_max"])
+                and int(right_geometry["close_ma_min"]) <= int(left_geometry["close_ma_max"]))
+    child_links = {key: sorted(old for old, old_data in parent.items() if linked(old_data, data)) for key, data in child.items()}
+    parent_links = {key: sorted(new for new, new_data in child.items() if linked(data, new_data)) for key, data in parent.items()}
+    rows: list[tuple[str | None, str | None, str, str]] = []
+    for new, old_ids in sorted(child_links.items()):
+        if not old_ids:
+            rows.append((new, None, "NEW", "{}"))
+        for old in old_ids:
+            relation = "MERGED" if len(old_ids) > 1 else "SPLIT" if len(parent_links[old]) > 1 else "CONTINUED"
+            overlap = sorted(child[new][0] & parent[old][0])
+            rows.append((new, old, relation, _canonical_json({"overlap_point_keys": overlap})))
+    for old, new_ids in sorted(parent_links.items()):
+        if not new_ids:
+            rows.append((None, old, "DROPPED", "{}"))
+    return tuple(rows)
+
+
+def _stored_plateau_facts(
+    connection: duckdb.DuckDBPyConnection, run_id: str,
+) -> dict[str, tuple[set[str], Mapping[str, object]]]:
+    facts: dict[str, tuple[set[str], Mapping[str, object]]] = {}
+    for plateau_id, metrics_json in connection.execute(
+        "select plateau_id, metrics_json from plateaus where run_id=? order by plateau_id",
+        [run_id],
+    ).fetchall():
+        members = {
+            str(key)
+            for (key,) in connection.execute(
+                "select canonical_point_key from plateau_members where run_id=? and plateau_id=?",
+                [run_id, plateau_id],
+            ).fetchall()
+        }
+        facts[str(plateau_id)] = (members, json.loads(metrics_json or "{}"))
+    return facts
+
+
+def _comparison_facts(
+    connection: duckdb.DuckDBPyConnection,
+    child_run_id: str,
+    child_surface_id: str,
+    comparison_run_id: str | None,
+) -> dict[str, tuple[set[str], Mapping[str, object]]]:
+    if comparison_run_id is None:
+        return {}
+    if comparison_run_id == child_run_id:
+        raise ValueError("analysis run cannot compare lineage with itself")
+    comparison = connection.execute(
+        """select s.side from analysis_runs r join surfaces s using(surface_id)
+             where r.run_id=?""",
+        [comparison_run_id],
+    ).fetchone()
+    current = connection.execute(
+        "select side from surfaces where surface_id=?", [child_surface_id]
+    ).fetchone()
+    if comparison is None or current is None or comparison[0] != current[0]:
+        raise ValueError("comparison run is unknown or outside the surface scope")
+    return _stored_plateau_facts(connection, comparison_run_id)
+
+
+def _insert_lineage(
+    connection: duckdb.DuckDBPyConnection,
+    child_run_id: str,
+    comparison_run_id: str | None,
+    parent: Mapping[str, object],
+    child: Mapping[str, object],
+) -> None:
+    if comparison_run_id is None:
+        return
+    for child_id, parent_id, relation, raw_detail in classify_plateau_lineage(parent, child):
+        lineage_id = sha256(
+            f"{child_run_id}|{child_id}|{comparison_run_id}|{parent_id}|{relation}".encode()
+        ).hexdigest()
+        detail = json.loads(raw_detail)
+        detail["comparison_run_id"] = comparison_run_id
+        connection.execute(
+            """insert into plateau_lineage values (?,?,?,?,?,?,?)
+                 on conflict(lineage_id) do nothing""",
+            [
+                lineage_id,
+                child_run_id if child_id else None,
+                child_id,
+                comparison_run_id if parent_id else None,
+                parent_id,
+                relation,
+                _canonical_json(detail),
+            ],
+        )
+
+
+def publish_analysis_run(analysis_connection: duckdb.DuckDBPyConnection, result: object) -> PublishedAnalysisRun:
+    """Atomically store a run and links while retaining surface points by reference."""
+    ensure_analysis_schema(analysis_connection)
+    surface_id, algorithm_version, config = str(result.surface_id), str(result.algorithm_version), result.algorithm_config
+    config_json = _canonical_json(config)
+    run_id = _run_identity(surface_id, algorithm_version, config_json)
+    existing = analysis_connection.execute("select run_id from analysis_runs where run_id=?", [run_id]).fetchone()
+    if existing:
+        child_facts = _stored_plateau_facts(analysis_connection, run_id)
+        parent_facts = _comparison_facts(
+            analysis_connection, run_id, surface_id, getattr(result, "comparison_run_id", None)
+        )
+        analysis_connection.execute("begin transaction")
+        try:
+            _insert_lineage(
+                analysis_connection,
+                run_id,
+                getattr(result, "comparison_run_id", None),
+                parent_facts,
+                child_facts,
+            )
+            analysis_connection.execute("commit")
+        except BaseException:
+            analysis_connection.execute("rollback")
+            raise
+        return PublishedAnalysisRun(run_id, surface_id, False)
+    if analysis_connection.execute("select 1 from surfaces where surface_id=?", [surface_id]).fetchone() is None:
+        raise ValueError("analysis run references unknown surface")
+    plateaus = result.plateaus
+    candidates = result.candidates
+    comparison_run_id = getattr(result, "comparison_run_id", None)
+    parent_members = _comparison_facts(
+        analysis_connection, run_id, surface_id, comparison_run_id
+    )
+    child_members = {str(row["plateau_id"]): ({str(value) for value in row.get("all_point_ids", ())}, row) for row in plateaus.to_dict("records")}
+    analysis_connection.execute("begin transaction")
+    try:
+        analysis_connection.execute("insert into analysis_runs(run_id,surface_id,algorithm_version,algorithm_config_json) values (?,?,?,?)", [run_id, surface_id, algorithm_version, config_json])
+        for row in plateaus.to_dict("records"):
+            plateau_id = str(row["plateau_id"])
+            metrics = {key: value for key, value in row.items() if key not in {"plateau_id", "all_point_ids", "core_point_ids", "supported_point_ids"}}
+            analysis_connection.execute("insert into plateaus(run_id,plateau_id,surface_id,metrics_json) values (?,?,?,?)", [run_id, plateau_id, surface_id, _analysis_json(metrics)])
+            members = tuple(row.get("all_point_ids", ()))
+            analysis_connection.executemany("insert into plateau_members(run_id,plateau_id,surface_id,canonical_point_key) values (?,?,?,?)", [(run_id, plateau_id, surface_id, str(point)) for point in members])
+        for row in candidates.to_dict("records"):
+            plateau_ids = tuple(str(value) for value in row.get("plateau_ids", ()))
+            if not 2 <= len(plateau_ids) <= 4 or len(set(plateau_ids)) != len(plateau_ids):
+                raise ValueError("candidate requires two to four distinct plateau IDs")
+            candidate_json = _analysis_json(row)
+            candidate_id = sha256(f"{run_id}|{candidate_json}".encode()).hexdigest()
+            analysis_connection.execute("insert into candidates values (?,?,?,?)", [candidate_id, run_id, surface_id, candidate_json])
+            analysis_connection.executemany("insert into candidate_plateaus values (?,?,?,?)", [(candidate_id, run_id, plateau_id, surface_id) for plateau_id in plateau_ids])
+        _insert_lineage(
+            analysis_connection,
+            run_id,
+            comparison_run_id,
+            parent_members,
+            child_members,
+        )
+        analysis_connection.execute("commit")
+    except BaseException:
+        analysis_connection.execute("rollback")
+        raise
+    return PublishedAnalysisRun(run_id, surface_id, True)

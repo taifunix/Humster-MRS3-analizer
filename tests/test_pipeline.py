@@ -11,7 +11,7 @@ from openpyxl import load_workbook
 
 from mrs3.config import AlgorithmConfig
 from mrs3.models import Side
-from mrs3.pipeline import SelectionInputs, _pair_history, run_selection
+from mrs3.pipeline import PipelineInput, SelectionInputs, _pair_history, run_published_pipeline, run_selection
 from tests.factories import write_selection_inputs
 from tests.test_package_loader import write_real_package
 
@@ -22,6 +22,29 @@ def _digest_files(directory: Path, pattern: str) -> str:
         digest.update(path.relative_to(directory).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def test_published_pipeline_scopes_listing_dates_and_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mrs3.pipeline as pipeline
+
+    points = pd.DataFrame([{"symbol": "AAAUSDT", "side": "LONG"}])
+    monkeypatch.setattr(pipeline, "annotate_eligibility", lambda values, _: values)
+    monkeypatch.setattr(pipeline, "annotate_refine", lambda values, _: (values, pd.DataFrame()))
+    monkeypatch.setattr(pipeline, "build_plateaus", lambda values, _: (values, pd.DataFrame()))
+    monkeypatch.setattr(pipeline, "find_isolated_peaks", lambda *_: pd.DataFrame())
+    monkeypatch.setattr(pipeline, "build_close_profiles", lambda _, plateaus, __: (plateaus, pd.DataFrame()))
+    monkeypatch.setattr(pipeline, "select_base_one_order", lambda *_: pd.DataFrame())
+    monkeypatch.setattr(pipeline, "build_structures", lambda *_: (pd.DataFrame(columns=["status", "plateau_ids"]), pd.DataFrame()))
+    monkeypatch.setattr(pipeline, "load_listing_dates", lambda _: {"AAAUSDT": pd.Timestamp("2020-01-01", tz="UTC"), "UNUSED": pd.Timestamp("2020-01-01", tz="UTC")})
+
+    result = run_published_pipeline(PipelineInput("surface", points), Path("dates.csv"), Side.LONG, AlgorithmConfig.defaults())
+
+    assert result.algorithm_config["listing_dates"] == {"AAAUSDT": "2020-01-01T00:00:00+00:00"}
+    monkeypatch.setattr(pipeline, "load_listing_dates", lambda _: {})
+    with pytest.raises(ValueError, match="missing listing dates"):
+        run_published_pipeline(PipelineInput("surface", points), Path("dates.csv"), Side.LONG, AlgorithmConfig.defaults())
+    with pytest.raises(ValueError, match="side does not match"):
+        run_published_pipeline(PipelineInput("surface", points), Path("dates.csv"), Side.SHORT, AlgorithmConfig.defaults())
 
 
 def test_pipeline_builds_two_plateaus_and_validated_json(tmp_path: Path) -> None:

@@ -14,7 +14,7 @@ import pandas as pd
 from .audit import canonical_frame_json, write_audit_csvs, write_audit_workbook
 from .config import AlgorithmConfig
 from .eligibility import annotate_eligibility
-from .loader import load_points
+from .loader import load_listing_dates, load_points
 from .lots import LotMethod, allocate_lots
 from .locking import OutputDirectoryLock
 from .models import InputAudit, Side
@@ -60,6 +60,36 @@ class RunArtifacts:
     generated_strategies: list[dict[str, object]]
     manifest: dict[str, object]
     output_dir: Path
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineInput:
+    """In-memory, immutable-surface input for the shared plateau stages."""
+    surface_id: str
+    points: pd.DataFrame
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineResult:
+    """Persistable analysis facts; deliberately excludes file exports and source data."""
+    surface_id: str
+    algorithm_version: str
+    algorithm_config: Mapping[str, object]
+    plateaus: pd.DataFrame
+    candidates: pd.DataFrame
+    comparison_run_id: str | None = None
+
+
+@dataclass(slots=True)
+class _AnalysisStages:
+    points: pd.DataFrame
+    refine_requests: pd.DataFrame
+    plateaus: pd.DataFrame
+    close_profiles: pd.DataFrame
+    isolated_peaks: pd.DataFrame
+    base_one_order: pd.DataFrame
+    structures: pd.DataFrame
+    structure_diagnostics: pd.DataFrame
 
 
 def _sha256_file(path: Path) -> str:
@@ -406,6 +436,30 @@ def _apply_package_event_unions(
     return output
 
 
+def _analyze_points(points: pd.DataFrame, config: AlgorithmConfig) -> _AnalysisStages:
+    eligible = annotate_eligibility(points, config)
+    refined, raw_missing = annotate_refine(eligible, config)
+    refine_requests = _aggregate_refine_requests(raw_missing)
+    plateau_points, plateaus = build_plateaus(refined, config)
+    plateaus = _apply_package_event_unions(plateau_points, plateaus)
+    isolated = find_isolated_peaks(plateau_points, config)
+    plateaus, close_profiles = build_close_profiles(plateau_points, plateaus, config)
+    base_one_order = select_base_one_order(plateau_points, plateaus, config)
+    structures, diagnostics = build_structures(
+        plateau_points, plateaus, close_profiles, config
+    )
+    return _AnalysisStages(
+        plateau_points,
+        refine_requests,
+        plateaus,
+        close_profiles,
+        isolated,
+        base_one_order,
+        structures,
+        diagnostics,
+    )
+
+
 def _run_selection_unlocked(inputs: SelectionInputs, config: AlgorithmConfig) -> RunArtifacts:
     output_dir = inputs.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -425,17 +479,18 @@ def _run_selection_unlocked(inputs: SelectionInputs, config: AlgorithmConfig) ->
             inputs.csv_path, inputs.dates_path, inputs.side, config
         )
         input_path = inputs.csv_path
-    eligible = annotate_eligibility(loaded, config)
-    refined, raw_missing = annotate_refine(eligible, config)
-    refine_requests = _aggregate_refine_requests(raw_missing)
-    plateau_points, plateaus = build_plateaus(refined, config)
-    plateaus = _apply_package_event_unions(plateau_points, plateaus)
-    isolated = find_isolated_peaks(plateau_points, config)
-    plateaus, close_profiles = build_close_profiles(plateau_points, plateaus, config)
-    base_one_order = select_base_one_order(plateau_points, plateaus, config)
-    structures, structure_diagnostics = build_structures(
-        plateau_points, plateaus, close_profiles, config
+    stages = _analyze_points(loaded, config)
+    plateau_points, refine_requests, plateaus = (
+        stages.points,
+        stages.refine_requests,
+        stages.plateaus,
     )
+    close_profiles, isolated, base_one_order = (
+        stages.close_profiles,
+        stages.isolated_peaks,
+        stages.base_one_order,
+    )
+    structures, structure_diagnostics = stages.structures, stages.structure_diagnostics
     template = json.loads(inputs.template_path.read_text(encoding="utf-8"))
     lot_variants, generated = _build_variants(
         template, plateau_points, base_one_order, structures, config
@@ -553,3 +608,44 @@ def _run_selection_unlocked(inputs: SelectionInputs, config: AlgorithmConfig) ->
 def run_selection(inputs: SelectionInputs, config: AlgorithmConfig) -> RunArtifacts:
     with OutputDirectoryLock(inputs.output_dir):
         return _run_selection_unlocked(inputs, config)
+
+
+def run_published_pipeline(
+    input: PipelineInput,
+    dates_path: Path,
+    side: Side,
+    config: AlgorithmConfig,
+    comparison_run_id: str | None = None,
+) -> PipelineResult:
+    """Run the common eligibility/selection stages after explicit listing-date resolution."""
+    listing_dates = load_listing_dates(dates_path)
+    points = input.points.copy()
+    if not points["side"].eq(side.value).all():
+        raise ValueError("published surface side does not match analysis side")
+    missing = sorted(set(points["symbol"]).difference(listing_dates))
+    if missing:
+        raise ValueError(f"missing listing dates: {missing}")
+    points["listing_date"] = points["symbol"].map(listing_dates)
+    stages = _analyze_points(points, config)
+    candidates = stages.structures.loc[
+        stages.structures["status"].eq("READY_MRS3_STRUCTURE")
+    ].copy()
+    candidates["plateau_ids"] = candidates["plateau_ids"].map(tuple)
+    dates_snapshot = {
+        symbol: listing_dates[symbol].isoformat()
+        for symbol in sorted(set(points["symbol"]))
+    }
+    dates_json = json.dumps(dates_snapshot, sort_keys=True, separators=(",", ":"))
+    algorithm_config = {
+        "algorithm": _canonical(config),
+        "listing_dates": dates_snapshot,
+        "listing_dates_sha256": hashlib.sha256(dates_json.encode()).hexdigest(),
+    }
+    return PipelineResult(
+        input.surface_id,
+        ALGORITHM_VERSION,
+        algorithm_config,
+        stages.plateaus,
+        candidates,
+        comparison_run_id,
+    )

@@ -102,6 +102,11 @@ def _load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
     return dict(zip(frame["symbol"], frame["listing_date"], strict=True))
 
 
+def load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
+    """Load the explicit UTC listing-date snapshot used by analysis adapters."""
+    return _load_listing_dates(path)
+
+
 def load_points(
     csv_path: Path | pd.DataFrame,
     dates_path: Path,

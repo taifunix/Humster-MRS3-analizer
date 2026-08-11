@@ -210,9 +210,18 @@ The append-only analysis store contains at minimum:
 - `plateaus`;
 - `plateau_members`;
 - `candidates`;
+- `candidate_plateaus`;
 - `plateau_lineage`.
 
 Raw actions, equity, wallet series and HTML are never copied into it.
+
+Analysis schema v2 represents one logical 2–4ORD candidate once in
+`candidates` and stores every constituent plateau in the
+`candidate_plateaus` junction. Upgrading a v1 analysis store is one
+transaction: existing candidates retain their prior plateau link, published
+surfaces and `surface_points` are unchanged, and any failure leaves the v1
+store readable. Additional candidate memberships are never hidden only in
+JSON.
 
 ## Surface identity and publication
 
@@ -239,8 +248,17 @@ deterministic run identity is derived from those inputs. Recalculation does
 not copy surface points, and changing only plateau settings never creates a
 new surface.
 
+Published surface metrics do not invent a symbol listing date. Before the
+common eligibility pipeline runs, it resolves listing dates from an explicit
+listing-date input. The canonical snapshot/hash of that input is part of the
+analysis-run configuration and deterministic identity, not the surface
+identity. This keeps one immutable point surface reusable while making the
+history gate reproducible.
+
 Period-specific plateau IDs are local to their run. `plateau_lineage` connects
-runs using common canonical points and geometric overlap:
+runs using common canonical points and geometric overlap. The comparison run
+is explicit; an implicit "latest" run is not selected across algorithm
+variants:
 
 - `CONTINUED`;
 - `SPLIT`;
