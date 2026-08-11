@@ -14,10 +14,11 @@ if TYPE_CHECKING:
     from .duckdb_direct import DirectPoint, DirectSurface
 
 
-ANALYSIS_SCHEMA_VERSION = 2
+ANALYSIS_SCHEMA_VERSION = 3
 EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT = (
-    "a61bf184df6377f5161e13ba4e542bb36b669c528af360ddbb9b62d666f6adba"
+    "58a445394e54f43f95cce56d2019ae4fb97040ccae83769debe205aa93987db8"
 )
+_V2_FINGERPRINT = "a61bf184df6377f5161e13ba4e542bb36b669c528af360ddbb9b62d666f6adba"
 _V1_FINGERPRINT = "f2a206838bdbe1483c11df88d6ebeb51f137fbc54f0c2a3d07453a6ffb364aa6"
 _DIRECT_REQUIRED_METRICS = {
     "TotalPnLPercent",
@@ -49,6 +50,56 @@ class PublishedAnalysisRun:
     created: bool
 
 
+@dataclass(frozen=True, slots=True)
+class AnalysisRunFacts:
+    facts_state: str
+    unique_point_count: int | None
+    economic_eligible_point_count: int | None
+    event_eligible_point_count: int | None
+    plateau_count: int | None
+    ready_candidate_count: int | None
+    final_state: str
+
+
+def _facts(row: tuple[object, ...]) -> AnalysisRunFacts:
+    return AnalysisRunFacts(str(row[0]), *(None if value is None else int(value) for value in row[1:6]), str(row[6]))
+
+
+def list_surface_library(
+    connection: duckdb.DuckDBPyConnection, *, side: str | None = None,
+    period_start_utc: str | None = None, period_end_utc: str | None = None,
+    symbol: str | None = None, build_mode: str | None = None,
+    parent_surface_id: str | None = None, source_hash: str | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Read-only library rows; each run retains its own facts and metrics."""
+    verify_analysis_schema(connection)
+    clauses, values = ["1=1"], []
+    for column, value in (("s.side", side), ("s.build_mode", build_mode), ("s.parent_surface_id", parent_surface_id)):
+        if value is not None: clauses.append(f"{column}=?"); values.append(value)
+    if period_start_utc is not None: clauses.append("s.period_start_utc>=?"); values.append(period_start_utc)
+    if period_end_utc is not None: clauses.append("s.period_end_utc<=?"); values.append(period_end_utc)
+    if symbol is not None: clauses.append("exists(select 1 from surface_pairs sp where sp.surface_id=s.surface_id and sp.symbol=?)"); values.append(symbol)
+    if source_hash is not None: clauses.append("exists(select 1 from surface_sources ss where ss.surface_id=s.surface_id and ss.source_hash=?)"); values.append(source_hash)
+    rows = connection.execute(f"select s.surface_id,s.parent_surface_id,s.period_start_utc,s.period_end_utc,s.side,s.build_mode from surfaces s where {' and '.join(clauses)} order by s.period_start_utc,s.surface_id", values).fetchall()
+    result = []
+    for surface_id, parent, start, end, row_side, mode in rows:
+        runs = []
+        for run_id, state, unique, economic, event, plateaus, ready, final in connection.execute("""select r.run_id,f.facts_state,f.unique_point_count,f.economic_eligible_point_count,f.event_eligible_point_count,f.plateau_count,f.ready_candidate_count,f.final_state from analysis_runs r join analysis_run_facts f using(run_id) where r.surface_id=? order by r.run_id""", [surface_id]).fetchall():
+            runs.append({"run_id": str(run_id), "facts": _facts((state, unique, economic, event, plateaus, ready, final))})
+        result.append({"surface_id": str(surface_id), "parent_surface_id": parent, "period_start_utc": str(start), "period_end_utc": str(end), "side": str(row_side), "build_mode": str(mode), "unique_point_count": int(connection.execute("select count(*) from surface_points where surface_id=?", [surface_id]).fetchone()[0]), "source_hashes": tuple(row[0] for row in connection.execute("select source_hash from surface_sources where surface_id=? order by source_hash", [surface_id]).fetchall()), "coverage_reasons": tuple(row[0] for row in connection.execute("select issue_code from coverage_issues where surface_id=? order by issue_code,issue_id", [surface_id]).fetchall()), "runs": tuple(runs)})
+    return tuple(result)
+
+
+def compare_analysis_runs(connection: duckdb.DuckDBPyConnection, left_run_id: str, right_run_id: str) -> dict[str, object]:
+    """Read two published runs without lineage writes or metric aggregation."""
+    def one(run_id: str) -> dict[str, object]:
+        row = connection.execute("""select r.run_id,r.surface_id,s.parent_surface_id,s.period_start_utc,s.period_end_utc,s.side,f.facts_state,f.unique_point_count,f.economic_eligible_point_count,f.event_eligible_point_count,f.plateau_count,f.ready_candidate_count,f.final_state from analysis_runs r join surfaces s using(surface_id) join analysis_run_facts f using(run_id) where r.run_id=?""", [run_id]).fetchone()
+        if row is None: raise ValueError("unknown analysis run")
+        return {"run_id": str(row[0]), "surface_id": str(row[1]), "parent_surface_id": row[2], "period_start_utc": str(row[3]), "period_end_utc": str(row[4]), "side": str(row[5]), "facts": _facts(tuple(row[6:]))}
+    verify_analysis_schema(connection)
+    return {"left": one(left_run_id), "right": one(right_run_id)}
+
+
 _TABLES = {
     "schema_info",
     "surfaces",
@@ -64,8 +115,9 @@ _TABLES = {
     "candidates",
     "candidate_plateaus",
     "plateau_lineage",
+    "analysis_run_facts",
 }
-_V1_TABLES = _TABLES - {"candidate_plateaus"}
+_V1_TABLES = _TABLES - {"candidate_plateaus", "analysis_run_facts"}
 
 
 def _table_names(connection: duckdb.DuckDBPyConnection) -> set[str]:
@@ -118,8 +170,34 @@ def _verify_schema(connection: duckdb.DuckDBPyConnection) -> None:
     if metadata.get("schema_version") == "1" and metadata.get("schema_fingerprint") == _V1_FINGERPRINT:
         if tables != _V1_TABLES or _schema_fingerprint(connection) != _V1_FINGERPRINT:
             raise AnalysisSchemaError("analysis database schema fingerprint does not match v1")
-        _migrate_v1_to_v2(connection)
+        connection.execute("begin transaction")
+        try:
+            _migrate_v1_to_v2(connection, transactional=False)
+            _migrate_v2_to_v3(connection, transactional=False)
+            connection.execute("commit")
+        except BaseException:
+            connection.execute("rollback")
+            raise
         return
+    if metadata.get("schema_version") == "2" and metadata.get("schema_fingerprint") == _V2_FINGERPRINT:
+        if tables != (_TABLES - {"analysis_run_facts"}) or _schema_fingerprint(connection) != _V2_FINGERPRINT:
+            raise AnalysisSchemaError("analysis database schema fingerprint does not match v2")
+        _migrate_v2_to_v3(connection)
+        return
+    _verify_current_schema(connection, tables, metadata)
+
+
+def _verify_current_schema(
+    connection: duckdb.DuckDBPyConnection,
+    tables: set[str] | None = None,
+    metadata: Mapping[str, str] | None = None,
+) -> None:
+    tables = _table_names(connection) if tables is None else tables
+    if metadata is None:
+        try:
+            metadata = dict(connection.execute("select key, value from schema_info").fetchall())
+        except duckdb.Error as error:
+            raise AnalysisSchemaError("analysis database has no readable schema metadata") from error
     if tables != _TABLES:
         raise AnalysisSchemaError("analysis database tables do not match the required schema")
     if metadata.get("schema_version") != str(ANALYSIS_SCHEMA_VERSION):
@@ -128,9 +206,15 @@ def _verify_schema(connection: duckdb.DuckDBPyConnection) -> None:
             f"is not v{ANALYSIS_SCHEMA_VERSION}"
         )
     if metadata.get("schema_fingerprint") != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
-        raise AnalysisSchemaError("analysis database stored schema fingerprint is not v2")
+        raise AnalysisSchemaError("analysis database stored schema fingerprint is not v3")
     if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
-        raise AnalysisSchemaError("analysis database schema fingerprint does not match v2")
+        raise AnalysisSchemaError("analysis database schema fingerprint does not match v3")
+
+
+def verify_analysis_schema(connection: duckdb.DuckDBPyConnection) -> int:
+    """Verify the current v3 contract without attempting any migration."""
+    _verify_current_schema(connection)
+    return ANALYSIS_SCHEMA_VERSION
 
 
 def _create_tables(connection: duckdb.DuckDBPyConnection) -> None:
@@ -213,6 +297,17 @@ def _create_tables(connection: duckdb.DuckDBPyConnection) -> None:
             unique(surface_id, algorithm_version, algorithm_config_json),
             unique(run_id, surface_id)
         );
+        create table analysis_run_facts(
+            run_id varchar primary key references analysis_runs(run_id),
+            facts_state varchar not null check(facts_state in ('COMPUTED', 'UNAVAILABLE_LEGACY')),
+            unique_point_count bigint check(unique_point_count is null or unique_point_count >= 0),
+            economic_eligible_point_count bigint check(economic_eligible_point_count is null or economic_eligible_point_count >= 0),
+            event_eligible_point_count bigint check(event_eligible_point_count is null or event_eligible_point_count >= 0),
+            plateau_count bigint check(plateau_count is null or plateau_count >= 0),
+            ready_candidate_count bigint check(ready_candidate_count is null or ready_candidate_count >= 0),
+            final_state varchar not null check(final_state = 'COMMITTED'),
+            check((facts_state = 'COMPUTED' and unique_point_count is not null and economic_eligible_point_count is not null and event_eligible_point_count is not null and plateau_count is not null and ready_candidate_count is not null) or (facts_state = 'UNAVAILABLE_LEGACY' and unique_point_count is null and economic_eligible_point_count is null and event_eligible_point_count is null and plateau_count is null and ready_candidate_count is null))
+        );
         create table plateaus(
             run_id varchar not null,
             plateau_id varchar not null,
@@ -280,9 +375,10 @@ def _create_tables(connection: duckdb.DuckDBPyConnection) -> None:
     )
 
 
-def _migrate_v1_to_v2(connection: duckdb.DuckDBPyConnection) -> None:
+def _migrate_v1_to_v2(connection: duckdb.DuckDBPyConnection, *, transactional: bool = True) -> None:
     """Upgrade candidate ownership to a junction without touching published facts."""
-    connection.execute("begin transaction")
+    if transactional:
+        connection.execute("begin transaction")
     try:
         legacy = connection.execute(
             "select candidate_id, run_id, plateau_id, surface_id, candidate_json from candidates"
@@ -306,13 +402,44 @@ def _migrate_v1_to_v2(connection: duckdb.DuckDBPyConnection) -> None:
             connection.executemany("insert into candidate_plateaus values (?,?,?,?)", [(a,b,c,d) for a,b,c,d,e in legacy])
         connection.execute("drop table candidates_v1")
         connection.execute("create index candidate_plateaus_by_run on candidate_plateaus(run_id, plateau_id)")
-        if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
+        if _schema_fingerprint(connection) != _V2_FINGERPRINT:
             raise AnalysisSchemaError("v1 migration DDL does not match the code-owned v2 fingerprint")
+        connection.execute("update schema_info set value=? where key='schema_version'", ["2"])
+        connection.execute("update schema_info set value=? where key='schema_fingerprint'", [_V2_FINGERPRINT])
+        if transactional:
+            connection.execute("commit")
+    except BaseException:
+        if transactional:
+            connection.execute("rollback")
+        raise
+
+
+def _migrate_v2_to_v3(connection: duckdb.DuckDBPyConnection, *, transactional: bool = True) -> None:
+    """Add immutable run facts; old runs remain coherently unavailable."""
+    if transactional:
+        connection.execute("begin transaction")
+    try:
+        connection.execute("""create table analysis_run_facts(
+            run_id varchar primary key references analysis_runs(run_id),
+            facts_state varchar not null check(facts_state in ('COMPUTED', 'UNAVAILABLE_LEGACY')),
+            unique_point_count bigint check(unique_point_count is null or unique_point_count >= 0),
+            economic_eligible_point_count bigint check(economic_eligible_point_count is null or economic_eligible_point_count >= 0),
+            event_eligible_point_count bigint check(event_eligible_point_count is null or event_eligible_point_count >= 0),
+            plateau_count bigint check(plateau_count is null or plateau_count >= 0),
+            ready_candidate_count bigint check(ready_candidate_count is null or ready_candidate_count >= 0),
+            final_state varchar not null check(final_state = 'COMMITTED'),
+            check((facts_state = 'COMPUTED' and unique_point_count is not null and economic_eligible_point_count is not null and event_eligible_point_count is not null and plateau_count is not null and ready_candidate_count is not null) or (facts_state = 'UNAVAILABLE_LEGACY' and unique_point_count is null and economic_eligible_point_count is null and event_eligible_point_count is null and plateau_count is null and ready_candidate_count is null))
+        )""")
+        connection.execute("insert into analysis_run_facts(run_id,facts_state,final_state) select run_id,'UNAVAILABLE_LEGACY','COMMITTED' from analysis_runs")
+        if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
+            raise AnalysisSchemaError("v2 migration DDL does not match the code-owned v3 fingerprint")
         connection.execute("update schema_info set value=? where key='schema_version'", [str(ANALYSIS_SCHEMA_VERSION)])
         connection.execute("update schema_info set value=? where key='schema_fingerprint'", [EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT])
-        connection.execute("commit")
+        if transactional:
+            connection.execute("commit")
     except BaseException:
-        connection.execute("rollback")
+        if transactional:
+            connection.execute("rollback")
         raise
 
 
@@ -326,7 +453,7 @@ def ensure_analysis_schema(connection: duckdb.DuckDBPyConnection) -> int:
     try:
         _create_tables(connection)
         if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
-            raise AnalysisSchemaError("analysis schema DDL does not match the code-owned v2 fingerprint")
+            raise AnalysisSchemaError("analysis schema DDL does not match the code-owned v3 fingerprint")
         connection.executemany(
             "insert into schema_info(key, value) values (?, ?)",
             [
@@ -713,7 +840,20 @@ def publish_analysis_run(analysis_connection: duckdb.DuckDBPyConnection, result:
     config_json = _canonical_json(config)
     run_id = _run_identity(surface_id, algorithm_version, config_json)
     existing = analysis_connection.execute("select run_id from analysis_runs where run_id=?", [run_id]).fetchone()
+    supplied_facts = getattr(result, "statistics", None)
+    names = ("unique_point_count", "economic_eligible_point_count", "event_eligible_point_count", "plateau_count", "ready_candidate_count")
+    if supplied_facts is not None:
+        if set(supplied_facts) != set(names) or any(isinstance(supplied_facts[name], bool) or not isinstance(supplied_facts[name], int) or supplied_facts[name] < 0 for name in names):
+            raise ValueError("analysis run facts are invalid")
     if existing:
+        stored_facts = analysis_connection.execute(
+            "select facts_state,unique_point_count,economic_eligible_point_count,event_eligible_point_count,plateau_count,ready_candidate_count from analysis_run_facts where run_id=?", [run_id]
+        ).fetchone()
+        if stored_facts is None:
+            raise ValueError("analysis run facts are missing")
+        expected = ("COMPUTED", *(supplied_facts[name] for name in names)) if supplied_facts is not None else ("UNAVAILABLE_LEGACY", None, None, None, None, None)
+        if tuple(stored_facts) != expected:
+            raise ValueError("analysis run facts conflict with immutable publication")
         child_facts = _stored_plateau_facts(analysis_connection, run_id)
         parent_facts = _comparison_facts(
             analysis_connection, run_id, surface_id, getattr(result, "comparison_run_id", None)
@@ -744,6 +884,13 @@ def publish_analysis_run(analysis_connection: duckdb.DuckDBPyConnection, result:
     analysis_connection.execute("begin transaction")
     try:
         analysis_connection.execute("insert into analysis_runs(run_id,surface_id,algorithm_version,algorithm_config_json) values (?,?,?,?)", [run_id, surface_id, algorithm_version, config_json])
+        if supplied_facts is None:
+            analysis_connection.execute("insert into analysis_run_facts(run_id,facts_state,final_state) values (?, 'UNAVAILABLE_LEGACY', 'COMMITTED')", [run_id])
+        else:
+            analysis_connection.execute(
+                "insert into analysis_run_facts values (?,?,?,?,?,?,?,?)",
+                [run_id, "COMPUTED", *(supplied_facts[name] for name in names), "COMMITTED"],
+            )
         for row in plateaus.to_dict("records"):
             plateau_id = str(row["plateau_id"])
             metrics = {key: value for key, value in row.items() if key not in {"plateau_id", "all_point_ids", "core_point_ids", "supported_point_ids"}}

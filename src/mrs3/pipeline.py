@@ -78,6 +78,7 @@ class PipelineResult:
     plateaus: pd.DataFrame
     candidates: pd.DataFrame
     comparison_run_id: str | None = None
+    statistics: Mapping[str, int] | None = None
 
 
 @dataclass(slots=True)
@@ -648,4 +649,11 @@ def run_published_pipeline(
         stages.plateaus,
         candidates,
         comparison_run_id,
+        {
+            "unique_point_count": len(stages.points),
+            "economic_eligible_point_count": int(stages.points["economic_pass"].sum()),
+            "event_eligible_point_count": int(stages.points["event_eligible"].sum()),
+            "plateau_count": len(stages.plateaus),
+            "ready_candidate_count": len(candidates),
+        },
     )

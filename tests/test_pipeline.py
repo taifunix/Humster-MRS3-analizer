@@ -28,7 +28,11 @@ def test_published_pipeline_scopes_listing_dates_and_fails_closed(monkeypatch: p
     import mrs3.pipeline as pipeline
 
     points = pd.DataFrame([{"symbol": "AAAUSDT", "side": "LONG"}])
-    monkeypatch.setattr(pipeline, "annotate_eligibility", lambda values, _: values)
+    monkeypatch.setattr(
+        pipeline,
+        "annotate_eligibility",
+        lambda values, _: values.assign(economic_pass=True, event_eligible=True),
+    )
     monkeypatch.setattr(pipeline, "annotate_refine", lambda values, _: (values, pd.DataFrame()))
     monkeypatch.setattr(pipeline, "build_plateaus", lambda values, _: (values, pd.DataFrame()))
     monkeypatch.setattr(pipeline, "find_isolated_peaks", lambda *_: pd.DataFrame())

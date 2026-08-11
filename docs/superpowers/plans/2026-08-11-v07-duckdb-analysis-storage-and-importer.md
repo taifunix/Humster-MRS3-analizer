@@ -425,22 +425,26 @@ publish_analysis_run(analysis_connection, result) -> PublishedAnalysisRun
 - Test: `tests/test_analysis_storage.py`
 - Create: `tests/test_analysis_exports.py`
 
-- [ ] RED-test library filtering, build/analysis progress, coverage and point/
+- [x] RED-test library filtering, build/analysis progress, coverage and point/
   eligible/plateau/READY counts, parent/source lineage and final state.
-- [ ] Add panel workflows and tests for **Refine**, **Re-run analysis** and
+- [x] Upgrade analysis schema v2 → v3 transactionally with immutable
+  `analysis_run_facts`; migrate only derivable legacy counts and expose missing
+  economic/event facts as unavailable rather than recomputing or inventing them.
+- [x] Add panel workflows and tests for **Refine**, **Re-run analysis** and
   **Compare periods**, keeping period metrics separate.
-- [ ] Implement **Re-run analysis** through `load_published_surface` and
+- [x] Implement **Re-run analysis** through `load_published_surface` and
   `publish_analysis_run`: no source DB, rematerialization or new surface; RED
   tests preserve `surface_id` and every `surface_points` row.
-- [ ] Implement **Compare periods** as read-only comparison of published runs:
+- [x] Implement **Compare periods** as read-only comparison of published runs:
   no source read, materialization, publication or metric combination.
-- [ ] Show separate unique-point, economic-eligible, event-eligible, plateau,
+- [x] Show separate unique-point, economic-eligible, event-eligible, plateau,
   READY, coverage-reason, parent/source-lineage and final-state facts.
-- [ ] RED-test byte-stable CSV/Excel exports of one immutable surface/run with a
+- [x] RED-test byte-stable CSV/Excel exports of one immutable surface/run with a
   manifest; exports never become canonical storage.
-- [ ] Implement read-only published-generation queries and
+- [x] Implement read-only published-generation queries and
   `export_analysis_run(connection, run_id, output_path) -> ExportResult`.
-- [ ] Run GREEN, review and commit: `feat: expose analysis duckdb results`.
+- [x] Run GREEN: `104` focused tests. Independent Terra review approved after
+  one fix round. Commit: `feat: expose analysis duckdb results`.
 
 ### Task 15: Final verification and documentation
 

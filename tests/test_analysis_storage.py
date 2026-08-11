@@ -32,6 +32,7 @@ REQUIRED_TABLES = {
     "candidates",
     "candidate_plateaus",
     "plateau_lineage",
+    "analysis_run_facts",
 }
 
 
@@ -139,6 +140,40 @@ def test_publish_analysis_run_is_deterministic_and_does_not_copy_surface_points(
     assert not second.created
     assert analysis.execute("select count(*) from surface_points").fetchone() == (1,)
     assert analysis.execute("select count(*) from plateau_lineage").fetchone() == (0,)
+
+
+def test_v3_stores_computed_run_facts_and_legacy_is_not_zero(connections) -> None:
+    from mrs3.analysis_storage import publish_analysis_run, publish_surface
+    from mrs3.pipeline import PipelineResult
+
+    _, analysis = connections
+    surface = publish_surface(analysis, _surface())
+    legacy = publish_analysis_run(analysis, PipelineResult(surface.surface_id, "v1", {}, pd.DataFrame(), pd.DataFrame()))
+    assert analysis.execute("select facts_state, unique_point_count from analysis_run_facts where run_id=?", [legacy.run_id]).fetchone() == ("UNAVAILABLE_LEGACY", None)
+    computed = publish_analysis_run(analysis, PipelineResult(surface.surface_id, "v2", {}, pd.DataFrame(), pd.DataFrame(), None, {"unique_point_count": 1, "economic_eligible_point_count": 1, "event_eligible_point_count": 1, "plateau_count": 0, "ready_candidate_count": 0}))
+    assert analysis.execute("select facts_state, unique_point_count, economic_eligible_point_count from analysis_run_facts where run_id=?", [computed.run_id]).fetchone() == ("COMPUTED", 1, 1)
+    with pytest.raises(ValueError, match="facts"):
+        publish_analysis_run(analysis, replace(PipelineResult(surface.surface_id, "v2", {}, pd.DataFrame(), pd.DataFrame(), None, {"unique_point_count": 2, "economic_eligible_point_count": 1, "event_eligible_point_count": 1, "plateau_count": 0, "ready_candidate_count": 0})))
+
+
+def test_library_filters_and_compare_keep_run_facts_separate(connections) -> None:
+    from mrs3.analysis_storage import compare_analysis_runs, list_surface_library, publish_analysis_run, publish_surface
+    from mrs3.pipeline import PipelineResult
+
+    _, analysis = connections
+    first = publish_surface(analysis, _surface())
+    second = publish_surface(analysis, _surface(source_hash="b" * 64))
+    facts = {"unique_point_count": 1, "economic_eligible_point_count": 1, "event_eligible_point_count": 1, "plateau_count": 0, "ready_candidate_count": 0}
+    left = publish_analysis_run(analysis, PipelineResult(first.surface_id, "v1", {}, pd.DataFrame(), pd.DataFrame(), None, facts))
+    right = publish_analysis_run(analysis, PipelineResult(second.surface_id, "v1", {}, pd.DataFrame(), pd.DataFrame(), None, {**facts, "economic_eligible_point_count": 0}))
+    rows = list_surface_library(analysis, symbol="BTCUSDT", source_hash="b" * 64)
+    assert [row["surface_id"] for row in rows] == [second.surface_id]
+    assert rows[0]["runs"][0]["facts"].economic_eligible_point_count == 0
+    before = analysis.execute("select count(*) from plateau_lineage").fetchone()
+    comparison = compare_analysis_runs(analysis, left.run_id, right.run_id)
+    assert comparison["left"]["facts"].economic_eligible_point_count == 1
+    assert comparison["right"]["facts"].economic_eligible_point_count == 0
+    assert analysis.execute("select count(*) from plateau_lineage").fetchone() == before
 
 
 def test_repeated_run_publishes_each_explicit_lineage_comparison(connections) -> None:
@@ -331,10 +366,11 @@ def test_v1_migration_preserves_candidate_link_and_published_surface_bytes() -> 
         _v1_with_one_candidate(connection)
         before = connection.execute("select * from surfaces").fetchall(), connection.execute("select * from surface_points").fetchall()
 
-        assert ensure_analysis_schema(connection) == 2
+        assert ensure_analysis_schema(connection) == ANALYSIS_SCHEMA_VERSION
 
         assert connection.execute("select candidate_id, run_id, surface_id, candidate_json from candidates").fetchall() == [("C1", "R1", "S1", '{"legacy":true}')]
         assert connection.execute("select candidate_id, run_id, plateau_id, surface_id from candidate_plateaus").fetchall() == [("C1", "R1", "P1", "S1")]
+        assert connection.execute("select facts_state, unique_point_count, economic_eligible_point_count, event_eligible_point_count, plateau_count, ready_candidate_count, final_state from analysis_run_facts").fetchall() == [("UNAVAILABLE_LEGACY", None, None, None, None, None, "COMMITTED")]
         assert (connection.execute("select * from surfaces").fetchall(), connection.execute("select * from surface_points").fetchall()) == before
     finally:
         connection.close()
@@ -356,6 +392,27 @@ def test_v1_migration_rolls_back_on_injected_failure(monkeypatch: pytest.MonkeyP
         assert connection.execute("select candidate_id, plateau_id from candidates").fetchall() == [("C1", "P1")]
     finally:
         connection.close()
+
+
+def test_read_only_library_rejects_legacy_schema_without_migrating(tmp_path: Path) -> None:
+    from mrs3.analysis_storage import list_surface_library
+
+    database = tmp_path / "legacy.duckdb"
+    writable = duckdb.connect(str(database))
+    _v1_with_one_candidate(writable)
+    writable.close()
+
+    read_only = duckdb.connect(str(database), read_only=True)
+    try:
+        with pytest.raises(AnalysisSchemaError):
+            list_surface_library(read_only)
+    finally:
+        read_only.close()
+    check = duckdb.connect(str(database), read_only=True)
+    try:
+        assert dict(check.execute("select key, value from schema_info").fetchall())["schema_version"] == "1"
+    finally:
+        check.close()
 
 
 def test_claimed_v1_with_expected_table_names_but_wrong_schema_is_rejected(

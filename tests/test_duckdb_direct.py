@@ -251,7 +251,7 @@ def test_publication_rejects_unknown_mode_bad_hash_and_nonfinite_metrics(connect
     ):
         with pytest.raises(ValueError):
             publish_surface(analysis, invalid)
-    assert analysis.execute("select count(*) from information_schema.tables").fetchone()[0] == 14
+    assert analysis.execute("select count(*) from information_schema.tables").fetchone()[0] == 15
     assert analysis.execute("select count(*) from surfaces").fetchone() == (0,)
 
 
@@ -308,6 +308,31 @@ def test_panel_build_orders_preflight_materialization_revalidation_and_publicati
     assert calls == ["preflight", "materialize", "preflight", "publish"]
     assert phases == ["PREFLIGHT", "MATERIALIZING", "REVALIDATING", "PUBLISHED"]
     assert published.created is True
+
+
+def test_panel_refine_passes_the_explicit_chosen_parent_to_publication(
+    connections, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, analysis = connections
+    _seed_report(source)
+    captured: list[str | None] = []
+
+    def publish(_connection: duckdb.DuckDBPyConnection, surface: object):
+        captured.append(surface.parent_surface_id)  # type: ignore[attr-defined]
+        return type("Published", (), {"surface_id": "child", "points": surface.points})()
+
+    monkeypatch.setattr("mrs3.duckdb_direct.publish_surface", publish)
+
+    run_panel_direct_build(
+        source,
+        analysis,
+        _request(),
+        lambda: False,
+        lambda *_args, **_kwargs: None,
+        parent_surface_id="chosen-parent",
+    )
+
+    assert captured == ["chosen-parent"]
 
 
 def test_panel_build_rejects_source_hash_change_immediately_before_publish(

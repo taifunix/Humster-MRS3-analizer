@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 import csv
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,10 +20,16 @@ import webbrowser
 
 import duckdb
 
+from .analysis_exports import export_analysis_run
+from .analysis_storage import compare_analysis_runs, ensure_analysis_schema, list_surface_library, publish_analysis_run
+from .config import AlgorithmConfig
 from .config import DuckDBImportSettings, load_duckdb_import_settings, save_duckdb_import_settings
 from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, import_html_tree, preflight_html_import
 from .duckdb_source_schema import migrate_source_database
 from .duckdb_direct import DirectBuildRequest, DirectMaterializationError, DirectPreflight, preflight_duckdb_direct, run_panel_direct_build
+from .models import Side
+from .pipeline import run_published_pipeline
+from .published_surface import load_published_surface
 
 
 _DIRECT_MATERIALIZER_VERSION = "v1"
@@ -217,6 +223,20 @@ PANEL_HTML = r"""<!doctype html>
             <div class="buttons"><button type="button" onclick="directPreflight()">Check coverage</button><button type="button" class="primary" onclick="directBuild()">Build surface</button><button type="button" onclick="directCancel()">Cancel</button></div>
             <div id="directCoverage" role="group" aria-label="Direct surface symbols"></div><div id="directStatus" class="muted" aria-live="polite">No direct build.</div>
           </div></details>
+          <details><summary>Analysis Library</summary><div class="stack">
+            <div class="row"><label>Side<select id="analysis_side"><option value="">Any</option><option>LONG</option><option>SHORT</option></select></label><label>Build mode<select id="analysis_build_mode"><option value="">Any</option><option>DUCKDB_DIRECT</option></select></label></div><label>Symbol<input id="analysis_symbol" type="text"></label>
+            <div class="row"><label>Period start<input id="analysis_period_start" type="datetime-local"></label><label>Period end<input id="analysis_period_end" type="datetime-local"></label></div>
+            <div class="row"><label>Parent surface<input id="analysis_parent" type="text"></label><label>Source hash<input id="analysis_source_hash" type="text"></label></div>
+            <div class="buttons"><button type="button" onclick="analysisInitialize()">Initialize / migrate v3</button><button type="button" onclick="analysisRefresh()">Refresh library</button></div>
+            <label>Surface ID<input id="analysis_surface_id" type="text"></label><label>Run ID<input id="analysis_run_id" type="text"></label>
+            <div class="stats"><div class="stat"><b id="analysis_unique">—</b><span>unique points</span></div><div class="stat"><b id="analysis_economic">—</b><span>economic eligible</span></div><div class="stat"><b id="analysis_event">—</b><span>event eligible</span></div><div class="stat"><b id="analysis_plateaus">—</b><span>plateaus</span></div><div class="stat"><b id="analysis_ready">—</b><span>READY</span></div></div>
+            <label>Listing dates<div class="path-control"><input id="analysis_dates" type="text"><button type="button" class="secondary" onclick="browse('analysis_dates','dates',false)">Browse…</button></div></label>
+            <label>Algorithm config<div class="path-control"><input id="analysis_config" type="text"><button type="button" class="secondary" onclick="browse('analysis_config','config',false)">Browse…</button></div></label>
+            <label>Export directory<div class="path-control"><input id="analysis_output" type="text"><button type="button" class="secondary" onclick="browse('analysis_output','directory',false)">Browse…</button></div></label>
+            <div class="row"><label>Left run<input id="analysis_left_run" type="text"></label><label>Right run<input id="analysis_right_run" type="text"></label></div>
+            <div class="buttons"><button type="button" onclick="analysisRefine()">Refine</button><button type="button" class="primary" onclick="analysisRerun()">Re-run analysis</button><button type="button" onclick="analysisCompare()">Compare periods</button><button type="button" onclick="analysisExport()">Export</button></div>
+            <div id="analysisLibrary"></div><div id="analysisStatus" class="muted" aria-live="polite">No analysis selected.</div>
+          </div></details>
         </div>
       </section>
       <section role="tabpanel" id="panel-candidates" aria-labelledby="tab-candidates" hidden>
@@ -335,8 +355,19 @@ function renderDirectCoverage(result) {
   for (const symbol of Object.keys(result.unavailable_symbols || {})) { const row=document.createElement('div'); row.className='direct-unavailable'; const reasons=(result.coverage_issues || []).filter(item=>item.symbol===symbol).map(item=>`${item.code}: ${item.detail}`).join('; '); row.textContent=`⚠ ${symbol} · ${reasons || 'unavailable'}`; target.appendChild(row); }
 }
 async function directPreflight() { try { const result=await duckdbRequest('/api/duckdb-direct/preflight', directPayload()); directPreflightToken=result.token; renderDirectCoverage(result); document.getElementById('directStatus').textContent='Coverage checked.'; } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
-async function directBuild() { try { const selected=[...document.querySelectorAll('input[name="direct_selected_symbol"]:checked')].map(item=>item.value); render(await duckdbRequest('/api/duckdb-direct/start', {...directPayload(), preflight_token:directPreflightToken, selected_symbols:selected})); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+async function directBuild(parentSurfaceId='') { try { const selected=[...document.querySelectorAll('input[name="direct_selected_symbol"]:checked')].map(item=>item.value); const payload={...directPayload(), preflight_token:directPreflightToken, selected_symbols:selected}; if(parentSurfaceId) payload.parent_surface_id=parentSurfaceId; render(await duckdbRequest('/api/duckdb-direct/start', payload)); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
 async function directCancel() { try { render(await duckdbRequest('/api/duckdb-direct/cancel')); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+function showAnalysisFacts(facts={}) { for (const [id,key] of [['analysis_unique','unique_point_count'],['analysis_economic','economic_eligible_point_count'],['analysis_event','event_eligible_point_count'],['analysis_plateaus','plateau_count'],['analysis_ready','ready_candidate_count']]) document.getElementById(id).textContent=facts[key] ?? '—'; }
+function renderAnalysisLibrary(rows) {
+  const target=document.getElementById('analysisLibrary'); target.replaceChildren();
+  for(const surface of rows) { const button=document.createElement('button'); button.type='button'; button.className='secondary'; button.textContent=`${surface.period_start_utc} → ${surface.period_end_utc} · ${surface.side} · ${surface.unique_point_count} points`; button.onclick=()=>{ document.getElementById('analysis_surface_id').value=surface.surface_id; const run=(surface.runs||[])[0]; document.getElementById('analysis_run_id').value=run?.run_id||''; showAnalysisFacts(run?.facts||{unique_point_count:surface.unique_point_count}); document.getElementById('analysisStatus').textContent=`parent=${surface.parent_surface_id||'none'} · sources=${(surface.source_hashes||[]).length} · coverage=${(surface.coverage_reasons||[]).join(', ')||'OK'} · final=${run?.facts?.final_state||run?.facts?.facts_state||'surface only'}`; }; target.appendChild(button); }
+}
+async function analysisRefresh() { try { const rows=await duckdbRequest('/api/analysis/library',{side:value('analysis_side'),build_mode:value('analysis_build_mode'),symbol:value('analysis_symbol'),period_start_utc:value('analysis_period_start'),period_end_utc:value('analysis_period_end'),parent_surface_id:value('analysis_parent'),source_hash:value('analysis_source_hash')}); renderAnalysisLibrary(rows); document.getElementById('analysisStatus').textContent=`${rows.length} surfaces`; } catch(error){ document.getElementById('analysisStatus').textContent=error.message; } }
+async function analysisInitialize(){ try { const result=await duckdbRequest('/api/analysis/initialize',{}); document.getElementById('analysisStatus').textContent=`Analysis schema v${result.schema_version} ready.`; } catch(error){ document.getElementById('analysisStatus').textContent=error.message; } }
+function analysisRefine(){ const parent=value('analysis_surface_id'); if(!parent){ document.getElementById('analysisStatus').textContent='Select a parent surface.'; return; } directBuild(parent); }
+async function analysisRerun(){ try { render(await duckdbRequest('/api/analysis/rerun',{surface_id:value('analysis_surface_id'),dates_path:value('analysis_dates'),config_path:value('analysis_config'),comparison_run_id:value('analysis_left_run')})); } catch(error){ document.getElementById('analysisStatus').textContent=error.message; } }
+async function analysisCompare(){ try { const result=await duckdbRequest('/api/analysis/compare',{left_run_id:value('analysis_left_run'),right_run_id:value('analysis_right_run')}); document.getElementById('analysisStatus').textContent=JSON.stringify(result); } catch(error){ document.getElementById('analysisStatus').textContent=error.message; } }
+async function analysisExport(){ try { const result=await duckdbRequest('/api/analysis/export',{run_id:value('analysis_run_id'),output_path:value('analysis_output')}); document.getElementById('analysisStatus').textContent=`Exported ${result.output} · ${result.manifest}`; } catch(error){ document.getElementById('analysisStatus').textContent=error.message; } }
 function renderDashboard(dashboard) {
   const target = document.getElementById('decisionDashboard'); target.replaceChildren();
   const order = ['csv', 'duckdb', 'candidates', 'tester', 'posttest'];
@@ -358,6 +389,8 @@ function render(data) {
   renderDashboard(data.dashboard);
   const imported = data.duckdb_import;
   if (imported) { document.getElementById('duckdbImportStatus').textContent = `${imported.final_state} · safe_to_delete=${imported.safe_to_delete}`; for (const [name, count] of Object.entries(imported.counts || {})) { const item=document.getElementById('import_'+name); if (item) item.textContent=count; } }
+  const analysis = data.analysis;
+  if (analysis) { document.getElementById('analysis_surface_id').value=analysis.surface_id||''; if(analysis.run_id) document.getElementById('analysis_run_id').value=analysis.run_id; showAnalysisFacts(analysis.statistics||{}); document.getElementById('analysisStatus').textContent=`${analysis.phase}${analysis.run_id?' · '+analysis.run_id:''}${analysis.error?' · '+analysis.error:''}`; }
   const direct = data.duckdb_direct;
   if (direct) document.getElementById('directStatus').textContent = `${direct.phase} · points=${direct.point_count || 0}${direct.surface_id ? ' · '+direct.surface_id : ''}`;
   const job = data.job;
@@ -479,6 +512,20 @@ class _DirectJob:
     point_count: int = 0
     publication_state: str = "PENDING"
     error: str | None = None
+    parent_surface_id: str | None = None
+
+
+@dataclass(slots=True)
+class _AnalysisJob:
+    surface_id: str
+    dates_path: Path
+    config_path: Path
+    comparison_run_id: str | None = None
+    running: bool = True
+    phase: str = "STARTING"
+    run_id: str | None = None
+    statistics: dict[str, int] = field(default_factory=dict)
+    error: str | None = None
 
 class PanelController:
     def __init__(
@@ -493,6 +540,13 @@ class PanelController:
         direct_connection_factory: Callable[..., duckdb.DuckDBPyConnection] = duckdb.connect,
         direct_preflight_func: Callable[[duckdb.DuckDBPyConnection, DirectBuildRequest], DirectPreflight] = preflight_duckdb_direct,
         direct_build_func: Callable[..., object] = run_panel_direct_build,
+        analysis_library_func: Callable[..., object] = list_surface_library,
+        analysis_compare_func: Callable[..., object] = compare_analysis_runs,
+        analysis_load_func: Callable[..., object] = load_published_surface,
+        analysis_run_func: Callable[..., object] = run_published_pipeline,
+        analysis_publish_func: Callable[..., object] = publish_analysis_run,
+        analysis_export_func: Callable[..., object] = export_analysis_run,
+        analysis_config_loader: Callable[[Path], object] = AlgorithmConfig.from_json,
     ) -> None:
         self.root = root.resolve()
         self.default_config = self._path(default_config)
@@ -514,6 +568,14 @@ class PanelController:
         self._direct_build_func = direct_build_func
         self._direct_preflight: tuple[DirectBuildRequest, DirectPreflight, str] | None = None
         self._direct_job: _DirectJob | None = None
+        self._analysis_job: _AnalysisJob | None = None
+        self._analysis_library_func = analysis_library_func
+        self._analysis_compare_func = analysis_compare_func
+        self._analysis_load_func = analysis_load_func
+        self._analysis_run_func = analysis_run_func
+        self._analysis_publish_func = analysis_publish_func
+        self._analysis_export_func = analysis_export_func
+        self._analysis_config_loader = analysis_config_loader
 
     @staticmethod
     def _section(action: str) -> str:
@@ -833,6 +895,35 @@ class PanelController:
         except (duckdb.Error, OSError) as error:
             raise ValueError("direct preflight failed") from error
 
+    def _analysis_path(self) -> Path:
+        analysis = self._import_settings().analysis_duckdb_path
+        if analysis is None:
+            raise ValueError("analysis_duckdb_path must be configured")
+        return analysis
+
+    def _with_analysis(self, read_only: bool, callback: Callable[[duckdb.DuckDBPyConnection], object]) -> object:
+        try:
+            connection = self._direct_connection_factory(str(self._analysis_path()), read_only=read_only)
+        except (duckdb.Error, OSError) as error:
+            raise ValueError("analysis database is unavailable") from error
+        try:
+            try:
+                return callback(connection)
+            except (duckdb.Error, OSError) as error:
+                raise ValueError("analysis operation failed") from error
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _jsonable(value: object) -> object:
+        if is_dataclass(value):
+            return PanelController._jsonable(asdict(value))
+        if isinstance(value, Mapping):
+            return {str(key): PanelController._jsonable(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [PanelController._jsonable(item) for item in value]
+        return value
+
     @staticmethod
     def _direct_preflight_document(request: DirectBuildRequest, preflight: DirectPreflight, token: str) -> dict[str, object]:
         return {"token": token, "selected_symbols": list(preflight.usable_timeframes), "usable_timeframes": {key: list(value) for key, value in preflight.usable_timeframes.items()}, "unavailable_symbols": {key: list(value) for key, value in preflight.unavailable_symbols.items()}, "coverage_issues": [{"symbol": item.symbol, "timeframe": item.timeframe, "code": item.code, "detail": item.detail} for item in preflight.coverage_issues]}
@@ -847,6 +938,7 @@ class PanelController:
 
     def start_duckdb_direct(self, payload: Mapping[str, object]) -> dict[str, object]:
         request, token = self._direct_request(payload), self._required(payload, "preflight_token")
+        parent_surface_id = self._optional_string(payload, "parent_surface_id") or None
         with self._lock:
             if self._direct_job and self._direct_job.running: raise RuntimeError("another direct build is already running")
             if self._direct_preflight is None: raise ValueError("latest preflight token is required")
@@ -856,7 +948,22 @@ class PanelController:
             selected = self._direct_request({**payload, "symbols": chosen})
             if replace(selected, symbols=request.symbols) != request: raise ValueError("latest preflight token is required")
             if not set(selected.symbols).issubset(preflight.usable_timeframes): raise ValueError("selected symbol is unavailable")
-            job = _DirectJob(selected, original, preflight); self._direct_job = job
+        if parent_surface_id is not None:
+            exists = self._with_analysis(
+                True,
+                lambda connection: connection.execute(
+                    "select 1 from surfaces where surface_id=?", [parent_surface_id]
+                ).fetchone(),
+            )
+            if exists is None:
+                raise ValueError("unknown parent surface")
+        with self._lock:
+            if self._direct_job and self._direct_job.running:
+                raise RuntimeError("another direct build is already running")
+            if self._direct_preflight != (original, preflight, expected):
+                raise ValueError("latest preflight token is required")
+            job = _DirectJob(selected, original, preflight, parent_surface_id=parent_surface_id)
+            self._direct_job = job
         threading.Thread(target=self._run_duckdb_direct, args=(job,), name="mrs3-panel-duckdb-direct", daemon=True).start()
         return self.snapshot()
 
@@ -871,7 +978,13 @@ class PanelController:
             analysis = self._direct_connection_factory(str(analysis_path), read_only=False)
             def progress(phase: str, **facts: object) -> None:
                 with self._lock: job.phase = phase; job.point_count = int(facts.get("materialized_points", job.point_count))
-            published = self._direct_build_func(source, analysis, job.request, job.cancel.is_set, progress)
+            if job.parent_surface_id is None:
+                published = self._direct_build_func(source, analysis, job.request, job.cancel.is_set, progress)
+            else:
+                published = self._direct_build_func(
+                    source, analysis, job.request, job.cancel.is_set, progress,
+                    parent_surface_id=job.parent_surface_id,
+                )
             with self._lock:
                 job.surface_id, job.point_count, job.phase, job.publication_state = str(published.surface_id), len(published.points), "PUBLISHED", "PUBLISHED"
         except BaseException as error:
@@ -889,6 +1002,79 @@ class PanelController:
             if self._direct_job is None: raise ValueError("no direct build")
             self._direct_job.cancel.set()
         return self.snapshot()["duckdb_direct"]
+
+    def analysis_library(self, payload: Mapping[str, object]) -> object:
+        allowed = ("side", "period_start_utc", "period_end_utc", "symbol", "build_mode", "parent_surface_id", "source_hash")
+        filters = {name: self._optional_string(payload, name) for name in allowed}
+        filters = {name: value for name, value in filters.items() if value}
+        if "side" in filters:
+            filters["side"] = filters["side"].upper()
+            if filters["side"] not in {"LONG", "SHORT"}:
+                raise ValueError("side must be LONG or SHORT")
+        rows = self._with_analysis(True, lambda connection: self._analysis_library_func(connection, **filters))
+        return self._jsonable(rows)
+
+    def initialize_analysis(self) -> dict[str, int]:
+        version = self._with_analysis(False, ensure_analysis_schema)
+        return {"schema_version": int(version)}
+
+    def compare_analysis(self, payload: Mapping[str, object]) -> object:
+        left = self._required(payload, "left_run_id")
+        right = self._required(payload, "right_run_id")
+        result = self._with_analysis(True, lambda connection: self._analysis_compare_func(connection, left, right))
+        return self._jsonable(result)
+
+    def export_analysis(self, payload: Mapping[str, object]) -> dict[str, object]:
+        run_id = self._required(payload, "run_id")
+        output = self._path(self._required(payload, "output_path"))
+        result = self._with_analysis(True, lambda connection: self._analysis_export_func(connection, run_id, output))
+        return {
+            "run_id": str(result.run_id), "surface_id": str(result.surface_id),
+            "output": Path(result.output_path).name, "manifest": Path(result.manifest_path).name,
+            "row_counts": dict(result.row_counts),
+        }
+
+    def start_analysis_rerun(self, payload: Mapping[str, object]) -> dict[str, object]:
+        job = _AnalysisJob(
+            self._required(payload, "surface_id"),
+            self._path(self._required(payload, "dates_path")),
+            self._path(self._required(payload, "config_path")),
+            self._optional_string(payload, "comparison_run_id") or None,
+        )
+        with self._lock:
+            if self._analysis_job and self._analysis_job.running:
+                raise RuntimeError("another analysis is already running")
+            self._analysis_job = job
+        threading.Thread(target=self._run_analysis, args=(job,), name="mrs3-panel-analysis", daemon=True).start()
+        return self.snapshot()
+
+    def _run_analysis(self, job: _AnalysisJob) -> None:
+        connection = None
+        try:
+            connection = self._direct_connection_factory(str(self._analysis_path()), read_only=False)
+            with self._lock: job.phase = "LOADING"
+            loaded = self._analysis_load_func(connection, job.surface_id)
+            side = Side(str(loaded.points["side"].iloc[0]))
+            config = self._analysis_config_loader(job.config_path)
+            with self._lock: job.phase = "ANALYZING"
+            result = self._analysis_run_func(
+                loaded, job.dates_path, side, config,
+                comparison_run_id=job.comparison_run_id,
+            )
+            if str(result.surface_id) != job.surface_id:
+                raise ValueError("analysis changed immutable surface")
+            with self._lock: job.phase = "PUBLISHING"
+            published = self._analysis_publish_func(connection, result)
+            with self._lock:
+                job.run_id = str(published.run_id)
+                job.statistics = {str(key): int(value) for key, value in (result.statistics or {}).items()}
+                job.phase = "COMMITTED"
+        except BaseException as error:
+            with self._lock:
+                job.phase, job.error = "FAILED", f"{type(error).__name__}: analysis failed"
+        finally:
+            if connection is not None: connection.close()
+            with self._lock: job.running = False
 
     def start(self, action: str, payload: Mapping[str, object]) -> dict[str, object]:
         command, artifacts = self._build_command(action, payload)
@@ -1236,7 +1422,17 @@ class PanelController:
                 "point_count": direct_job.point_count,
                 "surface_id": direct_job.surface_id,
                 "publication_state": direct_job.publication_state,
+                "parent_surface_id": direct_job.parent_surface_id,
                 "error": direct_job.error,
+            }
+            analysis_job = self._analysis_job
+            analysis_document = None if analysis_job is None else {
+                "running": analysis_job.running,
+                "phase": analysis_job.phase,
+                "surface_id": analysis_job.surface_id,
+                "run_id": analysis_job.run_id,
+                "statistics": dict(analysis_job.statistics),
+                "error": analysis_job.error,
             }
         return {
             "defaults": {
@@ -1246,6 +1442,7 @@ class PanelController:
             "job": job_document,
             "duckdb_import": import_document,
             "duckdb_direct": direct_document,
+            "analysis": analysis_document,
             "dashboard": dashboard,
         }
 
@@ -1365,7 +1562,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/initialize", "/api/analysis/library", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -1406,6 +1603,16 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.start_duckdb_direct(document)
             elif endpoint == "/api/duckdb-direct/cancel":
                 result = self.server.controller.cancel_duckdb_direct()
+            elif endpoint == "/api/analysis/library":
+                result = self.server.controller.analysis_library(document)
+            elif endpoint == "/api/analysis/initialize":
+                result = self.server.controller.initialize_analysis()
+            elif endpoint == "/api/analysis/rerun":
+                result = self.server.controller.start_analysis_rerun(document)
+            elif endpoint == "/api/analysis/compare":
+                result = self.server.controller.compare_analysis(document)
+            elif endpoint == "/api/analysis/export":
+                result = self.server.controller.export_analysis(document)
             else:
                 action = str(document.get("action", ""))
                 result = self.server.controller.start(action, document)
@@ -1415,7 +1622,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             self._json(400, {"error": str(error)})
             return
-        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start"} else 200, result)
+        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun"} else 200, result)
 
 
 def create_panel_server(

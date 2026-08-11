@@ -69,6 +69,114 @@ def _wait_direct_finished(controller: PanelController) -> dict[str, object]:
     raise AssertionError("panel direct build did not finish")
 
 
+def _wait_analysis_finished(controller: PanelController) -> dict[str, object]:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        document = controller.snapshot()["analysis"]
+        if document and not document["running"]:
+            return document
+        time.sleep(.01)
+    raise AssertionError("panel analysis did not finish")
+
+
+def test_analysis_library_rerun_compare_and_export_use_only_analysis_database(tmp_path: Path) -> None:
+    opened: list[tuple[str, bool]] = []
+    calls: list[object] = []
+
+    class Connection:
+        def close(self) -> None: pass
+
+    def connect(path: str, *, read_only: bool) -> Connection:
+        opened.append((Path(path).name, read_only)); return Connection()
+
+    class Points:
+        def __getitem__(self, _key: str) -> object:
+            return SimpleNamespace(iloc=["LONG"])
+
+    points = Points()
+    pipeline_input = SimpleNamespace(surface_id="surface-1", points=points)
+    pipeline_result = SimpleNamespace(surface_id="surface-1", statistics={
+        "unique_point_count": 12, "economic_eligible_point_count": 10,
+        "event_eligible_point_count": 8, "plateau_count": 3,
+        "ready_candidate_count": 2,
+    })
+
+    controller = PanelController(
+        tmp_path, tmp_path / "config.local.json",
+        direct_connection_factory=connect,
+        analysis_library_func=lambda _connection, **filters: calls.append(("library", filters)) or ({"surface_id": "surface-1", "runs": ()},),
+        analysis_compare_func=lambda _connection, left, right: calls.append(("compare", left, right)) or {"left": {"run_id": left}, "right": {"run_id": right}},
+        analysis_load_func=lambda _connection, surface_id: calls.append(("load", surface_id)) or pipeline_input,
+        analysis_run_func=lambda loaded, dates, side, config, comparison_run_id=None: calls.append(("run", loaded.surface_id, side.value, comparison_run_id)) or pipeline_result,
+        analysis_publish_func=lambda _connection, result: calls.append(("publish", result.surface_id)) or SimpleNamespace(run_id="run-2", surface_id=result.surface_id),
+        analysis_export_func=lambda _connection, run_id, output: calls.append(("export", run_id, Path(output).name)) or SimpleNamespace(output_path=Path(output), manifest_path=Path(output) / "manifest.json", run_id=run_id, surface_id="surface-1", row_counts={"surface_points": 12}),
+        analysis_config_loader=lambda path: calls.append(("config", Path(path).name)) or object(),
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+
+    assert controller.analysis_library({"side": "LONG", "symbol": "BTCUSDT"})[0]["surface_id"] == "surface-1"
+    comparison = controller.compare_analysis({"left_run_id": "run-1", "right_run_id": "run-2"})
+    assert comparison == {"left": {"run_id": "run-1"}, "right": {"run_id": "run-2"}}
+    exported = controller.export_analysis({"run_id": "run-2", "output_path": str(tmp_path / "export")})
+    assert exported["manifest"] == "manifest.json"
+    controller.start_analysis_rerun({"surface_id": "surface-1", "dates_path": "dates.csv", "config_path": "config.json", "comparison_run_id": "run-1"})
+    status = _wait_analysis_finished(controller)
+    assert status["surface_id"] == "surface-1" and status["run_id"] == "run-2"
+    assert status["statistics"]["ready_candidate_count"] == 2
+    assert opened == [
+        ("analysis.duckdb", True), ("analysis.duckdb", True),
+        ("analysis.duckdb", True), ("analysis.duckdb", False),
+    ]
+    assert all(name != "source.duckdb" for name, _ in opened)
+
+
+def test_analysis_refine_validates_and_passes_explicit_parent_before_source_work(tmp_path: Path) -> None:
+    opened: list[tuple[str, bool]] = []
+    parents: list[str | None] = []
+
+    class Connection:
+        def __init__(self, analysis: bool) -> None: self.analysis = analysis
+        def execute(self, _query: str, values: object = None) -> object:
+            return SimpleNamespace(fetchone=lambda: (1,) if values == ["surface-1"] else None)
+        def close(self) -> None: pass
+
+    def connect(path: str, *, read_only: bool) -> Connection:
+        opened.append((Path(path).name, read_only)); return Connection(Path(path).name == "analysis.duckdb")
+
+    preflight = DirectPreflight(
+        {"BTCUSDT": ("1h",)}, {}, (), MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}),
+        ("a" * 64,), (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",),
+    )
+    def build(*_args: object, parent_surface_id: str | None = None) -> object:
+        parents.append(parent_surface_id); return SimpleNamespace(surface_id="surface-2", points=(object(),))
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", direct_connection_factory=connect, direct_preflight_func=lambda *_: preflight, direct_build_func=build)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+    payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
+    token = controller.duckdb_direct_preflight(payload)["token"]
+    with pytest.raises(ValueError, match="unknown parent surface"):
+        controller.start_duckdb_direct({**payload, "preflight_token": token, "parent_surface_id": "missing"})
+    assert opened == [("source.duckdb", True), ("analysis.duckdb", True)]
+    controller.start_duckdb_direct({**payload, "preflight_token": token, "parent_surface_id": "surface-1"})
+    assert _wait_direct_finished(controller)["surface_id"] == "surface-2"
+    assert parents == ["surface-1"]
+
+
+def test_analysis_library_ui_and_routes_are_exposed() -> None:
+    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+    for marker in ("Analysis Library", "analysis_side", "analysis_symbol", "analysis_surface_id", "analysis_run_id", "analysis_dates", "analysis_config", "analysis_output", "analysis_unique", "analysis_economic", "analysis_event", "analysis_plateaus", "analysis_ready", "analysisStatus"):
+        assert marker in html
+    for endpoint in ("/api/analysis/initialize", "/api/analysis/library", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export"):
+        assert endpoint in html or endpoint in __import__("mrs3.panel", fromlist=["_PanelHandler"])._PanelHandler.do_POST.__code__.co_consts
+
+
+def test_analysis_schema_initialization_is_explicit_and_library_then_reads_only(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    controller.duckdb_import_settings({"analysis_duckdb_path": "analysis.duckdb"})
+    assert controller.initialize_analysis() == {"schema_version": 3}
+    assert controller.analysis_library({}) == []
+
+
 def test_direct_build_requires_matching_latest_preflight_and_closes_distinct_connections(tmp_path: Path) -> None:
     connections: list[tuple[str, bool, object]] = []
 

@@ -207,6 +207,7 @@ The append-only analysis store contains at minimum:
 - `coverage_issues`;
 - `dedup_decisions`;
 - `analysis_runs`;
+- `analysis_run_facts`;
 - `plateaus`;
 - `plateau_members`;
 - `candidates`;
@@ -222,6 +223,14 @@ transaction: existing candidates retain their prior plateau link, published
 surfaces and `surface_points` are unchanged, and any failure leaves the v1
 store readable. Additional candidate memberships are never hidden only in
 JSON.
+
+Analysis schema v3 adds one immutable `analysis_run_facts` row per run for
+unique-point, economic-eligible, event-eligible, plateau and READY-candidate
+counts plus final state. These run results cannot be reconstructed by a
+read-only library query from v2 after the external listing-date input is gone.
+The v2 → v3 migration derives only facts already present in the analysis DB
+and marks unavailable legacy eligibility counts explicitly; it never invents
+them or reopens the source DB.
 
 ## Surface identity and publication
 
@@ -301,6 +310,11 @@ specific immutable surface or analysis run.
 - Panel tests cover settings persistence, import preflight/progress, single-job
   enforcement, coverage warnings, surface statistics and stale-preflight
   rejection.
+- Task 14 tests cover the explicit writable v3 initialization/migration action,
+  read-only library/compare/export paths, immutable-surface analysis re-runs,
+  explicit refinement parentage, separate period facts and byte-stable exports.
+  Focused evidence is `104 passed`; independent Terra review approved after
+  the read-only migration boundary was separated from schema initialization.
 
 ## Non-goals
 

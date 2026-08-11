@@ -155,6 +155,17 @@ targets add idempotent lineage without copying points. Focused verification is
 to unavailable Windows symlink privilege. Independent Terra review approved
 after two fix rounds.
 
+Task 14 library, statistics and deterministic exports is complete. Analysis
+schema v3 stores immutable per-run point/eligibility/plateau/READY facts and
+atomically migrates v1/v2 history as explicitly unavailable rather than
+inventing eligibility counts. The panel exposes an explicit writable v3
+initialization/migration action; library, compare and export then remain
+read-only, while re-run analysis reuses the same immutable surface without
+opening the source DB. Refine requires an explicit existing parent surface.
+CSV/XLSX exports are byte-stable generated artifacts with a hashed manifest,
+not canonical storage. Focused evidence is `104 passed`; independent Terra
+review approved after one fix round.
+
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
 included cycles. The package has `source_summary_status=VERIFIED` and
@@ -176,14 +187,11 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1–13 are complete.
+slice; Tasks 1–14 are complete.
 
-1. Implement Task 14 library, statistics and deterministic exports from the
-   [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
-   plus **Refine**, **Re-run analysis** and **Compare periods** in an
-   independently reviewed TDD slice.
-2. Complete Task 15 verification and documentation.
-3. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
+1. Complete Task 15 verification and documentation, including the copied-real-
+   data smoke and final full-suite evidence.
+2. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
 
 ## Blockers
 

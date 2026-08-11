@@ -1,7 +1,7 @@
 """Read-only preflight and in-memory materialization for direct v5 source reports."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Callable, Mapping
 
@@ -196,6 +196,8 @@ def run_panel_direct_build(
     request: DirectBuildRequest,
     cancellation: Callable[[], bool],
     progress_callback: Callable[..., object],
+    *,
+    parent_surface_id: str | None = None,
 ) -> PublishedSurface:
     """Build and atomically publish a preflight-bound direct surface."""
     if source_connection is analysis_connection:
@@ -216,6 +218,8 @@ def run_panel_direct_build(
         raise DirectMaterializationError("active source changed after preflight")
     if cancellation():
         raise DirectMaterializationError("direct materialization cancelled before publication")
+    if parent_surface_id is not None:
+        surface = replace(surface, parent_surface_id=parent_surface_id)
     published = publish_surface(analysis_connection, surface)
     progress_callback("PUBLISHED", materialized_points=len(published.points), publication_state="PUBLISHED")
     return published
