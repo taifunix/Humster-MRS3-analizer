@@ -56,9 +56,10 @@ def _reserved_margin(
     Заявки снимаются в двух случаях: слоты заняты (лимит достигнут) и встречная
     сторона по паре уже в позиции при ``cancel_opposite``.
 
-    ``exclude`` убирает из суммы стратегию, чью новую заявку проверяют отдельно:
-    иначе её маржа посчиталась бы дважды — как висящая заявка и как открываемая
-    позиция.
+    ``exclude`` снимает у одной стратегии резерв **под висящую заявку**: её
+    номинал в гейте входа прибавляется отдельно, иначе счёт был бы двойным.
+    Уже открытые позиции той же стратегии при этом остаются в сумме — при
+    перекрывающихся циклах они занимают маржу независимо от новой заявки.
 
     Позиции суммируются, а не берутся по одной на стратегию: журнал может
     содержать перекрывающиеся циклы, и каждый из них занимает маржу.
@@ -69,9 +70,12 @@ def _reserved_margin(
     pairs_in_position = {(o.pair, o.side) for o in open_positions}
     total = 0.0
     for m in members:
-        if m.strategy_id == exclude:
-            continue
         held = position_margin.get(m.strategy_id)
+        if m.strategy_id == exclude:
+            # позиции считаем, резерв под новую заявку — нет
+            if held is not None:
+                total += held * m.imr
+            continue
         if held is not None:
             total += held * m.imr
             continue
@@ -86,9 +90,15 @@ def _reserved_margin(
 
 
 def _slots_used(open_positions: list[_Open], cfg: RunConfig) -> int:
+    """Сколько слотов занято.
+
+    По умолчанию слот равен позиции. При ``long_short_same_slot`` обе стороны
+    одной пары считаются за один слот — это открытый вопрос по контракту
+    ограничителя, поэтому вынесен в настройку.
+    """
     if not cfg.long_short_same_slot:
         return len(open_positions)
-    return len({(o.pair, o.side) if False else o.pair for o in open_positions})
+    return len({o.pair for o in open_positions})
 
 
 def simulate_set(
@@ -111,10 +121,15 @@ def simulate_set(
 
     # §10.2: при совпадении времени решает приоритет по PnL30_DD5, убыванию.
     # Алфавитный порядок здесь был бы произволом.
+    #
+    # Нормировка на DD берётся из конфига. На сам порядок она не влияет —
+    # общий положительный множитель ранжирование не меняет, — но держать её
+    # согласованной с гейтом дешевле, чем потом объяснять расхождение.
     def _priority_key(m: StrategyInput) -> tuple[float, float, str]:
         days = max(m.d_eff_days, 1e-9)
-        pnl30_dd5 = m.pnl_pct * 5.0 / m.dd_pct * 30.0 / days if m.dd_pct else 0.0
-        return (-pnl30_dd5, m.lot_x_base, m.strategy_id)
+        norm = cfg.dd_target_pct
+        pnl_dd = m.pnl_pct * norm / m.dd_pct * 30.0 / days if m.dd_pct else 0.0
+        return (-pnl_dd, m.lot_x_base, m.strategy_id)
 
     priority = {
         m.strategy_id: i

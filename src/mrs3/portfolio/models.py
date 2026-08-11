@@ -79,13 +79,20 @@ class StrategyInput:
         if not 0 < self.mmr < self.imr <= 1:
             raise ValueError(f"{self.strategy_id}: expected 0 < mmr < imr <= 1")
 
+    def _require_trades(self) -> list[TradeRecord]:
+        if not self.trades:
+            raise ValueError(
+                f"{self.strategy_id}: журнал сделок пуст, окно истории не определено"
+            )
+        return self.trades
+
     @property
     def window_start(self) -> datetime:
-        return min(t.entry_ts for t in self.trades)
+        return min(t.entry_ts for t in self._require_trades())
 
     @property
     def window_end(self) -> datetime:
-        return max(t.exit_ts for t in self.trades)
+        return max(t.exit_ts for t in self._require_trades())
 
     @property
     def d_eff_days(self) -> float:

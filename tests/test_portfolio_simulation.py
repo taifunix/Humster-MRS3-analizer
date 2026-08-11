@@ -369,3 +369,88 @@ def test_single_day_history_does_not_divide_by_zero():
     assert member.d_eff_days > 0
     assert member.trades_per_day > 0
     assert member.occupancy > 0
+
+
+# --- вторая волна ревью ---------------------------------------------------
+
+
+def test_gate_counts_existing_position_of_entering_strategy():
+    """При перекрытии циклов уже открытая позиция входящей стратегии учитывается.
+
+    `exclude` обязан снимать только резерв под новую заявку, а не всю маржу
+    стратегии: иначе второй вход проходил бы гейт, которого не должен пройти.
+    """
+    overlapping = StrategyInput(
+        strategy_id="A", pair="XUSDT", side="LONG", timeframe="1h",
+        lot_x_base=0.4, pnl_pct=10.0, dd_pct=5.0, turnover_24h=50_000_000.0,
+        trades=[
+            TradeRecord("A", T0, T0 + timedelta(hours=10), 0.01),
+            TradeRecord("A", T0 + timedelta(hours=1), T0 + timedelta(hours=11), 0.01),
+        ],
+    )
+    one_position = 0.4 * 0.05          # lot * imr
+    cfg = RunConfig(
+        deposit=1000.0, limiters=(2,), margin_limit=one_position * 1.5,
+        d_eff_common_min_days=0.0, oos_min_days=1e9,
+    )
+    result = simulate_set([overlapping], 2, {"A": 0.4}, cfg)
+    outcome = result.outcomes[0]
+    assert outcome.accepted == 1
+    assert outcome.blocked_margin == 1
+
+
+def test_priority_order_is_scale_invariant_in_dd_target():
+    """Нормировка на DD не меняет порядок: это общий положительный множитель."""
+    weak = StrategyInput(
+        strategy_id="AAA", pair="P1", side="LONG", timeframe="1h",
+        lot_x_base=0.3, pnl_pct=5.0, dd_pct=5.0, turnover_24h=50_000_000.0,
+        trades=trades("AAA", 4, hold_min=600, gap_min=1),
+    )
+    strong = StrategyInput(
+        strategy_id="ZZZ", pair="P2", side="LONG", timeframe="1h",
+        lot_x_base=0.3, pnl_pct=80.0, dd_pct=5.0, turnover_24h=50_000_000.0,
+        trades=trades("ZZZ", 4, hold_min=600, gap_min=1),
+    )
+    lots = {"AAA": 0.1, "ZZZ": 0.1}
+    five = simulate_set([weak, strong], 1, lots, CFG)
+    eight = simulate_set(
+        [weak, strong], 1, lots,
+        RunConfig(deposit=1000.0, limiters=(1,), dd_target_pct=8.0,
+                  d_eff_common_min_days=0.0, oos_min_days=1e9),
+    )
+    assert [o.accepted for o in five.outcomes] == [o.accepted for o in eight.outcomes]
+
+
+def test_long_short_same_slot_counts_pair_once():
+    long_ = strat("L", count=6, hold=600, gap=1, pair="XLKUSDT", side="LONG")
+    short = strat("S", count=6, hold=600, gap=1, pair="XLKUSDT", side="SHORT")
+    same = RunConfig(deposit=1000.0, limiters=(1,), long_short_same_slot=True,
+                     cancel_opposite=False, d_eff_common_min_days=0.0, oos_min_days=1e9)
+    apart = RunConfig(deposit=1000.0, limiters=(1,), long_short_same_slot=False,
+                      cancel_opposite=False, d_eff_common_min_days=0.0, oos_min_days=1e9)
+    lots = {"L": 0.05, "S": 0.05}
+    merged = simulate_set([long_, short], 1, lots, same)
+    split = simulate_set([long_, short], 1, lots, apart)
+    assert sum(o.accepted for o in merged.outcomes) >= sum(o.accepted for o in split.outcomes)
+
+
+def test_empty_trade_log_gives_readable_error():
+    member = StrategyInput(
+        strategy_id="A", pair="XUSDT", side="LONG", timeframe="1h",
+        lot_x_base=0.2, pnl_pct=10.0, dd_pct=5.0, turnover_24h=1_000_000.0,
+    )
+    with pytest.raises(ValueError, match="журнал сделок пуст"):
+        _ = member.window_start
+
+
+def test_mae_note_distinguishes_partial_from_full():
+    from mrs3.portfolio.pipeline import _mae_note
+
+    full = [strat("A", count=6, mae=-0.02)]
+    none = [strat("B", count=6, mae=None)]
+    mixed = [strat("A", count=6, mae=-0.02), strat("B", count=6, mae=None)]
+
+    assert "верхняя граница" in _mae_note(full)
+    assert "занижена" in _mae_note(none)
+    partial = _mae_note(mixed)
+    assert "завышена" in partial and "занижена" in partial

@@ -140,6 +140,26 @@ def _set_row(result: SetResult) -> dict:
     }
 
 
+def _mae_note(ready: Sequence[StrategyInput]) -> str:
+    """Оговорка про просадку зависит от того, у скольких циклов есть MAE.
+
+    Полное покрытие: MAE — худшая точка цикла, применяется на всём его
+    протяжении, значит просадка завышена.
+    Частичное: циклы без MAE дают нулевой плавающий убыток, значит на них
+    просадка занижена. Смешивать эти два утверждения в одну фразу нельзя.
+    """
+    total = sum(len(s.trades) for s in ready)
+    known = sum(1 for s in ready for t in s.trades if t.mae_frac is not None)
+    if not total or not known:
+        return "MAE отсутствует: просадка считается только по закрытым сделкам и занижена"
+    if known == total:
+        return "MAE применяется на всём цикле, а не помарочно: просадка — верхняя граница"
+    return (
+        f"MAE есть у {known} циклов из {total}: там просадка завышена, "
+        "на остальных занижена — величина не является границей ни сверху, ни снизу"
+    )
+
+
 def run_portfolio(inputs: PortfolioInputs) -> dict:
     cfg = inputs.config
     out = Path(inputs.output_dir)
@@ -213,7 +233,7 @@ def run_portfolio(inputs: PortfolioInputs) -> dict:
             item
             for item in (
                 "очередь в стакане не моделируется: результат — верхняя граница",
-                "MAE применяется на всём цикле, а не помарочно: просадка — верхняя граница",
+                _mae_note(ready),
                 "MMR/IMR взяты из CSV, сверить с /v5/market/risk-limit",
                 "target_share ESTIMATED, пока не измерен по стакану L2"
                 if any(s.target_share_source == "ESTIMATED" for s in ready)
