@@ -55,6 +55,54 @@ class ParsedReport:
 
 
 @dataclass(frozen=True, slots=True)
+class CompactRecord:
+    """Immutable, storage-ready representation of one compact HTML report."""
+
+    source_sha256: str
+    source_file: str
+    source_size: int
+    settings_json: str
+    point_id: str
+    symbol: str
+    side: str
+    timeframe: str
+    open_ma_type: str
+    open_ma_source: str
+    open_ma_len: int
+    open_multiplier: str
+    close_ma_type: str
+    close_ma_source: str
+    close_ma_len: int
+    grid_id: str
+    sample_count: int
+    start_timestamp_ms: int
+    end_timestamp_ms: int
+    series_codec: str
+    actions_codec: str
+    timestamps_zlib: bytes
+    actions_zlib: bytes
+    equity_zlib: bytes
+    wallet_zlib: bytes
+    raw_action_count: int
+    equity_sample_count: int
+    wallet_change_count: int
+
+    @property
+    def source_hash(self) -> str:
+        """Compatibility spelling used by the original importer internals."""
+        return self.source_sha256
+
+
+@dataclass(frozen=True, slots=True)
+class CompactParseOutcome:
+    source_file: str
+    source_sha256: str
+    record: CompactRecord | None
+    error_classification: str | None
+    error_message: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ImportResult:
     scanned_reports: int
     imported_reports: int
@@ -232,6 +280,65 @@ def _decode_actions(blob: bytes, expected_count: int) -> tuple[dict[str, str], .
     return tuple(dict(zip(headers, row, strict=True)) for row in rows)
 
 
+def _compact_record(report: ParsedReport) -> CompactRecord:
+    timestamps_zlib = _encode_deltas(report.timestamps_ms)
+    actions_zlib = _encode_actions(report.actions)
+    equity_zlib = _encode_deltas(report.equity_scaled)
+    wallet_zlib, wallet_change_count = _encode_wallet_changes(report.wallet_scaled)
+    point = report.point
+    return CompactRecord(
+        source_sha256=report.source_hash,
+        source_file=report.source_file,
+        source_size=report.source_size,
+        settings_json=report.settings_json,
+        point_id=str(point["point_id"]),
+        symbol=str(point["symbol"]),
+        side=str(point["side"]),
+        timeframe=str(point["timeframe"]),
+        open_ma_type=str(point["open_ma_type"]),
+        open_ma_source=str(point["open_ma_source"]),
+        open_ma_len=int(point["open_ma_len"]),
+        open_multiplier=str(point["open_multiplier"]),
+        close_ma_type=str(point["close_ma_type"]),
+        close_ma_source=str(point["close_ma_source"]),
+        close_ma_len=int(point["close_ma_len"]),
+        grid_id=report.grid_id,
+        sample_count=len(report.timestamps_ms),
+        start_timestamp_ms=report.timestamps_ms[0],
+        end_timestamp_ms=report.timestamps_ms[-1],
+        series_codec=SERIES_CODEC,
+        actions_codec=ACTIONS_CODEC,
+        timestamps_zlib=timestamps_zlib,
+        actions_zlib=actions_zlib,
+        equity_zlib=equity_zlib,
+        wallet_zlib=wallet_zlib,
+        raw_action_count=len(report.actions),
+        equity_sample_count=len(report.equity_scaled),
+        wallet_change_count=wallet_change_count,
+    )
+
+
+def build_compact_record(path: Path) -> CompactRecord:
+    """Parse and encode one HTML report into the public compact-record contract."""
+    return _compact_record(_parse_report(path))
+
+
+def read_compact_record(path: Path) -> CompactParseOutcome:
+    """Return a stable success/error value for callers such as process workers."""
+    source_file = str(path.resolve())
+    try:
+        record = build_compact_record(path)
+    except Exception as exc:
+        try:
+            source_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            classification = "INVALID_REPORT"
+        except OSError:
+            source_sha256 = "UNREADABLE"
+            classification = "SOURCE_UNREADABLE"
+        return CompactParseOutcome(source_file, source_sha256, None, classification, str(exc))
+    return CompactParseOutcome(source_file, record.source_sha256, record, None, None)
+
+
 def _parse_report(path: Path) -> ParsedReport:
     try:
         source = path.read_text(encoding="utf-8")
@@ -318,22 +425,24 @@ def _load_known(connection: duckdb.DuckDBPyConnection) -> tuple[dict[str, tuple[
 
 
 def _insert_report(connection: duckdb.DuckDBPyConnection, report: ParsedReport, known_canonical: dict[str, str], known_grids: set[str], known_points: set[str]) -> tuple[str, int]:
-    report_id = "RP_" + report.source_hash[:24]
-    canonical_key = f"{report.point['point_id']}|{report.grid_id}"
+    return _insert_compact_record(connection, _compact_record(report), known_canonical, known_grids, known_points)
+
+
+def _insert_compact_record(connection: duckdb.DuckDBPyConnection, report: CompactRecord, known_canonical: dict[str, str], known_grids: set[str], known_points: set[str]) -> tuple[str, int]:
+    report_id = "RP_" + report.source_sha256[:24]
+    canonical_key = f"{report.point_id}|{report.grid_id}"
     if canonical_key in known_canonical:
         raise ValueError(f"DUPLICATE_POINT_WINDOW_CONFLICT: already imported as {known_canonical[canonical_key]}")
-    if report.point["point_id"] not in known_points:
-        p = report.point
-        connection.execute("INSERT INTO point_configs VALUES (?,?,?,?,?,?,?,?,?,?,?)", [p["point_id"], p["symbol"], p["side"], p["timeframe"], p["open_ma_type"], p["open_ma_source"], p["open_ma_len"], p["open_multiplier"], p["close_ma_type"], p["close_ma_source"], p["close_ma_len"]])
-        known_points.add(str(p["point_id"]))
+    if report.point_id not in known_points:
+        connection.execute("INSERT INTO point_configs VALUES (?,?,?,?,?,?,?,?,?,?,?)", [report.point_id, report.symbol, report.side, report.timeframe, report.open_ma_type, report.open_ma_source, report.open_ma_len, report.open_multiplier, report.close_ma_type, report.close_ma_source, report.close_ma_len])
+        known_points.add(report.point_id)
     if report.grid_id not in known_grids:
-        connection.execute("INSERT INTO time_grids VALUES (?,?,?,?,?)", [report.grid_id, len(report.timestamps_ms), report.timestamps_ms[0], report.timestamps_ms[-1], _encode_deltas(report.timestamps_ms)])
+        connection.execute("INSERT INTO time_grids VALUES (?,?,?,?,?)", [report.grid_id, report.sample_count, report.start_timestamp_ms, report.end_timestamp_ms, report.timestamps_zlib])
         known_grids.add(report.grid_id)
-    wallet_zlib, wallet_change_count = _encode_wallet_changes(report.wallet_scaled)
-    connection.execute("INSERT INTO report_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [report_id, report.source_hash, canonical_key, report.point["point_id"], report.grid_id, report.source_file, report.source_size, datetime.now(timezone.utc), report.settings_json, len(report.actions), len(report.equity_scaled), wallet_change_count])
-    connection.execute("INSERT INTO report_payloads VALUES (?,?,?,?,?,?)", [report_id, SERIES_CODEC, ACTIONS_CODEC, _encode_actions(report.actions), _encode_deltas(report.equity_scaled), wallet_zlib])
+    connection.execute("INSERT INTO report_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [report_id, report.source_sha256, canonical_key, report.point_id, report.grid_id, report.source_file, report.source_size, datetime.now(timezone.utc), report.settings_json, report.raw_action_count, report.equity_sample_count, report.wallet_change_count])
+    connection.execute("INSERT INTO report_payloads VALUES (?,?,?,?,?,?)", [report_id, report.series_codec, report.actions_codec, report.actions_zlib, report.equity_zlib, report.wallet_zlib])
     known_canonical[canonical_key] = report_id
-    return report_id, wallet_change_count
+    return report_id, report.wallet_change_count
 
 
 def load_report_payload(connection: duckdb.DuckDBPyConnection, report_id: str) -> dict[str, Any]:
@@ -394,20 +503,20 @@ def import_html_reports(html_dir: Path, database_path: Path, audit_dir: Path, *,
             source_file = str(path.resolve())
             source_hash = ""
             try:
-                report = _parse_report(path)
-                source_hash = report.source_hash
+                report = build_compact_record(path)
+                source_hash = report.source_sha256
                 existing = known_hashes.get(source_hash)
                 if existing:
                     skipped += 1
                     checklist.append({"source_file": source_file, "sha256": source_hash, "import_status": "SKIPPED_IDENTICAL", "report_id": existing[0], "raw_actions": str(existing[1]), "equity_samples": str(existing[2]), "wallet_change_samples": str(existing[3]), "safe_to_delete": "YES", "reason": "already imported by identical SHA-256"})
                 else:
-                    report_id, wallet_count = _insert_report(connection, report, known_canonical, known_grids, known_points)
-                    known_hashes[source_hash] = (report_id, len(report.actions), len(report.equity_scaled), wallet_count)
+                    report_id, wallet_count = _insert_compact_record(connection, report, known_canonical, known_grids, known_points)
+                    known_hashes[source_hash] = (report_id, report.raw_action_count, report.equity_sample_count, wallet_count)
                     imported += 1
-                    raw_actions += len(report.actions)
-                    equity_samples += len(report.equity_scaled)
+                    raw_actions += report.raw_action_count
+                    equity_samples += report.equity_sample_count
                     pending += 1
-                    checklist.append({"source_file": source_file, "sha256": source_hash, "import_status": "OK", "report_id": report_id, "raw_actions": str(len(report.actions)), "equity_samples": str(len(report.equity_scaled)), "wallet_change_samples": str(wallet_count), "safe_to_delete": "YES", "reason": ""})
+                    checklist.append({"source_file": source_file, "sha256": source_hash, "import_status": "OK", "report_id": report_id, "raw_actions": str(report.raw_action_count), "equity_samples": str(report.equity_sample_count), "wallet_change_samples": str(wallet_count), "safe_to_delete": "YES", "reason": ""})
                     if pending >= batch_size:
                         connection.execute("COMMIT")
                         connection.execute("BEGIN TRANSACTION")

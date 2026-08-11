@@ -14,7 +14,6 @@ import argparse
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -45,7 +44,8 @@ def _load_base_importer() -> Any:
 
 
 _base = _load_base_importer()
-ParsedReport = _base.ParsedReport
+CompactRecord = _base.CompactRecord
+ParseOutcome = _base.CompactParseOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,26 +59,9 @@ class ImportResult:
     equity_sample_count: int
 
 
-@dataclass(frozen=True, slots=True)
-class ParseOutcome:
-    source_file: str
-    source_hash: str
-    report: Any | None
-    error: str | None
-
-
 def _parse_worker(source_file: str) -> ParseOutcome:
     """Process-pool target. It has no database access by design."""
-    path = Path(source_file)
-    try:
-        report = _base._parse_report(path)
-        return ParseOutcome(source_file, report.source_hash, report, None)
-    except Exception as exc:
-        try:
-            source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
-            source_hash = "UNREADABLE"
-        return ParseOutcome(source_file, source_hash, None, str(exc))
+    return _base.read_compact_record(Path(source_file))
 
 
 def _write_csv(path: Path, fields: list[str], rows: Iterable[dict[str, str]]) -> None:
@@ -109,33 +92,33 @@ def _write_audit(audit_dir: Path, result: ImportResult, checklist: list[dict[str
 
 
 def _quarantine(connection: duckdb.DuckDBPyConnection, outcome: ParseOutcome, checklist: list[dict[str, str]], quarantine: list[dict[str, str]]) -> None:
-    reason = outcome.error or "unknown worker error"
+    reason = outcome.error_message or "unknown worker error"
     connection.execute(
         "INSERT INTO rejected_imports VALUES (?,?,?,?) ON CONFLICT (source_sha256) DO UPDATE SET source_file=excluded.source_file, detected_at_utc=excluded.detected_at_utc, reason=excluded.reason",
-        [outcome.source_hash, outcome.source_file, datetime.now(timezone.utc), reason],
+        [outcome.source_sha256, outcome.source_file, datetime.now(timezone.utc), reason],
     )
-    checklist.append({"source_file": outcome.source_file, "sha256": outcome.source_hash, "import_status": "QUARANTINE", "report_id": "", "raw_actions": "", "equity_samples": "", "wallet_change_samples": "", "safe_to_delete": "NO", "reason": reason})
-    quarantine.append({"source_file": outcome.source_file, "sha256": outcome.source_hash, "reason": reason})
+    checklist.append({"source_file": outcome.source_file, "sha256": outcome.source_sha256, "import_status": "QUARANTINE", "report_id": "", "raw_actions": "", "equity_samples": "", "wallet_change_samples": "", "safe_to_delete": "NO", "reason": reason})
+    quarantine.append({"source_file": outcome.source_file, "sha256": outcome.source_sha256, "reason": reason})
 
 
 def _store_outcome(connection: duckdb.DuckDBPyConnection, outcome: ParseOutcome, known_hashes: dict[str, tuple[str, int, int, int]], known_canonical: dict[str, str], known_grids: set[str], known_points: set[str], checklist: list[dict[str, str]], quarantine: list[dict[str, str]]) -> tuple[str, int, int]:
     """Return status, raw actions, and equity samples for one completed parse."""
-    if outcome.error or outcome.report is None:
+    if outcome.error_classification or outcome.record is None:
         _quarantine(connection, outcome, checklist, quarantine)
         return "quarantine", 0, 0
-    report = outcome.report
-    existing = known_hashes.get(report.source_hash)
+    report = outcome.record
+    existing = known_hashes.get(report.source_sha256)
     if existing:
-        checklist.append({"source_file": outcome.source_file, "sha256": report.source_hash, "import_status": "SKIPPED_IDENTICAL", "report_id": existing[0], "raw_actions": str(existing[1]), "equity_samples": str(existing[2]), "wallet_change_samples": str(existing[3]), "safe_to_delete": "YES", "reason": "already imported by identical SHA-256"})
+        checklist.append({"source_file": outcome.source_file, "sha256": report.source_sha256, "import_status": "SKIPPED_IDENTICAL", "report_id": existing[0], "raw_actions": str(existing[1]), "equity_samples": str(existing[2]), "wallet_change_samples": str(existing[3]), "safe_to_delete": "YES", "reason": "already imported by identical SHA-256"})
         return "skipped", 0, 0
     try:
-        report_id, wallet_count = _base._insert_report(connection, report, known_canonical, known_grids, known_points)
+        report_id, wallet_count = _base._insert_compact_record(connection, report, known_canonical, known_grids, known_points)
     except Exception as exc:
-        _quarantine(connection, ParseOutcome(outcome.source_file, report.source_hash, None, str(exc)), checklist, quarantine)
+        _quarantine(connection, ParseOutcome(outcome.source_file, report.source_sha256, None, "STORAGE_CONFLICT", str(exc)), checklist, quarantine)
         return "quarantine", 0, 0
-    known_hashes[report.source_hash] = (report_id, len(report.actions), len(report.equity_scaled), wallet_count)
-    checklist.append({"source_file": outcome.source_file, "sha256": report.source_hash, "import_status": "OK", "report_id": report_id, "raw_actions": str(len(report.actions)), "equity_samples": str(len(report.equity_scaled)), "wallet_change_samples": str(wallet_count), "safe_to_delete": "YES", "reason": ""})
-    return "imported", len(report.actions), len(report.equity_scaled)
+    known_hashes[report.source_sha256] = (report_id, report.raw_action_count, report.equity_sample_count, wallet_count)
+    checklist.append({"source_file": outcome.source_file, "sha256": report.source_sha256, "import_status": "OK", "report_id": report_id, "raw_actions": str(report.raw_action_count), "equity_samples": str(report.equity_sample_count), "wallet_change_samples": str(wallet_count), "safe_to_delete": "YES", "reason": ""})
+    return "imported", report.raw_action_count, report.equity_sample_count
 
 
 def import_html_reports(html_dir: Path, database_path: Path, audit_dir: Path, *, workers: int = 20, progress_every: int = 10, batch_size: int = 250) -> ImportResult:
@@ -178,7 +161,7 @@ def import_html_reports(html_dir: Path, database_path: Path, audit_dir: Path, *,
                     try:
                         outcome = future.result()
                     except BaseException as exc:
-                        outcome = ParseOutcome(source_file, "UNREADABLE", None, f"worker failed: {exc}")
+                        outcome = ParseOutcome(source_file, "UNREADABLE", None, "WORKER_FAILURE", f"worker failed: {exc}")
                     parsed += 1
                     status, action_count, equity_count = _store_outcome(connection, outcome, known_hashes, known_canonical, known_grids, known_points, checklist, quarantine)
                     if status == "imported":

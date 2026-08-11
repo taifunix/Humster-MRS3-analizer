@@ -75,6 +75,16 @@ for `tests/test_config.py`; the full suite reaches `334 passed` and has the
 same eight runner-test fixture failures outside this task. Independent Terra
 review and re-review are approved; Task 5 is complete.
 
+Task 6 has a staged, independently Terra-reviewed compact-importer parity
+contract: v3 exposes an immutable compact record, v4 workers return that same
+contract while dynamically loading the adjacent v3 codec, and the `mrs3`
+adapter decodes its compact payloads. Focused evidence is `4 passed` for
+`tests/test_duckdb_events.py`; the full suite reaches `338 passed` and has the
+same eight runner-test fixture failures outside this task. The required final
+verification on a copied real MRS HTML report has not been performed because
+no such source file is available in the repository; therefore Task 6 remains
+incomplete and must not be treated as import evidence for later tasks.
+
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
 included cycles. The package has `source_summary_status=VERIFIED` and
@@ -96,10 +106,13 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1–5 are complete and Task 6 is next.
+slice; Tasks 1–5 are complete. Task 6 implementation is staged and awaits its
+scoped commit, but its required real-report verification remains the next
+action.
 
-1. Start Task 6 from the
-   [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
+1. Obtain a real MRS HTML report, copy it to a temporary location and verify
+   the Task 6 importer against a temporary DuckDB without writing the
+   production database; then record the evidence and mark Task 6 complete.
 2. Apply the confirmed external-review remediation tasks listed in the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 3. Implement the approved source-DuckDB migration/importer and direct analysis
@@ -108,8 +121,9 @@ slice; Tasks 1–5 are complete and Task 6 is next.
 
 ## Blockers
 
-- No external data blocker is known for the core storage/importer work.
-  CSV/DuckDB overlay is explicitly deferred and no economic threshold changes
+- Task 6 lacks the required real MRS HTML source for its final temporary-copy
+  import verification. Do not start Task 7 until this evidence is recorded.
+- CSV/DuckDB overlay is explicitly deferred and no economic threshold changes
   are implied.
 
 ## Queued module hook

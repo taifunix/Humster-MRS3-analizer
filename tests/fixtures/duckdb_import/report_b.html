@@ -1,0 +1,16 @@
+<!doctype html>
+<html><body>
+<pre>{"basic":{"symbol":"ETHUSDT","time_frame":"15m","use_long":false,"use_short":true},"mrs2":{"ma_long":{"type":"EMA","source":"hl2","len":30,"multiplier":"0.96"},"ma_close_long":{"type":"EMA","source":"close","len":10},"ma_short":{"type":"WMA","source":"hl2","len":31,"multiplier":"1.04"},"ma_close_short":{"type":"EMA","source":"close","len":11}}}</pre>
+<table>
+  <thead><tr><th>Timestamp</th><th>Symbol</th><th>Action</th><th>Side</th><th>Post Side</th><th>PnL</th><th>Balance</th></tr></thead>
+  <tbody>
+    <tr><td>2024-02-01T00:00:00Z</td><td>ETHUSDT</td><td>Opened</td><td>Sell</td><td>short</td><td>0</td><td>200</td></tr>
+    <tr><td>2024-02-01T00:15:00Z</td><td>ETHUSDT</td><td>Decreased</td><td>Buy</td><td>short</td><td>-1.25</td><td>198.75</td></tr>
+    <tr><td>2024-02-01T00:45:00Z</td><td>ETHUSDT</td><td>Closed</td><td>Buy</td><td></td><td>4.75</td><td>203.5</td></tr>
+  </tbody>
+</table>
+<script>
+const walletSeries = [[1706745600000,200],[1706746500000,198.75],[1706747400000,198.75],[1706748300000,203.5]];
+const equitySeries = [[1706745600000,200],[1706746500000,197.5],[1706747400000,201.125],[1706748300000,203.5]];
+</script>
+</body></html>

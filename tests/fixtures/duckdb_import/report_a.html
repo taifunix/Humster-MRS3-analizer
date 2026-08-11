@@ -1,0 +1,15 @@
+<!doctype html>
+<html><body>
+<pre>{"basic":{"symbol":"BTCUSDT","time_frame":"1h","use_long":true,"use_short":false},"mrs2":{"ma_long":{"type":"EMA","source":"close","len":20,"multiplier":"0.97"},"ma_close_long":{"type":"SMA","source":"close","len":8},"ma_short":{"type":"EMA","source":"close","len":21,"multiplier":"1.03"},"ma_close_short":{"type":"SMA","source":"close","len":9}}}</pre>
+<table>
+  <thead><tr><th>Timestamp</th><th>Symbol</th><th>Action</th><th>Side</th><th>Post Side</th><th>PnL</th><th>Balance</th></tr></thead>
+  <tbody>
+    <tr><td>2024-01-01T00:00:00Z</td><td>BTCUSDT</td><td>Opened</td><td>Buy</td><td>long</td><td>0</td><td>100</td></tr>
+    <tr><td>2024-01-01T02:00:00Z</td><td>BTCUSDT</td><td>Closed</td><td>Sell</td><td></td><td>2.5</td><td>102.5</td></tr>
+  </tbody>
+</table>
+<script>
+const walletSeries = [[1704067200000,100],[1704070800000,100],[1704074400000,102.5]];
+const equitySeries = [[1704067200000,100],[1704070800000,98.25],[1704074400000,102.5]];
+</script>
+</body></html>

@@ -126,6 +126,35 @@ def decode_wallet_changes(
     return changes
 
 
+def decode_compact_record(record: object) -> dict[str, object]:
+    """Decode the immutable compact-record contract exposed by the v3 codec."""
+    series_codec = str(getattr(record, "series_codec"))
+    actions_codec = str(getattr(record, "actions_codec"))
+    if actions_codec != ACTION_CODEC:
+        raise SourcePackError(f"unsupported actions codec: {actions_codec}")
+    payload_bytes = {
+        "timestamps_zlib": bytes(getattr(record, "timestamps_zlib")),
+        "actions_zlib": bytes(getattr(record, "actions_zlib")),
+        "equity_zlib": bytes(getattr(record, "equity_zlib")),
+        "wallet_zlib": bytes(getattr(record, "wallet_zlib")),
+    }
+    return {
+        "timestamps_ms": decode_compact_deltas(
+            payload_bytes["timestamps_zlib"], int(getattr(record, "sample_count")), codec=series_codec
+        ),
+        "actions": decode_compact_actions(
+            payload_bytes["actions_zlib"], int(getattr(record, "raw_action_count"))
+        ),
+        "equity_scaled": decode_compact_deltas(
+            payload_bytes["equity_zlib"], int(getattr(record, "equity_sample_count")), codec=series_codec
+        ),
+        "wallet_changes": decode_wallet_changes(
+            payload_bytes["wallet_zlib"], int(getattr(record, "wallet_change_count")), codec=series_codec
+        ),
+        "payload_bytes": payload_bytes,
+    }
+
+
 def _query_batches(
     con: duckdb.DuckDBPyConnection, query: str, parameters: Sequence[object] = (), *, batch_size: int = 500
 ) -> Iterator[list[dict[str, object]]]:
