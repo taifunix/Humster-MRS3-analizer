@@ -127,11 +127,13 @@ and independent Terra review approved after three fix rounds.
 Task 10 is complete (`224a039`): the analysis DuckDB schema has 13 focused
 passing tests and an independent clean review.
 
-Task 11A backend is complete (`2a157de`): in-memory direct-surface coverage,
-canonical-grid and total-trades-proxy materialization uses active v5 data with
-deterministic facts, distinct source/analysis connections and no raw-data copy.
-Its 21 relevant tests pass and review was clean after one fix round. Panel/build
-orchestration is still outstanding.
+Task 11 DUCKDB_DIRECT materialization and panel orchestration is complete.
+The panel keeps materializer constants server-side, freezes the full preflight
+snapshot behind a token, selects usable symbols by default and renders missing
+coverage as noninteractive warnings. Build uses distinct read-only source and
+writable analysis connections, revalidates the complete source contract before
+publication, supports cancellation and publishes no raw source data. The relevant
+suite passes `69` tests, and independent Terra review approved the implementation.
 
 Task 12 atomic immutable publication is complete (`f72aae3`). All identity
 inputs and order-independent source hashes are covered. New same-period/scope
@@ -163,13 +165,15 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1–10, Task 11A backend and Task 12 are complete.
+slice; Tasks 1–12 are complete.
 
-1. Implement Task 11 panel/build orchestration from the
-    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
-    in an independently reviewed TDD slice.
-2. Implement Task 13 pipeline adaptation and lineage in an independently reviewed TDD slice.
-3. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
+1. Implement Task 13 pipeline adaptation and lineage from the
+   [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
+   in an independently reviewed TDD slice.
+2. Implement Task 14 library/statistics/exports plus **Refine**, **Re-run analysis**
+   and **Compare periods**.
+3. Complete Task 15 verification and documentation.
+4. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
 
 ## Blockers
 

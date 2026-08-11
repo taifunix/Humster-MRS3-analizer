@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Tasks 0–10 and Task 12 are complete; Task 11A backend is complete, while Task 11 panel/build orchestration remains before Task 13. Task 6 was committed in `05369c2`; its
+**Status:** Tasks 0–12 are complete; Task 13 is next. Task 6 was committed in `05369c2`; its
 copied-real-HTML smoke established v3/v4/mrs3 adapter parity `PASS` and a
 temporary v3 DuckDB import with `1` scanned, `1` imported and `0` quarantined
 reports, `78` raw
@@ -335,18 +335,19 @@ run_panel_direct_build(
   surface declares one trades-proxy mode; real event IDs stay diagnostic only.
 - [x] Implement active-report reads and deterministic coverage/dedup facts; do
   not route through or implement the deferred CSV overlay.
-- [ ] Add panel RED tests for usable symbols checked by default, noninteractive
+- [x] Add panel RED tests for usable symbols checked by default, noninteractive
   unavailable warnings, cancellable build and stale-preflight rejection after
   active source hashes change.
-- [ ] Make the panel action invoke exactly preflight → materialize → publish;
+- [x] Make the panel action invoke exactly preflight → materialize → publish;
   unavailable selection blocks materialization, cancellation blocks publication
   and hashes are revalidated immediately before publication.
-- [ ] Use this action only for the initial direct build and a source-backed
-  **Refine** that intentionally creates a child surface.
+- [x] Expose this action only for the initial direct build. Keep source-backed
+  **Refine**, which intentionally creates a child surface, in Task 14.
 - [x] Require distinct source/analysis connections and prove no raw source data
   is copied into the analysis store.
-- [ ] Run GREEN: `.venv\Scripts\python.exe -m pytest tests/test_duckdb_direct.py tests/test_duckdb_events.py tests/test_pipeline.py tests/test_panel.py -q`.
-- [ ] Review and commit: `feat: materialize duckdb direct surfaces`.
+- [x] Run GREEN: `.venv\Scripts\python.exe -m pytest tests/test_duckdb_direct.py tests/test_duckdb_events.py tests/test_pipeline.py tests/test_panel.py -q` (`69 passed`).
+- [x] Independent Terra review approved the implementation after root
+  consolidation and CSS re-review. Commit message: `feat: materialize duckdb direct surfaces`.
 
 ### Task 12: Publish immutable surfaces atomically
 

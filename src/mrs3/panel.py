@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 import csv
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,9 +18,18 @@ from urllib.parse import parse_qs, urlparse
 import uuid
 import webbrowser
 
+import duckdb
+
 from .config import DuckDBImportSettings, load_duckdb_import_settings, save_duckdb_import_settings
 from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, import_html_tree, preflight_html_import
 from .duckdb_source_schema import migrate_source_database
+from .duckdb_direct import DirectBuildRequest, DirectMaterializationError, DirectPreflight, preflight_duckdb_direct, run_panel_direct_build
+
+
+_DIRECT_MATERIALIZER_VERSION = "v1"
+_DIRECT_POINT_CONFIG_HASH = sha256(
+    b"event_mode=legacy_trades_proxy;point_event_count=TotalTrades"
+).hexdigest()
 
 
 _BROWSE_FILE_TYPES: dict[str, tuple[tuple[str, str], ...]] = {
@@ -140,6 +149,7 @@ PANEL_HTML = r"""<!doctype html>
     .status-name { font-size: 20px; font-weight: 800; }
     .state { font-weight: 800; }
     .state.good { color: var(--green); } .state.bad { color: var(--red); } .state.work { color: var(--amber); }
+    .direct-unavailable { color: var(--red); font-weight: 600; }
     .bar { height: 13px; overflow: hidden; background: #0a1121; border: 1px solid var(--line); border-radius: 999px; margin: 16px 0 8px; }
     .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--blue), var(--green)); transition: width .35s ease; }
     .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 13px 0; }
@@ -200,6 +210,13 @@ PANEL_HTML = r"""<!doctype html>
           <label>HTML-выборка (3–5)<input id="verification_sample_count" value="3" type="number" min="3" max="5" step="1"></label>
           <div class="buttons"><button data-runnable="true" class="primary" onclick="startAction('source-duckdb')">Собрать DuckDB-пакет</button><span class="badge">real_independent_events</span></div>
           <details><summary>HTML → source DuckDB import</summary><div class="stack"><label>HTML root<div class="path-control"><input id="import_html_root" type="text"><button type="button" class="secondary" onclick="browse('import_html_root','directory',false)">Browse…</button></div></label><div class="buttons"><button type="button" onclick="duckdbPreflight()">Preflight</button><button type="button" class="primary" onclick="duckdbImport()">Start import</button><button type="button" onclick="duckdbCancel()">Cancel</button></div><div id="duckdbImportStatus" aria-live="polite" class="muted">No import job.</div><div class="stats"><div class="stat"><b id="import_parsed">0</b><span>parsed</span></div><div class="stat"><b id="import_inserted">0</b><span>inserted</span></div><div class="stat"><b id="import_replaced">0</b><span>replaced</span></div><div class="stat"><b id="import_identical">0</b><span>identical</span></div><div class="stat"><b id="import_ambiguous">0</b><span>ambiguous</span></div><div class="stat"><b id="import_quarantined">0</b><span>quarantined</span></div></div></div></details>
+          <details open><summary>Immutable DUCKDB_DIRECT surface</summary><div class="stack">
+            <fieldset class="row"><legend>UTC window</legend><label>Start<input id="direct_start" type="datetime-local"></label><label>End<input id="direct_end" type="datetime-local"></label></fieldset>
+            <div class="row"><label>Side<select id="direct_side"><option>LONG</option><option>SHORT</option></select></label><label>Symbols (; separated)<input id="direct_symbols" type="text" placeholder="BTCUSDT;ETHUSDT"></label></div>
+            <fieldset class="row"><legend>Shift range, bp</legend><label>Start<input id="direct_shift_start" type="number" step="1"></label><label>End<input id="direct_shift_end" type="number" step="1"></label><label>Step<input id="direct_shift_step" type="number" min="1" step="1"></label></fieldset>
+            <div class="buttons"><button type="button" onclick="directPreflight()">Check coverage</button><button type="button" class="primary" onclick="directBuild()">Build surface</button><button type="button" onclick="directCancel()">Cancel</button></div>
+            <div id="directCoverage" role="group" aria-label="Direct surface symbols"></div><div id="directStatus" class="muted" aria-live="polite">No direct build.</div>
+          </div></details>
         </div>
       </section>
       <section role="tabpanel" id="panel-candidates" aria-labelledby="tab-candidates" hidden>
@@ -309,6 +326,17 @@ async function migrateDuckdb() { try { const settings=await duckdbRequest('/api/
 async function duckdbPreflight() { try { const result = await duckdbRequest('/api/duckdb-import/preflight', {root_path:value('import_html_root')}); duckdbPreflightToken=result.token; document.getElementById('notice').textContent=`Preflight: ${result.discovered} reports.`; } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function duckdbImport() { try { const result = await duckdbRequest('/api/duckdb-import/start', {root_path:value('import_html_root'), preflight_token:duckdbPreflightToken}); render(result); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function duckdbCancel() { try { render(await duckdbRequest('/api/duckdb-import/cancel')); } catch (error) { document.getElementById('notice').textContent=error.message; } }
+let directPreflightToken = '';
+function directUtc(id) { const raw=value(id); if (!raw) return ''; return raw.endsWith('Z') ? raw : new Date(raw+'Z').toISOString(); }
+function directPayload() { return {start_utc:directUtc('direct_start'), end_utc:directUtc('direct_end'), side:value('direct_side'), symbols:value('direct_symbols').split(';'), shift_start_bp:value('direct_shift_start'), shift_end_bp:value('direct_shift_end'), shift_step_bp:value('direct_shift_step')}; }
+function renderDirectCoverage(result) {
+  const target=document.getElementById('directCoverage'); target.replaceChildren();
+  for (const [symbol,timeframes] of Object.entries(result.usable_timeframes || {})) { const label=document.createElement('label'); const box=document.createElement('input'); box.type='checkbox'; box.name='direct_selected_symbol'; box.value=symbol; box.checked=true; label.append(box, document.createTextNode(` ${symbol} · ${timeframes.join(', ')}`)); target.appendChild(label); }
+  for (const symbol of Object.keys(result.unavailable_symbols || {})) { const row=document.createElement('div'); row.className='direct-unavailable'; const reasons=(result.coverage_issues || []).filter(item=>item.symbol===symbol).map(item=>`${item.code}: ${item.detail}`).join('; '); row.textContent=`⚠ ${symbol} · ${reasons || 'unavailable'}`; target.appendChild(row); }
+}
+async function directPreflight() { try { const result=await duckdbRequest('/api/duckdb-direct/preflight', directPayload()); directPreflightToken=result.token; renderDirectCoverage(result); document.getElementById('directStatus').textContent='Coverage checked.'; } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+async function directBuild() { try { const selected=[...document.querySelectorAll('input[name="direct_selected_symbol"]:checked')].map(item=>item.value); render(await duckdbRequest('/api/duckdb-direct/start', {...directPayload(), preflight_token:directPreflightToken, selected_symbols:selected})); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+async function directCancel() { try { render(await duckdbRequest('/api/duckdb-direct/cancel')); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
 function renderDashboard(dashboard) {
   const target = document.getElementById('decisionDashboard'); target.replaceChildren();
   const order = ['csv', 'duckdb', 'candidates', 'tester', 'posttest'];
@@ -330,6 +358,8 @@ function render(data) {
   renderDashboard(data.dashboard);
   const imported = data.duckdb_import;
   if (imported) { document.getElementById('duckdbImportStatus').textContent = `${imported.final_state} · safe_to_delete=${imported.safe_to_delete}`; for (const [name, count] of Object.entries(imported.counts || {})) { const item=document.getElementById('import_'+name); if (item) item.textContent=count; } }
+  const direct = data.duckdb_direct;
+  if (direct) document.getElementById('directStatus').textContent = `${direct.phase} · points=${direct.point_count || 0}${direct.surface_id ? ' · '+direct.surface_id : ''}`;
   const job = data.job;
   const buttons = document.querySelectorAll('[data-runnable]'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
   if (!job) return;
@@ -437,6 +467,19 @@ class _ImportJob:
     error: str | None = None
 
 
+@dataclass(slots=True)
+class _DirectJob:
+    request: DirectBuildRequest
+    preflight_request: DirectBuildRequest
+    preflight: DirectPreflight
+    cancel: threading.Event = field(default_factory=threading.Event)
+    running: bool = True
+    phase: str = "STARTING"
+    surface_id: str | None = None
+    point_count: int = 0
+    publication_state: str = "PENDING"
+    error: str | None = None
+
 class PanelController:
     def __init__(
         self,
@@ -447,6 +490,9 @@ class PanelController:
         preflight_func: Callable[[ImportRequest], ImportPreflight] = preflight_html_import,
         import_func: Callable[[ImportRequest, Callable[[ImportProgress], object] | None], ImportJobResult] = import_html_tree,
         migration_func: Callable[[Path, Path], object] = migrate_source_database,
+        direct_connection_factory: Callable[..., duckdb.DuckDBPyConnection] = duckdb.connect,
+        direct_preflight_func: Callable[[duckdb.DuckDBPyConnection, DirectBuildRequest], DirectPreflight] = preflight_duckdb_direct,
+        direct_build_func: Callable[..., object] = run_panel_direct_build,
     ) -> None:
         self.root = root.resolve()
         self.default_config = self._path(default_config)
@@ -463,6 +509,11 @@ class PanelController:
         self._preflight_func = preflight_func
         self._import_func = import_func
         self._migration_func = migration_func
+        self._direct_connection_factory = direct_connection_factory
+        self._direct_preflight_func = direct_preflight_func
+        self._direct_build_func = direct_build_func
+        self._direct_preflight: tuple[DirectBuildRequest, DirectPreflight, str] | None = None
+        self._direct_job: _DirectJob | None = None
 
     @staticmethod
     def _section(action: str) -> str:
@@ -726,6 +777,118 @@ class PanelController:
             updated = DuckDBImportSettings(target, current.analysis_duckdb_path, current.default_html_root, current.audit_root, current.workers, current.transaction_batch_size)
             save_duckdb_import_settings(self.default_config, updated)
         return self._settings_document(updated)
+
+    @staticmethod
+    def _direct_request(payload: Mapping[str, object]) -> DirectBuildRequest:
+        def symbols(value: object) -> tuple[str, ...]:
+            items = value.split(";") if isinstance(value, str) else value
+            if not isinstance(items, (list, tuple)): raise ValueError("symbols must be a list or semicolon-separated string")
+            result = tuple(sorted({str(item).strip() for item in items if str(item).strip()}))
+            if not result: raise ValueError("at least one symbol is required")
+            return result
+        def shifts() -> tuple[int, ...]:
+            raw = payload.get("required_shifts_bp")
+            if raw is not None:
+                values = raw.split(";") if isinstance(raw, str) else raw
+                try: return tuple(sorted({int(value) for value in values}))
+                except (TypeError, ValueError): raise ValueError("required_shifts_bp must be integers") from None
+            try:
+                start, end, step = (int(payload[name]) for name in ("shift_start_bp", "shift_end_bp", "shift_step_bp"))
+            except (KeyError, TypeError, ValueError): raise ValueError("shift range must be integers") from None
+            if step < 1 or end < start or (end - start) % step: raise ValueError("shift range is invalid")
+            return tuple(range(start, end + 1, step))
+        side = PanelController._required(payload, "side").upper()
+        if side not in {"LONG", "SHORT"}: raise ValueError("side must be LONG or SHORT")
+        return DirectBuildRequest(
+            PanelController._required(payload, "start_utc"), PanelController._required(payload, "end_utc"),
+            side, symbols(payload.get("symbols", ())), shifts(),
+            _DIRECT_MATERIALIZER_VERSION, _DIRECT_POINT_CONFIG_HASH,
+        )
+
+    @staticmethod
+    def _direct_token(request: DirectBuildRequest, preflight: DirectPreflight) -> str:
+        document = {
+            "request": {name: list(value) if isinstance(value, tuple) else value for name, value in ((name, getattr(request, name)) for name in request.__dataclass_fields__)},
+            "usable": {key: list(value) for key, value in preflight.usable_timeframes.items()},
+            "unavailable": {key: list(value) for key, value in preflight.unavailable_symbols.items()},
+            "issues": [(item.symbol, item.timeframe, item.code, item.detail) for item in preflight.coverage_issues],
+            "grid": dict(preflight.grid_contract), "hashes": list(preflight.source_hashes),
+            "manifest": list(preflight.manifest), "points": list(preflight.accepted_point_keys),
+        }
+        return sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _direct_paths(self) -> tuple[Path, Path]:
+        settings = self._import_settings()
+        source, analysis = settings.source_duckdb_path, settings.analysis_duckdb_path
+        if source is None or analysis is None: raise ValueError("source_duckdb_path and analysis_duckdb_path must be configured")
+        if source == analysis: raise ValueError("source and analysis DuckDB paths must differ")
+        return source, analysis
+
+    def _with_source(self, callback: Callable[[duckdb.DuckDBPyConnection], object]) -> object:
+        source, _ = self._direct_paths()
+        try:
+            connection = self._direct_connection_factory(str(source), read_only=True)
+            try: return callback(connection)
+            finally: connection.close()
+        except (duckdb.Error, OSError) as error:
+            raise ValueError("direct preflight failed") from error
+
+    @staticmethod
+    def _direct_preflight_document(request: DirectBuildRequest, preflight: DirectPreflight, token: str) -> dict[str, object]:
+        return {"token": token, "selected_symbols": list(preflight.usable_timeframes), "usable_timeframes": {key: list(value) for key, value in preflight.usable_timeframes.items()}, "unavailable_symbols": {key: list(value) for key, value in preflight.unavailable_symbols.items()}, "coverage_issues": [{"symbol": item.symbol, "timeframe": item.timeframe, "code": item.code, "detail": item.detail} for item in preflight.coverage_issues]}
+
+    def duckdb_direct_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
+        request = self._direct_request(payload)
+        preflight = self._with_source(lambda source: self._direct_preflight_func(source, request))
+        assert isinstance(preflight, DirectPreflight)
+        token = self._direct_token(request, preflight)
+        with self._lock: self._direct_preflight = (request, preflight, token)
+        return self._direct_preflight_document(request, preflight, token)
+
+    def start_duckdb_direct(self, payload: Mapping[str, object]) -> dict[str, object]:
+        request, token = self._direct_request(payload), self._required(payload, "preflight_token")
+        with self._lock:
+            if self._direct_job and self._direct_job.running: raise RuntimeError("another direct build is already running")
+            if self._direct_preflight is None: raise ValueError("latest preflight token is required")
+            original, preflight, expected = self._direct_preflight
+            if token != expected or request != original: raise ValueError("latest preflight token is required")
+            chosen = payload.get("selected_symbols", tuple(preflight.usable_timeframes))
+            selected = self._direct_request({**payload, "symbols": chosen})
+            if replace(selected, symbols=request.symbols) != request: raise ValueError("latest preflight token is required")
+            if not set(selected.symbols).issubset(preflight.usable_timeframes): raise ValueError("selected symbol is unavailable")
+            job = _DirectJob(selected, original, preflight); self._direct_job = job
+        threading.Thread(target=self._run_duckdb_direct, args=(job,), name="mrs3-panel-duckdb-direct", daemon=True).start()
+        return self.snapshot()
+
+    def _run_duckdb_direct(self, job: _DirectJob) -> None:
+        source = analysis = None
+        try:
+            source_path, analysis_path = self._direct_paths()
+            source = self._direct_connection_factory(str(source_path), read_only=True)
+            if job.cancel.is_set(): raise DirectMaterializationError("direct build cancelled")
+            active = self._direct_preflight_func(source, job.preflight_request)
+            if active != job.preflight: raise DirectMaterializationError("active source changed after preflight")
+            analysis = self._direct_connection_factory(str(analysis_path), read_only=False)
+            def progress(phase: str, **facts: object) -> None:
+                with self._lock: job.phase = phase; job.point_count = int(facts.get("materialized_points", job.point_count))
+            published = self._direct_build_func(source, analysis, job.request, job.cancel.is_set, progress)
+            with self._lock:
+                job.surface_id, job.point_count, job.phase, job.publication_state = str(published.surface_id), len(published.points), "PUBLISHED", "PUBLISHED"
+        except BaseException as error:
+            with self._lock:
+                job.phase = "CANCELLED" if job.cancel.is_set() else "FAILED"
+                job.publication_state = job.phase
+                job.error = "direct build cancelled" if job.cancel.is_set() else f"{type(error).__name__}: direct build failed"
+        finally:
+            if analysis is not None: analysis.close()
+            if source is not None: source.close()
+            with self._lock: job.running = False
+
+    def cancel_duckdb_direct(self) -> dict[str, object]:
+        with self._lock:
+            if self._direct_job is None: raise ValueError("no direct build")
+            self._direct_job.cancel.set()
+        return self.snapshot()["duckdb_direct"]
 
     def start(self, action: str, payload: Mapping[str, object]) -> dict[str, object]:
         command, artifacts = self._build_command(action, payload)
@@ -1065,6 +1228,16 @@ class PanelController:
                     "error": import_job.error or ("import failed" if result and result.error else None),
                     "artifacts": ({"import_manifest": "import_manifest.json", "import_checklist": "html_delete_checklist.json"} if evidence_valid else {}),
                 }
+            direct_job = self._direct_job
+            direct_document = None if direct_job is None else {
+                "running": direct_job.running,
+                "cancel_requested": direct_job.cancel.is_set(),
+                "phase": direct_job.phase,
+                "point_count": direct_job.point_count,
+                "surface_id": direct_job.surface_id,
+                "publication_state": direct_job.publication_state,
+                "error": direct_job.error,
+            }
         return {
             "defaults": {
                 "root": str(self.root),
@@ -1072,6 +1245,7 @@ class PanelController:
             },
             "job": job_document,
             "duckdb_import": import_document,
+            "duckdb_direct": direct_document,
             "dashboard": dashboard,
         }
 
@@ -1191,7 +1365,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -1226,6 +1400,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.cancel_duckdb_import()
             elif endpoint == "/api/duckdb-import/migrate":
                 result = self.server.controller.migrate_duckdb_import(document)
+            elif endpoint == "/api/duckdb-direct/preflight":
+                result = self.server.controller.duckdb_direct_preflight(document)
+            elif endpoint == "/api/duckdb-direct/start":
+                result = self.server.controller.start_duckdb_direct(document)
+            elif endpoint == "/api/duckdb-direct/cancel":
+                result = self.server.controller.cancel_duckdb_direct()
             else:
                 action = str(document.get("action", ""))
                 result = self.server.controller.start(action, document)
@@ -1235,7 +1415,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             self._json(400, {"error": str(error)})
             return
-        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start"} else 200, result)
+        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start"} else 200, result)
 
 
 def create_panel_server(

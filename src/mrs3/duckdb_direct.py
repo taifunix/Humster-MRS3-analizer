@@ -16,6 +16,7 @@ from .duckdb_events import (
 )
 from .duckdb_source_schema import NORMALIZATION_CONTRACT_VERSION, validate_source_database
 from .source_packs import SourcePackError
+from .analysis_storage import PublishedSurface, publish_surface
 
 
 TRADES_PROXY_EVENT_MODE = "legacy_trades_proxy"
@@ -155,13 +156,13 @@ def preflight_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, reques
     )
 
 
-def materialize_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, analysis_connection: duckdb.DuckDBPyConnection, request: DirectBuildRequest, cancellation: Callable[[], bool]) -> DirectSurface:
+def materialize_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, analysis_connection: duckdb.DuckDBPyConnection, request: DirectBuildRequest, cancellation: Callable[[], bool], *, preflight: DirectPreflight | None = None) -> DirectSurface:
     """Decode only preflight-accepted reports into a non-published direct surface."""
     if source_connection is analysis_connection:
         raise DirectMaterializationError("source and analysis connections must be distinct")
     if cancellation():
         raise DirectMaterializationError("direct materialization cancelled before publication")
-    preflight = preflight_duckdb_direct(source_connection, request)
+    preflight = preflight or preflight_duckdb_direct(source_connection, request)
     if preflight.unavailable_symbols:
         raise DirectMaterializationError("selected symbol has no usable timeframe")
     start, end = _window(request)
@@ -187,3 +188,34 @@ def materialize_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, anal
     if len({point.canonical_point_key for point in points}) != len(points):
         raise DirectMaterializationError("canonical point uniqueness failed")
     return DirectSurface(request, preflight, TRADES_PROXY_EVENT_MODE, tuple(points))
+
+
+def run_panel_direct_build(
+    source_connection: duckdb.DuckDBPyConnection,
+    analysis_connection: duckdb.DuckDBPyConnection,
+    request: DirectBuildRequest,
+    cancellation: Callable[[], bool],
+    progress_callback: Callable[..., object],
+) -> PublishedSurface:
+    """Build and atomically publish a preflight-bound direct surface."""
+    if source_connection is analysis_connection:
+        raise DirectMaterializationError("source and analysis connections must be distinct")
+    progress_callback("PREFLIGHT", selected_symbols=len(request.symbols))
+    preflight = preflight_duckdb_direct(source_connection, request)
+    if preflight.unavailable_symbols:
+        raise DirectMaterializationError("selected symbol has no usable timeframe")
+    if cancellation():
+        raise DirectMaterializationError("direct materialization cancelled before publication")
+    progress_callback("MATERIALIZING", usable_timeframes=sum(map(len, preflight.usable_timeframes.values())))
+    surface = materialize_duckdb_direct(source_connection, analysis_connection, request, cancellation, preflight=preflight)
+    if cancellation():
+        raise DirectMaterializationError("direct materialization cancelled before publication")
+    progress_callback("REVALIDATING", materialized_points=len(surface.points))
+    active = preflight_duckdb_direct(source_connection, request)
+    if active != preflight:
+        raise DirectMaterializationError("active source changed after preflight")
+    if cancellation():
+        raise DirectMaterializationError("direct materialization cancelled before publication")
+    published = publish_surface(analysis_connection, surface)
+    progress_callback("PUBLISHED", materialized_points=len(published.points), publication_state="PUBLISHED")
+    return published

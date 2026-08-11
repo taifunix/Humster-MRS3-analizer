@@ -14,6 +14,7 @@ from mrs3.duckdb_direct import (
     DirectMaterializationError,
     materialize_duckdb_direct,
     preflight_duckdb_direct,
+    run_panel_direct_build,
 )
 from mrs3.analysis_storage import publish_surface
 from mrs3.duckdb_events import ACTION_CODEC, EQUITY_CODEC
@@ -274,3 +275,107 @@ def test_explicit_parent_requires_same_period_and_selected_scope(connections) ->
         with pytest.raises(ValueError, match="explicit parent"):
             publish_surface(analysis, child)
     assert analysis.execute("select count(*) from surfaces").fetchone() == (1,)
+
+
+def test_panel_build_orders_preflight_materialization_revalidation_and_publication(
+    connections, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, analysis = connections
+    _seed_report(source)
+    calls: list[str] = []
+    original_preflight = preflight_duckdb_direct
+
+    def preflight(connection: duckdb.DuckDBPyConnection, request: DirectBuildRequest):
+        calls.append("preflight")
+        return original_preflight(connection, request)
+
+    def materialize(*args: object, **kwargs: object):
+        calls.append("materialize")
+        return materialize_duckdb_direct(*args, **kwargs)  # type: ignore[arg-type]
+
+    def publish(connection: duckdb.DuckDBPyConnection, surface: object):
+        calls.append("publish")
+        return publish_surface(connection, surface)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("mrs3.duckdb_direct.preflight_duckdb_direct", preflight)
+    monkeypatch.setattr("mrs3.duckdb_direct.materialize_duckdb_direct", materialize)
+    monkeypatch.setattr("mrs3.duckdb_direct.publish_surface", publish)
+
+    phases: list[str] = []
+    published = run_panel_direct_build(source, analysis, _request(), lambda: False, lambda phase, **_: phases.append(phase))
+
+    assert calls == ["preflight", "materialize", "preflight", "publish"]
+    assert phases == ["PREFLIGHT", "MATERIALIZING", "REVALIDATING", "PUBLISHED"]
+    assert published.created is True
+
+
+def test_panel_build_rejects_source_hash_change_immediately_before_publish(
+    connections, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, analysis = connections
+    point = _seed_report(source)
+    original_preflight = preflight_duckdb_direct
+    calls = 0
+
+    def changed_after_materialization(connection: duckdb.DuckDBPyConnection, request: DirectBuildRequest):
+        nonlocal calls
+        calls += 1
+        preflight = original_preflight(connection, request)
+        if calls == 2:
+            return replace(preflight, source_hashes=("b" * 64,), manifest=((point, "b" * 64),))
+        return preflight
+
+    monkeypatch.setattr("mrs3.duckdb_direct.preflight_duckdb_direct", changed_after_materialization)
+
+    with pytest.raises(DirectMaterializationError, match="active source changed"):
+        run_panel_direct_build(source, analysis, _request(), lambda: False, lambda *_args, **_kwargs: None)
+    assert analysis.execute("select count(*) from information_schema.tables where table_name='surfaces'").fetchone() == (0,)
+
+
+def test_panel_build_rejects_changed_preflight_contract_before_publish(
+    connections, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, analysis = connections
+    _seed_report(source)
+    original_preflight = preflight_duckdb_direct
+    calls = 0
+
+    def changed_after_materialization(connection: duckdb.DuckDBPyConnection, request: DirectBuildRequest):
+        nonlocal calls
+        calls += 1
+        preflight = original_preflight(connection, request)
+        return replace(preflight, accepted_point_keys=("changed",)) if calls == 2 else preflight
+
+    monkeypatch.setattr("mrs3.duckdb_direct.preflight_duckdb_direct", changed_after_materialization)
+
+    with pytest.raises(DirectMaterializationError, match="active source changed"):
+        run_panel_direct_build(source, analysis, _request(), lambda: False, lambda *_args, **_kwargs: None)
+    assert analysis.execute("select count(*) from information_schema.tables where table_name='surfaces'").fetchone() == (0,)
+
+
+def test_panel_build_cancellation_after_materialization_blocks_publication(
+    connections, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, analysis = connections
+    _seed_report(source)
+    cancelled = False
+    original_materialize = materialize_duckdb_direct
+    published = False
+
+    def materialize(*args: object, **kwargs: object):
+        nonlocal cancelled
+        surface = original_materialize(*args, **kwargs)  # type: ignore[arg-type]
+        cancelled = True
+        return surface
+
+    def publish(*_: object) -> object:
+        nonlocal published
+        published = True
+        raise AssertionError("cancelled build must not publish")
+
+    monkeypatch.setattr("mrs3.duckdb_direct.materialize_duckdb_direct", materialize)
+    monkeypatch.setattr("mrs3.duckdb_direct.publish_surface", publish)
+    with pytest.raises(DirectMaterializationError, match="cancelled"):
+        run_panel_direct_build(source, analysis, _request(), lambda: cancelled, lambda *_args, **_kwargs: None)
+    assert published is False
+    assert analysis.execute("select count(*) from information_schema.tables where table_name='surfaces'").fetchone() == (0,)

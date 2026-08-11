@@ -7,12 +7,13 @@ import json
 from pathlib import Path
 import time
 from hashlib import sha256
-from dataclasses import replace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
 from mrs3.panel import PanelController, _Job, create_panel_server
 from mrs3.duckdb_import import ImportJobResult, ImportPreflight, ImportProgress
+from mrs3.duckdb_direct import CoverageIssue, DirectPreflight
 
 
 class _FakeProcess:
@@ -56,6 +57,157 @@ def _wait_import_finished(controller: PanelController) -> dict[str, object]:
             return document
         time.sleep(.01)
     raise AssertionError("panel import did not finish")
+
+
+def _wait_direct_finished(controller: PanelController) -> dict[str, object]:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        document = controller.snapshot()["duckdb_direct"]
+        if document and not document["running"]:
+            return document
+        time.sleep(.01)
+    raise AssertionError("panel direct build did not finish")
+
+
+def test_direct_build_requires_matching_latest_preflight_and_closes_distinct_connections(tmp_path: Path) -> None:
+    connections: list[tuple[str, bool, object]] = []
+
+    class Connection:
+        def __init__(self) -> None: self.closed = False
+        def close(self) -> None: self.closed = True
+
+    def connect(path: str, *, read_only: bool) -> Connection:
+        connection = Connection(); connections.append((path, read_only, connection)); return connection
+
+    preflight = DirectPreflight(
+        {"BTCUSDT": ("1h",)}, {}, (), MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}),
+        ("a" * 64,), (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",),
+    )
+    calls: list[str] = []
+    def inspect(_: object, __: object) -> DirectPreflight: calls.append("preflight"); return preflight
+    def build(_: object, __: object, ___: object, ____: object, progress: object) -> object:
+        calls.append("build"); progress("PUBLISHED", materialized_points=1); return SimpleNamespace(surface_id="surface-1", points=(object(),))
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", direct_connection_factory=connect, direct_preflight_func=inspect, direct_build_func=build)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+    request = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
+    flight = controller.duckdb_direct_preflight(request)
+    with pytest.raises(ValueError, match="latest preflight token"):
+        controller.start_duckdb_direct({**request, "preflight_token": "wrong"})
+    with pytest.raises(ValueError, match="latest preflight token"):
+        controller.start_duckdb_direct({**request, "side": "SHORT", "preflight_token": flight["token"]})
+    controller.start_duckdb_direct({**request, "preflight_token": flight["token"]})
+    result = _wait_direct_finished(controller)
+    assert result["surface_id"] == "surface-1"
+    assert calls == ["preflight", "preflight", "build"]
+    assert [(Path(path).name, read_only, connection.closed) for path, read_only, connection in connections] == [("source.duckdb", True, True), ("source.duckdb", True, True), ("analysis.duckdb", False, True)]
+    assert str(tmp_path) not in json.dumps(result)
+
+
+def test_direct_build_rejects_same_database_before_open_and_ui_has_controls(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    controller.duckdb_import_settings({"source_duckdb_path": "same.duckdb", "analysis_duckdb_path": "same.duckdb"})
+    payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
+    with pytest.raises(ValueError, match="must differ"):
+        controller.duckdb_direct_preflight(payload)
+    for control in ("direct_start", "direct_end", "direct_side", "direct_shift_start", "direct_shift_end", "direct_shift_step", "direct_symbols"):
+        assert f'id="{control}"' in __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+    def fail_open(*_args: object, **_kwargs: object) -> object:
+        raise OSError(str(tmp_path))
+    controller._direct_connection_factory = fail_open
+    with pytest.raises(ValueError, match="direct preflight failed") as error:
+        controller.duckdb_direct_preflight(payload)
+    assert str(tmp_path) not in str(error.value)
+
+
+def test_direct_preflight_defaults_usable_symbols_and_marks_unavailable(tmp_path: Path) -> None:
+    preflight = DirectPreflight(
+        {"BTCUSDT": ("1h",)}, {"ETHUSDT": ("1h",)},
+        (CoverageIssue("ETHUSDT", "1h", "GRID_NOT_COVERED", "missing grid cells"),),
+        MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}), ("a" * 64,),
+        (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",),
+    )
+    class Connection:
+        def close(self) -> None: pass
+    controller = PanelController(
+        tmp_path, tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_preflight_func=lambda *_: preflight,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+    payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT", "ETHUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
+    document = controller.duckdb_direct_preflight(payload)
+    assert document["selected_symbols"] == ["BTCUSDT"]
+    assert document["unavailable_symbols"] == {"ETHUSDT": ["1h"]}
+    with pytest.raises(ValueError, match="at least one symbol"):
+        controller.start_duckdb_direct({**payload, "preflight_token": document["token"], "selected_symbols": []})
+    with pytest.raises(ValueError, match="unavailable"):
+        controller.start_duckdb_direct({**payload, "preflight_token": document["token"], "selected_symbols": ["ETHUSDT"]})
+
+
+def test_direct_build_reports_cancellation_without_leaking_paths(tmp_path: Path) -> None:
+    started, release = __import__("threading").Event(), __import__("threading").Event()
+    base = DirectPreflight({"BTCUSDT": ("1h",)}, {}, (), MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}), ("a" * 64,), (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",))
+    calls = 0
+    def inspect(*_: object) -> DirectPreflight:
+        nonlocal calls; calls += 1
+        return base if calls < 2 else base
+    class Connection:
+        def close(self) -> None: pass
+    def build(*args: object) -> object:
+        cancellation, progress = args[-2], args[-1]
+        started.set(); progress("MATERIALIZING", materialized_points=1); release.wait(1)
+        if cancellation(): raise ValueError(f"cancelled at {tmp_path}")
+        return SimpleNamespace(surface_id="surface-1", points=(object(),))
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", direct_connection_factory=lambda *_args, **_kwargs: Connection(), direct_preflight_func=inspect, direct_build_func=build)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+    payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
+    token = controller.duckdb_direct_preflight(payload)["token"]
+    controller.start_duckdb_direct({**payload, "preflight_token": token})
+    assert started.wait(1); assert controller.cancel_duckdb_direct()["cancel_requested"] is True
+    release.set(); status = _wait_direct_finished(controller)
+    assert status["publication_state"] == "CANCELLED"
+    assert str(tmp_path) not in json.dumps(status)
+
+
+def test_direct_build_rejects_changed_source_snapshot_before_build(tmp_path: Path) -> None:
+    base = DirectPreflight({"BTCUSDT": ("1h",)}, {}, (), MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}), ("a" * 64,), (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",))
+    changed = DirectPreflight(base.usable_timeframes, base.unavailable_symbols, base.coverage_issues, base.grid_contract, base.source_hashes, base.manifest, ("changed",))
+    calls, built = 0, False
+    def inspect(*_: object) -> DirectPreflight:
+        nonlocal calls; calls += 1; return base if calls == 1 else changed
+    class Connection:
+        def close(self) -> None: pass
+    def build(*_: object) -> object:
+        nonlocal built; built = True; raise AssertionError("must not build stale source")
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", direct_connection_factory=lambda *_args, **_kwargs: Connection(), direct_preflight_func=inspect, direct_build_func=build)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+    payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
+    token = controller.duckdb_direct_preflight(payload)["token"]
+    controller.start_duckdb_direct({**payload, "preflight_token": token})
+    status = _wait_direct_finished(controller)
+    assert status["publication_state"] == "FAILED"
+    assert built is False
+
+
+def test_direct_build_closes_source_if_analysis_open_fails(tmp_path: Path) -> None:
+    base = DirectPreflight({"BTCUSDT": ("1h",)}, {}, (), MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}), ("a" * 64,), (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",))
+    opened: list[object] = []
+    class Connection:
+        def __init__(self) -> None: self.closed = False
+        def close(self) -> None: self.closed = True
+    def connect(_path: str, *, read_only: bool) -> Connection:
+        if not read_only: raise OSError("analysis open failed")
+        connection = Connection(); opened.append(connection); return connection
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", direct_connection_factory=connect, direct_preflight_func=lambda *_: base)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+    payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
+    token = controller.duckdb_direct_preflight(payload)["token"]
+    controller.start_duckdb_direct({**payload, "preflight_token": token})
+    assert _wait_direct_finished(controller)["publication_state"] == "FAILED"
+    assert all(connection.closed for connection in opened)
 
 
 class _ImportUiParser(HTMLParser):
@@ -153,12 +305,20 @@ def test_http_duckdb_import_settings_and_preflight_are_dedicated_routes(tmp_path
     def migrate(_: Path, target: Path) -> object:
         target.write_bytes(b"migrated")
         return type("Migration", (), {"validation": type("Validation", (), {"valid": True})(), "target_database_sha256": sha256(target.read_bytes()).hexdigest()})()
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", preflight_func=lambda _: ImportPreflight("token", 0, 5, "digest"), migration_func=migrate)
+    class Connection:
+        def close(self) -> None: pass
+    direct = DirectPreflight({"BTCUSDT": ("1h",)}, {}, (), MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}), ("a" * 64,), (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",))
+    controller = PanelController(
+        tmp_path, tmp_path / "config.local.json",
+        preflight_func=lambda _: ImportPreflight("token", 0, 5, "digest"), migration_func=migrate,
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_preflight_func=lambda *_: direct,
+    )
     server = create_panel_server("127.0.0.1", 0, controller)
     thread = __import__("threading").Thread(target=server.serve_forever, daemon=True); thread.start()
     connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
     try:
-        settings = {"source_duckdb_path": "source.duckdb", "audit_root": "audit", "default_html_root": "html"}
+        settings = {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit", "default_html_root": "html"}
         connection.request("POST", "/api/duckdb-import/settings", json.dumps(settings).encode(), {"Content-Type": "application/json"})
         saved = connection.getresponse(); assert saved.status == 200; saved.read()
         connection.request("GET", "/api/duckdb-import/settings")
@@ -167,6 +327,10 @@ def test_http_duckdb_import_settings_and_preflight_are_dedicated_routes(tmp_path
         connection.request("POST", "/api/duckdb-import/preflight", json.dumps({"root_path": "html"}).encode(), {"Content-Type": "application/json"})
         response = connection.getresponse(); assert response.status == 200
         assert json.loads(response.read())["token"] == "token"
+        direct_payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
+        connection.request("POST", "/api/duckdb-direct/preflight", json.dumps(direct_payload).encode(), {"Content-Type": "application/json"})
+        direct_response = connection.getresponse(); assert direct_response.status == 200
+        assert json.loads(direct_response.read())["selected_symbols"] == ["BTCUSDT"]
         connection.request("POST", "/api/duckdb-import/migrate", json.dumps({"target_path": "migrated.duckdb"}).encode(), {"Content-Type": "application/json"})
         migrated = connection.getresponse(); assert migrated.status == 200
         assert json.loads(migrated.read())["source_duckdb_path"] == str((tmp_path / "migrated.duckdb").resolve())
@@ -185,7 +349,10 @@ def test_http_ui_exposes_persistent_import_settings_and_migration_controls(tmp_p
         parser.feed(response.read().decode("utf-8"))
         assert response.status == 200
         assert {"import_source_duckdb", "import_analysis_duckdb", "import_default_html_root", "import_audit_root", "import_workers", "import_batch_size", "migration_target"} <= parser.input_ids
-        assert {"saveDuckdbSettings()", "migrateDuckdb()"} <= parser.actions
+        assert {"direct_start", "direct_end", "direct_shift_start", "direct_shift_end", "direct_shift_step", "direct_symbols"} <= parser.input_ids
+        assert {"saveDuckdbSettings()", "migrateDuckdb()", "directPreflight()", "directBuild()", "directCancel()"} <= parser.actions
+        panel_html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+        assert ".direct-unavailable" in panel_html and "row.className='direct-unavailable'" in panel_html
     finally:
         connection.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
 
