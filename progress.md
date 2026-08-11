@@ -31,6 +31,16 @@ full-horizon source gate; PnL/DD remain mandatory
 `NOT_COMPARABLE_WINDOW_SCOPE` diagnostics. The DuckDB materializer uses bounded
 reads and retains the complete cycle/exclusion audit.
 
+Task 1 of the approved DuckDB storage/importer plan rejects lossy
+fractional/non-finite integer loader values, accepts only Python `None` and
+`pd.NA` wins/losses values as zero, and rejects empty normalized input before
+downstream processing. Focused evidence: `52 passed` for `tests/test_loader.py` and
+`33 passed` for `tests/test_source_packs.py` with the local `.venv` on
+2026-08-11. The full suite reaches `316 passed` but has eight independent
+runner-test failures because three required HTML fixtures are absent from Git;
+those paths are outside Task 1 and were not changed. Independent re-review is
+approved; Task 1 is complete.
+
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
 included cycles. The package has `source_summary_status=VERIFIED` and
@@ -51,9 +61,10 @@ and does not block the core delivery.
 ## Next required work
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
-approved. No implementation from that plan has started.
+approved. Task 0 is represented by the existing `d76b985` package-side/UTC
+slice; Task 1 is complete and Task 2 is next.
 
-1. Start with mandatory Task 0 from the
+1. Start Task 2 from the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 2. Apply the confirmed external-review remediation tasks listed in the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).

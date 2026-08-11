@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-import math
 from pathlib import Path
 
 import pandas as pd
@@ -16,6 +15,35 @@ class InputError(ValueError):
 
 EVENT_MODES = frozenset({"legacy_trades_proxy", "real_independent_events"})
 LEGACY_EVENT_IDS_HASH = "LEGACY_PROXY_NO_EVENT_IDS"
+
+
+def _exact_integer(
+    values: pd.Series,
+    field: str,
+    *,
+    non_negative: bool = False,
+    missing_as_zero: bool = False,
+) -> pd.Series:
+    parsed: list[int] = []
+    for value in values:
+        if value is None or value is pd.NA:
+            if missing_as_zero:
+                parsed.append(0)
+                continue
+            raise InputError(f"{field} must be finite exact integers")
+        try:
+            number = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise InputError(f"{field} must be finite exact integers") from exc
+        if not number.is_finite() or number != number.to_integral_value():
+            raise InputError(f"{field} must be finite exact integers")
+        integer = int(number)
+        if non_negative and integer < 0:
+            raise InputError(f"{field} must be finite exact integers")
+        if not -(2**63) <= integer < 2**63:
+            raise InputError(f"{field} must be finite exact integers")
+        parsed.append(integer)
+    return pd.Series(parsed, index=values.index, dtype="int64")
 
 
 def normalize_shift(
@@ -103,23 +131,29 @@ def load_points(
     service_mask = raw[[columns[key] for key in essential_keys]].isna().any(axis=1)
     service_rows = int(service_mask.sum())
     data = raw.loc[~service_mask].copy()
+    if data.empty:
+        raise InputError("no usable data rows")
     listing_dates = _load_listing_dates(dates_path)
 
     points = pd.DataFrame(
         {
-            "run_id": pd.to_numeric(data[columns["run_id"]], errors="raise").astype("int64"),
+            "run_id": _exact_integer(data[columns["run_id"]], "run_id"),
             "symbol": data[columns["symbol"]].astype(str).str.strip(),
             "side": side.value,
             "timeframe": data[columns["timeframe"]].astype(str).str.strip(),
-            "open_ma": pd.to_numeric(data[columns["open_ma"]], errors="raise").astype("int64"),
-            "close_ma": pd.to_numeric(data[columns["close_ma"]], errors="raise").astype("int64"),
+            "open_ma": _exact_integer(data[columns["open_ma"]], "open_ma"),
+            "close_ma": _exact_integer(data[columns["close_ma"]], "close_ma"),
             "multiplier": pd.to_numeric(data[columns["multiplier"]], errors="raise").astype(float),
             "report_start": pd.to_datetime(data[columns["report_start"]], errors="raise", utc=True),
             "report_end": pd.to_datetime(data[columns["report_end"]], errors="raise", utc=True),
             "pnl_pct": pd.to_numeric(data[columns["pnl_pct"]], errors="raise").astype(float),
-            "trades": pd.to_numeric(data[columns["trades"]], errors="raise").astype("int64"),
-            "wins": pd.to_numeric(data[columns["wins"]], errors="coerce").fillna(0).astype("int64"),
-            "losses": pd.to_numeric(data[columns["losses"]], errors="coerce").fillna(0).astype("int64"),
+            "trades": _exact_integer(data[columns["trades"]], "trades"),
+            "wins": _exact_integer(
+                data[columns["wins"]], "wins", non_negative=True, missing_as_zero=True
+            ),
+            "losses": _exact_integer(
+                data[columns["losses"]], "losses", non_negative=True, missing_as_zero=True
+            ),
             "win_rate_pct": pd.to_numeric(data[columns["win_rate_pct"]], errors="raise").astype(float),
             "dd_pct": pd.to_numeric(data[columns["dd_pct"]], errors="raise").astype(float),
             "profit_factor": pd.to_numeric(data[columns["profit_factor"]], errors="coerce").astype(float),
@@ -172,15 +206,9 @@ def load_points(
     else:
         if "point_event_count" not in data:
             raise InputError("point_event_count is required with event_mode")
-        event_counts = pd.to_numeric(data["point_event_count"], errors="raise")
-        valid_event_counts = event_counts.map(
-            lambda value: math.isfinite(float(value))
-            and float(value) >= 0
-            and float(value).is_integer()
+        points["point_event_count"] = _exact_integer(
+            data["point_event_count"], "point_event_count", non_negative=True
         )
-        if not valid_event_counts.all():
-            raise InputError("point_event_count must be finite non-negative integers")
-        points["point_event_count"] = event_counts.astype("int64")
         if points["event_mode"].iloc[0] == "legacy_trades_proxy" and not points[
             "point_event_count"
         ].eq(points["trades"]).all():

@@ -144,6 +144,86 @@ def test_service_rows_are_excluded_and_counted(tmp_path: Path) -> None:
     assert audit.service_rows == 1
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("Run id", 1.5),
+        ("Run id", float("inf")),
+        ("Run id", "1.0000000000000000001"),
+        ("settings[*].mrs2.ma_long.len", 3.5),
+        ("settings[*].mrs2.ma_long.len", float("inf")),
+        ("settings[*].mrs2.ma_long.len", "3.0000000000000000001"),
+        ("settings[*].mrs2.ma_close_long.len", 4.5),
+        ("settings[*].mrs2.ma_close_long.len", float("inf")),
+        ("settings[*].mrs2.ma_close_long.len", "4.0000000000000000001"),
+        ("TotalTrades", 20.5),
+        ("TotalTrades", float("inf")),
+        ("TotalTrades", "20.0000000000000000001"),
+    ],
+)
+def test_load_points_rejects_lossy_integer_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    _, dates_path = _write_inputs(tmp_path, [_source_row()])
+    raw = pd.DataFrame([_source_row(**{field: value})])
+
+    with pytest.raises(InputError, match="integer|finite|run_id|open_ma|close_ma|trades"):
+        load_points(raw, dates_path, Side.LONG, _config())
+
+
+@pytest.mark.parametrize("missing", [None, pd.NA])
+def test_load_points_converts_only_genuine_missing_wins_and_losses_to_zero(
+    tmp_path: Path, missing: object
+) -> None:
+    _, dates_path = _write_inputs(tmp_path, [_source_row()])
+    raw = pd.DataFrame([_source_row(Win=missing, Los=missing)])
+
+    points, _ = load_points(raw, dates_path, Side.LONG, _config())
+
+    assert points[["wins", "losses"]].to_dict("records") == [{"wins": 0, "losses": 0}]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("Win", ""),
+        ("Win", "not-a-number"),
+        ("Win", -1),
+        ("Win", 1.5),
+        ("Win", float("inf")),
+        ("Win", float("nan")),
+        ("Los", ""),
+        ("Los", "not-a-number"),
+        ("Los", -1),
+        ("Los", 1.5),
+        ("Los", float("inf")),
+        ("Los", float("nan")),
+    ],
+)
+def test_load_points_rejects_invalid_wins_and_losses(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    _, dates_path = _write_inputs(tmp_path, [_source_row()])
+    raw = pd.DataFrame([_source_row(**{field: value})])
+
+    with pytest.raises(InputError, match="wins|losses"):
+        load_points(raw, dates_path, Side.LONG, _config())
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pd.DataFrame([_source_row()]).iloc[0:0],
+        pd.DataFrame([_source_row(**{"settings[*].basic.symbol": None})]),
+    ],
+)
+def test_load_points_rejects_empty_normalized_input(tmp_path: Path, raw: pd.DataFrame) -> None:
+    _, dates_path = _write_inputs(tmp_path, [_source_row()])
+
+    with pytest.raises(InputError, match="no usable data rows"):
+        load_points(raw, dates_path, Side.LONG, _config())
+
+
 def test_duplicate_parameter_cell_is_rejected(tmp_path: Path) -> None:
     rows = [_source_row(), _source_row(**{"Run id": 2})]
     csv_path, dates_path = _write_inputs(tmp_path, rows)
