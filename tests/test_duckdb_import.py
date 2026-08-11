@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import shutil
+from threading import Event, Thread
 
 import duckdb
 import pytest
@@ -183,6 +184,18 @@ def test_canonical_multiplier_replacement_and_a_to_b_to_a_append_audit(
         ).fetchall() == [(hash_a, hash_b, "job-b"), (hash_b, hash_a, "job-c")]
     finally:
         connection.close()
+
+
+def _assert_failed_evidence_finalized(result) -> None:
+    manifest_bytes = result.manifest_path.read_bytes()
+    checklist_bytes = result.checklist_path.read_bytes()
+    assert result.manifest_sha256 == sha256(manifest_bytes).hexdigest()
+    assert result.checklist_sha256 == sha256(checklist_bytes).hexdigest()
+    manifest = json.loads(manifest_bytes)
+    checklist = json.loads(checklist_bytes)
+    assert manifest["final_state"] == "FAILED"
+    assert manifest["safe_to_delete"] == "NO"
+    assert checklist["safe_to_delete"] == "NO"
 
 
 def test_crlf_input_keeps_raw_manifest_hash_but_uses_v3_semantic_source_identity(
@@ -605,3 +618,187 @@ def test_incompatible_normalization_contract_fails_before_database_publication(
     assert result.safe_to_delete == "NO"
     assert "normalization contract" in (result.error or "")
     assert database.read_bytes() == database_before
+
+
+def test_concurrent_import_to_same_resolved_database_is_rejected_without_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+    entered_parse = Event()
+    allow_parse = Event()
+    real_reader = duckdb_events.read_compact_html
+
+    def blocked_reader(path: Path):
+        entered_parse.set()
+        assert allow_parse.wait(timeout=5)
+        return real_reader(path)
+
+    monkeypatch.setattr(duckdb_events, "read_compact_html", blocked_reader)
+    first_result = []
+    first = Thread(
+        target=lambda: first_result.append(
+            import_html_tree(_request(tmp_path, incoming, job_id="first"), None)
+        )
+    )
+    first.start()
+    assert entered_parse.wait(timeout=5)
+
+    second = import_html_tree(_request(tmp_path, incoming, job_id="second"), None)
+
+    assert second.final_state == "FAILED"
+    assert second.safe_to_delete == "NO"
+    assert "already being written" in (second.error or "")
+    assert not (tmp_path / "source.duckdb").exists()
+    _assert_failed_evidence_finalized(second)
+    allow_parse.set()
+    first.join(timeout=5)
+    assert not first.is_alive()
+    assert first_result[0].final_state == "COMMITTED"
+
+
+def test_busy_invalid_target_is_not_opened_before_lock_failure_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+    database = tmp_path / "source.duckdb"
+    invalid_target = b"invalid target owned by another writer"
+    database.write_bytes(invalid_target)
+    request = _request(tmp_path, incoming, job_id="busy-invalid")
+
+    def reject_database_open(*args, **kwargs):
+        raise AssertionError("busy target must not be opened")
+
+    with duckdb_import._source_database_lock(database):
+        monkeypatch.setattr(duckdb, "connect", reject_database_open)
+        result = import_html_tree(request, None)
+
+    assert result.final_state == "FAILED"
+    assert result.safe_to_delete == "NO"
+    assert "already being written" in (result.error or "")
+    assert database.read_bytes() == invalid_target
+    _assert_failed_evidence_finalized(result)
+
+
+def test_symlink_alias_to_same_database_is_rejected_as_second_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    alias_parent = tmp_path / "alias"
+    try:
+        alias_parent.symlink_to(real_parent, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+    entered_parse = Event()
+    allow_parse = Event()
+    real_reader = duckdb_events.read_compact_html
+
+    def blocked_reader(path: Path):
+        entered_parse.set()
+        assert allow_parse.wait(timeout=5)
+        return real_reader(path)
+
+    monkeypatch.setattr(duckdb_events, "read_compact_html", blocked_reader)
+    real_request = replace(
+        _request(tmp_path, incoming, job_id="real-path"),
+        database_path=real_parent / "source.duckdb",
+    )
+    alias_request = replace(
+        _request(tmp_path, incoming, job_id="alias-path"),
+        database_path=alias_parent / "source.duckdb",
+    )
+    first_result = []
+    first = Thread(
+        target=lambda: first_result.append(import_html_tree(real_request, None))
+    )
+    first.start()
+    assert entered_parse.wait(timeout=5)
+
+    second = import_html_tree(alias_request, None)
+
+    assert second.final_state == "FAILED"
+    assert "already being written" in (second.error or "")
+    assert not (real_parent / "source.duckdb").exists()
+    _assert_failed_evidence_finalized(second)
+    allow_parse.set()
+    first.join(timeout=5)
+    assert not first.is_alive()
+    assert first_result[0].final_state == "COMMITTED"
+
+
+def test_writer_lock_is_released_when_evidence_finalization_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+    request = _request(
+        tmp_path,
+        incoming,
+        job_id="evidence-error",
+        cancellation_requested=lambda: True,
+    )
+    real_write_evidence = duckdb_import._write_evidence
+
+    def fail_evidence(*args, **kwargs):
+        raise RuntimeError("injected evidence failure")
+
+    monkeypatch.setattr(duckdb_import, "_write_evidence", fail_evidence)
+    with pytest.raises(RuntimeError, match="injected evidence failure"):
+        import_html_tree(request, None)
+
+    monkeypatch.setattr(duckdb_import, "_write_evidence", real_write_evidence)
+    retry = import_html_tree(
+        _request(tmp_path, incoming, job_id="after-evidence-error"), None
+    )
+
+    assert retry.final_state == "COMMITTED"
+
+
+def test_existing_target_changed_after_preflight_is_preserved(tmp_path: Path) -> None:
+    initial = tmp_path / "initial"
+    _copy_report(initial, "report.html")
+    import_html_tree(_request(tmp_path, initial, job_id="initial"), None)
+    database = tmp_path / "source.duckdb"
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "replacement.html")
+    _rewrite(incoming / "replacement.html", "98.25", "98.50")
+    external_bytes = b"externally changed target"
+
+    def replace_target_after_staging(progress) -> None:
+        if progress.inserted + progress.replaced:
+            database.write_bytes(external_bytes)
+
+    result = import_html_tree(
+        _request(tmp_path, incoming, job_id="stale-existing"), replace_target_after_staging
+    )
+
+    assert result.final_state == "FAILED"
+    assert result.safe_to_delete == "NO"
+    assert "source database changed during import" in (result.error or "")
+    assert database.read_bytes() == external_bytes
+    _assert_failed_evidence_finalized(result)
+
+
+def test_target_appearing_after_absent_preflight_is_preserved(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+    database = tmp_path / "source.duckdb"
+    external_bytes = b"target appeared after preflight"
+
+    def create_target_after_staging(progress) -> None:
+        if progress.inserted + progress.replaced:
+            database.write_bytes(external_bytes)
+
+    result = import_html_tree(
+        _request(tmp_path, incoming, job_id="stale-absent"), create_target_after_staging
+    )
+
+    assert result.final_state == "FAILED"
+    assert result.safe_to_delete == "NO"
+    assert "source database changed during import" in (result.error or "")
+    assert database.read_bytes() == external_bytes
+    _assert_failed_evidence_finalized(result)

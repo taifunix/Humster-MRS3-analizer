@@ -30,6 +30,7 @@ from .duckdb_source_schema import (
     normalize_source_shift,
     validate_source_database,
 )
+from .locking import OutputDirectoryLock
 
 
 COMPACT_IMPORT_SCHEMA_VERSION = 4
@@ -172,6 +173,22 @@ def _inputs_unchanged(snapshots: tuple[_Snapshot, ...]) -> bool:
     )
 
 
+def _source_database_lock(database_path: Path) -> OutputDirectoryLock:
+    """Return the existing advisory lock pattern scoped to one resolved DB path."""
+    resolved = database_path.resolve()
+    token = sha256(str(resolved).encode("utf-8")).hexdigest()
+    return OutputDirectoryLock(resolved.parent / f".mrs3-import-{token}")
+
+
+def _database_identity(database_path: Path) -> str | None:
+    """Return the raw target identity captured around staging publication."""
+    if not database_path.exists():
+        return None
+    if not database_path.is_file():
+        raise ValueError(f"source database target is not a file: {database_path}")
+    return _file_sha256(database_path)
+
+
 def _default_job_id(
     request: ImportRequest, snapshots: tuple[_Snapshot, ...], active_hashes: tuple[str, ...]
 ) -> str:
@@ -183,6 +200,18 @@ def _default_job_id(
     }
     payload = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return f"import-{sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _lock_failure_job_id(
+    request: ImportRequest, snapshots: tuple[_Snapshot, ...]
+) -> str:
+    data = {
+        "database": str(Path(request.database_path)),
+        "inputs": [(item.relative_path, item.input_sha256) for item in snapshots],
+        "root": str(Path(request.root_path)),
+    }
+    payload = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return f"import-busy-{sha256(payload.encode('utf-8')).hexdigest()[:24]}"
 
 
 def _emit(
@@ -475,6 +504,24 @@ def _write_evidence(
 def import_html_tree(
     request: ImportRequest, progress_callback: Callable[[ImportProgress], object] | None
 ) -> ImportJobResult:
+    """Import while holding the resolved source database's writer lock."""
+    database_lock = _source_database_lock(Path(request.database_path))
+    try:
+        database_lock.__enter__()
+    except Exception as exc:
+        return _import_html_tree(request, progress_callback, lock_error=exc)
+    try:
+        return _import_html_tree(request, progress_callback, lock_error=None)
+    finally:
+        database_lock.__exit__(None, None, None)
+
+
+def _import_html_tree(
+    request: ImportRequest,
+    progress_callback: Callable[[ImportProgress], object] | None,
+    *,
+    lock_error: Exception | None,
+) -> ImportJobResult:
     """Import a recursive HTML tree through read-only parsing and one writer."""
     if request.workers < 1 or request.transaction_batch_size < 1:
         raise ValueError("workers and transaction_batch_size must be at least one")
@@ -483,7 +530,7 @@ def import_html_tree(
     snapshots = _snapshot_reports(root, paths)
     active_hashes: tuple[str, ...] = ()
     database_path = Path(request.database_path)
-    if database_path.is_file():
+    if lock_error is None and database_path.is_file():
         connection = duckdb.connect(str(database_path), read_only=True)
         try:
             tables = {row[0] for row in connection.execute("show tables").fetchall()}
@@ -496,7 +543,12 @@ def import_html_tree(
                 )
         finally:
             connection.close()
-    job_id = request.job_id or _default_job_id(request, snapshots, active_hashes)
+    if request.job_id is not None:
+        job_id = request.job_id
+    elif lock_error is not None:
+        job_id = _lock_failure_job_id(request, snapshots)
+    else:
+        job_id = _default_job_id(request, snapshots, active_hashes)
     if not _JOB_ID.fullmatch(job_id):
         raise ValueError("job_id must be a safe 1-128 character identifier")
     counts = {name: 0 for name in ("parsed", "inserted", "replaced", "identical", "ambiguous", "quarantined")}
@@ -516,7 +568,10 @@ def import_html_tree(
     error: str | None = None
     prepared: list[_PreparedReport] = []
     _emit(progress_callback, final_state, len(snapshots), counts)
-    if _cancelled(request):
+    if lock_error is not None:
+        final_state = "FAILED"
+        error = f"{type(lock_error).__name__}: {lock_error}"
+    elif _cancelled(request):
         final_state = "CANCELLED"
     else:
         try:
@@ -566,6 +621,7 @@ def import_html_tree(
                     "AMBIGUOUS_BATCH_DUPLICATE: the complete import batch was not published"
                 )
             database_path.parent.mkdir(parents=True, exist_ok=True)
+            preflight_target_identity = _database_identity(database_path)
             with tempfile.TemporaryDirectory(prefix="mrs3-import-", dir=database_path.parent) as stage_dir:
                 stage_path = Path(stage_dir) / database_path.name
                 if database_path.is_file():
@@ -641,6 +697,8 @@ def import_html_tree(
                 if final_state == "COMMITTED":
                     if not _inputs_unchanged(snapshots):
                         raise ValueError("input HTML snapshot changed during import")
+                    if _database_identity(database_path) != preflight_target_identity:
+                        raise ValueError("source database changed during import")
                     os.replace(stage_path, database_path)
         except Exception as exc:
             final_state = "FAILED"
@@ -663,7 +721,7 @@ def import_html_tree(
         request, job_id, final_state, counts, evidence, error
     )
     _emit(progress_callback, final_state, len(snapshots), counts)
-    return ImportJobResult(
+    result = ImportJobResult(
         job_id=job_id,
         final_state=final_state,
         discovered=len(snapshots),
@@ -680,3 +738,4 @@ def import_html_tree(
         checklist_sha256=checklist_hash,
         error=error,
     )
+    return result
