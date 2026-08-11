@@ -3,10 +3,82 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 import json
+from pathlib import Path
 
 import pytest
 
-from mrs3.config import AlgorithmConfig
+import mrs3.config as config_module
+from mrs3.config import (
+    AlgorithmConfig,
+    DuckDBImportSettings,
+    load_duckdb_import_settings,
+    save_duckdb_import_settings,
+)
+
+
+def test_duckdb_import_settings_round_trip_preserves_other_local_config(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(
+        json.dumps({"panel": {"theme": "dark"}, "duckdb_import": {"future": "keep"}}),
+        encoding="utf-8",
+    )
+    settings = DuckDBImportSettings(
+        source_duckdb_path=Path("source.duckdb"),
+        analysis_duckdb_path=Path("analysis.duckdb"),
+        default_html_root=Path("reports"),
+        audit_root=Path("audit"),
+        workers=2,
+        transaction_batch_size=50,
+    )
+
+    save_duckdb_import_settings(path, settings)
+
+    assert load_duckdb_import_settings(path) == settings
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["panel"] == {"theme": "dark"}
+    assert saved["duckdb_import"]["future"] == "keep"
+
+
+def test_duckdb_import_settings_missing_section_uses_safe_defaults(tmp_path) -> None:
+    settings = load_duckdb_import_settings(tmp_path / "missing.json")
+
+    assert settings == DuckDBImportSettings()
+
+
+def test_duckdb_import_settings_failed_atomic_replace_preserves_original(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "config.local.json"
+    original = b'{"panel":{"theme":"dark"}}\n'
+    path.write_bytes(original)
+
+    def fail_replace(source, destination) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(config_module.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        save_duckdb_import_settings(path, DuckDBImportSettings(workers=2))
+
+    assert path.read_bytes() == original
+    assert tuple(tmp_path.iterdir()) == (path,)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"duckdb_import": []}, "duckdb_import must be an object"),
+        ({"duckdb_import": {"workers": True}}, "duckdb_import.workers must be a positive integer"),
+        ({"duckdb_import": {"transaction_batch_size": 0}}, "duckdb_import.transaction_batch_size must be a positive integer"),
+        ({"duckdb_import": {"audit_root": 7}}, "duckdb_import.audit_root must be a string or null"),
+    ],
+)
+def test_duckdb_import_settings_reject_malformed_values(tmp_path, payload, message: str) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_duckdb_import_settings(path)
 
 
 @pytest.mark.parametrize(

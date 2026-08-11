@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+import os
 from pathlib import Path
 import json
+import tempfile
 
 from .models import Side
 
@@ -35,6 +37,96 @@ DEFAULT_SIDE_COLUMNS = {
         "multiplier": "settings[*].mrs2.ma_short.multiplier",
     },
 }
+
+
+@dataclass(frozen=True, slots=True)
+class DuckDBImportSettings:
+    source_duckdb_path: Path | None = None
+    analysis_duckdb_path: Path | None = None
+    default_html_root: Path | None = None
+    audit_root: Path | None = None
+    workers: int = 4
+    transaction_batch_size: int = 250
+
+    def __post_init__(self) -> None:
+        for name in (
+            "source_duckdb_path",
+            "analysis_duckdb_path",
+            "default_html_root",
+            "audit_root",
+        ):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, Path):
+                raise ValueError(f"duckdb_import.{name} must be a path or null")
+        for name in ("workers", "transaction_batch_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"duckdb_import.{name} must be a positive integer")
+
+
+def _local_config_object(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("config.local.json must be an object")
+    return raw
+
+
+def _optional_path_from_json(value: object, name: str) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"duckdb_import.{name} must be a string or null")
+    return Path(value)
+
+
+def load_duckdb_import_settings(path: Path) -> DuckDBImportSettings:
+    raw = _local_config_object(path)
+    section = raw.get("duckdb_import")
+    if section is None:
+        return DuckDBImportSettings()
+    if not isinstance(section, dict):
+        raise ValueError("duckdb_import must be an object")
+    return DuckDBImportSettings(
+        source_duckdb_path=_optional_path_from_json(section.get("source_duckdb_path"), "source_duckdb_path"),
+        analysis_duckdb_path=_optional_path_from_json(section.get("analysis_duckdb_path"), "analysis_duckdb_path"),
+        default_html_root=_optional_path_from_json(section.get("default_html_root"), "default_html_root"),
+        audit_root=_optional_path_from_json(section.get("audit_root"), "audit_root"),
+        workers=section.get("workers", 4),
+        transaction_batch_size=section.get("transaction_batch_size", 250),
+    )
+
+
+def save_duckdb_import_settings(path: Path, settings: DuckDBImportSettings) -> None:
+    raw = _local_config_object(path)
+    existing = raw.get("duckdb_import")
+    if existing is not None and not isinstance(existing, dict):
+        raise ValueError("duckdb_import must be an object")
+    section = dict(existing or {})
+    for name in (
+        "source_duckdb_path",
+        "analysis_duckdb_path",
+        "default_html_root",
+        "audit_root",
+    ):
+        value = getattr(settings, name)
+        section[name] = None if value is None else str(value)
+    section["workers"] = settings.workers
+    section["transaction_batch_size"] = settings.transaction_batch_size
+    raw["duckdb_import"] = section
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False
+    ) as temporary:
+        json.dump(raw, temporary, ensure_ascii=False, indent=2)
+        temporary.write("\n")
+        temporary_path = Path(temporary.name)
+    try:
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _base_rates_from_json(value: object) -> dict[str, Decimal]:
