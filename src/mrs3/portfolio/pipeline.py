@@ -210,10 +210,16 @@ def run_portfolio(inputs: PortfolioInputs) -> dict:
         },
         "oos": {k: v for k, v in oos.items() if k != "rows"},
         "unverified": [
-            "очередь в стакане не моделируется: результат — верхняя граница",
-            "MMR/IMR взяты из CSV, сверить с /v5/market/risk-limit",
-            "target_share ESTIMATED, пока не измерен по стакану L2"
-            if any(s.target_share_source == "ESTIMATED" for s in ready) else "",
+            item
+            for item in (
+                "очередь в стакане не моделируется: результат — верхняя граница",
+                "MAE применяется на всём цикле, а не помарочно: просадка — верхняя граница",
+                "MMR/IMR взяты из CSV, сверить с /v5/market/risk-limit",
+                "target_share ESTIMATED, пока не измерен по стакану L2"
+                if any(s.target_share_source == "ESTIMATED" for s in ready)
+                else "",
+            )
+            if item
         ],
         "artifacts": sorted(p.name for p in out.glob("*")),
     }

@@ -48,25 +48,37 @@ def _reserved_margin(
     open_positions: list[_Open],
     slots_free: bool,
     cfg: RunConfig,
+    exclude: str | None = None,
 ) -> float:
     """Занятая маржа: позиции плюс висящие заявки.
 
     Стратегия резервирует маржу, если держит позицию либо если её заявки висят.
     Заявки снимаются в двух случаях: слоты заняты (лимит достигнут) и встречная
     сторона по паре уже в позиции при ``cancel_opposite``.
+
+    ``exclude`` убирает из суммы стратегию, чью новую заявку проверяют отдельно:
+    иначе её маржа посчиталась бы дважды — как висящая заявка и как открываемая
+    позиция.
+
+    Позиции суммируются, а не берутся по одной на стратегию: журнал может
+    содержать перекрывающиеся циклы, и каждый из них занимает маржу.
     """
-    busy = {o.strategy_id: o for o in open_positions}
+    position_margin: dict[str, float] = {}
+    for o in open_positions:
+        position_margin[o.strategy_id] = position_margin.get(o.strategy_id, 0.0) + o.notional
     pairs_in_position = {(o.pair, o.side) for o in open_positions}
     total = 0.0
     for m in members:
-        position = busy.get(m.strategy_id)
-        if position is not None:
-            total += position.notional * m.imr
+        if m.strategy_id == exclude:
+            continue
+        held = position_margin.get(m.strategy_id)
+        if held is not None:
+            total += held * m.imr
             continue
         if not slots_free:
             continue  # заявки сняты по достижении лимита
         if cfg.cancel_opposite and any(
-            p == m.pair and s != m.side for p, s in pairs_in_position
+            p == m.pair and side != m.side for p, side in pairs_in_position
         ):
             continue  # встречные заявки сняты
         total += min(lots[m.strategy_id] * equity, m.capacity) * m.imr
@@ -95,13 +107,30 @@ def simulate_set(
     if d_eff <= 0:
         raise ValueError("history windows do not overlap")
 
-    priority = {m.strategy_id: i for i, m in enumerate(ordered)}
     by_id = {m.strategy_id: m for m in ordered}
 
+    # §10.2: при совпадении времени решает приоритет по PnL30_DD5, убыванию.
+    # Алфавитный порядок здесь был бы произволом.
+    def _priority_key(m: StrategyInput) -> tuple[float, float, str]:
+        days = max(m.d_eff_days, 1e-9)
+        pnl30_dd5 = m.pnl_pct * 5.0 / m.dd_pct * 30.0 / days if m.dd_pct else 0.0
+        return (-pnl30_dd5, m.lot_x_base, m.strategy_id)
+
+    priority = {
+        m.strategy_id: i
+        for i, m in enumerate(sorted(ordered, key=_priority_key))
+    }
+
+    # Вход обязан попасть в окно; выход за правую границу допустим — позиция
+    # закрывается принудительно в конце. Иначе при разрезе истории пополам
+    # вторая половина теряла бы сделки, начатые у самой границы.
     signals: list[tuple[datetime, int, str, TradeRecord]] = []
+    truncated = 0
     for m in ordered:
         for trade in m.trades:
-            if start <= trade.entry_ts and trade.exit_ts <= end:
+            if start <= trade.entry_ts < end:
+                if trade.exit_ts > end:
+                    truncated += 1
                 signals.append((trade.entry_ts, priority[m.strategy_id], m.strategy_id, trade))
     signals.sort(key=lambda s: (s[0], s[1]))
 
@@ -116,7 +145,10 @@ def simulate_set(
     max_margin_ratio = 0.0
     max_occupancy = 0.0
     min_buffer = float("inf")
-    has_mae = any(t.mae_frac is not None for m in ordered for t in m.trades)
+    mae_total = sum(len(m.trades) for m in ordered)
+    mae_known = sum(1 for m in ordered for t in m.trades if t.mae_frac is not None)
+    has_mae = mae_known > 0
+    mae_coverage = mae_known / mae_total if mae_total else 0.0
 
     def close_due(now: datetime) -> None:
         nonlocal wallet
@@ -144,8 +176,13 @@ def simulate_set(
         equity_points.append(equity)
 
         slots_free = _slots_used(open_positions, cfg) < limiter
-        occupied = _reserved_margin(ordered, lots, equity, open_positions, slots_free, cfg)
-        max_occupancy = max(max_occupancy, occupied / equity if equity > 0 else 0.0)
+        occupied_all = _reserved_margin(
+            ordered, lots, equity, open_positions, slots_free, cfg
+        )
+        max_occupancy = max(max_occupancy, occupied_all / equity if equity > 0 else 0.0)
+        occupied_others = _reserved_margin(
+            ordered, lots, equity, open_positions, slots_free, cfg, exclude=sid
+        )
 
         mm = sum(p.notional * by_id[p.strategy_id].mmr for p in open_positions)
         notional_total = sum(p.notional for p in open_positions)
@@ -168,7 +205,7 @@ def simulate_set(
         if notional <= 0:
             blocked_margin[sid] += 1
             continue
-        if (occupied + notional * member.imr) / equity > cfg.margin_limit:
+        if (occupied_others + notional * member.imr) / equity > cfg.margin_limit:
             blocked_margin[sid] += 1
             continue
 
@@ -185,7 +222,31 @@ def simulate_set(
         )
         accepted[sid] += 1
 
-    close_due(end)
+        # Замер ПОСЛЕ открытия: пик занятой маржи и ликвидационного отношения
+        # приходится именно сюда, до следующего сигнала его никто бы не увидел.
+        after = _reserved_margin(
+            ordered,
+            lots,
+            equity,
+            open_positions,
+            _slots_used(open_positions, cfg) < limiter,
+            cfg,
+        )
+        if equity > 0:
+            max_occupancy = max(max_occupancy, after / equity)
+            mm_after = sum(p.notional * by_id[p.strategy_id].mmr for p in open_positions)
+            max_margin_ratio = max(max_margin_ratio, mm_after / equity)
+            notional_after = sum(p.notional for p in open_positions)
+            if notional_after > 0:
+                min_buffer = min(min_buffer, (equity - mm_after) / notional_after)
+
+    # позиции, доживающие до конца окна, закрываем принудительно
+    for pos in open_positions:
+        gain = pos.net_frac * pos.notional
+        wallet += gain
+        pnl_by_id[pos.strategy_id] += gain
+        equity_points.append(wallet)
+    open_positions.clear()
 
     peak = equity_points[0]
     max_dd = 0.0
@@ -200,6 +261,12 @@ def simulate_set(
     flags: list[str] = []
     if not has_mae:
         flags.append("CLOSED_TRADE_DD_ONLY")
+    elif mae_coverage < 1.0:
+        # часть циклов без MAE считается нулевым плавающим убытком,
+        # значит просадка занижена — молчать об этом нельзя
+        flags.append(f"PARTIAL_MAE_COVERAGE_{mae_coverage:.0%}")
+    if truncated:
+        flags.append(f"TRUNCATED_AT_WINDOW_END_{truncated}")
     if any(m.target_share_source == "ESTIMATED" for m in ordered):
         flags.append("TARGET_SHARE_ESTIMATED")
     if any(

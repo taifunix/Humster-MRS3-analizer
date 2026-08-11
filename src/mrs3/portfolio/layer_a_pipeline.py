@@ -90,8 +90,8 @@ def read_candidates(
         window_start = pick("window_start")
         window_end = pick("window_end")
 
-        out.append(
-            Candidate(
+        try:
+            candidate = Candidate(
                 strategy_id=sid,
                 pair=row["pair"].strip(),
                 side=row["side"].strip().upper(),
@@ -117,7 +117,11 @@ def read_candidates(
                 .strip()
                 .upper(),
             )
-        )
+        except (ValueError, TypeError) as exc:
+            if isinstance(exc, LayerAError):
+                raise
+            raise LayerAError(f"{sid}: {exc}") from exc
+        out.append(candidate)
     if not out:
         raise LayerAError("во входном CSV нет ни одного кандидата")
     return out

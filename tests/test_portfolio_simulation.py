@@ -272,3 +272,100 @@ def test_flags_report_missing_mae():
 def test_flags_report_estimated_target_share():
     result = simulate_set([strat("A", count=10)], 1, {"A": 0.05}, CFG)
     assert "TARGET_SHARE_ESTIMATED" in result.flags
+
+
+# --- регрессии по замечаниям ревью --------------------------------------
+
+
+def test_entering_strategy_margin_is_not_double_counted():
+    """Маржа входящей стратегии считалась дважды: как заявка и как позиция.
+
+    При пороге ровно между одинарным и двойным резервом вход обязан пройти.
+    """
+    members = [strat("A", count=6, hold=60, gap=600, lot=0.5)]
+    single = 0.5 * 0.05           # lot * imr
+    cfg = RunConfig(
+        deposit=1000.0, limiters=(1,), margin_limit=single * 1.5,
+        d_eff_common_min_days=0.0, oos_min_days=1e9,
+    )
+    result = simulate_set(members, 1, {"A": 0.5}, cfg)
+    assert sum(o.accepted for o in result.outcomes) == 6
+    assert sum(o.blocked_margin for o in result.outcomes) == 0
+
+
+def test_overlapping_positions_of_one_strategy_both_reserve_margin():
+    """Перекрывающиеся циклы в журнале: маржу занимает каждый, а не последний."""
+    overlapping = StrategyInput(
+        strategy_id="A", pair="XUSDT", side="LONG", timeframe="1h",
+        lot_x_base=0.2, pnl_pct=10.0, dd_pct=5.0, turnover_24h=50_000_000.0,
+        trades=[
+            TradeRecord("A", T0, T0 + timedelta(hours=10), 0.01),
+            TradeRecord("A", T0 + timedelta(hours=1), T0 + timedelta(hours=11), 0.01),
+        ],
+    )
+    result = simulate_set([overlapping], 2, {"A": 0.2}, CFG)
+    assert sum(o.accepted for o in result.outcomes) == 2
+    # две позиции по 0.2 * 0.05 = 0.02 каждая
+    assert result.max_occupancy_margin == pytest.approx(0.02, abs=5e-3)
+
+
+def test_priority_follows_pnl_dd_not_alphabet():
+    """При одновременных сигналах первым идёт сильнейший по PnL30_DD5."""
+    weak = StrategyInput(
+        strategy_id="AAA", pair="P1", side="LONG", timeframe="1h",
+        lot_x_base=0.3, pnl_pct=5.0, dd_pct=5.0, turnover_24h=50_000_000.0,
+        trades=trades("AAA", 4, hold_min=600, gap_min=1),
+    )
+    strong = StrategyInput(
+        strategy_id="ZZZ", pair="P2", side="LONG", timeframe="1h",
+        lot_x_base=0.3, pnl_pct=80.0, dd_pct=5.0, turnover_24h=50_000_000.0,
+        trades=trades("ZZZ", 4, hold_min=600, gap_min=1),
+    )
+    result = simulate_set([weak, strong], 1, {"AAA": 0.1, "ZZZ": 0.1}, CFG)
+    outcomes = {o.strategy_id: o for o in result.outcomes}
+    assert outcomes["ZZZ"].accepted >= outcomes["AAA"].accepted
+
+
+def test_partial_mae_coverage_is_flagged():
+    """Часть циклов без MAE считается нулём — это должно быть видно в флагах."""
+    with_mae = strat("A", count=10, mae=-0.02)
+    without = strat("B", count=10, mae=None)
+    result = simulate_set([with_mae, without], 2, {"A": 0.05, "B": 0.05}, CFG)
+    assert any(f.startswith("PARTIAL_MAE_COVERAGE") for f in result.flags)
+    assert "CLOSED_TRADE_DD_ONLY" not in result.flags
+
+
+def test_full_mae_coverage_has_no_partial_flag():
+    members = [strat(s, count=10, mae=-0.02) for s in ("A", "B")]
+    result = simulate_set(members, 2, {"A": 0.05, "B": 0.05}, CFG)
+    assert not any(f.startswith("PARTIAL_MAE") for f in result.flags)
+
+
+def test_trade_crossing_window_end_is_kept_and_flagged():
+    """Сделка, начатая в окне и вышедшая за него, не теряется."""
+    member = StrategyInput(
+        strategy_id="A", pair="XUSDT", side="LONG", timeframe="1h",
+        lot_x_base=0.2, pnl_pct=10.0, dd_pct=5.0, turnover_24h=50_000_000.0,
+        trades=[
+            TradeRecord("A", T0, T0 + timedelta(hours=1), 0.01),
+            TradeRecord("A", T0 + timedelta(hours=2), T0 + timedelta(hours=50), 0.02),
+        ],
+    )
+    window = (T0, T0 + timedelta(hours=10))
+    result = simulate_set([member], 1, {"A": 0.2}, CFG, window=window)
+    assert sum(o.accepted for o in result.outcomes) == 2
+    assert any(f.startswith("TRUNCATED_AT_WINDOW_END") for f in result.flags)
+
+
+def test_single_day_history_does_not_divide_by_zero():
+    member = StrategyInput(
+        strategy_id="A", pair="XUSDT", side="LONG", timeframe="5m",
+        lot_x_base=0.2, pnl_pct=1.0, dd_pct=5.0, turnover_24h=1_000_000.0,
+        trades=[
+            TradeRecord("A", T0, T0 + timedelta(minutes=5), 0.001),
+            TradeRecord("A", T0 + timedelta(minutes=10), T0 + timedelta(minutes=15), 0.001),
+        ],
+    )
+    assert member.d_eff_days > 0
+    assert member.trades_per_day > 0
+    assert member.occupancy > 0

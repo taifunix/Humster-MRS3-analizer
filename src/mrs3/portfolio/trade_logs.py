@@ -55,6 +55,15 @@ class StrategyTradeStats:
         return (self.window_end - self.window_start).total_seconds() / 86400.0
 
 
+def _safe_table(name: str) -> str:
+    """Имя таблицы подставляется в SQL, поэтому допускаем только простые имена."""
+    if not name or not all(ch.isalnum() or ch == "_" for ch in name):
+        raise TradeLogError(
+            f"недопустимое имя таблицы {name!r}: только буквы, цифры и подчёркивание"
+        )
+    return name
+
+
 def _require_duckdb():
     try:
         import duckdb  # noqa: PLC0415
@@ -84,6 +93,7 @@ def _median(values: Sequence[float]) -> float:
 
 def inspect_schema(db_path: Path, table: str = "trades") -> dict:
     """Проверить, что таблица существует и содержит обязательные колонки."""
+    table = _safe_table(table)
     if not Path(db_path).exists():
         raise TradeLogError(f"файл базы не найден: {db_path}")
     duckdb = _require_duckdb()

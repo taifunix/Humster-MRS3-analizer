@@ -89,7 +89,9 @@ class StrategyInput:
 
     @property
     def d_eff_days(self) -> float:
-        return (self.window_end - self.window_start).total_seconds() / 86400.0
+        """Длина истории. Никогда не ноль: все производные на неё делят."""
+        days = (self.window_end - self.window_start).total_seconds() / 86400.0
+        return max(days, 1.0 / 1440.0)  # пол в одну минуту
 
     @property
     def median_hold_min(self) -> float:

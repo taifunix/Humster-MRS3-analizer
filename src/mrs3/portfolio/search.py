@@ -233,10 +233,18 @@ def split_validation(
 
 
 def _rank(values: Sequence[float]) -> list[float]:
+    """Ранги со средним по связкам: без этого равные значения искажают корреляцию."""
     order = sorted(range(len(values)), key=lambda i: values[i])
     ranks = [0.0] * len(values)
-    for position, index in enumerate(order):
-        ranks[index] = float(position)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        shared = (i + j) / 2.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = shared
+        i = j + 1
     return ranks
 
 
