@@ -68,6 +68,13 @@ mappings fails closed. Focused evidence is `20 passed` for
 task. Independent Terra review approved the staged implementation; Task 4 is
 complete.
 
+Task 5 validates `base_rate_tf` object and scalar value types before Decimal
+conversion. Null, non-object and non-scalar values now yield field-specific
+`ValueError` with the original cause chained. Focused evidence is `15 passed`
+for `tests/test_config.py`; the full suite reaches `334 passed` and has the
+same eight runner-test fixture failures outside this task. Independent Terra
+review and re-review are approved; Task 5 is complete.
+
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
 included cycles. The package has `source_summary_status=VERIFIED` and
@@ -89,9 +96,9 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1–4 are complete and Task 5 is next.
+slice; Tasks 1–5 are complete and Task 6 is next.
 
-1. Start Task 5 from the
+1. Start Task 6 from the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 2. Apply the confirmed external-review remediation tasks listed in the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).

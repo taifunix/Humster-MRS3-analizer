@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from decimal import Decimal
+import json
 
 import pytest
 
@@ -58,3 +59,36 @@ def test_shift_domain_can_extend_beyond_calibrated_shift_factors() -> None:
     config = replace(AlgorithmConfig.defaults(), shift_domain_max_bp=700)
 
     assert config.shift_domain_max_bp == 700
+
+
+@pytest.mark.parametrize(
+    ("base_rate_tf", "message"),
+    [
+        (None, "base_rate_tf must be an object"),
+        ({"2h": None}, "base_rate_tf.2h"),
+        ([], "base_rate_tf must be an object"),
+    ],
+)
+def test_from_json_rejects_null_or_non_object_base_rate_config(
+    tmp_path, base_rate_tf: object, message: str
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"base_rate_tf": base_rate_tf}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message) as error:
+        AlgorithmConfig.from_json(path)
+
+    assert error.value.__cause__ is not None
+
+
+@pytest.mark.parametrize("rate", [[], {}, True])
+def test_from_json_rejects_non_scalar_base_rate_before_decimal(
+    tmp_path, rate: object
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"base_rate_tf": {"2h": rate}}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="base_rate_tf.2h") as error:
+        AlgorithmConfig.from_json(path)
+
+    assert isinstance(error.value.__cause__, TypeError)

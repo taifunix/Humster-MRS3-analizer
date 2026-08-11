@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import json
 
@@ -35,6 +35,28 @@ DEFAULT_SIDE_COLUMNS = {
         "multiplier": "settings[*].mrs2.ma_short.multiplier",
     },
 }
+
+
+def _base_rates_from_json(value: object) -> dict[str, Decimal]:
+    if not isinstance(value, dict):
+        error = TypeError("base_rate_tf must be an object")
+        raise ValueError("base_rate_tf must be an object") from error
+    rates: dict[str, Decimal] = {}
+    for timeframe, rate in value.items():
+        field = f"base_rate_tf.{timeframe}"
+        if (
+            not isinstance(timeframe, str)
+            or rate is None
+            or isinstance(rate, bool)
+            or not isinstance(rate, (str, int, float, Decimal))
+        ):
+            error = TypeError(f"{field} must be a decimal")
+            raise ValueError(f"{field} must be a decimal") from error
+        try:
+            rates[timeframe] = Decimal(str(rate))
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError(f"{field} must be a decimal") from error
+    return rates
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +233,7 @@ class AlgorithmConfig:
     @classmethod
     def from_json(cls, path: Path) -> "AlgorithmConfig":
         raw = json.loads(path.read_text(encoding="utf-8"))
+        base_rates = _base_rates_from_json(raw.get("base_rate_tf", cls().base_rates))
         columns = raw.get("columns", {})
         base = dict(DEFAULT_BASE_COLUMNS)
         base.update(columns.get("base", {}))
@@ -222,10 +245,7 @@ class AlgorithmConfig:
             side_columns=side_columns,
             grid_tolerance_bp=float(raw.get("grid_tolerance_bp", 0.000001)),
             history_min_days=Decimal(str(raw.get("history_min_days", 7))),
-            base_rates={
-                key: Decimal(str(value))
-                for key, value in raw.get("base_rate_tf", cls().base_rates).items()
-            },
+            base_rates=base_rates,
             shift_factors=tuple(
                 (int(item["max_bp"]), Decimal(str(item["value"])))
                 for item in raw.get(
