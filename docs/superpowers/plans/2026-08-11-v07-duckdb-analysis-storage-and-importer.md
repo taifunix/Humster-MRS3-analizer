@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Tasks 0–10 are complete; Task 11A backend is complete, while Task 11 panel/build orchestration and Task 12 publication remain. Task 6 was committed in `05369c2`; its
+**Status:** Tasks 0–10 and Task 12 are complete; Task 11A backend is complete, while Task 11 panel/build orchestration remains before Task 13. Task 6 was committed in `05369c2`; its
 copied-real-HTML smoke established v3/v4/mrs3 adapter parity `PASS` and a
 temporary v3 DuckDB import with `1` scanned, `1` imported and `0` quarantined
 reports, `78` raw
@@ -360,16 +360,20 @@ run_panel_direct_build(
 `publish_surface(analysis_connection, surface) -> PublishedSurface`; it never
 receives a source connection.
 
-- [ ] RED-test deterministic digest inputs, identical-build deduplication,
+- [x] RED-test deterministic digest inputs, identical-build deduplication,
   transaction rollback, immutable parent surfaces, raw-reproduction status
-  after source replacement and stable ordered reads.
-- [ ] Ensure plateau algorithm settings do not affect `surface_id`.
-- [ ] Mutation-test every identity input: build mode, UTC period, side, selected
+  after source replacement and stable ordered reads. Source hashes are ordered,
+  parents are explicit only, and identical deduplication compares and returns
+  the stored immutable facts.
+- [x] Ensure plateau algorithm settings do not affect `surface_id`.
+- [x] Mutation-test every identity input: build mode, UTC period, side, selected
   symbols/timeframes, source hashes, grid/normalization contracts, materializer
   version and point-materialization configuration.
-- [ ] Publish all surface/source/pair/timeframe/point/coverage/dedup rows in one
-  transaction after validation.
-- [ ] Run GREEN, review and commit: `feat: publish immutable analysis surfaces`.
+- [x] Publish all surface/source/pair/timeframe/point/coverage/dedup rows in one
+  transaction after validation, with rollback and no source connection or raw
+  source-data copy.
+- [x] Run GREEN (`41 passed`) and independent Terra review (approved after two
+  fix rounds). Pending commit message: `feat: publish immutable analysis surfaces`.
 
 ### Task 13: Adapt published points to the common pipeline and persist lineage
 

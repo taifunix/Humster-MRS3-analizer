@@ -131,7 +131,15 @@ Task 11A backend is complete (`2a157de`): in-memory direct-surface coverage,
 canonical-grid and total-trades-proxy materialization uses active v5 data with
 deterministic facts, distinct source/analysis connections and no raw-data copy.
 Its 21 relevant tests pass and review was clean after one fix round. Panel/build
-orchestration and atomic publication are still outstanding.
+orchestration is still outstanding.
+
+Task 12 atomic immutable publication is complete, pending commit
+`feat: publish immutable analysis surfaces`. All identity inputs, ordered source
+hashes and explicit-parent-only semantics are covered. Identical builds compare
+and return stored immutable facts; every publication table is written in one
+transaction with rollback, without a source connection or raw-data copy. The
+relevant suite passes `41` tests, and independent Terra review approved after
+two fix rounds.
 
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
@@ -154,12 +162,12 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1–10 and Task 11A backend are complete.
+slice; Tasks 1–10, Task 11A backend and Task 12 are complete.
 
 1. Implement Task 11 panel/build orchestration from the
     [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
     in an independently reviewed TDD slice.
-2. Implement Task 12 atomic publication in an independently reviewed TDD slice.
+2. Implement Task 13 pipeline adaptation and lineage in an independently reviewed TDD slice.
 3. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
 
 ## Blockers

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import duckdb
 import pytest
 
 from mrs3.analysis_storage import ANALYSIS_SCHEMA_VERSION, AnalysisSchemaError, ensure_analysis_schema
+from mrs3.duckdb_direct import (
+    CoverageIssue,
+    DirectBuildRequest,
+    DirectPoint,
+    DirectPreflight,
+    DirectSurface,
+)
 
 
 REQUIRED_TABLES = {
@@ -43,6 +51,78 @@ def _tables(connection: duckdb.DuckDBPyConnection) -> set[str]:
             "select table_name from information_schema.tables where table_schema = 'main'"
         ).fetchall()
     }
+
+
+def _surface(*, source_hash: str = "a" * 64) -> DirectSurface:
+    request = DirectBuildRequest(
+        "2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z", "LONG", ("BTCUSDT",),
+        (100,), "v1", "c" * 64,
+    )
+    preflight = DirectPreflight(
+        {"BTCUSDT": ("1h",)}, {}, (),
+        {"kind": "OBSERVED_GRID_CONTRACT", "required_shifts_bp": (100,), "pairs": ("100|3|9",), "normalization_contract_version": "v1"},
+        (source_hash,), (("report", source_hash),), ("BTCUSDT|LONG|1h|100|3|9",),
+    )
+    return DirectSurface(
+        request, preflight, "legacy_trades_proxy",
+        (DirectPoint("BTCUSDT|LONG|1h|100|3|9", "report", source_hash, 7, {"TotalTrades": 7}),),
+    )
+
+
+def test_publish_surface_is_deterministic_deduplicated_and_persists_materialized_provenance(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    first = publish_surface(analysis, _surface())
+    second = publish_surface(analysis, _surface())
+
+    assert first.surface_id == second.surface_id
+    assert second.created is False
+    assert analysis.execute("select count(*) from surfaces").fetchone() == (1,)
+    assert analysis.execute("select provenance_state from surface_points").fetchone() == ("REPRODUCIBLE_AT_PUBLICATION",)
+
+
+def test_publish_surface_creates_immutable_child_and_rolls_back_invalid_materialized_input(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    parent = publish_surface(analysis, _surface())
+    same_period_child = publish_surface(analysis, _surface(source_hash="b" * 64))
+    assert same_period_child.parent_surface_id == parent.surface_id
+    parent_dedup = publish_surface(analysis, _surface())
+    assert parent_dedup.created is False
+    assert parent_dedup.parent_surface_id is None
+    same_period_dedup = publish_surface(analysis, _surface(source_hash="b" * 64))
+    assert same_period_dedup.created is False
+    assert same_period_dedup.parent_surface_id == parent.surface_id
+    child = publish_surface(analysis, replace(_surface(source_hash="c" * 64), parent_surface_id=parent.surface_id))
+    assert child.parent_surface_id == parent.surface_id
+    assert analysis.execute("select provenance_state from surface_points where surface_id=?", [child.surface_id]).fetchone() == ("REPRODUCIBLE_AT_PUBLICATION",)
+
+    invalid = _surface(source_hash="not-a-hash")
+    with pytest.raises(ValueError, match="source hash"):
+        publish_surface(analysis, invalid)
+    assert analysis.execute("select count(*) from surfaces").fetchone() == (3,)
+
+
+@pytest.mark.parametrize(
+    "alter",
+    [
+        lambda point: replace(point, metrics={"TotalTrades": 7, "TotalPnL": 1}),
+        lambda point: replace(point, source_report_id="other-report"),
+    ],
+)
+def test_dedup_rejects_facts_that_do_not_match_immutable_stored_points(connections, alter) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    publish_surface(analysis, _surface())
+    incoming = _surface()
+    changed = alter(incoming.points[0])
+    tampered = replace(incoming, points=(changed,), preflight=replace(incoming.preflight, manifest=((changed.source_report_id, changed.source_hash),)))
+
+    with pytest.raises(ValueError, match="immutable"):
+        publish_surface(analysis, tampered)
 
 
 def test_bootstrap_creates_only_analysis_tables_in_a_distinct_database(connections: tuple[duckdb.DuckDBPyConnection, duckdb.DuckDBPyConnection]) -> None:

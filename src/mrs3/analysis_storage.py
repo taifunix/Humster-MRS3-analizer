@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
+from typing import TYPE_CHECKING, Mapping
 
 import duckdb
+
+if TYPE_CHECKING:
+    from .duckdb_direct import DirectPoint, DirectSurface
 
 
 ANALYSIS_SCHEMA_VERSION = 1
@@ -14,6 +20,14 @@ EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT = (
 
 class AnalysisSchemaError(ValueError):
     """Raised when an analysis DuckDB does not match this storage contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedSurface:
+    surface_id: str
+    parent_surface_id: str | None
+    created: bool
+    points: tuple[DirectPoint, ...]
 
 
 _TABLES = {
@@ -252,3 +266,209 @@ def ensure_analysis_schema(connection: duckdb.DuckDBPyConnection) -> int:
         connection.execute("rollback")
         raise
     return ANALYSIS_SCHEMA_VERSION
+
+
+def _canonical_json(value: object) -> str:
+    def normalize(item: object) -> object:
+        if isinstance(item, Mapping):
+            return {str(key): normalize(value) for key, value in item.items()}
+        if isinstance(item, tuple | list):
+            return [normalize(value) for value in item]
+        return item
+
+    return json.dumps(normalize(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+
+
+def _utc(value: str) -> str:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("surface period must be UTC-aware")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _surface_identity(surface: DirectSurface) -> tuple[str, dict[str, object]]:
+    request, preflight = surface.request, surface.preflight
+    start, end = _utc(request.start_utc), _utc(request.end_utc)
+    identity = {
+        "build_mode": surface.build_mode,
+        "period": [start, end],
+        "side": request.side,
+        "selected_symbols": sorted(request.symbols),
+        "selected_timeframes": {
+            symbol: sorted(timeframes) for symbol, timeframes in sorted(preflight.usable_timeframes.items())
+        },
+        "source_hashes": sorted(preflight.source_hashes),
+        "grid_contract": json.loads(_canonical_json(preflight.grid_contract)),
+        "normalization_contract": preflight.grid_contract.get("normalization_contract_version"),
+        "materializer_version": request.materializer_version,
+        "point_materialization_config_hash": request.point_materialization_config_hash,
+    }
+    return sha256(_canonical_json(identity).encode("ascii")).hexdigest(), identity
+
+
+def _point_parts(point: DirectPoint) -> tuple[str, str, str, int, int, int]:
+    parts = point.canonical_point_key.split("|")
+    if len(parts) != 6:
+        raise ValueError("canonical point key must have six fields")
+    symbol, side, timeframe, shift, open_ma, close_ma = parts
+    try:
+        return symbol, side, timeframe, int(shift), int(open_ma), int(close_ma)
+    except ValueError as error:
+        raise ValueError("canonical point key has non-integer grid fields") from error
+
+
+def _validate_surface(surface: DirectSurface, identity: dict[str, object]) -> tuple[DirectPoint, ...]:
+    if surface.build_mode != "DUCKDB_DIRECT" or surface.event_mode != "legacy_trades_proxy":
+        raise ValueError("direct surface must use legacy_trades_proxy")
+    if identity["side"] not in {"LONG", "SHORT"} or identity["period"][0] >= identity["period"][1]:
+        raise ValueError("surface identity is invalid")
+    config_hash = str(identity["point_materialization_config_hash"])
+    if len(config_hash) != 64 or any(char not in "0123456789abcdef" for char in config_hash):
+        raise ValueError("point materialization config hash must be a SHA-256 digest")
+    if not surface.points:
+        raise ValueError("surface has no materialized points")
+    manifest = tuple(surface.preflight.manifest)
+    source_hashes = tuple(identity["source_hashes"])
+    if len(set(manifest)) != len(manifest):
+        raise ValueError("source manifest must be unique")
+    if len(set(source_hashes)) != len(source_hashes) or set(source_hash for _, source_hash in manifest) != set(source_hashes):
+        raise ValueError("source manifest hashes must match source hashes")
+    points = tuple(sorted(surface.points, key=lambda point: point.canonical_point_key))
+    if len({point.canonical_point_key for point in points}) != len(points):
+        raise ValueError("canonical point uniqueness failed")
+    if tuple(point.canonical_point_key for point in points) != tuple(sorted(surface.preflight.accepted_point_keys)):
+        raise ValueError("accepted point keys do not match materialized points")
+    if set(manifest) != {(point.source_report_id, point.source_hash) for point in points} or set(source_hashes) != {point.source_hash for point in points}:
+        raise ValueError("materialized manifest does not match point provenance")
+    usable = surface.preflight.usable_timeframes
+    grid_pairs = set(surface.preflight.grid_contract.get("pairs", ()))
+    for point in points:
+        symbol, side, timeframe, shift, open_ma, close_ma = _point_parts(point)
+        if symbol not in surface.request.symbols or side != surface.request.side or timeframe not in usable.get(symbol, ()):
+            raise ValueError("point is outside the selected surface scope")
+        if shift not in surface.request.required_shifts_bp or f"{shift}|{open_ma}|{close_ma}" not in grid_pairs:
+            raise ValueError("point is outside the immutable grid contract")
+        if len(point.source_hash) != 64 or any(char not in "0123456789abcdef" for char in point.source_hash):
+            raise ValueError("source hash must be a lowercase SHA-256 digest")
+        if (point.source_report_id, point.source_hash) not in manifest or point.source_hash not in source_hashes:
+            raise ValueError("point provenance is absent from materialized preflight")
+        if point.point_event_count < 0 or point.metrics.get("TotalTrades") != point.point_event_count:
+            raise ValueError("point event count must equal materialized TotalTrades")
+        try:
+            _canonical_json(point.metrics)
+        except (TypeError, ValueError) as error:
+            raise ValueError("point metrics must be finite canonical JSON") from error
+    return points
+
+
+def _surface_scope(connection: duckdb.DuckDBPyConnection, surface_id: str) -> tuple[tuple[str, str], ...]:
+    return tuple(connection.execute(
+        """select distinct p.symbol, t.timeframe from surface_timeframes t
+             join surface_pairs p using(surface_id, pair_key)
+            where t.surface_id=? order by p.symbol, t.timeframe""", [surface_id]
+    ).fetchall())
+
+
+def _parent_surface_id(
+    connection: duckdb.DuckDBPyConnection, identity: dict[str, object], explicit_parent_id: str | None,
+    exclude_surface_id: str | None = None,
+) -> str | None:
+    scope = tuple(
+        (symbol, timeframe)
+        for symbol, timeframes in identity["selected_timeframes"].items()  # type: ignore[union-attr]
+        for timeframe in timeframes
+    )
+    if explicit_parent_id is not None:
+        parent = connection.execute(
+            """select surface_id from surfaces where surface_id=? and build_mode=?
+                 and period_start_utc=? and period_end_utc=? and side=?""",
+            [explicit_parent_id, identity["build_mode"], identity["period"][0], identity["period"][1], identity["side"]],
+        ).fetchone()
+        if parent is None or _surface_scope(connection, explicit_parent_id) != scope:
+            raise ValueError("explicit parent surface is invalid")
+        return explicit_parent_id
+    for (surface_id,) in connection.execute(
+        """select surface_id from surfaces where build_mode=? and period_start_utc=?
+             and period_end_utc=? and side=? order by created_at_utc desc, surface_id desc""",
+        [identity["build_mode"], identity["period"][0], identity["period"][1], identity["side"]],
+    ).fetchall():
+        if surface_id != exclude_surface_id and _surface_scope(connection, str(surface_id)) == scope:
+            return str(surface_id)
+    return None
+
+
+def publish_surface(analysis_connection: duckdb.DuckDBPyConnection, surface: DirectSurface) -> PublishedSurface:
+    """Atomically persist a fully materialized direct surface without reopening its source."""
+    ensure_analysis_schema(analysis_connection)
+    surface_id, identity = _surface_identity(surface)
+    points = _validate_surface(surface, identity)
+    existing = analysis_connection.execute("select surface_id, parent_surface_id from surfaces where surface_id=?", [surface_id]).fetchone()
+    if existing:
+        stored = tuple(analysis_connection.execute(
+            """select canonical_point_key,source_report_id,source_hash,point_event_count,provenance_state,metrics_json
+                 from surface_points where surface_id=? order by canonical_point_key""", [surface_id]
+        ).fetchall())
+        incoming = tuple(
+            (point.canonical_point_key, point.source_report_id, point.source_hash, point.point_event_count,
+             "REPRODUCIBLE_AT_PUBLICATION", _canonical_json(point.metrics))
+            for point in points
+        )
+        if stored != incoming or (surface.parent_surface_id is not None and existing[1] != surface.parent_surface_id):
+            raise ValueError("incoming surface conflicts with immutable publication")
+        from .duckdb_direct import DirectPoint
+        return PublishedSurface(
+            str(existing[0]), existing[1], False,
+            tuple(DirectPoint(key, report_id, source_hash, event_count, json.loads(metrics_json))
+                  for key, report_id, source_hash, event_count, provenance, metrics_json in stored),
+        )
+    expected_parent_id = _parent_surface_id(analysis_connection, identity, surface.parent_surface_id)
+    analysis_connection.execute("begin transaction")
+    try:
+        parent_id = expected_parent_id
+        analysis_connection.execute(
+            """insert into surfaces(surface_id,parent_surface_id,build_mode,period_start_utc,period_end_utc,side,
+                grid_contract_json,normalization_contract_version,materializer_version,point_materialization_config_hash)
+                values (?,?,?,?,?,?,?,?,?,?)""",
+            [surface_id, parent_id, identity["build_mode"], identity["period"][0], identity["period"][1], identity["side"],
+             _canonical_json(identity["grid_contract"]), identity["normalization_contract"], identity["materializer_version"], identity["point_materialization_config_hash"]],
+        )
+        analysis_connection.executemany("insert into surface_sources(surface_id,source_hash) values (?,?)", [(surface_id, source_hash) for source_hash in identity["source_hashes"]])
+        pairs: set[tuple[str, str, str, int, int, int]] = set()
+        timeframes: set[tuple[str, str]] = set()
+        for point in points:
+            symbol, side, timeframe, shift, open_ma, close_ma = _point_parts(point)
+            pair_key = f"{symbol}|{side}|{shift}|{open_ma}|{close_ma}"
+            pairs.add((pair_key, symbol, side, shift, open_ma, close_ma))
+            timeframes.add((pair_key, timeframe))
+        analysis_connection.executemany("insert into surface_pairs values (?,?,?,?,?,?,?)", [(surface_id, *pair) for pair in sorted(pairs)])
+        analysis_connection.executemany("insert into surface_timeframes values (?,?,?,?)", [(surface_id, pair_key, timeframe, "USABLE") for pair_key, timeframe in sorted(timeframes)])
+        analysis_connection.executemany(
+            "insert into surface_points values (?,?,?,?,?,?,?,?,?)",
+            [(surface_id, point.canonical_point_key, f"{'|'.join(point.canonical_point_key.split('|')[:2])}|{'|'.join(point.canonical_point_key.split('|')[3:])}", point.canonical_point_key.split("|")[2], point.point_event_count, point.source_report_id, point.source_hash, "REPRODUCIBLE_AT_PUBLICATION", _canonical_json(point.metrics)) for point in points],
+        )
+        issues = [(sha256(f"{surface_id}|{issue.symbol}|{issue.timeframe}|{issue.code}|{issue.detail}".encode()).hexdigest(), surface_id, issue.symbol, issue.timeframe, issue.code, _canonical_json({"detail": issue.detail})) for issue in surface.preflight.coverage_issues]
+        if issues:
+            analysis_connection.executemany("insert into coverage_issues values (?,?,?,?,?,?)", issues)
+        analysis_connection.executemany(
+            "insert into dedup_decisions values (?,?,?,?,?)",
+            [(sha256(f"{surface_id}|{point.canonical_point_key}".encode()).hexdigest(), surface_id, point.canonical_point_key, "ACCEPTED", _canonical_json({"source_hash": point.source_hash})) for point in points],
+        )
+        analysis_connection.execute("commit")
+    except BaseException:
+        analysis_connection.execute("rollback")
+        raise
+    return PublishedSurface(surface_id, parent_id, True, points)
+
+
+def surface_raw_reproduction_status(
+    analysis_connection: duckdb.DuckDBPyConnection, surface_id: str, active_source_hashes: set[str],
+) -> str:
+    """Derive raw reproducibility from supplied active provenance, without opening source storage."""
+    hashes = {
+        str(row[0]) for row in analysis_connection.execute(
+            "select source_hash from surface_sources where surface_id=?", [surface_id]
+        ).fetchall()
+    }
+    if not hashes:
+        raise ValueError("unknown surface")
+    return "REPRODUCIBLE" if hashes <= set(active_source_hashes) else "RAW_REPLACED"

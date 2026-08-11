@@ -62,13 +62,17 @@ class DirectPoint:
     source_hash: str
     point_event_count: int
     metrics: Mapping[str, int | float | None]
+    provenance_state: str = "REPRODUCIBLE"
 
 
 @dataclass(frozen=True, slots=True)
 class DirectSurface:
+    request: DirectBuildRequest
     preflight: DirectPreflight
     event_mode: str
     points: tuple[DirectPoint, ...]
+    parent_surface_id: str | None = None
+    build_mode: str = "DUCKDB_DIRECT"
 
 
 def _window(request: DirectBuildRequest) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -182,4 +186,4 @@ def materialize_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, anal
         points.append(DirectPoint(str(point_key), report_id, source_hash, int(metrics["TotalTrades"]), metrics))
     if len({point.canonical_point_key for point in points}) != len(points):
         raise DirectMaterializationError("canonical point uniqueness failed")
-    return DirectSurface(preflight, TRADES_PROXY_EVENT_MODE, tuple(points))
+    return DirectSurface(request, preflight, TRADES_PROXY_EVENT_MODE, tuple(points))
