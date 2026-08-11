@@ -10,6 +10,9 @@ from .duckdb_events import build_duckdb_package
 from .models import Side
 from .panel import serve_panel
 from .pipeline import SelectionInputs, run_selection
+from .portfolio.layer_a_pipeline import LayerAInputs, run_layer_a
+from .portfolio.models import RunConfig
+from .portfolio.pipeline import PortfolioInputs, run_portfolio
 from .posttest import run_posttest
 from .runner.config import RunnerConfig
 from .runner.workflow import plan_batch, run_batch
@@ -63,6 +66,32 @@ def _parser() -> argparse.ArgumentParser:
     posttest.add_argument("--strategies-dir", type=Path, required=True)
     posttest.add_argument("--config", type=Path, required=True)
     posttest.add_argument("--output-dir", type=Path, required=True)
+    portfolio = subparsers.add_parser(
+        "portfolio-layer-a",
+        help="screen strategy combinations before simulation (Portfolio Analyzer, Layer A)",
+    )
+    portfolio.add_argument("--candidates-csv", type=Path, required=True)
+    portfolio.add_argument("--output-dir", type=Path, required=True)
+    portfolio.add_argument("--trades-db", type=Path, default=None)
+    portfolio.add_argument("--trades-table", default="trades")
+    portfolio.add_argument("--limiters", default="2,3,4")
+    portfolio.add_argument("--max-size-factor", type=int, default=3)
+    run = subparsers.add_parser(
+        "portfolio-run",
+        help="full portfolio analysis: simulation, lot fitting, margin, pareto, OOS",
+    )
+    run.add_argument("--strategies-csv", type=Path, required=True)
+    run.add_argument("--trades-db", type=Path, required=True)
+    run.add_argument("--output-dir", type=Path, required=True)
+    run.add_argument("--trades-table", default="trades")
+    run.add_argument("--deposit", type=float, default=1000.0)
+    run.add_argument("--dd-target", type=float, default=5.0)
+    run.add_argument("--margin-limit", type=float, default=0.40)
+    run.add_argument("--limiters", default="2,3,4")
+    run.add_argument("--max-size-factor", type=int, default=3)
+    run.add_argument("--weight-levels", default="1")
+    run.add_argument("--keep-opposite", action="store_true")
+    run.add_argument("--long-short-same-slot", action="store_true")
     panel = subparsers.add_parser(
         "panel", help="run the local MRS3 control panel"
     )
@@ -110,6 +139,49 @@ def main(argv: Sequence[str] | None = None) -> int:
             verification_sample_count=args.verification_sample_count,
         )
         print(json.dumps(package.manifest, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "portfolio-layer-a":
+        limiters = tuple(
+            int(part) for part in str(args.limiters).split(",") if part.strip()
+        )
+        manifest = run_layer_a(
+            LayerAInputs(
+                candidates_csv=args.candidates_csv,
+                output_dir=args.output_dir,
+                trades_db=args.trades_db,
+                trades_table=args.trades_table,
+                limiters=limiters or (2, 3, 4),
+                max_size_factor=args.max_size_factor,
+            )
+        )
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "portfolio-run":
+        manifest = run_portfolio(
+            PortfolioInputs(
+                strategies_csv=args.strategies_csv,
+                trades_db=args.trades_db,
+                output_dir=args.output_dir,
+                trades_table=args.trades_table,
+                config=RunConfig(
+                    deposit=args.deposit,
+                    dd_target_pct=args.dd_target,
+                    margin_limit=args.margin_limit,
+                    limiters=tuple(
+                        int(p) for p in str(args.limiters).split(",") if p.strip()
+                    )
+                    or (2, 3, 4),
+                    max_size_factor=args.max_size_factor,
+                    cancel_opposite=not args.keep_opposite,
+                    long_short_same_slot=args.long_short_same_slot,
+                    weight_levels=tuple(
+                        int(p) for p in str(args.weight_levels).split(",") if p.strip()
+                    )
+                    or (1,),
+                ),
+            )
+        )
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
         return 0
     if args.command == "tester-plan":
         config = RunnerConfig.from_json(args.config)

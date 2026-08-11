@@ -647,6 +647,82 @@ def test_controller_rejects_invalid_duckdb_verification_sample_count_before_laun
         )
 
 
+def test_controller_builds_portfolio_layer_a_command(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+
+    command, artifacts = controller._build_command(
+        "portfolio-layer-a",
+        {
+            "candidates_csv": "results.csv",
+            "output_dir": "portfolio_out",
+            "trades_db": "trades.duckdb",
+            "trades_table": "trades",
+            "limiters": "2,4",
+            "max_size_factor": "3",
+        },
+    )
+
+    assert command[1:4] == ("-m", "mrs3.cli", "portfolio-layer-a")
+    assert str((tmp_path / "results.csv").resolve()) in command
+    assert str((tmp_path / "portfolio_out").resolve()) in command
+    assert str((tmp_path / "trades.duckdb").resolve()) in command
+    assert command[command.index("--limiters") + 1] == "2,4"
+    assert command[command.index("--max-size-factor") + 1] == "3"
+    assert "--config" not in command
+    assert artifacts["manifest"] == (tmp_path / "portfolio_out").resolve() / "portfolio_manifest.json"
+    assert artifacts["coverage"] == (tmp_path / "portfolio_out").resolve() / "00_Trade_Log_Coverage.csv"
+
+
+def test_controller_builds_portfolio_run_command(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+
+    command, artifacts = controller._build_command(
+        "portfolio-run",
+        {
+            "strategies_csv": "results.csv",
+            "output_dir": "portfolio_out",
+            "trades_db": "trades.duckdb",
+            "trades_table": "trades",
+            "limiters": "2,3,4",
+            "max_size_factor": "3",
+            "deposit": "2000",
+            "dd_target": "8",
+            "margin_limit": "0.5",
+            "weight_levels": "1,2",
+            "cancel_opposite": "0",
+            "long_short_same_slot": "1",
+        },
+    )
+
+    assert command[1:4] == ("-m", "mrs3.cli", "portfolio-run")
+    assert "--config" not in command
+    assert command[command.index("--deposit") + 1] == "2000"
+    assert command[command.index("--dd-target") + 1] == "8"
+    assert command[command.index("--margin-limit") + 1] == "0.5"
+    assert command[command.index("--weight-levels") + 1] == "1,2"
+    assert "--keep-opposite" in command
+    assert "--long-short-same-slot" in command
+    assert artifacts["pareto"] == (tmp_path / "portfolio_out").resolve() / "06_Pareto_Front.csv"
+
+
+@pytest.mark.parametrize("limiters", ["2,x", "0", "-1,2"])
+def test_controller_rejects_invalid_portfolio_limiters(
+    tmp_path: Path, limiters: str
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
+
+    with pytest.raises(ValueError, match="limiters"):
+        controller._build_command(
+            "portfolio-layer-a",
+            {"candidates_csv": "results.csv", "output_dir": "out", "limiters": limiters},
+        )
+
+
+def test_controller_section_maps_portfolio_actions() -> None:
+    assert PanelController._section("portfolio-layer-a") == "portfolio"
+    assert PanelController._section("portfolio-run") == "portfolio"
+
+
 def test_controller_selects_verified_source_package_without_raw_csv(
     tmp_path: Path,
 ) -> None:
@@ -947,8 +1023,8 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert 'id="verify_html_root"' in html
         assert 'id="verification_sample_count"' in html
         assert "Совместимый CSV-вход (текущий путь)" in html
-        assert "Симулятор сетов недоступен" in html
-        assert "Рекомендации недоступны" in html
+        assert "Только слой A" in html
+        assert "Запустить полный прогон" in html
         assert 'data-runnable="true"' in html
         assert "document.querySelectorAll('[data-runnable]')" in html
         assert 'aria-live="polite"' in html
