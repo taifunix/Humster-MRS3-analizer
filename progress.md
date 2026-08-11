@@ -31,7 +31,7 @@ full-horizon source gate; PnL/DD remain mandatory
 `NOT_COMPARABLE_WINDOW_SCOPE` diagnostics. The DuckDB materializer uses bounded
 reads and retains the complete cycle/exclusion audit.
 
-Task 1 of the approved DuckDB storage/importer plan rejects lossy
+Task 1 (`270249f`) of the approved DuckDB storage/importer plan rejects lossy
 fractional/non-finite integer loader values, accepts only Python `None` and
 `pd.NA` wins/losses values as zero, and rejects empty normalized input before
 downstream processing. Focused evidence: `52 passed` for `tests/test_loader.py` and
@@ -41,7 +41,7 @@ runner-test failures because three required HTML fixtures are absent from Git;
 those paths are outside Task 1 and were not changed. Independent re-review is
 approved; Task 1 is complete.
 
-Task 2 validates `point_event_count` in eligibility before its `int64` cast:
+Task 2 (`f61ffc8`) validates `point_event_count` in eligibility before its `int64` cast:
 fractional, negative and non-finite numeric/text values are rejected, while
 the legacy missing-column proxy remains `trades`. Focused evidence is
 `32 passed` for `tests/test_eligibility.py`; the full suite reaches
@@ -49,7 +49,7 @@ the legacy missing-column proxy remains `trades`. Focused evidence is
 task. Independent Terra review approved the staged implementation; Task 2 is
 complete.
 
-Task 3 requires exactly one normalized UTC `report_start`/`report_end` pair
+Task 3 (`bf899d3`) requires exactly one normalized UTC `report_start`/`report_end` pair
 for raw CSV input before eligibility. Pair-history output now asserts that
 invariant instead of synthesizing min/max endpoints; the audit records the
 coherent window and its derived `effective_days`. Focused evidence is
@@ -58,7 +58,7 @@ reaches `326 passed` and has the same eight runner-test fixture failures
 outside this task. Independent Terra review and re-review are approved; Task
 3 is complete.
 
-Task 4 aligns Plateau Library eligibility ID tuples with the annotated
+Task 4 (`869bd70`) aligns Plateau Library eligibility ID tuples with the annotated
 standalone/depth predicates. Per-point event hashes are no longer presented as
 a plateau event union: only source-package event mappings can produce the real
 union, while legacy retains `N/A_LEGACY_PROXY` and raw real-event input without
@@ -68,24 +68,24 @@ mappings fails closed. Focused evidence is `20 passed` for
 task. Independent Terra review approved the staged implementation; Task 4 is
 complete.
 
-Task 5 validates `base_rate_tf` object and scalar value types before Decimal
+Task 5 (`c579801`) validates `base_rate_tf` object and scalar value types before Decimal
 conversion. Null, non-object and non-scalar values now yield field-specific
 `ValueError` with the original cause chained. Focused evidence is `15 passed`
 for `tests/test_config.py`; the full suite reaches `334 passed` and has the
 same eight runner-test fixture failures outside this task. Independent Terra
 review and re-review are approved; Task 5 is complete.
 
-Task 6 has a committed, independently Terra-reviewed compact-importer parity
+Task 6 (`05369c2`) has a committed, independently Terra-reviewed compact-importer parity
 contract: v3 exposes an immutable compact record, v4 workers return that same
 contract while dynamically loading the adjacent v3 codec, and the `mrs3`
 adapter decodes its compact payloads. Focused evidence is `4 passed` for
-`tests/test_duckdb_events.py`; the full suite reaches `338 passed` and has the
-same eight runner-test fixture failures outside this task. The required final
-verification on a copied real MRS HTML report has not been performed because
-no such source file is available in the repository; therefore Task 6 remains
-incomplete and must not be treated as import evidence for later tasks.
+`tests/test_duckdb_events.py`. A copied-real-HTML smoke established v3/v4/mrs3
+adapter parity `PASS` and a temporary v3 DuckDB import without writing the
+production database: schema `v3`, scanned `1`, imported `1`, quarantined `0`,
+raw actions `78`, equity samples `646`, and wallet changes `79`. Task 6 is
+complete.
 
-Task 7 adds a versioned source DuckDB schema v5 and an out-of-place v4
+Task 7 (`e2bcde9`) adds a versioned source DuckDB schema v5 and an out-of-place v4
 migration. The v5 contract persists normalization metadata, identifies a
 point by normalized shift and MA pair plus its period, uses the time-grid hash
 only as integrity evidence, and keeps active payload hashes separate from
@@ -99,17 +99,18 @@ eight absent-runner-fixture failures. Independent Terra review found and the
 re-review verified the report-period/time-grid-bounds integrity check; Task 7
 is complete.
 
-Task 8 adds the recursive HTML-to-source-DuckDB import boundary. It snapshots
+Task 8 (`b7dc23e`) adds the recursive HTML-to-source-DuckDB import boundary. It snapshots
 every input without moving, rewriting or deleting HTML; parses read-only in
 parallel; groups canonical identities before a single-writer publication; and
 records deterministic hashed manifest/checklist evidence. Insert, identical
 skip, new period/shift, `A -> B -> A` replacement history, quarantine,
 cancellation and safe retry are covered. Any same-batch canonical ambiguity
 now stops the entire job before staging or DuckDB access, so neither an
-existing target nor a new target can be published. Focused/relevant evidence
-is `62 passed`; the full suite reaches `363 passed` with the same eight
-absent-runner-fixture failures. Independent Terra review and re-review are
-approved; Task 8 is complete.
+existing target nor a new target can be published. The isolated pipeline test
+passes `1/1`; its combined failure was temporary ACL noise. However, Task 8 is
+reopened: the isolated importer test parses `1` and quarantines `1` because a
+raw-byte snapshot hash is compared with the normalized codec hash on Windows
+CRLF input. Correct that mismatch before treating Task 8 as complete.
 
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
@@ -132,27 +133,23 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1–5, 7 and 8 are complete. Task 6 implementation is committed,
-but its required real-report verification remains the next action.
+slice; Tasks 1–7 are complete. Task 8 (`b7dc23e`) is reopened for the Windows
+CRLF snapshot-hash/normalized-codec-hash mismatch.
 
-1. Obtain a real MRS HTML report, copy it to a temporary location and verify
-   the Task 6 importer against a temporary DuckDB without writing the
-   production database; then record the evidence and mark Task 6 complete.
+1. Correct and independently verify the Task 8 Windows CRLF hash mismatch:
+   the importer must not quarantine a valid report merely because the raw-byte
+   snapshot hash differs from the normalized codec hash.
 2. Start Task 9 from the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
-   only after recording the separate Task 6 evidence or receiving explicit
-   user authorization to continue past it.
-3. Apply the confirmed external-review remediation tasks listed in the
-   [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
-4. Implement the approved source-DuckDB migration/importer and direct analysis
-   surface storage in independently reviewed TDD slices.
-5. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
+   only after Task 8 is corrected and re-verified.
+3. Continue the remaining core delivery in independently reviewed TDD slices.
+4. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
 
 ## Blockers
 
-- Task 6 lacks the required real MRS HTML source for its final temporary-copy
-  import verification. Tasks 7 and 8 were completed by explicit user
-  authorization; this evidence remains required to close Task 6.
+- Task 8 is blocked on correction of the Windows CRLF raw-byte snapshot-hash
+  versus normalized codec-hash mismatch. Task 9 remains blocked on that
+  correction.
 - CSV/DuckDB overlay is explicitly deferred and no economic threshold changes
   are implied.
 

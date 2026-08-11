@@ -2,8 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved for execution. No implementation task has started; Task 0
-is the mandatory first action in the next coding session.
+**Status:** Tasks 0–7 are complete. Task 6 was committed in `05369c2`; its
+copied-real-HTML smoke established v3/v4/mrs3 adapter parity `PASS` and a
+temporary v3 DuckDB import with `1` scanned, `1` imported and `0` quarantined
+reports, `78` raw
+actions, `646` equity samples and `79` wallet changes, without a production DB
+write. Task 8 was committed in `b7dc23e` but is reopened: on Windows CRLF
+input, its raw-byte snapshot hash disagrees with the normalized codec hash,
+causing the isolated importer test to parse `1` and quarantine `1`. The
+isolated pipeline test passes `1/1`; its combined failure was temporary ACL
+noise. Task 9 is blocked until Task 8 is corrected and re-verified.
 
 **Goal:** Add a safely appendable source DuckDB, panel-managed HTML import,
 immutable `DUCKDB_DIRECT` analysis surfaces and persistent plateau/candidate
@@ -43,10 +51,10 @@ This blocking task finishes before Task 1. It must not absorb any DuckDB work.
 - Modify only as required by the existing slice: `tests/test_package_loader.py`
 - Modify: `progress.md`
 
-- [ ] Inspect the existing diff and remove no unrelated user changes.
-- [ ] Run `.venv\Scripts\python.exe -m pytest tests/test_loader.py tests/test_package_loader.py -q`.
-- [ ] Obtain independent review, apply only confirmed findings, rerun and re-review.
-- [ ] Update current evidence, run `git diff --check`, inspect the exact staged
+- [x] Inspect the existing diff and remove no unrelated user changes.
+- [x] Run `.venv\Scripts\python.exe -m pytest tests/test_loader.py tests/test_package_loader.py -q`.
+- [x] Obtain independent review, apply only confirmed findings, rerun and re-review.
+- [x] Update current evidence, run `git diff --check`, inspect the exact staged
   scope and commit separately: `fix: preserve package side and utc normalization`.
 
 ### Review triage
@@ -75,17 +83,17 @@ This blocking task finishes before Task 1. It must not absorb any DuckDB work.
 **Interface:** Keep `load_points(...) -> tuple[pd.DataFrame, InputAudit]`; all
 validation failures use `InputError` before constructing point IDs.
 
-- [ ] Add parameterized RED tests for fractional/non-finite `run_id`, `open_ma`,
+- [x] Add parameterized RED tests for fractional/non-finite `run_id`, `open_ma`,
   `close_ma` and `trades`.
-- [ ] Add RED tests proving only genuine pandas `NA`/Python `None` becomes `0`;
+- [x] Add RED tests proving only genuine pandas `NA`/Python `None` becomes `0`;
   blank strings, non-empty nonnumeric, negative, fractional and non-finite
   wins/losses raise `InputError` before coercion.
-- [ ] Add RED tests for zero rows and all-service rows.
-- [ ] Run RED: `.venv\Scripts\python.exe -m pytest tests/test_loader.py -q`.
-- [ ] Add one reusable exact-integer parser, then guard `data.empty` before any
+- [x] Add RED tests for zero rows and all-service rows.
+- [x] Run RED: `.venv\Scripts\python.exe -m pytest tests/test_loader.py -q`.
+- [x] Add one reusable exact-integer parser, then guard `data.empty` before any
   event-mode `iloc[0]`.
-- [ ] Run GREEN and `tests/test_source_packs.py`; the latter must remain unchanged.
-- [ ] Review and commit: `fix: reject lossy loader values`.
+- [x] Run GREEN and `tests/test_source_packs.py`; the latter must remain unchanged.
+- [x] Review and commit: `fix: reject lossy loader values`.
 
 ### Task 2: Validate eligibility event counts
 
@@ -93,12 +101,12 @@ validation failures use `InputError` before constructing point IDs.
 - Modify: `src/mrs3/eligibility.py`
 - Test: `tests/test_eligibility.py`
 
-- [ ] Add RED tests for numeric/text fractional, negative and non-finite
+- [x] Add RED tests for numeric/text fractional, negative and non-finite
   `point_event_count` reaching `annotate_eligibility` directly.
-- [ ] Run RED: `.venv\Scripts\python.exe -m pytest tests/test_eligibility.py -q`.
-- [ ] Reuse the exact non-negative integer rule before casting; preserve legacy
+- [x] Run RED: `.venv\Scripts\python.exe -m pytest tests/test_eligibility.py -q`.
+- [x] Reuse the exact non-negative integer rule before casting; preserve legacy
   proxy behavior.
-- [ ] Run GREEN, review and commit: `fix: validate eligibility event counts`.
+- [x] Run GREEN, review and commit: `fix: validate eligibility event counts`.
 
 ### Task 3: Enforce one raw-CSV period and coherent pair history
 
@@ -108,14 +116,14 @@ validation failures use `InputError` before constructing point IDs.
 - Test: `tests/test_loader.py`
 - Test: `tests/test_pipeline.py`
 
-- [ ] Add RED raw-CSV tests with two distinct `(report_start, report_end)` pairs;
+- [x] Add RED raw-CSV tests with two distinct `(report_start, report_end)` pairs;
   expect `InputError` before eligibility.
-- [ ] Add a GREEN-path assertion that every `01_Pair_History` row reports the
+- [x] Add a GREEN-path assertion that every `01_Pair_History` row reports the
   single accepted window and derives `effective_days` from coherent rows.
-- [ ] Run RED: `.venv\Scripts\python.exe -m pytest tests/test_loader.py tests/test_pipeline.py -q`.
-- [ ] Validate one normalized UTC window in `load_points`; make `_pair_history`
+- [x] Run RED: `.venv\Scripts\python.exe -m pytest tests/test_loader.py tests/test_pipeline.py -q`.
+- [x] Validate one normalized UTC window in `load_points`; make `_pair_history`
   assert rather than synthesize min/max endpoints.
-- [ ] Run GREEN, review and commit: `fix: enforce one csv analysis window`.
+- [x] Run GREEN, review and commit: `fix: enforce one csv analysis window`.
 
 ### Task 4: Align Plateau Library eligibility and event provenance
 
@@ -125,16 +133,16 @@ validation failures use `InputError` before constructing point IDs.
 - Test: `tests/test_plateau.py`
 - Test: `tests/test_pipeline.py`
 
-- [ ] Add RED regression where geometric members include economic-, sample-,
+- [x] Add RED regression where geometric members include economic-, sample-,
   history- and event-ineligible points; library ID tuples must equal the
   annotated `standalone_eligible`/`depth_eligible` sets.
-- [ ] Add RED regression proving `build_plateaus` cannot label hashes-per-point
+- [x] Add RED regression proving `build_plateaus` cannot label hashes-per-point
   as a true `PlateauEventSet` union.
-- [ ] Run RED: `.venv\Scripts\python.exe -m pytest tests/test_plateau.py tests/test_pipeline.py -q`.
-- [ ] Derive both ID tuples from the same predicates as annotations. Publish real
+- [x] Run RED: `.venv\Scripts\python.exe -m pytest tests/test_plateau.py tests/test_pipeline.py -q`.
+- [x] Derive both ID tuples from the same predicates as annotations. Publish real
   union count/hash only in `_apply_package_event_unions`; keep legacy values
   `N/A_LEGACY_PROXY` and fail closed if real mappings are absent.
-- [ ] Run GREEN, review and commit: `fix: align plateau audit eligibility`.
+- [x] Run GREEN, review and commit: `fix: align plateau audit eligibility`.
 
 ### Task 5: Stabilize null configuration errors
 
@@ -142,12 +150,12 @@ validation failures use `InputError` before constructing point IDs.
 - Modify: `src/mrs3/config.py`
 - Test: `tests/test_config.py`
 
-- [ ] Add RED cases for `base_rate_tf: null`, null values and non-object nested
+- [x] Add RED cases for `base_rate_tf: null`, null values and non-object nested
   configuration.
-- [ ] Run RED: `.venv\Scripts\python.exe -m pytest tests/test_config.py -q`.
-- [ ] Validate mapping/value types before `Decimal`; raise field-specific
+- [x] Run RED: `.venv\Scripts\python.exe -m pytest tests/test_config.py -q`.
+- [x] Validate mapping/value types before `Decimal`; raise field-specific
   `ValueError` with the original exception chained.
-- [ ] Run GREEN, review and commit: `fix: validate null algorithm config`.
+- [x] Run GREEN, review and commit: `fix: validate null algorithm config`.
 
 ---
 
@@ -163,13 +171,13 @@ validation failures use `InputError` before constructing point IDs.
 - Create: `tests/fixtures/duckdb_import/report_a.html`
 - Create: `tests/fixtures/duckdb_import/report_b.html`
 
-- [ ] Add RED parity tests comparing codec metadata, payload bytes/counts, source
+- [x] Add RED parity tests comparing codec metadata, payload bytes/counts, source
   text SHA and error classification for representative compact HTML.
-- [ ] Define one immutable compact-record value contract consumed by the v4
+- [x] Define one immutable compact-record value contract consumed by the v4
   worker and `mrs3` adapter; v4 must still load the adjacent v3 codec.
-- [ ] Run RED/GREEN: `.venv\Scripts\python.exe -m pytest tests/test_duckdb_events.py -q`.
-- [ ] Verify on a copied real sample without writing the production database.
-- [ ] Review and commit: `refactor: expose compact importer contract`.
+- [x] Run RED/GREEN: `.venv\Scripts\python.exe -m pytest tests/test_duckdb_events.py -q`.
+- [x] Verify on a copied real sample without writing the production database.
+- [x] Review and commit: `refactor: expose compact importer contract`.
 
 ### Task 7: Add source schema v5 and out-of-place migration
 
@@ -187,24 +195,28 @@ canonical_report_key(metadata) -> str
 normalize_source_shift(value, contract_version) -> int
 ```
 
-- [ ] Add RED tests proving source/target paths differ and the old DB remains
+- [x] Add RED tests proving source/target paths differ and the old DB remains
   byte-for-byte unchanged after success or any validation/transaction failure.
-- [ ] Keep Task 7 independent of configuration; configured-path activation is
+- [x] Keep Task 7 independent of configuration; configured-path activation is
   owned and tested only by Task 9.
-- [ ] Validate schema/constraints, rows, canonical report keys, active hashes,
+- [x] Validate schema/constraints, rows, canonical report keys, active hashes,
   decoded payloads, references and row/payload hashes.
-- [ ] Prove `0.99` and `0.9900` normalize to one canonical point and the
+- [x] Prove `0.99` and `0.9900` normalize to one canonical point and the
   time-grid hash is integrity evidence, not report identity.
-- [ ] Prove one active SHA cannot belong to a second active canonical report;
+- [x] Prove one active SHA cannot belong to a second active canonical report;
   historical audit may repeat hashes outside the active uniqueness constraint.
-- [ ] Add RED normalized-contract metadata and incompatible-setting tests that
+- [x] Add RED normalized-contract metadata and incompatible-setting tests that
   fail before target preflight/write.
-- [ ] Implement the exact spec model: one active payload per canonical
+- [x] Implement the exact spec model: one active payload per canonical
   point+period; active hashes separate from replacement history.
-- [ ] Run GREEN: `.venv\Scripts\python.exe -m pytest tests/test_duckdb_source_schema.py tests/test_duckdb_events.py -q`.
-- [ ] Review and commit: `feat: add versioned source duckdb schema`.
+- [x] Run GREEN: `.venv\Scripts\python.exe -m pytest tests/test_duckdb_source_schema.py tests/test_duckdb_events.py -q`.
+- [x] Review and commit: `feat: add versioned source duckdb schema`.
 
 ### Task 8: Implement recursive append/replacement import
+
+**Current status:** Reopened. Do not mark this task complete until the Windows
+CRLF raw-byte snapshot-hash versus normalized codec-hash mismatch is corrected
+and independently re-verified.
 
 **Files:**
 - Create: `src/mrs3/duckdb_import.py`
