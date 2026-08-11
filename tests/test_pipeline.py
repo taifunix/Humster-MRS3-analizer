@@ -121,7 +121,7 @@ def test_pair_history_rejects_mixed_report_windows() -> None:
         _pair_history(points)
 
 
-def test_pipeline_manifest_keeps_real_event_mode_from_source_package(tmp_path: Path) -> None:
+def test_pipeline_real_event_metadata_without_mappings_fails_closed(tmp_path: Path) -> None:
     paths = write_selection_inputs(tmp_path / "inputs")
     source = pd.read_csv(paths["csv"])
     source["event_mode"] = "real_independent_events"
@@ -134,6 +134,9 @@ def test_pipeline_manifest_keeps_real_event_mode_from_source_package(tmp_path: P
     result = run_selection(inputs, config)
 
     assert result.manifest["event_mode"] == "real_independent_events"
+    assert not result.plateaus["ready"].any()
+    assert result.plateaus["plateau_event_count"].isna().all()
+    assert result.plateaus["plateau_event_ids_hash"].isna().all()
 
 
 def test_pipeline_package_manifest_and_plateaus_use_distinct_real_events(

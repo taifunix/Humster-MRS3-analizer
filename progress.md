@@ -58,6 +58,16 @@ reaches `326 passed` and has the same eight runner-test fixture failures
 outside this task. Independent Terra review and re-review are approved; Task
 3 is complete.
 
+Task 4 aligns Plateau Library eligibility ID tuples with the annotated
+standalone/depth predicates. Per-point event hashes are no longer presented as
+a plateau event union: only source-package event mappings can produce the real
+union, while legacy retains `N/A_LEGACY_PROXY` and raw real-event input without
+mappings fails closed. Focused evidence is `20 passed` for
+`tests/test_plateau.py tests/test_pipeline.py`; the full suite reaches
+`328 passed` and has the same eight runner-test fixture failures outside this
+task. Independent Terra review approved the staged implementation; Task 4 is
+complete.
+
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
 included cycles. The package has `source_summary_status=VERIFIED` and
@@ -79,9 +89,9 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1–3 are complete and Task 4 is next.
+slice; Tasks 1–4 are complete and Task 5 is next.
 
-1. Start Task 4 from the
+1. Start Task 5 from the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 2. Apply the confirmed external-review remediation tasks listed in the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).

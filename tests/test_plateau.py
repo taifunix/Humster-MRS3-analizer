@@ -29,6 +29,7 @@ def _point(
     sample: bool = True,
     history: bool = True,
     events: int = 3,
+    economic: bool = True,
 ) -> dict[str, object]:
     return {
         "point_id": point_id,
@@ -45,7 +46,7 @@ def _point(
         "win_rate_pct": 90.0,
         "profit_factor": 3.0,
         "trades": trades,
-        "economic_pass": True,
+        "economic_pass": economic,
         "refine_required": False,
         "standalone_sample_pass": sample,
         "history_pass": history,
@@ -143,6 +144,44 @@ def test_geometric_plateau_without_event_eligible_point_is_not_mrs3_usable() -> 
     assert not plateaus.iloc[0]["ready"]
     assert plateaus.iloc[0]["status"] == "INSUFFICIENT_INDEPENDENT_EVENTS"
     assert not annotated["depth_eligible"].any()
+
+
+def test_plateau_library_eligibility_ids_match_annotated_points() -> None:
+    points = pd.DataFrame(
+        [
+            _point("ELIGIBLE", shift_bp=230, open_ma=2),
+            _point("SAMPLE", shift_bp=230, open_ma=3, sample=False),
+            _point("HISTORY", shift_bp=230, open_ma=4, history=False),
+            _point("EVENT", shift_bp=230, open_ma=5, events=2),
+            _point("ECONOMIC", shift_bp=230, open_ma=6, economic=False),
+        ]
+    )
+
+    annotated, plateaus = build_plateaus(points, AlgorithmConfig.defaults())
+
+    library = plateaus.iloc[0]
+    assert library["standalone_eligible_point_ids"] == tuple(
+        sorted(annotated.loc[annotated["standalone_eligible"], "point_id"])
+    )
+    assert library["depth_eligible_point_ids"] == tuple(
+        sorted(annotated.loc[annotated["depth_eligible"], "point_id"])
+    )
+
+
+def test_plateau_library_does_not_treat_point_hashes_as_event_union() -> None:
+    points = pd.DataFrame(
+        [
+            _point("P1", shift_bp=230, open_ma=2),
+            _point("P2", shift_bp=230, open_ma=3),
+        ]
+    )
+    points["event_mode"] = "real_independent_events"
+    points["event_ids_hash"] = ["point-hash-1", "point-hash-2"]
+
+    _, plateaus = build_plateaus(points, AlgorithmConfig.defaults())
+
+    assert pd.isna(plateaus.iloc[0]["plateau_event_count"])
+    assert pd.isna(plateaus.iloc[0]["plateau_event_ids_hash"])
 
 
 def test_isolated_peak_is_audited_but_not_used_as_plateau() -> None:

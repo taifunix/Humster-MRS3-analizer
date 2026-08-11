@@ -270,11 +270,17 @@ def _build_group_plateaus(
         standalone_ids = tuple(
             point_id
             for point_id in all_ids
-            if bool(records[point_id]["standalone_sample_pass"])
+            if bool(records[point_id]["economic_pass"])
+            and bool(records[point_id]["standalone_sample_pass"])
             and bool(records[point_id]["history_pass"])
+            and bool(records[point_id].get("event_eligible", True))
         )
-        event_mode = str(records[all_ids[0]].get("event_mode", "legacy_trades_proxy"))
-        event_ids = sorted(str(records[point_id].get("event_ids_hash", "")) for point_id in all_ids if bool(records[point_id].get("event_eligible", True)))
+        depth_ids = tuple(
+            point_id
+            for point_id in all_ids
+            if bool(records[point_id]["economic_pass"])
+            and bool(records[point_id].get("event_eligible", True))
+        )
         mrs3_usable = any(bool(records[point_id].get("event_eligible", True)) and bool(records[point_id].get("economic_pass", False)) for point_id in all_ids)
         output.append(
             {
@@ -296,10 +302,10 @@ def _build_group_plateaus(
                 "best_pnl_point_id": _best_point_id(all_ids, records, "pnl_pct"),
                 "best_eff_point_id": _best_point_id(all_ids, records, "efficiency"),
                 "standalone_eligible_point_ids": standalone_ids,
-                "depth_eligible_point_ids": all_ids,
+                "depth_eligible_point_ids": depth_ids,
                 "envelope": float(component_envelope(rows)),
-                "plateau_event_count": None if event_mode == "legacy_trades_proxy" else len(event_ids),
-                "plateau_event_ids_hash": "N/A_LEGACY_PROXY" if event_mode == "legacy_trades_proxy" else (hashlib.sha256("|".join(event_ids).encode()).hexdigest() if event_ids else ""),
+                "plateau_event_count": None,
+                "plateau_event_ids_hash": None,
                 "status": "MRS3_USABLE" if mrs3_usable else "INSUFFICIENT_INDEPENDENT_EVENTS",
                 "ready": mrs3_usable,
             }

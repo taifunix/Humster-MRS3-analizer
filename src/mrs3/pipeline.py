@@ -380,6 +380,10 @@ def _apply_package_event_unions(
         output["plateau_event_ids_hash"] = "N/A_LEGACY_PROXY"
         return output
     if "_event_ids" not in points:
+        output["plateau_event_count"] = None
+        output["plateau_event_ids_hash"] = None
+        output["status"] = "INSUFFICIENT_INDEPENDENT_EVENTS"
+        output["ready"] = False
         return output
     point_events = dict(
         zip(points["point_id"].astype(str), points["_event_ids"], strict=True)
