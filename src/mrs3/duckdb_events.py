@@ -5,11 +5,14 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from hashlib import sha256
+import importlib.util
 import json
 from pathlib import Path
 import re
 import shutil
 import struct
+import sys
+from threading import Lock
 import tempfile
 from typing import Iterator, Mapping, Sequence
 import zlib
@@ -48,6 +51,39 @@ POINT_COLUMNS = [
     "settings[*].mrs2.ma_close_short.len", "settings[*].mrs2.ma_short.multiplier",
     "event_mode", "point_event_count", "event_ids_hash", "window_metrics_status",
 ]
+
+_COMPACT_IMPORTER_LOCK = Lock()
+_COMPACT_IMPORTER: object | None = None
+
+
+def _load_compact_importer() -> object:
+    global _COMPACT_IMPORTER
+    with _COMPACT_IMPORTER_LOCK:
+        if _COMPACT_IMPORTER is not None:
+            return _COMPACT_IMPORTER
+        importer_path = (
+            Path(__file__).parents[2]
+            / "programs"
+            / "Обработчик HTML-DuckDB"
+            / "mrs3_html_compact_importer_v3.py"
+        )
+        spec = importlib.util.spec_from_file_location("_mrs3_compact_importer_v3", importer_path)
+        if not spec or not spec.loader:
+            raise RuntimeError(f"cannot load compact HTML codec: {importer_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _COMPACT_IMPORTER = module
+        return module
+
+
+def read_compact_html(path: Path) -> object:
+    """Parse one HTML report into the immutable compact codec contract.
+
+    This adapter deliberately exposes no DuckDB connection to parsing workers.
+    """
+    importer = _load_compact_importer()
+    return importer.read_compact_record(Path(path))
 
 
 @dataclass(frozen=True, slots=True)

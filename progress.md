@@ -99,6 +99,18 @@ eight absent-runner-fixture failures. Independent Terra review found and the
 re-review verified the report-period/time-grid-bounds integrity check; Task 7
 is complete.
 
+Task 8 adds the recursive HTML-to-source-DuckDB import boundary. It snapshots
+every input without moving, rewriting or deleting HTML; parses read-only in
+parallel; groups canonical identities before a single-writer publication; and
+records deterministic hashed manifest/checklist evidence. Insert, identical
+skip, new period/shift, `A -> B -> A` replacement history, quarantine,
+cancellation and safe retry are covered. Any same-batch canonical ambiguity
+now stops the entire job before staging or DuckDB access, so neither an
+existing target nor a new target can be published. Focused/relevant evidence
+is `62 passed`; the full suite reaches `363 passed` with the same eight
+absent-runner-fixture failures. Independent Terra review and re-review are
+approved; Task 8 is complete.
+
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
 included cycles. The package has `source_summary_status=VERIFIED` and
@@ -120,13 +132,13 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1–5 and 7 are complete. Task 6 implementation is committed, but
-its required real-report verification remains the next action.
+slice; Tasks 1–5, 7 and 8 are complete. Task 6 implementation is committed,
+but its required real-report verification remains the next action.
 
 1. Obtain a real MRS HTML report, copy it to a temporary location and verify
    the Task 6 importer against a temporary DuckDB without writing the
    production database; then record the evidence and mark Task 6 complete.
-2. Start Task 8 from the
+2. Start Task 9 from the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
    only after recording the separate Task 6 evidence or receiving explicit
    user authorization to continue past it.
@@ -139,8 +151,8 @@ its required real-report verification remains the next action.
 ## Blockers
 
 - Task 6 lacks the required real MRS HTML source for its final temporary-copy
-  import verification. Task 7 was completed by explicit user authorization;
-  this evidence remains required to close Task 6.
+  import verification. Tasks 7 and 8 were completed by explicit user
+  authorization; this evidence remains required to close Task 6.
 - CSV/DuckDB overlay is explicitly deferred and no economic threshold changes
   are implied.
 
