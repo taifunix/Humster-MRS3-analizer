@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import struct
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator, Mapping, Sequence
 import zlib
 
@@ -932,26 +933,96 @@ def _copy_snapshot(
         )
 
 
-def migrate_source_database(source_path: Path, target_path: Path) -> SourceMigrationResult:
-    """Validate v4 read-only, then atomically publish a separate validated v5 database."""
+def _trusted_v4_metadata(connection: duckdb.DuckDBPyConnection) -> tuple[tuple[dict[str, object], ...], dict[str, dict[str, object]], int, frozenset[str]]:
+    """Read trusted-v4 metadata, decoding only time grids needed for v5 identity."""
+    _verify_columns(connection, _REQUIRED_V4_COLUMNS, "v4 source")
+    metadata = _schema_metadata(connection)
+    if metadata.get("schema_version") != "4":
+        raise SourceSchemaError("source database schema version is not v4")
+    _verify_contract_metadata(metadata, required=False)
+    points = _rows(connection, "select * from point_configs order by point_id")
+    report_count = int(connection.execute("select count(*) from report_runs").fetchone()[0])
+    payload_count = int(connection.execute("select count(*) from report_payloads").fetchone()[0])
+    if report_count != payload_count:
+        raise SourceSchemaError("v4 report and payload row counts/references do not match")
+    if int(connection.execute("select count(*) from report_runs r left join report_payloads p using(report_id) where p.report_id is null").fetchone()[0]) or int(connection.execute("select count(*) from report_payloads p left join report_runs r using(report_id) where r.report_id is null").fetchone()[0]):
+        raise SourceSchemaError("v4 report and payload row counts/references do not match")
+    if int(connection.execute("select count(*) from report_runs") .fetchone()[0]) != int(connection.execute("select count(distinct source_sha256) from report_runs").fetchone()[0]):
+        raise SourceSchemaError("v4 source hashes are not unique")
+    if int(connection.execute("select count(*) from report_runs") .fetchone()[0]) != int(connection.execute("select count(distinct canonical_key) from report_runs").fetchone()[0]):
+        raise SourceSchemaError("v4 canonical keys are not unique")
+    if int(connection.execute("select count(*) from report_runs r left join point_configs c using(point_id) left join time_grids g using(grid_id) where c.point_id is null or g.grid_id is null").fetchone()[0]):
+        raise SourceSchemaError("v4 report has a missing point or grid reference")
+    grids: dict[str, dict[str, object]] = {}
+    for old in _iter_rows(connection, "select * from time_grids order by grid_id"):
+        timestamps = decode_compact_deltas(bytes(old["timestamps_zlib"]), int(old["sample_count"]), codec=EQUITY_CODEC)
+        if not timestamps or timestamps[0] != int(old["start_timestamp_ms"]) or timestamps[-1] != int(old["end_timestamp_ms"]) or any(right <= left for left, right in zip(timestamps, timestamps[1:])):
+            raise SourceSchemaError("v4 time-grid bounds do not match decoded payload")
+        row = {"grid_hash": _grid_content_hash(timestamps), "sample_count": old["sample_count"], "start_timestamp_ms": old["start_timestamp_ms"], "end_timestamp_ms": old["end_timestamp_ms"], "timestamps_zlib": old["timestamps_zlib"]}
+        row["row_sha256"] = _grid_hash(row)
+        grids[str(old["grid_id"])] = row
+    source_hashes = frozenset(str(row[0]) for row in connection.execute("select source_sha256 from report_runs").fetchall())
+    return points, grids, report_count, source_hashes
+
+
+def _trusted_prepare_batch(reports: Sequence[dict[str, object]], payloads: Mapping[str, dict[str, object]], points: Mapping[str, dict[str, object]], grids: Mapping[str, dict[str, object]]) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    prepared_reports: list[dict[str, object]] = []
+    prepared_payloads: list[dict[str, object]] = []
+    for old in reports:
+        point, grid = points[str(old["point_id"])], grids[str(old["grid_id"])]
+        point_metadata = {
+            "symbol": point["symbol"], "side": point["side"], "timeframe": point["timeframe"],
+            "open_multiplier": point["open_multiplier_raw"], "open_ma_len": point["open_ma_len"],
+            "close_ma_len": point["close_ma_len"],
+        }
+        if _canonical_point_values(_settings_point(old["settings_json"], str(point["side"]))) != _canonical_point_values(point_metadata):
+            raise SourceSchemaError("v4 report settings do not match its point row")
+        row = {"report_id": old["report_id"], "canonical_report_key": canonical_report_key({**point, "report_period_start_ms": grid["start_timestamp_ms"], "report_period_end_ms": grid["end_timestamp_ms"]}), "canonical_point_key": point["canonical_point_key"], "grid_hash": grid["grid_hash"], "source_sha256": old["source_sha256"], "source_file": old["source_file"], "source_size": old["source_size"], "imported_at_utc": old["imported_at_utc"], "settings_json": old["settings_json"], "raw_action_count": old["raw_action_count"], "equity_sample_count": old["equity_sample_count"], "wallet_change_count": old["wallet_change_count"], "report_period_start_ms": grid["start_timestamp_ms"], "report_period_end_ms": grid["end_timestamp_ms"]}
+        row["row_sha256"] = _report_hash(row)
+        payload = dict(payloads[str(old["report_id"])])
+        payload["payload_sha256"] = _payload_hash(payload)
+        prepared_reports.append(row); prepared_payloads.append(payload)
+    return prepared_reports, prepared_payloads
+
+
+def _trusted_prepare_record(old: dict[str, object], payload: dict[str, object], points: Mapping[str, dict[str, object]], grids: Mapping[str, dict[str, object]]) -> tuple[dict[str, object], dict[str, object]]:
+    """Prepare one detached record; deliberately does not decode opaque payloads."""
+    reports, payloads = _trusted_prepare_batch((old,), {str(old["report_id"]): payload}, points, grids)
+    return reports[0], payloads[0]
+
+
+def _validate_v5_structural(connection: duckdb.DuckDBPyConnection) -> SourceValidationResult:
+    """Validate v5 persisted structure and hashes without decoding opaque report payloads."""
+    _verify_columns(connection, _REQUIRED_V5_COLUMNS, "v5 source"); _verify_v5_constraints(connection)
+    metadata = _schema_metadata(connection)
+    if metadata.get("schema_version") != str(SOURCE_SCHEMA_VERSION): raise SourceSchemaError("migrated database is not v5")
+    _verify_contract_metadata(metadata, required=True)
+    counts = tuple(int(connection.execute(f"select count(*) from {table}").fetchone()[0]) for table in ("active_reports", "point_configs", "time_grids", "report_payloads", "replacement_history"))
+    reports, points, grids, payloads, replacements = counts
+    if reports != payloads or int(connection.execute("select count(*) from active_reports r full outer join report_payloads p using(report_id) where r.report_id is null or p.report_id is null").fetchone()[0]): raise SourceSchemaError("active report/payload references do not match")
+    for row in _iter_rows(connection, "select * from point_configs order by canonical_point_key"):
+        if row["canonical_point_key"] != _canonical_point_key(row) or row["row_sha256"] != _point_hash(row): raise SourceSchemaError("point row hash or canonical key mismatch")
+    for row in _iter_rows(connection, "select * from time_grids order by grid_hash"):
+        if row["row_sha256"] != _grid_hash(row): raise SourceSchemaError("time-grid row hash mismatch")
+    for row in _iter_rows(connection, "select r.*,g.start_timestamp_ms as grid_start_timestamp_ms,g.end_timestamp_ms as grid_end_timestamp_ms from active_reports r join time_grids g using(grid_hash) order by r.canonical_report_key"):
+        if row["canonical_report_key"] != canonical_report_key(row) or row["row_sha256"] != _report_hash(row) or int(row["report_period_start_ms"]) != int(row["grid_start_timestamp_ms"]) or int(row["report_period_end_ms"]) != int(row["grid_end_timestamp_ms"]): raise SourceSchemaError("active report row hash or canonical key mismatch")
+    for row in _iter_rows(connection, "select * from report_payloads order by report_id"):
+        if row["series_codec"] != EQUITY_CODEC or row["actions_codec"] != ACTION_CODEC:
+            raise SourceSchemaError("report payload codec is incompatible")
+        if row["payload_sha256"] != _payload_hash(row): raise SourceSchemaError("report payload hash mismatch")
+    return SourceValidationResult(True, SOURCE_SCHEMA_VERSION, reports, points, grids, payloads, replacements, ())
+
+
+def migrate_source_database(source_path: Path, target_path: Path, *, workers: int = 4, transaction_batch_size: int = 500) -> SourceMigrationResult:
+    """Stream a trusted v4 archive into a validated v5 staging database."""
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1 or isinstance(transaction_batch_size, bool) or not isinstance(transaction_batch_size, int) or transaction_batch_size < 1:
+        raise SourceSchemaError("workers and transaction_batch_size must be positive integers")
     source = Path(source_path).resolve()
     target = Path(target_path).resolve()
     if source == target:
         raise SourceSchemaError("source and target database paths must be different")
     if not source.is_file():
         raise SourceSchemaError(f"source database does not exist: {source}")
-    source_before = _file_sha256(source)
-
-    source_connection = duckdb.connect(str(source), read_only=True)
-    try:
-        snapshot = _read_v4_snapshot(source_connection)
-    except (duckdb.Error, SourcePackError, SourceSchemaError, ValueError, zlib.error) as error:
-        if isinstance(error, SourceSchemaError):
-            raise
-        raise SourceSchemaError(f"v4 source validation failed: {error}") from error
-    finally:
-        source_connection.close()
-
     if target.exists():
         raise SourceSchemaError(f"target database already exists: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -962,26 +1033,58 @@ def migrate_source_database(source_path: Path, target_path: Path) -> SourceMigra
     stage = Path(stage_name)
     stage.unlink()
     stage_connection: duckdb.DuckDBPyConnection | None = None
-    copy_source_connection: duckdb.DuckDBPyConnection | None = None
+    source_connection: duckdb.DuckDBPyConnection | None = None
     try:
-        stage_connection = duckdb.connect(str(stage))
-        ensure_source_schema(stage_connection)
-        copy_source_connection = duckdb.connect(str(source), read_only=True)
+        source_connection = duckdb.connect(str(source), read_only=True)
+        source_connection.execute("begin transaction")
+        points, grids, report_count, source_hashes = _trusted_v4_metadata(source_connection)
+        stage_connection = duckdb.connect(str(stage)); ensure_source_schema(stage_connection)
+        converted_points: dict[str, dict[str, object]] = {}
         stage_connection.execute("begin transaction")
         try:
-            _copy_snapshot(stage_connection, copy_source_connection, snapshot)
+            for old in points:
+                point = {"canonical_point_key": _canonical_point_key(old), "symbol": str(old["symbol"]).strip(), "side": str(old["side"]).strip().upper(), "timeframe": str(old["timeframe"]).strip(), "shift_bp": normalize_source_shift(old["open_multiplier"], NORMALIZATION_CONTRACT_VERSION), "open_ma_type": old["open_ma_type"], "open_ma_source": old["open_ma_source"], "open_ma_len": old["open_ma_len"], "open_multiplier_raw": old["open_multiplier"], "close_ma_type": old["close_ma_type"], "close_ma_source": old["close_ma_source"], "close_ma_len": old["close_ma_len"]}; point["row_sha256"] = _point_hash(point); converted_points[str(old["point_id"])] = point
+                stage_connection.execute("insert into point_configs values (?,?,?,?,?,?,?,?,?,?,?,?,?)", list(point.values()))
+            for grid in grids.values(): stage_connection.execute("insert into time_grids values (?,?,?,?,?,?)", list(grid.values()))
             stage_connection.execute("commit")
         except BaseException:
-            stage_connection.execute("rollback")
-            raise
-        copy_source_connection.close()
-        copy_source_connection = None
+            stage_connection.execute("rollback"); raise
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            last_id: str | None = None
+            while True:
+                query = "select report_id,source_sha256,canonical_key,point_id,grid_id,source_file,source_size,imported_at_utc,settings_json,raw_action_count,equity_sample_count,wallet_change_count from report_runs"
+                parameters: tuple[object, ...] = ()
+                if last_id is not None:
+                    query += " where report_id > ?"
+                    parameters = (last_id,)
+                reports = list(_iter_rows(source_connection, query + " order by report_id limit ?", (*parameters, transaction_batch_size), batch_size=transaction_batch_size))
+                if not reports: break
+                expected = {str(row["report_id"]) for row in reports}
+                last_id = str(reports[-1]["report_id"])
+                placeholders = ",".join("?" for _ in expected)
+                payload_rows = list(_iter_rows(source_connection, f"select report_id,series_codec,actions_codec,actions_zlib,equity_zlib,wallet_zlib from report_payloads where report_id in ({placeholders})", tuple(expected), batch_size=transaction_batch_size))
+                payloads = {str(row["report_id"]): row for row in payload_rows}
+                if len(payload_rows) != len(payloads) or set(payloads) != expected: raise SourceSchemaError("v4 payload batch identifiers do not match report batch")
+                if any(row["series_codec"] != EQUITY_CODEC or row["actions_codec"] != ACTION_CODEC for row in payload_rows):
+                    raise SourceSchemaError("v4 report payload codec is incompatible")
+                prepared = list(executor.map(_trusted_prepare_record, reports, (payloads[str(row["report_id"])] for row in reports), (converted_points for _ in reports), (grids for _ in reports)))
+                prepared_reports = [row for row, _ in prepared]
+                prepared_payloads = [payload for _, payload in prepared]
+                stage_connection.execute("begin transaction")
+                try:
+                    stage_connection.executemany("insert into active_reports values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [list(row.values()) for row in prepared_reports])
+                    stage_connection.executemany("insert into report_payloads values (?,?,?,?,?,?,?)", [list(row.values()) for row in prepared_payloads])
+                    stage_connection.execute("commit")
+                except BaseException:
+                    stage_connection.execute("rollback"); raise
+        if int(source_connection.execute("select count(*) from report_runs").fetchone()[0]) != report_count: raise SourceSchemaError("source database changed during migration")
+        source_connection.execute("commit"); source_connection.close(); source_connection = None
         stage_connection.close()
         stage_connection = None
 
         validation_connection = duckdb.connect(str(stage), read_only=True)
         try:
-            validation = validate_source_database(validation_connection)
+            validation = _validate_v5_structural(validation_connection)
             migrated_hashes = frozenset(
                 str(row[0])
                 for row in validation_connection.execute(
@@ -992,23 +1095,24 @@ def migrate_source_database(source_path: Path, target_path: Path) -> SourceMigra
             validation_connection.close()
         if not validation.valid:
             raise SourceSchemaError(f"migrated source validation failed: {validation.errors}")
-        if migrated_hashes != snapshot.source_hashes:
+        if migrated_hashes != source_hashes:
             raise SourceSchemaError("migrated active source-hash parity failed")
         if (
-            validation.report_count != len(snapshot.reports)
-            or validation.payload_count != snapshot.payload_count
-            or validation.point_count != len({_canonical_point_key(row) for row in snapshot.points})
-            or validation.grid_count != len({str(row["grid_hash"]) for row in snapshot.grids})
+            validation.report_count != report_count
+            or validation.payload_count != report_count
+            or validation.point_count != len({str(row["canonical_point_key"]) for row in converted_points.values()})
+            or validation.grid_count != len({str(row["grid_hash"]) for row in grids.values()})
         ):
             raise SourceSchemaError("migrated row-count parity failed")
-        if _file_sha256(source) != source_before:
-            raise SourceSchemaError("source database changed during out-of-place migration")
-        stage.replace(target)
+        try:
+            os.rename(stage, target)
+        except FileExistsError as error:
+            raise SourceSchemaError(f"target database already exists: {target}") from error
     except BaseException:
         if stage_connection is not None:
             stage_connection.close()
-        if copy_source_connection is not None:
-            copy_source_connection.close()
+        if source_connection is not None:
+            source_connection.close()
         if stage.exists():
             stage.unlink()
         raise
@@ -1020,7 +1124,7 @@ def migrate_source_database(source_path: Path, target_path: Path) -> SourceMigra
         validation.point_count,
         validation.grid_count,
         validation.payload_count,
-        source_before,
+        "",
         _file_sha256(target),
         validation,
     )

@@ -258,10 +258,109 @@ def test_migration_rejects_same_path_and_validation_failure_without_touching_old
     corrupted = source.read_bytes()
     target = tmp_path / "must-not-exist.duckdb"
 
-    with pytest.raises(SourceSchemaError, match="payload"):
-        migrate_source_database(source, target)
+    # Trusted production migration copies opaque report payloads.  The explicit
+    # full validator remains the opt-in payload-integrity check.
+    migrate_source_database(source, target)
     assert source.read_bytes() == corrupted
+    con = duckdb.connect(str(target), read_only=True)
+    try:
+        assert not validate_source_database(con).valid
+    finally:
+        con.close()
+
+
+def test_trusted_migration_does_not_decode_report_payloads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mrs3 import duckdb_source_schema
+
+    source = _v4_database(tmp_path / "source-v4.duckdb")
+    target = tmp_path / "source-v5.duckdb"
+
+    def forbidden(*_: object, **__: object) -> object:
+        raise AssertionError("trusted migration must not decode report payloads")
+
+    monkeypatch.setattr(duckdb_source_schema, "decode_compact_actions", forbidden)
+    monkeypatch.setattr(duckdb_source_schema, "decode_wallet_changes", forbidden)
+    result = migrate_source_database(source, target, workers=2, transaction_batch_size=1)
+
+    assert result.validation.valid
+
+
+@pytest.mark.parametrize("workers,batch_size", [(0, 1), (1, 0), (True, 1), (1, True)])
+def test_trusted_migration_rejects_non_positive_worker_or_batch_values(
+    tmp_path: Path, workers: object, batch_size: object
+) -> None:
+    source = _v4_database(tmp_path / "source-v4.duckdb")
+    with pytest.raises(SourceSchemaError, match="positive integer"):
+        migrate_source_database(source, tmp_path / "target.duckdb", workers=workers, transaction_batch_size=batch_size)  # type: ignore[arg-type]
+
+
+def test_trusted_migration_rejects_invalid_codec_without_publishing(tmp_path: Path) -> None:
+    source = _v4_database(tmp_path / "source-v4.duckdb")
+    target = tmp_path / "target-v5.duckdb"
+    con = duckdb.connect(str(source)); con.execute("update report_payloads set actions_codec='wrong'"); con.close()
+
+    with pytest.raises(SourceSchemaError, match="codec"):
+        migrate_source_database(source, target)
+
     assert not target.exists()
+
+
+def test_trusted_migration_does_not_replace_target_created_at_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mrs3 import duckdb_source_schema
+
+    source = _v4_database(tmp_path / "source-v4.duckdb")
+    target = tmp_path / "target-v5.duckdb"
+    rename = duckdb_source_schema.os.rename
+
+    def race(stage: Path, destination: Path) -> None:
+        destination.write_bytes(b"racer")
+        rename(stage, destination)
+
+    monkeypatch.setattr(duckdb_source_schema.os, "rename", race)
+    with pytest.raises(SourceSchemaError, match="already exists"):
+        migrate_source_database(source, target)
+    assert target.read_bytes() == b"racer"
+
+
+def test_trusted_migration_prepares_batch_records_concurrently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mrs3 import duckdb_source_schema
+    import threading
+
+    source = _v4_database(tmp_path / "source-v4.duckdb")
+    con = duckdb.connect(str(source))
+    try:
+        con.execute("insert into point_configs values (?,?,?,?,?,?,?,?,?,?,?)", ["P2", "BTCUSDT", "LONG", "15m", "ema", "close", 3, "0.98", "ema", "close", 9])
+        con.execute("insert into report_runs values (?,?,?,?,?,?,?,?,?,?,?,?)", ["R2", "b" * 64, "P2|G1", "P2", "G1", "C:/reports/report-2.html", 124, "2026-08-11T00:00:00Z", _settings("BTCUSDT", "0.98"), 1, 2, 1])
+        payload = con.execute("select * from report_payloads where report_id='R1'").fetchone()
+        con.execute("insert into report_payloads values (?,?,?,?,?,?)", ["R2", *payload[1:]])
+    finally:
+        con.close()
+    original = duckdb_source_schema._trusted_prepare_record
+    barrier = threading.Barrier(2)
+    def prepare(*args: object) -> object:
+        barrier.wait(timeout=2)
+        return original(*args)  # type: ignore[arg-type]
+    monkeypatch.setattr(duckdb_source_schema, "_trusted_prepare_record", prepare)
+
+    migrate_source_database(source, tmp_path / "target-v5.duckdb", workers=2, transaction_batch_size=2)
+
+
+def test_trusted_migration_paginates_multiple_batches_and_includes_empty_report_id(tmp_path: Path) -> None:
+    source = _v4_database(tmp_path / "source-v4.duckdb")
+    con = duckdb.connect(str(source))
+    try:
+        con.execute("update report_runs set report_id='' where report_id='R1'")
+        con.execute("update report_payloads set report_id='' where report_id='R1'")
+        con.execute("insert into point_configs values (?,?,?,?,?,?,?,?,?,?,?)", ["P2", "BTCUSDT", "LONG", "15m", "ema", "close", 3, "0.98", "ema", "close", 9])
+        con.execute("insert into report_runs values (?,?,?,?,?,?,?,?,?,?,?,?)", ["R2", "b" * 64, "P2|G1", "P2", "G1", "C:/reports/report-2.html", 124, "2026-08-11T00:00:00Z", _settings("BTCUSDT", "0.98"), 1, 2, 1])
+        payload = con.execute("select * from report_payloads where report_id='' ").fetchone()
+        con.execute("insert into report_payloads values (?,?,?,?,?,?)", ["R2", *payload[1:]])
+    finally:
+        con.close()
+
+    result = migrate_source_database(source, tmp_path / "target-v5.duckdb", transaction_batch_size=1)
+
+    assert result.report_count == 2
 
 
 def test_incompatible_normalization_contract_fails_before_target_preflight_or_write(
@@ -278,7 +377,7 @@ def test_incompatible_normalization_contract_fails_before_target_preflight_or_wr
     before_source = source.read_bytes()
     before_target = target.read_bytes()
 
-    with pytest.raises(SourceSchemaError, match="normalization contract"):
+    with pytest.raises(SourceSchemaError, match="already exists"):
         migrate_source_database(source, target)
 
     assert source.read_bytes() == before_source
@@ -351,10 +450,10 @@ def test_transaction_failure_removes_stage_and_keeps_source_unchanged(
     target = tmp_path / "source-v5.duckdb"
     before = source.read_bytes()
 
-    def fail_copy(connection: object, source_connection: object, snapshot: object) -> None:
+    def fail_copy(*_: object) -> None:
         raise duckdb.TransactionException("injected transaction failure")
 
-    monkeypatch.setattr(duckdb_source_schema, "_copy_snapshot", fail_copy)
+    monkeypatch.setattr(duckdb_source_schema, "_trusted_prepare_batch", fail_copy)
 
     with pytest.raises(duckdb.TransactionException, match="injected"):
         migrate_source_database(source, target)

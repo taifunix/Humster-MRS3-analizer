@@ -1,14 +1,14 @@
 # Progress
 
-**Updated:** 2026-08-11
+**Updated:** 2026-08-12
 **Current branch:** `main`
 **Current feature:** [v0.7 DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
 
 ## Verified repository baseline
 
 - Root package: `src/mrs3`; tests: `tests`; project version: `0.7.0`.
-- Latest complete repository suite: `467 passed, 2 skipped`
-  (`.venv\\Scripts\\python.exe -m pytest -q -p no:cacheprovider`, 2026-08-11).
+- Latest complete repository suite: `478 passed, 2 skipped`
+  (`.venv\\Scripts\\python.exe -m pytest -q --basetemp C:\\tmp\\humster-trusted-migration-full`, 2026-08-12).
   Both skips are Windows symlink-permission tests, not product failures.
 - DuckDB v3/v4 importer pair is preserved in `programs/Обработчик HTML-DuckDB/`; v4 requires adjacent v3 codec.
 - Local tester configuration exists outside Git as ignored `config.local.json`.
@@ -193,17 +193,29 @@ analysis DuckDB. A possible CSV-base overlay is isolated in the
 [optional/deferred specification](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md)
 and does not block the core delivery.
 
+Trusted-v4 migration performance is implemented and independently reviewed.
+It streams v4 metadata and exact matching payload batches through one read-only
+transaction; detached workers prepare records while one DuckDB writer commits
+them. Raw v4 report payloads are not decoded, and the staged v5 database is
+validated structurally before an atomic no-replace publish. Focused evidence:
+`67 passed` for `tests/test_duckdb_source_schema.py tests/test_panel.py`.
+The 96,767-report production migration has not yet been rerun, so no duration
+claim is recorded.
+
 ## Next required work
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
 slice; Tasks 1–15 are complete.
 
-1. Use the panel to initialize the chosen production analysis DuckDB, publish
+1. Run the trusted-v4 production migration and record its observed duration,
+   counts and structural-validation result. Before direct panel analysis, fix
+   the separate preflight path so it does not perform full payload validation.
+2. Use the panel to initialize the chosen production analysis DuckDB, publish
    required real surfaces and run their plateau analyses.
-2. Continue the READY-candidate → tester → DD5 product loop; source metrics
+3. Continue the READY-candidate → tester → DD5 product loop; source metrics
    remain diagnostic until those real tests exist.
-3. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
+4. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
 
 ## Blockers
 

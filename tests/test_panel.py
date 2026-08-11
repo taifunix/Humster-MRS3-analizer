@@ -409,6 +409,39 @@ def test_duckdb_import_migration_activates_only_valid_unchanged_target(tmp_path:
         controller.migrate_duckdb_import({"target_path": "migrated.duckdb"})
 
 
+def test_duckdb_migration_forwards_worker_and_batch_settings(tmp_path: Path) -> None:
+    source = tmp_path / "source.duckdb"; source.write_bytes(b"source")
+    target = tmp_path / "target.duckdb"
+    received: dict[str, object] = {}
+
+    def migrate(origin: Path, destination: Path, *, workers: int, transaction_batch_size: int) -> object:
+        received.update(origin=origin, workers=workers, transaction_batch_size=transaction_batch_size)
+        destination.write_bytes(b"target")
+        return type("Migration", (), {"validation": type("Validation", (), {"valid": True})(), "target_database_sha256": sha256(destination.read_bytes()).hexdigest()})()
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", migration_func=migrate)
+    controller.duckdb_import_settings({"source_duckdb_path": str(source), "workers": 7, "transaction_batch_size": 13})
+    controller.migrate_duckdb_import({"target_path": str(target)})
+
+    assert received == {"origin": source.resolve(), "workers": 7, "transaction_batch_size": 13}
+
+
+def test_duckdb_migration_hashes_target_without_read_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "source.duckdb"; source.write_bytes(b"source")
+    target = tmp_path / "target.duckdb"
+    def migrate(_: Path, destination: Path) -> object:
+        destination.write_bytes(b"target")
+        return type("Migration", (), {"validation": type("Validation", (), {"valid": True})(), "target_database_sha256": sha256(b"target").hexdigest()})()
+    original = Path.read_bytes
+    def reject(path: Path) -> bytes:
+        if path == target: raise AssertionError("migrated target must be streamed")
+        return original(path)
+    monkeypatch.setattr(Path, "read_bytes", reject)
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", migration_func=migrate)
+    controller.duckdb_import_settings({"source_duckdb_path": str(source)})
+    controller.migrate_duckdb_import({"target_path": str(target)})
+
+
 def test_http_duckdb_import_settings_and_preflight_are_dedicated_routes(tmp_path: Path) -> None:
     def migrate(_: Path, target: Path) -> object:
         target.write_bytes(b"migrated")

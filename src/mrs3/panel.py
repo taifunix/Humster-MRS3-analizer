@@ -5,6 +5,7 @@ import csv
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
+import inspect
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -82,6 +83,14 @@ def _native_browse(kind: str, multiple: bool) -> tuple[Path, ...]:
     except Exception as error:
         raise ValueError(f"native file chooser is unavailable: {error}") from error
     return tuple(Path(value).resolve() for value in values)
+
+
+def _stream_sha256(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 PANEL_HTML = r"""<!doctype html>
@@ -830,8 +839,15 @@ class PanelController:
         if settings.source_duckdb_path is None: raise ValueError("source_duckdb_path must be configured")
         target = self._path(self._required(payload, "target_path"))
         if target == settings.source_duckdb_path: raise ValueError("source and target paths must be different")
-        result = self._migration_func(settings.source_duckdb_path, target)
-        if not getattr(getattr(result, "validation", None), "valid", False) or not target.is_file() or sha256(target.read_bytes()).hexdigest() != getattr(result, "target_database_sha256", None): raise ValueError("migration target validation failed")
+        arguments = (settings.source_duckdb_path, target)
+        options = {"workers": settings.workers, "transaction_batch_size": settings.transaction_batch_size}
+        try:
+            inspect.signature(self._migration_func).bind(*arguments, **options)
+        except TypeError:
+            result = self._migration_func(*arguments)
+        else:
+            result = self._migration_func(*arguments, **options)
+        if not getattr(getattr(result, "validation", None), "valid", False) or not target.is_file() or _stream_sha256(target) != getattr(result, "target_database_sha256", None): raise ValueError("migration target validation failed")
         with self._lock:
             current = self._import_settings()
             if current.source_duckdb_path != settings.source_duckdb_path:
