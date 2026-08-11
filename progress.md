@@ -41,6 +41,14 @@ runner-test failures because three required HTML fixtures are absent from Git;
 those paths are outside Task 1 and were not changed. Independent re-review is
 approved; Task 1 is complete.
 
+Task 2 validates `point_event_count` in eligibility before its `int64` cast:
+fractional, negative and non-finite numeric/text values are rejected, while
+the legacy missing-column proxy remains `trades`. Focused evidence is
+`32 passed` for `tests/test_eligibility.py`; the full suite reaches
+`324 passed` and has the same eight runner-test fixture failures outside this
+task. Independent Terra review approved the staged implementation; Task 2 is
+complete.
+
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
 included cycles. The package has `source_summary_status=VERIFIED` and
@@ -62,9 +70,9 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Task 1 is complete and Task 2 is next.
+slice; Tasks 1 and 2 are complete and Task 3 is next.
 
-1. Start Task 2 from the
+1. Start Task 3 from the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 2. Apply the confirmed external-review remediation tasks listed in the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).

@@ -117,6 +117,19 @@ def test_event_gate_marks_points_below_configured_minimum_ineligible() -> None:
     assert "INSUFFICIENT_POINT_EVENTS" in out.iloc[0]["reject_reasons"]
 
 
+@pytest.mark.parametrize(
+    "point_event_count",
+    [1.5, "1.5", -1, "-1", float("inf"), "inf", float("nan"), "nan"],
+)
+def test_event_gate_rejects_lossy_point_event_counts(point_event_count: object) -> None:
+    """A lossy cast must not turn invalid event counts into valid counts."""
+    with pytest.raises(ValueError):
+        annotate_eligibility(
+            pd.DataFrame([_point(point_event_count=point_event_count)]),
+            AlgorithmConfig.defaults(),
+        )
+
+
 def test_economic_minimum_pnl_is_configurable_and_strict() -> None:
     config = replace(
         AlgorithmConfig.defaults(), economic_min_pnl_pct=Decimal("30")

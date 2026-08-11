@@ -1,11 +1,32 @@
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 
 import numpy as np
 import pandas as pd
 
 from .config import AlgorithmConfig
+
+
+_INT64_MAX = Decimal("9223372036854775807")
+
+
+def _exact_non_negative_integer(values: pd.Series, field: str) -> pd.Series:
+    parsed: list[int] = []
+    for value in values:
+        try:
+            integer = Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"{field} must be a non-negative integer") from exc
+        if (
+            not integer.is_finite()
+            or integer < 0
+            or integer != integer.to_integral_value()
+            or integer > _INT64_MAX
+        ):
+            raise ValueError(f"{field} must be a non-negative integer")
+        parsed.append(int(integer))
+    return pd.Series(parsed, index=values.index, dtype="int64")
 
 
 def base_rate(timeframe: str, config: AlgorithmConfig) -> Decimal:
@@ -71,7 +92,9 @@ def annotate_eligibility(points: pd.DataFrame, config: AlgorithmConfig) -> pd.Da
     out = points.copy()
     if "point_event_count" not in out:
         out["point_event_count"] = out["trades"]
-    out["point_event_count"] = pd.to_numeric(out["point_event_count"], errors="raise").astype("int64")
+    out["point_event_count"] = _exact_non_negative_integer(
+        out["point_event_count"], "point_event_count"
+    )
     out["effective_start"] = out[["report_start", "listing_date"]].max(axis=1)
     out["effective_days"] = (
         (out["report_end"] - out["effective_start"]).dt.total_seconds() / 86400.0
