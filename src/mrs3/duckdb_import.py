@@ -46,6 +46,17 @@ class ImportRequest:
     transaction_batch_size: int = 250
     job_id: str | None = None
     cancellation_requested: Callable[[], bool] | None = None
+    expected_preflight_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ImportPreflight:
+    """Path-free import snapshot suitable for display and start authorization."""
+
+    token: str
+    discovered: int
+    source_schema_version: int | None
+    target_identity_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +198,62 @@ def _database_identity(database_path: Path) -> str | None:
     if not database_path.is_file():
         raise ValueError(f"source database target is not a file: {database_path}")
     return _file_sha256(database_path)
+
+
+def _preflight_token(
+    database_path: Path, snapshots: tuple[_Snapshot, ...], target_identity: str | None
+) -> str:
+    payload = {
+        "inputs": [(item.relative_path, item.input_sha256) for item in snapshots],
+        "target_identity": target_identity,
+        "target_path": str(database_path.resolve()),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _target_identity_digest(target_identity: str | None) -> str:
+    encoded = json.dumps(
+        {"target_identity": target_identity}, sort_keys=True, separators=(",", ":")
+    )
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _preflight_from_snapshots(
+    database_path: Path, snapshots: tuple[_Snapshot, ...]
+) -> tuple[ImportPreflight, str | None]:
+    target_identity = _database_identity(database_path)
+    schema_version: int | None = None
+    if target_identity is not None:
+        try:
+            connection = duckdb.connect(str(database_path), read_only=True)
+            try:
+                validation = validate_source_database(connection)
+            finally:
+                connection.close()
+        except Exception as exc:
+            raise ValueError(f"source database validation failed: {exc}") from exc
+        if not validation.valid:
+            raise ValueError(f"source database validation failed: {validation.errors}")
+        if _database_identity(database_path) != target_identity:
+            raise ValueError("source database changed during preflight")
+        schema_version = validation.schema_version
+    return (
+        ImportPreflight(
+            token=_preflight_token(database_path, snapshots, target_identity),
+            discovered=len(snapshots),
+            source_schema_version=schema_version,
+            target_identity_digest=_target_identity_digest(target_identity),
+        ),
+        target_identity,
+    )
+
+
+def preflight_html_import(request: ImportRequest) -> ImportPreflight:
+    """Snapshot recursive HTML inputs and validate the current source target."""
+    root = Path(request.root_path)
+    snapshots = _snapshot_reports(root, discover_compact_reports(root))
+    return _preflight_from_snapshots(Path(request.database_path), snapshots)[0]
 
 
 def _default_job_id(
@@ -530,19 +597,32 @@ def _import_html_tree(
     snapshots = _snapshot_reports(root, paths)
     active_hashes: tuple[str, ...] = ()
     database_path = Path(request.database_path)
-    if lock_error is None and database_path.is_file():
-        connection = duckdb.connect(str(database_path), read_only=True)
+    expected_target_identity: str | None = None
+    if lock_error is None and request.expected_preflight_token is not None:
         try:
-            tables = {row[0] for row in connection.execute("show tables").fetchall()}
-            if "active_reports" in tables:
-                active_hashes = tuple(
-                    row[0]
-                    for row in connection.execute(
-                        "select source_sha256 from active_reports order by source_sha256"
-                    ).fetchall()
-                )
-        finally:
-            connection.close()
+            current_preflight, expected_target_identity = _preflight_from_snapshots(
+                database_path, snapshots
+            )
+            if current_preflight.token != request.expected_preflight_token:
+                raise ValueError("preflight token does not match current import inputs and target")
+        except Exception as exc:
+            lock_error = exc
+    if lock_error is None and database_path.is_file():
+        try:
+            connection = duckdb.connect(str(database_path), read_only=True)
+            try:
+                tables = {row[0] for row in connection.execute("show tables").fetchall()}
+                if "active_reports" in tables:
+                    active_hashes = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            "select source_sha256 from active_reports order by source_sha256"
+                        ).fetchall()
+                    )
+            finally:
+                connection.close()
+        except Exception as exc:
+            lock_error = exc
     if request.job_id is not None:
         job_id = request.job_id
     elif lock_error is not None:
@@ -622,6 +702,11 @@ def _import_html_tree(
                 )
             database_path.parent.mkdir(parents=True, exist_ok=True)
             preflight_target_identity = _database_identity(database_path)
+            if (
+                request.expected_preflight_token is not None
+                and preflight_target_identity != expected_target_identity
+            ):
+                raise ValueError("preflight token does not match current import inputs and target")
             with tempfile.TemporaryDirectory(prefix="mrs3-import-", dir=database_path.parent) as stage_dir:
                 stage_path = Path(stage_dir) / database_path.name
                 if database_path.is_file():

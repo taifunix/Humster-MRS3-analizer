@@ -15,6 +15,7 @@ from mrs3.duckdb_import import (
     ImportRequest,
     discover_compact_reports,
     import_html_tree,
+    preflight_html_import,
 )
 from mrs3.duckdb_source_schema import ensure_source_schema
 
@@ -800,5 +801,176 @@ def test_target_appearing_after_absent_preflight_is_preserved(tmp_path: Path) ->
     assert result.final_state == "FAILED"
     assert result.safe_to_delete == "NO"
     assert "source database changed during import" in (result.error or "")
+    assert database.read_bytes() == external_bytes
+    _assert_failed_evidence_finalized(result)
+
+
+def test_preflight_is_deterministic_and_authorizes_unchanged_import(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "nested/report.html")
+    request = _request(tmp_path, incoming, job_id="preflight-success")
+
+    first = preflight_html_import(request)
+    second = preflight_html_import(request)
+    result = import_html_tree(replace(request, expected_preflight_token=first.token), None)
+
+    assert first == second
+    assert first.discovered == 1
+    assert first.source_schema_version is None
+    assert result.final_state == "COMMITTED"
+
+
+def test_changed_input_after_preflight_is_rejected_without_target_mutation(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    report = _copy_report(incoming, "report.html")
+    request = _request(tmp_path, incoming, job_id="stale-input")
+    preflight = preflight_html_import(request)
+    _rewrite(report, "98.25", "98.50")
+
+    result = import_html_tree(replace(request, expected_preflight_token=preflight.token), None)
+
+    assert result.final_state == "FAILED"
+    assert result.safe_to_delete == "NO"
+    assert "preflight" in (result.error or "")
+    assert not (tmp_path / "source.duckdb").exists()
+    _assert_failed_evidence_finalized(result)
+
+
+def test_changed_existing_target_after_preflight_is_rejected_without_replacement(tmp_path: Path) -> None:
+    initial = tmp_path / "initial"
+    _copy_report(initial, "report.html")
+    import_html_tree(_request(tmp_path, initial, job_id="initial"), None)
+    database = tmp_path / "source.duckdb"
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "replacement.html")
+    request = _request(tmp_path, incoming, job_id="stale-target")
+    preflight = preflight_html_import(request)
+    external_bytes = b"external target mutation"
+    database.write_bytes(external_bytes)
+
+    result = import_html_tree(replace(request, expected_preflight_token=preflight.token), None)
+
+    assert result.final_state == "FAILED"
+    assert result.safe_to_delete == "NO"
+    assert database.read_bytes() == external_bytes
+    _assert_failed_evidence_finalized(result)
+
+
+def test_target_appearing_after_absent_preflight_is_rejected(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+    request = _request(tmp_path, incoming, job_id="appeared-target")
+    preflight = preflight_html_import(request)
+    database = tmp_path / "source.duckdb"
+    external_bytes = b"external target appeared"
+    database.write_bytes(external_bytes)
+
+    result = import_html_tree(replace(request, expected_preflight_token=preflight.token), None)
+
+    assert result.final_state == "FAILED"
+    assert result.safe_to_delete == "NO"
+    assert database.read_bytes() == external_bytes
+    _assert_failed_evidence_finalized(result)
+
+
+def test_preflight_rejects_invalid_existing_source_database(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+    database = tmp_path / "source.duckdb"
+    database.write_bytes(b"not a duckdb database")
+
+    with pytest.raises(ValueError, match="source database validation failed"):
+        preflight_html_import(_request(tmp_path, incoming))
+
+
+def test_preflight_public_representation_does_not_leak_local_paths(tmp_path: Path) -> None:
+    incoming = tmp_path / "private-root"
+    _copy_report(incoming, "nested/report.html")
+
+    preflight = preflight_html_import(_request(tmp_path, incoming))
+
+    rendered = repr(preflight)
+    assert str(tmp_path) not in rendered
+    assert "private-root" not in rendered
+
+
+def test_target_changed_between_token_check_and_staging_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initial = tmp_path / "initial"
+    _copy_report(initial, "report.html")
+    import_html_tree(_request(tmp_path, initial, job_id="initial"), None)
+    database = tmp_path / "source.duckdb"
+    external_root = tmp_path / "external"
+    _copy_report(external_root, "report-b.html", "report_b.html")
+    external_database = tmp_path / "external.duckdb"
+    import_html_tree(
+        replace(
+            _request(tmp_path, external_root, job_id="external"),
+            database_path=external_database,
+        ),
+        None,
+    )
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "replacement.html")
+    request = _request(tmp_path, incoming, job_id="boundary-target")
+    preflight = preflight_html_import(request)
+    external_bytes = external_database.read_bytes()
+    real_reader = duckdb_events.read_compact_html
+
+    def mutate_target_after_token_check(path: Path):
+        shutil.copyfile(external_database, database)
+        return real_reader(path)
+
+    monkeypatch.setattr(duckdb_events, "read_compact_html", mutate_target_after_token_check)
+    result = import_html_tree(replace(request, expected_preflight_token=preflight.token), None)
+
+    assert result.final_state == "FAILED"
+    assert database.read_bytes() == external_bytes
+    _assert_failed_evidence_finalized(result)
+
+
+def test_preflight_token_is_bound_to_resolved_target_path(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+    request = _request(tmp_path, incoming, job_id="other-target")
+    preflight = preflight_html_import(request)
+    other_target = tmp_path / "other.duckdb"
+
+    result = import_html_tree(
+        replace(request, database_path=other_target, expected_preflight_token=preflight.token),
+        None,
+    )
+
+    assert result.final_state == "FAILED"
+    assert result.safe_to_delete == "NO"
+    assert not other_target.exists()
+    _assert_failed_evidence_finalized(result)
+
+
+def test_invalid_target_after_token_validation_finalizes_unsafe_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initial = tmp_path / "initial"
+    _copy_report(initial, "report.html")
+    import_html_tree(_request(tmp_path, initial, job_id="initial"), None)
+    database = tmp_path / "source.duckdb"
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "replacement.html")
+    request = _request(tmp_path, incoming, job_id="invalid-after-token")
+    preflight = preflight_html_import(request)
+    external_bytes = b"invalid mutation after token validation"
+    real_preflight = duckdb_import._preflight_from_snapshots
+
+    def mutate_target_after_preflight(*args, **kwargs):
+        result = real_preflight(*args, **kwargs)
+        database.write_bytes(external_bytes)
+        return result
+
+    monkeypatch.setattr(duckdb_import, "_preflight_from_snapshots", mutate_target_after_preflight)
+    result = import_html_tree(replace(request, expected_preflight_token=preflight.token), None)
+
+    assert result.final_state == "FAILED"
+    assert result.safe_to_delete == "NO"
     assert database.read_bytes() == external_bytes
     _assert_failed_evidence_finalized(result)
