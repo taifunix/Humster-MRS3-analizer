@@ -315,6 +315,13 @@ specific immutable surface or analysis run.
   explicit refinement parentage, separate period facts and byte-stable exports.
   Focused evidence is `104 passed`; independent Terra review approved after
   the read-only migration boundary was separated from schema initialization.
+- Final verification passes `467` tests; two tests skip only because Windows
+  symlink privileges are unavailable. A copied-real-data smoke imported one
+  report into v4, migrated it out-of-place to a valid v5 database, append-
+  imported a second report with zero quarantine, revalidated `2` reports / `2`
+  points / `2` grids / `2` payloads, and published one direct point with `458`
+  trading events into analysis schema v3. All smoke artifacts remain outside
+  Git. The optional CSV/DuckDB overlay remains unimplemented and deferred.
 
 ## Non-goals
 

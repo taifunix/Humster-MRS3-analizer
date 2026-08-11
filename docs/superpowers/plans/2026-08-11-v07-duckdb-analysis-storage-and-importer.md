@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Tasks 0–13 are complete; Task 14 is next. Task 6 was committed in `05369c2`; its
+**Status:** Tasks 0–15 are complete; final verification is recorded. Task 6 was committed in `05369c2`; its
 copied-real-HTML smoke established v3/v4/mrs3 adapter parity `PASS` and a
 temporary v3 DuckDB import with `1` scanned, `1` imported and `0` quarantined
 reports, `78` raw
@@ -454,11 +454,15 @@ publish_analysis_run(analysis_connection, result) -> PublishedAnalysisRun
 - Modify: `README.md` only after verifying a changed public command
 - Modify: active spec only to record acceptance evidence, not rewrite history
 
-- [ ] Run all focused files from Tasks 1–14, then
+- [x] Run all focused files from Tasks 1–14, then
   `.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider`.
-- [ ] Perform a copied-real-data migration/import/direct-surface smoke test; keep
+- [x] Perform a copied-real-data migration/import/direct-surface smoke test; keep
   paths, databases and output artifacts outside Git.
-- [ ] Run `git diff --check`, inspect staged scope and scan for local paths.
-- [ ] Obtain final independent review and re-review after any correction.
-- [ ] Record exact evidence and confirm the optional overlay remains unimplemented.
-- [ ] Commit: `docs: record duckdb analysis storage evidence`.
+- [x] Run `git diff --check`, inspect staged scope and scan for local paths.
+- [x] Obtain final independent review and re-review after any correction.
+- [x] Record exact evidence and confirm the optional overlay remains unimplemented.
+- [x] Full suite: `467 passed, 2 skipped`; both skips are unavailable Windows
+  symlink privileges. Copied-real-data smoke: v4 import `1/1`, v5 migration
+  valid, append import `1/1`, quarantine `0`, source validation `2` reports,
+  direct surface `1` point / `458` events in analysis schema v3. Commit:
+  `docs: record duckdb analysis storage evidence`.

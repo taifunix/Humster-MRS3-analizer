@@ -20,6 +20,11 @@ Humster MRS3 Analyzer — локальный, детерминированный
 
 Цель ближайшего этапа — сохранить source DuckDB единым пополняемым lossless-хранилищем HTML-отчётов, перенести управление импортом в веб-панель и материализовывать воспроизводимые поверхности для анализа плато в отдельную append-only analysis DuckDB. Анализ напрямую из source DuckDB сначала публикует неизменяемую поверхность, а затем запускает общий plateau pipeline. Контракт зафиксирован в [спецификации DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 
+Этап реализован и проверен: source schema v5, управляемый импорт, immutable
+analysis surfaces, повторный plateau-анализ, lineage, библиотека результатов и
+детерминированные экспорты доступны из общего v0.7 контура. Это завершает
+инфраструктуру анализа, но не доказывает доходность готовых MRS3-стратегий.
+
 Соединение CSV с DuckDB не входит в обязательную поставку и не блокирует этот этап. Оно вынесено в отдельное [необязательное ТЗ CSV-DuckDB overlay](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md) со статусом **Optional / Deferred**. Существующие [event source packs](docs/specs/2026-08-10-v07-event-source-packs.md), [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) и [ADR-0003](docs/decisions/0003-source-integrity-action-metrics.md) остаются диагностическими зависимостями.
 
 ### Этапы поставки
@@ -64,7 +69,7 @@ Humster MRS3 Analyzer — локальный, детерминированный
 | Active prerequisite | [Safe runner smoke-test](docs/specs/2026-08-10-v06-runner-safe-root-json-smoke.md) | безопасная проверка панели и одного реального прогона | локальный tester; до v0.7 implementation |
 | Active | [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md) | последовательность import → materializer → unified input → selector | v4 evidence, event-filter spec |
 | Active | [v0.7 event source packs](docs/specs/2026-08-10-v07-event-source-packs.md) | CSV/DuckDB пакеты, event modes и closed-cycle audit | v4 evidence, event-filter spec |
-| Active / Approved | [v0.7 DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md) | единый source DuckDB, импорт из панели, analysis DuckDB и plateau lineage | event source packs, event-filter spec |
+| Implemented / Verified | [v0.7 DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md) | единый source DuckDB, импорт из панели, analysis DuckDB и plateau lineage | event source packs, event-filter spec |
 | Optional / Deferred | [v0.7 CSV-DuckDB overlay](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md) | необязательное объединение CSV coarse-grid и DuckDB fine-grid | DuckDB analysis storage, event-filter spec |
 | Accepted | [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) | раздельная full-horizon/windowed verification для real packages v2 | event source packs |
 | Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
