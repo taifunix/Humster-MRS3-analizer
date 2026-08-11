@@ -49,6 +49,15 @@ the legacy missing-column proxy remains `trades`. Focused evidence is
 task. Independent Terra review approved the staged implementation; Task 2 is
 complete.
 
+Task 3 requires exactly one normalized UTC `report_start`/`report_end` pair
+for raw CSV input before eligibility. Pair-history output now asserts that
+invariant instead of synthesizing min/max endpoints; the audit records the
+coherent window and its derived `effective_days`. Focused evidence is
+`62 passed` for `tests/test_loader.py tests/test_pipeline.py`; the full suite
+reaches `326 passed` and has the same eight runner-test fixture failures
+outside this task. Independent Terra review and re-review are approved; Task
+3 is complete.
+
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
 included cycles. The package has `source_summary_status=VERIFIED` and
@@ -70,9 +79,9 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1 and 2 are complete and Task 3 is next.
+slice; Tasks 1–3 are complete and Task 4 is next.
 
-1. Start Task 3 from the
+1. Start Task 4 from the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 2. Apply the confirmed external-review remediation tasks listed in the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).

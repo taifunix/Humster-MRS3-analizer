@@ -140,18 +140,22 @@ def _aggregate_refine_requests(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def _pair_history(points: pd.DataFrame) -> pd.DataFrame:
+    report_periods = points[["report_start", "report_end"]].drop_duplicates()
+    assert len(report_periods) == 1, "pair history requires one report period"
     rows: list[dict[str, object]] = []
     for keys, group in points.groupby(["symbol", "side"], sort=True):
         symbol, side = keys
+        report_start = group["report_start"].iloc[0]
+        report_end = group["report_end"].iloc[0]
         rows.append(
             {
                 "symbol": symbol,
                 "side": side,
-                "listing_date": group["listing_date"].min(),
-                "report_start": group["report_start"].min(),
-                "report_end": group["report_end"].max(),
-                "effective_start": group["effective_start"].min(),
-                "effective_days": group["effective_days"].max(),
+                "listing_date": group["listing_date"].iloc[0],
+                "report_start": report_start,
+                "report_end": report_end,
+                "effective_start": group["effective_start"].iloc[0],
+                "effective_days": group["effective_days"].iloc[0],
                 "history_pass": bool(group["history_pass"].all()),
             }
         )

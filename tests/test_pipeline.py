@@ -6,11 +6,12 @@ import hashlib
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from openpyxl import load_workbook
 
 from mrs3.config import AlgorithmConfig
 from mrs3.models import Side
-from mrs3.pipeline import SelectionInputs, run_selection
+from mrs3.pipeline import SelectionInputs, _pair_history, run_selection
 from tests.factories import write_selection_inputs
 from tests.test_package_loader import write_real_package
 
@@ -80,6 +81,44 @@ def test_pipeline_builds_two_plateaus_and_validated_json(tmp_path: Path) -> None
         "16_Point_Events",
         "17_Plateau_Events",
     ]
+    history = pd.read_excel(inputs.output_dir / "audit.xlsx", sheet_name="01_Pair_History")
+    assert pd.to_datetime(history["report_start"], utc=True).eq(
+        pd.Timestamp("2026-07-15", tz="UTC")
+    ).all()
+    assert pd.to_datetime(history["report_end"], utc=True).eq(
+        pd.Timestamp("2026-08-06", tz="UTC")
+    ).all()
+    assert history["effective_days"].eq(22.0).all()
+
+
+def test_pair_history_rejects_mixed_report_windows() -> None:
+    points = pd.DataFrame(
+        [
+            {
+                "symbol": "AAAUSDT",
+                "side": "LONG",
+                "listing_date": pd.Timestamp("2026-07-01", tz="UTC"),
+                "report_start": pd.Timestamp("2026-07-15", tz="UTC"),
+                "report_end": pd.Timestamp("2026-08-06", tz="UTC"),
+                "effective_start": pd.Timestamp("2026-07-15", tz="UTC"),
+                "effective_days": 22.0,
+                "history_pass": True,
+            },
+            {
+                "symbol": "AAAUSDT",
+                "side": "LONG",
+                "listing_date": pd.Timestamp("2026-07-01", tz="UTC"),
+                "report_start": pd.Timestamp("2026-07-16", tz="UTC"),
+                "report_end": pd.Timestamp("2026-08-07", tz="UTC"),
+                "effective_start": pd.Timestamp("2026-07-16", tz="UTC"),
+                "effective_days": 22.0,
+                "history_pass": True,
+            },
+        ]
+    )
+
+    with pytest.raises(AssertionError, match="one report period"):
+        _pair_history(points)
 
 
 def test_pipeline_manifest_keeps_real_event_mode_from_source_package(tmp_path: Path) -> None:

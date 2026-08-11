@@ -171,6 +171,8 @@ def load_points(
     invalid_period = points["report_end"] <= points["report_start"]
     if invalid_period.any():
         raise InputError("report EndDate must be later than StartDate")
+    if len(points[["report_start", "report_end"]].drop_duplicates()) != 1:
+        raise InputError("input must contain exactly one report period")
 
     key_columns = ["symbol", "side", "timeframe", "shift_bp", "open_ma", "close_ma"]
     duplicate_mask = points.duplicated(key_columns, keep=False)

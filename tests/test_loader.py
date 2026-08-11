@@ -113,6 +113,24 @@ def test_load_points_normalizes_date_only_listing_and_report_times_to_utc(tmp_pa
     assert str(points.iloc[0]["report_start"].tz) == "UTC"
 
 
+def test_load_points_rejects_multiple_report_windows(tmp_path: Path) -> None:
+    rows = [
+        _source_row(),
+        _source_row(
+            **{
+                "Run id": 2,
+                "settings[*].mrs2.ma_long.multiplier": 0.974,
+                "StartDate": "2026-07-16 00:00:00",
+                "EndDate": "2026-08-07 00:00:00",
+            }
+        ),
+    ]
+    csv_path, dates_path = _write_inputs(tmp_path, rows)
+
+    with pytest.raises(InputError, match="exactly one report period"):
+        load_points(csv_path, dates_path, Side.LONG, _config())
+
+
 @pytest.mark.parametrize(
     "rows",
     [
