@@ -2,16 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Tasks 0–7 are complete. Task 6 was committed in `05369c2`; its
+**Status:** Tasks 0–8 are complete; Task 9 is next. Task 6 was committed in `05369c2`; its
 copied-real-HTML smoke established v3/v4/mrs3 adapter parity `PASS` and a
 temporary v3 DuckDB import with `1` scanned, `1` imported and `0` quarantined
 reports, `78` raw
 actions, `646` equity samples and `79` wallet changes, without a production DB
-write. Task 8 was committed in `b7dc23e` but is reopened: on Windows CRLF
-input, its raw-byte snapshot hash disagrees with the normalized codec hash,
-causing the isolated importer test to parse `1` and quarantine `1`. The
-isolated pipeline test passes `1/1`; its combined failure was temporary ACL
-noise. Task 9 is blocked until Task 8 is corrected and re-verified.
+write. Task 8 was committed in `b7dc23e`; its follow-up correction preserves
+the raw input SHA for manifest/mutation evidence while the normalized v3/v4
+semantic SHA drives report identity, `report_id`, deduplication and migration
+compatibility. CRLF and LF inputs are identical under that semantic contract;
+mutation and invalid UTF-8 fail closed. The related suite passes `66` tests.
 
 **Goal:** Add a safely appendable source DuckDB, panel-managed HTML import,
 immutable `DUCKDB_DIRECT` analysis surfaces and persistent plateau/candidate
@@ -214,9 +214,9 @@ normalize_source_shift(value, contract_version) -> int
 
 ### Task 8: Implement recursive append/replacement import
 
-**Current status:** Reopened. Do not mark this task complete until the Windows
-CRLF raw-byte snapshot-hash versus normalized codec-hash mismatch is corrected
-and independently re-verified.
+**Current status:** Complete. The RED regression parsed `1` report and
+quarantined `1` valid Windows CRLF input before the semantic-SHA correction;
+the related suite now passes `66` tests.
 
 **Files:**
 - Create: `src/mrs3/duckdb_import.py`
@@ -229,32 +229,32 @@ and independently re-verified.
 import_html_tree(request: ImportRequest, progress_callback) -> ImportJobResult
 ```
 
-- [ ] Add RED tests for insert, active identical skip, new period/shift append,
+- [x] Add RED tests for insert, active identical skip, new period/shift append,
   `A -> B -> A`, parser quarantine, transaction rollback and safe retry/resume.
-- [ ] Repeat the canonicalization/integrity/active-hash invariants from Task 7
+- [x] Repeat the canonicalization/integrity/active-hash invariants from Task 7
   through the actual import boundary.
-- [ ] Add RED same-batch ambiguity test: two different HTML files with one
+- [x] Add RED same-batch ambiguity test: two different HTML files with one
   canonical point+period produce `AMBIGUOUS_BATCH_DUPLICATE` and no replacement.
-- [ ] RED-test deterministic recursive discovery at multiple nesting depths.
-- [ ] Snapshot every discovered HTML path and byte hash; assert success,
+- [x] RED-test deterministic recursive discovery at multiple nesting depths.
+- [x] Snapshot every discovered HTML path and byte hash; assert success,
   quarantine, cancellation and failure never move, rename, rewrite or delete an
   input file.
-- [ ] RED-test a deterministic per-job manifest with canonical relative paths,
+- [x] RED-test a deterministic per-job manifest with canonical relative paths,
   input hashes, report classifications, parity results, counts and final state;
   link a deterministic quarantine/deletion checklist and hash both artifacts.
-- [ ] Set `safe_to_delete=YES` only for committed schema-v4 import with complete
+- [x] Set `safe_to_delete=YES` only for committed schema-v4 import with complete
   manifest, zero quarantine and successful parity/validation for every HTML;
   cancellation, ambiguity, quarantine or incomplete/failing evidence is `NO`.
-- [ ] Treat the checklist as evidence only: import never deletes source HTML.
-- [ ] Include manifest/checklist paths and hashes in `ImportJobResult`.
-- [ ] Assert progress/final telemetry includes parsed, inserted, replaced,
+- [x] Treat the checklist as evidence only: import never deletes source HTML.
+- [x] Include manifest/checklist paths and hashes in `ImportJobResult`.
+- [x] Assert progress/final telemetry includes parsed, inserted, replaced,
   identical, ambiguous and quarantined counts.
-- [ ] Define `discover_compact_reports(root_path) -> tuple[Path, ...]`; quarantine
+- [x] Define `discover_compact_reports(root_path) -> tuple[Path, ...]`; quarantine
   is a database result, never a filesystem move.
-- [ ] Implement parallel read-only parsing and one coordinator writer; group all
+- [x] Implement parallel read-only parsing and one coordinator writer; group all
   decisions before writes and append old/new hashes to immutable audit.
-- [ ] Run GREEN: `.venv\Scripts\python.exe -m pytest tests/test_duckdb_import.py tests/test_duckdb_events.py -q`.
-- [ ] Review and commit: `feat: import html into source duckdb`.
+- [x] Run GREEN: `.venv\Scripts\python.exe -m pytest tests/test_duckdb_import.py tests/test_duckdb_events.py -q`.
+- [x] Review and commit: `feat: import html into source duckdb`.
 
 ### Task 9: Integrate the importer into the panel
 

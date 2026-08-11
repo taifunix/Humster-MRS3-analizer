@@ -106,11 +106,14 @@ records deterministic hashed manifest/checklist evidence. Insert, identical
 skip, new period/shift, `A -> B -> A` replacement history, quarantine,
 cancellation and safe retry are covered. Any same-batch canonical ambiguity
 now stops the entire job before staging or DuckDB access, so neither an
-existing target nor a new target can be published. The isolated pipeline test
-passes `1/1`; its combined failure was temporary ACL noise. However, Task 8 is
-reopened: the isolated importer test parses `1` and quarantines `1` because a
-raw-byte snapshot hash is compared with the normalized codec hash on Windows
-CRLF input. Correct that mismatch before treating Task 8 as complete.
+existing target nor a new target can be published. The RED regression parsed
+`1` report and quarantined `1` valid Windows CRLF input because it compared the
+raw-byte snapshot SHA with the normalized codec SHA. The corrected contract
+keeps raw input SHA as manifest and mutation evidence; normalized v3/v4 semantic
+SHA drives report identity, `report_id`, deduplication and migration
+compatibility. CRLF and LF inputs are identical under the semantic contract;
+mutation and invalid UTF-8 fail closed. The related suite passes `66` tests.
+Task 8 is complete.
 
 Read-only v2 materialization then completed: `96,767` reports, `8,050`
 coverage-accepted points, `88,717` coverage-rejected reports and `4,932,780`
@@ -133,23 +136,16 @@ and does not block the core delivery.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
-slice; Tasks 1–7 are complete. Task 8 (`b7dc23e`) is reopened for the Windows
-CRLF snapshot-hash/normalized-codec-hash mismatch.
+slice; Tasks 1–8 are complete. Task 9 is next.
 
-1. Correct and independently verify the Task 8 Windows CRLF hash mismatch:
-   the importer must not quarantine a valid report merely because the raw-byte
-   snapshot hash differs from the normalized codec hash.
-2. Start Task 9 from the
+1. Start Task 9 from the
    [core implementation plan](docs/superpowers/plans/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
-   only after Task 8 is corrected and re-verified.
-3. Continue the remaining core delivery in independently reviewed TDD slices.
-4. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
+   in an independently reviewed TDD slice.
+2. Continue the remaining core delivery in independently reviewed TDD slices.
+3. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
 
 ## Blockers
 
-- Task 8 is blocked on correction of the Windows CRLF raw-byte snapshot-hash
-  versus normalized codec-hash mismatch. Task 9 remains blocked on that
-  correction.
 - CSV/DuckDB overlay is explicitly deferred and no economic threshold changes
   are implied.
 

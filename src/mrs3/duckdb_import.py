@@ -94,6 +94,7 @@ class _Snapshot:
     path: Path
     relative_path: str
     input_sha256: str
+    codec_source_sha256: str
     source_size: int
 
 
@@ -140,13 +141,23 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _codec_source_sha256(source: bytes) -> str:
+    """Match the v3 codec's UTF-8 text identity with universal newlines."""
+    try:
+        normalized = source.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    except UnicodeDecodeError:
+        return ""
+    return sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _snapshot_reports(root: Path, paths: tuple[Path, ...]) -> tuple[_Snapshot, ...]:
     return tuple(
         _Snapshot(
             path=path,
             relative_path=_canonical_relative(path, root),
-            input_sha256=_file_sha256(path),
-            source_size=path.stat().st_size,
+            input_sha256=sha256(source := path.read_bytes()).hexdigest(),
+            codec_source_sha256=_codec_source_sha256(source),
+            source_size=len(source),
         )
         for path in paths
     )
@@ -207,8 +218,11 @@ def _prepare(snapshot: _Snapshot, outcome: object, imported_at: datetime) -> _Pr
     record = getattr(outcome, "record")
     if record is None:
         raise ValueError("compact parser returned no record")
-    if str(getattr(outcome, "source_sha256")) != snapshot.input_sha256:
-        raise ValueError("parser SHA-256 does not match the snapshotted input bytes")
+    outcome_source_sha256 = str(getattr(outcome, "source_sha256"))
+    if outcome_source_sha256 != snapshot.codec_source_sha256:
+        raise ValueError("parser SHA-256 does not match the snapshotted source text")
+    if outcome_source_sha256 != str(getattr(record, "source_sha256")):
+        raise ValueError("parser SHA-256 does not match the compact record")
     decoded = duckdb_events.decode_compact_record(record)
     timestamps = tuple(int(value) for value in decoded["timestamps_ms"])
     if not timestamps:
@@ -254,13 +268,13 @@ def _prepare(snapshot: _Snapshot, outcome: object, imported_at: datetime) -> _Pr
         "timestamps_zlib": bytes(getattr(record, "timestamps_zlib")),
     }
     grid["row_sha256"] = _grid_hash(grid)
-    report_id = sha256(f"{report_key}\0{snapshot.input_sha256}".encode("utf-8")).hexdigest()
+    report_id = sha256(f"{report_key}\0{snapshot.codec_source_sha256}".encode("utf-8")).hexdigest()
     report: dict[str, object] = {
         "report_id": report_id,
         "canonical_report_key": report_key,
         "canonical_point_key": point_key,
         "grid_hash": grid["grid_hash"],
-        "source_sha256": snapshot.input_sha256,
+        "source_sha256": snapshot.codec_source_sha256,
         "source_file": snapshot.relative_path,
         "source_size": snapshot.source_size,
         "imported_at_utc": imported_at,
@@ -537,7 +551,7 @@ def import_html_tree(
             candidates: list[_PreparedReport] = []
             for key in sorted(grouped):
                 group = grouped[key]
-                if len({item.snapshot.input_sha256 for item in group}) > 1:
+                if len({item.snapshot.codec_source_sha256 for item in group}) > 1:
                     for item in group:
                         evidence_by_path[item.snapshot.relative_path]["classification"] = "AMBIGUOUS_BATCH_DUPLICATE"
                     counts["ambiguous"] += len(group)
@@ -569,7 +583,7 @@ def import_html_tree(
                     active_by_hash = {str(value): str(key) for key, value in active_rows}
                     decisions: list[_WriteDecision] = []
                     for item in candidates:
-                        source_hash = item.snapshot.input_sha256
+                        source_hash = item.snapshot.codec_source_sha256
                         evidence_item = evidence_by_path[item.snapshot.relative_path]
                         active_hash_key = active_by_hash.get(source_hash)
                         if active_hash_key is not None:

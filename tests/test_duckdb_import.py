@@ -42,6 +42,15 @@ def _snapshot(root: Path) -> dict[str, str]:
     }
 
 
+def _codec_source_hash(path: Path) -> str:
+    return sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+
+
+def _newline_variants(path: Path) -> tuple[bytes, bytes]:
+    lf = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return lf, lf.replace(b"\n", b"\r\n")
+
+
 def _request(
     tmp_path: Path,
     incoming: Path,
@@ -151,11 +160,11 @@ def test_canonical_multiplier_replacement_and_a_to_b_to_a_append_audit(
 ) -> None:
     incoming = tmp_path / "incoming"
     report = _copy_report(incoming, "report.html")
-    hash_a = sha256(report.read_bytes()).hexdigest()
+    hash_a = _codec_source_hash(report)
     assert import_html_tree(_request(tmp_path, incoming, job_id="job-a"), None).inserted == 1
 
     _rewrite(report, '"multiplier":"0.97"', '"multiplier":"0.9700"')
-    hash_b = sha256(report.read_bytes()).hexdigest()
+    hash_b = _codec_source_hash(report)
     replaced = import_html_tree(_request(tmp_path, incoming, job_id="job-b"), None)
     assert replaced.replaced == 1
     assert _active_rows(tmp_path / "source.duckdb")[0][1] == hash_b
@@ -174,6 +183,117 @@ def test_canonical_multiplier_replacement_and_a_to_b_to_a_append_audit(
         ).fetchall() == [(hash_a, hash_b, "job-b"), (hash_b, hash_a, "job-c")]
     finally:
         connection.close()
+
+
+def test_crlf_input_keeps_raw_manifest_hash_but_uses_v3_semantic_source_identity(
+    tmp_path: Path,
+) -> None:
+    crlf_root = tmp_path / "crlf"
+    crlf_report = _copy_report(crlf_root, "report.html")
+    lf_bytes, crlf_bytes = _newline_variants(crlf_report)
+    crlf_report.write_bytes(crlf_bytes)
+    expected_source_hash = sha256(
+        crlf_report.read_text(encoding="utf-8").encode("utf-8")
+    ).hexdigest()
+    raw_input_hash = sha256(crlf_bytes).hexdigest()
+    assert expected_source_hash != raw_input_hash
+
+    first = import_html_tree(_request(tmp_path, crlf_root, job_id="crlf"), None)
+
+    assert first.final_state == "COMMITTED"
+    assert _active_rows(tmp_path / "source.duckdb")[0][1] == expected_source_hash
+    manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["reports"][0]["input_sha256"] == raw_input_hash
+
+    lf_root = tmp_path / "lf"
+    lf_report = _copy_report(lf_root, "report.html")
+    lf_report.write_bytes(lf_bytes)
+    lf_input_hash = sha256(lf_bytes).hexdigest()
+    assert lf_input_hash != raw_input_hash
+    second = import_html_tree(_request(tmp_path, lf_root, job_id="lf"), None)
+
+    assert (second.inserted, second.replaced, second.identical, second.ambiguous) == (0, 0, 1, 0)
+    assert _active_rows(tmp_path / "source.duckdb")[0][1] == expected_source_hash
+    second_manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
+    assert second_manifest["reports"][0]["input_sha256"] == lf_input_hash
+
+
+def test_same_batch_crlf_and_lf_are_identical_not_ambiguous(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    crlf_report = _copy_report(incoming, "a-crlf.html")
+    lf_bytes, crlf_bytes = _newline_variants(crlf_report)
+    crlf_report.write_bytes(crlf_bytes)
+    lf_report = _copy_report(incoming, "b-lf.html")
+    lf_report.write_bytes(lf_bytes)
+    assert sha256(crlf_bytes).hexdigest() != sha256(lf_bytes).hexdigest()
+
+    result = import_html_tree(_request(tmp_path, incoming, job_id="mixed-newlines"), None)
+
+    assert result.final_state == "COMMITTED"
+    assert (result.inserted, result.identical, result.ambiguous) == (1, 1, 0)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert {
+        item["relative_path"]: item["classification"] for item in manifest["reports"]
+    } == {
+        "a-crlf.html": "INSERTED",
+        "b-lf.html": "SKIPPED_BATCH_IDENTICAL",
+    }
+
+
+def test_crlf_to_lf_mutation_during_parse_prevents_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initial = tmp_path / "initial"
+    original = _copy_report(initial, "report.html")
+    original_hash = _codec_source_hash(original)
+    import_html_tree(_request(tmp_path, initial, job_id="initial"), None)
+    database = tmp_path / "source.duckdb"
+    database_before = database.read_bytes()
+
+    incoming = tmp_path / "incoming"
+    changed = _copy_report(incoming, "report.html")
+    _rewrite(changed, "98.25", "98.50")
+    lf_bytes, crlf_bytes = _newline_variants(changed)
+    changed.write_bytes(crlf_bytes)
+    raw_snapshot_hash = sha256(crlf_bytes).hexdigest()
+    assert raw_snapshot_hash != sha256(lf_bytes).hexdigest()
+    real_reader = duckdb_events.read_compact_html
+
+    def mutate_after_parse(path: Path):
+        outcome = real_reader(path)
+        path.write_bytes(lf_bytes)
+        return outcome
+
+    monkeypatch.setattr(duckdb_events, "read_compact_html", mutate_after_parse)
+    result = import_html_tree(_request(tmp_path, incoming, job_id="mutated"), None)
+
+    assert result.final_state == "FAILED"
+    assert result.safe_to_delete == "NO"
+    assert (result.inserted, result.replaced) == (0, 0)
+    assert database.read_bytes() == database_before
+    assert _active_rows(database)[0][1] == original_hash
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["reports"][0]["input_sha256"] == raw_snapshot_hash
+    assert manifest["reports"][0]["classification"] == "NOT_IMPORTED_FAILURE"
+
+
+def test_invalid_utf8_is_quarantined_with_raw_hash_and_no_active_report(
+    tmp_path: Path,
+) -> None:
+    incoming = tmp_path / "incoming"
+    invalid = _copy_report(incoming, "invalid.html")
+    invalid_bytes = invalid.read_bytes() + b"\xff"
+    invalid.write_bytes(invalid_bytes)
+    raw_input_hash = sha256(invalid_bytes).hexdigest()
+
+    result = import_html_tree(_request(tmp_path, incoming, job_id="invalid-utf8"), None)
+
+    assert (result.parsed, result.quarantined) == (0, 1)
+    assert result.safe_to_delete == "NO"
+    assert _active_rows(tmp_path / "source.duckdb") == []
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["reports"][0]["input_sha256"] == raw_input_hash
+    assert manifest["reports"][0]["classification"] == "INVALID_REPORT"
 
 
 def test_manifest_and_checklist_are_deterministic_complete_and_hashed(tmp_path: Path) -> None:
@@ -230,7 +350,7 @@ def test_same_batch_different_payloads_are_ambiguous_and_do_not_replace(
 ) -> None:
     initial = tmp_path / "initial"
     original = _copy_report(initial, "report.html")
-    original_hash = sha256(original.read_bytes()).hexdigest()
+    original_hash = _codec_source_hash(original)
     import_html_tree(_request(tmp_path, initial, job_id="initial"), None)
 
     incoming = tmp_path / "ambiguous"
@@ -376,7 +496,7 @@ def test_transaction_failure_keeps_previous_active_report_and_retry_is_safe(
 ) -> None:
     initial = tmp_path / "initial"
     original = _copy_report(initial, "report.html")
-    original_hash = sha256(original.read_bytes()).hexdigest()
+    original_hash = _codec_source_hash(original)
     import_html_tree(_request(tmp_path, initial, job_id="initial"), None)
     database = tmp_path / "source.duckdb"
     database_before = database.read_bytes()
@@ -384,7 +504,7 @@ def test_transaction_failure_keeps_previous_active_report_and_retry_is_safe(
     incoming = tmp_path / "retry"
     replacement = _copy_report(incoming, "a-replacement.html")
     _rewrite(replacement, "98.25", "98.50")
-    replacement_hash = sha256(replacement.read_bytes()).hexdigest()
+    replacement_hash = _codec_source_hash(replacement)
     _copy_report(incoming, "b-insert.html", "report_b.html")
     inputs_before = _snapshot(incoming)
     real_write = duckdb_import._write_decision
@@ -422,7 +542,7 @@ def test_transaction_failure_keeps_previous_active_report_and_retry_is_safe(
     assert (retry.inserted, retry.replaced, retry.identical) == (1, 1, 0)
     assert {row[1] for row in _active_rows(database)} == {
         replacement_hash,
-        sha256((FIXTURES / "report_b.html").read_bytes()).hexdigest(),
+        _codec_source_hash(FIXTURES / "report_b.html"),
     }
     assert _snapshot(incoming) == inputs_before
 
