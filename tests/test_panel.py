@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from http.client import HTTPConnection
+from html.parser import HTMLParser
 import io
 import json
 from pathlib import Path
 import time
+from hashlib import sha256
+from dataclasses import replace
 
 import pytest
 
 from mrs3.panel import PanelController, _Job, create_panel_server
+from mrs3.duckdb_import import ImportJobResult, ImportPreflight, ImportProgress
 
 
 class _FakeProcess:
@@ -30,6 +34,259 @@ def _wait_finished(controller: PanelController) -> dict[str, object]:
             return snapshot
         time.sleep(0.01)
     raise AssertionError("panel job did not finish")
+
+
+def _import_result(tmp_path: Path, *, final_state: str = "COMMITTED", tampered: bool = False) -> ImportJobResult:
+    audit = tmp_path / "audit" / "job-1"
+    audit.mkdir(parents=True)
+    checklist = audit / "html_delete_checklist.json"
+    checklist.write_text(json.dumps({"job_id": "job-1", "safe_to_delete": "YES"}), encoding="utf-8")
+    manifest = audit / "import_manifest.json"
+    manifest.write_text(json.dumps({"job_id": "job-1", "final_state": final_state, "safe_to_delete": "YES", "artifacts": {"checklist": {"sha256": sha256(checklist.read_bytes()).hexdigest()}}}), encoding="utf-8")
+    if tampered:
+        checklist.write_text("not json", encoding="utf-8")
+    return ImportJobResult("job-1", final_state, 3, 2, 1, 0, 1, 0, 0, "YES", manifest, sha256(manifest.read_bytes()).hexdigest(), checklist, sha256(checklist.read_bytes()).hexdigest())
+
+
+def _wait_import_finished(controller: PanelController) -> dict[str, object]:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        document = controller.snapshot()["duckdb_import"]
+        if document and not document["running"]:
+            return document
+        time.sleep(.01)
+    raise AssertionError("panel import did not finish")
+
+
+class _ImportUiParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_ids: set[str] = set()
+        self.actions: set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "input" and attributes.get("id"):
+            self.input_ids.add(str(attributes["id"]))
+        if tag == "button" and attributes.get("onclick"):
+            self.actions.add(str(attributes["onclick"]))
+
+
+def test_duckdb_import_settings_preflight_start_cancel_and_evidence_gate(tmp_path: Path) -> None:
+    calls: list[object] = []
+
+    def preflight(request: object) -> ImportPreflight:
+        calls.append(request)
+        return ImportPreflight("token-1", 3, 5, "digest")
+
+    def importer(request: object, progress: object) -> ImportJobResult:
+        progress(ImportProgress("RUNNING", 3, 2, 1, 0, 1, 0, 0))
+        return _import_result(tmp_path)
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", preflight_func=preflight, import_func=importer)
+    settings = controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "default_html_root": "html", "audit_root": "audit", "workers": 2, "transaction_batch_size": 10})
+    assert settings["workers"] == 2
+    assert controller.duckdb_import_preflight({"root_path": "html"})["token"] == "token-1"
+    with pytest.raises(ValueError, match="preflight"):
+        controller.start_duckdb_import({"root_path": "html"})
+    controller.start_duckdb_import({"root_path": "html", "preflight_token": "token-1"})
+    deadline = time.monotonic() + 1
+    while controller.snapshot()["duckdb_import"]["running"] and time.monotonic() < deadline:
+        time.sleep(.01)
+    job = controller.snapshot()["duckdb_import"]
+    assert job["counts"] == {"parsed": 2, "inserted": 1, "replaced": 0, "identical": 1, "ambiguous": 0, "quarantined": 0}
+    assert job["final_state"] == "COMMITTED"
+    assert job["safe_to_delete"] == "YES"
+    assert all(str(tmp_path) not in value for value in json.dumps(job).splitlines())
+    assert controller.cancel_duckdb_import()["running"] is False
+
+
+def test_duckdb_import_rejects_stale_and_parallel_jobs_and_tampered_evidence(tmp_path: Path) -> None:
+    released = __import__("threading").Event()
+    started = __import__("threading").Event()
+
+    def preflight(_: object) -> ImportPreflight:
+        return ImportPreflight("fresh", 1, 5, "digest")
+
+    def importer(_: object, __: object) -> ImportJobResult:
+        started.set(); released.wait(1)
+        return _import_result(tmp_path, tampered=True)
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", preflight_func=preflight, import_func=importer)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "default_html_root": "html", "audit_root": "audit"})
+    controller.duckdb_import_preflight({"root_path": "html"})
+    with pytest.raises(ValueError, match="preflight"):
+        controller.start_duckdb_import({"root_path": "html", "preflight_token": "stale"})
+    controller.start_duckdb_import({"root_path": "html", "preflight_token": "fresh"})
+    assert started.wait(1)
+    with pytest.raises(RuntimeError, match="already running"):
+        controller.start_duckdb_import({"root_path": "html", "preflight_token": "fresh"})
+    assert controller.cancel_duckdb_import()["cancel_requested"] is True
+    released.set()
+    deadline = time.monotonic() + 1
+    while controller.snapshot()["duckdb_import"]["running"] and time.monotonic() < deadline:
+        time.sleep(.01)
+    job = controller.snapshot()["duckdb_import"]
+    assert job["safe_to_delete"] == "NO"
+    assert job["artifacts"] == {}
+
+
+def test_duckdb_import_migration_activates_only_valid_unchanged_target(tmp_path: Path) -> None:
+    target = tmp_path / "migrated.duckdb"
+    target.write_bytes(b"target")
+    source = tmp_path / "source.duckdb"
+    source.write_bytes(b"source")
+
+    class Result:
+        target_path = target
+        target_database_sha256 = sha256(target.read_bytes()).hexdigest()
+        validation = type("Validation", (), {"valid": True})()
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", migration_func=lambda *_: Result())
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb"})
+    assert controller.migrate_duckdb_import({"target_path": "migrated.duckdb"})["source_duckdb_path"] == str(target.resolve())
+    with pytest.raises(ValueError, match="different"):
+        controller.migrate_duckdb_import({"target_path": "migrated.duckdb"})
+
+
+def test_http_duckdb_import_settings_and_preflight_are_dedicated_routes(tmp_path: Path) -> None:
+    def migrate(_: Path, target: Path) -> object:
+        target.write_bytes(b"migrated")
+        return type("Migration", (), {"validation": type("Validation", (), {"valid": True})(), "target_database_sha256": sha256(target.read_bytes()).hexdigest()})()
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", preflight_func=lambda _: ImportPreflight("token", 0, 5, "digest"), migration_func=migrate)
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True); thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        settings = {"source_duckdb_path": "source.duckdb", "audit_root": "audit", "default_html_root": "html"}
+        connection.request("POST", "/api/duckdb-import/settings", json.dumps(settings).encode(), {"Content-Type": "application/json"})
+        saved = connection.getresponse(); assert saved.status == 200; saved.read()
+        connection.request("GET", "/api/duckdb-import/settings")
+        loaded = connection.getresponse(); assert loaded.status == 200
+        assert json.loads(loaded.read())["workers"] == 4
+        connection.request("POST", "/api/duckdb-import/preflight", json.dumps({"root_path": "html"}).encode(), {"Content-Type": "application/json"})
+        response = connection.getresponse(); assert response.status == 200
+        assert json.loads(response.read())["token"] == "token"
+        connection.request("POST", "/api/duckdb-import/migrate", json.dumps({"target_path": "migrated.duckdb"}).encode(), {"Content-Type": "application/json"})
+        migrated = connection.getresponse(); assert migrated.status == 200
+        assert json.loads(migrated.read())["source_duckdb_path"] == str((tmp_path / "migrated.duckdb").resolve())
+    finally:
+        connection.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_http_ui_exposes_persistent_import_settings_and_migration_controls(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True); thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("GET", "/")
+        response = connection.getresponse(); parser = _ImportUiParser()
+        parser.feed(response.read().decode("utf-8"))
+        assert response.status == 200
+        assert {"import_source_duckdb", "import_analysis_duckdb", "import_default_html_root", "import_audit_root", "import_workers", "import_batch_size", "migration_target"} <= parser.input_ids
+        assert {"saveDuckdbSettings()", "migrateDuckdb()"} <= parser.actions
+    finally:
+        connection.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_completed_import_revalidates_evidence_before_status_and_download(tmp_path: Path) -> None:
+    result = _import_result(tmp_path)
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", preflight_func=lambda _: ImportPreflight("token", 1, 5, "digest"), import_func=lambda *_: result)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "audit_root": "audit"})
+    controller.duckdb_import_preflight({"root_path": "html"})
+    controller.start_duckdb_import({"root_path": "html", "preflight_token": "token"})
+    assert _wait_import_finished(controller)["safe_to_delete"] == "YES"
+    result.checklist_path.write_text("{}", encoding="utf-8")
+    status = controller.snapshot()["duckdb_import"]
+    assert status["final_state"] != "COMMITTED"
+    assert status["safe_to_delete"] == "NO"
+    assert status["artifacts"] == {}
+    assert controller.artifact("import_checklist") is None
+
+
+def test_artifact_response_serves_the_bytes_that_passed_evidence_validation(tmp_path: Path) -> None:
+    result = _import_result(tmp_path)
+    expected = result.checklist_path.read_bytes()
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", preflight_func=lambda _: ImportPreflight("token", 1, 5, "digest"), import_func=lambda *_: result)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "audit_root": "audit"})
+    controller.duckdb_import_preflight({"root_path": "html"})
+    controller.start_duckdb_import({"root_path": "html", "preflight_token": "token"})
+    assert _wait_import_finished(controller)["safe_to_delete"] == "YES"
+    original_artifact = controller.artifact
+    def mutate_after_validation(name: str) -> object:
+        approved = original_artifact(name)
+        result.checklist_path.write_bytes(b"tampered-after-validation")
+        return approved
+    controller.artifact = mutate_after_validation  # type: ignore[method-assign]
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True); thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("GET", "/api/artifact?name=import_checklist")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read() == expected
+    finally:
+        connection.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_generic_artifact_http_response_remains_path_streamed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    artifact = tmp_path / "results.csv"; expected = b"header\nrow\n"; artifact.write_bytes(expected)
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    controller._job = _Job("generic", "tester-run", (), {"output_csv": artifact}, {"output_csv": None}, status="SUCCEEDED")
+    original_read_bytes = Path.read_bytes
+    def reject_bulk_read(path: Path) -> bytes:
+        if path == artifact:
+            raise AssertionError("generic artifact must remain streamed")
+        return original_read_bytes(path)
+    monkeypatch.setattr(Path, "read_bytes", reject_bulk_read)
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True); thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("GET", "/api/artifact?name=output_csv")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read() == expected
+    finally:
+        connection.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_settings_change_during_migration_survives_source_activation(tmp_path: Path) -> None:
+    source = tmp_path / "source.duckdb"; source.write_bytes(b"source")
+    target = tmp_path / "target.duckdb"
+    started = __import__("threading").Event(); release = __import__("threading").Event()
+    def migrate(_: Path, destination: Path) -> object:
+        started.set(); assert release.wait(1)
+        destination.write_bytes(b"target")
+        return type("Migration", (), {"validation": type("Validation", (), {"valid": True})(), "target_database_sha256": sha256(destination.read_bytes()).hexdigest()})()
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", migration_func=migrate)
+    controller.duckdb_import_settings({"source_duckdb_path": str(source), "workers": 4})
+    migration = __import__("threading").Thread(target=lambda: controller.migrate_duckdb_import({"target_path": str(target)}))
+    settings = __import__("threading").Thread(target=lambda: controller.duckdb_import_settings({"workers": 9}))
+    migration.start(); assert started.wait(1); settings.start(); release.set()
+    migration.join(2); settings.join(2)
+    final = controller.duckdb_import_settings()
+    assert final["source_duckdb_path"] == str(target.resolve())
+    assert final["workers"] == 9
+
+
+@pytest.mark.parametrize("result_error", [False, True])
+def test_import_status_never_exposes_absolute_paths_from_errors(tmp_path: Path, result_error: bool) -> None:
+    secret = tmp_path / "html" / "report.html"
+    def importer(*_: object) -> ImportJobResult:
+        if not result_error:
+            raise RuntimeError(f"cannot open {secret}")
+        result = _import_result(tmp_path, final_state="FAILED")
+        return replace(result, error=f"cannot open {secret}")
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", preflight_func=lambda _: ImportPreflight("token", 1, 5, "digest"), import_func=importer)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "audit_root": "audit"})
+    controller.duckdb_import_preflight({"root_path": "html"})
+    controller.start_duckdb_import({"root_path": "html", "preflight_token": "token"})
+    document = _wait_import_finished(controller)
+    assert document["error"] is not None
+    assert str(tmp_path) not in document["error"]
 
 
 def test_controller_builds_shell_free_tester_command_and_captures_log(

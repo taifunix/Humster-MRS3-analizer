@@ -4,6 +4,7 @@ from collections import deque
 import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -16,6 +17,10 @@ from typing import Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 import uuid
 import webbrowser
+
+from .config import DuckDBImportSettings, load_duckdb_import_settings, save_duckdb_import_settings
+from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, import_html_tree, preflight_html_import
+from .duckdb_source_schema import migrate_source_database
 
 
 _BROWSE_FILE_TYPES: dict[str, tuple[tuple[str, str], ...]] = {
@@ -194,6 +199,7 @@ PANEL_HTML = r"""<!doctype html>
           <label>HTML-каталог для верификации (необязательно)<div class="path-control"><input id="verify_html_root" value="" type="text"><button type="button" class="secondary" onclick="browse('verify_html_root','directory',false)">Выбрать…</button></div></label>
           <label>HTML-выборка (3–5)<input id="verification_sample_count" value="3" type="number" min="3" max="5" step="1"></label>
           <div class="buttons"><button data-runnable="true" class="primary" onclick="startAction('source-duckdb')">Собрать DuckDB-пакет</button><span class="badge">real_independent_events</span></div>
+          <details><summary>HTML → source DuckDB import</summary><div class="stack"><label>HTML root<div class="path-control"><input id="import_html_root" type="text"><button type="button" class="secondary" onclick="browse('import_html_root','directory',false)">Browse…</button></div></label><div class="buttons"><button type="button" onclick="duckdbPreflight()">Preflight</button><button type="button" class="primary" onclick="duckdbImport()">Start import</button><button type="button" onclick="duckdbCancel()">Cancel</button></div><div id="duckdbImportStatus" aria-live="polite" class="muted">No import job.</div><div class="stats"><div class="stat"><b id="import_parsed">0</b><span>parsed</span></div><div class="stat"><b id="import_inserted">0</b><span>inserted</span></div><div class="stat"><b id="import_replaced">0</b><span>replaced</span></div><div class="stat"><b id="import_identical">0</b><span>identical</span></div><div class="stat"><b id="import_ambiguous">0</b><span>ambiguous</span></div><div class="stat"><b id="import_quarantined">0</b><span>quarantined</span></div></div></div></details>
         </div>
       </section>
       <section role="tabpanel" id="panel-candidates" aria-labelledby="tab-candidates" hidden>
@@ -210,6 +216,16 @@ PANEL_HTML = r"""<!doctype html>
         <h2>Настройки</h2><p class="source-note">Постоянные локальные пути. Выбор открывает системный диалог только по вашему действию; ручной ввод сохраняется.</p>
         <div class="stack workflow-card">
           <label>Конфигурация runner<div class="path-control"><input id="config" type="text"><button type="button" class="secondary" onclick="browse('config','config',false)">Выбрать…</button></div></label>
+          <details open><summary>DuckDB import</summary><div class="stack">
+            <label>Source DuckDB<div class="path-control"><input id="import_source_duckdb" type="text"><button type="button" class="secondary" onclick="browse('import_source_duckdb','duckdb',false)">Выбрать…</button></div></label>
+            <label>Analysis DuckDB<div class="path-control"><input id="import_analysis_duckdb" type="text"><button type="button" class="secondary" onclick="browse('import_analysis_duckdb','duckdb',false)">Выбрать…</button></div></label>
+            <label>HTML root<div class="path-control"><input id="import_default_html_root" type="text"><button type="button" class="secondary" onclick="browse('import_default_html_root','directory',false)">Выбрать…</button></div></label>
+            <label>Audit root<div class="path-control"><input id="import_audit_root" type="text"><button type="button" class="secondary" onclick="browse('import_audit_root','directory',false)">Выбрать…</button></div></label>
+            <div class="row"><label>Workers<input id="import_workers" type="number" min="1" step="1"></label><label>Transaction batch size<input id="import_batch_size" type="number" min="1" step="1"></label></div>
+            <button type="button" onclick="saveDuckdbSettings()">Сохранить настройки импорта</button>
+            <label>Migration target<div class="path-control"><input id="migration_target" type="text"><button type="button" class="secondary" onclick="browse('migration_target','duckdb',false)">Выбрать…</button></div></label>
+            <button type="button" onclick="migrateDuckdb()">Мигрировать и активировать</button>
+          </div></details>
           <div class="row"><label>Каталог CSV source-pack<div class="path-control"><input id="csv_output_dir" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('csv_output_dir','directory',false)">Выбрать…</button></div></label><label>Каталог DuckDB source-pack<div class="path-control"><input id="duckdb_output_dir" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('duckdb_output_dir','directory',false)">Выбрать…</button></div></label></div>
           <div class="row"><label>Каталог результата selection<div class="path-control"><input id="select_output_dir" value="output_long" type="text"><button type="button" class="secondary" onclick="browse('select_output_dir','directory',false)">Выбрать…</button></div></label><label>Итоговый CSV тестера<div class="path-control"><input id="output_csv" value="results\mrs3_long_results.csv" type="text"><button type="button" class="secondary" onclick="browse('output_csv','results_csv',false)">Выбрать…</button></div></label></div>
           <label>Каталог DD5<div class="path-control"><input id="posttest_output_dir" value="posttest_long" type="text"><button type="button" class="secondary" onclick="browse('posttest_output_dir','directory',false)">Выбрать…</button></div></label>
@@ -284,6 +300,15 @@ async function browse(id, kind, multiple) {
     else { notice.textContent = 'Выбор отменён.'; }
   } catch (error) { notice.textContent = error.message; }
 }
+let duckdbPreflightToken = '';
+async function duckdbRequest(endpoint, body={}) { const response = await fetch(endpoint, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}); const document = await response.json(); if (!response.ok) throw new Error(document.error || 'Import request failed'); return document; }
+function showDuckdbSettings(settings) { const fields={source_duckdb_path:'import_source_duckdb', analysis_duckdb_path:'import_analysis_duckdb', default_html_root:'import_default_html_root', audit_root:'import_audit_root', workers:'import_workers', transaction_batch_size:'import_batch_size'}; for (const [name,id] of Object.entries(fields)) document.getElementById(id).value=settings[name] ?? ''; if (!value('import_html_root')) document.getElementById('import_html_root').value=settings.default_html_root ?? ''; }
+async function loadDuckdbSettings() { try { const response=await fetch('/api/duckdb-import/settings', {cache:'no-store'}); const settings=await response.json(); if (!response.ok) throw new Error(settings.error || 'Settings load failed'); showDuckdbSettings(settings); } catch (error) { document.getElementById('notice').textContent=error.message; } }
+async function saveDuckdbSettings() { try { const settings=await duckdbRequest('/api/duckdb-import/settings', {source_duckdb_path:value('import_source_duckdb') || null, analysis_duckdb_path:value('import_analysis_duckdb') || null, default_html_root:value('import_default_html_root') || null, audit_root:value('import_audit_root') || null, workers:value('import_workers'), transaction_batch_size:value('import_batch_size')}); showDuckdbSettings(settings); document.getElementById('notice').textContent='Настройки импорта сохранены.'; } catch (error) { document.getElementById('notice').textContent=error.message; } }
+async function migrateDuckdb() { try { const settings=await duckdbRequest('/api/duckdb-import/migrate', {target_path:value('migration_target')}); showDuckdbSettings(settings); document.getElementById('notice').textContent='Миграция проверена и активирована.'; } catch (error) { document.getElementById('notice').textContent=error.message; } }
+async function duckdbPreflight() { try { const result = await duckdbRequest('/api/duckdb-import/preflight', {root_path:value('import_html_root')}); duckdbPreflightToken=result.token; document.getElementById('notice').textContent=`Preflight: ${result.discovered} reports.`; } catch (error) { document.getElementById('notice').textContent=error.message; } }
+async function duckdbImport() { try { const result = await duckdbRequest('/api/duckdb-import/start', {root_path:value('import_html_root'), preflight_token:duckdbPreflightToken}); render(result); } catch (error) { document.getElementById('notice').textContent=error.message; } }
+async function duckdbCancel() { try { render(await duckdbRequest('/api/duckdb-import/cancel')); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 function renderDashboard(dashboard) {
   const target = document.getElementById('decisionDashboard'); target.replaceChildren();
   const order = ['csv', 'duckdb', 'candidates', 'tester', 'posttest'];
@@ -303,6 +328,8 @@ function renderDashboard(dashboard) {
 function render(data) {
   if (!defaultsLoaded && data.defaults) { document.getElementById('config').value = data.defaults.config; defaultsLoaded = true; }
   renderDashboard(data.dashboard);
+  const imported = data.duckdb_import;
+  if (imported) { document.getElementById('duckdbImportStatus').textContent = `${imported.final_state} · safe_to_delete=${imported.safe_to_delete}`; for (const [name, count] of Object.entries(imported.counts || {})) { const item=document.getElementById('import_'+name); if (item) item.textContent=count; } }
   const job = data.job;
   const buttons = document.querySelectorAll('[data-runnable]'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
   if (!job) return;
@@ -363,6 +390,7 @@ for (const tab of tabs) {
   });
 }
 syncCandidateSource();
+loadDuckdbSettings();
 async function refresh() { try { const response=await fetch('/api/status', {cache:'no-store'}); render(await response.json()); } catch (_) {} }
 refresh(); setInterval(refresh, 1200);
 </script>
@@ -396,6 +424,19 @@ class _Job:
         return self.status in {"STARTING", "RUNNING"}
 
 
+@dataclass(slots=True)
+class _ImportJob:
+    token: str
+    root: Path
+    cancel: threading.Event = field(default_factory=threading.Event)
+    running: bool = True
+    phase: str = "STARTING"
+    counts: dict[str, int] = field(default_factory=lambda: {name: 0 for name in ("parsed", "inserted", "replaced", "identical", "ambiguous", "quarantined")})
+    result: ImportJobResult | None = None
+    evidence_valid: bool = False
+    error: str | None = None
+
+
 class PanelController:
     def __init__(
         self,
@@ -403,6 +444,9 @@ class PanelController:
         default_config: Path,
         process_factory: Callable[..., object] = subprocess.Popen,
         browse_factory: Callable[[str, bool], tuple[Path, ...]] = _native_browse,
+        preflight_func: Callable[[ImportRequest], ImportPreflight] = preflight_html_import,
+        import_func: Callable[[ImportRequest, Callable[[ImportProgress], object] | None], ImportJobResult] = import_html_tree,
+        migration_func: Callable[[Path, Path], object] = migrate_source_database,
     ) -> None:
         self.root = root.resolve()
         self.default_config = self._path(default_config)
@@ -413,6 +457,12 @@ class PanelController:
         # Keep only artifact paths created by this controller instance.  The
         # dashboard must never discover data by scanning user directories.
         self._section_jobs: dict[str, _Job] = {}
+        self._preflight: ImportPreflight | None = None
+        self._preflight_root: Path | None = None
+        self._import_job: _ImportJob | None = None
+        self._preflight_func = preflight_func
+        self._import_func = import_func
+        self._migration_func = migration_func
 
     @staticmethod
     def _section(action: str) -> str:
@@ -572,6 +622,110 @@ class PanelController:
             raise ValueError(f"unsupported browse kind: {kind}")
         paths = self._browse_factory(kind, multiple)
         return tuple(str(path.resolve()) for path in paths)
+
+    def _import_settings(self, payload: Mapping[str, object] | None = None) -> DuckDBImportSettings:
+        if payload is None:
+            return load_duckdb_import_settings(self.default_config)
+        previous = load_duckdb_import_settings(self.default_config)
+        paths = {name: payload.get(name, getattr(previous, name)) for name in ("source_duckdb_path", "analysis_duckdb_path", "default_html_root", "audit_root")}
+        def path(name: str) -> Path | None:
+            value = paths[name]
+            if value is None or value == "": return None
+            if isinstance(value, Path): return value
+            if not isinstance(value, str): raise ValueError(f"{name} must be a string or null")
+            return self._path(value)
+        def number(name: str) -> int:
+            value = payload.get(name, getattr(previous, name))
+            if isinstance(value, bool): raise ValueError(f"{name} must be a positive integer")
+            try: result = int(value)
+            except (TypeError, ValueError): raise ValueError(f"{name} must be a positive integer") from None
+            if result < 1: raise ValueError(f"{name} must be a positive integer")
+            return result
+        return DuckDBImportSettings(**{name: path(name) for name in paths}, workers=number("workers"), transaction_batch_size=number("transaction_batch_size"))
+
+    @staticmethod
+    def _settings_document(settings: DuckDBImportSettings) -> dict[str, object]:
+        # Paths are returned only by the settings endpoint, never by job status.
+        return {name: (str(value) if isinstance(value, Path) else value) for name, value in ((name, getattr(settings, name)) for name in ("source_duckdb_path", "analysis_duckdb_path", "default_html_root", "audit_root", "workers", "transaction_batch_size"))}
+
+    def duckdb_import_settings(self, payload: Mapping[str, object] | None = None) -> dict[str, object]:
+        with self._lock:
+            settings = self._import_settings(payload)
+            if payload is not None: save_duckdb_import_settings(self.default_config, settings)
+        return self._settings_document(settings)
+
+    def _request(self, root: Path, settings: DuckDBImportSettings, *, token: str | None = None, cancellation_requested: Callable[[], bool] | None = None) -> ImportRequest:
+        if settings.source_duckdb_path is None or settings.audit_root is None:
+            raise ValueError("source_duckdb_path and audit_root must be configured")
+        return ImportRequest(root, settings.source_duckdb_path, settings.audit_root, settings.workers, settings.transaction_batch_size, cancellation_requested=cancellation_requested, expected_preflight_token=token)
+
+    def duckdb_import_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
+        settings = self._import_settings()
+        root = self._path(self._required(payload, "root_path"))
+        preflight = self._preflight_func(self._request(root, settings))
+        with self._lock:
+            self._preflight, self._preflight_root = preflight, root
+        return {"token": preflight.token, "discovered": preflight.discovered, "source_schema_version": preflight.source_schema_version, "target_identity_digest": preflight.target_identity_digest}
+
+    def start_duckdb_import(self, payload: Mapping[str, object]) -> dict[str, object]:
+        root, token = self._path(self._required(payload, "root_path")), self._required(payload, "preflight_token")
+        with self._lock:
+            if self._import_job is not None and self._import_job.running: raise RuntimeError("another import is already running")
+            if self._preflight is None or self._preflight_root != root or self._preflight.token != token: raise ValueError("latest preflight token is required")
+            job = _ImportJob(token, root); self._import_job = job
+        threading.Thread(target=self._run_duckdb_import, args=(job,), name="mrs3-panel-duckdb-import", daemon=True).start()
+        return self.snapshot()
+
+    def _run_duckdb_import(self, job: _ImportJob) -> None:
+        try:
+            settings = self._import_settings()
+            def progress(item: ImportProgress) -> None:
+                with self._lock: job.phase, job.counts = item.final_state, item.counts
+            result = self._import_func(self._request(job.root, settings, token=job.token, cancellation_requested=job.cancel.is_set), progress)
+            with self._lock:
+                job.result, job.phase = result, result.final_state
+                job.counts = {name: getattr(result, name) for name in job.counts}
+                job.evidence_valid = self._valid_import_evidence(result)
+        except BaseException as error:
+            with self._lock: job.phase, job.error = "FAILED", f"{type(error).__name__}: import failed"
+        finally:
+            with self._lock: job.running = False
+
+    @staticmethod
+    def _import_evidence(result: ImportJobResult) -> tuple[bytes, bytes] | None:
+        try:
+            manifest_bytes, checklist_bytes = result.manifest_path.read_bytes(), result.checklist_path.read_bytes()
+            if sha256(manifest_bytes).hexdigest() != result.manifest_sha256 or sha256(checklist_bytes).hexdigest() != result.checklist_sha256: return None
+            manifest, checklist = json.loads(manifest_bytes), json.loads(checklist_bytes)
+            valid = isinstance(manifest, dict) and isinstance(checklist, dict) and manifest.get("job_id") == result.job_id == checklist.get("job_id") and manifest.get("final_state") == result.final_state and manifest.get("safe_to_delete") == checklist.get("safe_to_delete") == result.safe_to_delete and manifest.get("artifacts", {}).get("checklist", {}).get("sha256") == result.checklist_sha256
+            return (manifest_bytes, checklist_bytes) if valid else None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError): return None
+
+    @staticmethod
+    def _valid_import_evidence(result: ImportJobResult) -> bool:
+        return PanelController._import_evidence(result) is not None
+
+    def cancel_duckdb_import(self) -> dict[str, object]:
+        with self._lock:
+            if self._import_job is None: raise ValueError("no import job")
+            self._import_job.cancel.set()
+        return self.snapshot()["duckdb_import"]
+
+    def migrate_duckdb_import(self, payload: Mapping[str, object]) -> dict[str, object]:
+        with self._lock:
+            settings = self._import_settings()
+        if settings.source_duckdb_path is None: raise ValueError("source_duckdb_path must be configured")
+        target = self._path(self._required(payload, "target_path"))
+        if target == settings.source_duckdb_path: raise ValueError("source and target paths must be different")
+        result = self._migration_func(settings.source_duckdb_path, target)
+        if not getattr(getattr(result, "validation", None), "valid", False) or not target.is_file() or sha256(target.read_bytes()).hexdigest() != getattr(result, "target_database_sha256", None): raise ValueError("migration target validation failed")
+        with self._lock:
+            current = self._import_settings()
+            if current.source_duckdb_path != settings.source_duckdb_path:
+                raise ValueError("source_duckdb_path changed during migration")
+            updated = DuckDBImportSettings(target, current.analysis_duckdb_path, current.default_html_root, current.audit_root, current.workers, current.transaction_batch_size)
+            save_duckdb_import_settings(self.default_config, updated)
+        return self._settings_document(updated)
 
     def start(self, action: str, payload: Mapping[str, object]) -> dict[str, object]:
         command, artifacts = self._build_command(action, payload)
@@ -894,23 +1048,44 @@ class PanelController:
                         for name, path in current_artifacts.items()
                     },
                 }
+            import_job = self._import_job
+            if import_job is None:
+                import_document = None
+            else:
+                result = import_job.result
+                evidence_valid = bool(result and self._valid_import_evidence(result))
+                safe = "YES" if evidence_valid and result and result.final_state == "COMMITTED" and result.safe_to_delete == "YES" else "NO"
+                import_document = {
+                    "running": import_job.running,
+                    "cancel_requested": import_job.cancel.is_set(),
+                    "phase": import_job.phase,
+                    "final_state": (result.final_state if evidence_valid else "EVIDENCE_INVALID") if result else import_job.phase,
+                    "counts": dict(import_job.counts),
+                    "safe_to_delete": safe,
+                    "error": import_job.error or ("import failed" if result and result.error else None),
+                    "artifacts": ({"import_manifest": "import_manifest.json", "import_checklist": "html_delete_checklist.json"} if evidence_valid else {}),
+                }
         return {
             "defaults": {
                 "root": str(self.root),
                 "config": str(self.default_config),
             },
             "job": job_document,
+            "duckdb_import": import_document,
             "dashboard": dashboard,
         }
 
-    def artifact(self, name: str) -> Path | None:
+    def artifact(self, name: str) -> Path | tuple[str, bytes] | None:
         with self._lock:
-            if self._job is None:
-                return None
-            path = self._job.artifacts.get(name)
-            baseline = self._job.artifact_baseline.get(name)
+            path = self._job.artifacts.get(name) if self._job else None
+            baseline = self._job.artifact_baseline.get(name) if self._job else None
         if path is None or not path.is_file() or self._signature(path) == baseline:
-            return None
+            with self._lock:
+                result = self._import_job.result if self._import_job else None
+                evidence = self._import_evidence(result) if result is not None else None
+            if result is None or evidence is None:
+                return None
+            return {"import_manifest": (result.manifest_path.name, evidence[0]), "import_checklist": (result.checklist_path.name, evidence[1])}.get(name)
         return path
 
 
@@ -973,27 +1148,41 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             self._json(200, self.server.controller.snapshot())
             return
+        if parsed.path == "/api/duckdb-import/settings":
+            try:
+                self._json(200, self.server.controller.duckdb_import_settings())
+            except ValueError as error:
+                self._json(400, {"error": str(error)})
+            return
         if parsed.path == "/api/artifact":
             name = parse_qs(parsed.query).get("name", [""])[0]
             artifact = self.server.controller.artifact(name)
             if artifact is None:
                 self._json(404, {"error": "artifact is not available"})
                 return
-            content_type = mimetypes.guess_type(artifact.name)[0] or "application/octet-stream"
-            size = artifact.stat().st_size
+            if isinstance(artifact, Path):
+                filename, data = artifact.name, None
+                size = artifact.stat().st_size
+            else:
+                filename, data = artifact
+                size = len(data)
+            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(size))
             self.send_header(
                 "Content-Disposition",
-                f'attachment; filename="{artifact.name.replace(chr(34), "")}"',
+                f'attachment; filename="{filename.replace(chr(34), "")}"',
             )
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
-            with artifact.open("rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    self.wfile.write(chunk)
+            if data is not None:
+                self.wfile.write(data)
+            else:
+                with artifact.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        self.wfile.write(chunk)
             return
         self._json(404, {"error": "not found"})
 
@@ -1002,7 +1191,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -1027,6 +1216,16 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 if not isinstance(kind, str):
                     raise ValueError("browse kind must be a string")
                 result = {"paths": self.server.controller.browse(kind, multiple)}
+            elif endpoint == "/api/duckdb-import/settings":
+                result = self.server.controller.duckdb_import_settings(document)
+            elif endpoint == "/api/duckdb-import/preflight":
+                result = self.server.controller.duckdb_import_preflight(document)
+            elif endpoint == "/api/duckdb-import/start":
+                result = self.server.controller.start_duckdb_import(document)
+            elif endpoint == "/api/duckdb-import/cancel":
+                result = self.server.controller.cancel_duckdb_import()
+            elif endpoint == "/api/duckdb-import/migrate":
+                result = self.server.controller.migrate_duckdb_import(document)
             else:
                 action = str(document.get("action", ""))
                 result = self.server.controller.start(action, document)
@@ -1036,7 +1235,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             self._json(400, {"error": str(error)})
             return
-        self._json(200 if endpoint == "/api/browse" else 202, result)
+        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start"} else 200, result)
 
 
 def create_panel_server(

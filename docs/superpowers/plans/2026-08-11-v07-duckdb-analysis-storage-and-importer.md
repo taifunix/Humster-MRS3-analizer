@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Tasks 0–8 are complete; Task 9 is next. Task 6 was committed in `05369c2`; its
+**Status:** Tasks 0–10 are complete; Task 11A backend is complete, while Task 11 panel/build orchestration and Task 12 publication remain. Task 6 was committed in `05369c2`; its
 copied-real-HTML smoke established v3/v4/mrs3 adapter parity `PASS` and a
 temporary v3 DuckDB import with `1` scanned, `1` imported and `0` quarantined
 reports, `78` raw
@@ -266,27 +266,27 @@ import_html_tree(request: ImportRequest, progress_callback) -> ImportJobResult
 - Test: `tests/test_panel.py`
 - Test: `tests/test_duckdb_import.py`
 
-- [ ] Add RED tests for saved source DB/default HTML/audit roots, workers and
+- [x] Add RED tests for saved source DB/default HTML/audit roots, workers and
   batch size plus the separate analysis DB path and native directory pickers.
-- [ ] Require panel progress/final state to expose `parsed`, `inserted`,
+- [x] Require panel progress/final state to expose `parsed`, `inserted`,
   `replaced`, `identical`, `ambiguous` and `quarantined` explicitly; matching
   active content is classified only as `identical`.
-- [ ] Add RED progress-phase, cancellation, success and stable-failure tests.
-- [ ] Successful jobs expose verified manifest/checklist links and
+- [x] Add RED progress-phase, cancellation, success and stable-failure tests.
+- [x] Successful jobs expose verified manifest/checklist links and
   `safe_to_delete`; failed/cancelled jobs show explicit failure, finalized
   evidence links when present and always `safe_to_delete=NO`.
-- [ ] Never expose success/`YES` before both artifacts are finalized and hashes
+- [x] Never expose success/`YES` before both artifacts are finalized and hashes
   verified; the panel never performs deletion.
-- [ ] Add RED single-writer and stale-preflight rejection tests.
-- [ ] Define `DuckDBImportSettings`, `DuckDBImportProgress` and panel job state;
+- [x] Add RED single-writer and stale-preflight rejection tests.
+- [x] Define `DuckDBImportSettings`, `DuckDBImportProgress` and panel job state;
   keep parsing/schema logic out of HTML/JavaScript.
-- [ ] Persist `source_duckdb_path` and `analysis_duckdb_path` only in ignored
+- [x] Persist `source_duckdb_path` and `analysis_duckdb_path` only in ignored
   `config.local.json`; never put real paths in tracked templates or docs.
-- [ ] Add migration activation that runs every Task 7 validation and atomically
+- [x] Add migration activation that runs every Task 7 validation and atomically
   switches the ignored source path only after success; failure retains both the
   old file and old configured path.
-- [ ] Run GREEN: `.venv\Scripts\python.exe -m pytest tests/test_config.py tests/test_panel.py tests/test_duckdb_import.py -q`.
-- [ ] Review and commit: `feat: manage duckdb import from panel`.
+- [x] Run GREEN: root suite `87 passed, 1 skipped`; the skip requires Windows symlink privilege.
+- [x] Review after three fix rounds and commit: `feat: manage duckdb import from panel`.
 
 ### Task 10: Create the analysis DuckDB schema
 
@@ -296,14 +296,14 @@ import_html_tree(request: ImportRequest, progress_callback) -> ImportJobResult
 
 **Interface:** `ensure_analysis_schema(analysis_connection) -> int`.
 
-- [ ] RED-test bootstrap/version/foreign-key/unique constraints and rollback for
+- [x] RED-test bootstrap/version/foreign-key/unique constraints and rollback for
   exactly: `surfaces`, `surface_sources`, `surface_pairs`, `surface_timeframes`,
   `surface_points`, `coverage_issues`, `dedup_decisions`, `analysis_runs`,
   `plateaus`, `plateau_members`, `candidates`, `plateau_lineage`.
-- [ ] Implement only schema metadata, those tables and required indexes.
-- [ ] Use explicit distinct source/analysis connections in fixtures and assert
+- [x] Implement only schema metadata, those tables and required indexes.
+- [x] Use explicit distinct source/analysis connections in fixtures and assert
   the analysis DB contains no raw payloads, actions, equity or wallet data.
-- [ ] Run GREEN, review and commit: `feat: add analysis duckdb schema`.
+- [x] Run GREEN (13 focused tests), independent review and commit: `feat: add analysis duckdb schema` (`224a039`).
 
 ### Task 11: Materialize a `DUCKDB_DIRECT` surface
 
@@ -328,12 +328,12 @@ run_panel_direct_build(
 ) -> PublishedSurface
 ```
 
-- [ ] RED-test UTC `[start,end)` whole-report coverage, selected symbols,
+- [x] RED-test UTC `[start,end)` whole-report coverage, selected symbols,
   timeframe exclusion, manifest and `OBSERVED_GRID_CONTRACT` completeness,
   missing/conflicting cells and canonical point uniqueness.
-- [ ] Assert every final point has `point_event_count == TotalTrades` and the
+- [x] Assert every final point has `point_event_count == TotalTrades` and the
   surface declares one trades-proxy mode; real event IDs stay diagnostic only.
-- [ ] Implement active-report reads and deterministic coverage/dedup facts; do
+- [x] Implement active-report reads and deterministic coverage/dedup facts; do
   not route through or implement the deferred CSV overlay.
 - [ ] Add panel RED tests for usable symbols checked by default, noninteractive
   unavailable warnings, cancellable build and stale-preflight rejection after
@@ -343,7 +343,7 @@ run_panel_direct_build(
   and hashes are revalidated immediately before publication.
 - [ ] Use this action only for the initial direct build and a source-backed
   **Refine** that intentionally creates a child surface.
-- [ ] Require distinct source/analysis connections and prove no raw source data
+- [x] Require distinct source/analysis connections and prove no raw source data
   is copied into the analysis store.
 - [ ] Run GREEN: `.venv\Scripts\python.exe -m pytest tests/test_duckdb_direct.py tests/test_duckdb_events.py tests/test_pipeline.py tests/test_panel.py -q`.
 - [ ] Review and commit: `feat: materialize duckdb direct surfaces`.

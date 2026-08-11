@@ -59,6 +59,15 @@ Copy-Item config.local.json.example config.local.json
 выберите от 3 до 5 HTML-образцов; путь используется только во время локального
 запуска и не сохраняется в package manifest.
 
+Проверенный workflow импорта DuckDB в панели: в Settings задайте
+`source_duckdb_path`, `analysis_duckdb_path`, каталоги HTML/audit, число workers
+и batch size, затем выполните preflight перед Start. Задание можно отменить;
+панель показывает шесть счётчиков `parsed`, `inserted`, `replaced`, `identical`,
+`ambiguous` и `quarantined`. Миграция создаёт и проверяет новый файл вне места
+активного источника и активирует его только после успешной валидации, сохраняя
+параллельные изменения Settings. `safe_to_delete=YES` появляется лишь после
+проверки обоих артефактов; панель сама HTML не удаляет.
+
 Перед запуском на production данных прочитайте активную спецификацию: [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md).
 
 ## Важные ограничения
