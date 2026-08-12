@@ -7,7 +7,7 @@
 ## Verified repository baseline
 
 - Root package: `src/mrs3`; tests: `tests`; project version: `0.7.0`.
-- Latest complete repository suite: `478 passed, 2 skipped`
+- Latest complete repository suite: `485 passed, 2 skipped`
   (`.venv\\Scripts\\python.exe -m pytest -q --basetemp C:\\tmp\\humster-trusted-migration-full`, 2026-08-12).
   Both skips are Windows symlink-permission tests, not product failures.
 - DuckDB v3/v4 importer pair is preserved in `programs/Обработчик HTML-DuckDB/`; v4 requires adjacent v3 codec.
@@ -237,8 +237,11 @@ The full repository suite then passed `485` tests with the same two Windows
 symlink-permission skips.
 
 Configuration decision: Preflight and import intentionally use the same
-persisted `workers` value (`6` in the local configuration). A separate
+persisted `workers` value (`15` in the current local configuration). A separate
 `preflight_workers` setting is unnecessary and is not planned.
+
+Current session handoff for moving the long HTML import to another machine:
+[remote import handoff](docs/HANDOFF_2026-08-12_REMOTE_IMPORT.md).
 
 ## Queued module hook
 
