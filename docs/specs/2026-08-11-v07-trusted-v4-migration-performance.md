@@ -1,6 +1,6 @@
 # Trusted v4 migration performance
 
-**Status:** Implemented / production benchmark pending
+**Status:** Implemented / verified on production archive
 
 **Depends on:** [DuckDB analysis storage and importer](2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
 
@@ -42,6 +42,15 @@ check. It is not part of this production migration path.
 The configured worker and batch values from the panel are forwarded to the
 migration. CPU use can improve hashing throughput, but the single DuckDB
 writer and storage bandwidth prevent a promise of linear core scaling.
+
+## Production evidence
+
+On 2026-08-12 the trusted archive was migrated with `workers=8` and
+`transaction_batch_size=250`. Structural validation passed: `96,767` active
+reports, `96,767` payloads, `96,767` point rows and `96,527` time-grid rows.
+The resulting v5 file SHA-256 is
+`09ecfea75391602398b87f0d1523200280928b0e8b0080e272a65abc90d8b661`.
+No full v4 or v5 payload-decode pass was run as part of this trusted migration.
 
 ## Non-goals
 

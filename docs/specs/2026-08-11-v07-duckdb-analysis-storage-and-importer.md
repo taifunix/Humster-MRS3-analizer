@@ -173,6 +173,11 @@ Reports must cover the whole period. Missing or conflicting required grid
 cells exclude the affected timeframe. A symbol is unavailable only when no
 usable timeframe remains. The panel shows exact coverage reasons before build.
 
+Direct preflight validates the v5 schema, constraints, references, canonical
+keys and persisted row/payload hashes structurally. It does not decode every
+opaque report payload; full payload decoding remains an explicit integrity
+diagnostic and is not an everyday panel preflight cost.
+
 In direct mode `point_event_count = TotalTrades`. Confirmed event IDs and cycle
 audits may remain diagnostic, but they do not enter plateau eligibility or
 union.

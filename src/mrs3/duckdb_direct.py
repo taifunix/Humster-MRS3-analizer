@@ -14,7 +14,7 @@ from .duckdb_events import (
     decode_compact_deltas,
     decode_wallet_changes,
 )
-from .duckdb_source_schema import NORMALIZATION_CONTRACT_VERSION, validate_source_database
+from .duckdb_source_schema import NORMALIZATION_CONTRACT_VERSION, validate_source_database_structural
 from .source_packs import SourcePackError
 from .analysis_storage import PublishedSurface, publish_surface
 
@@ -105,7 +105,7 @@ def _reports(source: duckdb.DuckDBPyConnection, request: DirectBuildRequest) -> 
 def preflight_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, request: DirectBuildRequest) -> DirectPreflight:
     """Validate full UTC coverage and observed-grid completeness without decoding payloads."""
     start, end = _window(request)
-    validation = validate_source_database(source_connection)
+    validation = validate_source_database_structural(source_connection)
     if not validation.valid:
         raise DirectMaterializationError(f"invalid active v5 source: {validation.errors}")
     start_ms, end_ms = start.value // 1_000_000, end.value // 1_000_000

@@ -997,6 +997,7 @@ def _validate_v5_structural(connection: duckdb.DuckDBPyConnection) -> SourceVali
     metadata = _schema_metadata(connection)
     if metadata.get("schema_version") != str(SOURCE_SCHEMA_VERSION): raise SourceSchemaError("migrated database is not v5")
     _verify_contract_metadata(metadata, required=True)
+    if metadata.get("storage_mode") != STORAGE_MODE: raise SourceSchemaError("source database has incompatible storage mode")
     counts = tuple(int(connection.execute(f"select count(*) from {table}").fetchone()[0]) for table in ("active_reports", "point_configs", "time_grids", "report_payloads", "replacement_history"))
     reports, points, grids, payloads, replacements = counts
     if reports != payloads or int(connection.execute("select count(*) from active_reports r full outer join report_payloads p using(report_id) where r.report_id is null or p.report_id is null").fetchone()[0]): raise SourceSchemaError("active report/payload references do not match")
@@ -1011,6 +1012,14 @@ def _validate_v5_structural(connection: duckdb.DuckDBPyConnection) -> SourceVali
             raise SourceSchemaError("report payload codec is incompatible")
         if row["payload_sha256"] != _payload_hash(row): raise SourceSchemaError("report payload hash mismatch")
     return SourceValidationResult(True, SOURCE_SCHEMA_VERSION, reports, points, grids, payloads, replacements, ())
+
+
+def validate_source_database_structural(connection: duckdb.DuckDBPyConnection) -> SourceValidationResult:
+    """Validate v5 structure and hashes without decoding opaque report payloads."""
+    try:
+        return _validate_v5_structural(connection)
+    except (duckdb.Error, SourcePackError, SourceSchemaError, ValueError, zlib.error) as error:
+        return SourceValidationResult(False, 0, 0, 0, 0, 0, 0, (str(error),))
 
 
 def migrate_source_database(source_path: Path, target_path: Path, *, workers: int = 4, transaction_batch_size: int = 500) -> SourceMigrationResult:
@@ -1084,7 +1093,7 @@ def migrate_source_database(source_path: Path, target_path: Path, *, workers: in
 
         validation_connection = duckdb.connect(str(stage), read_only=True)
         try:
-            validation = _validate_v5_structural(validation_connection)
+            validation = validate_source_database_structural(validation_connection)
             migrated_hashes = frozenset(
                 str(row[0])
                 for row in validation_connection.execute(

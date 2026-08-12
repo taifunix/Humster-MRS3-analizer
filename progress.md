@@ -199,8 +199,17 @@ transaction; detached workers prepare records while one DuckDB writer commits
 them. Raw v4 report payloads are not decoded, and the staged v5 database is
 validated structurally before an atomic no-replace publish. Focused evidence:
 `67 passed` for `tests/test_duckdb_source_schema.py tests/test_panel.py`.
-The 96,767-report production migration has not yet been rerun, so no duration
-claim is recorded.
+The production trusted-v4 migration is complete. With `workers=8` and
+`transaction_batch_size=250`, it created the separately published v5 archive
+with structural validation `True`: `96,767` reports, `96,767` payloads,
+`96,767` point rows and `96,527` grids. Its target SHA-256 is
+`09ecfea75391602398b87f0d1523200280928b0e8b0080e272a65abc90d8b661`.
+The trusted contract deliberately did not run a full payload-decode pass.
+
+Direct DuckDB preflight now uses the same structural v5 validation rather than
+the full payload-decoding validator. It still reruns before build to reject a
+changed source snapshot; a focused regression forbids action/wallet decoders
+during preflight. Focused evidence: `18 passed` for `tests/test_duckdb_direct.py`.
 
 ## Next required work
 
@@ -208,14 +217,11 @@ The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
 slice; Tasks 1–15 are complete.
 
-1. Run the trusted-v4 production migration and record its observed duration,
-   counts and structural-validation result. Before direct panel analysis, fix
-   the separate preflight path so it does not perform full payload validation.
-2. Use the panel to initialize the chosen production analysis DuckDB, publish
+1. Use the panel to initialize the chosen production analysis DuckDB, publish
    required real surfaces and run their plateau analyses.
-3. Continue the READY-candidate → tester → DD5 product loop; source metrics
+2. Continue the READY-candidate → tester → DD5 product loop; source metrics
    remain diagnostic until those real tests exist.
-4. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
+3. Keep CSV/DuckDB overlay deferred unless the user activates its separate ТЗ.
 
 ## Blockers
 

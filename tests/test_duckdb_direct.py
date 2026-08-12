@@ -8,6 +8,7 @@ from dataclasses import replace
 import duckdb
 import pytest
 
+from mrs3 import duckdb_source_schema
 from mrs3.duckdb_direct import (
     CoverageIssue,
     DirectBuildRequest,
@@ -98,6 +99,41 @@ def test_preflight_accepts_utc_half_open_coverage_and_observed_grid_contract(con
     assert preflight.grid_contract["required_shifts_bp"] == (100,)
     assert preflight.grid_contract["pairs"] == ("100|3|9",)
     assert preflight.accepted_point_keys == (point,)
+
+
+def test_preflight_does_not_run_full_payload_validation(
+    connections, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = connections
+    _seed_report(source)
+
+    def forbidden(*_: object) -> object:
+        raise AssertionError("direct preflight must not decode all report payloads")
+
+    monkeypatch.setattr(duckdb_source_schema, "decode_compact_actions", forbidden)
+    monkeypatch.setattr(duckdb_source_schema, "decode_wallet_changes", forbidden)
+
+    assert preflight_duckdb_direct(source, _request()).usable_timeframes == {
+        "BTCUSDT": ("1h",)
+    }
+
+
+def test_preflight_rejects_incompatible_storage_mode(connections) -> None:
+    source, _ = connections
+    _seed_report(source)
+    source.execute("update schema_info set value='incompatible' where key='storage_mode'")
+
+    with pytest.raises(DirectMaterializationError, match="invalid active v5 source"):
+        preflight_duckdb_direct(source, _request())
+
+
+def test_preflight_wraps_structural_source_error(connections) -> None:
+    source, _ = connections
+    _seed_report(source)
+    source.execute("update active_reports set row_sha256=?", ["0" * 64])
+
+    with pytest.raises(DirectMaterializationError, match="invalid active v5 source"):
+        preflight_duckdb_direct(source, _request())
 
 
 def test_preflight_grid_contract_is_immutable(connections) -> None:
