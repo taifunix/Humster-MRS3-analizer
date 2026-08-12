@@ -697,3 +697,155 @@ redundancy_filter:
 7. если включен redundancy filter, откладываются только exact same-behavior dominated candidates;
 8. никакие weighted scores или arbitrary Top-N не используются;
 9. результат детерминирован.
+
+---
+
+# 24. DUCKDB_DIRECT independent events и интерактивный Phase 2
+
+Этот раздел уточняет контракт для v4/v5 HTML, загруженных в source DuckDB, и
+заменяет прежнее временное поведение `DUCKDB_DIRECT`, в котором
+`PointEventCount` приравнивался к `TotalTrades`.
+
+## 24.1. Real independent events в immutable surface
+
+При `Build surface` materializer обязан восстановить закрытые position cycles
+из compact actions каждого принятого отчёта строго по контракту
+`docs/specs/2026-08-10-v07-event-source-packs.md`, включая порядок actions,
+неполные/пересекающие границы окна cycles и invalid-order exclusions. Для
+каждого полностью попавшего в выбранное half-open UTC-окно цикла используется
+существующий детерминированный `event_id`:
+
+```text
+sha256(Pair + "|" + PositionSide + "|" + TF + "|" + OpenedAtUtcNs)
+```
+
+Для каждой point:
+
+```text
+PointEventSet = unique(event_id)
+PointEventCount = size(PointEventSet)
+OrderEventSignature = sha256(sorted(PointEventSet))
+event_mode = real_independent_events
+```
+
+`OpenedAtUtcNs` — целое число nanoseconds from Unix epoch, полученное после
+преобразования в `pandas.Timestamp` и нормализации в UTC. Поэтому текстовые
+представления одного instant (`Z`, `+00:00`, лишние нули fraction) дают одну
+строку hash input. Общий event-id helper используется и DuckDB package, и
+`DUCKDB_DIRECT`. Этот operational event contract для текущего этапа уточняет
+раздел 2: independent event здесь означает один reconstructed closed cycle с
+тем же Pair/PositionSide/TF и exact opening instant. Более широкая кластеризация
+нескольких циклов в одну market excursion является отдельной будущей
+калибровкой и в этот scope не входит.
+
+`TotalTrades` остаётся независимо пересчитанной window-метрикой и не является
+источником `PointEventCount`, даже если их значения совпали. Проверка window
+metrics выполняется по ADR
+`docs/decisions/0002-source-summary-and-window-metrics-verification.md` и тому
+же `calculate_point_metrics`, который использует DuckDB package. Ошибка
+декодирования, reconstruction или нарушения структурных инвариантов блокирует
+публикацию; расхождение с full-horizon HTML summary само по себе не является
+ошибкой для другого UTC-окна.
+
+Analysis DuckDB хранит membership событий как immutable facts, связанные с
+`surface_id` и `canonical_point_key`. Существующие опубликованные
+`legacy_trades_proxy` surface не изменяются задним числом. Для применения
+нового контракта пользователь повторяет `Build surface` и analysis run из уже
+импортированного source DuckDB; повторный HTML-импорт не требуется.
+`event_mode` входит в canonical surface identity. Переход на этот контракт
+обязан увеличить `materializer_version` и изменить
+`point_materialization_config_hash`, поэтому real-events build всегда получает
+новый `surface_id` и не может дедуплицироваться в legacy surface.
+
+## 24.2. Неразрушающее применение Phase 2
+
+Phase 2 является воспроизводимым представлением immutable analysis run и не
+перезаписывает сохранённые candidates. Exact `BehaviorKey` всегда является
+обязательной границей сравнения. Кандидаты из разных `BehaviorKey` никогда не
+сравниваются.
+
+Панель предоставляет независимые checkbox-критерии:
+
+- `Source PnL`;
+- `PnL/DD`;
+- `CloseSupport`;
+- `PointEventCount`.
+
+Поскольку exact `BehaviorKey` уже включает полные `OrderEventSignature`,
+`PointEventCount` соответствующих orders внутри одной группы математически
+одинаков. Поэтому этот checkbox сохраняется как явная проверка контракта и для
+audit, но при корректных данных самостоятельно не должен откладывать
+candidates. Непустой результат его criterion sheet считается нарушением
+инварианта.
+
+При выбранном наборе критериев сравниваются ordered orders A и B с одинаковыми
+позициями внутри общего `BehaviorKey`. Для каждого включённого критерия A
+должен быть не хуже B **на каждом соответствующем order**. Для
+`CloseSupport` дополнительно явно сравнивается minimum по всем orders. Хотя бы
+одно из всех сравниваемых order-level значений должно быть строго лучше.
+Суммирование или усреднение `Source PnL` orders запрещено: `Source PnL`
+сравнивается только как ordered vector `Order1 A >= Order1 B`, `Order2 A >=
+Order2 B` и так далее. Aggregate strategy PnL не вычисляется и не участвует ни
+в dominance, ни в criterion sheets XLS.
+
+В терминах раздела 18 исходный persisted `READY_MRS3_STRUCTURE` соответствует
+`READY_ALL`. Если условие выполнено, view-level `filter_status` B становится
+`DEFERRED_REDUNDANT`; в противном случае он остаётся
+`READY_AFTER_FILTERS`, что соответствует `TEST_PRIMARY`. Исходный сохранённый status
+`READY_MRS3_STRUCTURE` не изменяется. Если B доминируют несколько candidates,
+`deferred_by` равен `StructureID` лексикографически минимальной пары
+`(StructureID, candidate_id)` среди всех валидных dominators. При отсутствии
+выбранных критериев все исходные READY
+candidates получают `READY_AFTER_FILTERS`. Результат обязан содержать
+`deferred_by`, `deferred_by_candidate_id`, список включённых критериев и
+сравниваемые order-level значения A/B. Удаление candidates запрещено.
+
+Один включённый критерий является диагностическим single-dimension view.
+Одновременное включение всех четырёх критериев является safe Pareto filter из
+раздела 15. Улучшение по одному критерию не компенсирует ухудшение по другому:
+такие candidates остаются `READY_AFTER_FILTERS`. Генерация JSON использует
+только `READY_AFTER_FILTERS` текущего представления, но исходный analysis run
+остаётся неизменным.
+
+## 24.3. XLS audit выбранных фильтров
+
+Панель предоставляет `Export filter audit XLS`. Workbook создаётся для
+конкретных `run_id`, набора критериев и версии алгоритма и содержит минимум:
+
+- `Summary` — входное количество, активные критерии, READY и deferred counts;
+- `READY_AFTER_FILTERS` — итоговый список оставшихся candidates;
+- отдельный лист для каждого включённого критерия — candidates, которые этот
+  критерий отложил бы при самостоятельном применении внутри exact
+  `BehaviorKey`;
+- `DEFERRED_COMBINED` — фактически отложенные текущей комбинацией критериев.
+
+Каждая строка исключения содержит candidate ID, `BehaviorKey`, `deferred_by`,
+критерий или комбинацию критериев, значения A/B по всем четырём измерениям и
+детерминированную причину. Листы создаются в перечисленном выше порядке,
+criterion sheets — в порядке `Source PnL`, `PnL/DD`, `CloseSupport`,
+`PointEventCount`, а строки каждого листа сортируются по `BehaviorKey`, затем
+`candidate_id`. Даже пустой включённый criterion sheet содержит фиксированные
+headers. Числа экспортируются как числа без предварительного округления.
+Повторный export с теми же `run_id`, algorithm version и criteria обязан давать
+эквивалентные табличные данные; byte-identical XLSX не требуется.
+
+## 24.4. Дополнительные acceptance tests
+
+1. Две points одного Pair/Side/TF с одинаковым временем открытия получают
+   общий `event_id`, даже если их shift/MA различаются.
+2. `PointEventCount` равен числу уникальных восстановленных циклов, а не слепо
+   скопированному `TotalTrades`.
+3. Эквивалентные timestamp representations дают одинаковый `event_id`, а
+   legacy и real-events builds имеют разные `surface_id`.
+4. Published surface загружает exact event membership без обращения к source
+   DuckDB.
+5. BehaviorKey меняется при изменении любой ordered OrderEventSignature.
+6. Каждый checkbox работает отдельно; комбинация требует одного общего
+   dominator A, не худшего по каждому order-level значению всех включённых
+   критериев.
+7. Если A лучше по одному включённому критерию, но хуже по другому, ни A, ни B
+   не откладываются этой парой.
+8. Фильтр не сравнивает разные BehaviorKey и не изменяет analysis run.
+9. При нескольких dominators `deferred_by` выбирается детерминированно.
+10. XLS содержит отдельные criterion sheets и итоговый combined sheet с полным
+   audit trail.
