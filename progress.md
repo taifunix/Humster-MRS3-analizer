@@ -236,10 +236,9 @@ disabled while the background preflight is active. Focused evidence is
 The full repository suite then passed `485` tests with the same two Windows
 symlink-permission skips.
 
-Backlog note: preflight currently uses the persisted `workers` value (`6` in
-the local configuration), shared with import parsing. A separate
-`preflight_workers` setting is planned but not yet implemented; see the
-[follow-up plan](docs/superpowers/plans/2026-08-12-html-import-preflight-progress.md).
+Configuration decision: Preflight and import intentionally use the same
+persisted `workers` value (`6` in the local configuration). A separate
+`preflight_workers` setting is unnecessary and is not planned.
 
 ## Queued module hook
 
