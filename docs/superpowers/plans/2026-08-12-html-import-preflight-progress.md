@@ -49,3 +49,16 @@ pytest.
   `validate_source_database_structural`.
 - [x] Run focused tests, `git diff --check`, independent review and re-review
   if needed; update spec/PRD/progress and create one scoped `fix:` commit.
+
+### Follow-up backlog: independent preflight worker count
+
+The current production setting `workers=6` is shared by HTML snapshotting,
+HTML parsing and detached import preparation. This is adequate for the
+current 10-core/50-GB machine, but it couples two different bottlenecks.
+Evaluate adding a separate persisted `preflight_workers` setting in the panel
+and `DuckDBImportSettings`, with validation and a safe fallback to `workers`
+for old `config.local.json` files. The setting must affect only snapshot/hash
+workers; import parsing and the single DuckDB writer keep their existing
+contracts. Add focused settings, request-wiring and concurrency tests before
+implementation. Do not change the current setting until that task is
+implemented and reviewed.

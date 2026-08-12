@@ -236,6 +236,11 @@ disabled while the background preflight is active. Focused evidence is
 The full repository suite then passed `485` tests with the same two Windows
 symlink-permission skips.
 
+Backlog note: preflight currently uses the persisted `workers` value (`6` in
+the local configuration), shared with import parsing. A separate
+`preflight_workers` setting is planned but not yet implemented; see the
+[follow-up plan](docs/superpowers/plans/2026-08-12-html-import-preflight-progress.md).
+
 ## Queued module hook
 
 **Анализатор Портфеля:** [спецификация v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) передана отдельной команде. Начинать с проверки входных контрактов; до trade timestamps и определённого limiter допускается только Layer A, без симулятора и рекомендаций по сету.
