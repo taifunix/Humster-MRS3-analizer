@@ -25,7 +25,7 @@ from .analysis_exports import export_analysis_run
 from .analysis_storage import compare_analysis_runs, ensure_analysis_schema, list_surface_library, publish_analysis_run
 from .config import AlgorithmConfig
 from .config import DuckDBImportSettings, load_duckdb_import_settings, save_duckdb_import_settings
-from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, import_html_tree, preflight_html_import
+from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, SnapshotProgress, import_html_tree, preflight_html_import
 from .duckdb_source_schema import migrate_source_database
 from .duckdb_direct import DirectBuildRequest, DirectMaterializationError, DirectPreflight, preflight_duckdb_direct, run_panel_direct_build
 from .models import Side
@@ -352,7 +352,7 @@ function showDuckdbSettings(settings) { const fields={source_duckdb_path:'import
 async function loadDuckdbSettings() { try { const response=await fetch('/api/duckdb-import/settings', {cache:'no-store'}); const settings=await response.json(); if (!response.ok) throw new Error(settings.error || 'Settings load failed'); showDuckdbSettings(settings); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function saveDuckdbSettings() { try { const settings=await duckdbRequest('/api/duckdb-import/settings', {source_duckdb_path:value('import_source_duckdb') || null, analysis_duckdb_path:value('import_analysis_duckdb') || null, default_html_root:value('import_default_html_root') || null, audit_root:value('import_audit_root') || null, workers:value('import_workers'), transaction_batch_size:value('import_batch_size')}); showDuckdbSettings(settings); document.getElementById('notice').textContent='Настройки импорта сохранены.'; } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function migrateDuckdb() { try { const settings=await duckdbRequest('/api/duckdb-import/migrate', {target_path:value('migration_target')}); showDuckdbSettings(settings); document.getElementById('notice').textContent='Миграция проверена и активирована.'; } catch (error) { document.getElementById('notice').textContent=error.message; } }
-async function duckdbPreflight() { try { const result = await duckdbRequest('/api/duckdb-import/preflight', {root_path:value('import_html_root')}); duckdbPreflightToken=result.token; document.getElementById('notice').textContent=`Preflight: ${result.discovered} reports.`; } catch (error) { document.getElementById('notice').textContent=error.message; } }
+async function duckdbPreflight() { try { render(await duckdbRequest('/api/duckdb-import/preflight', {root_path:value('import_html_root')})); document.getElementById('notice').textContent='Preflight started.'; } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function duckdbImport() { try { const result = await duckdbRequest('/api/duckdb-import/start', {root_path:value('import_html_root'), preflight_token:duckdbPreflightToken}); render(result); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function duckdbCancel() { try { render(await duckdbRequest('/api/duckdb-import/cancel')); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 let directPreflightToken = '';
@@ -398,6 +398,13 @@ function render(data) {
   renderDashboard(data.dashboard);
   const imported = data.duckdb_import;
   if (imported) { document.getElementById('duckdbImportStatus').textContent = `${imported.final_state} · safe_to_delete=${imported.safe_to_delete}`; for (const [name, count] of Object.entries(imported.counts || {})) { const item=document.getElementById('import_'+name); if (item) item.textContent=count; } }
+  const preflight = data.duckdb_import_preflight;
+  if (preflight) { const bytes=v=>`${(Number(v||0)/1073741824).toFixed(2)} GB`; document.getElementById('duckdbImportStatus').textContent = preflight.running ? `Preflight · ${preflight.snapshotted}/${preflight.discovered} files · ${bytes(preflight.processed_bytes)}/${bytes(preflight.total_bytes)}` : (preflight.error || `Preflight ready · ${preflight.discovered} reports`); if(preflight.token) duckdbPreflightToken=preflight.token; }
+  const preflightBusy = Boolean(preflight?.running);
+  const importBusy = Boolean(imported?.running);
+  if (imported && !preflight && !preflightBusy) document.getElementById('duckdbImportStatus').textContent = `${imported.final_state} / safe_to_delete=${imported.safe_to_delete}`;
+  document.querySelector('button[onclick="duckdbPreflight()"]')?.toggleAttribute('disabled', preflightBusy || importBusy);
+  document.querySelector('button[onclick="duckdbImport()"]')?.toggleAttribute('disabled', preflightBusy || importBusy || !preflight?.token);
   const analysis = data.analysis;
   if (analysis) { document.getElementById('analysis_surface_id').value=analysis.surface_id||''; if(analysis.run_id) document.getElementById('analysis_run_id').value=analysis.run_id; showAnalysisFacts(analysis.statistics||{}); document.getElementById('analysisStatus').textContent=`${analysis.phase}${analysis.run_id?' · '+analysis.run_id:''}${analysis.error?' · '+analysis.error:''}`; }
   const direct = data.duckdb_direct;
@@ -510,6 +517,19 @@ class _ImportJob:
 
 
 @dataclass(slots=True)
+class _ImportPreflightJob:
+    root: Path
+    running: bool = True
+    phase: str = "SNAPSHOTTING"
+    discovered: int = 0
+    snapshotted: int = 0
+    total_bytes: int = 0
+    processed_bytes: int = 0
+    token: str | None = None
+    error: str | None = None
+
+
+@dataclass(slots=True)
 class _DirectJob:
     request: DirectBuildRequest
     preflight_request: DirectBuildRequest
@@ -569,6 +589,7 @@ class PanelController:
         self._preflight: ImportPreflight | None = None
         self._preflight_root: Path | None = None
         self._import_job: _ImportJob | None = None
+        self._import_preflight_job: _ImportPreflightJob | None = None
         self._preflight_func = preflight_func
         self._import_func = import_func
         self._migration_func = migration_func
@@ -784,15 +805,49 @@ class PanelController:
     def duckdb_import_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
         settings = self._import_settings()
         root = self._path(self._required(payload, "root_path"))
-        preflight = self._preflight_func(self._request(root, settings))
+        # Injected test/dry-run implementations stay synchronous; production
+        # preflight runs in the background so the browser can poll progress.
+        if self._preflight_func is not preflight_html_import:
+            with self._lock:
+                if self._import_job and self._import_job.running: raise RuntimeError("HTML import is already running")
+                if self._import_preflight_job and self._import_preflight_job.running: raise RuntimeError("HTML preflight is already running")
+                job = _ImportPreflightJob(root); self._import_preflight_job = job
+            try:
+                preflight = self._preflight_func(self._request(root, settings))
+            except BaseException:
+                with self._lock: job.running, job.phase, job.error = False, "FAILED", "HTML preflight failed"
+                raise
+            with self._lock:
+                self._preflight, self._preflight_root = preflight, root
+                job.running, job.phase, job.discovered, job.snapshotted, job.token = False, "READY", preflight.discovered, preflight.discovered, preflight.token
+            return self.snapshot()["duckdb_import_preflight"]
         with self._lock:
-            self._preflight, self._preflight_root = preflight, root
-        return {"token": preflight.token, "discovered": preflight.discovered, "source_schema_version": preflight.source_schema_version, "target_identity_digest": preflight.target_identity_digest}
+            if self._import_preflight_job and self._import_preflight_job.running: raise RuntimeError("HTML preflight is already running")
+            if self._import_job and self._import_job.running: raise RuntimeError("HTML import is already running")
+            self._preflight = None
+            self._preflight_root = None
+            job = _ImportPreflightJob(root); self._import_preflight_job = job
+        threading.Thread(target=self._run_duckdb_import_preflight, args=(job, settings), name="mrs3-panel-duckdb-preflight", daemon=True).start()
+        return self.snapshot()["duckdb_import_preflight"]
+
+    def _run_duckdb_import_preflight(self, job: _ImportPreflightJob, settings: DuckDBImportSettings) -> None:
+        def progress(item: SnapshotProgress) -> None:
+            with self._lock: job.discovered, job.snapshotted, job.total_bytes, job.processed_bytes = item.discovered, item.snapshotted, item.total_bytes, item.processed_bytes
+        try:
+            if len(inspect.signature(self._preflight_func).parameters) > 1:
+                preflight = self._preflight_func(self._request(job.root, settings), progress)
+            else: preflight = self._preflight_func(self._request(job.root, settings))
+            with self._lock: self._preflight, self._preflight_root, job.token, job.phase = preflight, job.root, preflight.token, "READY"
+        except BaseException:
+            with self._lock: job.phase, job.error = "FAILED", "HTML preflight failed"
+        finally:
+            with self._lock: job.running = False
 
     def start_duckdb_import(self, payload: Mapping[str, object]) -> dict[str, object]:
         root, token = self._path(self._required(payload, "root_path")), self._required(payload, "preflight_token")
         with self._lock:
             if self._import_job is not None and self._import_job.running: raise RuntimeError("another import is already running")
+            if self._import_preflight_job is not None and self._import_preflight_job.running: raise RuntimeError("HTML preflight is still running")
             if self._preflight is None or self._preflight_root != root or self._preflight.token != token: raise ValueError("latest preflight token is required")
             job = _ImportJob(token, root); self._import_job = job
         threading.Thread(target=self._run_duckdb_import, args=(job,), name="mrs3-panel-duckdb-import", daemon=True).start()
@@ -1414,6 +1469,8 @@ class PanelController:
                     },
                 }
             import_job = self._import_job
+            preflight_job = self._import_preflight_job
+            preflight_document = None if preflight_job is None else {"running": preflight_job.running, "phase": preflight_job.phase, "discovered": preflight_job.discovered, "snapshotted": preflight_job.snapshotted, "total_bytes": preflight_job.total_bytes, "processed_bytes": preflight_job.processed_bytes, "token": preflight_job.token, "error": preflight_job.error}
             if import_job is None:
                 import_document = None
             else:
@@ -1457,6 +1514,7 @@ class PanelController:
             },
             "job": job_document,
             "duckdb_import": import_document,
+            "duckdb_import_preflight": preflight_document,
             "duckdb_direct": direct_document,
             "analysis": analysis_document,
             "dashboard": dashboard,

@@ -5,7 +5,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import shutil
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 
 import duckdb
 import pytest
@@ -818,6 +818,30 @@ def test_preflight_is_deterministic_and_authorizes_unchanged_import(tmp_path: Pa
     assert first.discovered == 1
     assert first.source_schema_version is None
     assert result.final_state == "COMMITTED"
+
+
+def test_preflight_snapshots_in_parallel_and_reports_byte_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "a/report.html")
+    _copy_report(incoming, "b/report.html", "report_b.html")
+    request = _request(tmp_path, incoming)
+    gate = Barrier(2)
+    original = duckdb_import._snapshot_one
+
+    def gated(root: Path, path: Path):
+        gate.wait(timeout=2)
+        return original(root, path)
+
+    monkeypatch.setattr(duckdb_import, "_snapshot_one", gated)
+    progress = []
+    preflight = preflight_html_import(request, progress.append)
+
+    assert preflight.discovered == 2
+    assert [item.snapshotted for item in progress] == [0, 1, 2]
+    assert progress[0].discovered == 2 and progress[0].total_bytes > 0
+    assert progress[-1].processed_bytes == progress[-1].total_bytes > 0
 
 
 def test_changed_input_after_preflight_is_rejected_without_target_mutation(tmp_path: Path) -> None:

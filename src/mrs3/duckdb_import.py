@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -29,6 +29,7 @@ from .duckdb_source_schema import (
     ensure_source_schema,
     normalize_source_shift,
     validate_source_database,
+    validate_source_database_structural,
 )
 from .locking import OutputDirectoryLock
 
@@ -57,6 +58,14 @@ class ImportPreflight:
     discovered: int
     source_schema_version: int | None
     target_identity_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotProgress:
+    discovered: int
+    snapshotted: int
+    total_bytes: int
+    processed_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,17 +171,23 @@ def _codec_source_sha256(source: bytes) -> str:
     return sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def _snapshot_reports(root: Path, paths: tuple[Path, ...]) -> tuple[_Snapshot, ...]:
-    return tuple(
-        _Snapshot(
-            path=path,
-            relative_path=_canonical_relative(path, root),
-            input_sha256=sha256(source := path.read_bytes()).hexdigest(),
-            codec_source_sha256=_codec_source_sha256(source),
-            source_size=len(source),
-        )
-        for path in paths
-    )
+def _snapshot_one(root: Path, path: Path) -> _Snapshot:
+    source = path.read_bytes()
+    return _Snapshot(path, _canonical_relative(path, root), sha256(source).hexdigest(), _codec_source_sha256(source), len(source))
+
+
+def _snapshot_reports(root: Path, paths: tuple[Path, ...], workers: int = 1, progress_callback: Callable[[SnapshotProgress], object] | None = None) -> tuple[_Snapshot, ...]:
+    total_bytes = sum(path.stat().st_size for path in paths)
+    if progress_callback:
+        progress_callback(SnapshotProgress(len(paths), 0, total_bytes, 0))
+    results: list[_Snapshot | None] = [None] * len(paths)
+    processed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_snapshot_one, root, path): index for index, path in enumerate(paths)}
+        for completed, future in enumerate(as_completed(futures), start=1):
+            snapshot = future.result(); results[futures[future]] = snapshot; processed += snapshot.source_size
+            if progress_callback: progress_callback(SnapshotProgress(len(paths), completed, total_bytes, processed))
+    return tuple(snapshot for snapshot in results if snapshot is not None)
 
 
 def _inputs_unchanged(snapshots: tuple[_Snapshot, ...]) -> bool:
@@ -228,7 +243,7 @@ def _preflight_from_snapshots(
         try:
             connection = duckdb.connect(str(database_path), read_only=True)
             try:
-                validation = validate_source_database(connection)
+                validation = validate_source_database_structural(connection)
             finally:
                 connection.close()
         except Exception as exc:
@@ -249,10 +264,10 @@ def _preflight_from_snapshots(
     )
 
 
-def preflight_html_import(request: ImportRequest) -> ImportPreflight:
+def preflight_html_import(request: ImportRequest, progress_callback: Callable[[SnapshotProgress], object] | None = None) -> ImportPreflight:
     """Snapshot recursive HTML inputs and validate the current source target."""
     root = Path(request.root_path)
-    snapshots = _snapshot_reports(root, discover_compact_reports(root))
+    snapshots = _snapshot_reports(root, discover_compact_reports(root), request.workers, progress_callback)
     return _preflight_from_snapshots(Path(request.database_path), snapshots)[0]
 
 
@@ -594,7 +609,7 @@ def _import_html_tree(
         raise ValueError("workers and transaction_batch_size must be at least one")
     root = Path(request.root_path)
     paths = discover_compact_reports(root)
-    snapshots = _snapshot_reports(root, paths)
+    snapshots = _snapshot_reports(root, paths, request.workers)
     active_hashes: tuple[str, ...] = ()
     database_path = Path(request.database_path)
     expected_target_identity: str | None = None

@@ -125,6 +125,15 @@ Daily import controls:
   reports;
 - final manifest/checklist links and explicit success/failure state.
 
+### Large HTML preflight progress
+
+For a large HTML tree, Preflight snapshots and hashes every discovered file
+before it can authorize import. The panel runs this work in the configured
+worker pool and exposes a live, non-path-leaking state with discovered-file
+count, snapshotted-file count and processed bytes/total bytes. It disables a
+second Preflight or Start action while that request is active. This is only a
+progress surface; it does not change the snapshot/token safety contract.
+
 Settings contain:
 
 - source DuckDB path;

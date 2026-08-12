@@ -11,6 +11,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
+from mrs3 import panel as panel_module
 from mrs3.panel import PanelController, _Job, create_panel_server
 from mrs3.duckdb_import import ImportJobResult, ImportPreflight, ImportProgress
 from mrs3.duckdb_direct import CoverageIssue, DirectPreflight
@@ -361,6 +362,32 @@ def test_duckdb_import_settings_preflight_start_cancel_and_evidence_gate(tmp_pat
     assert controller.cancel_duckdb_import()["running"] is False
 
 
+def test_default_html_preflight_runs_in_background_and_exposes_progress(tmp_path: Path) -> None:
+    html_root = tmp_path / "html"
+    html_root.mkdir()
+    (html_root / "a.html").write_bytes(b"a")
+    (html_root / "nested.html").write_bytes(b"b")
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        preflight_func=panel_module.preflight_html_import,
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "audit_root": "audit", "workers": 2}
+    )
+
+    initial = controller.duckdb_import_preflight({"root_path": "html"})
+    assert initial["running"] is True or initial["phase"] == "READY"
+    deadline = time.monotonic() + 2
+    while controller.snapshot()["duckdb_import_preflight"]["running"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    status = controller.snapshot()["duckdb_import_preflight"]
+    assert status["phase"] == "READY"
+    assert status["discovered"] == status["snapshotted"] == 2
+    assert status["processed_bytes"] == status["total_bytes"] == 2
+    assert status["token"]
+
+
 def test_duckdb_import_rejects_stale_and_parallel_jobs_and_tampered_evidence(tmp_path: Path) -> None:
     released = __import__("threading").Event()
     started = __import__("threading").Event()
@@ -389,6 +416,44 @@ def test_duckdb_import_rejects_stale_and_parallel_jobs_and_tampered_evidence(tmp
     job = controller.snapshot()["duckdb_import"]
     assert job["safe_to_delete"] == "NO"
     assert job["artifacts"] == {}
+
+
+def test_duckdb_preflight_rejects_running_import(tmp_path: Path) -> None:
+    started = __import__("threading").Event()
+    release = __import__("threading").Event()
+
+    def preflight(_: object) -> ImportPreflight:
+        return ImportPreflight("fresh", 1, 5, "digest")
+
+    def importer(_: object, __: object) -> ImportJobResult:
+        started.set(); release.wait(1)
+        return _import_result(tmp_path)
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", preflight_func=preflight, import_func=importer)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "audit_root": "audit"})
+    controller.duckdb_import_preflight({"root_path": "html"})
+    controller.start_duckdb_import({"root_path": "html", "preflight_token": "fresh"})
+    assert started.wait(1)
+    with pytest.raises(RuntimeError, match="already running"):
+        controller.duckdb_import_preflight({"root_path": "html"})
+    release.set()
+
+
+def test_sync_preflight_marker_blocks_import_for_entire_call(tmp_path: Path) -> None:
+    started = __import__("threading").Event()
+    release = __import__("threading").Event()
+
+    def preflight(_: object) -> ImportPreflight:
+        started.set(); release.wait(1)
+        return ImportPreflight("fresh", 1, 5, "digest")
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", preflight_func=preflight)
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "audit_root": "audit"})
+    worker = __import__("threading").Thread(target=lambda: controller.duckdb_import_preflight({"root_path": "html"}))
+    worker.start(); assert started.wait(1)
+    with pytest.raises(RuntimeError, match="preflight is still running"):
+        controller.start_duckdb_import({"root_path": "html", "preflight_token": "fresh"})
+    release.set(); worker.join(1)
 
 
 def test_duckdb_import_migration_activates_only_valid_unchanged_target(tmp_path: Path) -> None:
@@ -494,6 +559,7 @@ def test_http_ui_exposes_persistent_import_settings_and_migration_controls(tmp_p
         assert {"saveDuckdbSettings()", "migrateDuckdb()", "directPreflight()", "directBuild()", "directCancel()"} <= parser.actions
         panel_html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
         assert ".direct-unavailable" in panel_html and "row.className='direct-unavailable'" in panel_html
+        assert "duckdb_import_preflight" in panel_html and "processed_bytes" in panel_html
     finally:
         connection.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
 

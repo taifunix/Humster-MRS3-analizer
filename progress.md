@@ -228,6 +228,14 @@ slice; Tasks 1–15 are complete.
 - CSV/DuckDB overlay is explicitly deferred and no economic threshold changes
   are implied.
 
+The HTML import preflight UX follow-up is complete: snapshots run with the
+configured worker pool, the panel exposes path-free discovered/snapshotted and
+processed/total-byte progress, and duplicate Preflight/Start actions are
+disabled while the background preflight is active. Focused evidence is
+`81 passed, 1 skipped` for `tests/test_duckdb_import.py tests/test_panel.py`.
+The full repository suite then passed `485` tests with the same two Windows
+symlink-permission skips.
+
 ## Queued module hook
 
 **Анализатор Портфеля:** [спецификация v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) передана отдельной команде. Начинать с проверки входных контрактов; до trade timestamps и определённого limiter допускается только Layer A, без симулятора и рекомендаций по сету.
