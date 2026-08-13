@@ -135,11 +135,10 @@ def parse_strategy_table(fragment: str) -> tuple[StrategyRow, ...]:
         action_cell = cells[-1]
         has_result, run_id = _result_run_id(action_cell)
         percent = _progress_percent(action_cell)
-        if has_result:
-            state = RowState.RESULT
-            percent = None
-        elif percent is not None:
+        if percent is not None:
             state = RowState.RUNNING
+        elif has_result:
+            state = RowState.RESULT
         else:
             state = RowState.TEST
         rows.append(

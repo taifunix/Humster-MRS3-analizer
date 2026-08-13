@@ -136,14 +136,24 @@ def stop_bot(
 
     shutdown_error: str | None = None
     endpoint_called = False
-    client = client_factory(config)
+    client: ShutdownClient | None = None
     try:
+        client = client_factory(config)
         client.shutdown()
         endpoint_called = True
     except Exception as error:
         shutdown_error = f"{type(error).__name__}: {error}"
     finally:
-        client.close()
+        if client is not None:
+            try:
+                client.close()
+            except Exception as error:
+                close_error = f"{type(error).__name__}: {error}"
+                shutdown_error = (
+                    f"{shutdown_error}; close={close_error}"
+                    if shutdown_error is not None
+                    else f"close={close_error}"
+                )
 
     if _wait_for_exit(bot.process, config.shutdown_timeout_seconds):
         return StopResult(

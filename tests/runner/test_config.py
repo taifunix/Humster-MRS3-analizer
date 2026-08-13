@@ -40,6 +40,10 @@ def test_runner_config_resolves_paths_and_runtime_values(tmp_path: Path) -> None
                     "wizard_progress": "tester/wizard_progress.json",
                     "bot_args": ["--port", "8087"],
                     "poll_interval_seconds": 0.25,
+                    "max_parallel_submissions": 10,
+                    "max_strategy_attempts": 4,
+                    "max_bot_restarts": 30,
+                    "submission_delay_seconds": 0.2,
                 }
             }
         ),
@@ -54,6 +58,11 @@ def test_runner_config_resolves_paths_and_runtime_values(tmp_path: Path) -> None
     assert config.report_dir == (bot / "tester" / "report" / "my_test").resolve()
     assert config.bot_args == ("--port", "8087")
     assert config.poll_interval_seconds == pytest.approx(0.25)
+    assert config.max_parallel_submissions == 10
+    assert config.max_strategy_attempts == 4
+    assert config.max_bot_restarts == 30
+    assert config.submission_delay_seconds == pytest.approx(0.2)
+    assert config.result_report_grace_seconds == pytest.approx(15)
 
 
 @pytest.mark.parametrize(

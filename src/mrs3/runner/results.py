@@ -7,6 +7,7 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 import tempfile
+from typing import Mapping
 from urllib.parse import unquote, urlparse
 
 from lxml import etree, html as lxml_html
@@ -340,6 +341,7 @@ def reconcile_results(
     wizard_results: tuple[WizardResult, ...],
     report_dir: Path,
     tolerance: Decimal,
+    report_paths: Mapping[str, Path] | None = None,
 ) -> pd.DataFrame:
     if len(set(expected_names)) != len(expected_names) or not expected_names:
         raise ValueError("expected strategy names must be non-empty and unique")
@@ -361,8 +363,12 @@ def reconcile_results(
     resolved_report_dir = report_dir.resolve()
     for name in expected_names:
         result = by_name[name]
-        report_path = (resolved_report_dir / result.report_name).resolve()
-        if report_path.parent != resolved_report_dir or not report_path.is_file():
+        report_path = (report_paths or {}).get(name)
+        if report_path is None:
+            report_path = (resolved_report_dir / result.report_name).resolve()
+        else:
+            report_path = report_path.resolve()
+        if not report_path.is_file():
             raise ResultParseError(f"HTML report is missing for {name}: {report_path}")
         report = parse_html_report(report_path)
         if report.strategy_name != name:

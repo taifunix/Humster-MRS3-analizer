@@ -65,6 +65,23 @@ def test_strategy_table_parses_ready_running_and_result_rows() -> None:
     assert rows[2].percent == pytest.approx(62)
 
 
+def test_strategy_table_prefers_live_progress_over_stale_result_link() -> None:
+    rows = parse_strategy_table(
+        """
+        <table id="tester-strategies-table"><tbody><tr>
+          <td>Bybit</td><td>ONUSDT</td><td>mrs3</td><td>5m</td><td>A</td>
+          <td>
+            <button hx-get="/htmx/tester/wizard/result?runId=old-run">Result</button>
+            <progress value="28" max="100"></progress>
+          </td>
+        </tr></tbody></table>
+        """
+    )
+
+    assert rows[0].state is RowState.RUNNING
+    assert rows[0].percent == pytest.approx(28)
+
+
 def test_launch_rejects_wizard_for_different_strategy() -> None:
     wizard_html = (FIXTURES / "tester_wizard.html").read_text(encoding="utf-8")
     transport = httpx.MockTransport(lambda request: httpx.Response(200, text=wizard_html))

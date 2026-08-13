@@ -49,6 +49,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     tester_plan.add_argument("--config", type=Path, required=True)
     tester_plan.add_argument("--strategies", type=Path, required=True)
+    tester_plan.add_argument("--output-csv", type=Path)
     tester_run = subparsers.add_parser(
         "tester-run", help="run every strategy through the Hamster Bot tester"
     )
@@ -56,7 +57,7 @@ def _parser() -> argparse.ArgumentParser:
     tester_run.add_argument("--strategies", type=Path, required=True)
     tester_run.add_argument("--output-csv", type=Path, required=True)
     posttest = subparsers.add_parser(
-        "posttest", help="normalize tester results to DD5 and build retest JSON files"
+        "posttest", help="normalize tester results to calculated DD5 comparison metrics"
     )
     posttest.add_argument("--results-csv", type=Path, required=True)
     posttest.add_argument("--audit-xlsx", type=Path, required=True)
@@ -113,7 +114,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "tester-plan":
         config = RunnerConfig.from_json(args.config)
-        plan = plan_batch(config, args.strategies)
+        plan = plan_batch(config, args.strategies, args.output_csv)
         print(
             json.dumps(
                 {
@@ -122,6 +123,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "expected_names": plan.expected_names,
                     "filenames": plan.filenames,
                     "file_hashes": dict(plan.file_hashes),
+                    "resume_completed_count": len(plan.resume_completed_names),
+                    "resume_remaining_names": plan.resume_remaining_names,
                     "actions": plan.actions,
                 },
                 ensure_ascii=False,
@@ -160,9 +163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     "workbook": str(result.workbook),
                     "csv_directory": str(result.csv_directory),
-                    "scaled_strategies_dir": str(result.scaled_strategies_dir),
                     "manifest": str(result.manifest),
-                    "scaled_count": result.scaled_count,
                 },
                 ensure_ascii=False,
                 indent=2,

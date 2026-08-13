@@ -24,6 +24,73 @@
 
 ## Current verified state
 
+The sequential production workflow now carries an immutable analysis run into
+READY-only strategy JSON generation. It emits EQUAL and INCOME variants without
+rerunning selection, then pre-fills the legacy Test plan, tester-run and DD5
+controls with the generated strategy directory. The bot remains manually
+started after Test plan. Focused evidence: `65 passed` for
+`tests/test_analysis_strategies.py tests/test_panel.py tests/test_strategy_json.py`.
+
+DD5 post-test is calculation-only: `posttest.xlsx` and its CSV sheets rank real
+tick-test results by `projected_pnl_dd5` and `projected_dd_pct`. The standard
+workflow does not create scaled DD5 JSON or require a second DD5 tick-test.
+
+Post-test now also applies one final sequential selection independently per
+`symbol + side + timeframe`: adverse-only IQR filtering on holding p95 and
+trade count, then DD5 PnL/capital Pareto, efficiency/first-shift Pareto, and a
+conditional efficiency/Close-MA Pareto only when more than three candidates
+remain in that timeframe. Focused evidence on 2026-08-13: `95 passed` in
+`tests/test_posttest.py tests/test_cli.py tests/test_panel.py`; the current 55-row ONUSDT/LONG/2h sample evaluates as
+`55 -> 47 -> 9 -> 1` on full-precision source values. The earlier read-only
+check through the two-decimal display workbook showed seven stage-1 rows;
+selection correctly uses the unrounded normalized values.
+
+Post-test workbooks are decision-first: `00_Selection_Summary` reports one row
+per Pair/Side/TF with all filter and Pareto counts, and `01_Finalists` contains
+only final rows. Existing raw, normalized, comparison and holding sheets remain
+after them. Preview evidence: `Output/posttest_layout_preview/posttest.xlsx`.
+
+READY JSON generation now selects up to three 1ORD baselines independently per
+`Pair + Side + TF`, not three globally when the panel timeframe scope is `All`.
+For the current ONUSDT/LONG run, seven timeframes each expose three baselines;
+the same 526 filtered multi-order structures therefore produce 1,073 JSON
+(`526 * 2 + 21`).
+
+Post-test also derives a diagnostic position-holding audit from each tester
+result's immutable `trades_json`. A cycle ends only at `closed` with `Post
+Size=0`; partial `decreased` actions never end it. The current 52-result LONG
+batch produced 4,201 full cycles and zero holding exclusions in
+`posttest_holding_long`.
+
+The panel HTML import path retains the completed in-memory Preflight snapshot
+and passes it to Start import, avoiding a second full HTML discovery and hash
+pass. HTML parsing and preparation use a bounded multi-process queue, so
+configured workers use separate CPU processes while one coordinator remains
+the only DuckDB writer. The coordinator writes points, grids, reports, payloads
+and replacement audit rows in DuckDB batches rather than per-report SQL calls.
+For an authorized Preflight, Start reuses the already structural-validated
+source and verifies only each written batch's metadata/payload references; it
+does not revalidate or decode historical opaque payloads. Target and input
+freshness checks, single-writer lock, evidence artifacts and no-delete rule
+remain in force. The panel reports `PARSING`, `GROUPING`, `STAGING`, `WRITING`
+and `PUBLISHING` with live counts. Focused evidence on 2026-08-12: `88 passed,
+1 skipped` for `tests/test_duckdb_import.py tests/test_panel.py`; the skip is
+the Windows symlink-permission test. The local import worker setting is 30 and
+transaction batches are 2,000.
+
+DUCKDB_DIRECT now derives its frozen required-shift list from reports that cover
+the user-selected UTC window when no explicit shift list is supplied. The panel
+therefore no longer exposes manual range fields for ordinary whole-surface
+analysis and displays the resolved list after coverage preflight. Focused
+evidence is `70 passed` for `tests/test_panel.py tests/test_duckdb_direct.py`.
+
+Direct preflight now retains the maximal common MA-pair grid across its frozen
+shifts, records excluded incomplete pairs, and deterministically resolves
+overlapping active report windows by choosing the narrowest covering report.
+This prevents an incomplete pair or overlapping historical period from
+discarding an otherwise usable timeframe. Focused evidence is 72 passed for
+tests/test_panel.py and tests/test_duckdb_direct.py.
+
 CSV and DuckDB source-package builders, v2 source verification, package loading,
 the selector event gate and the panel source-package controls are implemented.
 ADR-0003 makes `TotalTrades`, `WinRate` and `ProfitFactor` the fail-closed
@@ -239,6 +306,244 @@ symlink-permission skips.
 Configuration decision: Preflight and import intentionally use the same
 persisted `workers` value (`15` in the current local configuration). A separate
 `preflight_workers` setting is unnecessary and is not planned.
+
+Real-event DUCKDB_DIRECT and interactive Phase 2 filtering are implemented
+under `docs/specs/v07-event-filter-and-shortlist.md` section 24. Direct
+materialization now reconstructs closed cycles from compact actions and stores
+exact event memberships in analysis schema v4; `PointEventCount` is the unique
+membership count and is no longer copied from `TotalTrades`. Existing v3
+analysis databases migrate in place without rewriting legacy surfaces. New
+builds use `event_mode=real_independent_events`, materializer
+`v2-real-events`, and a distinct surface identity.
+
+The panel exposes independent structural-group criteria for per-order Source
+PnL, per-order PnL/DD, per-order CloseSupport and PointEventCount. Filtering is
+non-destructive, JSON generation rejects selected deferred candidates, and the
+same criteria can be exported to deterministic XLS with standalone criterion
+sheets plus `DEFERRED_COMBINED`. Source PnL is never summed or averaged by the
+filter. Focused verification passed `165` tests across direct/storage/pipeline,
+source packages, shortlist/XLS, strategy generation, panel and analysis
+exports. Independent LUNA review findings were fixed: strategy generation now
+fails the entire request when any selected candidate is not READY, shortlist
+validates stored point-event counts and rejects unknown event modes, and XLS
+records the analysis algorithm version while retaining Decimal values until
+the final Excel serialization boundary. Direct v3-to-v4 migration and
+cross-point event-ID identity have dedicated acceptance tests. Fresh focused
+verification passed `169` tests. The full suite produced `504 passed, 2 skipped, 8 failed`; all eight
+failures are pre-existing missing-fixture errors because this clone lacks
+`tests/fixtures/tester_wizard.html`, `tester_table.html`, and the referenced
+ADMSTOCK HTML report.
+
+The representative defect is fixed under algorithm version
+`0.7-representative-v2`: each Plateau/Pair/Side/TF/CommonCloseMA contributes
+exactly one point before structures are combined. Corrected immutable run
+`6a65684feaf1e5e928babd5590a508378dfa9b4e130ef311a36853ad2ac715b0` on
+surface `8e4f5c4147b0ee2dee38f8d2415e896cc14460b997d7577cc1e1adf226573226`
+is `COMMITTED`, has 1715 READY candidates and zero representative violations
+across 196 used Plateau/TF/CloseMA groups. Phase 2 results are: Source PnL
+filters remain available independently; all four together produce 526/1189
+READY/deferred across 58 structural comparison groups. The panel returns only
+seven Pair/TF aggregate rows (1363-byte real response) with 2/3/4-order and
+READY/DEFERRED/ALL counts; candidate descriptions and checkboxes are removed.
+JSON generation resolves all READY IDs in the selected Pair/TF scope on the
+server. XLS remains the complete candidate-level audit.
+
+Next operational step: refresh the panel, select the corrected run, inspect
+the Phase 2 criteria, then export the audit XLS or generate JSON only from the
+visible READY selection. No HTML re-import or surface rebuild is required.
+
+Deferred UI/report task: redesign the human-readable format of
+`phase2_filter_audit.xlsx` after its desired columns, sheet layout and styling
+are agreed; do not change filter semantics or exact audit values as part of
+that presentation work.
+
+Local persistent analyzer data is stored under the ignored project `data/`
+tree (`databases`, `import_audit`, `legacy`) rather than mixed with bot reports.
+Source HTML and future tester reports remain under the bot-owned
+`tester/report` tree and are neither moved nor duplicated.
+
+The final DD5 comparison report now includes the immutable per-order
+`shift_bp_vector`. Its Excel-facing metrics and lot vectors are rounded to two
+decimals, while normalized calculations retain their full precision for ranking.
+
+The final report also provides scoped alternative Pareto flags for capital,
+holding p95, close MA, first entry shift and their combined objective. They are
+separate diagnostic filters and do not replace the primary DD5 rank. Pareto
+compares all 1–4ORD strategies inside the same Pair/Side/TF; order count is not
+a comparison boundary.
+
+JSON generation now selects three 1ORD structures in the selected Pair/TF
+scope before tester-run. Their selection order is DD5 PnL, lower raw DD,
+PointEventCount, first shift and point ID; DD5 consumes their real tester
+results alongside 2–4ORD strategies and does not add source baselines late.
+
+The first two-strategy tester pilot exposed a runner readiness defect: the bot
+also listed a protected nested `Bybit/AAOIUSDT` strategy, while the runner
+incorrectly required exact equality with the installed root batch. Readiness
+now requires the installed names as a `TEST`-state subset; unrelated protected
+rows are ignored and are never submitted or monitored. A failure after bot
+startup now attempts a verified stop before recording `FAILED`, while keeping
+reports and wizard logs for diagnosis. Focused evidence: `5 passed`; the broader
+runner selection produced `37 passed, 1 skipped, 4 failed`, with all four
+failures caused by the already documented missing ADMSTOCK HTML fixture.
+
+Tester-run panel output now presents concise English lifecycle/progress/report
+messages and suppresses unreadable localization output. The captured stdout is
+preserved beside the tester CSV as `<results-stem>.raw.log` and exposed as a
+downloadable artifact. Focused evidence: `2 passed` for the panel log behavior.
+
+The runner now uses a controlled tester window rather than submitting an entire
+directory at once. Local runner defaults are `max_parallel_submissions=10` and
+`max_strategy_attempts=4`. A slot is refilled only after its Result row,
+matching wizard entry and stable HTML report are verified. A strategy observed
+as RUNNING and later returned to TEST is resubmitted automatically; exhausted
+attempts fail with the exact names and preserve tester artifacts. Progress
+reports unique submissions and a retry counter. Focused evidence: `17 passed`
+for runner monitor/config and panel retry rendering. The broader runner tests
+remain blocked by absent untracked tester HTML fixtures.
+
+The controlled runner also recovers a tester `RESULT` row that has its matching
+wizard entry but no report HTML: after two consecutive missing-report polls it
+uses the same four-attempt retry budget. This prevents a completed-count stall
+with a non-empty Result count. Focused runner monitor/config/panel evidence:
+`18 passed`.
+
+The 1073-strategy batch then exposed a second runner defect: a transient
+tester `HTTP 500` from `/htmx/tester/strategies-table` stopped the whole batch
+after 13 completed results. The runner now treats transient HTTP failures and
+startup/stall timeouts as process-recoverable: it stops the bot, validates and
+retains current one-strategy wizard/HTML results, then restarts only the
+remaining names. `max_bot_restarts` is configured locally as `30`; it does not
+reinstall JSON or clear reports between these restarts. Progress is cumulative
+and includes `bot_restart_count`. A transient bot startup failure is also
+recoverable; deterministic HTTP `4xx` responses fail immediately without a
+restart. Config/workflow evidence: `52 passed, 1
+skipped` (two fixture-dependent workflow tests excluded because this clone
+lacks the untracked ADMSTOCK HTML fixture); `compileall` and `git diff --check`
+passed. The panel was restarted after this verification. Next operational step:
+run the preserved failed 1073 strategy plan; the runner will validate existing
+reports and continue only the outstanding names.
+
+Deferred panel task: after `tester-plan`, show a final batch summary with
+current JSON, verified reusable results, remaining retests and a reason if
+resume is unavailable. Before `tester-run`, show the exact prepared count for
+the clean or resume path.
+
+Tester launch requests are now spaced by the local
+`submission_delay_seconds=0.2` setting, including retries, while retaining the
+10-strategy window. The panel reads the structured `tester-plan` response and
+shows total JSON, reusable results and the exact prepared count in the run
+button. Focused monitor/config/panel evidence: `19 passed`.
+
+Resume now snapshots the already reconciled wizard entries before starting the
+tester and merges them with the post-run wizard log. This protects valid prior
+results if the tester rewrites its shared `wizard_result.json` while retesting
+only missing strategies. On the current 52-strategy LONG batch, 52 HTML files
+exist but only 17 wizard entries remain after the tester reported a file-lock
+write error; `tester-plan` correctly resumes those 17 and prepares only 35.
+Focused workflow evidence: `2 passed`.
+
+Tester HTML collision recovery is now intentionally optimistic for the closed
+`hb_c.exe` writer. Analysis of the preserved batch found 654 one-strategy wizard
+entries but only two duplicate `chartUrl` groups (four affected strategies), so
+serializing every same-timeframe test would be disproportionate. The runner
+therefore keeps the full configured parallel window; its existing
+Result/wizard/stable/matching-HTML validation rejects a collided report. Only
+the affected group is restarted in a sequential repair lane, and only those
+repair HTML files are copied into a temporary immutable result directory for
+final reconciliation. Focused evidence is `15 passed` for controlled-monitor
+and workflow collision scheduling/recovery. The developer-side permanent fix
+is to include the already generated `runId` in both report filename and
+`chartUrl`.
+
+The runner now supports bounded `settings_strategy` batches. The local
+`strategy_batch_size` is `50`: it stops the bot after each verified chunk,
+replaces only runner-installed root JSON files, and then starts the bot for the
+next chunk. Focused runner evidence: `24 passed, 1 skipped` in
+`tests/runner/test_workflow.py tests/runner/test_files.py tests/runner/test_config.py`.
+
+Duplicate tester-run prevention is now output-scoped: a live runner owns an
+exclusive `.runner.lock` beside its result CSV. A duplicate launch fails before
+it changes state or invokes the bot; a stale lock from a dead PID is reclaimed.
+Focused evidence: `38 passed, 1 skipped` for runner workflow, monitor, files
+and config tests.
+
+The temporary HTML collision workaround now includes a 50 ms background
+snapshot collector. It waits for a stable report file, derives the strategy
+name from its HTML payload, saves a unique immutable copy, and passes that copy
+to reconciliation. This is a pragmatic mitigation for the closed tester's
+shared report filename, not a replacement for the required `runId` report
+contract. Focused runner evidence: `58 passed, 1 skipped`; two legacy workflow
+tests remain blocked by the absent untracked ADMSTOCK HTML fixture.
+
+Before the next resumed tester batch, the active report directory was archived
+in place: `737` files were renamed from `*.html` to `*.html.saved`; a local
+sidecar retained `657` validated report paths. A fresh exact plan confirms
+`1073` expected, `657` reusable and `416` remaining, while the original report
+filenames are free for the closed tester to write again.
+
+Manual verification on 2026-08-13 confirmed that the closed tester completes
+ten simultaneous button presses for one `ONUSDT/5m` batch without error. The
+runner no longer serializes its initial window by `symbol + timeframe`: local
+`max_parallel_submissions` is `10`, and the snapshot collector preserves
+individual reports. The sequential collision lane is retained only after an
+actual `BatchHtmlCollision` is detected. Focused workflow and snapshot tests
+pass; the panel is intentionally stopped for manual tester inspection.
+
+The next root cause was confirmed from the live tester table: a strategy can
+show a stale `Result` link while its newer run still exposes a progress bar.
+The HTTP parser now gives live progress precedence, so that row remains
+`RUNNING` and is never submitted a second time. This matches the tester UI:
+the runner performs the same single-strategy wizard GET and wizard-run POST as
+the `Test` and `Run` buttons. Focused evidence: `1 passed` HTTP regression and
+`5 passed` monitor/workflow regressions. The panel remains available; the
+interrupted tester-run and its bot were stopped before this change.
+
+False retries after a real Result were then traced to reuse of
+`report_stability_polls` as a two-second retry deadline. The runner now uses a
+separate local `result_report_grace_seconds=15`: it waits for the matching HTML
+to appear after Result, while a genuinely missing report still consumes a retry
+only after that deadline. Focused evidence: `2 passed` grace-period monitor
+tests, `10 passed` config tests and `1 passed` HTTP state regression. The
+active tester-run and its bot were stopped before this change; the panel stays
+available for a clean resume.
+
+The 2026-08-14 end-to-end runner audit replaced the interrupted-run recovery
+contract. `tester-run` publishes progress and stops the verified bot before
+hydrating resume evidence; collector threads close on every exception; captured
+snapshots are merged before process restart; stale pre-launch `RESULT` rows are
+rejected; and the four-attempt limit is cumulative across bot restarts. Progress
+retains retry counts/reasons, grouped restart reasons and the last restart error.
+`stop_bot` still reaches verified terminate/kill fallback when shutdown client
+creation or close fails, and interrupted root-JSON installation rolls back
+before propagating `KeyboardInterrupt`.
+
+The in-place `*.html -> *.html.saved` archiver was removed. Existing saved
+files remain read-only legacy evidence for the interrupted batch, while new
+evidence uses immutable per-strategy snapshots outside the tester report
+directory. Automatic HTML-only result synthesis was removed: normal resume
+requires persisted/current wizard evidence plus matching HTML. A one-time,
+explicit `legacy_html_only` migration validated all `803/803` historical HTML
+paths and wrote an audited sidecar; unchanged evidence is subsequently checked
+by path/size/mtime in about two seconds instead of reparsing all HTML.
+
+The immutable source batch lost by using the bot staging directory as its source
+was regenerated deterministically from analysis run
+`6a65684feaf1e5e928babd5590a508378dfa9b4e130ef311a36853ad2ac715b0` with all
+four Phase-2 criteria. The restored source is
+`data/tester_batches/ONUSDT_LONG_all_tf_6a65684feaf1/strategies`; all `1073`
+names and hashes exactly match the interrupted state. Read-only `tester-plan`
+reports `803` verified reusable results and `270` remaining. Local runtime
+settings are `strategy_batch_size=250`, `max_parallel_submissions=35`,
+`max_strategy_attempts=4`, and `max_bot_restarts=30`. The tester was not started
+during this audit.
+
+Final 2026-08-14 handoff: SHA-256 evidence was materialized for all `803`
+reusable reports and the read-only plan was rechecked as `1073` expected,
+`803` ready and `270` remaining. Focused runner/panel verification is
+`151 passed, 1 skipped, 2 deselected`. Continue from
+`docs/HANDOFF_2026-08-14_TESTER_RUNNER_AUDIT.md`; do not launch the tester
+without first reproducing the same plan counts.
 
 Current session handoff for moving the long HTML import to another machine:
 [remote import handoff](docs/HANDOFF_2026-08-12_REMOTE_IMPORT.md).

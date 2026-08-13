@@ -64,6 +64,23 @@ def test_preparation_removes_reports_and_logs_then_installs_exact_batch(
     assert batch.expected_names == ("A", "B")
 
 
+def test_resume_preparation_preserves_reports_and_wizard_logs(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    report = config.report_dir / "A.html"
+    report.write_text("complete", encoding="utf-8")
+    config.wizard_result.write_text("[]", encoding="utf-8")
+    config.wizard_progress.write_text("{}", encoding="utf-8")
+    source = tmp_path / "generated"
+    _strategy(source / "A.json", "A")
+
+    prepare_batch_files(config, source, preserve_raw_artifacts=True)
+
+    assert report.read_text(encoding="utf-8") == "complete"
+    assert config.wizard_result.read_text(encoding="utf-8") == "[]"
+    assert config.wizard_progress.read_text(encoding="utf-8") == "{}"
+
+
 def test_invalid_strategy_json_leaves_existing_bot_files_untouched(tmp_path: Path) -> None:
     config = _config(tmp_path)
     original = _strategy(config.strategy_dir / "original.json", "original")
@@ -236,6 +253,32 @@ def test_failed_root_install_restores_root_json_and_preserves_nested_tree(
 
     assert original.is_file()
     assert protected.is_file()
+    assert not (config.strategy_dir / "NEW.json").exists()
+    assert not config.strategy_dir.with_name(
+        f".{config.strategy_dir.name}.mrs3-backup"
+    ).exists()
+
+
+def test_interrupted_root_install_rolls_back_before_propagating_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    original = _strategy(config.strategy_dir / "OLD.json", "OLD")
+    source = tmp_path / "generated"
+    _strategy(source / "NEW.json", "NEW")
+    real_copy = runner_files.shutil.copy2
+
+    def interrupt_root_copy(source_path: Path, destination: Path) -> Path:
+        if destination.parent == config.strategy_dir:
+            raise KeyboardInterrupt
+        return real_copy(source_path, destination)
+
+    monkeypatch.setattr(runner_files.shutil, "copy2", interrupt_root_copy)
+
+    with pytest.raises(KeyboardInterrupt):
+        prepare_batch_files(config, source)
+
+    assert original.is_file()
     assert not (config.strategy_dir / "NEW.json").exists()
     assert not config.strategy_dir.with_name(
         f".{config.strategy_dir.name}.mrs3-backup"

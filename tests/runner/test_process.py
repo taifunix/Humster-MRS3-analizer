@@ -123,3 +123,35 @@ def test_fallback_terminates_only_verified_pid(
     assert wanted.terminated
     assert not other.terminated
     assert not other.killed
+
+
+@pytest.mark.parametrize("failure", ["factory", "close"])
+def test_stop_falls_back_to_verified_process_when_shutdown_client_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    config = _config(tmp_path)
+    wanted = FakeProcess(101, config.executable_path)
+    monkeypatch.setattr(
+        "mrs3.runner.process.psutil.net_connections",
+        lambda kind: [_connection(101, 8087)],
+    )
+    monkeypatch.setattr("mrs3.runner.process.psutil.Process", lambda pid: wanted)
+
+    class BrokenClient:
+        def shutdown(self) -> None:
+            pass
+
+        def close(self) -> None:
+            if failure == "close":
+                raise OSError("close failed")
+
+    def factory(_: RunnerConfig) -> BrokenClient:
+        if failure == "factory":
+            raise OSError("factory failed")
+        return BrokenClient()
+
+    result = stop_bot(config, factory)
+
+    assert result.forced
+    assert wanted.terminated
+    assert failure in (result.shutdown_error or "")

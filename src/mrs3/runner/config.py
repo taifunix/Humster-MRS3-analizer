@@ -54,6 +54,13 @@ def _positive_float(raw: dict[str, object], key: str, default: float) -> float:
     return value
 
 
+def _positive_int(raw: dict[str, object], key: str, default: int) -> int:
+    value = int(raw.get(key, default))
+    if value <= 0:
+        raise RunnerConfigError(f"{key} must be greater than zero")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class RunnerConfig:
     bot_root: Path
@@ -71,7 +78,13 @@ class RunnerConfig:
     poll_interval_seconds: float = 1.0
     batch_timeout_seconds: float = 86400.0
     stall_timeout_seconds: float = 1800.0
+    max_parallel_submissions: int = 10
+    strategy_batch_size: int = 50
+    max_strategy_attempts: int = 4
+    max_bot_restarts: int = 30
+    submission_delay_seconds: float = 0.2
     report_stability_polls: int = 2
+    result_report_grace_seconds: float = 15.0
     metric_tolerance: Decimal = Decimal("0.01")
 
     @classmethod
@@ -154,6 +167,12 @@ class RunnerConfig:
             poll_interval_seconds=_positive_float(raw, "poll_interval_seconds", 1.0),
             batch_timeout_seconds=_positive_float(raw, "batch_timeout_seconds", 86400.0),
             stall_timeout_seconds=_positive_float(raw, "stall_timeout_seconds", 1800.0),
+            max_parallel_submissions=_positive_int(raw, "max_parallel_submissions", 10),
+            strategy_batch_size=_positive_int(raw, "strategy_batch_size", 50),
+            max_strategy_attempts=_positive_int(raw, "max_strategy_attempts", 4),
+            max_bot_restarts=_positive_int(raw, "max_bot_restarts", 30),
+            submission_delay_seconds=_positive_float(raw, "submission_delay_seconds", 0.2),
             report_stability_polls=stability_polls,
+            result_report_grace_seconds=_positive_float(raw, "result_report_grace_seconds", 15.0),
             metric_tolerance=metric_tolerance,
         )

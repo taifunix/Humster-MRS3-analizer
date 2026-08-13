@@ -167,6 +167,8 @@ def prepare_batch_files(
     source_strategies: Path,
     *,
     expected_file_hashes: tuple[tuple[str, str], ...] | None = None,
+    selected_names: tuple[str, ...] | None = None,
+    preserve_raw_artifacts: bool = False,
 ) -> BatchFiles:
     strategy_dir, report_dir, result, progress = validate_runner_paths(config)
     if _source_is_inside_strategy_dir(source_strategies, strategy_dir):
@@ -179,6 +181,13 @@ def prepare_batch_files(
         raise BatchPreparationError(
             "strategy batch content changed after the read-only preflight"
         )
+    if selected_names is not None:
+        selected = set(selected_names)
+        if len(selected) != len(selected_names):
+            raise BatchPreparationError("selected strategy names must be unique")
+        validated = tuple(item for item in validated if item[1] in selected)
+        if tuple(item[1] for item in validated) != selected_names:
+            raise BatchPreparationError("selected strategy names are not in the source batch")
     strategy_dir.mkdir(parents=True, exist_ok=True)
     backup = strategy_dir.with_name(f".{strategy_dir.name}.mrs3-backup")
     if backup.exists():
@@ -197,10 +206,7 @@ def prepare_batch_files(
             shutil.copy2(source, staging / source.name)
         staged = _validate_source(staging)
         staged_hashes = _file_hashes(staged)
-        if staged_hashes != source_hashes or (
-            expected_file_hashes is not None
-            and staged_hashes != expected_file_hashes
-        ):
+        if staged_hashes != _file_hashes(validated):
             raise BatchPreparationError(
                 "strategy batch content changed while staged copies were being created"
             )
@@ -214,7 +220,8 @@ def prepare_batch_files(
                 "staged strategy collides with protected root entry: "
                 + ", ".join(protected_collisions)
             )
-        _remove_raw_artifacts(report_dir, result, progress)
+        if not preserve_raw_artifacts:
+            _remove_raw_artifacts(report_dir, result, progress)
         backup.mkdir()
         backup_created = True
         for existing in _root_json_files(strategy_dir):
@@ -227,7 +234,7 @@ def prepare_batch_files(
             raise BatchPreparationError("installed strategy batch does not match staging")
         shutil.rmtree(backup)
         backup_created = False
-    except Exception as error:
+    except BaseException as error:
         if backup_created:
             try:
                 _restore_root_json(strategy_dir, backup, tuple(installed))
@@ -235,6 +242,8 @@ def prepare_batch_files(
                 raise BatchPreparationError(
                     f"root JSON rollback failed; recovery required at {backup}"
                 ) from rollback_error
+        if not isinstance(error, Exception):
+            raise
         if isinstance(error, BatchPreparationError):
             raise
         raise BatchPreparationError("could not install tester strategy batch") from error

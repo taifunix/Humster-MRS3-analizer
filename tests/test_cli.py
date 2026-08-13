@@ -34,7 +34,7 @@ def test_select_cli_writes_manifest_and_returns_zero(tmp_path: Path) -> None:
 
     manifest = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))
     assert code == 0
-    assert manifest["algorithm_version"] == "0.6"
+    assert manifest["algorithm_version"] == "0.7-representative-v2"
     assert manifest["ready_json_count"] == 5
 
 
@@ -316,19 +316,20 @@ def test_posttest_cli_dispatches_dd5_comparison(
     output = tmp_path / "posttest"
     called: dict[str, Path] = {}
 
-    def fake_posttest(results_value, audit_value, strategies_value, output_value, config):
+    def fake_posttest(
+        results_value, audit_value, strategies_value, output_value, config, analysis_database=None
+    ):
         called.update(
             results=results_value,
             audit=audit_value,
             strategies=strategies_value,
             output=output_value,
+            analysis_database=analysis_database,
         )
         return SimpleNamespace(
             workbook=output_value / "posttest.xlsx",
             csv_directory=output_value / "posttest_csv",
-            scaled_strategies_dir=output_value / "scaled_strategies",
             manifest=output_value / "posttest_manifest.json",
-            scaled_count=3,
         )
 
     monkeypatch.setattr(cli, "run_posttest", fake_posttest)
@@ -352,7 +353,11 @@ def test_posttest_cli_dispatches_dd5_comparison(
     summary = json.loads(capsys.readouterr().out)
     assert code == 0
     assert called["results"] == results
-    assert summary["scaled_count"] == 3
+    assert summary == {
+        "workbook": str(output / "posttest.xlsx"),
+        "csv_directory": str(output / "posttest_csv"),
+        "manifest": str(output / "posttest_manifest.json"),
+    }
 
 
 def test_panel_cli_starts_loopback_server(tmp_path: Path, monkeypatch) -> None:
