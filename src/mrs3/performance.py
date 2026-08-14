@@ -81,9 +81,14 @@ def _decimal(value: object) -> Decimal:
 def _settings(document: object) -> dict[str, object]:
     candidates: list[dict[str, object]] = []
     for pre in document.xpath("//pre"):
+        raw = "".join(pre.itertext()).strip()
+        if not raw:
+            continue
         try:
-            value = json.loads("".join(pre.itertext()).strip())
-        except (json.JSONDecodeError, TypeError):
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as error:
+            if raw.startswith("{"):
+                raise PerformanceParseError("malformed settings JSON") from error
             continue
         if isinstance(value, dict) and isinstance(value.get("name"), str) and value["name"] and isinstance(value.get("basic"), dict):
             candidates.append(value)
@@ -147,9 +152,14 @@ def _raw_series_timestamps(source: str, name: str) -> tuple[datetime, ...]:
 def _raw_inventory(source: str, document: object) -> _RawInventory:
     settings_count = 0
     for pre in document.xpath("//pre"):
+        raw = "".join(pre.itertext()).strip()
+        if not raw:
+            continue
         try:
-            value = json.loads("".join(pre.itertext()).strip())
-        except (json.JSONDecodeError, TypeError):
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as error:
+            if raw.startswith("{"):
+                raise PerformanceParseError("malformed settings JSON") from error
             continue
         if isinstance(value, dict) and isinstance(value.get("name"), str) and value["name"] and isinstance(value.get("basic"), dict):
             settings_count += 1

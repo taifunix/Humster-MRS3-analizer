@@ -32,6 +32,12 @@ def test_parser_rejects_duplicate_equity_series() -> None:
         parse_performance_report((FIXTURES / "report_duplicate_equity.html").read_bytes())
 
 
+def test_parser_rejects_malformed_settings_like_pre_alongside_valid_settings() -> None:
+    source = (FIXTURES / "report_valid.html").read_bytes() + b'<pre>{"name":"broken",</pre>'
+    with pytest.raises(PerformanceParseError, match="malformed settings JSON"):
+        parse_performance_report(source)
+
+
 def test_parser_rejects_duplicate_table_headers_before_mapping_rows() -> None:
     source = (FIXTURES / "report_valid.html").read_bytes().replace(
         b"<th>Side</th>", b"<th>Symbol</th>"
