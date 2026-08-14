@@ -174,6 +174,48 @@ def _safe_report_path(inbox: Path, value: str) -> Path:
     return candidate
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_inbox_manifest(inbox: Path, manifest: dict[str, object]) -> None:
+    if manifest.get("schema_version") != 1:
+        raise PerformanceImportError("invalid inbox manifest schema_version")
+    for field in ("batch_id", "tester_config_sha256"):
+        if not isinstance(manifest.get(field), str) or not manifest[field].strip():
+            raise PerformanceImportError(f"inbox manifest field is missing: {field}")
+    expected = manifest.get("expected_strategy_names")
+    entries = manifest.get("entries")
+    if not isinstance(expected, list) or not all(isinstance(name, str) and name for name in expected):
+        raise PerformanceImportError("inbox manifest expected_strategy_names is invalid")
+    if not isinstance(entries, list) or not entries:
+        raise PerformanceImportError("inbox manifest entries are missing")
+    _canonical_contract(manifest)
+    required = (
+        "manifest_entry_id", "strategy_name", "strategy_version_id", "strategy_path",
+        "report_path", "wizard_run_id", "exchange_name", "source_strategy_sha256",
+        "source_report_sha256",
+    )
+    identities: set[tuple[str, str, str]] = set()
+    names: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or any(not isinstance(entry.get(field), str) or not entry[field].strip() for field in required):
+            raise PerformanceImportError("inbox manifest entry is incomplete")
+        identity = (entry["manifest_entry_id"], entry["strategy_version_id"], entry["strategy_name"])
+        if identity in identities or entry["manifest_entry_id"] in {item[0] for item in identities}:
+            raise PerformanceImportError("duplicate inbox manifest entry identity")
+        identities.add(identity)
+        names.append(entry["strategy_name"])
+        _safe_report_path(inbox, entry["report_path"])
+        _safe_report_path(inbox, entry["strategy_path"])
+    if sorted(names) != sorted(expected):
+        raise PerformanceImportError("inbox manifest strategy names do not match expected names")
+
+
 def _prepare_entry(inbox: Path, manifest_entry: dict[str, object]) -> dict[str, object]:
     report_path = inbox / str(manifest_entry["report_path"])
     strategy_path = inbox / str(manifest_entry["strategy_path"])
@@ -196,6 +238,11 @@ def _prepare_entry(inbox: Path, manifest_entry: dict[str, object]) -> dict[str, 
     parsed = parse_performance_report(report_bytes)
     if parsed.settings.get("name") != manifest_entry.get("strategy_name"):
         raise PerformanceImportError("strategy name mismatch")
+    settings = strategy.get("settings")
+    if not isinstance(settings, list) or _canonical(parsed.settings) not in {
+        _canonical(item) for item in settings
+    }:
+        raise PerformanceImportError("parsed HTML settings mismatch inbox strategy settings")
     contract_id, commission_json = _canonical_contract(_read_json(inbox / "inbox_manifest.json"))
     start = parsed.inventory.minimum_timestamp
     end = parsed.inventory.maximum_timestamp
@@ -319,8 +366,9 @@ def _verify_readback(database: Path, prepared: list[dict[str, object]], import_i
 def import_performance_batch(request: PerformanceImportRequest) -> PerformanceImportResult:
     inbox = Path(request.inbox)
     manifest = _read_json(inbox / "inbox_manifest.json")
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1 or not isinstance(manifest.get("entries"), list):
+    if not isinstance(manifest, dict):
         raise PerformanceImportError("invalid inbox manifest")
+    _validate_inbox_manifest(inbox, manifest)
     import_id = uuid.uuid4().hex
     audit_entries: list[dict[str, object]] = []
     prepared: list[dict[str, object]] = []
@@ -380,14 +428,14 @@ def resume_performance_cleanup(request: PerformanceImportRequest) -> None:
             if schema is None or schema[0] != "1":
                 raise PerformanceImportError("cleanup requires schema v1 readback evidence")
             for row in rows:
-                if row["safe_to_delete"] != "YES" or row["cleanup_state"] not in {"DELETE_READY", "DELETING"}:
+                if row["safe_to_delete"] != "YES" or row["cleanup_state"] not in {"DELETE_READY", "DELETING", "DELETED"}:
                     continue
                 report = _safe_report_path(inbox, row["report_path"])
                 evidence = audit_entries.get(row["manifest_entry_id"])
                 if evidence is None or evidence.get("status") not in {"IMPORTED", "SKIPPED"} or evidence.get("source_html_sha256") != row["source_html_sha256"]:
                     raise PerformanceImportError("cleanup requires matching audit evidence")
                 db_row = connection.execute("select source_html_sha256, status, safe_to_delete, cleanup_state from import_files where import_id = ? and manifest_entry_id = ?", [audit["import_id"], row["manifest_entry_id"]]).fetchone()
-                if db_row is None or db_row[0] != row["source_html_sha256"] or db_row[1] not in {"IMPORTED", "SKIPPED"} or not db_row[2] or db_row[3] not in {"DELETE_READY", "DELETING"}:
+                if db_row is None or db_row[0] != row["source_html_sha256"] or db_row[1] not in {"IMPORTED", "SKIPPED"} or not db_row[2] or db_row[3] not in {"DELETE_READY", "DELETING", "DELETED"}:
                     raise PerformanceImportError("cleanup requires database readback evidence")
                 eligible.append((row, report))
     except PerformanceImportError:
@@ -399,6 +447,21 @@ def resume_performance_cleanup(request: PerformanceImportRequest) -> None:
         if matching is None:
             continue
         report = matching[1]
+        with duckdb.connect(str(request.database), read_only=True) as readback:
+            db_state = readback.execute(
+                "select cleanup_state from import_files where import_id = ? and manifest_entry_id = ?",
+                [audit["import_id"], row["manifest_entry_id"]],
+            ).fetchone()[0]
+        if db_state == "DELETING" and row["cleanup_state"] == "DELETED" and not report.exists():
+            deleted_at = row["deleted_at_utc"] or datetime.now(timezone.utc).isoformat()
+            with duckdb.connect(str(request.database)) as connection:
+                connection.execute(
+                    "update import_files set cleanup_state='DELETED', deleted_at_utc=? where import_id=? and manifest_entry_id=?",
+                    [deleted_at, audit["import_id"], row["manifest_entry_id"]],
+                )
+            continue
+        if not report.is_file() or _file_sha256(report) != row["source_html_sha256"]:
+            raise PerformanceImportError("report hash mismatch immediately before delete")
         row["cleanup_state"] = "DELETING"
         _write_checklist(inbox, rows)
         with duckdb.connect(str(request.database)) as connection:

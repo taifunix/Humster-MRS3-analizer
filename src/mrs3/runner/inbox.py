@@ -77,9 +77,17 @@ def _canonical_json(document: object) -> bytes:
     ).encode("utf-8")
 
 
-def _commission_contract(config: RunnerConfig) -> tuple[dict[str, str], str, str]:
+def _commission_contract(
+    config: RunnerConfig, tester_config_bytes: bytes | None = None
+) -> tuple[dict[str, str], str, str]:
+    snapshot = tester_config_bytes
+    if snapshot is None:
+        try:
+            snapshot = config.tester_config.read_bytes()
+        except OSError as error:
+            raise InboxCaptureError("could not read tester_config") from error
     try:
-        document = json.loads(config.tester_config.read_text(encoding="utf-8"))
+        document = json.loads(snapshot.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise InboxCaptureError("could not read tester_config") from error
     values = document.get("tester_config") if isinstance(document, dict) else None
@@ -90,7 +98,7 @@ def _commission_contract(config: RunnerConfig) -> tuple[dict[str, str], str, str
         raise InboxCaptureError(f"missing commission field: {missing}")
     contract = {field: _canonical_decimal(values[field], field) for field in _COMMISSION_FIELDS}
     canonical = _canonical_json(contract)
-    return contract, sha256(canonical).hexdigest(), sha256(config.tester_config.read_bytes()).hexdigest()
+    return contract, sha256(canonical).hexdigest(), sha256(snapshot).hexdigest()
 
 
 def capture_verified_inbox(
@@ -99,8 +107,10 @@ def capture_verified_inbox(
     plan: object,
     results: tuple[WizardResult, ...],
     report_paths: Mapping[str, Path],
+    *,
+    tester_config_bytes: bytes | None = None,
 ) -> Path:
-    contract, contract_id, tester_config_hash = _commission_contract(config)
+    contract, contract_id, tester_config_hash = _commission_contract(config, tester_config_bytes)
     expected_names = tuple(plan.expected_names)
     if len(results) != len({result.strategy_names[0] for result in results}):
         raise InboxCaptureError("duplicate verified results")

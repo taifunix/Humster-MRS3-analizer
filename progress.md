@@ -4,13 +4,14 @@
 **Current branch:** `feat/strategy-performance-duckdb`
 **Current feature:** Task 4 calculation-only DD5 from committed strategy-performance DuckDB
 
-## Task 4 verified state
+## Task 4 implementation state (pending production acceptance)
 
 The new `performance-dd5` path imports a complete inbox, reads only committed
 performance rows, calculates DD5 without creating retest strategies, exports
 the existing workbook format plus a `CALCULATION_ONLY` manifest, persists
 `dd5_runs` and `dd5_results` transactionally, and resumes cleanup only after
-successful export. The legacy CSV `posttest` command remains unchanged.
+successful export. The legacy CSV `posttest` command remains unchanged. No
+production 476-strategy acceptance evidence is claimed here.
 
 Task 4 fix round 1 adds fresh DD5 persistence readback before artifact export
 and strict panel validation of inbox manifest contracts, entry hashes and

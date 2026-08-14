@@ -32,7 +32,7 @@ def _request(tmp_path: Path) -> PerformanceImportRequest:
     reports.mkdir(parents=True)
     strategies.mkdir()
     report = FIXTURE.read_bytes()
-    strategy = {"name": "MRS3 Demo", "exchange": {"name": "Bybit"}, "settings": []}
+    strategy = {"name": "MRS3 Demo", "exchange": {"name": "Bybit"}, "settings": [{"name": "MRS3 Demo", "basic": {"side": "LONG", "strategy": "MRS3", "symbol": "ONUSDT", "time_frame": "1h"}}]}
     strategy_id = hashlib.sha256(_canonical(strategy)).hexdigest()
     (strategies / f"{strategy_id}.json").write_bytes(_canonical(strategy))
     entry_id = "entry-1"
@@ -92,6 +92,39 @@ def test_conflict_keeps_html_and_database_unchanged(tmp_path: Path) -> None:
         import_performance_batch(request)
     assert report.is_file()
     assert _count(request.database, "backtest_runs") == 1
+
+
+def test_settings_mismatch_is_quarantined(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    strategy_path = next((request.inbox / "strategies").glob("*.json"))
+    strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
+    strategy["settings"][0]["basic"]["symbol"] = "OTHERUSDT"
+    strategy_path.write_bytes(_canonical(strategy))
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entry = manifest["entries"][0]
+    entry["source_strategy_sha256"] = hashlib.sha256(strategy_path.read_bytes()).hexdigest()
+    entry["strategy_version_id"] = hashlib.sha256(_canonical(strategy)).hexdigest()
+    manifest_path.write_bytes(_canonical(manifest))
+
+    result = import_performance_batch(request)
+
+    assert result.quarantined_count == 1
+    audit = json.loads((request.inbox / "import_audit.v4.json").read_text(encoding="utf-8"))
+    assert "settings" in audit["entries"][0]["error_message"]
+
+
+def test_import_preflight_rejects_duplicate_identity_before_file_reads(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"].append(dict(manifest["entries"][0]))
+    manifest["entries"][1]["report_path"] = "../outside.html"
+    manifest_path.write_bytes(_canonical(manifest))
+
+    with pytest.raises(PerformanceImportError, match="duplicate"):
+        import_performance_batch(request)
+    assert _count(request.database, "backtest_runs") == 0
 
 
 def test_malformed_report_is_quarantined_and_audited_without_deletion(tmp_path: Path) -> None:
@@ -160,6 +193,36 @@ def test_cleanup_rejects_report_path_outside_inbox(tmp_path: Path) -> None:
     with pytest.raises(PerformanceImportError, match="inbox"):
         resume_performance_cleanup(request)
     assert outside.is_file()
+
+
+def test_cleanup_hash_mismatch_preserves_html(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    import_performance_batch(request)
+    report = request.inbox / "reports" / "entry-1.html"
+    report.write_bytes(report.read_bytes() + b"changed")
+
+    with pytest.raises(PerformanceImportError, match="hash"):
+        resume_performance_cleanup(request)
+    assert report.is_file()
+
+
+def test_cleanup_repairs_deleted_checklist_when_database_is_deleting(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    import_performance_batch(request)
+    checklist = request.inbox / "html_delete_checklist.v4.csv"
+    rows = list(csv.DictReader(checklist.open(newline="", encoding="utf-8")))
+    rows[0]["cleanup_state"] = "DELETED"
+    with checklist.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    with duckdb.connect(str(request.database)) as connection:
+        connection.execute("update import_files set cleanup_state='DELETING'")
+
+    resume_performance_cleanup(request)
+
+    assert not (request.inbox / "reports" / "entry-1.html").exists()
+    assert next(csv.DictReader(checklist.open(newline="", encoding="utf-8")))["cleanup_state"] == "DELETED"
 
 
 def test_same_strategy_version_allows_distinct_period(tmp_path: Path) -> None:

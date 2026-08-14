@@ -47,3 +47,14 @@ def test_initialize_rejects_unknown_schema_version(tmp_path: Path) -> None:
         connection.execute("update schema_info set value = '999' where key = 'schema_version'")
     with pytest.raises(PerformanceStoreError, match="unknown schema version"):
         initialize_performance_database(database)
+
+
+def test_portfolio_layer_input_exposes_dd5_and_timestamp_availability(tmp_path: Path) -> None:
+    database = tmp_path / "strategy_performance.duckdb"
+    initialize_performance_database(database)
+    with duckdb.connect(str(database), read_only=True) as connection:
+        columns = {row[0] for row in connection.execute("describe portfolio_layer_a_input").fetchall()}
+    assert {
+        "scaled_lots_json", "projected_pnl_dd5", "projected_dd_pct", "holding_filter",
+        "pareto_rank", "action_timestamps_available", "equity_timestamps_available",
+    } <= columns

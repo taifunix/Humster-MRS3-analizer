@@ -126,3 +126,17 @@ def test_capture_rejects_blank_exchange_name(tmp_path: Path) -> None:
 
     with pytest.raises(InboxCaptureError, match="exchange.name"):
         capture_verified_inbox(config, output, plan, (wizard,), {"A": report})
+
+
+def test_capture_uses_supplied_immutable_tester_config_snapshot(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    output, plan, wizard, report = _inputs(tmp_path, config)
+    snapshot = config.tester_config.read_bytes()
+    config.tester_config.write_text(json.dumps({"tester_config": {}}), encoding="utf-8")
+
+    inbox = capture_verified_inbox(
+        config, output, plan, (wizard,), {"A": report}, tester_config_bytes=snapshot
+    )
+
+    manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["tester_config_sha256"] == sha256(snapshot).hexdigest()

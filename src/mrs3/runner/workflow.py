@@ -91,6 +91,14 @@ class BatchRunResult:
     inbox_path: Path | None = None
 
 
+def _require_complete_verified_reports(
+    expected_names: tuple[str, ...], report_paths: Mapping[str, Path]
+) -> None:
+    missing = sorted(set(expected_names).difference(report_paths))
+    if missing or any(not report_paths[name].is_file() for name in expected_names):
+        raise RuntimeError("verified HTML reports are incomplete: " + ", ".join(missing or expected_names))
+
+
 def validate_runtime_preflight(config: RunnerConfig) -> None:
     validate_runner_paths(config)
     if not config.bot_root.is_dir():
@@ -765,6 +773,7 @@ def run_batch(
     verified_report_paths: dict[str, Path] = {}
     report_snapshot_dir = output.parent / f".{output.stem}.report_snapshots"
     try:
+        tester_config_snapshot = config.tester_config.read_bytes()
         saved_resume_results = plan.resume_results
         report_progress(
             {
@@ -823,11 +832,12 @@ def run_batch(
             write_results_csv_atomic(frame, output)
             advance("CSV_COMMITTED")
             inbox_path = None
-            if set(verified_report_paths) >= set(plan.expected_names):
-                inbox_path = capture_verified_inbox(
-                    config, output, plan, saved_resume_results, verified_report_paths
-                )
-                advance("INBOX_CAPTURED")
+            _require_complete_verified_reports(plan.expected_names, verified_report_paths)
+            inbox_path = capture_verified_inbox(
+                config, output, plan, saved_resume_results, verified_report_paths,
+                tester_config_bytes=tester_config_snapshot,
+            )
+            advance("INBOX_CAPTURED")
             advance("COMPLETED")
             return BatchRunResult(
                 output_csv=output,
@@ -1096,11 +1106,12 @@ def run_batch(
         bot_started = False
         advance("STOPPED_FOR_CLEANUP")
         inbox_path = None
-        if set(verified_report_paths) >= set(plan.expected_names):
-            inbox_path = capture_verified_inbox(
-                config, output, plan, tuple(saved_resume_results), verified_report_paths
-            )
-            advance("INBOX_CAPTURED")
+        _require_complete_verified_reports(plan.expected_names, verified_report_paths)
+        inbox_path = capture_verified_inbox(
+            config, output, plan, tuple(saved_resume_results), verified_report_paths,
+            tester_config_bytes=tester_config_snapshot,
+        )
+        advance("INBOX_CAPTURED")
         cleanup_completed_batch(config)
         shutil.rmtree(report_snapshot_dir, ignore_errors=True)
         advance("RAW_ARTIFACTS_REMOVED")

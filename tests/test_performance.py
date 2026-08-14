@@ -73,11 +73,20 @@ def test_parser_rejects_duplicate_table_headers_before_mapping_rows() -> None:
 
 
 def test_inventory_timestamp_bounds_include_equity_series() -> None:
-    source = (FIXTURES / "report_valid.html").read_bytes().replace(
-        b"1785549600000,\"1012.5\"", b"1785553200000,\"1012.5\""
-    )
+    source = (FIXTURES / "report_valid.html").read_bytes()
+    source = source.replace(b"1785549600000,\"1012.50\"", b"1785553200000,\"1012.50\"")
+    source = source.replace(b"1785549600000,\"1012.5\"", b"1785553200000,\"1012.5\"")
     parsed = parse_performance_report(source)
     assert parsed.inventory.maximum_timestamp == datetime(2026, 8, 1, 3, tzinfo=timezone.utc)
+
+
+def test_parser_rejects_wallet_equity_timestamp_mismatch() -> None:
+    source = (FIXTURES / "report_valid.html").read_bytes().replace(
+        b"1785546000000,\"1005.25\"],[1785549600000,\"1012.5\"]",
+        b"1785546000001,\"1005.25\"],[1785549600000,\"1012.5\"]",
+    )
+    with pytest.raises(PerformanceParseError, match="timestamps"):
+        parse_performance_report(source)
 
 
 def test_parser_wraps_epoch_conversion_errors() -> None:

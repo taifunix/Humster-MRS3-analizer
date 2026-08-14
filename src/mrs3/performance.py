@@ -291,6 +291,8 @@ def parse_performance_report(source: bytes) -> ParsedPerformanceReport:
     action_times = tuple(_timestamp(row["Timestamp"]) for row in actions)
     wallet_times = tuple(_epoch_timestamp(point[0]) for point in wallet)
     equity_times = tuple(_epoch_timestamp(point[0]) for point in equity)
+    if wallet_times != equity_times:
+        raise PerformanceParseError("wallet/equity timestamps must match pairwise")
     if (
         raw.settings_count != 1
         or len(metrics) != raw.metric_count

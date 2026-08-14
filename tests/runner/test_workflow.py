@@ -283,6 +283,11 @@ def test_run_rejects_output_inside_bot_root(tmp_path: Path) -> None:
         run_batch(config, source, config.bot_root / "results.csv")
 
 
+def test_workflow_requires_verified_report_for_every_expected_strategy() -> None:
+    with pytest.raises(RuntimeError, match="verified HTML reports"):
+        runner_workflow._require_complete_verified_reports(("A", "B"), {"A": Path("A.html")})
+
+
 def test_nested_strategy_source_fails_before_bot_stop(tmp_path: Path) -> None:
     config = _config(tmp_path)
     source = config.strategy_dir / "Bybit"

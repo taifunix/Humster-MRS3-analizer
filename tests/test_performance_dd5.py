@@ -55,3 +55,35 @@ def test_dd5_persistence_failure_leaves_no_export_artifacts(tmp_path: Path) -> N
 
     assert not (output / "posttest.xlsx").exists()
     assert not (output / "posttest_manifest.json").exists()
+
+
+def test_dd5_retry_uses_skipped_import_file_and_regenerates_from_stored_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _request(tmp_path)
+    first = import_performance_batch(request)
+    with duckdb.connect(str(request.database)) as connection:
+        connection.execute(
+            "update strategy_versions set settings_json = ?",
+            [json.dumps({"mrs3": {"ma_long": [{"lot_x": 1}]}})],
+        )
+    import mrs3.performance_dd5 as performance_dd5
+    monkeypatch.setattr(
+        performance_dd5,
+        "write_posttest_outputs",
+        lambda *_: (_ for _ in ()).throw(OSError("export failed")),
+    )
+    with pytest.raises(OSError, match="export failed"):
+        run_performance_dd5(
+            request.database, first.import_id, tmp_path / "failed", AlgorithmConfig.defaults()
+        )
+    retry = import_performance_batch(request)
+    assert retry.skipped_count == 1
+    monkeypatch.undo()
+
+    artifacts = run_performance_dd5(
+        request.database, retry.import_id, tmp_path / "retry", AlgorithmConfig.defaults()
+    )
+
+    assert artifacts.manifest_json["dd5_run_id"] == artifacts.dd5_run_id
+    assert artifacts.workbook.exists()
