@@ -38,6 +38,40 @@ def _wait_finished(controller: PanelController) -> dict[str, object]:
     raise AssertionError("panel job did not finish")
 
 
+def test_panel_rejects_performance_dd5_without_inbox_manifest(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+
+    with pytest.raises(ValueError, match="inbox_manifest.json is missing"):
+        PanelController(tmp_path, tmp_path / "config.json")._build_command(
+            "performance-dd5",
+            {"config": "config.json", "database": "performance.duckdb", "inbox": "inbox", "output_dir": "posttest"},
+        )
+
+
+def test_panel_rejects_performance_dd5_without_commission_contract(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "inbox_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "batch_id": "batch-1",
+                "expected_strategy_names": ["Demo"],
+                "tester_config_sha256": "0" * 64,
+                "entries": [{}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="commission contract"):
+        PanelController(tmp_path, tmp_path / "config.json")._build_command(
+            "performance-dd5",
+            {"config": "config.json", "database": "performance.duckdb", "inbox": "inbox", "output_dir": "posttest"},
+        )
+
+
 def _import_result(tmp_path: Path, *, final_state: str = "COMMITTED", tampered: bool = False) -> ImportJobResult:
     audit = tmp_path / "audit" / "job-1"
     audit.mkdir(parents=True)
