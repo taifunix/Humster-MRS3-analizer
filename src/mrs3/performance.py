@@ -36,6 +36,9 @@ class ParsedPerformanceReport:
     inventory: PerformanceInventory
 
 
+_TESTER_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
 @dataclass(frozen=True, slots=True)
 class _RawInventory:
     settings_count: int
@@ -53,8 +56,14 @@ def _text(node: object) -> str:
 
 
 def _timestamp(value: str) -> datetime:
+    value = value.strip()
+    if _TESTER_TIMESTAMP.fullmatch(value):
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError as error:
+            raise PerformanceParseError(f"invalid UTC timestamp: {value!r}") from error
     try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (TypeError, ValueError) as error:
         raise PerformanceParseError(f"invalid UTC timestamp: {value!r}") from error
     if parsed.tzinfo is None:
@@ -103,6 +112,10 @@ def _tables(document: object) -> tuple[dict[str, str], tuple[dict[str, str], ...
     trade_matches: list[tuple[tuple[dict[str, str], ...], tuple[str, ...]]] = []
     for table in document.xpath("//table"):
         headers = tuple(_text(cell) for cell in table.xpath(".//thead/tr[1]/th|.//thead/tr[1]/td"))
+        metric_candidate = len(headers) >= 2 and headers[:2] == ("Metric", "Value")
+        trade_candidate = {"Timestamp", "Symbol", "Action", "PnL"} <= set(headers)
+        if (metric_candidate or trade_candidate) and len(headers) != len(set(headers)):
+            raise PerformanceParseError("duplicate table header")
         rows: list[dict[str, str]] = []
         for row in table.xpath(".//tbody/tr"):
             cells = [_text(cell) for cell in row.xpath("./th|./td")]
@@ -119,11 +132,19 @@ def _tables(document: object) -> tuple[dict[str, str], tuple[dict[str, str], ...
             metric_matches.append((metrics, headers))
         if {"Timestamp", "Symbol", "Action", "PnL"} <= set(headers):
             trade_matches.append((tuple(rows), headers))
-    if len(metric_matches) != 1:
-        raise PerformanceParseError("exactly one Metric/Value table is required")
     if len(trade_matches) != 1:
         raise PerformanceParseError("exactly one trade table is required")
-    metrics, metric_headers = metric_matches[0]
+    if not metric_matches:
+        raise PerformanceParseError("exactly one Metric/Value table is required")
+    metric_headers = metric_matches[0][1]
+    metrics: dict[str, str] = {}
+    for candidate, headers in metric_matches:
+        if headers != metric_headers:
+            raise PerformanceParseError("metric table headers differ")
+        for key, value in candidate.items():
+            if key in metrics:
+                raise PerformanceParseError("metrics contain duplicate or empty keys")
+            metrics[key] = value
     actions, trade_headers = trade_matches[0]
     return metrics, actions, metric_headers, trade_headers
 
@@ -238,28 +259,41 @@ def _raw_inventory(source: str) -> _RawInventory:
         if isinstance(value, dict) and isinstance(value.get("name"), str) and value["name"] and isinstance(value.get("basic"), dict):
             settings_count += 1
 
-    metric_matches: list[tuple[int, tuple[str, ...]]] = []
+    metric_matches: list[tuple[int, tuple[str, ...], tuple[str, ...]]] = []
     trade_matches: list[tuple[int, tuple[str, ...], tuple[datetime, ...]]] = []
     for headers, rows in parser.tables:
+        metric_candidate = len(headers) >= 2 and headers[:2] == ("Metric", "Value")
+        trade_candidate = {"Timestamp", "Symbol", "Action", "PnL"} <= set(headers)
+        if not metric_candidate and not trade_candidate:
+            continue
         if len(headers) != len(set(headers)):
             raise PerformanceParseError("duplicate table header")
         if any(len(row) != len(headers) for row in rows):
             raise PerformanceParseError("table row width differs from its headers")
-        if len(headers) >= 2 and headers[:2] == ("Metric", "Value"):
+        if metric_candidate:
             keys = [row[0] for row in rows]
             if any(not key for key in keys) or len(keys) != len(set(keys)):
                 raise PerformanceParseError("metrics contain duplicate or empty keys")
-            metric_matches.append((len(rows), headers))
-        if {"Timestamp", "Symbol", "Action", "PnL"} <= set(headers):
+            metric_matches.append((len(rows), headers, tuple(keys)))
+        if trade_candidate:
             timestamp_index = headers.index("Timestamp")
             trade_matches.append((len(rows), headers, tuple(_timestamp(row[timestamp_index]) for row in rows)))
     if settings_count != 1:
         raise PerformanceParseError("exactly one complete settings JSON object is required")
-    if len(metric_matches) != 1:
+    if not metric_matches:
         raise PerformanceParseError("exactly one Metric/Value table is required")
     if len(trade_matches) != 1:
         raise PerformanceParseError("exactly one trade table is required")
-    metric_count, metric_headers = metric_matches[0]
+    metric_headers = metric_matches[0][1]
+    metric_count = 0
+    metric_keys: set[str] = set()
+    for count, headers, keys in metric_matches:
+        if headers != metric_headers:
+            raise PerformanceParseError("metric table headers differ")
+        if metric_keys.intersection(keys):
+            raise PerformanceParseError("metrics contain duplicate or empty keys")
+        metric_keys.update(keys)
+        metric_count += count
     trade_count, trade_headers, action_timestamps = trade_matches[0]
     return _RawInventory(
         settings_count,

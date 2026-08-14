@@ -518,6 +518,33 @@ function renderDashboard(dashboard) {
     target.appendChild(card);
   }
 }
+function renderPerformanceProgress(active, progress, fallbackStage) {
+  let block = document.getElementById('performanceProgress');
+  if (!active) { if (block) block.hidden = true; return; }
+  if (!block) {
+    block = document.createElement('section');
+    block.id = 'performanceProgress';
+    block.className = 'stack';
+    block.setAttribute('aria-live', 'polite');
+    block.setAttribute('aria-label', 'Performance DD5 progress');
+    block.innerHTML = '<h3>Performance DD5 progress</h3><div class="stats"><div class="stat"><b id="performanceStage">—</b><span>stage</span></div><div class="stat"><b id="performanceCompleted">0</b><span>completed</span></div><div class="stat"><b id="performanceTotal">0</b><span>total</span></div><div class="stat"><b id="performanceScheduled">0</b><span>scheduled</span></div><div class="stat"><b id="performancePrepared">0</b><span>prepared</span></div><div class="stat"><b id="performanceImported">0</b><span>imported</span></div><div class="stat"><b id="performanceSkipped">0</b><span>skipped</span></div><div class="stat"><b id="performanceQuarantined">0</b><span>quarantined</span></div></div><div id="performancePhases" class="muted"></div><div id="performanceTerminalError" class="muted" hidden></div>';
+ document.getElementById('progressText').after(block);
+  }
+  block.hidden = false;
+  document.getElementById('performanceStage').textContent = progress.stage || fallbackStage;
+ document.getElementById('performanceCompleted').textContent = progress.completed || 0;
+ document.getElementById('performanceTotal').textContent = progress.total || 0;
+  document.getElementById('performanceScheduled').textContent = progress.scheduled || 0;
+  document.getElementById('performancePrepared').textContent = progress.prepared || 0;
+  document.getElementById('performanceImported').textContent = progress.imported || 0;
+  document.getElementById('performanceSkipped').textContent = progress.skipped || 0;
+ document.getElementById('performanceQuarantined').textContent = progress.quarantined || 0;
+  const phases = progress.phase_seconds || {};
+  document.getElementById('performancePhases').textContent = Object.entries(phases).map(([key, value]) => `${key}: ${Number(value).toFixed(2)}s`).join(' | ');
+ const terminalError = document.getElementById('performanceTerminalError');
+  terminalError.hidden = !progress.terminal_error;
+  terminalError.textContent = progress.terminal_error ? `terminal error: ${progress.terminal_error}` : '';
+}
 function render(data) {
   if (!defaultsLoaded && data.defaults) { document.getElementById('config').value = data.defaults.config; document.getElementById('analysis_config').value = data.defaults.config; workflowDefaults=data.defaults.workflow || workflowDefaults; applyWorkflowDefaults(); const tester=data.defaults.tester || {}; if(tester.strategies){ document.getElementById('strategies').value=tester.strategies; } if(tester.output_csv){ document.getElementById('output_csv').value=tester.output_csv; document.getElementById('results_csv').value=tester.output_csv; } document.getElementById('posttest_output_dir').value=nextPosttestOutput(value('results_csv')); defaultsLoaded = true; }
   renderDashboard(data.dashboard);
@@ -539,28 +566,31 @@ function render(data) {
   const job = data.job;
   const buttons = document.querySelectorAll('[data-runnable]'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
   if (!job) return;
-  const workflow = job.workflow || {}; const progress = job.progress || {};
+  const workflow = job.workflow || {}; const progress = job.progress || {}; const performance = job.performance_progress || {};
   const plan = job.plan_summary;
   if (plan) { const summary=document.getElementById('testerPlanSummary'); if(summary) summary.textContent=`${plan.mode === 'RESUME' ? 'Возобновление' : 'Новый запуск'}: всего ${plan.total}; готово ${plan.reusable}; подготовлено к тесту ${plan.prepared}.`; const runButton=document.getElementById('runButton'); if(runButton) runButton.textContent=`Запустить тесты (${plan.prepared})`; }
-  const phase = job.status === 'FAILED' ? 'FAILED' : (workflow.state || progress.workflow_state || job.status);
+  const performanceAction = job.action === 'performance-dd5';
+  renderPerformanceProgress(performanceAction, performance, job.status);
+  const phase = job.status === 'FAILED' ? 'FAILED' : (performanceAction ? (performance.stage || job.status) : (workflow.state || progress.workflow_state || job.status));
   const testerAction = job.action === 'tester-run';
   document.getElementById('operationStats').hidden = !testerAction;
   document.getElementById('activeStrategies').hidden = !testerAction;
   document.getElementById('operation').textContent = labels[job.action] || job.action;
   const state = document.getElementById('state'); state.textContent = labels[phase] || phase;
   state.className = 'state ' + (job.status === 'FAILED' || phase === 'FAILED' ? 'bad' : (job.running ? 'work' : 'good'));
-  const expected = Number(progress.expected_count || job.expected_count || 0);
-  const complete = Number(progress.completed_count || 0); const submitted = Number(progress.submitted_count || 0);
-  const monitoring = Number(progress.polls || 0) > 0;
+  const expected = Number(performanceAction ? (performance.total || 0) : (progress.expected_count || job.expected_count || 0));
+  const complete = Number(performanceAction ? (performance.completed || 0) : (progress.completed_count || 0)); const submitted = Number(progress.submitted_count || 0);
+  const monitoring = performanceAction || Number(progress.polls || 0) > 0;
   const shown = monitoring ? complete : submitted; const percent = expected ? Math.min(100, shown * 100 / expected) : (job.running ? 3 : 100);
   document.getElementById('barFill').style.width = percent + '%';
   document.getElementById('progressBar').setAttribute('aria-valuenow', String(Math.round(percent)));
   document.getElementById('progressText').textContent = expected ? (monitoring ? `${complete} завершено из ${expected} · ${percent.toFixed(1)}%` : `${submitted} отправлено из ${expected} · ${percent.toFixed(1)}%`) : (job.error || labels[phase] || phase);
+  if (performanceAction) document.getElementById('progressText').textContent = `${performance.stage || phase}${expected ? ` · ${complete}/${expected}` : ''}${performance.quarantined ? ` · quarantined=${performance.quarantined}` : ''}${performance.terminal_error ? ` · ${performance.terminal_error}` : ''}`;
   document.getElementById('submitted').textContent = submitted;
   document.getElementById('running').textContent = progress.running_count || 0;
   document.getElementById('result').textContent = progress.result_count || 0;
   document.getElementById('completed').textContent = complete;
-  document.getElementById('retries').textContent = progress.retry_count || 0;
+  document.getElementById('retries').textContent = performanceAction ? (performance.quarantined || 0) : (progress.retry_count || 0);
   const tbody = document.getElementById('activeRows'); tbody.replaceChildren();
   for (const item of (progress.active || [])) {
     const row = document.createElement('tr');
@@ -631,6 +661,7 @@ class _Job:
     error: str | None = None
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=500))
     plan_summary: dict[str, object] | None = None
+    performance_progress: dict[str, object] | None = None
 
     @property
     def running(self) -> bool:
@@ -1689,6 +1720,19 @@ class PanelController:
                         raw_handle.write(str(raw_line))
                         raw_handle.flush()
                     if line:
+                        if job.action == "performance-dd5":
+                            try:
+                                event = json.loads(line).get("performance_progress")
+                            except (TypeError, ValueError):
+                                event = None
+                            if isinstance(event, dict):
+                                with self._lock:
+                                    job.performance_progress = {
+                                        key: event[key]
+                                        for key in ("stage", "completed", "total", "quarantined", "scheduled", "prepared", "imported", "skipped", "phase_seconds", "terminal_error")
+                                        if key in event
+                                    }
+                                continue
                         display_line = (
                             _normalise_tester_log_line(line)
                             if job.action == "tester-run"
@@ -1962,6 +2006,7 @@ class PanelController:
                     "error": job.error,
                     "logs": list(job.logs),
                     "plan_summary": job.plan_summary,
+                    "performance_progress": job.performance_progress,
                     "expected_count": job.expected_count,
                     "workflow": self._read_json(state_path),
                     "progress": self._read_json(progress_path),

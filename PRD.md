@@ -78,5 +78,7 @@ analysis surfaces, повторный plateau-анализ, lineage, библи�
 | Queued — hook «Анализатор Портфеля» | [Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) | отдельный анализ готовых MRS3-стратегий и сетов | individual results, trade timestamps, limiter/L2/margin contract |
 | Accepted | [ADR-0001](docs/decisions/0001-repository-and-documentation-model.md) | root v0.7 и модель документации | — |
 | Pending production acceptance | [Strategy performance DuckDB governing spec](docs/specs/2026-08-14-strategy-performance-duckdb.md) | transactional performance import, DB-only DD5 and safe cleanup | [ADR-0004](docs/decisions/0004-strategy-performance-evidence-store.md) |
+| Active implementation contract | [Performance report import to DuckDB](docs/specs/2026-08-14-performance-report-import-duckdb.md) | immutable HTML-report import, canonical metrics, transaction, idempotency and cleanup | Strategy performance DuckDB, ADR-0004--0006 |
+| Active implementation contract | [DD5 calculation and finalist selection](docs/specs/2026-08-14-dd5-finalist-selection.md) | DD5 formulas, scoped filters, Pareto, finalists and XLSX contract | Performance report import to DuckDB |
 
 Полная навигация: [docs/README.md](docs/README.md). Оперативная точка: [progress.md](progress.md).

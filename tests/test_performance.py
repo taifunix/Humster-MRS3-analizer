@@ -72,6 +72,24 @@ def test_parser_rejects_duplicate_table_headers_before_mapping_rows() -> None:
         parse_performance_report(source)
 
 
+def test_parser_ignores_duplicate_headers_in_irrelevant_calendar_table() -> None:
+    source = (
+        (FIXTURES / "report_valid.html").read_bytes()
+        .replace(
+            b"<table><thead>",
+            b'<table class="monthly-heatmap-table"><thead>',
+            1,
+        )
+    )
+    source = source.replace(
+        b"</html>",
+        b"<table><thead><tr><th>Year</th><th>Jan</th><th>Year</th></tr></thead>"
+        b"<tbody><tr><td>2026</td><td>1</td><td>2026</td></tr></tbody></table></html>",
+    )
+    parsed = parse_performance_report(source)
+    assert parsed.inventory.trade_row_count == 2
+
+
 def test_inventory_timestamp_bounds_include_equity_series() -> None:
     source = (FIXTURES / "report_valid.html").read_bytes()
     source = source.replace(b"1785549600000,\"1012.50\"", b"1785553200000,\"1012.50\"")
@@ -86,6 +104,36 @@ def test_parser_rejects_wallet_equity_timestamp_mismatch() -> None:
         b"1785546000001,\"1005.25\"],[1785549600000,\"1012.5\"]",
     )
     with pytest.raises(PerformanceParseError, match="timestamps"):
+        parse_performance_report(source)
+
+
+def test_parser_interprets_canonical_tester_timestamps_as_utc() -> None:
+    source = (FIXTURES / "report_valid.html").read_bytes()
+    source = source.replace(b"2026-08-01T00:00:00Z", b"2026-08-01 00:00:00")
+    source = source.replace(b"2026-08-01T01:00:00+00:00", b"2026-08-01 01:00:00")
+    parsed = parse_performance_report(source)
+    assert parsed.actions[0]["Timestamp"] == "2026-08-01 00:00:00"
+    assert parsed.inventory.minimum_timestamp == datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+
+def test_parser_aggregates_metric_sections_with_identical_headers() -> None:
+    source = (FIXTURES / "report_valid.html").read_bytes()
+    source = source.replace(
+        b'<tr><td>Total PnL, %</td><td>12.50</td><td>exact</td></tr>\n'
+        b'<tr><td>Total Trades</td><td>2</td><td>exact</td></tr>',
+        b'<tr><td>Total PnL, %</td><td>12.50</td><td>exact</td></tr></tbody></table>'
+        b'<table><thead><tr><th>Metric</th><th>Value</th><th>Notes</th></tr></thead><tbody>'
+        b'<tr><td>Total Trades</td><td>2</td><td>exact</td></tr>',
+    )
+    parsed = parse_performance_report(source)
+    assert parsed.metrics == {"Total PnL, %": "12.50", "Total Trades": "2"}
+    assert parsed.inventory.metric_count == 2
+
+
+@pytest.mark.parametrize("timestamp", [b"2026-8-1 00:00:00", b"08/01/2026 00:00:00", b"2026-08-01T00:00:00"])
+def test_parser_rejects_ambiguous_or_unzoned_noncanonical_timestamps(timestamp: bytes) -> None:
+    source = (FIXTURES / "report_valid.html").read_bytes().replace(b"2026-08-01T00:00:00Z", timestamp)
+    with pytest.raises(PerformanceParseError, match="timestamp"):
         parse_performance_report(source)
 
 

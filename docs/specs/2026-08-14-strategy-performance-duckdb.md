@@ -73,9 +73,14 @@ with separate schemas and provenance.
 uses sorted keys, UTF-8 and compact separators. The strategy name is descriptive
 and is not the identity.
 
-The top-level strategy `exchange.name` is required and becomes the normalized
-exchange. Missing exchange data is a contract error. If HTML also exposes the
-exchange, it must match the strategy exactly after case normalization.
+The top-level strategy `exchange.name` and manifest `exchange_name` are
+required, must match after case normalization, and are the exchange source of
+truth. Missing or conflicting source exchange data is a contract error. If HTML
+also exposes the exchange, its name must either match the source after case
+normalization or equal the exact case-normalized Hamster Bot runtime marker
+`tester`. For the marker form only `exchange.name` is substituted with the
+source name before canonical comparison; every other HTML settings field remains
+an exact canonical match.
 
 ### 5.2 Commission contract
 
@@ -192,7 +197,8 @@ inventory, status, quarantine reason, cleanup state and deletion result.
 - `first_seen_at_utc TIMESTAMPTZ NOT NULL`
 
 Canonical settings from the inbox JSON and embedded HTML settings must be
-identical. A mismatch quarantines the report.
+identical, subject only to the `tester` exchange runtime-marker rule in section
+5.1. A mismatch quarantines the report.
 
 ### 6.3 Backtest facts
 
@@ -215,21 +221,43 @@ identical. A mismatch quarantines the report.
 
 - `test_run_id VARCHAR PRIMARY KEY`
 - required `DECIMAL(38,12)` fields: `final_balance`, `total_pnl`,
-  `total_pnl_pct`, `max_drawdown`, `max_drawdown_pct`, `total_fees`,
-  `win_rate_pct`, `profit_factor`, `days_in_test`;
+   `total_pnl_pct`, `max_drawdown`, `max_drawdown_pct`, `total_fees`,
+   `win_rate_pct`, `days_in_test`;
+- nullable `DECIMAL(38,12)` field: `profit_factor`, with required
+  `profit_factor_status VARCHAR`;
 - required integer fields: `total_trades`, `win_trades`, `loss_trades`;
 - nullable `DECIMAL(38,12)` diagnostics: `gross_profit`, `gross_loss`,
   `trading_volume_usdt`, `funding_net`, `funding_received`, `funding_paid`,
   `expectancy_per_trade`, `position_avg_pct`, `position_max_pct`,
   `risk_reward`, `recovery_factor`, `months_in_test`, `months_with_data`;
 - nullable integer diagnostics: `total_transactions`, `pairs_count`;
+
+The required Profit Factor label accepts only `Profit Factor` or `Profit Factor
+(gross profit/gross loss)`. The stored field name remains `profit_factor`. The
+exact raw value `n/a` means gross loss is zero: it is retained in `metrics_json`,
+stores typed `profit_factor=NULL` with
+`profit_factor_status=UNDEFINED_GROSS_LOSS_ZERO`, and is never converted to a
+numeric default or infinity. A missing, other non-numeric or non-finite value
+quarantines the report. `AVAILABLE` is the only numeric status.
 - nullable text diagnostic: `report_range`;
 - `metrics_json VARCHAR NOT NULL` containing the complete canonical metric map.
 
 `initial_balance` remains required on `backtest_runs`. Any missing or
 non-finite required metric quarantines the report. Optional diagnostics may be
 NULL only when the HTML does not expose that metric; the reason is recorded in
-the import audit. No required DD5 field may be NULL.
+the import audit. `profit_factor` is the sole typed DD5 diagnostic allowed to
+be NULL under the explicit status contract above; DD5 PnL/DD calculation and
+ranking do not use it, and exports mark it unavailable.
+
+Canonical typed performance metrics come from immutable series evidence, not
+the rounded HTML Metric/Value summary: `final_balance`, `total_pnl` and
+`total_pnl_pct` use the last `wallet` sample and the persisted initial balance;
+`max_drawdown` is the greatest monetary drawdown in the ordered `equity`
+series; and `max_drawdown_pct` divides that same drawdown by its peak equity.
+`win_rate_pct` is `win_trades / total_trades * 100`. Empty, mismatched,
+non-finite or non-monotonic series, invalid trade counts, or disagreement with
+the declared report precision quarantine the report. `metrics_json` retains the
+complete HTML summary as diagnostic evidence only.
 
 New HTML metrics are retained in `metrics_json` even before a typed column is
 added in a later schema migration.
@@ -333,8 +361,11 @@ exactly one `walletSeries` plus one `equitySeries` JavaScript array. It records
 raw table headers, metric count, trade-row count, wallet/equity sample counts and
 their minimum/maximum UTC timestamps in the v4 audit sidecar.
 
-The semantic parser must reproduce the inventory counts exactly. Trade and
-series timestamps must be valid UTC instants; series must be non-empty and
+The semantic parser must reproduce the inventory counts exactly. Trade
+timestamps accept ISO-8601 UTC/offset values or the tester's exact
+`YYYY-MM-DD HH:MM:SS` representation, which is interpreted as UTC. Other
+timezone-less or locale-dependent formats are invalid. Series timestamps must
+be valid UTC instants; series must be non-empty and
 strictly increasing. A missing, duplicate, malformed or unrecognised mandatory
 section is `STRUCTURAL_QUARANTINE`; it cannot be imported or deleted.
 
@@ -344,16 +375,21 @@ Pressing `Calculate DD5` performs these phases:
 
 1. `PREFLIGHT`: load the completed runner state and inbox manifest; require an
    exact expected-name set and matching file hashes.
-2. `PARSING`: inventory and parse reports read-only in bounded parallel workers.
-   Parse full settings, every metric, every action and complete wallet/equity
-   series from the immutable copied bytes.
+2. `PARSING`: inventory and parse reports read-only with a bounded
+   `ProcessPoolExecutor`. The coordinator submits independent entries in
+   manifest order and collects completed outcomes by manifest index before any
+   identity decision. Workers receive immutable inbox paths or report bytes,
+   never open DuckDB, and never delete HTML or mutate audit/checklist. Parse
+   full settings, every metric, every action and complete wallet/equity series
+   from the immutable copied bytes.
 3. `VALIDATING`: compare embedded settings with strategy JSON, validate the
    required strategy exchange and captured commission contract, periods,
    timestamps, numeric values, inventory counts and unique identities.
 4. `STAGING`: prepare all database rows without changing the published database.
 5. `COMMITTING`: use one DuckDB writer and one transaction for the whole import.
-6. `READBACK`: reopen/read the committed rows and verify report, action and
-   equity counts plus payload hashes.
+6. `READBACK`: within the same publication transaction, read the staged rows
+   and verify report, action and equity counts plus payload hashes before the
+   coordinator commits.
 7. `CALCULATING_DD5`: calculate DD5 only from committed database rows and write
    `dd5_runs`/`dd5_results` transactionally.
 8. `EXPORTING`: generate `posttest.xlsx` and a small JSON manifest from the DD5
@@ -368,6 +404,33 @@ database transaction rolls back. Successfully imported duplicates may be deleted
 only when readback confirms their existing identical payload. Cleanup resumes
 idempotently after a process crash: `DELETING` is rechecked by file hash and
 either returned to `DELETE_READY` or completed as `DELETED`.
+
+### 8.1 Parallel Preparation and Bulk Publication
+
+- The default preparation worker count is `4`; the safe documented maximum is
+  `8`. Explicit worker counts come from the existing `duckdb_import` settings
+  and are clamped by the import coordinator; workers below `1` are rejected.
+- Preparation is deterministic: each manifest entry is submitted with its
+  manifest index, and completed outcomes are buffered and sorted by that index
+  before identity/conflict decisions. A different worker completion order must
+  not change database rows, audit entries, checklist rows or results.
+- There is exactly one DuckDB publication writer and one coordinator
+  transaction. `backtest_actions` and `backtest_equity` are written with bulk
+  append/register operations in bounded chunks, not one `execute` per row.
+  Schema precision, typed columns and readback validation are unchanged.
+- Idempotent supplements may avoid a full HTML parse only when committed
+  `import_files`/`backtest_runs` evidence proves the same manifest entry,
+  source report hash/size, strategy version and payload hash. New or changed
+  entries always receive full validation; conflicting identities fail closed
+  and unknown reports are never skipped silently.
+- Progress events expose stage, prepared/scheduled, imported/skipped,
+  quarantined, elapsed phase seconds and total counters. CLI/panel journals
+  throttle duplicate preparation events; terminal stage failures are always
+  emitted. Result and audit evidence include phase timing/counts without local
+  absolute paths.
+- Cancellation or any preparation/write/readback failure leaves every inbox
+  HTML intact, preserves audit/checklist safety rules, rolls back the single
+  publication transaction and does not mark anything `DELETE_READY`.
 
 ## 9. XLSX and CSV Contract
 

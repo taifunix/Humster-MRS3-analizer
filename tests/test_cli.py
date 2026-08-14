@@ -376,7 +376,7 @@ def test_performance_dd5_cli_imports_calculates_then_cleans_up(
     imported = PerformanceImportResult("import-1", 1, 0, 0)
 
     monkeypatch.setattr(cli.AlgorithmConfig, "from_json", lambda path: cli.AlgorithmConfig.defaults())
-    monkeypatch.setattr(cli, "import_performance_batch", lambda request: events.append("import") or imported)
+    monkeypatch.setattr(cli, "import_performance_batch", lambda request, progress=None: events.append("import") or imported)
     monkeypatch.setattr(cli, "run_performance_dd5", lambda *args: events.append("dd5") or SimpleNamespace(workbook=output / "posttest.xlsx", manifest=output / "posttest_manifest.json"))
     monkeypatch.setattr(cli, "resume_performance_cleanup", lambda request: events.append("cleanup"))
 
@@ -387,7 +387,45 @@ def test_performance_dd5_cli_imports_calculates_then_cleans_up(
 
     assert code == 0
     assert events == ["import", "dd5", "cleanup"]
-    assert json.loads(capsys.readouterr().out)["import_id"] == "import-1"
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["import_id"] == "import-1"
+
+
+def test_performance_dd5_cli_uses_duckdb_import_workers_and_transaction_batch_size(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from mrs3.performance_import import PerformanceImportResult
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"duckdb_import": {"workers": 7, "transaction_batch_size": 13}}),
+        encoding="utf-8",
+    )
+    seen: list[object] = []
+    imported = PerformanceImportResult("import-settings", 1, 0, 0)
+    monkeypatch.setattr(cli.AlgorithmConfig, "from_json", lambda path: cli.AlgorithmConfig.defaults())
+    monkeypatch.setattr(
+        cli,
+        "import_performance_batch",
+        lambda request, progress=None: seen.append(request) or imported,
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_performance_dd5",
+        lambda *args: SimpleNamespace(workbook=tmp_path / "posttest.xlsx", manifest=tmp_path / "posttest_manifest.json"),
+    )
+    monkeypatch.setattr(cli, "resume_performance_cleanup", lambda request: None)
+
+    code = main([
+        "performance-dd5", "--database", str(tmp_path / "performance.duckdb"),
+        "--inbox", str(tmp_path / "inbox"), "--config", str(config),
+        "--output-dir", str(tmp_path / "posttest"),
+    ])
+
+    assert code == 0
+    assert len(seen) == 1
+    assert seen[0].workers == 7
+    assert seen[0].transaction_batch_size == 13
 
 
 def test_panel_cli_starts_loopback_server(tmp_path: Path, monkeypatch) -> None:

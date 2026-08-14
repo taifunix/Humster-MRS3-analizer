@@ -28,6 +28,17 @@ class _FakeProcess:
         return self.returncode
 
 
+class _PerformanceProgressProcess(_FakeProcess):
+    def __init__(self, command: list[str], **kwargs: object) -> None:
+        super().__init__(command, **kwargs)
+        self.stdout = io.StringIO(
+            "ordinary diagnostic\n"
+            '{"performance_progress":{"stage":"READBACK_VERIFIED","completed":1,"total":1,"quarantined":0,"scheduled":1,"prepared":1,"imported":1,"skipped":0,"phase_seconds":{"PARSE_PREPARE":0.1}}}\n'
+            '{"performance_progress":{"stage":"READBACK_VERIFIED","completed":1,"total":1,"quarantined":0,"scheduled":1,"prepared":1,"imported":1,"skipped":0,"phase_seconds":{"PARSE_PREPARE":0.1},"terminal_error":"ValueError"}}\n'
+        )
+        self.returncode = 1
+
+
 def _wait_finished(controller: PanelController) -> dict[str, object]:
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
@@ -726,6 +737,23 @@ def test_controller_builds_shell_free_tester_command_and_captures_log(
     ]
 
 
+def test_performance_dd5_job_preserves_last_progress_snapshot_on_failure(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_PerformanceProgressProcess)
+    controller._job = _Job("performance", "performance-dd5", (), {}, {})
+
+    controller._run_job("performance")
+
+    job = controller.snapshot()["job"]
+    assert job["status"] == "FAILED"
+    assert job["logs"] == ["ordinary diagnostic"]
+    assert job["performance_progress"] == {
+        "stage": "READBACK_VERIFIED", "completed": 1, "total": 1,
+        "quarantined": 0, "scheduled": 1, "prepared": 1, "imported": 1,
+        "skipped": 0, "phase_seconds": {"PARSE_PREPARE": 0.1},
+        "terminal_error": "ValueError",
+    }
+
+
 def test_controller_builds_source_csv_command_without_tester_config(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
 
@@ -1090,6 +1118,10 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert "prefers-contrast: more" in html
         assert "function activateTab" in html
         assert "function browse" in html
+        assert "performance_progress" in html
+        assert "function renderPerformanceProgress" in html
+        assert "performanceProgress" in html
+        assert "performanceTerminalError" in html
         assert "/api/browse" in html
         assert "CSV-файлы" in html
 

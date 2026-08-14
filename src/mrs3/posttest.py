@@ -378,6 +378,7 @@ def _final_comparison_columns(frame: pd.DataFrame) -> pd.DataFrame:
         "trades",
         "win_rate_pct",
         "profit_factor",
+        "profit_factor_status",
     ]
     present = [column for column in primary if column in frame.columns]
     return frame.loc[:, present]

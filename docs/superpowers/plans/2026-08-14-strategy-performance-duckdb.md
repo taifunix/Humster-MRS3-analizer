@@ -245,3 +245,40 @@ git commit -m "feat: run DD5 from strategy performance DuckDB"
 - [ ] Run .venv\Scripts\python.exe -m pytest tests/runner/test_inbox.py tests/test_performance.py tests/test_performance_store.py tests/test_performance_import.py tests/test_performance_dd5.py tests/test_posttest.py tests/test_panel.py tests/test_cli.py -q.
 - [ ] Run an independent review of the final diff.
 - [ ] Start a fresh 476-strategy non-5m ONUSDT tester batch only after its new inbox is complete. Require 476/476, zero quarantine, readback, DuckDB DD5 and audit-backed cleanup before treating the run as evidence.
+
+## Follow-up: Excel Visibility Parity
+
+- [ ] Return `common_close_ma` to the visible `Close MA` column in both
+  `01_Finalists` and `18_Final_Comparison`. Preserve it in the raw and DD5
+  audit sheets, add a regression test for both visible sheets, and do not
+  substitute it with the `pareto_dd5_close_ma` boolean flag.
+
+# Follow-up: DD5 Import Throughput
+
+Observed production-scale evidence (2026-08-14): one completed inbox contains
+476 HTML reports with multi-million action/equity samples. The current import
+validates and prepares entries sequentially, so it occupies one CPU core for an
+extended period before the transactional DuckDB write and Excel export begin.
+
+The accepted next iteration adds bounded parallel preparation and bulk
+publication to the Performance DuckDB import path:
+
+- Parse/validate preparation uses a bounded `ProcessPoolExecutor` with a safe
+  default (`4`) and documented maximum (`8`). Workers only read immutable
+  inbox paths/bytes, never open DuckDB, and never mutate HTML, audit or
+  checklist evidence.
+- Completed preparation is buffered and sorted by manifest index before
+  identity/conflict decisions, so worker completion order cannot change the
+  published database or audit.
+- `backtest_actions` and `backtest_equity` replace row-at-a-time `execute`
+  writes with bulk append/register in bounded chunks inside the one publication
+  transaction.
+- Idempotent supplements can skip full HTML parsing only when committed
+  `import_files`/`backtest_runs` evidence proves identical manifest entry,
+  source hash/size, strategy version and payload hash.
+- Progress exposes validate, scheduled/prepared, imported/skipped,
+  transaction-write and readback stages with counters and phase timings; CLI
+  and panel journals throttle non-terminal duplicates. Result/audit evidence
+  stores phase timing/counts without local paths.
+- Cancellation/error preserves HTML and audit/checklist safety, rolls back the
+  single transaction, and never marks `DELETE_READY` on failure.

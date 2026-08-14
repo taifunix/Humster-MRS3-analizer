@@ -1,4 +1,5 @@
 from pathlib import Path
+from decimal import Decimal
 
 import duckdb
 import pytest
@@ -47,6 +48,29 @@ def test_initialize_rejects_unknown_schema_version(tmp_path: Path) -> None:
         connection.execute("update schema_info set value = '999' where key = 'schema_version'")
     with pytest.raises(PerformanceStoreError, match="unknown schema version"):
         initialize_performance_database(database)
+
+
+def test_initialize_migrates_existing_profit_factor_to_nullable_status_contract(tmp_path: Path) -> None:
+    database = tmp_path / "strategy_performance.duckdb"
+    initialize_performance_database(database)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("alter table backtest_metrics drop column profit_factor_status")
+        connection.execute("alter table backtest_metrics alter column profit_factor set not null")
+        connection.execute(
+            "insert into backtest_metrics (test_run_id, final_balance, total_pnl, total_pnl_pct, max_drawdown, max_drawdown_pct, total_fees, win_rate_pct, profit_factor, days_in_test, total_trades, win_trades, loss_trades, metrics_json) values ('old', 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 0, '{}')"
+        )
+
+    initialize_performance_database(database)
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        columns = {
+            row[0]: row for row in connection.execute("describe backtest_metrics").fetchall()
+        }
+        assert columns["profit_factor"][2] == "YES"
+        assert columns["profit_factor_status"][1] == "VARCHAR"
+        assert connection.execute(
+            "select profit_factor, profit_factor_status from backtest_metrics where test_run_id = 'old'"
+        ).fetchone() == (Decimal("2.000000000000"), "AVAILABLE")
 
 
 def test_portfolio_layer_input_exposes_dd5_and_timestamp_availability(tmp_path: Path) -> None:

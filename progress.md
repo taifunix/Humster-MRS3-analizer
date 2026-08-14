@@ -1,17 +1,19 @@
 # Progress
 
 **Updated:** 2026-08-14
-**Current branch:** `integrate/performance-with-main`
-**Current feature:** Task 4 calculation-only DD5 from committed strategy-performance DuckDB
+**Current branch:** `main`
+**Current feature:** Performance report import and DD5 finalist selection
 
-## Task 4 implementation state (pending production acceptance)
+## Performance DuckDB state (real-batch evidence; implementation hardening)
 
 The new `performance-dd5` path imports a complete inbox, reads only committed
 performance rows, calculates DD5 without creating retest strategies, exports
 the existing workbook format plus a `CALCULATION_ONLY` manifest, persists
 `dd5_runs` and `dd5_results` transactionally, and resumes cleanup only after
-successful export. The legacy CSV `posttest` command remains unchanged. No
-production 476-strategy acceptance evidence is claimed here.
+successful export. The legacy CSV `posttest` command remains unchanged. The
+real 476-strategy completed inbox is committed with zero quarantine and has a
+calculation-only DD5 export; ongoing work hardens the general import contract
+and documents the operational source of truth.
 
 Task 4 fix round 1 adds fresh DD5 persistence readback before artifact export
 and strict panel validation of inbox manifest contracts, entry hashes and
@@ -580,6 +582,48 @@ successfully with `8` Pareto candidates at the `5%` DD target in
 `posttest_long/ONUSDT_exept_5min`. This is legacy name-only output, not
 Performance DuckDB production acceptance evidence.
 
+Current 2026-08-14 Performance DuckDB parser/import follow-up: the immutable
+476-report inbox now parses a representative real HTML structurally. HTML trade
+timestamps use the exact tester UTC representation `YYYY-MM-DD HH:MM:SS`, and
+the seven `Metric`/`Value` sections aggregate only with identical headers and
+unique keys. The tester rewrites HTML `exchange.name` to runtime marker
+`tester`; source strategy plus manifest exchange remain the source of truth and
+all other settings compare canonically. Focused performance/import tests pass;
+the completed real inbox has since been imported and reconciled as recorded
+below. See ADR-0005.
+
+Next implementation status for import throughput: bounded parallel preparation
+and bulk publication are now an accepted contract. The coordinator must use a
+single DuckDB writer/transaction, sort prepared outcomes by manifest order,
+bulk-write action/equity rows, allow evidence-proven supplement skips, and
+publish throttled stage/counter/timing progress while preserving committed
+performance evidence, panel availability, inbox bytes and output artifacts.
+The focused implementation and regression tests for this slice are complete;
+the real 476-report import evidence is recorded below.
+
+Current 2026-08-14 Performance DuckDB DD5 follow-up: literal tester Profit
+Factor `n/a` now imports as `NULL` with
+`UNDEFINED_GROSS_LOSS_ZERO`, retaining raw metrics and never inventing a numeric
+value. DD5 PnL/DD ranking does not use Profit Factor; unavailable rows remain
+candidates and exports/manifest report their count. Existing v1 performance
+DuckDB files migrate this nullable/status contract idempotently. Panel
+`performance-dd5` now reports sequential `VALIDATE`, `SCHEDULED`,
+`PARSE_PREPARE`, `TRANSACTIONAL_IMPORT`, `READBACK_VERIFIED`,
+`CALCULATE_EXPORT`, `CLEANUP` and terminal-error snapshots. Bounded parallel
+preparation and bulk publication are implemented. The real 476-report import
+and its calculation-only DD5 export have completed; see ADR-0006.
+
+Current 2026-08-14 canonical DD5 evidence: the completed 476-strategy inbox
+was imported as `476/476` with zero quarantine. DD5 derives PnL from the final
+immutable wallet sample and drawdown from the maximum monetary equity drawdown
+and its peak at the same sample; the rounded HTML summary is diagnostic only.
+The calculation-only DD5 run completed with 476 rows and 8 primary Pareto
+candidates. Independent checks found zero raw-metric mismatches against the
+historical runner CSV at `1e-8`, zero DD5 formula mismatches, zero primary
+Pareto mismatches, valid active-order lot vectors (length 1--4), and populated
+selection thresholds. The canonical XLSX was exported successfully; no HTML
+re-import was performed for this calculation.
+
 Current session handoff for moving the long HTML import to another machine:
 [remote import handoff](docs/HANDOFF_2026-08-12_REMOTE_IMPORT.md).
 
@@ -590,6 +634,17 @@ Current session handoff for moving the long HTML import to another machine:
 ## Update protocol
 
 Replace this file’s verified-state and next-action sections whenever a commit changes the operational state. Keep only the present blocker set; durable decisions belong in ADRs and feature requirements belong in specs.
+
+## Completed iteration: DD5 import throughput and visibility
+
+- Panel-visible progress for the DuckDB DD5 import now includes validate,
+  scheduled/prepared, imported/skipped, transaction-write and readback stages,
+  phase timings and a terminal error that identifies the failed stage.
+- Independent HTML parse/validation preparation is parallelized with a bounded
+  worker count while preserving deterministic entry ordering; DuckDB writes,
+  audit commit and cleanup remain serial and transactional.
+- Production verification recorded above used the completed 476-report inbox;
+  it did not alter bot-owned reports or start a tester batch.
 ## 2026-08-14: completed 476-run capture recovery
 
 - Root cause confirmed: the run reached `CSV_COMMITTED` with `476/476` verified
