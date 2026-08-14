@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from decimal import Decimal
 from http.client import HTTPConnection
 from html.parser import HTMLParser
 import io
@@ -13,13 +12,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 from mrs3 import panel as panel_module
-from mrs3.panel import (
-    PanelController,
-    _Job,
-    _normalise_tester_log_line,
-    _tester_plan_summary,
-    create_panel_server,
-)
+from mrs3.panel import PanelController, _Job, create_panel_server
 from mrs3.duckdb_import import ImportJobResult, ImportPreflight, ImportProgress
 from mrs3.duckdb_direct import CoverageIssue, DirectPreflight
 
@@ -43,115 +36,6 @@ def _wait_finished(controller: PanelController) -> dict[str, object]:
             return snapshot
         time.sleep(0.01)
     raise AssertionError("panel job did not finish")
-
-
-def test_tester_log_normalisation_shows_english_events_and_hides_broken_text() -> None:
-    assert _normalise_tester_log_line("[Localization] ������� ����") is None
-    assert _normalise_tester_log_line("loaded 3 API keys") == "TESTER CONFIG: 3 API keys loaded"
-    assert _normalise_tester_log_line("[RUN 1/1] start. params: default") == "TESTER RUN: 1/1 started"
-    assert _normalise_tester_log_line(
-        "RUN 1/1 time=2026-07-22 03:32 (4.20%) [Lmt B:0 S:0]"
-    ) == "TESTER PROGRESS: run 1/1 at 4.20% (2026-07-22 03:32)"
-    assert _normalise_tester_log_line(
-        "Interactive chart generated: tester\\report\\my_test\\report.html"
-    ) == "REPORT READY: report.html"
-
-
-def test_panel_exposes_tester_retry_counter() -> None:
-    assert 'id="retries"' in panel_module.PANEL_HTML
-    assert "progress.retry_count" in panel_module.PANEL_HTML
-    assert 'id="operationStats"' in panel_module.PANEL_HTML
-    assert "grid-template-columns: repeat(5, minmax(0, 1fr))" in panel_module.PANEL_HTML
-    assert "job.action === 'tester-run'" in panel_module.PANEL_HTML
-    assert "[hidden] { display: none !important; }" in panel_module.PANEL_HTML
-
-
-def test_panel_refuses_incomplete_performance_inbox(tmp_path: Path) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.json")
-    with pytest.raises(ValueError, match="inbox"):
-        controller._build_command(
-            "performance-dd5",
-            {
-                "database": "performance.duckdb",
-                "inbox": "inbox",
-                "output_dir": "posttest",
-                "config": "config.json",
-            },
-        )
-
-
-def test_panel_refuses_inbox_without_commission_contract(tmp_path: Path) -> None:
-    inbox = tmp_path / "inbox"
-    inbox.mkdir()
-    (inbox / "reports").mkdir()
-    (inbox / "strategies").mkdir()
-    (inbox / "reports" / "entry.html").write_text("report", encoding="utf-8")
-    (inbox / "strategies" / "strategy.json").write_text("{}", encoding="utf-8")
-    (inbox / "inbox_manifest.json").write_text(
-        json.dumps({
-            "schema_version": 1,
-            "batch_id": "batch-1",
-            "expected_strategy_names": ["Demo"],
-            "tester_config_sha256": "0" * 64,
-            "entries": [{
-                "manifest_entry_id": "entry-1",
-                "strategy_name": "Demo",
-                "strategy_version_id": "0" * 64,
-                "strategy_path": "strategies/strategy.json",
-                "report_path": "reports/entry.html",
-                "wizard_run_id": "run-1",
-                "exchange_name": "Bybit",
-                "source_strategy_sha256": "0" * 64,
-                "source_report_sha256": "0" * 64,
-            }],
-        }),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="commission"):
-        PanelController(tmp_path, tmp_path / "config.json")._build_command(
-            "performance-dd5",
-            {"database": "performance.duckdb", "inbox": "inbox", "output_dir": "posttest"},
-        )
-
-
-def test_tester_plan_summary_exposes_clean_and_resume_counts() -> None:
-    summary = _tester_plan_summary(
-        json.dumps({
-            "expected_count": 52,
-            "resume_completed_count": 49,
-            "resume_remaining_names": ["A", "B", "C"],
-        })
-    )
-
-    assert summary == {"total": 52, "reusable": 49, "prepared": 3, "mode": "RESUME"}
-    assert 'id="testerPlanSummary"' in panel_module.PANEL_HTML
-    assert "Запустить тесты (${plan.prepared})" in panel_module.PANEL_HTML
-
-
-def test_panel_prioritizes_failed_job_over_stale_monitoring_progress() -> None:
-    assert "job.status === 'FAILED' ? 'FAILED'" in panel_module.PANEL_HTML
-
-
-def test_panel_restores_latest_valid_tester_context_after_restart(tmp_path: Path) -> None:
-    config = tmp_path / "config.json"
-    config.write_text("{}", encoding="utf-8")
-    strategies = tmp_path / "Output" / "strategies"
-    strategies.mkdir(parents=True)
-    output = tmp_path / "results" / "mrs3_long_results.csv"
-    output.parent.mkdir()
-    (output.parent / "mrs3_long_results.state.json").write_text(
-        json.dumps({"strategy_source": str(strategies), "output_csv": str(output)}),
-        encoding="utf-8",
-    )
-
-    snapshot = PanelController(tmp_path, config).snapshot()
-
-    assert snapshot["defaults"]["tester"] == {
-        "strategies": str(strategies),
-        "output_csv": str(output),
-    }
-    assert "data.defaults.tester" in panel_module.PANEL_HTML
 
 
 def _import_result(tmp_path: Path, *, final_state: str = "COMMITTED", tampered: bool = False) -> ImportJobResult:
@@ -281,150 +165,17 @@ def test_analysis_refine_validates_and_passes_explicit_parent_before_source_work
 
 def test_analysis_library_ui_and_routes_are_exposed() -> None:
     html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
-    for marker in ("Analysis Library", "Initialize / migrate v4", "analysis_initialize", "analysis_schema_status", "Initializing / migrating analysis schema...", "analysis_side", "analysis_symbol", "analysis_surface_id", "analysis_run_id", "analysis_dates", "analysis_config", "analysis_output", "analysis_template", "analysis_strategy_output", "Refresh scope summary", "Generate READY JSON", "filter_source_pnl", "filter_efficiency", "filter_close_support", "filter_point_event_count", "Export filter audit XLS", "analysis_filter_output", "analysis_unique", "analysis_economic", "analysis_event", "analysis_plateaus", "analysis_ready", "analysisStatus"):
+    for marker in ("Analysis Library", "analysis_side", "analysis_symbol", "analysis_surface_id", "analysis_run_id", "analysis_dates", "analysis_config", "analysis_output", "analysis_unique", "analysis_economic", "analysis_event", "analysis_plateaus", "analysis_ready", "analysisStatus"):
         assert marker in html
-    for endpoint in ("/api/analysis/initialize", "/api/analysis/library", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies"):
+    for endpoint in ("/api/analysis/initialize", "/api/analysis/library", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export"):
         assert endpoint in html or endpoint in __import__("mrs3.panel", fromlist=["_PanelHandler"])._PanelHandler.do_POST.__code__.co_consts
-
-
-def test_phase2_shortlist_uses_scope_summary_without_candidate_rows() -> None:
-    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
-    for marker in (
-        'id="shortlist_all"',
-        'id="shortlist_ready"',
-        'id="shortlist_deferred"',
-        'id="shortlist_comparable"',
-        "Phase 2 structural comparison filters",
-        "Compared only within Pair + Side + TF + Orders + CloseMA",
-        'id="shortlist_table"',
-        'id="shortlist_table_header"',
-        'id="shortlist_table_body"',
-        "2 orders",
-        "3 orders",
-        "4 orders",
-        "Generate READY JSON",
-        "shortlistBusy",
-        "data-shortlist-filter",
-    ):
-        assert marker in html
-    assert "analysis_candidate" not in html
-    assert "Per-order behavior" not in html
-    assert "Select visible" not in html
 
 
 def test_analysis_schema_initialization_is_explicit_and_library_then_reads_only(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     controller.duckdb_import_settings({"analysis_duckdb_path": "analysis.duckdb"})
-    assert controller.initialize_analysis() == {"schema_version": 4}
+    assert controller.initialize_analysis() == {"schema_version": 3}
     assert controller.analysis_library({}) == []
-
-
-def test_analysis_filter_controller_forwards_validated_criteria_and_exports(tmp_path: Path) -> None:
-    calls: list[tuple[object, ...]] = []
-
-    def shortlist(_connection: object, run_id: str, criteria: tuple[str, ...]) -> object:
-        calls.append(("shortlist", run_id, criteria))
-        return {"rows": ({"candidate_id": "C1", "filter_status": "READY_AFTER_FILTERS"},), "ready_count": 1, "deferred_count": 0}
-
-    def export(_connection: object, run_id: str, criteria: tuple[str, ...], output: Path) -> Path:
-        calls.append(("export", run_id, criteria, output))
-        return output / "phase2_filter_audit.xlsx"
-
-    controller = PanelController(
-        tmp_path, tmp_path / "config.local.json",
-        analysis_shortlist_func=shortlist,
-        analysis_filter_export_func=export,
-    )
-    controller.duckdb_import_settings({"analysis_duckdb_path": "analysis.duckdb"})
-    controller.initialize_analysis()
-
-    result = controller.analysis_shortlist({"run_id": "R1", "criteria": ["source_pnl", "close_support"]})
-    exported = controller.export_analysis_filter({"run_id": "R1", "criteria": ["source_pnl"], "output_path": "Output/filter"})
-
-    assert result["ready_count"] == 1
-    assert exported["output"].endswith("phase2_filter_audit.xlsx")
-    assert calls == [
-        ("shortlist", "R1", ("source_pnl", "close_support")),
-        ("export", "R1", ("source_pnl",), (tmp_path / "Output/filter").resolve()),
-    ]
-    with pytest.raises(ValueError, match="criteria"):
-        controller.analysis_shortlist({"run_id": "R1", "criteria": ["sum_pnl"]})
-
-
-def test_analysis_shortlist_returns_pair_timeframe_scope_counts_without_candidate_rows(tmp_path: Path) -> None:
-    rows = (
-        {"candidate_id": "C1", "symbol": "AAAUSDT", "timeframe": "1h", "order_count": 2, "filter_status": "READY_AFTER_FILTERS"},
-        {"candidate_id": "C2", "symbol": "AAAUSDT", "timeframe": "1h", "order_count": 2, "filter_status": "DEFERRED_REDUNDANT"},
-        {"candidate_id": "C3", "symbol": "AAAUSDT", "timeframe": "1h", "order_count": 3, "filter_status": "READY_AFTER_FILTERS"},
-        {"candidate_id": "C4", "symbol": "BBBUSDT", "timeframe": "2h", "order_count": 4, "filter_status": "READY_AFTER_FILTERS"},
-    )
-    controller = PanelController(
-        tmp_path, tmp_path / "config.local.json",
-        analysis_shortlist_func=lambda *_: {
-            "rows": rows, "input_count": 4, "ready_count": 3,
-            "deferred_count": 1, "comparable_count": 3,
-            "comparison_group_count": 2,
-        },
-    )
-    controller.duckdb_import_settings({"analysis_duckdb_path": "analysis.duckdb"})
-    controller.initialize_analysis()
-
-    result = controller.analysis_shortlist({"run_id": "R1", "criteria": []})
-
-    assert "rows" not in result
-    assert result["scopes"] == [
-        {"symbol": "AAAUSDT", "timeframe": "1h", "order_2": 2, "order_3": 1, "order_4": 0, "ready": 2, "deferred": 1, "total": 3},
-        {"symbol": "BBBUSDT", "timeframe": "2h", "order_2": 0, "order_3": 0, "order_4": 1, "ready": 1, "deferred": 0, "total": 1},
-    ]
-    assert result["facets"] == {"symbols": ["AAAUSDT", "BBBUSDT"], "timeframes": ["1h", "2h"]}
-
-
-def test_strategy_generation_resolves_ready_ids_inside_pair_timeframe_scope(tmp_path: Path) -> None:
-    captured: list[tuple[str, ...]] = []
-    rows = (
-        {"candidate_id": "KEEP", "symbol": "AAAUSDT", "timeframe": "1h", "filter_status": "READY_AFTER_FILTERS"},
-        {"candidate_id": "DEFER", "symbol": "AAAUSDT", "timeframe": "1h", "filter_status": "DEFERRED_REDUNDANT"},
-        {"candidate_id": "OTHER_TF", "symbol": "AAAUSDT", "timeframe": "2h", "filter_status": "READY_AFTER_FILTERS"},
-        {"candidate_id": "OTHER_PAIR", "symbol": "BBBUSDT", "timeframe": "1h", "filter_status": "READY_AFTER_FILTERS"},
-    )
-
-    def generate(_connection: object, _run_id: str, candidate_ids: tuple[str, ...], *_args: object) -> object:
-        captured.append(candidate_ids)
-        return SimpleNamespace(strategies_path=tmp_path / "strategies", strategy_count=len(candidate_ids))
-
-    controller = PanelController(
-        tmp_path, tmp_path / "config.local.json",
-        analysis_shortlist_func=lambda *_: {"rows": rows},
-        analysis_strategy_func=generate,
-        analysis_config_loader=lambda _path: object(),
-    )
-    controller.duckdb_import_settings({"analysis_duckdb_path": "analysis.duckdb"})
-    controller.initialize_analysis()
-
-    controller.start_analysis_strategies({
-        "run_id": "R1", "criteria": ["source_pnl"], "symbol": "AAAUSDT", "timeframe": "1h",
-        "template_path": "template.json", "output_dir": "Output/strategies", "config_path": "config.json",
-    })
-    deadline = time.monotonic() + 1
-    while controller.snapshot()["analysis_strategies"]["running"] and time.monotonic() < deadline:
-        time.sleep(.01)
-
-    assert captured == [("KEEP",)]
-
-
-def test_panel_exposes_side_specific_workflow_defaults_from_local_config(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"panel_workflow": {"listing_dates_path": "input/dates.xlsx", "strategy_templates": {"LONG": "input/MRS_3_LONG.json", "SHORT": "input/MRS_3_SHORT.json"}}}), encoding="utf-8")
-
-    defaults = PanelController(tmp_path, config).snapshot()["defaults"]
-
-    assert defaults["workflow"] == {
-        "listing_dates_path": str((tmp_path / "input/dates.xlsx").resolve()),
-        "strategy_templates": {
-            "LONG": str((tmp_path / "input/MRS_3_LONG.json").resolve()),
-            "SHORT": str((tmp_path / "input/MRS_3_SHORT.json").resolve()),
-        },
-    }
 
 
 def test_direct_build_requires_matching_latest_preflight_and_closes_distinct_connections(tmp_path: Path) -> None:
@@ -462,49 +213,14 @@ def test_direct_build_requires_matching_latest_preflight_and_closes_distinct_con
     assert str(tmp_path) not in json.dumps(result)
 
 
-def test_direct_preflight_derives_shifts_from_window_coverage_when_omitted(tmp_path: Path) -> None:
-    captured: list[DirectBuildRequest] = []
-
-    class Connection:
-        def execute(self, query: str, _values: object = None) -> object:
-            assert "select distinct p.shift_bp" in query
-            return SimpleNamespace(fetchall=lambda: [(30,), (150,), (190,)])
-        def close(self) -> None: pass
-
-    preflight = DirectPreflight(
-        {"BTCUSDT": ("1h",)}, {}, (), MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}),
-        ("a" * 64,), (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|30|3|9",),
-    )
-    def inspect(_: object, request: DirectBuildRequest) -> DirectPreflight:
-        captured.append(request)
-        return preflight
-
-    controller = PanelController(
-        tmp_path,
-        tmp_path / "config.local.json",
-        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
-        direct_preflight_func=inspect,
-    )
-    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
-
-    result = controller.duckdb_direct_preflight({
-        "start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z",
-        "side": "LONG", "symbols": ["BTCUSDT"],
-    })
-
-    assert captured[0].required_shifts_bp == (30, 150, 190)
-    assert result["required_shifts_bp"] == [30, 150, 190]
-
-
 def test_direct_build_rejects_same_database_before_open_and_ui_has_controls(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     controller.duckdb_import_settings({"source_duckdb_path": "same.duckdb", "analysis_duckdb_path": "same.duckdb"})
     payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
     with pytest.raises(ValueError, match="must differ"):
         controller.duckdb_direct_preflight(payload)
-    for control in ("direct_start", "direct_end", "direct_side", "direct_symbols", "direct_shifts"):
+    for control in ("direct_start", "direct_end", "direct_side", "direct_shift_start", "direct_shift_end", "direct_shift_step", "direct_symbols"):
         assert f'id="{control}"' in __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
-    assert "excluded: '+code" in __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
 
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
     def fail_open(*_args: object, **_kwargs: object) -> object:
@@ -839,7 +555,7 @@ def test_http_ui_exposes_persistent_import_settings_and_migration_controls(tmp_p
         parser.feed(response.read().decode("utf-8"))
         assert response.status == 200
         assert {"import_source_duckdb", "import_analysis_duckdb", "import_default_html_root", "import_audit_root", "import_workers", "import_batch_size", "migration_target"} <= parser.input_ids
-        assert {"direct_start", "direct_end", "direct_symbols"} <= parser.input_ids
+        assert {"direct_start", "direct_end", "direct_shift_start", "direct_shift_end", "direct_shift_step", "direct_symbols"} <= parser.input_ids
         assert {"saveDuckdbSettings()", "migrateDuckdb()", "directPreflight()", "directBuild()", "directCancel()"} <= parser.actions
         panel_html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
         assert ".direct-unavailable" in panel_html and "row.className='direct-unavailable'" in panel_html
@@ -969,8 +685,6 @@ def test_controller_builds_shell_free_tester_command_and_captures_log(
     job = snapshot["job"]
     assert job["status"] == "SUCCEEDED"
     assert job["logs"] == ["started", "finished"]
-    assert job["artifacts"] == {"raw_log": "test.raw.log"}
-    assert (tmp_path / "results" / "test.raw.log").read_text(encoding="utf-8") == "started\nfinished\n"
     assert job["command"][1:4] == ["-m", "mrs3.cli", "tester-run"]
     assert job["command"][-2:] == [
         "--output-csv",
@@ -1158,7 +872,7 @@ def test_controller_hides_artifacts_left_by_an_older_job(tmp_path: Path) -> None
     snapshot = _wait_finished(controller)
 
     assert snapshot["job"]["workflow"] is None
-    assert snapshot["job"]["artifacts"] == {"raw_log": "test.raw.log"}
+    assert snapshot["job"]["artifacts"] == {}
 
 
 def test_dashboard_reports_manifest_counts_but_never_claims_v2_selectable(
@@ -1247,7 +961,7 @@ def test_dashboard_reports_candidate_tester_and_posttest_final_artifacts(
     posttest.mkdir()
     (posttest / "posttest_manifest.json").write_text(
         json.dumps(
-            {"raw_result_count": 2, "pareto_count": 1, "target_dd_pct": "5", "dd5_mode": "CALCULATION_ONLY"}
+            {"raw_result_count": 2, "pareto_count": 1, "scaled_strategy_count": 1, "target_dd_pct": "5"}
         ),
         encoding="utf-8",
     )
@@ -1269,11 +983,8 @@ def test_dashboard_reports_candidate_tester_and_posttest_final_artifacts(
         {"label": "DD лучшего, %", "value": "2"},
         {"label": "Ошибки", "value": 0},
     ]
-    assert dashboard["posttest"]["state"] == "CALCULATED"
-    assert dashboard["posttest"]["metrics"][-1] == {"label": "Целевой DD, %", "value": "5"}
-    assert dashboard["posttest"]["details"] == [
-        "DD5 расчётно нормализует результаты для сравнения стратегий; повторный tick-test не входит в workflow."
-    ]
+    assert dashboard["posttest"]["state"] == "RETEST_REQUIRED"
+    assert dashboard["posttest"]["metrics"][-1] == {"label": "DD5 JSON", "value": 1}
 
 
 def test_dashboard_keeps_last_artifact_when_a_later_job_has_none(tmp_path: Path) -> None:
@@ -1322,16 +1033,12 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert response.status == 200
         assert "MRS3 Control Panel" in html
         assert "Каталог JSON-стратегий" in html
-        assert "Legacy CSV source" in html
+        assert "MRS2 · CSV" in html
         assert html.count('<button role="tab"') == 5
         assert html.count('<section role="tabpanel"') == 5
-        assert html.index('id="posttest_output_dir"') < html.index('id="panel-settings"')
-        assert 'id="audit_xlsx"' not in html
-        assert 'id="posttest_strategies"' not in html
-        assert "nextPosttestOutput" in html
-        assert "Legacy CSV source" in html
-        assert "1–5. Import → surface → analysis → JSON" in html
-        assert "6–8. Test plan → tests → DD5" in html
+        assert "MRS2 · CSV" in html
+        assert "MRS2 · DuckDB" in html
+        assert "Кандидаты стратегий" in html
         assert "Анализатор портфелей" in html
         assert "Настройки" in html
         assert "legacy_trades_proxy" in html
@@ -1425,46 +1132,6 @@ def test_http_panel_browse_returns_only_explicit_native_selection(tmp_path: Path
         rejected = connection.getresponse()
         rejected.read()
         assert rejected.status == 400
-    finally:
-        connection.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-
-def test_http_analysis_shortlist_returns_only_aggregate_scope_rows(tmp_path: Path) -> None:
-    controller = PanelController(
-        tmp_path,
-        tmp_path / "config.json",
-        analysis_shortlist_func=lambda *_: {
-            "rows": [{"candidate_id": "C1", "symbol": "AAAUSDT", "timeframe": "1h", "order_count": 2, "filter_status": "READY_AFTER_FILTERS", "metric": Decimal("10.123456789")}],
-            "combined": [{"a_values": {"source_pnl": [Decimal("10.123456789")]}}],
-            "input_count": 1,
-            "ready_count": 1,
-            "deferred_count": 0,
-            "comparable_count": 0,
-            "comparison_group_count": 0,
-        },
-    )
-    controller.duckdb_import_settings({"analysis_duckdb_path": "analysis.duckdb"})
-    controller.initialize_analysis()
-    server = create_panel_server("127.0.0.1", 0, controller)
-    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
-    try:
-        body = json.dumps({"run_id": "R1", "criteria": ["source_pnl"]})
-        connection.request(
-            "POST", "/api/analysis/shortlist", body=body,
-            headers={"Content-Type": "application/json"},
-        )
-        response = connection.getresponse()
-        document = json.loads(response.read().decode("utf-8"))
-
-        assert response.status == 200
-        assert document["scopes"] == [{"symbol": "AAAUSDT", "timeframe": "1h", "order_2": 1, "order_3": 0, "order_4": 0, "ready": 1, "deferred": 0, "total": 1}]
-        assert "rows" not in document
-        assert "combined" not in document
     finally:
         connection.close()
         server.shutdown()

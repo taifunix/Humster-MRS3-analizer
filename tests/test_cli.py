@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import mrs3.cli as cli
 import pytest
 from mrs3.cli import main
+from mrs3.pipeline import ALGORITHM_VERSION
 from tests.factories import write_selection_inputs
 
 
@@ -34,7 +35,7 @@ def test_select_cli_writes_manifest_and_returns_zero(tmp_path: Path) -> None:
 
     manifest = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))
     assert code == 0
-    assert manifest["algorithm_version"] == "0.7-representative-v2"
+    assert manifest["algorithm_version"] == ALGORITHM_VERSION
     assert manifest["ready_json_count"] == 5
 
 
@@ -239,6 +240,8 @@ def _write_runner_config(tmp_path: Path) -> Path:
                     "report_dir": "tester/report/my_test",
                     "wizard_result": "tester/wizard_result.json",
                     "wizard_progress": "tester/wizard_progress.json",
+                    "tester_config": "tester/tester_config.json",
+                    "inbox_root": "data/tester_inbox",
                 }
             }
         ),
