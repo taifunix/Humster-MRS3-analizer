@@ -66,6 +66,20 @@ def test_panel_exposes_tester_retry_counter() -> None:
     assert "[hidden] { display: none !important; }" in panel_module.PANEL_HTML
 
 
+def test_panel_refuses_incomplete_performance_inbox(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.json")
+    with pytest.raises(ValueError, match="inbox"):
+        controller._build_command(
+            "performance-dd5",
+            {
+                "database": "performance.duckdb",
+                "inbox": "inbox",
+                "output_dir": "posttest",
+                "config": "config.json",
+            },
+        )
+
+
 def test_tester_plan_summary_exposes_clean_and_resume_counts() -> None:
     summary = _tester_plan_summary(
         json.dumps({

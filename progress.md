@@ -1,8 +1,16 @@
 # Progress
 
-**Updated:** 2026-08-12
-**Current branch:** `main`
-**Current feature:** [v0.7 DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md)
+**Updated:** 2026-08-14
+**Current branch:** `feat/strategy-performance-duckdb`
+**Current feature:** Task 4 calculation-only DD5 from committed strategy-performance DuckDB
+
+## Task 4 verified state
+
+The new `performance-dd5` path imports a complete inbox, reads only committed
+performance rows, calculates DD5 without creating retest strategies, exports
+the existing workbook format plus a `CALCULATION_ONLY` manifest, persists
+`dd5_runs` and `dd5_results` transactionally, and resumes cleanup only after
+successful export. The legacy CSV `posttest` command remains unchanged.
 
 ## Verified repository baseline
 

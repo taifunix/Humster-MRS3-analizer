@@ -360,6 +360,33 @@ def test_posttest_cli_dispatches_dd5_comparison(
     }
 
 
+def test_performance_dd5_cli_imports_calculates_then_cleans_up(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from mrs3.performance_import import PerformanceImportResult
+
+    events: list[str] = []
+    database = tmp_path / "performance.duckdb"
+    inbox = tmp_path / "inbox"
+    output = tmp_path / "posttest"
+    config = tmp_path / "config.json"
+    imported = PerformanceImportResult("import-1", 1, 0, 0)
+
+    monkeypatch.setattr(cli.AlgorithmConfig, "from_json", lambda path: cli.AlgorithmConfig.defaults())
+    monkeypatch.setattr(cli, "import_performance_batch", lambda request: events.append("import") or imported)
+    monkeypatch.setattr(cli, "run_performance_dd5", lambda *args: events.append("dd5") or SimpleNamespace(workbook=output / "posttest.xlsx", manifest=output / "posttest_manifest.json"))
+    monkeypatch.setattr(cli, "resume_performance_cleanup", lambda request: events.append("cleanup"))
+
+    code = main([
+        "performance-dd5", "--database", str(database), "--inbox", str(inbox),
+        "--config", str(config), "--output-dir", str(output),
+    ])
+
+    assert code == 0
+    assert events == ["import", "dd5", "cleanup"]
+    assert json.loads(capsys.readouterr().out)["import_id"] == "import-1"
+
+
 def test_panel_cli_starts_loopback_server(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.json"
     called: dict[str, object] = {}

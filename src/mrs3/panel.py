@@ -253,6 +253,7 @@ PANEL_HTML = r"""<!doctype html>
         <div class="stack workflow-card"><h3>1. Собрать кандидатов</h3><label>Источник точек<select id="select_source_mode" onchange="syncCandidateSource()"><option value="csv">Совместимый CSV-вход</option><option value="package">Проверенный source-pack</option></select></label><label id="raw_csv_source">Совместимый CSV-вход (текущий путь)<div class="path-control"><input id="input_csv" value="reports_history_bybit_long_day2.csv" type="text"><button type="button" class="secondary" onclick="browse('input_csv','csv',false)">Выбрать…</button></div></label><label id="package_source" hidden>Каталог проверенного source-pack<div class="path-control"><input id="source_package" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('source_package','directory',false)">Выбрать…</button></div></label><div class="row"><label>Даты листинга<div class="path-control"><input id="dates" value="dates.xlsx" type="text"><button type="button" class="secondary" onclick="browse('dates','dates',false)">Выбрать…</button></div></label><label>Шаблон JSON<div class="path-control"><input id="template" value="ADM_3_LONG_SHORT.json" type="text"><button type="button" class="secondary" onclick="browse('template','template',false)">Выбрать…</button></div></label></div><label>Сторона<select id="side"><option>LONG</option><option>SHORT</option></select></label><button data-runnable="true" onclick="startAction('select')">Запустить селектор</button></div>
         <div class="stack workflow-card"><h3>2. Проверить и тестировать</h3><label>Каталог JSON-стратегий<div class="path-control"><input id="strategies" value="output_long\strategies" type="text"><button type="button" class="secondary" onclick="browse('strategies','directory',false)">Выбрать…</button></div></label><div class="buttons"><button data-runnable="true" id="planButton" onclick="startAction('tester-plan')">Проверить план</button><button data-runnable="true" id="runButton" class="primary" onclick="startAction('tester-run')">Запустить тесты</button></div></div>
         <div class="stack workflow-card"><h3>3. DD5 после теста</h3><p class="source-note">Финальные выводы требуют реального tick-test и DD5 retest.</p><label>CSV результатов<div class="path-control"><input id="results_csv" value="results\mrs3_long_results.csv" type="text"><button type="button" class="secondary" onclick="browse('results_csv','results_csv',false)">Выбрать…</button></div></label><label>Audit XLSX<div class="path-control"><input id="audit_xlsx" value="output_long\audit.xlsx" type="text"><button type="button" class="secondary" onclick="browse('audit_xlsx','audit_xlsx',false)">Выбрать…</button></div></label><label>Каталог исходных стратегий<div class="path-control"><input id="posttest_strategies" value="output_long\strategies" type="text"><button type="button" class="secondary" onclick="browse('posttest_strategies','directory',false)">Выбрать…</button></div></label><button data-runnable="true" onclick="startAction('posttest')">Собрать DD5</button></div>
+        <div class="stack workflow-card"><h3>Performance DuckDB DD5</h3><p class="source-note">CALCULATION_ONLY: import, calculate, export, then cleanup.</p><label>Performance DuckDB<div class="path-control"><input id="performance_database" value="output_long\strategy_performance.duckdb" type="text"><button type="button" class="secondary" onclick="browse('performance_database','duckdb',false)">Выбрать…</button></div></label><label>Completed performance inbox<div class="path-control"><input id="performance_inbox" value="output_long\performance_inbox" type="text"><button type="button" class="secondary" onclick="browse('performance_inbox','directory',false)">Выбрать…</button></div></label><button data-runnable="true" onclick="startAction('performance-dd5')">Run DuckDB DD5</button></div>
       </section>
       <section role="tabpanel" id="panel-portfolio" aria-labelledby="tab-portfolio" hidden>
         <h2>Анализатор портфелей</h2><p id="portfolio-prerequisites" class="source-note"><span class="queued">Queued — Layer A only after input-contract check.</span> Нужны: формат individual results, timestamps входа/выхода, limiter contract (positions vs orders; LONG/SHORT; hedge/one-way), L2 и margin data/rules. Анализатор не превращает source-метрики или individual ranking в портфельный результат.</p>
@@ -325,6 +326,7 @@ function payload(action) {
       : {input_csv:value('input_csv')};
     return {...base, ...source, dates:value('dates'), template:value('template'), side:value('side'), output_dir:value('select_output_dir')};
   }
+  if (action === 'performance-dd5') return {...base, database:value('performance_database'), inbox:value('performance_inbox'), output_dir:value('posttest_output_dir')};
   return {...base, results_csv:value('results_csv'), audit_xlsx:value('audit_xlsx'), strategies:value('posttest_strategies'), output_dir:value('posttest_output_dir')};
 }
 async function startAction(action) {
@@ -616,6 +618,7 @@ class PanelController:
             "tester-plan": "tester",
             "tester-run": "tester",
             "posttest": "posttest",
+            "performance-dd5": "posttest",
         }[action]
 
     def _path(self, value: str | Path) -> Path:
@@ -732,6 +735,35 @@ class PanelController:
             artifacts = {
                 "manifest": output_dir / "run_manifest.json",
                 "audit": output_dir / "audit.xlsx",
+            }
+        elif action == "performance-dd5":
+            database = self._path(self._required(payload, "database"))
+            inbox = self._path(self._required(payload, "inbox"))
+            output_dir = self._path(self._required(payload, "output_dir"))
+            manifest = inbox / "inbox_manifest.json"
+            if not manifest.is_file():
+                raise ValueError("inbox is incomplete: inbox_manifest.json is missing")
+            try:
+                document = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise ValueError("inbox is incomplete: invalid manifest") from error
+            entries = document.get("entries") if isinstance(document, dict) else None
+            if not isinstance(entries, list) or not entries:
+                raise ValueError("inbox is incomplete: manifest has no entries")
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("inbox is incomplete: invalid manifest entry")
+                for key in ("report_path", "strategy_path"):
+                    relative = Path(str(entry.get(key, "")))
+                    if relative.is_absolute() or ".." in relative.parts or not (inbox / relative).is_file():
+                        raise ValueError(f"inbox is incomplete: missing {key}")
+            command[3] = "performance-dd5"
+            command.extend(
+                ["--database", str(database), "--inbox", str(inbox), "--output-dir", str(output_dir)]
+            )
+            artifacts = {
+                "workbook": output_dir / "posttest.xlsx",
+                "manifest": output_dir / "posttest_manifest.json",
             }
         elif action == "posttest":
             results_csv = self._path(self._required(payload, "results_csv"))

@@ -11,6 +11,12 @@ from .models import Side
 from .panel import serve_panel
 from .pipeline import SelectionInputs, run_selection
 from .posttest import run_posttest
+from .performance_dd5 import run_performance_dd5
+from .performance_import import (
+    PerformanceImportRequest,
+    import_performance_batch,
+    resume_performance_cleanup,
+)
 from .runner.config import RunnerConfig
 from .runner.workflow import plan_batch, run_batch
 from .source_packs import build_csv_package
@@ -64,6 +70,13 @@ def _parser() -> argparse.ArgumentParser:
     posttest.add_argument("--strategies-dir", type=Path, required=True)
     posttest.add_argument("--config", type=Path, required=True)
     posttest.add_argument("--output-dir", type=Path, required=True)
+    performance_dd5 = subparsers.add_parser(
+        "performance-dd5", help="import committed tester evidence and calculate DD5"
+    )
+    performance_dd5.add_argument("--database", type=Path, required=True)
+    performance_dd5.add_argument("--inbox", type=Path, required=True)
+    performance_dd5.add_argument("--config", type=Path, required=True)
+    performance_dd5.add_argument("--output-dir", type=Path, required=True)
     panel = subparsers.add_parser(
         "panel", help="run the local MRS3 control panel"
     )
@@ -169,6 +182,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 indent=2,
             )
         )
+        return 0
+    if args.command == "performance-dd5":
+        config = AlgorithmConfig.from_json(args.config)
+        request = PerformanceImportRequest(args.inbox, args.database)
+        imported = import_performance_batch(request)
+        if imported.quarantined_count:
+            raise ValueError("DD5 refused an import with quarantined reports")
+        result = run_performance_dd5(args.database, imported.import_id, args.output_dir, config)
+        resume_performance_cleanup(request)
+        print(json.dumps({"import_id": imported.import_id, "workbook": str(result.workbook), "manifest": str(result.manifest)}, ensure_ascii=False, indent=2))
         return 0
     if args.command == "panel":
         serve_panel(
