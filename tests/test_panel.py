@@ -80,6 +80,41 @@ def test_panel_refuses_incomplete_performance_inbox(tmp_path: Path) -> None:
         )
 
 
+def test_panel_refuses_inbox_without_commission_contract(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "reports").mkdir()
+    (inbox / "strategies").mkdir()
+    (inbox / "reports" / "entry.html").write_text("report", encoding="utf-8")
+    (inbox / "strategies" / "strategy.json").write_text("{}", encoding="utf-8")
+    (inbox / "inbox_manifest.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "batch_id": "batch-1",
+            "expected_strategy_names": ["Demo"],
+            "tester_config_sha256": "0" * 64,
+            "entries": [{
+                "manifest_entry_id": "entry-1",
+                "strategy_name": "Demo",
+                "strategy_version_id": "0" * 64,
+                "strategy_path": "strategies/strategy.json",
+                "report_path": "reports/entry.html",
+                "wizard_run_id": "run-1",
+                "exchange_name": "Bybit",
+                "source_strategy_sha256": "0" * 64,
+                "source_report_sha256": "0" * 64,
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="commission"):
+        PanelController(tmp_path, tmp_path / "config.json")._build_command(
+            "performance-dd5",
+            {"database": "performance.duckdb", "inbox": "inbox", "output_dir": "posttest"},
+        )
+
+
 def test_tester_plan_summary_exposes_clean_and_resume_counts() -> None:
     summary = _tester_plan_summary(
         json.dumps({

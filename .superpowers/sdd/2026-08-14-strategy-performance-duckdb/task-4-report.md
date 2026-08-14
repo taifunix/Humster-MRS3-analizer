@@ -57,3 +57,26 @@ Commit SHA: af05348 (amended final SHA will be recorded by Git after report incl
 
 - The repository baseline has unrelated CLI fixture drift and a panel test collection mismatch; those files were not repaired because doing so would exceed Task 4 scope.
 - The legacy CSV posttest path remains separate from the new DuckDB DD5 action.
+
+## Fix Round 1 Evidence
+
+RED:
+
+```powershell
+$testTemp = Join-Path $env:TEMP 'mrs3-task4-fix1-dd5-red'; & 'D:\SHARE\!MN\hamster\MRS-Analizer\.venv\Scripts\python.exe' -m pytest tests/test_performance_dd5.py tests/test_panel.py -q --basetemp $testTemp -p no:cacheprovider
+```
+
+The panel command stopped during collection on the pre-existing missing
+`_normalise_tester_log_line` import. Running `tests/test_performance_dd5.py`
+alone produced the expected RED: `1 failed, 1 passed`, with
+`posttest.xlsx` present after forced DD5 persistence failure.
+
+GREEN:
+
+```powershell
+$testTemp = Join-Path $env:TEMP 'mrs3-task4-fix1-green-dd5'; & 'D:\SHARE\!MN\hamster\MRS-Analizer\.venv\Scripts\python.exe' -m pytest tests/test_performance_dd5.py -q --basetemp $testTemp -p no:cacheprovider
+```
+
+Result: `2 passed`. `git diff --check` passed. The panel-focused test remains
+unexecutable in this tree because of the documented baseline collection
+blocker; its strict manifest validation is covered by the added test.

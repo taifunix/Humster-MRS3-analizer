@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import duckdb
+import pytest
 
 from mrs3.config import AlgorithmConfig
 from mrs3.performance_dd5 import run_performance_dd5
@@ -36,3 +37,21 @@ def test_dd5_reads_committed_import_and_exports_calculation_only_artifacts(tmp_p
         assert connection.execute("select count(*) from dd5_runs").fetchone()[0] == 1
         assert connection.execute("select status from dd5_runs").fetchone()[0] == "CALCULATION_ONLY"
         assert connection.execute("select count(*) from dd5_results").fetchone()[0] == 1
+
+
+def test_dd5_persistence_failure_leaves_no_export_artifacts(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    imported = import_performance_batch(request)
+    with duckdb.connect(str(request.database)) as connection:
+        connection.execute(
+            "update strategy_versions set settings_json = ?",
+            [json.dumps({"mrs3": {"ma_long": [{"lot_x": 1}]}})],
+        )
+        connection.execute("drop table dd5_results")
+
+    output = tmp_path / "posttest"
+    with pytest.raises(duckdb.Error):
+        run_performance_dd5(request.database, imported.import_id, output, AlgorithmConfig.defaults())
+
+    assert not (output / "posttest.xlsx").exists()
+    assert not (output / "posttest_manifest.json").exists()

@@ -12,6 +12,11 @@ the existing workbook format plus a `CALCULATION_ONLY` manifest, persists
 `dd5_runs` and `dd5_results` transactionally, and resumes cleanup only after
 successful export. The legacy CSV `posttest` command remains unchanged.
 
+Task 4 fix round 1 adds fresh DD5 persistence readback before artifact export
+and strict panel validation of inbox manifest contracts, entry hashes and
+paths. The panel test suite remains blocked by its pre-existing missing helper
+import; no baseline repair was made.
+
 ## Verified repository baseline
 
 - Root package: `src/mrs3`; tests: `tests`; project version: `0.7.0`.

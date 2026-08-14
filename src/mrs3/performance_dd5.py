@@ -81,6 +81,20 @@ def _read_rows(database: Path, import_id: str) -> list[dict[str, object]]:
     return result
 
 
+def _verify_dd5_readback(database: Path, dd5_run_id: str, import_id: str, expected_count: int) -> None:
+    with duckdb.connect(str(database), read_only=True) as connection:
+        run = connection.execute(
+            "select import_id, status, input_test_count from dd5_runs where dd5_run_id = ?",
+            [dd5_run_id],
+        ).fetchone()
+        result_count = connection.execute(
+            "select count(*) from dd5_results where dd5_run_id = ?",
+            [dd5_run_id],
+        ).fetchone()[0]
+    if run != (import_id, "CALCULATION_ONLY", expected_count) or result_count != expected_count:
+        raise ValueError("DD5 readback verification failed")
+
+
 def run_performance_dd5(
     database: Path,
     import_id: str,
@@ -95,8 +109,6 @@ def run_performance_dd5(
     )
     tables = compare_posttest(raw, variants, config)
     output_dir = Path(output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_posttest_outputs(tables, output_dir)
 
     dd5_run_id = uuid.uuid4().hex
     manifest_json: dict[str, object] = {
@@ -109,9 +121,6 @@ def run_performance_dd5(
         "scaled_strategy_count": 0,
         "scaled_strategies_require_retest": False,
     }
-    manifest = output_dir / "posttest_manifest.json"
-    manifest.write_text(json.dumps(manifest_json, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
     with duckdb.connect(str(database)) as connection:
         connection.execute("begin transaction")
         try:
@@ -146,6 +155,12 @@ def run_performance_dd5(
         except Exception:
             connection.execute("rollback")
             raise
+
+    _verify_dd5_readback(database, dd5_run_id, import_id, len(tables.normalized))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_posttest_outputs(tables, output_dir)
+    manifest = output_dir / "posttest_manifest.json"
+    manifest.write_text(json.dumps(manifest_json, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     return PerformanceDd5Artifacts(
         workbook=output_dir / "posttest.xlsx",

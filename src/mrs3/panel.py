@@ -30,6 +30,7 @@ from .duckdb_source_schema import migrate_source_database
 from .duckdb_direct import DirectBuildRequest, DirectMaterializationError, DirectPreflight, preflight_duckdb_direct, run_panel_direct_build
 from .models import Side
 from .pipeline import run_published_pipeline
+from .performance_import import _canonical, _canonical_contract, _sha256
 from .published_surface import load_published_surface
 
 
@@ -643,6 +644,76 @@ class PanelController:
         return value
 
     @staticmethod
+    def _validate_performance_inbox(inbox: Path) -> None:
+        manifest_path = inbox / "inbox_manifest.json"
+        try:
+            document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError("inbox is incomplete: invalid manifest") from error
+        if not isinstance(document, dict) or document.get("schema_version") != 1:
+            raise ValueError("inbox is incomplete: schema_version must be 1")
+        for field in ("batch_id", "tester_config_sha256"):
+            if not isinstance(document.get(field), str) or not document[field].strip():
+                raise ValueError(f"inbox is incomplete: {field} is missing")
+        if not PanelController._is_hash(document["tester_config_sha256"]):
+            raise ValueError("inbox is incomplete: tester_config_sha256 is invalid")
+        expected_names = document.get("expected_strategy_names")
+        entries = document.get("entries")
+        if not isinstance(expected_names, list) or not all(isinstance(name, str) and name for name in expected_names):
+            raise ValueError("inbox is incomplete: expected_strategy_names is invalid")
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("inbox is incomplete: manifest has no entries")
+        try:
+            _canonical_contract(document)
+        except Exception as error:
+            raise ValueError(f"inbox is incomplete: commission contract: {error}") from error
+        names: list[str] = []
+        required = ("manifest_entry_id", "strategy_name", "strategy_version_id", "strategy_path", "report_path", "wizard_run_id", "exchange_name", "source_strategy_sha256", "source_report_sha256")
+        for entry in entries:
+            if not isinstance(entry, dict) or any(not isinstance(entry.get(field), str) or not entry[field].strip() for field in required):
+                raise ValueError("inbox is incomplete: mandatory entry field is missing")
+            names.append(entry["strategy_name"])
+            for field in ("strategy_version_id", "source_strategy_sha256", "source_report_sha256"):
+                if not PanelController._is_hash(entry[field]):
+                    raise ValueError(f"inbox is incomplete: {field} is invalid")
+            paths: dict[str, Path] = {}
+            for field in ("strategy_path", "report_path"):
+                relative = Path(entry[field])
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("inbox is incomplete: path is outside inbox")
+                candidate = (inbox / relative).resolve()
+                try:
+                    candidate.relative_to(inbox.resolve())
+                except ValueError as error:
+                    raise ValueError("inbox is incomplete: path is outside inbox") from error
+                if not candidate.is_file():
+                    raise ValueError(f"inbox is incomplete: missing {field}")
+                paths[field] = candidate
+            if _sha256(paths["report_path"].read_bytes()) != entry["source_report_sha256"]:
+                raise ValueError("inbox is incomplete: report hash mismatch")
+            strategy_bytes = paths["strategy_path"].read_bytes()
+            if _sha256(strategy_bytes) != entry["source_strategy_sha256"]:
+                raise ValueError("inbox is incomplete: strategy hash mismatch")
+            try:
+                strategy = json.loads(strategy_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as error:
+                raise ValueError("inbox is incomplete: invalid strategy JSON") from error
+            if not isinstance(strategy, dict) or _sha256(_canonical(strategy)) != entry["strategy_version_id"]:
+                raise ValueError("inbox is incomplete: strategy version hash mismatch")
+        if sorted(names) != sorted(expected_names):
+            raise ValueError("inbox is incomplete: strategy names do not match")
+
+    @staticmethod
+    def _is_hash(value: object) -> bool:
+        if not isinstance(value, str) or len(value) != 64:
+            return False
+        try:
+            int(value, 16)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
     def _optional_string(payload: Mapping[str, object], name: str) -> str:
         value = payload.get(name)
         return value.strip() if isinstance(value, str) else ""
@@ -743,20 +814,7 @@ class PanelController:
             manifest = inbox / "inbox_manifest.json"
             if not manifest.is_file():
                 raise ValueError("inbox is incomplete: inbox_manifest.json is missing")
-            try:
-                document = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as error:
-                raise ValueError("inbox is incomplete: invalid manifest") from error
-            entries = document.get("entries") if isinstance(document, dict) else None
-            if not isinstance(entries, list) or not entries:
-                raise ValueError("inbox is incomplete: manifest has no entries")
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    raise ValueError("inbox is incomplete: invalid manifest entry")
-                for key in ("report_path", "strategy_path"):
-                    relative = Path(str(entry.get(key, "")))
-                    if relative.is_absolute() or ".." in relative.parts or not (inbox / relative).is_file():
-                        raise ValueError(f"inbox is incomplete: missing {key}")
+            self._validate_performance_inbox(inbox)
             command[3] = "performance-dd5"
             command.extend(
                 ["--database", str(database), "--inbox", str(inbox), "--output-dir", str(output_dir)]
