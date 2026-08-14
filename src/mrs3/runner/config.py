@@ -81,6 +81,8 @@ class RunnerConfig:
     report_dir: Path
     wizard_result: Path
     wizard_progress: Path
+    tester_config: Path
+    inbox_root: Path
     bot_args: tuple[str, ...] = ()
     request_timeout_seconds: float = 15.0
     startup_timeout_seconds: float = 60.0
@@ -96,8 +98,6 @@ class RunnerConfig:
     report_stability_polls: int = 2
     result_report_grace_seconds: float = 15.0
     metric_tolerance: Decimal = Decimal("0.01")
-    tester_config: Path = Path()
-    inbox_root: Path = Path()
 
     @classmethod
     def from_json(cls, path: Path) -> RunnerConfig:

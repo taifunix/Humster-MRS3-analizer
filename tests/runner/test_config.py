@@ -15,6 +15,20 @@ def test_accepts_exact_my_test_under_configured_bot_root(tmp_path: Path) -> None
     assert validate_report_directory(target, bot) == target.resolve()
 
 
+def test_runner_config_requires_tester_evidence_paths() -> None:
+    with pytest.raises(TypeError, match="tester_config.*inbox_root"):
+        RunnerConfig(
+            Path("bot"),
+            Path("bot/hb_c.exe"),
+            "http://127.0.0.1:8087",
+            8087,
+            Path("bot/settings_strategy"),
+            Path("bot/tester/report/my_test"),
+            Path("bot/tester/wizard_result.json"),
+            Path("bot/tester/wizard_progress.json"),
+        )
+
+
 @pytest.mark.parametrize("relative", [".", "tester", "tester/report", "other/my_test"])
 def test_rejects_broad_or_wrong_cleanup_target(tmp_path: Path, relative: str) -> None:
     bot = tmp_path / "hb"

@@ -53,6 +53,8 @@ def _config(tmp_path: Path, port: int = 8087) -> RunnerConfig:
         report_dir=(bot / "tester/report/my_test").resolve(),
         wizard_result=(bot / "tester/wizard_result.json").resolve(),
         wizard_progress=(bot / "tester/wizard_progress.json").resolve(),
+        tester_config=(bot / "tester/tester_config.json").resolve(),
+        inbox_root=(tmp_path / "tester_inbox").resolve(),
         shutdown_timeout_seconds=0.01,
         metric_tolerance=Decimal("0.01"),
     )

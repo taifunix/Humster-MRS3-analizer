@@ -129,7 +129,8 @@ def capture_verified_inbox(
             if not isinstance(strategy, dict):
                 raise InboxCaptureError(f"strategy JSON is not an object for {name}")
             exchange = strategy.get("exchange")
-            if not isinstance(exchange, dict) or not isinstance(exchange.get("name"), str):
+            exchange_name = exchange.get("name") if isinstance(exchange, dict) else None
+            if not isinstance(exchange_name, str) or not exchange_name.strip():
                 raise InboxCaptureError(f"strategy exchange.name is missing for {name}")
             strategy_bytes = _canonical_json(strategy)
             strategy_id = sha256(strategy_bytes).hexdigest()
@@ -140,7 +141,7 @@ def capture_verified_inbox(
                 _canonical_json({"strategy": strategy_id, "report": report_hash, "run": result.run_id})
             ).hexdigest()[:32]
             final_report = inbox / "reports" / f"{entry_id}.html"
-            _atomic_bytes(final_report, report_bytes)
+            copied_report_bytes = _atomic_bytes(final_report, report_bytes)
             entries.append(
                 {
                     "manifest_entry_id": entry_id,
@@ -149,9 +150,9 @@ def capture_verified_inbox(
                     "strategy_path": str(strategy_target.relative_to(inbox)).replace("\\", "/"),
                     "report_path": str(final_report.relative_to(inbox)).replace("\\", "/"),
                     "wizard_run_id": result.run_id,
-                    "exchange_name": exchange["name"],
+                    "exchange_name": exchange_name,
                     "source_strategy_sha256": sha256(strategy_bytes).hexdigest(),
-                    "source_report_sha256": report_hash,
+                    "source_report_sha256": sha256(copied_report_bytes).hexdigest(),
                 }
             )
         manifest = {

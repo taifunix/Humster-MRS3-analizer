@@ -35,6 +35,8 @@ def _config(tmp_path: Path) -> RunnerConfig:
         report_dir=(bot / "tester/report/my_test").resolve(),
         wizard_result=(bot / "tester/wizard_result.json").resolve(),
         wizard_progress=(bot / "tester/wizard_progress.json").resolve(),
+        tester_config=(bot / "tester/tester_config.json").resolve(),
+        inbox_root=(tmp_path / "tester_inbox").resolve(),
         poll_interval_seconds=0.001,
         batch_timeout_seconds=0.2,
         stall_timeout_seconds=0.2,
