@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from html.parser import HTMLParser
 import json
 import re
 
-from lxml import html
+from lxml import etree, html
 
 
 class PerformanceParseError(ValueError):
@@ -149,10 +150,83 @@ def _raw_series_timestamps(source: str, name: str) -> tuple[datetime, ...]:
     return tuple(timestamps)
 
 
-def _raw_inventory(source: str, document: object) -> _RawInventory:
+def _series(source: str, name: str) -> tuple[tuple[int, Decimal], ...]:
+    assignments = list(re.finditer(rf"\b(?:const|let|var)\s+{name}\s*=\s*", source))
+    if len(assignments) != 1:
+        raise PerformanceParseError(f"exactly one {name} assignment is required")
+    try:
+        raw = json.JSONDecoder().raw_decode(source[assignments[0].end():])[0]
+    except json.JSONDecodeError as error:
+        raise PerformanceParseError(f"malformed {name} array") from error
+    if not isinstance(raw, list) or not raw:
+        raise PerformanceParseError(f"{name} must be non-empty")
+    result: list[tuple[int, Decimal]] = []
+    previous: int | None = None
+    for point in raw:
+        if not isinstance(point, list) or len(point) != 2 or not isinstance(point[0], int) or isinstance(point[0], bool):
+            raise PerformanceParseError(f"malformed {name} point")
+        timestamp = point[0]
+        if previous is not None and timestamp <= previous:
+            raise PerformanceParseError(f"{name} timestamps must be strictly increasing")
+        value = _decimal(point[1])
+        result.append((timestamp, value))
+        previous = timestamp
+    return tuple(result)
+
+
+class _RawMarkupParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.pre_text: list[str] = []
+        self.tables: list[tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]] = []
+        self._pre_parts: list[str] | None = None
+        self._table_headers: list[str] | None = None
+        self._table_rows: list[tuple[str, ...]] | None = None
+        self._row: list[str] | None = None
+        self._cell_parts: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "pre":
+            self._pre_parts = []
+        elif tag == "table":
+            self._table_headers, self._table_rows = [], []
+        elif tag == "tr" and self._table_rows is not None:
+            self._row = []
+        elif tag in {"th", "td"} and self._row is not None:
+            self._cell_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._pre_parts is not None:
+            self._pre_parts.append(data)
+        if self._cell_parts is not None:
+            self._cell_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "pre" and self._pre_parts is not None:
+            self.pre_text.append(" ".join("".join(self._pre_parts).split()))
+            self._pre_parts = None
+        elif tag in {"th", "td"} and self._cell_parts is not None and self._row is not None:
+            value = " ".join("".join(self._cell_parts).split())
+            self._row.append(value)
+            self._cell_parts = None
+        elif tag == "tr" and self._row is not None and self._table_rows is not None:
+            if self._table_headers is None or not self._table_headers:
+                self._table_headers = list(self._row)
+            else:
+                self._table_rows.append(tuple(self._row))
+            self._row = None
+        elif tag == "table" and self._table_headers is not None and self._table_rows is not None:
+            self.tables.append((tuple(self._table_headers), tuple(self._table_rows)))
+            self._table_headers = None
+            self._table_rows = None
+
+
+def _raw_inventory(source: str) -> _RawInventory:
+    parser = _RawMarkupParser()
+    parser.feed(source)
+    parser.close()
     settings_count = 0
-    for pre in document.xpath("//pre"):
-        raw = "".join(pre.itertext()).strip()
+    for raw in parser.pre_text:
         if not raw:
             continue
         try:
@@ -166,11 +240,9 @@ def _raw_inventory(source: str, document: object) -> _RawInventory:
 
     metric_matches: list[tuple[int, tuple[str, ...]]] = []
     trade_matches: list[tuple[int, tuple[str, ...], tuple[datetime, ...]]] = []
-    for table in document.xpath("//table"):
-        headers = tuple(_text(cell) for cell in table.xpath(".//thead/tr[1]/th|.//thead/tr[1]/td"))
+    for headers, rows in parser.tables:
         if len(headers) != len(set(headers)):
             raise PerformanceParseError("duplicate table header")
-        rows = [tuple(_text(cell) for cell in row.xpath("./th|./td")) for row in table.xpath(".//tbody/tr")]
         if any(len(row) != len(headers) for row in rows):
             raise PerformanceParseError("table row width differs from its headers")
         if len(headers) >= 2 and headers[:2] == ("Metric", "Value"):
@@ -201,39 +273,15 @@ def _raw_inventory(source: str, document: object) -> _RawInventory:
     )
 
 
-def _series(source: str, name: str) -> tuple[tuple[int, Decimal], ...]:
-    assignments = list(re.finditer(rf"\b(?:const|let|var)\s+{name}\s*=\s*", source))
-    if len(assignments) != 1:
-        raise PerformanceParseError(f"exactly one {name} assignment is required")
-    try:
-        raw = json.JSONDecoder().raw_decode(source[assignments[0].end():])[0]
-    except json.JSONDecodeError as error:
-        raise PerformanceParseError(f"malformed {name} array") from error
-    if not isinstance(raw, list) or not raw:
-        raise PerformanceParseError(f"{name} must be non-empty")
-    result: list[tuple[int, Decimal]] = []
-    previous: int | None = None
-    for point in raw:
-        if not isinstance(point, list) or len(point) != 2 or not isinstance(point[0], int) or isinstance(point[0], bool):
-            raise PerformanceParseError(f"malformed {name} point")
-        timestamp = point[0]
-        if previous is not None and timestamp <= previous:
-            raise PerformanceParseError(f"{name} timestamps must be strictly increasing")
-        value = _decimal(point[1])
-        result.append((timestamp, value))
-        previous = timestamp
-    return tuple(result)
-
-
 def parse_performance_report(source: bytes) -> ParsedPerformanceReport:
     if not isinstance(source, bytes):
         raise PerformanceParseError("source must be bytes")
     try:
         decoded = source.decode("utf-8", errors="strict")
+        raw = _raw_inventory(decoded)
         document = html.fromstring(decoded)
-    except (UnicodeDecodeError, ValueError) as error:
+    except (UnicodeDecodeError, etree.ParserError) as error:
         raise PerformanceParseError("malformed UTF-8 or HTML") from error
-    raw = _raw_inventory(decoded, document)
     settings = _settings(document)
     metrics, actions, metric_headers, trade_headers = _tables(document)
     wallet = _series(decoded, "walletSeries")

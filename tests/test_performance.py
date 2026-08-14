@@ -3,6 +3,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import mrs3.performance as performance
 
 from mrs3.performance import PerformanceParseError, parse_performance_report
 
@@ -35,6 +36,31 @@ def test_parser_rejects_duplicate_equity_series() -> None:
 def test_parser_rejects_malformed_settings_like_pre_alongside_valid_settings() -> None:
     source = (FIXTURES / "report_valid.html").read_bytes() + b'<pre>{"name":"broken",</pre>'
     with pytest.raises(PerformanceParseError, match="malformed settings JSON"):
+        parse_performance_report(source)
+
+
+def test_raw_inventory_rejects_structure_before_semantic_dom_can_hide_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (FIXTURES / "report_valid.html").read_bytes() + (
+        b'<pre>{"name":"second","basic":{}}</pre>'
+    )
+    original = performance.html.fromstring
+
+    def hide_extra_pre(value: object) -> object:
+        document = original(value)
+        for pre in document.xpath("//pre")[1:]:
+            pre.getparent().remove(pre)
+        return document
+
+    monkeypatch.setattr(performance.html, "fromstring", hide_extra_pre)
+    with pytest.raises(PerformanceParseError, match="settings"):
+        parse_performance_report(source)
+
+
+@pytest.mark.parametrize("source", [b"", b"<html><body><"])
+def test_parser_normalizes_empty_and_malformed_html(source: bytes) -> None:
+    with pytest.raises(PerformanceParseError):
         parse_performance_report(source)
 
 
