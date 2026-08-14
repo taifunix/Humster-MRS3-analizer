@@ -7,7 +7,7 @@ import duckdb
 import pytest
 
 from mrs3.config import AlgorithmConfig
-from mrs3.performance_dd5 import run_performance_dd5
+from mrs3.performance_dd5 import regenerate_performance_dd5, run_performance_dd5
 from mrs3.performance_import import import_performance_batch
 from tests.test_performance_import import _request
 
@@ -87,3 +87,26 @@ def test_dd5_retry_uses_skipped_import_file_and_regenerates_from_stored_run(
 
     assert artifacts.manifest_json["dd5_run_id"] == artifacts.dd5_run_id
     assert artifacts.workbook.exists()
+
+
+def test_dd5_artifacts_can_be_regenerated_from_stored_run(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    imported = import_performance_batch(request)
+    with duckdb.connect(str(request.database)) as connection:
+        connection.execute(
+            "update strategy_versions set settings_json = ?",
+            [json.dumps({"mrs3": {"ma_long": [{"lot_x": 1}]}})],
+        )
+    original = run_performance_dd5(
+        request.database, imported.import_id, tmp_path / "first", AlgorithmConfig.defaults()
+    )
+    regenerated = regenerate_performance_dd5(
+        request.database, original.dd5_run_id, tmp_path / "regenerated"
+    )
+    assert regenerated.dd5_run_id == original.dd5_run_id
+    assert regenerated.workbook.exists()
+    with duckdb.connect(str(request.database), read_only=True) as connection:
+        config_json = connection.execute(
+            "select config_json from dd5_runs where dd5_run_id = ?", [original.dd5_run_id]
+        ).fetchone()[0]
+    assert set(json.loads(config_json)) == {field.name for field in __import__("dataclasses").fields(AlgorithmConfig)}

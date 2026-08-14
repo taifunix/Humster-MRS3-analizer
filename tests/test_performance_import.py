@@ -32,7 +32,7 @@ def _request(tmp_path: Path) -> PerformanceImportRequest:
     reports.mkdir(parents=True)
     strategies.mkdir()
     report = FIXTURE.read_bytes()
-    strategy = {"name": "MRS3 Demo", "exchange": {"name": "Bybit"}, "settings": [{"name": "MRS3 Demo", "basic": {"side": "LONG", "strategy": "MRS3", "symbol": "ONUSDT", "time_frame": "1h"}}]}
+    strategy = {"name": "MRS3 Demo", "exchange": {"name": "Bybit"}, "basic": {"side": "LONG", "strategy": "MRS3", "symbol": "ONUSDT", "time_frame": "1h"}}
     strategy_id = hashlib.sha256(_canonical(strategy)).hexdigest()
     (strategies / f"{strategy_id}.json").write_bytes(_canonical(strategy))
     entry_id = "entry-1"
@@ -98,7 +98,7 @@ def test_settings_mismatch_is_quarantined(tmp_path: Path) -> None:
     request = _request(tmp_path)
     strategy_path = next((request.inbox / "strategies").glob("*.json"))
     strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
-    strategy["settings"][0]["basic"]["symbol"] = "OTHERUSDT"
+    strategy["basic"]["symbol"] = "OTHERUSDT"
     strategy_path.write_bytes(_canonical(strategy))
     manifest_path = request.inbox / "inbox_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

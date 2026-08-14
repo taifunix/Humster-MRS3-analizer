@@ -77,10 +77,6 @@ analysis surfaces, повторный plateau-анализ, lineage, библи�
 | Planned | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | empirical cap без leakage | завершённые tick-tests |
 | Queued — hook «Анализатор Портфеля» | [Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) | отдельный анализ готовых MRS3-стратегий и сетов | individual results, trade timestamps, limiter/L2/margin contract |
 | Accepted | [ADR-0001](docs/decisions/0001-repository-and-documentation-model.md) | root v0.7 и модель документации | — |
+| Pending production acceptance | [Strategy performance DuckDB governing spec](docs/specs/2026-08-14-strategy-performance-duckdb.md) | transactional performance import, DB-only DD5 and safe cleanup | [ADR-0004](docs/decisions/0004-strategy-performance-evidence-store.md) |
 
 Полная навигация: [docs/README.md](docs/README.md). Оперативная точка: [progress.md](progress.md).
-## Task 4 Status: Pending Production Acceptance
-
-Strategy-performance DuckDB DD5 is implemented as a calculation-only path from committed imports, pending production acceptance. It preserves the legacy CSV posttest workflow and requires complete inbox evidence before panel execution.
-
-| Pending production acceptance | [Strategy performance DuckDB governing spec](docs/specs/2026-08-14-strategy-performance-duckdb.md) | immutable inbox, transactional evidence store and calculation-only DD5 | [ADR-0004](docs/decisions/0004-strategy-performance-evidence-store.md) |

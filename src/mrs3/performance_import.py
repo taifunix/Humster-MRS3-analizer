@@ -192,6 +192,8 @@ def _validate_inbox_manifest(inbox: Path, manifest: dict[str, object]) -> None:
     entries = manifest.get("entries")
     if not isinstance(expected, list) or not all(isinstance(name, str) and name for name in expected):
         raise PerformanceImportError("inbox manifest expected_strategy_names is invalid")
+    if len(set(expected)) != len(expected):
+        raise PerformanceImportError("duplicate expected strategy name")
     if not isinstance(entries, list) or not entries:
         raise PerformanceImportError("inbox manifest entries are missing")
     _canonical_contract(manifest)
@@ -202,14 +204,26 @@ def _validate_inbox_manifest(inbox: Path, manifest: dict[str, object]) -> None:
     )
     identities: set[tuple[str, str, str]] = set()
     names: list[str] = []
+    report_paths: set[str] = set()
+    strategy_paths: set[str] = set()
+    entry_ids: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or any(not isinstance(entry.get(field), str) or not entry[field].strip() for field in required):
             raise PerformanceImportError("inbox manifest entry is incomplete")
         identity = (entry["manifest_entry_id"], entry["strategy_version_id"], entry["strategy_name"])
-        if identity in identities or entry["manifest_entry_id"] in {item[0] for item in identities}:
+        if identity in identities or entry["manifest_entry_id"] in entry_ids:
             raise PerformanceImportError("duplicate inbox manifest entry identity")
         identities.add(identity)
+        entry_ids.add(entry["manifest_entry_id"])
         names.append(entry["strategy_name"])
+        if entry["strategy_name"] in names[:-1]:
+            raise PerformanceImportError("duplicate manifest strategy name")
+        if entry["report_path"] in report_paths:
+            raise PerformanceImportError("duplicate manifest report path")
+        if entry["strategy_path"] in strategy_paths:
+            raise PerformanceImportError("duplicate manifest strategy path")
+        report_paths.add(entry["report_path"])
+        strategy_paths.add(entry["strategy_path"])
         _safe_report_path(inbox, entry["report_path"])
         _safe_report_path(inbox, entry["strategy_path"])
     if sorted(names) != sorted(expected):
@@ -239,9 +253,9 @@ def _prepare_entry(inbox: Path, manifest_entry: dict[str, object]) -> dict[str, 
     if parsed.settings.get("name") != manifest_entry.get("strategy_name"):
         raise PerformanceImportError("strategy name mismatch")
     settings = strategy.get("settings")
-    if not isinstance(settings, list) or _canonical(parsed.settings) not in {
-        _canonical(item) for item in settings
-    }:
+    if settings is None:
+        settings = {key: value for key, value in strategy.items() if key != "exchange"}
+    if not isinstance(settings, dict) or _canonical(parsed.settings) != _canonical(settings):
         raise PerformanceImportError("parsed HTML settings mismatch inbox strategy settings")
     contract_id, commission_json = _canonical_contract(_read_json(inbox / "inbox_manifest.json"))
     start = parsed.inventory.minimum_timestamp

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
@@ -11,6 +11,7 @@ import duckdb
 import pandas as pd
 
 from .config import AlgorithmConfig
+from .models import Side
 from .posttest import compare_posttest, write_posttest_outputs
 
 
@@ -21,6 +22,44 @@ class PerformanceDd5Artifacts:
     manifest: Path
     manifest_json: dict[str, object]
     dd5_run_id: str
+
+
+_DECIMAL_CONFIG_FIELDS = {
+    "history_min_days", "economic_min_pnl_pct", "economic_min_win_rate_pct",
+    "economic_max_dd_pct", "economic_min_efficiency", "core_link_min",
+    "plateau_envelope_min", "supported_link_min", "isolated_peak_relative",
+    "equivalent_tolerance", "close_core_min", "close_supported_min",
+    "numeric_tolerance", "initial_lot_sum", "target_dd_pct",
+    "close_multiplier_long", "close_multiplier_short",
+}
+
+
+def _config_json(config: AlgorithmConfig) -> str:
+    value: dict[str, object] = {}
+    for item in fields(config):
+        current = getattr(config, item.name)
+        if item.name == "side_columns":
+            current = {key.value: columns for key, columns in current.items()}
+        elif item.name == "shift_factors":
+            current = [[boundary, str(factor)] for boundary, factor in current]
+        elif item.name in _DECIMAL_CONFIG_FIELDS:
+            current = str(current)
+        elif item.name == "base_rates":
+            current = {key: str(rate) for key, rate in current.items()}
+        value[item.name] = current
+    return json.dumps(value, sort_keys=True)
+
+
+def _config_from_json(raw: str) -> AlgorithmConfig:
+    value = json.loads(raw)
+    defaults = AlgorithmConfig.defaults()
+    kwargs = {item.name: value.get(item.name, getattr(defaults, item.name)) for item in fields(defaults)}
+    kwargs["side_columns"] = {Side(key): dict(columns) for key, columns in kwargs["side_columns"].items()}
+    kwargs["base_rates"] = {key: Decimal(str(rate)) for key, rate in kwargs["base_rates"].items()}
+    kwargs["shift_factors"] = tuple((int(boundary), Decimal(str(factor))) for boundary, factor in kwargs["shift_factors"])
+    for name in _DECIMAL_CONFIG_FIELDS:
+        kwargs[name] = Decimal(str(kwargs[name]))
+    return AlgorithmConfig(**kwargs)
 
 
 def _lots(value: object) -> list[Decimal]:
@@ -167,7 +206,7 @@ def run_performance_dd5(
                     import_id,
                     datetime.now(timezone.utc),
                     config.target_dd_pct,
-                    json.dumps({"target_dd_pct": str(config.target_dd_pct)}),
+                    _config_json(config),
                     len(tables.normalized),
                     "CALCULATION_ONLY",
                 ],
@@ -200,15 +239,37 @@ def run_performance_dd5(
 
     _verify_dd5_readback(database, dd5_run_id, import_id, len(tables.normalized))
     tables = _read_persisted_results(database, dd5_run_id, import_id, config)
+    return regenerate_performance_dd5(database, dd5_run_id, output_dir)
+
+
+def regenerate_performance_dd5(
+    database: Path, dd5_run_id: str, output_dir: Path
+) -> PerformanceDd5Artifacts:
+    database = Path(database).resolve()
+    with duckdb.connect(str(database), read_only=True) as connection:
+        run = connection.execute(
+            "select import_id, config_json from dd5_runs where dd5_run_id = ?",
+            [dd5_run_id],
+        ).fetchone()
+    if run is None:
+        raise ValueError(f"unknown DD5 run: {dd5_run_id}")
+    import_id, config_json = run
+    config = _config_from_json(config_json)
+    tables = _read_persisted_results(database, dd5_run_id, import_id, config)
+    manifest_json: dict[str, object] = {
+        "database": database.name,
+        "import_id": import_id,
+        "dd5_run_id": dd5_run_id,
+        "raw_result_count": len(tables.raw),
+        "pareto_count": int(tables.comparison["pareto"].sum()),
+        "target_dd_pct": str(config.target_dd_pct),
+        "dd5_mode": "CALCULATION_ONLY",
+        "scaled_strategy_count": 0,
+        "scaled_strategies_require_retest": False,
+    }
+    output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     write_posttest_outputs(tables, output_dir)
     manifest = output_dir / "posttest_manifest.json"
     manifest.write_text(json.dumps(manifest_json, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    return PerformanceDd5Artifacts(
-        workbook=output_dir / "posttest.xlsx",
-        csv_directory=output_dir / "posttest_csv",
-        manifest=manifest,
-        manifest_json=manifest_json,
-        dd5_run_id=dd5_run_id,
-    )
+    return PerformanceDd5Artifacts(output_dir / "posttest.xlsx", output_dir / "posttest_csv", manifest, manifest_json, dd5_run_id)

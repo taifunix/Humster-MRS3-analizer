@@ -14,9 +14,15 @@ import mrs3.runner.workflow as runner_workflow
 from mrs3.runner.config import RunnerConfig
 from mrs3.runner.files import BatchPreparationError
 from mrs3.runner.http import RowState, StrategyRow
-from mrs3.runner.monitor import BatchCompletion, BatchHtmlCollision
+from mrs3.runner.monitor import BatchCompletion, BatchHtmlCollision, StrategyCompletion
 from mrs3.runner.results import ResultMismatchError, WizardResult
-from mrs3.runner.workflow import BatchPlan, WorkflowDependencies, plan_batch, run_batch
+from mrs3.runner.workflow import (
+    BatchPlan,
+    WorkflowDependencies,
+    _load_or_capture_tester_config_snapshot,
+    plan_batch,
+    run_batch,
+)
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
@@ -60,6 +66,25 @@ def _strategy(directory: Path, name: str) -> None:
     (directory / f"{name}.json").write_text(
         json.dumps({"name": name, "exchange": {"name": "Bybit"}, "settings": []}), encoding="utf-8"
     )
+
+
+def _verified_completion(config: RunnerConfig, names: tuple[str, ...]) -> BatchCompletion:
+    config.report_dir.mkdir(parents=True, exist_ok=True)
+    strategies = {}
+    for name in names:
+        report = config.report_dir / f"{name}.html"
+        report.write_text(f'<pre>{{"name":"{name}"}}</pre>', encoding="utf-8")
+        strategies[name] = StrategyCompletion(name, RowState.RESULT, (), f"run-{name}", report, True, 1)
+    return BatchCompletion(strategies, 1, 0.1)
+
+
+def test_tester_config_snapshot_is_reused_after_restart(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    output = tmp_path / "out" / "results.csv"
+    first = _load_or_capture_tester_config_snapshot(output, config)
+    config.tester_config.write_text('{"tester_config":{"MakerFee":"changed"}}', encoding="utf-8")
+    second = _load_or_capture_tester_config_snapshot(output, config)
+    assert second == first
 
 
 class BatchClient:
@@ -247,8 +272,12 @@ def test_all_reusable_resume_commits_without_starting_bot(
     source = tmp_path / "generated"
     _strategy(source, "A")
     output = tmp_path / "results.csv"
+    snapshot_dir = output.parent / ".results.report_snapshots"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "A__verified.html").write_text('<pre>{"name":"A"}</pre>', encoding="utf-8")
+    saved = WizardResult("run-a", "", ("A",), {}, "/A.html", "A.html", "", "")
     plan = runner_workflow.BatchPlan(
-        source, ("A",), ("A.json",), (), (), (), ("A",)
+        source, ("A",), ("A.json",), (), (), (), ("A",), (saved,)
     )
     monkeypatch.setattr(runner_workflow, "plan_batch", lambda *_args, **_kwargs: plan)
     monkeypatch.setattr(
@@ -393,9 +422,9 @@ def test_batch_keeps_shared_timeframe_in_parallel_window(
         def close(self) -> None:
             pass
 
-    def monitor(*_: object, **kwargs: object) -> BatchCompletion:
+    def monitor(_: object, names: tuple[str, ...], *args: object, **kwargs: object) -> BatchCompletion:
         monitor_kwargs.update(kwargs)
-        return BatchCompletion({}, 1, 0.1)
+        return _verified_completion(config, names)
 
     monkeypatch.setattr(runner_workflow, "monitor_controlled_batch", monitor)
     monkeypatch.setattr(
@@ -446,7 +475,7 @@ def test_batch_installs_strategies_in_configured_chunks(
 
     def monitor(_: object, names: tuple[str, ...], *__: object, **___: object) -> BatchCompletion:
         observed_chunks.append(names)
-        return BatchCompletion({}, 1, 0.1)
+        return _verified_completion(config, names)
 
     monkeypatch.setattr(runner_workflow, "monitor_controlled_batch", monitor)
     monkeypatch.setattr(
@@ -550,6 +579,9 @@ def test_transient_http_failure_restarts_bot_and_runs_only_remaining_names(
     _strategy(source, "A")
     _strategy(source, "B")
     output = tmp_path / "results.csv"
+    snapshot_dir = output.parent / ".results.report_snapshots"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "A__verified.html").write_text('<pre>{"name":"A"}</pre>', encoding="utf-8")
     starts: list[str] = []
     stops: list[str] = []
     monitored: list[tuple[str, ...]] = []
@@ -579,7 +611,7 @@ def test_transient_http_failure_restarts_bot_and_runs_only_remaining_names(
         monitored.append(names)
         if len(monitored) == 1:
             raise _tester_http_500()
-        return BatchCompletion(strategies={}, polls=1, elapsed_seconds=0.1)
+        return _verified_completion(config, names)
 
     monkeypatch.setattr(runner_workflow, "monitor_controlled_batch", monitor)
     monkeypatch.setattr(
@@ -646,7 +678,7 @@ def test_html_collision_retries_only_colliding_names_in_serial_lane(
         collision_keys.append(kwargs.get("collision_keys"))
         if len(monitored) == 1:
             raise BatchHtmlCollision(("A", "B"))
-        return BatchCompletion({}, 1, 0.1)
+        return _verified_completion(config, names)
 
     monkeypatch.setattr(runner_workflow, "monitor_controlled_batch", monitor)
     monkeypatch.setattr(runner_workflow, "_validated_results_for_names", lambda *_: saved)
@@ -737,12 +769,12 @@ def test_recovery_continues_when_stopping_an_already_dead_bot_fails(
         def close(self) -> None:
             pass
 
-    def monitor(*_: object, **__: object) -> BatchCompletion:
+    def monitor(_: object, names: tuple[str, ...], *args: object, **__: object) -> BatchCompletion:
         nonlocal monitors
         monitors += 1
         if monitors == 1:
             raise _tester_http_500()
-        return BatchCompletion(strategies={}, polls=1, elapsed_seconds=0.1)
+        return _verified_completion(config, names)
 
     def stop(_: RunnerConfig) -> None:
         nonlocal stops
@@ -803,7 +835,7 @@ def test_transient_bot_start_failure_retries_the_remaining_batch(
     monkeypatch.setattr(
         runner_workflow,
         "monitor_controlled_batch",
-        lambda *_args, **_kwargs: BatchCompletion({}, 1, 0.1),
+        lambda _client, names, *_args, **_kwargs: _verified_completion(config, names),
     )
     monkeypatch.setattr(
         runner_workflow,
@@ -1001,6 +1033,9 @@ def test_run_stops_bot_and_publishes_progress_before_resume_hydration(
     source = tmp_path / "generated"
     _strategy(source, "A")
     output = (tmp_path / "results.csv").resolve()
+    snapshot_dir = output.parent / ".results.report_snapshots"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "A__verified.html").write_text('<pre>{"name":"A"}</pre>', encoding="utf-8")
     calls: list[str] = []
     light = BatchPlan(source.resolve(), ("A",), ("A.json",), (("A.json", "hash"),), (), ())
     result = WizardResult("run-a", "", ("A",), {}, "/A.html", "A.html", "", "")
@@ -1048,7 +1083,9 @@ def test_restart_recovers_snapshot_before_resubmitting(
     _strategy(source, "B")
     output = tmp_path / "results.csv"
     snapshot = tmp_path / "A.snapshot.html"
-    snapshot.write_text("A", encoding="utf-8")
+    snapshot.write_text('<pre>{"name":"A"}</pre>', encoding="utf-8")
+    snapshot_b = tmp_path / "B.snapshot.html"
+    snapshot_b.write_text('<pre>{"name":"B"}</pre>', encoding="utf-8")
     snapshot_available = False
     monitored: list[tuple[str, ...]] = []
     initial_attempts: list[dict[str, int]] = []
@@ -1090,7 +1127,7 @@ def test_restart_recovers_snapshot_before_resubmitting(
             raise _tester_http_500()
         if len(monitored) == 2:
             raise runner_workflow.BatchTimeout("tester stalled")
-        return BatchCompletion({}, 1, 0.1)
+        return _verified_completion(config, names)
 
     def validated(
         _: RunnerConfig,
@@ -1103,7 +1140,7 @@ def test_restart_recovers_snapshot_before_resubmitting(
     monkeypatch.setattr(
         runner_workflow,
         "_load_snapshot_report_paths",
-        lambda *_: {"A": snapshot} if snapshot_available else {},
+            lambda *_: {"A": snapshot, "B": snapshot_b} if snapshot_available else {},
     )
     monkeypatch.setattr(runner_workflow, "_validated_results_for_names", validated)
     monkeypatch.setattr(

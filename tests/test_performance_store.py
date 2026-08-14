@@ -58,3 +58,14 @@ def test_portfolio_layer_input_exposes_dd5_and_timestamp_availability(tmp_path: 
         "scaled_lots_json", "projected_pnl_dd5", "projected_dd_pct", "holding_filter",
         "pareto_rank", "action_timestamps_available", "equity_timestamps_available",
     } <= columns
+
+
+def test_dd5_latest_results_selects_only_newest_run(tmp_path: Path) -> None:
+    database = tmp_path / "strategy_performance.duckdb"
+    initialize_performance_database(database)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("insert into dd5_runs values ('old', 'I', '2026-08-01T00:00:00Z', 5, '{}', 1, 'CALCULATION_ONLY')")
+        connection.execute("insert into dd5_runs values ('new', 'I', '2026-08-02T00:00:00Z', 5, '{}', 1, 'CALCULATION_ONLY')")
+        connection.execute("insert into dd5_results (dd5_run_id, test_run_id) values ('old', 'T')")
+        connection.execute("insert into dd5_results (dd5_run_id, test_run_id) values ('new', 'T')")
+        assert connection.execute("select dd5_run_id from dd5_latest_results where test_run_id = 'T'").fetchone() == ('new',)

@@ -66,3 +66,53 @@ Commit SHA: recorded in the final response for this single commit.
 - Legacy runner workflow mocks need verified HTML fixtures or explicit capture mocks before that suite can be green.
 - The pre-existing panel import mismatch and CLI fixture drift were not repaired.
 - Production acceptance, including any 476-strategy run, remains pending.
+
+# Final Fix Round 2
+
+## Requirement Mapping
+
+1. Importer compares the complete canonical generated strategy object (top-level JSON shape, excluding only exchange metadata) with parsed HTML settings; mismatch remains quarantined.
+2. Runner writes one immutable tester-config snapshot sidecar before submission and reuses it across restart/resume.
+3. DD5 stores the complete `AlgorithmConfig` and exposes `regenerate_performance_dd5(database, dd5_run_id, output_dir)` using only committed rows.
+4. `dd5_latest_results` and `portfolio_layer_a_input` select one newest DD5 result per test run.
+5. All nine successful workflow mocks now provide verified HTML paths for every expected strategy; the mandatory guard is unchanged.
+6. Import preflight rejects duplicate expected names, entry IDs, strategy names, report paths and strategy paths before reads/commit.
+7. The active PRD documentation registry links the governing spec and ADR-0004, while production acceptance remains pending.
+
+## TDD Evidence
+
+RED command:
+
+```powershell
+$testTemp = Join-Path $env:TEMP 'mrs3-final-fix2-red'; & 'D:\SHARE\!MN\hamster\MRS-Analizer\.venv\Scripts\python.exe' -m pytest tests/test_performance_store.py tests/test_performance_dd5.py tests/runner/test_workflow.py -q --basetemp $testTemp -p no:cacheprovider
+```
+
+RED result: collection failed because the new regeneration and persistent snapshot APIs were not yet implemented.
+
+GREEN commands/results:
+
+```powershell
+$testTemp = Join-Path $env:TEMP 'mrs3-final-fix2-green-core'; & 'D:\SHARE\!MN\hamster\MRS-Analizer\.venv\Scripts\python.exe' -m pytest tests/test_performance_store.py tests/test_performance_dd5.py tests/runner/test_workflow.py::test_tester_config_snapshot_is_reused_after_restart -q --basetemp $testTemp -p no:cacheprovider
+# 9 passed
+$testTemp = Join-Path $env:TEMP 'mrs3-final-fix2-workflow-green4'; & 'D:\SHARE\!MN\hamster\MRS-Analizer\.venv\Scripts\python.exe' -m pytest tests/runner/test_workflow.py -q --basetemp $testTemp -p no:cacheprovider
+# 32 passed
+```
+
+`git diff --check` passed.
+
+## Changed Files
+
+- `src/mrs3/performance_dd5.py`
+- `src/mrs3/performance_store.py`
+- `src/mrs3/runner/workflow.py`
+- `tests/test_performance_dd5.py`
+- `tests/test_performance_store.py`
+- `tests/runner/test_workflow.py`
+- `tests/test_performance_import.py`
+- `src/mrs3/performance_import.py`
+- `PRD.md`
+- This report
+
+## Concerns
+
+The broader focused suite and unrelated panel/CLI baseline drift still require separate verification; no MRS2 or legacy CLI repairs were made. Production acceptance remains pending.

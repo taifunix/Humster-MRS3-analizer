@@ -397,6 +397,18 @@ def _load_snapshot_report_paths(output_csv: Path, expected_names: tuple[str, ...
     return paths
 
 
+def _load_or_capture_tester_config_snapshot(output_csv: Path, config: RunnerConfig) -> bytes:
+    path = output_csv.with_name(f".{output_csv.stem}.tester-config.snapshot")
+    if path.is_file():
+        return path.read_bytes()
+    snapshot = config.tester_config.read_bytes()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_bytes(snapshot)
+    os.replace(temporary, path)
+    return snapshot
+
+
 def _result_document(result: WizardResult) -> dict[str, object]:
     return {
         "run_id": result.run_id,
@@ -773,7 +785,7 @@ def run_batch(
     verified_report_paths: dict[str, Path] = {}
     report_snapshot_dir = output.parent / f".{output.stem}.report_snapshots"
     try:
-        tester_config_snapshot = config.tester_config.read_bytes()
+        tester_config_snapshot = _load_or_capture_tester_config_snapshot(output, config)
         saved_resume_results = plan.resume_results
         report_progress(
             {
