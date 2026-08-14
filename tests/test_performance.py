@@ -32,6 +32,34 @@ def test_parser_rejects_duplicate_equity_series() -> None:
         parse_performance_report((FIXTURES / "report_duplicate_equity.html").read_bytes())
 
 
+def test_parser_rejects_duplicate_table_headers_before_mapping_rows() -> None:
+    source = (FIXTURES / "report_valid.html").read_bytes().replace(
+        b"<th>Side</th>", b"<th>Symbol</th>"
+    )
+    with pytest.raises(PerformanceParseError, match="duplicate table header"):
+        parse_performance_report(source)
+
+
+def test_inventory_timestamp_bounds_include_equity_series() -> None:
+    source = (FIXTURES / "report_valid.html").read_bytes().replace(
+        b"1785549600000,\"1012.5\"", b"1785553200000,\"1012.5\""
+    )
+    parsed = parse_performance_report(source)
+    assert parsed.inventory.maximum_timestamp == datetime(2026, 8, 1, 3, tzinfo=timezone.utc)
+
+
+def test_parser_wraps_epoch_conversion_errors() -> None:
+    source = (FIXTURES / "report_valid.html").read_bytes()
+    for old, new in (
+        (b"1785542400000", b"999999999999999999990"),
+        (b"1785546000000", b"999999999999999999991"),
+        (b"1785549600000", b"999999999999999999992"),
+    ):
+        source = source.replace(old, new)
+    with pytest.raises(PerformanceParseError, match="invalid UTC timestamp"):
+        parse_performance_report(source)
+
+
 @pytest.mark.parametrize(
     "replacement",
     [b"const walletSeries = [];", b"const equitySeries = [[1785542400000, \"NaN\"]];"],
