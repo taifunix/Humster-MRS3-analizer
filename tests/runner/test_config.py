@@ -38,6 +38,8 @@ def test_runner_config_resolves_paths_and_runtime_values(tmp_path: Path) -> None
                     "report_dir": "tester/report/my_test",
                     "wizard_result": "tester/wizard_result.json",
                     "wizard_progress": "tester/wizard_progress.json",
+                    "tester_config": "tester/tester_config.json",
+                    "inbox_root": "data/tester_inbox",
                     "bot_args": ["--port", "8087"],
                     "poll_interval_seconds": 0.25,
                     "max_parallel_submissions": 10,
@@ -56,6 +58,8 @@ def test_runner_config_resolves_paths_and_runtime_values(tmp_path: Path) -> None
     assert config.executable_path == (bot / "hb_c.exe").resolve()
     assert config.strategy_dir == (bot / "settings_strategy").resolve()
     assert config.report_dir == (bot / "tester" / "report" / "my_test").resolve()
+    assert config.tester_config == (bot / "tester" / "tester_config.json").resolve()
+    assert config.inbox_root == (tmp_path / "data" / "tester_inbox").resolve()
     assert config.bot_args == ("--port", "8087")
     assert config.poll_interval_seconds == pytest.approx(0.25)
     assert config.max_parallel_submissions == 10
@@ -86,6 +90,8 @@ def test_runner_config_rejects_nonlocal_or_mismatched_endpoint(
             "report_dir": "tester/report/my_test",
             "wizard_result": "tester/wizard_result.json",
             "wizard_progress": "tester/wizard_progress.json",
+            "tester_config": "tester/tester_config.json",
+            "inbox_root": "data/tester_inbox",
         }
     }
     path = tmp_path / "config.json"
@@ -109,6 +115,8 @@ def test_runner_config_rejects_nonstandard_strategy_directory(tmp_path: Path) ->
                     "report_dir": "tester/report/my_test",
                     "wizard_result": "tester/wizard_result.json",
                     "wizard_progress": "tester/wizard_progress.json",
+                    "tester_config": "tester/tester_config.json",
+                    "inbox_root": "data/tester_inbox",
                 }
             }
         ),
@@ -116,4 +124,27 @@ def test_runner_config_rejects_nonstandard_strategy_directory(tmp_path: Path) ->
     )
 
     with pytest.raises(UnsafePathError, match="settings_strategy"):
+        RunnerConfig.from_json(path)
+
+
+def test_runner_config_rejects_inbox_inside_bot_root(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {"tester_runner": {
+                "bot_root": str(tmp_path / "hb"),
+                "executable": "hb_c.exe",
+                "base_url": "http://127.0.0.1:8087",
+                "port": 8087,
+                "strategy_dir": "settings_strategy",
+                "report_dir": "tester/report/my_test",
+                "wizard_result": "tester/wizard_result.json",
+                "wizard_progress": "tester/wizard_progress.json",
+                "tester_config": "tester/tester_config.json",
+                "inbox_root": "hb/data/tester_inbox",
+            }}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(UnsafePathError, match="outside bot_root"):
         RunnerConfig.from_json(path)

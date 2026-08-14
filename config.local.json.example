@@ -89,6 +89,8 @@
     "report_dir": "tester/report/my_test",
     "wizard_result": "tester/wizard_result.json",
     "wizard_progress": "tester/wizard_progress.json",
+    "tester_config": "tester/tester_config.json",
+    "inbox_root": "data/tester_inbox",
     "bot_args": [],
     "request_timeout_seconds": 15,
     "startup_timeout_seconds": 60,

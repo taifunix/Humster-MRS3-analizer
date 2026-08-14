@@ -20,13 +20,21 @@ from mrs3.runner.workflow import BatchPlan, WorkflowDependencies, plan_batch, ru
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
-REPORT_FIXTURE = FIXTURES / "my_test_run_001_of_001_ADMSTOCK_USDT_2h_2026-07-01_3.html"
 
 
 def _config(tmp_path: Path) -> RunnerConfig:
     bot = (tmp_path / "hb").resolve()
     bot.mkdir(parents=True)
     (bot / "hb_c.exe").write_bytes(b"test executable")
+    tester = bot / "tester"
+    tester.mkdir()
+    tester_config = tester / "tester_config.json"
+    tester_config.write_text(
+        json.dumps(
+            {"tester_config": {"MakerFee": "0.0002", "TakerFee": "0.0004", "SlippagePercent": "0.01", "FundingRate": "0.0001", "FundingIntervalHours": "8"}}
+        ),
+        encoding="utf-8",
+    )
     return RunnerConfig(
         bot_root=bot,
         executable_path=(bot / "hb_c.exe").resolve(),
@@ -36,6 +44,8 @@ def _config(tmp_path: Path) -> RunnerConfig:
         report_dir=(bot / "tester/report/my_test").resolve(),
         wizard_result=(bot / "tester/wizard_result.json").resolve(),
         wizard_progress=(bot / "tester/wizard_progress.json").resolve(),
+        tester_config=tester_config,
+        inbox_root=tmp_path / "inbox",
         poll_interval_seconds=0.001,
         startup_timeout_seconds=0.1,
         batch_timeout_seconds=0.2,
@@ -48,7 +58,7 @@ def _config(tmp_path: Path) -> RunnerConfig:
 def _strategy(directory: Path, name: str) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{name}.json").write_text(
-        json.dumps({"name": name, "settings": []}), encoding="utf-8"
+        json.dumps({"name": name, "exchange": {"name": "Bybit"}, "settings": []}), encoding="utf-8"
     )
 
 
@@ -70,9 +80,21 @@ class BatchClient:
         assert name == "A"
         self.launched = True
         self.config.report_dir.mkdir(parents=True, exist_ok=True)
-        html = REPORT_FIXTURE.read_text(encoding="utf-8").replace('"ADM1"', '"A"')
-        (self.config.report_dir / "A.html").write_text(html, encoding="utf-8")
         total_pnl = -6000 if self.mismatch else -6825.6651944
+        html = f"""<html><body>
+<pre>{{"name":"{name}","basic":{{"symbol":"ADMSTOCK_USDT","time_frame":"2h","strategy":"mrs2"}}}}</pre>
+<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+<tr><td>Initial balance</td><td>1000</td></tr><tr><td>Final balance</td><td>-5825.6651944</td></tr>
+<tr><td>Total PnL</td><td>-6825.6651944</td></tr><tr><td>Total PnL, %</td><td>-682.56651944</td></tr>
+<tr><td>Total Trades</td><td>2</td></tr><tr><td>Win Rate, %</td><td>50</td></tr>
+<tr><td>Win Trades</td><td>1</td></tr><tr><td>Los Trades</td><td>1</td></tr>
+<tr><td>Max Drawdown</td><td>6891</td></tr><tr><td>Max Drawdown, %</td><td>646.0958922978</td></tr>
+<tr><td>Total fees</td><td>9.6289444</td></tr></tbody></table>
+<table><thead><tr><th>Timestamp</th><th>Symbol</th><th>Action</th><th>PnL</th></tr></thead><tbody>
+<tr><td>2026-07-01T00:00:00Z</td><td>ADMSTOCK_USDT</td><td>Opened</td><td>0</td></tr>
+<tr><td>2026-07-02T00:00:00Z</td><td>ADMSTOCK_USDT</td><td>Closed</td><td>-6825.6651944</td></tr>
+</tbody></table></body></html>"""
+        (self.config.report_dir / "A.html").write_text(html, encoding="utf-8")
         self.config.wizard_result.write_text(
             json.dumps(
                 [
@@ -333,7 +355,7 @@ def test_successful_batch_commits_csv_before_raw_cleanup(tmp_path: Path) -> None
     assert not config.report_dir.exists()
     assert not config.wizard_result.exists()
     assert client.closed
-    assert stop_observations == [False, True]
+    assert stop_observations == [False, False, True]
     assert result.events.index("CSV_COMMITTED") < result.events.index(
         "STOPPED_FOR_CLEANUP"
     ) < result.events.index("RAW_ARTIFACTS_REMOVED")

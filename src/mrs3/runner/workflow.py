@@ -25,6 +25,7 @@ from .files import (
     validate_runner_paths,
 )
 from .http import RowState, StrategyRow, TesterHttpClient
+from .inbox import capture_verified_inbox
 from .monitor import BatchCompletion, BatchHtmlCollision, BatchTimeout, monitor_controlled_batch
 from .process import start_bot, stop_bot
 from .results import (
@@ -87,6 +88,7 @@ class BatchRunResult:
     events: tuple[str, ...]
     completion: BatchCompletion
     result_rows: int
+    inbox_path: Path | None = None
 
 
 def validate_runtime_preflight(config: RunnerConfig) -> None:
@@ -820,6 +822,12 @@ def run_batch(
             advance("RECONCILED")
             write_results_csv_atomic(frame, output)
             advance("CSV_COMMITTED")
+            inbox_path = None
+            if set(verified_report_paths) >= set(plan.expected_names):
+                inbox_path = capture_verified_inbox(
+                    config, output, plan, saved_resume_results, verified_report_paths
+                )
+                advance("INBOX_CAPTURED")
             advance("COMPLETED")
             return BatchRunResult(
                 output_csv=output,
@@ -828,6 +836,7 @@ def run_batch(
                 events=tuple(events),
                 completion=BatchCompletion(strategies={}, polls=0, elapsed_seconds=0),
                 result_rows=len(frame),
+                inbox_path=inbox_path,
             )
         batch_number = 0
         while run_names:
@@ -1086,6 +1095,12 @@ def run_batch(
         dependencies.stop(config)
         bot_started = False
         advance("STOPPED_FOR_CLEANUP")
+        inbox_path = None
+        if set(verified_report_paths) >= set(plan.expected_names):
+            inbox_path = capture_verified_inbox(
+                config, output, plan, tuple(saved_resume_results), verified_report_paths
+            )
+            advance("INBOX_CAPTURED")
         cleanup_completed_batch(config)
         shutil.rmtree(report_snapshot_dir, ignore_errors=True)
         advance("RAW_ARTIFACTS_REMOVED")
@@ -1099,6 +1114,7 @@ def run_batch(
             events=tuple(events),
             completion=completion,
             result_rows=len(frame),
+            inbox_path=inbox_path,
         )
     except BaseException as error:
         if bot_started:

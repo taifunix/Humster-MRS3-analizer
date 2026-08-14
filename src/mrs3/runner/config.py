@@ -27,6 +27,16 @@ def _resolve_inside(path: Path, root: Path, label: str) -> Path:
     return resolved
 
 
+def _resolve_outside(path: Path, root: Path, label: str) -> Path:
+    resolved_root = root.resolve()
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        return resolved
+    raise UnsafePathError(f"{label} must be outside bot_root: {resolved}")
+
+
 def validate_report_directory(path: Path, bot_root: Path) -> Path:
     resolved = _resolve_inside(path, bot_root, "report_dir")
     suffix = tuple(part.casefold() for part in resolved.parts[-3:])
@@ -86,6 +96,8 @@ class RunnerConfig:
     report_stability_polls: int = 2
     result_report_grace_seconds: float = 15.0
     metric_tolerance: Decimal = Decimal("0.01")
+    tester_config: Path = Path()
+    inbox_root: Path = Path()
 
     @classmethod
     def from_json(cls, path: Path) -> RunnerConfig:
@@ -104,6 +116,8 @@ class RunnerConfig:
             "report_dir",
             "wizard_result",
             "wizard_progress",
+            "tester_config",
+            "inbox_root",
         }
         missing = sorted(required.difference(raw))
         if missing:
@@ -125,6 +139,11 @@ class RunnerConfig:
         report_dir = validate_report_directory(bot_path("report_dir"), bot_root)
         wizard_result = bot_path("wizard_result")
         wizard_progress = bot_path("wizard_progress")
+        tester_config = bot_path("tester_config")
+        configured_inbox = Path(str(raw["inbox_root"]))
+        if not configured_inbox.is_absolute():
+            configured_inbox = config_path.parent / configured_inbox
+        inbox_root = _resolve_outside(configured_inbox, bot_root, "inbox_root")
         if executable_path.name.casefold() != "hb_c.exe":
             raise RunnerConfigError("executable must name hb_c.exe")
 
@@ -175,4 +194,6 @@ class RunnerConfig:
             report_stability_polls=stability_polls,
             result_report_grace_seconds=_positive_float(raw, "result_report_grace_seconds", 15.0),
             metric_tolerance=metric_tolerance,
+            tester_config=tester_config,
+            inbox_root=inbox_root,
         )
