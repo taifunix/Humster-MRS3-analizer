@@ -50,7 +50,9 @@ def _inputs(tmp_path: Path, config: RunnerConfig) -> tuple[Path, BatchPlan, Wiza
         encoding="utf-8",
     )
     report = tmp_path / "A.html"
-    report.write_bytes(b'<pre>{"name":"A","exchange":{"name":"Bybit"}}</pre>\n')
+    report.write_bytes(
+        b'<pre>{"name":"A","basic":{"symbol":"ONUSDT"},"exchange":{"name":"Bybit"}}</pre>\n'
+    )
     plan = BatchPlan(source, ("A",), ("A.json",), (("A.json", "hash"),), (), ())
     wizard = WizardResult("run-1", "now", ("A",), {}, "/tester-report/my_test/A.html", "A.html", "period", "0")
     return tmp_path / "results.csv", plan, wizard, report
@@ -69,6 +71,44 @@ def test_capture_copies_exact_html_strategy_and_fee_contract(tmp_path: Path) -> 
     assert entry["strategy_name"] == "A"
     assert entry["exchange_name"] == "Bybit"
     assert (inbox / entry["strategy_path"]).read_bytes() == b'{"exchange":{"name":"Bybit"},"name":"A","settings":[]}'
+
+
+def test_capture_accepts_html_escaped_strategy_settings_pre(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    output, plan, wizard, report = _inputs(tmp_path, config)
+    report.write_text(
+        '<html><body><pre>{&quot;name&quot;:&quot;A&quot;,&quot;basic&quot;:{&quot;symbol&quot;:&quot;ONUSDT&quot;}}</pre></body></html>',
+        encoding="utf-8",
+    )
+
+    inbox = capture_verified_inbox(config, output, plan, (wizard,), {"A": report})
+
+    entry = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))["entries"][0]
+    assert (inbox / entry["report_path"]).read_text(encoding="utf-8") == report.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_capture_accepts_flat_tester_config_contract(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.tester_config.write_text(
+        json.dumps(
+            {
+                "MakerFee": "0.0002",
+                "TakerFee": "0.0004",
+                "SlippagePercent": "0.01",
+                "FundingRate": "0.0001",
+                "FundingIntervalHours": "8",
+            }
+        ),
+        encoding="utf-8",
+    )
+    output, plan, wizard, report = _inputs(tmp_path, config)
+
+    inbox = capture_verified_inbox(config, output, plan, (wizard,), {"A": report})
+
+    manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["commission_contract"]["TakerFee"] == "0.0004"
 
 
 def test_capture_rejects_missing_maker_fee(tmp_path: Path) -> None:

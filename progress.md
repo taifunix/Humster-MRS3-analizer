@@ -590,3 +590,15 @@ Current session handoff for moving the long HTML import to another machine:
 ## Update protocol
 
 Replace this file’s verified-state and next-action sections whenever a commit changes the operational state. Keep only the present blocker set; durable decisions belong in ADRs and feature requirements belong in specs.
+## 2026-08-14: completed 476-run capture recovery
+
+- Root cause confirmed: the run reached `CSV_COMMITTED` with `476/476` verified
+  results, but inbox capture rejected the actual flat `hb/config_tester.json`
+  with `InboxCaptureError: tester_config object is missing`.
+- The runner now accepts both the existing nested `tester_config` object and
+  Hamster Bot's flat commission JSON, while keeping all five fields mandatory.
+- Recovery is intentionally the existing resumable `tester-run`: with all 476
+  results hydrated from saved state and report snapshots, it starts no bot and
+  submits no strategies, then captures the immutable inbox after exact-name
+  validation.
+- Focused regression tests are pending verification in this session.

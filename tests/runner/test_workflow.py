@@ -73,7 +73,7 @@ def _verified_completion(config: RunnerConfig, names: tuple[str, ...]) -> BatchC
     strategies = {}
     for name in names:
         report = config.report_dir / f"{name}.html"
-        report.write_text(f'<pre>{{"name":"{name}"}}</pre>', encoding="utf-8")
+        report.write_text(f'<pre>{{"name":"{name}","basic":{{}}}}</pre>', encoding="utf-8")
         strategies[name] = StrategyCompletion(name, RowState.RESULT, (), f"run-{name}", report, True, 1)
     return BatchCompletion(strategies, 1, 0.1)
 
@@ -269,12 +269,24 @@ def test_all_reusable_resume_commits_without_starting_bot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
+    config.tester_config.write_text(
+        json.dumps(
+            {
+                "MakerFee": "0.0002",
+                "TakerFee": "0.0004",
+                "SlippagePercent": "0.01",
+                "FundingRate": "0.0001",
+                "FundingIntervalHours": "8",
+            }
+        ),
+        encoding="utf-8",
+    )
     source = tmp_path / "generated"
     _strategy(source, "A")
     output = tmp_path / "results.csv"
     snapshot_dir = output.parent / ".results.report_snapshots"
     snapshot_dir.mkdir()
-    (snapshot_dir / "A__verified.html").write_text('<pre>{"name":"A"}</pre>', encoding="utf-8")
+    (snapshot_dir / "A__verified.html").write_text('<pre>{"name":"A","basic":{}}</pre>', encoding="utf-8")
     saved = WizardResult("run-a", "", ("A",), {}, "/A.html", "A.html", "", "")
     plan = runner_workflow.BatchPlan(
         source, ("A",), ("A.json",), (), (), (), ("A",), (saved,)
@@ -301,6 +313,8 @@ def test_all_reusable_resume_commits_without_starting_bot(
     assert result.result_rows == 1
     assert output.exists()
     assert "CSV_COMMITTED" in result.events
+    assert result.inbox_path is not None
+    assert (result.inbox_path / "inbox_manifest.json").is_file()
 
 
 def test_run_rejects_output_inside_bot_root(tmp_path: Path) -> None:
@@ -579,7 +593,7 @@ def test_transient_http_failure_restarts_bot_and_runs_only_remaining_names(
     output = tmp_path / "results.csv"
     snapshot_dir = output.parent / ".results.report_snapshots"
     snapshot_dir.mkdir()
-    (snapshot_dir / "A__verified.html").write_text('<pre>{"name":"A"}</pre>', encoding="utf-8")
+    (snapshot_dir / "A__verified.html").write_text('<pre>{"name":"A","basic":{}}</pre>', encoding="utf-8")
     starts: list[str] = []
     stops: list[str] = []
     monitored: list[tuple[str, ...]] = []
@@ -1053,7 +1067,7 @@ def test_run_stops_bot_and_publishes_progress_before_resume_hydration(
     output = (tmp_path / "results.csv").resolve()
     snapshot_dir = output.parent / ".results.report_snapshots"
     snapshot_dir.mkdir()
-    (snapshot_dir / "A__verified.html").write_text('<pre>{"name":"A"}</pre>', encoding="utf-8")
+    (snapshot_dir / "A__verified.html").write_text('<pre>{"name":"A","basic":{}}</pre>', encoding="utf-8")
     calls: list[str] = []
     light = BatchPlan(source.resolve(), ("A",), ("A.json",), (("A.json", "hash"),), (), ())
     result = WizardResult("run-a", "", ("A",), {}, "/A.html", "A.html", "", "")
@@ -1101,9 +1115,9 @@ def test_restart_recovers_snapshot_before_resubmitting(
     _strategy(source, "B")
     output = tmp_path / "results.csv"
     snapshot = tmp_path / "A.snapshot.html"
-    snapshot.write_text('<pre>{"name":"A"}</pre>', encoding="utf-8")
+    snapshot.write_text('<pre>{"name":"A","basic":{}}</pre>', encoding="utf-8")
     snapshot_b = tmp_path / "B.snapshot.html"
-    snapshot_b.write_text('<pre>{"name":"B"}</pre>', encoding="utf-8")
+    snapshot_b.write_text('<pre>{"name":"B","basic":{}}</pre>', encoding="utf-8")
     snapshot_available = False
     monitored: list[tuple[str, ...]] = []
     initial_attempts: list[dict[str, int]] = []

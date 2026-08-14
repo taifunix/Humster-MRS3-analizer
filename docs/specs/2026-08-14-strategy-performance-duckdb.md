@@ -81,9 +81,12 @@ exchange, it must match the strategy exactly after case normalization.
 
 The effective tester commission contract is required because the test cannot
 run reproducibly without it. The runner must snapshot the configured
-`tester_config` once per batch and extract `MakerFee`, `TakerFee`,
+the tester config once per batch and extract `MakerFee`, `TakerFee`,
 `SlippagePercent`, `FundingRate` and `FundingIntervalHours` from that immutable
-copy. The canonical object is stored and hashed as `commission_contract_id`.
+copy. Both the legacy nested form (`{"tester_config": {...}}`) and the actual
+Hamster Bot flat form (`{...commission fields...}`) are accepted; when the
+nested key is present it remains authoritative and must be an object. The
+canonical object is stored and hashed as `commission_contract_id`.
 Missing, non-finite or substituted commission evidence quarantines the batch.
 No default and no `UNKNOWN` value are permitted.
 

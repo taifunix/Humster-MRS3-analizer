@@ -4,12 +4,11 @@ from hashlib import sha256
 import json
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-import re
 import tempfile
 from typing import Mapping
 
 from .config import RunnerConfig
-from .results import WizardResult
+from .results import WizardResult, extract_html_strategy_name as _extract_html_strategy_name
 
 
 class InboxCaptureError(RuntimeError):
@@ -38,15 +37,11 @@ def _canonical_decimal(value: object, field: str) -> str:
     return result
 
 
-def extract_html_strategy_name(source: bytes) -> str:
-    try:
-        text = source.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise InboxCaptureError("HTML report is not UTF-8") from error
-    match = re.search(r'"(?:strategyName|name)"\s*:\s*"([^"\\]+)"', text)
-    if match is None or not match.group(1).strip():
+def extract_html_strategy_name(path: Path) -> str:
+    name = _extract_html_strategy_name(path)
+    if name is None:
         raise InboxCaptureError("HTML report has no embedded strategy name")
-    return match.group(1)
+    return name
 
 
 def _atomic_bytes(target: Path, data: bytes) -> bytes:
@@ -90,7 +85,14 @@ def _commission_contract(
         document = json.loads(snapshot.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise InboxCaptureError("could not read tester_config") from error
-    values = document.get("tester_config") if isinstance(document, dict) else None
+    if not isinstance(document, dict):
+        values = None
+    elif "tester_config" in document:
+        # Keep the documented nested form strict when it is present.
+        values = document["tester_config"]
+    else:
+        # Hamster Bot's local config is also emitted as a flat JSON object.
+        values = document
     if not isinstance(values, dict):
         raise InboxCaptureError("tester_config object is missing")
     missing = next((field for field in _COMMISSION_FIELDS if field not in values), None)
@@ -129,7 +131,7 @@ def capture_verified_inbox(
             if report_path is None or not report_path.is_file():
                 raise InboxCaptureError(f"HTML report is missing for {name}")
             report_bytes = report_path.read_bytes()
-            if extract_html_strategy_name(report_bytes) != name:
+            if extract_html_strategy_name(report_path) != name:
                 raise InboxCaptureError(f"HTML strategy name differs for {name}")
             source = plan.strategy_source / f"{name}.json"
             try:
