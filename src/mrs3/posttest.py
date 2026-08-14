@@ -331,6 +331,7 @@ def _final_comparison_columns(frame: pd.DataFrame) -> pd.DataFrame:
     """Put calculated DD5 decision metrics before raw diagnostic fields."""
     primary = [
         "strategy_name",
+        "test_run_id",
         "metric_source",
         "analysis_run_id",
         "source_point_id",
@@ -905,7 +906,7 @@ def compare_posttest(
         ascending=[False, True, True],
         kind="mergesort",
     ).reset_index(drop=True)
-    comparison = _round_final_comparison_display(_final_comparison_columns(comparison))
+    comparison = _final_comparison_columns(comparison)
     return PosttestTables(
         raw=raw,
         normalized=normalized,
@@ -939,6 +940,7 @@ def scale_strategy_json(
 
 
 def write_posttest_outputs(tables: PosttestTables, output_dir: Path) -> None:
+    comparison_display = _round_final_comparison_display(tables.comparison)
     audit_sheets = {
         "16_Raw_MRS3_Results": tables.raw,
         "17_DD5_Normalized": tables.normalized,
@@ -947,10 +949,11 @@ def write_posttest_outputs(tables: PosttestTables, output_dir: Path) -> None:
         "20_Position_Holding_Exclusions": tables.holding_exclusions,
     }
     workbook_sheets = {
-        "00_Selection_Summary": selection_summary(tables.comparison),
-        "01_Finalists": selection_finalists(tables.comparison),
+        "00_Selection_Summary": selection_summary(comparison_display),
+        "01_Finalists": selection_finalists(comparison_display),
         **audit_sheets,
     }
+    workbook_sheets["18_Final_Comparison"] = comparison_display
     write_audit_csvs(audit_sheets, output_dir / "posttest_csv")
     write_audit_workbook(workbook_sheets, output_dir / "posttest.xlsx")
 

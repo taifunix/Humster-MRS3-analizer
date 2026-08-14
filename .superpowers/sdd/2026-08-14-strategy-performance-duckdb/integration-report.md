@@ -125,6 +125,28 @@ wired into runner scheduling or a CLI command.
 - JSON parsing of both config examples: passed.
 - `git diff --check`: passed.
 
+## Integration fix round 1
+
+Reviewer finding 1 was fixed in `src/mrs3/posttest.py`: `compare_posttest()`
+now returns the typed, full-precision comparison frame, including
+`test_run_id` and Decimal lot tuples. `write_posttest_outputs()` creates the
+rounded lot/numeric projection only for workbook-facing sheets; DD5 persistence
+and CSV audit output use the calculation frame. Regression coverage was added
+to `tests/test_posttest.py` and `tests/test_performance_dd5.py`, including a
+DuckDB assertion for the persisted identity and exact lot vector.
+
+Reviewer finding 2 was fixed in `progress.md`: the historical 476-row output is
+explicitly labeled legacy name-only output and explicitly excluded from
+Performance DuckDB production acceptance evidence.
+
+TDD evidence:
+
+- RED: `py -3.13 -m pytest -q tests/test_performance_dd5.py tests/test_posttest.py`
+  resulted in `6 failed, 21 passed`; failures reproduced missing `test_run_id`
+  in DD5 persistence and the unrounded comparison contract.
+- GREEN: the same command resulted in `27 passed`.
+- No generated artifacts were added or modified.
+
 The two skips are Windows symlink-permission tests (`WinError 1314`). No full
 476-strategy tester run or production acceptance claim was made.
 

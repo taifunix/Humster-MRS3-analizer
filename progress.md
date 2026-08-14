@@ -575,8 +575,10 @@ strategy source recorded in the matching completed runner state, without
 parsing report HTML. A missing settings column or an all-empty settings column
 uses that source; partially populated settings remain an error. DD5 derives
 `effective_days` from the persisted wizard period and leaves unavailable Profit
-Factor blank. The real `476`-row result run completed successfully with `8`
-Pareto candidates at the `5%` DD target in `posttest_long/ONUSDT_exept_5min`.
+Factor blank. The historical `476`-row legacy name-only output completed
+successfully with `8` Pareto candidates at the `5%` DD target in
+`posttest_long/ONUSDT_exept_5min`. This is legacy name-only output, not
+Performance DuckDB production acceptance evidence.
 
 Current session handoff for moving the long HTML import to another machine:
 [remote import handoff](docs/HANDOFF_2026-08-12_REMOTE_IMPORT.md).

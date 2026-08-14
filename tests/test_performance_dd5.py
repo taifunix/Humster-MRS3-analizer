@@ -39,6 +39,32 @@ def test_dd5_reads_committed_import_and_exports_calculation_only_artifacts(tmp_p
         assert connection.execute("select count(*) from dd5_results").fetchone()[0] == 1
 
 
+def test_dd5_persists_typed_identity_and_full_precision_lot_vector(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    imported = import_performance_batch(request)
+    with duckdb.connect(str(request.database)) as connection:
+        connection.execute(
+            "update strategy_versions set settings_json = ?",
+            [json.dumps({"mrs3": {"ma_long": [{"lot_x": "0.333333333333"}, {"lot_x": "0.666666666667"}]}})],
+        )
+
+    artifacts = run_performance_dd5(
+        request.database,
+        imported.import_id,
+        tmp_path / "posttest",
+        AlgorithmConfig.defaults(),
+    )
+
+    with duckdb.connect(str(request.database), read_only=True) as connection:
+        test_run_id, raw_json = connection.execute(
+            "select test_run_id, raw_json from dd5_results where dd5_run_id = ?",
+            [artifacts.dd5_run_id],
+        ).fetchone()
+    raw = json.loads(raw_json)
+    assert raw["test_run_id"] == test_run_id
+    assert raw["lots"] == ["0.333333333333", "0.666666666667"]
+
+
 def test_dd5_persistence_failure_leaves_no_export_artifacts(tmp_path: Path) -> None:
     request = _request(tmp_path)
     imported = import_performance_batch(request)

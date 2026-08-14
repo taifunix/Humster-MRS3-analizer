@@ -181,7 +181,7 @@ def test_compare_posttest_measures_holding_until_full_close_only() -> None:
     comparison = tables.comparison.iloc[0]
     assert comparison["full_position_cycle_count"] == 1
     assert comparison["holding_median_minutes"] == 60.0
-    assert comparison["time_in_market_pct"] == 4.17
+    assert comparison["time_in_market_pct"] == pytest.approx(4.166666666666667)
     assert tables.holding_exclusions.empty
     assert tables.comparison.columns[:8].tolist() == [
         "strategy_name",
@@ -378,7 +378,7 @@ def test_run_posttest_falls_back_to_strategy_json_when_name_only_rows_have_no_se
     assert manifest["audit_xlsx"] == "derived_from_strategy_json"
 
 
-def test_final_comparison_shows_shifts_and_rounds_display_values() -> None:
+def test_final_comparison_keeps_typed_full_precision_values() -> None:
     strategy = {
         "name": "A",
         "basic": {"use_long": True},
@@ -392,13 +392,14 @@ def test_final_comparison_shows_shifts_and_rounds_display_values() -> None:
     raw = pd.DataFrame(
         [
             {
+                "test_run_id": "run-precision",
                 "strategy_name": "A",
-                "total_pnl_pct": 20.12345,
-                "max_drawdown_pct": 10.12345,
-                "win_rate_pct": 80.12345,
-                "profit_factor": 2.12345,
+                "total_pnl_pct": Decimal("20.12345"),
+                "max_drawdown_pct": Decimal("10.12345"),
+                "win_rate_pct": Decimal("80.12345"),
+                "profit_factor": Decimal("2.12345"),
                 "total_trades": 20,
-                "days_in_test": 20.12345,
+                "days_in_test": Decimal("20.12345"),
                 "strategy_settings_json": json.dumps(strategy),
             }
         ]
@@ -412,11 +413,13 @@ def test_final_comparison_shows_shifts_and_rounds_display_values() -> None:
 
     comparison = tables.comparison.iloc[0]
     assert comparison["shift_bp_vector"] == "30 / 110"
-    assert comparison["projected_pnl_dd5"] == 9.94
-    assert comparison["dd5_scale"] == 0.49
-    assert comparison["win_rate_pct"] == 80.12
-    assert comparison["lots"] == '["0.33", "0.67"]'
-    assert tables.normalized.iloc[0]["win_rate_pct"] == pytest.approx(80.12345)
+    assert comparison["test_run_id"] == "run-precision"
+    assert isinstance(comparison["projected_pnl_dd5"], Decimal)
+    assert comparison["projected_pnl_dd5"] == tables.normalized.iloc[0]["projected_pnl_dd5"]
+    assert comparison["dd5_scale"] == tables.normalized.iloc[0]["dd5_scale"]
+    assert comparison["win_rate_pct"] == Decimal("80.12345")
+    assert comparison["lots"] == (Decimal("0.333333"), Decimal("0.666667"))
+    assert tables.normalized.iloc[0]["win_rate_pct"] == Decimal("80.12345")
 
 
 def test_final_comparison_exposes_scoped_pareto_variants() -> None:
