@@ -7,6 +7,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+import mrs3.performance_import as performance_import
 
 from mrs3.performance_import import (
     PerformanceImportError,
@@ -128,3 +129,95 @@ def test_cleanup_resumes_after_crash_in_deleting_state(tmp_path: Path) -> None:
     assert not (request.inbox / "reports" / "entry-1.html").exists()
     final_rows = list(csv.DictReader(checklist.open(newline="", encoding="utf-8")))
     assert final_rows[0]["cleanup_state"] == "DELETED"
+
+
+def test_cleanup_requires_valid_audit_evidence(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    import_performance_batch(request)
+    audit_path = request.inbox / "import_audit.v4.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit["schema_version"] = 3
+    audit_path.write_bytes(_canonical(audit))
+
+    with pytest.raises(PerformanceImportError, match="audit"):
+        resume_performance_cleanup(request)
+    assert (request.inbox / "reports" / "entry-1.html").is_file()
+
+
+def test_cleanup_rejects_report_path_outside_inbox(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    import_performance_batch(request)
+    checklist = request.inbox / "html_delete_checklist.v4.csv"
+    rows = list(csv.DictReader(checklist.open(newline="", encoding="utf-8")))
+    outside = tmp_path / "outside.html"
+    outside.write_text("retain", encoding="utf-8")
+    rows[0]["report_path"] = str(outside)
+    with checklist.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with pytest.raises(PerformanceImportError, match="inbox"):
+        resume_performance_cleanup(request)
+    assert outside.is_file()
+
+
+def test_same_strategy_version_allows_distinct_period(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    first = import_performance_batch(request)
+    report = request.inbox / "reports" / "entry-1.html"
+    report.write_bytes(report.read_bytes().replace(b"1785549600000", b"1785553200000"))
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"][0]["source_report_sha256"] = hashlib.sha256(report.read_bytes()).hexdigest()
+    manifest_path.write_bytes(_canonical(manifest))
+
+    second = import_performance_batch(request)
+
+    assert first.imported_count == second.imported_count == 1
+    assert _count(request.database, "strategy_versions") == 1
+    assert _count(request.database, "backtest_runs") == 2
+
+
+def test_import_files_records_readback_counts_and_delete_state(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+
+    result = import_performance_batch(request)
+
+    with duckdb.connect(str(request.database), read_only=True) as connection:
+        row = connection.execute(
+            "select import_id, status, source_html_sha256, action_count, equity_sample_count, safe_to_delete, cleanup_state from import_files"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == result.import_id
+    assert row[1] == "IMPORTED"
+    assert row[2] == hashlib.sha256((request.inbox / "reports" / "entry-1.html").read_bytes()).hexdigest()
+    assert row[3:5] == (2, 3)
+    assert row[5:7] == (True, "DELETE_READY")
+
+
+def test_database_init_failure_writes_audit_and_retains_html(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    bad_database = tmp_path / "database-dir"
+    bad_database.mkdir()
+    request = PerformanceImportRequest(request.inbox, bad_database)
+
+    with pytest.raises(PerformanceImportError, match="database"):
+        import_performance_batch(request)
+    assert (request.inbox / "reports" / "entry-1.html").is_file()
+    audit = json.loads((request.inbox / "import_audit.v4.json").read_text(encoding="utf-8"))
+    assert audit["schema_version"] == 4
+    assert audit["status"] == "FAILED"
+
+
+def test_readback_failure_never_marks_delete_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    request = _request(tmp_path)
+
+    def fail_readback(*args: object, **kwargs: object) -> None:
+        raise PerformanceImportError("readback verification failed")
+
+    monkeypatch.setattr(performance_import, "_verify_readback", fail_readback)
+    with pytest.raises(PerformanceImportError, match="readback"):
+        import_performance_batch(request)
+    assert (request.inbox / "reports" / "entry-1.html").is_file()
+    assert not (request.inbox / "html_delete_checklist.v4.csv").exists()
