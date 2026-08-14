@@ -33,7 +33,7 @@ from .strategy_json import (
 )
 
 
-ALGORITHM_VERSION = "0.6"
+ALGORITHM_VERSION = "0.7-representative-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,7 +253,7 @@ def _base_structure(point: pd.Series) -> dict[str, object]:
 def _write_json_atomic(path: Path, value: object) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     temporary.replace(path)

@@ -223,6 +223,34 @@ def test_snapshot_collector_preserves_each_strategy_from_a_shared_html_path(
     assert collector.snapshot_for("B").read_text(encoding="utf-8") == "B "
 
 
+def test_snapshot_collector_survives_a_partially_written_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    report = report_dir / "shared.html"
+    calls = 0
+
+    def extract_name(_: Path) -> str | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return "A"
+
+    monkeypatch.setattr(runner_monitor, "extract_html_strategy_name", extract_name)
+    collector = runner_monitor._ReportSnapshotCollector(
+        ("A",), report_dir, tmp_path / "snapshots"
+    )
+
+    report.write_text("complete", encoding="utf-8")
+    collector.capture_once()
+    collector.capture_once()
+    collector.capture_once()
+
+    assert collector.snapshot_for("A").read_text(encoding="utf-8") == "complete"
+
+
 def test_snapshot_collector_ignores_reports_older_than_the_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

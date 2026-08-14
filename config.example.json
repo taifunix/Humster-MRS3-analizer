@@ -98,7 +98,13 @@
     "poll_interval_seconds": 1,
     "batch_timeout_seconds": 86400,
     "stall_timeout_seconds": 1800,
+    "max_parallel_submissions": 10,
+    "strategy_batch_size": 50,
+    "max_strategy_attempts": 4,
+    "max_bot_restarts": 30,
+    "submission_delay_seconds": 0.2,
     "report_stability_polls": 2,
+    "result_report_grace_seconds": 15,
     "metric_tolerance": 0.01
   }
 }

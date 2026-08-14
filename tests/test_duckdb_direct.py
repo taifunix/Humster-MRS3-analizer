@@ -18,7 +18,7 @@ from mrs3.duckdb_direct import (
     run_panel_direct_build,
 )
 from mrs3.analysis_storage import publish_surface
-from mrs3.duckdb_events import ACTION_CODEC, EQUITY_CODEC
+from mrs3.duckdb_events import ACTION_CODEC, EQUITY_CODEC, canonical_event_id
 from mrs3.duckdb_source_schema import (
     NORMALIZATION_CONTRACT_VERSION,
     _grid_content_hash,
@@ -43,6 +43,7 @@ def _seed_report(
     source: duckdb.DuckDBPyConnection, *, symbol: str = "BTCUSDT", timeframe: str = "1h",
     shift: int = 100, open_ma: int = 3, close_ma: int = 9, trades: int = 7,
     start_ms: int = START_MS, end_ms: int = END_MS, source_hash: str | None = None,
+    actions: tuple[dict[str, str], ...] = (),
 ) -> str:
     point_key = f"{symbol}|LONG|{timeframe}|{shift}|{open_ma}|{close_ma}"
     point = {
@@ -51,7 +52,8 @@ def _seed_report(
         "open_multiplier_raw": "0.99", "close_ma_type": "EMA", "close_ma_source": "close", "close_ma_len": close_ma,
     }
     point["row_sha256"] = _point_hash(point)
-    source.execute("insert into point_configs values (?,?,?,?,?,?,?,?,?,?,?,?,?)", list(point.values()))
+    if source.execute("select count(*) from point_configs where canonical_point_key=?", [point_key]).fetchone()[0] == 0:
+        source.execute("insert into point_configs values (?,?,?,?,?,?,?,?,?,?,?,?,?)", list(point.values()))
     timestamps = (start_ms, (start_ms + end_ms) // 2, end_ms)
     import struct, zlib
     grid = {"grid_hash": _grid_content_hash(timestamps), "sample_count": len(timestamps), "start_timestamp_ms": start_ms, "end_timestamp_ms": end_ms, "timestamps_zlib": zlib.compress(struct.pack("<3q", timestamps[0], timestamps[1] - timestamps[0], timestamps[2] - timestamps[1]))}
@@ -61,10 +63,12 @@ def _seed_report(
     canonical = canonical_report_key({"canonical_point_key": point_key, "report_period_start_ms": start_ms, "report_period_end_ms": end_ms})
     source_hash = source_hash or _hash(canonical)
     report_id = _hash(canonical, source_hash)
-    report = {"report_id": report_id, "canonical_report_key": canonical, "canonical_point_key": point_key, "grid_hash": grid["grid_hash"], "source_sha256": source_hash, "source_file": "fixture.html", "source_size": 1, "imported_at_utc": datetime(2026, 8, 11), "settings_json": "{}", "raw_action_count": 0, "equity_sample_count": 3, "wallet_change_count": 1, "report_period_start_ms": start_ms, "report_period_end_ms": end_ms}
+    report = {"report_id": report_id, "canonical_report_key": canonical, "canonical_point_key": point_key, "grid_hash": grid["grid_hash"], "source_sha256": source_hash, "source_file": "fixture.html", "source_size": 1, "imported_at_utc": datetime(2026, 8, 11), "settings_json": "{}", "raw_action_count": len(actions), "equity_sample_count": 3, "wallet_change_count": 1, "report_period_start_ms": start_ms, "report_period_end_ms": end_ms}
     report["row_sha256"] = _report_hash(report)
     source.execute("insert into active_reports values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", list(report.values()))
-    payload = {"report_id": report_id, "series_codec": EQUITY_CODEC, "actions_codec": ACTION_CODEC, "actions_zlib": zlib.compress(json.dumps({"headers": [], "rows": []}).encode()), "equity_zlib": zlib.compress(struct.pack("<3q", 100, 90, 110)), "wallet_zlib": zlib.compress(struct.pack("<Iq", 0, 100))}
+    headers = sorted({key for action in actions for key in action})
+    action_payload = {"headers": headers, "rows": [[action.get(header, "") for header in headers] for action in actions]}
+    payload = {"report_id": report_id, "series_codec": EQUITY_CODEC, "actions_codec": ACTION_CODEC, "actions_zlib": zlib.compress(json.dumps(action_payload).encode()), "equity_zlib": zlib.compress(struct.pack("<3q", 100, 90, 110)), "wallet_zlib": zlib.compress(struct.pack("<Iq", 0, 100))}
     payload["payload_sha256"] = _payload_hash(payload)
     source.execute("insert into report_payloads values (?,?,?,?,?,?,?)", list(payload.values()))
     return point_key
@@ -148,7 +152,7 @@ def test_preflight_grid_contract_is_immutable(connections) -> None:
         preflight.grid_contract["required_shifts_bp"].append(200)  # type: ignore[union-attr]
 
 
-def test_preflight_excludes_missing_grid_cells_and_marks_symbol_unavailable(connections) -> None:
+def test_preflight_excludes_timeframe_when_no_ma_pair_is_common_to_every_shift(connections) -> None:
     source, _ = connections
     _seed_report(source, shift=100)
     _seed_report(source, shift=200, open_ma=4, close_ma=10)
@@ -157,19 +161,86 @@ def test_preflight_excludes_missing_grid_cells_and_marks_symbol_unavailable(conn
 
     assert preflight.usable_timeframes == {}
     assert preflight.unavailable_symbols == {"BTCUSDT": ("1h",)}
-    assert {issue.code for issue in preflight.coverage_issues} == {"MISSING_GRID_CELL"}
+    assert {issue.code for issue in preflight.coverage_issues} == {"GRID_NO_COMMON_PAIRS"}
 
 
-def test_materialization_uses_trades_proxy_and_does_not_publish_to_analysis(connections) -> None:
+def test_preflight_keeps_maximal_complete_ma_pair_grid_and_audits_excluded_pairs(connections) -> None:
+    source, _ = connections
+    _seed_report(source, shift=100, open_ma=3, close_ma=9)
+    _seed_report(source, shift=100, open_ma=4, close_ma=10)
+    _seed_report(source, shift=200, open_ma=3, close_ma=9)
+
+    preflight = preflight_duckdb_direct(source, _request(required_shifts_bp=(100, 200)))
+
+    assert preflight.usable_timeframes == {"BTCUSDT": ("1h",)}
+    assert preflight.grid_contract["pairs"] == ("100|3|9", "200|3|9")
+    assert len(preflight.accepted_point_keys) == 2
+    assert {issue.code for issue in preflight.coverage_issues} == {"EXCLUDED_INCOMPLETE_PAIR"}
+
+
+def test_preflight_selects_the_narrowest_covering_report_for_an_overlapping_cell(connections) -> None:
+    source, _ = connections
+    _seed_report(source, end_ms=END_MS + 3_600_000)
+    _seed_report(source, end_ms=END_MS)
+
+    preflight = preflight_duckdb_direct(source, _request())
+
+    assert preflight.usable_timeframes == {"BTCUSDT": ("1h",)}
+    assert len(preflight.manifest) == 1
+    assert {issue.code for issue in preflight.coverage_issues} == {"OVERLAPPING_REPORTS_RESOLVED"}
+
+
+def test_materialization_uses_real_independent_events_and_does_not_publish_to_analysis(connections) -> None:
     source, analysis = connections
-    point = _seed_report(source, trades=7)
+    actions = (
+        {"Timestamp": "2024-01-01T00:10:00Z", "Symbol": "BTCUSDT", "Action": "opened", "Post Side": "long", "Side": "buy", "PnL": "0"},
+        {"Timestamp": "2024-01-01T00:30:00Z", "Symbol": "BTCUSDT", "Action": "decreased", "Post Side": "long", "Side": "sell", "PnL": "1"},
+        {"Timestamp": "2024-01-01T01:00:00Z", "Symbol": "BTCUSDT", "Action": "closed", "Post Side": "", "Side": "sell", "PnL": "2"},
+    )
+    point = _seed_report(source, actions=actions)
 
     surface = materialize_duckdb_direct(source, analysis, _request(), lambda: False)
 
-    assert surface.event_mode == "legacy_trades_proxy"
+    assert surface.event_mode == "real_independent_events"
     assert surface.points[0].canonical_point_key == point
-    assert surface.points[0].point_event_count == surface.points[0].metrics["TotalTrades"] == 0
+    assert surface.points[0].point_event_count == 1
+    assert surface.points[0].event_ids == (
+        canonical_event_id("BTCUSDT", "long", "1h", "2024-01-01T00:10:00Z"),
+    )
+    assert surface.points[0].metrics["TotalTrades"] == 2
     assert analysis.execute("select count(*) from information_schema.tables").fetchone() == (0,)
+
+
+def test_canonical_event_id_normalizes_equivalent_utc_timestamps() -> None:
+    expected = canonical_event_id("BTCUSDT", "long", "1h", "2024-01-01T00:10:00Z")
+
+    assert canonical_event_id("BTCUSDT", "long", "1h", "2023-12-31T19:10:00-05:00") == expected
+    assert canonical_event_id("BTCUSDT", "long", "1h", "2024-01-01T00:10:00.000000+00:00") == expected
+
+
+def test_materializer_reuses_event_id_across_points_only_for_same_opening(connections) -> None:
+    source, analysis = connections
+
+    def cycle(opened_at: str) -> tuple[dict[str, str], ...]:
+        return (
+            {"Timestamp": opened_at, "Symbol": "BTCUSDT", "Action": "opened", "Post Side": "long", "Side": "buy", "PnL": "0"},
+            {"Timestamp": "2024-01-01T01:00:00Z", "Symbol": "BTCUSDT", "Action": "closed", "Post Side": "", "Side": "sell", "PnL": "2"},
+        )
+
+    _seed_report(source, shift=100, actions=cycle("2024-01-01T00:10:00Z"))
+    _seed_report(source, shift=200, actions=cycle("2023-12-31T19:10:00-05:00"))
+    _seed_report(source, shift=300, actions=cycle("2024-01-01T00:20:00Z"))
+
+    surface = materialize_duckdb_direct(
+        source, analysis, _request(required_shifts_bp=(100, 200, 300)), lambda: False
+    )
+    event_by_shift = {
+        int(point.canonical_point_key.split("|")[3]): point.event_ids[0]
+        for point in surface.points
+    }
+
+    assert event_by_shift[100] == event_by_shift[200]
+    assert event_by_shift[100] != event_by_shift[300]
 
 
 def test_materialization_rejects_same_connection_and_cancellation_before_publication(connections) -> None:
@@ -209,6 +280,7 @@ def test_publication_identity_changes_for_each_surface_contract_input(connection
     changed_point = replace(surface.points[0], source_hash=changed_hash)
     variants = (
         replace(surface, build_mode="OTHER_DIRECT"),
+        replace(surface, event_mode="legacy_trades_proxy"),
         replace(surface, request=replace(surface.request, start_utc="2024-01-01T00:01:00Z")),
         replace(surface, request=replace(surface.request, side="SHORT")),
         replace(surface, request=replace(surface.request, symbols=("ETHUSDT",))),
@@ -287,7 +359,7 @@ def test_publication_rejects_unknown_mode_bad_hash_and_nonfinite_metrics(connect
     ):
         with pytest.raises(ValueError):
             publish_surface(analysis, invalid)
-    assert analysis.execute("select count(*) from information_schema.tables").fetchone()[0] == 15
+    assert analysis.execute("select count(*) from information_schema.tables").fetchone()[0] == 16
     assert analysis.execute("select count(*) from surfaces").fetchone() == (0,)
 
 

@@ -208,7 +208,7 @@ def test_analysis_library_ui_and_routes_are_exposed() -> None:
 def test_analysis_schema_initialization_is_explicit_and_library_then_reads_only(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     controller.duckdb_import_settings({"analysis_duckdb_path": "analysis.duckdb"})
-    assert controller.initialize_analysis() == {"schema_version": 3}
+    assert controller.initialize_analysis() == {"schema_version": 4}
     assert controller.analysis_library({}) == []
 
 
@@ -253,7 +253,7 @@ def test_direct_build_rejects_same_database_before_open_and_ui_has_controls(tmp_
     payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
     with pytest.raises(ValueError, match="must differ"):
         controller.duckdb_direct_preflight(payload)
-    for control in ("direct_start", "direct_end", "direct_side", "direct_shift_start", "direct_shift_end", "direct_shift_step", "direct_symbols"):
+    for control in ("direct_start", "direct_end", "direct_side", "direct_symbols", "direct_shifts"):
         assert f'id="{control}"' in __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
 
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
@@ -589,7 +589,7 @@ def test_http_ui_exposes_persistent_import_settings_and_migration_controls(tmp_p
         parser.feed(response.read().decode("utf-8"))
         assert response.status == 200
         assert {"import_source_duckdb", "import_analysis_duckdb", "import_default_html_root", "import_audit_root", "import_workers", "import_batch_size", "migration_target"} <= parser.input_ids
-        assert {"direct_start", "direct_end", "direct_shift_start", "direct_shift_end", "direct_shift_step", "direct_symbols"} <= parser.input_ids
+        assert {"direct_start", "direct_end", "direct_symbols"} <= parser.input_ids
         assert {"saveDuckdbSettings()", "migrateDuckdb()", "directPreflight()", "directBuild()", "directCancel()"} <= parser.actions
         panel_html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
         assert ".direct-unavailable" in panel_html and "row.className='direct-unavailable'" in panel_html
@@ -906,7 +906,7 @@ def test_controller_hides_artifacts_left_by_an_older_job(tmp_path: Path) -> None
     snapshot = _wait_finished(controller)
 
     assert snapshot["job"]["workflow"] is None
-    assert snapshot["job"]["artifacts"] == {}
+    assert snapshot["job"]["artifacts"] == {"raw_log": "test.raw.log"}
 
 
 def test_dashboard_reports_manifest_counts_but_never_claims_v2_selectable(
@@ -995,7 +995,7 @@ def test_dashboard_reports_candidate_tester_and_posttest_final_artifacts(
     posttest.mkdir()
     (posttest / "posttest_manifest.json").write_text(
         json.dumps(
-            {"raw_result_count": 2, "pareto_count": 1, "scaled_strategy_count": 1, "target_dd_pct": "5"}
+            {"raw_result_count": 2, "pareto_count": 1, "scaled_strategy_count": 1, "target_dd_pct": "5", "dd5_mode": "CALCULATION_ONLY"}
         ),
         encoding="utf-8",
     )
@@ -1017,8 +1017,9 @@ def test_dashboard_reports_candidate_tester_and_posttest_final_artifacts(
         {"label": "DD лучшего, %", "value": "2"},
         {"label": "Ошибки", "value": 0},
     ]
-    assert dashboard["posttest"]["state"] == "RETEST_REQUIRED"
-    assert dashboard["posttest"]["metrics"][-1] == {"label": "DD5 JSON", "value": 1}
+    assert dashboard["posttest"]["state"] == "CALCULATED"
+    assert dashboard["posttest"]["metrics"][-1]["value"] == "5"
+    assert dashboard["posttest"]["details"]
 
 
 def test_dashboard_keeps_last_artifact_when_a_later_job_has_none(tmp_path: Path) -> None:
@@ -1067,12 +1068,11 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert response.status == 200
         assert "MRS3 Control Panel" in html
         assert "Каталог JSON-стратегий" in html
-        assert "MRS2 · CSV" in html
+        assert "Legacy CSV source" in html
         assert html.count('<button role="tab"') == 5
         assert html.count('<section role="tabpanel"') == 5
-        assert "MRS2 · CSV" in html
-        assert "MRS2 · DuckDB" in html
-        assert "Кандидаты стратегий" in html
+        assert "Import" in html and "surface" in html and "analysis" in html
+        assert "Test plan" in html and "DD5" in html
         assert "Анализатор портфелей" in html
         assert "Настройки" in html
         assert "legacy_trades_proxy" in html

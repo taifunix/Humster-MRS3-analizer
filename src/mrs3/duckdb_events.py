@@ -15,6 +15,7 @@ import sys
 from threading import Lock
 import tempfile
 from typing import Iterator, Mapping, Sequence
+from types import SimpleNamespace
 import zlib
 
 import duckdb
@@ -84,6 +85,27 @@ def read_compact_html(path: Path) -> object:
     """
     importer = _load_compact_importer()
     return importer.read_compact_record(Path(path))
+
+
+def read_compact_html_for_process(path: Path) -> object:
+    """Return a pickle-safe form of the dynamically loaded codec result."""
+    outcome = read_compact_html(path)
+    record = getattr(outcome, "record", None)
+    serialized_record = None
+    if record is not None:
+        serialized_record = SimpleNamespace(
+            **{
+                name: getattr(record, name)
+                for name in getattr(record, "__dataclass_fields__", {})
+            }
+        )
+    return SimpleNamespace(
+        source_file=getattr(outcome, "source_file"),
+        source_sha256=getattr(outcome, "source_sha256"),
+        record=serialized_record,
+        error_classification=getattr(outcome, "error_classification"),
+        error_message=getattr(outcome, "error_message"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,9 +309,8 @@ def calculate_point_metrics(
         raise SourcePackError("wallet changes do not cover requested window")
     starting_wallet = wallet_values[starting_change]
     ending_wallet = wallet_values[ending_change]
-    window_start_index = int(timestamps.searchsorted(start, side="left"))
-    window_end_index = int(timestamps.searchsorted(end, side="left"))
-    window_equity = equity[window_start_index:window_end_index]
+    # The last observation before the half-open window establishes its equity baseline.
+    window_equity = equity[start_index : end_index + 1]
     peak = window_equity[0]
     max_drawdown = 0
     max_drawdown_percent = 0.0
@@ -319,8 +340,11 @@ def calculate_point_metrics(
     }
 
 
-def _event_id(symbol: str, position_side: str, timeframe: str, opened_at: pd.Timestamp) -> str:
-    payload = "|".join((symbol, position_side, timeframe, opened_at.isoformat()))
+def canonical_event_id(
+    symbol: str, position_side: str, timeframe: str, opened_at: str | pd.Timestamp
+) -> str:
+    timestamp = _utc(str(opened_at))
+    payload = "|".join((symbol, position_side, timeframe, str(timestamp.value)))
     return sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -375,7 +399,7 @@ def reconstruct_closed_cycles(
         else:
             included.append(
                 ClosedCycle(
-                    event_id=_event_id(symbol, position_side, timeframe, opened_at),
+                    event_id=canonical_event_id(symbol, position_side, timeframe, opened_at),
                     symbol=symbol,
                     position_side=position_side,
                     timeframe=timeframe,

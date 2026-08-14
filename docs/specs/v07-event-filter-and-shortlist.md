@@ -42,7 +42,16 @@
 - генерацию 2/3/4ORD независимо;
 - EQUAL и INCOME lot variants;
 - JSON generation;
-- DD5-normalization и post-test comparison.
+- DD5-normalization и post-test comparison по расчётным `projected_pnl_dd5` и `projected_dd_pct`; DD5 JSON и отдельный DD5 retest не входят в workflow.
+
+### JSON serialization order
+
+Generated strategy JSON is a human-reviewable derivative of the selected
+template. Its object-key order and the order of unchanged arrays must remain
+identical to the template at every nesting level. Generation may only replace
+the documented MRS3 values and the active order-array contents; it must not
+alphabetically sort strategy JSON. Canonical key sorting remains permitted only
+for internal hashes and manifests.
 
 Меняется только статистическая пригодность points/plateaus для MRS3 и последующий redundancy filter.
 
@@ -285,6 +294,11 @@ INSUFFICIENT_INDEPENDENT_EVENTS
    даже если `CloseSupportRetention >=0.75`;
 7. если points остались — выбрать representative.
 
+Выбор выполняется ровно один раз для каждой комбинации
+`Plateau + Pair + Side + TF + CommonCloseMA` до перебора комбинаций Plateau.
+Candidate generation получает только выбранную representative point и не
+перебирает остальные 5%-equivalent points этого Plateau.
+
 ---
 
 # 10. Новый порядок выбора representative внутри 5%-group
@@ -390,34 +404,29 @@ PlateauEventCount
 
 Разрешено откладывать только стратегии, которые фактически показывают одно и то же наблюдаемое entry-поведение.
 
-Для каждого selected order хранить:
+Для Phase 2 candidates сравниваются внутри одной структурной группы:
 
 ```text
-OrderEventSignature =
-    hash(sorted(PointEventSet(selected_point)))
-```
-
-Для MRS3:
-
-```text
-BehaviorKey =
+ComparisonKey =
     Pair
     + Side
     + TF
     + OrderCount
     + CommonCloseMA
-    + ordered OrderEventSignature[]
 ```
 
-Две стратегии считаются `same_behavior` только если их `BehaviorKey` полностью одинаков.
+`PointEventCount` и остальные order-level метрики не входят в `ComparisonKey`:
+они являются критериями dominance. Полные event memberships остаются immutable
+audit facts, но не дробят comparison groups. Кандидаты из разных
+`ComparisonKey` не сравниваются.
 
 Не использовать fuzzy similarity.
 
 ---
 
-# 15. Safe redundancy filter внутри same_behavior
+# 15. Safe redundancy filter внутри structural comparison group
 
-Сравнивать кандидатов только внутри одной `BehaviorKey`.
+Сравнивать кандидатов только внутри одного `ComparisonKey`.
 
 Кандидат B можно перевести в:
 
@@ -457,7 +466,7 @@ min CloseSupport_A >= min CloseSupport_B
 ```text
 status = DEFERRED_REDUNDANT
 deferred_by = StructureID
-defer_reason = SAME_BEHAVIOR_DOMINATED
+defer_reason = SAME_STRUCTURE_DOMINATED
 ```
 
 Такую стратегию можно вернуть во вторую тестовую волну.
@@ -481,7 +490,7 @@ defer_reason = SAME_BEHAVIOR_DOMINATED
 - event-based штрафы к lot_x;
 - отдельные категории weak/medium/strong events.
 
-Если после Event Filter + exact same-behavior dominance объем все еще неприемлем — сначала показать новый отчет, затем отдельно проектировать следующий фильтр.
+Если после Event Filter + exact structural-group dominance объем все еще неприемлем — сначала показать новый отчет, затем отдельно проектировать следующий фильтр.
 
 ---
 
@@ -559,7 +568,7 @@ Order2EventCount
 Order3EventCount
 Order4EventCount
 
-BehaviorKey
+ComparisonKey
 Status
 DeferredBy
 DeferReason
@@ -575,7 +584,7 @@ event_filter:
 
 redundancy_filter:
   enabled: true
-  exact_same_behavior_only: true
+  exact_comparison_key_only: true
 ```
 
 `min_point_events` обязательно хранить в config, а не hardcode.
@@ -632,15 +641,15 @@ redundancy_filter:
 8. EventCount одинаков:
    выбрать больший shift.
 
-### Same behavior
+### Structural comparison group
 
-9. Разные OpenMA/shift, но identical order event sets и CommonCloseMA:
-   одинаковый `BehaviorKey`.
+9. Разные OpenMA/shift и event sets, но одинаковые Pair/Side/TF/OrderCount/CommonCloseMA:
+   одинаковый `ComparisonKey`.
 
-10. Те же event sets, но другая CommonCloseMA:
-    разные `BehaviorKey`.
+10. Та же структура, но другая CommonCloseMA:
+    разные `ComparisonKey`.
 
-11. Одинаковый BehaviorKey, A полностью доминирует B:
+11. Одинаковый ComparisonKey, A полностью доминирует B:
     B -> `DEFERRED_REDUNDANT`.
 
 12. У A выше PnL, но у B выше PointEventCount:
@@ -651,7 +660,7 @@ redundancy_filter:
 13. Повторный запуск дает те же:
     - PointEventCount;
     - selected representatives;
-    - BehaviorKey;
+    - ComparisonKey;
     - statuses.
 
 ---
@@ -673,8 +682,8 @@ redundancy_filter:
 
 ## Phase 2 — только если стратегий все еще много
 
-9. Добавить exact `BehaviorKey`.
-10. Добавить same-behavior Pareto dominance.
+9. Добавить exact `ComparisonKey`.
+10. Добавить same-structure Pareto dominance.
 11. Перевести dominated candidates в `DEFERRED_REDUNDANT`.
 12. Снова вывести количество TEST_PRIMARY JSON.
 
@@ -694,7 +703,7 @@ redundancy_filter:
 4. representatives перевыбираются в пользу большего EventCount внутри 5%-equivalent group;
 5. MRS3 universe полностью пересобирается;
 6. старые данные не удаляются, а остаются в audit;
-7. если включен redundancy filter, откладываются только exact same-behavior dominated candidates;
+7. если включен redundancy filter, откладываются только dominated candidates внутри exact `ComparisonKey`;
 8. никакие weighted scores или arbitrary Top-N не используются;
 9. результат детерминирован.
 
@@ -760,8 +769,8 @@ Analysis DuckDB хранит membership событий как immutable facts, �
 ## 24.2. Неразрушающее применение Phase 2
 
 Phase 2 является воспроизводимым представлением immutable analysis run и не
-перезаписывает сохранённые candidates. Exact `BehaviorKey` всегда является
-обязательной границей сравнения. Кандидаты из разных `BehaviorKey` никогда не
+перезаписывает сохранённые candidates. Structural `ComparisonKey` всегда является
+обязательной границей сравнения. Кандидаты из разных `ComparisonKey` никогда не
 сравниваются.
 
 Панель предоставляет независимые checkbox-критерии:
@@ -771,15 +780,12 @@ Phase 2 является воспроизводимым представлени
 - `CloseSupport`;
 - `PointEventCount`.
 
-Поскольку exact `BehaviorKey` уже включает полные `OrderEventSignature`,
-`PointEventCount` соответствующих orders внутри одной группы математически
-одинаков. Поэтому этот checkbox сохраняется как явная проверка контракта и для
-audit, но при корректных данных самостоятельно не должен откладывать
-candidates. Непустой результат его criterion sheet считается нарушением
-инварианта.
+`PointEventCount` сравнивается как ordered vector внутри `ComparisonKey` и может
+самостоятельно откладывать dominated candidates. Event IDs не используются как
+граница сравнения.
 
 При выбранном наборе критериев сравниваются ordered orders A и B с одинаковыми
-позициями внутри общего `BehaviorKey`. Для каждого включённого критерия A
+позициями внутри общего `ComparisonKey`. Для каждого включённого критерия A
 должен быть не хуже B **на каждом соответствующем order**. Для
 `CloseSupport` дополнительно явно сравнивается minimum по всем orders. Хотя бы
 одно из всех сравниваемых order-level значений должно быть строго лучше.
@@ -816,14 +822,14 @@ candidates получают `READY_AFTER_FILTERS`. Результат обяза
 - `READY_AFTER_FILTERS` — итоговый список оставшихся candidates;
 - отдельный лист для каждого включённого критерия — candidates, которые этот
   критерий отложил бы при самостоятельном применении внутри exact
-  `BehaviorKey`;
+  `ComparisonKey`;
 - `DEFERRED_COMBINED` — фактически отложенные текущей комбинацией критериев.
 
-Каждая строка исключения содержит candidate ID, `BehaviorKey`, `deferred_by`,
+Каждая строка исключения содержит candidate ID, `ComparisonKey`, `deferred_by`,
 критерий или комбинацию критериев, значения A/B по всем четырём измерениям и
 детерминированную причину. Листы создаются в перечисленном выше порядке,
 criterion sheets — в порядке `Source PnL`, `PnL/DD`, `CloseSupport`,
-`PointEventCount`, а строки каждого листа сортируются по `BehaviorKey`, затем
+`PointEventCount`, а строки каждого листа сортируются по `ComparisonKey`, затем
 `candidate_id`. Даже пустой включённый criterion sheet содержит фиксированные
 headers. Числа экспортируются как числа без предварительного округления.
 Повторный export с теми же `run_id`, algorithm version и criteria обязан давать
@@ -839,13 +845,90 @@ headers. Числа экспортируются как числа без пре
    legacy и real-events builds имеют разные `surface_id`.
 4. Published surface загружает exact event membership без обращения к source
    DuckDB.
-5. BehaviorKey меняется при изменении любой ordered OrderEventSignature.
+5. `ComparisonKey` не меняется при изменении event membership; при этом может
+   измениться order-level `PointEventCount`.
 6. Каждый checkbox работает отдельно; комбинация требует одного общего
    dominator A, не худшего по каждому order-level значению всех включённых
    критериев.
 7. Если A лучше по одному включённому критерию, но хуже по другому, ни A, ни B
    не откладываются этой парой.
-8. Фильтр не сравнивает разные BehaviorKey и не изменяет analysis run.
+8. Фильтр не сравнивает разные ComparisonKey и не изменяет analysis run.
 9. При нескольких dominators `deferred_by` выбирается детерминированно.
 10. XLS содержит отдельные criterion sheets и итоговый combined sheet с полным
-   audit trail.
+    audit trail.
+
+## 24.5. Агрегированный shortlist в панели
+
+Панель не отображает candidate-level описания и индивидуальные checkbox. Для
+каждого `Pair + TF` она показывает только количества структур на 2, 3 и 4
+ордера, а также итоговые `READY`, `DEFERRED` и `ALL` для текущего набора Phase 2
+критериев. Pair и TF доступны как необязательные scope-фильтры.
+
+`Generate READY JSON` не принимает выбранные в браузере candidate IDs. Сервер
+повторно строит неразрушающее shortlist-представление для тех же criteria,
+выбирает все `READY_AFTER_FILTERS` внутри текущего Pair/TF scope и передаёт их
+существующему генератору. Пустой scope означает все Pair/TF выбранного run.
+Полный candidate-level audit остаётся только в XLS export.
+
+## 25. Post-test position holding audit
+
+`posttest` derives position holding only from the tester row's immutable
+`trades_json`. A position cycle starts at the first `opened` action for one
+`strategy_name + symbol + position_side` and ends only at `Action=closed` with
+numeric `Post Size=0`. `increased` and `decreased` actions never end or restart
+the cycle. A `closed` action is assigned to LONG for `Side=sell` and SHORT for
+`Side=buy`.
+
+`posttest.xlsx` and `posttest_csv` contain `19_Position_Holding_Cycles` and
+`20_Position_Holding_Exclusions`. The final comparison carries the number of
+full cycles, mean/median/p95 holding minutes, time-in-market percentage and
+the number of exclusions. Missing, malformed, overlapping or unclosed actions
+are audit exclusions and are never guessed.
+
+Holding metrics are diagnostic in this version. They do not alter DD5 Pareto or
+ranking until their computation has been checked against real tester reports.
+
+`18_Final_Comparison` exposes the immutable entry `shift_bp_vector` recovered
+from each strategy's active MRS3 multipliers. Its report-facing numeric values,
+including `lots` and `scaled_lots`, are rounded to two decimals. Normalized
+values remain unrounded for DD5 calculations, Pareto selection and audit.
+
+The final comparison also exposes independently filterable, scoped Pareto
+flags. Each compares all order counts within the same `symbol + side + timeframe`.
+All maximize `pnl30_dd5`; the variants respectively minimize capital proxy,
+holding p95, close MA, maximize the first entry shift, or apply all four
+objectives together. `order_count` is descriptive only and never prevents a
+1ORD strategy from dominating or being dominated by a 2–4ORD strategy. These
+are diagnostic alternative fronts and do not change
+the primary DD5 ranking.
+
+Before the tester batch, JSON generation derives up to three 1ORD structures
+independently for every selected `Pair + Side + TF` scope from standalone-ready
+points. Selecting `All` timeframes never applies one global top-three limit.
+Within each scope it ranks by DD5 PnL descending, raw DD ascending,
+`PointEventCount` descending, first shift descending, then point ID. The
+resulting 1ORD JSON are tested alongside 2–4ORD strategies and enter post-test
+Pareto only from their real tester results.
+
+## 26. Sequential post-test selection
+
+The final post-test selection is calculated independently inside each
+`symbol + side + timeframe`; candidate counts from different timeframes are
+never combined. Before any selection Pareto, an adverse-only Tukey IQR filter
+rejects a row when `holding_p95_minutes > Q3 + 1.5 * IQR` or
+`trades < Q1 - 1.5 * IQR`. Low holding and high trade counts are never rejected
+as outliers.
+
+Eligible rows pass through these stages in order:
+
+1. maximize `pnl30_dd5` and minimize `capital_requirement_proxy`;
+2. among stage-1 survivors, maximize `capital_efficiency_30` and
+   `first_shift_bp`;
+3. only when stage 2 leaves more than three rows in that same scope, maximize
+   `capital_efficiency_30` and minimize `common_close_ma`.
+
+When stage 2 leaves three or fewer rows, all are final. Stage 3 retains its
+entire Pareto front and does not force a top-three truncation. The final sheet
+exposes scope thresholds, filter eligibility, every stage flag, the final flag
+and an exclusion reason. Existing independent Pareto flags remain diagnostic
+and do not define this sequential result.

@@ -6,6 +6,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import time
@@ -252,7 +253,17 @@ def _wait_for_verified_batch_results(
                 config.metric_tolerance,
                 **reconcile_kwargs,
             )
-        except (ResultMismatchError, ResultParseError, OSError) as error:
+        except ResultMismatchError as error:
+            mismatched = tuple(
+                name
+                for name in re.findall(r"HTML strategy name differs for ([^:]+):", str(error))
+                if name in expected
+            )
+            if mismatched:
+                raise BatchHtmlCollision(mismatched) from error
+            stable = 0
+            last_error = error
+        except (ResultParseError, OSError) as error:
             stable = 0
             last_error = error
         else:

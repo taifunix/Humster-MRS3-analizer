@@ -515,6 +515,20 @@ def test_duckdb_metric_materializer_rejects_a_non_covering_grid() -> None:
         )
 
 
+def test_duckdb_metric_materializer_uses_the_equity_value_before_window_start() -> None:
+    metrics = calculate_point_metrics(
+        ["2026-07-15T00:00:00Z", "2026-07-15T10:00:00Z"],
+        [1000, 1000],
+        [(0, 1000)],
+        (),
+        "2026-07-15T01:00:00Z",
+        "2026-07-15T09:00:00Z",
+    )
+
+    assert metrics["MaxDrawdown"] == 0
+    assert metrics["TotalPnL"] == 0
+
+
 def test_duckdb_metric_materializer_rejects_unknown_series_codecs() -> None:
     with pytest.raises(SourcePackError, match="unsupported equity codec"):
         decode_compact_deltas(b"", expected_count=0, codec="unknown")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
@@ -14,6 +14,7 @@ from typing import Callable, Mapping
 import unicodedata
 
 import duckdb
+import pandas as pd
 
 from . import duckdb_events
 from .duckdb_source_schema import (
@@ -38,6 +39,10 @@ COMPACT_IMPORT_SCHEMA_VERSION = 4
 _JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
+class _ImportCancelled(Exception):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class ImportRequest:
     root_path: Path
@@ -48,6 +53,7 @@ class ImportRequest:
     job_id: str | None = None
     cancellation_requested: Callable[[], bool] | None = None
     expected_preflight_token: str | None = None
+    preflight: ImportPreflight | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +64,9 @@ class ImportPreflight:
     discovered: int
     source_schema_version: int | None
     target_identity_digest: str
+    snapshots: tuple[_Snapshot, ...] = field(default=(), repr=False, compare=False)
+    root_path: Path | None = field(default=None, repr=False, compare=False)
+    target_identity: str | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +126,7 @@ class _Snapshot:
     input_sha256: str
     codec_source_sha256: str
     source_size: int
+    source_mtime_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +145,14 @@ class _WriteDecision:
     operation: str
     prepared: _PreparedReport
     old_source_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedOutcome:
+    snapshot: _Snapshot
+    prepared: _PreparedReport | None
+    classification: str | None = None
+    reason: str | None = None
 
 
 def _canonical_relative(path: Path, root: Path) -> str:
@@ -172,8 +190,12 @@ def _codec_source_sha256(source: bytes) -> str:
 
 
 def _snapshot_one(root: Path, path: Path) -> _Snapshot:
+    before = path.stat()
     source = path.read_bytes()
-    return _Snapshot(path, _canonical_relative(path, root), sha256(source).hexdigest(), _codec_source_sha256(source), len(source))
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError(f"input HTML changed while preflight was reading it: {path}")
+    return _Snapshot(path, _canonical_relative(path, root), sha256(source).hexdigest(), _codec_source_sha256(source), len(source), after.st_mtime_ns)
 
 
 def _snapshot_reports(root: Path, paths: tuple[Path, ...], workers: int = 1, progress_callback: Callable[[SnapshotProgress], object] | None = None) -> tuple[_Snapshot, ...]:
@@ -191,10 +213,11 @@ def _snapshot_reports(root: Path, paths: tuple[Path, ...], workers: int = 1, pro
 
 
 def _inputs_unchanged(snapshots: tuple[_Snapshot, ...]) -> bool:
+    """Fast guard for a preflight-authorized tree; content hashes are retained as evidence."""
     return all(
         item.path.is_file()
-        and item.path.stat().st_size == item.source_size
-        and _file_sha256(item.path) == item.input_sha256
+        and (item.path.stat().st_size, item.path.stat().st_mtime_ns)
+        == (item.source_size, item.source_mtime_ns)
         for item in snapshots
     )
 
@@ -207,12 +230,13 @@ def _source_database_lock(database_path: Path) -> OutputDirectoryLock:
 
 
 def _database_identity(database_path: Path) -> str | None:
-    """Return the raw target identity captured around staging publication."""
+    """Return a cheap target identity captured around staging publication."""
     if not database_path.exists():
         return None
     if not database_path.is_file():
         raise ValueError(f"source database target is not a file: {database_path}")
-    return _file_sha256(database_path)
+    stat = database_path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
 
 
 def _preflight_token(
@@ -259,6 +283,7 @@ def _preflight_from_snapshots(
             discovered=len(snapshots),
             source_schema_version=schema_version,
             target_identity_digest=_target_identity_digest(target_identity),
+            target_identity=target_identity,
         ),
         target_identity,
     )
@@ -268,7 +293,59 @@ def preflight_html_import(request: ImportRequest, progress_callback: Callable[[S
     """Snapshot recursive HTML inputs and validate the current source target."""
     root = Path(request.root_path)
     snapshots = _snapshot_reports(root, discover_compact_reports(root), request.workers, progress_callback)
-    return _preflight_from_snapshots(Path(request.database_path), snapshots)[0]
+    preflight, _ = _preflight_from_snapshots(Path(request.database_path), snapshots)
+    return ImportPreflight(
+        preflight.token,
+        preflight.discovered,
+        preflight.source_schema_version,
+        preflight.target_identity_digest,
+        snapshots,
+        root.resolve(),
+        preflight.target_identity,
+    )
+
+
+def _prepare_worker(snapshot: _Snapshot, imported_at: datetime) -> _PreparedOutcome:
+    outcome = duckdb_events.read_compact_html_for_process(snapshot.path)
+    if getattr(outcome, "error_classification") or getattr(outcome, "record") is None:
+        return _PreparedOutcome(snapshot, None, str(getattr(outcome, "error_classification") or "INVALID_REPORT"))
+    try:
+        return _PreparedOutcome(snapshot, _prepare(snapshot, outcome, imported_at))
+    except Exception as exc:
+        return _PreparedOutcome(snapshot, None, "INTEGRITY_QUARANTINE", str(exc))
+
+
+def _stream_prepared_reports(
+    snapshots: tuple[_Snapshot, ...], workers: int, imported_at: datetime,
+    cancellation_requested: Callable[[], bool] | None = None,
+):
+    """Yield completed parse/prepare work with bounded process-pool memory."""
+    iterator = iter(snapshots)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        pending: dict[Future[_PreparedOutcome], _Snapshot] = {}
+
+        def fill() -> None:
+            while len(pending) < workers * 3:
+                try:
+                    snapshot = next(iterator)
+                except StopIteration:
+                    return
+                pending[executor.submit(_prepare_worker, snapshot, imported_at)] = snapshot
+
+        fill()
+        while pending:
+            if cancellation_requested and cancellation_requested():
+                for future in pending:
+                    future.cancel()
+                raise _ImportCancelled
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                snapshot = pending.pop(future)
+                try:
+                    yield future.result()
+                except BaseException as exc:
+                    yield _PreparedOutcome(snapshot, None, "INVALID_REPORT", f"worker failed: {exc}")
+            fill()
 
 
 def _default_job_id(
@@ -503,6 +580,129 @@ def _write_decision(
         )
 
 
+def _append_rows(
+    connection: duckdb.DuckDBPyConnection,
+    table: str,
+    columns: tuple[str, ...],
+    rows: list[list[object]] | list[tuple[object, ...]],
+) -> None:
+    if rows:
+        connection.append(table, pd.DataFrame.from_records(rows, columns=columns))
+
+
+def _insert_rows_ignore_conflicts(
+    connection: duckdb.DuckDBPyConnection,
+    table: str,
+    temporary_name: str,
+    columns: tuple[str, ...],
+    rows: list[list[object]],
+) -> None:
+    if not rows:
+        return
+    connection.register(temporary_name, pd.DataFrame.from_records(rows, columns=columns))
+    try:
+        column_list = ",".join(columns)
+        connection.execute(
+            f"insert into {table} ({column_list}) select {column_list} from {temporary_name} on conflict do nothing"
+        )
+    finally:
+        connection.unregister(temporary_name)
+
+
+def _write_decisions_batch(
+    connection: duckdb.DuckDBPyConnection,
+    decisions: list[_WriteDecision],
+    job_id: str,
+    imported_at: datetime,
+) -> None:
+    """Write one atomic batch without issuing SQL once per report field group."""
+    replacements = [decision for decision in decisions if decision.operation == "replace"]
+    if replacements:
+        replacement_keys = [(decision.prepared.canonical_report_key,) for decision in replacements]
+        connection.executemany(
+            "delete from active_reports where canonical_report_key=?", replacement_keys
+        )
+
+    points = {decision.prepared.canonical_point_key: decision.prepared.point for decision in decisions}
+    point_columns = (
+        "canonical_point_key", "symbol", "side", "timeframe", "shift_bp",
+        "open_ma_type", "open_ma_source", "open_ma_len", "open_multiplier_raw",
+        "close_ma_type", "close_ma_source", "close_ma_len", "row_sha256",
+    )
+    _insert_rows_ignore_conflicts(
+        connection, "point_configs", "_import_points", point_columns,
+        [[point[name] for name in point_columns] for point in points.values()],
+    )
+
+    grids = {str(decision.prepared.grid["grid_hash"]): decision.prepared.grid for decision in decisions}
+    grid_columns = (
+        "grid_hash", "sample_count", "start_timestamp_ms", "end_timestamp_ms",
+        "timestamps_zlib", "row_sha256",
+    )
+    _insert_rows_ignore_conflicts(
+        connection, "time_grids", "_import_grids", grid_columns,
+        [[grid[name] for name in grid_columns] for grid in grids.values()],
+    )
+
+    report_columns = (
+        "report_id", "canonical_report_key", "canonical_point_key", "grid_hash",
+        "source_sha256", "source_file", "source_size", "imported_at_utc", "settings_json",
+        "raw_action_count", "equity_sample_count", "wallet_change_count",
+        "report_period_start_ms", "report_period_end_ms", "row_sha256",
+    )
+    _append_rows(
+        connection, "active_reports", report_columns,
+        [[decision.prepared.report[name] for name in report_columns] for decision in decisions],
+    )
+    payload_columns = (
+        "report_id", "series_codec", "actions_codec", "actions_zlib", "equity_zlib",
+        "wallet_zlib", "payload_sha256",
+    )
+    _append_rows(
+        connection, "report_payloads", payload_columns,
+        [[decision.prepared.payload[name] for name in payload_columns] for decision in decisions],
+    )
+    if replacements:
+        history_rows = []
+        for decision in replacements:
+            old_hash = str(decision.old_source_sha256)
+            canonical_key = decision.prepared.canonical_report_key
+            new_hash = str(decision.prepared.report["source_sha256"])
+            audit_id = sha256(f"{job_id}\0{canonical_key}\0{old_hash}\0{new_hash}".encode()).hexdigest()
+            history_rows.append((audit_id, canonical_key, old_hash, new_hash, imported_at, job_id))
+        _append_rows(
+            connection,
+            "replacement_history",
+            ("audit_id", "canonical_report_key", "old_source_sha256", "new_source_sha256", "imported_at_utc", "job_id"),
+            history_rows,
+        )
+
+
+def _validate_written_batch(
+    connection: duckdb.DuckDBPyConnection, decisions: list[_WriteDecision]
+) -> None:
+    """Confirm the committed metadata for this batch without re-reading historical blobs."""
+    expected = {
+        (decision.prepared.canonical_report_key, str(decision.prepared.report["source_sha256"]))
+        for decision in decisions
+    }
+    source_hashes = [source_hash for _, source_hash in expected]
+    rows = connection.execute(
+        "select canonical_report_key,source_sha256 from active_reports where source_sha256 = any(?)",
+        [source_hashes],
+    ).fetchall()
+    actual = {(str(key), str(source_hash)) for key, source_hash in rows}
+    if actual != expected:
+        raise ValueError("batch write verification failed for active report metadata")
+    payload_count = int(connection.execute(
+        "select count(*) from report_payloads p join active_reports r using(report_id) "
+        "where r.source_sha256 = any(?)",
+        [source_hashes],
+    ).fetchone()[0])
+    if payload_count != len(expected):
+        raise ValueError("batch write verification failed for report payload references")
+
+
 def _atomic_json(path: Path, payload: object) -> str:
     encoded = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -608,12 +808,28 @@ def _import_html_tree(
     if request.workers < 1 or request.transaction_batch_size < 1:
         raise ValueError("workers and transaction_batch_size must be at least one")
     root = Path(request.root_path)
-    paths = discover_compact_reports(root)
-    snapshots = _snapshot_reports(root, paths, request.workers)
+    paths: tuple[Path, ...]
+    snapshots: tuple[_Snapshot, ...]
     active_hashes: tuple[str, ...] = ()
     database_path = Path(request.database_path)
     expected_target_identity: str | None = None
-    if lock_error is None and request.expected_preflight_token is not None:
+    if request.preflight is not None:
+        snapshots = request.preflight.snapshots
+        paths = tuple(item.path for item in snapshots)
+        if request.expected_preflight_token != request.preflight.token:
+            lock_error = ValueError("preflight token does not match current import inputs and target")
+        elif request.preflight.root_path != root.resolve():
+            lock_error = ValueError("preflight token does not match current import inputs and target")
+        elif not _inputs_unchanged(snapshots):
+            lock_error = ValueError("input HTML snapshot changed after preflight")
+        else:
+            expected_target_identity = request.preflight.target_identity
+            if _database_identity(database_path) != expected_target_identity:
+                lock_error = ValueError("preflight token does not match current import inputs and target")
+    else:
+        paths = discover_compact_reports(root)
+        snapshots = _snapshot_reports(root, paths, request.workers)
+    if lock_error is None and request.preflight is None and request.expected_preflight_token is not None:
         try:
             current_preflight, expected_target_identity = _preflight_from_snapshots(
                 database_path, snapshots
@@ -662,7 +878,7 @@ def _import_html_tree(
     final_state = "RUNNING"
     error: str | None = None
     prepared: list[_PreparedReport] = []
-    _emit(progress_callback, final_state, len(snapshots), counts)
+    _emit(progress_callback, "PARSING", len(snapshots), counts)
     if lock_error is not None:
         final_state = "FAILED"
         error = f"{type(lock_error).__name__}: {lock_error}"
@@ -670,37 +886,43 @@ def _import_html_tree(
         final_state = "CANCELLED"
     else:
         try:
-            with ThreadPoolExecutor(max_workers=request.workers) as executor:
-                outcomes = tuple(executor.map(duckdb_events.read_compact_html, paths))
-            for snapshot, outcome in zip(snapshots, outcomes, strict=True):
+            for outcome in _stream_prepared_reports(
+                snapshots, request.workers, imported_at, request.cancellation_requested
+            ):
+                snapshot = outcome.snapshot
                 item = evidence_by_path[snapshot.relative_path]
-                if getattr(outcome, "error_classification") or getattr(outcome, "record") is None:
-                    item["classification"] = str(getattr(outcome, "error_classification") or "INVALID_REPORT")
+                if outcome.prepared is None:
+                    item["classification"] = str(outcome.classification or "INVALID_REPORT")
                     item["parity"] = "FAIL"
                     item["validation"] = "FAIL"
+                    if outcome.reason:
+                        item["reason"] = outcome.reason
                     counts["quarantined"] += 1
+                    _emit(progress_callback, "PARSING", len(snapshots), counts)
                     continue
                 counts["parsed"] += 1
-                try:
-                    value = _prepare(snapshot, outcome, imported_at)
-                except Exception as exc:
+                value = outcome.prepared
+                if _payload_hash(value.payload) != value.payload["payload_sha256"]:
                     item["classification"] = "INTEGRITY_QUARANTINE"
                     item["parity"] = "FAIL"
                     item["validation"] = "FAIL"
-                    item["reason"] = str(exc)
+                    item["reason"] = "prepared payload hash changed before write"
                     counts["quarantined"] += 1
+                    _emit(progress_callback, "PARSING", len(snapshots), counts)
                     continue
                 item["canonical_report_key"] = value.canonical_report_key
                 item["parity"] = "PASS"
                 item["validation"] = "PASS"
                 prepared.append(value)
+                _emit(progress_callback, "PARSING", len(snapshots), counts)
 
+            _emit(progress_callback, "GROUPING", len(snapshots), counts)
             grouped: dict[str, list[_PreparedReport]] = {}
             for item in prepared:
                 grouped.setdefault(item.canonical_report_key, []).append(item)
             candidates: list[_PreparedReport] = []
             for key in sorted(grouped):
-                group = grouped[key]
+                group = sorted(grouped[key], key=lambda item: item.snapshot.relative_path)
                 if len({item.snapshot.codec_source_sha256 for item in group}) > 1:
                     for item in group:
                         evidence_by_path[item.snapshot.relative_path]["classification"] = "AMBIGUOUS_BATCH_DUPLICATE"
@@ -715,6 +937,7 @@ def _import_html_tree(
                 raise ValueError(
                     "AMBIGUOUS_BATCH_DUPLICATE: the complete import batch was not published"
                 )
+            _emit(progress_callback, "STAGING", len(snapshots), counts)
             database_path.parent.mkdir(parents=True, exist_ok=True)
             preflight_target_identity = _database_identity(database_path)
             if (
@@ -729,9 +952,10 @@ def _import_html_tree(
                 connection = duckdb.connect(str(stage_path))
                 try:
                     ensure_source_schema(connection)
-                    preflight = validate_source_database(connection)
-                    if not preflight.valid:
-                        raise ValueError(f"source database validation failed: {preflight.errors}")
+                    if request.preflight is None:
+                        preflight = validate_source_database_structural(connection)
+                        if not preflight.valid:
+                            raise ValueError(f"source database validation failed: {preflight.errors}")
                     active_rows = connection.execute(
                         "select canonical_report_key,source_sha256 from active_reports"
                     ).fetchall()
@@ -757,17 +981,18 @@ def _import_html_tree(
 
                     replacements = [item for item in decisions if item.operation == "replace"]
                     if replacements:
+                        # DuckDB enforces this foreign key across a transaction boundary.
                         connection.execute("begin transaction")
                         try:
-                            for decision in replacements:
-                                connection.execute(
-                                    "delete from report_payloads where report_id=(select report_id from active_reports where canonical_report_key=?)",
-                                    [decision.prepared.canonical_report_key],
-                                )
+                            connection.executemany(
+                                "delete from report_payloads where report_id=(select report_id from active_reports where canonical_report_key=?)",
+                                [(item.prepared.canonical_report_key,) for item in replacements],
+                            )
                             connection.execute("commit")
                         except BaseException:
                             connection.execute("rollback")
                             raise
+                    _emit(progress_callback, "WRITING", len(snapshots), counts)
                     for offset in range(0, len(decisions), request.transaction_batch_size):
                         if _cancelled(request):
                             final_state = "CANCELLED"
@@ -775,8 +1000,8 @@ def _import_html_tree(
                         batch = decisions[offset : offset + request.transaction_batch_size]
                         connection.execute("begin transaction")
                         try:
-                            for decision in batch:
-                                _write_decision(connection, decision, job_id, imported_at)
+                            _write_decisions_batch(connection, batch, job_id, imported_at)
+                            _validate_written_batch(connection, batch)
                             connection.execute("commit")
                         except BaseException:
                             connection.execute("rollback")
@@ -786,20 +1011,20 @@ def _import_html_tree(
                             evidence_by_path[decision.prepared.snapshot.relative_path]["classification"] = classification
                             counter = "inserted" if decision.operation == "insert" else "replaced"
                             counts[counter] += 1
-                        _emit(progress_callback, "RUNNING", len(snapshots), counts)
+                        _emit(progress_callback, "WRITING", len(snapshots), counts)
                     else:
                         final_state = "COMMITTED"
-                    validation = validate_source_database(connection)
-                    if not validation.valid:
-                        raise ValueError(f"post-import source validation failed: {validation.errors}")
                 finally:
                     connection.close()
                 if final_state == "COMMITTED":
+                    _emit(progress_callback, "PUBLISHING", len(snapshots), counts)
                     if not _inputs_unchanged(snapshots):
                         raise ValueError("input HTML snapshot changed during import")
                     if _database_identity(database_path) != preflight_target_identity:
                         raise ValueError("source database changed during import")
                     os.replace(stage_path, database_path)
+        except _ImportCancelled:
+            final_state = "CANCELLED"
         except Exception as exc:
             final_state = "FAILED"
             error = f"{type(exc).__name__}: {exc}"

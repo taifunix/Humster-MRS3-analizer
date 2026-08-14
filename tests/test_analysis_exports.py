@@ -19,6 +19,7 @@ def _analysis_with_run() -> duckdb.DuckDBPyConnection:
     connection.execute("insert into surface_pairs values ('S1', 'PAIR', 'BTCUSDT', 'LONG', 100, 3, 9)")
     connection.execute("insert into surface_timeframes values ('S1', 'PAIR', '1h', 'USABLE')")
     connection.execute("insert into surface_points values ('S1', 'BTCUSDT|LONG|1h|100|3|9', 'PAIR', '1h', 7, 'report', ?, 'REPRODUCIBLE_AT_PUBLICATION', '{\"TotalTrades\":7}')", ["a" * 64])
+    connection.execute("insert into surface_point_events values ('S1', 'BTCUSDT|LONG|1h|100|3|9', ?)", ["1" * 64])
     connection.execute("insert into coverage_issues values ('I1', 'S1', 'ETHUSDT', '1h', 'MISSING', '{\"detail\":\"absent\"}')")
     connection.execute("insert into analysis_runs(run_id, surface_id, algorithm_version, algorithm_config_json) values ('R1', 'S1', 'v1', '{\"minimum\":3}')")
     if connection.execute("select 1 from information_schema.tables where table_schema='main' and table_name='analysis_run_facts'").fetchone():
@@ -56,6 +57,7 @@ def test_export_is_byte_stable_and_manifest_hashes_match_files(tmp_path: Path) -
         assert manifest["run_id"] == "R1"
         assert manifest["surface_id"] == "S1"
         assert manifest["row_counts"]["surface_points"] == 1
+        assert manifest["row_counts"]["surface_point_events"] == 1
         if "analysis_run_facts" in manifest["row_counts"]:
             assert manifest["facts_state"] == "COMPUTED"
             assert manifest["counts"]["unique_point_count"] == 1

@@ -130,6 +130,14 @@ def test_event_gate_rejects_lossy_point_event_counts(point_event_count: object) 
         )
 
 
+def test_real_event_mode_requires_point_event_count() -> None:
+    with pytest.raises(ValueError, match="point_event_count"):
+        annotate_eligibility(
+            pd.DataFrame([_point(event_mode="real_independent_events")]),
+            AlgorithmConfig.defaults(),
+        )
+
+
 def test_economic_minimum_pnl_is_configurable_and_strict() -> None:
     config = replace(
         AlgorithmConfig.defaults(), economic_min_pnl_pct=Decimal("30")

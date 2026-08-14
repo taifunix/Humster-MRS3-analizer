@@ -4,6 +4,7 @@ from collections import deque
 import csv
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from hashlib import sha256
 import inspect
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,6 +12,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
@@ -22,6 +24,9 @@ import webbrowser
 import duckdb
 
 from .analysis_exports import export_analysis_run
+from .analysis_strategies import generate_analysis_strategies
+from .analysis_shortlist import CRITERIA, filter_analysis_candidates
+from .analysis_filter_export import export_filter_audit
 from .analysis_storage import compare_analysis_runs, ensure_analysis_schema, list_surface_library, publish_analysis_run
 from .config import AlgorithmConfig
 from .config import DuckDBImportSettings, load_duckdb_import_settings, save_duckdb_import_settings
@@ -34,10 +39,64 @@ from .performance_import import _canonical, _canonical_contract, _sha256
 from .published_surface import load_published_surface
 
 
-_DIRECT_MATERIALIZER_VERSION = "v1"
+_DIRECT_MATERIALIZER_VERSION = "v2-real-events"
 _DIRECT_POINT_CONFIG_HASH = sha256(
-    b"event_mode=legacy_trades_proxy;point_event_count=TotalTrades"
+    b"event_mode=real_independent_events;event_id=pair|position_side|timeframe|opened_at_utc_ns"
 ).hexdigest()
+_TESTER_START_PATTERN = re.compile(r"^\[RUN (\d+)/(\d+)\] start\.")
+_TESTER_PROGRESS_PATTERN = re.compile(
+    r"^RUN (\d+)/(\d+) time=([^ ]+ [^ ]+) \(([0-9]+(?:\.[0-9]+)?)%\)"
+)
+
+
+def _normalise_tester_log_line(line: str) -> str | None:
+    """Return concise UI-safe tester progress while retaining raw output on disk."""
+    if "\ufffd" in line or re.search(r"[\u0400-\u04ff]", line):
+        return None
+    if match := _TESTER_START_PATTERN.match(line):
+        return f"TESTER RUN: {match.group(1)}/{match.group(2)} started"
+    if match := _TESTER_PROGRESS_PATTERN.match(line):
+        return (
+            f"TESTER PROGRESS: run {match.group(1)}/{match.group(2)} "
+            f"at {match.group(4)}% ({match.group(3)})"
+        )
+    if match := re.fullmatch(r"loaded (\d+) API keys", line, flags=re.IGNORECASE):
+        return f"TESTER CONFIG: {match.group(1)} API keys loaded"
+    if match := re.fullmatch(r"loaded (\d+) settings files", line, flags=re.IGNORECASE):
+        return f"TESTER CONFIG: {match.group(1)} settings files loaded"
+    if line.startswith("Interactive chart generated:"):
+        return f"REPORT READY: {Path(line.removeprefix('Interactive chart generated:').strip()).name}"
+    return line
+
+
+def _tester_plan_summary(output: str) -> dict[str, object] | None:
+    try:
+        document = json.loads(output)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(document, dict):
+        return None
+    total = document.get("expected_count")
+    reusable = document.get("resume_completed_count", 0)
+    remaining = document.get("resume_remaining_names")
+    if (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or isinstance(reusable, bool)
+        or not isinstance(reusable, int)
+        or not isinstance(remaining, list)
+        or not all(isinstance(name, str) for name in remaining)
+    ):
+        return None
+    prepared = len(remaining)
+    if total < 0 or reusable < 0 or reusable + prepared != total:
+        return None
+    return {
+        "total": total,
+        "reusable": reusable,
+        "prepared": prepared,
+        "mode": "RESUME" if reusable else "CLEAN",
+    }
 
 
 _BROWSE_FILE_TYPES: dict[str, tuple[tuple[str, str], ...]] = {
@@ -168,7 +227,8 @@ PANEL_HTML = r"""<!doctype html>
     .direct-unavailable { color: var(--red); font-weight: 600; }
     .bar { height: 13px; overflow: hidden; background: #0a1121; border: 1px solid var(--line); border-radius: 999px; margin: 16px 0 8px; }
     .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--blue), var(--green)); transition: width .35s ease; }
-    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 13px 0; }
+    .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin: 13px 0; }
+    [hidden] { display: none !important; }
     .stat { background: var(--panel-2); border-radius: 10px; padding: 10px; }
     .stat b { display: block; font-size: 19px; } .stat span { color: var(--muted); font-size: 11px; }
     .notice { min-height: 20px; margin: 8px 0; color: var(--amber); }
@@ -187,6 +247,24 @@ PANEL_HTML = r"""<!doctype html>
     .decision-metric { color: var(--muted); font-size: .72rem; }
     .decision-metric b { display: block; color: var(--text); font-size: 1rem; }
     .decision-details { margin: .55rem 0 0; padding-left: 1rem; color: var(--muted); font-size: .76rem; }
+    .shortlist-counters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
+    .shortlist-counter { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+    .shortlist-counter b { display: block; color: var(--text); font-size: 1.15rem; }
+    .shortlist-counter span { color: var(--muted); font-size: .68rem; font-weight: 700; letter-spacing: .06em; }
+    .shortlist-table-wrap { overflow: auto; max-height: 470px; border: 1px solid var(--line); border-radius: 10px; background: #0d1425; }
+    #shortlist_table { min-width: 930px; margin: 0; }
+    #shortlist_table th { position: sticky; top: 0; z-index: 1; background: #17223a; color: #cbd8ef; font-size: .7rem; letter-spacing: .04em; text-transform: uppercase; }
+    #shortlist_table td { vertical-align: top; font-size: .76rem; }
+    #shortlist_table tbody tr:hover { background: rgba(92,141,255,.08); }
+    .shortlist-status { font-weight: 800; white-space: nowrap; }
+    .shortlist-status.ready { color: var(--green); }
+    .shortlist-status.deferred { color: var(--amber); }
+    .shortlist-structure { color: var(--text); font-weight: 700; }
+    .shortlist-group { display: block; color: var(--muted); font-size: .68rem; font-weight: 400; }
+    .shortlist-orders { min-width: 420px; color: #cbd8ef; line-height: 1.55; }
+    .shortlist-order { display: block; white-space: nowrap; }
+    .shortlist-empty { padding: 18px; color: var(--muted); text-align: center; }
+    @media (max-width: 650px) { .shortlist-counters { grid-template-columns: 1fr 1fr; } }
     @keyframes panel-in { from { opacity: .55; } to { opacity: 1; } }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
     @media (prefers-reduced-transparency: reduce) { .card, .tablist { background: var(--panel); backdrop-filter: none; } }
@@ -201,9 +279,9 @@ PANEL_HTML = r"""<!doctype html>
     <div class="badge">127.0.0.1 · отдельный процесс</div>
   </header>
   <div class="tablist" role="tablist" aria-label="Рабочие разделы MRS3">
-    <button role="tab" id="tab-csv-source" aria-selected="true" aria-controls="panel-csv-source" tabindex="0">MRS2 · CSV</button>
-    <button role="tab" id="tab-duckdb-source" aria-selected="false" aria-controls="panel-duckdb-source" tabindex="-1">MRS2 · DuckDB</button>
-    <button role="tab" id="tab-candidates" aria-selected="false" aria-controls="panel-candidates" tabindex="-1">Кандидаты стратегий</button>
+    <button role="tab" id="tab-csv-source" aria-selected="true" aria-controls="panel-csv-source" tabindex="0">Legacy CSV source</button>
+    <button role="tab" id="tab-duckdb-source" aria-selected="false" aria-controls="panel-duckdb-source" tabindex="-1">1–5. Import → surface → analysis → JSON</button>
+    <button role="tab" id="tab-candidates" aria-selected="false" aria-controls="panel-candidates" tabindex="-1">6–8. Test plan → tests → DD5</button>
     <button role="tab" id="tab-portfolio" aria-selected="false" aria-controls="panel-portfolio" tabindex="-1">Анализатор портфелей</button>
     <button role="tab" id="tab-settings" aria-selected="false" aria-controls="panel-settings" tabindex="-1">Настройки</button>
   </div>
@@ -228,8 +306,8 @@ PANEL_HTML = r"""<!doctype html>
           <details><summary>HTML → source DuckDB import</summary><div class="stack"><label>HTML root<div class="path-control"><input id="import_html_root" type="text"><button type="button" class="secondary" onclick="browse('import_html_root','directory',false)">Browse…</button></div></label><div class="buttons"><button type="button" onclick="duckdbPreflight()">Preflight</button><button type="button" class="primary" onclick="duckdbImport()">Start import</button><button type="button" onclick="duckdbCancel()">Cancel</button></div><div id="duckdbImportStatus" aria-live="polite" class="muted">No import job.</div><div class="stats"><div class="stat"><b id="import_parsed">0</b><span>parsed</span></div><div class="stat"><b id="import_inserted">0</b><span>inserted</span></div><div class="stat"><b id="import_replaced">0</b><span>replaced</span></div><div class="stat"><b id="import_identical">0</b><span>identical</span></div><div class="stat"><b id="import_ambiguous">0</b><span>ambiguous</span></div><div class="stat"><b id="import_quarantined">0</b><span>quarantined</span></div></div></div></details>
           <details open><summary>Immutable DUCKDB_DIRECT surface</summary><div class="stack">
             <fieldset class="row"><legend>UTC window</legend><label>Start<input id="direct_start" type="datetime-local"></label><label>End<input id="direct_end" type="datetime-local"></label></fieldset>
-            <div class="row"><label>Side<select id="direct_side"><option>LONG</option><option>SHORT</option></select></label><label>Symbols (; separated)<input id="direct_symbols" type="text" placeholder="BTCUSDT;ETHUSDT"></label></div>
-            <fieldset class="row"><legend>Shift range, bp</legend><label>Start<input id="direct_shift_start" type="number" step="1"></label><label>End<input id="direct_shift_end" type="number" step="1"></label><label>Step<input id="direct_shift_step" type="number" min="1" step="1"></label></fieldset>
+            <div class="row"><label>Side<select id="direct_side" onchange="applyWorkflowDefaults(true)"><option>LONG</option><option>SHORT</option></select></label><label>Symbols (; separated)<input id="direct_symbols" type="text" placeholder="BTCUSDT;ETHUSDT"></label></div>
+            <div class="source-note">Shifts: <output id="direct_shifts">Auto-detected after coverage check.</output><br>All observed shifts that cover the selected UTC window are frozen into the surface contract automatically.</div>
             <div class="buttons"><button type="button" onclick="directPreflight()">Check coverage</button><button type="button" class="primary" onclick="directBuild()">Build surface</button><button type="button" onclick="directCancel()">Cancel</button></div>
             <div id="directCoverage" role="group" aria-label="Direct surface symbols"></div><div id="directStatus" class="muted" aria-live="polite">No direct build.</div>
           </div></details>
@@ -237,7 +315,8 @@ PANEL_HTML = r"""<!doctype html>
             <div class="row"><label>Side<select id="analysis_side"><option value="">Any</option><option>LONG</option><option>SHORT</option></select></label><label>Build mode<select id="analysis_build_mode"><option value="">Any</option><option>DUCKDB_DIRECT</option></select></label></div><label>Symbol<input id="analysis_symbol" type="text"></label>
             <div class="row"><label>Period start<input id="analysis_period_start" type="datetime-local"></label><label>Period end<input id="analysis_period_end" type="datetime-local"></label></div>
             <div class="row"><label>Parent surface<input id="analysis_parent" type="text"></label><label>Source hash<input id="analysis_source_hash" type="text"></label></div>
-            <div class="buttons"><button type="button" onclick="analysisInitialize()">Initialize / migrate v3</button><button type="button" onclick="analysisRefresh()">Refresh library</button></div>
+            <div class="buttons"><button id="analysis_initialize" type="button" onclick="analysisInitialize()">Initialize / migrate v4</button><button type="button" onclick="analysisRefresh()">Refresh library</button></div>
+            <div id="analysis_schema_status" class="muted" aria-live="assertive">Analysis schema status is unknown.</div>
             <label>Surface ID<input id="analysis_surface_id" type="text"></label><label>Run ID<input id="analysis_run_id" type="text"></label>
             <div class="stats"><div class="stat"><b id="analysis_unique">—</b><span>unique points</span></div><div class="stat"><b id="analysis_economic">—</b><span>economic eligible</span></div><div class="stat"><b id="analysis_event">—</b><span>event eligible</span></div><div class="stat"><b id="analysis_plateaus">—</b><span>plateaus</span></div><div class="stat"><b id="analysis_ready">—</b><span>READY</span></div></div>
             <label>Listing dates<div class="path-control"><input id="analysis_dates" type="text"><button type="button" class="secondary" onclick="browse('analysis_dates','dates',false)">Browse…</button></div></label>
@@ -246,15 +325,23 @@ PANEL_HTML = r"""<!doctype html>
             <div class="row"><label>Left run<input id="analysis_left_run" type="text"></label><label>Right run<input id="analysis_right_run" type="text"></label></div>
             <div class="buttons"><button type="button" onclick="analysisRefine()">Refine</button><button type="button" class="primary" onclick="analysisRerun()">Re-run analysis</button><button type="button" onclick="analysisCompare()">Compare periods</button><button type="button" onclick="analysisExport()">Export</button></div>
             <div id="analysisLibrary"></div><div id="analysisStatus" class="muted" aria-live="polite">No analysis selected.</div>
+            <hr><h3>5. JSON strategies from this analysis run</h3><p class="source-note">Only READY candidates from the selected immutable run. The bot is not started automatically.</p>
+            <label>Strategy template<div class="path-control"><input id="analysis_template" value="ADM_3_LONG_SHORT.json" type="text"><button type="button" class="secondary" onclick="browse('analysis_template','template',false)">Browse…</button></div></label>
+            <label>Strategy output directory<div class="path-control"><input id="analysis_strategy_output" value="Output\\strategies" type="text"><button type="button" class="secondary" onclick="browse('analysis_strategy_output','directory',false)">Browse…</button></div></label>
+            <div class="shortlist-counters" aria-live="polite" aria-label="Shortlist counts"><div class="shortlist-counter"><b id="shortlist_all">0</b><span>ALL CANDIDATES</span></div><div class="shortlist-counter"><b id="shortlist_ready">0</b><span>READY</span></div><div class="shortlist-counter"><b id="shortlist_deferred">0</b><span>DEFERRED</span></div><div class="shortlist-counter"><b id="shortlist_comparable">0</b><span>COMPARABLE</span></div></div>
+            <div class="row"><label>Pair scope<select id="shortlist_symbol_mode" data-shortlist-control="true" onchange="analysisShortlist()"><option value="all">All pairs</option><option value="include">Only selected</option><option value="exclude">All except selected</option></select></label><label>Timeframe scope<select id="shortlist_timeframe_mode" data-shortlist-control="true" onchange="analysisShortlist()"><option value="all">All timeframes</option><option value="include">Only selected</option><option value="exclude">All except selected</option></select></label></div><div class="row"><fieldset><legend>Pairs</legend><div id="shortlist_symbols"></div></fieldset><fieldset><legend>Timeframes</legend><div id="shortlist_timeframes"></div></fieldset></div>
+            <fieldset><legend>Phase 2 structural comparison filters</legend><div class="row"><label><input id="filter_source_pnl" data-shortlist-filter="true" type="checkbox" onchange="analysisShortlist()"> Source PnL per order</label><label><input id="filter_efficiency" data-shortlist-filter="true" type="checkbox" onchange="analysisShortlist()"> PnL/DD per order</label><label><input id="filter_close_support" data-shortlist-filter="true" type="checkbox" onchange="analysisShortlist()"> CloseSupport per order</label><label><input id="filter_point_event_count" data-shortlist-filter="true" type="checkbox" onchange="analysisShortlist()"> PointEventCount per order</label></div><p class="source-note">Compared only within Pair + Side + TF + Orders + CloseMA. Source PnL is never summed.</p></fieldset>
+            <label>Filter audit output<div class="path-control"><input id="analysis_filter_output" value="Output\phase2_filter_audit.xlsx" type="text"><button type="button" class="secondary" onclick="browse('analysis_filter_output','audit_xlsx',false)">Browse…</button></div></label>
+            <div class="buttons"><button id="shortlist_refresh" data-shortlist-control="true" type="button" onclick="analysisShortlist()">Refresh scope summary</button><button id="shortlist_export" data-shortlist-control="true" type="button" onclick="analysisFilterExport()">Export filter audit XLS</button><button id="shortlist_generate" data-shortlist-control="true" type="button" class="primary" onclick="analysisStrategies()">Generate READY JSON</button></div><div id="analysisStrategiesStatus" class="muted" aria-live="polite">Refresh the Pair/TF scope summary.</div><div id="shortlist_audit_note" class="source-note">Candidate-level details are available in the XLS audit.</div><div id="shortlist_table_container" class="shortlist-table-wrap"><table id="shortlist_table"><thead id="shortlist_table_header"><tr><th scope="col">Pair</th><th scope="col">TF</th><th scope="col">2 orders</th><th scope="col">3 orders</th><th scope="col">4 orders</th><th scope="col">READY</th><th scope="col">DEFERRED</th><th scope="col">ALL</th></tr></thead><tbody id="shortlist_table_body"></tbody></table><div id="shortlist_empty" class="shortlist-empty" hidden>No strategies match the current scope.</div></div>
           </div></details>
         </div>
       </section>
       <section role="tabpanel" id="panel-candidates" aria-labelledby="tab-candidates" hidden>
-        <h2>Кандидаты стратегий</h2><p class="source-note">Source-метрики — диагностика, а не результат готовой MRS3-стратегии.</p>
-        <div class="stack workflow-card"><h3>1. Собрать кандидатов</h3><label>Источник точек<select id="select_source_mode" onchange="syncCandidateSource()"><option value="csv">Совместимый CSV-вход</option><option value="package">Проверенный source-pack</option></select></label><label id="raw_csv_source">Совместимый CSV-вход (текущий путь)<div class="path-control"><input id="input_csv" value="reports_history_bybit_long_day2.csv" type="text"><button type="button" class="secondary" onclick="browse('input_csv','csv',false)">Выбрать…</button></div></label><label id="package_source" hidden>Каталог проверенного source-pack<div class="path-control"><input id="source_package" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('source_package','directory',false)">Выбрать…</button></div></label><div class="row"><label>Даты листинга<div class="path-control"><input id="dates" value="dates.xlsx" type="text"><button type="button" class="secondary" onclick="browse('dates','dates',false)">Выбрать…</button></div></label><label>Шаблон JSON<div class="path-control"><input id="template" value="ADM_3_LONG_SHORT.json" type="text"><button type="button" class="secondary" onclick="browse('template','template',false)">Выбрать…</button></div></label></div><label>Сторона<select id="side"><option>LONG</option><option>SHORT</option></select></label><button data-runnable="true" onclick="startAction('select')">Запустить селектор</button></div>
-        <div class="stack workflow-card"><h3>2. Проверить и тестировать</h3><label>Каталог JSON-стратегий<div class="path-control"><input id="strategies" value="output_long\strategies" type="text"><button type="button" class="secondary" onclick="browse('strategies','directory',false)">Выбрать…</button></div></label><div class="buttons"><button data-runnable="true" id="planButton" onclick="startAction('tester-plan')">Проверить план</button><button data-runnable="true" id="runButton" class="primary" onclick="startAction('tester-run')">Запустить тесты</button></div></div>
-        <div class="stack workflow-card"><h3>3. DD5 после теста</h3><p class="source-note">Финальные выводы требуют реального tick-test и DD5 retest.</p><label>CSV результатов<div class="path-control"><input id="results_csv" value="results\mrs3_long_results.csv" type="text"><button type="button" class="secondary" onclick="browse('results_csv','results_csv',false)">Выбрать…</button></div></label><label>Audit XLSX<div class="path-control"><input id="audit_xlsx" value="output_long\audit.xlsx" type="text"><button type="button" class="secondary" onclick="browse('audit_xlsx','audit_xlsx',false)">Выбрать…</button></div></label><label>Каталог исходных стратегий<div class="path-control"><input id="posttest_strategies" value="output_long\strategies" type="text"><button type="button" class="secondary" onclick="browse('posttest_strategies','directory',false)">Выбрать…</button></div></label><button data-runnable="true" onclick="startAction('posttest')">Собрать DD5</button></div>
-        <div class="stack workflow-card"><h3>Performance DuckDB DD5</h3><p class="source-note">CALCULATION_ONLY: import, calculate, export, then cleanup.</p><label>Performance DuckDB<div class="path-control"><input id="performance_database" value="output_long\strategy_performance.duckdb" type="text"><button type="button" class="secondary" onclick="browse('performance_database','duckdb',false)">Выбрать…</button></div></label><label>Completed performance inbox<div class="path-control"><input id="performance_inbox" value="output_long\performance_inbox" type="text"><button type="button" class="secondary" onclick="browse('performance_inbox','directory',false)">Выбрать…</button></div></label><button data-runnable="true" onclick="startAction('performance-dd5')">Run DuckDB DD5</button></div>
+        <h2>6–8. Test plan, tests, DD5</h2><p class="source-note">The generated JSON directory is pre-filled here after step 5. Source metrics remain diagnostic.</p>
+        <div class="stack workflow-card"><h3>6. Manual legacy candidate generation</h3><p class="source-note">Use only for CSV/source-pack research, not after an immutable analysis run.</p><label>Источник точек<select id="select_source_mode" onchange="syncCandidateSource()"><option value="csv">Совместимый CSV-вход</option><option value="package">Проверенный source-pack</option></select></label><label id="raw_csv_source">Совместимый CSV-вход (текущий путь)<div class="path-control"><input id="input_csv" value="reports_history_bybit_long_day2.csv" type="text"><button type="button" class="secondary" onclick="browse('input_csv','csv',false)">Выбрать…</button></div></label><label id="package_source" hidden>Каталог проверенного source-pack<div class="path-control"><input id="source_package" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('source_package','directory',false)">Выбрать…</button></div></label><div class="row"><label>Даты листинга<div class="path-control"><input id="dates" value="dates.xlsx" type="text"><button type="button" class="secondary" onclick="browse('dates','dates',false)">Выбрать…</button></div></label><label>Шаблон JSON<div class="path-control"><input id="template" value="ADM_3_LONG_SHORT.json" type="text"><button type="button" class="secondary" onclick="browse('template','template',false)">Выбрать…</button></div></label></div><label>Сторона<select id="side"><option>LONG</option><option>SHORT</option></select></label><button data-runnable="true" onclick="startAction('select')">Запустить селектор</button></div>
+        <div class="stack workflow-card"><h3>7. Test plan and tester run</h3><label>Каталог JSON-стратегий<div class="path-control"><input id="strategies" value="output_long\strategies" type="text"><button type="button" class="secondary" onclick="browse('strategies','directory',false)">Выбрать…</button></div></label><div class="buttons"><button data-runnable="true" id="planButton" onclick="startAction('tester-plan')">Проверить план</button><button data-runnable="true" id="runButton" class="primary" onclick="startAction('tester-run')">Запустить тесты</button></div><div id="testerPlanSummary" class="muted">План ещё не проверен.</div></div>
+        <div class="stack workflow-card"><h3>8. DD5 calculated comparison</h3><p class="source-note">DD5 — расчётная нормализация для ранжирования по projected PnL/DD. Настройки стратегии и сделки берутся из проверенного CSV; повторный tick-test DD5 JSON не входит в workflow.</p><label>CSV результатов<div class="path-control"><input id="results_csv" value="results\mrs3_long_results.csv" type="text"><button type="button" class="secondary" onclick="browse('results_csv','results_csv',false)">Выбрать…</button></div></label><label>Новый каталог результата DD5<div class="path-control"><input id="posttest_output_dir" type="text" readonly><button type="button" class="secondary" onclick="browse('posttest_output_dir','directory',false)">Выбрать…</button></div></label><button data-runnable="true" onclick="startAction('posttest')">Рассчитать DD5</button></div>
+        <div class="stack workflow-card"><h3>Performance DuckDB DD5</h3><p class="source-note">CALCULATION_ONLY: import, calculate, export, then cleanup.</p><label>Performance DuckDB<div class="path-control"><input id="performance_database" value="data/databases/strategy_performance.duckdb" type="text"><button type="button" class="secondary" onclick="browse('performance_database','duckdb',false)">Select...</button></div></label><label>Completed performance inbox<div class="path-control"><input id="performance_inbox" value="data/tester_inbox" type="text"><button type="button" class="secondary" onclick="browse('performance_inbox','directory',false)">Select...</button></div></label><button data-runnable="true" onclick="startAction('performance-dd5')">Run DuckDB DD5</button></div>
       </section>
       <section role="tabpanel" id="panel-portfolio" aria-labelledby="tab-portfolio" hidden>
         <h2>Анализатор портфелей</h2><p id="portfolio-prerequisites" class="source-note"><span class="queued">Queued — Layer A only after input-contract check.</span> Нужны: формат individual results, timestamps входа/выхода, limiter contract (positions vs orders; LONG/SHORT; hedge/one-way), L2 и margin data/rules. Анализатор не превращает source-метрики или individual ranking в портфельный результат.</p>
@@ -276,7 +363,6 @@ PANEL_HTML = r"""<!doctype html>
           </div></details>
           <div class="row"><label>Каталог CSV source-pack<div class="path-control"><input id="csv_output_dir" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('csv_output_dir','directory',false)">Выбрать…</button></div></label><label>Каталог DuckDB source-pack<div class="path-control"><input id="duckdb_output_dir" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('duckdb_output_dir','directory',false)">Выбрать…</button></div></label></div>
           <div class="row"><label>Каталог результата selection<div class="path-control"><input id="select_output_dir" value="output_long" type="text"><button type="button" class="secondary" onclick="browse('select_output_dir','directory',false)">Выбрать…</button></div></label><label>Итоговый CSV тестера<div class="path-control"><input id="output_csv" value="results\mrs3_long_results.csv" type="text"><button type="button" class="secondary" onclick="browse('output_csv','results_csv',false)">Выбрать…</button></div></label></div>
-          <label>Каталог DD5<div class="path-control"><input id="posttest_output_dir" value="posttest_long" type="text"><button type="button" class="secondary" onclick="browse('posttest_output_dir','directory',false)">Выбрать…</button></div></label>
         </div>
       </section>
       <div id="notice" class="notice" aria-live="polite"></div>
@@ -288,14 +374,15 @@ PANEL_HTML = r"""<!doctype html>
       </div>
       <div id="progressBar" class="bar" role="progressbar" aria-label="Прогресс операции" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="barFill"></div></div>
       <div id="progressText" class="muted">Ожидание запуска</div>
-      <div class="stats">
+      <div id="operationStats" class="stats">
         <div class="stat"><b id="submitted">0</b><span>отправлено</span></div>
         <div class="stat"><b id="running">0</b><span>в работе</span></div>
         <div class="stat"><b id="result">0</b><span>результат</span></div>
         <div class="stat"><b id="completed">0</b><span>проверено</span></div>
+        <div class="stat"><b id="retries">0</b><span>повторы</span></div>
       </div>
-      <h3>Активные стратегии</h3>
-      <div style="max-height:220px;overflow:auto"><table><thead><tr><th>Имя</th><th>Статус</th><th>%</th></tr></thead><tbody id="activeRows"></tbody></table></div>
+      <div id="activeStrategies"><h3>Активные стратегии</h3>
+      <div style="max-height:220px;overflow:auto"><table><thead><tr><th>Имя</th><th>Статус</th><th>%</th></tr></thead><tbody id="activeRows"></tbody></table></div></div>
       <h3 style="margin-top:15px">Готовые файлы</h3><div id="artifacts" class="artifacts muted">Пока нет</div>
       <h3 style="margin-top:15px">Журнал</h3><pre id="logs">Панель готова.</pre>
       <section class="decision-dashboard" aria-live="polite" aria-label="Статистика для решений">
@@ -307,17 +394,23 @@ PANEL_HTML = r"""<!doctype html>
 </main>
 <script>
 const labels = {
-  'tester-plan':'Проверка плана', 'tester-run':'Пакетное тестирование', 'select':'Создание стратегий', 'posttest':'DD5-анализ', 'source-csv':'CSV source-pack', 'source-duckdb':'DuckDB source-pack',
+  'tester-plan':'Проверка плана', 'tester-run':'Пакетное тестирование', 'select':'Создание стратегий', 'posttest':'DD5-анализ', 'performance-dd5':'Performance DuckDB DD5', 'source-csv':'CSV source-pack', 'source-duckdb':'DuckDB source-pack',
   'PRECHECK':'Предварительная проверка', 'STOPPED':'Бот остановлен', 'CLEAN':'Отчёты очищены', 'INSTALLED':'Стратегии установлены',
   'STARTED':'Бот запущен', 'VISIBLE':'Стратегии появились', 'SUBMITTED':'Все тесты отправлены', 'MONITORING':'Идёт тестирование',
   'RECONCILED':'Результаты сверены', 'CSV_COMMITTED':'CSV сохранён', 'STOPPED_FOR_CLEANUP':'Бот остановлен для очистки',
   'RAW_ARTIFACTS_REMOVED':'Временные отчёты удалены', 'COMPLETED':'Завершено', 'FAILED':'Ошибка'
 };
 let defaultsLoaded = false;
+let workflowDefaults = {listing_dates_path:'', strategy_templates:{}};
 const value = id => document.getElementById(id).value.trim();
+function nextPosttestOutput(csvPath) {
+  const stem=(csvPath.split(/[\\/]/).pop() || 'results').replace(/\.csv$/i,'').replace(/[^a-z0-9_-]+/gi,'_');
+  const now=new Date(); const pad=n=>String(n).padStart(2,'0');
+  return `Output\\posttest_${stem}_${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
 function payload(action) {
   const base = {action, config:value('config')};
-  if (action === 'tester-plan') return {...base, strategies:value('strategies')};
+  if (action === 'tester-plan') return {...base, strategies:value('strategies'), output_csv:value('output_csv')};
   if (action === 'tester-run') return {...base, strategies:value('strategies'), output_csv:value('output_csv')};
   if (action === 'source-csv') return {...base, input_csv:value('source_csv_files'), start:value('csv_start'), end:value('csv_end'), output_dir:value('csv_output_dir')};
   if (action === 'source-duckdb') return {...base, database:value('source_duckdb'), start:value('duckdb_start'), end:value('duckdb_end'), output_dir:value('duckdb_output_dir'), verify_html_root:value('verify_html_root'), verification_sample_count:value('verification_sample_count')};
@@ -328,7 +421,7 @@ function payload(action) {
     return {...base, ...source, dates:value('dates'), template:value('template'), side:value('side'), output_dir:value('select_output_dir')};
   }
   if (action === 'performance-dd5') return {...base, database:value('performance_database'), inbox:value('performance_inbox'), output_dir:value('posttest_output_dir')};
-  return {...base, results_csv:value('results_csv'), audit_xlsx:value('audit_xlsx'), strategies:value('posttest_strategies'), output_dir:value('posttest_output_dir')};
+  return {...base, results_csv:value('results_csv'), output_dir:value('posttest_output_dir')};
 }
 async function startAction(action) {
   const notice = document.getElementById('notice'); notice.textContent = 'Запуск…';
@@ -352,6 +445,7 @@ async function browse(id, kind, multiple) {
 let duckdbPreflightToken = '';
 async function duckdbRequest(endpoint, body={}) { const response = await fetch(endpoint, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}); const document = await response.json(); if (!response.ok) throw new Error(document.error || 'Import request failed'); return document; }
 function showDuckdbSettings(settings) { const fields={source_duckdb_path:'import_source_duckdb', analysis_duckdb_path:'import_analysis_duckdb', default_html_root:'import_default_html_root', audit_root:'import_audit_root', workers:'import_workers', transaction_batch_size:'import_batch_size'}; for (const [name,id] of Object.entries(fields)) document.getElementById(id).value=settings[name] ?? ''; if (!value('import_html_root')) document.getElementById('import_html_root').value=settings.default_html_root ?? ''; }
+function applyWorkflowDefaults(force=false) { const side=value('direct_side') || 'LONG'; const dates=workflowDefaults.listing_dates_path || ''; const template=workflowDefaults.strategy_templates?.[side] || ''; for(const id of ['analysis_dates','dates']) { if(dates && (force || !value(id))) document.getElementById(id).value=dates; } for(const id of ['analysis_template','template']) { if(template && (force || !value(id) || value(id)==='ADM_3_LONG_SHORT.json')) document.getElementById(id).value=template; } }
 async function loadDuckdbSettings() { try { const response=await fetch('/api/duckdb-import/settings', {cache:'no-store'}); const settings=await response.json(); if (!response.ok) throw new Error(settings.error || 'Settings load failed'); showDuckdbSettings(settings); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function saveDuckdbSettings() { try { const settings=await duckdbRequest('/api/duckdb-import/settings', {source_duckdb_path:value('import_source_duckdb') || null, analysis_duckdb_path:value('import_analysis_duckdb') || null, default_html_root:value('import_default_html_root') || null, audit_root:value('import_audit_root') || null, workers:value('import_workers'), transaction_batch_size:value('import_batch_size')}); showDuckdbSettings(settings); document.getElementById('notice').textContent='Настройки импорта сохранены.'; } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function migrateDuckdb() { try { const settings=await duckdbRequest('/api/duckdb-import/migrate', {target_path:value('migration_target')}); showDuckdbSettings(settings); document.getElementById('notice').textContent='Миграция проверена и активирована.'; } catch (error) { document.getElementById('notice').textContent=error.message; } }
@@ -360,10 +454,12 @@ async function duckdbImport() { try { const result = await duckdbRequest('/api/d
 async function duckdbCancel() { try { render(await duckdbRequest('/api/duckdb-import/cancel')); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 let directPreflightToken = '';
 function directUtc(id) { const raw=value(id); if (!raw) return ''; return raw.endsWith('Z') ? raw : new Date(raw+'Z').toISOString(); }
-function directPayload() { return {start_utc:directUtc('direct_start'), end_utc:directUtc('direct_end'), side:value('direct_side'), symbols:value('direct_symbols').split(';'), shift_start_bp:value('direct_shift_start'), shift_end_bp:value('direct_shift_end'), shift_step_bp:value('direct_shift_step')}; }
+function directPayload() { return {start_utc:directUtc('direct_start'), end_utc:directUtc('direct_end'), side:value('direct_side'), symbols:value('direct_symbols').split(';')}; }
 function renderDirectCoverage(result) {
   const target=document.getElementById('directCoverage'); target.replaceChildren();
+  document.getElementById('direct_shifts').textContent=(result.required_shifts_bp || []).join('; ') || 'No shifts cover this window';
   for (const [symbol,timeframes] of Object.entries(result.usable_timeframes || {})) { const label=document.createElement('label'); const box=document.createElement('input'); box.type='checkbox'; box.name='direct_selected_symbol'; box.value=symbol; box.checked=true; label.append(box, document.createTextNode(` ${symbol} · ${timeframes.join(', ')}`)); target.appendChild(label); }
+  const excluded=new Map(); for(const issue of (result.coverage_issues || [])){ if(!['GRID_NOT_COVERED','GRID_NO_COMMON_PAIRS','CONFLICTING_CANONICAL_POINT'].includes(issue.code)) continue; const key=issue.symbol+' · '+issue.timeframe; excluded.set(key,issue.code); } for(const [scope,code] of excluded){ const row=document.createElement('div'); row.className='direct-unavailable'; row.textContent='! '+scope+' excluded: '+code; target.appendChild(row); }
   for (const symbol of Object.keys(result.unavailable_symbols || {})) { const row=document.createElement('div'); row.className='direct-unavailable'; const reasons=(result.coverage_issues || []).filter(item=>item.symbol===symbol).map(item=>`${item.code}: ${item.detail}`).join('; '); row.textContent=`⚠ ${symbol} · ${reasons || 'unavailable'}`; target.appendChild(row); }
 }
 async function directPreflight() { try { const result=await duckdbRequest('/api/duckdb-direct/preflight', directPayload()); directPreflightToken=result.token; renderDirectCoverage(result); document.getElementById('directStatus').textContent='Coverage checked.'; } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
@@ -375,11 +471,37 @@ function renderAnalysisLibrary(rows) {
   for(const surface of rows) { const button=document.createElement('button'); button.type='button'; button.className='secondary'; button.textContent=`${surface.period_start_utc} → ${surface.period_end_utc} · ${surface.side} · ${surface.unique_point_count} points`; button.onclick=()=>{ document.getElementById('analysis_surface_id').value=surface.surface_id; const run=(surface.runs||[])[0]; document.getElementById('analysis_run_id').value=run?.run_id||''; showAnalysisFacts(run?.facts||{unique_point_count:surface.unique_point_count}); document.getElementById('analysisStatus').textContent=`parent=${surface.parent_surface_id||'none'} · sources=${(surface.source_hashes||[]).length} · coverage=${(surface.coverage_reasons||[]).join(', ')||'OK'} · final=${run?.facts?.final_state||run?.facts?.facts_state||'surface only'}`; }; target.appendChild(button); }
 }
 async function analysisRefresh() { try { const rows=await duckdbRequest('/api/analysis/library',{side:value('analysis_side'),build_mode:value('analysis_build_mode'),symbol:value('analysis_symbol'),period_start_utc:value('analysis_period_start'),period_end_utc:value('analysis_period_end'),parent_surface_id:value('analysis_parent'),source_hash:value('analysis_source_hash')}); renderAnalysisLibrary(rows); document.getElementById('analysisStatus').textContent=`${rows.length} surfaces`; } catch(error){ document.getElementById('analysisStatus').textContent=error.message; } }
-async function analysisInitialize(){ try { const result=await duckdbRequest('/api/analysis/initialize',{}); document.getElementById('analysisStatus').textContent=`Analysis schema v${result.schema_version} ready.`; } catch(error){ document.getElementById('analysisStatus').textContent=error.message; } }
+async function analysisInitialize(){ const button=document.getElementById('analysis_initialize'), status=document.getElementById('analysis_schema_status'); button.disabled=true; status.textContent='Initializing / migrating analysis schema...'; try { const result=await duckdbRequest('/api/analysis/initialize',{}); status.textContent=`Analysis schema v${result.schema_version} ready.`; document.getElementById('analysisStatus').textContent=status.textContent; } catch(error){ status.textContent=`Analysis schema failed: ${error.message}`; document.getElementById('analysisStatus').textContent=status.textContent; } finally { button.disabled=false; } }
 function analysisRefine(){ const parent=value('analysis_surface_id'); if(!parent){ document.getElementById('analysisStatus').textContent='Select a parent surface.'; return; } directBuild(parent); }
 async function analysisRerun(){ try { render(await duckdbRequest('/api/analysis/rerun',{surface_id:value('analysis_surface_id'),dates_path:value('analysis_dates'),config_path:value('analysis_config'),comparison_run_id:value('analysis_left_run')})); } catch(error){ document.getElementById('analysisStatus').textContent=error.message; } }
 async function analysisCompare(){ try { const result=await duckdbRequest('/api/analysis/compare',{left_run_id:value('analysis_left_run'),right_run_id:value('analysis_right_run')}); document.getElementById('analysisStatus').textContent=JSON.stringify(result); } catch(error){ document.getElementById('analysisStatus').textContent=error.message; } }
 async function analysisExport(){ try { const result=await duckdbRequest('/api/analysis/export',{run_id:value('analysis_run_id'),output_path:value('analysis_output')}); document.getElementById('analysisStatus').textContent=`Exported ${result.output} · ${result.manifest}`; } catch(error){ document.getElementById('analysisStatus').textContent=error.message; } }
+let shortlistScopes=[];
+let shortlistMeta={input_count:0,ready_count:0,deferred_count:0,comparable_count:0,comparison_group_count:0};
+let shortlistBusy=false;
+function analysisFilterCriteria(){ return [['filter_source_pnl','source_pnl'],['filter_efficiency','efficiency'],['filter_close_support','close_support'],['filter_point_event_count','point_event_count']].filter(([id])=>document.getElementById(id).checked).map(([,name])=>name); }
+function setShortlistBusy(busy){ shortlistBusy=busy; document.querySelectorAll('[data-shortlist-control],[data-shortlist-filter]').forEach(item=>item.disabled=busy); if(busy) document.getElementById('analysisStrategiesStatus').textContent='Loading shortlist…'; }
+function renderShortlist(){
+  const body=document.getElementById('shortlist_table_body'); body.replaceChildren();
+  document.getElementById('shortlist_all').textContent=shortlistMeta.input_count;
+  document.getElementById('shortlist_ready').textContent=shortlistMeta.ready_count;
+  document.getElementById('shortlist_deferred').textContent=shortlistMeta.deferred_count;
+  document.getElementById('shortlist_comparable').textContent=shortlistMeta.comparable_count;
+  document.getElementById('shortlist_empty').hidden=shortlistScopes.length !== 0;
+  for(const item of shortlistScopes){
+    const row=document.createElement('tr');
+    for(const value of [item.symbol,item.timeframe,item.order_2,item.order_3,item.order_4,item.ready,item.deferred,item.total]){ const cell=document.createElement('td'); cell.textContent=value; row.appendChild(cell); }
+    body.appendChild(row);
+  }
+}
+async function analysisShortlist(){ if(shortlistBusy) return; const selectedSymbol=value('shortlist_symbol'), selectedTf=value('shortlist_timeframe'); setShortlistBusy(true); try { const result=await duckdbRequest('/api/analysis/shortlist',{run_id:value('analysis_run_id'),criteria:analysisFilterCriteria(),symbol:selectedSymbol,timeframe:selectedTf}); shortlistScopes=result.scopes||[]; shortlistMeta={input_count:result.input_count??0,ready_count:result.ready_count??0,deferred_count:result.deferred_count??0,comparable_count:result.comparable_count??0,comparison_group_count:result.comparison_group_count??0}; const symbol=document.getElementById('shortlist_symbol'), tf=document.getElementById('shortlist_timeframe'); symbol.replaceChildren(new Option('All','')); tf.replaceChildren(new Option('All','')); for(const item of (result.facets?.symbols||[])) symbol.add(new Option(item,item)); for(const item of (result.facets?.timeframes||[])) tf.add(new Option(item,item)); symbol.value=selectedSymbol; tf.value=selectedTf; renderShortlist(); document.getElementById('analysisStrategiesStatus').textContent=`${shortlistMeta.ready_count} READY · ${shortlistMeta.deferred_count} DEFERRED · ${shortlistMeta.comparable_count} COMPARABLE · ${shortlistMeta.comparison_group_count} comparison groups`; } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } finally { setShortlistBusy(false); } }
+async function analysisFilterExport(){ if(shortlistBusy) return; setShortlistBusy(true); try { const result=await duckdbRequest('/api/analysis/filter-export',{run_id:value('analysis_run_id'),criteria:analysisFilterCriteria(),output_path:value('analysis_filter_output')}); document.getElementById('analysisStrategiesStatus').textContent=`Filter audit: ${result.output}`; } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } finally { setShortlistBusy(false); } }
+async function analysisStrategies(){ try { render(await duckdbRequest('/api/analysis/strategies',{run_id:value('analysis_run_id'),criteria:analysisFilterCriteria(),symbol:value('shortlist_symbol'),timeframe:value('shortlist_timeframe'),template_path:value('analysis_template'),output_dir:value('analysis_strategy_output'),config_path:value('analysis_config')})); } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } }
+function selectedScope(name){ return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(item=>item.value); }
+function shortlistScopePayload(){ return {symbol_mode:value('shortlist_symbol_mode'),symbols:selectedScope('shortlist_symbol'),timeframe_mode:value('shortlist_timeframe_mode'),timeframes:selectedScope('shortlist_timeframe')}; }
+function renderScopeOptions(targetId,name,items,selected){ const target=document.getElementById(targetId); target.replaceChildren(); for(const item of items){ const label=document.createElement('label'), box=document.createElement('input'); box.type='checkbox'; box.name=name; box.value=item; box.checked=selected.includes(item); box.dataset.shortlistControl='true'; box.onchange=analysisShortlist; label.append(box,document.createTextNode(` ${item}`)); target.appendChild(label); } }
+async function analysisShortlist(){ if(shortlistBusy) return; const payload=shortlistScopePayload(); setShortlistBusy(true); try { const result=await duckdbRequest('/api/analysis/shortlist',{run_id:value('analysis_run_id'),criteria:analysisFilterCriteria(),...payload}); shortlistScopes=result.scopes||[]; shortlistMeta={input_count:result.input_count??0,ready_count:result.ready_count??0,deferred_count:result.deferred_count??0,comparable_count:result.comparable_count??0,comparison_group_count:result.comparison_group_count??0}; renderScopeOptions('shortlist_symbols','shortlist_symbol',result.facets?.symbols||[],payload.symbols); renderScopeOptions('shortlist_timeframes','shortlist_timeframe',result.facets?.timeframes||[],payload.timeframes); renderShortlist(); document.getElementById('analysisStrategiesStatus').textContent=`${shortlistMeta.ready_count} READY; ${shortlistMeta.deferred_count} DEFERRED; ${shortlistMeta.comparable_count} COMPARABLE; ${shortlistMeta.comparison_group_count} comparison groups`; } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } finally { setShortlistBusy(false); } }
+async function analysisStrategies(){ try { render(await duckdbRequest('/api/analysis/strategies',{run_id:value('analysis_run_id'),criteria:analysisFilterCriteria(),...shortlistScopePayload(),template_path:value('analysis_template'),output_dir:value('analysis_strategy_output'),config_path:value('analysis_config')})); } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } }
 function renderDashboard(dashboard) {
   const target = document.getElementById('decisionDashboard'); target.replaceChildren();
   const order = ['csv', 'duckdb', 'candidates', 'tester', 'posttest'];
@@ -387,7 +509,7 @@ function renderDashboard(dashboard) {
     const item = dashboard?.[key]; if (!item) continue;
     const card = document.createElement('section'); card.className = 'decision-card';
     const heading = document.createElement('h4'); heading.textContent = item.title; card.appendChild(heading);
-    const state = document.createElement('div'); const positive=['SELECTABLE','PACKAGE_COMPLETE','READY_FOR_TEST','COMPLETED']; const failed=['FAILED']; state.className = 'decision-state ' + (positive.includes(item.state) ? 'good' : (failed.includes(item.state) ? 'bad' : '')); state.textContent = item.state; card.appendChild(state);
+    const state = document.createElement('div'); const positive=['SELECTABLE','PACKAGE_COMPLETE','READY_FOR_TEST','CALCULATED','COMPLETED']; const failed=['FAILED']; state.className = 'decision-state ' + (positive.includes(item.state) ? 'good' : (failed.includes(item.state) ? 'bad' : '')); state.textContent = item.state; card.appendChild(state);
     const metrics = document.createElement('div'); metrics.className = 'decision-metrics';
     for (const metric of (item.metrics || [])) { const block=document.createElement('div'); block.className='decision-metric'; const number=document.createElement('b'); number.textContent=metric.value; block.append(number, document.createTextNode(metric.label)); metrics.appendChild(block); }
     card.appendChild(metrics);
@@ -397,26 +519,33 @@ function renderDashboard(dashboard) {
   }
 }
 function render(data) {
-  if (!defaultsLoaded && data.defaults) { document.getElementById('config').value = data.defaults.config; defaultsLoaded = true; }
+  if (!defaultsLoaded && data.defaults) { document.getElementById('config').value = data.defaults.config; document.getElementById('analysis_config').value = data.defaults.config; workflowDefaults=data.defaults.workflow || workflowDefaults; applyWorkflowDefaults(); const tester=data.defaults.tester || {}; if(tester.strategies){ document.getElementById('strategies').value=tester.strategies; } if(tester.output_csv){ document.getElementById('output_csv').value=tester.output_csv; document.getElementById('results_csv').value=tester.output_csv; } document.getElementById('posttest_output_dir').value=nextPosttestOutput(value('results_csv')); defaultsLoaded = true; }
   renderDashboard(data.dashboard);
   const imported = data.duckdb_import;
-  if (imported) { document.getElementById('duckdbImportStatus').textContent = `${imported.final_state} · safe_to_delete=${imported.safe_to_delete}`; for (const [name, count] of Object.entries(imported.counts || {})) { const item=document.getElementById('import_'+name); if (item) item.textContent=count; } }
+  if (imported) { document.getElementById('duckdbImportStatus').textContent = `${imported.running ? imported.phase : imported.final_state} · parsed=${imported.counts?.parsed || 0}/${imported.discovered || 0} · inserted=${imported.counts?.inserted || 0} · replaced=${imported.counts?.replaced || 0} · quarantined=${imported.counts?.quarantined || 0} · safe_to_delete=${imported.safe_to_delete}`; for (const [name, count] of Object.entries(imported.counts || {})) { const item=document.getElementById('import_'+name); if (item) item.textContent=count; } }
   const preflight = data.duckdb_import_preflight;
   if (preflight) { const bytes=v=>`${(Number(v||0)/1073741824).toFixed(2)} GB`; document.getElementById('duckdbImportStatus').textContent = preflight.running ? `Preflight · ${preflight.snapshotted}/${preflight.discovered} files · ${bytes(preflight.processed_bytes)}/${bytes(preflight.total_bytes)}` : (preflight.error || `Preflight ready · ${preflight.discovered} reports`); if(preflight.token) duckdbPreflightToken=preflight.token; }
   const preflightBusy = Boolean(preflight?.running);
   const importBusy = Boolean(imported?.running);
-  if (imported && !preflight && !preflightBusy) document.getElementById('duckdbImportStatus').textContent = `${imported.final_state} / safe_to_delete=${imported.safe_to_delete}`;
+  if (imported && !preflight && !preflightBusy) document.getElementById('duckdbImportStatus').textContent = `${imported.running ? imported.phase : imported.final_state} · parsed=${imported.counts?.parsed || 0}/${imported.discovered || 0} · inserted=${imported.counts?.inserted || 0} · replaced=${imported.counts?.replaced || 0} · quarantined=${imported.counts?.quarantined || 0} · safe_to_delete=${imported.safe_to_delete}`;
   document.querySelector('button[onclick="duckdbPreflight()"]')?.toggleAttribute('disabled', preflightBusy || importBusy);
   document.querySelector('button[onclick="duckdbImport()"]')?.toggleAttribute('disabled', preflightBusy || importBusy || !preflight?.token);
   const analysis = data.analysis;
-  if (analysis) { document.getElementById('analysis_surface_id').value=analysis.surface_id||''; if(analysis.run_id) document.getElementById('analysis_run_id').value=analysis.run_id; showAnalysisFacts(analysis.statistics||{}); document.getElementById('analysisStatus').textContent=`${analysis.phase}${analysis.run_id?' · '+analysis.run_id:''}${analysis.error?' · '+analysis.error:''}`; }
+  if (analysis) { document.getElementById('analysis_surface_id').value=analysis.surface_id||''; if(analysis.run_id) { document.getElementById('analysis_run_id').value=analysis.run_id; const prefix=analysis.run_id.slice(0,12); if(!value('analysis_output')) document.getElementById('analysis_output').value=`Output\\analysis_${prefix}`; if(value('analysis_strategy_output')==='Output\\strategies') document.getElementById('analysis_strategy_output').value=`Output\\strategies_${prefix}`; } showAnalysisFacts(analysis.statistics||{}); document.getElementById('analysisStatus').textContent=`${analysis.phase}${analysis.run_id?' · '+analysis.run_id:''}${analysis.error?' · '+analysis.error:''}`; }
+  const strategy=data.analysis_strategies;
+  if(strategy){ document.getElementById('analysisStrategiesStatus').textContent=`${strategy.phase} · ${strategy.strategy_count||0} JSON${strategy.error?' · '+strategy.error:''}`; if(strategy.strategies_path){ document.getElementById('strategies').value=strategy.strategies_path; } }
   const direct = data.duckdb_direct;
   if (direct) document.getElementById('directStatus').textContent = `${direct.phase} · points=${direct.point_count || 0}${direct.surface_id ? ' · '+direct.surface_id : ''}`;
   const job = data.job;
   const buttons = document.querySelectorAll('[data-runnable]'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
   if (!job) return;
   const workflow = job.workflow || {}; const progress = job.progress || {};
-  const phase = workflow.state || progress.workflow_state || job.status;
+  const plan = job.plan_summary;
+  if (plan) { const summary=document.getElementById('testerPlanSummary'); if(summary) summary.textContent=`${plan.mode === 'RESUME' ? 'Возобновление' : 'Новый запуск'}: всего ${plan.total}; готово ${plan.reusable}; подготовлено к тесту ${plan.prepared}.`; const runButton=document.getElementById('runButton'); if(runButton) runButton.textContent=`Запустить тесты (${plan.prepared})`; }
+  const phase = job.status === 'FAILED' ? 'FAILED' : (workflow.state || progress.workflow_state || job.status);
+  const testerAction = job.action === 'tester-run';
+  document.getElementById('operationStats').hidden = !testerAction;
+  document.getElementById('activeStrategies').hidden = !testerAction;
   document.getElementById('operation').textContent = labels[job.action] || job.action;
   const state = document.getElementById('state'); state.textContent = labels[phase] || phase;
   state.className = 'state ' + (job.status === 'FAILED' || phase === 'FAILED' ? 'bad' : (job.running ? 'work' : 'good'));
@@ -431,6 +560,7 @@ function render(data) {
   document.getElementById('running').textContent = progress.running_count || 0;
   document.getElementById('result').textContent = progress.result_count || 0;
   document.getElementById('completed').textContent = complete;
+  document.getElementById('retries').textContent = progress.retry_count || 0;
   const tbody = document.getElementById('activeRows'); tbody.replaceChildren();
   for (const item of (progress.active || [])) {
     const row = document.createElement('tr');
@@ -500,6 +630,7 @@ class _Job:
     pid: int | None = None
     error: str | None = None
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=500))
+    plan_summary: dict[str, object] | None = None
 
     @property
     def running(self) -> bool:
@@ -510,6 +641,7 @@ class _Job:
 class _ImportJob:
     token: str
     root: Path
+    preflight: ImportPreflight
     cancel: threading.Event = field(default_factory=threading.Event)
     running: bool = True
     phase: str = "STARTING"
@@ -559,6 +691,21 @@ class _AnalysisJob:
     statistics: dict[str, int] = field(default_factory=dict)
     error: str | None = None
 
+
+@dataclass(slots=True)
+class _StrategyJob:
+    run_id: str
+    template_path: Path
+    output_dir: Path
+    config_path: Path
+    candidate_ids: tuple[str, ...] = ()
+    criteria: tuple[str, ...] = ()
+    running: bool = True
+    phase: str = "STARTING"
+    strategies_path: Path | None = None
+    strategy_count: int = 0
+    error: str | None = None
+
 class PanelController:
     def __init__(
         self,
@@ -578,6 +725,9 @@ class PanelController:
         analysis_run_func: Callable[..., object] = run_published_pipeline,
         analysis_publish_func: Callable[..., object] = publish_analysis_run,
         analysis_export_func: Callable[..., object] = export_analysis_run,
+        analysis_strategy_func: Callable[..., object] = generate_analysis_strategies,
+        analysis_shortlist_func: Callable[..., object] = filter_analysis_candidates,
+        analysis_filter_export_func: Callable[..., object] = export_filter_audit,
         analysis_config_loader: Callable[[Path], object] = AlgorithmConfig.from_json,
     ) -> None:
         self.root = root.resolve()
@@ -602,12 +752,16 @@ class PanelController:
         self._direct_preflight: tuple[DirectBuildRequest, DirectPreflight, str] | None = None
         self._direct_job: _DirectJob | None = None
         self._analysis_job: _AnalysisJob | None = None
+        self._strategy_job: _StrategyJob | None = None
         self._analysis_library_func = analysis_library_func
         self._analysis_compare_func = analysis_compare_func
         self._analysis_load_func = analysis_load_func
         self._analysis_run_func = analysis_run_func
         self._analysis_publish_func = analysis_publish_func
         self._analysis_export_func = analysis_export_func
+        self._analysis_strategy_func = analysis_strategy_func
+        self._analysis_shortlist_func = analysis_shortlist_func
+        self._analysis_filter_export_func = analysis_filter_export_func
         self._analysis_config_loader = analysis_config_loader
 
     @staticmethod
@@ -628,6 +782,67 @@ class PanelController:
             candidate = self.root / candidate
         return candidate.resolve()
 
+    def _workflow_defaults(self) -> dict[str, object]:
+        try:
+            document = json.loads(self.default_config.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return {"listing_dates_path": "", "strategy_templates": {}}
+        raw = document.get("panel_workflow", {})
+        if not isinstance(raw, dict):
+            return {"listing_dates_path": "", "strategy_templates": {}}
+        dates = raw.get("listing_dates_path", "")
+        templates = raw.get("strategy_templates", {})
+        resolved_templates = {
+            side: str(self._path(path))
+            for side, path in templates.items()
+            if side in {"LONG", "SHORT"} and isinstance(path, str) and path.strip()
+        } if isinstance(templates, dict) else {}
+        return {
+            "listing_dates_path": str(self._path(dates)) if isinstance(dates, str) and dates.strip() else "",
+            "strategy_templates": resolved_templates,
+        }
+
+    def _tester_defaults(self) -> dict[str, str]:
+        """Restore only the newest valid tester context saved by this project."""
+        candidates: list[tuple[int, Path, Path]] = []
+        results_dir = self.root / "results"
+        try:
+            state_paths = results_dir.glob("*.state.json")
+        except OSError:
+            return {}
+        for state_path in state_paths:
+            document = self._read_json(state_path)
+            strategy_source = document.get("strategy_source")
+            output_csv = document.get("output_csv")
+            if not isinstance(strategy_source, str) or not isinstance(output_csv, str):
+                continue
+            source = Path(strategy_source)
+            output = Path(output_csv)
+            if not source.is_dir():
+                continue
+            try:
+                candidates.append((state_path.stat().st_mtime_ns, source, output))
+            except OSError:
+                continue
+        if not candidates:
+            return {}
+        _, source, output = max(candidates, key=lambda item: item[0])
+        return {"strategies": str(source), "output_csv": str(output)}
+
+    def _completed_tester_strategy_source(self, results_csv: Path) -> Path | None:
+        state_path = results_csv.with_name(f"{results_csv.stem}.state.json")
+        document = self._read_json(state_path)
+        if document.get("state") != "COMPLETED":
+            return None
+        output_csv = document.get("output_csv")
+        strategy_source = document.get("strategy_source")
+        if not isinstance(output_csv, str) or not isinstance(strategy_source, str):
+            return None
+        if self._path(output_csv) != results_csv.resolve():
+            return None
+        source = Path(strategy_source)
+        return source if source.is_dir() else None
+
     @staticmethod
     def _signature(path: Path) -> tuple[int, int] | None:
         try:
@@ -642,6 +857,16 @@ class PanelController:
         if not value:
             raise ValueError(f"required field is empty: {name}")
         return value
+
+    @staticmethod
+    def _is_hash(value: object) -> bool:
+        if not isinstance(value, str) or len(value) != 64:
+            return False
+        try:
+            int(value, 16)
+        except ValueError:
+            return False
+        return True
 
     @staticmethod
     def _validate_performance_inbox(inbox: Path) -> None:
@@ -704,19 +929,30 @@ class PanelController:
             raise ValueError("inbox is incomplete: strategy names do not match")
 
     @staticmethod
-    def _is_hash(value: object) -> bool:
-        if not isinstance(value, str) or len(value) != 64:
-            return False
-        try:
-            int(value, 16)
-        except ValueError:
-            return False
-        return True
-
-    @staticmethod
     def _optional_string(payload: Mapping[str, object], name: str) -> str:
         value = payload.get(name)
         return value.strip() if isinstance(value, str) else ""
+
+    @staticmethod
+    def _scope_values(payload: Mapping[str, object], name: str) -> tuple[str, ...]:
+        value = payload.get(name)
+        if value is None:
+            return ()
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"{name} must be a list")
+        return tuple(sorted({item.strip() for item in value if isinstance(item, str) and item.strip()}))
+
+    @classmethod
+    def _scope_matches(
+        cls, payload: Mapping[str, object], singular: str, plural: str, value: object
+    ) -> bool:
+        selected = cls._scope_values(payload, plural)
+        if not selected:
+            return not cls._optional_string(payload, singular) or value == cls._optional_string(payload, singular)
+        mode = cls._optional_string(payload, f"{singular}_mode") or "all"
+        if mode not in {"all", "include", "exclude"}:
+            raise ValueError(f"{singular}_mode must be all, include, or exclude")
+        return mode == "all" or (str(value) in selected) == (mode == "include")
 
     @staticmethod
     def _verification_sample_count(payload: Mapping[str, object]) -> int:
@@ -764,13 +1000,16 @@ class PanelController:
         if action in {"tester-plan", "tester-run"}:
             strategies = self._path(self._required(payload, "strategies"))
             command.extend(["--strategies", str(strategies)])
-            if action == "tester-run":
+            if action in {"tester-plan", "tester-run"} and payload.get("output_csv"):
                 output = self._path(self._required(payload, "output_csv"))
                 command.extend(["--output-csv", str(output)])
+            if action == "tester-run":
+                output = self._path(self._required(payload, "output_csv"))
                 artifacts = {
                     "output_csv": output,
                     "state": output.with_name(f"{output.stem}.state.json"),
                     "progress": output.with_name(f"{output.stem}.progress.json"),
+                    "raw_log": output.with_name(f"{output.stem}.raw.log"),
                 }
         elif action == "select":
             input_csv_value = self._optional_string(payload, "input_csv")
@@ -807,26 +1046,12 @@ class PanelController:
                 "manifest": output_dir / "run_manifest.json",
                 "audit": output_dir / "audit.xlsx",
             }
-        elif action == "performance-dd5":
-            database = self._path(self._required(payload, "database"))
-            inbox = self._path(self._required(payload, "inbox"))
-            output_dir = self._path(self._required(payload, "output_dir"))
-            manifest = inbox / "inbox_manifest.json"
-            if not manifest.is_file():
-                raise ValueError("inbox is incomplete: inbox_manifest.json is missing")
-            self._validate_performance_inbox(inbox)
-            command[3] = "performance-dd5"
-            command.extend(
-                ["--database", str(database), "--inbox", str(inbox), "--output-dir", str(output_dir)]
-            )
-            artifacts = {
-                "workbook": output_dir / "posttest.xlsx",
-                "manifest": output_dir / "posttest_manifest.json",
-            }
         elif action == "posttest":
             results_csv = self._path(self._required(payload, "results_csv"))
-            audit_xlsx = self._path(self._required(payload, "audit_xlsx"))
-            strategies = self._path(self._required(payload, "strategies"))
+            audit_xlsx = self.root / "__embedded_tester_settings__.xlsx"
+            strategies = self._completed_tester_strategy_source(results_csv) or (
+                self.root / "__embedded_tester_settings__"
+            )
             output_dir = self._path(self._required(payload, "output_dir"))
             command.extend(
                 [
@@ -844,6 +1069,16 @@ class PanelController:
                 "workbook": output_dir / "posttest.xlsx",
                 "manifest": output_dir / "posttest_manifest.json",
             }
+        elif action == "performance-dd5":
+            database = self._path(self._required(payload, "database"))
+            inbox = self._path(self._required(payload, "inbox"))
+            output_dir = self._path(self._required(payload, "output_dir"))
+            if not (inbox / "inbox_manifest.json").is_file():
+                raise ValueError("inbox is incomplete: inbox_manifest.json is missing")
+            self._validate_performance_inbox(inbox)
+            command[3] = "performance-dd5"
+            command.extend(["--database", str(database), "--inbox", str(inbox), "--output-dir", str(output_dir)])
+            artifacts = {"workbook": output_dir / "posttest.xlsx", "manifest": output_dir / "posttest_manifest.json"}
         else:
             raise ValueError(f"unsupported action: {action}")
         return tuple(command), artifacts
@@ -887,10 +1122,10 @@ class PanelController:
             if payload is not None: save_duckdb_import_settings(self.default_config, settings)
         return self._settings_document(settings)
 
-    def _request(self, root: Path, settings: DuckDBImportSettings, *, token: str | None = None, cancellation_requested: Callable[[], bool] | None = None) -> ImportRequest:
+    def _request(self, root: Path, settings: DuckDBImportSettings, *, token: str | None = None, cancellation_requested: Callable[[], bool] | None = None, preflight: ImportPreflight | None = None) -> ImportRequest:
         if settings.source_duckdb_path is None or settings.audit_root is None:
             raise ValueError("source_duckdb_path and audit_root must be configured")
-        return ImportRequest(root, settings.source_duckdb_path, settings.audit_root, settings.workers, settings.transaction_batch_size, cancellation_requested=cancellation_requested, expected_preflight_token=token)
+        return ImportRequest(root, settings.source_duckdb_path, settings.audit_root, settings.workers, settings.transaction_batch_size, cancellation_requested=cancellation_requested, expected_preflight_token=token, preflight=preflight)
 
     def duckdb_import_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
         settings = self._import_settings()
@@ -939,7 +1174,7 @@ class PanelController:
             if self._import_job is not None and self._import_job.running: raise RuntimeError("another import is already running")
             if self._import_preflight_job is not None and self._import_preflight_job.running: raise RuntimeError("HTML preflight is still running")
             if self._preflight is None or self._preflight_root != root or self._preflight.token != token: raise ValueError("latest preflight token is required")
-            job = _ImportJob(token, root); self._import_job = job
+            job = _ImportJob(token, root, self._preflight); self._import_job = job
         threading.Thread(target=self._run_duckdb_import, args=(job,), name="mrs3-panel-duckdb-import", daemon=True).start()
         return self.snapshot()
 
@@ -948,7 +1183,7 @@ class PanelController:
             settings = self._import_settings()
             def progress(item: ImportProgress) -> None:
                 with self._lock: job.phase, job.counts = item.final_state, item.counts
-            result = self._import_func(self._request(job.root, settings, token=job.token, cancellation_requested=job.cancel.is_set), progress)
+            result = self._import_func(self._request(job.root, settings, token=job.token, cancellation_requested=job.cancel.is_set, preflight=job.preflight), progress)
             with self._lock:
                 job.result, job.phase = result, result.final_state
                 job.counts = {name: getattr(result, name) for name in job.counts}
@@ -1013,8 +1248,11 @@ class PanelController:
             raw = payload.get("required_shifts_bp")
             if raw is not None:
                 values = raw.split(";") if isinstance(raw, str) else raw
-                try: return tuple(sorted({int(value) for value in values}))
+                try: return tuple(sorted({int(value) for value in values if str(value).strip()}))
                 except (TypeError, ValueError): raise ValueError("required_shifts_bp must be integers") from None
+            range_values = tuple(payload.get(name) for name in ("shift_start_bp", "shift_end_bp", "shift_step_bp"))
+            if all(value is None or str(value).strip() == "" for value in range_values):
+                return ()
             try:
                 start, end, step = (int(payload[name]) for name in ("shift_start_bp", "shift_end_bp", "shift_step_bp"))
             except (KeyError, TypeError, ValueError): raise ValueError("shift range must be integers") from None
@@ -1027,6 +1265,42 @@ class PanelController:
             side, symbols(payload.get("symbols", ())), shifts(),
             _DIRECT_MATERIALIZER_VERSION, _DIRECT_POINT_CONFIG_HASH,
         )
+
+    @staticmethod
+    def _direct_window_ms(request: DirectBuildRequest) -> tuple[int, int]:
+        try:
+            start = datetime.fromisoformat(request.start_utc.replace("Z", "+00:00"))
+            end = datetime.fromisoformat(request.end_utc.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("UTC window is invalid") from error
+        start = start.replace(tzinfo=timezone.utc) if start.tzinfo is None else start.astimezone(timezone.utc)
+        end = end.replace(tzinfo=timezone.utc) if end.tzinfo is None else end.astimezone(timezone.utc)
+        if end <= start:
+            raise ValueError("UTC end must be later than start")
+        return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+    def _resolve_direct_request(self, payload: Mapping[str, object]) -> DirectBuildRequest:
+        request = self._direct_request(payload)
+        if request.required_shifts_bp:
+            return request
+        start_ms, end_ms = self._direct_window_ms(request)
+
+        def available_shifts(connection: duckdb.DuckDBPyConnection) -> tuple[int, ...]:
+            rows = connection.execute(
+                """select distinct p.shift_bp
+                     from active_reports r join point_configs p using(canonical_point_key)
+                     join time_grids g using(grid_hash)
+                    where p.side=? and p.symbol in (select * from unnest(?))
+                      and g.sample_count > 0 and g.start_timestamp_ms <= ? and g.end_timestamp_ms >= ?
+                    order by p.shift_bp""",
+                [request.side, list(request.symbols), start_ms, end_ms],
+            ).fetchall()
+            return tuple(int(row[0]) for row in rows)
+
+        shifts = self._with_source(available_shifts)
+        if not shifts:
+            raise ValueError("no shifts fully cover the selected UTC window")
+        return replace(request, required_shifts_bp=shifts)
 
     @staticmethod
     def _direct_token(request: DirectBuildRequest, preflight: DirectPreflight) -> str:
@@ -1083,14 +1357,16 @@ class PanelController:
             return {str(key): PanelController._jsonable(item) for key, item in value.items()}
         if isinstance(value, (tuple, list)):
             return [PanelController._jsonable(item) for item in value]
+        if isinstance(value, Decimal):
+            return str(value)
         return value
 
     @staticmethod
     def _direct_preflight_document(request: DirectBuildRequest, preflight: DirectPreflight, token: str) -> dict[str, object]:
-        return {"token": token, "selected_symbols": list(preflight.usable_timeframes), "usable_timeframes": {key: list(value) for key, value in preflight.usable_timeframes.items()}, "unavailable_symbols": {key: list(value) for key, value in preflight.unavailable_symbols.items()}, "coverage_issues": [{"symbol": item.symbol, "timeframe": item.timeframe, "code": item.code, "detail": item.detail} for item in preflight.coverage_issues]}
+        return {"token": token, "required_shifts_bp": list(request.required_shifts_bp), "selected_symbols": list(preflight.usable_timeframes), "usable_timeframes": {key: list(value) for key, value in preflight.usable_timeframes.items()}, "unavailable_symbols": {key: list(value) for key, value in preflight.unavailable_symbols.items()}, "coverage_issues": [{"symbol": item.symbol, "timeframe": item.timeframe, "code": item.code, "detail": item.detail} for item in preflight.coverage_issues]}
 
     def duckdb_direct_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
-        request = self._direct_request(payload)
+        request = self._resolve_direct_request(payload)
         preflight = self._with_source(lambda source: self._direct_preflight_func(source, request))
         assert isinstance(preflight, DirectPreflight)
         token = self._direct_token(request, preflight)
@@ -1098,7 +1374,7 @@ class PanelController:
         return self._direct_preflight_document(request, preflight, token)
 
     def start_duckdb_direct(self, payload: Mapping[str, object]) -> dict[str, object]:
-        request, token = self._direct_request(payload), self._required(payload, "preflight_token")
+        request, token = self._resolve_direct_request(payload), self._required(payload, "preflight_token")
         parent_surface_id = self._optional_string(payload, "parent_surface_id") or None
         with self._lock:
             if self._direct_job and self._direct_job.running: raise RuntimeError("another direct build is already running")
@@ -1106,7 +1382,7 @@ class PanelController:
             original, preflight, expected = self._direct_preflight
             if token != expected or request != original: raise ValueError("latest preflight token is required")
             chosen = payload.get("selected_symbols", tuple(preflight.usable_timeframes))
-            selected = self._direct_request({**payload, "symbols": chosen})
+            selected = self._direct_request({**payload, "symbols": chosen, "required_shifts_bp": request.required_shifts_bp})
             if replace(selected, symbols=request.symbols) != request: raise ValueError("latest preflight token is required")
             if not set(selected.symbols).issubset(preflight.usable_timeframes): raise ValueError("selected symbol is unavailable")
         if parent_surface_id is not None:
@@ -1195,6 +1471,121 @@ class PanelController:
             "row_counts": dict(result.row_counts),
         }
 
+    def start_analysis_strategies(self, payload: Mapping[str, object]) -> dict[str, object]:
+        run_id = self._required(payload, "run_id")
+        criteria = self._analysis_criteria(payload)
+        shortlist = self._jsonable(self._with_analysis(
+            True, lambda connection: self._analysis_shortlist_func(connection, run_id, criteria)
+        ))
+        if not isinstance(shortlist, Mapping):
+            raise ValueError("analysis shortlist returned an invalid result")
+        candidate_ids = tuple(
+            str(row["candidate_id"])
+            for row in shortlist.get("rows", ())
+            if row.get("filter_status") == "READY_AFTER_FILTERS"
+            and self._scope_matches(payload, "symbol", "symbols", row.get("symbol"))
+            and self._scope_matches(payload, "timeframe", "timeframes", row.get("timeframe"))
+        )
+        if not candidate_ids:
+            raise ValueError("no READY candidates in the selected Pair/TF scope")
+        job = _StrategyJob(
+            run_id,
+            self._path(self._required(payload, "template_path")),
+            self._path(self._required(payload, "output_dir")),
+            self._path(self._required(payload, "config_path")),
+        )
+        job.candidate_ids = candidate_ids
+        job.criteria = criteria
+        with self._lock:
+            if self._strategy_job and self._strategy_job.running:
+                raise RuntimeError("strategy generation is already running")
+            self._strategy_job = job
+        threading.Thread(target=self._run_analysis_strategies, args=(job,), name="mrs3-panel-strategies", daemon=True).start()
+        return self.snapshot()
+
+    def _run_analysis_strategies(self, job: _StrategyJob) -> None:
+        connection = None
+        try:
+            with self._lock:
+                job.phase = "GENERATING"
+            connection = self._direct_connection_factory(str(self._analysis_path()), read_only=True)
+            result = self._analysis_strategy_func(
+                connection, job.run_id, job.candidate_ids, job.template_path, job.output_dir,
+                self._analysis_config_loader(job.config_path), job.criteria,
+            )
+            with self._lock:
+                job.strategies_path = Path(result.strategies_path)
+                job.strategy_count = int(result.strategy_count)
+                job.phase = "COMMITTED"
+        except BaseException as error:
+            with self._lock:
+                job.phase, job.error = "FAILED", f"{type(error).__name__}: {error}"
+        finally:
+            if connection is not None:
+                connection.close()
+            with self._lock:
+                job.running = False
+
+    def analysis_shortlist(self, payload: Mapping[str, object]) -> object:
+        run_id = self._required(payload, "run_id")
+        result = self._jsonable(self._with_analysis(
+            True, lambda connection: self._analysis_shortlist_func(connection, run_id, self._analysis_criteria(payload))
+        ))
+        if not isinstance(result, Mapping):
+            return result
+        public_fields = (
+            "run_id", "surface_id", "criteria", "input_count", "ready_count",
+            "deferred_count", "comparison_group_count", "comparable_count",
+        )
+        document = {name: result[name] for name in public_fields if name in result}
+        rows = list(result.get("rows", ()))
+        document["facets"] = {
+            "symbols": sorted({str(row["symbol"]) for row in rows if row.get("symbol")}),
+            "timeframes": sorted({str(row["timeframe"]) for row in rows if row.get("timeframe")}),
+        }
+        rows = [
+            row for row in rows
+            if self._scope_matches(payload, "symbol", "symbols", row.get("symbol"))
+            and self._scope_matches(payload, "timeframe", "timeframes", row.get("timeframe"))
+        ]
+        scopes: dict[tuple[str, str], dict[str, object]] = {}
+        for row in rows:
+            key = (str(row.get("symbol", "")), str(row.get("timeframe", "")))
+            scope = scopes.setdefault(key, {
+                "symbol": key[0], "timeframe": key[1],
+                "order_2": 0, "order_3": 0, "order_4": 0,
+                "ready": 0, "deferred": 0, "total": 0,
+            })
+            order_count = int(row.get("order_count", 0))
+            if order_count in (2, 3, 4):
+                scope[f"order_{order_count}"] += 1
+            scope["total"] += 1
+            status = "deferred" if row.get("filter_status") == "DEFERRED_REDUNDANT" else "ready"
+            scope[status] += 1
+        document["scopes"] = [scopes[key] for key in sorted(scopes)]
+        return document
+
+    @staticmethod
+    def _analysis_criteria(payload: Mapping[str, object]) -> tuple[str, ...]:
+        raw = payload.get("criteria", ())
+        if not isinstance(raw, (list, tuple)) or not all(isinstance(item, str) for item in raw):
+            raise ValueError("criteria must be a list of filter names")
+        unknown = sorted(set(raw).difference(CRITERIA))
+        if unknown:
+            raise ValueError(f"unknown criteria: {unknown}")
+        return tuple(name for name in CRITERIA if name in raw)
+
+    def export_analysis_filter(self, payload: Mapping[str, object]) -> dict[str, str]:
+        run_id = self._required(payload, "run_id")
+        output = self._path(self._required(payload, "output_path"))
+        result = self._with_analysis(
+            True,
+            lambda connection: self._analysis_filter_export_func(
+                connection, run_id, self._analysis_criteria(payload), output
+            ),
+        )
+        return {"run_id": run_id, "output": str(Path(result))}
+
     def start_analysis_rerun(self, payload: Mapping[str, object]) -> dict[str, object]:
         job = _AnalysisJob(
             self._required(payload, "surface_id"),
@@ -1269,7 +1660,12 @@ class PanelController:
             job.status = "RUNNING"
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
+        raw_log = job.artifacts.get("raw_log") if job.action == "tester-run" else None
+        raw_handle = None
         try:
+            if raw_log is not None:
+                raw_log.parent.mkdir(parents=True, exist_ok=True)
+                raw_handle = raw_log.open("w", encoding="utf-8", newline="")
             process = self._process_factory(
                 list(job.command),
                 cwd=self.root,
@@ -1284,16 +1680,30 @@ class PanelController:
             with self._lock:
                 job.pid = int(getattr(process, "pid", 0)) or None
             output = getattr(process, "stdout", None)
+            captured: list[str] = []
             if output is not None:
                 for raw_line in output:
+                    captured.append(str(raw_line))
                     line = str(raw_line).rstrip("\r\n")
+                    if raw_handle is not None:
+                        raw_handle.write(str(raw_line))
+                        raw_handle.flush()
                     if line:
+                        display_line = (
+                            _normalise_tester_log_line(line)
+                            if job.action == "tester-run"
+                            else line
+                        )
+                        if display_line is None:
+                            continue
                         with self._lock:
-                            job.logs.append(line[:4000])
+                            job.logs.append(display_line[:4000])
             exit_code = int(process.wait())
             with self._lock:
                 job.exit_code = exit_code
                 job.status = "SUCCEEDED" if exit_code == 0 else "FAILED"
+                if exit_code == 0 and job.action == "tester-plan":
+                    job.plan_summary = _tester_plan_summary("".join(captured))
                 if exit_code != 0:
                     job.error = f"command exited with code {exit_code}"
         except BaseException as error:
@@ -1302,6 +1712,8 @@ class PanelController:
                 job.error = f"{type(error).__name__}: {error}"
                 job.logs.append(job.error)
         finally:
+            if raw_handle is not None:
+                raw_handle.close()
             with self._lock:
                 job.finished_at = _utc_now()
                 if self._artifact_paths(job):
@@ -1490,7 +1902,6 @@ class PanelController:
             ("Реальные результаты", "raw_result_count"),
             ("Pareto", "pareto_count"),
             ("Целевой DD, %", "target_dd_pct"),
-            ("DD5 JSON", "scaled_strategy_count"),
         )
         metrics = [
             {"label": label, "value": self._integer(manifest.get(key)) if key != "target_dd_pct" else (self._number_text(manifest.get(key)) or "—")}
@@ -1499,9 +1910,9 @@ class PanelController:
         return {
             "title": "DD5 после теста",
             "available": True,
-            "state": "RETEST_REQUIRED" if manifest.get("scaled_strategies_require_retest") is not False else "COMPLETED",
+            "state": "CALCULATED" if manifest.get("dd5_mode") == "CALCULATION_ONLY" else "COMPLETED",
             "metrics": metrics,
-            "details": ["DD5 JSON требуют отдельного повторного tick-test."],
+            "details": ["DD5 расчётно нормализует результаты для сравнения стратегий; повторный tick-test не входит в workflow."],
         }
 
     def _dashboard(self, jobs: Mapping[str, _Job]) -> dict[str, object]:
@@ -1550,6 +1961,7 @@ class PanelController:
                     "pid": job.pid,
                     "error": job.error,
                     "logs": list(job.logs),
+                    "plan_summary": job.plan_summary,
                     "expected_count": job.expected_count,
                     "workflow": self._read_json(state_path),
                     "progress": self._read_json(progress_path),
@@ -1571,6 +1983,7 @@ class PanelController:
                     "running": import_job.running,
                     "cancel_requested": import_job.cancel.is_set(),
                     "phase": import_job.phase,
+                    "discovered": result.discovered if result else import_job.preflight.discovered,
                     "final_state": (result.final_state if evidence_valid else "EVIDENCE_INVALID") if result else import_job.phase,
                     "counts": dict(import_job.counts),
                     "safe_to_delete": safe,
@@ -1597,16 +2010,28 @@ class PanelController:
                 "statistics": dict(analysis_job.statistics),
                 "error": analysis_job.error,
             }
+            strategy_job = self._strategy_job
+            strategy_document = None if strategy_job is None else {
+                "running": strategy_job.running,
+                "phase": strategy_job.phase,
+                "run_id": strategy_job.run_id,
+                "strategies_path": str(strategy_job.strategies_path) if strategy_job.strategies_path else None,
+                "strategy_count": strategy_job.strategy_count,
+                "error": strategy_job.error,
+            }
         return {
             "defaults": {
                 "root": str(self.root),
                 "config": str(self.default_config),
+                "workflow": self._workflow_defaults(),
+                "tester": self._tester_defaults(),
             },
             "job": job_document,
             "duckdb_import": import_document,
             "duckdb_import_preflight": preflight_document,
             "duckdb_direct": direct_document,
             "analysis": analysis_document,
+            "analysis_strategies": strategy_document,
             "dashboard": dashboard,
         }
 
@@ -1726,7 +2151,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/initialize", "/api/analysis/library", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/initialize", "/api/analysis/library", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -1777,6 +2202,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.compare_analysis(document)
             elif endpoint == "/api/analysis/export":
                 result = self.server.controller.export_analysis(document)
+            elif endpoint == "/api/analysis/shortlist":
+                result = self.server.controller.analysis_shortlist(document)
+            elif endpoint == "/api/analysis/filter-export":
+                result = self.server.controller.export_analysis_filter(document)
+            elif endpoint == "/api/analysis/strategies":
+                result = self.server.controller.start_analysis_strategies(document)
             else:
                 action = str(document.get("action", ""))
                 result = self.server.controller.start(action, document)
@@ -1786,7 +2217,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             self._json(400, {"error": str(error)})
             return
-        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun"} else 200, result)
+        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies"} else 200, result)
 
 
 def create_panel_server(

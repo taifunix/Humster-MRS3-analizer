@@ -13,13 +13,14 @@ from .duckdb_events import (
     decode_compact_actions,
     decode_compact_deltas,
     decode_wallet_changes,
+    reconstruct_closed_cycles,
 )
 from .duckdb_source_schema import NORMALIZATION_CONTRACT_VERSION, validate_source_database_structural
 from .source_packs import SourcePackError
 from .analysis_storage import PublishedSurface, publish_surface
 
 
-TRADES_PROXY_EVENT_MODE = "legacy_trades_proxy"
+REAL_EVENT_MODE = "real_independent_events"
 
 
 class DirectMaterializationError(ValueError):
@@ -63,6 +64,7 @@ class DirectPoint:
     source_hash: str
     point_event_count: int
     metrics: Mapping[str, int | float | None]
+    event_ids: tuple[str, ...] = ()
     provenance_state: str = "REPRODUCIBLE"
 
 
@@ -110,12 +112,32 @@ def preflight_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, reques
         raise DirectMaterializationError(f"invalid active v5 source: {validation.errors}")
     start_ms, end_ms = start.value // 1_000_000, end.value // 1_000_000
     all_reports = _reports(source_connection, request)
-    covered = [
+    covered_candidates = [
         row for row in all_reports
         if int(row["sample_count"]) > 0
         and int(row["start_timestamp_ms"]) <= start_ms
         and int(row["end_timestamp_ms"]) >= end_ms
     ]
+    covered: list[dict[str, object]] = []
+    overlaps: dict[tuple[str, str], int] = {}
+    by_point: dict[str, list[dict[str, object]]] = {}
+    for row in covered_candidates:
+        by_point.setdefault(str(row["canonical_point_key"]), []).append(row)
+    for point_key, candidates in by_point.items():
+        # Prefer the smallest report window that still covers the requested window.
+        selected = min(
+            candidates,
+            key=lambda row: (
+                int(row["end_timestamp_ms"]) - int(row["start_timestamp_ms"]),
+                int(row["start_timestamp_ms"]),
+                int(row["end_timestamp_ms"]),
+                str(row["report_id"]),
+            ),
+        )
+        covered.append(selected)
+        if len(candidates) > 1:
+            scope = (str(selected["symbol"]), str(selected["timeframe"]))
+            overlaps[scope] = overlaps.get(scope, 0) + 1
     issues: list[CoverageIssue] = []
     by_timeframe: dict[tuple[str, str], list[dict[str, object]]] = {}
     for row in covered:
@@ -127,24 +149,30 @@ def preflight_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, reques
     required = set(request.required_shifts_bp)
     for symbol, timeframe in sorted(discovered_timeframes):
         rows = by_timeframe.get((symbol, timeframe), [])
+        overlap_count = overlaps.get((symbol, timeframe), 0)
+        if overlap_count:
+            issues.append(CoverageIssue(symbol, timeframe, "OVERLAPPING_REPORTS_RESOLVED", f"selected narrowest covering report for {overlap_count} cells"))
         by_shift: dict[int, set[tuple[int, int]]] = {}
         for row in rows:
             by_shift.setdefault(int(row["shift_bp"]), set()).add((int(row["open_ma_len"]), int(row["close_ma_len"])))
-        observed = set().union(*(by_shift.get(shift, set()) for shift in required))
-        missing = [(shift, pair) for shift in sorted(required) for pair in sorted(observed - by_shift.get(shift, set()))]
+        shift_pairs = [by_shift.get(shift, set()) for shift in required]
+        observed = set().union(*shift_pairs)
+        complete = set.intersection(*shift_pairs) if shift_pairs else set()
         if not observed:
             issues.append(CoverageIssue(symbol, timeframe, "GRID_NOT_COVERED", "no report covers the requested UTC half-open window"))
-        elif missing:
-            for shift, pair in missing:
-                issues.append(CoverageIssue(symbol, timeframe, "MISSING_GRID_CELL", f"shift={shift}; pair={pair[0]}|{pair[1]}"))
+        elif not complete:
+            issues.append(CoverageIssue(symbol, timeframe, "GRID_NO_COMMON_PAIRS", "no MA pair is present at every required shift"))
         else:
-            keys = {str(row["canonical_point_key"]) for row in rows if int(row["shift_bp"]) in required and (int(row["open_ma_len"]), int(row["close_ma_len"])) in observed}
-            if len(keys) != len([row for row in rows if int(row["shift_bp"]) in required and (int(row["open_ma_len"]), int(row["close_ma_len"])) in observed]):
+            for open_ma, close_ma in sorted(observed - complete):
+                missing_shifts = [str(shift) for shift in sorted(required) if (open_ma, close_ma) not in by_shift.get(shift, set())]
+                issues.append(CoverageIssue(symbol, timeframe, "EXCLUDED_INCOMPLETE_PAIR", f"pair={open_ma}|{close_ma}; missing_shifts={','.join(missing_shifts)}"))
+            keys = {str(row["canonical_point_key"]) for row in rows if int(row["shift_bp"]) in required and (int(row["open_ma_len"]), int(row["close_ma_len"])) in complete}
+            if len(keys) != len([row for row in rows if int(row["shift_bp"]) in required and (int(row["open_ma_len"]), int(row["close_ma_len"])) in complete]):
                 issues.append(CoverageIssue(symbol, timeframe, "CONFLICTING_CANONICAL_POINT", "multiple active reports map to one canonical point"))
                 continue
             usable.setdefault(symbol, []).append(timeframe)
             accepted.extend(row for row in rows if str(row["canonical_point_key"]) in keys)
-            contract_pairs.update(f"{shift}|{open_ma}|{close_ma}" for shift in required for open_ma, close_ma in observed)
+            contract_pairs.update(f"{shift}|{open_ma}|{close_ma}" for shift in required for open_ma, close_ma in complete)
     unavailable = {symbol: tuple(sorted(tf for sym, tf in discovered_timeframes if sym == symbol)) for symbol in request.symbols if symbol not in usable}
     accepted.sort(key=lambda row: str(row["canonical_point_key"]))
     return DirectPreflight(
@@ -181,13 +209,19 @@ def materialize_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, anal
         point_key, action_count, equity_count, wallet_count, series_codec, _, actions_blob, equity_blob, wallet_blob, sample_count, timestamps_blob = row
         try:
             grid = pd.to_datetime(decode_compact_deltas(bytes(timestamps_blob), int(sample_count), codec=str(series_codec)), unit="ms", utc=True)
-            metrics = calculate_point_metrics(grid, decode_compact_deltas(bytes(equity_blob), int(equity_count), codec=str(series_codec)), decode_wallet_changes(bytes(wallet_blob), int(wallet_count), codec=str(series_codec)), decode_compact_actions(bytes(actions_blob), int(action_count)), start.isoformat(), end.isoformat())
+            actions = decode_compact_actions(bytes(actions_blob), int(action_count))
+            metrics = calculate_point_metrics(grid, decode_compact_deltas(bytes(equity_blob), int(equity_count), codec=str(series_codec)), decode_wallet_changes(bytes(wallet_blob), int(wallet_count), codec=str(series_codec)), actions, start.isoformat(), end.isoformat())
+            symbol, _, timeframe, *_ = str(point_key).split("|")
+            reconstruction = reconstruct_closed_cycles(
+                str(report_id), symbol, timeframe, actions, start.isoformat(), end.isoformat()
+            )
+            event_ids = tuple(sorted({cycle.event_id for cycle in reconstruction.included}))
         except SourcePackError as error:
             raise DirectMaterializationError(f"cannot materialize {point_key}: {error}") from error
-        points.append(DirectPoint(str(point_key), report_id, source_hash, int(metrics["TotalTrades"]), metrics))
+        points.append(DirectPoint(str(point_key), report_id, source_hash, len(event_ids), metrics, event_ids))
     if len({point.canonical_point_key for point in points}) != len(points):
         raise DirectMaterializationError("canonical point uniqueness failed")
-    return DirectSurface(request, preflight, TRADES_PROXY_EVENT_MODE, tuple(points))
+    return DirectSurface(request, preflight, REAL_EVENT_MODE, tuple(points))
 
 
 def run_panel_direct_build(

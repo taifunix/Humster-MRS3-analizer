@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import html as stdlib_html
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -152,6 +153,25 @@ def _extract_settings(document: object) -> dict[str, object]:
             f"HTML report must contain one complete strategy settings object, found {len(candidates)}"
         )
     return candidates[0]
+
+
+def extract_html_strategy_name(path: Path) -> str | None:
+    """Read the embedded strategy name without constructing an HTML DOM."""
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    candidates: list[str] = []
+    for raw in re.findall(r"<pre\b[^>]*>(.*?)</pre\s*>", source, flags=re.IGNORECASE | re.DOTALL):
+        try:
+            settings = json.loads(stdlib_html.unescape(raw).strip())
+        except json.JSONDecodeError:
+            continue
+        name = settings.get("name") if isinstance(settings, dict) else None
+        basic = settings.get("basic") if isinstance(settings, dict) else None
+        if isinstance(name, str) and name and isinstance(basic, dict):
+            candidates.append(name)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _extract_trades(document: object) -> tuple[dict[str, str], ...]:
@@ -336,6 +356,39 @@ def _result_row(result: WizardResult, report: HtmlReport) -> dict[str, object]:
     }
 
 
+def _name_verified_result_row(
+    result: WizardResult, strategy_name: str, report_path: Path
+) -> dict[str, object]:
+    """Persist runner evidence without walking the report's metric/trade tables."""
+    def wizard_stat(name: str) -> object | None:
+        value = result.stats.get(name)
+        return float(value) if isinstance(value, (int, float, Decimal)) else None
+
+    return {
+        "strategy_name": strategy_name,
+        "run_id": result.run_id,
+        "timestamp": result.timestamp,
+        "period": result.period,
+        "elapsed": result.elapsed,
+        "report_file": result.report_name,
+        "report_sha256": _sha256(report_path),
+        "chart_url": result.chart_url,
+        "verification_mode": "strategy_name_only",
+        "initial_balance": wizard_stat("InitialBalance"),
+        "final_balance": wizard_stat("FinalBalance"),
+        "total_pnl": wizard_stat("TotalPnL"),
+        "total_pnl_pct": wizard_stat("TotalPnLPercent"),
+        "total_trades": wizard_stat("TotalTrades"),
+        "win_rate_pct": wizard_stat("WinRate"),
+        "max_drawdown": wizard_stat("MaxDrawdown"),
+        "max_drawdown_pct": wizard_stat("MaxDrawdownPercent"),
+        "total_fees": wizard_stat("TotalFees"),
+        "strategy_settings_json": "",
+        "trades_json": "[]",
+        "html_metrics_json": "{}",
+    }
+
+
 def reconcile_results(
     expected_names: tuple[str, ...],
     wizard_results: tuple[WizardResult, ...],
@@ -370,19 +423,14 @@ def reconcile_results(
             report_path = report_path.resolve()
         if not report_path.is_file():
             raise ResultParseError(f"HTML report is missing for {name}: {report_path}")
-        report = parse_html_report(report_path)
-        if report.strategy_name != name:
+        embedded_name = extract_html_strategy_name(report_path)
+        if embedded_name is None:
+            raise ResultParseError(f"HTML strategy name is unavailable for {name}: {report_path}")
+        if embedded_name != name:
             raise ResultMismatchError(
-                f"HTML strategy name differs for {name}: {report.strategy_name}"
+                f"HTML strategy name differs for {name}: {embedded_name}"
             )
-        for json_name, html_name in CORE_METRICS.items():
-            exact = _stat(result, json_name)
-            rendered = _required_html_metric(report, html_name)
-            if abs(exact - rendered) > tolerance:
-                raise ResultMismatchError(
-                    f"{name} metric mismatch {json_name}: JSON={exact}, HTML={rendered}"
-                )
-        rows.append(_result_row(result, report))
+        rows.append(_name_verified_result_row(result, embedded_name, report_path))
     return pd.DataFrame(rows)
 
 

@@ -1,7 +1,7 @@
 # Progress
 
 **Updated:** 2026-08-14
-**Current branch:** `feat/strategy-performance-duckdb`
+**Current branch:** `integrate/performance-with-main`
 **Current feature:** Task 4 calculation-only DD5 from committed strategy-performance DuckDB
 
 ## Task 4 implementation state (pending production acceptance)
@@ -26,6 +26,16 @@ import; no baseline repair was made.
   Both skips are Windows symlink-permission tests, not product failures.
 - DuckDB v3/v4 importer pair is preserved in `programs/Обработчик HTML-DuckDB/`; v4 requires adjacent v3 codec.
 - Local tester configuration exists outside Git as ignored `config.local.json`.
+- READY JSON generation in the panel supports multi-pair and multi-timeframe
+  scopes: `All`, `Only selected`, and `All except selected`. The same scope is
+  enforced when the controller resolves READY candidate IDs, so `5m` can be
+  excluded while generating every other timeframe.
+- Tester runner verification is operationally name-only: a stable report and
+  matching embedded strategy name are sufficient after a one-strategy wizard
+  Result entry. It does not parse HTML metric or trade tables; generated rows
+  are marked `strategy_name_only` and are not post-test/DD5 evidence.
+- An embedded-name collision after a tester Result automatically enters the
+  existing serial repair lane for only the mismatched strategy.
 - Repository foundation, documentation model, importer/source preservation and Claude Code instructions are committed on `main`.
 
 ## Current verified external evidence
@@ -558,6 +568,15 @@ reusable reports and the read-only plan was rechecked as `1073` expected,
 `151 passed, 1 skipped, 2 deselected`. Continue from
 `docs/HANDOFF_2026-08-14_TESTER_RUNNER_AUDIT.md`; do not launch the tester
 without first reproducing the same plan counts.
+
+Current 2026-08-14 DD5 follow-up: name-only tester verification deliberately
+leaves `strategy_settings_json` empty. DD5 now falls back to the immutable
+strategy source recorded in the matching completed runner state, without
+parsing report HTML. A missing settings column or an all-empty settings column
+uses that source; partially populated settings remain an error. DD5 derives
+`effective_days` from the persisted wizard period and leaves unavailable Profit
+Factor blank. The real `476`-row result run completed successfully with `8`
+Pareto candidates at the `5%` DD target in `posttest_long/ONUSDT_exept_5min`.
 
 Current session handoff for moving the long HTML import to another machine:
 [remote import handoff](docs/HANDOFF_2026-08-12_REMOTE_IMPORT.md).

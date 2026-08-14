@@ -33,6 +33,7 @@ _QUERIES = {
     "surface_pairs": ("select * from surface_pairs where surface_id=? order by pair_key", "surface"),
     "surface_timeframes": ("select * from surface_timeframes where surface_id=? order by pair_key, timeframe", "surface"),
     "surface_points": ("select * from surface_points where surface_id=? order by canonical_point_key", "surface"),
+    "surface_point_events": ("select * from surface_point_events where surface_id=? order by canonical_point_key,event_id", "surface"),
     "coverage_issues": ("select * from coverage_issues where surface_id=? order by issue_id", "surface"),
     "analysis_run": ("select * from analysis_runs where run_id=? order by run_id", "run"),
     "analysis_run_facts": ("select * from analysis_run_facts where run_id=? order by run_id", "run"),

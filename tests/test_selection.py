@@ -93,6 +93,15 @@ def test_equivalent_group_prefers_more_independent_events_before_shift() -> None
     assert chosen["point_id"] == "MORE_EVENTS"
 
 
+def test_real_event_representative_rejects_missing_point_event_count() -> None:
+    rows = pd.DataFrame([
+        {**_point("REAL", "P1", shift_bp=190), "event_mode": "real_independent_events"}
+    ])
+
+    with pytest.raises(ValueError, match="point_event_count"):
+        choose_equivalent_default(rows, AlgorithmConfig.defaults())
+
+
 @pytest.mark.parametrize(
     ("support", "status"),
     [
@@ -264,6 +273,92 @@ def _structure_fixture(
 def test_two_three_four_orders_are_generated_independently() -> None:
     structures, _ = build_structures(*_structure_fixture(), AlgorithmConfig.defaults())
     assert set(structures["order_count"]) == {2, 3, 4}
+
+
+def test_structures_use_one_representative_per_plateau_and_close_ma() -> None:
+    points = pd.DataFrame(
+        [
+            {**_point("P1_MORE_EVENTS", "P1", shift_bp=110), "point_event_count": 6, "event_eligible": True},
+            {**_point("P1_MORE_SHIFT", "P1", shift_bp=120, pnl=98, efficiency=9.8), "point_event_count": 4, "event_eligible": True},
+            {**_point("P2_ONLY", "P2", shift_bp=180), "point_event_count": 5, "event_eligible": True},
+        ]
+    )
+    plateaus = pd.DataFrame(
+        [_plateau("P1", ("P1_MORE_EVENTS", "P1_MORE_SHIFT")), _plateau("P2", ("P2_ONLY",))]
+    )
+    profiles = pd.DataFrame(
+        [
+            {"plateau_id": plateau_id, "symbol": "AAAUSDT", "side": "LONG", "timeframe": "2h", "close_ma": 4, "support": 1.0, "status": "PRIMARY_CLOSE", "point_id": point_id}
+            for plateau_id, point_id in (("P1", "P1_MORE_EVENTS"), ("P2", "P2_ONLY"))
+        ]
+    )
+
+    structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+    used = {
+        order["point_id"]
+        for orders in structures["orders"]
+        for order in orders
+    }
+    assert "P1_MORE_EVENTS" in used
+    assert "P1_MORE_SHIFT" not in used
+
+
+def test_structures_choose_one_representative_for_each_close_ma() -> None:
+    points = pd.DataFrame(
+        [
+            {**_point("P1_C4_MORE_EVENTS", "P1", shift_bp=110, close_ma=4), "point_event_count": 6, "event_eligible": True},
+            {**_point("P1_C4_MORE_SHIFT", "P1", shift_bp=120, close_ma=4, pnl=98, efficiency=9.8), "point_event_count": 4, "event_eligible": True},
+            {**_point("P1_C5_ONLY", "P1", shift_bp=110, close_ma=5), "point_event_count": 5, "event_eligible": True},
+            {**_point("P2_C4_ONLY", "P2", shift_bp=180, close_ma=4), "point_event_count": 5, "event_eligible": True},
+            {**_point("P2_C5_ONLY", "P2", shift_bp=180, close_ma=5), "point_event_count": 5, "event_eligible": True},
+        ]
+    )
+    plateaus = pd.DataFrame([
+        _plateau("P1", tuple(points.loc[points["plateau_id"].eq("P1"), "point_id"])),
+        _plateau("P2", tuple(points.loc[points["plateau_id"].eq("P2"), "point_id"])),
+    ])
+    profiles = pd.DataFrame([
+        {"plateau_id": plateau_id, "symbol": "AAAUSDT", "side": "LONG", "timeframe": "2h", "close_ma": close_ma, "support": 1.0, "status": "SUPPORTED_CLOSE", "point_id": point_id}
+        for plateau_id, close_ma, point_id in (
+            ("P1", 4, "P1_C4_MORE_EVENTS"), ("P1", 5, "P1_C5_ONLY"),
+            ("P2", 4, "P2_C4_ONLY"), ("P2", 5, "P2_C5_ONLY"),
+        )
+    ])
+
+    structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+    assert set(structures["common_close_ma"]) == {4, 5}
+    assert {
+        (row.common_close_ma, tuple(order["point_id"] for order in row.orders))
+        for row in structures.itertuples(index=False)
+    } == {
+        (4, ("P1_C4_MORE_EVENTS", "P2_C4_ONLY")),
+        (5, ("P1_C5_ONLY", "P2_C5_ONLY")),
+    }
+    assert "source_pnl_sum" not in structures.columns
+
+
+def test_structures_use_the_representative_frozen_in_close_profiles() -> None:
+    points = pd.DataFrame([
+        {**_point("P1_PROFILE", "P1", shift_bp=110), "point_event_count": 4, "event_eligible": True},
+        {**_point("P1_OTHER", "P1", shift_bp=120), "point_event_count": 9, "event_eligible": True},
+        {**_point("P2_PROFILE", "P2", shift_bp=180), "point_event_count": 5, "event_eligible": True},
+    ])
+    plateaus = pd.DataFrame([
+        _plateau("P1", ("P1_PROFILE", "P1_OTHER")),
+        _plateau("P2", ("P2_PROFILE",)),
+    ])
+    profiles = pd.DataFrame([
+        {"plateau_id": "P1", "symbol": "AAAUSDT", "side": "LONG", "timeframe": "2h", "close_ma": 4, "support": 1.0, "status": "PRIMARY_CLOSE", "point_id": "P1_PROFILE"},
+        {"plateau_id": "P2", "symbol": "AAAUSDT", "side": "LONG", "timeframe": "2h", "close_ma": 4, "support": 1.0, "status": "PRIMARY_CLOSE", "point_id": "P2_PROFILE"},
+    ])
+
+    structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+    assert tuple(order["point_id"] for order in structures.iloc[0]["orders"]) == (
+        "P1_PROFILE", "P2_PROFILE"
+    )
 
 
 def test_deep_order_does_not_require_standalone_sample() -> None:

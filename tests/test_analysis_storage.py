@@ -24,6 +24,7 @@ REQUIRED_TABLES = {
     "surface_pairs",
     "surface_timeframes",
     "surface_points",
+    "surface_point_events",
     "coverage_issues",
     "dedup_decisions",
     "analysis_runs",
@@ -112,6 +113,23 @@ def _surface(*, source_hash: str = "a" * 64) -> DirectSurface:
     )
 
 
+def _real_surface(*, source_hash: str = "b" * 64) -> DirectSurface:
+    legacy = _surface(source_hash=source_hash)
+    point = replace(
+        legacy.points[0], point_event_count=2, event_ids=("1" * 64, "2" * 64)
+    )
+    return replace(
+        legacy,
+        event_mode="real_independent_events",
+        request=replace(
+            legacy.request,
+            materializer_version="v2-real-events",
+            point_materialization_config_hash="d" * 64,
+        ),
+        points=(point,),
+    )
+
+
 def test_publish_surface_is_deterministic_deduplicated_and_persists_materialized_provenance(connections) -> None:
     from mrs3.analysis_storage import publish_surface
 
@@ -123,6 +141,23 @@ def test_publish_surface_is_deterministic_deduplicated_and_persists_materialized
     assert second.created is False
     assert analysis.execute("select count(*) from surfaces").fetchone() == (1,)
     assert analysis.execute("select provenance_state from surface_points").fetchone() == ("REPRODUCIBLE_AT_PUBLICATION",)
+
+
+def test_real_surface_persists_exact_event_membership_and_has_distinct_identity(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    legacy = publish_surface(analysis, _surface(source_hash="b" * 64))
+    real = publish_surface(analysis, _real_surface())
+
+    assert real.surface_id != legacy.surface_id
+    assert analysis.execute(
+        "select event_id from surface_point_events where surface_id=? order by event_id",
+        [real.surface_id],
+    ).fetchall() == [("1" * 64,), ("2" * 64,)]
+    assert analysis.execute(
+        "select event_mode from surfaces where surface_id=?", [real.surface_id]
+    ).fetchone() == ("real_independent_events",)
 
 
 def test_publish_analysis_run_is_deterministic_and_does_not_copy_surface_points(connections) -> None:
@@ -364,14 +399,45 @@ def test_v1_migration_preserves_candidate_link_and_published_surface_bytes() -> 
     connection = duckdb.connect(":memory:")
     try:
         _v1_with_one_candidate(connection)
-        before = connection.execute("select * from surfaces").fetchall(), connection.execute("select * from surface_points").fetchall()
+        surface_columns = "surface_id,parent_surface_id,build_mode,period_start_utc,period_end_utc,side,grid_contract_json,normalization_contract_version,materializer_version,point_materialization_config_hash,created_at_utc"
+        before = connection.execute(f"select {surface_columns} from surfaces").fetchall(), connection.execute("select * from surface_points").fetchall()
 
         assert ensure_analysis_schema(connection) == ANALYSIS_SCHEMA_VERSION
 
         assert connection.execute("select candidate_id, run_id, surface_id, candidate_json from candidates").fetchall() == [("C1", "R1", "S1", '{"legacy":true}')]
         assert connection.execute("select candidate_id, run_id, plateau_id, surface_id from candidate_plateaus").fetchall() == [("C1", "R1", "P1", "S1")]
         assert connection.execute("select facts_state, unique_point_count, economic_eligible_point_count, event_eligible_point_count, plateau_count, ready_candidate_count, final_state from analysis_run_facts").fetchall() == [("UNAVAILABLE_LEGACY", None, None, None, None, None, "COMMITTED")]
-        assert (connection.execute("select * from surfaces").fetchall(), connection.execute("select * from surface_points").fetchall()) == before
+        assert (connection.execute(f"select {surface_columns} from surfaces").fetchall(), connection.execute("select * from surface_points").fetchall()) == before
+        assert connection.execute("select event_mode from surfaces").fetchall() == [("legacy_trades_proxy",)]
+    finally:
+        connection.close()
+
+
+def test_v3_migration_preserves_data_and_marks_existing_surfaces_legacy() -> None:
+    from mrs3 import analysis_storage
+
+    connection = duckdb.connect(":memory:")
+    try:
+        _v1_with_one_candidate(connection)
+        analysis_storage._migrate_v1_to_v2(connection)
+        analysis_storage._migrate_v2_to_v3(connection)
+        assert dict(connection.execute("select key, value from schema_info").fetchall())["schema_version"] == "3"
+        before = connection.execute(
+            "select candidate_id, run_id, surface_id, candidate_json from candidates"
+        ).fetchall()
+
+        assert ensure_analysis_schema(connection) == ANALYSIS_SCHEMA_VERSION
+
+        assert connection.execute(
+            "select candidate_id, run_id, surface_id, candidate_json from candidates"
+        ).fetchall() == before
+        assert connection.execute("select event_mode from surfaces").fetchall() == [
+            ("legacy_trades_proxy",)
+        ]
+        assert connection.execute("select * from surface_point_events").fetchall() == []
+        assert dict(connection.execute("select key, value from schema_info").fetchall())[
+            "schema_version"
+        ] == str(ANALYSIS_SCHEMA_VERSION)
     finally:
         connection.close()
 

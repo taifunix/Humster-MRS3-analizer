@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
+from concurrent.futures import Future
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -121,6 +123,9 @@ def test_insert_identical_period_and_shift_append_emit_complete_progress(
     assert first.safe_to_delete == "YES"
     assert _snapshot(incoming) == before
     assert progress[-1].final_state == "COMMITTED"
+    assert {item.final_state for item in progress} >= {
+        "PARSING", "GROUPING", "STAGING", "WRITING", "PUBLISHING", "COMMITTED"
+    }
     assert progress[-1].counts == {
         "parsed": 1,
         "inserted": 1,
@@ -271,14 +276,14 @@ def test_crlf_to_lf_mutation_during_parse_prevents_replacement(
     changed.write_bytes(crlf_bytes)
     raw_snapshot_hash = sha256(crlf_bytes).hexdigest()
     assert raw_snapshot_hash != sha256(lf_bytes).hexdigest()
-    real_reader = duckdb_events.read_compact_html
+    real_parser = duckdb_import._stream_prepared_reports
 
-    def mutate_after_parse(path: Path):
-        outcome = real_reader(path)
-        path.write_bytes(lf_bytes)
-        return outcome
+    def mutate_after_parse(snapshots, workers, imported_at, cancellation_requested=None):
+        outcomes = list(real_parser(snapshots, workers, imported_at, cancellation_requested))
+        changed.write_bytes(lf_bytes)
+        yield from outcomes
 
-    monkeypatch.setattr(duckdb_events, "read_compact_html", mutate_after_parse)
+    monkeypatch.setattr(duckdb_import, "_stream_prepared_reports", mutate_after_parse)
     result = import_html_tree(_request(tmp_path, incoming, job_id="mutated"), None)
 
     assert result.final_state == "FAILED"
@@ -469,13 +474,14 @@ def test_parser_and_payload_integrity_failures_are_quarantine_without_file_moves
     corrupt_root = tmp_path / "corrupt"
     _copy_report(corrupt_root, "corrupt.html")
     corrupt_before = _snapshot(corrupt_root)
-    real_reader = duckdb_events.read_compact_html
+    real_parser = duckdb_import._stream_prepared_reports
 
-    def corrupt_reader(path: Path):
-        outcome = real_reader(path)
-        return replace(outcome, record=replace(outcome.record, equity_zlib=b"not-zlib"))
+    def corrupt_parser(snapshots, workers, imported_at, cancellation_requested=None):
+        outcomes = list(real_parser(snapshots, workers, imported_at, cancellation_requested))
+        outcomes[0].prepared.payload["equity_zlib"] = b"not-zlib"
+        yield from outcomes
 
-    monkeypatch.setattr(duckdb_events, "read_compact_html", corrupt_reader)
+    monkeypatch.setattr(duckdb_import, "_stream_prepared_reports", corrupt_parser)
     corrupt_result = import_html_tree(
         _request(tmp_path, corrupt_root, database_name="corrupt.duckdb", job_id="corrupt"),
         None,
@@ -521,17 +527,17 @@ def test_transaction_failure_keeps_previous_active_report_and_retry_is_safe(
     replacement_hash = _codec_source_hash(replacement)
     _copy_report(incoming, "b-insert.html", "report_b.html")
     inputs_before = _snapshot(incoming)
-    real_write = duckdb_import._write_decision
+    real_write = duckdb_import._write_decisions_batch
     calls = 0
 
-    def fail_second_write(connection, decision, job_id, imported_at):
+    def fail_second_write(connection, decisions, job_id, imported_at):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise duckdb.TransactionException("injected batch failure")
-        return real_write(connection, decision, job_id, imported_at)
+        return real_write(connection, decisions, job_id, imported_at)
 
-    monkeypatch.setattr(duckdb_import, "_write_decision", fail_second_write)
+    monkeypatch.setattr(duckdb_import, "_write_decisions_batch", fail_second_write)
     failed = import_html_tree(
         _request(tmp_path, incoming, job_id="failed", batch_size=1), None
     )
@@ -547,7 +553,7 @@ def test_transaction_failure_keeps_previous_active_report_and_retry_is_safe(
     assert _active_rows(database)[0][1] == original_hash
     assert _snapshot(incoming) == inputs_before
 
-    monkeypatch.setattr(duckdb_import, "_write_decision", real_write)
+    monkeypatch.setattr(duckdb_import, "_write_decisions_batch", real_write)
     retry = import_html_tree(
         _request(tmp_path, incoming, job_id="retry", batch_size=2), None
     )
@@ -559,6 +565,47 @@ def test_transaction_failure_keeps_previous_active_report_and_retry_is_safe(
         _codec_source_hash(FIXTURES / "report_b.html"),
     }
     assert _snapshot(incoming) == inputs_before
+
+
+def test_import_uses_structural_validation_not_global_payload_redecode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+
+    def fail_full_validation(*_args, **_kwargs):
+        raise AssertionError("full payload validation must not run during import")
+
+    monkeypatch.setattr(duckdb_import, "validate_source_database", fail_full_validation)
+
+    result = import_html_tree(_request(tmp_path, incoming), None)
+
+    assert result.final_state == "COMMITTED"
+
+
+def test_authorized_preflight_is_not_revalidated_after_staging_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+    request = _request(tmp_path, incoming)
+    preflight = preflight_html_import(request)
+    authorized = replace(
+        request,
+        expected_preflight_token=preflight.token,
+        preflight=preflight,
+    )
+
+    def fail_structural_validation(*_args, **_kwargs):
+        raise AssertionError("authorized preflight must be reused")
+
+    monkeypatch.setattr(
+        duckdb_import, "validate_source_database_structural", fail_structural_validation
+    )
+
+    result = import_html_tree(authorized, None)
+
+    assert result.final_state == "COMMITTED"
 
 
 def test_cancellation_after_a_stage_batch_does_not_report_unpublished_writes(
@@ -628,14 +675,14 @@ def test_concurrent_import_to_same_resolved_database_is_rejected_without_publica
     _copy_report(incoming, "report.html")
     entered_parse = Event()
     allow_parse = Event()
-    real_reader = duckdb_events.read_compact_html
+    real_parser = duckdb_import._stream_prepared_reports
 
-    def blocked_reader(path: Path):
+    def blocked_parser(snapshots, workers, imported_at, cancellation_requested=None):
         entered_parse.set()
         assert allow_parse.wait(timeout=5)
-        return real_reader(path)
+        yield from real_parser(snapshots, workers, imported_at, cancellation_requested)
 
-    monkeypatch.setattr(duckdb_events, "read_compact_html", blocked_reader)
+    monkeypatch.setattr(duckdb_import, "_stream_prepared_reports", blocked_parser)
     first_result = []
     first = Thread(
         target=lambda: first_result.append(
@@ -820,6 +867,30 @@ def test_preflight_is_deterministic_and_authorizes_unchanged_import(tmp_path: Pa
     assert result.final_state == "COMMITTED"
 
 
+def test_import_reuses_the_preflight_snapshot_without_resnapshotting_html(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "nested/report.html")
+    request = _request(tmp_path, incoming, job_id="preflight-reuse")
+    preflight = preflight_html_import(request)
+
+    def reject_resnapshot(*_: object) -> tuple[object, ...]:
+        raise AssertionError("import must reuse the completed preflight snapshot")
+
+    monkeypatch.setattr(duckdb_import, "_snapshot_reports", reject_resnapshot)
+    result = import_html_tree(
+        replace(
+            request,
+            expected_preflight_token=preflight.token,
+            preflight=preflight,
+        ),
+        None,
+    )
+
+    assert result.final_state == "COMMITTED"
+
+
 def test_preflight_snapshots_in_parallel_and_reports_byte_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -842,6 +913,81 @@ def test_preflight_snapshots_in_parallel_and_reports_byte_progress(
     assert [item.snapshotted for item in progress] == [0, 1, 2]
     assert progress[0].discovered == 2 and progress[0].total_bytes > 0
     assert progress[-1].processed_bytes == progress[-1].total_bytes > 0
+
+
+def test_parsing_uses_a_process_pool_with_the_configured_worker_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "a/report.html")
+    _copy_report(incoming, "b/report.html", "report_b.html")
+    workers: list[int] = []
+
+    class RecordingExecutor:
+        def __init__(self, *, max_workers: int) -> None:
+            workers.append(max_workers)
+
+        def __enter__(self) -> RecordingExecutor:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def submit(self, function, *args):
+            future = Future()
+            future.set_result(function(*args))
+            return future
+
+    monkeypatch.setattr(duckdb_import, "ProcessPoolExecutor", RecordingExecutor)
+
+    snapshots = duckdb_import._snapshot_reports(incoming, discover_compact_reports(incoming), 2)
+    outcomes = list(duckdb_import._stream_prepared_reports(snapshots, 30, datetime.now(timezone.utc)))
+
+    assert workers == [30]
+    assert len(outcomes) == 2
+
+
+def test_process_pool_returns_a_parse_outcome_from_a_real_worker(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+
+    snapshots = duckdb_import._snapshot_reports(incoming, discover_compact_reports(incoming), 1)
+    outcome = list(duckdb_import._stream_prepared_reports(snapshots, 1, datetime.now(timezone.utc)))[0]
+
+    assert outcome.classification is None
+    assert outcome.prepared is not None
+
+
+def test_process_pool_streams_prepared_reports_without_parent_side_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "a/report.html")
+    _copy_report(incoming, "b/report.html", "report_b.html")
+    snapshots = duckdb_import._snapshot_reports(incoming, discover_compact_reports(incoming), 2)
+
+    monkeypatch.setattr(duckdb_import, "_prepare", lambda *_: (_ for _ in ()).throw(AssertionError("parent must not prepare worker results")))
+    outcomes = list(duckdb_import._stream_prepared_reports(snapshots, 2, datetime.now(timezone.utc)))
+
+    assert len(outcomes) == 2
+    assert all(item.prepared is not None for item in outcomes)
+
+
+def test_cancellation_during_process_parsing_does_not_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    _copy_report(incoming, "report.html")
+
+    monkeypatch.setattr(
+        duckdb_import, "_stream_prepared_reports",
+        lambda *_: (_ for _ in ()).throw(duckdb_import._ImportCancelled),
+    )
+    result = import_html_tree(_request(tmp_path, incoming, cancellation_requested=lambda: False), None)
+
+    assert result.final_state == "CANCELLED"
+    assert result.safe_to_delete == "NO"
+    assert not (tmp_path / "source.duckdb").exists()
 
 
 def test_changed_input_after_preflight_is_rejected_without_target_mutation(tmp_path: Path) -> None:
@@ -940,13 +1086,14 @@ def test_target_changed_between_token_check_and_staging_is_rejected(
     request = _request(tmp_path, incoming, job_id="boundary-target")
     preflight = preflight_html_import(request)
     external_bytes = external_database.read_bytes()
-    real_reader = duckdb_events.read_compact_html
+    real_parser = duckdb_import._stream_prepared_reports
 
-    def mutate_target_after_token_check(path: Path):
+    def mutate_target_after_token_check(snapshots, workers, imported_at, cancellation_requested=None):
+        outcomes = list(real_parser(snapshots, workers, imported_at, cancellation_requested))
         shutil.copyfile(external_database, database)
-        return real_reader(path)
+        yield from outcomes
 
-    monkeypatch.setattr(duckdb_events, "read_compact_html", mutate_target_after_token_check)
+    monkeypatch.setattr(duckdb_import, "_stream_prepared_reports", mutate_target_after_token_check)
     result = import_html_tree(replace(request, expected_preflight_token=preflight.token), None)
 
     assert result.final_state == "FAILED"

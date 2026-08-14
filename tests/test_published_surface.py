@@ -4,7 +4,7 @@ import duckdb
 
 from mrs3.analysis_storage import publish_surface
 from mrs3.published_surface import load_published_surface
-from tests.test_analysis_storage import _surface
+from tests.test_analysis_storage import _real_surface, _surface
 
 
 def test_load_published_surface_reads_only_materialized_analysis_points() -> None:
@@ -23,5 +23,19 @@ def test_load_published_surface_reads_only_materialized_analysis_points() -> Non
             "win_rate_pct": 71.4, "profit_factor": 2.0,
         }
         assert "listing_date" not in loaded.points
+    finally:
+        connection.close()
+
+
+def test_load_real_published_surface_restores_exact_event_membership() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        surface = publish_surface(connection, _real_surface())
+
+        loaded = load_published_surface(connection, surface.surface_id)
+
+        assert loaded.points.loc[0, "event_mode"] == "real_independent_events"
+        assert loaded.points.loc[0, "point_event_count"] == 2
+        assert loaded.points.loc[0, "_event_ids"] == ("1" * 64, "2" * 64)
     finally:
         connection.close()

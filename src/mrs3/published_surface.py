@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 import math
 
 import duckdb
@@ -48,7 +49,7 @@ def load_published_surface(
 ) -> PipelineInput:
     """Read immutable point facts from the analysis DB without opening the source DB."""
     period = analysis_connection.execute(
-        "select period_start_utc, period_end_utc, side from surfaces where surface_id=?",
+        "select period_start_utc, period_end_utc, side, event_mode from surfaces where surface_id=?",
         [surface_id],
     ).fetchone()
     if period is None:
@@ -61,7 +62,15 @@ def load_published_surface(
     if not rows:
         raise ValueError("published surface has no points")
 
-    start, end, surface_side = _utc(period[0]), _utc(period[1]), str(period[2])
+    start, end, surface_side, event_mode = _utc(period[0]), _utc(period[1]), str(period[2]), str(period[3])
+    event_rows = analysis_connection.execute(
+        "select canonical_point_key,event_id from surface_point_events where surface_id=? order by canonical_point_key,event_id",
+        [surface_id],
+    ).fetchall()
+    events_by_point: dict[str, tuple[str, ...]] = {}
+    for key, event_id in event_rows:
+        events_by_point.setdefault(str(key), ())
+        events_by_point[str(key)] = (*events_by_point[str(key)], str(event_id))
     points: list[dict[str, object]] = []
     for run_id, (key, event_count, metrics_json) in enumerate(rows, start=1):
         parts = str(key).split("|")
@@ -83,8 +92,18 @@ def load_published_surface(
         if not isinstance(metrics, dict) or _REQUIRED_METRICS.difference(metrics):
             raise ValueError("published surface metrics are incomplete")
         trades = _count(metrics["TotalTrades"], "TotalTrades")
-        if trades != _count(event_count, "point_event_count"):
-            raise ValueError("published point_event_count must equal TotalTrades")
+        count = _count(event_count, "point_event_count")
+        event_ids = events_by_point.get(str(key), ())
+        if event_mode == "legacy_trades_proxy":
+            if event_ids or trades != count:
+                raise ValueError("legacy published point events are inconsistent")
+            event_ids_hash = LEGACY_EVENT_IDS_HASH
+        elif event_mode == "real_independent_events":
+            if len(event_ids) != count:
+                raise ValueError("published point event membership is inconsistent")
+            event_ids_hash = sha256("|".join(event_ids).encode("utf-8")).hexdigest()
+        else:
+            raise ValueError("published surface has invalid event mode")
         multiplier = 1 + (-shift_bp if side == "LONG" else shift_bp) / 10_000
         points.append(
             {
@@ -109,9 +128,10 @@ def load_published_surface(
                 "trades": trades,
                 "wins": _count(metrics["Win"], "Win"),
                 "losses": _count(metrics["Los"], "Los"),
-                "event_mode": "legacy_trades_proxy",
-                "point_event_count": trades,
-                "event_ids_hash": LEGACY_EVENT_IDS_HASH,
+                "event_mode": event_mode,
+                "point_event_count": count,
+                "event_ids_hash": event_ids_hash,
+                "_event_ids": event_ids,
                 "report_start": start,
                 "report_end": end,
             }

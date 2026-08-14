@@ -10,6 +10,7 @@ htmlcov/
 
 # Local runtime configuration and artifacts
 config.local.json
+data/
 output/
 results/
 audit_csv/

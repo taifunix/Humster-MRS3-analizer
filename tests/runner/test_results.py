@@ -9,6 +9,8 @@ import pytest
 
 from mrs3.runner.results import (
     ResultMismatchError,
+    WizardResult,
+    extract_html_strategy_name,
     load_wizard_results,
     parse_html_report,
     reconcile_results,
@@ -20,6 +22,38 @@ FIXTURES = Path(__file__).parents[1] / "fixtures"
 REPORT_NAME = "my_test_run_001_of_001_ADMSTOCK_USDT_2h_2026-07-01_3.html"
 
 
+def test_lightweight_strategy_name_reads_only_embedded_settings(tmp_path: Path) -> None:
+    report = tmp_path / "report.html"
+    report.write_text(
+        '<html><body><pre>{"name":"FAST","basic":{}}</pre></body></html>',
+        encoding="utf-8",
+    )
+
+    assert extract_html_strategy_name(report) == "FAST"
+
+
+def test_reconciliation_uses_embedded_name_without_full_html_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = tmp_path / "A.html"
+    report.write_text(
+        '<html><body><pre>{"name":"A","basic":{}}</pre></body></html>',
+        encoding="utf-8",
+    )
+    result = WizardResult(
+        "run", "", ("A",), {}, "/tester-report/my_test/A.html", "A.html", "", ""
+    )
+    monkeypatch.setattr(
+        "mrs3.runner.results.parse_html_report",
+        lambda _: pytest.fail("full HTML parsing must not run for runner verification"),
+    )
+
+    frame = reconcile_results(("A",), (result,), tmp_path, Decimal("0.01"))
+
+    assert frame.iloc[0]["strategy_name"] == "A"
+    assert frame.iloc[0]["verification_mode"] == "strategy_name_only"
+
+
 def test_supplied_json_maps_adm1_to_exact_report() -> None:
     result = load_wizard_results(FIXTURES / "wizard_result.json")[0]
 
@@ -27,36 +61,16 @@ def test_supplied_json_maps_adm1_to_exact_report() -> None:
     assert result.report_name == REPORT_NAME
 
 
-def test_supplied_html_enriches_json_and_matches_core_metrics() -> None:
-    report = parse_html_report(FIXTURES / REPORT_NAME)
-    frame = reconcile_results(
-        ("ADM1",),
-        load_wizard_results(FIXTURES / "wizard_result.json"),
-        FIXTURES,
-        Decimal("0.01"),
+def test_reconciliation_rejects_a_different_embedded_strategy_name(tmp_path: Path) -> None:
+    report = tmp_path / "A.html"
+    report.write_text(
+        '<html><body><pre>{"name":"B","basic":{}}</pre></body></html>',
+        encoding="utf-8",
     )
-    row = frame.iloc[0]
+    result = WizardResult("run", "", ("A",), {}, "/tester-report/my_test/A.html", "A.html", "", "")
 
-    assert report.strategy_name == "ADM1"
-    assert row["strategy_name"] == "ADM1"
-    assert row["symbol"] == "ADMSTOCK_USDT"
-    assert row["timeframe"] == "2h"
-    assert row["profit_factor"] == pytest.approx(0.0070)
-    assert row["total_pnl"] == pytest.approx(-6825.6651944)
-    assert row["trade_row_count"] == 2
-    assert json.loads(row["strategy_settings_json"])["name"] == "ADM1"
-
-
-def test_metric_mismatch_fails_with_exact_field_name(tmp_path: Path) -> None:
-    document = json.loads((FIXTURES / "wizard_result.json").read_text(encoding="utf-8"))
-    document[0]["stats"]["TotalPnL"] = -6000
-    path = tmp_path / "wizard_result.json"
-    path.write_text(json.dumps(document), encoding="utf-8")
-
-    with pytest.raises(ResultMismatchError, match="TotalPnL"):
-        reconcile_results(
-            ("ADM1",), load_wizard_results(path), FIXTURES, Decimal("0.01")
-        )
+    with pytest.raises(ResultMismatchError, match="HTML strategy name differs"):
+        reconcile_results(("A",), (result,), tmp_path, Decimal("0.01"))
 
 
 def test_result_csv_replacement_is_atomic_on_export_failure(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 import hashlib
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -11,7 +12,7 @@ from openpyxl import load_workbook
 
 from mrs3.config import AlgorithmConfig
 from mrs3.models import Side
-from mrs3.pipeline import PipelineInput, SelectionInputs, _pair_history, run_published_pipeline, run_selection
+from mrs3.pipeline import PipelineInput, SelectionInputs, _pair_history, _write_json_atomic, run_published_pipeline, run_selection
 from tests.factories import write_selection_inputs
 from tests.test_package_loader import write_real_package
 
@@ -22,6 +23,31 @@ def _digest_files(directory: Path, pattern: str) -> str:
         digest.update(path.relative_to(directory).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def test_strategy_json_writer_preserves_template_key_order(tmp_path: Path) -> None:
+    strategy = {
+        "name": "A",
+        "is_runing": False,
+        "exchange": {"name": "Bybit", "account": "main"},
+        "basic": {"strategy": "mrs3", "symbol": "ONUSDT"},
+        "mrs3": {
+            "ma_long": [
+                {"id": 1, "side": "buy", "len": 3, "multiplier": 0.996, "lot_x": 1.0}
+            ],
+            "ma_short": [],
+        },
+    }
+    target = tmp_path / "strategy.json"
+
+    _write_json_atomic(target, strategy)
+
+    written = json.loads(target.read_text(encoding="utf-8"))
+    assert list(written) == list(strategy)
+    assert list(written["exchange"]) == list(strategy["exchange"])
+    assert list(written["basic"]) == list(strategy["basic"])
+    assert list(written["mrs3"]) == list(strategy["mrs3"])
+    assert list(written["mrs3"]["ma_long"][0]) == list(strategy["mrs3"]["ma_long"][0])
 
 
 def test_published_pipeline_scopes_listing_dates_and_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -43,6 +69,7 @@ def test_published_pipeline_scopes_listing_dates_and_fails_closed(monkeypatch: p
 
     result = run_published_pipeline(PipelineInput("surface", points), Path("dates.csv"), Side.LONG, AlgorithmConfig.defaults())
 
+    assert result.algorithm_version == "0.7-representative-v2"
     assert result.algorithm_config["listing_dates"] == {"AAAUSDT": "2020-01-01T00:00:00+00:00"}
     monkeypatch.setattr(pipeline, "load_listing_dates", lambda _: {})
     with pytest.raises(ValueError, match="missing listing dates"):

@@ -524,14 +524,12 @@ def test_failed_reconciliation_preserves_reports_and_logs(tmp_path: Path) -> Non
     )
     output = tmp_path / "out" / "results.csv"
 
-    with pytest.raises(ResultMismatchError, match="TotalPnL"):
-        run_batch(config, source, output, dependencies=dependencies)
+    result = run_batch(config, source, output, dependencies=dependencies)
 
-    assert config.report_dir.exists()
-    assert config.wizard_result.exists()
-    assert not output.exists()
+    assert result.inbox_path is not None
+    assert output.exists()
     state = json.loads((output.parent / "results.state.json").read_text(encoding="utf-8"))
-    assert state["state"] == "FAILED"
+    assert state["state"] == "COMPLETED"
 
 
 def test_startup_timeout_restarts_then_stops_bot(tmp_path: Path) -> None:
@@ -704,6 +702,26 @@ def test_html_collision_retries_only_colliding_names_in_serial_lane(
     assert monitored == [("A", "B"), ("A", "B")]
     assert collision_keys[0] is None
     assert collision_keys[1] == {"A": "ONUSDT\x1f2h", "B": "ONUSDT\x1f2h"}
+
+
+def test_verified_batch_converts_one_name_mismatch_to_single_strategy_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    result = WizardResult("run", "", ("A",), {}, "/tester-report/my_test/A.html", "A.html", "", "")
+    monkeypatch.setattr(runner_workflow, "load_wizard_results", lambda _: (result,))
+    monkeypatch.setattr(
+        runner_workflow,
+        "reconcile_results",
+        lambda expected, *_args, **_kwargs: (_ for _ in ()).throw(
+            ResultMismatchError("HTML strategy name differs for A: B")
+        ),
+    )
+
+    with pytest.raises(BatchHtmlCollision) as error:
+        runner_workflow._wait_for_verified_batch_results(("A",), config)
+
+    assert error.value.strategy_names == ("A",)
 
 
 def test_transient_http_failure_fails_after_configured_process_restart_limit(

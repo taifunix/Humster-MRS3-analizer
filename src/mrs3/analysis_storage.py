@@ -14,10 +14,9 @@ if TYPE_CHECKING:
     from .duckdb_direct import DirectPoint, DirectSurface
 
 
-ANALYSIS_SCHEMA_VERSION = 3
-EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT = (
-    "58a445394e54f43f95cce56d2019ae4fb97040ccae83769debe205aa93987db8"
-)
+ANALYSIS_SCHEMA_VERSION = 4
+EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT = "160f5d1eb62270987d0c8256cb95ef1ee403d36201906f2bac36622988196fc6"
+_V3_FINGERPRINT = "58a445394e54f43f95cce56d2019ae4fb97040ccae83769debe205aa93987db8"
 _V2_FINGERPRINT = "a61bf184df6377f5161e13ba4e542bb36b669c528af360ddbb9b62d666f6adba"
 _V1_FINGERPRINT = "f2a206838bdbe1483c11df88d6ebeb51f137fbc54f0c2a3d07453a6ffb364aa6"
 _DIRECT_REQUIRED_METRICS = {
@@ -107,6 +106,7 @@ _TABLES = {
     "surface_pairs",
     "surface_timeframes",
     "surface_points",
+    "surface_point_events",
     "coverage_issues",
     "dedup_decisions",
     "analysis_runs",
@@ -117,7 +117,7 @@ _TABLES = {
     "plateau_lineage",
     "analysis_run_facts",
 }
-_V1_TABLES = _TABLES - {"candidate_plateaus", "analysis_run_facts"}
+_V1_TABLES = _TABLES - {"candidate_plateaus", "analysis_run_facts", "surface_point_events"}
 
 
 def _table_names(connection: duckdb.DuckDBPyConnection) -> set[str]:
@@ -174,15 +174,28 @@ def _verify_schema(connection: duckdb.DuckDBPyConnection) -> None:
         try:
             _migrate_v1_to_v2(connection, transactional=False)
             _migrate_v2_to_v3(connection, transactional=False)
+            _migrate_v3_to_v4(connection, transactional=False)
             connection.execute("commit")
         except BaseException:
             connection.execute("rollback")
             raise
         return
     if metadata.get("schema_version") == "2" and metadata.get("schema_fingerprint") == _V2_FINGERPRINT:
-        if tables != (_TABLES - {"analysis_run_facts"}) or _schema_fingerprint(connection) != _V2_FINGERPRINT:
+        if tables != (_TABLES - {"analysis_run_facts", "surface_point_events"}) or _schema_fingerprint(connection) != _V2_FINGERPRINT:
             raise AnalysisSchemaError("analysis database schema fingerprint does not match v2")
-        _migrate_v2_to_v3(connection)
+        connection.execute("begin transaction")
+        try:
+            _migrate_v2_to_v3(connection, transactional=False)
+            _migrate_v3_to_v4(connection, transactional=False)
+            connection.execute("commit")
+        except BaseException:
+            connection.execute("rollback")
+            raise
+        return
+    if metadata.get("schema_version") == "3" and metadata.get("schema_fingerprint") == _V3_FINGERPRINT:
+        if tables != (_TABLES - {"surface_point_events"}) or _schema_fingerprint(connection) != _V3_FINGERPRINT:
+            raise AnalysisSchemaError("analysis database schema fingerprint does not match v3")
+        _migrate_v3_to_v4(connection)
         return
     _verify_current_schema(connection, tables, metadata)
 
@@ -206,13 +219,13 @@ def _verify_current_schema(
             f"is not v{ANALYSIS_SCHEMA_VERSION}"
         )
     if metadata.get("schema_fingerprint") != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
-        raise AnalysisSchemaError("analysis database stored schema fingerprint is not v3")
+        raise AnalysisSchemaError("analysis database stored schema fingerprint is not v4")
     if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
-        raise AnalysisSchemaError("analysis database schema fingerprint does not match v3")
+        raise AnalysisSchemaError("analysis database schema fingerprint does not match v4")
 
 
 def verify_analysis_schema(connection: duckdb.DuckDBPyConnection) -> int:
-    """Verify the current v3 contract without attempting any migration."""
+    """Verify the current v4 contract without attempting any migration."""
     _verify_current_schema(connection)
     return ANALYSIS_SCHEMA_VERSION
 
@@ -233,6 +246,7 @@ def _create_tables(connection: duckdb.DuckDBPyConnection) -> None:
             materializer_version varchar,
             point_materialization_config_hash varchar,
             created_at_utc timestamp not null default current_timestamp,
+            event_mode varchar,
             check(period_end_utc > period_start_utc)
         );
         create table surface_sources(
@@ -272,6 +286,14 @@ def _create_tables(connection: duckdb.DuckDBPyConnection) -> None:
             primary key(surface_id, canonical_point_key),
             foreign key(surface_id, pair_key, timeframe)
                 references surface_timeframes(surface_id, pair_key, timeframe)
+        );
+        create table surface_point_events(
+            surface_id varchar not null,
+            canonical_point_key varchar not null,
+            event_id varchar not null check(length(event_id) = 64),
+            primary key(surface_id, canonical_point_key, event_id),
+            foreign key(surface_id, canonical_point_key)
+                references surface_points(surface_id, canonical_point_key)
         );
         create table coverage_issues(
             issue_id varchar primary key,
@@ -431,8 +453,34 @@ def _migrate_v2_to_v3(connection: duckdb.DuckDBPyConnection, *, transactional: b
             check((facts_state = 'COMPUTED' and unique_point_count is not null and economic_eligible_point_count is not null and event_eligible_point_count is not null and plateau_count is not null and ready_candidate_count is not null) or (facts_state = 'UNAVAILABLE_LEGACY' and unique_point_count is null and economic_eligible_point_count is null and event_eligible_point_count is null and plateau_count is null and ready_candidate_count is null))
         )""")
         connection.execute("insert into analysis_run_facts(run_id,facts_state,final_state) select run_id,'UNAVAILABLE_LEGACY','COMMITTED' from analysis_runs")
-        if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
+        if _schema_fingerprint(connection) != _V3_FINGERPRINT:
             raise AnalysisSchemaError("v2 migration DDL does not match the code-owned v3 fingerprint")
+        connection.execute("update schema_info set value='3' where key='schema_version'")
+        connection.execute("update schema_info set value=? where key='schema_fingerprint'", [_V3_FINGERPRINT])
+        if transactional:
+            connection.execute("commit")
+    except BaseException:
+        if transactional:
+            connection.execute("rollback")
+        raise
+
+
+def _migrate_v3_to_v4(connection: duckdb.DuckDBPyConnection, *, transactional: bool = True) -> None:
+    """Add immutable event mode and exact point-event membership."""
+    if transactional:
+        connection.execute("begin transaction")
+    try:
+        connection.execute("alter table surfaces add column event_mode varchar")
+        connection.execute("update surfaces set event_mode='legacy_trades_proxy'")
+        connection.execute("""create table surface_point_events(
+            surface_id varchar not null,
+            canonical_point_key varchar not null,
+            event_id varchar not null check(length(event_id) = 64),
+            primary key(surface_id, canonical_point_key, event_id),
+            foreign key(surface_id, canonical_point_key)
+                references surface_points(surface_id, canonical_point_key))""")
+        if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
+            raise AnalysisSchemaError("v3 migration DDL does not match the code-owned v4 fingerprint")
         connection.execute("update schema_info set value=? where key='schema_version'", [str(ANALYSIS_SCHEMA_VERSION)])
         connection.execute("update schema_info set value=? where key='schema_fingerprint'", [EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT])
         if transactional:
@@ -453,7 +501,7 @@ def ensure_analysis_schema(connection: duckdb.DuckDBPyConnection) -> int:
     try:
         _create_tables(connection)
         if _schema_fingerprint(connection) != EXPECTED_ANALYSIS_SCHEMA_FINGERPRINT:
-            raise AnalysisSchemaError("analysis schema DDL does not match the code-owned v3 fingerprint")
+            raise AnalysisSchemaError("analysis schema DDL does not match the code-owned v4 fingerprint")
         connection.executemany(
             "insert into schema_info(key, value) values (?, ?)",
             [
@@ -526,6 +574,7 @@ def _surface_identity(surface: DirectSurface) -> tuple[str, dict[str, object]]:
         "normalization_contract": preflight.grid_contract.get("normalization_contract_version"),
         "materializer_version": request.materializer_version,
         "point_materialization_config_hash": request.point_materialization_config_hash,
+        "event_mode": surface.event_mode,
     }
     return sha256(_canonical_json(identity).encode("ascii")).hexdigest(), identity
 
@@ -541,7 +590,7 @@ def _point_parts(point: DirectPoint) -> tuple[str, str, str, int, int, int]:
         raise ValueError("canonical point key has non-integer grid fields") from error
 
 
-def _validate_direct_metrics(metrics: Mapping[str, object], event_count: int) -> None:
+def _validate_direct_metrics(metrics: Mapping[str, object]) -> None:
     if _DIRECT_REQUIRED_METRICS.difference(metrics):
         raise ValueError("point metrics are incomplete")
 
@@ -560,15 +609,13 @@ def _validate_direct_metrics(metrics: Mapping[str, object], event_count: int) ->
         value = number(name)
         if value < 0 or value != value.to_integral_value():
             raise ValueError(f"point metric {name} must be a non-negative integer")
-    if int(number("TotalTrades")) != event_count:
-        raise ValueError("point event count must equal materialized TotalTrades")
     if metrics["ProfitFactor"] is not None:
         number("ProfitFactor")
 
 
 def _validate_surface(surface: DirectSurface, identity: dict[str, object]) -> tuple[DirectPoint, ...]:
-    if surface.build_mode != "DUCKDB_DIRECT" or surface.event_mode != "legacy_trades_proxy":
-        raise ValueError("direct surface must use legacy_trades_proxy")
+    if surface.build_mode != "DUCKDB_DIRECT" or surface.event_mode not in {"legacy_trades_proxy", "real_independent_events"}:
+        raise ValueError("direct surface has invalid event mode")
     if identity["side"] not in {"LONG", "SHORT"} or identity["period"][0] >= identity["period"][1]:
         raise ValueError("surface identity is invalid")
     config_hash = str(identity["point_materialization_config_hash"])
@@ -603,7 +650,15 @@ def _validate_surface(surface: DirectSurface, identity: dict[str, object]) -> tu
             raise ValueError("point provenance is absent from materialized preflight")
         if point.point_event_count < 0:
             raise ValueError("point event count must be non-negative")
-        _validate_direct_metrics(point.metrics, point.point_event_count)
+        _validate_direct_metrics(point.metrics)
+        if surface.event_mode == "legacy_trades_proxy":
+            if point.event_ids or point.point_event_count != int(point.metrics["TotalTrades"]):
+                raise ValueError("legacy point event count must equal TotalTrades without memberships")
+        else:
+            if tuple(sorted(set(point.event_ids))) != point.event_ids or len(point.event_ids) != point.point_event_count:
+                raise ValueError("real point event membership does not match point event count")
+            if any(len(event_id) != 64 or any(char not in "0123456789abcdef" for char in event_id) for event_id in point.event_ids):
+                raise ValueError("event IDs must be lowercase SHA-256 digests")
         try:
             _canonical_json(point.metrics)
         except (TypeError, ValueError) as error:
@@ -652,7 +707,7 @@ def publish_surface(analysis_connection: duckdb.DuckDBPyConnection, surface: Dir
     ensure_analysis_schema(analysis_connection)
     surface_id, identity = _surface_identity(surface)
     points = _validate_surface(surface, identity)
-    existing = analysis_connection.execute("select surface_id, parent_surface_id from surfaces where surface_id=?", [surface_id]).fetchone()
+    existing = analysis_connection.execute("select surface_id, parent_surface_id, event_mode from surfaces where surface_id=?", [surface_id]).fetchone()
     if existing:
         stored = tuple(analysis_connection.execute(
             """select canonical_point_key,source_report_id,source_hash,point_event_count,provenance_state,metrics_json
@@ -663,13 +718,23 @@ def publish_surface(analysis_connection: duckdb.DuckDBPyConnection, surface: Dir
              "REPRODUCIBLE_AT_PUBLICATION", _canonical_json(point.metrics))
             for point in points
         )
-        if stored != incoming or (surface.parent_surface_id is not None and existing[1] != surface.parent_surface_id):
+        stored_events = tuple(analysis_connection.execute(
+            "select canonical_point_key,event_id from surface_point_events where surface_id=? order by canonical_point_key,event_id",
+            [surface_id],
+        ).fetchall())
+        incoming_events = tuple(
+            (point.canonical_point_key, event_id)
+            for point in points for event_id in point.event_ids
+        )
+        if stored != incoming or stored_events != incoming_events or existing[2] != surface.event_mode or (surface.parent_surface_id is not None and existing[1] != surface.parent_surface_id):
             raise ValueError("incoming surface conflicts with immutable publication")
         from .duckdb_direct import DirectPoint
         return PublishedSurface(
             str(existing[0]), existing[1], False,
-            tuple(DirectPoint(key, report_id, source_hash, event_count, json.loads(metrics_json))
-                  for key, report_id, source_hash, event_count, provenance, metrics_json in stored),
+            tuple(DirectPoint(
+                key, report_id, source_hash, event_count, json.loads(metrics_json),
+                tuple(event_id for point_key, event_id in stored_events if point_key == key),
+            ) for key, report_id, source_hash, event_count, provenance, metrics_json in stored),
         )
     expected_parent_id = _parent_surface_id(analysis_connection, identity, surface.parent_surface_id)
     analysis_connection.execute("begin transaction")
@@ -677,10 +742,10 @@ def publish_surface(analysis_connection: duckdb.DuckDBPyConnection, surface: Dir
         parent_id = expected_parent_id
         analysis_connection.execute(
             """insert into surfaces(surface_id,parent_surface_id,build_mode,period_start_utc,period_end_utc,side,
-                grid_contract_json,normalization_contract_version,materializer_version,point_materialization_config_hash)
-                values (?,?,?,?,?,?,?,?,?,?)""",
+                grid_contract_json,normalization_contract_version,materializer_version,point_materialization_config_hash,event_mode)
+                values (?,?,?,?,?,?,?,?,?,?,?)""",
             [surface_id, parent_id, identity["build_mode"], identity["period"][0], identity["period"][1], identity["side"],
-             _canonical_json(identity["grid_contract"]), identity["normalization_contract"], identity["materializer_version"], identity["point_materialization_config_hash"]],
+             _canonical_json(identity["grid_contract"]), identity["normalization_contract"], identity["materializer_version"], identity["point_materialization_config_hash"], identity["event_mode"]],
         )
         analysis_connection.executemany("insert into surface_sources(surface_id,source_hash) values (?,?)", [(surface_id, source_hash) for source_hash in identity["source_hashes"]])
         pairs: set[tuple[str, str, str, int, int, int]] = set()
@@ -696,6 +761,12 @@ def publish_surface(analysis_connection: duckdb.DuckDBPyConnection, surface: Dir
             "insert into surface_points values (?,?,?,?,?,?,?,?,?)",
             [(surface_id, point.canonical_point_key, f"{'|'.join(point.canonical_point_key.split('|')[:2])}|{'|'.join(point.canonical_point_key.split('|')[3:])}", point.canonical_point_key.split("|")[2], point.point_event_count, point.source_report_id, point.source_hash, "REPRODUCIBLE_AT_PUBLICATION", _canonical_json(point.metrics)) for point in points],
         )
+        event_rows = [
+            (surface_id, point.canonical_point_key, event_id)
+            for point in points for event_id in point.event_ids
+        ]
+        if event_rows:
+            analysis_connection.executemany("insert into surface_point_events values (?,?,?)", event_rows)
         issues = [(sha256(f"{surface_id}|{issue.symbol}|{issue.timeframe}|{issue.code}|{issue.detail}".encode()).hexdigest(), surface_id, issue.symbol, issue.timeframe, issue.code, _canonical_json({"detail": issue.detail})) for issue in surface.preflight.coverage_issues]
         if issues:
             analysis_connection.executemany("insert into coverage_issues values (?,?,?,?,?,?)", issues)

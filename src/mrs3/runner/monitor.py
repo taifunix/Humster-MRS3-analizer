@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlparse
 
 from .config import RunnerConfig
 from .http import RowState, StrategyRow
-from .results import ResultParseError, parse_html_report
+from .results import ResultParseError, extract_html_strategy_name
 
 
 class BatchTimeout(TimeoutError):
@@ -154,10 +154,7 @@ def _report_matches_strategy(path: Path, name: str) -> bool:
 
 
 def _report_strategy_name(path: Path) -> str | None:
-    try:
-        return parse_html_report(path).strategy_name
-    except ResultParseError:
-        return None
+    return extract_html_strategy_name(path)
 
 
 class _ReportSnapshotCollector:
@@ -241,8 +238,11 @@ class _ReportSnapshotCollector:
             key = (report, signature)
             if stable_polls < 2 or key in self._inspected:
                 continue
-            self._inspected.add(key)
             name = _report_strategy_name(report)
+            if name is None:
+                # Keep polling this revision until the tester finishes writing it.
+                continue
+            self._inspected.add(key)
             if name not in self._expected_names:
                 continue
             self._snapshot_dir.mkdir(parents=True, exist_ok=True)

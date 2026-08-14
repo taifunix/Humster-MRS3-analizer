@@ -32,7 +32,6 @@ STRUCTURE_COLUMNS = [
     "orders",
     "plateau_ids",
     "min_close_support",
-    "source_pnl_sum",
     "source_eff_mean",
     "low_sample_depth_count",
     "Order1EventCount",
@@ -104,6 +103,8 @@ def choose_equivalent_default(
     if equivalents.empty:
         raise ValueError("cannot choose representative from an empty point set")
     if "point_event_count" not in equivalents:
+        if "event_mode" in equivalents and equivalents["event_mode"].eq("real_independent_events").any():
+            raise ValueError("point_event_count is required for real_independent_events")
         equivalents["point_event_count"] = equivalents["trades"]
     return equivalents.sort_values(
         ["point_event_count", "shift_bp", "pnl_pct", "efficiency", "trades", "dd_pct", "point_id"],
@@ -346,17 +347,12 @@ def _structure_id(
     return f"STR_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]}"
 
 
-def _tuple_priority(orders: Sequence[Mapping[str, object]]) -> tuple[object, ...]:
-    return (
-        -sum(int(order["shift_bp"]) for order in orders),
-        -sum(float(order["source_pnl_pct"]) for order in orders),
-        -sum(float(order["source_efficiency"]) for order in orders) / len(orders),
-        -sum(int(order["trades"]) for order in orders),
-        tuple(str(order["point_id"]) for order in orders),
-    )
-
-
 def _order_from_point(point: pd.Series, close_support: float) -> dict[str, object]:
+    point_event_count = point.get("point_event_count")
+    if pd.isna(point_event_count):
+        if point.get("event_mode") == "real_independent_events":
+            raise ValueError("point_event_count is required for real_independent_events")
+        point_event_count = point["trades"]
     return {
         "plateau_id": str(point["plateau_id"]),
         "point_id": str(point["point_id"]),
@@ -367,7 +363,7 @@ def _order_from_point(point: pd.Series, close_support: float) -> dict[str, objec
         "source_dd_pct": float(point["dd_pct"]),
         "source_efficiency": float(point["efficiency"]),
         "trades": int(point["trades"]),
-        "point_event_count": int(point.get("point_event_count", point["trades"])),
+        "point_event_count": int(point_event_count),
         "close_support": float(close_support),
         "standalone_eligible": bool(point["standalone_eligible"]),
         "depth_eligible": bool(point["depth_eligible"]),
@@ -401,18 +397,17 @@ def build_structures(
         support_by_plateau = {
             str(row.plateau_id): float(row.support) for row in family.itertuples(index=False)
         }
+        point_by_plateau = {
+            str(row.plateau_id): str(row.point_id) for row in family.itertuples(index=False)
+        }
         candidates_by_plateau: dict[str, list[pd.Series]] = {}
         for plateau_id in sorted(support_by_plateau):
             candidates = points.loc[
-                points["plateau_id"].eq(plateau_id)
-                & points["close_ma"].eq(int(close_ma))
+                points["point_id"].eq(point_by_plateau[plateau_id])
                 & points["economic_pass"]
+                & points["event_eligible"]
             ].copy()
-            equivalents = _equivalent_rows(candidates, config)
-            equivalents = equivalents.loc[equivalents["event_eligible"]]
-            candidates_by_plateau[plateau_id] = [
-                row for _, row in equivalents.sort_values("point_id", kind="mergesort").iterrows()
-            ]
+            candidates_by_plateau[plateau_id] = [] if candidates.empty else [candidates.iloc[0]]
         plateau_ids = [
             plateau_id
             for plateau_id in sorted(candidates_by_plateau)
@@ -454,7 +449,6 @@ def build_structures(
                 chosen_pool = ready_tuples if ready_tuples else deep_tuples
                 if not chosen_pool:
                     continue
-                chosen_pool.sort(key=_tuple_priority)
                 orders = chosen_pool[0]
                 status = (
                     "READY_MRS3_STRUCTURE" if ready_tuples else "DEEP_GAP_RESEARCH"
@@ -493,9 +487,6 @@ def build_structures(
                         "min_close_support": min(
                             float(order["close_support"]) for order in numbered_orders
                         ),
-                        "source_pnl_sum": sum(
-                            float(order["source_pnl_pct"]) for order in numbered_orders
-                        ),
                         "source_eff_mean": sum(
                             float(order["source_efficiency"]) for order in numbered_orders
                         )
@@ -520,12 +511,11 @@ def build_structures(
                 "timeframe",
                 "order_count",
                 "min_close_support",
-                "source_pnl_sum",
                 "source_eff_mean",
                 "low_sample_depth_count",
                 "structure_id",
             ],
-            ascending=[True, True, True, True, False, False, False, True, True],
+            ascending=[True, True, True, True, False, False, True, True],
             kind="mergesort",
         ).reset_index(drop=True)
     diagnostics = pd.DataFrame(

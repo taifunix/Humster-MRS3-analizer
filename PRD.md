@@ -13,7 +13,7 @@ Humster MRS3 Analyzer — локальный, детерминированный
 1. audit происхождения каждой MRS2-точки и причины каждого исключения;
 2. воспроизводимые READY структуры 1ORD/2ORD/3ORD/4ORD с EQUAL и INCOME lot variants;
 3. JSON, технически валидные для тестера;
-4. результаты реального tick-test, DD5-retest и individual ranking;
+4. результаты реального tick-test, расчётная DD5-нормализация и individual ranking;
 5. только после накопления результатов — калиброванный безопасный pre-test potential filter.
 
 ## Текущий этап: v0.7 DuckDB analysis storage and importer
@@ -36,7 +36,7 @@ analysis surfaces, повторный plateau-анализ, lineage, библи�
 | 2 | Source packages | CSV и raw payloads v4 | один declared event mode, window и audit на пакет |
 | 3 | DuckDB materializer | raw payloads v4 | closed cycles, exclusions и `point_period_metrics` |
 | 4 | Selector v0.7 | ровно один source package | event gate, full rebuild, audit и JSON |
-| 5 | Реальные MRS3 results | READY JSON | raw + DD5 retests и individual ranking |
+| 5 | Реальные MRS3 results | READY JSON | raw tick-test + расчётное DD5 ranking и individual ranking |
 | 6 | Source-potential calibration | достаточная пачка results | LOPO-validated optional cap |
 
 ## Границы и safety rules

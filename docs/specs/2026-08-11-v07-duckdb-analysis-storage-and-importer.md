@@ -128,11 +128,22 @@ Daily import controls:
 ### Large HTML preflight progress
 
 For a large HTML tree, Preflight snapshots and hashes every discovered file
-before it can authorize import. The panel runs this work in the configured
-worker pool and exposes a live, non-path-leaking state with discovered-file
-count, snapshotted-file count and processed bytes/total bytes. It disables a
-second Preflight or Start action while that request is active. This is only a
-progress surface; it does not change the snapshot/token safety contract.
+once before it can authorize import. The panel retains that immutable snapshot
+only in process memory and Start import consumes it directly; Start must not
+repeat directory discovery or full HTML hashing. The panel runs Preflight in
+the configured worker pool and exposes a live, non-path-leaking state with
+discovered-file count, snapshotted-file count and processed bytes/total bytes.
+It disables a second Preflight or Start action while that request is active.
+HTML parsing runs in a `ProcessPoolExecutor` with the configured worker count;
+workers return pickle-safe codec results and never open DuckDB. At most one
+bounded queue of `workers * 3` parse/prepare tasks is in flight. Each completed
+worker result updates panel progress. Cancellation stops scheduling remaining
+HTML before publication. After canonical grouping, the one DuckDB coordinator
+writes points, grids, reports, payloads and replacement audit rows with
+per-table batch operations, not SQL once per report. An authorized Preflight is
+reused after staging copy; each committed batch verifies its written report
+metadata and payload references, while historical opaque payloads are not
+globally decoded or revalidated during Start import.
 
 Settings contain:
 
@@ -151,12 +162,18 @@ remain only in ignored configuration and operational logs.
 - Exact duplicate detection occurs before replacement.
 - Incoming canonical duplicates are grouped before write decisions, so process
   completion order cannot choose a winner.
-- Replacement updates report metadata and payload in one transaction.
+- Replacement updates report metadata and payload atomically in the unpublished
+  staging database.
 - A failed transaction leaves the previous canonical report readable.
 - Committed batches may remain after a later job failure; repeating the same
   import safely skips identical reports and resumes the rest.
 - HTML is never deleted by the importer.
 - Quarantine and deletion checklists remain mandatory operational evidence.
+- Start import rejects a changed preflight tree using file size and
+  `mtime_ns`, and repeats that inexpensive check before staging publication.
+  It does not perform another full-tree HTML or source-DuckDB hash pass.
+- Running import progress identifies `PARSING`, `GROUPING`, `STAGING`,
+  `WRITING` and `PUBLISHING`, with parsed/inserted/replaced/quarantined counts.
 
 ## Direct DuckDB analysis surface
 
@@ -173,6 +190,13 @@ A direct build consumes:
 - selected symbols and usable timeframes;
 - an immutable grid contract;
 - the materializer version and point-materialization configuration hash.
+
+The panel derives the required shift list automatically when the user has not
+explicitly supplied one: it takes every observed shift that has at least one
+report fully covering the requested UTC window for the selected side and
+symbols. Preflight freezes that resulting list into the immutable surface
+contract and still rejects incomplete MA-pair/timeframe cells. Manual shift
+range controls are not required for ordinary whole-surface analysis.
 
 Plateau/selection algorithm settings are not surface inputs. They belong only
 to an `analysis_run`, so a different plateau configuration reuses the same
@@ -201,11 +225,17 @@ Historical source data lacking such a manifest may use an immutable
 `OBSERVED_GRID_CONTRACT`:
 
 1. Select the required shift range and step explicitly.
-2. Take the union of observed MA pairs over required shifts.
-3. Require the same MA-pair set at every required shift.
-4. Exclude incomplete timeframes and record missing cells.
+2. Take the intersection of observed MA pairs over required shifts.
+3. Include the maximal MA-pair set present at every required shift.
+4. Record and exclude incomplete MA pairs; exclude a timeframe only when no
+   complete MA pair remains.
 5. State that a point absent at every shift cannot be discovered from observed
    data alone.
+
+When more than one active report for the same canonical point covers the
+requested window, direct preflight deterministically selects the narrowest
+covering report (then stable start/end/report-ID tie-breakers) and records the
+resolved overlap in coverage audit.
 
 No missing cell is interpolated.
 
@@ -296,6 +326,8 @@ Lineage never merges period metrics.
 The panel provides:
 
 - source coverage preflight by symbol/timeframe;
+- an explicit writable analysis-schema v4 initialization/migration action with
+  visible in-place `running`, `ready` or error feedback next to the action;
 - selected-by-default checkboxes for usable symbols;
 - red noninteractive warnings for unavailable symbols;
 - surface build progress and final unique-point counts;
@@ -305,6 +337,36 @@ The panel provides:
 
 The analysis DuckDB is canonical. CSV and Excel are generated exports of a
 specific immutable surface or analysis run.
+
+### Sequential panel workflow
+
+The panel presents the production path in execution order: source import,
+direct surface, plateau analysis, review/export, JSON strategy generation,
+test-plan validation, tester run, then DD5 post-test analysis. Earlier
+manual/advanced controls remain available, but they do not replace this path.
+
+Selecting a surface pre-fills the analysis input. A committed analysis run
+pre-fills its run ID and a semantic, empty export directory. Generating JSON
+uses only `READY_MRS3_STRUCTURE` candidates stored for that exact analysis run;
+it reloads the immutable surface solely to validate the source points used by
+each generated JSON. It never re-runs plateau selection, consumes a legacy
+CSV/source-pack, or automatically starts the bot.
+
+The panel first renders a reviewable shortlist for the selected run. Every row
+shows its structure ID, pair, timeframe, common Close MA, order count and each
+selected point's shift, PnL, drawdown and event/trade count. JSON generation
+requires an explicit nonempty selection from that shortlist; it must not
+silently emit every READY row. For every selected READY structure, generation
+emits exactly the `EQUAL` and `INCOME` lot variants. Publication is atomic: a
+failure leaves a prior strategy directory intact. Its generated strategy
+directory becomes the default input to the subsequent Test plan and Run tests
+controls. Paths whose values cannot be inferred, such as the user-owned
+strategy template and listing-date file, remain explicit editable inputs.
+
+The panel does not invent a Top-N reduction. The event-specification's exact
+same-behavior redundancy filter is available only to runs with real independent
+event identities; a `legacy_trades_proxy` run remains reviewable but cannot
+claim that such a reduction is valid.
 
 ## Acceptance evidence
 
@@ -324,7 +386,7 @@ specific immutable surface or analysis run.
 - Panel tests cover settings persistence, import preflight/progress, single-job
   enforcement, coverage warnings, surface statistics and stale-preflight
   rejection.
-- Task 14 tests cover the explicit writable v3 initialization/migration action,
+- Task 14 tests cover the explicit writable v4 initialization/migration action,
   read-only library/compare/export paths, immutable-surface analysis re-runs,
   explicit refinement parentage, separate period facts and byte-stable exports.
   Focused evidence is `104 passed`; independent Terra review approved after

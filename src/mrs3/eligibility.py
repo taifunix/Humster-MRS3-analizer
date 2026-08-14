@@ -91,6 +91,8 @@ def _reject_reasons(row: pd.Series, config: AlgorithmConfig) -> tuple[str, ...]:
 def annotate_eligibility(points: pd.DataFrame, config: AlgorithmConfig) -> pd.DataFrame:
     out = points.copy()
     if "point_event_count" not in out:
+        if "event_mode" in out and out["event_mode"].eq("real_independent_events").any():
+            raise ValueError("point_event_count is required for real_independent_events")
         out["point_event_count"] = out["trades"]
     out["point_event_count"] = _exact_non_negative_integer(
         out["point_event_count"], "point_event_count"
