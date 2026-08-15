@@ -29,6 +29,7 @@ from mrs3.duckdb_direct import (
     DirectQueueResult,
     DirectSurface,
     _canonical_json_bytes,
+    _effective_window,
     coverage_audit_csv_bytes,
     coverage_inventory_csv_bytes,
     list_duckdb_direct_coverage,
@@ -325,6 +326,107 @@ def test_coverage_merges_touching_effective_windows_per_cell(connections) -> Non
     assert row.interval_start_utc == "2024-01-01T00:00:00.000+00:00"
     assert row.interval_end_utc == "2024-01-01T04:00:00.000+00:00"
     assert row.gap_details == ()
+
+
+def _seed_onusdt_shift_430_double_zero_rows(
+    source: duckdb.DuckDBPyConnection,
+) -> None:
+    zero_ms = START_MS
+    for open_ma in (5, 6, 7):
+        for close_ma in range(2, 8):
+            _seed_report(
+                source,
+                symbol="ONUSDT",
+                timeframe="15m",
+                shift=430,
+                open_ma=open_ma,
+                close_ma=close_ma,
+                start_ms=zero_ms,
+                end_ms=zero_ms,
+                grid_start_ms=zero_ms,
+                grid_end_ms=zero_ms,
+                source_hash=_hash("onusdt", open_ma, close_ma),
+            )
+
+
+def test_coverage_ignores_double_degenerate_rows_only_when_report_and_grid_are_zero_duration(
+    connections,
+) -> None:
+    source, _ = connections
+    _seed_report(source)
+    baseline = list_duckdb_direct_coverage(source, symbols=())
+
+    _seed_onusdt_shift_430_double_zero_rows(source)
+    coverage = list_duckdb_direct_coverage(source, symbols=())
+
+    assert coverage.rows == baseline.rows
+    assert coverage.intervals == baseline.intervals
+    assert [(row.symbol, row.timeframe) for row in coverage.rows] == [("BTCUSDT", "1h")]
+
+
+@pytest.mark.parametrize("grid_zero", [False, True])
+def test_effective_window_remains_fail_closed_for_single_degenerate_windows(
+    connections,
+    grid_zero: bool,
+) -> None:
+    source, _ = connections
+    if grid_zero:
+        _seed_report(
+            source,
+            source_hash="grid-zero",
+            start_ms=START_MS,
+            end_ms=END_MS,
+            grid_start_ms=START_MS,
+            grid_end_ms=START_MS,
+        )
+    else:
+        _seed_report(
+            source,
+            source_hash="report-zero",
+            start_ms=START_MS,
+            end_ms=START_MS,
+            grid_start_ms=START_MS,
+            grid_end_ms=END_MS,
+        )
+
+    with pytest.raises(DirectMaterializationError, match="empty report/grid intersection"):
+        list_duckdb_direct_coverage(source, symbols=())
+
+
+def test_effective_window_remains_fail_closed_for_reversed_and_disjoint_windows() -> None:
+    rows = (
+        {
+            "canonical_point_key": "SYM|LONG|15m|430|5|2",
+            "report_period_start_ms": 300,
+            "report_period_end_ms": 100,
+            "start_timestamp_ms": 0,
+            "end_timestamp_ms": 200,
+        },
+        {
+            "canonical_point_key": "SYM|LONG|15m|430|5|2",
+            "report_period_start_ms": 0,
+            "report_period_end_ms": 200,
+            "start_timestamp_ms": 300,
+            "end_timestamp_ms": 100,
+        },
+        {
+            "canonical_point_key": "SYM|LONG|15m|430|5|2",
+            "report_period_start_ms": 300,
+            "report_period_end_ms": 100,
+            "start_timestamp_ms": 400,
+            "end_timestamp_ms": 50,
+        },
+        {
+            "canonical_point_key": "SYM|LONG|15m|430|5|2",
+            "report_period_start_ms": 0,
+            "report_period_end_ms": 100,
+            "start_timestamp_ms": 200,
+            "end_timestamp_ms": 300,
+        },
+    )
+    for row in rows:
+        with pytest.raises(DirectMaterializationError, match="empty report/grid intersection"):
+            _effective_window(row)
 
 
 def _seed_readiness_scope(

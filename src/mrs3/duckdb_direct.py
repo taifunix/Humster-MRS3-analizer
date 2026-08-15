@@ -232,6 +232,13 @@ def _reports(source: duckdb.DuckDBPyConnection, request: DirectBuildRequest) -> 
         parameters,
     )
     rows = [dict(zip((item[0] for item in cursor.description), row, strict=True)) for row in cursor.fetchall()]
+    rows = [
+        row for row in rows
+        if not (
+            int(row["report_period_start_ms"]) == int(row["report_period_end_ms"])
+            and int(row["start_timestamp_ms"]) == int(row["end_timestamp_ms"])
+        )
+    ]
     if not request.selected_scopes:
         return rows
     selected = set(request.selected_scopes)
