@@ -29,6 +29,14 @@ and the existing
 - The DuckDB surface coverage contract has a separately approved amendment in
   ADR-0008. Runtime still uses the earlier one-MA-pair readiness rule and aborts
   globally on structurally zero-duration report/grid rows.
+- The ADR-0008 implementation project draft is written in
+  [the Common Close-MA Readiness plan](docs/superpowers/plans/2026-08-15-common-close-ma-readiness.md)
+  as a project draft. ADR-0008 is frozen; the draft requires revision before
+  execution and no implementation task may start from it.
+- Priority 1 is the approved operational patch for the current one-MA-pair
+  flow: double-zero isolation, stale-token clearing, actionable safe errors,
+  side ordinal, coverage artifact links, truthful UTC/Side guidance, exact
+  preview-to-real-preflight reproduction, and one current panel process.
 
 ## Latest Verification
 
@@ -42,16 +50,18 @@ and the existing
 
 ## Next Required Work
 
-1. Write and execute the implementation plan for ADR-0008 before relying on
-   panel coverage completeness across Close MA `2..7`.
-2. Resolve the contract/plan mismatch before changing behavior: the runner must
+1. Write and review the Priority-1 operational patch implementation plan, then
+   execute it with TDD and a live one-process panel smoke check.
+2. Do not execute or extend the frozen ADR-0008 project plan until that work is
+   resumed explicitly.
+3. Resolve the contract/plan mismatch before changing behavior: the runner must
    remain name-only, while library acceptance currently requires full metric
    and trade reconciliation. Record the chosen library-specific boundary in the
    specification and plan.
-3. Execute Task 3 with failing workflow and CLI tests.
-4. Publish and verify the library manifest before removing any live duplicate.
-5. Add a read-only `tester-report-library` command with explicit `--apply`.
-6. Run focused and relevant broader tests, `git diff --check`, and independent
+4. Execute Task 3 with failing workflow and CLI tests.
+5. Publish and verify the library manifest before removing any live duplicate.
+6. Add a read-only `tester-report-library` command with explicit `--apply`.
+7. Run focused and relevant broader tests, `git diff --check`, and independent
    review before enabling operational cleanup.
 
 ## Blockers And Safety
@@ -61,6 +71,21 @@ and the existing
 - Do not treat the current panel coverage checkbox as proof that every Close MA
   `2..7` shares the displayed interval until ADR-0008 is implemented and
   verified.
+- The live panel on port `8765` serves stale HTML and does not expose the current
+  multi-side/date-only source implementation; it must be restarted before UI
+  behavior is accepted.
+- `ONUSDT` coverage currently aborts globally on its structurally double-zero
+  `LONG/15m` rows, so no coverage token or inventory is produced for otherwise
+  usable ONUSDT scopes.
+- Coverage-token `/preflight` currently previews cached common intervals only;
+  source revalidation, side audits, and real `DirectPreflight` occur after
+  `Start`, so expensive failures appear late in the background job.
+- Direct runs repeat full source validation and payload hashing several times;
+  a normal two-side run can perform up to eight structural passes over the
+  current archive.
+- A failed coverage refresh leaves the previous table/token visible. Background
+  `FAILED`/`PARTIAL` details and queue ordinal are discarded, and the panel does
+  not expose the generated coverage audit links.
 - The approved report-library specification is not currently registered in the
   active-document table in `PRD.md`.
 - Do not use `publish_verified_reports(..., apply=True)` operationally yet: the

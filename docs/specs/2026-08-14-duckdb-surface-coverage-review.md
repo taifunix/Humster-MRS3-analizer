@@ -1,10 +1,11 @@
 # DuckDB Surface Coverage Review
 
-**Status:** Approved contract change; implementation pending
+**Status:** Priority-1 operational patch approved; ADR-0008 implementation frozen
 **Date:** 2026-08-15
 **Design evidence:** [DuckDB Surface Coverage Review Design](../superpowers/specs/2026-08-14-duckdb-surface-coverage-review-design.md)
 **Baseline implementation evidence:** [DuckDB Surface Coverage Review Baseline Plan](../superpowers/plans/2026-08-14-duckdb-surface-coverage-review.md)
-**ADR-0008 implementation plan:** Pending written-spec review
+**ADR-0008 project plan (frozen; revision required before execution):**
+[Common Close-MA Readiness Plan](../superpowers/plans/2026-08-15-common-close-ma-readiness.md)
 **Related ADRs:** [ADR-0007](../decisions/0007-observed-sparse-surface-contract.md),
 [ADR-0008](../decisions/0008-common-close-ma-readiness-and-degenerate-row-isolation.md)
 
@@ -25,10 +26,10 @@ In scope:
   materialization;
 - `Pair -> LONG/SHORT -> TF` rows with date-only
   `Select | TF | Available interval | Gap` presentation;
-- readiness-gated selection using `close_ma_2_7_common_interval_v1`: every Close
-  MA `2..7` has at least one Open MA satisfying `shift_readiness_v1` with
-  maximum `430 bp`, exact `30/150/430` boundaries, `<=10 bp` then `<=40 bp`
-  maximum gaps, and denser optional data accepted;
+- readiness-gated selection using the currently implemented
+  `shift_readiness_v1` with maximum `430 bp`, exact `30/150/430` boundaries,
+  `<=10 bp` then `<=40 bp` maximum gaps, one common MA pair, and denser optional
+  data accepted;
 - publication of every fully covering factual point for selected gap-free and
   readiness-passing scopes, including points above `430 bp` and partial MA
   coverage;
@@ -50,6 +51,57 @@ Out of scope:
   progress-activity panel phase;
 - portfolio simulation or treating source metrics as tested MRS3 performance.
 
+### Priority-1 Operational Patch
+
+The current one-MA-pair runtime contract remains active while this patch is
+implemented. The patch is intentionally limited to making that existing flow
+usable and diagnosable:
+
+- ignore a source row only when its report window and persisted grid window are
+  each zero-duration; every other empty intersection remains fail-closed;
+- clear the browser coverage token and previous review before a new scan and
+  keep them cleared if that scan fails;
+- preserve safe error redaction while exposing controlled direct-preflight,
+  preparation, and publication failures in direct job status;
+- retain and render active side, ordinal, and total for sequential side work;
+- expose verified coverage inventory and side-audit artifacts through the
+  existing artifact endpoint;
+- state beside the direct controls that coverage derives UTC intervals and side
+  from checked `Pair + Side + TF` rows; the manual UTC/Side controls do not
+  constrain the coverage-token workflow;
+- after verification, stop duplicate panel processes and launch one process
+  serving the current source.
+
+The coverage preview token and real preflight are one contract. The token binds
+the source evidence, displayed rows and exact intervals, readiness witnesses,
+and inventory hash. The selected preview binds exact `Pair + Side + TF` scopes
+and the per-side common UTC interval. At `Start`, the real preflight revalidates
+the source under the existing read-only transaction. If the source is unchanged,
+its selected scopes, per-timeframe coverage facts, per-side publication
+intervals, and readiness-contract version must exactly equal the accepted UI
+preview. Any mismatch or changed token fails before publication; the real
+preflight may not silently widen, narrow, add, or remove a UI-selected scope.
+
+This patch does not convert the token preview into a prepared-surface token and
+does not remove the mandatory source revalidation at `Start`.
+
+### Frozen ADR-0008 Follow-up
+
+ADR-0008 implementation is frozen until explicitly resumed. Before execution,
+its project plan and detailed design must be revised together to include:
+
+- common Close MA `2..7` readiness and the compact `MA-C` presentation;
+- human-readable `coverage_summary.csv` and ignored-row diagnostics;
+- indeterminate/elapsed coverage progress and repeat-submit locking;
+- measured reduction of repeated structural source passes;
+- one real-preflight contract shared with the preview, with an explicitly
+  approved reuse or prepared-token lifecycle;
+- all remaining Priority-1 findings that are not closed by the operational
+  patch.
+
+No ADR-0008 production task may start from the linked project plan until that
+revision is approved.
+
 ## 3. Invariants
 
 1. Coverage is derived only from source DuckDB `report_start/report_end` facts
@@ -59,11 +111,10 @@ Out of scope:
 2. A row is selectable only when it has a continuous factual chain and a
    readiness-passing exact interval; rows with gaps or no readiness-capable
    interval are diagnostic-only and disabled.
-3. The readiness contract is exact: every Close MA `2..7` has one selected Open
-   MA covering boundary shifts `30`, `150`, and `430` with maximum gaps of
-   `10 bp` then `40 bp`. A selected Open MA cannot be stitched across
-   subintervals; different Close MAs may select different Open MAs. The row uses
-   the longest common qualifying interval and stores all six ordered witnesses.
+3. The active readiness contract is exact: one MA pair covers boundary shifts
+   `30`, `150`, and `430` with maximum gaps of `10 bp` then `40 bp`. Denser
+   shifts and optional partial MA coverage do not disable an otherwise ready
+   row. The common Close MA `2..7` replacement remains frozen under ADR-0008.
 4. `430 bp` is a minimum gate. Once passed, every fully covering factual point
    is included; no absent point is synthesized.
 5. V1 rectangular surface identity and validation remain unchanged. V2 identity
@@ -94,8 +145,7 @@ canonical scope/invariant file together without introducing contradictions.
 - ADR-0007 and ADR-0008 are accepted, and this canonical spec is linked from
   PRD and progress.
 - Factual coverage and readiness tests prove deterministic merging, exact
-  readiness, optional-data acceptance, all Close MAs `2..7`, differing selected
-  Open MAs, common-interval tie-breaking, and complete missing-interval
+  one-MA-pair readiness, optional-data acceptance, and complete missing-interval
   reporting.
 - Coverage tests prove structurally degenerate rows do not contribute or abort,
   while incompatible non-empty windows and one-sided zero-duration windows fail
@@ -118,3 +168,11 @@ canonical scope/invariant file together without introducing contradictions.
   implementation plan.
 - PRD points to this canonical spec; progress records only verified facts and
   does not claim implementation that has not been completed.
+- Priority-1 tests prove double-zero exclusion, stale-token clearing, safe error
+  display, side ordinal retention, coverage artifact links, and truthful
+  UTC/Side guidance.
+- A token-to-real-preflight regression test proves unchanged source data yields
+  exactly the previewed scopes, per-timeframe coverage facts, side intervals,
+  and current readiness version; changed evidence fails before publication.
+- A live smoke check proves exactly one panel process serves the current
+  date-only, side-aware source UI.
