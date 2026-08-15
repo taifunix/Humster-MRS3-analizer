@@ -16,12 +16,17 @@ from mrs3 import panel as panel_module
 from mrs3.panel import PanelController, _Job, create_panel_server
 from mrs3.duckdb_import import ImportJobResult, ImportPreflight, ImportProgress
 from mrs3.duckdb_direct import (
+    DirectBuildRequest,
     CoverageIssue,
     CoverageReviewRow,
     DirectCoverage,
+    DirectMaterializationError,
     DirectPreflight,
     DirectQueueResult,
     DirectScope,
+    READINESS_CONTRACT_VERSION,
+    READINESS_MAX_SHIFT_BP,
+    V2_GRID_CONTRACT_KIND,
     _CoverageScan,
 )
 
@@ -35,6 +40,23 @@ class _FakeProcess:
 
     def wait(self) -> int:
         return self.returncode
+
+
+class _SynchronousThread:
+    def __init__(
+        self,
+        target: object = None,
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+        **_: object,
+    ) -> None:
+        self.target = target
+        self.args = args
+        self.kwargs = kwargs or {}
+
+    def start(self) -> None:
+        if self.target is not None:
+            self.target(*self.args, **self.kwargs)
 
 
 class _PerformanceProgressProcess(_FakeProcess):
@@ -444,6 +466,134 @@ def test_direct_start_derives_one_common_interval_per_side(tmp_path: Path) -> No
         "2024-01-02T00:00:00.000+00:00",
         "2024-01-02T00:00:00.000+00:00",
     ]
+
+
+def test_preview_contract_matches_direct_start_requests_and_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    scan = _fake_coverage_scan(tmp_path)
+    captured: list[DirectBuildRequest] = []
+    published: list[object] = []
+
+    def prepare(
+        _source: object,
+        requests: tuple[DirectBuildRequest, ...],
+        *,
+        audit_root: object,
+        coverage_scan: object,
+        cancellation: object,
+        progress_callback: object,
+    ) -> tuple[object, ...]:
+        captured.extend(requests)
+        return tuple(
+            SimpleNamespace(request=request, points=(), preflight=SimpleNamespace(audit_sha256=''))
+            for request in requests
+        )
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        *,
+        cancellation: object,
+        progress_callback: object,
+        parent_surface_id: str | None = None,
+    ) -> DirectQueueResult:
+        published.append(True)
+        return DirectQueueResult(
+            'PUBLISHED',
+            tuple(
+                SimpleNamespace(surface_id=f'surface-{surface.request.side}', points=())
+                for surface in surfaces
+            ),
+        )
+
+    monkeypatch.setattr('mrs3.panel.threading.Thread', _SynchronousThread)
+    controller = PanelController(
+        tmp_path,
+        tmp_path / 'config.local.json',
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+        direct_prepare_func=prepare,
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings({'source_duckdb_path': 'source.duckdb', 'analysis_duckdb_path': 'analysis.duckdb', 'audit_root': 'audit'})
+    controller.duckdb_direct_coverage({'symbols': []})
+    payload = {
+        'coverage_token': 'coverage-token',
+        'selected_scopes': [
+            {'symbol': 'BTCUSDT', 'side': 'LONG', 'timeframe': '1h'},
+            {'symbol': 'BTCUSDT', 'side': 'SHORT', 'timeframe': '1h'},
+        ],
+    }
+
+    preview = controller.duckdb_direct_preflight(payload)
+    controller.start_duckdb_direct(payload)
+    status = controller.snapshot()['duckdb_direct']
+
+    assert status['publication_state'] == 'PUBLISHED'
+    assert published == [True]
+    assert len(captured) == 2
+    for side in ('LONG', 'SHORT'):
+        interval = preview['selected_intervals'][side.lower()]
+        request = next(item for item in captured if item.side == side)
+        assert request.start_utc == interval['start_utc']
+        assert request.end_utc == interval['end_utc']
+        assert request.selected_scopes == ('BTCUSDT|1h',)
+        assert request.symbols == ('BTCUSDT',)
+        assert request.grid_contract_kind == V2_GRID_CONTRACT_KIND
+        assert request.readiness_contract_version == READINESS_CONTRACT_VERSION
+        assert request.readiness_max_shift_bp == READINESS_MAX_SHIFT_BP
+
+
+def test_direct_prepare_failure_never_calls_publish_and_snapshot_is_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    scan = _fake_coverage_scan(tmp_path)
+    published: list[object] = []
+
+    def prepare(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        raise DirectMaterializationError('active coverage scan changed after preflight')
+
+    def publish(*_args: object, **_kwargs: object) -> DirectQueueResult:
+        published.append(True)
+        return DirectQueueResult('PUBLISHED', ())
+
+    monkeypatch.setattr('mrs3.panel.threading.Thread', _SynchronousThread)
+    controller = PanelController(
+        tmp_path,
+        tmp_path / 'config.local.json',
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+        direct_prepare_func=prepare,
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings({'source_duckdb_path': 'source.duckdb', 'analysis_duckdb_path': 'analysis.duckdb', 'audit_root': 'audit'})
+    controller.duckdb_direct_coverage({'symbols': []})
+    payload = {
+        'coverage_token': 'coverage-token',
+        'selected_scopes': [
+            {'symbol': 'BTCUSDT', 'side': 'LONG', 'timeframe': '1h'},
+            {'symbol': 'BTCUSDT', 'side': 'SHORT', 'timeframe': '1h'},
+        ],
+    }
+
+    controller.duckdb_direct_preflight(payload)
+    controller.start_duckdb_direct(payload)
+    status = controller.snapshot()['duckdb_direct']
+
+    assert status['publication_state'] == 'FAILED'
+    assert status['phase'] == 'FAILED'
+    assert status['surface_id'] is None
+    assert status['error'] == 'DirectMaterializationError: direct build failed'
+    assert published == []
 
 
 def test_v2_selected_preflight_ignores_legacy_window_and_does_not_call_legacy_preflight(tmp_path: Path) -> None:

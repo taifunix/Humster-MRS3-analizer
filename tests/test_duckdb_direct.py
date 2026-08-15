@@ -27,7 +27,12 @@ from mrs3.duckdb_direct import (
     DirectPoint,
     DirectPreflight,
     DirectQueueResult,
+    DirectScope,
     DirectSurface,
+    _CoverageScan,
+    _coverage_scan_rows,
+    common_intervals_for_scopes,
+    coverage_scan_direct,
     _canonical_json_bytes,
     _effective_window,
     coverage_audit_csv_bytes,
@@ -57,6 +62,7 @@ from mrs3.duckdb_source_schema import (
 
 START_MS = 1_704_067_200_000
 END_MS = 1_704_074_400_000
+READY_SHIFTS = tuple(range(30, 151, 10)) + tuple(range(190, 431, 40))
 
 
 def _hash(*values: object) -> str:
@@ -943,6 +949,218 @@ def test_coverage_scan_returns_long_and_short_groups(connections) -> None:
         ("BTCUSDT", "SHORT", "1h"),
     ]
     assert len(coverage.rows) == 2
+
+
+def _seed_ready_scope(
+    source: duckdb.DuckDBPyConnection,
+    *,
+    side: str = 'LONG',
+) -> None:
+    _seed_readiness_scope(
+        source,
+        symbol='BTCUSDT',
+        side=side,
+        shifts=READY_SHIFTS,
+    )
+
+
+def _coverage_build_request(
+    scan: _CoverageScan,
+    *,
+    symbol: str = 'BTCUSDT',
+    side: str = 'LONG',
+    timeframe: str = '1h',
+) -> DirectBuildRequest:
+    interval = common_intervals_for_scopes(
+        scan.coverage,
+        (DirectScope(symbol, side, timeframe),),
+    )[0]
+    return _request(
+        start_utc=interval.start_utc,
+        end_utc=interval.end_utc,
+        side=side,
+        symbols=(symbol,),
+        required_shifts_bp=(),
+        selected_scopes=(f'{symbol}|{timeframe}',),
+        grid_contract_kind=V2_GRID_CONTRACT_KIND,
+        readiness_contract_version=READINESS_CONTRACT_VERSION,
+        readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+    )
+
+
+def test_unchanged_source_scan_token_and_prepare_match_preview(
+    connections, tmp_path: Path
+) -> None:
+    source, _ = connections
+    _seed_ready_scope(source, side='LONG')
+    _seed_ready_scope(source, side='SHORT')
+
+    scan = coverage_scan_direct(source, tmp_path, symbols=())
+    active_scan = coverage_scan_direct(source, tmp_path, symbols=())
+    assert active_scan.token == scan.token
+    assert active_scan.source_evidence_sha256 == scan.source_evidence_sha256
+    assert active_scan.inventory_sha256 == scan.inventory_sha256
+
+    scopes = (
+        DirectScope('BTCUSDT', 'LONG', '1h'),
+        DirectScope('BTCUSDT', 'SHORT', '1h'),
+    )
+    preview_intervals = common_intervals_for_scopes(active_scan.coverage, scopes)
+    requests = tuple(
+        _coverage_build_request(active_scan, side=scope.side)
+        for scope in scopes
+    )
+    surfaces = prepare_direct_surfaces(
+        source,
+        requests,
+        audit_root=tmp_path,
+        coverage_scan=scan,
+    )
+    assert [surface.request.side for surface in surfaces] == ['LONG', 'SHORT']
+    for request, interval in zip(requests, preview_intervals, strict=True):
+        assert request.start_utc == interval.start_utc
+        assert request.end_utc == interval.end_utc
+        assert request.selected_scopes == ('BTCUSDT|1h',)
+        assert request.grid_contract_kind == V2_GRID_CONTRACT_KIND
+        assert request.readiness_contract_version == READINESS_CONTRACT_VERSION
+        assert request.readiness_max_shift_bp == READINESS_MAX_SHIFT_BP
+    for surface, request in zip(surfaces, requests, strict=True):
+        assert surface.request.start_utc == request.start_utc
+        assert surface.request.end_utc == request.end_utc
+        assert surface.request.side == request.side
+        assert surface.request.symbols == request.symbols
+        assert surface.request.selected_scopes == request.selected_scopes
+        assert surface.request.grid_contract_kind == request.grid_contract_kind
+        assert surface.request.readiness_contract_version == request.readiness_contract_version
+        assert surface.request.readiness_max_shift_bp == request.readiness_max_shift_bp
+
+
+def test_changed_source_fails_before_materializer(
+    connections, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = connections
+    _seed_ready_scope(source)
+    scan = coverage_scan_direct(source, tmp_path, symbols=())
+    request = _coverage_build_request(scan)
+    _seed_report(source, symbol='ETHUSDT', source_hash='changed-source')
+    materialized: list[object] = []
+
+    def fake_materialize(*args: object, **kwargs: object) -> DirectSurface:
+        materialized.append((args, kwargs))
+        raise AssertionError('materializer must not run after a changed source')
+
+    monkeypatch.setattr('mrs3.duckdb_direct.materialize_duckdb_direct', fake_materialize)
+
+    with pytest.raises(DirectMaterializationError, match='active coverage scan changed after preflight'):
+        prepare_direct_surfaces(
+            source,
+            (request,),
+            audit_root=tmp_path,
+            coverage_scan=scan,
+        )
+
+    assert materialized == []
+
+
+@pytest.mark.parametrize(
+    'mutate_coverage',
+    (
+        lambda coverage: replace(
+            coverage,
+            rows=tuple(
+                replace(row, interval_end_utc='2099-01-01T00:00:00.000+00:00')
+                for row in coverage.rows
+            ),
+        ),
+        lambda coverage: replace(
+            coverage,
+            intervals=tuple(
+                replace(
+                    interval,
+                    witness=replace(
+                        interval.witness,
+                        open_ma=4,
+                        close_ma=10,
+                        shifts_bp=(30, 150, 430),
+                        contract_version='shift_readiness_v2',
+                        max_shift_bp=500,
+                    ),
+                )
+                if interval.witness is not None else interval
+                for interval in coverage.intervals
+            ),
+        ),
+    ),
+    ids=('coverage-row', 'witness-contract'),
+)
+def test_coverage_token_changes_when_canonical_coverage_inputs_change(
+    connections,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate_coverage,
+) -> None:
+    source, _ = connections
+    _seed_ready_scope(source)
+    baseline = coverage_scan_direct(source, tmp_path, symbols=())
+    baseline_inventory = coverage_inventory_csv_bytes(source, symbols=())
+    monkeypatch.setattr(
+        'mrs3.duckdb_direct._direct_coverage',
+        lambda _rows: mutate_coverage(baseline.coverage),
+    )
+    monkeypatch.setattr(
+        'mrs3.duckdb_direct.coverage_inventory_csv_bytes',
+        lambda *args, **kwargs: baseline_inventory,
+    )
+    changed = coverage_scan_direct(source, tmp_path, symbols=())
+
+    assert changed.token != baseline.token
+    assert changed.inventory_sha256 == baseline.inventory_sha256
+    assert changed.source_evidence_sha256 == baseline.source_evidence_sha256
+
+
+def test_coverage_token_changes_when_inventory_changes(
+    connections, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = connections
+    _seed_ready_scope(source)
+    baseline = coverage_scan_direct(source, tmp_path, symbols=())
+    baseline_inventory = coverage_inventory_csv_bytes(source, symbols=())
+    monkeypatch.setattr(
+        'mrs3.duckdb_direct.coverage_inventory_csv_bytes',
+        lambda *args, **kwargs: baseline_inventory + b'changed',
+    )
+    changed = coverage_scan_direct(source, tmp_path, symbols=())
+
+    assert changed.coverage == baseline.coverage
+    assert changed.inventory_sha256 != baseline.inventory_sha256
+    assert changed.source_evidence_sha256 == baseline.source_evidence_sha256
+    assert changed.token != baseline.token
+
+
+def test_coverage_token_changes_when_source_evidence_changes(
+    connections, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = connections
+    _seed_ready_scope(source)
+    baseline = coverage_scan_direct(source, tmp_path, symbols=())
+    baseline_inventory = coverage_inventory_csv_bytes(source, symbols=())
+    rows = [dict(row) for row in _coverage_scan_rows(source, side=None, symbols=())]
+    assert rows
+    rows[0]['source_sha256'] = 'changed-source-evidence'.rjust(64, '0')
+    monkeypatch.setattr(
+        'mrs3.duckdb_direct._coverage_scan_rows',
+        lambda *args, **kwargs: rows,
+    )
+    monkeypatch.setattr(
+        'mrs3.duckdb_direct.coverage_inventory_csv_bytes',
+        lambda *args, **kwargs: baseline_inventory,
+    )
+    changed = coverage_scan_direct(source, tmp_path, symbols=())
+
+    assert changed.coverage == baseline.coverage
+    assert changed.inventory_sha256 == baseline.inventory_sha256
+    assert changed.source_evidence_sha256 != baseline.source_evidence_sha256
+    assert changed.token != baseline.token
 
 
 def test_v2_preflight_selects_narrowest_reports_and_includes_every_factual_point(connections) -> None:
