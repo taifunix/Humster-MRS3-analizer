@@ -69,6 +69,32 @@
 - [x] Mark feature verified, link ADR, record V2 schema-v4 evidence, sequential/partial semantics, and deferred work.
 - [x] Run final diff/status/review and commit `docs: record DuckDB coverage verification`.
 
+### Deferred Follow-up: MA-C Coverage Summary
+
+**Status:** Deferred; not part of the completed coverage implementation.
+
+When explicitly activated, add a separate human-readable
+`coverage_summary.csv` without changing the canonical detailed
+`coverage_inventory.csv` or publication-audit schemas.
+
+- Sort rows by `Pair`, LONG-before-SHORT `Side`, `TF`, then `MA-C`.
+- Emit one row for every expected closing MA in `2..7` with `FULL`, `PARTIAL`,
+  or `MISSING` status for the displayed exact interval.
+- Include the displayed interval, the best readiness-capable exact interval for
+  that MA-C, comma-separated readiness-capable Open MA values, and a stable
+  missing/partial reason.
+- Define `FULL` as at least one Open MA pair satisfying the complete shift
+  readiness contract across the displayed interval. `PARTIAL` means such a
+  pair has a shorter readiness-capable interval; `MISSING` means none exists.
+- Add a compact panel `MA-C` column that lists fully covered values and visually
+  highlights any missing or partial value from `2..7`.
+- Keep the existing checkbox rule unchanged: one fully ready MA pair is enough
+  to make the Pair/Side/TF row selectable.
+- Keep exact UTC timestamps in the CSV while the compact panel continues to
+  render dates only.
+- Handle zero-duration or otherwise invalid report/grid intersections under a
+  separately approved fail-closed versus per-scope-isolation contract.
+
 ## Ponytail Result
 
 No new production module, schema/table, dependency, persistent queue, retry endpoint, lease framework, or path-replacement hook. Add those only after their measurable deferred triggers occur.
