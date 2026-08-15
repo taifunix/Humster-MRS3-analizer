@@ -26,6 +26,9 @@ and the existing
   the inbox and then calls the existing broad cleanup directly.
 - Historical session logs and completed-plan narratives have been removed.
   Durable feature status belongs in `PRD.md`, feature specifications and ADRs.
+- The DuckDB surface coverage contract has a separately approved amendment in
+  ADR-0008. Runtime still uses the earlier one-MA-pair readiness rule and aborts
+  globally on structurally zero-duration report/grid rows.
 
 ## Latest Verification
 
@@ -39,20 +42,25 @@ and the existing
 
 ## Next Required Work
 
-1. Resolve the contract/plan mismatch before changing behavior: the runner must
+1. Write and execute the implementation plan for ADR-0008 before relying on
+   panel coverage completeness across Close MA `2..7`.
+2. Resolve the contract/plan mismatch before changing behavior: the runner must
    remain name-only, while library acceptance currently requires full metric
    and trade reconciliation. Record the chosen library-specific boundary in the
    specification and plan.
-2. Execute Task 3 with failing workflow and CLI tests.
-3. Publish and verify the library manifest before removing any live duplicate.
-4. Add a read-only `tester-report-library` command with explicit `--apply`.
-5. Run focused and relevant broader tests, `git diff --check`, and independent
+3. Execute Task 3 with failing workflow and CLI tests.
+4. Publish and verify the library manifest before removing any live duplicate.
+5. Add a read-only `tester-report-library` command with explicit `--apply`.
+6. Run focused and relevant broader tests, `git diff --check`, and independent
    review before enabling operational cleanup.
 
 ## Blockers And Safety
 
 - Task 3 operational integration is blocked by the unresolved reconciliation
   contract above.
+- Do not treat the current panel coverage checkbox as proof that every Close MA
+  `2..7` shares the displayed interval until ADR-0008 is implemented and
+  verified.
 - The approved report-library specification is not currently registered in the
   active-document table in `PRD.md`.
 - Do not use `publish_verified_reports(..., apply=True)` operationally yet: the

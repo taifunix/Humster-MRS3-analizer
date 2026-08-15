@@ -27,17 +27,21 @@ surface construction.
 - Coverage is derived only from source-DuckDB `report_start/report_end` facts.
 - Every interval uses normalized UTC half-open semantics `[start, end)`.
 - A report cell's effective window is the intersection of its report-period
-  window and persisted time-grid window. Empty intersections are invalid.
+  window and persisted time-grid window. A row whose report and grid windows
+  are both zero-duration is excluded before this calculation and contributes
+  no coverage. Every other empty intersection is a fail-closed structural
+  error.
 - Windows are grouped by `Pair + Side + TF + Shift + OpenMA + CloseMA`, ordered,
   and merged when they overlap or touch (`next.start <= current.end`). Separate
   active reports may therefore extend one factual chain for the same cell.
 - All effective start/end values form deterministic atomic timeline segments.
   For each segment, readiness is evaluated from the cells that fully cover that
-  segment. Adjacent passing segments merge only when at least one MA pair and
-  qualifying witness sequence fully covers their combined interval; readiness
-  is recomputed after every merge.
+  segment. Adjacent passing segments merge only when every Close MA in `2..7`
+  retains at least one Open MA and qualifying witness sequence covering their
+  combined interval; readiness is recomputed after every merge.
 - Passing chains are ordered by longest duration, earliest start, earliest end,
-  MA tuple, then witness-shift tuple. The first chain is the displayed interval.
+  then the ordered per-Close witness vector. The first chain is the displayed
+  interval.
 - One continuous chain has `Gap = none`.
 - Multiple chains list every missing interval chronologically as
   `missing: YYYY-MM-DD .. YYYY-MM-DD`.
@@ -45,36 +49,45 @@ surface construction.
 - When no readiness-capable interval exists, the row shows the longest factual
   interval for diagnosis and remains disabled.
 - When readiness is satisfied, the row shows the longest continuous interval
-  supported by the minimum readiness contract.
+  shared by every Close MA in `2..7` under the minimum readiness contract.
 
 ## Minimum Shift Readiness Contract
 
-The current readiness contract is `shift_readiness_v1` and records
-`readiness_max_shift_bp=430`. This is a minimum gate for starting a build, not
-an upper bound on data included in a surface.
+The scope readiness contract is `close_ma_2_7_common_interval_v1`. It applies
+the `shift_readiness_v1` sub-contract independently per selected MA pair and
+records `readiness_max_shift_bp=430`. This is a minimum gate for starting a
+build, not an upper bound on data included in a surface.
 
 For one `Pair + Side + TF` row and one exact UTC interval:
 
-1. At least one MA pair must have fully covering reports on a shift sequence
-   that begins at `30 bp`, passes through `150 bp`, and reaches `430 bp`.
+1. Every Close MA in `2..7` must have at least one Open MA with fully covering
+   reports on a shift sequence that begins at `30 bp`, passes through `150 bp`,
+   and reaches `430 bp`.
 2. Between `30 bp` and `150 bp`, consecutive shifts in that sequence may be no
    farther apart than `10 bp` (`0.1%`).
 3. Between `150 bp` and `430 bp`, consecutive shifts may be no farther apart
    than `40 bp` (`0.4%`).
 4. More detailed intermediate shifts are valid and never make a row fail.
-5. The same MA pair must be present and fully cover the interval at every shift
-   used by the qualifying sequence.
+5. For one Close MA, the same selected Open MA must fully cover the interval at
+   every shift used by its qualifying sequence. Different Close MAs may select
+   different Open MAs.
 6. A checkbox is enabled only when both factual-period continuity and this
    shift/MA contract pass for the row.
 
-For each MA pair, a canonical witness is selected independently in the two
-bands. Starting at each band's lower boundary, choose the greatest available
-shift not exceeding the current shift plus that band's maximum gap; repeat
-until the exact upper boundary is reached. A candidate missing exact boundary
-shifts `30`, `150`, or `430` fails. Among passing MA pairs, the lexicographically
-smallest `(open_ma, close_ma, witness_shift_tuple)` is persisted as the witness
-after the interval tie-breakers above. Denser non-witness shifts remain valid
-optional data.
+For each MA pair, a canonical shift witness is selected independently in the
+two bands. Starting at each band's lower boundary, choose the greatest
+available shift not exceeding the current shift plus that band's maximum gap;
+repeat until the exact upper boundary is reached. A candidate missing exact
+boundary shifts `30`, `150`, or `430` fails. For each Close MA, choose the
+lexicographically smallest passing `(open_ma, witness_shift_tuple)`. The scope
+persists the ordered witness vector for Close MA `2..7`. Interval ties resolve
+by longest duration, earliest start, earliest end, then this vector. One Close
+MA cannot stitch different Open MAs across subintervals. Denser non-witness
+shifts remain valid optional data.
+
+The scope-level readiness contract is
+`close_ma_2_7_common_interval_v1`; its per-pair shift sub-contract remains
+`shift_readiness_v1` with `readiness_max_shift_bp=430`.
 
 The contract is intentionally parameterized so a future specification may
 raise the readiness limit to `700 bp` without changing the surface or audit
@@ -96,7 +109,9 @@ contains:
 - exact UTC half-open publication interval and side;
 - selected `Pair + TF` scopes;
 - readiness-contract version and maximum readiness shift;
-- one canonical MA/witness-shift tuple per selected scope;
+- one ordered canonical readiness witness per Close MA `2..7` for every
+  selected scope; each witness records its Close MA, selected Open MA, and
+  canonical shift tuple;
 - the complete sorted set of included canonical point keys, selected report
   IDs, source hashes, and their aggregate hashes;
 - the publication-audit hash.
@@ -141,7 +156,8 @@ implementation.
   UTC interval.
 - This includes shifts above `430 bp`, denser intermediate shifts, and MA pairs
   that are present on only part of the observed shift set.
-- Missing or incomplete optional shifts and MA pairs do not block the build.
+- Missing or incomplete optional shifts and non-selected Open MA pairs do not
+  block the build after every Close MA `2..7` has one qualifying Open MA.
 - If overlapping reports can provide one canonical point, the existing
   deterministic narrowest-covering-report rule selects its source report.
 - Every included factual candidate and every readiness-required gap remains
@@ -199,6 +215,12 @@ tuple, and `displayed_interval=true` marks the one selected by the row tie-break
 Candidate selection and readiness-gap statuses are evaluated independently for
 that exact block. The publication audit contains one evaluation block for the
 side's exact common publication interval and has `displayed_interval=true`.
+
+Structurally degenerate rows whose report and grid windows are both
+zero-duration are ignored and emit no row in the current CSV schemas. Every
+other empty report/grid intersection aborts fail-closed. The existing
+`required_for_readiness` and `readiness_witness` columns identify the six
+selected per-Close witnesses without adding columns, statuses, or reason codes.
 
 Both files are suitable for manual analysis and use two explicit row types:
 
@@ -290,6 +312,11 @@ same canonical CSV format, but its hash is not part of surface identity.
   `grid_contract_json` exceeds 10 MB per surface or indexed evidence queries are
   measurably required.
 
+Longer per-Close partial intervals are not displayed, combined, or materialized
+as one readiness surface. A future `coverage_summary.csv` may report those
+intervals and ignored degenerate rows without changing the current canonical
+CSV schemas.
+
 The CSV covers all observed shifts, including shifts above `430 bp`, while
 clearly distinguishing optional data from combinations required to enable the
 checkbox. The panel shows a compact summary and exposes the CSV as an artifact.
@@ -312,8 +339,9 @@ current coverage-contract implementation plan and its acceptance tests.
 ## Data Flow
 
 1. The user starts one coverage scan.
-2. The backend inventories both sides, evaluates factual period chains, checks
-   the minimum shift/MA contract, and writes the coverage CSV.
+2. The backend inventories both sides, excludes structurally degenerate rows,
+   evaluates factual period chains, checks the common Close MA `2..7` readiness
+   contract, and writes the coverage CSV.
 3. The panel renders `Pair -> Side -> TF` groups and enables only rows that pass
    both temporal and minimum readiness checks.
 4. The user selects any enabled rows from one or both sides.
@@ -339,9 +367,12 @@ current coverage-contract implementation plan and its acceptance tests.
 - Coverage tests prove deterministic merging and complete missing-interval
   reporting.
 - Readiness tests cover exact minimum spacing, denser valid shifts, missing
-  boundaries, excessive shift gaps, and the common-MA requirement.
-- Tests prove optional incomplete shifts and MA pairs, including data above
-  `430 bp`, do not disable an otherwise ready row.
+  boundaries, excessive shift gaps, all Close MAs `2..7`, different selected
+  Open MAs, and deterministic common-interval tie-breaking.
+- Tests prove optional incomplete shifts and non-selected Open MA pairs,
+  including data above `430 bp`, do not disable an otherwise ready row.
+- Coverage tests prove that structurally degenerate rows are ignored while
+  every other empty report/grid intersection remains fail-closed.
 - Materialization tests prove every fully covering factual point is included and
   no absent point is synthesized.
 - Storage tests prove V1 rectangular validation remains unchanged, V2 sparse

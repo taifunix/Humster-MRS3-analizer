@@ -1,4 +1,8 @@
-# DuckDB Surface Coverage Review Implementation Plan
+# DuckDB Surface Coverage Review Baseline Implementation Plan
+
+**Status:** Completed baseline evidence for ADR-0007. This plan records the
+implemented one-MA-pair contract and is not the implementation plan for the
+pending ADR-0008 amendment.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Python 3.12, DuckDB, existing pandas materialization, stdlib JSON/CSV/hashlib, panel JavaScript, pytest.
 
-## Global Constraints
+## Historical Baseline Constraints
 
 - Preserve the dirty basic coverage implementation and unrelated user files.
 - TDD every behavior change; stage only task-owned paths; review every scoped commit.
@@ -88,12 +92,14 @@ When explicitly activated, add a separate human-readable
   pair has a shorter readiness-capable interval; `MISSING` means none exists.
 - Add a compact panel `MA-C` column that lists fully covered values and visually
   highlights any missing or partial value from `2..7`.
-- Keep the existing checkbox rule unchanged: one fully ready MA pair is enough
-  to make the Pair/Side/TF row selectable.
+- The checkbox gate is not deferred with this summary: the canonical contract
+  enables a Pair/Side/TF row only when every Close MA in `2..7` shares the
+  displayed continuous readiness interval, with at least one readiness-capable
+  Open MA per Close MA.
 - Keep exact UTC timestamps in the CSV while the compact panel continues to
   render dates only.
-- Handle zero-duration or otherwise invalid report/grid intersections under a
-  separately approved fail-closed versus per-scope-isolation contract.
+- Report ignored degenerate rows in this future summary; their runtime handling
+  is governed separately by ADR-0008 and is not deferred with this CSV.
 
 ## Ponytail Result
 

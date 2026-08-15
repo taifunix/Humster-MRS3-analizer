@@ -1,10 +1,12 @@
 # DuckDB Surface Coverage Review
 
-**Status:** Active implementation contract
+**Status:** Approved contract change; implementation pending
 **Date:** 2026-08-15
 **Design evidence:** [DuckDB Surface Coverage Review Design](../superpowers/specs/2026-08-14-duckdb-surface-coverage-review-design.md)
-**Implementation plan:** [DuckDB Surface Coverage Review Plan](../superpowers/plans/2026-08-14-duckdb-surface-coverage-review.md)
-**Related ADRs:** [ADR-0007](../decisions/0007-observed-sparse-surface-contract.md)
+**Baseline implementation evidence:** [DuckDB Surface Coverage Review Baseline Plan](../superpowers/plans/2026-08-14-duckdb-surface-coverage-review.md)
+**ADR-0008 implementation plan:** Pending written-spec review
+**Related ADRs:** [ADR-0007](../decisions/0007-observed-sparse-surface-contract.md),
+[ADR-0008](../decisions/0008-common-close-ma-readiness-and-degenerate-row-isolation.md)
 
 ## 1. Purpose
 
@@ -23,9 +25,10 @@ In scope:
   materialization;
 - `Pair -> LONG/SHORT -> TF` rows with date-only
   `Select | TF | Available interval | Gap` presentation;
-- readiness-gated selection using `shift_readiness_v1` with maximum `430 bp`,
-  exact `30/150/430` boundaries, `<=10 bp` then `<=40 bp` maximum gaps, one
-  common MA pair, and denser optional data accepted;
+- readiness-gated selection using `close_ma_2_7_common_interval_v1`: every Close
+  MA `2..7` has at least one Open MA satisfying `shift_readiness_v1` with
+  maximum `430 bp`, exact `30/150/430` boundaries, `<=10 bp` then `<=40 bp`
+  maximum gaps, and denser optional data accepted;
 - publication of every fully covering factual point for selected gap-free and
   readiness-passing scopes, including points above `430 bp` and partial MA
   coverage;
@@ -51,14 +54,16 @@ Out of scope:
 
 1. Coverage is derived only from source DuckDB `report_start/report_end` facts
    and persisted grid windows using normalized UTC half-open `[start, end)`
-   semantics.
+   semantics. Rows whose report and grid windows are both zero-duration are
+   ignored; every other empty intersection fails closed.
 2. A row is selectable only when it has a continuous factual chain and a
    readiness-passing exact interval; rows with gaps or no readiness-capable
    interval are diagnostic-only and disabled.
-3. The readiness contract is exact: boundary shifts `30`, `150`, and `430`;
-   maximum gaps are `10 bp` in the first band and `40 bp` in the second; one MA
-   pair must cover every witness shift. Denser shifts and optional partial MA
-   coverage never disable an otherwise ready row.
+3. The readiness contract is exact: every Close MA `2..7` has one selected Open
+   MA covering boundary shifts `30`, `150`, and `430` with maximum gaps of
+   `10 bp` then `40 bp`. A selected Open MA cannot be stitched across
+   subintervals; different Close MAs may select different Open MAs. The row uses
+   the longest common qualifying interval and stores all six ordered witnesses.
 4. `430 bp` is a minimum gate. Once passed, every fully covering factual point
    is included; no absent point is synthesized.
 5. V1 rectangular surface identity and validation remain unchanged. V2 identity
@@ -86,9 +91,15 @@ canonical scope/invariant file together without introducing contradictions.
 
 ## 5. Definition of Done
 
-- ADR-0007 is accepted and this canonical spec is linked from PRD and progress.
+- ADR-0007 and ADR-0008 are accepted, and this canonical spec is linked from
+  PRD and progress.
 - Factual coverage and readiness tests prove deterministic merging, exact
-  readiness, optional-data acceptance, and complete missing-interval reporting.
+  readiness, optional-data acceptance, all Close MAs `2..7`, differing selected
+  Open MAs, common-interval tie-breaking, and complete missing-interval
+  reporting.
+- Coverage tests prove structurally degenerate rows do not contribute or abort,
+  while incompatible non-empty windows and one-sided zero-duration windows fail
+  closed.
 - Materialization tests prove every fully covering factual point is included
   and no point is synthesized.
 - Storage tests prove V1 remains unchanged, V2 identity is deterministic, and
@@ -98,7 +109,7 @@ canonical scope/invariant file together without introducing contradictions.
   publication, zero-surface failures before publication, and deterministic
   `PARTIAL` behavior after LONG commits.
 - CSV tests prove canonical bytes, ordering, required columns, statuses, reason
-  grammar, hashes, and publication provenance.
+  grammar, hashes, publication provenance, and unchanged schemas.
 - UI tests prove the date-only nested Pair/Side layout, enabled and disabled
   row states, queue progress, and that the preflight progress-activity phase
   remains deferred.
