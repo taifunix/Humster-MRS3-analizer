@@ -1789,6 +1789,10 @@ class PanelController:
 
     def duckdb_direct_coverage(self, payload: Mapping[str, object]) -> dict[str, object]:
         with self._lock:
+            if self._direct_job is not None:
+                if self._direct_job.running:
+                    raise RuntimeError("another direct build is already running")
+                self._direct_job = None
             self._direct_coverage_scan = None
             self._direct_artifacts.clear()
         side, symbols = self._direct_coverage_payload(payload)
@@ -1988,10 +1992,6 @@ class PanelController:
                         len(getattr(surface, "points", ()))
                         for surface in result.surfaces
                     )
-                    if job.coverage_scan is not None:
-                        inventory = self._direct_artifacts.get("coverage_inventory")
-                        if inventory is not None:
-                            job.artifacts["coverage_inventory"] = inventory
                     if job.audit_root is not None:
                         for surface in prepared:
                             side = surface.request.side.lower()

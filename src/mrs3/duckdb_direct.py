@@ -889,7 +889,8 @@ def publish_direct_surfaces(
             published_surface = publish_surface(analysis_connection, surface)
         except BaseException as error:
             state = "PARTIAL" if published else "FAILED"
-            return DirectQueueResult(state, tuple(published), phase=state, error=str(error))
+            message = str(error) if isinstance(error, DirectMaterializationError) else "direct build failed"
+            return DirectQueueResult(state, tuple(published), phase=state, error=message)
         published.append(published_surface)
     return DirectQueueResult("PUBLISHED", tuple(published), phase="PUBLISHED")
 

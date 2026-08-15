@@ -16,6 +16,7 @@ from mrs3 import panel as panel_module
 from mrs3.panel import PanelController, _DirectJob, _Job, create_panel_server
 from mrs3.duckdb_import import ImportJobResult, ImportPreflight, ImportProgress
 from mrs3.duckdb_direct import (
+    publish_direct_surfaces,
     DirectBuildRequest,
     CoverageIssue,
     CoverageReviewRow,
@@ -785,6 +786,28 @@ def test_direct_queue_result_error_with_local_path_is_sanitized(
     assert raw_error not in panel_module.PANEL_HTML
 
 
+def test_direct_publish_unexpected_error_is_generic_in_panel_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_secret(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("secret internal state")
+
+    monkeypatch.setattr("mrs3.duckdb_direct.publish_surface", raise_secret)
+    status = _run_direct_coverage_job(
+        tmp_path,
+        monkeypatch,
+        publish=publish_direct_surfaces,
+    )
+
+    assert status["publication_state"] == "FAILED"
+    assert status["phase"] == "FAILED"
+    assert status["error"] == "direct build failed"
+    payload = json.dumps(status)
+    assert "secret internal state" not in payload
+    assert "RuntimeError" not in payload
+
+
 def test_direct_error_preserves_non_absolute_slash_text() -> None:
     assert panel_module._safe_direct_error("report/grid mismatch") == "report/grid mismatch"
 
@@ -1302,6 +1325,114 @@ def test_failed_check_clears_previous_scan_and_artifact(tmp_path: Path) -> None:
                 "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}],
             }
         )
+
+
+def test_direct_coverage_check_rejects_running_job_before_clearing_state(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    scan = _fake_coverage_scan(tmp_path)
+    job = _DirectJob(
+        running=True,
+        artifacts={"coverage_inventory": ("captured.csv", b"captured")},
+    )
+    controller._direct_job = job
+    controller._direct_coverage_scan = scan
+    controller._direct_artifacts["coverage_inventory"] = ("global.csv", b"global")
+
+    with pytest.raises(RuntimeError, match="another direct build is already running"):
+        controller.duckdb_direct_coverage({"symbols": []})
+
+    assert controller._direct_job is job
+    assert controller._direct_job.artifacts["coverage_inventory"] == ("captured.csv", b"captured")
+    assert controller._direct_coverage_scan is scan
+    assert controller._direct_artifacts["coverage_inventory"] == ("global.csv", b"global")
+
+
+def test_direct_coverage_check_clears_completed_job_before_serving_new_inventory(
+    tmp_path: Path,
+) -> None:
+    scan = _fake_coverage_scan(tmp_path)
+    inventory_bytes = scan.inventory_path.read_bytes()
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: type("Connection", (), {"close": lambda self: None})(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
+    )
+    controller._direct_job = _DirectJob(
+        running=False,
+        artifacts={"coverage_inventory": ("stale.csv", b"stale")},
+    )
+
+    controller.duckdb_direct_coverage({"symbols": []})
+
+    assert controller._direct_job is None
+    assert controller.snapshot()["duckdb_direct"] is None
+    assert controller.artifact("coverage_inventory") == ("coverage_inventory.csv", inventory_bytes)
+
+
+def test_direct_coverage_completion_keeps_inventory_captured_at_job_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    scan = _fake_coverage_scan(tmp_path)
+    captured_inventory = ("captured.csv", b"captured")
+    mutable_inventory = ("mutable.csv", b"mutable")
+    mutated = False
+
+    def prepare(
+        _source: object,
+        requests: tuple[object, ...],
+        **_: object,
+    ) -> tuple[object, ...]:
+        nonlocal mutated
+        controller._direct_artifacts["coverage_inventory"] = mutable_inventory
+        mutated = True
+        return tuple(
+            SimpleNamespace(request=request, points=(), preflight=SimpleNamespace(audit_sha256=""))
+            for request in requests
+        )
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        **_: object,
+    ) -> DirectQueueResult:
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(SimpleNamespace(surface_id=f"surface-{surface.request.side}", points=()) for surface in surfaces),
+        )
+
+    monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+        direct_prepare_func=prepare,
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
+    )
+    controller.duckdb_direct_coverage({"symbols": []})
+    controller._direct_artifacts["coverage_inventory"] = captured_inventory
+    controller.start_duckdb_direct(
+        {
+            "coverage_token": "coverage-token",
+            "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}],
+        }
+    )
+
+    assert mutated
+    assert controller._direct_job is not None
+    assert controller._direct_job.artifacts["coverage_inventory"] == captured_inventory
 
 
 def test_failed_start_clears_completed_prior_job_before_validation(tmp_path: Path) -> None:
