@@ -1,8 +1,33 @@
 # Progress
 
-**Updated:** 2026-08-14
+**Updated:** 2026-08-15
 **Current branch:** `main`
-**Current feature:** Performance report import and DD5 finalist selection
+**Current feature:** DuckDB surface coverage review
+
+## DuckDB surface coverage review
+
+The feature is implemented and verified for its scoped tests under the
+canonical [DuckDB surface coverage review](docs/specs/2026-08-14-duckdb-surface-coverage-review.md),
+[ADR-0007](docs/decisions/0007-observed-sparse-surface-contract.md), and
+[implementation plan](docs/superpowers/plans/2026-08-14-duckdb-surface-coverage-review.md).
+V2 stays in schema-v4 `grid_contract_json`; readiness uses exact `30/150/430` bp
+with `<=10 bp` then `<=40 bp` gaps and accepts denser data; every fully covering
+factual point is published. The canonical CSV is human-readable; publication is
+LONG then SHORT with `PARTIAL`/manual rerun after an earlier side commits. UI is
+`Pair -> LONG/SHORT -> TF` and date-only. Preflight progress/elapsed UI remains
+deferred to the next panel phase; speculative reliability infrastructure
+(persistent prepared queues and retry endpoints, source-path leases, atomic
+path replacement, schema-v5 evidence) remains deferred.
+
+Focused verification: `173 passed` for `tests/test_duckdb_direct.py
+tests/test_panel.py tests/test_analysis_storage.py`; `compileall` is clean.
+Broader verification: `62 passed, 1 skipped` for `tests/test_duckdb_import.py
+tests/test_duckdb_source_schema.py tests/test_published_surface.py`; the skip
+is the Windows symlink-privilege test.
+Full pytest: `745 passed, 2 skipped, 4 failed`; all four failures are
+pre-existing/missing local fixtures `tests/fixtures/tester_wizard.html` and
+`tests/fixtures/tester_table.html` in `tests/runner/test_http.py`, unrelated to
+this feature.
 
 ## Performance DuckDB state (real-batch evidence; implementation hardening)
 
@@ -305,6 +330,9 @@ changed source snapshot; a focused regression forbids action/wallet decoders
 during preflight. Focused evidence: `18 passed` for `tests/test_duckdb_direct.py`.
 
 ## Next required work
+
+For DuckDB surface coverage review, the feature is verified; the next panel
+phase should implement the deferred preflight progress/elapsed UI.
 
 The core specification and its 16-task plan (Task 0 plus Tasks 1–15) are
 approved. Task 0 is represented by the existing `d76b985` package-side/UTC
@@ -623,6 +651,20 @@ historical runner CSV at `1e-8`, zero DD5 formula mismatches, zero primary
 Pareto mismatches, valid active-order lot vectors (length 1--4), and populated
 selection thresholds. The canonical XLSX was exported successfully; no HTML
 re-import was performed for this calculation.
+
+Current 2026-08-14 DuckDB surface coverage follow-up: direct preflight now
+adds grouped `Pair + Side + TF` coverage review rows derived only from factual
+`report_start/report_end` windows in source DuckDB. The right-side panel renders
+those rows as `Select | TF | Available interval | Gap`, uses the longest
+continuous interval for diagnostic rows, lists every missing interval as
+`missing: YYYY-MM-DD .. YYYY-MM-DD`, and disables selection for any row with a
+gap. Direct build accepts `selected_scopes` and materializes only checked
+gap-free scopes, while the existing progress bar and log remain in the same
+right-side panel during the running build. Coverage discovery accepts an empty
+symbol filter as all source pairs for the selected side, and Build obtains a
+fresh preflight token for the checked scopes. Focused verification on
+2026-08-14: `84 passed` for
+`tests/test_duckdb_direct.py tests/test_panel.py`.
 
 Current session handoff for moving the long HTML import to another machine:
 [remote import handoff](docs/HANDOFF_2026-08-12_REMOTE_IMPORT.md).

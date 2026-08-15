@@ -18,6 +18,8 @@ Humster MRS3 Analyzer — локальный, детерминированный
 
 ## Текущий этап: v0.7 DuckDB analysis storage and importer
 
+Реализована и проверена отдельная [каноническая спецификация DuckDB surface coverage review](docs/specs/2026-08-14-duckdb-surface-coverage-review.md) и [ADR-0007](docs/decisions/0007-observed-sparse-surface-contract.md): readiness-gated выбор `Pair -> LONG/SHORT -> TF`, human-readable canonical CSV audit, sparse `OBSERVED_SPARSE_GRID_CONTRACT_V2` в schema-v4 `grid_contract_json`, последовательная публикация LONG/SHORT и `PARTIAL`/manual rerun. Readiness использует точные границы `30/150/430` bp с промежутками `<=10/<=40 bp`, принимает denser data и публикует все доступные фактические точки; UI — `Pair -> LONG/SHORT -> TF` с date-only форматом. Preflight progress/elapsed UI отложен в следующий панельный этап. Инфраструктура покрытия и sparse V2 не доказывают эффективность MRS3; финальные выводы требуют реального tick-test и DD5 retest.
+
 Цель ближайшего этапа — сохранить source DuckDB единым пополняемым lossless-хранилищем HTML-отчётов, перенести управление импортом в веб-панель и материализовывать воспроизводимые поверхности для анализа плато в отдельную append-only analysis DuckDB. Анализ напрямую из source DuckDB сначала публикует неизменяемую поверхность, а затем запускает общий plateau pipeline. Контракт зафиксирован в [спецификации DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 
 Этап реализован и проверен: source schema v5, управляемый импорт, immutable
@@ -80,5 +82,7 @@ analysis surfaces, повторный plateau-анализ, lineage, библи�
 | Pending production acceptance | [Strategy performance DuckDB governing spec](docs/specs/2026-08-14-strategy-performance-duckdb.md) | transactional performance import, DB-only DD5 and safe cleanup | [ADR-0004](docs/decisions/0004-strategy-performance-evidence-store.md) |
 | Active implementation contract | [Performance report import to DuckDB](docs/specs/2026-08-14-performance-report-import-duckdb.md) | immutable HTML-report import, canonical metrics, transaction, idempotency and cleanup | Strategy performance DuckDB, ADR-0004--0006 |
 | Active implementation contract | [DD5 calculation and finalist selection](docs/specs/2026-08-14-dd5-finalist-selection.md) | DD5 formulas, scoped filters, Pareto, finalists and XLSX contract | Performance report import to DuckDB |
+| Implemented / Verified | [DuckDB surface coverage review](docs/specs/2026-08-14-duckdb-surface-coverage-review.md) | readiness-gated `Pair -> LONG/SHORT -> TF` selection, human-readable canonical CSV audit, sparse `OBSERVED_SPARSE_GRID_CONTRACT_V2` in schema-v4 `grid_contract_json`, sequential LONG/SHORT publication, `PARTIAL`/manual rerun; preflight progress/elapsed UI deferred to next panel phase | DuckDB analysis storage, [ADR-0007](docs/decisions/0007-observed-sparse-surface-contract.md) |
+| Accepted | [ADR-0007](docs/decisions/0007-observed-sparse-surface-contract.md) | V1 unchanged; V2 evidence in existing `grid_contract_json`; one read transaction prepares selected sides; LONG then SHORT; `PARTIAL`/manual rerun; deferred retry/lease/path/schema-v5 | DuckDB surface coverage review |
 
 Полная навигация: [docs/README.md](docs/README.md). Оперативная точка: [progress.md](progress.md).
