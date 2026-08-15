@@ -38,7 +38,8 @@ and the existing
 - Priority 1 now provides double-zero isolation, server/browser stale-state
   clearing, actionable path-safe errors, side ordinal, verified coverage CSV
   links, truthful UTC/Side guidance, exact preview-to-real-preflight
-  reproduction, and one current panel listener.
+  reproduction, one current panel listener, and client-side Check coverage
+  activity feedback with duplicate-request protection.
 
 ## Latest Verification
 
@@ -49,17 +50,20 @@ and the existing
   failures are in `tests/runner/test_http.py` because the local
   `tests/fixtures/tester_wizard.html` and `tests/fixtures/tester_table.html`
   files are absent. The two skips require unavailable Windows symlink rights.
-- DuckDB Priority-1 relevant run: `212 passed` for
+- DuckDB Priority-1 relevant run: `213 passed` for
   `.venv\Scripts\python.exe -m pytest tests/test_duckdb_direct.py tests/test_panel.py tests/test_analysis_storage.py -q`.
 - The repository-wide run before the final four focused regressions reached
   `780 passed, 2 skipped, 4 failed`; the same four runner failures are caused
   only by the two absent fixtures above. No later repository-wide run covers
-  current `HEAD`; the current relevant evidence is `212 passed`.
+  current `HEAD`; the current relevant evidence is `213 passed`.
 - Read-only real-source evidence: exactly 18 expected ONUSDT/LONG/15m
   shift-430 double-zero rows exist; after exclusion, ONUSDT 15m LONG and SHORT
   are selectable with zero gap details.
 - Live panel smoke: one listener on `127.0.0.1:8765`, HTTP 200, current
   date-only/side-aware coverage UI and Priority-1 markers present.
+- The live listener was intentionally not restarted for the Check coverage
+  activity-feedback change; its already-loaded page remains unchanged until
+  the next normal panel restart.
 
 ## Next Required Work
 

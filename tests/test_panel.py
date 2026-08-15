@@ -1225,6 +1225,21 @@ def test_direct_coverage_ui_keeps_preflight_activity_feedback_deferred() -> None
     assert "coverageElapsed" not in html
 
 
+def test_direct_coverage_ui_shows_check_in_progress_and_blocks_duplicates() -> None:
+    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+    check = html.split("async function directPreflight()", 1)[1]
+    assert "let directCoverageChecking=false;" in html
+    assert "if (directCoverageChecking) return;" in check
+    assert "setDirectCoverageChecking(true)" in check
+    assert "setDirectCoverageChecking(false)" in check
+    assert "button.textContent=enabled?'Checking coverage...':'Check coverage'" in html
+    assert "button.disabled=enabled" in html
+    assert "target.setAttribute('aria-busy', String(enabled))" in html
+    assert "if (direct && !directCoverageChecking)" in html
+    assert check.index("setDirectCoverageChecking(true)") < check.index("duckdbRequest('/api/duckdb-direct/coverage'")
+    assert check.index("duckdbRequest('/api/duckdb-direct/coverage'") < check.index("setDirectCoverageChecking(false)")
+
+
 def test_direct_coverage_stale_check_clears_before_request_and_direct_start_prior_job_preserves_preview() -> None:
     html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
     check = html.split("async function directPreflight()", 1)[1]

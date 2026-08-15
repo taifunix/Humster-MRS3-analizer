@@ -308,20 +308,21 @@ The CSV covers all observed shifts, including shifts above `430 bp`, while
 clearly distinguishing optional data from combinations required to enable the
 checkbox. The panel shows a compact summary and exposes the CSV as an artifact.
 
-## Preflight Activity Feedback (Deferred Next Panel Phase)
+## Preflight Activity Feedback
 
-This section records the agreed next-phase behavior. It is excluded from the
-current coverage-contract implementation plan and its acceptance tests.
+The current panel gives immediate, truthful feedback for the synchronous
+coverage request without inventing a percentage from a query that has no stable
+total:
 
-- `Check coverage` reuses the existing right-side progress bar.
-- While the synchronous coverage request is active, the bar is indeterminate,
-  the state reads `Preparing coverage...`, and elapsed time is shown.
-- Repeated coverage submissions are disabled until the request succeeds or
-  fails.
-- Success replaces the activity state with the grouped coverage table.
-- Failure shows an explicit failed state and restores the action controls.
-- This phase does not invent a percentage from a query that has no stable total.
-  Staged backend progress may be added later if measurements justify it.
+- `Check coverage` changes to `Checking coverage...` and is disabled while the
+  request is active.
+- The status line is updated immediately and polling cannot overwrite it until
+  the request succeeds or fails.
+- Repeated coverage submissions are ignored until the request finishes.
+- Success replaces the activity state with the grouped coverage table; failure
+  shows the explicit error and restores the action control.
+- The existing right-side progress bar, elapsed-time display, and staged backend
+  percentage remain deferred until measurements justify them.
 
 ## Priority-1 Operational Patch
 

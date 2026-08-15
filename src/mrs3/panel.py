@@ -518,12 +518,20 @@ async function duckdbImport() { try { const result = await duckdbRequest('/api/d
 async function duckdbCancel() { try { render(await duckdbRequest('/api/duckdb-import/cancel')); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 let directPreflightToken = '';
 let directStartEligible=false;
+let directCoverageChecking=false;
 function directUtc(id) { const raw=value(id); if (!raw) return ''; return raw.endsWith('Z') ? raw : new Date(raw+'Z').toISOString(); }
 function directPayload() { return {start_utc:directUtc('direct_start'), end_utc:directUtc('direct_end'), side:value('direct_side'), symbols:value('direct_symbols').split(';')}; }
 function setDirectStartEligible(enabled) {
   directStartEligible=enabled;
   const button=document.querySelector('button[onclick="directBuild()"]');
   if (button) button.disabled=!enabled;
+}
+function setDirectCoverageChecking(enabled) {
+  directCoverageChecking=enabled;
+  const button=document.querySelector('button[onclick="directPreflight()"]');
+  if (button) { button.disabled=enabled; button.textContent=enabled?'Checking coverage...':'Check coverage'; }
+  const target=document.getElementById('directCoverage');
+  if (target) target.setAttribute('aria-busy', String(enabled));
 }
 function renderDirectArtifactLinks(artifacts={}) {
   const target=document.getElementById('directArtifacts');
@@ -558,7 +566,23 @@ function renderDirectCoverage(result) {
   const excluded=new Map(); for(const issue of (result.coverage_issues || [])){ if(!['GRID_NOT_COVERED','GRID_NO_COMMON_PAIRS','CONFLICTING_CANONICAL_POINT'].includes(issue.code)) continue; const key=issue.symbol+' · '+issue.timeframe; excluded.set(key,issue.code); } for(const [scope,code] of excluded){ const row=document.createElement('div'); row.className='direct-unavailable'; row.textContent='! '+scope+' excluded: '+code; target.appendChild(row); }
   for (const symbol of Object.keys(result.unavailable_symbols || {})) { const row=document.createElement('div'); row.className='direct-unavailable'; const reasons=(result.coverage_issues || []).filter(item=>item.symbol===symbol).map(item=>`${item.code}: ${item.detail}`).join('; '); row.textContent=`⚠ ${symbol} · ${reasons || 'unavailable'}`; target.appendChild(row); }
 }
-async function directPreflight() { clearDirectCoverageState(); try { const result=await duckdbRequest('/api/duckdb-direct/coverage', {symbols:value('direct_symbols').split(';')}); directPreflightToken=result.token||''; renderDirectCoverageReview(result); setDirectStartEligible(true); document.getElementById('directStatus').textContent='Coverage checked.'; } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+async function directPreflight() {
+  if (directCoverageChecking) return;
+  clearDirectCoverageState();
+  setDirectCoverageChecking(true);
+  document.getElementById('directStatus').textContent='Checking coverage...';
+  try {
+    const result=await duckdbRequest('/api/duckdb-direct/coverage', {symbols:value('direct_symbols').split(';')});
+    directPreflightToken=result.token||'';
+    renderDirectCoverageReview(result);
+    setDirectStartEligible(true);
+    document.getElementById('directStatus').textContent='Coverage checked.';
+  } catch(error) {
+    document.getElementById('directStatus').textContent=error.message;
+  } finally {
+    setDirectCoverageChecking(false);
+  }
+}
 async function directBuild(parentSurfaceId='') { clearDirectExecutionState(); try { const scopes=selectedDirectScopes(); if(!scopes.length) throw new Error('Select at least one gap-free Pair + TF row.'); const selectedSymbols=[...new Set(scopes.map(item=>item.symbol))]; const base={...directPayload(),symbols:selectedSymbols}; const flight=await duckdbRequest('/api/duckdb-direct/preflight',{...base,coverage_token:directPreflightToken,selected_scopes:scopes}); if(flight.token) directPreflightToken=flight.token; renderDirectCommonIntervals(flight.selected_intervals); const payload={...base,coverage_token:directPreflightToken,selected_scopes:scopes}; if(parentSurfaceId) payload.parent_surface_id=parentSurfaceId; document.getElementById('coverageReview').hidden=true; render(await duckdbRequest('/api/duckdb-direct/start', payload)); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
 async function directCancel() { try { render(await duckdbRequest('/api/duckdb-direct/cancel')); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
 function directDateOnly(utc) { return (utc || '').slice(0, 10); }
@@ -738,7 +762,7 @@ function render(data) {
   if(strategy){ document.getElementById('analysisStrategiesStatus').textContent=`${strategy.phase} · ${strategy.strategy_count||0} JSON${strategy.error?' · '+strategy.error:''}`; if(strategy.strategies_path){ document.getElementById('strategies').value=strategy.strategies_path; } }
   const direct = data.duckdb_direct;
   // directStatus is rendered below with publication/error/coordinate details
-  if (direct) {
+  if (direct && !directCoverageChecking) {
     const coordinate = direct.side && direct.ordinal && direct.total ? `· ${direct.side} ${direct.ordinal}/${direct.total}` : '';
     const publication = direct.publication_state ? `· ${direct.publication_state}` : '';
     const error = direct.error ? `· ${direct.error}` : '';
