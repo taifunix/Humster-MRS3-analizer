@@ -345,7 +345,8 @@ PANEL_HTML = r"""<!doctype html>
             <div class="row"><label>Side<select id="direct_side" onchange="applyWorkflowDefaults(true)"><option>LONG</option><option>SHORT</option></select></label><label>Symbols (; separated)<input id="direct_symbols" type="text" placeholder="BTCUSDT;ETHUSDT"></label></div>
             <div class="source-note">Shifts: <output id="direct_shifts">Auto-detected after coverage check.</output><br>All observed shifts that cover the selected UTC window are frozen into the surface contract automatically.</div>
             <div class="buttons"><button type="button" onclick="directPreflight()">Check coverage</button><button type="button" class="primary" onclick="directBuild()">Build surface</button><button type="button" onclick="directCancel()">Cancel</button></div>
-            <div id="directCoverage" role="note" class="muted">Coverage review appears in the right panel after preflight.</div><div id="directStatus" class="muted" aria-live="polite">No direct build.</div>
+            <div class="source-note">Coverage derives UTC intervals and side from checked Pair + Side + TF rows; manual UTC and Side fields do not constrain the coverage-token workflow.</div>
+            <div id="directCoverage" role="note" class="muted">Coverage review appears in the right panel after preflight.</div><div id="directStatus" class="muted" aria-live="polite">No direct build.</div><div id="directArtifacts" class="artifacts muted">Coverage artifacts appear after a successful check.</div>
           </div></details>
           <details><summary>Analysis Library</summary><div class="stack">
             <div class="row"><label>Side<select id="analysis_side"><option value="">Any</option><option>LONG</option><option>SHORT</option></select></label><label>Build mode<select id="analysis_build_mode"><option value="">Any</option><option>DUCKDB_DIRECT</option></select></label></div><label>Symbol<input id="analysis_symbol" type="text"></label>
@@ -496,8 +497,40 @@ async function duckdbPreflight() { try { render(await duckdbRequest('/api/duckdb
 async function duckdbImport() { try { const result = await duckdbRequest('/api/duckdb-import/start', {root_path:value('import_html_root'), preflight_token:duckdbPreflightToken}); render(result); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function duckdbCancel() { try { render(await duckdbRequest('/api/duckdb-import/cancel')); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 let directPreflightToken = '';
+let directStartEligible=false;
 function directUtc(id) { const raw=value(id); if (!raw) return ''; return raw.endsWith('Z') ? raw : new Date(raw+'Z').toISOString(); }
 function directPayload() { return {start_utc:directUtc('direct_start'), end_utc:directUtc('direct_end'), side:value('direct_side'), symbols:value('direct_symbols').split(';')}; }
+function setDirectStartEligible(enabled) {
+  directStartEligible=enabled;
+  const button=document.querySelector('button[onclick="directBuild()"]');
+  if (button) button.disabled=!enabled;
+}
+function renderDirectArtifactLinks(artifacts={}) {
+  const target=document.getElementById('directArtifacts');
+  if (!target) return;
+  target.replaceChildren();
+  const entries=Object.entries(artifacts || {});
+  if (!entries.length) { target.textContent='Coverage artifacts appear after a successful check.'; return; }
+  for (const [name, filename] of entries) { const link=document.createElement('a'); link.href='/api/artifact?name='+encodeURIComponent(name); link.textContent=filename; target.appendChild(link); }
+}
+function clearDirectCoverageState() {
+  directPreflightToken='';
+  setDirectStartEligible(false);
+  const target=document.getElementById('directCoverage');
+  if (target) target.textContent='Coverage review appears in the right panel after preflight.';
+  document.getElementById('coverageReview').hidden=true;
+  const body=document.getElementById('coverageReviewBody');
+  if (body) body.replaceChildren();
+  document.getElementById('direct_shifts').textContent='Auto-detected after coverage check.';
+  renderDirectArtifactLinks({});
+  const artifactBox=document.getElementById('artifacts');
+  if (artifactBox) artifactBox.textContent='';
+}
+function clearDirectExecutionState() {
+  document.getElementById('directStatus').textContent='No direct build.';
+  const artifactBox=document.getElementById('artifacts');
+  if (artifactBox) artifactBox.textContent='';
+}
 function renderDirectCoverage(result) {
   const target=document.getElementById('directCoverage'); target.replaceChildren();
   document.getElementById('direct_shifts').textContent=(result.required_shifts_bp || []).join('; ') || 'No shifts cover this window';
@@ -505,8 +538,8 @@ function renderDirectCoverage(result) {
   const excluded=new Map(); for(const issue of (result.coverage_issues || [])){ if(!['GRID_NOT_COVERED','GRID_NO_COMMON_PAIRS','CONFLICTING_CANONICAL_POINT'].includes(issue.code)) continue; const key=issue.symbol+' · '+issue.timeframe; excluded.set(key,issue.code); } for(const [scope,code] of excluded){ const row=document.createElement('div'); row.className='direct-unavailable'; row.textContent='! '+scope+' excluded: '+code; target.appendChild(row); }
   for (const symbol of Object.keys(result.unavailable_symbols || {})) { const row=document.createElement('div'); row.className='direct-unavailable'; const reasons=(result.coverage_issues || []).filter(item=>item.symbol===symbol).map(item=>`${item.code}: ${item.detail}`).join('; '); row.textContent=`⚠ ${symbol} · ${reasons || 'unavailable'}`; target.appendChild(row); }
 }
-async function directPreflight() { try { const result=await duckdbRequest('/api/duckdb-direct/coverage', {symbols:value('direct_symbols').split(';')}); directPreflightToken=result.token||''; renderDirectCoverageReview(result); document.getElementById('directStatus').textContent='Coverage checked.'; } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
-async function directBuild(parentSurfaceId='') { try { const scopes=selectedDirectScopes(); if(!scopes.length) throw new Error('Select at least one gap-free Pair + TF row.'); const selectedSymbols=[...new Set(scopes.map(item=>item.symbol))]; const base={...directPayload(),symbols:selectedSymbols}; const flight=await duckdbRequest('/api/duckdb-direct/preflight',{...base,coverage_token:directPreflightToken,selected_scopes:scopes}); if(flight.token) directPreflightToken=flight.token; renderDirectCommonIntervals(flight.selected_intervals); const payload={...base,coverage_token:directPreflightToken,selected_scopes:scopes}; if(parentSurfaceId) payload.parent_surface_id=parentSurfaceId; document.getElementById('coverageReview').hidden=true; render(await duckdbRequest('/api/duckdb-direct/start', payload)); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+async function directPreflight() { clearDirectCoverageState(); try { const result=await duckdbRequest('/api/duckdb-direct/coverage', {symbols:value('direct_symbols').split(';')}); directPreflightToken=result.token||''; renderDirectCoverageReview(result); setDirectStartEligible(true); document.getElementById('directStatus').textContent='Coverage checked.'; } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+async function directBuild(parentSurfaceId='') { clearDirectExecutionState(); try { const scopes=selectedDirectScopes(); if(!scopes.length) throw new Error('Select at least one gap-free Pair + TF row.'); const selectedSymbols=[...new Set(scopes.map(item=>item.symbol))]; const base={...directPayload(),symbols:selectedSymbols}; const flight=await duckdbRequest('/api/duckdb-direct/preflight',{...base,coverage_token:directPreflightToken,selected_scopes:scopes}); if(flight.token) directPreflightToken=flight.token; renderDirectCommonIntervals(flight.selected_intervals); const payload={...base,coverage_token:directPreflightToken,selected_scopes:scopes}; if(parentSurfaceId) payload.parent_surface_id=parentSurfaceId; document.getElementById('coverageReview').hidden=true; render(await duckdbRequest('/api/duckdb-direct/start', payload)); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
 async function directCancel() { try { render(await duckdbRequest('/api/duckdb-direct/cancel')); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
 function directDateOnly(utc) { return (utc || '').slice(0, 10); }
 function directIntervalLabel(row) { return `${directDateOnly(row.interval_start_utc)} .. ${directDateOnly(row.interval_end_utc)}`; }
@@ -521,6 +554,7 @@ function renderDirectCoverageReview(result) {
   const target=document.getElementById('directCoverage');
   const section=document.getElementById('coverageReview');
   const body=document.getElementById('coverageReviewBody');
+  renderDirectArtifactLinks(result.artifacts);
   target.textContent='Coverage review is shown in the right panel.';
   body.replaceChildren();
   document.getElementById('direct_shifts').textContent=(result.required_shifts_bp || []).join('; ') || 'No shifts cover this window';
@@ -684,6 +718,7 @@ function render(data) {
   if(strategy){ document.getElementById('analysisStrategiesStatus').textContent=`${strategy.phase} · ${strategy.strategy_count||0} JSON${strategy.error?' · '+strategy.error:''}`; if(strategy.strategies_path){ document.getElementById('strategies').value=strategy.strategies_path; } }
   const direct = data.duckdb_direct;
   if (direct) document.getElementById('directStatus').textContent = `${direct.phase} · points=${direct.point_count || 0}${direct.surface_id ? ' · '+direct.surface_id : ''}`;
+  if (direct && Object.keys(direct.artifacts || {}).length) renderDirectArtifactLinks(direct.artifacts);
   const job = data.job;
   const buttons = document.querySelectorAll('[data-runnable]'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
   if (!job) return;
@@ -724,6 +759,7 @@ function render(data) {
   for (const [name, filename] of Object.entries(artifacts)) { const link=document.createElement('a'); link.href='/api/artifact?name='+encodeURIComponent(name); link.textContent=filename; artifactBox.appendChild(link); }
   document.getElementById('logs').textContent = (job.logs || []).join('\n') || 'Ожидание вывода…';
 }
+setDirectStartEligible(false);
 const tabs = [...document.querySelectorAll('[role="tab"]')];
 function syncCandidateSource() {
   const packageSelected = value('select_source_mode') === 'package';
@@ -1723,6 +1759,9 @@ class PanelController:
         return document
 
     def duckdb_direct_coverage(self, payload: Mapping[str, object]) -> dict[str, object]:
+        with self._lock:
+            self._direct_coverage_scan = None
+            self._direct_artifacts.clear()
         side, symbols = self._direct_coverage_payload(payload)
         if self._direct_coverage_func is not list_duckdb_direct_coverage:
             rows = self._with_source(
@@ -1778,6 +1817,10 @@ class PanelController:
         }
 
     def start_duckdb_direct(self, payload: Mapping[str, object]) -> dict[str, object]:
+        with self._lock:
+            if self._direct_job is not None and self._direct_job.running:
+                raise RuntimeError("another direct build is already running")
+            self._direct_job = None
         coverage_token = self._optional_string(payload, 'coverage_token') or None
         parent_surface_id = self._optional_string(payload, "parent_surface_id") or None
         if coverage_token is not None:
@@ -1785,7 +1828,6 @@ class PanelController:
 
         request, token = self._resolve_direct_request(payload), self._required(payload, "preflight_token")
         with self._lock:
-            if self._direct_job and self._direct_job.running: raise RuntimeError("another direct build is already running")
             if self._direct_preflight is None: raise ValueError("latest preflight token is required")
             original, preflight, expected = self._direct_preflight
             raw_scopes = payload.get("selected_scopes")
@@ -1842,8 +1884,6 @@ class PanelController:
         parent_surface_id: str | None,
     ) -> dict[str, object]:
         with self._lock:
-            if self._direct_job and self._direct_job.running:
-                raise RuntimeError("another direct build is already running")
             scan = self._direct_coverage_scan
             if scan is None or coverage_token != scan.token:
                 raise ValueError("stale coverage token is required")
@@ -1858,6 +1898,8 @@ class PanelController:
             audit_root = self._import_settings().audit_root
             if audit_root is None:
                 raise ValueError("audit_root must be configured for direct builds")
+            if self._direct_job is not None and self._direct_job.running:
+                raise RuntimeError("another direct build is already running")
             job = _DirectJob(
                 requests=requests,
                 coverage_scan=scan,

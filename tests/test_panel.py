@@ -13,7 +13,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 from mrs3 import panel as panel_module
-from mrs3.panel import PanelController, _Job, create_panel_server
+from mrs3.panel import PanelController, _DirectJob, _Job, create_panel_server
 from mrs3.duckdb_import import ImportJobResult, ImportPreflight, ImportProgress
 from mrs3.duckdb_direct import (
     DirectBuildRequest,
@@ -956,6 +956,209 @@ def test_direct_coverage_ui_keeps_preflight_activity_feedback_deferred() -> None
     assert "Preparing coverage..." not in html
     assert "coverage_elapsed" not in html
     assert "coverageElapsed" not in html
+
+
+def test_direct_coverage_stale_check_clears_before_request_and_direct_start_prior_job_preserves_preview() -> None:
+    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+    check = html.split("async function directPreflight()", 1)[1]
+    assert check.index("clearDirectCoverageState()") < check.index("duckdbRequest('/api/duckdb-direct/coverage'")
+    assert check.index("setDirectStartEligible(true)") > check.index("duckdbRequest('/api/duckdb-direct/coverage'")
+    clear = html.split("function clearDirectCoverageState()", 1)[1]
+    assert "directPreflightToken=''" in clear
+    assert "document.getElementById('coverageReview').hidden=true" in clear
+    assert "setDirectStartEligible(false)" in clear
+    assert "renderDirectArtifactLinks({})" in clear
+    build = html.split("async function directBuild(parentSurfaceId='')", 1)[1]
+    assert build.index("clearDirectExecutionState()") < build.index("duckdbRequest('/api/duckdb-direct/preflight'")
+    assert "clearDirectCoverageState()" not in build
+    assert "setDirectStartEligible(false);\nconst tabs" in html
+
+
+def test_direct_coverage_artifact_links_use_existing_verified_route_only() -> None:
+    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+    assert "function renderDirectArtifactLinks" in html
+    assert "href='/api/artifact?name='+encodeURIComponent(name)" in html
+    assert "renderDirectArtifactLinks(result.artifacts)" in html
+    assert "renderDirectArtifactLinks(direct.artifacts)" in html
+    assert "Object.keys(direct.artifacts || {}).length" in html
+
+
+def test_direct_coverage_ui_manual_fields_do_not_constrain_token_workflow() -> None:
+    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+    assert "manual UTC and Side fields do not constrain the coverage-token workflow" in html
+    assert "from checked Pair + Side + TF rows" in html
+
+
+def test_direct_coverage_artifact_links_route_serves_verified_inventory_and_rejects_unverified_side_audit(
+    tmp_path: Path,
+) -> None:
+    scan = _fake_coverage_scan(tmp_path)
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: type("Connection", (), {"close": lambda self: None})(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
+    )
+    controller.duckdb_direct_coverage({"symbols": []})
+
+    assert controller.artifact("coverage_inventory") == (
+        "coverage_inventory.csv",
+        scan.inventory_path.read_bytes(),
+    )
+    assert controller.artifact("surface_coverage_audit_long") is None
+
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("GET", "/api/artifact?name=coverage_inventory")
+        verified = connection.getresponse()
+        assert verified.status == 200
+        assert verified.read() == scan.inventory_path.read_bytes()
+
+        connection.request("GET", "/api/artifact?name=surface_coverage_audit_long")
+        rejected = connection.getresponse()
+        rejected.read()
+        assert rejected.status == 404
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_failed_check_clears_previous_scan_and_artifact(tmp_path: Path) -> None:
+    scan = _fake_coverage_scan(tmp_path)
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: type("Connection", (), {"close": lambda self: None})(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
+    )
+    controller.duckdb_direct_coverage({"symbols": []})
+    assert controller.artifact("coverage_inventory") is not None
+
+    with pytest.raises(ValueError, match="symbols must be"):
+        controller.duckdb_direct_coverage({"symbols": 42})
+
+    assert controller._direct_coverage_scan is None
+    assert controller._direct_artifacts == {}
+    assert controller.artifact("coverage_inventory") is None
+    with pytest.raises(ValueError, match="stale coverage token"):
+        controller.duckdb_direct_preflight(
+            {
+                "coverage_token": "coverage-token",
+                "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}],
+            }
+        )
+
+
+def test_failed_start_clears_completed_prior_job_before_validation(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    controller._direct_job = _DirectJob(
+        running=False,
+        artifacts={
+            "surface_coverage_audit_long": ("surface_coverage_audit_LONG.csv", b"long,audit\n"),
+        },
+    )
+    assert controller.snapshot()["duckdb_direct"]["artifacts"] == {
+        "surface_coverage_audit_long": "surface_coverage_audit_LONG.csv"
+    }
+
+    with pytest.raises(ValueError, match="required field"):
+        controller.start_duckdb_direct({})
+
+    assert controller._direct_job is None
+    assert controller.snapshot()["duckdb_direct"] is None
+    assert controller.artifact("surface_coverage_audit_long") is None
+
+
+def test_successful_direct_snapshot_feeds_direct_artifact_renderer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    scan = _fake_coverage_scan(tmp_path)
+    audit_data = b"long,audit\n"
+
+    def prepare(
+        _source: object,
+        requests: tuple[object, ...],
+        *,
+        audit_root: object,
+        coverage_scan: object,
+        cancellation: object,
+        progress_callback: object,
+    ) -> tuple[object, ...]:
+        prepared: list[object] = []
+        for request in requests:
+            side = request.side
+            audit_sha = sha256(audit_data).hexdigest()
+            filename = f"surface_coverage_audit_{side}.csv"
+            path = Path(audit_root) / "surface_coverage" / audit_sha / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(audit_data)
+            prepared.append(
+                SimpleNamespace(
+                    request=request,
+                    points=(),
+                    preflight=SimpleNamespace(
+                        audit_sha256=audit_sha,
+                        audit_bytes=audit_data,
+                        audit_artifact_name=filename,
+                    ),
+                )
+            )
+        return tuple(prepared)
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        *,
+        cancellation: object,
+        progress_callback: object,
+        parent_surface_id: str | None = None,
+    ) -> DirectQueueResult:
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(SimpleNamespace(surface_id=f"surface-{surface.request.side}", points=()) for surface in surfaces),
+        )
+
+    monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+        direct_prepare_func=prepare,
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
+    )
+    controller.duckdb_direct_coverage({"symbols": []})
+    controller.start_duckdb_direct(
+        {
+            "coverage_token": "coverage-token",
+            "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}],
+        }
+    )
+    status = _wait_direct_finished(controller)
+
+    assert status["artifacts"] == {
+        "coverage_inventory": "coverage_inventory.csv",
+        "surface_coverage_audit_long": "surface_coverage_audit_LONG.csv",
+    }
+    assert "renderDirectArtifactLinks(direct.artifacts)" in panel_module.PANEL_HTML
 
 
 def test_analysis_schema_initialization_is_explicit_and_library_then_reads_only(tmp_path: Path) -> None:
