@@ -5,6 +5,7 @@ import csv
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
 from hashlib import sha256
 import inspect
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +17,7 @@ import re
 import subprocess
 import sys
 import threading
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 from urllib.parse import parse_qs, urlparse
 import uuid
 import webbrowser
@@ -32,7 +33,24 @@ from .config import AlgorithmConfig
 from .config import DuckDBImportSettings, load_duckdb_import_settings, save_duckdb_import_settings
 from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, SnapshotProgress, import_html_tree, preflight_html_import
 from .duckdb_source_schema import migrate_source_database
-from .duckdb_direct import DirectBuildRequest, DirectMaterializationError, DirectPreflight, preflight_duckdb_direct, run_panel_direct_build
+from .duckdb_direct import (
+    DirectBuildRequest,
+    DirectCommonInterval,
+    DirectMaterializationError,
+    DirectPreflight,
+    DirectScope,
+    READINESS_CONTRACT_VERSION,
+    READINESS_MAX_SHIFT_BP,
+    V2_GRID_CONTRACT_KIND,
+    _CoverageScan,
+    common_intervals_for_scopes,
+    coverage_scan_direct,
+    list_duckdb_direct_coverage,
+    preflight_duckdb_direct,
+    prepare_direct_surfaces,
+    publish_direct_surfaces,
+    run_panel_direct_build,
+)
 from .models import Side
 from .pipeline import run_published_pipeline
 from .performance_import import _canonical, _canonical_contract, _sha256
@@ -264,6 +282,24 @@ PANEL_HTML = r"""<!doctype html>
     .shortlist-orders { min-width: 420px; color: #cbd8ef; line-height: 1.55; }
     .shortlist-order { display: block; white-space: nowrap; }
     .shortlist-empty { padding: 18px; color: var(--muted); text-align: center; }
+    .coverage-review { display: grid; gap: 12px; margin: 14px 0 10px; }
+    .coverage-review-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+    .coverage-review-title { font-size: 15px; font-weight: 700; letter-spacing: -.02em; }
+    .coverage-review-note { color: var(--muted); font-size: 12px; }
+    .coverage-group { border: 1px solid rgba(188, 208, 255, .12); border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.015)); overflow: hidden; }
+    .coverage-group-head { display: flex; justify-content: space-between; gap: 10px; padding: 10px 12px; background: rgba(255,255,255,.03); border-bottom: 1px solid rgba(188, 208, 255, .08); }
+    .coverage-group-head b { font-size: 13px; letter-spacing: -.01em; }
+    .coverage-group-head span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+    .coverage-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    .coverage-table th { color: var(--muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+    .coverage-table th, .coverage-table td { padding: 9px 12px; border-bottom: 1px solid rgba(188, 208, 255, .06); vertical-align: top; }
+    .coverage-table tr:last-child td { border-bottom: 0; }
+    .coverage-check { width: 42px; text-align: center; }
+    .coverage-tf { width: 80px; white-space: nowrap; font-weight: 700; }
+    .coverage-interval { width: 240px; color: #dce7ff; }
+    .coverage-gap { color: var(--muted); }
+    .coverage-gap.bad { color: #ffb1ba; }
+    .coverage-empty { padding: 14px 12px; color: var(--muted); }
     @media (max-width: 650px) { .shortlist-counters { grid-template-columns: 1fr 1fr; } }
     @keyframes panel-in { from { opacity: .55; } to { opacity: 1; } }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
@@ -309,7 +345,7 @@ PANEL_HTML = r"""<!doctype html>
             <div class="row"><label>Side<select id="direct_side" onchange="applyWorkflowDefaults(true)"><option>LONG</option><option>SHORT</option></select></label><label>Symbols (; separated)<input id="direct_symbols" type="text" placeholder="BTCUSDT;ETHUSDT"></label></div>
             <div class="source-note">Shifts: <output id="direct_shifts">Auto-detected after coverage check.</output><br>All observed shifts that cover the selected UTC window are frozen into the surface contract automatically.</div>
             <div class="buttons"><button type="button" onclick="directPreflight()">Check coverage</button><button type="button" class="primary" onclick="directBuild()">Build surface</button><button type="button" onclick="directCancel()">Cancel</button></div>
-            <div id="directCoverage" role="group" aria-label="Direct surface symbols"></div><div id="directStatus" class="muted" aria-live="polite">No direct build.</div>
+            <div id="directCoverage" role="note" class="muted">Coverage review appears in the right panel after preflight.</div><div id="directStatus" class="muted" aria-live="polite">No direct build.</div>
           </div></details>
           <details><summary>Analysis Library</summary><div class="stack">
             <div class="row"><label>Side<select id="analysis_side"><option value="">Any</option><option>LONG</option><option>SHORT</option></select></label><label>Build mode<select id="analysis_build_mode"><option value="">Any</option><option>DUCKDB_DIRECT</option></select></label></div><label>Symbol<input id="analysis_symbol" type="text"></label>
@@ -374,6 +410,13 @@ PANEL_HTML = r"""<!doctype html>
       </div>
       <div id="progressBar" class="bar" role="progressbar" aria-label="Прогресс операции" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="barFill"></div></div>
       <div id="progressText" class="muted">Ожидание запуска</div>
+      <section id="coverageReview" class="coverage-review" aria-live="polite" aria-label="DuckDB coverage review" hidden>
+        <div class="coverage-review-head">
+          <div class="coverage-review-title">DuckDB coverage review</div>
+          <div class="coverage-review-note">Review gap-free scopes before direct materialization.</div>
+        </div>
+        <div id="coverageReviewBody"></div>
+      </section>
       <div id="operationStats" class="stats">
         <div class="stat"><b id="submitted">0</b><span>отправлено</span></div>
         <div class="stat"><b id="running">0</b><span>в работе</span></div>
@@ -462,9 +505,87 @@ function renderDirectCoverage(result) {
   const excluded=new Map(); for(const issue of (result.coverage_issues || [])){ if(!['GRID_NOT_COVERED','GRID_NO_COMMON_PAIRS','CONFLICTING_CANONICAL_POINT'].includes(issue.code)) continue; const key=issue.symbol+' · '+issue.timeframe; excluded.set(key,issue.code); } for(const [scope,code] of excluded){ const row=document.createElement('div'); row.className='direct-unavailable'; row.textContent='! '+scope+' excluded: '+code; target.appendChild(row); }
   for (const symbol of Object.keys(result.unavailable_symbols || {})) { const row=document.createElement('div'); row.className='direct-unavailable'; const reasons=(result.coverage_issues || []).filter(item=>item.symbol===symbol).map(item=>`${item.code}: ${item.detail}`).join('; '); row.textContent=`⚠ ${symbol} · ${reasons || 'unavailable'}`; target.appendChild(row); }
 }
-async function directPreflight() { try { const result=await duckdbRequest('/api/duckdb-direct/preflight', directPayload()); directPreflightToken=result.token; renderDirectCoverage(result); document.getElementById('directStatus').textContent='Coverage checked.'; } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
-async function directBuild(parentSurfaceId='') { try { const selected=[...document.querySelectorAll('input[name="direct_selected_symbol"]:checked')].map(item=>item.value); const payload={...directPayload(), preflight_token:directPreflightToken, selected_symbols:selected}; if(parentSurfaceId) payload.parent_surface_id=parentSurfaceId; render(await duckdbRequest('/api/duckdb-direct/start', payload)); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+async function directPreflight() { try { const result=await duckdbRequest('/api/duckdb-direct/coverage', {symbols:value('direct_symbols').split(';')}); directPreflightToken=result.token||''; renderDirectCoverageReview(result); document.getElementById('directStatus').textContent='Coverage checked.'; } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+async function directBuild(parentSurfaceId='') { try { const scopes=selectedDirectScopes(); if(!scopes.length) throw new Error('Select at least one gap-free Pair + TF row.'); const selectedSymbols=[...new Set(scopes.map(item=>item.symbol))]; const base={...directPayload(),symbols:selectedSymbols}; const flight=await duckdbRequest('/api/duckdb-direct/preflight',{...base,coverage_token:directPreflightToken,selected_scopes:scopes}); if(flight.token) directPreflightToken=flight.token; renderDirectCommonIntervals(flight.selected_intervals); const payload={...base,coverage_token:directPreflightToken,selected_scopes:scopes}; if(parentSurfaceId) payload.parent_surface_id=parentSurfaceId; document.getElementById('coverageReview').hidden=true; render(await duckdbRequest('/api/duckdb-direct/start', payload)); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
 async function directCancel() { try { render(await duckdbRequest('/api/duckdb-direct/cancel')); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+function directDateOnly(utc) { return (utc || '').slice(0, 10); }
+function directIntervalLabel(row) { return `${directDateOnly(row.interval_start_utc)} .. ${directDateOnly(row.interval_end_utc)}`; }
+function renderDirectCommonIntervals(intervals={}) {
+  const parts=Object.entries(intervals || {}).map(([side,item])=>`${side.toUpperCase()}: ${item.display}`);
+  if(parts.length) document.getElementById('direct_shifts').textContent=parts.join('; ');
+}
+function selectedDirectScopes() {
+  return [...document.querySelectorAll('input[name="direct_scope"]:checked')].map((item)=>({symbol:item.dataset.symbol,side:item.dataset.side,timeframe:item.dataset.timeframe}));
+}
+function renderDirectCoverageReview(result) {
+  const target=document.getElementById('directCoverage');
+  const section=document.getElementById('coverageReview');
+  const body=document.getElementById('coverageReviewBody');
+  target.textContent='Coverage review is shown in the right panel.';
+  body.replaceChildren();
+  document.getElementById('direct_shifts').textContent=(result.required_shifts_bp || []).join('; ') || 'No shifts cover this window';
+  const rows=[...(result.coverage_rows || [])];
+  if(!rows.length){
+    const empty=document.createElement('div');
+    empty.className='coverage-empty';
+    empty.textContent='No Pair + Side + TF scopes were discovered for the current selection.';
+    body.appendChild(empty);
+    section.hidden=false;
+    return;
+  }
+  const groups=new Map();
+  for(const row of rows){
+    const key=`${row.pair}|${row.side}`;
+    if(!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  for(const [key, items] of groups){
+    const [pair, side]=key.split('|');
+    const card=document.createElement('section');
+    card.className='coverage-group';
+    const head=document.createElement('div');
+    head.className='coverage-group-head';
+    const title=document.createElement('b');
+    title.textContent=pair;
+    const meta=document.createElement('span');
+    meta.textContent=side;
+    head.append(title, meta);
+    card.appendChild(head);
+    const table=document.createElement('table');
+    table.className='coverage-table';
+    table.innerHTML='<thead><tr><th class="coverage-check">Select</th><th class="coverage-tf">TF</th><th class="coverage-interval">Available interval</th><th class="coverage-gap">Gap</th></tr></thead>';
+    const tbody=document.createElement('tbody');
+    for(const item of items){
+      const row=document.createElement('tr');
+      const check=document.createElement('td');
+      check.className='coverage-check';
+      const box=document.createElement('input');
+      box.type='checkbox';
+      box.name='direct_scope';
+      box.dataset.symbol=item.pair;
+      box.dataset.side=item.side;
+      box.dataset.timeframe=item.timeframe;
+      box.checked=Boolean(item.selectable);
+      box.disabled=!item.selectable;
+      check.appendChild(box);
+      const tf=document.createElement('td');
+      tf.className='coverage-tf';
+      tf.textContent=item.timeframe;
+      const interval=document.createElement('td');
+      interval.className='coverage-interval';
+      interval.textContent=directIntervalLabel(item);
+      const gap=document.createElement('td');
+      gap.className='coverage-gap' + (item.gap_details?.length ? ' bad' : '');
+      gap.textContent=item.gap_details?.length ? item.gap_details.join('; ') : 'none';
+      row.append(check, tf, interval, gap);
+      tbody.appendChild(row);
+    }
+    table.appendChild(tbody);
+    card.appendChild(table);
+    body.appendChild(card);
+  }
+  section.hidden=false;
+}
 function showAnalysisFacts(facts={}) { for (const [id,key] of [['analysis_unique','unique_point_count'],['analysis_economic','economic_eligible_point_count'],['analysis_event','event_eligible_point_count'],['analysis_plateaus','plateau_count'],['analysis_ready','ready_candidate_count']]) document.getElementById(id).textContent=facts[key] ?? '—'; }
 function renderAnalysisLibrary(rows) {
   const target=document.getElementById('analysisLibrary'); target.replaceChildren();
@@ -697,9 +818,9 @@ class _ImportPreflightJob:
 
 @dataclass(slots=True)
 class _DirectJob:
-    request: DirectBuildRequest
-    preflight_request: DirectBuildRequest
-    preflight: DirectPreflight
+    request: DirectBuildRequest | None = None
+    preflight_request: DirectBuildRequest | None = None
+    preflight: DirectPreflight | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
     running: bool = True
     phase: str = "STARTING"
@@ -708,6 +829,10 @@ class _DirectJob:
     publication_state: str = "PENDING"
     error: str | None = None
     parent_surface_id: str | None = None
+    requests: tuple[DirectBuildRequest, ...] | None = None
+    coverage_scan: _CoverageScan | None = None
+    audit_root: Path | None = None
+    artifacts: dict[str, tuple[str, bytes]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -748,7 +873,11 @@ class PanelController:
         import_func: Callable[[ImportRequest, Callable[[ImportProgress], object] | None], ImportJobResult] = import_html_tree,
         migration_func: Callable[[Path, Path], object] = migrate_source_database,
         direct_connection_factory: Callable[..., duckdb.DuckDBPyConnection] = duckdb.connect,
+        direct_coverage_func: Callable[..., object] = list_duckdb_direct_coverage,
+        direct_coverage_scan_func: Callable[..., object] = coverage_scan_direct,
         direct_preflight_func: Callable[[duckdb.DuckDBPyConnection, DirectBuildRequest], DirectPreflight] = preflight_duckdb_direct,
+        direct_prepare_func: Callable[..., object] = prepare_direct_surfaces,
+        direct_publish_func: Callable[..., object] = publish_direct_surfaces,
         direct_build_func: Callable[..., object] = run_panel_direct_build,
         analysis_library_func: Callable[..., object] = list_surface_library,
         analysis_compare_func: Callable[..., object] = compare_analysis_runs,
@@ -778,8 +907,14 @@ class PanelController:
         self._import_func = import_func
         self._migration_func = migration_func
         self._direct_connection_factory = direct_connection_factory
+        self._direct_coverage_func = direct_coverage_func
+        self._direct_coverage_scan_func = direct_coverage_scan_func
         self._direct_preflight_func = direct_preflight_func
+        self._direct_prepare_func = direct_prepare_func
+        self._direct_publish_func = direct_publish_func
         self._direct_build_func = direct_build_func
+        self._direct_coverage_scan: _CoverageScan | None = None
+        self._direct_artifacts: dict[str, tuple[str, bytes]] = {}
         self._direct_preflight: tuple[DirectBuildRequest, DirectPreflight, str] | None = None
         self._direct_job: _DirectJob | None = None
         self._analysis_job: _AnalysisJob | None = None
@@ -1275,6 +1410,21 @@ class PanelController:
             result = tuple(sorted({str(item).strip() for item in items if str(item).strip()}))
             if not result: raise ValueError("at least one symbol is required")
             return result
+        def selected_scopes(value: object) -> tuple[str, ...]:
+            if value is None:
+                return ()
+            if not isinstance(value, (list, tuple)):
+                raise ValueError("selected_scopes must be a list")
+            scopes: set[str] = set()
+            for item in value:
+                if not isinstance(item, Mapping):
+                    raise ValueError("selected_scopes must contain objects")
+                symbol = str(item.get("symbol", "")).strip()
+                timeframe = str(item.get("timeframe", "")).strip()
+                if not symbol or not timeframe:
+                    raise ValueError("selected_scopes entries must include symbol and timeframe")
+                scopes.add(f"{symbol}|{timeframe}")
+            return tuple(sorted(scopes))
         def shifts() -> tuple[int, ...]:
             raw = payload.get("required_shifts_bp")
             if raw is not None:
@@ -1294,8 +1444,24 @@ class PanelController:
         return DirectBuildRequest(
             PanelController._required(payload, "start_utc"), PanelController._required(payload, "end_utc"),
             side, symbols(payload.get("symbols", ())), shifts(),
-            _DIRECT_MATERIALIZER_VERSION, _DIRECT_POINT_CONFIG_HASH,
+            _DIRECT_MATERIALIZER_VERSION, _DIRECT_POINT_CONFIG_HASH, selected_scopes(payload.get("selected_scopes")),
         )
+
+    @staticmethod
+    def _direct_coverage_payload(payload: Mapping[str, object]) -> tuple[str | None, tuple[str, ...]]:
+        raw_side = payload.get("side")
+        if raw_side is None or str(raw_side).strip() == "":
+            side = None
+        else:
+            side = str(raw_side).upper()
+            if side not in {"LONG", "SHORT"}:
+                raise ValueError("side must be LONG or SHORT")
+        items = payload.get("symbols", ())
+        values = items.split(";") if isinstance(items, str) else items
+        if not isinstance(values, (list, tuple)):
+            raise ValueError("symbols must be a list or semicolon-separated string")
+        symbols = tuple(sorted({str(item).strip() for item in values if str(item).strip()}))
+        return side, symbols
 
     @staticmethod
     def _direct_window_ms(request: DirectBuildRequest) -> tuple[int, int]:
@@ -1394,28 +1560,262 @@ class PanelController:
 
     @staticmethod
     def _direct_preflight_document(request: DirectBuildRequest, preflight: DirectPreflight, token: str) -> dict[str, object]:
-        return {"token": token, "required_shifts_bp": list(request.required_shifts_bp), "selected_symbols": list(preflight.usable_timeframes), "usable_timeframes": {key: list(value) for key, value in preflight.usable_timeframes.items()}, "unavailable_symbols": {key: list(value) for key, value in preflight.unavailable_symbols.items()}, "coverage_issues": [{"symbol": item.symbol, "timeframe": item.timeframe, "code": item.code, "detail": item.detail} for item in preflight.coverage_issues]}
+        return {
+            "token": token,
+            "required_shifts_bp": list(request.required_shifts_bp),
+            "selected_symbols": list(preflight.usable_timeframes),
+            "usable_timeframes": {key: list(value) for key, value in preflight.usable_timeframes.items()},
+            "unavailable_symbols": {key: list(value) for key, value in preflight.unavailable_symbols.items()},
+            "coverage_issues": [{"symbol": item.symbol, "timeframe": item.timeframe, "code": item.code, "detail": item.detail} for item in preflight.coverage_issues],
+            "coverage_rows": [
+                {
+                    "pair": item.symbol,
+                    "side": item.side,
+                    "timeframe": item.timeframe,
+                    "selectable": item.selectable,
+                    "interval_start_utc": item.interval_start_utc,
+                    "interval_end_utc": item.interval_end_utc,
+                    "gap_details": list(item.gap_details),
+                }
+                for item in preflight.coverage_rows
+            ],
+            "selected_scopes": [
+                {"symbol": item.symbol, "timeframe": item.timeframe}
+                for item in preflight.coverage_rows
+                if item.selectable
+            ],
+        }
+
+    @staticmethod
+    def _direct_scan_document(scan: _CoverageScan) -> dict[str, object]:
+        usable: dict[str, list[str]] = {}
+        coverage_rows: list[dict[str, object]] = []
+        selected_scopes: list[dict[str, str]] = []
+        for item in scan.coverage.rows:
+            coverage_rows.append(
+                {
+                    "pair": item.symbol,
+                    "side": item.side,
+                    "timeframe": item.timeframe,
+                    "selectable": item.selectable,
+                    "interval_start_utc": item.interval_start_utc,
+                    "interval_end_utc": item.interval_end_utc,
+                    "gap_details": list(item.gap_details),
+                }
+            )
+            if item.selectable:
+                usable.setdefault(item.symbol, []).append(item.timeframe)
+                selected_scopes.append({"symbol": item.symbol, "timeframe": item.timeframe})
+        return {
+            "token": scan.token,
+            "required_shifts_bp": [],
+            "selected_symbols": list(usable),
+            "usable_timeframes": {
+                symbol: sorted(set(timeframes))
+                for symbol, timeframes in usable.items()
+            },
+            "unavailable_symbols": {},
+            "coverage_issues": [],
+            "coverage_rows": coverage_rows,
+            "selected_scopes": selected_scopes,
+        }
+
+    @staticmethod
+    def _verified_direct_bytes(path: Path, expected_sha256: str) -> bytes:
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            raise ValueError("direct artifact is unavailable") from error
+        if hashlib.sha256(data).hexdigest() != expected_sha256:
+            raise ValueError("direct artifact verification failed")
+        return data
+
+    @staticmethod
+    def _direct_selected_scopes(
+        payload: Mapping[str, object],
+    ) -> tuple[DirectScope, ...]:
+        raw = payload.get("selected_scopes")
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError("selected_scopes must be a list")
+        scopes: list[DirectScope] = []
+        for item in raw:
+            if not isinstance(item, Mapping):
+                raise ValueError("selected_scopes must contain objects")
+            symbol = str(item.get("symbol", "")).strip()
+            timeframe = str(item.get("timeframe", "")).strip()
+            raw_side = item.get("side")
+            side = str(raw_side).strip().upper() if raw_side not in (None, "") else ""
+            if not symbol or not timeframe or side not in {"LONG", "SHORT"}:
+                raise ValueError("selected scope must include symbol, side, and timeframe")
+            scopes.append(DirectScope(symbol, side, timeframe))
+        if not scopes:
+            raise ValueError("at least one selected scope is required")
+        return tuple(scopes)
+
+    @staticmethod
+    def _direct_common_interval_document(interval: DirectCommonInterval) -> dict[str, object]:
+        return {
+            "side": interval.side,
+            "start_utc": interval.start_utc,
+            "end_utc": interval.end_utc,
+            "start_date": interval.start_utc[:10],
+            "end_date": interval.end_utc[:10],
+            "display": f"{interval.start_utc[:10]} .. {interval.end_utc[:10]}",
+            "scopes": [
+                {
+                    "symbol": scope.symbol,
+                    "side": scope.side,
+                    "timeframe": scope.timeframe,
+                }
+                for scope in interval.scopes
+            ],
+        }
+
+    @staticmethod
+    def _direct_common_intervals_document(
+        intervals: Sequence[DirectCommonInterval],
+    ) -> dict[str, dict[str, object]]:
+        return {
+            interval.side.lower(): PanelController._direct_common_interval_document(interval)
+            for interval in intervals
+        }
+
+    @staticmethod
+    def _direct_coverage_request(interval: DirectCommonInterval) -> DirectBuildRequest:
+        symbols = tuple(sorted({scope.symbol for scope in interval.scopes}))
+        selected_scopes = tuple(
+            f"{scope.symbol}|{scope.timeframe}"
+            for scope in sorted(interval.scopes, key=lambda scope: (scope.symbol, scope.timeframe))
+        )
+        return DirectBuildRequest(
+            interval.start_utc,
+            interval.end_utc,
+            interval.side,
+            symbols,
+            (),
+            _DIRECT_MATERIALIZER_VERSION,
+            _DIRECT_POINT_CONFIG_HASH,
+            selected_scopes=selected_scopes,
+            grid_contract_kind=V2_GRID_CONTRACT_KIND,
+            readiness_contract_version=READINESS_CONTRACT_VERSION,
+            readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+        )
 
     def duckdb_direct_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
+        coverage_token = self._optional_string(payload, "coverage_token") or None
+        if payload.get("selected_scopes") is not None and coverage_token is not None:
+            with self._lock:
+                scan = self._direct_coverage_scan
+            if scan is None or coverage_token != scan.token:
+                raise ValueError("stale coverage token is required")
+            scopes = self._direct_selected_scopes(payload)
+            intervals = common_intervals_for_scopes(scan.coverage, scopes)
+            document = self._direct_scan_document(scan)
+            document["selected_intervals"] = self._direct_common_intervals_document(intervals)
+            document["token"] = scan.token
+            return document
         request = self._resolve_direct_request(payload)
         preflight = self._with_source(lambda source: self._direct_preflight_func(source, request))
         assert isinstance(preflight, DirectPreflight)
         token = self._direct_token(request, preflight)
         with self._lock: self._direct_preflight = (request, preflight, token)
-        return self._direct_preflight_document(request, preflight, token)
+        document = self._direct_preflight_document(request, preflight, token)
+        return document
+
+    def duckdb_direct_coverage(self, payload: Mapping[str, object]) -> dict[str, object]:
+        side, symbols = self._direct_coverage_payload(payload)
+        if self._direct_coverage_func is not list_duckdb_direct_coverage:
+            rows = self._with_source(
+                lambda source: self._direct_coverage_func(
+                    source, side=side, symbols=symbols
+                )
+            )
+            return {
+                "coverage_rows": [
+                    {
+                        "pair": item.symbol,
+                        "side": item.side,
+                        "timeframe": item.timeframe,
+                        "selectable": item.selectable,
+                        "interval_start_utc": item.interval_start_utc,
+                        "interval_end_utc": item.interval_end_utc,
+                        "gap_details": list(item.gap_details),
+                    }
+                    for item in rows
+                ]
+            }
+        audit_root = self._import_settings().audit_root
+        if audit_root is None:
+            raise ValueError("audit_root must be configured for coverage scans")
+        scan = self._with_source(
+            lambda source: self._direct_coverage_scan_func(
+                source,
+                audit_root=audit_root,
+                symbols=symbols,
+            )
+        )
+        if not isinstance(scan, _CoverageScan):
+            raise ValueError("coverage scan returned an invalid result")
+        inventory_bytes = self._verified_direct_bytes(scan.inventory_path, scan.inventory_sha256)
+        with self._lock:
+            self._direct_coverage_scan = scan
+            self._direct_artifacts["coverage_inventory"] = (scan.inventory_path.name, inventory_bytes)
+        return {
+            "coverage_rows": [
+                {
+                    "pair": item.symbol,
+                    "side": item.side,
+                    "timeframe": item.timeframe,
+                    "selectable": item.selectable,
+                    "interval_start_utc": item.interval_start_utc,
+                    "interval_end_utc": item.interval_end_utc,
+                    "gap_details": list(item.gap_details),
+                }
+                for item in scan.coverage.rows
+            ],
+            "token": scan.token,
+            "artifacts": {"coverage_inventory": scan.inventory_path.name},
+        }
 
     def start_duckdb_direct(self, payload: Mapping[str, object]) -> dict[str, object]:
-        request, token = self._resolve_direct_request(payload), self._required(payload, "preflight_token")
+        coverage_token = self._optional_string(payload, 'coverage_token') or None
         parent_surface_id = self._optional_string(payload, "parent_surface_id") or None
+        if coverage_token is not None:
+            return self._start_direct_coverage_job(payload, coverage_token, parent_surface_id)
+
+        request, token = self._resolve_direct_request(payload), self._required(payload, "preflight_token")
         with self._lock:
             if self._direct_job and self._direct_job.running: raise RuntimeError("another direct build is already running")
             if self._direct_preflight is None: raise ValueError("latest preflight token is required")
             original, preflight, expected = self._direct_preflight
-            if token != expected or request != original: raise ValueError("latest preflight token is required")
-            chosen = payload.get("selected_symbols", tuple(preflight.usable_timeframes))
-            selected = self._direct_request({**payload, "symbols": chosen, "required_shifts_bp": request.required_shifts_bp})
-            if replace(selected, symbols=request.symbols) != request: raise ValueError("latest preflight token is required")
-            if not set(selected.symbols).issubset(preflight.usable_timeframes): raise ValueError("selected symbol is unavailable")
+            raw_scopes = payload.get("selected_scopes")
+            if raw_scopes is not None:
+                if token != expected or request != original:
+                    raise ValueError("latest preflight token is required")
+                selected = request
+                allowed_scopes = {
+                    f"{item.symbol}|{item.timeframe}"
+                    for item in preflight.coverage_rows
+                    if item.selectable
+                }
+                usable_scopes = {
+                    f"{symbol}|{timeframe}"
+                    for symbol, timeframes in preflight.usable_timeframes.items()
+                    for timeframe in timeframes
+                }
+                if not selected.selected_scopes:
+                    raise ValueError("at least one scope is required")
+                if not set(selected.selected_scopes).issubset(allowed_scopes & usable_scopes):
+                    raise ValueError("selected scope is unavailable")
+            else:
+                if token != expected or request != original:
+                    raise ValueError("latest preflight token is required")
+                chosen = payload.get("selected_symbols", tuple(preflight.usable_timeframes))
+                selected = self._direct_request({**payload, "symbols": chosen, "required_shifts_bp": request.required_shifts_bp})
+                if replace(selected, symbols=request.symbols, selected_scopes=()) != request:
+                    raise ValueError("latest preflight token is required")
+                if not set(selected.symbols).issubset(preflight.usable_timeframes):
+                    raise ValueError("selected symbol is unavailable")
         if parent_surface_id is not None:
             exists = self._with_analysis(
                 True,
@@ -1435,26 +1835,121 @@ class PanelController:
         threading.Thread(target=self._run_duckdb_direct, args=(job,), name="mrs3-panel-duckdb-direct", daemon=True).start()
         return self.snapshot()
 
+    def _start_direct_coverage_job(
+        self,
+        payload: Mapping[str, object],
+        coverage_token: str,
+        parent_surface_id: str | None,
+    ) -> dict[str, object]:
+        with self._lock:
+            if self._direct_job and self._direct_job.running:
+                raise RuntimeError("another direct build is already running")
+            scan = self._direct_coverage_scan
+            if scan is None or coverage_token != scan.token:
+                raise ValueError("stale coverage token is required")
+            scopes = self._direct_selected_scopes(payload)
+            intervals = common_intervals_for_scopes(scan.coverage, scopes)
+            requests = tuple(
+                self._direct_coverage_request(interval)
+                for interval in intervals
+            )
+            if parent_surface_id is not None and len(requests) != 1:
+                raise ValueError("parent_surface_id requires a single side")
+            audit_root = self._import_settings().audit_root
+            if audit_root is None:
+                raise ValueError("audit_root must be configured for direct builds")
+            job = _DirectJob(
+                requests=requests,
+                coverage_scan=scan,
+                audit_root=audit_root,
+                parent_surface_id=parent_surface_id,
+            )
+            job.artifacts.update(self._direct_artifacts)
+            self._direct_job = job
+        threading.Thread(target=self._run_duckdb_direct, args=(job,), name="mrs3-panel-duckdb-direct", daemon=True).start()
+        return self.snapshot()
+
     def _run_duckdb_direct(self, job: _DirectJob) -> None:
         source = analysis = None
         try:
             source_path, analysis_path = self._direct_paths()
             source = self._direct_connection_factory(str(source_path), read_only=True)
             if job.cancel.is_set(): raise DirectMaterializationError("direct build cancelled")
-            active = self._direct_preflight_func(source, job.preflight_request)
-            if active != job.preflight: raise DirectMaterializationError("active source changed after preflight")
-            analysis = self._direct_connection_factory(str(analysis_path), read_only=False)
             def progress(phase: str, **facts: object) -> None:
                 with self._lock: job.phase = phase; job.point_count = int(facts.get("materialized_points", job.point_count))
-            if job.parent_surface_id is None:
-                published = self._direct_build_func(source, analysis, job.request, job.cancel.is_set, progress)
-            else:
-                published = self._direct_build_func(
-                    source, analysis, job.request, job.cancel.is_set, progress,
+            if job.requests is not None:
+                prepared = self._direct_prepare_func(
+                    source,
+                    job.requests,
+                    audit_root=job.audit_root,
+                    coverage_scan=job.coverage_scan,
+                    cancellation=job.cancel.is_set,
+                    progress_callback=progress,
+                )
+                source.close()
+                source = None
+                analysis = self._direct_connection_factory(str(analysis_path), read_only=False)
+                result = self._direct_publish_func(
+                    analysis,
+                    prepared,
+                    cancellation=job.cancel.is_set,
+                    progress_callback=progress,
                     parent_surface_id=job.parent_surface_id,
                 )
-            with self._lock:
-                job.surface_id, job.point_count, job.phase, job.publication_state = str(published.surface_id), len(published.points), "PUBLISHED", "PUBLISHED"
+                with self._lock:
+                    job.publication_state = str(result.publication_state)
+                    job.phase = str(result.phase or result.publication_state)
+                    job.surface_id = (
+                        str(result.surfaces[0].surface_id)
+                        if result.surfaces
+                        else None
+                    )
+                    job.point_count = sum(
+                        len(getattr(surface, "points", ()))
+                        for surface in result.surfaces
+                    )
+                    if job.coverage_scan is not None:
+                        inventory = self._direct_artifacts.get("coverage_inventory")
+                        if inventory is not None:
+                            job.artifacts["coverage_inventory"] = inventory
+                    if job.audit_root is not None:
+                        for surface in prepared:
+                            side = surface.request.side.lower()
+                            audit_sha = (
+                                getattr(surface.preflight, "audit_sha256", "")
+                                if hasattr(surface, "preflight")
+                                else ""
+                            )
+                            if audit_sha:
+                                filename = (
+                                    getattr(surface.preflight, "audit_artifact_name", "")
+                                    or f"surface_coverage_audit_{surface.request.side}.csv"
+                                )
+                                audit_bytes = getattr(surface.preflight, "audit_bytes", None)
+                                if audit_bytes is None:
+                                    audit_path = (
+                                        Path(job.audit_root)
+                                        / "surface_coverage"
+                                        / str(audit_sha)
+                                        / filename
+                                    )
+                                    audit_bytes = self._verified_direct_bytes(audit_path, audit_sha)
+                                elif hashlib.sha256(audit_bytes).hexdigest() != audit_sha:
+                                    raise DirectMaterializationError("publication audit hash verification failed")
+                                job.artifacts[f"surface_coverage_audit_{side}"] = (filename, bytes(audit_bytes))
+            else:
+                active = self._direct_preflight_func(source, job.preflight_request)
+                if active != job.preflight: raise DirectMaterializationError("active source changed after preflight")
+                analysis = self._direct_connection_factory(str(analysis_path), read_only=False)
+                if job.parent_surface_id is None:
+                    published = self._direct_build_func(source, analysis, job.request, job.cancel.is_set, progress)
+                else:
+                    published = self._direct_build_func(
+                        source, analysis, job.request, job.cancel.is_set, progress,
+                        parent_surface_id=job.parent_surface_id,
+                    )
+                with self._lock:
+                    job.surface_id, job.point_count, job.phase, job.publication_state = str(published.surface_id), len(published.points), "PUBLISHED", "PUBLISHED"
         except BaseException as error:
             with self._lock:
                 job.phase = "CANCELLED" if job.cancel.is_set() else "FAILED"
@@ -2036,6 +2531,7 @@ class PanelController:
                     "artifacts": ({"import_manifest": "import_manifest.json", "import_checklist": "html_delete_checklist.json"} if evidence_valid else {}),
                 }
             direct_job = self._direct_job
+            direct_preflight = self._direct_preflight
             direct_document = None if direct_job is None else {
                 "running": direct_job.running,
                 "cancel_requested": direct_job.cancel.is_set(),
@@ -2045,7 +2541,17 @@ class PanelController:
                 "publication_state": direct_job.publication_state,
                 "parent_surface_id": direct_job.parent_surface_id,
                 "error": direct_job.error,
+                "artifacts": {
+                    name: filename
+                    for name, (filename, _) in direct_job.artifacts.items()
+                },
             }
+            if direct_preflight is not None:
+                request, preflight, token = direct_preflight
+                preflight_document = self._direct_preflight_document(request, preflight, token)
+                if direct_document is None:
+                    direct_document = {"running": False, "phase": "PREFLIGHT_READY", "point_count": 0}
+                direct_document["preflight"] = preflight_document
             analysis_job = self._analysis_job
             analysis_document = None if analysis_job is None else {
                 "running": analysis_job.running,
@@ -2081,6 +2587,9 @@ class PanelController:
         }
 
     def artifact(self, name: str) -> Path | tuple[str, bytes] | None:
+        direct_artifact = self._direct_artifact(name)
+        if direct_artifact is not None:
+            return direct_artifact
         with self._lock:
             path = self._job.artifacts.get(name) if self._job else None
             baseline = self._job.artifact_baseline.get(name) if self._job else None
@@ -2092,6 +2601,14 @@ class PanelController:
                 return None
             return {"import_manifest": (result.manifest_path.name, evidence[0]), "import_checklist": (result.checklist_path.name, evidence[1])}.get(name)
         return path
+
+    def _direct_artifact(self, name: str) -> tuple[str, bytes] | None:
+        with self._lock:
+            job = self._direct_job
+            direct_artifact = self._direct_artifacts.get(name)
+        if job is not None and name in job.artifacts:
+            return job.artifacts[name]
+        return direct_artifact
 
 
 class _PanelServer(ThreadingHTTPServer):
@@ -2196,7 +2713,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/initialize", "/api/analysis/library", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/initialize", "/api/analysis/library", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -2231,6 +2748,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.cancel_duckdb_import()
             elif endpoint == "/api/duckdb-import/migrate":
                 result = self.server.controller.migrate_duckdb_import(document)
+            elif endpoint == "/api/duckdb-direct/coverage":
+                result = self.server.controller.duckdb_direct_coverage(document)
             elif endpoint == "/api/duckdb-direct/preflight":
                 result = self.server.controller.duckdb_direct_preflight(document)
             elif endpoint == "/api/duckdb-direct/start":

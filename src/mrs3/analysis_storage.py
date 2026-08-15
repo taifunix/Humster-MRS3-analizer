@@ -28,6 +28,7 @@ _DIRECT_REQUIRED_METRICS = {
     "WinRate",
     "ProfitFactor",
 }
+V2_GRID_CONTRACT_KIND = "OBSERVED_SPARSE_GRID_CONTRACT_V2"
 
 
 class AnalysisSchemaError(ValueError):
@@ -536,6 +537,27 @@ def _canonical_json(value: object) -> str:
     return json.dumps(normalize(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
 
 
+def _strict_canonical_json(value: object) -> str:
+    def normalize(item: object) -> object:
+        if isinstance(item, Mapping):
+            if any(not isinstance(key, str) for key in item):
+                raise ValueError("object keys must be strings in V2 canonical JSON")
+            return {key: normalize(value) for key, value in item.items()}
+        if isinstance(item, (tuple, list)):
+            return [normalize(value) for value in item]
+        if isinstance(item, float):
+            raise ValueError("floats are forbidden in V2 canonical JSON")
+        return item
+
+    return json.dumps(
+        normalize(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
 def _analysis_json(value: object) -> str:
     def clean(item: object) -> object:
         if isinstance(item, Mapping):
@@ -561,6 +583,7 @@ def _utc(value: str) -> str:
 def _surface_identity(surface: DirectSurface) -> tuple[str, dict[str, object]]:
     request, preflight = surface.request, surface.preflight
     start, end = _utc(request.start_utc), _utc(request.end_utc)
+    kind = preflight.grid_contract.get("kind")
     identity = {
         "build_mode": surface.build_mode,
         "period": [start, end],
@@ -570,13 +593,42 @@ def _surface_identity(surface: DirectSurface) -> tuple[str, dict[str, object]]:
             symbol: sorted(timeframes) for symbol, timeframes in sorted(preflight.usable_timeframes.items())
         },
         "source_hashes": sorted(preflight.source_hashes),
-        "grid_contract": json.loads(_canonical_json(preflight.grid_contract)),
+        "grid_contract": json.loads(
+            _strict_canonical_json(preflight.grid_contract)
+            if kind == V2_GRID_CONTRACT_KIND
+            else _canonical_json(preflight.grid_contract)
+        ),
         "normalization_contract": preflight.grid_contract.get("normalization_contract_version"),
         "materializer_version": request.materializer_version,
         "point_materialization_config_hash": request.point_materialization_config_hash,
         "event_mode": surface.event_mode,
     }
-    return sha256(_canonical_json(identity).encode("ascii")).hexdigest(), identity
+    grid_contract = identity["grid_contract"]
+    if grid_contract.get("kind") == V2_GRID_CONTRACT_KIND:
+        from .duckdb_direct import point_evidence_jsonl_bytes, point_key_tuple
+
+        ordered_points = tuple(sorted(
+            surface.points,
+            key=lambda point: point_key_tuple(point.canonical_point_key),
+        ))
+        evidence_bytes = point_evidence_jsonl_bytes(ordered_points)
+        identity["materialized_point_evidence"] = evidence_bytes.decode("utf-8")
+        identity["materialized_point_evidence_sha256"] = sha256(evidence_bytes).hexdigest()
+        preflight_witnesses = getattr(preflight, "witnesses", ())
+        if "witnesses" not in grid_contract and preflight_witnesses:
+            grid_contract["witnesses"] = dict(preflight_witnesses)
+        for field in ("audit_artifact_name", "audit_schema_version", "audit_row_count", "audit_sha256"):
+            if field not in grid_contract:
+                value = getattr(preflight, field, None)
+                if value not in (None, "", 0):
+                    grid_contract[field] = value
+        identity["grid_contract"] = grid_contract
+    serialized = (
+        _strict_canonical_json(identity)
+        if kind == V2_GRID_CONTRACT_KIND
+        else _canonical_json(identity)
+    )
+    return sha256(serialized.encode("ascii")).hexdigest(), identity
 
 
 def _point_parts(point: DirectPoint) -> tuple[str, str, str, int, int, int]:
@@ -613,6 +665,61 @@ def _validate_direct_metrics(metrics: Mapping[str, object]) -> None:
         number("ProfitFactor")
 
 
+def _validate_v2_evidence_text(evidence: str) -> None:
+    from .duckdb_direct import point_key_tuple
+
+    lines = evidence.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    if not lines:
+        raise ValueError("V2 point evidence is empty")
+    keys: list[str] = []
+    for line in lines:
+        if not line:
+            raise ValueError("V2 point evidence has an empty record")
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError("V2 point evidence is malformed JSON") from error
+        if set(record) != {"point_key", "report_id", "source_sha256"} or any(
+            not isinstance(record[name], str) for name in ("point_key", "report_id", "source_sha256")
+        ):
+            raise ValueError("V2 point evidence record is malformed")
+        point_key_tuple(record["point_key"])
+        keys.append(record["point_key"])
+    if len(keys) != len(set(keys)):
+        raise ValueError("V2 point evidence has duplicate point keys")
+
+
+def _verify_v2_audit(surface: DirectSurface) -> None:
+    from .duckdb_direct import _audit_data_row_count
+
+    preflight = surface.preflight
+    audit_bytes = getattr(preflight, "audit_bytes", b"")
+    audit_sha256 = getattr(preflight, "audit_sha256", "") or preflight.grid_contract.get("audit_sha256", "")
+    artifact_name = getattr(preflight, "audit_artifact_name", "") or preflight.grid_contract.get("audit_artifact_name", "")
+    schema_version = getattr(preflight, "audit_schema_version", 0) or preflight.grid_contract.get("audit_schema_version", 0)
+    row_count = getattr(preflight, "audit_row_count", 0) or preflight.grid_contract.get("audit_row_count", 0)
+    if not isinstance(audit_bytes, bytes) or not audit_bytes:
+        raise ValueError("V2 audit bytes are required before publication")
+    if not isinstance(artifact_name, str) or not artifact_name:
+        raise ValueError("V2 audit artifact name is required")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version < 1:
+        raise ValueError("V2 audit schema version must be a positive integer")
+    if not isinstance(audit_sha256, str) or len(audit_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in audit_sha256
+    ):
+        raise ValueError("V2 audit hash must be a lowercase SHA-256 digest")
+    if sha256(audit_bytes).hexdigest() != audit_sha256:
+        raise ValueError("V2 audit hash mismatch")
+    if not isinstance(row_count, int) or isinstance(row_count, bool) or row_count < 0:
+        raise ValueError("V2 audit row count must be a non-negative integer")
+    if not audit_bytes.endswith(b"\n"):
+        raise ValueError("V2 audit CSV must be LF-terminated")
+    if row_count != _audit_data_row_count(audit_bytes):
+        raise ValueError("V2 audit row count mismatch")
+
+
 def _validate_surface(surface: DirectSurface, identity: dict[str, object]) -> tuple[DirectPoint, ...]:
     if surface.build_mode != "DUCKDB_DIRECT" or surface.event_mode not in {"legacy_trades_proxy", "real_independent_events"}:
         raise ValueError("direct surface has invalid event mode")
@@ -629,11 +736,23 @@ def _validate_surface(surface: DirectSurface, identity: dict[str, object]) -> tu
         raise ValueError("source manifest must be unique")
     if len(set(source_hashes)) != len(source_hashes) or set(source_hash for _, source_hash in manifest) != set(source_hashes):
         raise ValueError("source manifest hashes must match source hashes")
-    points = tuple(sorted(surface.points, key=lambda point: point.canonical_point_key))
+    kind = identity["grid_contract"].get("kind")
+    if kind == V2_GRID_CONTRACT_KIND:
+        from .duckdb_direct import point_key_tuple
+
+        point_sort = lambda point: point_key_tuple(point.canonical_point_key)
+        expected_keys = tuple(sorted(surface.preflight.accepted_point_keys, key=point_key_tuple))
+    else:
+        point_sort = lambda point: point.canonical_point_key
+        expected_keys = tuple(sorted(surface.preflight.accepted_point_keys))
+    points = tuple(sorted(surface.points, key=point_sort))
     if len({point.canonical_point_key for point in points}) != len(points):
         raise ValueError("canonical point uniqueness failed")
-    if tuple(point.canonical_point_key for point in points) != tuple(sorted(surface.preflight.accepted_point_keys)):
+    if tuple(point.canonical_point_key for point in points) != expected_keys:
         raise ValueError("accepted point keys do not match materialized points")
+    if kind == V2_GRID_CONTRACT_KIND:
+        _validate_v2_surface(surface, identity, points, manifest, source_hashes)
+        return points
     if set(manifest) != {(point.source_report_id, point.source_hash) for point in points} or set(source_hashes) != {point.source_hash for point in points}:
         raise ValueError("materialized manifest does not match point provenance")
     usable = surface.preflight.usable_timeframes
@@ -664,6 +783,138 @@ def _validate_surface(surface: DirectSurface, identity: dict[str, object]) -> tu
         except (TypeError, ValueError) as error:
             raise ValueError("point metrics must be finite canonical JSON") from error
     return points
+
+
+def _validate_v2_surface(
+    surface: DirectSurface,
+    identity: dict[str, object],
+    points: tuple[DirectPoint, ...],
+    manifest: tuple[tuple[str, str], ...],
+    source_hashes: tuple[str, ...],
+) -> None:
+    from .duckdb_direct import point_evidence_jsonl_bytes
+
+    provenance = tuple(sorted(
+        ((point.source_report_id, point.source_hash) for point in points),
+        key=lambda item: (item[0], item[1]),
+    ))
+    expected_manifest = tuple(sorted(manifest, key=lambda item: (item[0], item[1])))
+    if len({record for record in provenance}) != len(provenance):
+        raise ValueError("point/report/source assignment must be one-to-one")
+    if provenance != expected_manifest:
+        raise ValueError("materialized manifest does not match point provenance")
+    if tuple(sorted(source_hashes)) != tuple(sorted({point.source_hash for point in points})):
+        raise ValueError("materialized source hashes do not match preflight")
+    grid_contract = identity["grid_contract"]
+    scope_values = grid_contract.get("selected_scopes")
+    if not isinstance(scope_values, list) or not scope_values:
+        raise ValueError("V2 grid contract has no selected scopes")
+    if any(not isinstance(scope, str) for scope in scope_values):
+        raise ValueError("V2 selected scopes must be strings")
+    if len(set(scope_values)) != len(scope_values):
+        raise ValueError("V2 selected scopes must be unique")
+    selected_scopes = set(scope_values)
+    witnesses = grid_contract.get("witnesses", {})
+    if not isinstance(witnesses, Mapping) or set(witnesses) != selected_scopes:
+        raise ValueError("V2 grid contract must have exactly one witness per selected scope")
+    for scope in selected_scopes:
+        _validate_v2_witness(scope, witnesses[scope], surface.request.side)
+    evidence_text = grid_contract.get("point_evidence")
+    if not isinstance(evidence_text, str):
+        raise ValueError("V2 point evidence is missing")
+    _validate_v2_evidence_text(evidence_text)
+    expected_evidence = point_evidence_jsonl_bytes(points)
+    if evidence_text.encode("utf-8") != expected_evidence:
+        raise ValueError("V2 point evidence does not match materialized points")
+    if grid_contract.get("point_evidence_sha256") != sha256(expected_evidence).hexdigest():
+        raise ValueError("V2 point evidence hash mismatch")
+    usable = surface.preflight.usable_timeframes
+    for point in points:
+        symbol, side, timeframe, _shift, _open_ma, _close_ma = _point_parts(point)
+        if (
+            f"{symbol}|{timeframe}" not in selected_scopes
+            or side != surface.request.side
+            or symbol not in surface.request.symbols
+            or timeframe not in usable.get(symbol, ())
+        ):
+            raise ValueError("point is outside the selected V2 scope")
+        if len(point.source_hash) != 64 or any(char not in "0123456789abcdef" for char in point.source_hash):
+            raise ValueError("source hash must be a lowercase SHA-256 digest")
+        if (point.source_report_id, point.source_hash) not in manifest or point.source_hash not in source_hashes:
+            raise ValueError("point provenance is absent from materialized preflight")
+        if point.point_event_count < 0:
+            raise ValueError("point event count must be non-negative")
+        _validate_direct_metrics(point.metrics)
+        if surface.event_mode == "legacy_trades_proxy":
+            if point.event_ids or point.point_event_count != int(point.metrics["TotalTrades"]):
+                raise ValueError("legacy point event count must equal TotalTrades without memberships")
+        else:
+            if tuple(sorted(set(point.event_ids))) != point.event_ids or len(point.event_ids) != point.point_event_count:
+                raise ValueError("real point event membership does not match point event count")
+            if any(len(event_id) != 64 or any(char not in "0123456789abcdef" for char in event_id) for event_id in point.event_ids):
+                raise ValueError("event IDs must be lowercase SHA-256 digests")
+        try:
+            _canonical_json(point.metrics)
+        except (TypeError, ValueError) as error:
+            raise ValueError("point metrics must be finite canonical JSON") from error
+
+
+def _validate_v2_witness(scope: str, witness: object, expected_side: str) -> None:
+    from .duckdb_direct import READINESS_CONTRACT_VERSION, READINESS_MAX_SHIFT_BP
+
+    if not isinstance(witness, Mapping):
+        raise ValueError("V2 readiness witness must be a JSON object")
+    expected_keys = {"symbol", "side", "timeframe", "open_ma", "close_ma", "shifts_bp", "contract_version", "max_shift_bp"}
+    if set(witness) != expected_keys:
+        raise ValueError("V2 readiness witness must have exactly the preflight keys")
+    scope_parts = scope.split("|", maxsplit=1)
+    if len(scope_parts) != 2:
+        raise ValueError("V2 selected scope must be symbol|timeframe")
+    expected_symbol, expected_timeframe = scope_parts
+    symbol = witness.get("symbol")
+    if not isinstance(symbol, str) or not symbol:
+        raise ValueError("V2 readiness witness symbol must be a non-empty string")
+    if symbol != expected_symbol:
+        raise ValueError("V2 readiness witness symbol does not match selected scope")
+    timeframe = witness.get("timeframe")
+    if not isinstance(timeframe, str) or not timeframe:
+        raise ValueError("V2 readiness witness timeframe must be a non-empty string")
+    if timeframe != expected_timeframe:
+        raise ValueError("V2 readiness witness timeframe does not match selected scope")
+    side = witness.get("side")
+    if not isinstance(side, str) or not side:
+        raise ValueError("V2 readiness witness side must be a non-empty string")
+    if side != expected_side:
+        raise ValueError("V2 readiness witness side does not match surface side")
+    contract_version = witness.get("contract_version")
+    if not isinstance(contract_version, str) or contract_version != READINESS_CONTRACT_VERSION:
+        raise ValueError("V2 readiness witness contract_version must be shift_readiness_v1")
+    max_shift_bp = witness.get("max_shift_bp")
+    if isinstance(max_shift_bp, bool) or not isinstance(max_shift_bp, int) or max_shift_bp != READINESS_MAX_SHIFT_BP:
+        raise ValueError("V2 readiness witness max_shift_bp must be integer 430")
+    open_ma = witness.get("open_ma")
+    close_ma = witness.get("close_ma")
+    if isinstance(open_ma, bool) or not isinstance(open_ma, int) or open_ma <= 0:
+        raise ValueError("V2 readiness witness open_ma must be a positive integer")
+    if isinstance(close_ma, bool) or not isinstance(close_ma, int) or close_ma <= 0:
+        raise ValueError("V2 readiness witness close_ma must be a positive integer")
+    shifts = witness.get("shifts_bp")
+    if not isinstance(shifts, list) or not shifts:
+        raise ValueError("V2 readiness witness shifts_bp must be a non-empty integer list")
+    normalized: list[int] = []
+    for shift in shifts:
+        if isinstance(shift, bool) or not isinstance(shift, int):
+            raise ValueError("V2 readiness witness shifts_bp must be base-10 integers")
+        normalized.append(shift)
+    if normalized[0] != 30 or 150 not in normalized or normalized[-1] != 430:
+        raise ValueError("V2 readiness witness must start at 30, contain 150, and end at 430")
+    for current, following in zip(normalized, normalized[1:]):
+        if following <= current:
+            raise ValueError("V2 readiness witness shifts_bp must be strictly increasing")
+        if current < 150 and following - current > 10:
+            raise ValueError("V2 readiness witness violates the first band gap of <=10 bp")
+        if current >= 150 and following - current > 40:
+            raise ValueError("V2 readiness witness violates the second band gap of <=40 bp")
 
 
 def _surface_scope(connection: duckdb.DuckDBPyConnection, surface_id: str) -> tuple[tuple[str, str], ...]:
@@ -707,6 +958,8 @@ def publish_surface(analysis_connection: duckdb.DuckDBPyConnection, surface: Dir
     ensure_analysis_schema(analysis_connection)
     surface_id, identity = _surface_identity(surface)
     points = _validate_surface(surface, identity)
+    if surface.preflight.grid_contract.get("kind") == V2_GRID_CONTRACT_KIND:
+        _verify_v2_audit(surface)
     existing = analysis_connection.execute("select surface_id, parent_surface_id, event_mode from surfaces where surface_id=?", [surface_id]).fetchone()
     if existing:
         stored = tuple(analysis_connection.execute(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from http.client import HTTPConnection
 from html.parser import HTMLParser
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -14,7 +15,15 @@ import pytest
 from mrs3 import panel as panel_module
 from mrs3.panel import PanelController, _Job, create_panel_server
 from mrs3.duckdb_import import ImportJobResult, ImportPreflight, ImportProgress
-from mrs3.duckdb_direct import CoverageIssue, DirectPreflight
+from mrs3.duckdb_direct import (
+    CoverageIssue,
+    CoverageReviewRow,
+    DirectCoverage,
+    DirectPreflight,
+    DirectQueueResult,
+    DirectScope,
+    _CoverageScan,
+)
 
 
 class _FakeProcess:
@@ -113,6 +122,46 @@ def _wait_direct_finished(controller: PanelController) -> dict[str, object]:
             return document
         time.sleep(.01)
     raise AssertionError("panel direct build did not finish")
+
+
+def _fake_coverage_scan(tmp_path: Path) -> _CoverageScan:
+    long_row = CoverageReviewRow(
+        "BTCUSDT",
+        "LONG",
+        "1h",
+        True,
+        "2024-01-01T00:00:00.000+00:00",
+        "2024-01-02T00:00:00.000+00:00",
+        (),
+    )
+    short_row = CoverageReviewRow(
+        "BTCUSDT",
+        "SHORT",
+        "1h",
+        True,
+        "2024-01-01T00:00:00.000+00:00",
+        "2024-01-02T00:00:00.000+00:00",
+        (),
+    )
+    coverage = DirectCoverage(
+        (
+            DirectScope("BTCUSDT", "LONG", "1h"),
+            DirectScope("BTCUSDT", "SHORT", "1h"),
+        ),
+        (long_row, short_row),
+        (),
+    )
+    inventory = tmp_path / "surface_coverage" / "coverage_inventory.csv"
+    inventory.parent.mkdir(parents=True, exist_ok=True)
+    inventory.write_bytes(b"pair,side\n")
+    return _CoverageScan(
+        "coverage-token",
+        coverage,
+        inventory,
+        hashlib.sha256(inventory.read_bytes()).hexdigest(),
+        "s" * 64,
+        (),
+    )
 
 
 def _wait_analysis_finished(controller: PanelController) -> dict[str, object]:
@@ -216,6 +265,549 @@ def test_analysis_library_ui_and_routes_are_exposed() -> None:
         assert endpoint in html or endpoint in __import__("mrs3.panel", fromlist=["_PanelHandler"])._PanelHandler.do_POST.__code__.co_consts
 
 
+def test_direct_coverage_review_ui_is_exposed_in_right_panel() -> None:
+    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+    assert 'id="coverageReview"' in html
+    assert "DuckDB coverage review" in html
+    assert "function renderDirectCoverageReview" in html
+    assert 'name="direct_scope"' in html or "direct_scope" in html
+    assert "/api/duckdb-direct/coverage" in html
+    assert "const flight=await duckdbRequest('/api/duckdb-direct/preflight',{...base,coverage_token:directPreflightToken,selected_scopes:scopes})" in html
+    assert "symbols:selectedSymbols" in html
+    assert 'id="progressBar"' in html
+    assert 'id="logs"' in html
+
+
+def test_direct_coverage_scan_returns_both_sides_token_and_inventory_artifact(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    scan = _fake_coverage_scan(tmp_path)
+
+    def scan_func(
+        _connection: object, *, audit_root: object, symbols: tuple[str, ...]
+    ) -> _CoverageScan:
+        assert symbols == ()
+        return scan
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=scan_func,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+
+    document = controller.duckdb_direct_coverage({"symbols": []})
+
+    assert [row["side"] for row in document["coverage_rows"]] == ["LONG", "SHORT"]
+    assert document["token"] == "coverage-token"
+    assert document["artifacts"] == {"coverage_inventory": "coverage_inventory.csv"}
+    assert controller.artifact("coverage_inventory") == ("coverage_inventory.csv", scan.inventory_path.read_bytes())
+
+
+def test_panel_rejects_stale_coverage_token(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: _fake_coverage_scan(tmp_path),
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+    controller.duckdb_direct_coverage({"symbols": []})
+
+    with pytest.raises(ValueError, match="stale coverage token"):
+        controller.start_duckdb_direct(
+            {
+                "coverage_token": "stale",
+                "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}],
+            }
+        )
+
+
+def test_selected_common_intervals_are_returned_as_dates_before_start(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    preflight = DirectPreflight(
+        {"BTCUSDT": ("1h",)}, {}, (),
+        MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}),
+        ("a" * 64,), (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",),
+    )
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: _fake_coverage_scan(tmp_path),
+        direct_preflight_func=lambda *_args, **_kwargs: preflight,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+    controller.duckdb_direct_coverage({"symbols": []})
+    payload = {
+        "coverage_token": "coverage-token",
+        "start_utc": "2024-01-01T00:00:00Z",
+        "end_utc": "2024-01-02T00:00:00Z",
+        "side": "LONG",
+        "symbols": ["BTCUSDT"],
+        "required_shifts_bp": [100],
+        "selected_scopes": [
+            {"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"},
+            {"symbol": "BTCUSDT", "side": "SHORT", "timeframe": "1h"},
+        ],
+    }
+
+    document = controller.duckdb_direct_preflight(payload)
+    intervals = document["selected_intervals"]
+
+    assert set(intervals) == {"long", "short"}
+    assert intervals["long"]["start_date"] == "2024-01-01"
+    assert intervals["long"]["end_date"] == "2024-01-02"
+    assert intervals["long"]["display"] == "2024-01-01 .. 2024-01-02"
+    assert intervals["short"]["start_date"] == "2024-01-01"
+    assert document["token"] == "coverage-token"
+
+
+def test_direct_start_derives_one_common_interval_per_side(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    captured: list[object] = []
+    scan = _fake_coverage_scan(tmp_path)
+
+    def prepare(
+        _source: object,
+        requests: tuple[object, ...],
+        *,
+        audit_root: object,
+        coverage_scan: object,
+        cancellation: object,
+        progress_callback: object,
+    ) -> tuple[object, ...]:
+        captured.extend(requests)
+        return tuple(
+            SimpleNamespace(request=request, points=(), preflight=SimpleNamespace(audit_sha256=""))
+            for request in requests
+        )
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        *,
+        cancellation: object,
+        progress_callback: object,
+        parent_surface_id: str | None = None,
+    ) -> DirectQueueResult:
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(
+                SimpleNamespace(surface_id=f"surface-{surface.request.side}", points=())
+                for surface in surfaces
+            ),
+        )
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+        direct_prepare_func=prepare,
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+    controller.duckdb_direct_coverage({"symbols": []})
+    payload = {
+        "coverage_token": "coverage-token",
+        "selected_scopes": [
+            {"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"},
+            {"symbol": "BTCUSDT", "side": "SHORT", "timeframe": "1h"},
+        ],
+    }
+
+    controller.start_duckdb_direct(payload)
+    status = _wait_direct_finished(controller)
+
+    assert status["publication_state"] == "PUBLISHED"
+    assert len(captured) == 2
+    assert [getattr(request, "side") for request in captured] == ["LONG", "SHORT"]
+    assert [getattr(request, "start_utc") for request in captured] == [
+        "2024-01-01T00:00:00.000+00:00",
+        "2024-01-01T00:00:00.000+00:00",
+    ]
+    assert [getattr(request, "end_utc") for request in captured] == [
+        "2024-01-02T00:00:00.000+00:00",
+        "2024-01-02T00:00:00.000+00:00",
+    ]
+
+
+def test_v2_selected_preflight_ignores_legacy_window_and_does_not_call_legacy_preflight(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    scan = _fake_coverage_scan(tmp_path)
+
+    def legacy_preflight(*_args: object, **_kwargs: object) -> DirectPreflight:
+        raise AssertionError("legacy preflight must not run")
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+        direct_preflight_func=legacy_preflight,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+    controller.duckdb_direct_coverage({"symbols": []})
+
+    document = controller.duckdb_direct_preflight(
+        {
+            "coverage_token": "coverage-token",
+            "selected_scopes": [{"symbol": "BTCUSDT", "side": "SHORT", "timeframe": "1h"}],
+            "start_utc": "",
+            "end_utc": "",
+            "side": "LONG",
+            "symbols": ["BTCUSDT", "ETHUSDT"],
+        }
+    )
+
+    assert document["token"] == "coverage-token"
+    assert set(document["selected_intervals"]) == {"short"}
+    assert document["selected_intervals"]["short"]["start_date"] == "2024-01-01"
+    assert document["selected_intervals"]["short"]["end_date"] == "2024-01-02"
+
+
+def test_legacy_selected_preflight_uses_v1_without_explicit_coverage_token(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    preflight = DirectPreflight(
+        {"BTCUSDT": ("1h",)}, {}, (),
+        MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}),
+        ("a" * 64,), (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",),
+    )
+    legacy_calls: list[object] = []
+
+    def legacy_preflight(_source: object, request: object) -> DirectPreflight:
+        legacy_calls.append(request)
+        return preflight
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: _fake_coverage_scan(tmp_path),
+        direct_preflight_func=legacy_preflight,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+    controller.duckdb_direct_coverage({"symbols": []})
+
+    document = controller.duckdb_direct_preflight(
+        {
+            "start_utc": "2024-01-01T00:00:00Z",
+            "end_utc": "2024-01-02T00:00:00Z",
+            "side": "LONG",
+            "symbols": ["BTCUSDT"],
+            "required_shifts_bp": [100],
+            "selected_scopes": [{"symbol": "BTCUSDT", "timeframe": "1h"}],
+        }
+    )
+
+    assert len(legacy_calls) == 1
+    assert legacy_calls[0].selected_scopes == ("BTCUSDT|1h",)
+    assert document["token"] != "coverage-token"
+    assert "selected_intervals" not in document
+
+
+def test_legacy_selected_start_does_not_use_active_scan_without_explicit_coverage_token(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    preflight = DirectPreflight(
+        usable_timeframes={"BTCUSDT": ("1h",)},
+        unavailable_symbols={},
+        coverage_issues=(),
+        grid_contract=MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}),
+        source_hashes=("a" * 64,),
+        manifest=(("report-1", "a" * 64),),
+        accepted_point_keys=("BTCUSDT|LONG|1h|100|3|9",),
+        coverage_rows=(
+            CoverageReviewRow(
+                "BTCUSDT",
+                "LONG",
+                "1h",
+                True,
+                "2024-01-01T00:00:00.000+00:00",
+                "2024-01-02T00:00:00.000+00:00",
+                (),
+            ),
+        ),
+    )
+
+    def build(
+        _source: object,
+        _analysis: object,
+        _request: object,
+        _cancellation: object,
+        progress: object,
+    ) -> object:
+        progress("PUBLISHED", materialized_points=1)
+        return SimpleNamespace(surface_id="surface-1", points=(object(),))
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: _fake_coverage_scan(tmp_path),
+        direct_preflight_func=lambda *_args, **_kwargs: preflight,
+        direct_build_func=build,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+    controller.duckdb_direct_coverage({"symbols": []})
+    payload = {
+        "start_utc": "2024-01-01T00:00:00Z",
+        "end_utc": "2024-01-02T00:00:00Z",
+        "side": "LONG",
+        "symbols": ["BTCUSDT"],
+        "required_shifts_bp": [100],
+        "selected_scopes": [{"symbol": "BTCUSDT", "timeframe": "1h"}],
+    }
+    controller._direct_preflight = (
+        PanelController._direct_request(payload),
+        preflight,
+        "coverage-token",
+    )
+
+    controller.start_duckdb_direct({**payload, "preflight_token": "coverage-token"})
+
+    assert _wait_direct_finished(controller)["surface_id"] == "surface-1"
+
+
+def test_v2_selected_start_rejects_scope_without_explicit_side(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: _fake_coverage_scan(tmp_path),
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+    controller.duckdb_direct_coverage({"symbols": []})
+
+    with pytest.raises(ValueError, match="selected scope must include symbol, side, and timeframe"):
+        controller.start_duckdb_direct(
+            {
+                "coverage_token": "coverage-token",
+                "selected_scopes": [{"symbol": "BTCUSDT", "timeframe": "1h"}],
+                "start_utc": "",
+                "end_utc": "",
+                "side": "LONG",
+                "symbols": ["BTCUSDT"],
+            }
+        )
+
+
+def test_v2_selected_start_short_only_ignores_legacy_side_and_blank_window(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    captured: list[object] = []
+    scan = _fake_coverage_scan(tmp_path)
+
+    def prepare(
+        _source: object,
+        requests: tuple[object, ...],
+        *,
+        audit_root: object,
+        coverage_scan: object,
+        cancellation: object,
+        progress_callback: object,
+    ) -> tuple[object, ...]:
+        captured.extend(requests)
+        return tuple(
+            SimpleNamespace(request=request, points=(), preflight=SimpleNamespace(audit_sha256=""))
+            for request in requests
+        )
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        *,
+        cancellation: object,
+        progress_callback: object,
+        parent_surface_id: str | None = None,
+    ) -> DirectQueueResult:
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(SimpleNamespace(surface_id=f"surface-{surface.request.side}", points=()) for surface in surfaces),
+        )
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+        direct_prepare_func=prepare,
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+    controller.duckdb_direct_coverage({"symbols": []})
+
+    controller.start_duckdb_direct(
+        {
+            "coverage_token": "coverage-token",
+            "selected_scopes": [{"symbol": "BTCUSDT", "side": "SHORT", "timeframe": "1h"}],
+            "start_utc": "",
+            "end_utc": "",
+            "side": "LONG",
+            "symbols": ["BTCUSDT", "ETHUSDT"],
+        }
+    )
+    status = _wait_direct_finished(controller)
+
+    assert status["publication_state"] == "PUBLISHED"
+    assert len(captured) == 1
+    assert captured[0].side == "SHORT"
+    assert captured[0].start_utc == "2024-01-01T00:00:00.000+00:00"
+    assert captured[0].end_utc == "2024-01-02T00:00:00.000+00:00"
+    assert captured[0].symbols == ("BTCUSDT",)
+
+
+def test_direct_csv_artifacts_serve_immutable_bytes_after_backing_file_mutation_or_deletion(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    scan = _fake_coverage_scan(tmp_path)
+    inventory_bytes = scan.inventory_path.read_bytes()
+    audit_bytes = {"LONG": b"long,audit\\n", "SHORT": b"short,audit\\n"}
+    audit_paths: dict[str, Path] = {}
+
+    def prepare(
+        _source: object,
+        requests: tuple[object, ...],
+        *,
+        audit_root: object,
+        coverage_scan: object,
+        cancellation: object,
+        progress_callback: object,
+    ) -> tuple[object, ...]:
+        prepared: list[object] = []
+        for request in requests:
+            side = request.side
+            data = audit_bytes[side]
+            audit_sha = sha256(data).hexdigest()
+            filename = f"surface_coverage_audit_{side}.csv"
+            path = Path(audit_root) / "surface_coverage" / audit_sha / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            audit_paths[f"surface_coverage_audit_{side.lower()}"] = path
+            prepared.append(
+                SimpleNamespace(
+                    request=request,
+                    points=(),
+                    preflight=SimpleNamespace(audit_sha256=audit_sha, audit_bytes=data, audit_artifact_name=filename),
+                )
+            )
+        return tuple(prepared)
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        *,
+        cancellation: object,
+        progress_callback: object,
+        parent_surface_id: str | None = None,
+    ) -> DirectQueueResult:
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(SimpleNamespace(surface_id=f"surface-{surface.request.side}", points=()) for surface in surfaces),
+        )
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+        direct_prepare_func=prepare,
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+    controller.duckdb_direct_coverage({"symbols": []})
+    controller.start_duckdb_direct(
+        {
+            "coverage_token": "coverage-token",
+            "selected_scopes": [
+                {"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"},
+                {"symbol": "BTCUSDT", "side": "SHORT", "timeframe": "1h"},
+            ],
+        }
+    )
+    assert _wait_direct_finished(controller)["publication_state"] == "PUBLISHED"
+
+    scan.inventory_path.write_bytes(b"tampered")
+    for path in audit_paths.values():
+        path.unlink()
+
+    status = controller.snapshot()["duckdb_direct"]
+    assert status["artifacts"] == {
+        "coverage_inventory": "coverage_inventory.csv",
+        "surface_coverage_audit_long": "surface_coverage_audit_LONG.csv",
+        "surface_coverage_audit_short": "surface_coverage_audit_SHORT.csv",
+    }
+    assert controller.artifact("coverage_inventory") == ("coverage_inventory.csv", inventory_bytes)
+    assert controller.artifact("surface_coverage_audit_long") == ("surface_coverage_audit_LONG.csv", audit_bytes["LONG"])
+    assert controller.artifact("surface_coverage_audit_short") == ("surface_coverage_audit_SHORT.csv", audit_bytes["SHORT"])
+
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        expected = [
+            ("coverage_inventory", inventory_bytes),
+            ("surface_coverage_audit_long", audit_bytes["LONG"]),
+            ("surface_coverage_audit_short", audit_bytes["SHORT"]),
+        ]
+        for name, data in expected:
+            connection.request("GET", f"/api/artifact?name={name}")
+            response = connection.getresponse()
+            assert response.status == 200
+            assert response.read() == data
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+def test_direct_coverage_review_ui_is_pair_side_tf_and_date_only() -> None:
+    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+    assert "`${row.pair}|${row.side}`" in html
+    assert "meta.textContent=side" in html
+    assert "item.timeframe" in html
+    assert "function directDateOnly" in html
+    assert "directDateOnly(row.interval_start_utc)" in html
+    assert "directDateOnly(row.interval_end_utc)" in html
+
+
+def test_direct_coverage_ui_keeps_preflight_activity_feedback_deferred() -> None:
+    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+    assert "Preparing coverage..." not in html
+    assert "coverage_elapsed" not in html
+    assert "coverageElapsed" not in html
+
+
 def test_analysis_schema_initialization_is_explicit_and_library_then_reads_only(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     controller.duckdb_import_settings({"analysis_duckdb_path": "analysis.duckdb"})
@@ -299,6 +891,135 @@ def test_direct_preflight_defaults_usable_symbols_and_marks_unavailable(tmp_path
         controller.start_duckdb_direct({**payload, "preflight_token": document["token"], "selected_symbols": []})
     with pytest.raises(ValueError, match="unavailable"):
         controller.start_duckdb_direct({**payload, "preflight_token": document["token"], "selected_symbols": ["ETHUSDT"]})
+
+
+def test_direct_preflight_document_includes_coverage_review_rows(tmp_path: Path) -> None:
+    preflight = DirectPreflight(
+        {"BTCUSDT": ("1h",)}, {},
+        (),
+        MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}), ("a" * 64,),
+        (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",),
+        (
+            CoverageReviewRow(
+                symbol="BTCUSDT",
+                side="LONG",
+                timeframe="1h",
+                selectable=False,
+                interval_start_utc="2024-01-01T00:00:00+00:00",
+                interval_end_utc="2024-01-01T04:00:00+00:00",
+                gap_details=("missing: 2024-01-01 .. 2024-01-01",),
+            ),
+        ),
+    )
+
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_preflight_func=lambda *_: preflight,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+
+    document = controller.duckdb_direct_preflight(
+        {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
+    )
+
+    assert document["coverage_rows"] == [
+        {
+            "pair": "BTCUSDT",
+            "side": "LONG",
+            "timeframe": "1h",
+            "selectable": False,
+            "interval_start_utc": "2024-01-01T00:00:00+00:00",
+            "interval_end_utc": "2024-01-01T04:00:00+00:00",
+            "gap_details": ["missing: 2024-01-01 .. 2024-01-01"],
+        }
+    ]
+
+
+def test_direct_coverage_scan_does_not_require_window(tmp_path: Path) -> None:
+    rows = (
+        CoverageReviewRow(
+            symbol="BTCUSDT",
+            side="LONG",
+            timeframe="1h",
+            selectable=False,
+            interval_start_utc="2024-01-01T00:00:00+00:00",
+            interval_end_utc="2024-01-01T04:00:00+00:00",
+            gap_details=("missing: 2024-01-01 .. 2024-01-01",),
+        ),
+    )
+
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    received: list[tuple[str, tuple[str, ...]]] = []
+
+    def coverage(
+        _connection: object, *, side: str, symbols: tuple[str, ...]
+    ) -> tuple[CoverageReviewRow, ...]:
+        received.append((side, symbols))
+        return rows
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_func=coverage,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+
+    document = controller.duckdb_direct_coverage({"side": "LONG", "symbols": []})
+
+    assert received == [("LONG", ())]
+    assert document["coverage_rows"][0]["pair"] == "BTCUSDT"
+    assert document["coverage_rows"][0]["gap_details"] == ["missing: 2024-01-01 .. 2024-01-01"]
+
+
+def test_direct_build_rejects_gap_scope_selection(tmp_path: Path) -> None:
+    preflight = DirectPreflight(
+        {"BTCUSDT": ("1h",)}, {},
+        (),
+        MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}), ("a" * 64,),
+        (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",),
+        (
+            CoverageReviewRow(
+                symbol="BTCUSDT",
+                side="LONG",
+                timeframe="1h",
+                selectable=False,
+                interval_start_utc="2024-01-01T00:00:00+00:00",
+                interval_end_utc="2024-01-01T04:00:00+00:00",
+                gap_details=("missing: 2024-01-01 .. 2024-01-01",),
+            ),
+        ),
+    )
+
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_preflight_func=lambda *_: preflight,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
+    payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
+    selected_payload = {
+        **payload,
+        "selected_scopes": [{"symbol": "BTCUSDT", "timeframe": "1h"}],
+    }
+    token = controller.duckdb_direct_preflight(selected_payload)["token"]
+
+    with pytest.raises(ValueError, match="selected scope is unavailable"):
+        controller.start_duckdb_direct({**selected_payload, "preflight_token": token})
 
 
 def test_direct_build_reports_cancellation_without_leaking_paths(tmp_path: Path) -> None:
