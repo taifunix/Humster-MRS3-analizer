@@ -1,6 +1,6 @@
 # DuckDB Surface Coverage Review
 
-**Status:** Priority-1 operational patch approved; ADR-0008 implementation frozen
+**Status:** Priority-1 operational patch implemented and verified; remaining ADR-0008 common Close-MA work frozen
 **Date:** 2026-08-15
 **Design evidence:** [DuckDB Surface Coverage Review Design](../superpowers/specs/2026-08-14-duckdb-surface-coverage-review-design.md)
 **Baseline implementation evidence:** [DuckDB Surface Coverage Review Baseline Plan](../superpowers/plans/2026-08-14-duckdb-surface-coverage-review.md)
@@ -69,8 +69,8 @@ usable and diagnosable:
 - state beside the direct controls that coverage derives UTC intervals and side
   from checked `Pair + Side + TF` rows; the manual UTC/Side controls do not
   constrain the coverage-token workflow;
-- after verification, stop duplicate panel processes and launch one process
-  serving the current source.
+- after verification, stop duplicate panel trees and leave one listener serving
+  the current source on port 8765.
 
 The coverage preview token and real preflight are one contract. The token binds
 the source evidence, displayed rows and exact intervals, readiness witnesses,
@@ -85,10 +85,31 @@ preflight may not silently widen, narrow, add, or remove a UI-selected scope.
 This patch does not convert the token preview into a prepared-surface token and
 does not remove the mandatory source revalidation at `Start`.
 
+### Priority-1 Verification Evidence
+
+- Implementation plan: [DuckDB Coverage Operational Unblock](../superpowers/plans/2026-08-15-duckdb-coverage-operational-unblock.md).
+- Focused and relevant verification on 2026-08-15: `212 passed` for
+  `tests/test_duckdb_direct.py`, `tests/test_panel.py`, and
+  `tests/test_analysis_storage.py`.
+- A repository-wide run before the final four focused regressions reached `780
+  passed, 2 skipped, 4 failed`; the four unrelated failures are missing local
+  runner fixtures `tester_wizard.html` and `tester_table.html`. No subsequent
+  repository-wide run covers current `HEAD`; the current relevant evidence is
+  the `212 passed` run above.
+- Read-only production-source verification found the expected 18
+  `ONUSDT/LONG/15m` shift-430 double-zero rows. After exclusion, both ONUSDT
+  15m sides are selectable with zero gap details.
+- Independent task reviews and the cumulative review approved the final code.
+- Live smoke returned HTTP 200 from one listener on port 8765 and confirmed the
+  current date-only, side-aware UI, stale reset, artifact links, guidance, and
+  side ordinal rendering.
+
 ### Frozen ADR-0008 Follow-up
 
-ADR-0008 implementation is frozen until explicitly resumed. Before execution,
-its project plan and detailed design must be revised together to include:
+Priority-1 delivered ADR-0008's approved double-zero isolation rule. The
+remaining common Close-MA implementation is frozen until explicitly resumed.
+Before execution, its project plan and detailed design must be revised together
+to include:
 
 - common Close MA `2..7` readiness and the compact `MA-C` presentation;
 - human-readable `coverage_summary.csv` and ignored-row diagnostics;

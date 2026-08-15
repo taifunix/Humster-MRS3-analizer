@@ -26,17 +26,19 @@ and the existing
   the inbox and then calls the existing broad cleanup directly.
 - Historical session logs and completed-plan narratives have been removed.
   Durable feature status belongs in `PRD.md`, feature specifications and ADRs.
-- The DuckDB surface coverage contract has a separately approved amendment in
-  ADR-0008. Runtime still uses the earlier one-MA-pair readiness rule and aborts
-  globally on structurally zero-duration report/grid rows.
+- The DuckDB Priority-1 operational patch is implemented and verified. Runtime
+  intentionally remains on the earlier one-MA-pair readiness rule, but rows
+  whose report and grid windows are both zero-duration are now excluded without
+  weakening other fail-closed interval checks.
 - The ADR-0008 implementation project draft is written in
   [the Common Close-MA Readiness plan](docs/superpowers/plans/2026-08-15-common-close-ma-readiness.md)
-  as a project draft. ADR-0008 is frozen; the draft requires revision before
-  execution and no implementation task may start from it.
-- Priority 1 is the approved operational patch for the current one-MA-pair
-  flow: double-zero isolation, stale-token clearing, actionable safe errors,
-  side ordinal, coverage artifact links, truthful UTC/Side guidance, exact
-  preview-to-real-preflight reproduction, and one current panel process.
+  as a project draft. Priority-1 delivered the approved double-zero isolation
+  rule; the remaining common Close-MA work is frozen, and the draft requires
+  revision before execution.
+- Priority 1 now provides double-zero isolation, server/browser stale-state
+  clearing, actionable path-safe errors, side ordinal, verified coverage CSV
+  links, truthful UTC/Side guidance, exact preview-to-real-preflight
+  reproduction, and one current panel listener.
 
 ## Latest Verification
 
@@ -47,21 +49,30 @@ and the existing
   failures are in `tests/runner/test_http.py` because the local
   `tests/fixtures/tester_wizard.html` and `tests/fixtures/tester_table.html`
   files are absent. The two skips require unavailable Windows symlink rights.
+- DuckDB Priority-1 relevant run: `212 passed` for
+  `.venv\Scripts\python.exe -m pytest tests/test_duckdb_direct.py tests/test_panel.py tests/test_analysis_storage.py -q`.
+- The repository-wide run before the final four focused regressions reached
+  `780 passed, 2 skipped, 4 failed`; the same four runner failures are caused
+  only by the two absent fixtures above. No later repository-wide run covers
+  current `HEAD`; the current relevant evidence is `212 passed`.
+- Read-only real-source evidence: exactly 18 expected ONUSDT/LONG/15m
+  shift-430 double-zero rows exist; after exclusion, ONUSDT 15m LONG and SHORT
+  are selectable with zero gap details.
+- Live panel smoke: one listener on `127.0.0.1:8765`, HTTP 200, current
+  date-only/side-aware coverage UI and Priority-1 markers present.
 
 ## Next Required Work
 
-1. Write and review the Priority-1 operational patch implementation plan, then
-   execute it with TDD and a live one-process panel smoke check.
-2. Do not execute or extend the frozen ADR-0008 project plan until that work is
-   resumed explicitly.
-3. Resolve the contract/plan mismatch before changing behavior: the runner must
+1. Do not execute or extend the frozen remaining common Close-MA project plan
+   until that work is resumed explicitly.
+2. Resolve the contract/plan mismatch before changing behavior: the runner must
    remain name-only, while library acceptance currently requires full metric
    and trade reconciliation. Record the chosen library-specific boundary in the
    specification and plan.
-4. Execute Task 3 with failing workflow and CLI tests.
-5. Publish and verify the library manifest before removing any live duplicate.
-6. Add a read-only `tester-report-library` command with explicit `--apply`.
-7. Run focused and relevant broader tests, `git diff --check`, and independent
+3. Execute Task 3 with failing workflow and CLI tests.
+4. Publish and verify the library manifest before removing any live duplicate.
+5. Add a read-only `tester-report-library` command with explicit `--apply`.
+6. Run focused and relevant broader tests, `git diff --check`, and independent
    review before enabling operational cleanup.
 
 ## Blockers And Safety
@@ -71,23 +82,12 @@ and the existing
 - Do not treat the current panel coverage checkbox as proof that every Close MA
   `2..7` shares the displayed interval until ADR-0008 is implemented and
   verified.
-- The live panel on port `8765` serves stale HTML and does not expose the current
-  multi-side/date-only source implementation; it must be restarted before UI
-  behavior is accepted.
-- `ONUSDT` coverage currently aborts globally on its structurally double-zero
-  `LONG/15m` rows, so no coverage token or inventory is produced for otherwise
-  usable ONUSDT scopes.
 - Coverage-token `/preflight` currently previews cached common intervals only;
   source revalidation, side audits, and real `DirectPreflight` occur after
   `Start`, so expensive failures appear late in the background job.
 - Direct runs repeat full source validation and payload hashing several times;
   a normal two-side run can perform up to eight structural passes over the
   current archive.
-- A failed coverage refresh leaves the previous table/token visible. Background
-  `FAILED`/`PARTIAL` details and queue ordinal are discarded, and the panel does
-  not expose the generated coverage audit links.
-- The approved report-library specification is not currently registered in the
-  active-document table in `PRD.md`.
 - Do not use `publish_verified_reports(..., apply=True)` operationally yet: the
   current low-level path can remove a duplicate before manifest publication.
 - Do not treat HTML-only evidence as runner completion. A matching one-strategy
