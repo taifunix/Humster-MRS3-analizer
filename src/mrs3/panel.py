@@ -65,6 +65,26 @@ _TESTER_START_PATTERN = re.compile(r"^\[RUN (\d+)/(\d+)\] start\.")
 _TESTER_PROGRESS_PATTERN = re.compile(
     r"^RUN (\d+)/(\d+) time=([^ ]+ [^ ]+) \(([0-9]+(?:\.[0-9]+)?)%\)"
 )
+_DIRECT_GENERIC_ERROR = "direct build failed"
+_DIRECT_WINDOWS_PATH_PATTERN = re.compile(r"[A-Za-z]:[\\/]")
+_DIRECT_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<!\w)[\\/][^\s\"')]+")
+
+
+def _safe_direct_error(message: str | None) -> str | None:
+    """Return a client-safe direct error, suppressing local path details."""
+    if message is None:
+        return None
+    if _DIRECT_WINDOWS_PATH_PATTERN.search(message) or _DIRECT_ABSOLUTE_PATH_PATTERN.search(message):
+        return _DIRECT_GENERIC_ERROR
+    return message
+
+
+def _direct_error_message(error: BaseException) -> str:
+    if isinstance(error, DirectMaterializationError):
+        message = _safe_direct_error(str(error))
+        if message and message.strip():
+            return message
+    return _DIRECT_GENERIC_ERROR
 
 
 def _normalise_tester_log_line(line: str) -> str | None:
@@ -717,7 +737,13 @@ function render(data) {
   const strategy=data.analysis_strategies;
   if(strategy){ document.getElementById('analysisStrategiesStatus').textContent=`${strategy.phase} · ${strategy.strategy_count||0} JSON${strategy.error?' · '+strategy.error:''}`; if(strategy.strategies_path){ document.getElementById('strategies').value=strategy.strategies_path; } }
   const direct = data.duckdb_direct;
-  if (direct) document.getElementById('directStatus').textContent = `${direct.phase} · points=${direct.point_count || 0}${direct.surface_id ? ' · '+direct.surface_id : ''}`;
+  // directStatus is rendered below with publication/error/coordinate details
+  if (direct) {
+    const coordinate = direct.side && direct.ordinal && direct.total ? `· ${direct.side} ${direct.ordinal}/${direct.total}` : '';
+    const publication = direct.publication_state ? `· ${direct.publication_state}` : '';
+    const error = direct.error ? `· ${direct.error}` : '';
+    document.getElementById('directStatus').textContent = `${direct.phase}· points=${direct.point_count || 0}${coordinate}${publication}${error}${direct.surface_id ? `· `+direct.surface_id : ''}`;
+  }
   if (direct && Object.keys(direct.artifacts || {}).length) renderDirectArtifactLinks(direct.artifacts);
   const job = data.job;
   const buttons = document.querySelectorAll('[data-runnable]'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
@@ -862,6 +888,9 @@ class _DirectJob:
     phase: str = "STARTING"
     surface_id: str | None = None
     point_count: int = 0
+    side: str | None = None
+    ordinal: int = 0
+    total: int = 0
     publication_state: str = "PENDING"
     error: str | None = None
     parent_surface_id: str | None = None
@@ -1918,7 +1947,15 @@ class PanelController:
             source = self._direct_connection_factory(str(source_path), read_only=True)
             if job.cancel.is_set(): raise DirectMaterializationError("direct build cancelled")
             def progress(phase: str, **facts: object) -> None:
-                with self._lock: job.phase = phase; job.point_count = int(facts.get("materialized_points", job.point_count))
+                with self._lock:
+                    job.phase = phase
+                    job.point_count = int(facts.get("materialized_points", job.point_count))
+                    if "side" in facts:
+                        job.side = str(facts["side"])
+                    if "ordinal" in facts:
+                        job.ordinal = int(facts["ordinal"])
+                    if "total" in facts:
+                        job.total = int(facts["total"])
             if job.requests is not None:
                 prepared = self._direct_prepare_func(
                     source,
@@ -1941,6 +1978,7 @@ class PanelController:
                 with self._lock:
                     job.publication_state = str(result.publication_state)
                     job.phase = str(result.phase or result.publication_state)
+                    job.error = _safe_direct_error(result.error)
                     job.surface_id = (
                         str(result.surfaces[0].surface_id)
                         if result.surfaces
@@ -1996,7 +2034,7 @@ class PanelController:
             with self._lock:
                 job.phase = "CANCELLED" if job.cancel.is_set() else "FAILED"
                 job.publication_state = job.phase
-                job.error = "direct build cancelled" if job.cancel.is_set() else f"{type(error).__name__}: direct build failed"
+                job.error = "direct build cancelled" if job.cancel.is_set() else _direct_error_message(error)
         finally:
             if analysis is not None: analysis.close()
             if source is not None: source.close()
@@ -2579,6 +2617,9 @@ class PanelController:
                 "cancel_requested": direct_job.cancel.is_set(),
                 "phase": direct_job.phase,
                 "point_count": direct_job.point_count,
+                "side": direct_job.side,
+                "ordinal": direct_job.ordinal,
+                "total": direct_job.total,
                 "surface_id": direct_job.surface_id,
                 "publication_state": direct_job.publication_state,
                 "parent_surface_id": direct_job.parent_surface_id,

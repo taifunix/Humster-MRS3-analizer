@@ -592,8 +592,252 @@ def test_direct_prepare_failure_never_calls_publish_and_snapshot_is_failed(
     assert status['publication_state'] == 'FAILED'
     assert status['phase'] == 'FAILED'
     assert status['surface_id'] is None
-    assert status['error'] == 'DirectMaterializationError: direct build failed'
+    assert status['error'] == 'active coverage scan changed after preflight'
     assert published == []
+
+
+def _run_direct_coverage_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prepare: object = None,
+    publish: object = None,
+    sides: tuple[str, ...] = ("LONG",),
+) -> dict[str, object]:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    scan = _fake_coverage_scan(tmp_path)
+
+    def default_prepare(
+        _source: object,
+        requests: tuple[object, ...],
+        **_kwargs: object,
+    ) -> tuple[object, ...]:
+        return tuple(
+            SimpleNamespace(
+                request=request,
+                points=(),
+                preflight=SimpleNamespace(audit_sha256=""),
+            )
+            for request in requests
+        )
+
+    def default_publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        **_kwargs: object,
+    ) -> DirectQueueResult:
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(
+                SimpleNamespace(
+                    surface_id=f"surface-{surface.request.side}",
+                    points=(),
+                )
+                for surface in surfaces
+            ),
+        )
+
+    monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+        direct_prepare_func=prepare or default_prepare,
+        direct_publish_func=publish or default_publish,
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
+    )
+    controller.duckdb_direct_coverage({"symbols": []})
+    controller.start_duckdb_direct(
+        {
+            "coverage_token": "coverage-token",
+            "selected_scopes": [
+                {"symbol": "BTCUSDT", "side": side, "timeframe": "1h"}
+                for side in sides
+            ],
+        }
+    )
+    return controller.snapshot()["duckdb_direct"]
+
+
+def test_direct_job_has_small_typed_side_ordinal_total_defaults() -> None:
+    job = _DirectJob()
+
+    assert job.side is None
+    assert job.ordinal == 0
+    assert job.total == 0
+    assert isinstance(job.ordinal, int)
+    assert isinstance(job.total, int)
+
+
+def test_direct_coverage_job_progress_side_ordinal_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def prepare(
+        _source: object,
+        requests: tuple[object, ...],
+        *,
+        progress_callback: object,
+        **_kwargs: object,
+    ) -> tuple[object, ...]:
+        progress_callback("PREPARING_LONG", side="LONG", ordinal=1, total=2)
+        progress_callback("PREPARED_LONG", side="LONG", ordinal=1, total=2, materialized_points=3)
+        return tuple(
+            SimpleNamespace(request=request, points=(), preflight=SimpleNamespace(audit_sha256=""))
+            for request in requests
+        )
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        *,
+        progress_callback: object,
+        **_kwargs: object,
+    ) -> DirectQueueResult:
+        progress_callback("PUBLISHING_SHORT", side="SHORT", ordinal=2, total=2)
+        progress_callback("PUBLISHED_SHORT", side="SHORT", ordinal=2, total=2, materialized_points=5)
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(
+                SimpleNamespace(
+                    surface_id=f"surface-{surface.request.side}",
+                    points=(object(), object(), object(), object(), object()),
+                )
+                for surface in surfaces
+            ),
+        )
+
+    status = _run_direct_coverage_job(
+        tmp_path, monkeypatch, prepare=prepare, publish=publish, sides=("LONG", "SHORT")
+    )
+
+    assert status["side"] == "SHORT"
+    assert status["ordinal"] == 2
+    assert status["total"] == 2
+    assert status["point_count"] == 10
+    assert status["phase"] == "PUBLISHED"
+@pytest.mark.parametrize(
+    ("publication_state", "phase", "error"),
+    [
+        ("FAILED", "FAILED", "selected scope is unavailable"),
+        ("PARTIAL", "PARTIAL", "SHORT publication failed"),
+    ],
+)
+def test_direct_queue_result_publication_state_and_error_are_copied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publication_state: str,
+    phase: str,
+    error: str,
+) -> None:
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        **_kwargs: object,
+    ) -> DirectQueueResult:
+        published = () if publication_state == "FAILED" else tuple(
+            SimpleNamespace(surface_id="surface-LONG", points=())
+            for _ in surfaces
+        )
+        return DirectQueueResult(publication_state, published, phase=phase, error=error)
+
+    status = _run_direct_coverage_job(tmp_path, monkeypatch, publish=publish)
+
+    assert status["publication_state"] == publication_state
+    assert status["phase"] == phase
+    assert status["error"] == error
+    if publication_state == "PARTIAL":
+        assert status["surface_id"] == "surface-LONG"
+    else:
+        assert status["surface_id"] is None
+
+
+@pytest.mark.parametrize("raw_error", [
+    "path=/tmp/private.duckdb",
+    "failed;/tmp/private.duckdb",
+    "db:/home/bob/private.duckdb",
+    "source{/var/private.db}",
+    r"failed near \\server\share\private.duckdb",
+    r"failed near \Users\alice\private.duckdb",
+    r"source=C:\Users\alice\private.duckdb",
+])
+def test_direct_queue_result_error_with_local_path_is_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw_error: str
+) -> None:
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        **_kwargs: object,
+    ) -> DirectQueueResult:
+        return DirectQueueResult("FAILED", (), phase="FAILED", error=raw_error)
+
+    status = _run_direct_coverage_job(tmp_path, monkeypatch, publish=publish)
+
+    assert status["publication_state"] == "FAILED"
+    assert status["phase"] == "FAILED"
+    assert status["error"] == "direct build failed"
+    assert raw_error not in json.dumps(status)
+    assert raw_error not in panel_module.PANEL_HTML
+
+
+def test_direct_error_preserves_non_absolute_slash_text() -> None:
+    assert panel_module._safe_direct_error("report/grid mismatch") == "report/grid mismatch"
+
+
+@pytest.mark.parametrize("prepare_error", [
+    RuntimeError("unexpected boom near " + r"C:\Users\alice\secrets\source.duckdb" + " and /home/bob/secrets/analysis.duckdb"),
+    DirectMaterializationError("failed near " + r"C:\Users\alice\secrets\source.duckdb" + " and /home/bob/secrets/analysis.duckdb"),
+])
+def test_direct_prepare_unexpected_or_controlled_path_error_is_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prepare_error: BaseException
+) -> None:
+    windows_path = r"C:\Users\alice\secrets\source.duckdb"
+    posix_path = "/home/bob/secrets/analysis.duckdb"
+
+    def prepare(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        raise prepare_error
+
+    status = _run_direct_coverage_job(tmp_path, monkeypatch, prepare=prepare)
+
+    assert status["publication_state"] == "FAILED"
+    assert status["phase"] == "FAILED"
+    assert status["error"] == "direct build failed"
+    payload = json.dumps(status)
+    assert windows_path not in payload
+    assert posix_path not in payload
+    if isinstance(prepare_error, RuntimeError):
+        assert "boom" not in payload
+        assert "RuntimeError" not in payload
+    assert windows_path not in panel_module.PANEL_HTML
+    assert posix_path not in panel_module.PANEL_HTML
+
+
+def test_direct_status_renders_publication_state_error_and_side_coordinate() -> None:
+    html = panel_module.PANEL_HTML
+    direct_status = html.split("const direct = data.duckdb_direct;", 1)[1]
+    direct_render = html.split("function render(data)", 1)[1].split("const job = data.job;", 1)[0]
+
+    assert direct_render.count("document.getElementById('directStatus').textContent =") == 1
+    assert "direct.side" in direct_status
+    assert "direct.ordinal" in direct_status
+    assert "direct.total" in direct_status
+    assert "direct.publication_state" in direct_status
+    assert "direct.error" in direct_status
+    assert "${direct.ordinal}/${direct.total}" in direct_status
+
+
+def test_direct_status_keeps_existing_progress_scale_unchanged() -> None:
+    html = panel_module.PANEL_HTML
+
+    assert "document.getElementById('barFill').style.width = percent + '%';" in html
+    assert "document.getElementById('progressBar').setAttribute('aria-valuenow', String(Math.round(percent)));" in html
+    assert "directProgress" not in html
+    assert "directBar" not in html
 
 
 def test_v2_selected_preflight_ignores_legacy_window_and_does_not_call_legacy_preflight(tmp_path: Path) -> None:
