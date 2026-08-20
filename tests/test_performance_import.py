@@ -359,6 +359,45 @@ def test_html_exchange_other_than_source_or_tester_marker_is_quarantined(tmp_pat
     assert result.quarantined_count == 1
 
 
+def test_legacy_upnl_and_no_fix_settings_remain_importable(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    report = (
+        FIXTURE.read_bytes()
+        .replace(
+            b'"exchange":{"name":"Bybit"}',
+            b'"exchange":{"name":"Bybit","use_upnl":true}',
+        )
+        .replace(
+            b'"basic":{"symbol":"ONUSDT","time_frame":"1h","strategy":"MRS3","side":"LONG"}',
+            b'"basic":{"symbol":"ONUSDT","time_frame":"1h","strategy":"MRS3","side":"LONG","use_fix":false}',
+        )
+    )
+    _replace_report(request, report)
+    strategy = {
+        "name": "MRS3 Demo",
+        "exchange": {"name": "Bybit", "use_upnl": True},
+        "basic": {
+            "side": "LONG",
+            "strategy": "MRS3",
+            "symbol": "ONUSDT",
+            "time_frame": "1h",
+            "use_fix": False,
+        },
+    }
+    _replace_strategy(request, strategy)
+
+    result = import_performance_batch(request)
+
+    assert result.imported_count == 1
+    assert result.quarantined_count == 0
+    with duckdb.connect(str(request.database), read_only=True) as connection:
+        settings = json.loads(
+            connection.execute("select settings_json from strategy_versions").fetchone()[0]
+        )
+    assert settings["exchange"]["use_upnl"] is True
+    assert settings["basic"]["use_fix"] is False
+
+
 def test_profit_factor_gross_profit_gross_loss_label_is_imported(tmp_path: Path) -> None:
     request = _request(tmp_path)
     report = (request.inbox / "reports" / "entry-1.html").read_bytes().replace(

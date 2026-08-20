@@ -11,6 +11,11 @@ import pytest
 
 from mrs3.analysis_storage import ANALYSIS_SCHEMA_VERSION, AnalysisSchemaError, ensure_analysis_schema
 from mrs3.duckdb_direct import (
+    CANONICAL_GRID_VERSION,
+    CANONICAL_MATERIALIZER_VERSION,
+    DEFAULT_CANONICAL_SHIFTS_BP,
+    NORMALIZATION_CONTRACT_VERSION,
+    POINT_MATERIALIZATION_SEMANTICS_VERSION,
     READINESS_CONTRACT_VERSION,
     READINESS_MAX_SHIFT_BP,
     V2_GRID_CONTRACT_KIND,
@@ -19,6 +24,7 @@ from mrs3.duckdb_direct import (
     DirectPoint,
     DirectPreflight,
     DirectSurface,
+    canonical_point_materialization_config_hash,
     point_evidence_jsonl_bytes,
 )
 
@@ -146,26 +152,38 @@ def _v2_surface(
     audit_row_count: int = 1,
     audit_bytes: bytes = b"pair,side\nBTC,LONG\n",
 ) -> DirectSurface:
-    legacy = _surface(source_hash=source_hash)
-    point = replace(legacy.points[0], source_report_id=report_id)
+    legacy = replace(_surface(source_hash=source_hash), event_mode="real_independent_events")
+    point = replace(
+        legacy.points[0],
+        source_report_id=report_id,
+        event_ids=tuple(
+            f'{index:064x}' for index in range(1, legacy.points[0].point_event_count + 1)
+        ),
+    )
     evidence = point_evidence_jsonl_bytes((point,))
-    witness_shifts = tuple(range(30, 151, 10)) + tuple(range(190, 431, 40))
-    witness = {
-        'symbol': 'BTCUSDT',
-        'side': 'LONG',
-        'timeframe': '1h',
-        'open_ma': 3,
-        'close_ma': 9,
-        'shifts_bp': list(witness_shifts),
-        'contract_version': READINESS_CONTRACT_VERSION,
-        'max_shift_bp': READINESS_MAX_SHIFT_BP,
-    }
+    witness = [
+        {
+            'symbol': 'BTCUSDT',
+            'side': 'LONG',
+            'timeframe': '1h',
+            'open_ma': 3,
+            'close_ma': close_ma,
+            'shifts_bp': list(DEFAULT_CANONICAL_SHIFTS_BP),
+            'contract_version': READINESS_CONTRACT_VERSION,
+            'max_shift_bp': READINESS_MAX_SHIFT_BP,
+        }
+        for close_ma in range(2, 8)
+    ]
     grid_contract = {
         "kind": V2_GRID_CONTRACT_KIND,
+        "canonical_grid_version": CANONICAL_GRID_VERSION,
+        "canonical_shifts_bp": list(DEFAULT_CANONICAL_SHIFTS_BP),
+        "point_materialization_semantics_version": POINT_MATERIALIZATION_SEMANTICS_VERSION,
+        "point_materialization_config_hash": canonical_point_materialization_config_hash(DEFAULT_CANONICAL_SHIFTS_BP),
         "selected_scopes": ["BTCUSDT|1h"],
         "readiness_contract_version": READINESS_CONTRACT_VERSION,
         "readiness_max_shift_bp": READINESS_MAX_SHIFT_BP,
-        "normalization_contract_version": "v1",
+        "normalization_contract_version": NORMALIZATION_CONTRACT_VERSION,
         "witnesses": {
             'BTCUSDT|1h': witness,
         },
@@ -173,17 +191,22 @@ def _v2_surface(
         "point_evidence_sha256": sha256(evidence).hexdigest(),
         "audit_artifact_name": "surface_coverage_audit_LONG.csv",
         "audit_schema_version": audit_schema_version,
+        "audit_size_bytes": len(audit_bytes),
         "audit_row_count": audit_row_count,
         "audit_sha256": audit_sha256,
     }
     request = replace(
         legacy.request,
         selected_scopes=("BTCUSDT|1h",),
+        required_shifts_bp=DEFAULT_CANONICAL_SHIFTS_BP,
+        materializer_version=CANONICAL_MATERIALIZER_VERSION,
+        point_materialization_config_hash=canonical_point_materialization_config_hash(DEFAULT_CANONICAL_SHIFTS_BP),
         grid_contract_kind=V2_GRID_CONTRACT_KIND,
         readiness_contract_version=READINESS_CONTRACT_VERSION,
         readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
         audit_artifact_name="surface_coverage_audit_LONG.csv",
         audit_schema_version=audit_schema_version,
+        audit_size_bytes=len(audit_bytes),
         audit_row_count=audit_row_count,
         audit_sha256=audit_sha256,
         audit_bytes=audit_bytes,
@@ -201,11 +224,18 @@ def _v2_surface(
         point_evidence_sha256=sha256(evidence).hexdigest(),
         audit_artifact_name="surface_coverage_audit_LONG.csv",
         audit_schema_version=audit_schema_version,
+        audit_size_bytes=len(audit_bytes),
         audit_row_count=audit_row_count,
         audit_sha256=audit_sha256,
         audit_bytes=audit_bytes,
     )
-    return replace(legacy, request=request, preflight=preflight, points=(point,))
+    return replace(
+        legacy,
+        request=request,
+        preflight=preflight,
+        points=(point,),
+        event_mode='real_independent_events',
+    )
 
 
 def test_publish_surface_is_deterministic_deduplicated_and_persists_materialized_provenance(connections) -> None:
@@ -378,6 +408,253 @@ def test_publish_analysis_run_persists_2ord_and_4ord_candidates_through_junction
         join plateau_members pm using(run_id, plateau_id, surface_id)
         join surface_points sp using(surface_id, canonical_point_key)
         join surface_sources ss using(surface_id, source_hash)""").fetchone() == (6,)
+
+
+def _analysis_surface(keys: tuple[str, ...]) -> DirectSurface:
+    source_hash = "a" * 64
+    points = tuple(
+        DirectPoint(
+            key,
+            f"report{index}",
+            source_hash,
+            7,
+            {
+                "TotalTrades": 7,
+                "TotalPnLPercent": 10.0,
+                "MaxDrawdownPercent": 2.0,
+                "Win": 5,
+                "Los": 2,
+                "WinRate": 71.4,
+                "ProfitFactor": 2.0,
+            },
+        )
+        for index, key in enumerate(keys)
+    )
+    pairs = tuple("|".join(key.split("|")[3:]) for key in keys)
+    request = DirectBuildRequest(
+        "2024-01-01T00:00:00Z",
+        "2024-01-01T02:00:00Z",
+        "LONG",
+        ("BTCUSDT",),
+        (100,),
+        "v1",
+        "c" * 64,
+    )
+    preflight = DirectPreflight(
+        {"BTCUSDT": ("1h",)},
+        {},
+        (),
+        {
+            "kind": "OBSERVED_GRID_CONTRACT",
+            "required_shifts_bp": (100,),
+            "pairs": pairs,
+            "normalization_contract_version": "v1",
+        },
+        (source_hash,),
+        tuple((f"report{index}", source_hash) for index in range(len(keys))),
+        keys,
+    )
+    return DirectSurface(request, preflight, "legacy_trades_proxy", points)
+
+
+def _frozen_facts(key4: str, key5: str) -> dict[str, object]:
+    return {
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "timeframe": "1h",
+        "operational_facts_version": "cma_representatives_v1",
+        "primary_close_ma": 8,
+        "cma_representatives": [
+            {
+                "close_ma": 8,
+                "point_id": key4,
+                "support": 1.0,
+                "support_status": "PRIMARY_CLOSE",
+                "continuity_status": "USABLE",
+                "usable": True,
+            },
+            {
+                "close_ma": 9,
+                "point_id": key5,
+                "support": 0.8,
+                "support_status": "SUPPORTED_CLOSE",
+                "continuity_status": "USABLE",
+                "usable": True,
+            },
+        ],
+        "base_1ord_point_id": key4,
+        "standalone_eligible_point_ids": (key4,),
+    }
+
+
+def _fact_plateau(key4: str, key5: str, facts: dict[str, object]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "plateau_id": "P1",
+            "all_point_ids": (key4, key5),
+            "standalone_eligible_point_ids": (key4,),
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "timeframe": "1h",
+            "min_shift_bp": 100,
+            "max_shift_bp": 100,
+            "open_ma_min": 3,
+            "open_ma_max": 3,
+            "close_ma_min": 8,
+            "close_ma_max": 9,
+            "ready": True,
+            **facts,
+        }
+    ])
+
+
+def test_publish_analysis_run_persists_validated_frozen_facts(connections) -> None:
+    from mrs3.analysis_storage import publish_analysis_run, publish_surface
+    from mrs3.pipeline import PipelineResult
+
+    _, analysis = connections
+    key4 = "BTCUSDT|LONG|1h|100|3|8"
+    key5 = "BTCUSDT|LONG|1h|100|3|9"
+    surface = publish_surface(analysis, _analysis_surface((key4, key5)))
+    facts = _frozen_facts(key4, key5)
+    result = PipelineResult(
+        surface.surface_id, "0.7", {"frozen": True}, _fact_plateau(key4, key5, facts), pd.DataFrame()
+    )
+
+    published = publish_analysis_run(analysis, result)
+
+    stored = json.loads(
+        analysis.execute(
+            "select metrics_json from plateaus where run_id=? and plateau_id='P1'",
+            [published.run_id],
+        ).fetchone()[0]
+    )
+    assert stored["operational_facts_version"] == "cma_representatives_v1"
+    assert stored["primary_close_ma"] == 8
+    assert stored["cma_representatives"] == facts["cma_representatives"]
+    assert stored["base_1ord_point_id"] == key4
+
+
+def test_publish_analysis_run_rejects_facts_with_invalid_base(connections) -> None:
+    from mrs3.analysis_storage import publish_analysis_run, publish_surface
+    from mrs3.pipeline import PipelineResult
+
+    _, analysis = connections
+    key4 = "BTCUSDT|LONG|1h|100|3|8"
+    key5 = "BTCUSDT|LONG|1h|100|3|9"
+    surface = publish_surface(analysis, _analysis_surface((key4, key5)))
+    facts = _frozen_facts(key4, key5)
+    facts["base_1ord_point_id"] = "BTCUSDT|LONG|1h|100|3|99"
+    result = PipelineResult(
+        surface.surface_id, "0.7", {"frozen": True}, _fact_plateau(key4, key5, facts), pd.DataFrame()
+    )
+
+    with pytest.raises(ValueError, match="base"):
+        publish_analysis_run(analysis, result)
+
+
+def test_publish_analysis_run_rejects_representative_outside_surface(connections) -> None:
+    from mrs3.analysis_storage import publish_analysis_run, publish_surface
+    from mrs3.pipeline import PipelineResult
+
+    _, analysis = connections
+    key4 = "BTCUSDT|LONG|1h|100|3|8"
+    key5 = "BTCUSDT|LONG|1h|100|3|9"
+    surface = publish_surface(analysis, _analysis_surface((key4, key5)))
+    facts = _frozen_facts(key4, key5)
+    facts["cma_representatives"][0]["point_id"] = "BTCUSDT|LONG|1h|200|3|8"
+    result = PipelineResult(
+        surface.surface_id, "0.7", {"frozen": True}, _fact_plateau(key4, key5, facts), pd.DataFrame()
+    )
+
+    with pytest.raises(ValueError, match="outside the surface"):
+        publish_analysis_run(analysis, result)
+
+
+def test_publish_analysis_run_rejects_unknown_facts_version(connections) -> None:
+    from mrs3.analysis_storage import publish_analysis_run, publish_surface
+    from mrs3.pipeline import PipelineResult
+
+    _, analysis = connections
+    key4 = "BTCUSDT|LONG|1h|100|3|8"
+    key5 = "BTCUSDT|LONG|1h|100|3|9"
+    surface = publish_surface(analysis, _analysis_surface((key4, key5)))
+    facts = _frozen_facts(key4, key5)
+    facts["operational_facts_version"] = "bogus_v2"
+    result = PipelineResult(
+        surface.surface_id, "0.7", {"frozen": True}, _fact_plateau(key4, key5, facts), pd.DataFrame()
+    )
+
+    with pytest.raises(ValueError, match="version"):
+        publish_analysis_run(analysis, result)
+
+
+def test_publish_analysis_run_rejects_contradictory_support_status(connections) -> None:
+    from mrs3.analysis_storage import publish_analysis_run, publish_surface
+    from mrs3.pipeline import PipelineResult
+
+    _, analysis = connections
+    key4 = "BTCUSDT|LONG|1h|100|3|8"
+    key5 = "BTCUSDT|LONG|1h|100|3|9"
+    surface = publish_surface(analysis, _analysis_surface((key4, key5)))
+    facts = _frozen_facts(key4, key5)
+    facts["cma_representatives"][1]["support_status"] = "CORE_CLOSE"
+    result = PipelineResult(
+        surface.surface_id, "0.7", {"frozen": True}, _fact_plateau(key4, key5, facts), pd.DataFrame()
+    )
+
+    with pytest.raises(ValueError, match="support_status"):
+        publish_analysis_run(analysis, result)
+
+
+def test_publish_analysis_run_rejects_computed_ready_plateau_without_facts(connections) -> None:
+    from mrs3.analysis_storage import publish_analysis_run, publish_surface
+    from mrs3.pipeline import PipelineResult
+
+    _, analysis = connections
+    key4 = "BTCUSDT|LONG|1h|100|3|8"
+    key5 = "BTCUSDT|LONG|1h|100|3|9"
+    surface = publish_surface(analysis, _analysis_surface((key4, key5)))
+    result = PipelineResult(
+        surface.surface_id,
+        "0.7",
+        {"frozen": True},
+        _fact_plateau(key4, key5, {}),
+        pd.DataFrame(),
+        None,
+        {"unique_point_count": 2, "economic_eligible_point_count": 2, "event_eligible_point_count": 2, "plateau_count": 1, "ready_candidate_count": 0},
+    )
+
+    with pytest.raises(ValueError, match="frozen operational facts"):
+        publish_analysis_run(analysis, result)
+
+
+def test_publish_analysis_run_allows_legacy_ready_plateau_without_facts(connections) -> None:
+    from mrs3.analysis_storage import publish_analysis_run, publish_surface
+    from mrs3.pipeline import PipelineResult
+
+    _, analysis = connections
+    key4 = "BTCUSDT|LONG|1h|100|3|8"
+    key5 = "BTCUSDT|LONG|1h|100|3|9"
+    surface = publish_surface(analysis, _analysis_surface((key4, key5)))
+    result = PipelineResult(
+        surface.surface_id,
+        "0.6",
+        {"legacy": True},
+        _fact_plateau(key4, key5, {}),
+        pd.DataFrame(),
+    )
+
+    published = publish_analysis_run(analysis, result)
+
+    stored = json.loads(
+        analysis.execute(
+            "select metrics_json from plateaus where run_id=? and plateau_id='P1'",
+            [published.run_id],
+        ).fetchone()[0]
+    )
+    assert "operational_facts_version" not in stored
+    assert stored["ready"] is True
 
 
 def test_lineage_classification_requires_common_points_and_geometry() -> None:
@@ -827,7 +1104,7 @@ def test_v2_evidence_persists_in_existing_schema_v4_grid_contract_json(connectio
     expected_evidence = point_evidence_jsonl_bytes(surface.points).decode("utf-8")
     assert stored["kind"] == V2_GRID_CONTRACT_KIND
     assert stored["selected_scopes"] == ["BTCUSDT|1h"]
-    assert stored["witnesses"]["BTCUSDT|1h"]["open_ma"] == 3
+    assert stored["witnesses"]["BTCUSDT|1h"][0]["open_ma"] == 3
     assert stored["point_evidence"] == expected_evidence
     assert stored["point_evidence_sha256"] == sha256(expected_evidence.encode("utf-8")).hexdigest()
     assert stored["audit_artifact_name"] == "surface_coverage_audit_LONG.csv"
@@ -985,6 +1262,45 @@ def test_v2_publish_requires_audit_evidence_and_valid_schema(connections) -> Non
         publish_surface(analysis, invalid_schema)
 
 
+def test_v2_audit_metadata_is_exactly_bound_across_request_preflight_and_contract(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    base = _v2_surface()
+
+    missing_preflight_size = replace(
+        base,
+        preflight=replace(base.preflight, audit_size_bytes=0),
+    )
+    with pytest.raises(ValueError, match="audit metadata"):
+        publish_surface(analysis, missing_preflight_size)
+
+    missing_request_name = replace(
+        base,
+        request=replace(base.request, audit_artifact_name=""),
+    )
+    with pytest.raises(ValueError, match="audit metadata|artifact name"):
+        publish_surface(analysis, missing_request_name)
+
+    wrong_name = "surface_coverage_audit_SHORT.csv"
+    renamed = replace(
+        base,
+        request=replace(base.request, audit_artifact_name=wrong_name),
+        preflight=replace(base.preflight, audit_artifact_name=wrong_name),
+    )
+    renamed_contract = {
+        **renamed.preflight.grid_contract,
+        "audit_artifact_name": wrong_name,
+    }
+    renamed = replace(renamed, preflight=replace(renamed.preflight, grid_contract=renamed_contract))
+    with pytest.raises(ValueError, match="artifact name|metadata"):
+        publish_surface(analysis, renamed)
+
+    wrong_schema = _v2_surface(audit_schema_version=2)
+    with pytest.raises(ValueError, match="exactly 1"):
+        publish_surface(analysis, wrong_schema)
+
+
 def test_v2_publish_defines_audit_row_count_as_data_rows_excluding_header(connections) -> None:
     from mrs3.analysis_storage import publish_surface
 
@@ -1084,9 +1400,15 @@ def test_v2_rejects_noncanonical_witnesses_and_scope_identity(connections) -> No
         extra_scope: str | None = None,
     ) -> DirectSurface:
         selected = scopes or surface.preflight.grid_contract["selected_scopes"]
-        witnesses = {"BTCUSDT|1h": witness_value}
+        base_vector = surface.preflight.grid_contract["witnesses"]["BTCUSDT|1h"]
+        if isinstance(witness_value, dict):
+            vector = [dict(item) for item in base_vector]
+            vector[0] = dict(witness_value)
+        else:
+            vector = witness_value
+        witnesses = {"BTCUSDT|1h": vector}
         if extra_scope is not None:
-            witnesses[extra_scope] = witness_value
+            witnesses[extra_scope] = vector
         return replace(
             surface,
             preflight=replace(
@@ -1101,13 +1423,13 @@ def test_v2_rejects_noncanonical_witnesses_and_scope_identity(connections) -> No
 
     _, analysis = connections
     base = _v2_surface()
-    valid_shifts = tuple(range(30, 151, 10)) + tuple(range(190, 431, 40))
+    valid_shifts = DEFAULT_CANONICAL_SHIFTS_BP
     witness = {
         "symbol": "BTCUSDT",
         "side": "LONG",
         "timeframe": "1h",
         "open_ma": 3,
-        "close_ma": 9,
+        "close_ma": 2,
         "shifts_bp": list(valid_shifts),
         "contract_version": READINESS_CONTRACT_VERSION,
         "max_shift_bp": READINESS_MAX_SHIFT_BP,
@@ -1121,16 +1443,16 @@ def test_v2_rejects_noncanonical_witnesses_and_scope_identity(connections) -> No
         (with_witness(base, {key: value for key, value in witness.items() if key != "contract_version"}), "exact|keys"),
         (with_witness(base, {**witness, "symbol": "ETHUSDT"}), "symbol|scope"),
         (with_witness(base, {**witness, "timeframe": "4h"}), "timeframe|scope"),
-        (with_witness(base, {**witness, "side": "SHORT"}), "side"),
-        (with_witness(base, {**witness, "contract_version": "shift_readiness_v2"}), "contract_version|shift_readiness_v1"),
-        (with_witness(base, {**witness, "max_shift_bp": 700}), "max_shift_bp|430"),
-        (with_witness(base, {**witness, "max_shift_bp": True}), "max_shift_bp|integer"),
+        (with_witness(base, {**witness, "side": "SHORT"}), "scope|side"),
+        (with_witness(base, {**witness, "contract_version": "shift_readiness_v2"}), "contract"),
+        (with_witness(base, {**witness, "max_shift_bp": 700}), "contract|invalid"),
+        (with_witness(base, {**witness, "max_shift_bp": True}), "contract|invalid"),
         (with_witness(base, {**witness, "open_ma": True}), "integer"),
-        (with_witness(base, {**witness, "shifts_bp": [30, True, 150, 430]}), "integer"),
-        (with_witness(base, {**witness, "shifts_bp": [30, 50, 150, 190, 230, 270, 310, 350, 390, 430]}), "first band"),
-        (with_witness(base, {**witness, "shifts_bp": [30, 50, 100, 150, 190, 230, 270, 310, 350, 390, 430]}), "first band"),
-        (with_witness(base, {**witness, "shifts_bp": [30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 200, 430]}), "second band"),
-        (with_witness(base, {**witness, "shifts_bp": [30, 150]}), "430"),
+        (with_witness(base, {**witness, "shifts_bp": [30, True, 150, 430]}), "shifts_bp is invalid"),
+        (with_witness(base, {**witness, "shifts_bp": [30, 50, 150, 190, 230, 270, 310, 350, 390, 430]}), "canonical shifts"),
+        (with_witness(base, {**witness, "shifts_bp": [30, 50, 100, 150, 190, 230, 270, 310, 350, 390, 430]}), "canonical shifts"),
+        (with_witness(base, {**witness, "shifts_bp": [30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 200, 430]}), "canonical shifts"),
+        (with_witness(base, {**witness, "shifts_bp": [30, 150]}), "canonical shifts"),
         (with_witness(base, witness, extra_scope="BTCUSDT|4h"), "exactly one"),
         (with_witness(base, witness, scopes=["BTCUSDT|1h", "BTCUSDT|1h"]), "unique|exactly one"),
     )
@@ -1138,3 +1460,488 @@ def test_v2_rejects_noncanonical_witnesses_and_scope_identity(connections) -> No
     for surface, pattern in cases:
         with pytest.raises(ValueError, match=pattern):
             publish_surface(analysis, surface)
+
+
+def test_v2_admission_requires_canonical_grid_and_six_witness_vector(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    base = _v2_surface()
+    missing_grid = replace(
+        base,
+        preflight=replace(
+            base.preflight,
+            grid_contract={key: value for key, value in base.preflight.grid_contract.items() if key != "canonical_grid_version"},
+        ),
+    )
+    with pytest.raises(ValueError, match="canonical grid version"):
+        publish_surface(analysis, missing_grid)
+
+    singular = replace(
+        base,
+        preflight=replace(
+            base.preflight,
+            grid_contract={
+                **base.preflight.grid_contract,
+                "witnesses": {"BTCUSDT|1h": base.preflight.grid_contract["witnesses"]["BTCUSDT|1h"][0]},
+            },
+        ),
+    )
+    with pytest.raises(ValueError, match="six entries"):
+        publish_surface(analysis, singular)
+
+
+@pytest.mark.parametrize("request_kind, preflight_kind", [
+    (V2_GRID_CONTRACT_KIND, "OBSERVED_GRID_CONTRACT"),
+    ("OBSERVED_GRID_CONTRACT", V2_GRID_CONTRACT_KIND),
+])
+def test_v2_admission_requires_matching_request_and_preflight_contract_kinds(
+    connections, request_kind: str, preflight_kind: str
+) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    base = _v2_surface()
+    mismatched = replace(
+        base,
+        request=replace(base.request, grid_contract_kind=request_kind),
+        preflight=replace(
+            base.preflight,
+            grid_contract={**base.preflight.grid_contract, "kind": preflight_kind},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="V2 request and preflight grid contracts must agree"):
+        publish_surface(analysis, mismatched)
+
+
+def test_v2_rejects_self_consistent_non_default_canonical_shift_tuple(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    non_default = tuple(range(30, 151, 10)) + tuple(range(190, 431, 40))
+    non_default_hash = canonical_point_materialization_config_hash(non_default)
+    base = _v2_surface()
+    witness = [
+        {**item, "shifts_bp": list(non_default)}
+        for item in base.preflight.grid_contract["witnesses"]["BTCUSDT|1h"]
+    ]
+    contract = {
+        **base.preflight.grid_contract,
+        "canonical_shifts_bp": list(non_default),
+        "point_materialization_config_hash": non_default_hash,
+        "witnesses": {"BTCUSDT|1h": witness},
+    }
+    surface = replace(
+        base,
+        request=replace(
+            base.request,
+            required_shifts_bp=non_default,
+            point_materialization_config_hash=non_default_hash,
+        ),
+        preflight=replace(base.preflight, grid_contract=contract),
+    )
+
+    with pytest.raises(ValueError, match="canonical shifts"):
+        publish_surface(analysis, surface)
+
+
+def test_v2_rejects_non_canonical_materializer_version(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    surface = replace(
+        _v2_surface(),
+        request=replace(_v2_surface().request, materializer_version="v2-real-events"),
+    )
+
+    with pytest.raises(ValueError, match="materializer"):
+        publish_surface(analysis, surface)
+
+
+def test_v2_rejects_non_canonical_normalization_contract_version(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    surface = replace(
+        _v2_surface(),
+        preflight=replace(
+            _v2_surface().preflight,
+            grid_contract={
+                **_v2_surface().preflight.grid_contract,
+                "normalization_contract_version": "v0",
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError, match="normalization"):
+        publish_surface(analysis, surface)
+
+
+def test_v2_grid_witnesses_are_not_restored_from_preflight_fallback(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    base = _v2_surface()
+    contract = {
+        key: value for key, value in base.preflight.grid_contract.items() if key != "witnesses"
+    }
+    missing_grid_witnesses = replace(
+        base,
+        preflight=replace(base.preflight, grid_contract=contract),
+    )
+
+    with pytest.raises(ValueError, match="exactly one witness"):
+        publish_surface(analysis, missing_grid_witnesses)
+
+
+def test_v2_audit_metadata_is_not_restored_from_preflight_fallback(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    base = _v2_surface()
+    contract = {
+        key: value for key, value in base.preflight.grid_contract.items()
+        if key not in {
+            "audit_artifact_name",
+            "audit_schema_version",
+            "audit_size_bytes",
+            "audit_row_count",
+            "audit_sha256",
+        }
+    }
+    missing_audit_metadata = replace(
+        base,
+        preflight=replace(base.preflight, grid_contract=contract),
+    )
+
+    with pytest.raises(ValueError, match="audit metadata|audit size mismatch"):
+        publish_surface(analysis, missing_audit_metadata)
+
+
+def test_v2_admission_rejects_persisted_legacy_trades_proxy_event_mode(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    downgraded = replace(_v2_surface(), event_mode="legacy_trades_proxy")
+
+    with pytest.raises(ValueError, match="real_independent_events"):
+        publish_surface(analysis, downgraded)
+
+
+def _published_v2(
+    analysis: duckdb.DuckDBPyConnection, period_index: int = 0
+) -> tuple[str, dict[str, object]]:
+    from mrs3.analysis_storage import publish_surface
+
+    base = _v2_surface()
+    day = 1 + period_index
+    surface = publish_surface(
+        analysis,
+        replace(
+            base,
+            request=replace(
+                base.request,
+                start_utc=f"2024-01-{day:02d}T00:00:00Z",
+                end_utc=f"2024-01-{day:02d}T02:00:00Z",
+            ),
+        ),
+    )
+    contract = json.loads(
+        analysis.execute(
+            "select grid_contract_json from surfaces where surface_id=?", [surface.surface_id]
+        ).fetchone()[0]
+    )
+    return surface.surface_id, contract
+
+
+def _set_contract(
+    analysis: duckdb.DuckDBPyConnection, surface_id: str, contract: dict[str, object]
+) -> None:
+    analysis.execute(
+        "update surfaces set grid_contract_json=? where surface_id=?",
+        [json.dumps(contract), surface_id],
+    )
+
+
+def test_require_canonical_operational_surface_accepts_fresh_v2_surface(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+    surface_id, _ = _published_v2(analysis)
+
+    require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_missing_or_wrong_grid_fields(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+
+    surface_id, _ = _published_v2(analysis)
+    analysis.execute("update surfaces set grid_contract_json=NULL where surface_id=?", [surface_id])
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 1)
+    _set_contract(
+        analysis, surface_id,
+        {key: value for key, value in contract.items() if key != "kind"},
+    )
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 2)
+    _set_contract(analysis, surface_id, {**contract, "kind": "OBSERVED_GRID_CONTRACT"})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_missing_or_wrong_grid_version(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+
+    surface_id, contract = _published_v2(analysis)
+    _set_contract(
+        analysis, surface_id,
+        {key: value for key, value in contract.items() if key != "canonical_grid_version"},
+    )
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 1)
+    _set_contract(analysis, surface_id, {**contract, "canonical_grid_version": "mrs3_shift_grid_30_430_v1"})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_missing_or_wrong_canonical_shifts(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+
+    surface_id, contract = _published_v2(analysis)
+    _set_contract(
+        analysis, surface_id,
+        {key: value for key, value in contract.items() if key != "canonical_shifts_bp"},
+    )
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 1)
+    wrong_order = list(DEFAULT_CANONICAL_SHIFTS_BP)
+    wrong_order[0], wrong_order[1] = wrong_order[1], wrong_order[0]
+    _set_contract(analysis, surface_id, {**contract, "canonical_shifts_bp": wrong_order})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 2)
+    wrong_value = [*DEFAULT_CANONICAL_SHIFTS_BP, 600]
+    _set_contract(analysis, surface_id, {**contract, "canonical_shifts_bp": wrong_value})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_missing_or_wrong_readiness_version(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+
+    surface_id, contract = _published_v2(analysis)
+    _set_contract(
+        analysis, surface_id,
+        {key: value for key, value in contract.items() if key != "readiness_contract_version"},
+    )
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 1)
+    _set_contract(analysis, surface_id, {**contract, "readiness_contract_version": "close_ma_2_7_legacy_v1"})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_old_or_arbitrary_materializer(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+
+    surface_id, _ = _published_v2(analysis)
+    analysis.execute("update surfaces set materializer_version=NULL where surface_id=?", [surface_id])
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, _ = _published_v2(analysis, 1)
+    analysis.execute("update surfaces set materializer_version='v2-real-events' where surface_id=?", [surface_id])
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, _ = _published_v2(analysis, 2)
+    analysis.execute(
+        "update surfaces set materializer_version='v4-canonical-grid-parallel-hotfix' where surface_id=?",
+        [surface_id],
+    )
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_missing_or_wrong_semantics_version(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+
+    surface_id, contract = _published_v2(analysis)
+    _set_contract(
+        analysis, surface_id,
+        {key: value for key, value in contract.items() if key != "point_materialization_semantics_version"},
+    )
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 1)
+    _set_contract(
+        analysis, surface_id,
+        {**contract, "point_materialization_semantics_version": "legacy_point_materialization_v1"},
+    )
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_wrong_or_variant_config_hash(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+    from mrs3.duckdb_direct import canonical_point_materialization_semantic_payload
+
+    _, analysis = connections
+    payload = canonical_point_materialization_semantic_payload(DEFAULT_CANONICAL_SHIFTS_BP)
+    canonical_hash = canonical_point_materialization_config_hash(DEFAULT_CANONICAL_SHIFTS_BP)
+
+    def variant_hash(label: str) -> str:
+        if label == "pretty":
+            text = json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=True)
+        elif label == "newline":
+            text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+        elif label == "omitted":
+            subset = {key: value for key, value in payload.items() if key != "event_id_contract"}
+            text = json.dumps(subset, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        else:
+            text = json.dumps(
+                {**payload, "extra_field": "x"}, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+        return sha256(text.encode("ascii")).hexdigest()
+
+    for label in ("pretty", "newline", "omitted", "extra"):
+        digest = variant_hash(label)
+        assert digest != canonical_hash
+        surface_id, contract = _published_v2(analysis)
+        analysis.execute(
+            "update surfaces set point_materialization_config_hash=? where surface_id=?",
+            [digest, surface_id],
+        )
+        _set_contract(analysis, surface_id, {**contract, "point_materialization_config_hash": digest})
+        with pytest.raises(ValueError, match="config hash"):
+            require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 1)
+    wrong = "f" * 64
+    analysis.execute(
+        "update surfaces set point_materialization_config_hash=? where surface_id=?",
+        [wrong, surface_id],
+    )
+    _set_contract(analysis, surface_id, {**contract, "point_materialization_config_hash": wrong})
+    with pytest.raises(ValueError, match="config hash"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_wrong_event_mode(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+    surface_id, _ = _published_v2(analysis)
+    analysis.execute("update surfaces set event_mode='legacy_trades_proxy' where surface_id=?", [surface_id])
+
+    with pytest.raises(ValueError, match="event_mode"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_malformed_witnesses(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+
+    surface_id, contract = _published_v2(analysis)
+    vector = contract["witnesses"]["BTCUSDT|1h"]
+    _set_contract(analysis, surface_id, {**contract, "witnesses": {"BTCUSDT|1h": vector[:5]}})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 1)
+    _set_contract(analysis, surface_id, {**contract, "witnesses": {}})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 2)
+    reordered = [dict(item) for item in contract["witnesses"]["BTCUSDT|1h"]]
+    reordered[0], reordered[1] = reordered[1], reordered[0]
+    _set_contract(analysis, surface_id, {**contract, "witnesses": {"BTCUSDT|1h": reordered}})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 3)
+    shifted = [dict(item) for item in contract["witnesses"]["BTCUSDT|1h"]]
+    shifted[0]["shifts_bp"] = [*DEFAULT_CANONICAL_SHIFTS_BP[:-1], 600]
+    _set_contract(analysis, surface_id, {**contract, "witnesses": {"BTCUSDT|1h": shifted}})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_malformed_audit(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+
+    surface_id, contract = _published_v2(analysis)
+    _set_contract(analysis, surface_id, {**contract, "audit_schema_version": 2})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 1)
+    _set_contract(analysis, surface_id, {**contract, "audit_row_count": -1})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 2)
+    _set_contract(analysis, surface_id, {**contract, "audit_size_bytes": 0})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 3)
+    _set_contract(analysis, surface_id, {**contract, "audit_sha256": "z" * 64})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_require_canonical_operational_surface_rejects_malformed_point_evidence(connections) -> None:
+    from mrs3.analysis_storage import require_canonical_operational_surface
+
+    _, analysis = connections
+
+    surface_id, contract = _published_v2(analysis)
+    _set_contract(analysis, surface_id, {**contract, "point_evidence": "not-jsonl"})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+    surface_id, contract = _published_v2(analysis, 1)
+    _set_contract(analysis, surface_id, {**contract, "point_evidence_sha256": "f" * 64})
+    with pytest.raises(ValueError, match="fresh canonical"):
+        require_canonical_operational_surface(analysis, surface_id)
+
+
+def test_parent_materialization_rejects_legacy_parent_surface(connections) -> None:
+    from mrs3.analysis_storage import publish_surface
+
+    _, analysis = connections
+    legacy = publish_surface(analysis, _surface())
+
+    with pytest.raises(ValueError, match="fresh canonical"):
+        publish_surface(analysis, replace(_v2_surface(), parent_surface_id=legacy.surface_id))

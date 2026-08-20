@@ -39,6 +39,34 @@ _QUERIES = {
     "analysis_run_facts": ("select * from analysis_run_facts where run_id=? order by run_id", "run"),
     "plateaus": ("select * from plateaus where run_id=? order by plateau_id", "run"),
     "plateau_members": ("select * from plateau_members where run_id=? order by plateau_id, canonical_point_key", "run"),
+    "plateau_point_composition": (
+        """
+        select
+            pm.run_id,
+            pm.surface_id,
+            pm.plateau_id,
+            count(*) over (partition by pm.run_id, pm.plateau_id) as plateau_member_count,
+            pair.symbol,
+            pair.side,
+            sp.pair_key,
+            pair.shift_bp,
+            pair.open_ma,
+            pair.close_ma,
+            sp.timeframe,
+            sp.canonical_point_key,
+            sp.point_event_count,
+            sp.source_report_id,
+            sp.source_hash,
+            sp.provenance_state,
+            sp.metrics_json
+        from plateau_members pm
+        join surface_points sp using(surface_id, canonical_point_key)
+        join surface_pairs pair using(surface_id, pair_key)
+        where pm.run_id=?
+        order by pm.plateau_id, pair.symbol, pair.side, pair.shift_bp, pair.open_ma, pair.close_ma, sp.timeframe, sp.canonical_point_key
+        """,
+        "run",
+    ),
     "candidates": ("select * from candidates where run_id=? order by candidate_id", "run"),
     "candidate_plateaus": ("select * from candidate_plateaus where run_id=? order by candidate_id, plateau_id", "run"),
     "plateau_lineage": ("select * from plateau_lineage where child_run_id=? or parent_run_id=? order by lineage_id", "both"),

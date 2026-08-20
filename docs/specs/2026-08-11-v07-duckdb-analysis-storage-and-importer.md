@@ -156,6 +156,35 @@ Settings contain:
 The importer recursively discovers HTML below the selected root. Local paths
 remain only in ignored configuration and operational logs.
 
+## Debian command-line import runner
+
+For headless Debian hosts the same preflight-token workflow is available
+without starting the web panel:
+
+```sh
+chmod +x scripts/import-html-duckdb-debian.sh
+scripts/import-html-duckdb-debian.sh --html-root /data/reports --config /path/config.local.json
+```
+
+The wrapper locates the repository root relative to itself and invokes the
+platform-independent Python runner under `python3` (or `$PYTHON` if set). The
+runner loads the existing `duckdb_import` settings, requires
+`source_duckdb_path` and `audit_root`, preflights the HTML tree, then calls the
+existing `import_html_tree` importer with the exact preflight token bound. It
+never parses or writes DuckDB itself and never prints configuration contents.
+
+Progress is newline-delimited JSON on stdout: preflight snapshot progress,
+import phase progress, and a final summary with job id, counts,
+manifest/checklist paths, final state, safe-to-delete and error. The process
+exits nonzero when the final state is not `COMMITTED` or quarantined reports
+are nonzero.
+
+For transfer to a headless Debian host, the repository also provides the
+self-contained [`debian-duckdb-importer/`](../../debian-duckdb-importer/)
+bundle and its [Russian instructions](../../debian-duckdb-importer/IMPORT_INSTRUCTIONS.md).
+The bundle contains the same runner and v3 codec layout and does not require
+the panel service.
+
 ## Import safety checks
 
 - Parsing workers never write DuckDB; one coordinator owns the connection.

@@ -5,9 +5,13 @@ from types import MappingProxyType
 import csv
 import hashlib
 import io
+import pickle
+import threading
+import time
+from concurrent.futures import Future
 from hashlib import sha256
 from datetime import datetime
-from dataclasses import replace
+from dataclasses import MISSING, asdict, replace
 from pathlib import Path
 import os
 from types import MappingProxyType
@@ -15,10 +19,17 @@ from types import MappingProxyType
 import duckdb
 import pytest
 
+from mrs3 import duckdb_direct
 from mrs3 import duckdb_source_schema
+from mrs3.config import DEFAULT_CANONICAL_SHIFTS_BP, DirectMaterializationSettings
 from mrs3.duckdb_direct import (
+    CANONICAL_GRID_VERSION,
+    CANONICAL_MATERIALIZER_VERSION,
+    POINT_MATERIALIZATION_SEMANTICS_VERSION,
+    REAL_EVENT_MODE,
     READINESS_CONTRACT_VERSION,
     READINESS_MAX_SHIFT_BP,
+    REQUIRED_CLOSE_MAS,
     V2_GRID_CONTRACT_KIND,
     CoverageIssue,
     DirectBuildRequest,
@@ -29,24 +40,38 @@ from mrs3.duckdb_direct import (
     DirectQueueResult,
     DirectScope,
     DirectSurface,
+    MaterializationPayload,
     _CoverageScan,
     _coverage_scan_rows,
+    _direct_coverage,
+    _fetch_materialization_payload_batch,
+    _materialize_payload_chunk,
+    _materialize_payloads_parallel,
     common_intervals_for_scopes,
     coverage_scan_direct,
     _canonical_json_bytes,
     _effective_window,
     coverage_audit_csv_bytes,
     coverage_inventory_csv_bytes,
+    canonical_point_materialization_config_hash,
+    canonical_point_materialization_semantic_payload,
     list_duckdb_direct_coverage,
     materialize_duckdb_direct,
     point_evidence_jsonl_bytes,
     preflight_duckdb_direct,
     prepare_direct_surfaces,
+    replay_direct_preflights,
     publish_direct_surfaces,
+    verify_persisted_surface_audit,
     run_panel_direct_build,
     write_coverage_artifact,
 )
-from mrs3.analysis_storage import PublishedSurface, publish_surface
+from mrs3.analysis_storage import (
+    ANALYSIS_SCHEMA_VERSION,
+    PublishedSurface,
+    ensure_analysis_schema,
+    publish_surface,
+)
 from mrs3.duckdb_events import ACTION_CODEC, EQUITY_CODEC, canonical_event_id
 from mrs3.duckdb_source_schema import (
     NORMALIZATION_CONTRACT_VERSION,
@@ -62,7 +87,7 @@ from mrs3.duckdb_source_schema import (
 
 START_MS = 1_704_067_200_000
 END_MS = 1_704_074_400_000
-READY_SHIFTS = tuple(range(30, 151, 10)) + tuple(range(190, 431, 40))
+READY_SHIFTS = DEFAULT_CANONICAL_SHIFTS_BP
 
 
 def _hash(*values: object) -> str:
@@ -127,9 +152,16 @@ def _request(**changes: object) -> DirectBuildRequest:
 
 def _v2_preflight(side: str) -> DirectPreflight:
     return DirectPreflight(
-        {}, {}, (), MappingProxyType({"kind": V2_GRID_CONTRACT_KIND}),
+        {}, {}, (), MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}),
         (), (), (),
     )
+
+
+def test_direct_preflight_empty_witnesses_uses_default_factory() -> None:
+    field = DirectPreflight.__dataclass_fields__["witnesses"]
+
+    assert field.default_factory is not MISSING
+    assert field.default_factory() == MappingProxyType({})
 
 
 class _StatementSource:
@@ -460,112 +492,219 @@ def _seed_readiness_scope(
         )
 
 
-def test_readiness_uses_30_150_430_boundaries_and_gap_limits(connections) -> None:
+def test_readiness_requires_all_six_close_mas_on_common_interval(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(
-        source,
-        symbol="BTCUSDT",
-        shifts=tuple(range(30, 151, 10)) + tuple(range(190, 431, 40)),
-    )
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS, close_ma=close_ma)
     _seed_readiness_scope(
         source,
         symbol="ETHUSDT",
-        shifts=(30, 150, 430),
+        shifts=READY_SHIFTS,
         open_ma=4,
-        close_ma=10,
+        close_ma=7,
     )
 
     coverage = list_duckdb_direct_coverage(source, symbols=())
     btc = next(row for row in coverage.rows if row.symbol == "BTCUSDT")
     eth = next(row for row in coverage.rows if row.symbol == "ETHUSDT")
-    witness = next(item for item in coverage.intervals if item.scope.symbol == "BTCUSDT").witness
+    interval = next(item for item in coverage.intervals if item.scope.symbol == "BTCUSDT")
 
     assert btc.selectable is True
     assert btc.interval_start_utc == "2024-01-01T00:00:00.000+00:00"
     assert btc.interval_end_utc == "2024-01-01T02:00:00.000+00:00"
-    assert witness is not None
-    assert witness.open_ma == 3
-    assert witness.close_ma == 9
-    assert witness.shifts_bp == tuple(range(30, 151, 10)) + tuple(range(190, 431, 40))
+    assert tuple(w.close_ma for w in interval.witnesses) == REQUIRED_CLOSE_MAS
+    assert all(w.open_ma == 3 for w in interval.witnesses)
+    assert all(w.shifts_bp == READY_SHIFTS for w in interval.witnesses)
+    assert all(w.contract_version == READINESS_CONTRACT_VERSION for w in interval.witnesses)
+    assert all(w.max_shift_bp == READINESS_MAX_SHIFT_BP for w in interval.witnesses)
     assert eth.selectable is False
 
 
-def test_readiness_accepts_denser_shifts_and_requires_common_ma_pair(connections) -> None:
+def test_readiness_allows_different_open_ma_per_close_ma(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(source, symbol="BTCUSDT", shifts=tuple(range(30, 431, 5)))
-    _seed_readiness_scope(
-        source,
-        symbol="BTCUSDT",
-        shifts=(30, 150, 430),
-        open_ma=4,
-        close_ma=10,
-    )
-    _seed_readiness_scope(
-        source,
-        symbol="ETHUSDT",
-        shifts=(30, 430),
-        open_ma=3,
-        close_ma=9,
-    )
-    _seed_readiness_scope(
-        source,
-        symbol="ETHUSDT",
-        shifts=(30, 150),
-        open_ma=4,
-        close_ma=10,
-    )
+    for close_ma, open_ma in zip(REQUIRED_CLOSE_MAS, (3, 4, 5, 6, 7, 8), strict=True):
+        _seed_readiness_scope(
+            source, symbol="BTCUSDT", shifts=READY_SHIFTS, open_ma=open_ma, close_ma=close_ma
+        )
 
     coverage = list_duckdb_direct_coverage(source, symbols=())
-    btc = next(row for row in coverage.rows if row.symbol == "BTCUSDT")
-    eth = next(row for row in coverage.rows if row.symbol == "ETHUSDT")
-    witness = next(item for item in coverage.intervals if item.scope.symbol == "BTCUSDT").witness
+    row = next(iter(coverage.rows))
+    interval = next(iter(coverage.intervals))
 
-    assert btc.selectable is True
-    assert witness is not None
-    assert witness.open_ma == 3
-    assert witness.shifts_bp == tuple(range(30, 151, 10)) + tuple(range(190, 431, 40))
-    assert eth.selectable is False
+    assert row.selectable is True
+    assert tuple(w.open_ma for w in interval.witnesses) == (3, 4, 5, 6, 7, 8)
+    assert tuple(w.close_ma for w in interval.witnesses) == REQUIRED_CLOSE_MAS
 
 
-def test_readiness_retains_exact_150_when_optional_shift_is_immediately_above(connections) -> None:
+def test_readiness_keeps_later_start_candidate_when_it_is_longer(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(
-        source,
-        symbol="BTCUSDT",
-        shifts=(30, 35, 45, 55, 65, 75, 85, 95, 105, 115, 125, 135, 145, 150, 153, 190, 230, 270, 310, 350, 390, 430),
-    )
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(
+            source,
+            symbol="BTCUSDT",
+            shifts=READY_SHIFTS,
+            open_ma=3,
+            close_ma=close_ma,
+            start_ms=START_MS,
+            end_ms=START_MS + 2 * 3_600_000,
+        )
+        _seed_readiness_scope(
+            source,
+            symbol="BTCUSDT",
+            shifts=READY_SHIFTS,
+            open_ma=5,
+            close_ma=close_ma,
+            start_ms=START_MS + 3_600_000,
+            end_ms=START_MS + 4 * 3_600_000,
+        )
 
     coverage = list_duckdb_direct_coverage(source, symbols=())
-    witness = next(item for item in coverage.intervals if item.scope.symbol == "BTCUSDT").witness
+    row = next(iter(coverage.rows))
+    interval = next(item for item in coverage.intervals if item.selectable)
 
-    assert next(iter(coverage.rows)).selectable is True
-    assert witness is not None
-    assert 150 in witness.shifts_bp
+    assert row.interval_start_utc == "2024-01-01T01:00:00.000+00:00"
+    assert row.interval_end_utc == "2024-01-01T04:00:00.000+00:00"
+    assert tuple(w.open_ma for w in interval.witnesses) == (5,) * len(REQUIRED_CLOSE_MAS)
 
 
-def test_readiness_retains_exact_430_when_optional_shift_is_immediately_above(connections) -> None:
+def test_readiness_fails_closed_when_close_ma_7_is_missing(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(
-        source,
-        symbol="BTCUSDT",
-        shifts=tuple(range(30, 151, 10)) + (190, 230, 270, 310, 350, 385, 425, 430, 435),
-    )
+    for close_ma in REQUIRED_CLOSE_MAS[:-1]:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS, close_ma=close_ma)
 
     coverage = list_duckdb_direct_coverage(source, symbols=())
-    witness = next(item for item in coverage.intervals if item.scope.symbol == "BTCUSDT").witness
 
-    assert next(iter(coverage.rows)).selectable is True
-    assert witness is not None
-    assert witness.shifts_bp[-1] == 430
+    assert next(iter(coverage.rows)).selectable is False
+    assert all(not interval.selectable for interval in coverage.intervals)
 
 
-def test_optional_points_above_430_do_not_disable_ready_scope(connections) -> None:
+def test_readiness_rejects_stitching_two_open_mas_for_one_close_ma(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(
-        source,
-        symbol="BTCUSDT",
-        shifts=tuple(range(30, 151, 10)) + tuple(range(190, 431, 40)),
+    split = READY_SHIFTS.index(230)
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(
+            source, symbol="BTCUSDT", shifts=READY_SHIFTS[:split], close_ma=close_ma, open_ma=3
+        )
+        _seed_readiness_scope(
+            source, symbol="BTCUSDT", shifts=READY_SHIFTS[split:], close_ma=close_ma, open_ma=5
+        )
+
+    coverage = list_duckdb_direct_coverage(source, symbols=())
+
+    assert next(iter(coverage.rows)).selectable is False
+    assert all(not interval.selectable for interval in coverage.intervals)
+
+
+def test_readiness_rejects_missing_canonical_shift_550(connections) -> None:
+    source, _ = connections
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS[:-1], close_ma=close_ma)
+
+    coverage = list_duckdb_direct_coverage(source, symbols=())
+
+    assert next(iter(coverage.rows)).selectable is False
+
+
+def test_legacy_extra_shift_cannot_replace_missing_canonical_shift(connections) -> None:
+    source, _ = connections
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS[:-1], close_ma=close_ma)
+        _seed_report(
+            source,
+            symbol="BTCUSDT",
+            shift=1490,
+            open_ma=3,
+            close_ma=close_ma,
+            source_hash=_hash("extra", close_ma),
+        )
+
+    coverage = list_duckdb_direct_coverage(source, symbols=())
+
+    assert next(iter(coverage.rows)).selectable is False
+
+
+def test_readiness_is_deterministic_under_row_permutation(connections) -> None:
+    source, _ = connections
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS, close_ma=close_ma)
+    rows = _coverage_scan_rows(source, side=None, symbols=())
+    forward = _direct_coverage(rows)
+    backward = _direct_coverage(list(reversed(rows)))
+
+    assert forward == backward
+    assert forward.rows == backward.rows
+    assert forward.intervals == backward.intervals
+
+
+def test_readiness_prefers_earliest_start_when_candidate_durations_tie(connections) -> None:
+    source, _ = connections
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(
+            source,
+            symbol="BTCUSDT",
+            shifts=READY_SHIFTS,
+            close_ma=close_ma,
+            start_ms=START_MS,
+            end_ms=START_MS + 2 * 3_600_000,
+        )
+        _seed_readiness_scope(
+            source,
+            symbol="BTCUSDT",
+            shifts=READY_SHIFTS,
+            close_ma=close_ma,
+            start_ms=START_MS + 4 * 3_600_000,
+            end_ms=START_MS + 6 * 3_600_000,
+        )
+
+    coverage = list_duckdb_direct_coverage(source, symbols=())
+    row = next(iter(coverage.rows))
+    scope_intervals = [item for item in coverage.intervals if item.scope.symbol == "BTCUSDT"]
+
+    assert row.selectable is True
+    assert row.interval_start_utc == "2024-01-01T00:00:00.000+00:00"
+    assert row.interval_end_utc == "2024-01-01T02:00:00.000+00:00"
+    assert len(scope_intervals) == 2
+    assert scope_intervals[0].selectable is True
+    assert scope_intervals[1].selectable is False
+    assert {
+        (item.start_utc, item.end_utc) for item in scope_intervals
+    } == {
+        ("2024-01-01T00:00:00.000+00:00", "2024-01-01T02:00:00.000+00:00"),
+        ("2024-01-01T04:00:00.000+00:00", "2024-01-01T06:00:00.000+00:00"),
+    }
+
+
+def test_v2_request_rejects_noncanonical_materialization_tuple(connections) -> None:
+    supplied = (
+        30, 40, 50, 60, 70, 80, 90, 100, 110,
+        120, 130, 140, 150, 190, 230, 270, 310, 430, 550,
     )
+    assert supplied != DEFAULT_CANONICAL_SHIFTS_BP
+    source, _ = connections
+    request = _request(
+        grid_contract_kind=V2_GRID_CONTRACT_KIND,
+        selected_scopes=('BTCUSDT|1h',),
+        required_shifts_bp=supplied,
+        readiness_contract_version=READINESS_CONTRACT_VERSION,
+        readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+        materializer_version=CANONICAL_MATERIALIZER_VERSION,
+        point_materialization_config_hash=canonical_point_materialization_config_hash(supplied),
+        audit_artifact_name='surface_coverage_audit_LONG.csv',
+        audit_schema_version=1,
+        audit_size_bytes=1,
+        audit_row_count=0,
+        audit_sha256='a' * 64,
+        audit_bytes=b'x',
+    )
+
+    with pytest.raises(DirectMaterializationError, match="canonical shift tuple"):
+        preflight_duckdb_direct(source, request)
+
+
+def test_optional_noncanonical_points_do_not_disable_ready_scope(connections) -> None:
+    source, _ = connections
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS, close_ma=close_ma)
     _seed_report(source, shift=500, source_hash="shift-500")
     _seed_report(source, shift=600, source_hash="shift-600")
     _seed_report(source, shift=700, open_ma=4, close_ma=10, source_hash="shift-700")
@@ -581,24 +720,19 @@ def test_optional_points_above_430_do_not_disable_ready_scope(connections) -> No
     audit_rows = list(csv.DictReader(io.StringIO(csv_text)))
 
     assert row.selectable is True
-    for shift in (500, 600):
+    for shift in (500, 600, 700):
         point = next(item for item in audit_rows if item["shift_bp"] == str(shift))
         assert point["status"] == "AVAILABLE"
         assert point["required_for_readiness"] == "false"
-    optional_pair = next(item for item in audit_rows if item["shift_bp"] == "700")
-    assert optional_pair["status"] == "AVAILABLE"
-    assert optional_pair["open_ma"] == "4"
 
 
-def test_ready_chain_with_other_factual_gap_is_disabled(connections) -> None:
+def test_factual_gap_in_non_witness_pair_does_not_disable_ready_scope(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(
-        source,
-        symbol="BTCUSDT",
-        shifts=tuple(range(30, 151, 10)) + tuple(range(190, 431, 40)),
-        start_ms=START_MS,
-        end_ms=END_MS,
-    )
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(
+            source, symbol="BTCUSDT", shifts=READY_SHIFTS, close_ma=close_ma,
+            start_ms=START_MS, end_ms=END_MS,
+        )
     _seed_report(
         source,
         shift=100,
@@ -610,9 +744,8 @@ def test_ready_chain_with_other_factual_gap_is_disabled(connections) -> None:
     coverage = list_duckdb_direct_coverage(source, symbols=())
 
     row = next(iter(coverage.rows))
-    assert row.selectable is False
+    assert row.selectable is True
     assert row.gap_details == ("missing: 2024-01-01 .. 2024-01-01",)
-    assert all(not interval.selectable for interval in coverage.intervals)
 
 
 def test_inventory_emits_every_factual_chain_when_no_readiness_interval(connections) -> None:
@@ -644,22 +777,25 @@ def test_inventory_emits_every_factual_chain_when_no_readiness_interval(connecti
 
 def test_inventory_emits_every_candidate_chain_but_publication_emits_one_exact_block(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(
-        source,
-        symbol="BTCUSDT",
-        shifts=tuple(range(30, 151, 10)) + tuple(range(190, 431, 40)),
-        start_ms=START_MS,
-        end_ms=START_MS + 2 * 3_600_000,
-    )
-    _seed_readiness_scope(
-        source,
-        symbol="BTCUSDT",
-        shifts=tuple(range(30, 151, 10)) + tuple(range(190, 431, 40)),
-        open_ma=4,
-        close_ma=10,
-        start_ms=START_MS + 2 * 3_600_000,
-        end_ms=START_MS + 4 * 3_600_000,
-    )
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(
+            source,
+            symbol="BTCUSDT",
+            shifts=READY_SHIFTS,
+            close_ma=close_ma,
+            start_ms=START_MS,
+            end_ms=START_MS + 2 * 3_600_000,
+        )
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(
+            source,
+            symbol="BTCUSDT",
+            shifts=READY_SHIFTS,
+            open_ma=5,
+            close_ma=close_ma,
+            start_ms=START_MS + 2 * 3_600_000,
+            end_ms=START_MS + 4 * 3_600_000,
+        )
 
     inventory_rows = list(csv.DictReader(io.StringIO(coverage_inventory_csv_bytes(source).decode("utf-8"))))
     audit_rows = list(csv.DictReader(io.StringIO(coverage_audit_csv_bytes(
@@ -675,9 +811,10 @@ def test_inventory_emits_every_candidate_chain_but_publication_emits_one_exact_b
     assert all(row["displayed_interval"] == "true" for row in audit_rows)
 
 
-def test_readiness_rejects_exact_11_bp_gap(connections) -> None:
+def test_readiness_audit_reports_missing_canonical_shifts(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(source, symbol="BTCUSDT", shifts=(30, 41, 150, 430))
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS[:-1], close_ma=close_ma)
 
     csv_text = coverage_audit_csv_bytes(
         source,
@@ -686,51 +823,29 @@ def test_readiness_rejects_exact_11_bp_gap(connections) -> None:
     ).decode("utf-8")
     rows = list(csv.DictReader(io.StringIO(csv_text)))
 
-    gap = next(row for row in rows if row["row_type"] == "READINESS_GAP")
-    assert gap["status"] == "MISSING"
-    assert gap["reason_code"] == "SHIFT_GAP_EXCEEDS_MAX"
-    assert gap["reason_detail"] == "SHIFT_GAP_EXCEEDS_MAX: gap_start_bp=30, gap_end_bp=41, max_gap_bp=10"
-    assert (gap["gap_start_bp"], gap["gap_end_bp"], gap["max_gap_bp"]) == ("30", "41", "10")
+    gaps = [row for row in rows if row["row_type"] == "READINESS_GAP"]
+    assert gaps
+    assert all(row["status"] == "MISSING" for row in gaps)
+    assert all(row["reason_code"] == "MISSING_SHIFT" for row in gaps)
+    assert all("550" in row["reason_detail"] for row in gaps)
     assert next(iter(list_duckdb_direct_coverage(source, symbols=()).rows)).selectable is False
-
-
-def test_readiness_rejects_exact_41_bp_gap(connections) -> None:
-    source, _ = connections
-    _seed_readiness_scope(
-        source,
-        symbol="BTCUSDT",
-        shifts=tuple(range(30, 151, 10)) + (191, 430),
-    )
-
-    csv_text = coverage_audit_csv_bytes(
-        source,
-        "2024-01-01T00:00:00+00:00",
-        "2024-01-01T02:00:00+00:00",
-    ).decode("utf-8")
-    rows = list(csv.DictReader(io.StringIO(csv_text)))
-
-    gap = next(row for row in rows if row["row_type"] == "READINESS_GAP")
-    assert gap["status"] == "MISSING"
-    assert gap["reason_code"] == "SHIFT_GAP_EXCEEDS_MAX"
-    assert gap["reason_detail"] == "SHIFT_GAP_EXCEEDS_MAX: gap_start_bp=150, gap_end_bp=191, max_gap_bp=40"
-    assert (gap["gap_start_bp"], gap["gap_end_bp"], gap["max_gap_bp"]) == ("150", "191", "40")
 
 
 def test_coverage_csv_exact_columns_order_nulls_timestamps_reasons_and_hash(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS, close_ma=close_ma)
+    _seed_report(
         source,
-        symbol="BTCUSDT",
-        shifts=tuple(range(30, 151, 10)) + tuple(range(190, 431, 40)),
+        shift=30,
+        open_ma=3,
+        close_ma=2,
+        start_ms=START_MS,
+        end_ms=END_MS + 3_600_000,
+        source_hash="overlap",
     )
-    _seed_report(source, shift=30, start_ms=START_MS, end_ms=END_MS + 3_600_000, source_hash="overlap")
-    _seed_readiness_scope(
-        source,
-        symbol="ETHUSDT",
-        shifts=(30, 430),
-        open_ma=4,
-        close_ma=10,
-    )
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="ETHUSDT", shifts=READY_SHIFTS[:-1], close_ma=close_ma)
 
     csv_bytes = coverage_audit_csv_bytes(
         source,
@@ -744,8 +859,8 @@ def test_coverage_csv_exact_columns_order_nulls_timestamps_reasons_and_hash(conn
     assert not csv_bytes.startswith(b"\xef\xbb\xbf")
     assert b"\r\n" not in csv_bytes
     assert reader.fieldnames == list(COVERAGE_CSV_COLUMNS)
-    assert all(row["readiness_max_shift_bp"] == "430" for row in rows)
-    assert all(row["readiness_contract_version"] == "shift_readiness_v1" for row in rows)
+    assert all(row["readiness_max_shift_bp"] == str(READINESS_MAX_SHIFT_BP) for row in rows)
+    assert all(row["readiness_contract_version"] == READINESS_CONTRACT_VERSION for row in rows)
     assert all(
         row["interval_start_utc"].endswith("+00:00") and row["interval_end_utc"].endswith("+00:00")
         for row in rows
@@ -764,8 +879,9 @@ def test_coverage_csv_exact_columns_order_nulls_timestamps_reasons_and_hash(conn
     assert missing["source_sha256"] == ""
     assert missing["selected_report"] == ""
     assert missing["status"] == "MISSING"
-    assert missing["reason_code"] == "MISSING_BOUNDARY"
-    assert missing["reason_detail"] == "MISSING_BOUNDARY: boundary_bp=150"
+    assert missing["reason_code"] == "MISSING_SHIFT"
+    assert missing["reason_detail"] == "MISSING_SHIFT: missing_shifts=550"
+    assert missing["pair"] == "ETHUSDT"
     reproduced = coverage_audit_csv_bytes(
         source,
         "2024-01-01T00:00:00+00:00",
@@ -794,60 +910,33 @@ def test_canonical_json_rejects_finite_nan_and_infinite_nested_floats() -> None:
             _canonical_json_bytes({"nested": {"value": value}})
 
 
-def test_coverage_csv_fixed_bytes_quote_nulls_and_gap_grammar(connections) -> None:
+def test_coverage_csv_quotes_witness_cells_and_reproduces_bytes(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(source, symbol="BTCUSDT", shifts=(30, 41, 150, 430))
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS, close_ma=close_ma)
 
     csv_bytes = coverage_audit_csv_bytes(
         source,
         "2024-01-01T00:00:00+00:00",
         "2024-01-01T02:00:00+00:00",
     )
+    csv_text = csv_bytes.decode("utf-8")
+    rows = list(csv.DictReader(io.StringIO(csv_text)))
 
-    assert csv_bytes == (
-        "pair,side,timeframe,evaluation_id,displayed_interval,row_type,shift_bp,open_ma,close_ma,"
-        "interval_start_utc,interval_end_utc,report_start_utc,report_end_utc,grid_start_utc,grid_end_utc,"
-        "effective_start_utc,effective_end_utc,required_for_readiness,readiness_witness,"
-        "gap_start_bp,gap_end_bp,max_gap_bp,report_id,source_sha256,selected_report,status,"
-        "reason_code,reason_detail,readiness_contract_version,readiness_max_shift_bp\n"
-        "BTCUSDT,LONG,1h,e8a6cd104cf3c098b605ea3bcdfcc3d12dfec45c1ed72e4a86d621509dacfa99,true,"
-        "POINT_CANDIDATE,30,3,9,2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,false,,,,,"
-        "1e7bcbb887f5687caf2e40e83df1fd0c466dd591a911ed5aa26b73a4e8644cc3,"
-        "53946c36ad3aee20e1f50201b545ae8b2d8d56d253e7d08fb6cf36305dda413f,true,AVAILABLE,AVAILABLE,"
-        "AVAILABLE: selected_report=true,shift_readiness_v1,430\n"
-        "BTCUSDT,LONG,1h,e8a6cd104cf3c098b605ea3bcdfcc3d12dfec45c1ed72e4a86d621509dacfa99,true,"
-        "POINT_CANDIDATE,41,3,9,2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,false,,,,,"
-        "2cd4ebaae576121c3457fa348dbc848944a6c8ed31c3b1d10968fb63975ac450,"
-        "19c40cf2f71095f838b67f8a75f077694fd4197d8d5270f4f5a5787e92bb72a0,true,AVAILABLE,AVAILABLE,"
-        "AVAILABLE: selected_report=true,shift_readiness_v1,430\n"
-        "BTCUSDT,LONG,1h,e8a6cd104cf3c098b605ea3bcdfcc3d12dfec45c1ed72e4a86d621509dacfa99,true,"
-        "POINT_CANDIDATE,150,3,9,2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,false,,,,,"
-        "2c2a70f64a3cc1813310500723a50e5e81741fac8b564192498311552d20f166,"
-        "a376cedbdd77c3efcfa68c7a4d931a887227408d4279055b0041ad83429e0e9d,true,AVAILABLE,AVAILABLE,"
-        "AVAILABLE: selected_report=true,shift_readiness_v1,430\n"
-        "BTCUSDT,LONG,1h,e8a6cd104cf3c098b605ea3bcdfcc3d12dfec45c1ed72e4a86d621509dacfa99,true,"
-        "POINT_CANDIDATE,430,3,9,2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,"
-        "2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,false,,,,,"
-        "ed09e85273cbd7dac859ffc9ba6ba0bed58c518b6fdbb41e09a3cc0b39c61ca7,"
-        "d9f5bfe82700b75968fa122ec9fda221e7ca3974341672226747a32bf7f01d2f,true,AVAILABLE,AVAILABLE,"
-        "AVAILABLE: selected_report=true,shift_readiness_v1,430\n"
-        "BTCUSDT,LONG,1h,e8a6cd104cf3c098b605ea3bcdfcc3d12dfec45c1ed72e4a86d621509dacfa99,true,"
-        "READINESS_GAP,,3,9,2024-01-01T00:00:00.000+00:00,2024-01-01T02:00:00.000+00:00,,,,,,,true,,"
-        "30,41,10,,,,MISSING,SHIFT_GAP_EXCEEDS_MAX,"
-        "\"SHIFT_GAP_EXCEEDS_MAX: gap_start_bp=30, gap_end_bp=41, max_gap_bp=10\","
-        "shift_readiness_v1,430\n"
-    ).encode("utf-8")
+    assert not csv_bytes.startswith(b"\xef\xbb\xbf")
+    assert b"\r\n" not in csv_bytes
+    witness_row = next(row for row in rows if row["required_for_readiness"] == "true")
+    assert witness_row["readiness_witness"] == ",".join(map(str, READY_SHIFTS))
+    assert witness_row["readiness_contract_version"] == READINESS_CONTRACT_VERSION
+    assert witness_row["readiness_max_shift_bp"] == str(READINESS_MAX_SHIFT_BP)
+    assert csv_bytes == coverage_audit_csv_bytes(
+        source,
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-01T02:00:00+00:00",
+    )
+    digest = sha256(csv_bytes).hexdigest()
+    assert len(digest) == 64
+    assert digest.islower()
 
 
 def test_coverage_csv_sorts_long_before_short_and_reproduces_bytes(connections) -> None:
@@ -871,16 +960,18 @@ def test_coverage_csv_sorts_long_before_short_and_reproduces_bytes(connections) 
 
 def test_publication_audit_ignores_unselected_timeframe_source_changes(connections) -> None:
     source, _ = connections
-    shifts = tuple(range(30, 151, 10)) + tuple(range(190, 431, 40))
-    _seed_readiness_scope(source, symbol="BTCUSDT", shifts=shifts)
-    for shift in shifts:
-        _seed_report(
-            source,
-            symbol="BTCUSDT",
-            timeframe="4h",
-            shift=shift,
-            source_hash=_hash("initial-4h", "BTCUSDT", "LONG", shift, 3, 9, START_MS, END_MS),
-        )
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS, close_ma=close_ma)
+        for shift in READY_SHIFTS:
+            _seed_report(
+                source,
+                symbol="BTCUSDT",
+                timeframe="4h",
+                shift=shift,
+                open_ma=3,
+                close_ma=close_ma,
+                source_hash=_hash("initial-4h", "BTCUSDT", "LONG", shift, 3, close_ma, START_MS, END_MS),
+            )
 
     def audit_bytes() -> bytes:
         return coverage_audit_csv_bytes(
@@ -905,14 +996,17 @@ def test_publication_audit_ignores_unselected_timeframe_source_changes(connectio
         "delete from active_reports where canonical_point_key in "
         "(select canonical_point_key from point_configs where timeframe='4h')"
     )
-    for shift in shifts:
-        _seed_report(
-            source,
-            symbol="BTCUSDT",
-            timeframe="4h",
-            shift=shift,
-            source_hash=_hash("changed-4h", "BTCUSDT", "LONG", shift, 3, 9, START_MS, END_MS),
-        )
+    for close_ma in REQUIRED_CLOSE_MAS:
+        for shift in READY_SHIFTS:
+            _seed_report(
+                source,
+                symbol="BTCUSDT",
+                timeframe="4h",
+                shift=shift,
+                open_ma=3,
+                close_ma=close_ma,
+                source_hash=_hash("changed-4h", "BTCUSDT", "LONG", shift, 3, close_ma, START_MS, END_MS),
+            )
 
     changed_audit = audit_bytes()
     assert changed_audit == selected_audit
@@ -921,10 +1015,14 @@ def test_publication_audit_ignores_unselected_timeframe_source_changes(connectio
         return _request(
             grid_contract_kind=V2_GRID_CONTRACT_KIND,
             selected_scopes=("BTCUSDT|1h",),
+            required_shifts_bp=READY_SHIFTS,
+            materializer_version=CANONICAL_MATERIALIZER_VERSION,
+            point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
             readiness_contract_version=READINESS_CONTRACT_VERSION,
             readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
             audit_artifact_name="surface_coverage_audit_LONG.csv",
             audit_schema_version=1,
+            audit_size_bytes=len(audit),
             audit_row_count=len(list(csv.DictReader(io.StringIO(audit.decode("utf-8"))))),
             audit_sha256=sha256(audit).hexdigest(),
             audit_bytes=audit,
@@ -956,12 +1054,14 @@ def _seed_ready_scope(
     *,
     side: str = 'LONG',
 ) -> None:
-    _seed_readiness_scope(
-        source,
-        symbol='BTCUSDT',
-        side=side,
-        shifts=READY_SHIFTS,
-    )
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(
+            source,
+            symbol='BTCUSDT',
+            side=side,
+            shifts=READY_SHIFTS,
+            close_ma=close_ma,
+        )
 
 
 def _coverage_build_request(
@@ -980,11 +1080,79 @@ def _coverage_build_request(
         end_utc=interval.end_utc,
         side=side,
         symbols=(symbol,),
-        required_shifts_bp=(),
+        required_shifts_bp=READY_SHIFTS,
         selected_scopes=(f'{symbol}|{timeframe}',),
         grid_contract_kind=V2_GRID_CONTRACT_KIND,
+        materializer_version=CANONICAL_MATERIALIZER_VERSION,
+        point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
         readiness_contract_version=READINESS_CONTRACT_VERSION,
         readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+    )
+
+
+def test_canonical_phase1_smoke_preflight_materialization_and_publication(
+    connections, tmp_path: Path
+) -> None:
+    source, analysis = connections
+    _seed_ready_scope(source, side="LONG")
+    actions = (
+        {"Timestamp": "2024-01-01T00:10:00Z", "Symbol": "BTCUSDT", "Action": "opened", "Post Side": "long", "Side": "buy", "PnL": "0"},
+        {"Timestamp": "2024-01-01T01:00:00Z", "Symbol": "BTCUSDT", "Action": "closed", "Post Side": "", "Side": "sell", "PnL": "2"},
+    )
+    _seed_report(source, shift=30, open_ma=4, close_ma=10, actions=actions, source_hash="f" * 64)
+
+    scan = coverage_scan_direct(source, tmp_path, symbols=())
+    request = replace(_coverage_build_request(scan), grid_contract_kind="", materializer_version="")
+    (surface,) = prepare_direct_surfaces(source, (request,), audit_root=tmp_path, coverage_scan=scan)
+
+    assert READY_SHIFTS == (30, 40, 50, 60, 70, 90, 110, 140, 170, 200, 230, 270, 310, 350, 390, 430, 470, 510, 550)
+    assert surface.request.grid_contract_kind == V2_GRID_CONTRACT_KIND
+    assert surface.request.materializer_version == CANONICAL_MATERIALIZER_VERSION
+    contract = surface.preflight.grid_contract
+    assert contract["kind"] == V2_GRID_CONTRACT_KIND
+    assert contract["canonical_grid_version"] == CANONICAL_GRID_VERSION
+    assert contract["canonical_shifts_bp"] == list(READY_SHIFTS)
+    assert contract["point_materialization_semantics_version"] == POINT_MATERIALIZATION_SEMANTICS_VERSION
+    assert contract["point_materialization_config_hash"] == canonical_point_materialization_config_hash(READY_SHIFTS)
+    witnesses = contract["witnesses"]["BTCUSDT|1h"]
+    assert [w["close_ma"] for w in witnesses] == list(REQUIRED_CLOSE_MAS)
+    assert all(w["open_ma"] == 3 for w in witnesses)
+    assert all(w["shifts_bp"] == list(READY_SHIFTS) for w in witnesses)
+    assert all(w["contract_version"] == READINESS_CONTRACT_VERSION for w in witnesses)
+    assert all(w["max_shift_bp"] == READINESS_MAX_SHIFT_BP for w in witnesses)
+    expected_points = len(READY_SHIFTS) * len(REQUIRED_CLOSE_MAS) + 1
+    assert len(surface.preflight.accepted_point_keys) == expected_points
+
+    assert surface.event_mode == REAL_EVENT_MODE
+    assert surface.build_mode == "DUCKDB_DIRECT"
+    points_by_key = {point.canonical_point_key: point for point in surface.points}
+    assert len(points_by_key) == expected_points
+    assert all(
+        point.point_event_count == len(point.event_ids) and tuple(sorted(set(point.event_ids))) == point.event_ids
+        for point in surface.points
+    )
+    witness_point = points_by_key["BTCUSDT|LONG|1h|30|3|2"]
+    assert witness_point.point_event_count == 0
+    assert witness_point.event_ids == ()
+    event_point = points_by_key["BTCUSDT|LONG|1h|30|4|10"]
+    assert event_point.point_event_count == 1
+    assert event_point.event_ids == (canonical_event_id("BTCUSDT", "long", "1h", "2024-01-01T00:10:00Z"),)
+
+    result = publish_direct_surfaces(analysis, (surface,), audit_root=tmp_path)
+    assert result.publication_state == "PUBLISHED"
+    assert result.surfaces[0].created is True
+    assert tuple(point.canonical_point_key for point in result.surfaces[0].points) == tuple(
+        point.canonical_point_key for point in surface.points
+    )
+    assert ensure_analysis_schema(analysis) == ANALYSIS_SCHEMA_VERSION == 4
+    stored = analysis.execute(
+        "select build_mode, event_mode, materializer_version, point_materialization_config_hash from surfaces"
+    ).fetchone()
+    assert stored == (
+        "DUCKDB_DIRECT",
+        REAL_EVENT_MODE,
+        CANONICAL_MATERIALIZER_VERSION,
+        canonical_point_materialization_config_hash(READY_SHIFTS),
     )
 
 
@@ -1007,7 +1175,11 @@ def test_unchanged_source_scan_token_and_prepare_match_preview(
     )
     preview_intervals = common_intervals_for_scopes(active_scan.coverage, scopes)
     requests = tuple(
-        _coverage_build_request(active_scan, side=scope.side)
+        replace(
+            _coverage_build_request(active_scan, side=scope.side),
+            grid_contract_kind="",
+            materializer_version="",
+        )
         for scope in scopes
     )
     surfaces = prepare_direct_surfaces(
@@ -1017,22 +1189,22 @@ def test_unchanged_source_scan_token_and_prepare_match_preview(
         coverage_scan=scan,
     )
     assert [surface.request.side for surface in surfaces] == ['LONG', 'SHORT']
-    for request, interval in zip(requests, preview_intervals, strict=True):
+    for request, interval, surface in zip(requests, preview_intervals, surfaces, strict=True):
         assert request.start_utc == interval.start_utc
         assert request.end_utc == interval.end_utc
         assert request.selected_scopes == ('BTCUSDT|1h',)
-        assert request.grid_contract_kind == V2_GRID_CONTRACT_KIND
-        assert request.readiness_contract_version == READINESS_CONTRACT_VERSION
-        assert request.readiness_max_shift_bp == READINESS_MAX_SHIFT_BP
+        assert surface.request.grid_contract_kind == V2_GRID_CONTRACT_KIND
+        assert surface.request.readiness_contract_version == READINESS_CONTRACT_VERSION
+        assert surface.request.readiness_max_shift_bp == READINESS_MAX_SHIFT_BP
     for surface, request in zip(surfaces, requests, strict=True):
         assert surface.request.start_utc == request.start_utc
         assert surface.request.end_utc == request.end_utc
         assert surface.request.side == request.side
         assert surface.request.symbols == request.symbols
         assert surface.request.selected_scopes == request.selected_scopes
-        assert surface.request.grid_contract_kind == request.grid_contract_kind
-        assert surface.request.readiness_contract_version == request.readiness_contract_version
-        assert surface.request.readiness_max_shift_bp == request.readiness_max_shift_bp
+        assert surface.request.grid_contract_kind == V2_GRID_CONTRACT_KIND
+        assert surface.request.readiness_contract_version == READINESS_CONTRACT_VERSION
+        assert surface.request.readiness_max_shift_bp == READINESS_MAX_SHIFT_BP
 
 
 def test_changed_source_fails_before_materializer(
@@ -1041,7 +1213,11 @@ def test_changed_source_fails_before_materializer(
     source, _ = connections
     _seed_ready_scope(source)
     scan = coverage_scan_direct(source, tmp_path, symbols=())
-    request = _coverage_build_request(scan)
+    request = replace(
+        _coverage_build_request(scan),
+        grid_contract_kind="",
+        materializer_version="",
+    )
     _seed_report(source, symbol='ETHUSDT', source_hash='changed-source')
     materialized: list[object] = []
 
@@ -1062,6 +1238,24 @@ def test_changed_source_fails_before_materializer(
     assert materialized == []
 
 
+def test_prepare_direct_surfaces_rejects_v2_without_frozen_selected_state(
+    connections, tmp_path: Path
+) -> None:
+    source, _ = connections
+    _seed_ready_scope(source, side='LONG')
+
+    scan = coverage_scan_direct(source, tmp_path, symbols=())
+    request = _coverage_build_request(scan)
+
+    with pytest.raises(DirectMaterializationError, match='STALE_PREFLIGHT'):
+        prepare_direct_surfaces(
+            source,
+            (request,),
+            audit_root=tmp_path,
+            coverage_scan=scan,
+        )
+
+
 @pytest.mark.parametrize(
     'mutate_coverage',
     (
@@ -1077,16 +1271,19 @@ def test_changed_source_fails_before_materializer(
             intervals=tuple(
                 replace(
                     interval,
-                    witness=replace(
-                        interval.witness,
-                        open_ma=4,
-                        close_ma=10,
-                        shifts_bp=(30, 150, 430),
-                        contract_version='shift_readiness_v2',
-                        max_shift_bp=500,
+                    witnesses=tuple(
+                        replace(
+                            witness,
+                            open_ma=4,
+                            close_ma=10,
+                            shifts_bp=(30, 150, 430),
+                            contract_version='shift_readiness_v2',
+                            max_shift_bp=500,
+                        )
+                        for witness in interval.witnesses
                     ),
                 )
-                if interval.witness is not None else interval
+                if interval.witnesses else interval
                 for interval in coverage.intervals
             ),
         ),
@@ -1165,16 +1362,15 @@ def test_coverage_token_changes_when_source_evidence_changes(
 
 def test_v2_preflight_selects_narrowest_reports_and_includes_every_factual_point(connections) -> None:
     source, _ = connections
-    _seed_readiness_scope(
-        source,
-        symbol="BTCUSDT",
-        shifts=tuple(range(30, 151, 10)) + tuple(range(190, 431, 40)),
-    )
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS, close_ma=close_ma)
     _seed_report(source, shift=500, source_hash="optional-500")
     _seed_report(source, shift=600, open_ma=4, close_ma=10, source_hash="optional-600")
     _seed_report(
         source,
-        shift=430,
+        shift=30,
+        open_ma=3,
+        close_ma=2,
         start_ms=START_MS - 3_600_000,
         end_ms=END_MS + 3_600_000,
         source_hash="overlap-long",
@@ -1189,10 +1385,14 @@ def test_v2_preflight_selects_narrowest_reports_and_includes_every_factual_point
     request = _request(
         grid_contract_kind=V2_GRID_CONTRACT_KIND,
         selected_scopes=("BTCUSDT|1h",),
+        required_shifts_bp=READY_SHIFTS,
+        materializer_version=CANONICAL_MATERIALIZER_VERSION,
+        point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
         readiness_contract_version=READINESS_CONTRACT_VERSION,
         readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
         audit_artifact_name="surface_coverage_audit_LONG.csv",
         audit_schema_version=1,
+        audit_size_bytes=len(csv_bytes),
         audit_row_count=len(list(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8"))))),
         audit_sha256=sha256(csv_bytes).hexdigest(),
         audit_bytes=csv_bytes,
@@ -1203,25 +1403,71 @@ def test_v2_preflight_selects_narrowest_reports_and_includes_every_factual_point
     assert preflight.usable_timeframes == {"BTCUSDT": ("1h",)}
     assert preflight.grid_contract["kind"] == V2_GRID_CONTRACT_KIND
     assert preflight.grid_contract["selected_scopes"] == ["BTCUSDT|1h"]
-    witness = preflight.grid_contract["witnesses"]["BTCUSDT|1h"]
-    assert witness["symbol"] == "BTCUSDT"
-    assert witness["side"] == "LONG"
-    assert witness["timeframe"] == "1h"
-    assert witness["open_ma"] == 3
-    assert witness["close_ma"] == 9
-    assert witness["shifts_bp"][-1] == 430
-    assert witness["contract_version"] == READINESS_CONTRACT_VERSION
-    assert witness["max_shift_bp"] == READINESS_MAX_SHIFT_BP
-    assert set(witness) == {"symbol", "side", "timeframe", "open_ma", "close_ma", "shifts_bp", "contract_version", "max_shift_bp"}
-    assert len(preflight.accepted_point_keys) == 22
-    assert any("|500|" in key for key in preflight.accepted_point_keys)
-    assert any("|600|4|10" in key for key in preflight.accepted_point_keys)
-    assert len(preflight.manifest) == 22
+    witnesses = preflight.grid_contract["witnesses"]["BTCUSDT|1h"]
+    assert [w["close_ma"] for w in witnesses] == list(REQUIRED_CLOSE_MAS)
+    assert all(w["symbol"] == "BTCUSDT" for w in witnesses)
+    assert all(w["side"] == "LONG" for w in witnesses)
+    assert all(w["timeframe"] == "1h" for w in witnesses)
+    assert all(w["open_ma"] == 3 for w in witnesses)
+    assert all(w["shifts_bp"] == list(READY_SHIFTS) for w in witnesses)
+    assert all(w["contract_version"] == READINESS_CONTRACT_VERSION for w in witnesses)
+    assert all(w["max_shift_bp"] == READINESS_MAX_SHIFT_BP for w in witnesses)
+    assert all(
+        set(w) == {"symbol", "side", "timeframe", "open_ma", "close_ma", "shifts_bp", "contract_version", "max_shift_bp"}
+        for w in witnesses
+    )
+    assert len(preflight.accepted_point_keys) == len(READY_SHIFTS) * len(REQUIRED_CLOSE_MAS)
+    assert not any("|500|" in key for key in preflight.accepted_point_keys)
+    assert not any("|600|4|10" in key for key in preflight.accepted_point_keys)
+    assert len(preflight.manifest) == len(READY_SHIFTS) * len(REQUIRED_CLOSE_MAS)
     assert "overlap-long" not in {hash for _, hash in preflight.manifest}
     assert preflight.point_evidence_sha256 == sha256(
         preflight.grid_contract["point_evidence"].encode("utf-8")
     ).hexdigest()
     assert preflight.audit_sha256 == sha256(csv_bytes).hexdigest()
+
+
+def test_materialization_retains_factual_non_witness_points_on_canonical_shifts(connections) -> None:
+    source, analysis = connections
+    for close_ma in REQUIRED_CLOSE_MAS:
+        _seed_readiness_scope(source, symbol="BTCUSDT", shifts=READY_SHIFTS, close_ma=close_ma)
+    _seed_report(source, shift=110, open_ma=5, close_ma=10, source_hash="factual-nonwitness")
+    _seed_report(source, shift=600, open_ma=3, close_ma=9, source_hash="noncanonical-600")
+
+    csv_bytes = coverage_audit_csv_bytes(
+        source,
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-01T02:00:00+00:00",
+        symbols=("BTCUSDT",),
+    )
+    request = _request(
+        grid_contract_kind=V2_GRID_CONTRACT_KIND,
+        selected_scopes=("BTCUSDT|1h",),
+        required_shifts_bp=READY_SHIFTS,
+        materializer_version=CANONICAL_MATERIALIZER_VERSION,
+        point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
+        readiness_contract_version=READINESS_CONTRACT_VERSION,
+        readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+        audit_artifact_name="surface_coverage_audit_LONG.csv",
+        audit_schema_version=1,
+        audit_size_bytes=len(csv_bytes),
+        audit_row_count=len(list(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8"))))),
+        audit_sha256=sha256(csv_bytes).hexdigest(),
+        audit_bytes=csv_bytes,
+    )
+
+    preflight = preflight_duckdb_direct(source, request)
+
+    expected_total = len(READY_SHIFTS) * len(REQUIRED_CLOSE_MAS) + 1
+    assert len(preflight.accepted_point_keys) == expected_total
+    assert "BTCUSDT|LONG|1h|110|5|10" in preflight.accepted_point_keys
+    assert not any("|600|" in key for key in preflight.accepted_point_keys)
+
+    surface = materialize_duckdb_direct(source, analysis, request, lambda: False, preflight=preflight)
+    keys = tuple(point.canonical_point_key for point in surface.points)
+    assert len(keys) == expected_total
+    assert "BTCUSDT|LONG|1h|110|5|10" in keys
+    assert not any("|600|" in key for key in keys)
 
 
 def test_v2_point_evidence_jsonl_has_decoded_key_order_lf_canonical_types_and_exact_sha256() -> None:
@@ -1401,6 +1647,582 @@ def test_materializer_reuses_event_id_across_points_only_for_same_opening(connec
     assert event_by_shift[100] != event_by_shift[300]
 
 
+def _materialization_payload(
+    *,
+    canonical_point_key: str,
+    report_id: str,
+    source_hash: str,
+    grid_hash: str,
+    timestamps_blob: bytes,
+    actions: tuple[dict[str, str], ...] = (),
+) -> MaterializationPayload:
+    import struct, zlib
+    headers = sorted({key for action in actions for key in action})
+    action_payload = {"headers": headers, "rows": [[action.get(header, "") for header in headers] for action in actions]}
+    return MaterializationPayload(
+        canonical_point_key=canonical_point_key,
+        report_id=report_id,
+        source_hash=source_hash,
+        action_count=len(actions),
+        equity_count=3,
+        wallet_count=1,
+        series_codec=EQUITY_CODEC,
+        actions_blob=zlib.compress(json.dumps(action_payload).encode()),
+        equity_blob=zlib.compress(struct.pack("<3q", 100, 90, 110)),
+        wallet_blob=zlib.compress(struct.pack("<Iq", 0, 100)),
+        grid_hash=grid_hash,
+        sample_count=3,
+        timestamps_blob=timestamps_blob,
+    )
+
+
+def _shared_materialization_payloads() -> tuple[MaterializationPayload, ...]:
+    import struct, zlib
+    grid_hash = _hash("shared-materialization-grid")
+    timestamps = (START_MS, (START_MS + END_MS) // 2, END_MS)
+    timestamps_blob = zlib.compress(
+        struct.pack("<3q", timestamps[0], timestamps[1] - timestamps[0], timestamps[2] - timestamps[1])
+    )
+    actions = (
+        {"Timestamp": "2024-01-01T00:10:00Z", "Symbol": "BTCUSDT", "Action": "opened", "Post Side": "long", "Side": "buy", "PnL": "0"},
+        {"Timestamp": "2024-01-01T00:30:00Z", "Symbol": "BTCUSDT", "Action": "decreased", "Post Side": "long", "Side": "sell", "PnL": "1"},
+        {"Timestamp": "2024-01-01T01:00:00Z", "Symbol": "BTCUSDT", "Action": "closed", "Post Side": "", "Side": "sell", "PnL": "2"},
+    )
+    return (
+        _materialization_payload(
+            canonical_point_key="BTCUSDT|LONG|1h|100|3|9", report_id="report-a", source_hash="a" * 64,
+            grid_hash=grid_hash, timestamps_blob=timestamps_blob, actions=actions,
+        ),
+        _materialization_payload(
+            canonical_point_key="BTCUSDT|LONG|1h|200|3|9", report_id="report-b", source_hash="b" * 64,
+            grid_hash=grid_hash, timestamps_blob=timestamps_blob, actions=actions,
+        ),
+    )
+
+
+def test_materialization_payload_chunk_caches_shared_grid_and_matches_facts(monkeypatch: pytest.MonkeyPatch) -> None:
+    payloads = _shared_materialization_payloads()
+    timestamps_blob = payloads[0].timestamps_blob
+    calls: list[tuple[bytes, int]] = []
+    original = duckdb_direct.decode_compact_deltas
+
+    def counting_delta_decode(blob: bytes, expected_count: int, *, codec: str = EQUITY_CODEC) -> tuple[int, ...]:
+        calls.append((bytes(blob), int(expected_count)))
+        return original(blob, expected_count, codec=codec)
+
+    monkeypatch.setattr("mrs3.duckdb_direct.decode_compact_deltas", counting_delta_decode)
+
+    points = _materialize_payload_chunk(payloads, "2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z")
+
+    assert [point.canonical_point_key for point in points] == [payload.canonical_point_key for payload in payloads]
+    assert sum(1 for blob, _ in calls if blob == timestamps_blob) == 1
+    assert len(calls) == 3  # shared timestamps grid decodes once, equity decodes per payload
+    expected_event_ids = (canonical_event_id("BTCUSDT", "long", "1h", "2024-01-01T00:10:00Z"),)
+    for point, payload in zip(points, payloads, strict=True):
+        assert point.source_report_id == payload.report_id
+        assert point.source_hash == payload.source_hash
+        assert point.event_ids == expected_event_ids
+        assert point.point_event_count == 1
+        assert point.metrics["TotalTrades"] == 2
+    assert points[0].metrics == points[1].metrics
+    assert points[0].event_ids == points[1].event_ids
+
+
+def test_materialization_payload_chunk_is_picklable() -> None:
+    payloads = _shared_materialization_payloads()
+    assert pickle.loads(pickle.dumps(payloads)) == payloads
+    worker = pickle.loads(pickle.dumps(_materialize_payload_chunk))
+    points = worker(payloads, "2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z")
+    assert [point.canonical_point_key for point in points] == [payload.canonical_point_key for payload in payloads]
+
+
+def test_materialization_parallel_worker_counts_produce_identical_output() -> None:
+    payloads = _shared_materialization_payloads()
+    window_start_utc = "2024-01-01T00:00:00Z"
+    window_end_utc = "2024-01-01T02:00:00Z"
+
+    serial_points = _materialize_payloads_parallel(
+        payloads,
+        DirectMaterializationSettings(workers=1, worker_chunk_size=1, max_in_flight_chunks=1),
+        window_start_utc,
+        window_end_utc,
+        lambda: False,
+    )
+    parallel_points = _materialize_payloads_parallel(
+        payloads,
+        DirectMaterializationSettings(workers=15, worker_chunk_size=1, max_in_flight_chunks=15),
+        window_start_utc,
+        window_end_utc,
+        lambda: False,
+    )
+
+    assert [point.canonical_point_key for point in serial_points] == [
+        "BTCUSDT|LONG|1h|100|3|9",
+        "BTCUSDT|LONG|1h|200|3|9",
+    ]
+    assert [asdict(point) for point in serial_points] == [
+        asdict(point) for point in parallel_points
+    ]
+
+
+def test_canonical_semantic_payload_exact_fixture_and_digest() -> None:
+    payload = canonical_point_materialization_semantic_payload(DEFAULT_CANONICAL_SHIFTS_BP)
+    assert payload == {
+        "canonical_grid_version": CANONICAL_GRID_VERSION,
+        "canonical_shifts_bp": list(DEFAULT_CANONICAL_SHIFTS_BP),
+        "event_id_contract": "sha256_utf8_pipe(symbol,position_side,timeframe,opened_at_utc_ns)",
+        "event_mode": "real_independent_events",
+        "materialization_scope_contract": "fully_covering_selected_scope_points_on_exact_canonical_shifts",
+        "normalization_contract_version": NORMALIZATION_CONTRACT_VERSION,
+        "point_event_count_contract": "count_unique_sorted_canonical_event_ids",
+        "readiness_contract_version": READINESS_CONTRACT_VERSION,
+        "required_close_mas": list(REQUIRED_CLOSE_MAS),
+        "semantic_contract_version": POINT_MATERIALIZATION_SEMANTICS_VERSION,
+        "window_contract": "utc_half_open_[start,end)",
+    }
+    canonical_json_bytes = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+    ).encode("ascii")
+    assert canonical_json_bytes == (
+        b'{"canonical_grid_version":"mrs3_shift_grid_30_550_v1",'
+        b'"canonical_shifts_bp":[30,40,50,60,70,90,110,140,170,200,230,270,310,350,390,430,470,510,550],'
+        b'"event_id_contract":"sha256_utf8_pipe(symbol,position_side,timeframe,opened_at_utc_ns)",'
+        b'"event_mode":"real_independent_events",'
+        b'"materialization_scope_contract":"fully_covering_selected_scope_points_on_exact_canonical_shifts",'
+        b'"normalization_contract_version":"shift-bp-v1",'
+        b'"point_event_count_contract":"count_unique_sorted_canonical_event_ids",'
+        b'"readiness_contract_version":"close_ma_2_7_canonical_grid_v1",'
+        b'"required_close_mas":[2,3,4,5,6,7],'
+        b'"semantic_contract_version":"direct_point_materialization_v1",'
+        b'"window_contract":"utc_half_open_[start,end)"}'
+    )
+    assert canonical_point_materialization_config_hash(DEFAULT_CANONICAL_SHIFTS_BP) == (
+        "5391334fb82d78439e32b6f70a055bbc67f551efbd84f63670a64e5e98464903"
+    )
+
+
+def test_semantic_identity_ignores_materialization_worker_settings(
+    connections, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = connections
+    _seed_ready_scope(source)
+    scan = coverage_scan_direct(source, tmp_path, symbols=())
+    request = replace(
+        _coverage_build_request(scan),
+        grid_contract_kind="",
+        materializer_version="",
+    )
+
+    def fake_materialize(*args: object, **kwargs: object) -> DirectSurface:
+        return DirectSurface(args[2], kwargs["preflight"], REAL_EVENT_MODE, ())
+
+    monkeypatch.setattr("mrs3.duckdb_direct.materialize_duckdb_direct", fake_materialize)
+    serial = prepare_direct_surfaces(
+        source,
+        (request,),
+        audit_root=tmp_path,
+        coverage_scan=scan,
+        materialization_settings=DirectMaterializationSettings(
+            workers=1, worker_chunk_size=1, max_in_flight_chunks=1
+        ),
+    )[0]
+    parallel = prepare_direct_surfaces(
+        source,
+        (request,),
+        audit_root=tmp_path,
+        coverage_scan=scan,
+        materialization_settings=DirectMaterializationSettings(
+            workers=15, worker_chunk_size=16, max_in_flight_chunks=15
+        ),
+    )[0]
+    expected_hash = canonical_point_materialization_config_hash(DEFAULT_CANONICAL_SHIFTS_BP)
+    assert serial.request.point_materialization_config_hash == expected_hash
+    assert parallel.request.point_materialization_config_hash == expected_hash
+    assert serial.preflight.grid_contract["point_materialization_config_hash"] == expected_hash
+    assert (
+        parallel.preflight.grid_contract["point_materialization_config_hash"]
+        == serial.preflight.grid_contract["point_materialization_config_hash"]
+    )
+
+
+class _DeferredExecutor:
+    """Fake pool executor returning externally completed futures."""
+
+    def __init__(self, max_workers: int) -> None:
+        self.max_workers = max_workers
+        self.submitted: list[Future] = []
+        self.shutdown_calls: list[tuple[bool, bool]] = []
+        self.submit_hook = None
+
+    def submit(self, fn: object, *args: object, **kwargs: object) -> Future:
+        future: Future = Future()
+        self.submitted.append(future)
+        if self.submit_hook is not None:
+            self.submit_hook(future)
+        return future
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        self.shutdown_calls.append((wait, cancel_futures))
+
+
+def test_materialization_parallel_out_of_order_completion_preserves_manifest_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payloads = _shared_materialization_payloads()
+    executor = _DeferredExecutor(max_workers=2)
+    all_submitted = threading.Event()
+
+    def on_submit(_future: Future) -> None:
+        if len(executor.submitted) == len(payloads):
+            all_submitted.set()
+
+    executor.submit_hook = on_submit
+    monkeypatch.setattr("mrs3.duckdb_direct.ProcessPoolExecutor", lambda **_kwargs: executor)
+
+    results: list[tuple[DirectPoint, ...]] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(
+                _materialize_payloads_parallel(
+                    payloads,
+                    DirectMaterializationSettings(workers=2, worker_chunk_size=1, max_in_flight_chunks=2),
+                    "2024-01-01T00:00:00Z",
+                    "2024-01-01T02:00:00Z",
+                    lambda: False,
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert all_submitted.wait(timeout=5)
+    window = ("2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z")
+    executor.submitted[1].set_result(_materialize_payload_chunk((payloads[1],), *window))
+    executor.submitted[0].set_result(_materialize_payload_chunk((payloads[0],), *window))
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert [point.canonical_point_key for point in results[0]] == [
+        "BTCUSDT|LONG|1h|100|3|9",
+        "BTCUSDT|LONG|1h|200|3|9",
+    ]
+    assert executor.shutdown_calls == [(True, False)]
+
+
+def test_materialization_parallel_cancellation_shuts_down_with_cancel_futures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payloads = _shared_materialization_payloads()
+    executor = _DeferredExecutor(max_workers=2)
+    all_submitted = threading.Event()
+    cancelled = False
+
+    def on_submit(_future: Future) -> None:
+        if len(executor.submitted) == len(payloads):
+            nonlocal cancelled
+            cancelled = True
+            all_submitted.set()
+
+    executor.submit_hook = on_submit
+    monkeypatch.setattr("mrs3.duckdb_direct.ProcessPoolExecutor", lambda **_kwargs: executor)
+
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            _materialize_payloads_parallel(
+                payloads,
+                DirectMaterializationSettings(workers=2, worker_chunk_size=1, max_in_flight_chunks=2),
+                "2024-01-01T00:00:00Z",
+                "2024-01-01T02:00:00Z",
+                lambda: cancelled,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert all_submitted.wait(timeout=5)
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], DirectMaterializationError)
+    assert "cancelled" in str(errors[0])
+    assert executor.shutdown_calls == [(True, True)]
+    assert all(future.cancelled() for future in executor.submitted)
+
+
+def test_materialization_parallel_cancellation_observed_while_futures_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payloads = _shared_materialization_payloads()
+    executor = _DeferredExecutor(max_workers=2)
+    all_submitted = threading.Event()
+    executor.submit_hook = lambda _future: (
+        all_submitted.set() if len(executor.submitted) == len(payloads) else None
+    )
+    monkeypatch.setattr("mrs3.duckdb_direct.ProcessPoolExecutor", lambda **_kwargs: executor)
+
+    cancelled = False
+    wait_timeouts: list[float | None] = []
+
+    def timed_wait(
+        fs: object,
+        timeout: float | None = None,
+        return_when: object = duckdb_direct.FIRST_COMPLETED,
+    ) -> tuple[set[Future], set[Future]]:
+        nonlocal cancelled
+        wait_timeouts.append(timeout)
+        if timeout is not None:
+            cancelled = True
+        return set(), set(fs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("mrs3.duckdb_direct.wait", timed_wait)
+
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            _materialize_payloads_parallel(
+                payloads,
+                DirectMaterializationSettings(workers=2, worker_chunk_size=1, max_in_flight_chunks=2),
+                "2024-01-01T00:00:00Z",
+                "2024-01-01T02:00:00Z",
+                lambda: cancelled,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert all_submitted.wait(timeout=5)
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert wait_timeouts == [duckdb_direct._PARALLEL_WAIT_TIMEOUT_SECONDS]
+    assert len(errors) == 1
+    assert isinstance(errors[0], DirectMaterializationError)
+    assert "cancelled" in str(errors[0])
+    assert executor.shutdown_calls == [(True, True)]
+    assert all(future.cancelled() for future in executor.submitted)
+
+
+def test_materialization_parallel_worker_failure_shuts_down_with_cancel_futures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payloads = _shared_materialization_payloads()
+    executor = _DeferredExecutor(max_workers=2)
+    all_submitted = threading.Event()
+    executor.submit_hook = lambda _future: (
+        all_submitted.set() if len(executor.submitted) == len(payloads) else None
+    )
+    monkeypatch.setattr("mrs3.duckdb_direct.ProcessPoolExecutor", lambda **_kwargs: executor)
+
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            _materialize_payloads_parallel(
+                payloads,
+                DirectMaterializationSettings(workers=2, worker_chunk_size=1, max_in_flight_chunks=2),
+                "2024-01-01T00:00:00Z",
+                "2024-01-01T02:00:00Z",
+                lambda: False,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert all_submitted.wait(timeout=5)
+    window = ("2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z")
+    executor.submitted[1].set_result(_materialize_payload_chunk((payloads[1],), *window))
+    executor.submitted[0].set_exception(RuntimeError("worker exploded"))
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "worker exploded" in str(errors[0])
+    assert executor.shutdown_calls == [(True, True)]
+
+
+def test_materialization_parallel_emits_required_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payloads = _shared_materialization_payloads()
+
+    class _ImmediateExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self.max_workers = max_workers
+
+        def submit(self, fn: object, *args: object, **kwargs: object) -> Future:
+            future: Future = Future()
+            future.set_result(fn(*args, **kwargs))
+            return future
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            pass
+
+    monkeypatch.setattr("mrs3.duckdb_direct.ProcessPoolExecutor", _ImmediateExecutor)
+
+    events: list[dict[str, object]] = []
+
+    def progress(phase: str, **facts: object) -> None:
+        events.append({"phase": phase, **facts})
+
+    points = _materialize_payloads_parallel(
+        payloads,
+        DirectMaterializationSettings(workers=2, worker_chunk_size=1, max_in_flight_chunks=2),
+        "2024-01-01T00:00:00Z",
+        "2024-01-01T02:00:00Z",
+        lambda: False,
+        progress_callback=progress,
+    )
+
+    assert [point.canonical_point_key for point in points] == [
+        "BTCUSDT|LONG|1h|100|3|9",
+        "BTCUSDT|LONG|1h|200|3|9",
+    ]
+    materializing = [event for event in events if event["phase"] == "MATERIALIZING"]
+    assert len(materializing) == 2
+    required = {
+        "materialized_points",
+        "total_points",
+        "workers",
+        "elapsed_seconds",
+        "points_per_second",
+    }
+    for event in materializing:
+        assert required <= set(event)
+    assert [event["total_points"] for event in materializing] == [2, 2]
+    assert [event["materialized_points"] for event in materializing] == [1, 2]
+    assert [event["workers"] for event in materializing] == [2, 2]
+    assert all(event["elapsed_seconds"] >= 0 for event in materializing)
+    assert all(event["points_per_second"] >= 0 for event in materializing)
+
+
+def test_materialization_multi_batch_emits_global_telemetry(
+    connections, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, analysis = connections
+    for shift in (100, 200, 300):
+        _seed_report(source, shift=shift)
+
+    class _ImmediateExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self.max_workers = max_workers
+
+        def submit(self, fn: object, *args: object, **kwargs: object) -> Future:
+            future: Future = Future()
+            future.set_result(fn(*args, **kwargs))
+            return future
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            pass
+
+    monkeypatch.setattr("mrs3.duckdb_direct.ProcessPoolExecutor", _ImmediateExecutor)
+
+    events: list[dict[str, object]] = []
+
+    def progress(phase: str, **facts: object) -> None:
+        events.append({"phase": phase, **facts})
+
+    surface = materialize_duckdb_direct(
+        source,
+        analysis,
+        _request(required_shifts_bp=(100, 200, 300)),
+        lambda: False,
+        materialization_settings=DirectMaterializationSettings(
+            workers=2, fetch_batch_size=1, worker_chunk_size=1, max_in_flight_chunks=2
+        ),
+        progress_callback=progress,
+    )
+
+    assert [point.canonical_point_key for point in surface.points] == [
+        "BTCUSDT|LONG|1h|100|3|9",
+        "BTCUSDT|LONG|1h|200|3|9",
+        "BTCUSDT|LONG|1h|300|3|9",
+    ]
+    materializing = [event for event in events if event["phase"] == "MATERIALIZING"]
+    assert len(materializing) == 3
+    assert [event["materialized_points"] for event in materializing] == [1, 2, 3]
+    assert [event["total_points"] for event in materializing] == [3, 3, 3]
+    assert [event["workers"] for event in materializing] == [2, 2, 2]
+    elapsed = [float(event["elapsed_seconds"]) for event in materializing]
+    assert elapsed == sorted(elapsed)
+    assert all(float(event["points_per_second"]) >= 0 for event in materializing)
+
+
+def test_materialization_payload_chunk_does_not_touch_duckdb(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _ForbiddenDuckDB:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"worker must not access duckdb.{name}")
+
+    monkeypatch.setattr("mrs3.duckdb_direct.duckdb", _ForbiddenDuckDB())
+    points = _materialize_payload_chunk(_shared_materialization_payloads(), "2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z")
+    assert [point.canonical_point_key for point in points] == ["BTCUSDT|LONG|1h|100|3|9", "BTCUSDT|LONG|1h|200|3|9"]
+
+
+def test_materialization_payload_chunk_wraps_source_pack_error_as_direct_error() -> None:
+    payload = _materialization_payload(
+        canonical_point_key="BTCUSDT|LONG|1h|100|3|9",
+        report_id="report-a",
+        source_hash="a" * 64,
+        grid_hash="broken-grid",
+        timestamps_blob=b"not-a-zlib-payload",
+    )
+    with pytest.raises(DirectMaterializationError, match=r"cannot materialize BTCUSDT\|LONG\|1h\|100\|3\|9"):
+        _materialize_payload_chunk((payload,), "2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z")
+
+
+class _BulkRowSource:
+    """Fake bulk-fetch source returning pre-captured payload rows."""
+
+    def __init__(self, rows: tuple[tuple[object, ...], ...], *, duplicate: bool = False) -> None:
+        self._rows = rows
+        self._duplicate = duplicate
+
+    def execute(self, statement: str, params: object = None) -> "_BulkRowSource":
+        return self
+
+    def fetchall(self) -> tuple[tuple[object, ...], ...]:
+        return self._rows + self._rows if self._duplicate else self._rows
+
+
+def test_bulk_fetch_fails_closed_on_missing_duplicate_or_mismatched_report_evidence(
+    connections,
+) -> None:
+    source, _ = connections
+    point = _seed_report(source, source_hash="a" * 64)
+    report_id, source_hash = source.execute(
+        "select report_id, source_sha256 from active_reports where canonical_point_key=?",
+        [point],
+    ).fetchone()
+    manifest = ((str(report_id), str(source_hash)),)
+
+    payloads = _fetch_materialization_payload_batch(source, manifest)
+    assert len(payloads) == 1
+    assert payloads[0].canonical_point_key == point
+    assert payloads[0].source_hash == str(source_hash)
+
+    with pytest.raises(DirectMaterializationError, match="active source changed"):
+        _fetch_materialization_payload_batch(source, (("missing-report", str(source_hash)),))
+    with pytest.raises(DirectMaterializationError, match="active source changed"):
+        _fetch_materialization_payload_batch(source, ((str(report_id), "b" * 64),))
+
+    row = source.execute(
+        duckdb_direct._BULK_MATERIALIZATION_SQL, [[str(report_id)]]
+    ).fetchall()[0]
+    with pytest.raises(DirectMaterializationError, match="active source changed"):
+        _fetch_materialization_payload_batch(_BulkRowSource((row,), duplicate=True), manifest)
+
+
 def test_materialization_rejects_same_connection_and_cancellation_before_publication(connections) -> None:
     source, analysis = connections
     _seed_report(source)
@@ -1572,8 +2394,72 @@ def test_panel_build_orders_preflight_materialization_revalidation_and_publicati
     published = run_panel_direct_build(source, analysis, _request(), lambda: False, lambda phase, **_: phases.append(phase))
 
     assert calls == ["preflight", "materialize", "preflight", "publish"]
-    assert phases == ["PREFLIGHT", "MATERIALIZING", "REVALIDATING", "PUBLISHED"]
+    assert phases[0] == "PREFLIGHT"
+    assert phases[-2:] == ["REVALIDATING", "PUBLISHED"]
+    assert "MATERIALIZING" in phases[1:-2]
     assert published.created is True
+
+
+def test_replay_validates_all_sides_before_materializing_any_side(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _StatementSource()
+    audit = b"pair,side\nBTC,LONG\n"
+
+    def request(side: str) -> DirectBuildRequest:
+        return _request(
+            side=side,
+            grid_contract_kind=V2_GRID_CONTRACT_KIND,
+            selected_scopes=("BTCUSDT|1h",),
+            required_shifts_bp=READY_SHIFTS,
+            materializer_version=CANONICAL_MATERIALIZER_VERSION,
+            point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
+            readiness_contract_version=READINESS_CONTRACT_VERSION,
+            readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+            audit_artifact_name=f"surface_coverage_audit_{side}.csv",
+            audit_schema_version=1,
+            audit_size_bytes=len(audit),
+            audit_row_count=1,
+            audit_sha256=sha256(audit).hexdigest(),
+            audit_bytes=audit,
+        )
+
+    long_request, short_request = request("LONG"), request("SHORT")
+    scan = type("Scan", (), {"token": "scan", "symbols": ()})()
+    expected = {
+        "LONG": DirectPreflight({}, {}, (), MappingProxyType({"kind": V2_GRID_CONTRACT_KIND}), (), (), ()),
+        "SHORT": DirectPreflight({}, {}, (), MappingProxyType({"kind": V2_GRID_CONTRACT_KIND}), (), (), ()),
+    }
+    preflight_calls: list[str] = []
+    materialize_calls: list[str] = []
+
+    monkeypatch.setattr("mrs3.duckdb_direct._verify_scan_inventory", lambda _scan: None)
+    monkeypatch.setattr("mrs3.duckdb_direct.coverage_scan_direct", lambda *_args, **_kwargs: scan)
+    monkeypatch.setattr("mrs3.duckdb_direct.coverage_audit_csv_bytes", lambda *_args, **_kwargs: audit)
+    monkeypatch.setattr("mrs3.duckdb_direct.verify_persisted_surface_audit", lambda *_args, **_kwargs: audit)
+
+    def preflight(_source: object, current: DirectBuildRequest) -> DirectPreflight:
+        preflight_calls.append(current.side)
+        return expected[current.side]
+
+    def materialize(_source: object, _analysis: object, current: DirectBuildRequest, *_args: object, **_kwargs: object) -> DirectSurface:
+        materialize_calls.append(current.side)
+        return DirectSurface(current, expected[current.side], "real_independent_events", ())
+
+    monkeypatch.setattr("mrs3.duckdb_direct.preflight_duckdb_direct", preflight)
+    monkeypatch.setattr("mrs3.duckdb_direct.materialize_duckdb_direct", materialize)
+
+    with pytest.raises(DirectMaterializationError, match="STALE_PREFLIGHT"):
+        replay_direct_preflights(
+            source,
+            (long_request, short_request),
+            (expected["LONG"], replace(expected["SHORT"], source_hashes=("changed",))),
+            audit_root=tmp_path,
+            coverage_scan=scan,  # type: ignore[arg-type]
+        )
+
+    assert preflight_calls == ["LONG", "SHORT"]
+    assert materialize_calls == []
 
 
 def test_panel_refine_passes_the_explicit_chosen_parent_to_publication(
@@ -1677,10 +2563,17 @@ def test_direct_job_prepares_long_and_short_in_one_source_transaction_before_pub
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = _StatementSource()
-    long_request = _request(
-        side="LONG",
-        grid_contract_kind=V2_GRID_CONTRACT_KIND,
-        selected_scopes=("BTCUSDT|1h",),
+    long_request = replace(
+        _request(
+            side="LONG",
+            grid_contract_kind=V2_GRID_CONTRACT_KIND,
+            selected_scopes=("BTCUSDT|1h",),
+            required_shifts_bp=READY_SHIFTS,
+            materializer_version=CANONICAL_MATERIALIZER_VERSION,
+            point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
+        ),
+        grid_contract_kind="",
+        materializer_version="",
     )
     short_request = replace(long_request, side="SHORT")
     preflights = {"LONG": _v2_preflight("LONG"), "SHORT": _v2_preflight("SHORT")}
@@ -1733,10 +2626,17 @@ def test_either_side_preparation_failure_rolls_back_and_publishes_zero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = _StatementSource()
-    long_request = _request(
-        side="LONG",
-        grid_contract_kind=V2_GRID_CONTRACT_KIND,
-        selected_scopes=("BTCUSDT|1h",),
+    long_request = replace(
+        _request(
+            side="LONG",
+            grid_contract_kind=V2_GRID_CONTRACT_KIND,
+            selected_scopes=("BTCUSDT|1h",),
+            required_shifts_bp=READY_SHIFTS,
+            materializer_version=CANONICAL_MATERIALIZER_VERSION,
+            point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
+        ),
+        grid_contract_kind="",
+        materializer_version="",
     )
 
     def fake_preflight(connection: object, request: DirectBuildRequest) -> DirectPreflight:
@@ -1787,6 +2687,173 @@ def test_direct_job_publishes_long_before_short(monkeypatch: pytest.MonkeyPatch)
     assert result.publication_state == "PUBLISHED"
     assert sides == ["LONG", "SHORT"]
     assert phases == ["PUBLISHING_LONG", "PUBLISHING_SHORT"]
+
+
+def _canonical_admission_surface(*, grid_contract: dict[str, object]) -> DirectSurface:
+    audit = b"pair,side\nBTC,LONG\n"
+    request = _request(
+        grid_contract_kind=V2_GRID_CONTRACT_KIND,
+        required_shifts_bp=READY_SHIFTS,
+        materializer_version=CANONICAL_MATERIALIZER_VERSION,
+        point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
+        selected_scopes=("BTCUSDT|1h",),
+        readiness_contract_version=READINESS_CONTRACT_VERSION,
+        readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+        audit_artifact_name="surface_coverage_audit_LONG.csv",
+        audit_schema_version=1,
+        audit_size_bytes=len(audit),
+        audit_row_count=1,
+        audit_sha256=sha256(audit).hexdigest(),
+        audit_bytes=audit,
+    )
+    preflight = DirectPreflight(
+        {"BTCUSDT": ("1h",)}, {}, (), MappingProxyType(grid_contract),
+        ("a" * 64,), (("report", "a" * 64),), (),
+        witnesses=grid_contract.get("witnesses", ()),
+        audit_artifact_name=request.audit_artifact_name,
+        audit_schema_version=1,
+        audit_size_bytes=len(audit),
+        audit_row_count=1,
+        audit_sha256=request.audit_sha256,
+        audit_bytes=audit,
+    )
+    return DirectSurface(request, preflight, "real_independent_events", ())
+
+
+def test_v2_publish_requires_audit_root_even_when_canonical_grid_metadata_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr("mrs3.duckdb_direct.publish_surface", lambda *args: calls.append(args))
+    surface = _canonical_admission_surface(grid_contract={"kind": V2_GRID_CONTRACT_KIND})
+
+    result = publish_direct_surfaces(object(), (surface,))
+
+    assert result.publication_state == "FAILED"
+    assert calls == []
+    assert "audit root" in (result.error or "")
+
+
+def test_v2_request_with_legacy_preflight_cannot_bypass_audit_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr("mrs3.duckdb_direct.publish_surface", lambda *args: calls.append(args))
+    surface = _canonical_admission_surface(grid_contract={"kind": "OBSERVED_GRID_CONTRACT"})
+
+    result = publish_direct_surfaces(object(), (surface,), audit_root=tmp_path)
+
+    assert result.publication_state == "FAILED"
+    assert calls == []
+    assert "V2 preflight contract" in (result.error or "")
+
+
+def test_v2_publish_rejects_missing_grid_or_singular_witness_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audit = b"pair,side\nBTC,LONG\n"
+    singular = {
+        "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "open_ma": 3,
+        "close_ma": 2, "shifts_bp": list(READY_SHIFTS),
+        "contract_version": READINESS_CONTRACT_VERSION, "max_shift_bp": READINESS_MAX_SHIFT_BP,
+    }
+    contract = {
+        "kind": V2_GRID_CONTRACT_KIND,
+        "canonical_grid_version": CANONICAL_GRID_VERSION,
+        "canonical_shifts_bp": list(READY_SHIFTS),
+        "point_materialization_semantics_version": POINT_MATERIALIZATION_SEMANTICS_VERSION,
+        "point_materialization_config_hash": canonical_point_materialization_config_hash(READY_SHIFTS),
+        "selected_scopes": ["BTCUSDT|1h"],
+        "witnesses": {"BTCUSDT|1h": singular},
+        "audit_artifact_name": "surface_coverage_audit_LONG.csv",
+        "audit_schema_version": 1,
+        "audit_size_bytes": len(audit),
+        "audit_row_count": 1,
+        "audit_sha256": sha256(audit).hexdigest(),
+    }
+    surface = _canonical_admission_surface(grid_contract=contract)
+    calls: list[object] = []
+    monkeypatch.setattr("mrs3.duckdb_direct.publish_surface", lambda *args: calls.append(args))
+
+    result = publish_direct_surfaces(object(), (surface,), audit_root=tmp_path)
+
+    assert result.publication_state == "FAILED"
+    assert calls == []
+    assert "six entries" in (result.error or "")
+
+
+def test_persisted_v2_audit_rejects_zero_request_size_without_fallback(tmp_path: Path) -> None:
+    audit = b"pair,side\nBTC,LONG\n"
+    witness = {
+        "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "open_ma": 3,
+        "shifts_bp": list(READY_SHIFTS),
+        "contract_version": READINESS_CONTRACT_VERSION, "max_shift_bp": READINESS_MAX_SHIFT_BP,
+    }
+    contract = {
+        "kind": V2_GRID_CONTRACT_KIND,
+        "canonical_grid_version": CANONICAL_GRID_VERSION,
+        "canonical_shifts_bp": list(READY_SHIFTS),
+        "point_materialization_semantics_version": POINT_MATERIALIZATION_SEMANTICS_VERSION,
+        "point_materialization_config_hash": canonical_point_materialization_config_hash(READY_SHIFTS),
+        "selected_scopes": ["BTCUSDT|1h"],
+        "witnesses": {"BTCUSDT|1h": [dict(witness, close_ma=close_ma) for close_ma in REQUIRED_CLOSE_MAS]},
+        "audit_artifact_name": "surface_coverage_audit_LONG.csv",
+        "audit_schema_version": 1,
+        "audit_size_bytes": len(audit),
+        "audit_row_count": 1,
+        "audit_sha256": sha256(audit).hexdigest(),
+    }
+    surface = _canonical_admission_surface(grid_contract=contract)
+    malformed = replace(surface, request=replace(surface.request, audit_size_bytes=0))
+
+    with pytest.raises(DirectMaterializationError, match="size metadata is missing"):
+        verify_persisted_surface_audit(tmp_path, malformed)
+
+
+def test_v2_publish_verifies_saved_audit_before_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audit = b"pair,side\nBTC,LONG\n"
+    witness = {
+        "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "open_ma": 3,
+        "shifts_bp": list(READY_SHIFTS),
+        "contract_version": READINESS_CONTRACT_VERSION, "max_shift_bp": READINESS_MAX_SHIFT_BP,
+    }
+    contract = {
+        "kind": V2_GRID_CONTRACT_KIND,
+        "canonical_grid_version": CANONICAL_GRID_VERSION,
+        "canonical_shifts_bp": list(READY_SHIFTS),
+        "point_materialization_semantics_version": POINT_MATERIALIZATION_SEMANTICS_VERSION,
+        "point_materialization_config_hash": canonical_point_materialization_config_hash(READY_SHIFTS),
+        "selected_scopes": ["BTCUSDT|1h"],
+        "witnesses": {"BTCUSDT|1h": [dict(witness, close_ma=close_ma) for close_ma in REQUIRED_CLOSE_MAS]},
+        "audit_artifact_name": "surface_coverage_audit_LONG.csv",
+        "audit_schema_version": 1,
+        "audit_size_bytes": len(audit),
+        "audit_row_count": 1,
+        "audit_sha256": sha256(audit).hexdigest(),
+    }
+    surface = _canonical_admission_surface(grid_contract=contract)
+    path = tmp_path / "surface_coverage" / sha256(audit).hexdigest() / "surface_coverage_audit_LONG.csv"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(audit)
+    publish_calls: list[str] = []
+
+    def fake_publish(connection: object, surface: DirectSurface) -> PublishedSurface:
+        publish_calls.append(surface.request.side)
+        return PublishedSurface("surface-LONG", None, True, ())
+
+    monkeypatch.setattr("mrs3.duckdb_direct.publish_surface", fake_publish)
+
+    result = publish_direct_surfaces(object(), (surface,), audit_root=tmp_path)
+    assert result.publication_state == "PUBLISHED"
+    assert publish_calls == ["LONG"]
+
+    publish_calls.clear()
+    path.write_bytes(b"tampered audit bytes")
+    result = publish_direct_surfaces(object(), (surface,), audit_root=tmp_path)
+    assert result.publication_state == "FAILED"
+    assert publish_calls == []
+    assert "audit" in (result.error or "")
 
 
 def test_long_publication_failure_reports_failed_with_zero_surfaces(
@@ -1901,10 +2968,17 @@ def test_audit_write_failure_blocks_that_side_before_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = _StatementSource()
-    request = _request(
-        side="LONG",
-        grid_contract_kind=V2_GRID_CONTRACT_KIND,
-        selected_scopes=("BTCUSDT|1h",),
+    request = replace(
+        _request(
+            side="LONG",
+            grid_contract_kind=V2_GRID_CONTRACT_KIND,
+            selected_scopes=("BTCUSDT|1h",),
+            required_shifts_bp=READY_SHIFTS,
+            materializer_version=CANONICAL_MATERIALIZER_VERSION,
+            point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
+        ),
+        grid_contract_kind="",
+        materializer_version="",
     )
     original_write = write_coverage_artifact
 
@@ -1956,6 +3030,174 @@ def test_materialization_rejects_mixed_surface_side(connections) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda points: points[:-1],
+        lambda points: points + (
+            DirectPoint("BTCUSDT|LONG|1h|400|3|9", "extra-report", "e" * 64, 1, {"TotalTrades": 1}),
+        ),
+        lambda points: (points[0], replace(points[1], canonical_point_key="BTCUSDT|LONG|1h|300|3|9")),
+    ),
+    ids=("incomplete", "extra", "different-key-set"),
+)
+def test_materialization_rejects_worker_key_set_mismatch(
+    connections, monkeypatch: pytest.MonkeyPatch, mutate
+) -> None:
+    source, analysis = connections
+    _seed_report(source, shift=100)
+    _seed_report(source, shift=200)
+    request = _request(required_shifts_bp=(100, 200))
+    preflight = preflight_duckdb_direct(source, request)
+
+    def points_from_payloads(payloads: object) -> tuple[DirectPoint, ...]:
+        return tuple(
+            DirectPoint(
+                canonical_point_key=payload.canonical_point_key,
+                source_report_id=payload.report_id,
+                source_hash=payload.source_hash,
+                point_event_count=1,
+                metrics={"TotalTrades": 1},
+            )
+            for payload in payloads  # type: ignore[union-attr]
+        )
+
+    monkeypatch.setattr(
+        "mrs3.duckdb_direct._materialize_payloads_parallel",
+        lambda payloads, *args, **kwargs: mutate(points_from_payloads(payloads)),
+    )
+
+    with pytest.raises(DirectMaterializationError, match="manifest"):
+        materialize_duckdb_direct(source, analysis, request, lambda: False, preflight=preflight)
+
+
+def test_materialization_progress_carries_side(connections, monkeypatch: pytest.MonkeyPatch) -> None:
+    source, analysis = connections
+    _seed_report(source, shift=100)
+    _seed_report(source, shift=200)
+
+    class _ImmediateExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self.max_workers = max_workers
+
+        def submit(self, fn: object, *args: object, **kwargs: object) -> Future:
+            future: Future = Future()
+            future.set_result(fn(*args, **kwargs))
+            return future
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            pass
+
+    monkeypatch.setattr("mrs3.duckdb_direct.ProcessPoolExecutor", _ImmediateExecutor)
+
+    events: list[dict[str, object]] = []
+
+    def progress(phase: str, **facts: object) -> None:
+        events.append({"phase": phase, **facts})
+
+    surface = materialize_duckdb_direct(
+        source,
+        analysis,
+        _request(required_shifts_bp=(100, 200)),
+        lambda: False,
+        materialization_settings=DirectMaterializationSettings(
+            workers=2, fetch_batch_size=1, worker_chunk_size=1, max_in_flight_chunks=2
+        ),
+        progress_callback=progress,
+        progress_side="LONG",
+    )
+
+    materializing = [event for event in events if event["phase"] == "MATERIALIZING"]
+    assert len(materializing) == 2
+    assert all(event["side"] == "LONG" for event in materializing)
+    assert len(surface.points) == 2
+
+
+def test_prepare_direct_surfaces_forwards_side_to_materializer(
+    connections, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = connections
+    _seed_ready_scope(source, side="LONG")
+    scan = coverage_scan_direct(source, tmp_path, symbols=())
+    request = replace(
+        _coverage_build_request(scan),
+        grid_contract_kind="",
+        materializer_version="",
+    )
+    captured: list[str] = []
+
+    def fake_materialize(*args: object, **kwargs: object) -> DirectSurface:
+        captured.append(str(kwargs["progress_side"]))
+        return DirectSurface(args[2], kwargs["preflight"], "real_independent_events", ())
+
+    monkeypatch.setattr("mrs3.duckdb_direct.materialize_duckdb_direct", fake_materialize)
+
+    prepare_direct_surfaces(source, (request,), audit_root=tmp_path, coverage_scan=scan)
+
+    assert captured == ["LONG"]
+
+
+def test_replay_direct_preflights_forwards_side_to_materializer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _StatementSource()
+    audit = b"pair,side\nBTC,LONG\n"
+
+    def request(side: str) -> DirectBuildRequest:
+        return _request(
+            side=side,
+            grid_contract_kind=V2_GRID_CONTRACT_KIND,
+            selected_scopes=("BTCUSDT|1h",),
+            required_shifts_bp=READY_SHIFTS,
+            materializer_version=CANONICAL_MATERIALIZER_VERSION,
+            point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
+            readiness_contract_version=READINESS_CONTRACT_VERSION,
+            readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+            audit_artifact_name=f"surface_coverage_audit_{side}.csv",
+            audit_schema_version=1,
+            audit_size_bytes=len(audit),
+            audit_row_count=1,
+            audit_sha256=sha256(audit).hexdigest(),
+            audit_bytes=audit,
+        )
+
+    long_request, short_request = request("LONG"), request("SHORT")
+    scan = type("Scan", (), {"token": "scan", "symbols": ()})()
+    expected = {
+        "LONG": DirectPreflight({}, {}, (), MappingProxyType({"kind": V2_GRID_CONTRACT_KIND}), (), (), ()),
+        "SHORT": DirectPreflight({}, {}, (), MappingProxyType({"kind": V2_GRID_CONTRACT_KIND}), (), (), ()),
+    }
+    captured: list[str] = []
+
+    monkeypatch.setattr("mrs3.duckdb_direct._verify_scan_inventory", lambda _scan: None)
+    monkeypatch.setattr("mrs3.duckdb_direct.coverage_scan_direct", lambda *_args, **_kwargs: scan)
+    monkeypatch.setattr("mrs3.duckdb_direct.coverage_audit_csv_bytes", lambda *_args, **_kwargs: audit)
+    monkeypatch.setattr("mrs3.duckdb_direct.verify_persisted_surface_audit", lambda *_args, **_kwargs: audit)
+    monkeypatch.setattr(
+        "mrs3.duckdb_direct.preflight_duckdb_direct",
+        lambda _source, current: expected[current.side],
+    )
+
+    def fake_materialize(
+        _source: object, _analysis: object, current: DirectBuildRequest, *_args: object, **kwargs: object
+    ) -> DirectSurface:
+        captured.append(str(kwargs["progress_side"]))
+        return DirectSurface(current, expected[current.side], "real_independent_events", ())
+
+    monkeypatch.setattr("mrs3.duckdb_direct.materialize_duckdb_direct", fake_materialize)
+
+    surfaces = replay_direct_preflights(
+        source,
+        (long_request, short_request),
+        (expected["LONG"], expected["SHORT"]),
+        audit_root=tmp_path,
+        coverage_scan=scan,  # type: ignore[arg-type]
+    )
+
+    assert [surface.request.side for surface in surfaces] == ["LONG", "SHORT"]
+    assert captured == ["LONG", "SHORT"]
+
+
 def test_v2_preflight_requires_audit_evidence(connections) -> None:
     source, _ = connections
     _seed_readiness_scope(source, symbol="BTCUSDT", shifts=(30, 150, 430))
@@ -1964,6 +3206,9 @@ def test_v2_preflight_requires_audit_evidence(connections) -> None:
         selected_scopes=("BTCUSDT|1h",),
         readiness_contract_version=READINESS_CONTRACT_VERSION,
         readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+        required_shifts_bp=READY_SHIFTS,
+        materializer_version=CANONICAL_MATERIALIZER_VERSION,
+        point_materialization_config_hash=canonical_point_materialization_config_hash(READY_SHIFTS),
         audit_artifact_name="",
         audit_schema_version=0,
         audit_row_count=0,
@@ -1984,9 +3229,13 @@ def test_v2_preflight_audit_row_count_is_data_rows_excluding_header(connections)
         "selected_scopes": ("BTCUSDT|1h",),
         "readiness_contract_version": READINESS_CONTRACT_VERSION,
         "readiness_max_shift_bp": READINESS_MAX_SHIFT_BP,
+        "required_shifts_bp": READY_SHIFTS,
+        "materializer_version": CANONICAL_MATERIALIZER_VERSION,
+        "point_materialization_config_hash": canonical_point_materialization_config_hash(READY_SHIFTS),
         "audit_artifact_name": "surface_coverage_audit_LONG.csv",
         "audit_schema_version": 1,
         "audit_sha256": sha256(audit).hexdigest(),
+        "audit_size_bytes": len(audit),
         "audit_bytes": audit,
     }
 

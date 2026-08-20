@@ -69,7 +69,7 @@ def test_published_pipeline_scopes_listing_dates_and_fails_closed(monkeypatch: p
 
     result = run_published_pipeline(PipelineInput("surface", points), Path("dates.csv"), Side.LONG, AlgorithmConfig.defaults())
 
-    assert result.algorithm_version == "0.7-representative-v2"
+    assert result.algorithm_version == "0.7-canonical-phase1"
     assert result.algorithm_config["listing_dates"] == {"AAAUSDT": "2020-01-01T00:00:00+00:00"}
     monkeypatch.setattr(pipeline, "load_listing_dates", lambda _: {})
     with pytest.raises(ValueError, match="missing listing dates"):
@@ -311,6 +311,21 @@ def test_coarse_domain_emits_refine_requests_without_fabricated_points(tmp_path:
         AlgorithmConfig.from_json(paths["config"]),
         shift_domain_min_bp=30,
         shift_domain_max_bp=270,
+        canonical_shifts_bp=(
+            30,
+            40,
+            50,
+            60,
+            70,
+            90,
+            110,
+            140,
+            170,
+            190,
+            230,
+            270,
+        ),
+        gap_rules=((30, 80, 80), (80, 200, 100), (200, 271, 130)),
     )
     inputs = SelectionInputs(paths["csv"], paths["dates"], paths["template"], Side.LONG, tmp_path / "output")
 

@@ -180,3 +180,54 @@ def test_capture_uses_supplied_immutable_tester_config_snapshot(tmp_path: Path) 
 
     manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
     assert manifest["tester_config_sha256"] == sha256(snapshot).hexdigest()
+
+
+def test_capture_persists_v6_provenance(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    output, plan, wizard, report = _inputs(tmp_path, config)
+    provenance = {
+        "analysis_run_id": "run-v6",
+        "generation_manifest_sha256": "a" * 64,
+        "strategy_json_sha256": {"A.json": "b" * 64},
+    }
+    inbox = capture_verified_inbox(config, output, plan, (wizard,), {"A": report}, provenance=provenance)
+    manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["v6_provenance"] == provenance
+
+
+def test_capture_rejects_incomplete_v6_provenance(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    output, plan, wizard, report = _inputs(tmp_path, config)
+    with pytest.raises(InboxCaptureError, match="provenance is incomplete"):
+        capture_verified_inbox(
+            config, output, plan, (wizard,), {"A": report},
+            provenance={"analysis_run_id": "run-v6"},
+        )
+
+
+def test_capture_rejects_v6_provenance_hashes_not_covering_batch(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    output, plan, wizard, report = _inputs(tmp_path, config)
+    with pytest.raises(InboxCaptureError, match="strategy_json_sha256"):
+        capture_verified_inbox(
+            config, output, plan, (wizard,), {"A": report},
+            provenance={
+                "analysis_run_id": "run-v6",
+                "generation_manifest_sha256": "a" * 64,
+                "strategy_json_sha256": "not-a-map",
+            },
+        )
+
+
+def test_capture_rejects_malformed_v6_generation_hash(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    output, plan, wizard, report = _inputs(tmp_path, config)
+    with pytest.raises(InboxCaptureError, match="generation_manifest_sha256"):
+        capture_verified_inbox(
+            config, output, plan, (wizard,), {"A": report},
+            provenance={
+                "analysis_run_id": "run-v6",
+                "generation_manifest_sha256": "short",
+                "strategy_json_sha256": {"A.json": "b" * 64},
+            },
+        )

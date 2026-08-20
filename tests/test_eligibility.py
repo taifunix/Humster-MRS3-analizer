@@ -73,7 +73,9 @@ def test_history_below_seven_days_is_audited_but_not_passed() -> None:
         (310, Decimal("0.30")),
         (311, Decimal("0.20")),
         (470, Decimal("0.20")),
-        (471, None),
+        (510, Decimal("0.20")),
+        (550, Decimal("0.20")),
+        (551, None),
     ],
 )
 def test_shift_factor_boundaries(shift_bp: int, want: Decimal | None) -> None:
@@ -181,7 +183,7 @@ def test_economic_rejections_are_machine_readable(
 
 def test_shift_above_calibrated_domain_has_no_fabricated_relative_floor() -> None:
     out = annotate_eligibility(
-        pd.DataFrame([_point(shift_bp=480, shift_pct=4.8, trades=999)]),
+        pd.DataFrame([_point(shift_bp=560, shift_pct=5.6, trades=999)]),
         AlgorithmConfig.defaults(),
     ).iloc[0]
 

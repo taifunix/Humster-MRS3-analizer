@@ -7,7 +7,9 @@ import io
 import json
 import os
 import tempfile
-from dataclasses import dataclass, replace
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
@@ -30,15 +32,19 @@ from .duckdb_source_schema import (
 )
 from .source_packs import SourcePackError
 from .analysis_storage import PublishedSurface, publish_surface
+from .config import DEFAULT_CANONICAL_SHIFTS_BP, DirectMaterializationSettings
 
 
 REAL_EVENT_MODE = "real_independent_events"
 OBSERVED_GRID_CONTRACT_KIND = "OBSERVED_GRID_CONTRACT"
 V2_GRID_CONTRACT_KIND = "OBSERVED_SPARSE_GRID_CONTRACT_V2"
-READINESS_CONTRACT_VERSION = "shift_readiness_v1"
-READINESS_MAX_SHIFT_BP = 430
-READINESS_BOUNDARIES_BP = (30, 150, 430)
-READINESS_BAND_GAPS_BP = ((150, 10), (430, 40))
+CANONICAL_GRID_VERSION = "mrs3_shift_grid_30_550_v1"
+READINESS_CONTRACT_VERSION = "close_ma_2_7_canonical_grid_v1"
+CANONICAL_MATERIALIZER_VERSION = "v4-canonical-grid-parallel"
+POINT_MATERIALIZATION_SEMANTICS_VERSION = "direct_point_materialization_v1"
+V2_AUDIT_SCHEMA_VERSION = 1
+REQUIRED_CLOSE_MAS = (2, 3, 4, 5, 6, 7)
+READINESS_MAX_SHIFT_BP = 550
 COVERAGE_CSV_COLUMNS = (
     "pair", "side", "timeframe",
     "evaluation_id", "displayed_interval",
@@ -52,6 +58,7 @@ COVERAGE_CSV_COLUMNS = (
     "status", "reason_code", "reason_detail",
     "readiness_contract_version", "readiness_max_shift_bp",
 )
+_PARALLEL_WAIT_TIMEOUT_SECONDS = 0.1
 
 
 class DirectMaterializationError(ValueError):
@@ -76,6 +83,7 @@ class DirectBuildRequest:
     audit_row_count: int = 0
     audit_sha256: str = ""
     audit_bytes: bytes | None = None
+    audit_size_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +126,7 @@ class CoverageInterval:
     scope: DirectScope
     start_utc: str
     end_utc: str
-    witness: ReadinessWitness | None
+    witnesses: tuple[ReadinessWitness, ...]
     displayed: bool = False
     selectable: bool = False
 
@@ -143,13 +151,14 @@ class DirectPreflight:
     manifest: tuple[tuple[str, str], ...]
     accepted_point_keys: tuple[str, ...]
     coverage_rows: tuple[CoverageReviewRow, ...] = ()
-    witnesses: Mapping[str, object] = MappingProxyType({})
+    witnesses: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
     point_evidence_sha256: str = ""
     audit_artifact_name: str = ""
     audit_schema_version: int = 1
     audit_row_count: int = 0
     audit_sha256: str = ""
     audit_bytes: bytes | None = None
+    audit_size_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +206,14 @@ class DirectCommonInterval:
     start_utc: str
     end_utc: str
     scopes: tuple[DirectScope, ...]
+
+
+def _verify_scan_inventory(scan: _CoverageScan) -> None:
+    try:
+        if not scan.inventory_path.is_file() or hashlib.sha256(scan.inventory_path.read_bytes()).hexdigest() != scan.inventory_sha256:
+            raise DirectMaterializationError("STALE_PREFLIGHT")
+    except OSError as error:
+        raise DirectMaterializationError("STALE_PREFLIGHT") from error
 
 
 def _window(request: DirectBuildRequest) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -323,6 +340,44 @@ def _reject_canonical_floats(value: object) -> None:
             _reject_canonical_floats(item)
 
 
+def canonical_point_materialization_semantic_payload(
+    canonical_shifts_bp: tuple[int, ...],
+) -> dict[str, object]:
+    """Return the one canonical semantic contract used by direct surfaces."""
+    shifts = tuple(canonical_shifts_bp)
+    if (
+        not shifts
+        or any(isinstance(shift, bool) or not isinstance(shift, int) for shift in shifts)
+        or any(left >= right for left, right in zip(shifts, shifts[1:]))
+    ):
+        raise ValueError("canonical shifts must be a strictly increasing integer tuple")
+    return {
+        "canonical_grid_version": CANONICAL_GRID_VERSION,
+        "canonical_shifts_bp": list(shifts),
+        "event_id_contract": "sha256_utf8_pipe(symbol,position_side,timeframe,opened_at_utc_ns)",
+        "event_mode": REAL_EVENT_MODE,
+        "materialization_scope_contract": "fully_covering_selected_scope_points_on_exact_canonical_shifts",
+        "normalization_contract_version": NORMALIZATION_CONTRACT_VERSION,
+        "point_event_count_contract": "count_unique_sorted_canonical_event_ids",
+        "readiness_contract_version": READINESS_CONTRACT_VERSION,
+        "required_close_mas": list(REQUIRED_CLOSE_MAS),
+        "semantic_contract_version": POINT_MATERIALIZATION_SEMANTICS_VERSION,
+        "window_contract": "utc_half_open_[start,end)",
+    }
+
+
+def canonical_point_materialization_config_hash(canonical_shifts_bp: tuple[int, ...]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            canonical_point_materialization_semantic_payload(canonical_shifts_bp),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
+
+
 def point_key_tuple(canonical_point_key: str) -> tuple[str, str, str, int, int, int]:
     parts = canonical_point_key.split("|")
     if len(parts) != 6 or any(not part for part in parts):
@@ -397,15 +452,18 @@ def _verify_v2_audit_metadata(
     schema_version: int,
     row_count: int,
     sha256_digest: str,
+    size_bytes: int = 0,
 ) -> None:
     if not isinstance(audit_bytes, bytes) or not audit_bytes:
         raise DirectMaterializationError("V2 audit bytes are required")
     if not isinstance(artifact_name, str) or not artifact_name:
         raise DirectMaterializationError("V2 audit artifact name is required")
-    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version < 1:
-        raise DirectMaterializationError("V2 audit schema version must be a positive integer")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != V2_AUDIT_SCHEMA_VERSION:
+        raise DirectMaterializationError("V2 audit schema version must be exactly 1")
     if not isinstance(row_count, int) or isinstance(row_count, bool) or row_count < 0:
         raise DirectMaterializationError("V2 audit row count must be a non-negative integer")
+    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0 or size_bytes != len(audit_bytes):
+        raise DirectMaterializationError("V2 audit size mismatch")
     if not isinstance(sha256_digest, str) or len(sha256_digest) != 64 or any(
         char not in "0123456789abcdef" for char in sha256_digest
     ):
@@ -425,34 +483,6 @@ def _window_covers(window: tuple[int, int], start_ms: int, end_ms: int) -> bool:
     return window[0] <= start_ms and window[1] >= end_ms
 
 
-def _readiness_for_pair(
-    open_ma: int, close_ma: int, available_shifts: set[int]
-) -> tuple[ReadinessWitness | None, tuple[tuple[object, ...], ...]]:
-    missing_boundaries = [boundary for boundary in READINESS_BOUNDARIES_BP if boundary not in available_shifts]
-    if missing_boundaries:
-        return None, tuple(("MISSING_BOUNDARY", boundary) for boundary in missing_boundaries)
-    witness = [30]
-    current = 30
-    for upper, max_gap in READINESS_BAND_GAPS_BP:
-        while current < upper:
-            candidates = sorted(
-                shift for shift in available_shifts
-                if current < shift <= min(current + max_gap, upper)
-            )
-            if not candidates:
-                next_shift = min(
-                    (shift for shift in available_shifts if shift > current + max_gap), default=None
-                )
-                if next_shift is None:
-                    return None, (("MISSING_BOUNDARY", upper),)
-                return None, (("SHIFT_GAP_EXCEEDS_MAX", current, next_shift, max_gap),)
-            current = candidates[-1]
-            witness.append(current)
-        if current != upper:
-            return None, (("MISSING_BOUNDARY", upper),)
-    return ReadinessWitness(open_ma, close_ma, tuple(witness)), ()
-
-
 def _available_shifts(
     pair: tuple[int, int],
     interval: tuple[int, int],
@@ -466,24 +496,34 @@ def _available_shifts(
     }
 
 
-def _scope_witness(
+def _witness_vector_key(
+    witnesses: Sequence[ReadinessWitness],
+) -> tuple[tuple[int, int, tuple[int, ...]], ...]:
+    return tuple((witness.close_ma, witness.open_ma, witness.shifts_bp) for witness in witnesses)
+
+
+def _scope_witness_vector(
     rows: Sequence[dict[str, object]],
     start_ms: int,
     end_ms: int,
-) -> ReadinessWitness | None:
+    required_shifts_bp: Sequence[int],
+) -> tuple[ReadinessWitness, ...] | None:
     merged_cells = _scope_merged_cells(rows)
-    passing: list[tuple[tuple[int, int], ReadinessWitness]] = []
-    for pair in sorted({(open_ma, close_ma) for _, open_ma, close_ma in merged_cells}):
-        witness, _ = _readiness_for_pair(
-            pair[0],
-            pair[1],
-            _available_shifts(pair, (start_ms, end_ms), merged_cells),
-        )
-        if witness is not None:
-            passing.append((pair, witness))
-    if not passing:
-        return None
-    return min(passing, key=lambda item: (item[0], item[1].shifts_bp))[1]
+    required = set(required_shifts_bp)
+    witnesses: list[ReadinessWitness] = []
+    for close_ma in REQUIRED_CLOSE_MAS:
+        open_mas = sorted({
+            open_ma for (_, open_ma, current_close), _ in merged_cells.items()
+            if current_close == close_ma
+        })
+        candidates = [
+            open_ma for open_ma in open_mas
+            if required <= _available_shifts((open_ma, close_ma), (start_ms, end_ms), merged_cells)
+        ]
+        if not candidates:
+            return None
+        witnesses.append(ReadinessWitness(candidates[0], close_ma, tuple(required_shifts_bp)))
+    return tuple(witnesses)
 
 
 def _v2_selected_rows(
@@ -543,13 +583,6 @@ def _gap_details(chains: tuple[tuple[int, int], ...]) -> tuple[str, ...]:
     )
 
 
-def _interval_has_no_gap(
-    interval: tuple[int, int], factual_chains: tuple[tuple[int, int], ...]
-) -> bool:
-    start_ms, end_ms = interval
-    return any(window[0] <= start_ms and window[1] >= end_ms for window in factual_chains)
-
-
 def _direct_coverage(all_reports: list[dict[str, object]]) -> DirectCoverage:
     scope_keys = sorted(
         {(str(row["symbol"]), str(row["side"]), str(row["timeframe"])) for row in all_reports},
@@ -573,67 +606,59 @@ def _direct_coverage(all_reports: list[dict[str, object]]) -> DirectCoverage:
             for window in windows
             for boundary in window
         })
-        candidates: list[tuple[int, int, tuple[int, int], ReadinessWitness]] = []
-        pairs = sorted({(open_ma, close_ma) for _, open_ma, close_ma in merged_cells})
-        for pair in pairs:
-            runs: list[tuple[tuple[int, int], int, int, ReadinessWitness]] = []
-            for index in range(len(boundaries) - 1):
-                segment = (boundaries[index], boundaries[index + 1])
-                witness, _ = _readiness_for_pair(
-                    pair[0], pair[1], _available_shifts(pair, segment, merged_cells)
+        runs: list[tuple[int, int, tuple[ReadinessWitness, ...]]] = []
+        active_runs: list[tuple[int, int, tuple[ReadinessWitness, ...]]] = []
+        for index in range(len(boundaries) - 1):
+            segment = (boundaries[index], boundaries[index + 1])
+            vector = _scope_witness_vector(
+                scope_rows, segment[0], segment[1], DEFAULT_CANONICAL_SHIFTS_BP
+            )
+            if vector is None:
+                runs.extend(active_runs)
+                active_runs = []
+                continue
+            next_runs = []
+            for start_ms, end_ms, current_vector in active_runs:
+                combined = (start_ms, segment[1])
+                combined_vector = _scope_witness_vector(
+                    scope_rows, combined[0], combined[1], DEFAULT_CANONICAL_SHIFTS_BP
                 )
-                if witness is None:
-                    continue
-                if runs and runs[-1][0] == pair:
-                    combined_start = runs[-1][1]
-                    combined_end = segment[1]
-                    combined_witness, _ = _readiness_for_pair(
-                        pair[0],
-                        pair[1],
-                        _available_shifts(pair, (combined_start, combined_end), merged_cells),
-                    )
-                    if combined_witness is not None:
-                        runs[-1] = (pair, combined_start, combined_end, combined_witness)
-                        continue
-                runs.append((pair, segment[0], segment[1], witness))
-            candidates.extend((start, end, pair, witness) for pair, start, end, witness in runs)
-        unique_candidates = {
-            (start, end, pair, witness): (start, end, pair, witness)
-            for start, end, pair, witness in candidates
-        }
+                if combined_vector is not None:
+                    next_runs.append((combined[0], combined[1], combined_vector))
+                else:
+                    runs.append((start_ms, end_ms, current_vector))
+            active_runs = [*next_runs, (segment[0], segment[1], vector)]
+        runs.extend(active_runs)
         ordered_candidates = sorted(
-            unique_candidates.values(),
+            {
+                (start_ms, end_ms, vector): (start_ms, end_ms, vector)
+                for start_ms, end_ms, vector in runs
+            }.values(),
             key=lambda item: (
                 -(item[1] - item[0]),
                 item[0],
                 item[1],
-                item[2],
-                item[3].shifts_bp,
+                _witness_vector_key(item[2]),
             ),
         )
         selectable = False
         interval_start_utc = ""
         interval_end_utc = ""
         if ordered_candidates:
-            for index, (start_ms, end_ms, _pair, witness) in enumerate(ordered_candidates):
+            for index, (start_ms, end_ms, vector) in enumerate(ordered_candidates):
                 displayed = index == 0
-                current_selectable = (
-                    displayed
-                    and len(factual_chains) == 1
-                    and _interval_has_no_gap((start_ms, end_ms), factual_chains)
-                )
-                if displayed:
-                    selectable = current_selectable
-                    interval_start_utc = _utc_ms(start_ms)
-                    interval_end_utc = _utc_ms(end_ms)
                 intervals.append(CoverageInterval(
                     scope,
                     _utc_ms(start_ms),
                     _utc_ms(end_ms),
-                    witness,
+                    vector,
                     displayed=displayed,
-                    selectable=current_selectable,
+                    selectable=displayed,
                 ))
+                if displayed:
+                    selectable = True
+                    interval_start_utc = _utc_ms(start_ms)
+                    interval_end_utc = _utc_ms(end_ms)
         elif factual_chains:
             longest = max(factual_chains, key=lambda window: (window[1] - window[0], -window[0]))
             interval_start_utc = _utc_ms(longest[0])
@@ -648,6 +673,15 @@ def _direct_coverage(all_reports: list[dict[str, object]]) -> DirectCoverage:
             _gap_details(factual_chains),
         ))
     return DirectCoverage(scopes, tuple(rows), tuple(intervals))
+
+
+def canonical_coverage_from_rows(rows: Sequence[Mapping[str, object]]) -> DirectCoverage:
+    """Evaluate readiness using the same canonical 6-CloseMA/19-Shift contract.
+
+    Source-v6 adapters use this entry point with normalized report rows; keeping
+    the calculation here prevents a second, subtly different readiness policy.
+    """
+    return _direct_coverage([dict(row) for row in rows])
 
 
 def list_duckdb_direct_coverage(
@@ -684,6 +718,9 @@ def coverage_scan_direct(
     )))
     source_evidence_sha256 = hashlib.sha256(source_evidence).hexdigest()
     token_document = {
+        "canonical_grid_version": CANONICAL_GRID_VERSION,
+        "required_shifts_bp": list(DEFAULT_CANONICAL_SHIFTS_BP),
+        "readiness_contract_version": READINESS_CONTRACT_VERSION,
         "coverage_rows": tuple(
             (
                 row.symbol,
@@ -703,11 +740,16 @@ def coverage_scan_direct(
                 interval.scope.timeframe,
                 interval.start_utc,
                 interval.end_utc,
-                interval.witness.open_ma if interval.witness is not None else None,
-                interval.witness.close_ma if interval.witness is not None else None,
-                interval.witness.shifts_bp if interval.witness is not None else (),
-                interval.witness.contract_version if interval.witness is not None else "",
-                interval.witness.max_shift_bp if interval.witness is not None else 0,
+                tuple(
+                    (
+                        witness.open_ma,
+                        witness.close_ma,
+                        witness.shifts_bp,
+                        witness.contract_version,
+                        witness.max_shift_bp,
+                    )
+                    for witness in interval.witnesses
+                ),
             )
             for interval in coverage.intervals
         ),
@@ -778,6 +820,7 @@ def prepare_direct_surfaces(
     coverage_scan: _CoverageScan | None = None,
     cancellation: Callable[[], bool] = lambda: False,
     progress_callback: Callable[..., object] = lambda *args, **kwargs: None,
+    materialization_settings: DirectMaterializationSettings | None = None,
 ) -> tuple[DirectSurface, ...]:
     """Prepare all sides in memory under one read-only source transaction."""
     if not requests:
@@ -785,6 +828,12 @@ def prepare_direct_surfaces(
     ordered = tuple(sorted(requests, key=lambda request: 0 if request.side == "LONG" else 1))
     if len({request.side for request in ordered}) != len(ordered):
         raise DirectMaterializationError("only one request per side is allowed")
+    if any(
+        request.grid_contract_kind == V2_GRID_CONTRACT_KIND
+        or request.materializer_version == CANONICAL_MATERIALIZER_VERSION
+        for request in ordered
+    ):
+        raise DirectMaterializationError("STALE_PREFLIGHT")
     source_connection.execute("begin transaction")
     prepared: list[DirectSurface] = []
     try:
@@ -813,36 +862,54 @@ def prepare_direct_surfaces(
                 side=side,
                 symbols=request.symbols,
                 selected_scopes=request.selected_scopes,
+                required_shifts_bp=request.required_shifts_bp or DEFAULT_CANONICAL_SHIFTS_BP,
             )
             audit_sha256 = hashlib.sha256(audit_bytes).hexdigest()
             audit_artifact_name = f"surface_coverage_audit_{side}.csv"
+            audit_size_bytes = len(audit_bytes)
+            audit_row_count = _audit_data_row_count(audit_bytes)
+            if request.audit_bytes is not None and (
+                request.audit_bytes != audit_bytes
+                or request.audit_sha256 != audit_sha256
+                or request.audit_size_bytes != audit_size_bytes
+                or request.audit_row_count != audit_row_count
+                or request.audit_artifact_name != audit_artifact_name
+                or request.audit_schema_version != V2_AUDIT_SCHEMA_VERSION
+            ):
+                raise DirectMaterializationError("STALE_PREFLIGHT")
+            request = replace(
+                request,
+                grid_contract_kind=V2_GRID_CONTRACT_KIND,
+                materializer_version=CANONICAL_MATERIALIZER_VERSION,
+                point_materialization_config_hash=canonical_point_materialization_config_hash(
+                    request.required_shifts_bp or DEFAULT_CANONICAL_SHIFTS_BP
+                ),
+                readiness_contract_version=READINESS_CONTRACT_VERSION,
+                readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+                audit_artifact_name=audit_artifact_name,
+                audit_schema_version=V2_AUDIT_SCHEMA_VERSION,
+                audit_row_count=audit_row_count,
+                audit_sha256=audit_sha256,
+                audit_bytes=audit_bytes,
+                audit_size_bytes=audit_size_bytes,
+            )
+            preflight = preflight_duckdb_direct(source_connection, request)
+            if preflight.unavailable_symbols:
+                raise DirectMaterializationError("selected scope is unavailable")
             write_coverage_artifact(
                 audit_root,
                 f"surface_coverage/{audit_sha256}/{audit_artifact_name}",
                 audit_bytes,
             )
-            request = replace(
-                request,
-                grid_contract_kind=V2_GRID_CONTRACT_KIND,
-                readiness_contract_version=READINESS_CONTRACT_VERSION,
-                readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
-                audit_artifact_name=audit_artifact_name,
-                audit_schema_version=1,
-                audit_row_count=_audit_data_row_count(audit_bytes),
-                audit_sha256=audit_sha256,
-                audit_bytes=audit_bytes,
-            )
-            preflight = preflight_duckdb_direct(source_connection, request)
-            if preflight.unavailable_symbols:
-                raise DirectMaterializationError("selected scope is unavailable")
             if cancellation():
                 raise DirectMaterializationError("direct build cancelled before publication")
-            surface = materialize_duckdb_direct(
-                source_connection,
-                None,
-                request,
-                cancellation,
-                preflight=preflight,
+            materialize_kwargs: dict[str, object] = {"preflight": preflight}
+            if materialization_settings is not None:
+                materialize_kwargs["materialization_settings"] = materialization_settings
+            materialize_kwargs["progress_callback"] = progress_callback
+            materialize_kwargs["progress_side"] = request.side
+            surface = _materialize_direct_with_compat(
+                source_connection, None, request, cancellation, materialize_kwargs
             )
             prepared.append(surface)
             progress_callback(
@@ -857,10 +924,150 @@ def prepare_direct_surfaces(
     return tuple(prepared)
 
 
+def freeze_direct_preflights(
+    source_connection: duckdb.DuckDBPyConnection,
+    requests: Sequence[DirectBuildRequest],
+    *,
+    audit_root: str | os.PathLike[str],
+    coverage_scan: _CoverageScan,
+    preflight_func: Callable[[duckdb.DuckDBPyConnection, DirectBuildRequest], DirectPreflight] | None = None,
+) -> tuple[tuple[DirectBuildRequest, ...], tuple[DirectPreflight, ...]]:
+    """Freeze selected side requests and preflights before materialization."""
+    if not requests:
+        raise DirectMaterializationError("at least one direct request is required")
+    ordered = tuple(sorted(requests, key=lambda item: 0 if item.side == "LONG" else 1))
+    if len({item.side for item in ordered}) != len(ordered):
+        raise DirectMaterializationError("only one request per side is allowed")
+    source_connection.execute("begin transaction")
+    frozen_requests: list[DirectBuildRequest] = []
+    frozen_preflights: list[DirectPreflight] = []
+    try:
+        preflight_func = preflight_func or globals()["preflight_duckdb_direct"]
+        _verify_scan_inventory(coverage_scan)
+        active_scan = coverage_scan_direct(
+            source_connection,
+            audit_root,
+            symbols=coverage_scan.symbols,
+        )
+        if active_scan.token != coverage_scan.token:
+            raise DirectMaterializationError("stale coverage token is required")
+        for request in ordered:
+            audit_bytes = coverage_audit_csv_bytes(
+                source_connection,
+                request.start_utc,
+                request.end_utc,
+                side=request.side,
+                symbols=request.symbols,
+                selected_scopes=request.selected_scopes,
+                required_shifts_bp=request.required_shifts_bp or DEFAULT_CANONICAL_SHIFTS_BP,
+            )
+            audit_sha256 = hashlib.sha256(audit_bytes).hexdigest()
+            bound = replace(
+                request,
+                grid_contract_kind=V2_GRID_CONTRACT_KIND,
+                readiness_contract_version=READINESS_CONTRACT_VERSION,
+                readiness_max_shift_bp=READINESS_MAX_SHIFT_BP,
+                audit_artifact_name=f"surface_coverage_audit_{request.side}.csv",
+                audit_schema_version=V2_AUDIT_SCHEMA_VERSION,
+                audit_size_bytes=len(audit_bytes),
+                audit_row_count=_audit_data_row_count(audit_bytes),
+                audit_sha256=audit_sha256,
+                audit_bytes=audit_bytes,
+            )
+            preflight = preflight_func(source_connection, bound)
+            if preflight.unavailable_symbols:
+                raise DirectMaterializationError("selected scope is unavailable")
+            write_coverage_artifact(
+                audit_root,
+                f"surface_coverage/{audit_sha256}/{bound.audit_artifact_name}",
+                audit_bytes,
+            )
+            frozen_requests.append(bound)
+            frozen_preflights.append(preflight)
+        source_connection.execute("commit")
+    except BaseException:
+        source_connection.execute("rollback")
+        raise
+    return tuple(frozen_requests), tuple(frozen_preflights)
+
+
+def replay_direct_preflights(
+    source_connection: duckdb.DuckDBPyConnection,
+    requests: Sequence[DirectBuildRequest],
+    preflights: Sequence[DirectPreflight],
+    *,
+    audit_root: str | os.PathLike[str],
+    coverage_scan: _CoverageScan,
+    cancellation: Callable[[], bool] = lambda: False,
+    materialization_settings: DirectMaterializationSettings | None = None,
+    progress_callback: Callable[..., object] | None = None,
+) -> tuple[DirectSurface, ...]:
+    """Reproduce frozen state and materialize only after exact replay succeeds."""
+    ordered = tuple(sorted(zip(requests, preflights, strict=True), key=lambda item: 0 if item[0].side == "LONG" else 1))
+    source_connection.execute("begin transaction")
+    validated: list[tuple[DirectBuildRequest, DirectPreflight]] = []
+    try:
+        _verify_scan_inventory(coverage_scan)
+        active_scan = coverage_scan_direct(source_connection, audit_root, symbols=coverage_scan.symbols)
+        if active_scan.token != coverage_scan.token:
+            raise DirectMaterializationError("STALE_PREFLIGHT")
+        for request, expected in ordered:
+            if cancellation():
+                raise DirectMaterializationError("direct build cancelled before publication")
+            try:
+                audit_bytes = coverage_audit_csv_bytes(
+                    source_connection,
+                    request.start_utc,
+                    request.end_utc,
+                    side=request.side,
+                    symbols=request.symbols,
+                    selected_scopes=request.selected_scopes,
+                    required_shifts_bp=request.required_shifts_bp,
+                )
+            except BaseException as error:
+                raise DirectMaterializationError("STALE_PREFLIGHT") from error
+            active_request = replace(
+                request,
+                audit_size_bytes=len(audit_bytes),
+                audit_row_count=_audit_data_row_count(audit_bytes),
+                audit_sha256=hashlib.sha256(audit_bytes).hexdigest(),
+                audit_bytes=audit_bytes,
+            )
+            if active_request != request:
+                raise DirectMaterializationError("STALE_PREFLIGHT")
+            probe = DirectSurface(request, expected, REAL_EVENT_MODE, ())
+            try:
+                verify_persisted_surface_audit(audit_root, probe)
+                active = preflight_duckdb_direct(source_connection, active_request)
+            except BaseException as error:
+                raise DirectMaterializationError("STALE_PREFLIGHT") from error
+            if active != expected:
+                raise DirectMaterializationError("STALE_PREFLIGHT")
+            validated.append((request, expected))
+        surfaces: list[DirectSurface] = []
+        for request, expected in validated:
+            if cancellation():
+                raise DirectMaterializationError("direct build cancelled before publication")
+            materialize_kwargs: dict[str, object] = {"preflight": expected}
+            if materialization_settings is not None:
+                materialize_kwargs["materialization_settings"] = materialization_settings
+            materialize_kwargs["progress_callback"] = progress_callback
+            materialize_kwargs["progress_side"] = request.side
+            surfaces.append(_materialize_direct_with_compat(
+                source_connection, None, request, cancellation, materialize_kwargs
+            ))
+        source_connection.execute("commit")
+    except BaseException:
+        source_connection.execute("rollback")
+        raise
+    return tuple(surfaces)
+
+
 def publish_direct_surfaces(
     analysis_connection: duckdb.DuckDBPyConnection,
     surfaces: Sequence[DirectSurface],
     *,
+    audit_root: str | os.PathLike[str] | None = None,
     cancellation: Callable[[], bool] = lambda: False,
     progress_callback: Callable[..., object] = lambda *args, **kwargs: None,
     parent_surface_id: str | None = None,
@@ -873,6 +1080,23 @@ def publish_direct_surfaces(
         raise DirectMaterializationError("only one surface per side is allowed")
     if parent_surface_id is not None and len(ordered) != 1:
         raise DirectMaterializationError("parent_surface_id requires a single side")
+    canonical_surfaces = tuple(
+        surface for surface in ordered
+        if surface.request.grid_contract_kind == V2_GRID_CONTRACT_KIND
+        or (
+            isinstance(getattr(surface.preflight, "grid_contract", None), Mapping)
+            and surface.preflight.grid_contract.get("kind") == V2_GRID_CONTRACT_KIND
+        )
+    )
+    if canonical_surfaces and audit_root is None:
+        return DirectQueueResult("FAILED", (), phase="FAILED", error="persisted audit root is required")
+    if audit_root is not None and canonical_surfaces:
+        try:
+            for surface in canonical_surfaces:
+                verify_persisted_surface_audit(audit_root, surface)
+        except BaseException as error:
+            message = str(error) if isinstance(error, DirectMaterializationError) else "direct build failed"
+            return DirectQueueResult("FAILED", (), phase="FAILED", error=message)
     published: list[PublishedSurface] = []
     for index, surface in enumerate(ordered, start=1):
         if cancellation():
@@ -886,6 +1110,8 @@ def publish_direct_surfaces(
             total=len(ordered),
         )
         try:
+            if audit_root is not None and surface in canonical_surfaces:
+                verify_persisted_surface_audit(audit_root, surface)
             published_surface = publish_surface(analysis_connection, surface)
         except BaseException as error:
             state = "PARTIAL" if published else "FAILED"
@@ -901,6 +1127,7 @@ def _evaluation_rows_for_scope(
     interval_start_utc: str,
     interval_end_utc: str,
     displayed_interval: bool,
+    required_shifts_bp: Sequence[int],
 ) -> list[dict[str, object]]:
     start_ms = _as_utc_ms(interval_start_utc)
     end_ms = _as_utc_ms(interval_end_utc)
@@ -919,22 +1146,27 @@ def _evaluation_rows_for_scope(
     merged_cells = {
         cell: _merge_windows(windows) for cell, windows in cell_windows.items()
     }
+    required = set(required_shifts_bp)
     pairs = sorted({(open_ma, close_ma) for _, open_ma, close_ma in merged_cells})
     pair_witness: dict[tuple[int, int], ReadinessWitness | None] = {}
-    pair_diagnostics: dict[tuple[int, int], tuple[tuple[object, ...], ...]] = {}
+    pair_missing: dict[tuple[int, int], tuple[int, ...]] = {}
     for pair in pairs:
-        witness, diagnostics = _readiness_for_pair(
-            pair[0],
-            pair[1],
-            _available_shifts(pair, (start_ms, end_ms), merged_cells),
+        available = _available_shifts(pair, (start_ms, end_ms), merged_cells)
+        missing = tuple(sorted(required - available))
+        pair_missing[pair] = missing
+        pair_witness[pair] = (
+            None if missing else ReadinessWitness(pair[0], pair[1], tuple(required_shifts_bp))
         )
-        pair_witness[pair] = witness
-        pair_diagnostics[pair] = diagnostics
-    passing = [(pair, witness) for pair, witness in pair_witness.items() if witness is not None]
-    canonical_pair, canonical_witness = (
-        min(passing, key=lambda item: (item[0], item[1].shifts_bp)) if passing else (None, None)
-    )
-    canonical_shifts = set(canonical_witness.shifts_bp) if canonical_witness is not None else set()
+    close_witness: dict[int, ReadinessWitness] = {}
+    for close_ma in REQUIRED_CLOSE_MAS:
+        passing = [
+            witness for pair, witness in pair_witness.items()
+            if witness is not None and witness.close_ma == close_ma
+        ]
+        if passing:
+            close_witness[close_ma] = min(passing, key=lambda item: (item.open_ma, item.shifts_bp))
+    canonical_pairs = {(witness.open_ma, witness.close_ma) for witness in close_witness.values()}
+    canonical_shifts = required
     covering_by_cell: dict[tuple[int, int, int], list[dict[str, object]]] = {}
     for row in rows:
         effective = _effective_window(row)
@@ -986,7 +1218,7 @@ def _evaluation_rows_for_scope(
             )
         witness = pair_witness[pair]
         required_for_readiness = (
-            canonical_pair == pair
+            pair in canonical_pairs
             and witness is not None
             and int(row["shift_bp"]) in canonical_shifts
         )
@@ -1023,52 +1255,41 @@ def _evaluation_rows_for_scope(
             "readiness_max_shift_bp": READINESS_MAX_SHIFT_BP,
         })
     for pair in pairs:
-        for diagnostic in pair_diagnostics[pair]:
-            gap_start_bp = None
-            gap_end_bp = None
-            max_gap_bp = None
-            if diagnostic[0] == "MISSING_BOUNDARY":
-                reason_code = "MISSING_BOUNDARY"
-                reason_detail = f"MISSING_BOUNDARY: boundary_bp={diagnostic[1]}"
-            else:
-                _, gap_start_bp, gap_end_bp, max_gap_bp = diagnostic
-                reason_code = "SHIFT_GAP_EXCEEDS_MAX"
-                reason_detail = (
-                    f"SHIFT_GAP_EXCEEDS_MAX: gap_start_bp={gap_start_bp}, "
-                    f"gap_end_bp={gap_end_bp}, max_gap_bp={max_gap_bp}"
-                )
-            evaluations.append({
-                "pair": scope.symbol,
-                "side": scope.side,
-                "timeframe": scope.timeframe,
-                "evaluation_id": evaluation_id,
-                "displayed_interval": displayed_interval,
-                "row_type": "READINESS_GAP",
-                "shift_bp": None,
-                "open_ma": pair[0],
-                "close_ma": pair[1],
-                "interval_start_utc": normalized_start_utc,
-                "interval_end_utc": normalized_end_utc,
-                "report_start_utc": None,
-                "report_end_utc": None,
-                "grid_start_utc": None,
-                "grid_end_utc": None,
-                "effective_start_utc": None,
-                "effective_end_utc": None,
-                "required_for_readiness": True,
-                "readiness_witness": "",
-                "gap_start_bp": gap_start_bp,
-                "gap_end_bp": gap_end_bp,
-                "max_gap_bp": max_gap_bp,
-                "report_id": None,
-                "source_sha256": None,
-                "selected_report": None,
-                "status": "MISSING",
-                "reason_code": reason_code,
-                "reason_detail": reason_detail,
-                "readiness_contract_version": READINESS_CONTRACT_VERSION,
-                "readiness_max_shift_bp": READINESS_MAX_SHIFT_BP,
-            })
+        missing = pair_missing[pair]
+        if not missing or pair[1] in close_witness:
+            continue
+        evaluations.append({
+            "pair": scope.symbol,
+            "side": scope.side,
+            "timeframe": scope.timeframe,
+            "evaluation_id": evaluation_id,
+            "displayed_interval": displayed_interval,
+            "row_type": "READINESS_GAP",
+            "shift_bp": None,
+            "open_ma": pair[0],
+            "close_ma": pair[1],
+            "interval_start_utc": normalized_start_utc,
+            "interval_end_utc": normalized_end_utc,
+            "report_start_utc": None,
+            "report_end_utc": None,
+            "grid_start_utc": None,
+            "grid_end_utc": None,
+            "effective_start_utc": None,
+            "effective_end_utc": None,
+            "required_for_readiness": True,
+            "readiness_witness": "",
+            "gap_start_bp": None,
+            "gap_end_bp": None,
+            "max_gap_bp": None,
+            "report_id": None,
+            "source_sha256": None,
+            "selected_report": None,
+            "status": "MISSING",
+            "reason_code": "MISSING_SHIFT",
+            "reason_detail": "MISSING_SHIFT: missing_shifts=" + ",".join(map(str, missing)),
+            "readiness_contract_version": READINESS_CONTRACT_VERSION,
+            "readiness_max_shift_bp": READINESS_MAX_SHIFT_BP,
+        })
     return evaluations
 
 
@@ -1142,7 +1363,12 @@ def coverage_inventory_csv_bytes(
         if scope_intervals:
             for interval in scope_intervals:
                 evaluations.extend(_evaluation_rows_for_scope(
-                    scope_rows, scope, interval.start_utc, interval.end_utc, interval.displayed
+                    scope_rows,
+                    scope,
+                    interval.start_utc,
+                    interval.end_utc,
+                    interval.displayed,
+                    DEFAULT_CANONICAL_SHIFTS_BP,
                 ))
             continue
         factual_chains = _scope_factual_chains(scope_rows)
@@ -1155,6 +1381,7 @@ def coverage_inventory_csv_bytes(
                     _utc_ms(start_ms),
                     _utc_ms(end_ms),
                     (start_ms, end_ms) == longest,
+                    DEFAULT_CANONICAL_SHIFTS_BP,
                 ))
     return coverage_csv_bytes(evaluations)
 
@@ -1167,6 +1394,7 @@ def coverage_audit_csv_bytes(
     side: str | None = None,
     symbols: tuple[str, ...] = (),
     selected_scopes: tuple[str, ...] = (),
+    required_shifts_bp: Sequence[int] | None = None,
 ) -> bytes:
     all_rows = _coverage_scan_rows(source_connection, side=side, symbols=symbols)
     coverage = _direct_coverage(all_rows)
@@ -1190,7 +1418,12 @@ def coverage_audit_csv_bytes(
             and str(row["timeframe"]) == scope.timeframe
         ]
         evaluations.extend(_evaluation_rows_for_scope(
-            scope_rows, scope, interval_start_utc, interval_end_utc, True
+            scope_rows,
+            scope,
+            interval_start_utc,
+            interval_end_utc,
+            True,
+            required_shifts_bp or DEFAULT_CANONICAL_SHIFTS_BP,
         ))
     return coverage_csv_bytes(evaluations)
 
@@ -1222,6 +1455,109 @@ def write_coverage_artifact(audit_root: str | os.PathLike[str], relative_name: s
     return target
 
 
+def verify_persisted_surface_audit(
+    audit_root: str | os.PathLike[str],
+    surface: DirectSurface,
+) -> bytes:
+    """Read-only verification of the frozen side audit immediately before publish."""
+    request, preflight = surface.request, surface.preflight
+    contract = getattr(preflight, "grid_contract", None)
+    if not isinstance(contract, Mapping) or contract.get("kind") != V2_GRID_CONTRACT_KIND:
+        if request.grid_contract_kind == V2_GRID_CONTRACT_KIND:
+            raise DirectMaterializationError("V2 preflight contract is required")
+        return b""
+    if contract.get("canonical_grid_version") != CANONICAL_GRID_VERSION:
+        raise DirectMaterializationError("V2 canonical grid version is invalid")
+    canonical_shifts = contract.get("canonical_shifts_bp")
+    if not isinstance(canonical_shifts, (list, tuple)) or tuple(canonical_shifts) != tuple(request.required_shifts_bp):
+        raise DirectMaterializationError("V2 canonical shifts are invalid")
+    if contract.get("point_materialization_semantics_version") != POINT_MATERIALIZATION_SEMANTICS_VERSION:
+        raise DirectMaterializationError("V2 point materialization semantics version is invalid")
+    if contract.get("point_materialization_config_hash") != request.point_materialization_config_hash:
+        raise DirectMaterializationError("V2 point materialization config hash is invalid")
+    scopes = contract.get("selected_scopes")
+    witnesses = contract.get("witnesses")
+    if not isinstance(scopes, (list, tuple)) or not scopes or not isinstance(witnesses, Mapping) or set(witnesses) != set(scopes):
+        raise DirectMaterializationError("V2 readiness witnesses are invalid")
+    witness_keys = {"symbol", "side", "timeframe", "open_ma", "close_ma", "shifts_bp", "contract_version", "max_shift_bp"}
+    for scope in scopes:
+        vector = witnesses[scope]
+        if not isinstance(vector, list) or len(vector) != len(REQUIRED_CLOSE_MAS):
+            raise DirectMaterializationError("V2 readiness witness vector must contain six entries")
+        if any(not isinstance(item, Mapping) or set(item) != witness_keys for item in vector):
+            raise DirectMaterializationError("V2 readiness witness is malformed")
+        if [item["close_ma"] for item in vector] != list(REQUIRED_CLOSE_MAS):
+            raise DirectMaterializationError("V2 readiness witnesses must be ordered CloseMA 2..7")
+        expected_symbol, expected_timeframe = str(scope).split("|", maxsplit=1)
+        for item in vector:
+            if (item["symbol"], item["timeframe"], item["side"]) != (expected_symbol, expected_timeframe, request.side):
+                raise DirectMaterializationError("V2 readiness witness scope is invalid")
+            if item["shifts_bp"] != list(request.required_shifts_bp):
+                raise DirectMaterializationError("V2 readiness witness shifts are invalid")
+            if item["contract_version"] != READINESS_CONTRACT_VERSION or item["max_shift_bp"] != READINESS_MAX_SHIFT_BP:
+                raise DirectMaterializationError("V2 readiness witness contract is invalid")
+    artifact_name = request.audit_artifact_name
+    expected_name = f"surface_coverage_audit_{request.side}.csv"
+    if artifact_name != expected_name or preflight.audit_artifact_name != artifact_name:
+        raise DirectMaterializationError("persisted audit artifact name mismatch")
+    schema_version = request.audit_schema_version
+    if schema_version != V2_AUDIT_SCHEMA_VERSION or preflight.audit_schema_version != schema_version:
+        raise DirectMaterializationError("persisted audit schema version mismatch")
+    audit_sha256 = request.audit_sha256
+    if not audit_sha256 or preflight.audit_sha256 != audit_sha256:
+        raise DirectMaterializationError("persisted audit hash metadata mismatch")
+    expected_bytes = request.audit_bytes
+    if not isinstance(expected_bytes, bytes) or preflight.audit_bytes != expected_bytes:
+        raise DirectMaterializationError("persisted audit bytes are not frozen")
+    if not isinstance(request.audit_size_bytes, int) or isinstance(request.audit_size_bytes, bool) or request.audit_size_bytes <= 0:
+        raise DirectMaterializationError("persisted audit size metadata is missing")
+    expected_size = request.audit_size_bytes
+    if (
+        preflight.audit_size_bytes != expected_size
+    ):
+        raise DirectMaterializationError("persisted audit size metadata mismatch")
+    expected_rows = request.audit_row_count
+    if preflight.audit_row_count != expected_rows:
+        raise DirectMaterializationError("persisted audit row metadata mismatch")
+    path = Path(audit_root) / "surface_coverage" / audit_sha256 / artifact_name
+    try:
+        if not path.is_file():
+            raise DirectMaterializationError("persisted audit artifact is unavailable")
+        data = path.read_bytes()
+    except OSError as error:
+        raise DirectMaterializationError("persisted audit artifact is unavailable") from error
+    if len(data) != expected_size:
+        raise DirectMaterializationError("persisted audit byte-size mismatch")
+    if hashlib.sha256(data).hexdigest() != audit_sha256:
+        raise DirectMaterializationError("persisted audit hash mismatch")
+    if data != expected_bytes:
+        raise DirectMaterializationError("persisted audit bytes mismatch")
+    if not data.endswith(b"\n") or _audit_data_row_count(data) != expected_rows:
+        raise DirectMaterializationError("persisted audit row count mismatch")
+    for key, value in (
+        ("audit_artifact_name", artifact_name),
+        ("audit_schema_version", schema_version),
+        ("audit_size_bytes", expected_size),
+        ("audit_row_count", expected_rows),
+        ("audit_sha256", audit_sha256),
+    ):
+        contract_value = preflight.grid_contract.get(key)
+        if contract_value != value:
+            raise DirectMaterializationError("persisted audit metadata mismatch")
+    return data
+
+
+def _validate_canonical_v2_request(request: DirectBuildRequest) -> None:
+    if request.grid_contract_kind != V2_GRID_CONTRACT_KIND and request.materializer_version != CANONICAL_MATERIALIZER_VERSION:
+        return
+    if request.materializer_version != CANONICAL_MATERIALIZER_VERSION:
+        raise DirectMaterializationError("V2 request must use the canonical materializer version")
+    if tuple(request.required_shifts_bp) != DEFAULT_CANONICAL_SHIFTS_BP:
+        raise DirectMaterializationError("V2 request must use the exact canonical shift tuple")
+    if request.point_materialization_config_hash != canonical_point_materialization_config_hash(DEFAULT_CANONICAL_SHIFTS_BP):
+        raise DirectMaterializationError("V2 request has an invalid point materialization config hash")
+
+
 def _preflight_duckdb_direct_v2(
     source_connection: duckdb.DuckDBPyConnection,
     request: DirectBuildRequest,
@@ -1229,6 +1565,7 @@ def _preflight_duckdb_direct_v2(
     end_ms: int,
     all_reports: list[dict[str, object]],
 ) -> DirectPreflight:
+    _validate_canonical_v2_request(request)
     if request.readiness_contract_version != READINESS_CONTRACT_VERSION or request.readiness_max_shift_bp != READINESS_MAX_SHIFT_BP:
         raise DirectMaterializationError("V2 readiness contract is not active")
     _verify_v2_audit_metadata(
@@ -1237,6 +1574,7 @@ def _preflight_duckdb_direct_v2(
         schema_version=request.audit_schema_version,
         row_count=request.audit_row_count,
         sha256_digest=request.audit_sha256,
+        size_bytes=request.audit_size_bytes,
     )
     scope_rows: dict[tuple[str, str], list[dict[str, object]]] = {}
     for row in all_reports:
@@ -1255,7 +1593,9 @@ def _preflight_duckdb_direct_v2(
         if scope.count("|") != 1:
             raise DirectMaterializationError("V2 selected scope must be symbol|timeframe")
 
-    witnesses: dict[str, dict[str, object]] = {}
+    required_shifts_bp = request.required_shifts_bp or DEFAULT_CANONICAL_SHIFTS_BP
+    required = set(required_shifts_bp)
+    witnesses: dict[str, list[dict[str, object]]] = {}
     accepted_rows: list[dict[str, object]] = []
     issues: list[CoverageIssue] = []
     usable: dict[str, list[str]] = {}
@@ -1265,24 +1605,30 @@ def _preflight_duckdb_direct_v2(
         if not rows:
             issues.append(CoverageIssue(symbol, timeframe, "GRID_NOT_COVERED", "no report covers the selected scope"))
             continue
-        witness = _scope_witness(rows, start_ms, end_ms)
-        if witness is None:
+        witness_vector = _scope_witness_vector(rows, start_ms, end_ms, required_shifts_bp)
+        if witness_vector is None:
             issues.append(CoverageIssue(symbol, timeframe, "GRID_NOT_READY", "readiness contract is not satisfied"))
             continue
-        selected = _v2_selected_rows(rows, start_ms, end_ms)
+        selected = [
+            row for row in _v2_selected_rows(rows, start_ms, end_ms)
+            if int(row["shift_bp"]) in required
+        ]
         if not selected:
             issues.append(CoverageIssue(symbol, timeframe, "GRID_NOT_COVERED", "no report covers the requested UTC half-open window"))
             continue
-        witnesses[scope] = {
-            "symbol": symbol,
-            "side": request.side,
-            "timeframe": timeframe,
-            "open_ma": witness.open_ma,
-            "close_ma": witness.close_ma,
-            "shifts_bp": list(witness.shifts_bp),
-            "contract_version": witness.contract_version,
-            "max_shift_bp": witness.max_shift_bp,
-        }
+        witnesses[scope] = [
+            {
+                "symbol": symbol,
+                "side": request.side,
+                "timeframe": timeframe,
+                "open_ma": witness.open_ma,
+                "close_ma": witness.close_ma,
+                "shifts_bp": list(witness.shifts_bp),
+                "contract_version": witness.contract_version,
+                "max_shift_bp": witness.max_shift_bp,
+            }
+            for witness in witness_vector
+        ]
         accepted_rows.extend(selected)
         usable.setdefault(symbol, []).append(timeframe)
 
@@ -1297,15 +1643,21 @@ def _preflight_duckdb_direct_v2(
     ])
     grid_contract = {
         "kind": V2_GRID_CONTRACT_KIND,
+        "canonical_grid_version": CANONICAL_GRID_VERSION,
+        "canonical_shifts_bp": list(required_shifts_bp),
         "selected_scopes": list(selected_scopes),
         "readiness_contract_version": request.readiness_contract_version,
         "readiness_max_shift_bp": request.readiness_max_shift_bp,
         "normalization_contract_version": NORMALIZATION_CONTRACT_VERSION,
+        "materializer_version": request.materializer_version,
+        "point_materialization_semantics_version": POINT_MATERIALIZATION_SEMANTICS_VERSION,
+        "point_materialization_config_hash": request.point_materialization_config_hash,
         "witnesses": {scope: witnesses[scope] for scope in selected_scopes if scope in witnesses},
         "point_evidence": evidence_bytes.decode("utf-8"),
         "point_evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest(),
         "audit_artifact_name": request.audit_artifact_name,
         "audit_schema_version": request.audit_schema_version,
+        "audit_size_bytes": request.audit_size_bytes,
         "audit_row_count": request.audit_row_count,
         "audit_sha256": request.audit_sha256,
     }
@@ -1331,6 +1683,7 @@ def _preflight_duckdb_direct_v2(
         point_evidence_sha256=grid_contract["point_evidence_sha256"],
         audit_artifact_name=request.audit_artifact_name,
         audit_schema_version=request.audit_schema_version,
+        audit_size_bytes=request.audit_size_bytes,
         audit_row_count=request.audit_row_count,
         audit_sha256=request.audit_sha256,
         audit_bytes=request.audit_bytes,
@@ -1339,6 +1692,7 @@ def _preflight_duckdb_direct_v2(
 
 def preflight_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, request: DirectBuildRequest) -> DirectPreflight:
     """Validate full UTC coverage and observed-grid completeness without decoding payloads."""
+    _validate_canonical_v2_request(request)
     start, end = _window(request)
     validation = validate_source_database_structural(source_connection)
     if not validation.valid:
@@ -1436,6 +1790,220 @@ def preflight_duckdb_direct(source_connection: duckdb.DuckDBPyConnection, reques
     )
 
 
+@dataclass(frozen=True, slots=True)
+class MaterializationPayload:
+    """Pickle-safe primitive payload for one preflight-accepted report."""
+
+    canonical_point_key: str
+    report_id: str
+    source_hash: str
+    action_count: int
+    equity_count: int
+    wallet_count: int
+    series_codec: str
+    actions_blob: bytes
+    equity_blob: bytes
+    wallet_blob: bytes
+    grid_hash: str
+    sample_count: int
+    timestamps_blob: bytes
+
+
+def _materialize_payload_chunk(
+    chunk: tuple[MaterializationPayload, ...],
+    window_start_utc: str,
+    window_end_utc: str,
+) -> tuple[DirectPoint, ...]:
+    """Decode one chunk of pickle-safe payloads without touching DuckDB."""
+    grids_by_hash: dict[str, pd.DatetimeIndex] = {}
+    points: list[DirectPoint] = []
+    for payload in chunk:
+        try:
+            grid = grids_by_hash.get(payload.grid_hash)
+            if grid is None:
+                grid = pd.to_datetime(
+                    decode_compact_deltas(bytes(payload.timestamps_blob), int(payload.sample_count), codec=str(payload.series_codec)),
+                    unit="ms",
+                    utc=True,
+                )
+                grids_by_hash[payload.grid_hash] = grid
+            actions = decode_compact_actions(bytes(payload.actions_blob), int(payload.action_count))
+            metrics = calculate_point_metrics(
+                grid,
+                decode_compact_deltas(bytes(payload.equity_blob), int(payload.equity_count), codec=str(payload.series_codec)),
+                decode_wallet_changes(bytes(payload.wallet_blob), int(payload.wallet_count), codec=str(payload.series_codec)),
+                actions,
+                window_start_utc,
+                window_end_utc,
+            )
+            symbol, _, timeframe, *_ = str(payload.canonical_point_key).split("|")
+            reconstruction = reconstruct_closed_cycles(
+                str(payload.report_id), symbol, timeframe, actions, window_start_utc, window_end_utc
+            )
+            event_ids = tuple(sorted({cycle.event_id for cycle in reconstruction.included}))
+        except SourcePackError as error:
+            raise DirectMaterializationError(f"cannot materialize {payload.canonical_point_key}: {error}") from error
+        points.append(
+            DirectPoint(
+                str(payload.canonical_point_key),
+                payload.report_id,
+                payload.source_hash,
+                len(event_ids),
+                metrics,
+                event_ids,
+            )
+        )
+    return tuple(points)
+
+
+_BULK_MATERIALIZATION_SQL = 'select r.canonical_point_key,r.report_id,r.source_sha256,r.raw_action_count,r.equity_sample_count,r.wallet_change_count,p.series_codec,p.actions_zlib,p.equity_zlib,p.wallet_zlib,g.grid_hash,g.sample_count,g.timestamps_zlib from active_reports r join report_payloads p using(report_id) join time_grids g using(grid_hash) where r.report_id in (select * from unnest(?))'
+
+
+def _fetch_materialization_payload_batch(
+    source_connection: duckdb.DuckDBPyConnection,
+    manifest_batch: tuple[tuple[str, str], ...],
+) -> tuple[MaterializationPayload, ...]:
+    """Fetch one bulk payload batch for preflight-accepted reports."""
+    report_ids = [report_id for report_id, _ in manifest_batch]
+    rows = source_connection.execute(_BULK_MATERIALIZATION_SQL, [report_ids]).fetchall()
+    rows_by_id: dict[str, tuple[object, ...]] = {}
+    for row in rows:
+        row_report_id = str(row[1])
+        if row_report_id in rows_by_id:
+            raise DirectMaterializationError("active source changed after preflight")
+        rows_by_id[row_report_id] = row
+    payloads: list[MaterializationPayload] = []
+    for report_id, source_hash in manifest_batch:
+        row = rows_by_id.get(report_id)
+        if row is None or str(row[2]) != source_hash:
+            raise DirectMaterializationError("active source changed after preflight")
+        payloads.append(
+            MaterializationPayload(
+                canonical_point_key=str(row[0]),
+                report_id=str(row[1]),
+                source_hash=str(row[2]),
+                action_count=int(row[3]),
+                equity_count=int(row[4]),
+                wallet_count=int(row[5]),
+                series_codec=str(row[6]),
+                actions_blob=bytes(row[7]),
+                equity_blob=bytes(row[8]),
+                wallet_blob=bytes(row[9]),
+                grid_hash=str(row[10]),
+                sample_count=int(row[11]),
+                timestamps_blob=bytes(row[12]),
+            )
+        )
+    return tuple(payloads)
+
+
+def _materialize_payloads_parallel(
+    payloads: Sequence[MaterializationPayload],
+    settings: DirectMaterializationSettings,
+    window_start_utc: str,
+    window_end_utc: str,
+    cancellation: Callable[[], bool],
+    *,
+    progress_callback: Callable[..., object] | None = None,
+    progress_offset: int = 0,
+    progress_total: int | None = None,
+    progress_started_at: float | None = None,
+    progress_side: str | None = None,
+) -> tuple[DirectPoint, ...]:
+    """Materialize payload chunks with completion-driven bounded scheduling."""
+    chunk_size = settings.worker_chunk_size
+    chunks = tuple(
+        tuple(payloads[offset : offset + chunk_size])
+        for offset in range(0, len(payloads), chunk_size)
+    )
+    if cancellation():
+        raise DirectMaterializationError("direct materialization cancelled before publication")
+    total_chunks = len(chunks)
+    total_points = len(payloads) if progress_total is None else progress_total
+    started_at = time.monotonic() if progress_started_at is None else progress_started_at
+    results: dict[int, tuple[DirectPoint, ...]] = {}
+    pending: dict[Future, int] = {}
+    next_index = 0
+    completed_chunks = 0
+    materialized_points = 0
+    executor = ProcessPoolExecutor(max_workers=settings.workers)
+    try:
+        while completed_chunks < total_chunks:
+            if cancellation():
+                raise DirectMaterializationError("direct materialization cancelled before publication")
+            while next_index < total_chunks and len(pending) < settings.max_in_flight_chunks:
+                if cancellation():
+                    raise DirectMaterializationError("direct materialization cancelled before publication")
+                future = executor.submit(
+                    _materialize_payload_chunk, chunks[next_index], window_start_utc, window_end_utc
+                )
+                pending[future] = next_index
+                next_index += 1
+            if cancellation():
+                raise DirectMaterializationError("direct materialization cancelled before publication")
+            done, _ = wait(
+                tuple(pending),
+                timeout=_PARALLEL_WAIT_TIMEOUT_SECONDS,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+            for future in done:
+                if cancellation():
+                    raise DirectMaterializationError("direct materialization cancelled before publication")
+                index = pending.pop(future)
+                chunk_points = future.result()
+                results[index] = chunk_points
+                completed_chunks += 1
+                materialized_points += len(chunk_points)
+                if progress_callback is not None:
+                    elapsed_seconds = time.monotonic() - started_at
+                    global_materialized_points = progress_offset + materialized_points
+                    progress_callback(
+                        "MATERIALIZING",
+                        materialized_points=global_materialized_points,
+                        total_points=total_points,
+                        workers=settings.workers,
+                        elapsed_seconds=elapsed_seconds,
+                        points_per_second=(
+                            global_materialized_points / elapsed_seconds if elapsed_seconds > 0 else 0.0
+                        ),
+                        side=progress_side,
+                    )
+        executor.shutdown(wait=True)
+    except BaseException:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    return tuple(point for index in range(total_chunks) for point in results[index])
+
+
+def _materialize_direct_with_compat(
+    source_connection: duckdb.DuckDBPyConnection,
+    analysis_connection: duckdb.DuckDBPyConnection | None,
+    request: DirectBuildRequest,
+    cancellation: Callable[[], bool],
+    materialize_kwargs: dict[str, object],
+) -> DirectSurface:
+    """Call the materializer, dropping progress_callback for legacy callables."""
+    try:
+        return materialize_duckdb_direct(
+            source_connection, analysis_connection, request, cancellation, **materialize_kwargs
+        )
+    except TypeError as error:
+        message = str(error)
+        if "unexpected keyword argument" not in message:
+            raise
+        if "progress_callback" not in message and "progress_side" not in message:
+            raise
+        materialize_kwargs.pop("progress_callback", None)
+        materialize_kwargs.pop("progress_side", None)
+        return materialize_duckdb_direct(
+            source_connection, analysis_connection, request, cancellation, **materialize_kwargs
+        )
+
+
 def materialize_duckdb_direct(
     source_connection: duckdb.DuckDBPyConnection,
     analysis_connection: duckdb.DuckDBPyConnection | None,
@@ -1443,41 +2011,43 @@ def materialize_duckdb_direct(
     cancellation: Callable[[], bool],
     *,
     preflight: DirectPreflight | None = None,
+    materialization_settings: DirectMaterializationSettings | None = None,
+    progress_callback: Callable[..., object] | None = None,
+    progress_side: str | None = None,
 ) -> DirectSurface:
     """Decode only preflight-accepted reports into a non-published direct surface."""
+    settings = materialization_settings or DirectMaterializationSettings()
     if analysis_connection is not None and source_connection is analysis_connection:
         raise DirectMaterializationError("source and analysis connections must be distinct")
     if cancellation():
         raise DirectMaterializationError("direct materialization cancelled before publication")
+    _validate_canonical_v2_request(request)
     preflight = preflight or preflight_duckdb_direct(source_connection, request)
     if preflight.unavailable_symbols:
         raise DirectMaterializationError("selected symbol has no usable timeframe")
     start, end = _window(request)
     points: list[DirectPoint] = []
-    for report_id, source_hash in preflight.manifest:
+    manifest = preflight.manifest
+    progress_started_at = time.monotonic()
+    for offset in range(0, len(manifest), settings.fetch_batch_size):
         if cancellation():
             raise DirectMaterializationError("direct materialization cancelled before publication")
-        row = source_connection.execute(
-            """select r.canonical_point_key,r.raw_action_count,r.equity_sample_count,r.wallet_change_count,
-                      p.series_codec,p.actions_codec,p.actions_zlib,p.equity_zlib,p.wallet_zlib,g.sample_count,g.timestamps_zlib
-                 from active_reports r join report_payloads p using(report_id) join time_grids g using(grid_hash)
-                where r.report_id=? and r.source_sha256=?""", [report_id, source_hash]
-        ).fetchone()
-        if row is None:
-            raise DirectMaterializationError("active source changed after preflight")
-        point_key, action_count, equity_count, wallet_count, series_codec, _, actions_blob, equity_blob, wallet_blob, sample_count, timestamps_blob = row
-        try:
-            grid = pd.to_datetime(decode_compact_deltas(bytes(timestamps_blob), int(sample_count), codec=str(series_codec)), unit="ms", utc=True)
-            actions = decode_compact_actions(bytes(actions_blob), int(action_count))
-            metrics = calculate_point_metrics(grid, decode_compact_deltas(bytes(equity_blob), int(equity_count), codec=str(series_codec)), decode_wallet_changes(bytes(wallet_blob), int(wallet_count), codec=str(series_codec)), actions, start.isoformat(), end.isoformat())
-            symbol, _, timeframe, *_ = str(point_key).split("|")
-            reconstruction = reconstruct_closed_cycles(
-                str(report_id), symbol, timeframe, actions, start.isoformat(), end.isoformat()
+        batch = manifest[offset : offset + settings.fetch_batch_size]
+        payloads = _fetch_materialization_payload_batch(source_connection, batch)
+        points.extend(
+            _materialize_payloads_parallel(
+                payloads,
+                settings,
+                start.isoformat(),
+                end.isoformat(),
+                cancellation,
+                progress_callback=progress_callback,
+                progress_offset=len(points),
+                progress_total=len(manifest),
+                progress_started_at=progress_started_at,
+                progress_side=progress_side,
             )
-            event_ids = tuple(sorted({cycle.event_id for cycle in reconstruction.included}))
-        except SourcePackError as error:
-            raise DirectMaterializationError(f"cannot materialize {point_key}: {error}") from error
-        points.append(DirectPoint(str(point_key), report_id, source_hash, len(event_ids), metrics, event_ids))
+        )
     if request.grid_contract_kind == V2_GRID_CONTRACT_KIND:
         points.sort(key=lambda point: point_key_tuple(point.canonical_point_key))
     if len({point.canonical_point_key for point in points}) != len(points):
@@ -1488,6 +2058,11 @@ def materialize_duckdb_direct(
     }
     if point_sides and point_sides != {request.side}:
         raise DirectMaterializationError("direct surface side must match request side")
+    materialized_keys = tuple(point.canonical_point_key for point in points)
+    if len(materialized_keys) != len(manifest) or materialized_keys != preflight.accepted_point_keys:
+        raise DirectMaterializationError(
+            "direct surface point set does not match frozen preflight manifest"
+        )
     return DirectSurface(request, preflight, REAL_EVENT_MODE, tuple(points))
 
 
@@ -1510,7 +2085,13 @@ def run_panel_direct_build(
     if cancellation():
         raise DirectMaterializationError("direct materialization cancelled before publication")
     progress_callback("MATERIALIZING", usable_timeframes=sum(map(len, preflight.usable_timeframes.values())))
-    surface = materialize_duckdb_direct(source_connection, analysis_connection, request, cancellation, preflight=preflight)
+    surface = _materialize_direct_with_compat(
+        source_connection,
+        analysis_connection,
+        request,
+        cancellation,
+        {"preflight": preflight, "progress_callback": progress_callback, "progress_side": request.side},
+    )
     if cancellation():
         raise DirectMaterializationError("direct materialization cancelled before publication")
     progress_callback("REVALIDATING", materialized_points=len(surface.points))

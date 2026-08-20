@@ -11,6 +11,10 @@ from mrs3.plateau import (
     core_link,
     find_isolated_peaks,
 )
+from mrs3.refine import are_shift_neighbors
+
+
+CANONICAL = AlgorithmConfig.defaults().canonical_shifts_bp
 
 
 def _metric_point(pnl: float, efficiency: float) -> dict[str, float]:
@@ -74,8 +78,8 @@ def test_component_envelope_accepts_exactly_point_seven_five() -> None:
 def test_supported_point_cannot_bridge_two_core_components() -> None:
     points = pd.DataFrame(
         [
-            _point("A1", shift_bp=190, open_ma=2),
-            _point("A2", shift_bp=190, open_ma=3),
+            _point("A1", shift_bp=170, open_ma=2),
+            _point("A2", shift_bp=170, open_ma=3),
             _point("BORDER", shift_bp=230, open_ma=3, pnl=80, efficiency=8),
             _point("B1", shift_bp=270, open_ma=4),
             _point("B2", shift_bp=270, open_ma=5),
@@ -103,8 +107,8 @@ def test_singleton_without_core_link_is_not_ready_plateau() -> None:
 def test_plateau_ids_and_members_are_stable_under_input_shuffle() -> None:
     points = pd.DataFrame(
         [
-            _point("P1", shift_bp=190, open_ma=2, pnl=100, efficiency=10),
-            _point("P2", shift_bp=190, open_ma=3, pnl=95, efficiency=9.5),
+            _point("P1", shift_bp=170, open_ma=2, pnl=100, efficiency=10),
+            _point("P2", shift_bp=170, open_ma=3, pnl=95, efficiency=9.5),
             _point("P3", shift_bp=230, open_ma=3, pnl=80, efficiency=8),
         ]
     )
@@ -187,7 +191,7 @@ def test_plateau_library_does_not_treat_point_hashes_as_event_union() -> None:
 def test_isolated_peak_is_audited_but_not_used_as_plateau() -> None:
     points = pd.DataFrame(
         [
-            _point("BEST", shift_bp=190, open_ma=2, pnl=100, efficiency=10),
+            _point("BEST", shift_bp=170, open_ma=2, pnl=100, efficiency=10),
             _point("LOW", shift_bp=270, open_ma=6, pnl=40, efficiency=4),
         ]
     )
@@ -203,8 +207,8 @@ def test_isolated_peak_is_audited_but_not_used_as_plateau() -> None:
 def test_isolated_peak_threshold_uses_best_pair_tf_point_including_plateaus() -> None:
     points = pd.DataFrame(
         [
-            _point("CORE1", shift_bp=190, open_ma=2, pnl=100, efficiency=10),
-            _point("CORE2", shift_bp=190, open_ma=3, pnl=95, efficiency=9.5),
+            _point("CORE1", shift_bp=170, open_ma=2, pnl=100, efficiency=10),
+            _point("CORE2", shift_bp=170, open_ma=3, pnl=95, efficiency=9.5),
             _point("WEAK_SINGLE", shift_bp=270, open_ma=6, pnl=50, efficiency=5),
         ]
     )
@@ -213,3 +217,34 @@ def test_isolated_peak_threshold_uses_best_pair_tf_point_including_plateaus() ->
     isolated = find_isolated_peaks(annotated, AlgorithmConfig.defaults())
 
     assert isolated.empty
+
+
+def test_plateau_uses_same_canonical_shift_adjacency_as_refine() -> None:
+    points = pd.DataFrame(
+        [
+            _point("P70", shift_bp=70, open_ma=3),
+            _point("P90", shift_bp=90, open_ma=3),
+            _point("P110", shift_bp=110, open_ma=3),
+        ]
+    )
+
+    _, plateaus = build_plateaus(points, AlgorithmConfig.defaults())
+
+    assert len(plateaus) == 1
+    assert set(plateaus.iloc[0]["all_point_ids"]) == {"P70", "P90", "P110"}
+    assert are_shift_neighbors(70, 90, CANONICAL)
+    assert are_shift_neighbors(90, 110, CANONICAL)
+    assert not are_shift_neighbors(70, 110, CANONICAL)
+
+
+def test_plateau_does_not_link_non_adjacent_canonical_shifts() -> None:
+    points = pd.DataFrame(
+        [
+            _point("P70", shift_bp=70, open_ma=3),
+            _point("P110", shift_bp=110, open_ma=3),
+        ]
+    )
+
+    _, plateaus = build_plateaus(points, AlgorithmConfig.defaults())
+
+    assert plateaus.empty

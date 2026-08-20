@@ -1,5 +1,11 @@
 {
   "history_min_days": 7,
+  "direct_materialization": {
+    "workers": 15,
+    "fetch_batch_size": 256,
+    "worker_chunk_size": 16,
+    "max_in_flight_chunks": 30
+  },
   "base_rate_tf": {
     "5m": 2.27,
     "15m": 1.82,
@@ -14,7 +20,7 @@
     {"max_bp": 150, "value": 1.0},
     {"max_bp": 200, "value": 0.9},
     {"max_bp": 310, "value": 0.3},
-    {"max_bp": 470, "value": 0.2}
+    {"max_bp": 550, "value": 0.2}
   ],
   "absolute_floor_boundary_bp": 200,
   "absolute_floor_at_or_below": 10,
@@ -23,7 +29,7 @@
   "economic_min_win_rate_pct": 70,
   "economic_max_dd_pct": 11,
   "economic_min_efficiency": 3,
-  "shift_domain": {"min_bp": 30, "max_bp": 470},
+  "shift_domain": {"min_bp": 30, "max_bp": 550},
   "refine": {
     "fine_zone_max_exclusive_bp": 150,
     "boundary_zone_max_bp": 170,
@@ -41,7 +47,7 @@
     "isolated_peak_relative": 0.9,
     "equivalent_tolerance": 0.05
   },
-  "close_support": {"core_min": 0.9, "supported_min": 0.75},
+  "close_support": {"core_min": 0.9, "supported_min": 0.6},
   "gap": {
     "middle_zone_start_bp": 150,
     "lower_shift_lt_1_5_bp": 60,
@@ -113,5 +119,48 @@
       "LONG": "input/MRS_3_LONG.json",
       "SHORT": "input/MRS_3_SHORT.json"
     }
-  }
+  },
+  "canonical_shifts_bp": [
+    30,
+    40,
+    50,
+    60,
+    70,
+    90,
+    110,
+    140,
+    170,
+    200,
+    230,
+    270,
+    310,
+    350,
+    390,
+    430,
+    470,
+    510,
+    550
+  ],
+  "gap_rules": [
+    {
+      "lower_min_bp": 30,
+      "lower_max_exclusive_bp": 80,
+      "min_gap_bp": 80
+    },
+    {
+      "lower_min_bp": 80,
+      "lower_max_exclusive_bp": 200,
+      "min_gap_bp": 100
+    },
+    {
+      "lower_min_bp": 200,
+      "lower_max_exclusive_bp": 300,
+      "min_gap_bp": 130
+    },
+    {
+      "lower_min_bp": 300,
+      "lower_max_exclusive_bp": 551,
+      "min_gap_bp": 150
+    }
+  ]
 }

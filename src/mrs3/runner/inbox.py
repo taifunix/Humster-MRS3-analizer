@@ -111,6 +111,7 @@ def capture_verified_inbox(
     report_paths: Mapping[str, Path],
     *,
     tester_config_bytes: bytes | None = None,
+    provenance: Mapping[str, object] | None = None,
 ) -> Path:
     contract, contract_id, tester_config_hash = _commission_contract(config, tester_config_bytes)
     expected_names = tuple(plan.expected_names)
@@ -176,6 +177,27 @@ def capture_verified_inbox(
             "commission_contract_id": contract_id,
             "entries": entries,
         }
+        if provenance is not None:
+            if not isinstance(provenance, Mapping):
+                raise InboxCaptureError("provenance must be an object")
+            required = ("analysis_run_id", "generation_manifest_sha256", "strategy_json_sha256")
+            missing = [key for key in required if not provenance.get(key)]
+            if missing:
+                raise InboxCaptureError("provenance is incomplete: " + ", ".join(missing))
+            if not isinstance(provenance["analysis_run_id"], str) or not provenance["analysis_run_id"].strip():
+                raise InboxCaptureError("provenance is incomplete: analysis_run_id must be a string")
+            generation_hash = provenance["generation_manifest_sha256"]
+            if not isinstance(generation_hash, str) or len(generation_hash) != 64:
+                raise InboxCaptureError("provenance is incomplete: generation_manifest_sha256 must be a SHA-256 hash")
+            strategy_hashes = provenance["strategy_json_sha256"]
+            if not isinstance(strategy_hashes, Mapping):
+                raise InboxCaptureError("provenance is incomplete: strategy_json_sha256 must be an object")
+            expected_hash_names = {f"{name}.json" for name in expected_names}
+            if set(strategy_hashes) != expected_hash_names or any(
+                not isinstance(value, str) or len(value) != 64 for value in strategy_hashes.values()
+            ):
+                raise InboxCaptureError("provenance is incomplete: strategy_json_sha256 must cover the batch")
+            manifest["v6_provenance"] = json.loads(json.dumps(dict(provenance), sort_keys=True))
         _atomic_bytes(inbox / "inbox_manifest.json", _canonical_json(manifest))
         return inbox
     except BaseException:

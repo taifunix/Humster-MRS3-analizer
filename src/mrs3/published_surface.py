@@ -7,6 +7,7 @@ import math
 import duckdb
 import pandas as pd
 
+from .analysis_storage import require_canonical_operational_surface
 from .loader import LEGACY_EVENT_IDS_HASH
 from .pipeline import PipelineInput
 
@@ -54,6 +55,7 @@ def load_published_surface(
     ).fetchone()
     if period is None:
         raise ValueError("unknown published surface")
+    require_canonical_operational_surface(analysis_connection, surface_id)
     rows = analysis_connection.execute(
         """select canonical_point_key, point_event_count, metrics_json
              from surface_points where surface_id=? order by canonical_point_key""",

@@ -168,7 +168,7 @@ def test_four_orders_are_created_from_one_template_prototype() -> None:
 
 
 def test_generated_strategy_passes_hard_validation() -> None:
-    structure = _structure(Side.LONG, shifts=(90, 150, 230))
+    structure = _structure(Side.LONG, shifts=(70, 170, 310))
     generated = generate_strategy(
         _template(),
         structure,
@@ -198,6 +198,22 @@ def test_validation_rejects_structure_orders_not_sorted_by_shift() -> None:
     with pytest.raises(StrategyValidationError, match="sorted by shift"):
         validate_strategy(
             generated, corrupted, source_points, AlgorithmConfig.defaults()
+        )
+
+
+def test_validation_rejects_structure_with_too_small_gap() -> None:
+    structure = _structure(Side.LONG, shifts=(70, 140))
+    generated = generate_strategy(
+        _template(),
+        structure,
+        equal_lots(2, AlgorithmConfig.defaults()),
+        LotMethod.EQUAL,
+        AlgorithmConfig.defaults(),
+    )
+
+    with pytest.raises(StrategyValidationError, match="hard validation"):
+        validate_strategy(
+            generated, structure, _source_points(structure), AlgorithmConfig.defaults()
         )
 
 

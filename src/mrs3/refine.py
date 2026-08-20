@@ -1,108 +1,47 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import pandas as pd
 
 from .config import AlgorithmConfig
 
 
-@dataclass(frozen=True, slots=True)
-class ShiftDomain:
-    min_bp: int
-    max_bp: int
+def canonical_shift_neighbors(
+    center_bp: int,
+    canonical_shifts_bp: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Return the immediate left/right neighbors of center_bp in the canonical tuple.
 
-    def __post_init__(self) -> None:
-        if self.min_bp > self.max_bp:
-            raise ValueError("shift domain minimum exceeds maximum")
-
-
-def _fine_values(start: int, stop: int, step: int) -> tuple[int, ...]:
-    if start > stop:
-        return ()
-    first = ((start + step - 1) // step) * step
-    return tuple(range(first, stop + 1, step))
+    Adjacency is defined only by neighboring elements of the canonical shift
+    tuple; numeric distance or tested sparse values never infer neighbors.
+    Non-canonical centers are rejected deterministically.
+    """
+    canonical = tuple(int(value) for value in canonical_shifts_bp)
+    try:
+        index = canonical.index(center_bp)
+    except ValueError as error:
+        raise ValueError(f"center shift {center_bp} is not a canonical shift") from error
+    left = canonical[index - 1] if index > 0 else None
+    right = canonical[index + 1] if index + 1 < len(canonical) else None
+    return tuple(value for value in (left, right) if value is not None)
 
 
 def required_shift_neighbors(
     center_bp: int,
-    tested_bp: tuple[int, ...],
-    domain: ShiftDomain,
-    *,
-    fine_zone_max_exclusive_bp: int = 150,
-    boundary_zone_max_bp: int = 170,
-    fine_step_bp: int = 10,
-    fine_radius_bp: int = 30,
-    boundary_down_radius_bp: int = 30,
-    boundary_up_radius_bp: int = 50,
-    coarse_radius_bp: int = 50,
+    canonical_shifts_bp: tuple[int, ...],
 ) -> tuple[int, ...]:
-    if not domain.min_bp <= center_bp <= domain.max_bp:
-        raise ValueError(f"center shift {center_bp} is outside declared domain")
-    tested = tuple(sorted(set(int(value) for value in tested_bp)))
-
-    if center_bp < fine_zone_max_exclusive_bp:
-        start = max(domain.min_bp, center_bp - fine_radius_bp)
-        stop = min(domain.max_bp, center_bp + fine_radius_bp)
-        return _fine_values(start, stop, fine_step_bp)
-
-    if center_bp <= boundary_zone_max_bp:
-        lower = _fine_values(
-            max(domain.min_bp, center_bp - boundary_down_radius_bp),
-            center_bp - fine_step_bp,
-            fine_step_bp,
-        )
-        upper = tuple(
-            value
-            for value in tested
-            if center_bp < value <= min(domain.max_bp, center_bp + boundary_up_radius_bp)
-        )
-        if not upper and center_bp < domain.max_bp:
-            upper = (min(domain.max_bp, center_bp + boundary_up_radius_bp),)
-        return tuple(sorted(set((*lower, center_bp, *upper))))
-
-    actual = {
-        value
-        for value in tested
-        if abs(value - center_bp) <= coarse_radius_bp
-    }
-    actual.add(center_bp)
-    if center_bp > domain.min_bp and not any(value < center_bp for value in actual):
-        actual.add(max(domain.min_bp, center_bp - coarse_radius_bp))
-    if center_bp < domain.max_bp and not any(value > center_bp for value in actual):
-        actual.add(min(domain.max_bp, center_bp + coarse_radius_bp))
-    return tuple(sorted(actual))
-
-
-def _required_for_config(
-    center_bp: int,
-    tested_bp: tuple[int, ...],
-    config: AlgorithmConfig,
-) -> tuple[int, ...]:
-    return required_shift_neighbors(
-        center_bp,
-        tested_bp,
-        ShiftDomain(config.shift_domain_min_bp, config.shift_domain_max_bp),
-        fine_zone_max_exclusive_bp=config.fine_zone_max_exclusive_bp,
-        boundary_zone_max_bp=config.boundary_zone_max_bp,
-        fine_step_bp=config.fine_step_bp,
-        fine_radius_bp=config.fine_radius_bp,
-        boundary_down_radius_bp=config.boundary_down_radius_bp,
-        boundary_up_radius_bp=config.boundary_up_radius_bp,
-        coarse_radius_bp=config.coarse_radius_bp,
-    )
+    """Current shift plus its immediate canonical left/right neighbors."""
+    return (center_bp, *canonical_shift_neighbors(center_bp, canonical_shifts_bp))
 
 
 def are_shift_neighbors(
     left_bp: int,
     right_bp: int,
-    tested_bp: tuple[int, ...],
-    domain: ShiftDomain,
-    **rules: int,
+    canonical_shifts_bp: tuple[int, ...],
 ) -> bool:
-    left_required = required_shift_neighbors(left_bp, tested_bp, domain, **rules)
-    right_required = required_shift_neighbors(right_bp, tested_bp, domain, **rules)
-    return right_bp in left_required and left_bp in right_required
+    return (
+        right_bp in canonical_shift_neighbors(left_bp, canonical_shifts_bp)
+        and left_bp in canonical_shift_neighbors(right_bp, canonical_shifts_bp)
+    )
 
 
 def _ma_neighbors(center: int, minimum: int, maximum: int, radius: int) -> tuple[int, ...]:
@@ -133,7 +72,6 @@ def annotate_refine(
 
     for keys, group in out.groupby(group_columns, sort=True):
         symbol, side, timeframe = (str(value) for value in keys)
-        tested_shifts = tuple(sorted(int(value) for value in group["shift_bp"].unique()))
         open_min, open_max = int(group["open_ma"].min()), int(group["open_ma"].max())
         close_min, close_max = int(group["close_ma"].min()), int(group["close_ma"].max())
         existing = {
@@ -142,7 +80,9 @@ def annotate_refine(
         }
 
         for row in group.sort_values("point_id", kind="mergesort").itertuples(index=False):
-            required_shifts = _required_for_config(int(row.shift_bp), tested_shifts, config)
+            required_shifts = required_shift_neighbors(
+                int(row.shift_bp), config.canonical_shifts_bp
+            )
             required_open = _ma_neighbors(
                 int(row.open_ma), open_min, open_max, config.ma_neighbor_radius
             )

@@ -33,7 +33,7 @@ from .strategy_json import (
 )
 
 
-ALGORITHM_VERSION = "0.7-representative-v2"
+ALGORITHM_VERSION = "0.7-canonical-phase1"
 
 
 @dataclass(frozen=True, slots=True)

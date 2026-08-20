@@ -546,6 +546,26 @@ def test_failed_reconciliation_preserves_reports_and_logs(tmp_path: Path) -> Non
     assert state["state"] == "COMPLETED"
 
 
+def test_completed_state_persists_verified_inbox_path(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    source = tmp_path / "generated"
+    _strategy(source, "A")
+    client = BatchClient(config)
+    dependencies = WorkflowDependencies(
+        stop=lambda config: object(),
+        start=lambda config: object(),
+        client_factory=lambda config: client,
+    )
+    output = tmp_path / "out" / "results.csv"
+
+    result = run_batch(config, source, output, dependencies=dependencies)
+
+    assert result.inbox_path is not None
+    state = json.loads((output.parent / "results.state.json").read_text(encoding="utf-8"))
+    assert state["state"] == "COMPLETED"
+    assert state["inbox_path"] == str(result.inbox_path)
+
+
 def test_startup_timeout_restarts_then_stops_bot(tmp_path: Path) -> None:
     config = replace(_config(tmp_path), max_bot_restarts=1)
     source = tmp_path / "generated"

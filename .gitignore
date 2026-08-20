@@ -12,6 +12,9 @@ htmlcov/
 config.local.json
 data/
 output/
+[Dd]ata/
+[Ii]nput/
+[Oo]utput/
 results/
 audit_csv/
 strategies/
@@ -28,3 +31,11 @@ strategies/
 # Agent workspaces
 .superpowers/
 .worktrees/
+
+# Local generated evidence and temporary probes
+.codex/
+external-coder/
+.stage1-pytest-*/
+.task*
+tmp-strict*/
+posttest_*/

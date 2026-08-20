@@ -56,6 +56,8 @@ def generate_strategy(
     lots: Sequence[Decimal],
     method: LotMethod,
     config: AlgorithmConfig,
+    *,
+    provenance: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     generated = deepcopy(dict(template))
     side = Side(str(structure["side"]))
@@ -91,6 +93,8 @@ def generate_strategy(
         if side is Side.LONG
         else config.close_multiplier_short
     )
+    if provenance is not None:
+        generated["provenance"] = deepcopy(dict(provenance))
     json.dumps(generated, ensure_ascii=False, allow_nan=False)
     return generated
 

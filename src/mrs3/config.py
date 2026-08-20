@@ -25,6 +25,20 @@ DEFAULT_BASE_COLUMNS = {
     "run_id": "Run id",
 }
 
+DEFAULT_CANONICAL_SHIFTS_BP = (
+    30, 40, 50, 60, 70,
+    90, 110, 140, 170, 200,
+    230, 270, 310, 350, 390,
+    430, 470, 510, 550,
+)
+
+DEFAULT_GAP_RULES = (
+    (30, 80, 80),
+    (80, 200, 100),
+    (200, 300, 130),
+    (300, 551, 150),
+)
+
 DEFAULT_SIDE_COLUMNS = {
     Side.LONG: {
         "open_ma": "settings[*].mrs2.ma_long.len",
@@ -47,11 +61,13 @@ class DuckDBImportSettings:
     audit_root: Path | None = None
     workers: int = 4
     transaction_batch_size: int = 250
+    source_v6_surface_dir: Path | None = None
 
     def __post_init__(self) -> None:
         for name in (
             "source_duckdb_path",
             "analysis_duckdb_path",
+            "source_v6_surface_dir",
             "default_html_root",
             "audit_root",
         ):
@@ -91,6 +107,7 @@ def load_duckdb_import_settings(path: Path) -> DuckDBImportSettings:
     return DuckDBImportSettings(
         source_duckdb_path=_optional_path_from_json(section.get("source_duckdb_path"), "source_duckdb_path"),
         analysis_duckdb_path=_optional_path_from_json(section.get("analysis_duckdb_path"), "analysis_duckdb_path"),
+        source_v6_surface_dir=_optional_path_from_json(section.get("source_v6_surface_dir"), "source_v6_surface_dir"),
         default_html_root=_optional_path_from_json(section.get("default_html_root"), "default_html_root"),
         audit_root=_optional_path_from_json(section.get("audit_root"), "audit_root"),
         workers=section.get("workers", 4),
@@ -107,6 +124,7 @@ def save_duckdb_import_settings(path: Path, settings: DuckDBImportSettings) -> N
     for name in (
         "source_duckdb_path",
         "analysis_duckdb_path",
+        "source_v6_surface_dir",
         "default_html_root",
         "audit_root",
     ):
@@ -115,7 +133,10 @@ def save_duckdb_import_settings(path: Path, settings: DuckDBImportSettings) -> N
     section["workers"] = settings.workers
     section["transaction_batch_size"] = settings.transaction_batch_size
     raw["duckdb_import"] = section
+    _save_config_object(path, raw)
 
+
+def _save_config_object(path: Path, raw: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=path.parent, delete=False
@@ -127,6 +148,62 @@ def save_duckdb_import_settings(path: Path, settings: DuckDBImportSettings) -> N
         os.replace(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectMaterializationSettings:
+    workers: int = 15
+    fetch_batch_size: int = 256
+    worker_chunk_size: int = 16
+    max_in_flight_chunks: int = 30
+
+    def __post_init__(self) -> None:
+        for name in (
+            "workers",
+            "fetch_batch_size",
+            "worker_chunk_size",
+            "max_in_flight_chunks",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"direct_materialization.{name} must be a positive integer"
+                )
+        if self.max_in_flight_chunks < self.workers:
+            raise ValueError(
+                "direct_materialization.max_in_flight_chunks must be at least workers"
+            )
+
+
+def load_direct_materialization_settings(path: Path) -> DirectMaterializationSettings:
+    raw = _local_config_object(path)
+    section = raw.get("direct_materialization")
+    if section is None:
+        return DirectMaterializationSettings()
+    if not isinstance(section, dict):
+        raise ValueError("direct_materialization must be an object")
+    return DirectMaterializationSettings(
+        workers=section.get("workers", 15),
+        fetch_batch_size=section.get("fetch_batch_size", 256),
+        worker_chunk_size=section.get("worker_chunk_size", 16),
+        max_in_flight_chunks=section.get("max_in_flight_chunks", 30),
+    )
+
+
+def save_direct_materialization_settings(
+    path: Path, settings: DirectMaterializationSettings
+) -> None:
+    raw = _local_config_object(path)
+    existing = raw.get("direct_materialization")
+    if existing is not None and not isinstance(existing, dict):
+        raise ValueError("direct_materialization must be an object")
+    section = dict(existing or {})
+    section["workers"] = settings.workers
+    section["fetch_batch_size"] = settings.fetch_batch_size
+    section["worker_chunk_size"] = settings.worker_chunk_size
+    section["max_in_flight_chunks"] = settings.max_in_flight_chunks
+    raw["direct_materialization"] = section
+    _save_config_object(path, raw)
 
 
 def _base_rates_from_json(value: object) -> dict[str, Decimal]:
@@ -171,11 +248,12 @@ class AlgorithmConfig:
             "4h": Decimal("0.91"),
         }
     )
+    canonical_shifts_bp: tuple[int, ...] = DEFAULT_CANONICAL_SHIFTS_BP
     shift_factors: tuple[tuple[int, Decimal], ...] = (
         (150, Decimal("1.00")),
         (200, Decimal("0.90")),
         (310, Decimal("0.30")),
-        (470, Decimal("0.20")),
+        (550, Decimal("0.20")),
     )
     absolute_floor_boundary_bp: int = 200
     absolute_floor_at_or_below: int = 10
@@ -185,7 +263,7 @@ class AlgorithmConfig:
     economic_max_dd_pct: Decimal = Decimal("11")
     economic_min_efficiency: Decimal = Decimal("3")
     shift_domain_min_bp: int = 30
-    shift_domain_max_bp: int = 470
+    shift_domain_max_bp: int = 550
     fine_zone_max_exclusive_bp: int = 150
     boundary_zone_max_bp: int = 170
     fine_step_bp: int = 10
@@ -200,11 +278,12 @@ class AlgorithmConfig:
     isolated_peak_relative: Decimal = Decimal("0.90")
     equivalent_tolerance: Decimal = Decimal("0.05")
     close_core_min: Decimal = Decimal("0.90")
-    close_supported_min: Decimal = Decimal("0.75")
+    close_supported_min: Decimal = Decimal("0.60")
     gap_mid_start_bp: int = 150
     gap_lower_lt_150_bp: int = 60
     gap_lower_150_to_400_bp: int = 80
     deep_gap_boundary_bp: int = 400
+    gap_rules: tuple[tuple[int, int, int], ...] = DEFAULT_GAP_RULES
     max_orders: int = 4
     lot_rounding_decimals: int = 12
     numeric_tolerance: Decimal = Decimal("0.000000001")
@@ -237,6 +316,30 @@ class AlgorithmConfig:
 
         if self.shift_domain_min_bp < 0 or self.shift_domain_min_bp > self.shift_domain_max_bp:
             raise ValueError("shift domain must be non-negative and ordered")
+        try:
+            canonical_shifts_bp = tuple(self.canonical_shifts_bp)
+        except TypeError as error:
+            raise ValueError("canonical shifts must be an integer sequence") from error
+        object.__setattr__(self, "canonical_shifts_bp", canonical_shifts_bp)
+        if (
+            not canonical_shifts_bp
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in canonical_shifts_bp
+            )
+            or any(
+                left >= right
+                for left, right in zip(
+                    canonical_shifts_bp, canonical_shifts_bp[1:]
+                )
+            )
+            or canonical_shifts_bp[0] != self.shift_domain_min_bp
+            or canonical_shifts_bp[-1] != self.shift_domain_max_bp
+        ):
+            raise ValueError(
+                "canonical shifts must be a non-empty strictly increasing "
+                "integer tuple spanning the shift domain"
+            )
         if not self.shift_factors:
             raise ValueError("shift factors cannot be empty")
         boundaries = [maximum for maximum, _ in self.shift_factors]
@@ -301,6 +404,47 @@ class AlgorithmConfig:
             raise ValueError("gap thresholds must be positive")
         if not 0 < self.gap_mid_start_bp <= self.deep_gap_boundary_bp:
             raise ValueError("gap boundaries must be positive and ordered")
+        try:
+            gap_rules = tuple(
+                (
+                    rule["lower_min_bp"],
+                    rule["lower_max_exclusive_bp"],
+                    rule["min_gap_bp"],
+                )
+                if isinstance(rule, dict)
+                else tuple(rule)
+                for rule in self.gap_rules
+            )
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                "gap rules must define lower_min_bp, lower_max_exclusive_bp and min_gap_bp"
+            ) from error
+        object.__setattr__(self, "gap_rules", gap_rules)
+        if not gap_rules:
+            raise ValueError("gap rules must be non-empty")
+        expected_min = self.shift_domain_min_bp
+        for rule in gap_rules:
+            if len(rule) != 3:
+                raise ValueError("gap rules must contain exactly three values")
+            lower_min_bp, lower_max_exclusive_bp, min_gap_bp = rule
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in (lower_min_bp, lower_max_exclusive_bp, min_gap_bp)
+            ) or not (
+                0 <= lower_min_bp < lower_max_exclusive_bp
+                and min_gap_bp > 0
+                and lower_min_bp == expected_min
+            ):
+                raise ValueError(
+                    "gap rules must be ordered, non-overlapping, cover the shift "
+                    "domain and have positive minimum gaps"
+                )
+            expected_min = lower_max_exclusive_bp
+        if expected_min != self.shift_domain_max_bp + 1:
+            raise ValueError(
+                "gap rules must be ordered, non-overlapping, cover the shift "
+                "domain and have positive minimum gaps"
+            )
         if not 2 <= self.max_orders <= 4:
             raise ValueError("max_orders must be between 2 and 4")
         if self.lot_rounding_decimals < 0:
@@ -346,7 +490,7 @@ class AlgorithmConfig:
                         {"max_bp": 150, "value": 1.0},
                         {"max_bp": 200, "value": 0.9},
                         {"max_bp": 310, "value": 0.3},
-                        {"max_bp": 470, "value": 0.2},
+                        {"max_bp": 550, "value": 0.2},
                     ],
                 )
             ),
@@ -364,7 +508,7 @@ class AlgorithmConfig:
                 str(raw.get("economic_min_efficiency", 3))
             ),
             shift_domain_min_bp=int(raw.get("shift_domain", {}).get("min_bp", 30)),
-            shift_domain_max_bp=int(raw.get("shift_domain", {}).get("max_bp", 470)),
+            shift_domain_max_bp=int(raw.get("shift_domain", {}).get("max_bp", 550)),
             fine_zone_max_exclusive_bp=int(
                 raw.get("refine", {}).get("fine_zone_max_exclusive_bp", 150)
             ),
@@ -398,7 +542,7 @@ class AlgorithmConfig:
                 str(raw.get("close_support", {}).get("core_min", 0.90))
             ),
             close_supported_min=Decimal(
-                str(raw.get("close_support", {}).get("supported_min", 0.75))
+                str(raw.get("close_support", {}).get("supported_min", 0.60))
             ),
             gap_mid_start_bp=int(
                 raw.get("gap", {}).get("middle_zone_start_bp", 150)
@@ -412,6 +556,10 @@ class AlgorithmConfig:
             deep_gap_boundary_bp=int(
                 raw.get("gap", {}).get("deep_gap_boundary_bp", 400)
             ),
+            canonical_shifts_bp=tuple(
+                raw.get("canonical_shifts_bp", DEFAULT_CANONICAL_SHIFTS_BP)
+            ),
+            gap_rules=tuple(raw.get("gap_rules", DEFAULT_GAP_RULES)),
             max_orders=int(raw.get("max_orders", 4)),
             lot_rounding_decimals=int(raw.get("lot_rounding_decimals", 12)),
             numeric_tolerance=Decimal(str(raw.get("numeric_tolerance", 0.000000001))),

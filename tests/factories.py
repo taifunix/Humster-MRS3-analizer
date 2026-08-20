@@ -83,7 +83,14 @@ def write_selection_inputs(root: Path) -> dict[str, Path]:
     )
     config_path.write_text(
         json.dumps(
-            {"shift_domain": {"min_bp": 190, "max_bp": 270}},
+            {
+                "shift_domain": {"min_bp": 190, "max_bp": 270},
+                "canonical_shifts_bp": [190, 230, 270],
+                "gap_rules": [
+                    {"lower_min_bp": 190, "lower_max_exclusive_bp": 230, "min_gap_bp": 30},
+                    {"lower_min_bp": 230, "lower_max_exclusive_bp": 271, "min_gap_bp": 40},
+                ],
+            },
             ensure_ascii=False,
             indent=2,
         ),

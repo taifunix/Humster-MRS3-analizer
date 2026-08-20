@@ -682,6 +682,8 @@ def _write_state(
     plan: BatchPlan,
     output_csv: Path,
     error: str | None = None,
+    inbox_path: Path | None = None,
+    provenance: Mapping[str, object] | None = None,
 ) -> None:
     document = {
         "state": state,
@@ -693,6 +695,10 @@ def _write_state(
         "output_csv": str(output_csv),
         "error": error,
     }
+    if inbox_path is not None:
+        document["inbox_path"] = str(inbox_path)
+    if provenance is not None:
+        document["v6_provenance"] = dict(provenance)
     _write_json_atomic(path, document)
 
 
@@ -747,6 +753,7 @@ def run_batch(
     output_csv: Path,
     *,
     dependencies: WorkflowDependencies | None = None,
+    provenance: Mapping[str, object] | None = None,
 ) -> BatchRunResult:
     dependencies = dependencies or WorkflowDependencies()
     output = output_csv.resolve()
@@ -762,9 +769,9 @@ def run_batch(
     progress_file = _progress_path(output)
     events: list[str] = []
 
-    def advance(state: str) -> None:
+    def advance(state: str, *, inbox_path: Path | None = None) -> None:
         events.append(state)
-        _write_state(state_file, state, events, plan, output)
+        _write_state(state_file, state, events, plan, output, inbox_path=inbox_path, provenance=provenance)
 
     def report_progress(snapshot: dict[str, object]) -> None:
         _write_json_atomic(
@@ -859,9 +866,10 @@ def run_batch(
             inbox_path = capture_verified_inbox(
                 config, output, plan, saved_resume_results, verified_report_paths,
                 tester_config_bytes=tester_config_snapshot,
+                provenance=provenance,
             )
             advance("INBOX_CAPTURED")
-            advance("COMPLETED")
+            advance("COMPLETED", inbox_path=inbox_path)
             return BatchRunResult(
                 output_csv=output,
                 state_file=state_file,
@@ -1133,12 +1141,13 @@ def run_batch(
         inbox_path = capture_verified_inbox(
             config, output, plan, tuple(saved_resume_results), verified_report_paths,
             tester_config_bytes=tester_config_snapshot,
+            provenance=provenance,
         )
         advance("INBOX_CAPTURED")
         cleanup_completed_batch(config)
         shutil.rmtree(report_snapshot_dir, ignore_errors=True)
         advance("RAW_ARTIFACTS_REMOVED")
-        advance("COMPLETED")
+        advance("COMPLETED", inbox_path=inbox_path)
         if completion is None:
             raise RuntimeError("batch completion was not recorded")
         return BatchRunResult(

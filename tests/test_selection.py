@@ -8,12 +8,21 @@ import pytest
 
 from mrs3.config import AlgorithmConfig
 from mrs3.selection import (
+    OPERATIONAL_FACTS_VERSION,
     build_close_profiles,
     build_structures,
+    choose_cma_representative,
     choose_equivalent_default,
+    choose_primary_representative,
     close_status,
+    compute_close_support,
     equivalent,
+    has_frozen_operational_facts,
+    recompute_continuity,
+    required_gap_bp,
+    require_complete_operational_facts,
     select_base_one_order,
+    validate_frozen_operational_facts,
     validate_order_tuple,
 )
 
@@ -65,6 +74,57 @@ def _plateau(plateau_id: str, point_ids: tuple[str, ...]) -> dict[str, object]:
     }
 
 
+def _profile_row(
+    plateau_id: str,
+    point_id: str,
+    *,
+    close_ma: int = 4,
+    support: float = 1.0,
+    status: str = "PRIMARY_CLOSE",
+    continuity_status: str = "USABLE",
+    usable: bool = True,
+) -> dict[str, object]:
+    return {
+        "plateau_id": plateau_id,
+        "symbol": "AAAUSDT",
+        "side": "LONG",
+        "timeframe": "2h",
+        "close_ma": close_ma,
+        "support": support,
+        "status": status,
+        "point_id": point_id,
+        "continuity_status": continuity_status,
+        "usable": usable,
+    }
+
+
+def _event_point(
+    point_id: str,
+    *,
+    close_ma: int,
+    shift_bp: int,
+    pnl: float,
+    efficiency: float,
+    events: int,
+    event_eligible: bool = True,
+    open_ma: int = 3,
+    trades: int = 20,
+) -> dict[str, object]:
+    row = _point(
+        point_id,
+        "P1",
+        shift_bp=shift_bp,
+        open_ma=open_ma,
+        close_ma=close_ma,
+        pnl=pnl,
+        efficiency=efficiency,
+        trades=trades,
+    )
+    row["point_event_count"] = events
+    row["event_eligible"] = event_eligible
+    return row
+
+
 def test_equivalence_includes_exact_five_percent() -> None:
     left = {"pnl_pct": 95, "efficiency": 9.5}
     right = {"pnl_pct": 100, "efficiency": 10}
@@ -106,19 +166,19 @@ def test_real_event_representative_rejects_missing_point_event_count() -> None:
     ("support", "status"),
     [
         (Decimal("0.90"), "CORE_CLOSE"),
-        (Decimal("0.75"), "SUPPORTED_CLOSE"),
-        (Decimal("0.7499"), "UNSUPPORTED_CLOSE"),
+        (Decimal("0.60"), "SUPPORTED_CLOSE"),
+        (Decimal("0.5999"), "UNSUPPORTED_CLOSE"),
     ],
 )
 def test_close_support_boundaries(support: Decimal, status: str) -> None:
     assert close_status(support, AlgorithmConfig.defaults()) == status
 
 
-def test_close_expansion_stops_after_failed_period() -> None:
+def test_close_profile_has_one_representative_per_present_close_ma() -> None:
     rows = [
         _point("C4", "P1", shift_bp=230, close_ma=4, pnl=100, efficiency=10),
         _point("C5", "P1", shift_bp=230, close_ma=5, pnl=80, efficiency=8),
-        _point("C6", "P1", shift_bp=230, close_ma=6, pnl=70, efficiency=7),
+        _point("C6", "P1", shift_bp=230, close_ma=6, pnl=55, efficiency=5.5),
         _point("C7", "P1", shift_bp=230, close_ma=7, pnl=95, efficiency=9.5),
     ]
     points = pd.DataFrame(rows)
@@ -126,15 +186,16 @@ def test_close_expansion_stops_after_failed_period() -> None:
 
     _, profile = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
 
-    assert list(profile["close_ma"]) == [4, 5, 6]
+    assert list(profile["close_ma"]) == [4, 5, 6, 7]
     assert list(profile["status"]) == [
         "PRIMARY_CLOSE",
         "SUPPORTED_CLOSE",
         "UNSUPPORTED_CLOSE",
+        "CORE_CLOSE",
     ]
 
 
-def test_close_missing_required_cell_is_refine_diagnostic() -> None:
+def test_close_ma_missing_from_plateau_has_no_representative() -> None:
     rows = [
         _point("C4", "P1", shift_bp=230, close_ma=4),
         _point("C6", "P1", shift_bp=230, close_ma=6),
@@ -144,11 +205,12 @@ def test_close_missing_required_cell_is_refine_diagnostic() -> None:
 
     updated, profile = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
 
-    assert profile.query("close_ma == 5").iloc[0]["status"] == "REFINE_REQUIRED_CLOSE"
-    assert updated.iloc[0]["close_refine_required"]
+    assert profile.query("close_ma == 5").empty
+    assert list(profile["close_ma"]) == [4, 6]
+    assert not updated.iloc[0]["close_refine_required"]
 
 
-def test_close_existing_outside_plateau_is_unsupported_not_refine() -> None:
+def test_outside_plateau_close_ma_point_is_not_this_plateau_representative() -> None:
     points = pd.DataFrame(
         [
             _point("C4", "P1", shift_bp=230, close_ma=4),
@@ -161,13 +223,12 @@ def test_close_existing_outside_plateau_is_unsupported_not_refine() -> None:
         points, plateaus, AlgorithmConfig.defaults()
     )
 
-    neighbor = profile.query("close_ma == 5").iloc[0]
-    assert neighbor["status"] == "UNSUPPORTED_CLOSE"
-    assert not neighbor["refine_required"]
+    assert profile.query("close_ma == 5").empty
+    assert list(profile["close_ma"]) == [4]
     assert not updated.iloc[0]["close_refine_required"]
 
 
-def test_close_alternative_uses_configured_open_ma_radius() -> None:
+def test_close_representative_ignores_open_ma_and_shift_distance() -> None:
     points = pd.DataFrame(
         [
             _point("C4", "P1", shift_bp=230, open_ma=3, close_ma=4),
@@ -175,7 +236,7 @@ def test_close_alternative_uses_configured_open_ma_radius() -> None:
                 "C5",
                 "P1",
                 shift_bp=230,
-                open_ma=5,
+                open_ma=9,
                 close_ma=5,
                 pnl=80,
                 efficiency=8,
@@ -183,16 +244,15 @@ def test_close_alternative_uses_configured_open_ma_radius() -> None:
         ]
     )
     plateaus = pd.DataFrame([_plateau("P1", ("C4", "C5"))])
-    config = replace(AlgorithmConfig.defaults(), ma_neighbor_radius=2)
 
-    _, profile = build_close_profiles(points, plateaus, config)
+    _, profile = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
 
     alternative = profile.loc[profile["close_ma"].eq(5)].iloc[0]
     assert alternative["status"] == "SUPPORTED_CLOSE"
     assert alternative["point_id"] == "C5"
 
 
-def test_close_alternative_rejects_event_ineligible_equivalent_group() -> None:
+def test_event_ineligible_close_ma_has_no_representative_row() -> None:
     points = pd.DataFrame([
         {**_point("C4", "P1", shift_bp=230, close_ma=4), "event_eligible": True},
         {**_point("C5", "P1", shift_bp=230, close_ma=5, pnl=100, efficiency=10), "event_eligible": False},
@@ -201,7 +261,8 @@ def test_close_alternative_rejects_event_ineligible_equivalent_group() -> None:
 
     _, profile = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
 
-    assert profile.query("close_ma == 5").iloc[0]["status"] == "UNSUPPORTED_CLOSE"
+    assert list(profile["close_ma"]) == [4]
+    assert profile.query("close_ma == 5").empty
 
 
 def test_base_one_order_uses_dd5_after_plateau_local_equivalence() -> None:
@@ -216,7 +277,8 @@ def test_base_one_order_uses_dd5_after_plateau_local_equivalence() -> None:
         [_plateau("P1", ("P1_LOW", "P1_HIGH")), _plateau("P2", ("P2",))]
     )
 
-    selected = select_base_one_order(points, plateaus, AlgorithmConfig.defaults())
+    updated, _ = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+    selected = select_base_one_order(points, updated, AlgorithmConfig.defaults())
 
     assert selected.iloc[0]["point_id"] == "P2"
     assert selected.iloc[0]["selection_type"] == "BASE_1ORD"
@@ -229,7 +291,8 @@ def test_base_one_order_fallback_uses_configured_target_drawdown() -> None:
     plateaus = pd.DataFrame([_plateau("P1", ("P1",))])
     config = replace(AlgorithmConfig.defaults(), target_dd_pct=Decimal("7"))
 
-    selected = select_base_one_order(points, plateaus, config)
+    updated, _ = build_close_profiles(points, plateaus, config)
+    selected = select_base_one_order(points, updated, config)
 
     assert selected.iloc[0]["pnl_dd5_theoretical"] == pytest.approx(70.0)
 
@@ -238,10 +301,10 @@ def _structure_fixture(
     *, second_standalone: bool = True, first_standalone: bool = True
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     specs = [
-        ("P1", "A", 110, first_standalone),
+        ("P1", "A", 70, first_standalone),
         ("P2", "B", 170, second_standalone),
-        ("P3", "C", 250, True),
-        ("P4", "D", 330, True),
+        ("P3", "C", 310, True),
+        ("P4", "D", 470, True),
     ]
     points = pd.DataFrame(
         [
@@ -254,16 +317,7 @@ def _structure_fixture(
     )
     profiles = pd.DataFrame(
         [
-            {
-                "plateau_id": plateau_id,
-                "symbol": "AAAUSDT",
-                "side": "LONG",
-                "timeframe": "2h",
-                "close_ma": 4,
-                "support": 1.0,
-                "status": "PRIMARY_CLOSE",
-                "point_id": point_id,
-            }
+            _profile_row(plateau_id, point_id)
             for plateau_id, point_id, _, _ in specs
         ]
     )
@@ -280,7 +334,7 @@ def test_structures_use_one_representative_per_plateau_and_close_ma() -> None:
         [
             {**_point("P1_MORE_EVENTS", "P1", shift_bp=110), "point_event_count": 6, "event_eligible": True},
             {**_point("P1_MORE_SHIFT", "P1", shift_bp=120, pnl=98, efficiency=9.8), "point_event_count": 4, "event_eligible": True},
-            {**_point("P2_ONLY", "P2", shift_bp=180), "point_event_count": 5, "event_eligible": True},
+            {**_point("P2_ONLY", "P2", shift_bp=230), "point_event_count": 5, "event_eligible": True},
         ]
     )
     plateaus = pd.DataFrame(
@@ -288,7 +342,7 @@ def test_structures_use_one_representative_per_plateau_and_close_ma() -> None:
     )
     profiles = pd.DataFrame(
         [
-            {"plateau_id": plateau_id, "symbol": "AAAUSDT", "side": "LONG", "timeframe": "2h", "close_ma": 4, "support": 1.0, "status": "PRIMARY_CLOSE", "point_id": point_id}
+            _profile_row(plateau_id, point_id)
             for plateau_id, point_id in (("P1", "P1_MORE_EVENTS"), ("P2", "P2_ONLY"))
         ]
     )
@@ -310,8 +364,8 @@ def test_structures_choose_one_representative_for_each_close_ma() -> None:
             {**_point("P1_C4_MORE_EVENTS", "P1", shift_bp=110, close_ma=4), "point_event_count": 6, "event_eligible": True},
             {**_point("P1_C4_MORE_SHIFT", "P1", shift_bp=120, close_ma=4, pnl=98, efficiency=9.8), "point_event_count": 4, "event_eligible": True},
             {**_point("P1_C5_ONLY", "P1", shift_bp=110, close_ma=5), "point_event_count": 5, "event_eligible": True},
-            {**_point("P2_C4_ONLY", "P2", shift_bp=180, close_ma=4), "point_event_count": 5, "event_eligible": True},
-            {**_point("P2_C5_ONLY", "P2", shift_bp=180, close_ma=5), "point_event_count": 5, "event_eligible": True},
+            {**_point("P2_C4_ONLY", "P2", shift_bp=230, close_ma=4), "point_event_count": 5, "event_eligible": True},
+            {**_point("P2_C5_ONLY", "P2", shift_bp=230, close_ma=5), "point_event_count": 5, "event_eligible": True},
         ]
     )
     plateaus = pd.DataFrame([
@@ -319,7 +373,7 @@ def test_structures_choose_one_representative_for_each_close_ma() -> None:
         _plateau("P2", tuple(points.loc[points["plateau_id"].eq("P2"), "point_id"])),
     ])
     profiles = pd.DataFrame([
-        {"plateau_id": plateau_id, "symbol": "AAAUSDT", "side": "LONG", "timeframe": "2h", "close_ma": close_ma, "support": 1.0, "status": "SUPPORTED_CLOSE", "point_id": point_id}
+        _profile_row(plateau_id, point_id, close_ma=close_ma, status="SUPPORTED_CLOSE")
         for plateau_id, close_ma, point_id in (
             ("P1", 4, "P1_C4_MORE_EVENTS"), ("P1", 5, "P1_C5_ONLY"),
             ("P2", 4, "P2_C4_ONLY"), ("P2", 5, "P2_C5_ONLY"),
@@ -343,15 +397,15 @@ def test_structures_use_the_representative_frozen_in_close_profiles() -> None:
     points = pd.DataFrame([
         {**_point("P1_PROFILE", "P1", shift_bp=110), "point_event_count": 4, "event_eligible": True},
         {**_point("P1_OTHER", "P1", shift_bp=120), "point_event_count": 9, "event_eligible": True},
-        {**_point("P2_PROFILE", "P2", shift_bp=180), "point_event_count": 5, "event_eligible": True},
+        {**_point("P2_PROFILE", "P2", shift_bp=230), "point_event_count": 5, "event_eligible": True},
     ])
     plateaus = pd.DataFrame([
         _plateau("P1", ("P1_PROFILE", "P1_OTHER")),
         _plateau("P2", ("P2_PROFILE",)),
     ])
     profiles = pd.DataFrame([
-        {"plateau_id": "P1", "symbol": "AAAUSDT", "side": "LONG", "timeframe": "2h", "close_ma": 4, "support": 1.0, "status": "PRIMARY_CLOSE", "point_id": "P1_PROFILE"},
-        {"plateau_id": "P2", "symbol": "AAAUSDT", "side": "LONG", "timeframe": "2h", "close_ma": 4, "support": 1.0, "status": "PRIMARY_CLOSE", "point_id": "P2_PROFILE"},
+        _profile_row("P1", "P1_PROFILE"),
+        _profile_row("P2", "P2_PROFILE"),
     ])
 
     structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
@@ -359,6 +413,232 @@ def test_structures_use_the_representative_frozen_in_close_profiles() -> None:
     assert tuple(order["point_id"] for order in structures.iloc[0]["orders"]) == (
         "P1_PROFILE", "P2_PROFILE"
     )
+
+
+@pytest.mark.parametrize(
+    ("continuity_status", "usable"),
+    [
+        ("BLOCKED_BY_CONTINUITY", False),
+        ("BREAK_UNSUPPORTED", False),
+        ("USABLE", False),
+    ],
+)
+def test_unusable_continuity_representative_cannot_form_structure(
+    continuity_status: str, usable: bool
+) -> None:
+    points = pd.DataFrame(
+        [
+            {**_point("A", "P1", shift_bp=110), "point_event_count": 6, "event_eligible": True},
+            {**_point("B", "P2", shift_bp=170), "point_event_count": 5, "event_eligible": True},
+            {**_point("C", "P3", shift_bp=250), "point_event_count": 5, "event_eligible": True},
+        ]
+    )
+    plateaus = pd.DataFrame(
+        [_plateau("P1", ("A",)), _plateau("P2", ("B",)), _plateau("P3", ("C",))]
+    )
+    profiles = pd.DataFrame(
+        [
+            _profile_row(pid, ptid, continuity_status=cont_status, usable=is_usable)
+            for pid, ptid, cont_status, is_usable in (
+                ("P1", "A", "USABLE", True),
+                ("P2", "B", continuity_status, usable),
+                ("P3", "C", "USABLE", True),
+            )
+        ]
+    )
+
+    structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+    used_points = {
+        str(order["point_id"]) for orders in structures["orders"] for order in orders
+    }
+    used_plateaus = {
+        str(order["plateau_id"]) for orders in structures["orders"] for order in orders
+    }
+    assert "B" not in used_points
+    assert "P2" not in used_plateaus
+    assert any(
+        len(orders) == 2
+        and {str(order["plateau_id"]) for order in orders} == {"P1", "P3"}
+        for orders in structures["orders"]
+    )
+
+
+def test_below_support_floor_representative_cannot_form_structure() -> None:
+    points = pd.DataFrame(
+        [
+            {**_point("A", "P1", shift_bp=110), "point_event_count": 6, "event_eligible": True},
+            {**_point("B", "P2", shift_bp=170), "point_event_count": 5, "event_eligible": True},
+            {**_point("C", "P3", shift_bp=250), "point_event_count": 5, "event_eligible": True},
+        ]
+    )
+    plateaus = pd.DataFrame(
+        [_plateau("P1", ("A",)), _plateau("P2", ("B",)), _plateau("P3", ("C",))]
+    )
+    profiles = pd.DataFrame(
+        [
+            _profile_row("P1", "A"),
+            _profile_row("P2", "B", support=0.5, status="SUPPORTED_CLOSE"),
+            _profile_row("P3", "C"),
+        ]
+    )
+
+    structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+    used_plateaus = {
+        str(order["plateau_id"]) for orders in structures["orders"] for order in orders
+    }
+    assert "P2" not in used_plateaus
+    assert "P1" in used_plateaus and "P3" in used_plateaus
+
+
+def test_structure_uses_frozen_point_even_when_equivalent_alternate_exists() -> None:
+    points = pd.DataFrame(
+        [
+            {**_point("P1_FROZEN", "P1", shift_bp=110), "point_event_count": 4, "event_eligible": True},
+            {**_point("P1_ALT", "P1", shift_bp=120, pnl=98, efficiency=9.8), "point_event_count": 9, "event_eligible": True},
+            {**_point("P2_ONLY", "P2", shift_bp=230), "point_event_count": 5, "event_eligible": True},
+        ]
+    )
+    plateaus = pd.DataFrame(
+        [_plateau("P1", ("P1_FROZEN", "P1_ALT")), _plateau("P2", ("P2_ONLY",))]
+    )
+    profiles = pd.DataFrame(
+        [
+            _profile_row("P1", "P1_FROZEN"),
+            _profile_row("P2", "P2_ONLY"),
+        ]
+    )
+
+    fresh = choose_cma_representative(
+        points.loc[points["plateau_id"].eq("P1")], 4, AlgorithmConfig.defaults()
+    )
+    assert fresh["point_id"] == "P1_ALT"
+
+    structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+    used_points = {
+        str(order["point_id"]) for orders in structures["orders"] for order in orders
+    }
+    assert "P1_FROZEN" in used_points
+    assert "P1_ALT" not in used_points
+
+
+def test_one_plateau_never_supplies_two_orders_to_one_structure() -> None:
+    points = pd.DataFrame(
+        [
+            {**_point("A1", "P1", shift_bp=110), "point_event_count": 6, "event_eligible": True},
+            {**_point("A2", "P1", shift_bp=120, pnl=98, efficiency=9.8), "point_event_count": 5, "event_eligible": True},
+            {**_point("B", "P2", shift_bp=180), "point_event_count": 5, "event_eligible": True},
+            {**_point("C", "P3", shift_bp=250), "point_event_count": 5, "event_eligible": True},
+        ]
+    )
+    plateaus = pd.DataFrame(
+        [
+            _plateau("P1", ("A1", "A2")),
+            _plateau("P2", ("B",)),
+            _plateau("P3", ("C",)),
+        ]
+    )
+    profiles = pd.DataFrame(
+        [
+            _profile_row("P1", "A1"),
+            _profile_row("P1", "A2"),
+            _profile_row("P2", "B"),
+            _profile_row("P3", "C"),
+        ]
+    )
+
+    structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+    assert not structures.empty
+    for orders in structures["orders"]:
+        plateau_ids = [str(order["plateau_id"]) for order in orders]
+        assert len(set(plateau_ids)) == len(plateau_ids)
+    used_points = {
+        str(order["point_id"]) for orders in structures["orders"] for order in orders
+    }
+    assert not {"A1", "A2"} <= used_points
+
+
+def test_two_three_four_structures_are_independent_universes() -> None:
+    specs = [
+        ("P1", "A", 70),
+        ("P2", "B", 170),
+        ("P3", "C", 310),
+        ("P4", "D", 470),
+    ]
+    points = pd.DataFrame(
+        [
+            {**_point(point_id, plateau_id, shift_bp=shift), "point_event_count": 6, "event_eligible": True}
+            for plateau_id, point_id, shift in specs
+        ]
+    )
+    plateaus = pd.DataFrame(
+        [_plateau(plateau_id, (point_id,)) for plateau_id, point_id, _ in specs]
+    )
+    profiles = pd.DataFrame(
+        [_profile_row(plateau_id, point_id) for plateau_id, point_id, _ in specs]
+    )
+
+    structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+    assert set(structures["order_count"]) == {2, 3, 4}
+    assert (
+        structures["order_count"].value_counts().sort_index().to_dict()
+        == {2: 6, 3: 4, 4: 1}
+    )
+    structures_by_orders = {
+        tuple(str(order["plateau_id"]) for order in orders): order_count
+        for order_count, orders in zip(structures["order_count"], structures["orders"])
+    }
+    assert structures_by_orders[("P1", "P2")] == 2
+    assert structures_by_orders[("P1", "P2", "P3")] == 3
+    assert structures_by_orders[("P1", "P2", "P3", "P4")] == 4
+
+
+def test_max_orders_caps_independent_universes() -> None:
+    specs = [
+        ("P1", "A", 70),
+        ("P2", "B", 170),
+        ("P3", "C", 310),
+        ("P4", "D", 470),
+    ]
+    points = pd.DataFrame(
+        [
+            {**_point(point_id, plateau_id, shift_bp=shift), "point_event_count": 6, "event_eligible": True}
+            for plateau_id, point_id, shift in specs
+        ]
+    )
+    plateaus = pd.DataFrame(
+        [_plateau(plateau_id, (point_id,)) for plateau_id, point_id, _ in specs]
+    )
+    profiles = pd.DataFrame(
+        [_profile_row(plateau_id, point_id) for plateau_id, point_id, _ in specs]
+    )
+    config = replace(AlgorithmConfig.defaults(), max_orders=3)
+
+    structures, _ = build_structures(points, plateaus, profiles, config)
+
+    assert set(structures["order_count"]) == {2, 3}
+
+
+def test_structures_preserve_exact_point_event_counts() -> None:
+    points = pd.DataFrame(
+        [
+            {**_point("A", "P1", shift_bp=70, trades=20), "point_event_count": 6, "event_eligible": True},
+            {**_point("B", "P2", shift_bp=170, trades=15), "point_event_count": 5, "event_eligible": True},
+        ]
+    )
+    plateaus = pd.DataFrame([_plateau("P1", ("A",)), _plateau("P2", ("B",))])
+    profiles = pd.DataFrame([_profile_row("P1", "A"), _profile_row("P2", "B")])
+
+    structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+    row = structures.iloc[0]
+    assert tuple(order["point_event_count"] for order in row["orders"]) == (6, 5)
+    assert row["Order1EventCount"] == 6
+    assert row["Order2EventCount"] == 5
 
 
 def test_deep_order_does_not_require_standalone_sample() -> None:
@@ -384,13 +664,45 @@ def test_first_order_requires_standalone_eligibility() -> None:
     assert "NO_STANDALONE_ELIGIBLE_FIRST_ORDER" in set(rejected["reason"])
 
 
+def test_build_structures_rejects_gap_failures_without_deep_gap_status() -> None:
+    points = pd.DataFrame(
+        [
+            {**_point("A", "P1", shift_bp=70), "point_event_count": 6, "event_eligible": True},
+            {**_point("B", "P2", shift_bp=140), "point_event_count": 5, "event_eligible": True},
+            {**_point("C", "P3", shift_bp=470), "point_event_count": 5, "event_eligible": True},
+        ]
+    )
+    plateaus = pd.DataFrame(
+        [_plateau("P1", ("A",)), _plateau("P2", ("B",)), _plateau("P3", ("C",))]
+    )
+    profiles = pd.DataFrame(
+        [_profile_row("P1", "A"), _profile_row("P2", "B"), _profile_row("P3", "C")]
+    )
+
+    structures, diagnostics = build_structures(
+        points, plateaus, profiles, AlgorithmConfig.defaults()
+    )
+
+    assert not structures.empty
+    assert set(structures["status"]) == {"READY_MRS3_STRUCTURE"}
+    assert not structures["orders"].map(
+        lambda orders: tuple(order["point_id"] for order in orders) == ("A", "B")
+    ).any()
+    assert "GAP_TOO_SMALL" in set(diagnostics["reason"])
+    assert not diagnostics["status"].eq("DEEP_GAP_RESEARCH").any()
+
+
 @pytest.mark.parametrize(
     ("left", "right", "want_status"),
     [
-        (90, 150, "READY_MRS3_STRUCTURE"),
-        (150, 230, "READY_MRS3_STRUCTURE"),
-        (150, 220, "GAP_TOO_SMALL"),
-        (410, 500, "DEEP_GAP_RESEARCH"),
+        (70, 140, "GAP_TOO_SMALL"),
+        (70, 170, "READY_MRS3_STRUCTURE"),
+        (170, 270, "READY_MRS3_STRUCTURE"),
+        (200, 310, "GAP_TOO_SMALL"),
+        (200, 350, "READY_MRS3_STRUCTURE"),
+        (310, 430, "GAP_TOO_SMALL"),
+        (310, 470, "READY_MRS3_STRUCTURE"),
+        (410, 500, "GAP_TOO_SMALL"),
     ],
 )
 def test_gap_boundaries(left: int, right: int, want_status: str) -> None:
@@ -401,24 +713,46 @@ def test_gap_boundaries(left: int, right: int, want_status: str) -> None:
     assert validate_order_tuple(orders, AlgorithmConfig.defaults()) == want_status
 
 
-def test_gap_zone_boundary_comes_from_configuration() -> None:
-    config = replace(AlgorithmConfig.defaults(), gap_mid_start_bp=200)
+def test_gap_resolver_uses_configured_rules_not_hard_coded_thresholds() -> None:
+    config = replace(
+        AlgorithmConfig.defaults(),
+        gap_rules=((30, 80, 10), (80, 200, 10), (200, 300, 10), (300, 551, 10)),
+    )
     orders = [
-        {
-            "plateau_id": "P1",
-            "shift_bp": 190,
-            "standalone_eligible": True,
-            "depth_eligible": True,
-        },
-        {
-            "plateau_id": "P2",
-            "shift_bp": 250,
-            "standalone_eligible": True,
-            "depth_eligible": True,
-        },
+        {"plateau_id": "P1", "shift_bp": 70, "standalone_eligible": True, "depth_eligible": True},
+        {"plateau_id": "P2", "shift_bp": 90, "standalone_eligible": True, "depth_eligible": True},
     ]
-
     assert validate_order_tuple(orders, config) == "READY_MRS3_STRUCTURE"
+    assert validate_order_tuple(orders, AlgorithmConfig.defaults()) == "GAP_TOO_SMALL"
+
+
+def test_gap_validation_checks_every_adjacent_pair() -> None:
+    orders = [
+        {"plateau_id": "P1", "shift_bp": 70, "standalone_eligible": True, "depth_eligible": True},
+        {"plateau_id": "P2", "shift_bp": 170, "standalone_eligible": True, "depth_eligible": True},
+        {"plateau_id": "P3", "shift_bp": 230, "standalone_eligible": True, "depth_eligible": True},
+    ]
+    assert validate_order_tuple(orders, AlgorithmConfig.defaults()) == "GAP_TOO_SMALL"
+
+
+def test_required_gap_bp_reads_configured_rules() -> None:
+    config = AlgorithmConfig.defaults()
+    assert required_gap_bp(30, config) == 80
+    assert required_gap_bp(79, config) == 80
+    assert required_gap_bp(80, config) == 100
+    assert required_gap_bp(199, config) == 100
+    assert required_gap_bp(200, config) == 130
+    assert required_gap_bp(299, config) == 130
+    assert required_gap_bp(300, config) == 150
+    assert required_gap_bp(550, config) == 150
+
+
+def test_required_gap_bp_rejects_uncovered_left_shift() -> None:
+    config = AlgorithmConfig.defaults()
+    with pytest.raises(ValueError, match="not covered"):
+        required_gap_bp(551, config)
+    with pytest.raises(ValueError, match="not covered"):
+        required_gap_bp(29, config)
 
 
 def test_same_plateau_cannot_produce_two_orders() -> None:
@@ -427,3 +761,636 @@ def test_same_plateau_cannot_produce_two_orders() -> None:
         {"plateau_id": "P1", "shift_bp": 170, "standalone_eligible": True, "depth_eligible": True},
     ]
     assert validate_order_tuple(orders, AlgorithmConfig.defaults()) == "SAME_PLATEAU_USED_TWICE"
+
+
+def test_cma_representative_considers_all_close_ma_members() -> None:
+    rows = pd.DataFrame(
+        [
+            _event_point("NEAR", close_ma=4, shift_bp=110, open_ma=3, pnl=100, efficiency=10, events=4),
+            _event_point("FAR_SHIFT", close_ma=4, shift_bp=230, open_ma=3, pnl=98, efficiency=9.8, events=6),
+            _event_point("FAR_OPENMA", close_ma=4, shift_bp=110, open_ma=9, pnl=97, efficiency=9.7, events=5),
+        ]
+    )
+
+    chosen = choose_cma_representative(rows, 4, AlgorithmConfig.defaults())
+
+    assert chosen is not None
+    assert chosen["point_id"] == "FAR_SHIFT"
+
+
+def test_cma_economic_reference_does_not_use_event_count() -> None:
+    rows = pd.DataFrame(
+        [
+            _event_point("HIGH_PNL", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=4),
+            _event_point("MORE_EVENTS", close_ma=4, shift_bp=230, pnl=94, efficiency=9.4, events=9),
+        ]
+    )
+
+    chosen = choose_cma_representative(rows, 4, AlgorithmConfig.defaults())
+
+    assert chosen is not None
+    assert chosen["point_id"] == "HIGH_PNL"
+
+
+def test_cma_equivalence_uses_both_pnl_and_efficiency() -> None:
+    rows = pd.DataFrame(
+        [
+            _event_point("REF", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=4),
+            _event_point("PNL_OK_EFF_FAR", close_ma=4, shift_bp=230, pnl=96, efficiency=8, events=9),
+        ]
+    )
+
+    chosen = choose_cma_representative(rows, 4, AlgorithmConfig.defaults())
+
+    assert chosen is not None
+    assert chosen["point_id"] == "REF"
+
+
+def test_cma_event_filter_runs_after_equivalence() -> None:
+    rows = pd.DataFrame(
+        [
+            _event_point("INELIGIBLE_REF", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=9, event_eligible=False),
+            _event_point("ELIGIBLE_NEAR", close_ma=4, shift_bp=230, pnl=94, efficiency=9.4, events=9),
+        ]
+    )
+
+    chosen = choose_cma_representative(rows, 4, AlgorithmConfig.defaults())
+
+    assert chosen is None
+
+
+def test_cma_event_count_beats_higher_shift() -> None:
+    rows = pd.DataFrame(
+        [
+            _event_point("MORE_EVENTS", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=6),
+            _event_point("HIGHER_SHIFT", close_ma=4, shift_bp=230, pnl=97, efficiency=9.7, events=4),
+        ]
+    )
+
+    chosen = choose_cma_representative(rows, 4, AlgorithmConfig.defaults())
+
+    assert chosen is not None
+    assert chosen["point_id"] == "MORE_EVENTS"
+
+
+def test_cma_shift_tie_breaker_prefers_higher_shift() -> None:
+    rows = pd.DataFrame(
+        [
+            _event_point("LOWER_SHIFT", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=4),
+            _event_point("HIGHER_SHIFT", close_ma=4, shift_bp=230, pnl=97, efficiency=9.7, events=4),
+        ]
+    )
+
+    chosen = choose_cma_representative(rows, 4, AlgorithmConfig.defaults())
+
+    assert chosen is not None
+    assert chosen["point_id"] == "HIGHER_SHIFT"
+
+
+def test_cma_event_ineligible_point_cannot_be_representative() -> None:
+    rows = pd.DataFrame(
+        [
+            _event_point("ELIGIBLE_REF", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=4),
+            _event_point("INELIGIBLE_MORE_EVENTS", close_ma=4, shift_bp=230, pnl=98, efficiency=9.8, events=9, event_eligible=False),
+        ]
+    )
+
+    chosen = choose_cma_representative(rows, 4, AlgorithmConfig.defaults())
+
+    assert chosen is not None
+    assert chosen["point_id"] == "ELIGIBLE_REF"
+
+
+def test_cma_post_filter_rows_keep_original_equivalent_group() -> None:
+    rows = pd.DataFrame(
+        [
+            _event_point("REF", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=9, event_eligible=False),
+            _event_point("NEAR1", close_ma=4, shift_bp=230, pnl=99, efficiency=10.5, events=4),
+            _event_point("NEAR2", close_ma=4, shift_bp=230, pnl=98, efficiency=9.6, events=6),
+        ]
+    )
+
+    chosen = choose_cma_representative(rows, 4, AlgorithmConfig.defaults())
+
+    assert chosen is not None
+    assert chosen["point_id"] == "NEAR2"
+
+
+def test_event_ineligible_global_best_does_not_suppress_other_cma() -> None:
+    points = pd.DataFrame(
+        [
+            _event_point("BEST_INELIGIBLE", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=9, event_eligible=False),
+            _event_point("C5_ELIGIBLE", close_ma=5, shift_bp=230, pnl=80, efficiency=8, events=5),
+        ]
+    )
+    plateaus = pd.DataFrame([_plateau("P1", ("BEST_INELIGIBLE", "C5_ELIGIBLE"))])
+
+    updated, profile = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+    assert list(profile["close_ma"]) == [5]
+    assert profile.iloc[0]["point_id"] == "C5_ELIGIBLE"
+    assert profile.iloc[0]["support"] == pytest.approx(1.0)
+    assert profile.iloc[0]["status"] == "PRIMARY_CLOSE"
+    assert updated.iloc[0]["primary_close_ma"] == 5
+
+
+def test_cma_real_independent_events_retain_hard_floor() -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                **_event_point("LOW_EVENTS", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=2),
+                "event_mode": "real_independent_events",
+            }
+        ]
+    )
+
+    chosen = choose_cma_representative(rows, 4, AlgorithmConfig.defaults())
+
+    assert chosen is None
+
+
+def test_cma_one_representative_per_plateau_close_ma() -> None:
+    points = pd.DataFrame(
+        [
+            _event_point("C4_A", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=6),
+            _event_point("C4_B", close_ma=4, shift_bp=230, pnl=98, efficiency=9.8, events=4),
+            _event_point("C5", close_ma=5, shift_bp=230, pnl=80, efficiency=8, events=5),
+        ]
+    )
+    plateaus = pd.DataFrame([_plateau("P1", ("C4_A", "C4_B", "C5"))])
+
+    _, profile = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+    assert len(profile.query("close_ma == 4")) == 1
+    assert len(profile.query("close_ma == 5")) == 1
+    assert profile.query("close_ma == 4").iloc[0]["point_id"] == "C4_A"
+
+
+def test_cma_representative_deterministic_under_row_permutation() -> None:
+    rows = [
+        _event_point("A", close_ma=4, shift_bp=110, pnl=100, efficiency=10, events=6),
+        _event_point("B", close_ma=4, shift_bp=230, pnl=98, efficiency=9.8, events=4),
+        _event_point("C", close_ma=4, shift_bp=350, pnl=97, efficiency=9.7, events=5),
+    ]
+    frame = pd.DataFrame(rows)
+    shuffled = pd.concat([frame.iloc[[2]], frame.iloc[[0]], frame.iloc[[1]]], ignore_index=True)
+
+    assert choose_cma_representative(frame, 4, AlgorithmConfig.defaults())["point_id"] == "A"
+    assert choose_cma_representative(shuffled, 4, AlgorithmConfig.defaults())["point_id"] == "A"
+
+
+def _cma_plateau_rows() -> list[dict[str, object]]:
+    return [
+        _point("C4", "P1", shift_bp=230, close_ma=4, pnl=100, efficiency=10),
+        _point("C5", "P1", shift_bp=230, close_ma=5, pnl=80, efficiency=8),
+        _point("C6", "P1", shift_bp=230, close_ma=6, pnl=55, efficiency=5.5),
+        _point("C7", "P1", shift_bp=230, close_ma=7, pnl=95, efficiency=9.5),
+    ]
+
+
+def _frozen_facts_metrics() -> dict[str, object]:
+    return {
+        "symbol": "AAAUSDT",
+        "side": "LONG",
+        "timeframe": "2h",
+        "operational_facts_version": OPERATIONAL_FACTS_VERSION,
+        "primary_close_ma": 4,
+        "cma_representatives": [
+            {
+                "close_ma": 4,
+                "point_id": "AAAUSDT|LONG|2h|230|3|4",
+                "support": 1.0,
+                "support_status": "PRIMARY_CLOSE",
+                "continuity_status": "USABLE",
+                "usable": True,
+            },
+            {
+                "close_ma": 5,
+                "point_id": "AAAUSDT|LONG|2h|230|3|5",
+                "support": 0.8,
+                "support_status": "SUPPORTED_CLOSE",
+                "continuity_status": "USABLE",
+                "usable": True,
+            },
+        ],
+        "base_1ord_point_id": "AAAUSDT|LONG|2h|230|3|4",
+        "standalone_eligible_point_ids": ("AAAUSDT|LONG|2h|230|3|4",),
+    }
+
+
+def _facts_context(metrics: dict[str, object]) -> dict[str, object]:
+    members = {row["point_id"] for row in metrics["cma_representatives"]}
+    return {
+        "surface_point_ids": members | {"AAAUSDT|LONG|2h|230|3|6"},
+        "plateau_all_point_ids": members,
+        "standalone_eligible_point_ids": tuple(metrics.get("standalone_eligible_point_ids") or ()),
+    }
+
+
+def test_primary_close_is_existing_representative_with_support_one() -> None:
+    points = pd.DataFrame(_cma_plateau_rows())
+    plateaus = pd.DataFrame([_plateau("P1", tuple(row["point_id"] for row in _cma_plateau_rows()))])
+
+    updated, profile = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+    assert updated.iloc[0]["primary_close_ma"] == 4
+    primary = profile.loc[profile["status"].eq("PRIMARY_CLOSE")].iloc[0]
+    assert primary["close_ma"] == 4
+    assert primary["support"] == pytest.approx(1.0)
+    assert len(profile.query("status == 'PRIMARY_CLOSE'")) == 1
+
+
+def test_primary_ordering_breaks_pnl_then_efficiency_then_trades_then_dd() -> None:
+    config = AlgorithmConfig.defaults()
+
+    def primary_for(rows: list[dict[str, object]]) -> int:
+        points = pd.DataFrame(rows)
+        plateaus = pd.DataFrame([_plateau("P1", tuple(row["point_id"] for row in rows))])
+        updated, _ = build_close_profiles(points, plateaus, config)
+        return int(updated.iloc[0]["primary_close_ma"])
+
+    assert primary_for([
+        _point("C4", "P1", shift_bp=230, close_ma=4, pnl=100, efficiency=10),
+        _point("C5", "P1", shift_bp=230, close_ma=5, pnl=95, efficiency=12),
+    ]) == 4
+    assert primary_for([
+        _point("C4", "P1", shift_bp=230, close_ma=4, pnl=100, efficiency=10),
+        _point("C5", "P1", shift_bp=230, close_ma=5, pnl=100, efficiency=10, trades=25),
+    ]) == 5
+    assert primary_for([
+        _point("C4", "P1", shift_bp=230, close_ma=4, pnl=100, efficiency=10),
+        {**_point("C5", "P1", shift_bp=230, close_ma=5, pnl=100, efficiency=10), "dd_pct": 5.0},
+    ]) == 5
+    assert primary_for([
+        _point("C4", "P1", shift_bp=230, close_ma=4, pnl=100, efficiency=10),
+        _point("C5", "P1", shift_bp=230, close_ma=5, pnl=100, efficiency=10),
+    ]) == 4
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_primary_non_positive_pnl_fails_closed(bad: float) -> None:
+    bad_row = _point("C4", "P1", shift_bp=230, close_ma=4, pnl=100, efficiency=10)
+    bad_row["pnl_pct"] = bad
+    bad_row["dd_pct"] = 10.0
+    bad_row["pnl_dd5_theoretical"] = 50.0
+    points = pd.DataFrame([
+        bad_row,
+        _point("C5", "P1", shift_bp=230, close_ma=5, pnl=80, efficiency=8),
+    ])
+    plateaus = pd.DataFrame([_plateau("P1", ("C4", "C5"))])
+
+    with pytest.raises(ValueError, match="PnL"):
+        build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_primary_non_positive_efficiency_fails_closed(bad: float) -> None:
+    bad_row = _point("C4", "P1", shift_bp=230, close_ma=4, pnl=100, efficiency=10)
+    bad_row["efficiency"] = bad
+    bad_row["dd_pct"] = 10.0
+    bad_row["pnl_dd5_theoretical"] = 50.0
+    points = pd.DataFrame([
+        bad_row,
+        _point("C5", "P1", shift_bp=230, close_ma=5, pnl=80, efficiency=8),
+    ])
+    plateaus = pd.DataFrame([_plateau("P1", ("C4", "C5"))])
+
+    with pytest.raises(ValueError, match="efficiency"):
+        build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+
+@pytest.mark.parametrize("field", ["pnl_pct", "efficiency"])
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), float("-inf")])
+def test_close_support_operands_fail_closed(field: str, bad: float) -> None:
+    primary = pd.Series({"pnl_pct": 100, "efficiency": 10})
+    representative = pd.Series({"pnl_pct": 80, "efficiency": 8, field: bad})
+    with pytest.raises(ValueError):
+        compute_close_support(primary, representative)
+    bad_primary = pd.Series({"pnl_pct": 100, "efficiency": 10, field: bad})
+    with pytest.raises(ValueError):
+        compute_close_support(bad_primary, pd.Series({"pnl_pct": 80, "efficiency": 8}))
+
+
+def test_close_support_outside_one_fails_closed() -> None:
+    with pytest.raises(ValueError, match="CloseSupport"):
+        compute_close_support(
+            pd.Series({"pnl_pct": 80, "efficiency": 8}),
+            pd.Series({"pnl_pct": 100, "efficiency": 10}),
+        )
+
+
+def test_nan_primary_value_fails_the_whole_build_without_facts() -> None:
+    points = pd.DataFrame([
+        {**_point("C4", "P1", shift_bp=230, close_ma=4, pnl=100, efficiency=10), "pnl_pct": float("nan")},
+        _point("C5", "P1", shift_bp=230, close_ma=5, pnl=80, efficiency=8),
+    ])
+    plateaus = pd.DataFrame([_plateau("P1", ("C4", "C5"))])
+
+    with pytest.raises((ValueError, ArithmeticError)):
+        build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+
+def test_close_support_exact_90_60_classes_preserved() -> None:
+    points = pd.DataFrame(_cma_plateau_rows())
+    plateaus = pd.DataFrame([_plateau("P1", tuple(row["point_id"] for row in _cma_plateau_rows()))])
+
+    _, profile = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+    assert list(profile["close_ma"]) == [4, 5, 6, 7]
+    assert list(profile["status"]) == [
+        "PRIMARY_CLOSE",
+        "SUPPORTED_CLOSE",
+        "UNSUPPORTED_CLOSE",
+        "CORE_CLOSE",
+    ]
+
+
+def test_continuity_missing_intermediate_cma_blocks_outer() -> None:
+    rows = [
+        _point("C4", "P1", shift_bp=230, close_ma=4),
+        _point("C6", "P1", shift_bp=230, close_ma=6, pnl=90, efficiency=9),
+    ]
+    points = pd.DataFrame(rows)
+    plateaus = pd.DataFrame([_plateau("P1", tuple(row["point_id"] for row in rows))])
+
+    updated, _ = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+    by_cma = {row["close_ma"]: row for row in updated.iloc[0]["cma_representatives"]}
+
+    assert by_cma[4]["continuity_status"] == "USABLE" and by_cma[4]["usable"] is True
+    assert by_cma[6]["continuity_status"] == "BLOCKED_BY_CONTINUITY"
+    assert by_cma[6]["usable"] is False
+
+
+def test_continuity_unsupported_breaks_and_blocks_outer_high_support() -> None:
+    rows = [
+        _point("C4", "P1", shift_bp=230, close_ma=4),
+        _point("C5", "P1", shift_bp=230, close_ma=5, pnl=55, efficiency=5.5),
+        _point("C6", "P1", shift_bp=230, close_ma=6, pnl=99, efficiency=9.9),
+    ]
+    points = pd.DataFrame(rows)
+    plateaus = pd.DataFrame([_plateau("P1", tuple(row["point_id"] for row in rows))])
+
+    updated, _ = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+    by_cma = {row["close_ma"]: row for row in updated.iloc[0]["cma_representatives"]}
+
+    assert by_cma[5]["support_status"] == "UNSUPPORTED_CLOSE"
+    assert by_cma[5]["continuity_status"] == "BREAK_UNSUPPORTED"
+    assert by_cma[5]["usable"] is False
+    assert by_cma[6]["support_status"] == "CORE_CLOSE"
+    assert by_cma[6]["continuity_status"] == "BLOCKED_BY_CONTINUITY"
+    assert by_cma[6]["usable"] is False
+
+
+def test_continuity_adjacent_supported_rows_are_usable() -> None:
+    rows = [
+        _point("C4", "P1", shift_bp=230, close_ma=4),
+        _point("C5", "P1", shift_bp=230, close_ma=5, pnl=80, efficiency=8),
+        _point("C6", "P1", shift_bp=230, close_ma=6, pnl=95, efficiency=9.5),
+    ]
+    points = pd.DataFrame(rows)
+    plateaus = pd.DataFrame([_plateau("P1", tuple(row["point_id"] for row in rows))])
+
+    updated, _ = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+    by_cma = {row["close_ma"]: row for row in updated.iloc[0]["cma_representatives"]}
+
+    assert all(row["continuity_status"] == "USABLE" and row["usable"] is True for row in by_cma.values())
+
+
+def test_frozen_facts_shape_is_ordered_unique_and_versioned() -> None:
+    points = pd.DataFrame(_cma_plateau_rows())
+    plateaus = pd.DataFrame([_plateau("P1", tuple(row["point_id"] for row in _cma_plateau_rows()))])
+
+    updated, _ = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+    row = updated.iloc[0]
+    facts = row["cma_representatives"]
+
+    assert row["operational_facts_version"] == OPERATIONAL_FACTS_VERSION
+    assert row["primary_close_ma"] == 4
+    assert [entry["close_ma"] for entry in facts] == [4, 5, 6, 7]
+    assert len({entry["point_id"] for entry in facts}) == len(facts)
+    assert {entry["support_status"] for entry in facts} == {
+        "PRIMARY_CLOSE",
+        "SUPPORTED_CLOSE",
+        "UNSUPPORTED_CLOSE",
+        "CORE_CLOSE",
+    }
+    assert all(0 < entry["support"] <= 1 for entry in facts)
+    primary_entries = [entry for entry in facts if entry["support_status"] == "PRIMARY_CLOSE"]
+    assert len(primary_entries) == 1
+    assert primary_entries[0]["close_ma"] == row["primary_close_ma"]
+
+
+def test_frozen_base_uses_usable_standalone_representatives_only() -> None:
+    rows = [
+        _point("C4", "P1", shift_bp=230, close_ma=4),
+        _point("C5", "P1", shift_bp=230, close_ma=5, pnl=80, efficiency=8, standalone=False),
+    ]
+    points = pd.DataFrame(rows)
+    plateaus = pd.DataFrame([_plateau("P1", tuple(row["point_id"] for row in rows))])
+
+    updated, _ = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+    assert updated.iloc[0]["base_1ord_point_id"] == "C4"
+
+
+def test_frozen_base_is_null_when_no_standalone_usable_representative() -> None:
+    points = pd.DataFrame([
+        _point("C4", "P1", shift_bp=230, close_ma=4, standalone=False),
+    ])
+    plateaus = pd.DataFrame([_plateau("P1", ("C4",))])
+
+    updated, _ = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+    assert updated.iloc[0]["base_1ord_point_id"] is None
+
+
+def test_frozen_base_excludes_continuity_blocked_representatives() -> None:
+    rows = [
+        _point("C4", "P1", shift_bp=230, close_ma=4),
+        _point("C6", "P1", shift_bp=230, close_ma=6, pnl=90, efficiency=9),
+    ]
+    points = pd.DataFrame(rows)
+    plateaus = pd.DataFrame([_plateau("P1", tuple(row["point_id"] for row in rows))])
+
+    updated, _ = build_close_profiles(points, plateaus, AlgorithmConfig.defaults())
+
+    assert updated.iloc[0]["base_1ord_point_id"] == "C4"
+
+
+def test_select_base_one_order_requires_frozen_facts() -> None:
+    points = pd.DataFrame([_point("C4", "P1", shift_bp=230, close_ma=4)])
+    plateaus = pd.DataFrame([_plateau("P1", ("C4",))]).drop(columns=["ready"])
+
+    with pytest.raises(ValueError, match="frozen operational facts"):
+        select_base_one_order(points, plateaus, AlgorithmConfig.defaults())
+
+
+def test_validator_accepts_canonical_frozen_facts() -> None:
+    metrics = _frozen_facts_metrics()
+    validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+    assert has_frozen_operational_facts(metrics)
+
+
+def test_validator_rejects_unknown_version() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["operational_facts_version"] = "bogus_v2"
+    with pytest.raises(ValueError, match="version"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_unknown_statuses() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][1]["support_status"] = "MYSTERY_CLOSE"
+    with pytest.raises(ValueError, match="support_status"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][1]["continuity_status"] = "MYSTERY"
+    with pytest.raises(ValueError, match="continuity_status"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_support_status_contradiction() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][1]["support_status"] = "CORE_CLOSE"
+    with pytest.raises(ValueError, match="support_status"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_recomputes_continuity_and_rejects_trusted_flags() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][1]["continuity_status"] = "BLOCKED_BY_CONTINUITY"
+    metrics["cma_representatives"][1]["usable"] = False
+    with pytest.raises(ValueError, match="continuity"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_duplicate_and_unordered_close_ma() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"].append(dict(metrics["cma_representatives"][1]))
+    with pytest.raises(ValueError, match="duplicate"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"].reverse()
+    with pytest.raises(ValueError, match="ordered"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_duplicate_point_id() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][1]["point_id"] = metrics["cma_representatives"][0]["point_id"]
+    with pytest.raises(ValueError, match="duplicate"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_representative_outside_surface() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][0]["point_id"] = "AAAUSDT|LONG|2h|310|3|4"
+    with pytest.raises(ValueError, match="outside the surface"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_representative_outside_plateau() -> None:
+    metrics = _frozen_facts_metrics()
+    context = _facts_context(metrics)
+    context["plateau_all_point_ids"] = {"AAAUSDT|LONG|2h|230|3|4"}
+    with pytest.raises(ValueError, match="outside the Plateau"):
+        validate_frozen_operational_facts(metrics, **context)
+
+
+def test_validator_rejects_wrong_scope_and_close_ma() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][0]["point_id"] = "OTHER|LONG|2h|230|3|4"
+    with pytest.raises(ValueError, match="scope"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][0]["point_id"] = "AAAUSDT|LONG|2h|230|3|7"
+    with pytest.raises(ValueError, match="CloseMA"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_multiple_and_missing_primary() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][1]["support_status"] = "PRIMARY_CLOSE"
+    metrics["cma_representatives"][1]["support"] = 1.0
+    with pytest.raises(ValueError, match="PRIMARY_CLOSE"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][0]["support_status"] = "CORE_CLOSE"
+    with pytest.raises(ValueError, match="PRIMARY_CLOSE"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_invalid_base_point() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["base_1ord_point_id"] = "AAAUSDT|LONG|2h|230|3|6"
+    with pytest.raises(ValueError, match="base"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_base_not_usable_or_not_standalone() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["base_1ord_point_id"] = "AAAUSDT|LONG|2h|230|3|5"
+    with pytest.raises(ValueError, match="standalone-eligible"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_base_not_continuity_usable() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"] = [
+        metrics["cma_representatives"][0],
+        {
+            "close_ma": 6,
+            "point_id": "AAAUSDT|LONG|2h|230|3|6",
+            "support": 0.95,
+            "support_status": "CORE_CLOSE",
+            "continuity_status": "BLOCKED_BY_CONTINUITY",
+            "usable": False,
+        },
+    ]
+    metrics["base_1ord_point_id"] = "AAAUSDT|LONG|2h|230|3|6"
+    metrics["standalone_eligible_point_ids"] = (
+        "AAAUSDT|LONG|2h|230|3|4",
+        "AAAUSDT|LONG|2h|230|3|6",
+    )
+    with pytest.raises(ValueError, match="continuity-usable"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_require_complete_operational_facts_accepts_null_base_key() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["base_1ord_point_id"] = None
+
+    require_complete_operational_facts(metrics)
+
+
+def test_require_complete_operational_facts_rejects_missing_fact_fields() -> None:
+    with pytest.raises(ValueError, match="frozen operational facts"):
+        require_complete_operational_facts({})
+    metrics = _frozen_facts_metrics()
+    del metrics["base_1ord_point_id"]
+    with pytest.raises(ValueError, match="base_1ord_point_id"):
+        require_complete_operational_facts(metrics)
+
+
+def test_validator_requires_base_key_present_even_when_null() -> None:
+    metrics = _frozen_facts_metrics()
+    del metrics["base_1ord_point_id"]
+
+    with pytest.raises(ValueError, match="base_1ord_point_id"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_extra_representative_field() -> None:
+    metrics = _frozen_facts_metrics()
+    metrics["cma_representatives"][0]["extra_persisted_field"] = "nope"
+
+    with pytest.raises(ValueError, match="unexpected fields"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))
+
+
+def test_validator_rejects_missing_representative_field() -> None:
+    metrics = _frozen_facts_metrics()
+    del metrics["cma_representatives"][0]["usable"]
+
+    with pytest.raises(ValueError, match="missing fields"):
+        validate_frozen_operational_facts(metrics, **_facts_context(metrics))

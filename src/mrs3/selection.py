@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import hashlib
 import itertools
 from typing import Iterable, Mapping, Sequence
@@ -20,6 +20,8 @@ CLOSE_PROFILE_COLUMNS = [
     "status",
     "point_id",
     "refine_required",
+    "continuity_status",
+    "usable",
 ]
 
 STRUCTURE_COLUMNS = [
@@ -52,6 +54,36 @@ STRUCTURE_DIAGNOSTIC_COLUMNS = [
     "reason",
     "orders",
 ]
+
+
+OPERATIONAL_FACTS_VERSION = "cma_representatives_v1"
+
+FROZEN_OPERATIONAL_FACT_FIELDS = (
+    "operational_facts_version",
+    "primary_close_ma",
+    "cma_representatives",
+    "base_1ord_point_id",
+)
+
+REPRESENTATIVE_FACT_FIELDS = frozenset(
+    {"close_ma", "point_id", "support", "support_status", "continuity_status", "usable"}
+)
+
+SUPPORT_STATUS_VALUES = (
+    "PRIMARY_CLOSE",
+    "CORE_CLOSE",
+    "SUPPORTED_CLOSE",
+    "UNSUPPORTED_CLOSE",
+)
+
+CONTINUITY_STATUS_VALUES = (
+    "USABLE",
+    "BREAK_UNSUPPORTED",
+    "BLOCKED_BY_CONTINUITY",
+)
+
+_CLOSE_CORE_MIN = Decimal("0.90")
+_CLOSE_SUPPORTED_MIN = Decimal("0.60")
 
 
 def _decimal(value: object) -> Decimal:
@@ -121,27 +153,357 @@ def close_status(support: Decimal, config: AlgorithmConfig) -> str:
     return "UNSUPPORTED_CLOSE"
 
 
-def _profile_alt(
+def _finite_positive_decimal(value: object, label: str) -> Decimal:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError(f"{label} must be a finite positive number, got {value!r}") from error
+    if not number.is_finite():
+        raise ValueError(f"{label} must be finite, got {value!r}")
+    if number <= 0:
+        raise ValueError(f"{label} must be positive, got {value!r}")
+    return number
+
+
+def choose_primary_representative(representatives: Mapping[int, pd.Series]) -> pd.Series:
+    """Choose the single primary among existing representatives by economic ordering.
+
+    PnL DESC, efficiency/PnL-DD DESC, trades DESC, dd_pct ASC, point_id ASC.
+    """
+    if not representatives:
+        raise ValueError("cannot choose a primary without representatives")
+    frame = pd.DataFrame(list(representatives.values()))
+    return frame.sort_values(
+        ["pnl_pct", "efficiency", "trades", "dd_pct", "point_id"],
+        ascending=[False, False, False, True, True],
+        kind="mergesort",
+    ).iloc[0]
+
+
+def compute_close_support(
+    primary: Mapping[str, object],
+    representative: Mapping[str, object],
+) -> Decimal:
+    """Fail-closed CloseSupport = min(CMA_PnL / Primary_PnL, CMA_Eff / Primary_Eff)."""
+    primary_pnl = _finite_positive_decimal(primary["pnl_pct"], "Primary PnL")
+    primary_efficiency = _finite_positive_decimal(primary["efficiency"], "Primary efficiency")
+    cma_pnl = _finite_positive_decimal(representative["pnl_pct"], "CMA PnL")
+    cma_efficiency = _finite_positive_decimal(representative["efficiency"], "CMA efficiency")
+    support_pnl = cma_pnl / primary_pnl
+    support_efficiency = cma_efficiency / primary_efficiency
+    if not support_pnl.is_finite() or not support_efficiency.is_finite():
+        raise ValueError("CloseSupport division produced a non-finite value")
+    if support_pnl <= 0 or support_efficiency <= 0:
+        raise ValueError("CloseSupport division produced a non-positive value")
+    support = min(support_pnl, support_efficiency)
+    if not support.is_finite() or support <= 0 or support > 1:
+        raise ValueError(f"CloseSupport outside (0, 1]: {support}")
+    return support
+
+
+def recompute_continuity(
+    support_status_by_close_ma: Mapping[int, str],
+    primary_close_ma: int,
+) -> dict[int, tuple[str, bool]]:
+    """Recompute continuity independently downward/upward from the primary CloseMA.
+
+    Only adjacent integer CloseMAs are walked. A missing representative or an
+    UNSUPPORTED_CLOSE row breaks that direction; every outer representative is
+    BLOCKED_BY_CONTINUITY regardless of its raw support status.
+    """
+    if primary_close_ma not in support_status_by_close_ma:
+        raise ValueError("primary CloseMA is missing from representatives")
+    result: dict[int, tuple[str, bool]] = {primary_close_ma: ("USABLE", True)}
+    for step in (-1, 1):
+        current = primary_close_ma
+        while True:
+            next_close_ma = current + step
+            if next_close_ma not in support_status_by_close_ma:
+                break
+            if support_status_by_close_ma[next_close_ma] == "UNSUPPORTED_CLOSE":
+                result[next_close_ma] = ("BREAK_UNSUPPORTED", False)
+                break
+            result[next_close_ma] = ("USABLE", True)
+            current = next_close_ma
+    for close_ma in support_status_by_close_ma:
+        if close_ma not in result:
+            result[close_ma] = ("BLOCKED_BY_CONTINUITY", False)
+    return result
+
+
+def has_frozen_operational_facts(metrics: Mapping[str, object]) -> bool:
+    for key in (
+        "operational_facts_version",
+        "primary_close_ma",
+        "cma_representatives",
+        "base_1ord_point_id",
+    ):
+        if metrics.get(key) is not None:
+            return True
+    return False
+
+
+def missing_frozen_operational_facts(metrics: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the frozen operational fact fields absent from the metrics."""
+    return tuple(key for key in FROZEN_OPERATIONAL_FACT_FIELDS if key not in metrics)
+
+
+def require_complete_operational_facts(metrics: Mapping[str, object]) -> None:
+    """Fail closed when a canonical/COMPUTED plateau lacks any frozen fact field.
+
+    All four logical fields are mandatory; ``base_1ord_point_id`` may be null
+    but the key itself must be present. Explicitly legacy runs bypass this gate
+    at their call sites (facts_state ``UNAVAILABLE_LEGACY``).
+    """
+    missing = missing_frozen_operational_facts(metrics)
+    if missing:
+        raise ValueError(
+            "canonical/COMPUTED READY plateau lacks mandatory frozen operational facts: "
+            + ", ".join(missing)
+        )
+
+
+def _expected_close_status(support: Decimal) -> str:
+    if support >= _CLOSE_CORE_MIN:
+        return "CORE_CLOSE"
+    if support >= _CLOSE_SUPPORTED_MIN:
+        return "SUPPORTED_CLOSE"
+    return "UNSUPPORTED_CLOSE"
+
+
+def _validated_support(value: object, label: str) -> Decimal:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite positive number, got {value!r}")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError(f"{label} must be a finite positive number, got {value!r}") from error
+    if not number.is_finite():
+        raise ValueError(f"{label} must be finite, got {value!r}")
+    if number <= 0:
+        raise ValueError(f"{label} must be positive, got {value!r}")
+    return number
+
+
+def validate_frozen_operational_facts(
+    metrics: Mapping[str, object],
+    *,
+    surface_point_ids: Iterable[str],
+    plateau_all_point_ids: Iterable[str],
+    standalone_eligible_point_ids: Iterable[str],
+    numeric_tolerance: Decimal = Decimal("1e-9"),
+) -> None:
+    """Structural and semantic validation of frozen Plateau operational facts.
+
+    Shared by publication and read-time consumers. Continuity is recomputed
+    from the sorted representative list instead of trusting stored flags.
+    """
+    if not has_frozen_operational_facts(metrics):
+        return
+    require_complete_operational_facts(metrics)
+    if metrics.get("operational_facts_version") != OPERATIONAL_FACTS_VERSION:
+        raise ValueError(
+            f"unknown operational facts version: {metrics.get('operational_facts_version')!r}"
+        )
+    symbol, side, timeframe = (
+        metrics.get("symbol"),
+        metrics.get("side"),
+        metrics.get("timeframe"),
+    )
+    if not symbol or not side or not timeframe:
+        raise ValueError("plateau operational facts are missing symbol/side/timeframe scope")
+    primary_close_ma = metrics.get("primary_close_ma")
+    if isinstance(primary_close_ma, bool) or not isinstance(primary_close_ma, int):
+        raise ValueError("primary_close_ma must be an integer")
+    representatives = metrics.get("cma_representatives")
+    if not isinstance(representatives, list) or not representatives:
+        raise ValueError("cma_representatives must be a non-empty list")
+    surface_points = set(surface_point_ids)
+    plateau_points = set(plateau_all_point_ids)
+    standalone_points = set(standalone_eligible_point_ids)
+    close_mas: list[int] = []
+    point_ids: list[str] = []
+    primary_index: int | None = None
+    support_status_by_close_ma: dict[int, str] = {}
+    expected_status_by_close_ma: dict[int, str] = {}
+    for index, row in enumerate(representatives):
+        if not isinstance(row, dict):
+            raise ValueError("cma_representative entries must be objects")
+        extra_keys = sorted(set(row) - REPRESENTATIVE_FACT_FIELDS)
+        if extra_keys:
+            raise ValueError(
+                "cma_representative entry has unexpected fields: " + ", ".join(extra_keys)
+            )
+        missing_keys = sorted(REPRESENTATIVE_FACT_FIELDS - set(row))
+        if missing_keys:
+            raise ValueError(
+                "cma_representative entry is missing fields: " + ", ".join(missing_keys)
+            )
+        close_ma = row.get("close_ma")
+        if isinstance(close_ma, bool) or not isinstance(close_ma, int):
+            raise ValueError("representative close_ma must be an integer")
+        point_id = row.get("point_id")
+        if not isinstance(point_id, str) or not point_id:
+            raise ValueError("representative point_id must be a non-empty string")
+        if close_ma in support_status_by_close_ma:
+            raise ValueError(f"duplicate representative CloseMA: {close_ma}")
+        if point_id in point_ids:
+            raise ValueError(f"duplicate representative point_id: {point_id}")
+        support = _validated_support(
+            row.get("support"), f"representative close_ma {close_ma} support"
+        )
+        support_status = row.get("support_status")
+        if support_status not in SUPPORT_STATUS_VALUES:
+            raise ValueError(f"unknown support_status: {support_status!r}")
+        continuity_status = row.get("continuity_status")
+        if continuity_status not in CONTINUITY_STATUS_VALUES:
+            raise ValueError(f"unknown continuity_status: {continuity_status!r}")
+        usable = row.get("usable")
+        if not isinstance(usable, bool):
+            raise ValueError("representative usable must be a boolean")
+        parts = point_id.split("|")
+        if len(parts) != 6:
+            raise ValueError(f"representative point_id has invalid shape: {point_id!r}")
+        point_symbol, point_side, point_timeframe, _shift, _open_ma, point_close = parts
+        if (point_symbol, point_side, point_timeframe) != (
+            str(symbol),
+            str(side),
+            str(timeframe),
+        ):
+            raise ValueError(f"representative point {point_id} is outside the Plateau scope")
+        try:
+            parsed_close_ma = int(point_close)
+        except ValueError as error:
+            raise ValueError(f"representative point {point_id} has an invalid CloseMA") from error
+        if parsed_close_ma != close_ma:
+            raise ValueError(f"representative point {point_id} CloseMA does not match {close_ma}")
+        if point_id not in surface_points:
+            raise ValueError(f"representative point {point_id} is outside the surface")
+        if point_id not in plateau_points:
+            raise ValueError(f"representative point {point_id} is outside the Plateau")
+        close_mas.append(close_ma)
+        point_ids.append(point_id)
+        support_status_by_close_ma[close_ma] = support_status
+        expected_status_by_close_ma[close_ma] = _expected_close_status(support)
+        if support_status == "PRIMARY_CLOSE":
+            if primary_index is not None:
+                raise ValueError("more than one PRIMARY_CLOSE representative")
+            if abs(support - Decimal("1")) > numeric_tolerance:
+                raise ValueError("primary support must equal 1.0")
+            primary_index = index
+        elif support > 1:
+            raise ValueError(f"non-primary support outside (0, 1]: {support}")
+    if primary_index is None:
+        raise ValueError("frozen representatives have no PRIMARY_CLOSE row")
+    if close_mas != sorted(close_mas):
+        raise ValueError("representatives are not strictly ordered by close_ma")
+    primary_row = representatives[primary_index]
+    if primary_row["close_ma"] != primary_close_ma:
+        raise ValueError("primary_close_ma does not match the PRIMARY_CLOSE row")
+    if primary_row["continuity_status"] != "USABLE" or primary_row["usable"] is not True:
+        raise ValueError("primary representative must be continuity USABLE")
+    for close_ma, expected_status in expected_status_by_close_ma.items():
+        if close_ma == primary_close_ma:
+            continue
+        if support_status_by_close_ma[close_ma] != expected_status:
+            raise ValueError(
+                f"support_status does not match numeric support for CloseMA {close_ma}"
+            )
+    recomputed = recompute_continuity(support_status_by_close_ma, primary_close_ma)
+    for row in representatives:
+        close_ma = row["close_ma"]
+        expected_status, expected_usable = recomputed[close_ma]
+        if row["continuity_status"] != expected_status or row["usable"] != expected_usable:
+            raise ValueError(
+                f"continuity_status/usable contradict recomputed continuity for CloseMA {close_ma}"
+            )
+    base_id = metrics.get("base_1ord_point_id")
+    if base_id is not None:
+        if not isinstance(base_id, str) or not base_id:
+            raise ValueError("base_1ord_point_id must be a non-empty string or null")
+        if base_id not in surface_points:
+            raise ValueError(f"base point {base_id} is outside the surface")
+        if base_id not in plateau_points:
+            raise ValueError(f"base point {base_id} is outside the Plateau")
+        matches = [index for index, point_id in enumerate(point_ids) if point_id == base_id]
+        if len(matches) != 1:
+            raise ValueError(f"base point {base_id} must appear exactly once among representatives")
+        base_row = representatives[matches[0]]
+        if base_row["continuity_status"] != "USABLE" or base_row["usable"] is not True:
+            raise ValueError(f"base point {base_id} is not a continuity-usable representative")
+        if base_id not in standalone_points:
+            raise ValueError(f"base point {base_id} is not standalone-eligible")
+
+
+def choose_cma_representative(
     plateau_points: pd.DataFrame,
-    primary: pd.Series,
     close_ma: int,
-    open_ma_radius: int,
     config: AlgorithmConfig,
 ) -> pd.Series | None:
+    """Choose exactly one frozen representative for one Plateau + exact CloseMA.
+
+    Candidate pool is every Plateau member point with that exact CloseMA; the
+    global-primary Shift and OpenMA radius never restrict the pool. The
+    economic reference uses `_reference_row()` ordering only, the 5% equivalent
+    group is built before the event filter, and the final ranking is
+    deterministic. Returns None when no representative survives.
+    """
     candidates = plateau_points.loc[
-        plateau_points["economic_pass"]
-        & plateau_points["close_ma"].eq(close_ma)
-        & plateau_points["shift_bp"].eq(int(primary["shift_bp"]))
-        & plateau_points["open_ma"]
-        .sub(int(primary["open_ma"]))
-        .abs()
-        .le(open_ma_radius)
+        plateau_points["economic_pass"] & plateau_points["close_ma"].eq(close_ma)
     ]
     if candidates.empty:
         return None
     equivalents = _equivalent_rows(candidates, config)
-    equivalents = equivalents.loc[equivalents["event_eligible"]]
-    return None if equivalents.empty else choose_equivalent_default(equivalents, config)
+    if "event_eligible" not in equivalents:
+        equivalents["event_eligible"] = equivalents["economic_pass"]
+    equivalents = equivalents.loc[equivalents["event_eligible"]].copy()
+    if equivalents.empty:
+        return None
+    real_events = (
+        "event_mode" in equivalents
+        and equivalents["event_mode"].eq("real_independent_events").any()
+    )
+    if real_events:
+        if "point_event_count" not in equivalents:
+            raise ValueError("point_event_count is required for real_independent_events")
+        equivalents = equivalents.loc[
+            equivalents["point_event_count"].ge(config.min_point_events)
+        ].copy()
+        if equivalents.empty:
+            return None
+    if "point_event_count" not in equivalents:
+        equivalents["point_event_count"] = equivalents["trades"]
+    return equivalents.sort_values(
+        ["point_event_count", "shift_bp", "pnl_pct", "efficiency", "trades", "dd_pct", "point_id"],
+        ascending=[False, False, False, False, False, True, True],
+        kind="mergesort",
+    ).iloc[0]
+
+
+def _plateau_fact(
+    facts_by_plateau: Mapping[str, Mapping[str, object]],
+    plateau_id: object,
+    key: str,
+) -> object:
+    facts = facts_by_plateau.get(str(plateau_id))
+    return facts.get(key) if facts is not None else None
+
+
+def _frozen_base_point_id(
+    representatives: Mapping[int, pd.Series],
+    continuity: Mapping[int, tuple[str, bool]],
+    config: AlgorithmConfig,
+) -> str | None:
+    """Freeze at most one local BASE from continuity-usable standalone reps."""
+    candidates = [
+        representative
+        for close_ma, representative in representatives.items()
+        if continuity[close_ma][1] and bool(representative["standalone_eligible"])
+    ]
+    if not candidates:
+        return None
+    chosen = choose_equivalent_default(pd.DataFrame(candidates), config)
+    return str(chosen["point_id"])
 
 
 def build_close_profiles(
@@ -154,108 +516,89 @@ def build_close_profiles(
         points["event_eligible"] = points["economic_pass"]
     updated = plateaus.copy()
     profile_rows: list[dict[str, object]] = []
-    primary_by_plateau: dict[str, int] = {}
-    refine_by_plateau: dict[str, bool] = {}
+    facts_by_plateau: dict[str, dict[str, object]] = {}
 
     for plateau in plateaus.sort_values("plateau_id", kind="mergesort").itertuples(index=False):
+        if not bool(getattr(plateau, "ready", True)):
+            continue
         point_ids = set(plateau.all_point_ids)
         plateau_points = points.loc[points["point_id"].isin(point_ids)].copy()
-        plateau_points = plateau_points.loc[plateau_points["economic_pass"]]
-        if plateau_points.empty:
+        representatives: dict[int, pd.Series] = {}
+        for close_ma in sorted({int(value) for value in plateau_points["close_ma"]}):
+            representative = choose_cma_representative(plateau_points, close_ma, config)
+            if representative is not None:
+                representatives[close_ma] = representative
+        if not representatives:
             continue
-        equivalents = _equivalent_rows(plateau_points, config)
-        event_equivalents = equivalents.loc[equivalents["event_eligible"]]
-        if event_equivalents.empty:
-            continue
-        primary = choose_equivalent_default(event_equivalents, config)
+        primary = choose_primary_representative(representatives)
         primary_close = int(primary["close_ma"])
-        primary_by_plateau[str(plateau.plateau_id)] = primary_close
-        refine_required = False
+        _finite_positive_decimal(primary["pnl_pct"], "Primary PnL")
+        _finite_positive_decimal(primary["efficiency"], "Primary efficiency")
+        support_by_close_ma: dict[int, tuple[Decimal, str]] = {}
+        for close_ma, representative in representatives.items():
+            if close_ma == primary_close:
+                support = Decimal("1.0")
+                status = "PRIMARY_CLOSE"
+            else:
+                support = compute_close_support(primary, representative)
+                status = close_status(support, config)
+            support_by_close_ma[close_ma] = (support, status)
+        continuity = recompute_continuity(
+            {close_ma: status for close_ma, (_, status) in support_by_close_ma.items()},
+            primary_close,
+        )
+        cma_representatives = [
+            {
+                "close_ma": close_ma,
+                "point_id": str(representatives[close_ma]["point_id"]),
+                "support": float(support),
+                "support_status": status,
+                "continuity_status": continuity[close_ma][0],
+                "usable": continuity[close_ma][1],
+            }
+            for close_ma, (support, status) in sorted(support_by_close_ma.items())
+        ]
+        facts_by_plateau[str(plateau.plateau_id)] = {
+            "operational_facts_version": OPERATIONAL_FACTS_VERSION,
+            "primary_close_ma": primary_close,
+            "cma_representatives": cma_representatives,
+            "base_1ord_point_id": _frozen_base_point_id(representatives, continuity, config),
+        }
         base = {
             "plateau_id": str(plateau.plateau_id),
             "symbol": str(plateau.symbol),
             "side": str(plateau.side),
             "timeframe": str(plateau.timeframe),
         }
-        profile_rows.append(
-            {
-                **base,
-                "close_ma": primary_close,
-                "support": 1.0,
-                "status": "PRIMARY_CLOSE",
-                "point_id": str(primary["point_id"]),
-                "refine_required": False,
-            }
-        )
-        group_mask = (
-            points["symbol"].eq(plateau.symbol)
-            & points["side"].eq(plateau.side)
-            & points["timeframe"].eq(plateau.timeframe)
-        )
-        close_min = int(points.loc[group_mask, "close_ma"].min())
-        close_max = int(points.loc[group_mask, "close_ma"].max())
-        for direction in (-1, 1):
-            close_ma = primary_close + direction
-            while close_min <= close_ma <= close_max:
-                alternative = _profile_alt(
-                    plateau_points,
-                    primary,
-                    close_ma,
-                    config.ma_neighbor_radius,
-                    config,
-                )
-                if alternative is None:
-                    source_slice = points.loc[
-                        group_mask
-                        & points["close_ma"].eq(close_ma)
-                        & points["shift_bp"].eq(int(primary["shift_bp"]))
-                        & points["open_ma"]
-                        .sub(int(primary["open_ma"]))
-                        .abs()
-                        .le(config.ma_neighbor_radius)
-                    ]
-                    missing_source_cell = source_slice.empty
-                    refine_required = refine_required or missing_source_cell
-                    profile_rows.append(
-                        {
-                            **base,
-                            "close_ma": close_ma,
-                            "support": float("nan"),
-                            "status": (
-                                "REFINE_REQUIRED_CLOSE"
-                                if missing_source_cell
-                                else "UNSUPPORTED_CLOSE"
-                            ),
-                            "point_id": None,
-                            "refine_required": missing_source_cell,
-                        }
-                    )
-                    break
-                support = min(
-                    _decimal(alternative["pnl_pct"]) / _decimal(primary["pnl_pct"]),
-                    _decimal(alternative["efficiency"])
-                    / _decimal(primary["efficiency"]),
-                )
-                status = close_status(support, config)
-                profile_rows.append(
-                    {
-                        **base,
-                        "close_ma": close_ma,
-                        "support": float(support),
-                        "status": status,
-                        "point_id": str(alternative["point_id"]),
-                        "refine_required": False,
-                    }
-                )
-                if status == "UNSUPPORTED_CLOSE":
-                    break
-                close_ma += direction
-        refine_by_plateau[str(plateau.plateau_id)] = refine_required
+        for close_ma in sorted(support_by_close_ma):
+            support, status = support_by_close_ma[close_ma]
+            cont_status, usable = continuity[close_ma]
+            profile_rows.append(
+                {
+                    **base,
+                    "close_ma": close_ma,
+                    "support": float(support),
+                    "status": status,
+                    "point_id": str(representatives[close_ma]["point_id"]),
+                    "refine_required": False,
+                    "continuity_status": cont_status,
+                    "usable": usable,
+                }
+            )
 
-    updated["primary_close_ma"] = updated["plateau_id"].map(primary_by_plateau)
-    updated["close_refine_required"] = (
-        updated["plateau_id"].map(refine_by_plateau).fillna(False).astype(bool)
+    updated["operational_facts_version"] = updated["plateau_id"].map(
+        lambda plateau_id: _plateau_fact(facts_by_plateau, plateau_id, "operational_facts_version")
     )
+    updated["primary_close_ma"] = updated["plateau_id"].map(
+        lambda plateau_id: _plateau_fact(facts_by_plateau, plateau_id, "primary_close_ma")
+    )
+    updated["cma_representatives"] = updated["plateau_id"].map(
+        lambda plateau_id: _plateau_fact(facts_by_plateau, plateau_id, "cma_representatives")
+    )
+    updated["base_1ord_point_id"] = updated["plateau_id"].map(
+        lambda plateau_id: _plateau_fact(facts_by_plateau, plateau_id, "base_1ord_point_id")
+    )
+    updated["close_refine_required"] = False
     profile = pd.DataFrame(profile_rows, columns=CLOSE_PROFILE_COLUMNS)
     if not profile.empty:
         profile = profile.sort_values(
@@ -270,15 +613,29 @@ def select_base_one_order(
     plateaus: pd.DataFrame,
     config: AlgorithmConfig,
 ) -> pd.DataFrame:
-    ready_ids = set(plateaus.loc[plateaus["ready"], "plateau_id"])
-    candidates = points.loc[
-        points["plateau_id"].isin(ready_ids) & points["standalone_eligible"]
-    ].copy()
+    """Replay at most one frozen BASE per pair+side from per-Plateau facts.
+
+    Each Plateau BASE was frozen during representative selection from
+    continuity-usable representatives whose source point is standalone-eligible;
+    this replay never re-enumerates arbitrary Plateau standalone points.
+    """
+    empty = pd.DataFrame(columns=[*points.columns, "selection_type"])
+    if plateaus.empty:
+        return empty
+    if "base_1ord_point_id" not in plateaus.columns:
+        raise ValueError("plateaus are missing frozen operational facts")
+    base_rows = plateaus.loc[
+        plateaus["ready"] & plateaus["base_1ord_point_id"].notna()
+    ]
     local_rows: list[pd.Series] = []
-    for _, group in candidates.groupby("plateau_id", sort=True):
-        local_rows.append(choose_equivalent_default(group, config))
+    for row in base_rows.itertuples(index=False):
+        point_id = str(row.base_1ord_point_id)
+        matches = points.loc[points["point_id"].eq(point_id)]
+        if len(matches) != 1:
+            raise ValueError(f"frozen base point {point_id} is missing or duplicated")
+        local_rows.append(matches.iloc[0].copy())
     if not local_rows:
-        return pd.DataFrame(columns=[*points.columns, "selection_type"])
+        return empty
     local = pd.DataFrame(local_rows)
     if "pnl_dd5_theoretical" not in local.columns:
         local["pnl_dd5_theoretical"] = (
@@ -298,6 +655,16 @@ def select_base_one_order(
     return selected
 
 
+def required_gap_bp(left_shift_bp: int, config: AlgorithmConfig) -> int:
+    """Resolve the minimum required gap for the smaller/left sorted Shift."""
+    for lower_min_bp, lower_max_exclusive_bp, min_gap_bp in config.gap_rules:
+        if lower_min_bp <= left_shift_bp < lower_max_exclusive_bp:
+            return int(min_gap_bp)
+    raise ValueError(
+        f"left shift {left_shift_bp} is not covered by configured gap rules"
+    )
+
+
 def validate_order_tuple(
     orders: Sequence[Mapping[str, object]],
     config: AlgorithmConfig,
@@ -313,18 +680,10 @@ def validate_order_tuple(
         return "NO_STANDALONE_ELIGIBLE_FIRST_ORDER"
     if any(not bool(order["depth_eligible"]) for order in sorted_orders[1:]):
         return "DEPTH_NOT_ELIGIBLE"
-    deep_gap = False
     for left, right in zip(shifts, shifts[1:]):
-        if left < config.gap_mid_start_bp:
-            required = config.gap_lower_lt_150_bp
-        elif left <= config.deep_gap_boundary_bp:
-            required = config.gap_lower_150_to_400_bp
-        else:
-            deep_gap = True
-            continue
-        if right - left < required:
+        if right - left < required_gap_bp(left, config):
             return "GAP_TOO_SMALL"
-    return "DEEP_GAP_RESEARCH" if deep_gap else "READY_MRS3_STRUCTURE"
+    return "READY_MRS3_STRUCTURE"
 
 
 def _structure_id(
@@ -383,6 +742,8 @@ def build_structures(
     usable = close_profiles.loc[
         close_profiles["status"].isin(usable_status)
         & close_profiles["support"].ge(float(config.close_supported_min))
+        & close_profiles["continuity_status"].eq("USABLE")
+        & close_profiles["usable"].eq(True)
     ].copy()
     structure_rows: list[dict[str, object]] = []
     diagnostic_rows: list[dict[str, object]] = []
@@ -416,7 +777,6 @@ def build_structures(
         for order_count in range(2, min(config.max_orders, len(plateau_ids)) + 1):
             for plateau_combo in itertools.combinations(plateau_ids, order_count):
                 ready_tuples: list[list[dict[str, object]]] = []
-                deep_tuples: list[list[dict[str, object]]] = []
                 seen_reasons: set[str] = set()
                 for product in itertools.product(
                     *(candidates_by_plateau[plateau_id] for plateau_id in plateau_combo)
@@ -429,8 +789,6 @@ def build_structures(
                     status = validate_order_tuple(orders, config)
                     if status == "READY_MRS3_STRUCTURE":
                         ready_tuples.append(orders)
-                    elif status == "DEEP_GAP_RESEARCH":
-                        deep_tuples.append(orders)
                     else:
                         seen_reasons.add(status)
                 for reason in sorted(seen_reasons):
@@ -446,28 +804,9 @@ def build_structures(
                             "reason": reason,
                         }
                     )
-                chosen_pool = ready_tuples if ready_tuples else deep_tuples
-                if not chosen_pool:
+                if not ready_tuples:
                     continue
-                orders = chosen_pool[0]
-                status = (
-                    "READY_MRS3_STRUCTURE" if ready_tuples else "DEEP_GAP_RESEARCH"
-                )
-                if status == "DEEP_GAP_RESEARCH":
-                    diagnostic_rows.append(
-                        {
-                            "symbol": symbol,
-                            "side": side,
-                            "timeframe": timeframe,
-                            "common_close_ma": int(close_ma),
-                            "order_count": order_count,
-                            "plateau_ids": tuple(plateau_combo),
-                            "status": status,
-                            "reason": status,
-                            "orders": tuple(orders),
-                        }
-                    )
-                    continue
+                orders = ready_tuples[0]
                 numbered_orders = tuple(
                     {**order, "id": index}
                     for index, order in enumerate(orders, start=1)
@@ -499,7 +838,7 @@ def build_structures(
                         "Order2EventCount": int(numbered_orders[1]["point_event_count"]) if len(numbered_orders) >= 2 else None,
                         "Order3EventCount": int(numbered_orders[2]["point_event_count"]) if len(numbered_orders) >= 3 else None,
                         "Order4EventCount": int(numbered_orders[3]["point_event_count"]) if len(numbered_orders) >= 4 else None,
-                        "status": status,
+                        "status": "READY_MRS3_STRUCTURE",
                     }
                 )
     structures = pd.DataFrame(structure_rows, columns=STRUCTURE_COLUMNS)

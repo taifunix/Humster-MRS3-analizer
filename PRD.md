@@ -16,18 +16,50 @@ Humster MRS3 Analyzer — локальный, детерминированный
 4. результаты реального tick-test, расчётная DD5-нормализация и individual ranking;
 5. только после накопления результатов — калиброванный безопасный pre-test potential filter.
 
-## Текущий этап: v0.7 DuckDB analysis storage and importer
+## Текущий этап: v0.7 Source v6 fresh compact multi-scope — complete
 
-Базовый DuckDB surface coverage review и точечный Priority-1 operational patch [канонической спецификации](docs/specs/2026-08-14-duckdb-surface-coverage-review.md) реализованы и проверены: double-zero isolation, stale-token clearing, диагностируемые direct jobs, ordinal и coverage-artifact links при сохранении текущего one-MA-pair контракта. Priority-1 реализовал правило double-zero isolation из [ADR-0008](docs/decisions/0008-common-close-ma-readiness-and-degenerate-row-isolation.md); оставшаяся common Close-MA реализация и её [проект плана](docs/superpowers/plans/2026-08-15-common-close-ma-readiness.md) заморожены до отдельной ревизии, которая должна включить MA-C, `coverage_summary.csv`, progress feedback, оптимизацию повторных source passes и единый preview/real-preflight lifecycle.
+Предыдущий DuckDB analysis-storage/importer этап реализован и проверен:
+source schema v5, управляемый импорт, immutable analysis surfaces, повторный
+plateau-анализ, lineage, библиотека результатов и детерминированные экспорты
+уже доступны. Это инфраструктурная база нового Phase 1, но она не доказывает
+доходность готовых MRS3-стратегий.
 
-Цель ближайшего этапа — сохранить source DuckDB единым пополняемым lossless-хранилищем HTML-отчётов, перенести управление импортом в веб-панель и материализовывать воспроизводимые поверхности для анализа плато в отдельную append-only analysis DuckDB. Анализ напрямую из source DuckDB сначала публикует неизменяемую поверхность, а затем запускает общий plateau pipeline. Контракт зафиксирован в [спецификации DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
+Базовый [DuckDB surface coverage review](docs/specs/2026-08-14-duckdb-surface-coverage-review.md)
+и его Priority-1 patch также реализованы и проверены как **исторический текущий
+runtime**: double-zero isolation, stale-token clearing, диагностируемые direct
+jobs, ordinal и coverage-artifact links при старом one-MA-pair readiness.
+Readiness-поведение этого historical runtime заменено canonical six-CloseMA
+core в Task 2; panel/storage selected-preflight integration остаётся Task 3.
 
-Этап реализован и проверен: source schema v5, управляемый импорт, immutable
-analysis surfaces, повторный plateau-анализ, lineage, библиотека результатов и
-детерминированные экспорты доступны из общего v0.7 контура. Это завершает
-инфраструктуру анализа, но не доказывает доходность готовых MRS3-стратегий.
+Новая [Canonical Phase 1 specification](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md)
+утверждена как активный контракт, а [ADR-0009](docs/decisions/0009-canonical-phase1-surface-selection-contract.md)
+принят после независимого governance review. Они определяют свежие canonical
+surfaces и MRS3 selection:
 
-Соединение CSV с DuckDB не входит в обязательную поставку и не блокирует этот этап. Оно вынесено в отдельное [необязательное ТЗ CSV-DuckDB overlay](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md) со статусом **Optional / Deferred**. Существующие [event source packs](docs/specs/2026-08-10-v07-event-source-packs.md), [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) и [ADR-0003](docs/decisions/0003-source-integrity-action-metrics.md) остаются диагностическими зависимостями.
+- exact canonical Shift grid `30..550`;
+- один общий UTC-интервал и шесть readiness witnesses CloseMA `2..7`;
+- exact preview/audit/preflight replay;
+- bounded 15-process direct materialization;
+- frozen CMARepresentative / CloseMA continuity / BASE facts;
+- 2/3/4ORD только из frozen representatives;
+- независимый exact-scope 1ORD;
+- hard rejection старых/non-canonical surfaces из нового operational flow.
+
+Governance Task 0, canonical-config Task 1 и six-CloseMA readiness Task 2
+завершены; следующий шаг — Task 3 из отдельного плана. Task 2 проверен
+focused `79 passed`, `git diff --check` и независимым Luna `PASS`.
+Принятые ADR-0007 и ADR-0008 не переписываются; их конфликтующие части
+superseded ADR-0009 только для новых canonical surfaces. Старый
+[Common Close-MA Readiness plan](docs/superpowers/plans/2026-08-15-common-close-ma-readiness.md)
+остаётся frozen/non-executable.
+
+Source DuckDB остаётся единым пополняемым lossless-хранилищем HTML-отчётов, а
+Analysis DuckDB — append-only хранилищем immutable materialized surfaces,
+analysis runs и lineage согласно уже реализованной
+[спецификации DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
+
+Соединение CSV с DuckDB остаётся Optional / Deferred по
+[CSV-DuckDB overlay](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md).
 
 ### Этапы поставки
 
@@ -83,8 +115,62 @@ analysis surfaces, повторный plateau-анализ, lineage, библи�
 | Active implementation contract | [Performance report import to DuckDB](docs/specs/2026-08-14-performance-report-import-duckdb.md) | immutable HTML-report import, canonical metrics, transaction, idempotency and cleanup | Strategy performance DuckDB, ADR-0004--0006 |
 | Active implementation contract | [DD5 calculation and finalist selection](docs/specs/2026-08-14-dd5-finalist-selection.md) | DD5 formulas, scoped filters, Pareto, finalists and XLSX contract | Performance report import to DuckDB |
 | Active implementation contract | [Tester Report Library and Fast Identity](docs/specs/2026-08-14-tester-report-library-and-fast-identity.md) | verified report library, fast embedded identity and deferred workflow/CLI integration | [Name-only runner contract](docs/specs/2026-08-14-tester-name-only-verification.md) |
-| Implemented / Verified Priority-1 patch | [DuckDB surface coverage review](docs/specs/2026-08-14-duckdb-surface-coverage-review.md) | current one-MA-pair flow unblocked and diagnosed; preview and real preflight reproduce unchanged-source scopes and intervals; remaining ADR-0008 common Close-MA work is frozen | DuckDB analysis storage, [ADR-0007](docs/decisions/0007-observed-sparse-surface-contract.md), [ADR-0008](docs/decisions/0008-common-close-ma-readiness-and-degenerate-row-isolation.md) |
+| Active — implementation pending | [MRS3 v0.7 Canonical Phase 1](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md) | fresh canonical `30..550` surfaces, six CloseMA readiness, exact audit/preflight replay, parallel materialization, frozen CMA/BASE and independent 1ORD | [ADR-0009](docs/decisions/0009-canonical-phase1-surface-selection-contract.md), DuckDB analysis storage, event filter |
+| Accepted | [ADR-0009](docs/decisions/0009-canonical-phase1-surface-selection-contract.md) | supersedes conflicting ADR-0007/0008 readiness semantics for fresh Phase 1 surfaces without rewriting historical ADRs | Canonical Phase 1 spec |
+| Implemented / Verified Priority-1 patch — historical runtime evidence | [DuckDB surface coverage review](docs/specs/2026-08-14-duckdb-surface-coverage-review.md) | verified old one-MA-pair runtime and Priority-1 operational fixes; future canonical behavior is defined by the active 2026-08-16 Phase 1 spec | DuckDB analysis storage, ADR-0007, ADR-0008 |
 | Accepted | [ADR-0007](docs/decisions/0007-observed-sparse-surface-contract.md) | V1 unchanged; V2 evidence in existing `grid_contract_json`; one read transaction prepares selected sides; LONG then SHORT; `PARTIAL`/manual rerun; deferred retry/lease/path/schema-v5 | DuckDB surface coverage review |
 | Accepted | [ADR-0008](docs/decisions/0008-common-close-ma-readiness-and-degenerate-row-isolation.md) | common Close MA `2..7` interval and six scope witnesses; structurally zero-duration rows ignored, other empty intersections fail closed | DuckDB surface coverage review |
 
 Полная навигация: [docs/README.md](docs/README.md). Оперативная точка: [progress.md](progress.md).
+## Canonical Phase 1 status addendum (2026-08-17)
+
+Tasks 0–4 are complete and independently reviewed. Task 4 includes bounded
+bulk payload reads, 15-process CPU materialization, deterministic workers=1/15
+equivalence, cancellation-safe scheduling, frozen-manifest validation, and
+side-aware progress telemetry. The next implementation task is Task 5.
+
+## Proposed next architecture: Source v6 stitched surfaces (2026-08-18)
+
+The next product stage is a fresh Source DuckDB v6 rebuilt from HTML without a
+v5 migration. It normalises exact point/time facts, stitches compatible
+Fixed-lot report periods with a minimum 96-hour overlap plus bridge-cycle
+coverage, recalculates PnL/DD/trade metrics, and publishes each selected
+surface as a separate self-describing DuckDB file.
+
+| Status | Document | Purpose |
+| --- | --- | --- |
+| Accepted | [ADR-0010](docs/decisions/0010-source-v6-stitched-facts-and-surface-files.md) | fresh v6, stitch/metric/storage decision and supersession boundary |
+| Accepted | [Source v6 specification](docs/specs/2026-08-18-source-v6-stitched-surfaces.md) | normative inputs, identities, overlap, metrics, coverage, surfaces, analysis and panel contract |
+| Complete | [Source v6 implementation plan](docs/superpowers/plans/2026-08-18-source-v6-stitched-surfaces.md) | Ponytail-bounded TDD delivery sequence; full `.venv` suite and independent Terra review recorded in `progress.md` |
+| In progress (acceptance) | [Source v6 analysis handoff](docs/specs/2026-08-19-source-v6-analysis-handoff.md) and [plan](docs/superpowers/plans/2026-08-19-source-v6-analysis-handoff.md) | Windows v6 surface -> analysis -> READY JSON -> tester/DD5 lineage; implementation Tasks 1–6 have evidence, final acceptance/review and real end-to-end fixture remain |
+
+Pair deletion/compaction, v5 migration, exchange-mixed databases, missing-test
+strategy generation, exact tick MAE/MFE, margin and portfolio simulation remain
+outside this stage.
+
+## Source v6 fresh compact multi-scope (2026-08-20)
+
+The next product stage is the fresh-only `source-v6-fresh-compact-v1` format:
+raw HTML is re-imported into compact indexed fragments, with deterministic
+uncompressed fragment identity, audit/quarantine/stitch dispositions and
+`source_content_digest`. It does not migrate or dual-read v3/v4/v5 artifacts,
+and it does not store one row per sample, action, cycle or event.
+
+| Status | Document | Purpose |
+| --- | --- | --- |
+| Implemented / independently reviewed - Stage 1 | [ADR-0012](docs/decisions/0012-source-v6-fresh-compact-v1.md), [ADR-0014](docs/decisions/0014-source-v6-compact-publication.md), [Stage 1 evidence](.codex/stage1-acceptance-ledger.md) | fresh-only compact Source/import/merge boundary, lineage, no duplicate fact payloads, compact publication and verified real-corpus/recovery evidence; root gate accepted |
+| Implemented / independently reviewed | [ADR-0013](docs/decisions/0013-source-v6-incomplete-seam-cycle-exclusion.md) | old-owned compatible >=96h overlap, retained boundary cycles, period-local PnL/DD/PF; does not edit ADR-0011 |
+| Complete | [Fresh compact multi-scope plan](docs/superpowers/plans/2026-08-20-source-v6-fresh-compact-multiscope.md) | gated Stage 2 multi-scope materialization, immutable surface publication, separate parallel analysis and panel flow; full tests and independent review recorded in `progress.md` |
+
+The [2026-08-19 handoff Task 8](docs/superpowers/plans/2026-08-19-source-v6-analysis-handoff.md#task-8-fresh-only-compact-source-v6-and-parallel-multi-scope-surfaces)
+and the storage portion of the [2026-08-18 v6 contract](docs/specs/2026-08-18-source-v6-stitched-surfaces.md)
+are superseded for new compact artifacts by the documents above. Existing
+v6 artifacts and their historical evidence remain untouched; the accepted
+stitching and boundary rules remain applicable unless explicitly replaced.
+
+[ADR-0013](docs/decisions/0013-source-v6-incomplete-seam-cycle-exclusion.md)
+amends only the compatible-overlap seam case. Its user-approved old-owned
+policy is implemented and independently reviewed. The full real-pair metric
+audit is in [.codex/task6-recovery-overlap-report.md](.codex/task6-recovery-overlap-report.md):
+all 684 pairs resolved old-owned and verified two local periods, local PnL,
+maximum period DD% and retained-action Profit Factor.

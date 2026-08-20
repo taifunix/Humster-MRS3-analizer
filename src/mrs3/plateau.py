@@ -7,7 +7,7 @@ from typing import Iterable, Mapping
 import pandas as pd
 
 from .config import AlgorithmConfig
-from .refine import ShiftDomain, are_shift_neighbors
+from .refine import are_shift_neighbors, canonical_shift_neighbors
 
 
 MetricPoint = Mapping[str, object]
@@ -91,34 +91,21 @@ class _UnionFind:
         return keep
 
 
-def _shift_rule_kwargs(config: AlgorithmConfig) -> dict[str, int]:
-    return {
-        "fine_zone_max_exclusive_bp": config.fine_zone_max_exclusive_bp,
-        "boundary_zone_max_bp": config.boundary_zone_max_bp,
-        "fine_step_bp": config.fine_step_bp,
-        "fine_radius_bp": config.fine_radius_bp,
-        "boundary_down_radius_bp": config.boundary_down_radius_bp,
-        "boundary_up_radius_bp": config.boundary_up_radius_bp,
-        "coarse_radius_bp": config.coarse_radius_bp,
-    }
-
-
 def _geometric_neighbors(
     left: MetricPoint,
     right: MetricPoint,
-    tested_shifts: tuple[int, ...],
     config: AlgorithmConfig,
 ) -> bool:
     if abs(int(left["open_ma"]) - int(right["open_ma"])) > config.ma_neighbor_radius:
         return False
     if abs(int(left["close_ma"]) - int(right["close_ma"])) > config.ma_neighbor_radius:
         return False
+    if int(left["shift_bp"]) == int(right["shift_bp"]):
+        return True
     return are_shift_neighbors(
         int(left["shift_bp"]),
         int(right["shift_bp"]),
-        tested_shifts,
-        ShiftDomain(config.shift_domain_min_bp, config.shift_domain_max_bp),
-        **_shift_rule_kwargs(config),
+        config.canonical_shifts_bp,
     )
 
 
@@ -164,19 +151,13 @@ def _build_group_plateaus(
         )
         for _, row in candidate.iterrows()
     }
-    shift_neighbors: dict[int, tuple[int, ...]] = {}
-    for shift in tested_shifts:
-        shift_neighbors[shift] = tuple(
-            other
-            for other in tested_shifts
-            if are_shift_neighbors(
-                shift,
-                other,
-                tested_shifts,
-                ShiftDomain(config.shift_domain_min_bp, config.shift_domain_max_bp),
-                **_shift_rule_kwargs(config),
-            )
+    shift_neighbors: dict[int, tuple[int, ...]] = {
+        shift: (
+            shift,
+            *canonical_shift_neighbors(shift, config.canonical_shifts_bp),
         )
+        for shift in tested_shifts
+    }
 
     edges: list[tuple[Decimal, str, str]] = []
     for point_id, point in records.items():
@@ -232,7 +213,7 @@ def _build_group_plateaus(
             core_link(records[point_id], records[core_id])
             for plateau in plateaus
             for core_id in plateau["core"]
-            if _geometric_neighbors(records[point_id], records[core_id], tested_shifts, config)
+            if _geometric_neighbors(records[point_id], records[core_id], config)
         ]
         border_order.append((max(supports, default=Decimal("0")), point_id))
     border_order.sort(key=lambda item: (-item[0], item[1]))
@@ -244,9 +225,7 @@ def _build_group_plateaus(
                 (
                     core_link(records[point_id], records[core_id])
                     for core_id in plateau["core"]
-                    if _geometric_neighbors(
-                        records[point_id], records[core_id], tested_shifts, config
-                    )
+                    if _geometric_neighbors(records[point_id], records[core_id], config)
                 ),
                 default=Decimal("0"),
             )

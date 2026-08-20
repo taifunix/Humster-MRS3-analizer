@@ -18,7 +18,6 @@
 
 Если пользователь пишет **«работаем над Анализатором Портфеля»** (или `Portfolio Analyzer`), это означает: после шагов 1–3 минимального контекста обязательно прочитать `docs/specs/2026-08-09-portfolio-analyzer-v04.md`, затем `docs/decisions/0001-repository-and-documentation-model.md`, затем только разделы 9–10 `docs/archive/sources/MRS3_v07_MASTER_HANDOFF_LEGACY_DUCKDB_2026-08-10.md`.
 
-Для этого hook не читать всю legacy-spec или весь архив. Не менять v0.7 legacy selection. До подтверждения trade timestamps, limiter contract, L2 и margin data разрешён только Layer A; сетовый симулятор и рекомендации не реализовывать.
 
 ## Карта источников истины
 
@@ -53,6 +52,10 @@
 
 ## Git, проверка и review
 
+Все тесты проекта запускать только из локального окружения `.venv`:
+`.venv\\Scripts\\python.exe -m pytest ...` (не использовать системный
+`python`/`pytest`).
+
 Каждый коммит проходит один и тот же порядок:
 
 1. Сверить scope с active-spec и ограничить diff только связанными файлами.
@@ -67,5 +70,19 @@
 ## Локальный тестер и данные
 
 `config.local.json` — локальный, игнорируемый конфиг тестера; создать его из `config.local.json.example` и заполнить локальный `tester_runner.bot_root`. Реальные локальные пути, HTML, DuckDB, отчёты тестера, результаты, credentials и generated artifacts не коммитить и не упоминать в README.
+
+## Статус активного плана
+
+- Для актуализации чекбоксов и строк статуса активного плана закреплён отдельный
+  read-only maintainer `plan_status_maintainer` на модели `GPT-5.6 Luna light`.
+  Он сверяет только подтверждённые root evidence и reviewer disposition с
+  `docs/superpowers/plans/2026-08-19-source-v6-analysis-handoff.md`, после чего
+  обновляет в этом плане чекбоксы/статус без изменения кода, тестов,
+  спецификаций, PRD или `progress.md`. Он не закрывает задачу по одному лишь
+  сообщению исполнителя и не помечает review как PASS без фактического
+  `CODE_REVIEW_PASS`.
+- Root передаёт maintainer самодостаточный packet после каждой принятой задачи;
+  до этого maintainer не изменяет план. Root сохраняет ответственность за
+  acceptance, интеграцию, verification и решение по замечаниям review.
 
 Импортёры v3/v4 лежат в `programs/Обработчик HTML-DuckDB/`; v4 требует соседний v3 codec. Не переносить или не переписывать этот runtime-контур без отдельной спецификации и проверки на реальном пути отчётов.

@@ -10,9 +10,12 @@ import pytest
 import mrs3.config as config_module
 from mrs3.config import (
     AlgorithmConfig,
+    DirectMaterializationSettings,
     DuckDBImportSettings,
     load_duckdb_import_settings,
+    load_direct_materialization_settings,
     save_duckdb_import_settings,
+    save_direct_materialization_settings,
 )
 
 
@@ -81,6 +84,175 @@ def test_duckdb_import_settings_reject_malformed_values(tmp_path, payload, messa
         load_duckdb_import_settings(path)
 
 
+def test_direct_materialization_settings_defaults(tmp_path) -> None:
+    settings = DirectMaterializationSettings()
+
+    assert settings.workers == 15
+    assert settings.fetch_batch_size == 256
+    assert settings.worker_chunk_size == 16
+    assert settings.max_in_flight_chunks == 30
+    assert load_direct_materialization_settings(tmp_path / "missing.json") == settings
+
+
+def test_direct_materialization_settings_round_trip_preserves_other_local_config(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(
+        json.dumps(
+            {
+                "panel": {"theme": "dark"},
+                "direct_materialization": {"future": "keep"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = DirectMaterializationSettings(
+        workers=4, fetch_batch_size=128, worker_chunk_size=8, max_in_flight_chunks=16
+    )
+
+    save_direct_materialization_settings(path, settings)
+
+    assert load_direct_materialization_settings(path) == settings
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["panel"] == {"theme": "dark"}
+    assert saved["direct_materialization"]["future"] == "keep"
+
+
+def test_direct_materialization_settings_valid_overrides(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(
+        json.dumps(
+            {
+                "direct_materialization": {
+                    "workers": 8,
+                    "fetch_batch_size": 64,
+                    "worker_chunk_size": 4,
+                    "max_in_flight_chunks": 12,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_direct_materialization_settings(path)
+
+    assert loaded == DirectMaterializationSettings(
+        workers=8, fetch_batch_size=64, worker_chunk_size=4, max_in_flight_chunks=12
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {"direct_materialization": []},
+            "direct_materialization must be an object",
+        ),
+        (
+            {"direct_materialization": {"workers": True}},
+            "direct_materialization.workers must be a positive integer",
+        ),
+        (
+            {"direct_materialization": {"fetch_batch_size": True}},
+            "direct_materialization.fetch_batch_size must be a positive integer",
+        ),
+        (
+            {"direct_materialization": {"worker_chunk_size": True}},
+            "direct_materialization.worker_chunk_size must be a positive integer",
+        ),
+        (
+            {"direct_materialization": {"max_in_flight_chunks": True}},
+            "direct_materialization.max_in_flight_chunks must be a positive integer",
+        ),
+        (
+            {"direct_materialization": {"workers": 0}},
+            "direct_materialization.workers must be a positive integer",
+        ),
+        (
+            {"direct_materialization": {"fetch_batch_size": -1}},
+            "direct_materialization.fetch_batch_size must be a positive integer",
+        ),
+        (
+            {"direct_materialization": {"worker_chunk_size": 0}},
+            "direct_materialization.worker_chunk_size must be a positive integer",
+        ),
+        (
+            {"direct_materialization": {"max_in_flight_chunks": 0}},
+            "direct_materialization.max_in_flight_chunks must be a positive integer",
+        ),
+        (
+            {"direct_materialization": {"workers": 15, "max_in_flight_chunks": 14}},
+            "direct_materialization.max_in_flight_chunks must be at least workers",
+        ),
+    ],
+)
+def test_direct_materialization_settings_reject_malformed_values(
+    tmp_path, payload: dict[str, object], message: str
+) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_direct_materialization_settings(path)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"workers": True},
+            "direct_materialization.workers must be a positive integer",
+        ),
+        (
+            {"fetch_batch_size": 0},
+            "direct_materialization.fetch_batch_size must be a positive integer",
+        ),
+        (
+            {"max_in_flight_chunks": 2, "workers": 3},
+            "direct_materialization.max_in_flight_chunks must be at least workers",
+        ),
+    ],
+)
+def test_direct_materialization_settings_reject_invalid_construction(
+    changes: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        replace(DirectMaterializationSettings(), **changes)
+
+
+def test_direct_materialization_defaults_match_tracked_example() -> None:
+    raw = json.loads(Path("config.example.json").read_text(encoding="utf-8"))
+
+    defaults = DirectMaterializationSettings()
+
+    assert raw["direct_materialization"] == {
+        "workers": defaults.workers,
+        "fetch_batch_size": defaults.fetch_batch_size,
+        "worker_chunk_size": defaults.worker_chunk_size,
+        "max_in_flight_chunks": defaults.max_in_flight_chunks,
+    }
+
+
+def test_direct_materialization_settings_do_not_alter_algorithm_config_identity() -> None:
+    algorithm = AlgorithmConfig.defaults()
+    algorithm_fields = frozenset(algorithm.__dataclass_fields__)
+
+    settings = DirectMaterializationSettings()
+
+    assert isinstance(settings, DirectMaterializationSettings)
+    assert settings != algorithm
+    assert not isinstance(settings, AlgorithmConfig)
+    assert algorithm_fields.isdisjoint(
+        {
+            "workers",
+            "fetch_batch_size",
+            "worker_chunk_size",
+            "max_in_flight_chunks",
+        }
+    )
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
@@ -127,10 +299,145 @@ def test_algorithm_config_rejects_invalid_semantics(
         replace(AlgorithmConfig.defaults(), **changes)
 
 
+@pytest.mark.parametrize(
+    "canonical_shifts_bp",
+    [
+        (),
+        (30, 40, True),
+        (30, 40, 40, 550),
+        (40, 550),
+        (30, 510),
+    ],
+)
+def test_algorithm_config_rejects_invalid_canonical_shifts(
+    canonical_shifts_bp: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match="canonical shifts"):
+        replace(
+            AlgorithmConfig.defaults(), canonical_shifts_bp=canonical_shifts_bp
+        )
+
+
+@pytest.mark.parametrize(
+    "gap_rules",
+    [
+        (),
+        ((30, 80, 80), (80, 200, 100), (200, 300, 130)),
+        ((30, 80, 0), (80, 200, 100), (200, 300, 130), (300, 551, 150)),
+        ((30, 90, 80), (80, 200, 100), (200, 300, 130), (300, 551, 150)),
+    ],
+)
+def test_algorithm_config_rejects_invalid_gap_rules(
+    gap_rules: tuple[tuple[int, int, int], ...],
+) -> None:
+    with pytest.raises(ValueError, match="gap rules"):
+        replace(AlgorithmConfig.defaults(), gap_rules=gap_rules)
+
+
+def test_defaults_match_tracked_example() -> None:
+    raw = json.loads(Path("config.example.json").read_text(encoding="utf-8"))
+
+    loaded = AlgorithmConfig.from_json(Path("config.example.json"))
+    default = AlgorithmConfig.defaults()
+
+    assert default.canonical_shifts_bp == loaded.canonical_shifts_bp
+    assert default.canonical_shifts_bp == tuple(raw["canonical_shifts_bp"])
+    assert default.shift_domain_min_bp == raw["shift_domain"]["min_bp"]
+    assert default.shift_domain_max_bp == raw["shift_domain"]["max_bp"]
+    assert default.shift_domain_max_bp == 550
+    assert default.gap_rules == tuple(
+        (
+            rule["lower_min_bp"],
+            rule["lower_max_exclusive_bp"],
+            rule["min_gap_bp"],
+        )
+        for rule in raw["gap_rules"]
+    )
+    assert default.close_supported_min == Decimal("0.60")
+    assert default.close_core_min == Decimal("0.90")
+    assert default.supported_link_min == Decimal("0.75")
+    assert default.plateau_envelope_min == Decimal("0.75")
+    assert default.shift_factors[-1][0] == 550
+
+
+def test_from_json_accepts_canonical_fields(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "canonical_shifts_bp": [190, 230, 270],
+                "shift_domain": {"min_bp": 190, "max_bp": 270},
+                "gap_rules": [
+                    {"lower_min_bp": 190, "lower_max_exclusive_bp": 230, "min_gap_bp": 30},
+                    {"lower_min_bp": 230, "lower_max_exclusive_bp": 271, "min_gap_bp": 40},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = AlgorithmConfig.from_json(path)
+
+    assert loaded.canonical_shifts_bp == (190, 230, 270)
+    assert loaded.gap_rules == ((190, 230, 30), (230, 271, 40))
+
+
+def test_from_json_missing_canonical_fields_uses_defaults(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text("{}", encoding="utf-8")
+
+    loaded = AlgorithmConfig.from_json(path)
+
+    assert loaded.canonical_shifts_bp == AlgorithmConfig.defaults().canonical_shifts_bp
+    assert loaded.gap_rules == AlgorithmConfig.defaults().gap_rules
+
+
 def test_shift_domain_can_extend_beyond_calibrated_shift_factors() -> None:
-    config = replace(AlgorithmConfig.defaults(), shift_domain_max_bp=700)
+    config = replace(
+        AlgorithmConfig.defaults(),
+        shift_domain_max_bp=700,
+        canonical_shifts_bp=(
+            30,
+            40,
+            50,
+            60,
+            70,
+            90,
+            110,
+            140,
+            170,
+            200,
+            230,
+            270,
+            310,
+            350,
+            390,
+            430,
+            470,
+            510,
+            550,
+            700,
+        ),
+        gap_rules=(
+            (30, 80, 80),
+            (80, 200, 100),
+            (200, 300, 130),
+            (300, 551, 150),
+            (551, 701, 150),
+        ),
+    )
 
     assert config.shift_domain_max_bp == 700
+
+
+@pytest.mark.parametrize("shift_bp", [470, 510, 550])
+def test_final_shift_factor_covers_canonical_tail(shift_bp: int) -> None:
+    config = AlgorithmConfig.defaults()
+
+    assert next(
+        factor for maximum, factor in config.shift_factors if shift_bp <= maximum
+    ) == Decimal("0.20")
 
 
 @pytest.mark.parametrize(

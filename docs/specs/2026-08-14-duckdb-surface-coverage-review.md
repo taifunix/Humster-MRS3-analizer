@@ -1,6 +1,6 @@
 # DuckDB Surface Coverage Review
 
-**Status:** Priority-1 operational patch implemented and verified; remaining ADR-0008 common Close-MA work frozen
+**Status:** Implemented / verified historical runtime evidence; superseded for new Phase 1 behavior by [Canonical Phase 1 specification](2026-08-16-mrs3-v07-canonical-phase1.md)
 **Date:** 2026-08-15
 **Design evidence:** [DuckDB Surface Coverage Review Design](../superpowers/specs/2026-08-14-duckdb-surface-coverage-review-design.md)
 **Baseline implementation evidence:** [DuckDB Surface Coverage Review Baseline Plan](../superpowers/plans/2026-08-14-duckdb-surface-coverage-review.md)
@@ -9,14 +9,19 @@
 **Related ADRs:** [ADR-0007](../decisions/0007-observed-sparse-surface-contract.md),
 [ADR-0008](../decisions/0008-common-close-ma-readiness-and-degenerate-row-isolation.md)
 
+This document remains the implementation contract and evidence record for the
+verified Priority-1 one-MA-pair runtime. It is no longer the active contract
+for newly built canonical Phase 1 surfaces; those are governed by [ADR-0009](../decisions/0009-canonical-phase1-surface-selection-contract.md)
+and the linked Phase 1 specification. The historical runtime and its artifacts
+are not silently migrated or treated as canonical Phase 1 surfaces.
+
 ## 1. Purpose
 
-This document is the canonical active feature contract for the DuckDB surface
-coverage review. It approves the feature scope, invariants, and definition of
-done. The linked design is detailed design evidence; its algorithms and
-acceptance scenarios are used to implement and verify this contract. This file
-does not copy the full design into a separate rule set, and neither document
-should be edited to create a conflicting contract.
+This document records the historical runtime feature contract, its invariants,
+and its verified definition of done. The linked design is detailed evidence;
+its algorithms and acceptance scenarios describe this historical runtime. This
+file does not define the newer canonical Phase 1 behavior, which is specified
+separately and must not be retrofitted into this record.
 
 ## 2. Scope
 
@@ -163,8 +168,8 @@ canonical scope/invariant file together without introducing contradictions.
 
 ## 5. Definition of Done
 
-- ADR-0007 and ADR-0008 are accepted, and this canonical spec is linked from
-  PRD and progress.
+- ADR-0007 and ADR-0008 are accepted, and this historical runtime spec is linked
+  from PRD and progress as implementation evidence.
 - Factual coverage and readiness tests prove deterministic merging, exact
   one-MA-pair readiness, optional-data acceptance, and complete missing-interval
   reporting.

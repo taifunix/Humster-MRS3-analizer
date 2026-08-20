@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 import csv
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 from hashlib import sha256
@@ -25,15 +25,36 @@ import webbrowser
 import duckdb
 
 from .analysis_exports import export_analysis_run
-from .analysis_strategies import generate_analysis_strategies
+from .analysis_strategies import (
+    generate_analysis_strategies,
+    generate_v6_analysis_strategies,
+    load_validated_plateau_facts,
+)
 from .analysis_shortlist import CRITERIA, filter_analysis_candidates
 from .analysis_filter_export import export_filter_audit
-from .analysis_storage import compare_analysis_runs, ensure_analysis_schema, list_surface_library, publish_analysis_run
+from .analysis_storage import (
+    compare_analysis_runs,
+    ensure_analysis_schema,
+    list_surface_library,
+    publish_analysis_run,
+    require_canonical_operational_surface,
+)
 from .config import AlgorithmConfig
-from .config import DuckDBImportSettings, load_duckdb_import_settings, save_duckdb_import_settings
+from .config import (
+    DirectMaterializationSettings,
+    DuckDBImportSettings,
+    load_direct_materialization_settings,
+    load_duckdb_import_settings,
+    save_duckdb_import_settings,
+)
 from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, SnapshotProgress, import_html_tree, preflight_html_import
 from .duckdb_source_schema import migrate_source_database
+from .loader import load_listing_dates
 from .duckdb_direct import (
+    CANONICAL_GRID_VERSION,
+    CANONICAL_MATERIALIZER_VERSION,
+    POINT_MATERIALIZATION_SEMANTICS_VERSION,
+    V2_AUDIT_SCHEMA_VERSION,
     DirectBuildRequest,
     DirectCommonInterval,
     DirectMaterializationError,
@@ -48,6 +69,9 @@ from .duckdb_direct import (
     list_duckdb_direct_coverage,
     preflight_duckdb_direct,
     prepare_direct_surfaces,
+    freeze_direct_preflights,
+    replay_direct_preflights,
+    canonical_point_materialization_config_hash,
     publish_direct_surfaces,
     run_panel_direct_build,
 )
@@ -55,12 +79,37 @@ from .models import Side
 from .pipeline import run_published_pipeline
 from .performance_import import _canonical, _canonical_contract, _sha256
 from .published_surface import load_published_surface
+from .source_v6 import SourceV6Error, normalize_source_v6
+from .source_v6_importer import import_source_v6, preflight_source_v6, source_v6_import_lock
+from .source_v6_merge import (
+    merge_source_v6,
+    preflight_source_v6_merge,
+)
+from .source_v6_surface import (
+    SOURCE_V6_EVENT_MODE,
+    SOURCE_V6_EVENT_SCHEMA_VERSION,
+    SOURCE_V6_FROZEN_DIGEST_ALGORITHM,
+    SOURCE_V6_METRIC_SCHEMA_VERSION,
+    SOURCE_V6_READINESS_SCHEMA_VERSION,
+    SOURCE_V6_SURFACE_SCHEMA_VERSION,
+    load_source_v6_pipeline_input,
+    list_source_v6_analysis_runs,
+    publish_surface_db,
+    read_surface_db,
+    run_source_v6_analysis,
+    scan_surface_diagnostics,
+    _canonical_json as _source_v6_canonical_json,
+    _v6_listing_snapshot,
+)
+from .source_v6_analysis import export_plateau_report
+from .source_v6_coverage import canonical_ready_intervals, coverage_csv, coverage_json, missing_cells, select_ready_interval
+from .source_v6_materializer import materialize_source_v6
+from .source_v6_surface_fresh import publish_multiscope_surface, read_multiscope_surface
+from .source_v6_analysis_fresh import run_multiscope_analysis
 
 
-_DIRECT_MATERIALIZER_VERSION = "v2-real-events"
-_DIRECT_POINT_CONFIG_HASH = sha256(
-    b"event_mode=real_independent_events;event_id=pair|position_side|timeframe|opened_at_utc_ns"
-).hexdigest()
+_DIRECT_MATERIALIZER_VERSION = CANONICAL_MATERIALIZER_VERSION
+_DIRECT_POINT_CONFIG_HASH = canonical_point_materialization_config_hash(tuple(AlgorithmConfig().canonical_shifts_bp))
 _TESTER_START_PATTERN = re.compile(r"^\[RUN (\d+)/(\d+)\] start\.")
 _TESTER_PROGRESS_PATTERN = re.compile(
     r"^RUN (\d+)/(\d+) time=([^ ]+ [^ ]+) \(([0-9]+(?:\.[0-9]+)?)%\)"
@@ -326,6 +375,7 @@ PANEL_HTML = r"""<!doctype html>
     @media (prefers-reduced-transparency: reduce) { .card, .tablist { background: var(--panel); backdrop-filter: none; } }
     @media (prefers-contrast: more) { .card, .tablist, input, select { border-color: #fff; } }
     @media (max-width: 850px) { .grid { grid-template-columns: 1fr; } .stats, .decision-grid { grid-template-columns: 1fr 1fr; } }
+    #panel-candidates .workflow-card:first-of-type { display: none; }
   </style>
 </head>
 <body>
@@ -335,7 +385,7 @@ PANEL_HTML = r"""<!doctype html>
     <div class="badge">127.0.0.1 · отдельный процесс</div>
   </header>
   <div class="tablist" role="tablist" aria-label="Рабочие разделы MRS3">
-    <button role="tab" id="tab-csv-source" aria-selected="true" aria-controls="panel-csv-source" tabindex="0">Legacy CSV source</button>
+    <button role="tab" id="tab-csv-source" aria-selected="false" aria-controls="panel-csv-source" tabindex="-1" hidden>Legacy CSV source</button>
     <button role="tab" id="tab-duckdb-source" aria-selected="false" aria-controls="panel-duckdb-source" tabindex="-1">1–5. Import → surface → analysis → JSON</button>
     <button role="tab" id="tab-candidates" aria-selected="false" aria-controls="panel-candidates" tabindex="-1">6–8. Test plan → tests → DD5</button>
     <button role="tab" id="tab-portfolio" aria-selected="false" aria-controls="panel-portfolio" tabindex="-1">Анализатор портфелей</button>
@@ -343,7 +393,7 @@ PANEL_HTML = r"""<!doctype html>
   </div>
   <div class="grid">
     <section class="card stack">
-      <section role="tabpanel" id="panel-csv-source" aria-labelledby="tab-csv-source">
+      <section role="tabpanel" id="panel-csv-source" aria-labelledby="tab-csv-source" hidden>
         <h2>MRS2 · CSV</h2><p class="source-note">Точный UTC-интервал; PointEventCount = TotalTrades. Этот пакет нельзя смешивать с DuckDB-пакетом.</p>
         <div class="stack workflow-card">
           <label>CSV-файлы (через ;)<div class="path-control"><input id="source_csv_files" value="reports_history_bybit_long_day2.csv" type="text"><button type="button" class="secondary" onclick="browse('source_csv_files','csv',true)">Выбрать…</button></div></label>
@@ -351,7 +401,7 @@ PANEL_HTML = r"""<!doctype html>
           <div class="buttons"><button data-runnable="true" class="primary" onclick="startAction('source-csv')">Собрать CSV-пакет</button><span class="badge">legacy_trades_proxy</span></div>
         </div>
       </section>
-      <section role="tabpanel" id="panel-duckdb-source" aria-labelledby="tab-duckdb-source" hidden>
+      <section role="tabpanel" id="panel-duckdb-source" aria-labelledby="tab-duckdb-source">
         <h2>MRS2 · DuckDB</h2><p class="source-note">Данные read-only: учитываются только полностью закрытые циклы в [start, end), audit фиксирует исключения.</p>
         <div class="stack workflow-card">
           <label>DuckDB v4<div class="path-control"><input id="source_duckdb" value="mrs3_parallel_compact_v4.duckdb" type="text"><button type="button" class="secondary" onclick="browse('source_duckdb','duckdb',false)">Выбрать…</button></div></label>
@@ -367,6 +417,19 @@ PANEL_HTML = r"""<!doctype html>
             <div class="buttons"><button type="button" onclick="directPreflight()">Check coverage</button><button type="button" class="primary" onclick="directBuild()">Build surface</button><button type="button" onclick="directCancel()">Cancel</button></div>
             <div class="source-note">Coverage derives UTC intervals and side from checked Pair + Side + TF rows; manual UTC and Side fields do not constrain the coverage-token workflow.</div>
             <div id="directCoverage" role="note" class="muted">Coverage review appears in the right panel after preflight.</div><div id="directStatus" class="muted" aria-live="polite">No direct build.</div><div id="directArtifacts" class="artifacts muted">Coverage artifacts appear after a successful check.</div>
+          </div></details>
+          <details open><summary>Source v6 stitched surfaces</summary><div class="stack" id="sourceV6Workflow">
+            <label>HTML reports<div class="path-control"><input id="source_v6_root" type="text"><button type="button" class="secondary" onclick="browse('source_v6_root','directory',false)">Browse…</button></div></label>
+            <label>Fresh v6 database<div class="path-control"><input id="source_v6_database" value="Output/source-v6.duckdb" type="text"><button type="button" class="secondary" onclick="browse('source_v6_database','duckdb',false)">Browse…</button></div></label>
+            <fieldset class="row"><legend>READY scopes</legend><label>Pair|Side|TF<select id="source_v6_scope" multiple size="5"></select></label><label>Start<input id="source_v6_start_date" type="datetime-local"></label><label>End<input id="source_v6_end_date" type="datetime-local"></label></fieldset>
+            <div class="buttons"><button type="button" onclick="sourceV6Preflight()">Preflight</button><button type="button" class="primary" onclick="sourceV6Start()">Start Import → Surface</button><button type="button" onclick="sourceV6Cancel()">Cancel</button><button type="button" onclick="sourceV6Library()">Сведения</button><button type="button" onclick="sourceV6Gaps()">Download gaps</button><button type="button" onclick="sourceV6Export()">Plateau report</button></div>
+            <details><summary>Compact Source v6 merge-only</summary><div class="stack"><label>Input databases (semicolon-separated)<input id="source_v6_merge_inputs" type="text"></label><label>Fresh merge target<input id="source_v6_merge_target" type="text"></label><div class="buttons"><button type="button" onclick="sourceV6MergePreflight()">Merge preflight</button><button type="button" class="primary" onclick="sourceV6MergeStart()">Start merge</button><button type="button" onclick="sourceV6MergeCancel()">Cancel merge</button></div></div></details>
+            <label>Published surface<input id="source_v6_surface_path" type="text" readonly></label><label>Plateau output directory<input id="source_v6_export_dir" value="Output/source-v6-plateau" type="text"></label>
+            <label>Published surface to analyze<select id="source_v6_surface_select"></select></label>
+            <div class="row"><label>Listing dates snapshot<input id="source_v6_analysis_dates" type="text"></label><label>Analysis config<input id="source_v6_analysis_config" type="text"></label></div>
+            <label>Algorithm version<input id="source_v6_algorithm_version" value="0.7-canonical-phase1" type="text"></label>
+            <div class="buttons"><button type="button" class="primary" onclick="sourceV6Analyze()">Analyze v6 surface</button><button type="button" onclick="sourceV6AnalysisCancel()">Cancel analysis</button></div>
+            <progress id="source_v6_progress" max="1" value="0"></progress><div id="source_v6_status" class="muted" aria-live="polite">No Source v6 operation.</div><div id="source_v6_library" class="artifacts muted"></div>
           </div></details>
           <details><summary>Analysis Library</summary><div class="stack">
             <div class="row"><label>Side<select id="analysis_side"><option value="">Any</option><option>LONG</option><option>SHORT</option></select></label><label>Build mode<select id="analysis_build_mode"><option value="">Any</option><option>DUCKDB_DIRECT</option></select></label></div><label>Symbol<input id="analysis_symbol" type="text"></label>
@@ -389,7 +452,7 @@ PANEL_HTML = r"""<!doctype html>
             <div class="row"><label>Pair scope<select id="shortlist_symbol_mode" data-shortlist-control="true" onchange="analysisShortlist()"><option value="all">All pairs</option><option value="include">Only selected</option><option value="exclude">All except selected</option></select></label><label>Timeframe scope<select id="shortlist_timeframe_mode" data-shortlist-control="true" onchange="analysisShortlist()"><option value="all">All timeframes</option><option value="include">Only selected</option><option value="exclude">All except selected</option></select></label></div><div class="row"><fieldset><legend>Pairs</legend><div id="shortlist_symbols"></div></fieldset><fieldset><legend>Timeframes</legend><div id="shortlist_timeframes"></div></fieldset></div>
             <fieldset><legend>Phase 2 structural comparison filters</legend><div class="row"><label><input id="filter_source_pnl" data-shortlist-filter="true" type="checkbox" onchange="analysisShortlist()"> Source PnL per order</label><label><input id="filter_efficiency" data-shortlist-filter="true" type="checkbox" onchange="analysisShortlist()"> PnL/DD per order</label><label><input id="filter_close_support" data-shortlist-filter="true" type="checkbox" onchange="analysisShortlist()"> CloseSupport per order</label><label><input id="filter_point_event_count" data-shortlist-filter="true" type="checkbox" onchange="analysisShortlist()"> PointEventCount per order</label></div><p class="source-note">Compared only within Pair + Side + TF + Orders + CloseMA. Source PnL is never summed.</p></fieldset>
             <label>Filter audit output<div class="path-control"><input id="analysis_filter_output" value="Output\phase2_filter_audit.xlsx" type="text"><button type="button" class="secondary" onclick="browse('analysis_filter_output','audit_xlsx',false)">Browse…</button></div></label>
-            <div class="buttons"><button id="shortlist_refresh" data-shortlist-control="true" type="button" onclick="analysisShortlist()">Refresh scope summary</button><button id="shortlist_export" data-shortlist-control="true" type="button" onclick="analysisFilterExport()">Export filter audit XLS</button><button id="shortlist_generate" data-shortlist-control="true" type="button" class="primary" onclick="analysisStrategies()">Generate READY JSON</button></div><div id="analysisStrategiesStatus" class="muted" aria-live="polite">Refresh the Pair/TF scope summary.</div><div id="shortlist_audit_note" class="source-note">Candidate-level details are available in the XLS audit.</div><div id="shortlist_table_container" class="shortlist-table-wrap"><table id="shortlist_table"><thead id="shortlist_table_header"><tr><th scope="col">Pair</th><th scope="col">TF</th><th scope="col">2 orders</th><th scope="col">3 orders</th><th scope="col">4 orders</th><th scope="col">READY</th><th scope="col">DEFERRED</th><th scope="col">ALL</th></tr></thead><tbody id="shortlist_table_body"></tbody></table><div id="shortlist_empty" class="shortlist-empty" hidden>No strategies match the current scope.</div></div>
+            <div class="buttons"><button id="shortlist_refresh" data-shortlist-control="true" type="button" onclick="analysisShortlist()">Refresh scope summary</button><button id="shortlist_export" data-shortlist-control="true" type="button" onclick="analysisFilterExport()">Export filter audit XLS</button><button id="shortlist_generate" data-shortlist-control="true" type="button" class="primary" onclick="analysisStrategies()">Generate READY JSON</button></div><div id="analysisStrategiesStatus" class="muted" aria-live="polite">Refresh the Pair/TF scope summary.</div><div id="shortlist_audit_note" class="source-note">Candidate-level details are available in the XLS audit.</div><div id="shortlist_table_container" class="shortlist-table-wrap"><table id="shortlist_table"><thead id="shortlist_table_header"><tr><th scope="col">Pair</th><th scope="col">TF</th><th scope="col">1ORD</th><th scope="col">2 orders</th><th scope="col">3 orders</th><th scope="col">4 orders</th><th scope="col">READY</th><th scope="col">DEFERRED</th><th scope="col">ALL</th></tr></thead><tbody id="shortlist_table_body"></tbody></table><div id="shortlist_empty" class="shortlist-empty" hidden>No strategies match the current scope.</div></div>
           </div></details>
         </div>
       </section>
@@ -475,7 +538,7 @@ function nextPosttestOutput(csvPath) {
 function payload(action) {
   const base = {action, config:value('config')};
   if (action === 'tester-plan') return {...base, strategies:value('strategies'), output_csv:value('output_csv')};
-  if (action === 'tester-run') return {...base, strategies:value('strategies'), output_csv:value('output_csv')};
+  if (action === 'tester-run') return {...base, strategies:value('strategies'), output_csv:value('output_csv'), v6_confirmation:window.v6TesterConfirmation};
   if (action === 'source-csv') return {...base, input_csv:value('source_csv_files'), start:value('csv_start'), end:value('csv_end'), output_dir:value('csv_output_dir')};
   if (action === 'source-duckdb') return {...base, database:value('source_duckdb'), start:value('duckdb_start'), end:value('duckdb_end'), output_dir:value('duckdb_output_dir'), verify_html_root:value('verify_html_root'), verification_sample_count:value('verification_sample_count')};
   if (action === 'select') {
@@ -488,6 +551,12 @@ function payload(action) {
   return {...base, results_csv:value('results_csv'), output_dir:value('posttest_output_dir')};
 }
 async function startAction(action) {
+  if (action === 'tester-run' && window.v6TesterConfirmation) {
+    const c = window.v6TesterConfirmation;
+    const prompt = `Run v6 tester batch?\nSurface: ${c.source_surface_id}\nSurface manifest: ${c.source_manifest_sha256}\nAnalysis run/config: ${c.analysis_run_id} / ${c.analysis_config_sha256}\nREADY JSON count: ${c.strategy_count}\nGeneration manifest: ${c.generation_manifest_sha256}`;
+    if (!window.confirm(prompt)) { document.getElementById('notice').textContent = 'Tester run cancelled: v6 provenance was not confirmed.'; return; }
+    window.v6TesterConfirmation = {...c, confirmed:true};
+  }
   const notice = document.getElementById('notice'); notice.textContent = 'Запуск…';
   try {
     const response = await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload(action))});
@@ -516,6 +585,21 @@ async function migrateDuckdb() { try { const settings=await duckdbRequest('/api/
 async function duckdbPreflight() { try { render(await duckdbRequest('/api/duckdb-import/preflight', {root_path:value('import_html_root')})); document.getElementById('notice').textContent='Preflight started.'; } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function duckdbImport() { try { const result = await duckdbRequest('/api/duckdb-import/start', {root_path:value('import_html_root'), preflight_token:duckdbPreflightToken}); render(result); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function duckdbCancel() { try { render(await duckdbRequest('/api/duckdb-import/cancel')); } catch (error) { document.getElementById('notice').textContent=error.message; } }
+let sourceV6Token='';
+async function sourceV6Preflight() { try { const result=await duckdbRequest('/api/source-v6/preflight',{root_path:value('source_v6_root'),database_path:value('source_v6_database')}); sourceV6Token=result.token||''; const scope=document.getElementById('source_v6_scope'); scope.innerHTML=(result.scopes||[]).map(item=>`<option value="${item}">${item}</option>`).join(''); const ready=(result.ready_intervals||[]); const selected=ready.find(item=>item.scope_key===scope.value)||ready[0]; if(selected){ const start=document.getElementById('source_v6_start_date'); const end=document.getElementById('source_v6_end_date'); start.min=selected.start+'T00:00'; start.max=selected.end+'T23:59'; end.min=selected.start+'T00:00'; end.max=selected.end+'T23:59'; if(!start.value) start.value=selected.start+'T00:00'; if(!end.value) end.value=selected.end+'T23:59'; } document.getElementById('source_v6_status').textContent=`Preflight ready · ${result.parsed}/${result.total} reports`; document.getElementById('source_v6_progress').value=0; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
+async function sourceV6Start() { try { const scopes=[...document.getElementById('source_v6_scope').selectedOptions].map(item=>item.value); const result=await duckdbRequest('/api/source-v6/fresh/multiscope/start',{preflight_token:sourceV6Token,scope_keys:scopes}); document.getElementById('source_v6_progress').value=Number(result.progress||0); if(result.surface_path) document.getElementById('source_v6_surface_path').value=result.surface_path; document.getElementById('source_v6_status').textContent=`${result.phase} · ${result.current||0}/${result.total||0}${result.surface_id?' · '+result.surface_id:''}`; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
+let sourceV6MergeToken='';
+function sourceV6MergePayload() { return {input_paths:value('source_v6_merge_inputs').split(';').map(item=>item.trim()).filter(Boolean),target_path:value('source_v6_merge_target')}; }
+async function sourceV6MergePreflight() { try { const result=await duckdbRequest('/api/source-v6/merge/preflight',sourceV6MergePayload()); sourceV6MergeToken=result.token||''; document.getElementById('source_v6_status').textContent=`Merge preflight ready · ${result.total||0} inputs`; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
+async function sourceV6MergeStart() { try { if(!sourceV6MergeToken) await sourceV6MergePreflight(); const result=await duckdbRequest('/api/source-v6/merge/start',{preflight_token:sourceV6MergeToken}); document.getElementById('source_v6_status').textContent=`${result.phase} · ${result.accepted_count||0} fragments`; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
+async function sourceV6MergeCancel() { try { const result=await duckdbRequest('/api/source-v6/merge/cancel',{}); document.getElementById('source_v6_status').textContent=result.phase||'CANCELLED'; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
+async function sourceV6Cancel() { try { const result=await duckdbRequest('/api/source-v6/cancel',{}); document.getElementById('source_v6_status').textContent=result.phase||'CANCELLED'; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
+async function sourceV6Library() { try { const rows=await duckdbRequest('/api/source-v6/fresh/library',{}); const select=document.getElementById('source_v6_surface_select'); select.replaceChildren(); for(const item of rows.filter(item=>item.status==='VALID')) select.add(new Option(`${item.surface_id} · ${item.scope_count} READY scopes`,item.path)); if(select.options.length) document.getElementById('source_v6_surface_path').value=select.value; document.getElementById('source_v6_library').textContent=rows.map(item=>`${item.status} · ${item.surface_id||item.path}`).join('\n')||'No surfaces.'; } catch(error) { document.getElementById('source_v6_library').textContent=error.message; } }
+document.getElementById('source_v6_surface_select').addEventListener('change', event=>{ document.getElementById('source_v6_surface_path').value=event.target.value; });
+async function sourceV6Analyze() { try { const select=document.getElementById('source_v6_surface_select'), option=select.options[select.selectedIndex]; if(!option) throw new Error('Select a VALID fresh v6 surface from the library.'); const result=await duckdbRequest('/api/source-v6/fresh/multiscope/analysis/start',{surface_path:option.value,listing_dates_path:value('source_v6_analysis_dates')||value('analysis_dates'),config_path:value('source_v6_analysis_config')||value('analysis_config'),algorithm_version:value('source_v6_algorithm_version')}); if(result.analysis_path) document.getElementById('source_v6_status').textContent=`COMMITTED · ${result.analysis_path}`; else document.getElementById('source_v6_status').textContent=`${result.phase||'STARTING'} · analysis lifecycle`; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
+async function sourceV6AnalysisCancel() { try { const result=await duckdbRequest('/api/source-v6/cancel',{}); document.getElementById('source_v6_status').textContent=result.phase||'CANCELLED'; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
+async function sourceV6Gaps() { try { const start=document.getElementById('source_v6_start_date').value; const end=document.getElementById('source_v6_end_date').value; const result=await duckdbRequest('/api/source-v6/gaps',{start:start+'Z',end:end+'Z'}); document.getElementById('source_v6_status').textContent=`Gaps exported · ${result.cells.length} cells`; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
+async function sourceV6Export() { try { const result=await duckdbRequest('/api/source-v6/export',{surface_path:document.getElementById('source_v6_surface_path').value,output_dir:document.getElementById('source_v6_export_dir').value}); document.getElementById('source_v6_status').textContent=`Plateau report exported · ${result.report||'manifest'}`; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
 let directPreflightToken = '';
 let directStartEligible=false;
 let directCoverageChecking=false;
@@ -583,7 +667,7 @@ async function directPreflight() {
     setDirectCoverageChecking(false);
   }
 }
-async function directBuild(parentSurfaceId='') { clearDirectExecutionState(); try { const scopes=selectedDirectScopes(); if(!scopes.length) throw new Error('Select at least one gap-free Pair + TF row.'); const selectedSymbols=[...new Set(scopes.map(item=>item.symbol))]; const base={...directPayload(),symbols:selectedSymbols}; const flight=await duckdbRequest('/api/duckdb-direct/preflight',{...base,coverage_token:directPreflightToken,selected_scopes:scopes}); if(flight.token) directPreflightToken=flight.token; renderDirectCommonIntervals(flight.selected_intervals); const payload={...base,coverage_token:directPreflightToken,selected_scopes:scopes}; if(parentSurfaceId) payload.parent_surface_id=parentSurfaceId; document.getElementById('coverageReview').hidden=true; render(await duckdbRequest('/api/duckdb-direct/start', payload)); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
+async function directBuild(parentSurfaceId='') { clearDirectExecutionState(); try { const scopes=selectedDirectScopes(); if(!scopes.length) throw new Error('Select at least one gap-free Pair + TF row.'); const selectedSymbols=[...new Set(scopes.map(item=>item.symbol))]; const base={...directPayload(),symbols:selectedSymbols}; const flight=await duckdbRequest('/api/duckdb-direct/preflight',{...base,coverage_token:directPreflightToken,selected_scopes:scopes}); if(flight.preflight_token) directPreflightToken=flight.preflight_token; renderDirectCommonIntervals(flight.selected_intervals); const payload={...base,preflight_token:directPreflightToken,selected_scopes:scopes}; if(parentSurfaceId) payload.parent_surface_id=parentSurfaceId; document.getElementById('coverageReview').hidden=true; render(await duckdbRequest('/api/duckdb-direct/start', payload)); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
 async function directCancel() { try { render(await duckdbRequest('/api/duckdb-direct/cancel')); } catch(error) { document.getElementById('directStatus').textContent=error.message; } }
 function directDateOnly(utc) { return (utc || '').slice(0, 10); }
 function directIntervalLabel(row) { return `${directDateOnly(row.interval_start_utc)} .. ${directDateOnly(row.interval_end_utc)}`; }
@@ -689,7 +773,7 @@ function renderShortlist(){
   document.getElementById('shortlist_empty').hidden=shortlistScopes.length !== 0;
   for(const item of shortlistScopes){
     const row=document.createElement('tr');
-    for(const value of [item.symbol,item.timeframe,item.order_2,item.order_3,item.order_4,item.ready,item.deferred,item.total]){ const cell=document.createElement('td'); cell.textContent=value; row.appendChild(cell); }
+    for(const value of [item.symbol,item.timeframe,item.base_1ord,item.order_2,item.order_3,item.order_4,item.ready,item.deferred,item.total]){ const cell=document.createElement('td'); cell.textContent=value; row.appendChild(cell); }
     body.appendChild(row);
   }
 }
@@ -699,8 +783,8 @@ async function analysisStrategies(){ try { render(await duckdbRequest('/api/anal
 function selectedScope(name){ return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(item=>item.value); }
 function shortlistScopePayload(){ return {symbol_mode:value('shortlist_symbol_mode'),symbols:selectedScope('shortlist_symbol'),timeframe_mode:value('shortlist_timeframe_mode'),timeframes:selectedScope('shortlist_timeframe')}; }
 function renderScopeOptions(targetId,name,items,selected){ const target=document.getElementById(targetId); target.replaceChildren(); for(const item of items){ const label=document.createElement('label'), box=document.createElement('input'); box.type='checkbox'; box.name=name; box.value=item; box.checked=selected.includes(item); box.dataset.shortlistControl='true'; box.onchange=analysisShortlist; label.append(box,document.createTextNode(` ${item}`)); target.appendChild(label); } }
-async function analysisShortlist(){ if(shortlistBusy) return; const payload=shortlistScopePayload(); setShortlistBusy(true); try { const result=await duckdbRequest('/api/analysis/shortlist',{run_id:value('analysis_run_id'),criteria:analysisFilterCriteria(),...payload}); shortlistScopes=result.scopes||[]; shortlistMeta={input_count:result.input_count??0,ready_count:result.ready_count??0,deferred_count:result.deferred_count??0,comparable_count:result.comparable_count??0,comparison_group_count:result.comparison_group_count??0}; renderScopeOptions('shortlist_symbols','shortlist_symbol',result.facets?.symbols||[],payload.symbols); renderScopeOptions('shortlist_timeframes','shortlist_timeframe',result.facets?.timeframes||[],payload.timeframes); renderShortlist(); document.getElementById('analysisStrategiesStatus').textContent=`${shortlistMeta.ready_count} READY; ${shortlistMeta.deferred_count} DEFERRED; ${shortlistMeta.comparable_count} COMPARABLE; ${shortlistMeta.comparison_group_count} comparison groups`; } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } finally { setShortlistBusy(false); } }
-async function analysisStrategies(){ try { render(await duckdbRequest('/api/analysis/strategies',{run_id:value('analysis_run_id'),criteria:analysisFilterCriteria(),...shortlistScopePayload(),template_path:value('analysis_template'),output_dir:value('analysis_strategy_output'),config_path:value('analysis_config')})); } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } }
+async function analysisShortlist(){ if(shortlistBusy) return; const payload=shortlistScopePayload(); setShortlistBusy(true); try { const result=await duckdbRequest('/api/analysis/shortlist',{run_id:value('analysis_run_id'),source_v6_surface_path:value('source_v6_surface_path'),criteria:analysisFilterCriteria(),...payload}); shortlistScopes=result.scopes||[]; shortlistMeta={input_count:result.input_count??0,ready_count:result.ready_count??0,deferred_count:result.deferred_count??0,comparable_count:result.comparable_count??0,comparison_group_count:result.comparison_group_count??0}; renderScopeOptions('shortlist_symbols','shortlist_symbol',result.facets?.symbols||[],payload.symbols); renderScopeOptions('shortlist_timeframes','shortlist_timeframe',result.facets?.timeframes||[],payload.timeframes); renderShortlist(); document.getElementById('analysisStrategiesStatus').textContent=`${shortlistMeta.ready_count} READY; ${shortlistMeta.deferred_count} DEFERRED; ${shortlistMeta.comparable_count} COMPARABLE; ${shortlistMeta.comparison_group_count} comparison groups`; } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } finally { setShortlistBusy(false); } }
+async function analysisStrategies(){ if(!shortlistScopes.length){ document.getElementById('analysisStrategiesStatus').textContent='No shortlist scopes available. Refresh the Pair/TF scope summary before generating READY JSON.'; return; } try { render(await duckdbRequest('/api/analysis/strategies',{run_id:value('analysis_run_id'),source_v6_surface_path:value('source_v6_surface_path'),criteria:analysisFilterCriteria(),...shortlistScopePayload(),selected_scopes:shortlistScopes.map(item=>({symbol:item.symbol,side:item.side,timeframe:item.timeframe})),template_path:value('analysis_template'),output_dir:value('analysis_strategy_output'),config_path:value('analysis_config')})); } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } }
 function renderDashboard(dashboard) {
   const target = document.getElementById('decisionDashboard'); target.replaceChildren();
   const order = ['csv', 'duckdb', 'candidates', 'tester', 'posttest'];
@@ -744,6 +828,12 @@ function renderPerformanceProgress(active, progress, fallbackStage) {
   terminalError.hidden = !progress.terminal_error;
   terminalError.textContent = progress.terminal_error ? `terminal error: ${progress.terminal_error}` : '';
 }
+function autofillPerformanceInbox(workflow) {
+  if (!workflow || workflow.state !== 'COMPLETED' || !workflow.inbox_path) return;
+  const input = document.getElementById('performance_inbox');
+  const current = input && input.value;
+  if (input && (!current || current === 'data/tester_inbox')) input.value = workflow.inbox_path;
+}
 function render(data) {
   if (!defaultsLoaded && data.defaults) { document.getElementById('config').value = data.defaults.config; document.getElementById('analysis_config').value = data.defaults.config; workflowDefaults=data.defaults.workflow || workflowDefaults; applyWorkflowDefaults(); const tester=data.defaults.tester || {}; if(tester.strategies){ document.getElementById('strategies').value=tester.strategies; } if(tester.output_csv){ document.getElementById('output_csv').value=tester.output_csv; document.getElementById('results_csv').value=tester.output_csv; } document.getElementById('posttest_output_dir').value=nextPosttestOutput(value('results_csv')); defaultsLoaded = true; }
   renderDashboard(data.dashboard);
@@ -758,7 +848,11 @@ function render(data) {
   document.querySelector('button[onclick="duckdbImport()"]')?.toggleAttribute('disabled', preflightBusy || importBusy || !preflight?.token);
   const analysis = data.analysis;
   if (analysis) { document.getElementById('analysis_surface_id').value=analysis.surface_id||''; if(analysis.run_id) { document.getElementById('analysis_run_id').value=analysis.run_id; const prefix=analysis.run_id.slice(0,12); if(!value('analysis_output')) document.getElementById('analysis_output').value=`Output\\analysis_${prefix}`; if(value('analysis_strategy_output')==='Output\\strategies') document.getElementById('analysis_strategy_output').value=`Output\\strategies_${prefix}`; } showAnalysisFacts(analysis.statistics||{}); document.getElementById('analysisStatus').textContent=`${analysis.phase}${analysis.run_id?' · '+analysis.run_id:''}${analysis.error?' · '+analysis.error:''}`; }
+  const sourceV6Analysis = data.source_v6_analysis;
+  if (sourceV6Analysis) { document.getElementById('source_v6_surface_path').value=sourceV6Analysis.surface_path||''; }
+  if (sourceV6Analysis) { const total=Number(sourceV6Analysis.work_units_total||0), complete=Number(sourceV6Analysis.work_units_completed||0); document.getElementById('source_v6_progress').value=total ? complete/total : 0; document.getElementById('source_v6_status').textContent=`${sourceV6Analysis.phase} · ${complete}/${total} work units${sourceV6Analysis.analysis_run_id?' · '+sourceV6Analysis.analysis_run_id:''}${sourceV6Analysis.error?' · '+sourceV6Analysis.error:''}`; }
   const strategy=data.analysis_strategies;
+  window.v6TesterConfirmation = strategy?.v6_confirmation || null;
   if(strategy){ document.getElementById('analysisStrategiesStatus').textContent=`${strategy.phase} · ${strategy.strategy_count||0} JSON${strategy.error?' · '+strategy.error:''}`; if(strategy.strategies_path){ document.getElementById('strategies').value=strategy.strategies_path; } }
   const direct = data.duckdb_direct;
   // directStatus is rendered below with publication/error/coordinate details
@@ -773,6 +867,7 @@ function render(data) {
   const buttons = document.querySelectorAll('[data-runnable]'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
   if (!job) return;
   const workflow = job.workflow || {}; const progress = job.progress || {}; const performance = job.performance_progress || {};
+  autofillPerformanceInbox(workflow);
   const plan = job.plan_summary;
   if (plan) { const summary=document.getElementById('testerPlanSummary'); if(summary) summary.textContent=`${plan.mode === 'RESUME' ? 'Возобновление' : 'Новый запуск'}: всего ${plan.total}; готово ${plan.reusable}; подготовлено к тесту ${plan.prepared}.`; const runButton=document.getElementById('runButton'); if(runButton) runButton.textContent=`Запустить тесты (${plan.prepared})`; }
   const performanceAction = job.action === 'performance-dd5';
@@ -912,6 +1007,10 @@ class _DirectJob:
     phase: str = "STARTING"
     surface_id: str | None = None
     point_count: int = 0
+    workers: int = 0
+    elapsed_seconds: float = 0.0
+    points_per_second: float = 0.0
+    total_points: int = 0
     side: str | None = None
     ordinal: int = 0
     total: int = 0
@@ -922,6 +1021,17 @@ class _DirectJob:
     coverage_scan: _CoverageScan | None = None
     audit_root: Path | None = None
     artifacts: dict[str, tuple[str, bytes]] = field(default_factory=dict)
+    frozen_preflights: tuple[DirectPreflight, ...] | None = None
+    materialization_settings: DirectMaterializationSettings = field(default_factory=DirectMaterializationSettings)
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectPreflightState:
+    coverage_scan: _CoverageScan
+    requests: tuple[DirectBuildRequest, ...]
+    preflights: tuple[DirectPreflight, ...]
+    token: str
+    audit_root: Path
 
 
 @dataclass(slots=True)
@@ -938,16 +1048,44 @@ class _AnalysisJob:
 
 
 @dataclass(slots=True)
+class _SourceV6AnalysisJob:
+    surface_path: Path
+    surface_id: str
+    manifest_sha256: str
+    frozen_facts_sha256: str
+    scope: str
+    start_ms: int
+    end_ms: int
+    dates_path: Path
+    config_path: Path
+    algorithm_version: str
+    cancel: threading.Event = field(default_factory=threading.Event)
+    running: bool = True
+    phase: str = "STARTING"
+    completed_units: int = 0
+    total_units: int = 3
+    analysis_run_id: str | None = None
+    listing_dates_sha256: str | None = None
+    config_sha256: str | None = None
+    provenance: dict[str, object] = field(default_factory=dict)
+    error: str | None = None
+
+
+@dataclass(slots=True)
 class _StrategyJob:
     run_id: str
     template_path: Path
     output_dir: Path
     config_path: Path
     candidate_ids: tuple[str, ...] = ()
+    selected_scopes: tuple[tuple[str, str, str], ...] = ()
     criteria: tuple[str, ...] = ()
+    source_v6_surface_path: Path | None = None
     running: bool = True
     phase: str = "STARTING"
     strategies_path: Path | None = None
+    manifest_path: Path | None = None
+    v6_confirmation: dict[str, object] = field(default_factory=dict)
     strategy_count: int = 0
     error: str | None = None
 
@@ -978,6 +1116,9 @@ class PanelController:
         analysis_shortlist_func: Callable[..., object] = filter_analysis_candidates,
         analysis_filter_export_func: Callable[..., object] = export_filter_audit,
         analysis_config_loader: Callable[[Path], object] = AlgorithmConfig.from_json,
+        source_v6_adapter_func: Callable[..., object] = load_source_v6_pipeline_input,
+        source_v6_analysis_func: Callable[..., object] = run_source_v6_analysis,
+        source_v6_listing_dates_loader: Callable[[Path], Mapping[str, object]] = load_listing_dates,
     ) -> None:
         self.root = root.resolve()
         self.default_config = self._path(default_config)
@@ -1005,6 +1146,7 @@ class PanelController:
         self._direct_coverage_scan: _CoverageScan | None = None
         self._direct_artifacts: dict[str, tuple[str, bytes]] = {}
         self._direct_preflight: tuple[DirectBuildRequest, DirectPreflight, str] | None = None
+        self._direct_selected_preflight: _DirectPreflightState | None = None
         self._direct_job: _DirectJob | None = None
         self._analysis_job: _AnalysisJob | None = None
         self._strategy_job: _StrategyJob | None = None
@@ -1018,6 +1160,14 @@ class PanelController:
         self._analysis_shortlist_func = analysis_shortlist_func
         self._analysis_filter_export_func = analysis_filter_export_func
         self._analysis_config_loader = analysis_config_loader
+        self._source_v6_adapter_func = source_v6_adapter_func
+        self._source_v6_analysis_func = source_v6_analysis_func
+        self._source_v6_listing_dates_loader = source_v6_listing_dates_loader
+        self._source_v6_lock = threading.RLock()
+        self._source_v6_preflight: dict[str, object] | None = None
+        self._source_v6_merge_preflight: object | None = None
+        self._source_v6_job: dict[str, object] | None = None
+        self._source_v6_analysis_job: _SourceV6AnalysisJob | None = None
 
     @staticmethod
     def _section(action: str) -> str:
@@ -1254,6 +1404,24 @@ class PanelController:
             command.extend(["--config", str(config)])
         if action in {"tester-plan", "tester-run"}:
             strategies = self._path(self._required(payload, "strategies"))
+            v6_manifest = strategies / "strategy_manifest.json"
+            if v6_manifest.is_file():
+                manifest = self._read_json(v6_manifest)
+                if manifest is None:
+                    raise ValueError("v6 strategy manifest is invalid")
+                if manifest.get("generator_schema_version") == "mrs3-ready-json-v6-v1":
+                    confirmation = payload.get("v6_confirmation")
+                    if not isinstance(confirmation, Mapping) or confirmation.get("confirmed") is not True:
+                        raise ValueError("user confirmation is required for v6 tester execution")
+                    expected_confirmation = {
+                        key: manifest.get(key)
+                        for key in (
+                            "source_surface_id", "source_manifest_sha256", "analysis_run_id",
+                            "analysis_config_sha256", "strategy_count", "generation_manifest_sha256",
+                        )
+                    }
+                    if any(confirmation.get(key) != value for key, value in expected_confirmation.items()):
+                        raise ValueError("v6 tester confirmation does not match the generated manifest")
             command.extend(["--strategies", str(strategies)])
             if action in {"tester-plan", "tester-run"} and payload.get("output_csv"):
                 output = self._path(self._required(payload, "output_csv"))
@@ -1350,7 +1518,7 @@ class PanelController:
         if payload is None:
             return load_duckdb_import_settings(self.default_config)
         previous = load_duckdb_import_settings(self.default_config)
-        paths = {name: payload.get(name, getattr(previous, name)) for name in ("source_duckdb_path", "analysis_duckdb_path", "default_html_root", "audit_root")}
+        paths = {name: payload.get(name, getattr(previous, name)) for name in ("source_duckdb_path", "analysis_duckdb_path", "source_v6_surface_dir", "default_html_root", "audit_root")}
         def path(name: str) -> Path | None:
             value = paths[name]
             if value is None or value == "": return None
@@ -1369,13 +1537,545 @@ class PanelController:
     @staticmethod
     def _settings_document(settings: DuckDBImportSettings) -> dict[str, object]:
         # Paths are returned only by the settings endpoint, never by job status.
-        return {name: (str(value) if isinstance(value, Path) else value) for name, value in ((name, getattr(settings, name)) for name in ("source_duckdb_path", "analysis_duckdb_path", "default_html_root", "audit_root", "workers", "transaction_batch_size"))}
+        return {name: (str(value) if isinstance(value, Path) else value) for name, value in ((name, getattr(settings, name)) for name in ("source_duckdb_path", "analysis_duckdb_path", "source_v6_surface_dir", "default_html_root", "audit_root", "workers", "transaction_batch_size"))}
 
     def duckdb_import_settings(self, payload: Mapping[str, object] | None = None) -> dict[str, object]:
         with self._lock:
             settings = self._import_settings(payload)
             if payload is not None: save_duckdb_import_settings(self.default_config, settings)
         return self._settings_document(settings)
+
+    @staticmethod
+    def _source_v6_merge_inputs(payload: Mapping[str, object]) -> tuple[str, ...]:
+        raw = payload.get("input_paths", payload.get("database_paths", payload.get("inputs", payload.get("source_paths"))))
+        if isinstance(raw, str):
+            values = raw.replace("\n", ";").split(";")
+        elif isinstance(raw, (list, tuple)):
+            values = list(raw)
+        else:
+            raise ValueError("merge input_paths must be a list of database paths")
+        paths = tuple(dict.fromkeys(str(value).strip() for value in values if isinstance(value, str) and value.strip()))
+        if not paths:
+            raise ValueError("merge input_paths must not be empty")
+        return paths
+
+    def source_v6_merge_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Validate read-only compact inputs and bind a fresh merge target."""
+        with self._source_v6_lock:
+            current = self._source_v6_job
+            if current and current.get("phase") in {"RUNNING", "MERGE_RUNNING"}:
+                raise RuntimeError("another Source v6 write is already running")
+        paths = tuple(self._path(item) for item in self._source_v6_merge_inputs(payload))
+        target = self._path(self._required(payload, "target_path" if payload.get("target_path") else "database_path"))
+        preflight = preflight_source_v6_merge(paths, target)
+        with self._source_v6_lock:
+            self._source_v6_merge_preflight = preflight
+            self._source_v6_preflight = None
+            self._source_v6_job = {
+                "mode": "MERGE",
+                "phase": "MERGE_PREFLIGHT_READY",
+                "current": 0,
+                "total": len(paths),
+                "progress": 0.0,
+                "token": preflight.token,
+                "target_path": str(target),
+                "input_paths": tuple(str(path) for path in paths),
+                "error": None,
+                "cancel_requested": False,
+            }
+        return {
+            "mode": "MERGE",
+            "phase": "MERGE_PREFLIGHT_READY",
+            "token": preflight.token,
+            "target_path": str(target),
+            "input_paths": [str(path) for path in paths],
+            "total": len(paths),
+        }
+
+    def source_v6_merge_start(self, payload: Mapping[str, object]) -> dict[str, object]:
+        token = self._required(payload, "preflight_token")
+        with self._source_v6_lock:
+            preflight = self._source_v6_merge_preflight
+            job = self._source_v6_job
+            if preflight is None or job is None or job.get("mode") != "MERGE" or token != getattr(preflight, "token", None):
+                raise ValueError("latest Source v6 merge preflight token is required")
+            if job.get("phase") in {"RUNNING", "MERGE_RUNNING"}:
+                raise RuntimeError("Source v6 merge is already running")
+            job = dict(job)
+            job.update({"phase": "MERGE_RUNNING", "cancel_requested": False})
+            self._source_v6_job = job
+        try:
+            result = merge_source_v6(
+                preflight.input_paths,
+                preflight.target_path,
+                preflight=preflight,
+                cancellation_requested=lambda: bool(job["cancel_requested"]),
+            )
+            with self._source_v6_lock:
+                job.update({
+                    "phase": "MERGED",
+                    "current": result.input_count,
+                    "total": result.input_count,
+                    "progress": 1.0,
+                    "accepted_count": result.accepted_count,
+                    "duplicate_count": result.duplicate_count,
+                    "source_content_digest": result.source_content_digest,
+                    "target_path": str(result.target_path),
+                })
+        except BaseException as error:
+            with self._source_v6_lock:
+                job.update({
+                    "phase": "CANCELLED" if "cancelled" in str(error).lower() else "FAILED",
+                    "error": str(error),
+                })
+        return dict(job)
+
+    def source_v6_merge(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Run a merge-only panel operation, optionally using a preflight token."""
+        if payload.get("preflight_token"):
+            return self.source_v6_merge_start(payload)
+        preflight = self.source_v6_merge_preflight(payload)
+        return self.source_v6_merge_start({"preflight_token": preflight["token"]})
+
+    def source_v6_merge_cancel(self) -> dict[str, object]:
+        with self._source_v6_lock:
+            if self._source_v6_job is None or self._source_v6_job.get("mode") != "MERGE":
+                return {"phase": "IDLE", "cancel_requested": False}
+            self._source_v6_job["cancel_requested"] = True
+            if self._source_v6_job.get("phase") == "MERGE_PREFLIGHT_READY":
+                self._source_v6_job["phase"] = "CANCELLED"
+            return dict(self._source_v6_job)
+
+    def source_v6_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Parse a report tree without publication and issue a batch token."""
+        with self._source_v6_lock:
+            current = self._source_v6_job
+            if current and current.get("phase") in {"RUNNING", "MERGE_RUNNING"}:
+                raise RuntimeError("another Source v6 write is already running")
+        root = self._path(self._required(payload, "root_path"))
+        database = self._path(self._required(payload, "database_path"))
+        reports = tuple(sorted(root.rglob("*.html"))) if root.is_dir() else ((root,) if root.is_file() else ())
+        if not reports:
+            raise ValueError("no HTML reports found")
+        fragments = []
+        failures = []
+        for report in reports:
+            try:
+                fragments.append(normalize_source_v6(report.read_bytes(), source_name=report.name))
+            except (OSError, SourceV6Error) as error:
+                failures.append({"file": report.name, "error": str(error)})
+        if failures and not fragments:
+            raise ValueError("all Source v6 reports failed normalization")
+        with source_v6_import_lock(database):
+            import_preflight = preflight_source_v6(root, database)
+        token = import_preflight.token
+        with self._source_v6_lock:
+            self._source_v6_preflight = {"root": root, "database": database, "fragments": tuple(fragments), "import_preflight": import_preflight, "token": token}
+            self._source_v6_job = {"phase": "PREFLIGHT_READY", "current": 0, "total": len(fragments), "progress": 0.0, "token": token, "error": None, "surface_id": None, "cancel_requested": False}
+        scopes = sorted({f"{fragment.point.symbol}|{fragment.point.side}|{fragment.point.timeframe}" for fragment in fragments})
+        ready_intervals = [
+            {"scope_key": item.scope_key, "start": item.start.isoformat(), "end": item.end.isoformat()}
+            for item in canonical_ready_intervals(tuple(fragments))
+        ]
+        return {"phase": "PREFLIGHT_READY", "token": token, "total": len(fragments), "parsed": len(fragments), "failures": failures, "scopes": scopes, "ready_intervals": ready_intervals}
+
+    def source_v6_start(self, payload: Mapping[str, object]) -> dict[str, object]:
+        token = self._required(payload, "preflight_token")
+        with self._source_v6_lock:
+            state = self._source_v6_preflight
+            if state is None or token != state["token"]:
+                raise ValueError("latest Source v6 preflight token is required")
+            job = self._source_v6_job
+            if job and job.get("phase") in {"RUNNING", "MERGE_RUNNING"}:
+                raise RuntimeError("Source v6 import is already running")
+            job = {"phase": "RUNNING", "current": 0, "total": len(state["fragments"]), "progress": 0.0, "token": token, "error": None, "surface_id": None, "cancel_requested": False}
+            self._source_v6_job = job
+        try:
+            database = state["database"]
+            import_preflight = state["import_preflight"]
+            imported = import_source_v6(
+                state["root"],
+                database,
+                preflight=import_preflight,
+                workers=max(1, self._import_settings().workers),
+                cancellation_requested=lambda: bool(job["cancel_requested"]),
+            )
+            fragments = imported.accepted_fragments
+            active_fragments: list[object] = list(imported.active_fragments)
+            overlap_tail_decisions: list[dict[str, object]] = []
+            with self._source_v6_lock:
+                job.update({"current": len(fragments), "progress": 1.0})
+            if not active_fragments:
+                raise RuntimeError("no stitchable Source v6 fragments available for surface")
+            surface_dir = self._import_settings().source_v6_surface_dir or (self.root / "Output" / "source-v6-surfaces")
+            intervals = None
+            if payload.get("start_ms") is not None and payload.get("end_ms") is not None:
+                start_ms, end_ms = int(payload["start_ms"]), int(payload["end_ms"])
+                if end_ms <= start_ms:
+                    raise ValueError("selected Source v6 interval must be positive")
+                scope = str(payload.get("scope_key") or "|".join((active_fragments[0].point.symbol, active_fragments[0].point.side, active_fragments[0].point.timeframe)))
+                ready = canonical_ready_intervals(tuple(active_fragments))
+                scope_ready = tuple(item for item in ready if item.scope_key == scope)
+                if not scope_ready:
+                    raise ValueError("selected Source v6 interval is outside canonical READY coverage")
+                selected = select_ready_interval(scope_ready, scope_key=scope_ready[0].scope_key, start=datetime.fromtimestamp(start_ms / 1000, timezone.utc).date(), end=datetime.fromtimestamp(end_ms / 1000, timezone.utc).date())
+                start_ms = int(datetime.combine(selected.start, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
+                end_ms = int(datetime.combine(selected.end + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
+                intervals = {fragment.point.canonical_key: (start_ms, end_ms) for fragment in active_fragments if "|".join((fragment.point.symbol, fragment.point.side, fragment.point.timeframe)) == scope}
+            surface = publish_surface_db(surface_dir, tuple(active_fragments), intervals=intervals, overlap_tail_decisions=overlap_tail_decisions)
+            with self._source_v6_lock:
+                job.update({"phase": "PUBLISHED", "progress": 1.0, "surface_id": surface.stem, "surface_path": str(surface)})
+        except BaseException as error:
+            with self._source_v6_lock:
+                job.update({"phase": "CANCELLED" if "cancelled" in str(error).lower() else "FAILED", "error": str(error)})
+        return dict(job)
+
+    def source_v6_start_fresh(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Import once, then publish every selected READY scope into one fresh surface."""
+        token = self._required(payload, "preflight_token")
+        scope_keys = tuple(sorted({str(item) for item in payload.get("scope_keys", ()) if isinstance(item, str) and item.strip()}))
+        with self._source_v6_lock:
+            state = self._source_v6_preflight
+            if state is None or token != state["token"]:
+                raise ValueError("latest Source v6 preflight token is required")
+            if self._source_v6_job and self._source_v6_job.get("phase") == "RUNNING":
+                raise RuntimeError("Source v6 import is already running")
+            job = {"phase": "RUNNING", "current": 0, "total": len(state["fragments"]), "progress": 0.0, "token": token, "error": None, "surface_id": None, "cancel_requested": False}
+            self._source_v6_job = job
+        try:
+            imported = import_source_v6(state["root"], state["database"], preflight=state["import_preflight"], workers=max(1, self._import_settings().workers), cancellation_requested=lambda: bool(job["cancel_requested"]))
+            active = tuple(imported.active_fragments)
+            if not active:
+                raise RuntimeError("no stitchable Source v6 fragments available for surface")
+            available = {f"{item.point.symbol}|{item.point.side}|{item.point.timeframe}" for item in active}
+            selected = scope_keys or tuple(sorted(available))
+            if not set(selected).issubset(available):
+                raise ValueError("selected Source v6 scope is not present in imported facts")
+            surface_dir = self.root / "Output" / "surfaces-v6-compact"
+            surface = publish_multiscope_surface(surface_dir, materialize_source_v6(active, selected))
+            with self._source_v6_lock:
+                job.update({"phase": "PUBLISHED", "current": len(active), "progress": 1.0, "surface_id": surface.stem, "surface_path": str(surface), "scope_keys": selected})
+        except BaseException as error:
+            with self._source_v6_lock:
+                job.update({"phase": "CANCELLED" if "cancel" in str(error).casefold() else "FAILED", "error": str(error)})
+        return dict(job)
+
+    def source_v6_fresh_library(self) -> tuple[dict[str, object], ...]:
+        directory = self.root / "Output" / "surfaces-v6-compact"
+        rows = []
+        for path in sorted(directory.glob("*.surface-v6.duckdb")) if directory.is_dir() else ():
+            try:
+                payload = read_multiscope_surface(path)
+                rows.append({"path": str(path), "status": "VALID", **payload})
+            except (OSError, ValueError, duckdb.Error) as error:
+                rows.append({"path": str(path), "status": "MALFORMED", "error": str(error)})
+        return tuple(rows)
+
+    def source_v6_start_fresh_analysis(self, payload: Mapping[str, object]) -> dict[str, object]:
+        surface = self._path(self._required(payload, "surface_path"))
+        if not surface.name.endswith(".surface-v6.duckdb"):
+            raise ValueError("fresh Source v6 surface is required")
+        read_multiscope_surface(surface)
+        dates_path, config_path = self._path(self._required(payload, "listing_dates_path")), self._path(self._required(payload, "config_path"))
+        if not dates_path.is_file() or not config_path.is_file():
+            raise ValueError("listing-date snapshot and analysis config files are required")
+        with self._source_v6_lock:
+            if self._source_v6_job and self._source_v6_job.get("phase") == "RUNNING":
+                raise RuntimeError("another Source v6 write is already running")
+            job = {"phase": "RUNNING", "current": 0, "total": 1, "progress": 0.0, "error": None, "cancel_requested": False}
+            self._source_v6_job = job
+        try:
+            artifact = run_multiscope_analysis(surface, self.root / "Output" / "analysis-v6-compact", self._analysis_config_loader(config_path), listing_dates=self._source_v6_listing_dates_loader(dates_path), algorithm_version=str(payload.get("algorithm_version") or "0.7-canonical-phase1"), workers=max(1, self._import_settings().workers), cancel_check=lambda: bool(job["cancel_requested"]))
+            with self._source_v6_lock:
+                job.update({"phase": "COMMITTED", "current": 1, "progress": 1.0, "analysis_path": str(artifact), "analysis_id": artifact.stem})
+        except BaseException as error:
+            with self._source_v6_lock:
+                job.update({"phase": "CANCELLED" if job["cancel_requested"] or "cancel" in str(error).casefold() else "FAILED", "error": str(error)})
+        return dict(job)
+
+    def source_v6_cancel(self) -> dict[str, object]:
+        with self._source_v6_lock:
+            if self._source_v6_job is None:
+                return {"phase": "IDLE", "cancel_requested": False}
+            if self._source_v6_job.get("mode") == "MERGE":
+                self._source_v6_job["cancel_requested"] = True
+                if self._source_v6_job.get("phase") == "MERGE_PREFLIGHT_READY":
+                    self._source_v6_job["phase"] = "CANCELLED"
+                return dict(self._source_v6_job)
+            self._source_v6_job["cancel_requested"] = True
+            if self._source_v6_job.get("phase") == "PREFLIGHT_READY":
+                self._source_v6_job["phase"] = "CANCELLED"
+            return dict(self._source_v6_job)
+
+    def source_v6_library(self, payload: Mapping[str, object] | None = None) -> tuple[dict[str, object], ...]:
+        settings = self._import_settings()
+        directory = self._path(payload.get("directory")) if payload and payload.get("directory") else (settings.source_v6_surface_dir or (self.root / "Output" / "source-v6-surfaces"))
+        rows: list[dict[str, object]] = []
+        for item in scan_surface_diagnostics(directory):
+            row: dict[str, object] = {"path": item.path, "status": item.status, "surface_id": item.surface_id, "error": item.error}
+            if item.status == "VALID" and item.path.casefold().endswith(".duckdb"):
+                try:
+                    manifest = read_surface_db(item.path)
+                    row.update({
+                        "manifest_sha256": manifest.get("manifest_sha256"),
+                        "frozen_facts_sha256": manifest.get("frozen_facts_sha256"),
+                        "event_mode": manifest.get("event_mode"),
+                        "ready_intervals": tuple(dict(interval) for interval in manifest.get("ready_intervals", ())),
+                        "compatibility_versions": {
+                            key: manifest.get(key)
+                            for key in (
+                                "surface_schema_version", "metric_schema_version",
+                                "event_schema_version", "readiness_schema_version",
+                                "frozen_facts_digest_algorithm",
+                            )
+                        },
+                        "analysis_runs": tuple(
+                            {
+                                "analysis_run_id": item.get("analysis_run_id"),
+                                "state": item.get("state"),
+                                "event_mode": item.get("event_mode"),
+                                "selected_scope": item.get("metadata", {}).get("selected_scope") if isinstance(item.get("metadata"), Mapping) else None,
+                                "selected_interval": item.get("selected_interval"),
+                                "source_surface_id": item.get("metadata", {}).get("source_surface_id") if isinstance(item.get("metadata"), Mapping) else None,
+                            }
+                            for item in list_source_v6_analysis_runs(item.path)
+                        ),
+                    })
+                except (OSError, ValueError, duckdb.Error) as error:
+                    row.update({"status": "MALFORMED", "error": str(error), "surface_id": None})
+            rows.append(row)
+        return tuple(rows)
+
+    def _source_v6_surface_selection(self, payload: Mapping[str, object]) -> tuple[Path, dict[str, object]]:
+        path = self._path(self._required(payload, "surface_path"))
+        rows = self.source_v6_library()
+        selected = next((row for row in rows if Path(str(row["path"])).resolve() == path), None)
+        if selected is None or selected.get("status") != "VALID":
+            raise ValueError("selected Source v6 surface is not a VALID published library entry")
+        if path.suffix.casefold() != ".duckdb":
+            raise ValueError("v6 analysis requires a published DuckDB surface")
+        if selected.get("event_mode") != SOURCE_V6_EVENT_MODE:
+            raise ValueError("selected Source v6 surface has unsupported event mode")
+        expected_versions = {
+            "surface_schema_version": SOURCE_V6_SURFACE_SCHEMA_VERSION,
+            "metric_schema_version": SOURCE_V6_METRIC_SCHEMA_VERSION,
+            "event_schema_version": SOURCE_V6_EVENT_SCHEMA_VERSION,
+            "readiness_schema_version": SOURCE_V6_READINESS_SCHEMA_VERSION,
+            "frozen_facts_digest_algorithm": SOURCE_V6_FROZEN_DIGEST_ALGORITHM,
+        }
+        versions = selected.get("compatibility_versions")
+        if not isinstance(versions, Mapping) or any(versions.get(key) != value for key, value in expected_versions.items()):
+            raise ValueError("selected Source v6 surface has unsupported compatibility mapping")
+        for name in ("surface_id", "manifest_sha256", "frozen_facts_sha256"):
+            if not isinstance(selected.get(name), str) or not str(selected[name]).strip():
+                raise ValueError(f"selected Source v6 surface has no {name}")
+        try:
+            current = read_surface_db(path)
+        except (OSError, ValueError, duckdb.Error) as error:
+            raise ValueError(f"selected Source v6 surface cannot be revalidated: {error}") from error
+        for name in ("surface_id", "manifest_sha256", "frozen_facts_sha256"):
+            if str(current.get(name)) != str(selected[name]):
+                raise ValueError(f"selected Source v6 surface {name} changed since library refresh")
+        if current.get("event_mode") != SOURCE_V6_EVENT_MODE:
+            raise ValueError("selected Source v6 surface has unsupported event mode")
+        if any(current.get(key) != value for key, value in expected_versions.items()):
+            raise ValueError("selected Source v6 surface has unsupported compatibility mapping")
+        return path, selected
+
+    @staticmethod
+    def _source_v6_interval(payload: Mapping[str, object]) -> tuple[str, int, int]:
+        scope = payload.get("selected_scope", payload.get("scope"))
+        if not isinstance(scope, str) or len(scope.split("|")) != 3 or any(not part.strip() for part in scope.split("|")):
+            raise ValueError("selected READY scope is required as symbol|side|timeframe")
+
+        def millis(name: str, aliases: tuple[str, ...]) -> int:
+            raw = next((payload.get(alias) for alias in aliases if payload.get(alias) is not None), None)
+            if raw is None or isinstance(raw, bool):
+                raise ValueError(f"UTC {name} is required")
+            try:
+                if isinstance(raw, (int, float)):
+                    value = int(raw)
+                else:
+                    value = int(datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp() * 1000)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(f"UTC {name} is invalid") from None
+            return value
+
+        start_ms = millis("start", ("start_ms", "selected_start", "start"))
+        end_ms = millis("end", ("end_ms", "selected_end", "end"))
+        if end_ms <= start_ms:
+            raise ValueError("selected UTC interval must be non-empty")
+        return scope.strip(), start_ms, end_ms
+
+    def start_source_v6_analysis(self, payload: Mapping[str, object]) -> dict[str, object]:
+        surface_path, selected = self._source_v6_surface_selection(payload)
+        for field in ("surface_id", "manifest_sha256", "frozen_facts_sha256"):
+            requested = payload.get(field)
+            if requested not in (None, "") and str(requested) != str(selected[field]):
+                raise ValueError(f"selected surface {field} does not match the published library")
+        scope, start_ms, end_ms = self._source_v6_interval(payload)
+        dates_path = self._path(payload.get("listing_dates_path", payload.get("dates_path", "")))
+        config_path = self._path(payload.get("config_path", ""))
+        if not dates_path.is_file():
+            raise ValueError("listing-date snapshot file is required")
+        if not config_path.is_file():
+            raise ValueError("analysis config file is required")
+        algorithm_version = payload.get("algorithm_version")
+        if not isinstance(algorithm_version, str) or not algorithm_version.strip():
+            raise ValueError("algorithm_version is required")
+        # Load both inputs before creating a job so invalid files remain an
+        # actionable request error and cannot leave a misleading RUNNING state.
+        try:
+            listing_dates = self._source_v6_listing_dates_loader(dates_path)
+            config = self._analysis_config_loader(config_path)
+            snapshot = _v6_listing_snapshot(listing_dates)
+        except Exception as error:
+            raise ValueError(f"invalid analysis inputs: {error}") from error
+        dates_hash = sha256(_source_v6_canonical_json(snapshot).encode("utf-8")).hexdigest()
+        with self._lock:
+            job = self._source_v6_analysis_job
+            if job is not None and job.running:
+                raise RuntimeError("another Source v6 analysis is already running")
+            job = _SourceV6AnalysisJob(
+                surface_path=surface_path,
+                surface_id=str(selected["surface_id"]),
+                manifest_sha256=str(selected["manifest_sha256"]),
+                frozen_facts_sha256=str(selected["frozen_facts_sha256"]),
+                scope=scope,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                dates_path=dates_path,
+                config_path=config_path,
+                algorithm_version=algorithm_version.strip(),
+                listing_dates_sha256=dates_hash,
+            )
+            self._source_v6_analysis_job = job
+        threading.Thread(
+            target=self._run_source_v6_analysis,
+            args=(job, listing_dates, config),
+            name="mrs3-panel-source-v6-analysis",
+            daemon=True,
+        ).start()
+        return self.snapshot()
+
+    def _run_source_v6_analysis(
+        self,
+        job: _SourceV6AnalysisJob,
+        listing_dates: Mapping[str, object],
+        config: object,
+    ) -> None:
+        try:
+            with self._lock:
+                job.phase = "ADAPTING"
+            if job.cancel.is_set():
+                raise RuntimeError("Source v6 analysis cancelled")
+            adapter_kwargs = {
+                "selected_scope": job.scope,
+                "selected_start": job.start_ms,
+                "selected_end": job.end_ms,
+                "expected_surface_id": job.surface_id,
+                "expected_manifest_sha256": job.manifest_sha256,
+                "expected_frozen_facts_sha256": job.frozen_facts_sha256,
+            }
+            try:
+                adapter_signature = inspect.signature(self._source_v6_adapter_func)
+                accepts_cancel = (
+                    "cancel_check" in adapter_signature.parameters
+                    or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in adapter_signature.parameters.values())
+                )
+            except (TypeError, ValueError):
+                accepts_cancel = False
+            if accepts_cancel:
+                adapter_kwargs["cancel_check"] = job.cancel.is_set
+            pipeline_input = self._source_v6_adapter_func(job.surface_path, **adapter_kwargs)
+            if job.cancel.is_set():
+                raise RuntimeError("Source v6 analysis cancelled")
+            with self._lock:
+                job.completed_units = 1
+                job.phase = "ANALYZING"
+            if job.cancel.is_set():
+                raise RuntimeError("Source v6 analysis cancelled")
+            result = self._source_v6_analysis_func(
+                job.surface_path,
+                pipeline_input,
+                config,
+                algorithm_version=job.algorithm_version,
+                listing_dates=listing_dates,
+                listing_dates_sha256=job.listing_dates_sha256,
+                cancel_check=job.cancel.is_set,
+            )
+            if job.cancel.is_set():
+                raise RuntimeError("Source v6 analysis cancelled")
+            if not isinstance(result, Mapping) or result.get("state") != "COMMITTED":
+                raise ValueError("Source v6 analysis did not commit a run")
+            analysis_run_id = result.get("analysis_run_id") if isinstance(result, Mapping) else None
+            if not isinstance(analysis_run_id, str) or not analysis_run_id.strip():
+                raise ValueError("Source v6 analysis committed without a valid analysis_run_id")
+            with self._lock:
+                job.completed_units = 2
+                job.phase = "COMMITTED"
+                job.analysis_run_id = analysis_run_id
+                metadata = result.get("metadata")
+                job.provenance = dict(metadata) if isinstance(metadata, Mapping) else {}
+                job.config_sha256 = str(job.provenance.get("algorithm_config_sha256")) if job.provenance.get("algorithm_config_sha256") else None
+                job.completed_units = 3
+        except BaseException as error:
+            with self._lock:
+                job.phase = "CANCELLED" if job.cancel.is_set() or "cancel" in str(error).casefold() else "FAILED"
+                job.error = str(error)
+        finally:
+            with self._lock:
+                job.running = False
+
+    def cancel_source_v6_analysis(self) -> dict[str, object]:
+        with self._lock:
+            job = self._source_v6_analysis_job
+            if job is None:
+                return {"phase": "IDLE", "running": False, "cancel_requested": False}
+            job.cancel.set()
+            if job.phase == "STARTING":
+                job.phase = "CANCELLED"
+                job.running = False
+            return self._source_v6_analysis_document(job)
+
+    @staticmethod
+    def _source_v6_analysis_document(job: _SourceV6AnalysisJob) -> dict[str, object]:
+        return {
+            "running": job.running,
+            "phase": job.phase,
+            "status": job.phase,
+            "surface_id": job.surface_id,
+            "surface_path": str(job.surface_path),
+            "manifest_sha256": job.manifest_sha256,
+            "frozen_facts_sha256": job.frozen_facts_sha256,
+            "scope": job.scope,
+            "start_ms": job.start_ms,
+            "end_ms": job.end_ms,
+            "analysis_run_id": job.analysis_run_id,
+            "listing_dates_sha256": job.listing_dates_sha256,
+            "config_sha256": job.config_sha256,
+            "work_units_completed": job.completed_units,
+            "work_units_total": job.total_units,
+            "cancel_requested": job.cancel.is_set(),
+            "provenance": dict(job.provenance),
+            "error": job.error,
+        }
+
+    def source_v6_export(self, payload: Mapping[str, object]) -> dict[str, object]:
+        surface = self._path(self._required(payload, "surface_path"))
+        output = self._path(self._required(payload, "output_dir"))
+        return export_plateau_report(surface, output)
+
+    def source_v6_gaps(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Return deterministic missing-cell evidence for the latest preflight."""
+        with self._source_v6_lock:
+            state = self._source_v6_preflight
+        if state is None:
+            raise ValueError("Source v6 preflight is required before gap export")
+        start = datetime.fromisoformat(str(self._required(payload, "start")).replace("Z", "+00:00")).date()
+        end = datetime.fromisoformat(str(self._required(payload, "end")).replace("Z", "+00:00")).date()
+        cells = missing_cells(state["fragments"], start=start, end=end, point_keys=payload.get("point_keys"))
+        return {"cells": [asdict(cell) for cell in cells], "csv": coverage_csv(cells).decode("utf-8"), "json": coverage_json(cells).decode("utf-8")}
 
     def _request(self, root: Path, settings: DuckDBImportSettings, *, token: str | None = None, cancellation_requested: Callable[[], bool] | None = None, preflight: ImportPreflight | None = None) -> ImportRequest:
         if settings.source_duckdb_path is None or settings.audit_root is None:
@@ -1589,14 +2289,52 @@ class PanelController:
         return replace(request, required_shifts_bp=shifts)
 
     @staticmethod
-    def _direct_token(request: DirectBuildRequest, preflight: DirectPreflight) -> str:
+    def _direct_token(
+        request: DirectBuildRequest,
+        preflight: DirectPreflight,
+        *,
+        coverage_scan_token: str | None = None,
+        requests: Sequence[DirectBuildRequest] = (),
+        preflights: Sequence[DirectPreflight] = (),
+    ) -> str:
+        def one(current_request: DirectBuildRequest, current: DirectPreflight) -> dict[str, object]:
+            request_document = {}
+            for name in current_request.__dataclass_fields__:
+                value = getattr(current_request, name)
+                if isinstance(value, bytes):
+                    value = hashlib.sha256(value).hexdigest()
+                request_document[name] = list(value) if isinstance(value, tuple) else value
+            return {
+                "request": request_document,
+                "usable": {key: list(value) for key, value in current.usable_timeframes.items()},
+                "unavailable": {key: list(value) for key, value in current.unavailable_symbols.items()},
+                "issues": [(item.symbol, item.timeframe, item.code, item.detail) for item in current.coverage_issues],
+                "grid": PanelController._jsonable(dict(current.grid_contract)),
+                "hashes": list(current.source_hashes),
+                "manifest": list(current.manifest),
+                "points": list(current.accepted_point_keys),
+                "witnesses": PanelController._jsonable(dict(current.witnesses)),
+                "point_evidence_sha256": current.point_evidence_sha256,
+                "audit": {
+                    "artifact_name": current.audit_artifact_name,
+                    "schema_version": current.audit_schema_version,
+                    "size_bytes": current.audit_size_bytes,
+                    "row_count": current.audit_row_count,
+                    "sha256": current.audit_sha256,
+                },
+            }
+        request_list = tuple(requests) or (request,)
+        preflight_list = tuple(preflights) or (preflight,)
         document = {
-            "request": {name: list(value) if isinstance(value, tuple) else value for name, value in ((name, getattr(request, name)) for name in request.__dataclass_fields__)},
-            "usable": {key: list(value) for key, value in preflight.usable_timeframes.items()},
-            "unavailable": {key: list(value) for key, value in preflight.unavailable_symbols.items()},
-            "issues": [(item.symbol, item.timeframe, item.code, item.detail) for item in preflight.coverage_issues],
-            "grid": dict(preflight.grid_contract), "hashes": list(preflight.source_hashes),
-            "manifest": list(preflight.manifest), "points": list(preflight.accepted_point_keys),
+            "coverage_scan_token": coverage_scan_token,
+            "contracts": {
+                "grid_kind": V2_GRID_CONTRACT_KIND,
+                "grid_version": CANONICAL_GRID_VERSION,
+                "readiness_version": READINESS_CONTRACT_VERSION,
+                "materializer_version": CANONICAL_MATERIALIZER_VERSION,
+                "semantic_version": POINT_MATERIALIZATION_SEMANTICS_VERSION,
+            },
+            "sides": [one(current_request, current) for current_request, current in zip(request_list, preflight_list, strict=True)],
         }
         return sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -1651,6 +2389,7 @@ class PanelController:
     def _direct_preflight_document(request: DirectBuildRequest, preflight: DirectPreflight, token: str) -> dict[str, object]:
         return {
             "token": token,
+            "preflight_token": token,
             "required_shifts_bp": list(request.required_shifts_bp),
             "selected_symbols": list(preflight.usable_timeframes),
             "usable_timeframes": {key: list(value) for key, value in preflight.usable_timeframes.items()},
@@ -1673,6 +2412,11 @@ class PanelController:
                 for item in preflight.coverage_rows
                 if item.selectable
             ],
+            "audit_artifact_name": request.audit_artifact_name,
+            "audit_schema_version": request.audit_schema_version,
+            "audit_size_bytes": request.audit_size_bytes,
+            "audit_row_count": request.audit_row_count,
+            "audit_sha256": request.audit_sha256,
         }
 
     @staticmethod
@@ -1781,7 +2525,7 @@ class PanelController:
             interval.end_utc,
             interval.side,
             symbols,
-            (),
+            tuple(AlgorithmConfig().canonical_shifts_bp),
             _DIRECT_MATERIALIZER_VERSION,
             _DIRECT_POINT_CONFIG_HASH,
             selected_scopes=selected_scopes,
@@ -1792,16 +2536,63 @@ class PanelController:
 
     def duckdb_direct_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
         coverage_token = self._optional_string(payload, "coverage_token") or None
-        if payload.get("selected_scopes") is not None and coverage_token is not None:
+        selected_scopes_supplied = payload.get("selected_scopes") is not None
+        if selected_scopes_supplied and coverage_token is None:
+            raise ValueError("selected scopes require a valid coverage token")
+        if selected_scopes_supplied and coverage_token is not None:
             with self._lock:
                 scan = self._direct_coverage_scan
             if scan is None or coverage_token != scan.token:
                 raise ValueError("stale coverage token is required")
             scopes = self._direct_selected_scopes(payload)
             intervals = common_intervals_for_scopes(scan.coverage, scopes)
-            document = self._direct_scan_document(scan)
+            audit_root = self._import_settings().audit_root
+            if audit_root is None:
+                raise ValueError("audit_root must be configured for direct builds")
+            requests = tuple(self._direct_coverage_request(interval) for interval in intervals)
+            try:
+                frozen_requests, frozen_preflights = self._with_source(
+                    lambda source: freeze_direct_preflights(
+                        source,
+                        requests,
+                        audit_root=audit_root,
+                        coverage_scan=scan,
+                        preflight_func=self._direct_preflight_func,
+                    )
+                )
+            except BaseException:
+                with self._lock:
+                    self._direct_selected_preflight = None
+                    self._direct_preflight = None
+                raise
+            token = self._direct_token(
+                frozen_requests[0],
+                frozen_preflights[0],
+                coverage_scan_token=scan.token,
+                requests=frozen_requests,
+                preflights=frozen_preflights,
+            )
+            state = _DirectPreflightState(
+                scan,
+                frozen_requests,
+                frozen_preflights,
+                token,
+                Path(audit_root),
+            )
+            with self._lock:
+                current_scan = self._direct_coverage_scan
+                if current_scan is not scan or current_scan is None or current_scan.token != scan.token:
+                    self._direct_selected_preflight = None
+                    self._direct_preflight = None
+                    raise ValueError("stale coverage token is required")
+                self._direct_selected_preflight = state
+                self._direct_preflight = None
+            document = self._direct_preflight_document(
+                frozen_requests[0], frozen_preflights[0], token
+            )
             document["selected_intervals"] = self._direct_common_intervals_document(intervals)
-            document["token"] = scan.token
+            document["coverage_token"] = scan.token
+            document["selected_sides"] = [request.side for request in frozen_requests]
             return document
         request = self._resolve_direct_request(payload)
         preflight = self._with_source(lambda source: self._direct_preflight_func(source, request))
@@ -1816,8 +2607,10 @@ class PanelController:
             if self._direct_job is not None:
                 if self._direct_job.running:
                     raise RuntimeError("another direct build is already running")
-                self._direct_job = None
+            self._direct_job = None
             self._direct_coverage_scan = None
+            self._direct_selected_preflight = None
+            self._direct_preflight = None
             self._direct_artifacts.clear()
         side, symbols = self._direct_coverage_payload(payload)
         if self._direct_coverage_func is not list_duckdb_direct_coverage:
@@ -1881,9 +2674,58 @@ class PanelController:
         coverage_token = self._optional_string(payload, 'coverage_token') or None
         parent_surface_id = self._optional_string(payload, "parent_surface_id") or None
         if coverage_token is not None:
-            return self._start_direct_coverage_job(payload, coverage_token, parent_surface_id)
+            raise ValueError("stale coverage token cannot start materialization; preflight_token is required")
 
-        request, token = self._resolve_direct_request(payload), self._required(payload, "preflight_token")
+        supplied_token = self._required(payload, "preflight_token")
+        with self._lock:
+            selected_state = self._direct_selected_preflight
+        if selected_state is None:
+            raise ValueError("latest preflight token is required")
+        if selected_state is not None:
+            if supplied_token != selected_state.token:
+                raise ValueError("latest preflight token is required")
+            raw_scopes = payload.get("selected_scopes")
+            if raw_scopes is not None:
+                selected_scopes = tuple(
+                    f"{scope.symbol}|{scope.timeframe}"
+                    for scope in self._direct_selected_scopes(payload)
+                )
+                expected_scopes = tuple(
+                    scope
+                    for request in selected_state.requests
+                    for scope in request.selected_scopes
+                )
+                if selected_scopes != expected_scopes:
+                    raise ValueError("latest preflight token is required")
+            requests = selected_state.requests
+            if parent_surface_id is not None and len(requests) != 1:
+                raise ValueError("parent_surface_id requires a single side")
+            if parent_surface_id is not None:
+                self._with_analysis(
+                    True,
+                    lambda connection: require_canonical_operational_surface(
+                        connection, parent_surface_id
+                    ),
+                )
+            with self._lock:
+                if self._direct_job and self._direct_job.running:
+                    raise RuntimeError("another direct build is already running")
+                if self._direct_selected_preflight is not selected_state:
+                    raise ValueError("latest preflight token is required")
+                job = _DirectJob(
+                    requests=requests,
+                    coverage_scan=selected_state.coverage_scan,
+                    audit_root=selected_state.audit_root,
+                    frozen_preflights=selected_state.preflights,
+                    parent_surface_id=parent_surface_id,
+                    materialization_settings=load_direct_materialization_settings(self.default_config),
+                )
+                job.artifacts.update(self._direct_artifacts)
+                self._direct_job = job
+            threading.Thread(target=self._run_duckdb_direct, args=(job,), name="mrs3-panel-duckdb-direct", daemon=True).start()
+            return self.snapshot()
+
+        request, token = self._resolve_direct_request(payload), supplied_token
         with self._lock:
             if self._direct_preflight is None: raise ValueError("latest preflight token is required")
             original, preflight, expected = self._direct_preflight
@@ -1916,20 +2758,24 @@ class PanelController:
                 if not set(selected.symbols).issubset(preflight.usable_timeframes):
                     raise ValueError("selected symbol is unavailable")
         if parent_surface_id is not None:
-            exists = self._with_analysis(
+            self._with_analysis(
                 True,
-                lambda connection: connection.execute(
-                    "select 1 from surfaces where surface_id=?", [parent_surface_id]
-                ).fetchone(),
+                lambda connection: require_canonical_operational_surface(
+                    connection, parent_surface_id
+                ),
             )
-            if exists is None:
-                raise ValueError("unknown parent surface")
         with self._lock:
             if self._direct_job and self._direct_job.running:
                 raise RuntimeError("another direct build is already running")
             if self._direct_preflight != (original, preflight, expected):
                 raise ValueError("latest preflight token is required")
-            job = _DirectJob(selected, original, preflight, parent_surface_id=parent_surface_id)
+            job = _DirectJob(
+                selected,
+                original,
+                preflight,
+                parent_surface_id=parent_surface_id,
+                materialization_settings=load_direct_materialization_settings(self.default_config),
+            )
             self._direct_job = job
         threading.Thread(target=self._run_duckdb_direct, args=(job,), name="mrs3-panel-duckdb-direct", daemon=True).start()
         return self.snapshot()
@@ -1962,6 +2808,7 @@ class PanelController:
                 coverage_scan=scan,
                 audit_root=audit_root,
                 parent_surface_id=parent_surface_id,
+                materialization_settings=load_direct_materialization_settings(self.default_config),
             )
             job.artifacts.update(self._direct_artifacts)
             self._direct_job = job
@@ -1974,35 +2821,120 @@ class PanelController:
             source_path, analysis_path = self._direct_paths()
             source = self._direct_connection_factory(str(source_path), read_only=True)
             if job.cancel.is_set(): raise DirectMaterializationError("direct build cancelled")
+            frozen_manifest_total: int | None = None
+            if job.frozen_preflights is not None:
+                frozen_manifest_total = sum(len(preflight.manifest) for preflight in job.frozen_preflights)
+            side_base_points = 0
             def progress(phase: str, **facts: object) -> None:
+                nonlocal side_base_points
                 with self._lock:
                     job.phase = phase
-                    job.point_count = int(facts.get("materialized_points", job.point_count))
-                    if "side" in facts:
-                        job.side = str(facts["side"])
+                    incoming_side = facts.get("side")
+                    if incoming_side is not None and incoming_side != job.side:
+                        side_base_points = job.point_count
+                        job.side = str(incoming_side)
+                    if "materialized_points" in facts:
+                        job.point_count = side_base_points + int(facts["materialized_points"])
+                    else:
+                        job.point_count = int(facts.get("materialized_points", job.point_count))
+                    if frozen_manifest_total is not None:
+                        job.total_points = frozen_manifest_total
+                    elif "total_points" in facts:
+                        job.total_points = int(facts["total_points"])
+                    if "workers" in facts:
+                        job.workers = int(facts["workers"])
+                    if "elapsed_seconds" in facts:
+                        job.elapsed_seconds = float(facts["elapsed_seconds"])
+                    if "points_per_second" in facts:
+                        job.points_per_second = float(facts["points_per_second"])
                     if "ordinal" in facts:
                         job.ordinal = int(facts["ordinal"])
                     if "total" in facts:
                         job.total = int(facts["total"])
             if job.requests is not None:
-                prepared = self._direct_prepare_func(
-                    source,
-                    job.requests,
-                    audit_root=job.audit_root,
-                    coverage_scan=job.coverage_scan,
-                    cancellation=job.cancel.is_set,
-                    progress_callback=progress,
+                frozen_v2 = any(
+                    request.grid_contract_kind == V2_GRID_CONTRACT_KIND
+                    or (
+                        index < len(job.frozen_preflights or ())
+                        and job.frozen_preflights[index].grid_contract.get("kind") == V2_GRID_CONTRACT_KIND
+                    )
+                    for index, request in enumerate(job.requests)
                 )
+                if frozen_v2:
+                    if (
+                        job.frozen_preflights is None
+                        or len(job.frozen_preflights) != len(job.requests)
+                        or job.coverage_scan is None
+                        or job.audit_root is None
+                    ):
+                        raise DirectMaterializationError("STALE_PREFLIGHT")
+                    try:
+                        prepared = replay_direct_preflights(
+                            source,
+                            job.requests,
+                            job.frozen_preflights,
+                            audit_root=job.audit_root,
+                            coverage_scan=job.coverage_scan,
+                            cancellation=job.cancel.is_set,
+                            materialization_settings=job.materialization_settings,
+                            progress_callback=progress,
+                        )
+                    except TypeError as error:
+                        if "progress_callback" not in str(error) or "unexpected keyword argument" not in str(error):
+                            raise
+                        prepared = replay_direct_preflights(
+                            source,
+                            job.requests,
+                            job.frozen_preflights,
+                            audit_root=job.audit_root,
+                            coverage_scan=job.coverage_scan,
+                            cancellation=job.cancel.is_set,
+                            materialization_settings=job.materialization_settings,
+                        )
+                else:
+                    try:
+                        prepared = self._direct_prepare_func(
+                            source,
+                            job.requests,
+                            audit_root=job.audit_root,
+                            coverage_scan=job.coverage_scan,
+                            cancellation=job.cancel.is_set,
+                            progress_callback=progress,
+                            materialization_settings=job.materialization_settings,
+                        )
+                    except TypeError as error:
+                        if 'materialization_settings' not in str(error) or 'unexpected keyword argument' not in str(error):
+                            raise
+                        prepared = self._direct_prepare_func(
+                            source,
+                            job.requests,
+                            audit_root=job.audit_root,
+                            coverage_scan=job.coverage_scan,
+                            cancellation=job.cancel.is_set,
+                            progress_callback=progress,
+                        )
                 source.close()
                 source = None
                 analysis = self._direct_connection_factory(str(analysis_path), read_only=False)
-                result = self._direct_publish_func(
-                    analysis,
-                    prepared,
-                    cancellation=job.cancel.is_set,
-                    progress_callback=progress,
-                    parent_surface_id=job.parent_surface_id,
-                )
+                try:
+                    result = self._direct_publish_func(
+                        analysis,
+                        prepared,
+                        audit_root=job.audit_root,
+                        cancellation=job.cancel.is_set,
+                        progress_callback=progress,
+                        parent_surface_id=job.parent_surface_id,
+                    )
+                except TypeError as error:
+                    if "audit_root" not in str(error):
+                        raise
+                    result = self._direct_publish_func(
+                        analysis,
+                        prepared,
+                        cancellation=job.cancel.is_set,
+                        progress_callback=progress,
+                        parent_surface_id=job.parent_surface_id,
+                    )
                 with self._lock:
                     job.publication_state = str(result.publication_state)
                     job.phase = str(result.phase or result.publication_state)
@@ -2103,26 +3035,76 @@ class PanelController:
 
     def start_analysis_strategies(self, payload: Mapping[str, object]) -> dict[str, object]:
         run_id = self._required(payload, "run_id")
-        criteria = self._analysis_criteria(payload)
+        selected_scopes = self._analysis_selected_scopes(payload)
+        source_v6_surface_raw = payload.get("source_v6_surface_path")
+        source_v6_surface_path = (
+            self._path(source_v6_surface_raw)
+            if source_v6_surface_raw not in (None, "")
+            else None
+        )
+        if source_v6_surface_path is not None:
+            if not source_v6_surface_path.is_file() or source_v6_surface_path.suffix.casefold() != ".duckdb":
+                raise ValueError("v6 strategy generation requires a published DuckDB surface")
+            from .source_v6_surface import read_source_v6_analysis_run
+
+            result = read_source_v6_analysis_run(source_v6_surface_path, run_id)
+            metadata = result.get("metadata")
+            facts = result.get("facts")
+            if not isinstance(metadata, Mapping) or not isinstance(facts, Mapping):
+                raise ValueError("v6 analysis run is missing immutable READY facts")
+            raw_structures = facts.get("structures")
+            if not isinstance(raw_structures, list):
+                raise ValueError("v6 analysis run has no READY structure list")
+            ready_ids = {
+                str(item.get("candidate_id", item.get("structure_id")))
+                for item in raw_structures
+                if isinstance(item, Mapping)
+                and item.get("status") == "READY_MRS3_STRUCTURE"
+                and (
+                    str(item.get("symbol")),
+                    str(item.get("side")).upper(),
+                    str(item.get("timeframe")),
+                ) in selected_scopes
+            }
+            if not ready_ids:
+                raise ValueError("v6 analysis run has no READY candidate in the selected scopes")
+            requested_ids = payload.get("candidate_ids")
+            if requested_ids is None:
+                candidate_ids = tuple(sorted(ready_ids))
+            elif isinstance(requested_ids, (list, tuple)) and all(isinstance(item, str) for item in requested_ids):
+                requested = {item.strip() for item in requested_ids if item.strip()}
+                missing = sorted(requested.difference(ready_ids))
+                if missing:
+                    raise ValueError(f"selected v6 candidates are absent or not READY: {missing}")
+                candidate_ids = tuple(sorted(requested))
+                if not candidate_ids:
+                    raise ValueError("selected v6 candidates are absent or not READY")
+            else:
+                raise ValueError("candidate_ids must be a list of strings")
+            criteria = ()
+        else:
+            criteria = self._analysis_criteria(payload)
         shortlist = self._jsonable(self._with_analysis(
             True, lambda connection: self._analysis_shortlist_func(connection, run_id, criteria)
-        ))
-        if not isinstance(shortlist, Mapping):
-            raise ValueError("analysis shortlist returned an invalid result")
-        candidate_ids = tuple(
-            str(row["candidate_id"])
-            for row in shortlist.get("rows", ())
-            if row.get("filter_status") == "READY_AFTER_FILTERS"
-            and self._scope_matches(payload, "symbol", "symbols", row.get("symbol"))
-            and self._scope_matches(payload, "timeframe", "timeframes", row.get("timeframe"))
-        )
-        if not candidate_ids:
-            raise ValueError("no READY candidates in the selected Pair/TF scope")
+        )) if source_v6_surface_path is None else None
+        if source_v6_surface_path is None:
+            if not isinstance(shortlist, Mapping):
+                raise ValueError("analysis shortlist returned an invalid result")
+            candidate_ids = tuple(
+                str(row["candidate_id"])
+                for row in shortlist.get("rows", ())
+                if row.get("filter_status") == "READY_AFTER_FILTERS"
+                and self._scope_matches(payload, "symbol", "symbols", row.get("symbol"))
+                and self._scope_matches(payload, "timeframe", "timeframes", row.get("timeframe"))
+                and (str(row.get("symbol", "")), str(row.get("side", "")).upper(), str(row.get("timeframe", ""))) in selected_scopes
+            )
         job = _StrategyJob(
             run_id,
             self._path(self._required(payload, "template_path")),
             self._path(self._required(payload, "output_dir")),
             self._path(self._required(payload, "config_path")),
+            selected_scopes=selected_scopes,
+            source_v6_surface_path=source_v6_surface_path,
         )
         job.candidate_ids = candidate_ids
         job.criteria = criteria
@@ -2138,13 +3120,37 @@ class PanelController:
         try:
             with self._lock:
                 job.phase = "GENERATING"
-            connection = self._direct_connection_factory(str(self._analysis_path()), read_only=True)
-            result = self._analysis_strategy_func(
-                connection, job.run_id, job.candidate_ids, job.template_path, job.output_dir,
-                self._analysis_config_loader(job.config_path), job.criteria,
-            )
+            config = self._analysis_config_loader(job.config_path)
+            if job.source_v6_surface_path is not None:
+                result = generate_v6_analysis_strategies(
+                    job.source_v6_surface_path,
+                    job.run_id,
+                    job.candidate_ids,
+                    job.selected_scopes,
+                    job.template_path,
+                    job.output_dir,
+                    config,
+                )
+            else:
+                connection = self._direct_connection_factory(str(self._analysis_path()), read_only=True)
+                result = self._analysis_strategy_func(
+                    connection, job.run_id, job.candidate_ids, job.selected_scopes, job.template_path, job.output_dir,
+                    config, job.criteria,
+                )
             with self._lock:
                 job.strategies_path = Path(result.strategies_path)
+                manifest_path = getattr(result, "manifest_path", None)
+                job.manifest_path = Path(manifest_path) if manifest_path is not None else None
+                if job.source_v6_surface_path is not None and job.manifest_path is not None:
+                    manifest = json.loads(job.manifest_path.read_text(encoding="utf-8"))
+                    job.v6_confirmation = {
+                        "source_surface_id": manifest.get("source_surface_id"),
+                        "source_manifest_sha256": manifest.get("source_manifest_sha256"),
+                        "analysis_run_id": manifest.get("analysis_run_id"),
+                        "analysis_config_sha256": manifest.get("analysis_config_sha256"),
+                        "strategy_count": manifest.get("strategy_count"),
+                        "generation_manifest_sha256": manifest.get("generation_manifest_sha256"),
+                    }
                 job.strategy_count = int(result.strategy_count)
                 job.phase = "COMMITTED"
         except BaseException as error:
@@ -2158,9 +3164,61 @@ class PanelController:
 
     def analysis_shortlist(self, payload: Mapping[str, object]) -> object:
         run_id = self._required(payload, "run_id")
-        result = self._jsonable(self._with_analysis(
-            True, lambda connection: self._analysis_shortlist_func(connection, run_id, self._analysis_criteria(payload))
-        ))
+        criteria = self._analysis_criteria(payload)
+        source_v6_surface_raw = payload.get("source_v6_surface_path")
+        if source_v6_surface_raw not in (None, ""):
+            surface_path = self._path(source_v6_surface_raw)
+            if not surface_path.is_file() or surface_path.suffix.casefold() != ".duckdb":
+                raise ValueError("v6 shortlist requires a published DuckDB surface")
+            from .source_v6_surface import read_source_v6_analysis_run
+
+            result = read_source_v6_analysis_run(surface_path, run_id)
+            facts = result.get("facts")
+            if not isinstance(facts, Mapping) or not isinstance(facts.get("structures"), list):
+                raise ValueError("v6 analysis run has no READY structure list")
+            structures = [
+                item for item in facts["structures"]
+                if isinstance(item, Mapping) and item.get("status") == "READY_MRS3_STRUCTURE"
+            ]
+            scopes: dict[tuple[str, str, str], dict[str, object]] = {}
+            for item in structures:
+                key = (str(item.get("symbol")), str(item.get("side")).upper(), str(item.get("timeframe")))
+                if not all(key) or not self._scope_matches(payload, "symbol", "symbols", key[0]) or not self._scope_matches(payload, "timeframe", "timeframes", key[2]):
+                    continue
+                orders = int(item.get("order_count", len(item.get("orders", ()))))
+                row = scopes.setdefault(key, {
+                    "symbol": key[0], "side": key[1], "timeframe": key[2],
+                    "base_1ord": 0, "order_2": 0, "order_3": 0, "order_4": 0,
+                    "ready": 0, "deferred": 0, "total": 0,
+                })
+                row["ready"] = int(row["ready"]) + 1
+                row["total"] = int(row["total"]) + 1
+                row[f"order_{orders}" if orders > 1 else "base_1ord"] = int(row[f"order_{orders}" if orders > 1 else "base_1ord"]) + 1
+            scope_rows = tuple(scopes[key] for key in sorted(scopes))
+            return {
+                "run_id": run_id,
+                "criteria": list(criteria),
+                "input_count": sum(int(row["total"]) for row in scope_rows),
+                "ready_count": sum(int(row["ready"]) for row in scope_rows),
+                "deferred_count": 0,
+                "comparable_count": sum(int(row["ready"]) for row in scope_rows),
+                "comparison_group_count": len(scope_rows),
+                "rows": [],
+                "scopes": list(scope_rows),
+                "facets": {
+                    "symbols": sorted({str(row["symbol"]) for row in scope_rows}),
+                    "timeframes": sorted({str(row["timeframe"]) for row in scope_rows}),
+                },
+            }
+
+        def read(connection: duckdb.DuckDBPyConnection) -> object:
+            return (
+                self._analysis_shortlist_func(connection, run_id, criteria),
+                self._published_analysis_scopes(connection, run_id),
+            )
+
+        result, (published_scopes, base_counts) = self._with_analysis(True, read)
+        result = self._jsonable(result)
         if not isinstance(result, Mapping):
             return result
         public_fields = (
@@ -2169,20 +3227,25 @@ class PanelController:
         )
         document = {name: result[name] for name in public_fields if name in result}
         rows = list(result.get("rows", ()))
-        document["facets"] = {
-            "symbols": sorted({str(row["symbol"]) for row in rows if row.get("symbol")}),
-            "timeframes": sorted({str(row["timeframe"]) for row in rows if row.get("timeframe")}),
-        }
-        rows = [
-            row for row in rows
-            if self._scope_matches(payload, "symbol", "symbols", row.get("symbol"))
-            and self._scope_matches(payload, "timeframe", "timeframes", row.get("timeframe"))
-        ]
-        scopes: dict[tuple[str, str], dict[str, object]] = {}
+        scopes: dict[tuple[str, str, str], dict[str, object]] = {}
+        for symbol, side, timeframe in published_scopes:
+            key = (symbol, side, timeframe)
+            scopes.setdefault(key, {
+                "symbol": symbol, "side": side, "timeframe": timeframe,
+                "base_1ord": base_counts.get(key, 0),
+                "order_2": 0, "order_3": 0, "order_4": 0,
+                "ready": 0, "deferred": 0, "total": 0,
+            })
         for row in rows:
-            key = (str(row.get("symbol", "")), str(row.get("timeframe", "")))
+            symbol = str(row.get("symbol", ""))
+            side = str(row.get("side", "")).upper()
+            timeframe = str(row.get("timeframe", ""))
+            if not symbol or not side or not timeframe:
+                continue
+            key = (symbol, side, timeframe)
             scope = scopes.setdefault(key, {
-                "symbol": key[0], "timeframe": key[1],
+                "symbol": symbol, "side": side, "timeframe": timeframe,
+                "base_1ord": base_counts.get(key, 0),
                 "order_2": 0, "order_3": 0, "order_4": 0,
                 "ready": 0, "deferred": 0, "total": 0,
             })
@@ -2192,8 +3255,86 @@ class PanelController:
             scope["total"] += 1
             status = "deferred" if row.get("filter_status") == "DEFERRED_REDUNDANT" else "ready"
             scope[status] += 1
-        document["scopes"] = [scopes[key] for key in sorted(scopes)]
+        visible = [
+            key for key in sorted(scopes)
+            if self._scope_matches(payload, "symbol", "symbols", scopes[key].get("symbol"))
+            and self._scope_matches(payload, "timeframe", "timeframes", scopes[key].get("timeframe"))
+        ]
+        document["facets"] = {
+            "symbols": sorted({key[0] for key in scopes}),
+            "timeframes": sorted({key[2] for key in scopes}, key=self._timeframe_sort_key),
+        }
+        document["scopes"] = [scopes[key] for key in visible]
         return document
+
+    @staticmethod
+    def _timeframe_sort_key(value: str) -> tuple[int, str]:
+        digits = ""
+        for char in value:
+            if char.isdigit():
+                digits += char
+            else:
+                break
+        return (int(digits) if digits else -1, value[len(digits):])
+
+    @staticmethod
+    def _published_analysis_scopes(
+        connection: duckdb.DuckDBPyConnection, run_id: str
+    ) -> tuple[tuple[tuple[str, str, str], ...], dict[tuple[str, str, str], int]]:
+        found = connection.execute(
+            "select surface_id from analysis_runs where run_id=?", [run_id]
+        ).fetchone()
+        if found is None:
+            raise ValueError("unknown analysis run")
+        surface_id = str(found[0])
+        scopes: set[tuple[str, str, str]] = set()
+        for (key,) in connection.execute(
+            "select canonical_point_key from surface_points where surface_id=?",
+            [surface_id],
+        ).fetchall():
+            parts = str(key).split("|")
+            if len(parts) == 6:
+                scopes.add((parts[0], parts[1], parts[2]))
+        counts: dict[tuple[str, str, str], int] = {}
+        for _plateau_id, metrics in load_validated_plateau_facts(connection, run_id):
+            if not bool(metrics.get("ready")):
+                continue
+            base_id = metrics.get("base_1ord_point_id")
+            if not isinstance(base_id, str) or not base_id:
+                continue
+            key = (
+                str(metrics.get("symbol")),
+                str(metrics.get("side")),
+                str(metrics.get("timeframe")),
+            )
+            if all(key):
+                counts[key] = counts.get(key, 0) + 1
+        return tuple(sorted(scopes)), counts
+    @staticmethod
+    def _analysis_selected_scopes(payload: Mapping[str, object]) -> tuple[tuple[str, str, str], ...]:
+        raw = payload.get("selected_scopes")
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError("selected_scopes must be a list")
+        if not raw:
+            raise ValueError("selected_scopes must not be empty")
+        normalized: set[tuple[str, str, str]] = set()
+        for scope in raw:
+            if not isinstance(scope, Mapping):
+                raise ValueError("selected_scopes must contain objects")
+            symbol = scope.get("symbol")
+            side = scope.get("side")
+            timeframe = scope.get("timeframe")
+            if not all(isinstance(field, str) for field in (symbol, side, timeframe)):
+                raise ValueError("selected scope requires symbol, side, and timeframe strings")
+            symbol = symbol.strip()
+            side = side.strip().upper()
+            timeframe = timeframe.strip()
+            if not symbol or not side or not timeframe:
+                raise ValueError("selected scope requires non-empty symbol, side, and timeframe")
+            if side not in {"LONG", "SHORT"}:
+                raise ValueError(f"selected scope has invalid side: {side!r}")
+            normalized.add((symbol, side, timeframe))
+        return tuple(sorted(normalized))
 
     @staticmethod
     def _analysis_criteria(payload: Mapping[str, object]) -> tuple[str, ...]:
@@ -2641,6 +3782,10 @@ class PanelController:
                 "cancel_requested": direct_job.cancel.is_set(),
                 "phase": direct_job.phase,
                 "point_count": direct_job.point_count,
+                "workers": direct_job.workers,
+                "elapsed_seconds": direct_job.elapsed_seconds,
+                "points_per_second": direct_job.points_per_second,
+                "total_points": direct_job.total_points,
                 "side": direct_job.side,
                 "ordinal": direct_job.ordinal,
                 "total": direct_job.total,
@@ -2657,26 +3802,89 @@ class PanelController:
                 request, preflight, token = direct_preflight
                 preflight_document = self._direct_preflight_document(request, preflight, token)
                 if direct_document is None:
-                    direct_document = {"running": False, "phase": "PREFLIGHT_READY", "point_count": 0}
+                    direct_document = {
+                        "running": False,
+                        "phase": "PREFLIGHT_READY",
+                        "point_count": 0,
+                        "workers": 0,
+                        "elapsed_seconds": 0.0,
+                        "points_per_second": 0.0,
+                        "total_points": 0,
+                    }
+                direct_document["preflight"] = preflight_document
+            elif self._direct_selected_preflight is not None:
+                state = self._direct_selected_preflight
+                preflight_document = self._direct_preflight_document(
+                    state.requests[0], state.preflights[0], state.token
+                )
+                preflight_document["selected_sides"] = [request.side for request in state.requests]
+                preflight_document["coverage_token"] = state.coverage_scan.token
+                if direct_document is None:
+                    direct_document = {
+                        "running": False,
+                        "phase": "PREFLIGHT_READY",
+                        "point_count": 0,
+                        "workers": 0,
+                        "elapsed_seconds": 0.0,
+                        "points_per_second": 0.0,
+                        "total_points": 0,
+                    }
                 direct_document["preflight"] = preflight_document
             analysis_job = self._analysis_job
             analysis_document = None if analysis_job is None else {
                 "running": analysis_job.running,
                 "phase": analysis_job.phase,
+                "status": analysis_job.phase,
                 "surface_id": analysis_job.surface_id,
                 "run_id": analysis_job.run_id,
                 "statistics": dict(analysis_job.statistics),
                 "error": analysis_job.error,
             }
+            source_v6_analysis_job = self._source_v6_analysis_job
+            source_v6_analysis_document = (
+                None
+                if source_v6_analysis_job is None
+                else self._source_v6_analysis_document(source_v6_analysis_job)
+            )
+            # The existing Analysis section is also the landing place for a
+            # committed v6 run; keep the dedicated lifecycle document so the
+            # UI can distinguish it from the legacy rerun controls.
+            if source_v6_analysis_document is not None and (
+                analysis_document is None or source_v6_analysis_document["running"]
+            ):
+                analysis_document = {
+                    "running": source_v6_analysis_document["running"],
+                    "phase": source_v6_analysis_document["phase"],
+                    "status": source_v6_analysis_document["status"],
+                    "surface_id": source_v6_analysis_document["surface_id"],
+                    "run_id": source_v6_analysis_document["analysis_run_id"],
+                    "statistics": {},
+                    "error": source_v6_analysis_document["error"],
+                    "source": "SOURCE_V6",
+                    "manifest_sha256": source_v6_analysis_document["manifest_sha256"],
+                    "frozen_facts_sha256": source_v6_analysis_document["frozen_facts_sha256"],
+                    "listing_dates_sha256": source_v6_analysis_document["listing_dates_sha256"],
+                    "config_sha256": source_v6_analysis_document["config_sha256"],
+                    "scope": source_v6_analysis_document["scope"],
+                    "start_ms": source_v6_analysis_document["start_ms"],
+                    "end_ms": source_v6_analysis_document["end_ms"],
+                    "provenance": source_v6_analysis_document["provenance"],
+                }
             strategy_job = self._strategy_job
             strategy_document = None if strategy_job is None else {
                 "running": strategy_job.running,
                 "phase": strategy_job.phase,
                 "run_id": strategy_job.run_id,
+                "selected_scopes": [list(scope) for scope in strategy_job.selected_scopes],
                 "strategies_path": str(strategy_job.strategies_path) if strategy_job.strategies_path else None,
+                "manifest_path": str(strategy_job.manifest_path) if strategy_job.manifest_path else None,
+                "v6_confirmation": dict(strategy_job.v6_confirmation),
                 "strategy_count": strategy_job.strategy_count,
                 "error": strategy_job.error,
             }
+            source_v6_document = dict(self._source_v6_job) if self._source_v6_job is not None else None
+            if source_v6_document is not None:
+                source_v6_document.pop("fragments", None)
         return {
             "defaults": {
                 "root": str(self.root),
@@ -2689,7 +3897,9 @@ class PanelController:
             "duckdb_import_preflight": preflight_document,
             "duckdb_direct": direct_document,
             "analysis": analysis_document,
+            "source_v6_analysis": source_v6_analysis_document,
             "analysis_strategies": strategy_document,
+            "source_v6": source_v6_document,
             "dashboard": dashboard,
         }
 
@@ -2783,6 +3993,28 @@ class _PanelHandler(BaseHTTPRequestHandler):
             except ValueError as error:
                 self._json(400, {"error": str(error)})
             return
+        if parsed.path == "/api/source-v6/library":
+            try:
+                self._json(200, self.server.controller.source_v6_library())
+            except ValueError as error:
+                self._json(400, {"error": str(error)})
+            return
+        if parsed.path == "/api/source-v6/fresh/library":
+            try:
+                self._json(200, self.server.controller.source_v6_fresh_library())
+            except ValueError as error:
+                self._json(400, {"error": str(error)})
+            return
+        if parsed.path == "/api/source-v6/analysis/library":
+            try:
+                self._json(200, self.server.controller.source_v6_library())
+            except ValueError as error:
+                self._json(400, {"error": str(error)})
+            return
+        if parsed.path == "/api/source-v6/analysis/status":
+            document = self.server.controller.snapshot().get("source_v6_analysis")
+            self._json(200, document or {"phase": "IDLE", "running": False})
+            return
         if parsed.path == "/api/artifact":
             name = parse_qs(parsed.query).get("name", [""])[0]
             artifact = self.server.controller.artifact(name)
@@ -2820,7 +4052,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/initialize", "/api/analysis/library", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/initialize", "/api/analysis/library", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -2855,6 +4087,38 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.cancel_duckdb_import()
             elif endpoint == "/api/duckdb-import/migrate":
                 result = self.server.controller.migrate_duckdb_import(document)
+            elif endpoint == "/api/source-v6/preflight":
+                result = self.server.controller.source_v6_preflight(document)
+            elif endpoint == "/api/source-v6/start":
+                result = self.server.controller.source_v6_start(document)
+            elif endpoint == "/api/source-v6/fresh/multiscope/start":
+                result = self.server.controller.source_v6_start_fresh(document)
+            elif endpoint == "/api/source-v6/fresh/multiscope/analysis/start":
+                result = self.server.controller.source_v6_start_fresh_analysis(document)
+            elif endpoint == "/api/source-v6/cancel":
+                result = self.server.controller.source_v6_cancel()
+            elif endpoint == "/api/source-v6/merge/preflight":
+                result = self.server.controller.source_v6_merge_preflight(document)
+            elif endpoint == "/api/source-v6/merge/start":
+                result = self.server.controller.source_v6_merge_start(document)
+            elif endpoint == "/api/source-v6/merge/cancel":
+                result = self.server.controller.source_v6_merge_cancel()
+            elif endpoint == "/api/source-v6/merge":
+                result = self.server.controller.source_v6_merge(document)
+            elif endpoint == "/api/source-v6/library":
+                result = self.server.controller.source_v6_library(document)
+            elif endpoint == "/api/source-v6/gaps":
+                result = self.server.controller.source_v6_gaps(document)
+            elif endpoint == "/api/source-v6/export":
+                result = self.server.controller.source_v6_export(document)
+            elif endpoint == "/api/source-v6/analysis/library":
+                result = self.server.controller.source_v6_library(document)
+            elif endpoint == "/api/source-v6/analysis/start":
+                result = self.server.controller.start_source_v6_analysis(document)
+            elif endpoint == "/api/source-v6/analysis/status":
+                result = self.server.controller.snapshot().get("source_v6_analysis")
+            elif endpoint == "/api/source-v6/analysis/cancel":
+                result = self.server.controller.cancel_source_v6_analysis()
             elif endpoint == "/api/duckdb-direct/coverage":
                 result = self.server.controller.duckdb_direct_coverage(document)
             elif endpoint == "/api/duckdb-direct/preflight":
@@ -2888,7 +4152,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             self._json(400, {"error": str(error)})
             return
-        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies"} else 200, result)
+        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start"} else 200, result)
 
 
 def create_panel_server(

@@ -58,11 +58,53 @@ def test_export_is_byte_stable_and_manifest_hashes_match_files(tmp_path: Path) -
         assert manifest["surface_id"] == "S1"
         assert manifest["row_counts"]["surface_points"] == 1
         assert manifest["row_counts"]["surface_point_events"] == 1
+        assert manifest["row_counts"]["plateau_point_composition"] == 1
         if "analysis_run_facts" in manifest["row_counts"]:
             assert manifest["facts_state"] == "COMPUTED"
             assert manifest["counts"]["unique_point_count"] == 1
         for filename, digest in manifest["sha256"].items():
             assert sha256((first / filename).read_bytes()).hexdigest() == digest
+        composition = pd.read_csv(first / "plateau_point_composition.csv")
+        assert list(composition.columns) == [
+            "run_id",
+            "surface_id",
+            "plateau_id",
+            "plateau_member_count",
+            "symbol",
+            "side",
+            "pair_key",
+            "shift_bp",
+            "open_ma",
+            "close_ma",
+            "timeframe",
+            "canonical_point_key",
+            "point_event_count",
+            "source_report_id",
+            "source_hash",
+            "provenance_state",
+            "metrics_json",
+        ]
+        record = composition.to_dict("records")[0]
+        record["metrics_json"] = json.loads(record["metrics_json"])
+        assert record == {
+            "run_id": "R1",
+            "surface_id": "S1",
+            "plateau_id": "P1",
+            "plateau_member_count": 1,
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "pair_key": "PAIR",
+            "shift_bp": 100,
+            "open_ma": 3,
+            "close_ma": 9,
+            "timeframe": "1h",
+            "canonical_point_key": "BTCUSDT|LONG|1h|100|3|9",
+            "point_event_count": 7,
+            "source_report_id": "report",
+            "source_hash": "a" * 64,
+            "provenance_state": "REPRODUCIBLE_AT_PUBLICATION",
+            "metrics_json": {"TotalTrades": 7},
+        }
     finally:
         connection.close()
 

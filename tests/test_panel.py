@@ -5,6 +5,7 @@ from html.parser import HTMLParser
 import hashlib
 import io
 import json
+from dataclasses import replace
 from pathlib import Path
 import time
 from hashlib import sha256
@@ -14,6 +15,8 @@ import pytest
 
 from mrs3 import panel as panel_module
 from mrs3.panel import PanelController, _DirectJob, _Job, create_panel_server
+from mrs3.source_v6_importer import source_v6_import_lock
+from mrs3.config import DirectMaterializationSettings, load_direct_materialization_settings
 from mrs3.duckdb_import import ImportJobResult, ImportPreflight, ImportProgress
 from mrs3.duckdb_direct import (
     publish_direct_surfaces,
@@ -115,6 +118,17 @@ def test_panel_rejects_performance_dd5_without_commission_contract(tmp_path: Pat
         )
 
 
+def test_panel_autofills_performance_inbox_from_completed_workflow() -> None:
+    html = panel_module.PANEL_HTML
+    autofill = html.split("function autofillPerformanceInbox(workflow)", 1)[1]
+    assert "workflow.state !== 'COMPLETED'" in autofill
+    assert "workflow.inbox_path" in autofill
+    assert "document.getElementById('performance_inbox')" in autofill
+    assert "input.value = workflow.inbox_path" in autofill
+    render = html.split("function render(data)", 1)[1]
+    assert "autofillPerformanceInbox(workflow);" in render
+
+
 def _import_result(tmp_path: Path, *, final_state: str = "COMMITTED", tampered: bool = False) -> ImportJobResult:
     audit = tmp_path / "audit" / "job-1"
     audit.mkdir(parents=True)
@@ -185,6 +199,62 @@ def _fake_coverage_scan(tmp_path: Path) -> _CoverageScan:
         "s" * 64,
         (),
     )
+
+
+def _install_fake_stage_b(monkeypatch: pytest.MonkeyPatch, controller: PanelController) -> None:
+    """Keep panel unit tests source-free while exercising the Stage-B shape."""
+    def freeze(_source: object, requests: tuple[DirectBuildRequest, ...], **_: object) -> tuple[tuple[DirectBuildRequest, ...], tuple[DirectPreflight, ...]]:
+        bound: list[DirectBuildRequest] = []
+        preflights: list[DirectPreflight] = []
+        for request in requests:
+            audit = b"pair,side\nfixture," + request.side.encode() + b"\n"
+            request = replace(
+                request,
+                audit_artifact_name=f"surface_coverage_audit_{request.side}.csv",
+                audit_schema_version=1,
+                audit_size_bytes=len(audit),
+                audit_row_count=1,
+                audit_sha256=hashlib.sha256(audit).hexdigest(),
+                audit_bytes=audit,
+            )
+            symbol, timeframe = request.selected_scopes[0].split("|", maxsplit=1)
+            point = f"{symbol}|{request.side}|{timeframe}|30|3|2"
+            preflights.append(DirectPreflight(
+                {symbol: (timeframe,)}, {}, (),
+                MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}),
+                ("a" * 64,), (("report-1", "a" * 64),), (point,),
+                tuple(controller._direct_coverage_scan.coverage.rows) if controller._direct_coverage_scan else (),
+                audit_artifact_name=request.audit_artifact_name,
+                audit_schema_version=1,
+                audit_size_bytes=len(audit),
+                audit_row_count=1,
+                audit_sha256=request.audit_sha256,
+                audit_bytes=audit,
+            ))
+            bound.append(request)
+        return tuple(bound), tuple(preflights)
+    monkeypatch.setattr(panel_module, "freeze_direct_preflights", freeze)
+
+    def replay(
+        source: object,
+        requests: tuple[DirectBuildRequest, ...],
+        _preflights: tuple[DirectPreflight, ...],
+        *,
+        audit_root: object,
+        coverage_scan: object,
+        cancellation: object,
+        materialization_settings: object = None,
+    ) -> tuple[object, ...]:
+        return controller._direct_prepare_func(
+            source,
+            requests,
+            audit_root=audit_root,
+            coverage_scan=coverage_scan,
+            cancellation=cancellation,
+            progress_callback=lambda *_args, **_kwargs: None,
+        )
+
+    monkeypatch.setattr(panel_module, "replay_direct_preflights", replay)
 
 
 def _wait_analysis_finished(controller: PanelController) -> dict[str, object]:
@@ -272,12 +342,10 @@ def test_analysis_refine_validates_and_passes_explicit_parent_before_source_work
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
     payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
     token = controller.duckdb_direct_preflight(payload)["token"]
-    with pytest.raises(ValueError, match="unknown parent surface"):
-        controller.start_duckdb_direct({**payload, "preflight_token": token, "parent_surface_id": "missing"})
-    assert opened == [("source.duckdb", True), ("analysis.duckdb", True)]
-    controller.start_duckdb_direct({**payload, "preflight_token": token, "parent_surface_id": "surface-1"})
-    assert _wait_direct_finished(controller)["surface_id"] == "surface-2"
-    assert parents == ["surface-1"]
+    with pytest.raises(ValueError, match="latest preflight token is required"):
+        controller.start_duckdb_direct({**payload, "preflight_token": token, "parent_surface_id": "surface-1"})
+    assert opened == [("source.duckdb", True)]
+    assert parents == []
 
 
 def test_analysis_library_ui_and_routes_are_exposed() -> None:
@@ -353,7 +421,51 @@ def test_panel_rejects_stale_coverage_token(tmp_path: Path) -> None:
         )
 
 
-def test_selected_common_intervals_are_returned_as_dates_before_start(tmp_path: Path) -> None:
+def test_stage_b_does_not_install_when_coverage_scan_changes_during_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: _fake_coverage_scan(tmp_path),
+    )
+    controller.duckdb_import_settings({
+        "source_duckdb_path": "source.duckdb",
+        "analysis_duckdb_path": "analysis.duckdb",
+        "audit_root": "audit",
+    })
+    controller.duckdb_direct_coverage({"symbols": []})
+    _install_fake_stage_b(monkeypatch, controller)
+    frozen = panel_module.freeze_direct_preflights
+
+    def freeze_and_replace_scan(*args: object, **kwargs: object) -> object:
+        result = frozen(*args, **kwargs)
+        assert controller._direct_coverage_scan is not None
+        controller._direct_coverage_scan = replace(controller._direct_coverage_scan, token="changed")
+        return result
+
+    monkeypatch.setattr(panel_module, "freeze_direct_preflights", freeze_and_replace_scan)
+    payload = {
+        "coverage_token": "coverage-token",
+        "selected_scopes": [
+            {"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"},
+            {"symbol": "BTCUSDT", "side": "SHORT", "timeframe": "1h"},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="stale coverage token"):
+        controller.duckdb_direct_preflight(payload)
+
+    assert controller._direct_selected_preflight is None
+    assert controller._direct_preflight is None
+
+
+def test_selected_common_intervals_are_returned_as_dates_before_start(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class Connection:
         def close(self) -> None:
             pass
@@ -372,6 +484,7 @@ def test_selected_common_intervals_are_returned_as_dates_before_start(tmp_path: 
     )
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
     controller.duckdb_direct_coverage({"symbols": []})
+    _install_fake_stage_b(monkeypatch, controller)
     payload = {
         "coverage_token": "coverage-token",
         "start_utc": "2024-01-01T00:00:00Z",
@@ -393,10 +506,11 @@ def test_selected_common_intervals_are_returned_as_dates_before_start(tmp_path: 
     assert intervals["long"]["end_date"] == "2024-01-02"
     assert intervals["long"]["display"] == "2024-01-01 .. 2024-01-02"
     assert intervals["short"]["start_date"] == "2024-01-01"
-    assert document["token"] == "coverage-token"
+    assert document["token"] != "coverage-token"
+    assert document["preflight_token"] == document["token"]
 
 
-def test_direct_start_derives_one_common_interval_per_side(tmp_path: Path) -> None:
+def test_direct_start_derives_one_common_interval_per_side(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class Connection:
         def close(self) -> None:
             pass
@@ -445,6 +559,7 @@ def test_direct_start_derives_one_common_interval_per_side(tmp_path: Path) -> No
     )
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
     controller.duckdb_direct_coverage({"symbols": []})
+    _install_fake_stage_b(monkeypatch, controller)
     payload = {
         "coverage_token": "coverage-token",
         "selected_scopes": [
@@ -453,7 +568,8 @@ def test_direct_start_derives_one_common_interval_per_side(tmp_path: Path) -> No
         ],
     }
 
-    controller.start_duckdb_direct(payload)
+    token = controller.duckdb_direct_preflight(payload)["preflight_token"]
+    controller.start_duckdb_direct({"preflight_token": token, "selected_scopes": payload["selected_scopes"]})
     status = _wait_direct_finished(controller)
 
     assert status["publication_state"] == "PUBLISHED"
@@ -523,6 +639,7 @@ def test_preview_contract_matches_direct_start_requests_and_publishes(
     )
     controller.duckdb_import_settings({'source_duckdb_path': 'source.duckdb', 'analysis_duckdb_path': 'analysis.duckdb', 'audit_root': 'audit'})
     controller.duckdb_direct_coverage({'symbols': []})
+    _install_fake_stage_b(monkeypatch, controller)
     payload = {
         'coverage_token': 'coverage-token',
         'selected_scopes': [
@@ -532,7 +649,8 @@ def test_preview_contract_matches_direct_start_requests_and_publishes(
     }
 
     preview = controller.duckdb_direct_preflight(payload)
-    controller.start_duckdb_direct(payload)
+    preview["preflight_token"] = preview["token"]
+    controller.start_duckdb_direct({**payload, "coverage_token": None, "preflight_token": preview["preflight_token"]})
     status = controller.snapshot()['duckdb_direct']
 
     assert status['publication_state'] == 'PUBLISHED'
@@ -578,6 +696,7 @@ def test_direct_prepare_failure_never_calls_publish_and_snapshot_is_failed(
     )
     controller.duckdb_import_settings({'source_duckdb_path': 'source.duckdb', 'analysis_duckdb_path': 'analysis.duckdb', 'audit_root': 'audit'})
     controller.duckdb_direct_coverage({'symbols': []})
+    _install_fake_stage_b(monkeypatch, controller)
     payload = {
         'coverage_token': 'coverage-token',
         'selected_scopes': [
@@ -586,8 +705,8 @@ def test_direct_prepare_failure_never_calls_publish_and_snapshot_is_failed(
         ],
     }
 
-    controller.duckdb_direct_preflight(payload)
-    controller.start_duckdb_direct(payload)
+    token = controller.duckdb_direct_preflight(payload)["preflight_token"]
+    controller.start_duckdb_direct({"preflight_token": token, "selected_scopes": payload["selected_scopes"]})
     status = controller.snapshot()['duckdb_direct']
 
     assert status['publication_state'] == 'FAILED'
@@ -595,6 +714,56 @@ def test_direct_prepare_failure_never_calls_publish_and_snapshot_is_failed(
     assert status['surface_id'] is None
     assert status['error'] == 'active coverage scan changed after preflight'
     assert published == []
+
+
+def test_malformed_frozen_v2_preflight_never_falls_back_to_prepare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
+    )
+    scan = _fake_coverage_scan(tmp_path)
+    request = DirectBuildRequest(
+        "2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z", "LONG", ("BTCUSDT",),
+        (100,), "v1", "a" * 64, grid_contract_kind=V2_GRID_CONTRACT_KIND,
+    )
+    malformed = DirectPreflight(
+        {"BTCUSDT": ("1h",)}, {}, (), MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}),
+        (), (), (),
+    )
+    prepared: list[object] = []
+
+    def prepare(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        prepared.append(True)
+        return ()
+
+    controller._direct_prepare_func = prepare
+    monkeypatch.setattr(
+        panel_module,
+        "replay_direct_preflights",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(DirectMaterializationError("STALE_PREFLIGHT")),
+    )
+    job = _DirectJob(
+        requests=(request,),
+        coverage_scan=scan,
+        audit_root=tmp_path / "audit",
+        frozen_preflights=(malformed,),
+    )
+
+    controller._run_duckdb_direct(job)
+
+    assert prepared == []
+    assert job.publication_state == "FAILED"
+    assert job.error == "STALE_PREFLIGHT"
 
 
 def _run_direct_coverage_job(
@@ -654,13 +823,18 @@ def _run_direct_coverage_job(
         {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
     )
     controller.duckdb_direct_coverage({"symbols": []})
+    _install_fake_stage_b(monkeypatch, controller)
+    selected_payload = {
+        "selected_scopes": [
+            {"symbol": "BTCUSDT", "side": side, "timeframe": "1h"}
+            for side in sides
+        ],
+    }
+    token = controller.duckdb_direct_preflight({"coverage_token": "coverage-token", **selected_payload})["preflight_token"]
     controller.start_duckdb_direct(
         {
-            "coverage_token": "coverage-token",
-            "selected_scopes": [
-                {"symbol": "BTCUSDT", "side": side, "timeframe": "1h"}
-                for side in sides
-            ],
+            "preflight_token": token,
+            **selected_payload,
         }
     )
     return controller.snapshot()["duckdb_direct"]
@@ -802,7 +976,7 @@ def test_direct_publish_unexpected_error_is_generic_in_panel_snapshot(
 
     assert status["publication_state"] == "FAILED"
     assert status["phase"] == "FAILED"
-    assert status["error"] == "direct build failed"
+    assert status["error"] == "V2 preflight contract is required"
     payload = json.dumps(status)
     assert "secret internal state" not in payload
     assert "RuntimeError" not in payload
@@ -863,7 +1037,7 @@ def test_direct_status_keeps_existing_progress_scale_unchanged() -> None:
     assert "directBar" not in html
 
 
-def test_v2_selected_preflight_ignores_legacy_window_and_does_not_call_legacy_preflight(tmp_path: Path) -> None:
+def test_v2_selected_preflight_ignores_legacy_window_and_returns_distinct_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class Connection:
         def close(self) -> None:
             pass
@@ -882,6 +1056,7 @@ def test_v2_selected_preflight_ignores_legacy_window_and_does_not_call_legacy_pr
     )
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
     controller.duckdb_direct_coverage({"symbols": []})
+    _install_fake_stage_b(monkeypatch, controller)
 
     document = controller.duckdb_direct_preflight(
         {
@@ -894,13 +1069,14 @@ def test_v2_selected_preflight_ignores_legacy_window_and_does_not_call_legacy_pr
         }
     )
 
-    assert document["token"] == "coverage-token"
+    assert document["token"] != "coverage-token"
+    assert document["preflight_token"] == document["token"]
     assert set(document["selected_intervals"]) == {"short"}
     assert document["selected_intervals"]["short"]["start_date"] == "2024-01-01"
     assert document["selected_intervals"]["short"]["end_date"] == "2024-01-02"
 
 
-def test_legacy_selected_preflight_uses_v1_without_explicit_coverage_token(tmp_path: Path) -> None:
+def test_selected_preflight_requires_explicit_coverage_token(tmp_path: Path) -> None:
     class Connection:
         def close(self) -> None:
             pass
@@ -926,24 +1102,21 @@ def test_legacy_selected_preflight_uses_v1_without_explicit_coverage_token(tmp_p
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
     controller.duckdb_direct_coverage({"symbols": []})
 
-    document = controller.duckdb_direct_preflight(
-        {
-            "start_utc": "2024-01-01T00:00:00Z",
-            "end_utc": "2024-01-02T00:00:00Z",
-            "side": "LONG",
-            "symbols": ["BTCUSDT"],
-            "required_shifts_bp": [100],
-            "selected_scopes": [{"symbol": "BTCUSDT", "timeframe": "1h"}],
-        }
-    )
-
-    assert len(legacy_calls) == 1
-    assert legacy_calls[0].selected_scopes == ("BTCUSDT|1h",)
-    assert document["token"] != "coverage-token"
-    assert "selected_intervals" not in document
+    with pytest.raises(ValueError, match="selected scopes require a valid coverage token"):
+        controller.duckdb_direct_preflight(
+            {
+                "start_utc": "2024-01-01T00:00:00Z",
+                "end_utc": "2024-01-02T00:00:00Z",
+                "side": "LONG",
+                "symbols": ["BTCUSDT"],
+                "required_shifts_bp": [100],
+                "selected_scopes": [{"symbol": "BTCUSDT", "timeframe": "1h"}],
+            }
+        )
+    assert legacy_calls == []
 
 
-def test_legacy_selected_start_does_not_use_active_scan_without_explicit_coverage_token(tmp_path: Path) -> None:
+def test_selected_start_requires_live_selected_preflight_state(tmp_path: Path) -> None:
     class Connection:
         def close(self) -> None:
             pass
@@ -1003,9 +1176,8 @@ def test_legacy_selected_start_does_not_use_active_scan_without_explicit_coverag
         "coverage-token",
     )
 
-    controller.start_duckdb_direct({**payload, "preflight_token": "coverage-token"})
-
-    assert _wait_direct_finished(controller)["surface_id"] == "surface-1"
+    with pytest.raises(ValueError, match="latest preflight token"):
+        controller.start_duckdb_direct({**payload, "preflight_token": "coverage-token"})
 
 
 def test_v2_selected_start_rejects_scope_without_explicit_side(tmp_path: Path) -> None:
@@ -1022,7 +1194,7 @@ def test_v2_selected_start_rejects_scope_without_explicit_side(tmp_path: Path) -
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
     controller.duckdb_direct_coverage({"symbols": []})
 
-    with pytest.raises(ValueError, match="selected scope must include symbol, side, and timeframe"):
+    with pytest.raises(ValueError, match="coverage token.*cannot start"):
         controller.start_duckdb_direct(
             {
                 "coverage_token": "coverage-token",
@@ -1035,7 +1207,7 @@ def test_v2_selected_start_rejects_scope_without_explicit_side(tmp_path: Path) -
         )
 
 
-def test_v2_selected_start_short_only_ignores_legacy_side_and_blank_window(tmp_path: Path) -> None:
+def test_v2_selected_start_short_only_ignores_legacy_side_and_blank_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class Connection:
         def close(self) -> None:
             pass
@@ -1081,11 +1253,16 @@ def test_v2_selected_start_short_only_ignores_legacy_side_and_blank_window(tmp_p
     )
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
     controller.duckdb_direct_coverage({"symbols": []})
+    _install_fake_stage_b(monkeypatch, controller)
 
+    selected_payload = {
+        "selected_scopes": [{"symbol": "BTCUSDT", "side": "SHORT", "timeframe": "1h"}],
+    }
+    token = controller.duckdb_direct_preflight({"coverage_token": "coverage-token", **selected_payload})["preflight_token"]
     controller.start_duckdb_direct(
         {
-            "coverage_token": "coverage-token",
-            "selected_scopes": [{"symbol": "BTCUSDT", "side": "SHORT", "timeframe": "1h"}],
+            "preflight_token": token,
+            **selected_payload,
             "start_utc": "",
             "end_utc": "",
             "side": "LONG",
@@ -1102,7 +1279,343 @@ def test_v2_selected_start_short_only_ignores_legacy_side_and_blank_window(tmp_p
     assert captured[0].symbols == ("BTCUSDT",)
 
 
-def test_direct_csv_artifacts_serve_immutable_bytes_after_backing_file_mutation_or_deletion(tmp_path: Path) -> None:
+def test_direct_selected_start_forwards_local_materialization_settings_to_replay_and_prepare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"direct_materialization": {"workers": 7}}), encoding="utf-8")
+
+    scan = _fake_coverage_scan(tmp_path)
+    replay_settings: list[object] = []
+    prepare_settings: list[object] = []
+
+    def prepare(
+        _source: object,
+        requests: tuple[object, ...],
+        *,
+        audit_root: object,
+        coverage_scan: object,
+        cancellation: object,
+        progress_callback: object,
+        materialization_settings: object,
+    ) -> tuple[object, ...]:
+        prepare_settings.append(materialization_settings)
+        return tuple(
+            SimpleNamespace(request=request, points=(), preflight=SimpleNamespace(audit_sha256=""))
+            for request in requests
+        )
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        *,
+        cancellation: object,
+        progress_callback: object,
+        parent_surface_id: str | None = None,
+    ) -> DirectQueueResult:
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(SimpleNamespace(surface_id=f"surface-{surface.request.side}", points=()) for surface in surfaces),
+        )
+
+    def replay(
+        _source: object,
+        requests: tuple[object, ...],
+        _preflights: tuple[object, ...],
+        *,
+        audit_root: object,
+        coverage_scan: object,
+        cancellation: object,
+        materialization_settings: object,
+    ) -> tuple[object, ...]:
+        replay_settings.append(materialization_settings)
+        return prepare(
+            _source,
+            requests,
+            audit_root=audit_root,
+            coverage_scan=coverage_scan,
+            cancellation=cancellation,
+            progress_callback=lambda *_args, **_kwargs: None,
+            materialization_settings=materialization_settings,
+        )
+
+    monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    controller = PanelController(
+        tmp_path,
+        config,
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_coverage_scan_func=lambda *_args, **_kwargs: scan,
+        direct_prepare_func=prepare,
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
+    controller.duckdb_direct_coverage({"symbols": []})
+    _install_fake_stage_b(monkeypatch, controller)
+    monkeypatch.setattr(panel_module, "replay_direct_preflights", replay)
+    payload = {
+        "coverage_token": "coverage-token",
+        "selected_scopes": [
+            {"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"},
+            {"symbol": "BTCUSDT", "side": "SHORT", "timeframe": "1h"},
+        ],
+    }
+
+    token = controller.duckdb_direct_preflight(payload)["preflight_token"]
+    controller.start_duckdb_direct({"preflight_token": token, "selected_scopes": payload["selected_scopes"]})
+    status = controller.snapshot()["duckdb_direct"]
+
+    assert status["publication_state"] == "PUBLISHED"
+    assert replay_settings == [DirectMaterializationSettings(workers=7)]
+    assert prepare_settings == [DirectMaterializationSettings(workers=7)]
+
+
+def test_run_duckdb_direct_normal_prepare_uses_job_settings_and_retries_legacy_callable(
+    tmp_path: Path,
+) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"direct_materialization": {"workers": 7}}), encoding="utf-8")
+    settings = load_direct_materialization_settings(config)
+
+    calls: list[dict[str, object]] = []
+
+    def prepare(
+        _source: object,
+        requests: tuple[object, ...],
+        **kwargs: object,
+    ) -> tuple[object, ...]:
+        calls.append(dict(kwargs))
+        if "materialization_settings" in kwargs:
+            message = "prepare() got an unexpected keyword argument " + "'materialization_settings'"
+            raise TypeError(message)
+        return tuple(
+            SimpleNamespace(request=request, points=(), preflight=SimpleNamespace(audit_sha256=""))
+            for request in requests
+        )
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        *,
+        cancellation: object,
+        progress_callback: object,
+        parent_surface_id: str | None = None,
+    ) -> DirectQueueResult:
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(SimpleNamespace(surface_id=f"surface-{surface.request.side}", points=()) for surface in surfaces),
+        )
+
+    controller = PanelController(
+        tmp_path,
+        config,
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_prepare_func=prepare,
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
+    )
+    request = DirectBuildRequest(
+        "2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z", "LONG", ("BTCUSDT",), (100,), "v1", "a" * 64,
+    )
+    job = _DirectJob(
+        requests=(request,),
+        coverage_scan=_fake_coverage_scan(tmp_path),
+        audit_root=tmp_path / "audit",
+        materialization_settings=settings,
+    )
+    controller._run_duckdb_direct(job)
+
+    assert job.publication_state == "PUBLISHED"
+    assert len(calls) == 2
+    assert calls[0]["materialization_settings"].workers == 7
+    assert "materialization_settings" not in calls[1]
+
+
+def test_direct_snapshot_exposes_materialization_telemetry(tmp_path: Path) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    def prepare(
+        _source: object,
+        requests: tuple[object, ...],
+        *,
+        progress_callback: object,
+        **_kwargs: object,
+    ) -> tuple[object, ...]:
+        progress_callback(
+            "MATERIALIZING",
+            materialized_points=3,
+            total_points=5,
+            workers=4,
+            elapsed_seconds=1.5,
+            points_per_second=2.0,
+        )
+        return tuple(
+            SimpleNamespace(request=request, points=(), preflight=SimpleNamespace(audit_sha256=""))
+            for request in requests
+        )
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        *,
+        progress_callback: object,
+        **_kwargs: object,
+    ) -> DirectQueueResult:
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(
+                SimpleNamespace(
+                    surface_id=f"surface-{surface.request.side}",
+                    points=(object(), object(), object()),
+                )
+                for surface in surfaces
+            ),
+        )
+
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_prepare_func=prepare,
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
+    )
+    request = DirectBuildRequest(
+        "2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z", "LONG", ("BTCUSDT",), (100,), "v1", "a" * 64,
+    )
+    job = _DirectJob(
+        requests=(request,),
+        coverage_scan=_fake_coverage_scan(tmp_path),
+        audit_root=tmp_path / "audit",
+    )
+    controller._direct_job = job
+    controller._run_duckdb_direct(job)
+
+    status = controller.snapshot()["duckdb_direct"]
+    assert status["workers"] == 4
+    assert status["elapsed_seconds"] == 1.5
+    assert status["points_per_second"] == 2.0
+    assert status["total_points"] == 5
+    assert status["point_count"] == 3
+    assert status["phase"] == "PUBLISHED"
+
+
+def test_dual_side_replay_progress_is_side_aware_and_globally_coherent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    long_manifest = (("long-1", "a" * 64), ("long-2", "a" * 64))
+    short_manifest = (("short-1", "a" * 64), ("short-2", "a" * 64), ("short-3", "a" * 64))
+    long_preflight = DirectPreflight(
+        {}, {}, (), MappingProxyType({"kind": V2_GRID_CONTRACT_KIND}),
+        ("a" * 64,), long_manifest, ("LONG|1", "LONG|2"),
+    )
+    short_preflight = DirectPreflight(
+        {}, {}, (), MappingProxyType({"kind": V2_GRID_CONTRACT_KIND}),
+        ("a" * 64,), short_manifest, ("SHORT|1", "SHORT|2", "SHORT|3"),
+    )
+
+    observed_counts: list[int] = []
+    manifests = {"LONG": long_manifest, "SHORT": short_manifest}
+
+    def replay(
+        _source: object,
+        requests: tuple[object, ...],
+        _preflights: object,
+        *,
+        progress_callback: object,
+        **_kwargs: object,
+    ) -> tuple[object, ...]:
+        for request in requests:
+            side = request.side
+            local_total = len(manifests[side])
+            for completed in range(1, local_total + 1):
+                progress_callback(
+                    "MATERIALIZING",
+                    side=side,
+                    materialized_points=completed,
+                    total_points=local_total,
+                    workers=4,
+                    elapsed_seconds=1.0,
+                    points_per_second=2.0,
+                )
+                observed_counts.append(controller._direct_job.point_count)
+        return tuple(
+            SimpleNamespace(
+                request=request,
+                points=tuple(object() for _ in range(len(manifests[request.side]))),
+                preflight=SimpleNamespace(audit_sha256=""),
+            )
+            for request in requests
+        )
+
+    def publish(
+        _analysis: object,
+        surfaces: tuple[object, ...],
+        *,
+        progress_callback: object,
+        **_kwargs: object,
+    ) -> DirectQueueResult:
+        return DirectQueueResult(
+            "PUBLISHED",
+            tuple(
+                SimpleNamespace(surface_id=f"surface-{surface.request.side}", points=surface.points)
+                for surface in surfaces
+            ),
+        )
+
+    monkeypatch.setattr(panel_module, "replay_direct_preflights", replay)
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        direct_publish_func=publish,
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
+    )
+    long_request = DirectBuildRequest(
+        "2024-01-01T00:00:00Z", "2024-01-01T02:00:00Z", "LONG", ("BTCUSDT",), (100,), "v1", "a" * 64,
+        grid_contract_kind=V2_GRID_CONTRACT_KIND,
+    )
+    short_request = replace(long_request, side="SHORT")
+    job = _DirectJob(
+        requests=(long_request, short_request),
+        frozen_preflights=(long_preflight, short_preflight),
+        coverage_scan=_fake_coverage_scan(tmp_path),
+        audit_root=tmp_path / "audit",
+    )
+    controller._direct_job = job
+    controller._run_duckdb_direct(job)
+
+    status = controller.snapshot()["duckdb_direct"]
+    assert observed_counts == [1, 2, 3, 4, 5]
+    assert status["point_count"] == 5
+    assert status["total_points"] == 5
+    assert status["side"] == "SHORT"
+    assert status["workers"] == 4
+    assert status["elapsed_seconds"] == 1.0
+    assert status["points_per_second"] == 2.0
+    assert status["phase"] == "PUBLISHED"
+
+
+def test_direct_csv_artifacts_serve_immutable_bytes_after_backing_file_mutation_or_deletion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class Connection:
         def close(self) -> None:
             pass
@@ -1163,13 +1676,18 @@ def test_direct_csv_artifacts_serve_immutable_bytes_after_backing_file_mutation_
     )
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"})
     controller.duckdb_direct_coverage({"symbols": []})
+    _install_fake_stage_b(monkeypatch, controller)
+    selected_payload = {
+        "selected_scopes": [
+            {"symbol": "BTCUSDT", "side": side, "timeframe": "1h"}
+            for side in ("LONG", "SHORT")
+        ],
+    }
+    token = controller.duckdb_direct_preflight({"coverage_token": "coverage-token", **selected_payload})["preflight_token"]
     controller.start_duckdb_direct(
         {
-            "coverage_token": "coverage-token",
-            "selected_scopes": [
-                {"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"},
-                {"symbol": "BTCUSDT", "side": "SHORT", "timeframe": "1h"},
-            ],
+            "preflight_token": token,
+            **selected_payload,
         }
     )
     assert _wait_direct_finished(controller)["publication_state"] == "PUBLISHED"
@@ -1208,6 +1726,672 @@ def test_direct_csv_artifacts_serve_immutable_bytes_after_backing_file_mutation_
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_source_v6_panel_lifecycle_has_bound_token_progress_and_library(tmp_path: Path) -> None:
+    fixture_dir = Path(__file__).parent / "fixtures" / "performance"
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    for name in ("source_v6_fixed_lot_overlap_a.html", "source_v6_fixed_lot_overlap_b.html"):
+        (reports / name).write_bytes((fixture_dir / name).read_bytes())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    preflight = controller.source_v6_preflight({"root_path": str(reports), "database_path": "source-v6.duckdb"})
+    assert preflight["parsed"] == 2 and preflight["token"]
+    with pytest.raises(ValueError, match="latest Source v6 preflight"):
+        controller.source_v6_start({"preflight_token": "stale"})
+    result = controller.source_v6_start({"preflight_token": preflight["token"]})
+    assert result["phase"] == "PUBLISHED"
+    assert result["progress"] == 1.0
+    library = controller.source_v6_library()
+    assert any(item["status"] == "VALID" for item in library)
+
+
+def test_source_v6_panel_cancel_clears_preflight_state(tmp_path: Path) -> None:
+    fixture_dir = Path(__file__).parent / "fixtures" / "performance"
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "report.html").write_bytes((fixture_dir / "source_v6_fixed_lot_overlap_a.html").read_bytes())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    controller.source_v6_preflight({"root_path": str(reports), "database_path": "source-v6.duckdb"})
+    cancelled = controller.source_v6_cancel()
+    assert cancelled["phase"] == "CANCELLED"
+    assert cancelled["cancel_requested"] is True
+
+
+def test_source_v6_panel_start_rejects_held_shared_lock_without_target_mutation(tmp_path: Path) -> None:
+    fixture_dir = Path(__file__).parent / "fixtures" / "performance"
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "report.html").write_bytes((fixture_dir / "source_v6_fixed_lot_overlap_a.html").read_bytes())
+    target = tmp_path / "source-v6.duckdb"
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    preflight = controller.source_v6_preflight({"root_path": str(reports), "database_path": str(target)})
+
+    with source_v6_import_lock(target):
+        result = controller.source_v6_start({"preflight_token": preflight["token"]})
+
+    assert result["phase"] == "FAILED"
+    assert "already being written" in result["error"]
+    assert not target.exists()
+    assert not list(tmp_path.glob("*.staging*"))
+
+
+def test_source_v6_panel_merge_is_read_only_and_serialized(tmp_path: Path) -> None:
+    from mrs3.source_v6 import normalize_source_v6
+    from mrs3.source_v6_importer import source_v6_import_lock
+    from mrs3.source_v6_merge import merge_source_v6
+    from mrs3.source_v6_storage import create_v6_database, import_fragment, preflight_import
+
+    fixture_dir = Path(__file__).parent / "fixtures" / "performance"
+    sources = []
+    for index, name in enumerate(("source_v6_fixed_lot_overlap_a.html", "source_v6_fixed_lot_overlap_b.html")):
+        database = tmp_path / f"source-{index}.source-v6.duckdb"
+        fragment = normalize_source_v6((fixture_dir / name).read_bytes(), source_name=name)
+        create_v6_database(database, database_id=f"source-{index}")
+        import_fragment(database, fragment, preflight_token=preflight_import(database, fragment))
+        sources.append(database)
+    target = tmp_path / "merged.source-v6.duckdb"
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    preflight = controller.source_v6_merge_preflight({"input_paths": [str(path) for path in sources], "target_path": str(target)})
+    with source_v6_import_lock(target):
+        result = controller.source_v6_merge_start({"preflight_token": preflight["token"]})
+    assert result["phase"] == "FAILED"
+    assert "already being written" in result["error"]
+    assert not target.exists()
+
+    result = controller.source_v6_merge({"input_paths": [str(path) for path in sources], "target_path": str(target)})
+    assert result["phase"] == "MERGED"
+    assert result["duplicate_count"] == 0
+
+
+def test_source_v6_panel_dom_exposes_merge_only_lifecycle() -> None:
+    from mrs3.panel import PANEL_HTML
+
+    for control in ("sourceV6MergePreflight()", "sourceV6MergeStart()", "sourceV6MergeCancel()", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start"):
+        assert control in PANEL_HTML
+
+
+def test_source_v6_panel_dom_has_truthful_workflow_controls() -> None:
+    from mrs3.panel import PANEL_HTML
+
+    for control in ("sourceV6Preflight()", "sourceV6Start()", "sourceV6Cancel()", "sourceV6Library()", "source_v6_progress", "source_v6_status"):
+        assert control in PANEL_HTML
+    assert "/api/source-v6/preflight" in PANEL_HTML
+    assert "/api/source-v6/fresh/multiscope/start" in PANEL_HTML
+    assert "/api/source-v6/fresh/multiscope/analysis/start" in PANEL_HTML
+    assert 'id="source_v6_scope" multiple' in PANEL_HTML
+    assert "/api/source-v6/cancel" in PANEL_HTML
+    assert PANEL_HTML.count('id="source_v6_surface_path"') == 1
+    assert '<label>Published surface<input id="source_v6_surface_path" type="text" readonly></label>' in PANEL_HTML
+    assert '<input id="source_v6_surface_path" type="hidden">' not in PANEL_HTML
+
+
+def test_fresh_source_v6_analysis_uses_configured_worker_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    from mrs3.panel import PanelController
+
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"duckdb_import": {"workers": 3}}), encoding="utf-8")
+    dates, analysis = tmp_path / "dates.json", tmp_path / "analysis.json"
+    dates.write_text("{}", encoding="utf-8")
+    analysis.write_text("{}", encoding="utf-8")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", lambda path: {"surface_id": "surface"})
+    monkeypatch.setattr("mrs3.panel.run_multiscope_analysis", lambda surface, directory, loaded, **kwargs: captured.update({"surface": surface, "workers": kwargs["workers"], "cancel_check": kwargs["cancel_check"]}) or directory / "result.analysis-v6.duckdb")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda path: object(), source_v6_listing_dates_loader=lambda path: {"ONUSDT": "2020-01-01"})
+
+    result = controller.source_v6_start_fresh_analysis({"surface_path": "surface.surface-v6.duckdb", "listing_dates_path": str(dates), "config_path": str(analysis)})
+
+    assert result["phase"] == "COMMITTED"
+    assert captured["workers"] == 3
+    assert callable(captured["cancel_check"])
+
+
+def test_fresh_source_v6_analysis_reports_requested_cancellation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mrs3.panel import PanelController
+
+    dates, analysis = tmp_path / "dates.json", tmp_path / "analysis.json"
+    dates.write_text("{}", encoding="utf-8")
+    analysis.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", lambda path: {"surface_id": "surface"})
+    monkeypatch.setattr("mrs3.panel.run_multiscope_analysis", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Source v6 analysis cancelled")))
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda path: object(), source_v6_listing_dates_loader=lambda path: {})
+
+    result = controller.source_v6_start_fresh_analysis({"surface_path": "surface.surface-v6.duckdb", "listing_dates_path": str(dates), "config_path": str(analysis)})
+
+    assert result["phase"] == "CANCELLED"
+
+
+def test_source_v6_panel_keeps_legacy_fragment_out_of_operational_surface(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "performance" / "source_v6_legacy_nonstitchable.html"
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / fixture.name).write_bytes(fixture.read_bytes())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    preflight = controller.source_v6_preflight({"root_path": str(reports), "database_path": "source-v6.duckdb"})
+    result = controller.source_v6_start({"preflight_token": preflight["token"]})
+    assert result["phase"] == "FAILED"
+    assert "stitchable" in result["error"]
+
+
+def test_source_v6_panel_rejects_uncovered_selected_interval(tmp_path: Path) -> None:
+    fixture_dir = Path(__file__).parent / "fixtures" / "performance"
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    for name in ("source_v6_fixed_lot_overlap_a.html", "source_v6_fixed_lot_overlap_b.html"):
+        (reports / name).write_bytes((fixture_dir / name).read_bytes())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    preflight = controller.source_v6_preflight({"root_path": str(reports), "database_path": "source-v6.duckdb"})
+    result = controller.source_v6_start({"preflight_token": preflight["token"], "scope_key": "ONUSDT|LONG|1h", "start_ms": 1767225600000, "end_ms": 1767398400000})
+    assert result["phase"] == "FAILED"
+    assert "READY" in result["error"]
+
+
+def test_source_v6_analysis_panel_selects_published_surface_and_updates_analysis_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    surface = tmp_path / "source-v6-surface.duckdb"
+    dates = tmp_path / "dates.csv"
+    config = tmp_path / "config.json"
+    surface.write_bytes(b"published")
+    dates.write_text("dates", encoding="utf-8")
+    config.write_text("{}", encoding="utf-8")
+
+    def adapter(path: Path, **kwargs: object) -> object:
+        calls.append(("adapter", (path, kwargs)))
+        return object()
+
+    def analysis(path: Path, _input: object, _config: object, **kwargs: object) -> dict[str, object]:
+        calls.append(("analysis", (path, kwargs)))
+        return {
+            "state": "COMMITTED",
+            "analysis_run_id": "run-v6",
+            "metadata": {
+                "source_surface_id": "surface-v6",
+                "source_manifest_sha256": "m" * 64,
+                "source_frozen_facts_sha256": "f" * 64,
+                "algorithm_config_sha256": "c" * 64,
+            },
+        }
+
+    monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    controller = PanelController(
+        tmp_path,
+        config,
+        source_v6_adapter_func=adapter,
+        source_v6_analysis_func=analysis,
+        source_v6_listing_dates_loader=lambda _path: {"BTCUSDT": "2020-01-01"},
+        analysis_config_loader=lambda _path: object(),
+    )
+    monkeypatch.setattr(panel_module, "read_surface_db", lambda _path: {
+        "surface_id": "surface-v6", "manifest_sha256": "m" * 64,
+        "frozen_facts_sha256": "f" * 64, "event_mode": "real_independent_events",
+        "surface_schema_version": 6, "metric_schema_version": "source-v6-metrics-v1",
+        "event_schema_version": "source-v6-events-v1", "readiness_schema_version": "source-v6-readiness-v1",
+        "frozen_facts_digest_algorithm": "sha256-canonical-frozen-facts-v1",
+    })
+    controller.source_v6_library = lambda: ({
+        "path": str(surface), "status": "VALID", "surface_id": "surface-v6",
+        "manifest_sha256": "m" * 64, "frozen_facts_sha256": "f" * 64,
+        "event_mode": "real_independent_events",
+        "compatibility_versions": {
+            "surface_schema_version": 6, "metric_schema_version": "source-v6-metrics-v1",
+            "event_schema_version": "source-v6-events-v1", "readiness_schema_version": "source-v6-readiness-v1",
+            "frozen_facts_digest_algorithm": "sha256-canonical-frozen-facts-v1",
+        },
+    },)
+
+    result = controller.start_source_v6_analysis({
+        "surface_path": str(surface), "selected_scope": "BTCUSDT|LONG|1h",
+        "start_ms": 1_700_000_000_000, "end_ms": 1_700_003_600_000,
+        "listing_dates_path": str(dates), "config_path": str(config),
+        "algorithm_version": "v6-test",
+    })
+
+    assert calls[0][0] == "adapter"
+    assert calls[0][1][1]["expected_surface_id"] == "surface-v6"
+    assert "cancel_check" in calls[0][1][1]
+    assert calls[1][0] == "analysis"
+    assert calls[1][1][1]["listing_dates_sha256"]
+    assert result["analysis"]["run_id"] == "run-v6"
+    assert result["analysis"]["source"] == "SOURCE_V6"
+    assert result["source_v6_analysis"]["phase"] == "COMMITTED"
+    assert result["source_v6_analysis"]["work_units_completed"] == 3
+
+
+def test_source_v6_analysis_panel_rejects_missing_config_and_invalid_interval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = tmp_path / "source-v6-surface.duckdb"
+    dates = tmp_path / "dates.csv"
+    surface.write_bytes(b"published")
+    dates.write_text("dates", encoding="utf-8")
+    controller = PanelController(tmp_path, tmp_path / "config.json")
+    monkeypatch.setattr(panel_module, "read_surface_db", lambda _path: {
+        "surface_id": "surface-v6", "manifest_sha256": "m" * 64,
+        "frozen_facts_sha256": "f" * 64, "event_mode": "real_independent_events",
+        "surface_schema_version": 6, "metric_schema_version": "source-v6-metrics-v1",
+        "event_schema_version": "source-v6-events-v1", "readiness_schema_version": "source-v6-readiness-v1",
+        "frozen_facts_digest_algorithm": "sha256-canonical-frozen-facts-v1",
+    })
+    controller.source_v6_library = lambda: ({
+        "path": str(surface), "status": "VALID", "surface_id": "surface-v6",
+        "manifest_sha256": "m" * 64, "frozen_facts_sha256": "f" * 64,
+        "event_mode": "real_independent_events",
+        "compatibility_versions": {
+            "surface_schema_version": 6, "metric_schema_version": "source-v6-metrics-v1",
+            "event_schema_version": "source-v6-events-v1", "readiness_schema_version": "source-v6-readiness-v1",
+            "frozen_facts_digest_algorithm": "sha256-canonical-frozen-facts-v1",
+        },
+    },)
+    with pytest.raises(ValueError, match="UTC interval"):
+        controller.start_source_v6_analysis({
+            "surface_path": str(surface), "selected_scope": "BTCUSDT|LONG|1h",
+            "start_ms": 2, "end_ms": 1, "listing_dates_path": str(dates),
+            "config_path": str(tmp_path / "missing.json"), "algorithm_version": "v6-test",
+        })
+    config = tmp_path / "config.json"
+    config.write_text("{}", encoding="utf-8")
+    valid_interval = {
+        "surface_path": str(surface), "selected_scope": "BTCUSDT|LONG|1h",
+        "start_ms": 1, "end_ms": 2, "listing_dates_path": str(dates),
+        "config_path": str(tmp_path / "missing.json"), "algorithm_version": "v6-test",
+    }
+    with pytest.raises(ValueError, match="analysis config"):
+        controller.start_source_v6_analysis(valid_interval)
+    with pytest.raises(ValueError, match="invalid analysis inputs"):
+        controller.start_source_v6_analysis({**valid_interval, "config_path": str(config)})
+
+
+def test_source_v6_analysis_panel_revalidates_direct_api_surface_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    surface = tmp_path / "source-v6-surface.duckdb"
+    surface.write_bytes(b"published")
+    controller = PanelController(tmp_path, tmp_path / "config.json")
+    compatibility = {
+        "surface_schema_version": 6, "metric_schema_version": "source-v6-metrics-v1",
+        "event_schema_version": "source-v6-events-v1", "readiness_schema_version": "source-v6-readiness-v1",
+        "frozen_facts_digest_algorithm": "sha256-canonical-frozen-facts-v1",
+    }
+    current = {
+        "surface_id": "surface-v6", "manifest_sha256": "m" * 64,
+        "frozen_facts_sha256": "f" * 64, "event_mode": "real_independent_events", **compatibility,
+    }
+    monkeypatch.setattr(panel_module, "read_surface_db", lambda _path: dict(current))
+    row = {
+        "path": str(surface), "status": "VALID", "surface_id": "surface-v6",
+        "manifest_sha256": "m" * 64, "frozen_facts_sha256": "f" * 64,
+        "event_mode": "legacy_trades_proxy", "compatibility_versions": compatibility,
+    }
+    controller.source_v6_library = lambda: (row,)
+    with pytest.raises(ValueError, match="unsupported event mode"):
+        controller.start_source_v6_analysis({"surface_path": str(surface)})
+
+    row["event_mode"] = "real_independent_events"
+    row["compatibility_versions"] = {"surface_schema_version": 6}
+    with pytest.raises(ValueError, match="unsupported compatibility"):
+        controller.start_source_v6_analysis({"surface_path": str(surface)})
+
+    row["compatibility_versions"] = compatibility
+    row["manifest_sha256"] = "x" * 64
+    with pytest.raises(ValueError, match="changed since library"):
+        controller.start_source_v6_analysis({"surface_path": str(surface)})
+
+
+def test_source_v6_analysis_panel_rejects_missing_run_id_and_recovers_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    surface = tmp_path / "source-v6-surface.duckdb"
+    dates = tmp_path / "dates.csv"
+    config = tmp_path / "config.json"
+    surface.write_bytes(b"published")
+    dates.write_text("dates", encoding="utf-8")
+    config.write_text("{}", encoding="utf-8")
+    compatibility = {
+        "surface_schema_version": 6, "metric_schema_version": "source-v6-metrics-v1",
+        "event_schema_version": "source-v6-events-v1", "readiness_schema_version": "source-v6-readiness-v1",
+        "frozen_facts_digest_algorithm": "sha256-canonical-frozen-facts-v1",
+    }
+    manifest = {
+        "surface_id": "surface-v6", "manifest_sha256": "m" * 64,
+        "frozen_facts_sha256": "f" * 64, "event_mode": "real_independent_events", **compatibility,
+    }
+    monkeypatch.setattr(panel_module, "read_surface_db", lambda _path: dict(manifest))
+    monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    controller = PanelController(
+        tmp_path, config,
+        source_v6_adapter_func=lambda *_args, **_kwargs: object(),
+        source_v6_analysis_func=lambda *_args, **_kwargs: {"state": "COMMITTED"},
+        source_v6_listing_dates_loader=lambda _path: {"BTCUSDT": "2020-01-01"},
+        analysis_config_loader=lambda _path: object(),
+    )
+    controller.source_v6_library = lambda: ({"path": str(surface), "status": "VALID", **manifest, "compatibility_versions": compatibility},)
+    payload = {
+        "surface_path": str(surface), "selected_scope": "BTCUSDT|LONG|1h",
+        "start_ms": 1_700_000_000_000, "end_ms": 1_700_003_600_000,
+        "listing_dates_path": str(dates), "config_path": str(config), "algorithm_version": "v6-test",
+    }
+    failed = controller.start_source_v6_analysis(payload)
+    assert failed["source_v6_analysis"]["phase"] == "FAILED"
+    assert "analysis_run_id" in failed["source_v6_analysis"]["error"]
+
+    controller._source_v6_analysis_func = lambda *_args, **_kwargs: {
+        "state": "COMMITTED", "analysis_run_id": "run-recovered", "metadata": {},
+    }
+    recovered = controller.start_source_v6_analysis(payload)
+    assert recovered["source_v6_analysis"]["phase"] == "COMMITTED"
+    assert recovered["analysis"]["run_id"] == "run-recovered"
+
+
+def test_analysis_strategies_freezes_selected_scopes_and_allows_empty_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    def strategy_func(
+        connection: object, run_id: object, candidate_ids: object, selected_scopes: object,
+        template_path: object, output_dir: object, config: object, criteria: object,
+    ) -> object:
+        calls.append((run_id, candidate_ids, selected_scopes, Path(str(template_path)).name, Path(str(output_dir)).name, criteria))
+        return SimpleNamespace(strategies_path=tmp_path / "out" / "strategies", strategy_count=1)
+
+    monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    controller = PanelController(
+        tmp_path, tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        analysis_strategy_func=strategy_func,
+        analysis_shortlist_func=lambda *_args: {"rows": ()},
+        analysis_config_loader=lambda _path: object(),
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"}
+    )
+    template = tmp_path / "template.json"
+    template.write_text("{}", encoding="utf-8")
+
+    result = controller.start_analysis_strategies({
+        "run_id": "R1",
+        "selected_scopes": [
+            {"symbol": "ETHUSDT", "side": "LONG", "timeframe": "15m"},
+            {"symbol": "BTCUSDT", "side": "long", "timeframe": "1h"},
+            {"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"},
+        ],
+        "template_path": str(template),
+        "output_dir": str(tmp_path / "out"),
+        "config_path": str(tmp_path / "config.json"),
+        "criteria": [],
+    })
+
+    assert calls[0][1] == ()
+    assert calls[0][2] == (("BTCUSDT", "LONG", "1h"), ("ETHUSDT", "LONG", "15m"))
+    assert calls[0][3] == "template.json"
+    assert calls[0][4] == "out"
+    document = result["analysis_strategies"]
+    assert document["phase"] == "COMMITTED"
+    assert document["selected_scopes"] == [["BTCUSDT", "LONG", "1h"], ["ETHUSDT", "LONG", "15m"]]
+
+
+def test_analysis_strategies_failed_lifecycle_exposes_explicit_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    def strategy_func(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("no BASE or READY candidates exist in the selected scopes")
+
+    monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    controller = PanelController(
+        tmp_path, tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: Connection(),
+        analysis_strategy_func=strategy_func,
+        analysis_shortlist_func=lambda *_args: {"rows": ()},
+        analysis_config_loader=lambda _path: object(),
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"}
+    )
+    template = tmp_path / "template.json"
+    template.write_text("{}", encoding="utf-8")
+
+    result = controller.start_analysis_strategies({
+        "run_id": "R1",
+        "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}],
+        "template_path": str(template),
+        "output_dir": str(tmp_path / "out"),
+        "config_path": str(tmp_path / "config.json"),
+        "criteria": [],
+    })
+
+    document = result["analysis_strategies"]
+    assert document["phase"] == "FAILED"
+    assert document["running"] is False
+    assert document["strategy_count"] == 0
+    assert "no BASE or READY candidates" in document["error"]
+    assert document["selected_scopes"] == [["BTCUSDT", "LONG", "1h"]]
+
+
+def test_analysis_strategies_routes_committed_v6_run_without_legacy_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    surface = tmp_path / "surface.duckdb"
+    surface.write_bytes(b"published surface")
+    template = tmp_path / "template.json"
+    template.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "mrs3.source_v6_surface.read_source_v6_analysis_run",
+        lambda *_args: {
+            "analysis_run_id": "V6RUN",
+            "state": "COMMITTED",
+            "metadata": {"state": "COMMITTED"},
+            "facts": {
+                "structures": [{
+                    "candidate_id": "C_READY",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "timeframe": "1h",
+                    "status": "READY_MRS3_STRUCTURE",
+                }],
+            },
+        },
+    )
+
+    def v6_generator(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        return SimpleNamespace(
+            strategies_path=tmp_path / "generated",
+            strategy_count=1,
+        )
+
+    monkeypatch.setattr("mrs3.panel.generate_v6_analysis_strategies", v6_generator)
+    monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    controller = PanelController(
+        tmp_path,
+        tmp_path / "config.local.json",
+        analysis_config_loader=lambda _path: object(),
+    )
+    result = controller.start_analysis_strategies({
+        "run_id": "V6RUN",
+        "source_v6_surface_path": str(surface),
+        "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}],
+        "template_path": str(template),
+        "output_dir": str(tmp_path / "out"),
+        "config_path": str(tmp_path / "config.json"),
+    })
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert Path(str(args[0])) == surface.resolve()
+    assert args[1:4] == ("V6RUN", ("C_READY",), (("BTCUSDT", "LONG", "1h"),))
+    assert kwargs == {}
+    assert result["analysis_strategies"]["phase"] == "COMMITTED"
+
+
+def test_analysis_shortlist_reads_ready_v6_structures_from_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    surface = tmp_path / "surface.duckdb"
+    surface.write_bytes(b"published surface")
+    monkeypatch.setattr(
+        "mrs3.source_v6_surface.read_source_v6_analysis_run",
+        lambda *_args: {
+            "analysis_run_id": "V6RUN",
+            "facts": {"structures": [{
+                "candidate_id": "C_READY", "symbol": "BTCUSDT", "side": "LONG",
+                "timeframe": "1h", "order_count": 2, "status": "READY_MRS3_STRUCTURE",
+            }]},
+        },
+    )
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+
+    result = controller.analysis_shortlist({
+        "run_id": "V6RUN",
+        "source_v6_surface_path": str(surface),
+        "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}],
+        "criteria": [],
+    })
+
+    assert result["ready_count"] == 1
+    assert result["scopes"] == [{
+        "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h",
+        "base_1ord": 0, "order_2": 1, "order_3": 0, "order_4": 0,
+        "ready": 1, "deferred": 0, "total": 1,
+    }]
+
+
+def test_panel_requires_matching_v6_confirmation_before_tester_run(tmp_path: Path) -> None:
+    strategies = tmp_path / "strategies"
+    strategies.mkdir()
+    manifest = {
+        "generator_schema_version": "mrs3-ready-json-v6-v1",
+        "source_surface_id": "SURFACE",
+        "source_manifest_sha256": "m" * 64,
+        "analysis_run_id": "RUN",
+        "analysis_config_sha256": "c" * 64,
+        "strategy_count": 1,
+        "generation_manifest_sha256": "g" * 64,
+    }
+    (strategies / "strategy_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    base = {
+        "config": str(tmp_path / "config.json"),
+        "strategies": str(strategies),
+        "output_csv": str(tmp_path / "results.csv"),
+    }
+    with pytest.raises(ValueError, match="confirmation"):
+        controller._build_command("tester-run", base)
+    confirmation = {**manifest, "confirmed": True}
+    command, artifacts = controller._build_command("tester-run", {**base, "v6_confirmation": confirmation})
+    assert "tester-run" in command and artifacts["output_csv"].name == "results.csv"
+
+
+def test_analysis_strategies_rejects_malformed_selected_scopes(tmp_path: Path) -> None:
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    template = tmp_path / "template.json"
+    template.write_text("{}", encoding="utf-8")
+    base = {
+        "run_id": "R1",
+        "template_path": str(template),
+        "output_dir": str(tmp_path / "out"),
+        "config_path": str(tmp_path / "config.json"),
+    }
+
+    with pytest.raises(ValueError, match="side"):
+        controller.start_analysis_strategies({**base, "selected_scopes": [{"symbol": "BTCUSDT", "timeframe": "1h"}]})
+    with pytest.raises(ValueError, match="must be a list"):
+        controller.start_analysis_strategies({**base, "selected_scopes": "BTCUSDT"})
+    with pytest.raises(ValueError, match="must not be empty"):
+        controller.start_analysis_strategies({**base, "selected_scopes": []})
+
+
+def test_analysis_shortlist_includes_published_scopes_and_frozen_base_counts(
+    tmp_path: Path,
+) -> None:
+    import duckdb
+    from mrs3.analysis_storage import ensure_analysis_schema
+
+    connection = duckdb.connect(":memory:")
+    ensure_analysis_schema(connection)
+    connection.execute("insert into surfaces(surface_id, build_mode, period_start_utc, period_end_utc, side, event_mode) values ('S1', 'DUCKDB_DIRECT', '2026-01-01', '2026-01-02', 'LONG', 'legacy_trades_proxy')")
+    connection.execute("insert into analysis_runs(run_id, surface_id, algorithm_version, algorithm_config_json) values ('R1', 'S1', 'v1', '{}')")
+    for point_id in ("BTCUSDT|LONG|1h|100|3|9", "ETHUSDT|LONG|15m|100|3|9"):
+        symbol, side, timeframe, shift_bp, open_ma, close_ma = point_id.split("|")
+        pair_key = f"{symbol}|{side}|{shift_bp}|{open_ma}|{close_ma}"
+        connection.execute("insert into surface_pairs(surface_id, pair_key) values ('S1', ?)", [pair_key])
+        connection.execute("insert into surface_timeframes(surface_id, pair_key, timeframe) values ('S1', ?, ?)", [pair_key, timeframe])
+        connection.execute("insert into surface_points(surface_id, canonical_point_key, pair_key, timeframe, point_event_count, source_report_id, source_hash, provenance_state, metrics_json) values ('S1', ?, ?, ?, 7, 'report', ?, 'REPRODUCIBLE', '{}')", [point_id, pair_key, timeframe, "a" * 64])
+    metrics = {
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "timeframe": "1h",
+        "ready": True,
+        "operational_facts_version": "cma_representatives_v1",
+        "primary_close_ma": 9,
+        "cma_representatives": [
+            {
+                "close_ma": 9,
+                "point_id": "BTCUSDT|LONG|1h|100|3|9",
+                "support": 1.0,
+                "support_status": "PRIMARY_CLOSE",
+                "continuity_status": "USABLE",
+                "usable": True,
+            }
+        ],
+        "base_1ord_point_id": "BTCUSDT|LONG|1h|100|3|9",
+        "standalone_eligible_point_ids": ["BTCUSDT|LONG|1h|100|3|9"],
+    }
+    connection.execute("insert into plateaus(run_id, plateau_id, surface_id, metrics_json) values ('R1', 'P1', 'S1', ?)", [json.dumps(metrics)])
+    connection.execute("insert into plateau_members(run_id, plateau_id, surface_id, canonical_point_key) values ('R1', 'P1', 'S1', 'BTCUSDT|LONG|1h|100|3|9')")
+
+    controller = PanelController(
+        tmp_path, tmp_path / "config.local.json",
+        direct_connection_factory=lambda *_args, **_kwargs: connection,
+        analysis_shortlist_func=lambda *_args: {
+            "run_id": "R1", "surface_id": "S1", "criteria": (), "input_count": 0,
+            "ready_count": 0, "deferred_count": 0, "comparison_group_count": 0,
+            "comparable_count": 0, "rows": (),
+        },
+    )
+    controller.duckdb_import_settings(
+        {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"}
+    )
+    document = controller.analysis_shortlist({"run_id": "R1"})
+
+    scopes = {
+        tuple((row["symbol"], row["side"], row["timeframe"])): row
+        for row in document["scopes"]
+    }
+    assert set(scopes) == {("BTCUSDT", "LONG", "1h"), ("ETHUSDT", "LONG", "15m")}
+    assert scopes[("BTCUSDT", "LONG", "1h")]["base_1ord"] == 1
+    assert scopes[("ETHUSDT", "LONG", "15m")]["base_1ord"] == 0
+    assert scopes[("BTCUSDT", "LONG", "1h")]["order_2"] == 0
+    assert document["facets"]["symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert document["facets"]["timeframes"] == ["1h", "15m"]
+def test_analysis_shortlist_ui_includes_visible_1ord_column() -> None:
+    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+    header = html.split('id="shortlist_table_header"', 1)[1].split("</thead>", 1)[0]
+    assert '<th scope="col">1ORD</th>' in header
+    assert header.index('<th scope="col">1ORD</th>') < header.index('<th scope="col">2 orders</th>')
+    render = html.split("function renderShortlist()", 1)[1]
+    assert "item.base_1ord" in render
+
+
+def test_analysis_shortlist_ui_builds_selected_scopes_from_visible_scopes() -> None:
+    html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
+    strategies = html.split("async function analysisStrategies()")[-1]
+    assert "selected_scopes:shortlistScopes.map(item=>({symbol:item.symbol,side:item.side,timeframe:item.timeframe}))" in strategies
+    assert "No shortlist scopes available" in strategies
+    assert "shortlistScopePayload()" in strategies
+
+
 def test_direct_coverage_review_ui_is_pair_side_tf_and_date_only() -> None:
     html = __import__("mrs3.panel", fromlist=["PANEL_HTML"]).PANEL_HTML
     assert "`${row.pair}|${row.side}`" in html
@@ -1438,10 +2622,13 @@ def test_direct_coverage_completion_keeps_inventory_captured_at_job_creation(
     )
     controller.duckdb_direct_coverage({"symbols": []})
     controller._direct_artifacts["coverage_inventory"] = captured_inventory
+    _install_fake_stage_b(monkeypatch, controller)
+    selected_payload = {"selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}]}
+    token = controller.duckdb_direct_preflight({"coverage_token": "coverage-token", **selected_payload})["preflight_token"]
     controller.start_duckdb_direct(
         {
-            "coverage_token": "coverage-token",
-            "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}],
+            "preflight_token": token,
+            **selected_payload,
         }
     )
 
@@ -1536,10 +2723,13 @@ def test_successful_direct_snapshot_feeds_direct_artifact_renderer(
         {"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb", "audit_root": "audit"}
     )
     controller.duckdb_direct_coverage({"symbols": []})
+    _install_fake_stage_b(monkeypatch, controller)
+    selected_payload = {"selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}]}
+    token = controller.duckdb_direct_preflight({"coverage_token": "coverage-token", **selected_payload})["preflight_token"]
     controller.start_duckdb_direct(
         {
-            "coverage_token": "coverage-token",
-            "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}],
+            "preflight_token": token,
+            **selected_payload,
         }
     )
     status = _wait_direct_finished(controller)
@@ -1585,12 +2775,10 @@ def test_direct_build_requires_matching_latest_preflight_and_closes_distinct_con
         controller.start_duckdb_direct({**request, "preflight_token": "wrong"})
     with pytest.raises(ValueError, match="latest preflight token"):
         controller.start_duckdb_direct({**request, "side": "SHORT", "preflight_token": flight["token"]})
-    controller.start_duckdb_direct({**request, "preflight_token": flight["token"]})
-    result = _wait_direct_finished(controller)
-    assert result["surface_id"] == "surface-1"
-    assert calls == ["preflight", "preflight", "build"]
-    assert [(Path(path).name, read_only, connection.closed) for path, read_only, connection in connections] == [("source.duckdb", True, True), ("source.duckdb", True, True), ("analysis.duckdb", False, True)]
-    assert str(tmp_path) not in json.dumps(result)
+    with pytest.raises(ValueError, match="latest preflight token is required"):
+        controller.start_duckdb_direct({**request, "preflight_token": flight["token"]})
+    assert calls == ["preflight"]
+    assert [(Path(path).name, read_only, connection.closed) for path, read_only, connection in connections] == [("source.duckdb", True, True)]
 
 
 def test_direct_build_rejects_same_database_before_open_and_ui_has_controls(tmp_path: Path) -> None:
@@ -1630,9 +2818,9 @@ def test_direct_preflight_defaults_usable_symbols_and_marks_unavailable(tmp_path
     document = controller.duckdb_direct_preflight(payload)
     assert document["selected_symbols"] == ["BTCUSDT"]
     assert document["unavailable_symbols"] == {"ETHUSDT": ["1h"]}
-    with pytest.raises(ValueError, match="at least one symbol"):
+    with pytest.raises(ValueError, match="latest preflight token is required"):
         controller.start_duckdb_direct({**payload, "preflight_token": document["token"], "selected_symbols": []})
-    with pytest.raises(ValueError, match="unavailable"):
+    with pytest.raises(ValueError, match="latest preflight token is required"):
         controller.start_duckdb_direct({**payload, "preflight_token": document["token"], "selected_symbols": ["ETHUSDT"]})
 
 
@@ -1724,7 +2912,7 @@ def test_direct_coverage_scan_does_not_require_window(tmp_path: Path) -> None:
     assert document["coverage_rows"][0]["gap_details"] == ["missing: 2024-01-01 .. 2024-01-01"]
 
 
-def test_direct_build_rejects_gap_scope_selection(tmp_path: Path) -> None:
+def test_direct_preflight_rejects_selected_scope_without_coverage_token(tmp_path: Path) -> None:
     preflight = DirectPreflight(
         {"BTCUSDT": ("1h",)}, {},
         (),
@@ -1759,35 +2947,35 @@ def test_direct_build_rejects_gap_scope_selection(tmp_path: Path) -> None:
         **payload,
         "selected_scopes": [{"symbol": "BTCUSDT", "timeframe": "1h"}],
     }
-    token = controller.duckdb_direct_preflight(selected_payload)["token"]
-
-    with pytest.raises(ValueError, match="selected scope is unavailable"):
-        controller.start_duckdb_direct({**selected_payload, "preflight_token": token})
+    with pytest.raises(ValueError, match="selected scopes require a valid coverage token"):
+        controller.duckdb_direct_preflight(selected_payload)
 
 
 def test_direct_build_reports_cancellation_without_leaking_paths(tmp_path: Path) -> None:
-    started, release = __import__("threading").Event(), __import__("threading").Event()
     base = DirectPreflight({"BTCUSDT": ("1h",)}, {}, (), MappingProxyType({"kind": "OBSERVED_GRID_CONTRACT"}), ("a" * 64,), (("report-1", "a" * 64),), ("BTCUSDT|LONG|1h|100|3|9",))
-    calls = 0
+    connections: list[tuple[str, bool, object]] = []
+    calls, built = 0, False
     def inspect(*_: object) -> DirectPreflight:
         nonlocal calls; calls += 1
-        return base if calls < 2 else base
+        return base
     class Connection:
-        def close(self) -> None: pass
-    def build(*args: object) -> object:
-        cancellation, progress = args[-2], args[-1]
-        started.set(); progress("MATERIALIZING", materialized_points=1); release.wait(1)
-        if cancellation(): raise ValueError(f"cancelled at {tmp_path}")
-        return SimpleNamespace(surface_id="surface-1", points=(object(),))
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", direct_connection_factory=lambda *_args, **_kwargs: Connection(), direct_preflight_func=inspect, direct_build_func=build)
+        def __init__(self) -> None: self.closed = False
+        def close(self) -> None: self.closed = True
+    def connect(path: str, *, read_only: bool) -> Connection:
+        connection = Connection(); connections.append((path, read_only, connection)); return connection
+    def build(*_args: object) -> object:
+        nonlocal built; built = True
+        raise AssertionError("legacy start must fail closed before any build")
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", direct_connection_factory=connect, direct_preflight_func=inspect, direct_build_func=build)
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
     payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
     token = controller.duckdb_direct_preflight(payload)["token"]
-    controller.start_duckdb_direct({**payload, "preflight_token": token})
-    assert started.wait(1); assert controller.cancel_duckdb_direct()["cancel_requested"] is True
-    release.set(); status = _wait_direct_finished(controller)
-    assert status["publication_state"] == "CANCELLED"
-    assert str(tmp_path) not in json.dumps(status)
+    with pytest.raises(ValueError, match="latest preflight token is required") as error:
+        controller.start_duckdb_direct({**payload, "preflight_token": token})
+    assert built is False
+    assert calls == 1
+    assert str(tmp_path) not in str(error.value)
+    assert [(Path(path).name, read_only, connection.closed) for path, read_only, connection in connections] == [("source.duckdb", True, True)]
 
 
 def test_direct_build_rejects_changed_source_snapshot_before_build(tmp_path: Path) -> None:
@@ -1804,10 +2992,10 @@ def test_direct_build_rejects_changed_source_snapshot_before_build(tmp_path: Pat
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
     payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
     token = controller.duckdb_direct_preflight(payload)["token"]
-    controller.start_duckdb_direct({**payload, "preflight_token": token})
-    status = _wait_direct_finished(controller)
-    assert status["publication_state"] == "FAILED"
+    with pytest.raises(ValueError, match="latest preflight token is required"):
+        controller.start_duckdb_direct({**payload, "preflight_token": token})
     assert built is False
+    assert calls == 1
 
 
 def test_direct_build_closes_source_if_analysis_open_fails(tmp_path: Path) -> None:
@@ -1823,9 +3011,10 @@ def test_direct_build_closes_source_if_analysis_open_fails(tmp_path: Path) -> No
     controller.duckdb_import_settings({"source_duckdb_path": "source.duckdb", "analysis_duckdb_path": "analysis.duckdb"})
     payload = {"start_utc": "2024-01-01T00:00:00Z", "end_utc": "2024-01-02T00:00:00Z", "side": "LONG", "symbols": ["BTCUSDT"], "shift_start_bp": 100, "shift_end_bp": 100, "shift_step_bp": 100}
     token = controller.duckdb_direct_preflight(payload)["token"]
-    controller.start_duckdb_direct({**payload, "preflight_token": token})
-    assert _wait_direct_finished(controller)["publication_state"] == "FAILED"
-    assert all(connection.closed for connection in opened)
+    with pytest.raises(ValueError, match="latest preflight token is required"):
+        controller.start_duckdb_direct({**payload, "preflight_token": token})
+    assert len(opened) == 1
+    assert opened[0].closed is True
 
 
 class _ImportUiParser(HTMLParser):
