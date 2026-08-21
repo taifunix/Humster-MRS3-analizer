@@ -6,6 +6,12 @@
     "worker_chunk_size": 16,
     "max_in_flight_chunks": 30
   },
+  "source_v6_import": {
+    "write_batch_size": 32,
+    "worker_chunk_size": 64,
+    "max_in_flight_chunks": 60,
+    "segment_writer_limit": 4
+  },
   "base_rate_tf": {
     "5m": 2.27,
     "15m": 1.82,

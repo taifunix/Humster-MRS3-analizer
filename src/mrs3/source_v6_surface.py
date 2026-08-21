@@ -830,6 +830,10 @@ def publish_surface_db(directory: str | Path, fragments: Sequence[SourceV6Fragme
     """Publish the immutable manifest/facts and append-only analysis area in DuckDB."""
     if not fragments:
         raise SourceV6SurfaceError("cannot publish an empty surface")
+    if any(not isinstance(item, SourceV6Fragment) for item in fragments):
+        raise SourceV6SurfaceError(
+            "surface publication requires hydrated fragments, not metadata views"
+        )
     metrics = _surface_metrics(fragments, intervals)
     payload = _surface_payload(fragments, metrics, intervals, overlap_tail_decisions)
     output_dir = Path(directory)

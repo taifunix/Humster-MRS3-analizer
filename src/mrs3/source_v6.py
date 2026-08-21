@@ -7,7 +7,7 @@ in later stages and must not re-parse HTML.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from hashlib import sha256
@@ -21,6 +21,8 @@ from .performance import ParsedPerformanceReport, parse_performance_report
 
 
 SOURCE_V6_SCHEMA_VERSION = 1
+# Strict inverse of str(int): rejects "+5", " 5 ", "3_0", "-0", "05", "007".
+_INTEGER_FIELD = re.compile(r"0|-?[1-9][0-9]*")
 EXECUTION_FINGERPRINT_VERSION = "execution_compatibility_fingerprint_v1"
 
 
@@ -191,6 +193,35 @@ class PointIdentity:
             )
         )
 
+    @classmethod
+    def from_canonical_key(cls, key: str) -> "PointIdentity":
+        """Rebuild the identity that `canonical_key` encodes.
+
+        The key is a lossless join of every field, so a point can be recovered
+        from stored metadata without decoding a fragment payload.
+        """
+        parts = str(key).split("|")
+        if len(parts) != 10:
+            raise SourceV6Error(f"invalid canonical point key: {key!r}")
+        # int() would accept "+5", " 5 " and "3_0", which re-key differently.
+        if any(not _INTEGER_FIELD.fullmatch(parts[index]) for index in (3, 6, 9)):
+            raise SourceV6Error(f"invalid canonical point key: {key!r}")
+        try:
+            return cls(
+                symbol=parts[0],
+                side=parts[1],
+                timeframe=parts[2],
+                shift_bp=int(parts[3]),
+                open_ma_type=parts[4],
+                open_ma_source=parts[5],
+                open_ma_length=int(parts[6]),
+                close_ma_type=parts[7],
+                close_ma_source=parts[8],
+                close_ma_length=int(parts[9]),
+            )
+        except ValueError as error:
+            raise SourceV6Error(f"invalid canonical point key: {key!r}") from error
+
 
 @dataclass(frozen=True, slots=True)
 class NormalizedSample:
@@ -270,26 +301,67 @@ class EncodedSourceV6Fragment:
     codec: str
 
 
+# These mirror `dataclasses.asdict` for their exact field order, without its
+# recursive copy and per-value typing checks, which dominate canonical
+# serialisation of a large report.
 def _point_payload(point: PointIdentity) -> dict[str, object]:
-    return asdict(point)
+    return {
+        "symbol": point.symbol,
+        "side": point.side,
+        "timeframe": point.timeframe,
+        "shift_bp": point.shift_bp,
+        "open_ma_type": point.open_ma_type,
+        "open_ma_source": point.open_ma_source,
+        "open_ma_length": point.open_ma_length,
+        "close_ma_type": point.close_ma_type,
+        "close_ma_source": point.close_ma_source,
+        "close_ma_length": point.close_ma_length,
+    }
 
 
 def _action_payload(action: NormalizedAction) -> dict[str, object]:
-    return asdict(action)
+    return {
+        "action_id": action.action_id,
+        "timestamp_ms": action.timestamp_ms,
+        "symbol": action.symbol,
+        "order_id": action.order_id,
+        "action": action.action,
+        "fee": action.fee,
+        "pnl": action.pnl,
+        "balance": action.balance,
+        "size": action.size,
+        "post_size": action.post_size,
+        "post_side": action.post_side,
+    }
 
 
 def _cycle_payload(cycle: NormalizedCycle) -> dict[str, object]:
-    result = asdict(cycle)
-    result["action_ids"] = list(cycle.action_ids)
-    return result
+    return {
+        "cycle_id": cycle.cycle_id,
+        "symbol": cycle.symbol,
+        "order_id": cycle.order_id,
+        "action_ids": list(cycle.action_ids),
+        "open_timestamp_ms": cycle.open_timestamp_ms,
+        "close_timestamp_ms": cycle.close_timestamp_ms,
+        "realized_pnl": cycle.realized_pnl,
+        "fees": cycle.fees,
+    }
 
 
 def _event_payload(event: NormalizedEvent) -> dict[str, object]:
-    return asdict(event)
+    return {
+        "event_id": event.event_id,
+        "timestamp_ms": event.timestamp_ms,
+        "action_id": event.action_id,
+    }
 
 
 def _sample_payload(sample: NormalizedSample) -> dict[str, object]:
-    return asdict(sample)
+    return {
+        "timestamp_ms": sample.timestamp_ms,
+        "value": sample.value,
+        "upnl": sample.upnl,
+    }
 
 
 def canonical_fragment_payload(fragment: SourceV6Fragment) -> dict[str, object]:
@@ -388,12 +460,16 @@ def decode_fragment(payload: bytes, *, codec: str = "json+zlib-v1:9", expected_f
         if not codec.startswith("json+zlib-v1:"):
             raise SourceV6Error("unsupported compact codec")
         raw = zlib.decompress(bytes(payload))
+        # `raw` is the canonical document that `encode_fragment` hashed, so the
+        # identity follows from the stored bytes without rebuilding them.
+        actual = sha256(raw).hexdigest()
+        if expected_fragment_id is not None and actual != expected_fragment_id:
+            raise SourceV6Error("canonical fragment identity mismatch")
         document = json.loads(raw.decode("utf-8"))
         if not isinstance(document, Mapping):
             raise SourceV6Error("canonical fragment must be an object")
         fragment = _fragment_from_payload(document)
-        actual = canonical_fragment_id(fragment)
-        if actual != fragment.fragment_id or (expected_fragment_id is not None and actual != expected_fragment_id):
+        if actual != fragment.fragment_id:
             raise SourceV6Error("canonical fragment identity mismatch")
         return fragment
     except SourceV6Error:
@@ -487,6 +563,31 @@ def _action(report: ParsedPerformanceReport, point: PointIdentity, row: Mapping[
 
 
 def normalize_source_v6(source: bytes, *, source_name: str = "") -> SourceV6Fragment:
+    """Normalize one report; see `normalize_and_encode_source_v6` for imports."""
+    return _normalize_with_canonical(source, source_name=source_name)[1]
+
+
+def normalize_and_encode_source_v6(
+    source: bytes, *, source_name: str = "", compression_level: int = 9
+) -> tuple[SourceV6Fragment, EncodedSourceV6Fragment]:
+    """Normalize and encode in one pass, serialising the fragment only once.
+
+    Deriving the identity already produces the canonical document, so encoding
+    reuses those exact bytes instead of rebuilding them.
+    """
+    if not 0 <= compression_level <= 9:
+        raise SourceV6Error("compression level must be between 0 and 9")
+    canonical, fragment = _normalize_with_canonical(source, source_name=source_name)
+    encoded = EncodedSourceV6Fragment(
+        fragment.fragment_id,
+        canonical,
+        zlib.compress(canonical, compression_level),
+        f"json+zlib-v1:{compression_level}",
+    )
+    return fragment, encoded
+
+
+def _normalize_with_canonical(source: bytes, *, source_name: str = "") -> tuple[bytes, SourceV6Fragment]:
     if not isinstance(source, bytes):
         raise SourceV6Error("source must be bytes")
     source_hash = sha256(source).hexdigest()
@@ -565,9 +666,10 @@ def normalize_source_v6(source: bytes, *, source_name: str = "") -> SourceV6Frag
             tuple(cycle.cycle_id for cycle in cycles if not cycle.closed),
             dict(report.metrics),
         )
-        return SourceV6Fragment(
+        canonical = canonical_fragment_bytes(fragment)
+        return canonical, SourceV6Fragment(
             fragment.schema_version,
-            canonical_fragment_id(fragment),
+            sha256(canonical).hexdigest(),
             fragment.source_sha256,
             fragment.source_name,
             fragment.point,

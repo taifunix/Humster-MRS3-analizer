@@ -15,7 +15,7 @@ import pytest
 
 from mrs3 import panel as panel_module
 from mrs3.panel import PanelController, _DirectJob, _Job, create_panel_server
-from mrs3.source_v6_importer import source_v6_import_lock
+from mrs3.source_v6_importer import SourceV6WorkerFailure, source_v6_import_lock
 from mrs3.config import DirectMaterializationSettings, load_direct_materialization_settings
 from mrs3.duckdb_import import ImportJobResult, ImportPreflight, ImportProgress
 from mrs3.duckdb_direct import (
@@ -1744,6 +1744,91 @@ def test_source_v6_panel_lifecycle_has_bound_token_progress_and_library(tmp_path
     assert result["progress"] == 1.0
     library = controller.source_v6_library()
     assert any(item["status"] == "VALID" for item in library)
+
+
+def test_source_v6_panel_preflight_snapshots_metadata_without_html_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "performance" / "source_v6_fixed_lot_overlap_a.html"
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "report.html").write_bytes(fixture.read_bytes())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    monkeypatch.setattr(Path, "read_bytes", lambda _path: (_ for _ in ()).throw(AssertionError("panel preflight read HTML")))
+
+    result = controller.source_v6_preflight({"root_path": str(reports), "database_path": "source-v6.duckdb"})
+
+    assert result["total"] == 1
+    assert result["snapshots"][0]["ordinal"] == 0
+    assert result["snapshots"][0]["relative_path"] == "report.html"
+
+
+def test_source_v6_panel_routes_all_import_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture_dir = Path(__file__).parent / "fixtures" / "performance"
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    for name in ("source_v6_fixed_lot_overlap_a.html", "source_v6_fixed_lot_overlap_b.html"):
+        (reports / name).write_bytes((fixture_dir / name).read_bytes())
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({
+        "duckdb_import": {"workers": 2},
+        "source_v6_import": {
+            "write_batch_size": 7,
+            "worker_chunk_size": 8,
+            "max_in_flight_chunks": 2,
+            "segment_writer_limit": 2,
+        },
+    }), encoding="utf-8")
+    captured: dict[str, object] = {}
+    original = panel_module.import_source_v6
+
+    def wrapped(root: Path, database: Path, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return original(root, database, **kwargs)
+
+    monkeypatch.setattr(panel_module, "import_source_v6", wrapped)
+    controller = PanelController(tmp_path, config)
+    preflight = controller.source_v6_preflight({"root_path": str(reports), "database_path": "source-v6.duckdb"})
+
+    result = controller.source_v6_start({"preflight_token": preflight["token"]})
+
+    assert result["phase"] == "PUBLISHED"
+    assert {name: captured[name] for name in ("workers", "batch_size", "worker_chunk_size", "max_in_flight_chunks", "segment_writer_limit")} == {
+        "workers": 2,
+        "batch_size": 7,
+        "worker_chunk_size": 8,
+        "max_in_flight_chunks": 2,
+        "segment_writer_limit": 2,
+    }
+
+
+def test_source_v6_panel_clamps_default_writer_limit_for_partial_config(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"duckdb_import": {"workers": 2}, "source_v6_import": {"write_batch_size": 8}}), encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    workers, settings, limit = controller._source_v6_import_options()
+    assert workers == 2 and settings.write_batch_size == 8 and limit == 2
+
+
+def test_source_v6_panel_exposes_structured_worker_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "performance" / "source_v6_fixed_lot_overlap_a.html"
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "report.html").write_bytes(fixture.read_bytes())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    preflight = controller.source_v6_preflight({"root_path": str(reports), "database_path": "source-v6.duckdb"})
+    error = SourceV6WorkerFailure(0, "report.html", "input disappeared", "read")
+    monkeypatch.setattr(panel_module, "import_source_v6", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+
+    result = controller.source_v6_start({"preflight_token": preflight["token"]})
+
+    assert result["phase"] == "FAILED"
+    assert result["worker_failure"] == {
+        "ordinal": 0,
+        "path": str((reports / "report.html").resolve()),
+        "relative_path": "report.html",
+        "preflight_size": preflight["snapshots"][0]["size"],
+        "preflight_mtime_ns": preflight["snapshots"][0]["mtime_ns"],
+        "reason": "input disappeared",
+    }
 
 
 def test_source_v6_panel_cancel_clears_preflight_state(tmp_path: Path) -> None:

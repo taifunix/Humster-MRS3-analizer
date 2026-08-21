@@ -45,6 +45,7 @@ from .config import (
     DuckDBImportSettings,
     load_direct_materialization_settings,
     load_duckdb_import_settings,
+    load_source_v6_import_settings,
     save_duckdb_import_settings,
 )
 from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, SnapshotProgress, import_html_tree, preflight_html_import
@@ -79,8 +80,7 @@ from .models import Side
 from .pipeline import run_published_pipeline
 from .performance_import import _canonical, _canonical_contract, _sha256
 from .published_surface import load_published_surface
-from .source_v6 import SourceV6Error, normalize_source_v6
-from .source_v6_importer import import_source_v6, preflight_source_v6, source_v6_import_lock
+from .source_v6_importer import SourceV6WorkerFailure, import_source_v6, preflight_source_v6, source_v6_import_lock
 from .source_v6_merge import (
     merge_source_v6,
     preflight_source_v6_merge,
@@ -586,7 +586,7 @@ async function duckdbPreflight() { try { render(await duckdbRequest('/api/duckdb
 async function duckdbImport() { try { const result = await duckdbRequest('/api/duckdb-import/start', {root_path:value('import_html_root'), preflight_token:duckdbPreflightToken}); render(result); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 async function duckdbCancel() { try { render(await duckdbRequest('/api/duckdb-import/cancel')); } catch (error) { document.getElementById('notice').textContent=error.message; } }
 let sourceV6Token='';
-async function sourceV6Preflight() { try { const result=await duckdbRequest('/api/source-v6/preflight',{root_path:value('source_v6_root'),database_path:value('source_v6_database')}); sourceV6Token=result.token||''; const scope=document.getElementById('source_v6_scope'); scope.innerHTML=(result.scopes||[]).map(item=>`<option value="${item}">${item}</option>`).join(''); const ready=(result.ready_intervals||[]); const selected=ready.find(item=>item.scope_key===scope.value)||ready[0]; if(selected){ const start=document.getElementById('source_v6_start_date'); const end=document.getElementById('source_v6_end_date'); start.min=selected.start+'T00:00'; start.max=selected.end+'T23:59'; end.min=selected.start+'T00:00'; end.max=selected.end+'T23:59'; if(!start.value) start.value=selected.start+'T00:00'; if(!end.value) end.value=selected.end+'T23:59'; } document.getElementById('source_v6_status').textContent=`Preflight ready · ${result.parsed}/${result.total} reports`; document.getElementById('source_v6_progress').value=0; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
+async function sourceV6Preflight() { try { const result=await duckdbRequest('/api/source-v6/preflight',{root_path:value('source_v6_root'),database_path:value('source_v6_database')}); sourceV6Token=result.token||''; const scope=document.getElementById('source_v6_scope'); scope.innerHTML=(result.scopes||[]).map(item=>`<option value="${item}">${item}</option>`).join(''); const ready=(result.ready_intervals||[]); const selected=ready.find(item=>item.scope_key===scope.value)||ready[0]; if(selected){ const start=document.getElementById('source_v6_start_date'); const end=document.getElementById('source_v6_end_date'); start.min=selected.start+'T00:00'; start.max=selected.end+'T23:59'; end.min=selected.start+'T00:00'; end.max=selected.end+'T23:59'; if(!start.value) start.value=selected.start+'T00:00'; if(!end.value) end.value=selected.end+'T23:59'; } document.getElementById('source_v6_status').textContent=`Preflight ready · ${result.snapshotted ?? result.parsed ?? 0}/${result.total} reports`; document.getElementById('source_v6_progress').value=0; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
 async function sourceV6Start() { try { const scopes=[...document.getElementById('source_v6_scope').selectedOptions].map(item=>item.value); const result=await duckdbRequest('/api/source-v6/fresh/multiscope/start',{preflight_token:sourceV6Token,scope_keys:scopes}); document.getElementById('source_v6_progress').value=Number(result.progress||0); if(result.surface_path) document.getElementById('source_v6_surface_path').value=result.surface_path; document.getElementById('source_v6_status').textContent=`${result.phase} · ${result.current||0}/${result.total||0}${result.surface_id?' · '+result.surface_id:''}`; } catch(error) { document.getElementById('source_v6_status').textContent=error.message; } }
 let sourceV6MergeToken='';
 function sourceV6MergePayload() { return {input_paths:value('source_v6_merge_inputs').split(';').map(item=>item.trim()).filter(Boolean),target_path:value('source_v6_merge_target')}; }
@@ -1559,6 +1559,33 @@ class PanelController:
             raise ValueError("merge input_paths must not be empty")
         return paths
 
+    def _source_v6_import_options(self) -> tuple[int, object, int]:
+        workers = max(1, self._import_settings().workers)
+        settings = load_source_v6_import_settings(self.default_config)
+        config_document = json.loads(self.default_config.read_text(encoding="utf-8")) if self.default_config.exists() else {}
+        source_section = config_document.get("source_v6_import") if isinstance(config_document, dict) else None
+        if isinstance(source_section, dict) and "segment_writer_limit" in source_section:
+            settings.validate_for_workers(workers)
+            limit = settings.segment_writer_limit
+        else:
+            limit = min(settings.segment_writer_limit, workers)
+        return workers, settings, limit
+
+    @staticmethod
+    def _source_v6_worker_failure(error: BaseException, preflight: object) -> dict[str, object] | None:
+        if not isinstance(error, SourceV6WorkerFailure):
+            return None
+        snapshots = getattr(preflight, "snapshots", ())
+        snapshot = next((item for item in snapshots if item.input_ordinal == error.input_ordinal), None)
+        return {
+            "ordinal": error.input_ordinal,
+            "path": str(snapshot.path) if snapshot is not None else None,
+            "relative_path": error.relative_path,
+            "preflight_size": snapshot.source_size if snapshot is not None else None,
+            "preflight_mtime_ns": snapshot.source_mtime_ns if snapshot is not None else None,
+            "reason": error.reason,
+        }
+
     def source_v6_merge_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Validate read-only compact inputs and bind a fresh merge target."""
         with self._source_v6_lock:
@@ -1647,37 +1674,31 @@ class PanelController:
             return dict(self._source_v6_job)
 
     def source_v6_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
-        """Parse a report tree without publication and issue a batch token."""
+        """Snapshot report metadata without reading HTML and issue a batch token."""
         with self._source_v6_lock:
             current = self._source_v6_job
             if current and current.get("phase") in {"RUNNING", "MERGE_RUNNING"}:
                 raise RuntimeError("another Source v6 write is already running")
         root = self._path(self._required(payload, "root_path"))
         database = self._path(self._required(payload, "database_path"))
-        reports = tuple(sorted(root.rglob("*.html"))) if root.is_dir() else ((root,) if root.is_file() else ())
-        if not reports:
-            raise ValueError("no HTML reports found")
-        fragments = []
-        failures = []
-        for report in reports:
-            try:
-                fragments.append(normalize_source_v6(report.read_bytes(), source_name=report.name))
-            except (OSError, SourceV6Error) as error:
-                failures.append({"file": report.name, "error": str(error)})
-        if failures and not fragments:
-            raise ValueError("all Source v6 reports failed normalization")
         with source_v6_import_lock(database):
             import_preflight = preflight_source_v6(root, database)
         token = import_preflight.token
-        with self._source_v6_lock:
-            self._source_v6_preflight = {"root": root, "database": database, "fragments": tuple(fragments), "import_preflight": import_preflight, "token": token}
-            self._source_v6_job = {"phase": "PREFLIGHT_READY", "current": 0, "total": len(fragments), "progress": 0.0, "token": token, "error": None, "surface_id": None, "cancel_requested": False}
-        scopes = sorted({f"{fragment.point.symbol}|{fragment.point.side}|{fragment.point.timeframe}" for fragment in fragments})
-        ready_intervals = [
-            {"scope_key": item.scope_key, "start": item.start.isoformat(), "end": item.end.isoformat()}
-            for item in canonical_ready_intervals(tuple(fragments))
+        snapshots = import_preflight.snapshots
+        metadata = [
+            {
+                "ordinal": snapshot.input_ordinal,
+                "path": str(snapshot.path),
+                "relative_path": snapshot.relative_path,
+                "size": snapshot.source_size,
+                "mtime_ns": snapshot.source_mtime_ns,
+            }
+            for snapshot in snapshots
         ]
-        return {"phase": "PREFLIGHT_READY", "token": token, "total": len(fragments), "parsed": len(fragments), "failures": failures, "scopes": scopes, "ready_intervals": ready_intervals}
+        with self._source_v6_lock:
+            self._source_v6_preflight = {"root": root, "database": database, "snapshots": snapshots, "fragments": (), "import_preflight": import_preflight, "token": token}
+            self._source_v6_job = {"phase": "PREFLIGHT_READY", "current": 0, "total": len(snapshots), "progress": 0.0, "token": token, "error": None, "surface_id": None, "cancel_requested": False}
+        return {"phase": "PREFLIGHT_READY", "token": token, "total": len(snapshots), "parsed": len(snapshots), "snapshotted": len(snapshots), "failures": [], "scopes": [], "ready_intervals": [], "snapshots": metadata}
 
     def source_v6_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         token = self._required(payload, "preflight_token")
@@ -1688,22 +1709,28 @@ class PanelController:
             job = self._source_v6_job
             if job and job.get("phase") in {"RUNNING", "MERGE_RUNNING"}:
                 raise RuntimeError("Source v6 import is already running")
-            job = {"phase": "RUNNING", "current": 0, "total": len(state["fragments"]), "progress": 0.0, "token": token, "error": None, "surface_id": None, "cancel_requested": False}
+            job = {"phase": "RUNNING", "current": 0, "total": len(state["snapshots"]), "progress": 0.0, "token": token, "error": None, "surface_id": None, "cancel_requested": False}
             self._source_v6_job = job
         try:
             database = state["database"]
             import_preflight = state["import_preflight"]
+            workers, source_settings, segment_writer_limit = self._source_v6_import_options()
             imported = import_source_v6(
                 state["root"],
                 database,
                 preflight=import_preflight,
-                workers=max(1, self._import_settings().workers),
+                workers=workers,
+                batch_size=source_settings.write_batch_size,
+                worker_chunk_size=source_settings.worker_chunk_size,
+                max_in_flight_chunks=source_settings.max_in_flight_chunks,
+                segment_writer_limit=segment_writer_limit,
                 cancellation_requested=lambda: bool(job["cancel_requested"]),
             )
             fragments = imported.accepted_fragments
             active_fragments: list[object] = list(imported.active_fragments)
             overlap_tail_decisions: list[dict[str, object]] = []
             with self._source_v6_lock:
+                state["fragments"] = tuple(fragments)
                 job.update({"current": len(fragments), "progress": 1.0})
             if not active_fragments:
                 raise RuntimeError("no stitchable Source v6 fragments available for surface")
@@ -1728,6 +1755,9 @@ class PanelController:
         except BaseException as error:
             with self._source_v6_lock:
                 job.update({"phase": "CANCELLED" if "cancelled" in str(error).lower() else "FAILED", "error": str(error)})
+                failure = self._source_v6_worker_failure(error, state["import_preflight"])
+                if failure is not None:
+                    job["worker_failure"] = failure
         return dict(job)
 
     def source_v6_start_fresh(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -1740,11 +1770,24 @@ class PanelController:
                 raise ValueError("latest Source v6 preflight token is required")
             if self._source_v6_job and self._source_v6_job.get("phase") == "RUNNING":
                 raise RuntimeError("Source v6 import is already running")
-            job = {"phase": "RUNNING", "current": 0, "total": len(state["fragments"]), "progress": 0.0, "token": token, "error": None, "surface_id": None, "cancel_requested": False}
+            job = {"phase": "RUNNING", "current": 0, "total": len(state["snapshots"]), "progress": 0.0, "token": token, "error": None, "surface_id": None, "cancel_requested": False}
             self._source_v6_job = job
         try:
-            imported = import_source_v6(state["root"], state["database"], preflight=state["import_preflight"], workers=max(1, self._import_settings().workers), cancellation_requested=lambda: bool(job["cancel_requested"]))
+            workers, source_settings, segment_writer_limit = self._source_v6_import_options()
+            imported = import_source_v6(
+                state["root"],
+                state["database"],
+                preflight=state["import_preflight"],
+                workers=workers,
+                batch_size=source_settings.write_batch_size,
+                worker_chunk_size=source_settings.worker_chunk_size,
+                max_in_flight_chunks=source_settings.max_in_flight_chunks,
+                segment_writer_limit=segment_writer_limit,
+                cancellation_requested=lambda: bool(job["cancel_requested"]),
+            )
             active = tuple(imported.active_fragments)
+            with self._source_v6_lock:
+                state["fragments"] = tuple(imported.accepted_fragments)
             if not active:
                 raise RuntimeError("no stitchable Source v6 fragments available for surface")
             available = {f"{item.point.symbol}|{item.point.side}|{item.point.timeframe}" for item in active}
@@ -1758,6 +1801,9 @@ class PanelController:
         except BaseException as error:
             with self._source_v6_lock:
                 job.update({"phase": "CANCELLED" if "cancel" in str(error).casefold() else "FAILED", "error": str(error)})
+                failure = self._source_v6_worker_failure(error, state["import_preflight"])
+                if failure is not None:
+                    job["worker_failure"] = failure
         return dict(job)
 
     def source_v6_fresh_library(self) -> tuple[dict[str, object], ...]:

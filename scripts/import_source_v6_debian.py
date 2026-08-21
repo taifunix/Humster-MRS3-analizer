@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src" if (ROOT / "src").exists() else ROOT))
 
 from mrs3.source_v6 import SourceV6Error  # noqa: E402
-from mrs3.config import load_duckdb_import_settings  # noqa: E402
-from mrs3.source_v6_importer import SourceV6ImportError, import_source_v6, preflight_source_v6  # noqa: E402
+from mrs3.config import load_duckdb_import_settings, load_source_v6_import_settings  # noqa: E402
+from mrs3.source_v6_importer import SourceV6ImportError, SourceV6WorkerFailure, import_source_v6, preflight_source_v6  # noqa: E402
 
 
 def main() -> int:
@@ -28,26 +28,62 @@ def main() -> int:
     args = parser.parse_args()
     try:
         settings = load_duckdb_import_settings(args.config)
+        source_v6_settings = load_source_v6_import_settings(args.config)
+        config_document = json.loads(args.config.read_text(encoding="utf-8")) if args.config.exists() else {}
+        source_section = config_document.get("source_v6_import") if isinstance(config_document, dict) else None
+        segment_writer_limit = source_v6_settings.segment_writer_limit
+        if isinstance(source_section, dict) and "segment_writer_limit" in source_section:
+            source_v6_settings.validate_for_workers(settings.workers)
+        else:
+            segment_writer_limit = min(segment_writer_limit, settings.workers)
         preflight = preflight_source_v6(args.html, args.database)
-        imported = import_source_v6(
-            args.html,
-            args.database,
-            preflight=preflight,
-            workers=settings.workers,
-        )
+        import_options = {
+            "preflight": preflight,
+            "workers": settings.workers,
+            "batch_size": source_v6_settings.write_batch_size,
+            "worker_chunk_size": source_v6_settings.worker_chunk_size,
+            "max_in_flight_chunks": source_v6_settings.max_in_flight_chunks,
+            "segment_writer_limit": segment_writer_limit,
+            # Fact collections are only needed to publish a surface; coverage,
+            # readiness and the receipts below read metadata alone.
+            "hydrate_fragments": args.surface_dir is not None,
+        }
+        imported = import_source_v6(args.html, args.database, **import_options)
+    except SourceV6WorkerFailure as error:
+        snapshot = next((item for item in preflight.snapshots if item.input_ordinal == error.input_ordinal), None)
+        failure = {
+            "ordinal": error.input_ordinal,
+            "path": str(snapshot.path) if snapshot is not None else None,
+            "relative_path": error.relative_path,
+            "preflight_size": snapshot.source_size if snapshot is not None else None,
+            "preflight_mtime_ns": snapshot.source_mtime_ns if snapshot is not None else None,
+            "reason": error.reason,
+        }
+        print(json.dumps({"status": "FAILED", "error": str(error), "worker_failure": failure}, ensure_ascii=False))
+        return 1
     except (OSError, SourceV6Error, SourceV6ImportError, RuntimeError, ValueError) as error:
         print(json.dumps({"status": "FAILED", "error": str(error)}, ensure_ascii=False))
         return 1
-    accepted_by_source = {fragment.source_sha256: fragment for fragment in imported.accepted_fragments}
+    accepted_by_name = {fragment.source_name: fragment for fragment in imported.accepted_fragments}
     receipts = [
         {
             "file": snapshot.relative_path,
-            "status": "COMMITTED" if snapshot.source_sha256 in accepted_by_source else "QUARANTINED",
-            "safe_to_delete": imported.safe_to_delete if snapshot.source_sha256 in accepted_by_source else "NO",
+            "status": "COMMITTED" if snapshot.relative_path in accepted_by_name else "QUARANTINED",
+            "safe_to_delete": imported.safe_to_delete if snapshot.relative_path in accepted_by_name else "NO",
         }
         for snapshot in preflight.snapshots
     ]
-    result = {"status": imported.status, "reports": receipts, "source_content_digest": imported.source_content_digest, "quarantined": imported.quarantined_count, "workers": settings.workers}
+    result = {
+        "status": imported.status,
+        "reports": receipts,
+        "source_content_digest": imported.source_content_digest,
+        "quarantined": imported.quarantined_count,
+        "workers": settings.workers,
+        "write_batch_size": source_v6_settings.write_batch_size,
+        "worker_chunk_size": source_v6_settings.worker_chunk_size,
+        "max_in_flight_chunks": source_v6_settings.max_in_flight_chunks,
+        "segment_writer_limit": segment_writer_limit,
+    }
     from mrs3.source_v6_coverage import canonical_ready_intervals, coverage_cells
     active = list(imported.active_fragments)
     result["coverage"] = {

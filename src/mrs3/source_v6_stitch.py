@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from decimal import Decimal
 import json
@@ -173,8 +174,21 @@ def persist_resolution(
     timestamped action/sample/event owner and the bridge cycle's complete
     incoming membership before updating fragment/day activation state.
     """
-    from .source_v6_storage import persist_fragment_resolution
+    from .source_v6_storage import persist_fragment_resolutions
 
+    bridge, request = _resolution_request(outgoing, incoming, status=status, reason=reason)
+    persist_fragment_resolutions(database, (request,))
+    return bridge
+
+
+def _resolution_request(
+    outgoing: SourceV6Fragment,
+    incoming: SourceV6Fragment,
+    *,
+    status: str,
+    reason: str | None = None,
+) -> tuple[BridgeFacts | None, dict[str, object]]:
+    """Compute one resolver decision's fact rows without touching the database."""
     bridge = select_bridge_facts(outgoing, incoming) if status == "RESOLVED" else None
     boundary = outgoing.report_end_ms
     excluded_cycles, retained_cycles, old_open_cycles = _seam_cycle_sets(outgoing, incoming)
@@ -207,9 +221,14 @@ def persist_resolution(
         else:
             active = action.timestamp_ms >= incoming.report_start_ms
         fact_rows.append(("action", action.action_id, incoming.fragment_id, incoming.fragment_id, active, None if active else "INCOMPLETE_SEAM_CYCLE_EXCLUDED", None))
+    active_incoming_action_ids = {
+        row[1]
+        for row in fact_rows
+        if row[0] == "action" and row[2] == incoming.fragment_id and row[4]
+    }
     for event in incoming.events:
         action = incoming_actions.get(event.action_id)
-        active = bool(action and any(row[0] == "action" and row[1] == action.action_id and row[4] for row in fact_rows if row[2] == incoming.fragment_id)) if seam_status else event.timestamp_ms >= incoming.report_start_ms
+        active = bool(action and action.action_id in active_incoming_action_ids) if seam_status else event.timestamp_ms >= incoming.report_start_ms
         fact_rows.append(("event", event.event_id, incoming.fragment_id, incoming.fragment_id, active, None if active else "INCOMPLETE_SEAM_CYCLE_EXCLUDED", None))
     for cycle in incoming.cycles:
         active = cycle.cycle_id not in excluded_cycles if seam_status else cycle.closed
@@ -235,20 +254,42 @@ def persist_resolution(
         "new_anchor_timestamp_ms": new_anchors[-1].timestamp_ms if new_anchors else None,
         "excluded_net_effect": str(correction),
     }, sort_keys=True, separators=(",", ":"))
-    persist_fragment_resolution(database, outgoing_fragment_id=outgoing.fragment_id, incoming_fragment_id=incoming.fragment_id, status=status, fact_rows=fact_rows, reason=reason, boundary_ms=boundary if seam_status else None, evidence_json=evidence if seam_status else None)
-    return bridge
+    return bridge, {
+        "outgoing_fragment_id": outgoing.fragment_id,
+        "incoming_fragment_id": incoming.fragment_id,
+        "status": status,
+        "fact_rows": fact_rows,
+        "reason": reason,
+        "boundary_ms": boundary if seam_status else None,
+        "evidence_json": evidence if seam_status else None,
+    }
 
 
 def persist_batch_resolution(database: str, fragments: Sequence[SourceV6Fragment], resolution: BatchResolution) -> BatchResolution:
-    """Apply each adjacent batch decision after all fragments are imported."""
+    """Apply every adjacent batch decision in one transaction after import."""
+    from .source_v6_storage import persist_fragment_resolutions
+
     by_id = {fragment.fragment_id: fragment for fragment in fragments}
+    # active_fragments is already ordered by (report_start_ms, fragment_id), so
+    # the outgoing side is the last entry starting before the incoming one.
+    ordered_active = sorted(
+        resolution.active_fragments,
+        key=lambda fragment: (fragment.report_start_ms, fragment.fragment_id),
+    )
+    starts = [fragment.report_start_ms for fragment in ordered_active]
+    requests: list[dict[str, object]] = []
     for decision in resolution.decisions:
         incoming = by_id[decision.fragment_id]
-        prior = [fragment for fragment in resolution.active_fragments if fragment.report_start_ms < incoming.report_start_ms]
-        outgoing = max(prior, key=lambda fragment: (fragment.report_start_ms, fragment.fragment_id)) if prior else None
-        if outgoing is None:
+        index = bisect_left(starts, incoming.report_start_ms)
+        if index == 0:
             continue
-        persist_resolution(database, outgoing, incoming, status=decision.status, reason=decision.reason)
+        outgoing = ordered_active[index - 1]
+        _bridge, request = _resolution_request(
+            outgoing, incoming, status=decision.status, reason=decision.reason
+        )
+        requests.append(request)
+    if requests:
+        persist_fragment_resolutions(database, requests)
     return resolution
 
 

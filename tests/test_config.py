@@ -4,6 +4,7 @@ from dataclasses import replace
 from decimal import Decimal
 import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -12,11 +13,172 @@ from mrs3.config import (
     AlgorithmConfig,
     DirectMaterializationSettings,
     DuckDBImportSettings,
+    SourceV6ImportSettings,
     load_duckdb_import_settings,
     load_direct_materialization_settings,
+    load_source_v6_import_settings,
     save_duckdb_import_settings,
     save_direct_materialization_settings,
 )
+
+
+def test_source_v6_import_batch_size_uses_its_own_bounded_setting(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(json.dumps({"source_v6_import": {"write_batch_size": 8}}), encoding="utf-8")
+
+    assert load_source_v6_import_settings(path) == SourceV6ImportSettings(write_batch_size=8)
+
+
+@pytest.mark.parametrize("value", [0, 33, True])
+def test_source_v6_import_rejects_unsafe_batch_size(tmp_path, value: object) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(json.dumps({"source_v6_import": {"write_batch_size": value}}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_v6_import.write_batch_size must be an integer from 1 to 32"):
+        load_source_v6_import_settings(path)
+
+
+def test_source_v6_import_settings_defaults(tmp_path) -> None:
+    settings = SourceV6ImportSettings()
+
+    assert settings == SourceV6ImportSettings(
+        write_batch_size=32,
+        worker_chunk_size=64,
+        max_in_flight_chunks=60,
+        segment_writer_limit=4,
+    )
+    assert load_source_v6_import_settings(tmp_path / "missing.json") == settings
+
+
+@pytest.mark.parametrize(
+    ("field", "minimum", "maximum"),
+    [
+        ("write_batch_size", 1, 32),
+        ("worker_chunk_size", 1, 256),
+        ("max_in_flight_chunks", 1, 240),
+        ("segment_writer_limit", 1, 8),
+    ],
+)
+def test_source_v6_import_settings_accepts_exact_field_boundaries(
+    field: str, minimum: int, maximum: int
+) -> None:
+    defaults = SourceV6ImportSettings()
+
+    assert getattr(replace(defaults, **{field: minimum}), field) == minimum
+    assert getattr(replace(defaults, **{field: maximum}), field) == maximum
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("write_batch_size", 0, "source_v6_import.write_batch_size must be an integer from 1 to 32"),
+        ("write_batch_size", 33, "source_v6_import.write_batch_size must be an integer from 1 to 32"),
+        ("worker_chunk_size", 0, "source_v6_import.worker_chunk_size must be an integer from 1 to 256"),
+        ("worker_chunk_size", 257, "source_v6_import.worker_chunk_size must be an integer from 1 to 256"),
+        ("max_in_flight_chunks", 0, "source_v6_import.max_in_flight_chunks must be an integer from 1 to 240"),
+        ("max_in_flight_chunks", 241, "source_v6_import.max_in_flight_chunks must be an integer from 1 to 240"),
+        ("segment_writer_limit", 0, "source_v6_import.segment_writer_limit must be an integer from 1 to 8"),
+        ("segment_writer_limit", 9, "source_v6_import.segment_writer_limit must be an integer from 1 to 8"),
+        ("worker_chunk_size", True, "source_v6_import.worker_chunk_size must be an integer from 1 to 256"),
+        ("max_in_flight_chunks", 1.5, "source_v6_import.max_in_flight_chunks must be an integer from 1 to 240"),
+        ("segment_writer_limit", "4", "source_v6_import.segment_writer_limit must be an integer from 1 to 8"),
+    ],
+)
+def test_source_v6_import_settings_rejects_invalid_fields(
+    field: str, value: object, message: str
+) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        SourceV6ImportSettings(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("changes", "workers", "message"),
+    [
+        (
+            {"max_in_flight_chunks": 2},
+            3,
+            "source_v6_import.max_in_flight_chunks must be at least workers",
+        ),
+        (
+            {"worker_chunk_size": 256, "max_in_flight_chunks": 65},
+            1,
+            "source_v6_import.worker_chunk_size * max_in_flight_chunks must be at most 16384",
+        ),
+        (
+            {"segment_writer_limit": 4},
+            3,
+            "source_v6_import.segment_writer_limit must be at most workers",
+        ),
+    ],
+)
+def test_source_v6_import_settings_validates_worker_dependent_limits(
+    changes: dict[str, object], workers: int, message: str
+) -> None:
+    settings = SourceV6ImportSettings(**changes)
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        settings.validate_for_workers(workers)
+
+
+def test_source_v6_import_settings_loads_all_overrides(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(
+        json.dumps(
+            {
+                "source_v6_import": {
+                    "write_batch_size": 8,
+                    "worker_chunk_size": 128,
+                    "max_in_flight_chunks": 120,
+                    "segment_writer_limit": 3,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_source_v6_import_settings(path) == SourceV6ImportSettings(
+        write_batch_size=8,
+        worker_chunk_size=128,
+        max_in_flight_chunks=120,
+        segment_writer_limit=3,
+    )
+
+
+def test_source_v6_import_settings_partial_section_uses_dataclass_defaults(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(
+        json.dumps({"source_v6_import": {"worker_chunk_size": 128}}),
+        encoding="utf-8",
+    )
+
+    assert load_source_v6_import_settings(path) == replace(
+        SourceV6ImportSettings(), worker_chunk_size=128
+    )
+
+
+def test_source_v6_import_settings_rejects_unknown_keys(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(
+        json.dumps({"source_v6_import": {"worker_chunk_sze": 64}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape("source_v6_import contains unknown keys: worker_chunk_sze"),
+    ):
+        load_source_v6_import_settings(path)
+
+
+def test_source_v6_import_defaults_match_tracked_example() -> None:
+    raw = json.loads(Path("config.example.json").read_text(encoding="utf-8"))
+
+    assert raw["source_v6_import"] == {
+        "write_batch_size": 32,
+        "worker_chunk_size": 64,
+        "max_in_flight_chunks": 60,
+        "segment_writer_limit": 4,
+    }
 
 
 def test_duckdb_import_settings_round_trip_preserves_other_local_config(tmp_path) -> None:

@@ -35,6 +35,8 @@ def materialize_source_v6(
     requested = tuple(sorted(set(scope_keys)))
     if not requested:
         raise ValueError("at least one scope is required")
+    if any(not isinstance(item, SourceV6Fragment) for item in fragments):
+        raise ValueError("materialization requires hydrated fragments, not metadata views")
     witnesses = {item.scope_key: item for item in canonical_ready_intervals(tuple(fragments))}
     result = []
     for scope_key in requested:

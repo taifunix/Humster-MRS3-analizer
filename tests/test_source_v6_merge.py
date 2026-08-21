@@ -9,8 +9,11 @@ import pytest
 from mrs3.locking import OutputDirectoryBusyError
 from mrs3.source_v6 import normalize_source_v6
 from mrs3.source_v6_importer import source_v6_import_lock
+import mrs3.source_v6_merge as source_v6_merge
+
 from mrs3.source_v6_merge import merge_source_v6
 from mrs3.source_v6_storage import (
+    SourceV6StorageError,
     create_v6_database,
     database_info,
     import_fragment,
@@ -45,6 +48,77 @@ def _database_artifact_hashes(path: Path) -> tuple[str | None, ...]:
         None if not artifact.exists() else sha256(artifact.read_bytes()).hexdigest()
         for artifact in (path, Path(f"{path}.wal"), Path(f"{path}.tmp"))
     )
+
+
+MERGE_TABLES = (
+    "compact_fragments",
+    "points",
+    "fragment_origins",
+    "day_ownership",
+    "import_audit",
+    "quarantine",
+    "fact_ownership",
+    "fragment_resolutions",
+)
+
+
+def _dump_merged(path: Path) -> dict[str, list[tuple]]:
+    """Dump every published table, normalising per-run identifiers."""
+    connection = duckdb.connect(str(path), read_only=True)
+    try:
+        dump: dict[str, list[tuple]] = {}
+        for table in MERGE_TABLES:
+            columns = [
+                str(item[0])
+                for item in connection.execute(
+                    "select column_name from information_schema.columns "
+                    "where table_schema='main' and table_name=? order by ordinal_position",
+                    [table],
+                ).fetchall()
+            ]
+            rows = []
+            for row in connection.execute(f"select * from {table}").fetchall():
+                item = []
+                for name, value in zip(columns, row):
+                    if name == "audit_id":
+                        item.append("<id>")
+                    elif name.endswith("_at_utc"):
+                        item.append(None if value is None else "<ts>")
+                    else:
+                        item.append(value)
+                rows.append(tuple(item))
+            dump[table] = sorted(rows, key=repr)
+        return dump
+    finally:
+        connection.close()
+
+
+def test_merge_publishes_a_stable_table_layout(tmp_path: Path) -> None:
+    """Pin the merged artifact so a throughput rewrite cannot change it."""
+    first, second = _fragments()
+    left, right = tmp_path / "left.duckdb", tmp_path / "right.duckdb"
+    _db(left, first, "db-left")
+    _db(right, second, "db-right")
+    target = tmp_path / "merged.duckdb"
+
+    result = merge_source_v6([left, right], target)
+
+    assert result.status == "COMMITTED"
+    dump = _dump_merged(target)
+    ids = {row[0] for row in dump["compact_fragments"]}
+    assert ids == {first.fragment_id, second.fragment_id}
+    assert len(dump["import_audit"]) == 2
+    assert sorted((row[6], row[7]) for row in dump["import_audit"]) == [(0, 1), (1, 2)]
+    assert {row[5] for row in dump["import_audit"]} == {"COMMITTED"}
+    assert database_info(target)["mutation_generation"] == "2"
+    assert dump["quarantine"] == []
+    # Origins are flattened from both inputs, keeping each origin database id.
+    assert {row[3] for row in dump["fragment_origins"]} == {"db-left", "db-right"}
+    assert len(dump["day_ownership"]) > 0
+    # A second merge of the same inputs must produce the same artifact.
+    again = tmp_path / "merged-again.duckdb"
+    merge_source_v6([left, right], again)
+    assert _dump_merged(again) == dump
 
 
 def test_merge_deduplicates_fragments_recomputes_global_stitch_and_flattens_origins(tmp_path: Path) -> None:
@@ -242,3 +316,42 @@ def test_merge_result_reports_all_active_fragments_including_non_fixed_lot(tmp_p
     finally:
         connection.close()
     assert {str(row[0]) for row in rows} == expected
+
+
+def test_merge_readback_runs_on_committed_staging_and_publishes_nothing_when_it_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin both halves of the post-commit readback placement.
+
+    The readback was moved past `commit` for throughput, which is only sound
+    because committing writes a `.staging` file that nothing can reach. Two
+    things have to stay true and neither was covered: the readback must still
+    run at all, and a failure past the commit must still leave no target and no
+    staging residue. Deleting the call leaves every other merge test green.
+    """
+    first, _ = _fragments()
+    source = tmp_path / "source.source-v6.duckdb"
+    _db(source, first, "source")
+    target = tmp_path / "output.source-v6.duckdb"
+
+    real = source_v6_merge._verify_published_identity
+    calls: list[str] = []
+
+    def corrupt_then_verify(connection: duckdb.DuckDBPyConnection) -> None:
+        # `rollback` succeeds only while a transaction is open, so its failure
+        # is the assertion that the copy transaction has already committed.
+        # Move the call back inside the transaction and this raises nothing.
+        with pytest.raises(duckdb.TransactionException):
+            connection.execute("rollback")
+        connection.execute("update compact_fragments set payload_blob = ?", [b"not a payload"])
+        calls.append("verified")
+        real(connection)
+
+    monkeypatch.setattr(source_v6_merge, "_verify_published_identity", corrupt_then_verify)
+
+    with pytest.raises(SourceV6StorageError, match="readback mismatch"):
+        merge_source_v6((source,), target)
+
+    assert calls == ["verified"]
+    assert not target.exists()
+    assert not list(tmp_path.glob(f".{target.name}.*.staging*"))

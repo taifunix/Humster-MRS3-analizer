@@ -80,6 +80,43 @@ class DuckDBImportSettings:
                 raise ValueError(f"duckdb_import.{name} must be a positive integer")
 
 
+@dataclass(frozen=True, slots=True)
+class SourceV6ImportSettings:
+    write_batch_size: int = 32
+    worker_chunk_size: int = 64
+    max_in_flight_chunks: int = 60
+    segment_writer_limit: int = 4
+
+    def __post_init__(self) -> None:
+        bounds = {
+            "write_batch_size": (1, 32),
+            "worker_chunk_size": (1, 256),
+            "max_in_flight_chunks": (1, 240),
+            "segment_writer_limit": (1, 8),
+        }
+        for name, (minimum, maximum) in bounds.items():
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+                raise ValueError(
+                    f"source_v6_import.{name} must be an integer from {minimum} to {maximum}"
+                )
+
+    def validate_for_workers(self, workers: int) -> None:
+        if self.max_in_flight_chunks < workers:
+            raise ValueError(
+                "source_v6_import.max_in_flight_chunks must be at least workers"
+            )
+        if self.worker_chunk_size * self.max_in_flight_chunks > 16384:
+            raise ValueError(
+                "source_v6_import.worker_chunk_size * max_in_flight_chunks "
+                "must be at most 16384"
+            )
+        if self.segment_writer_limit > workers:
+            raise ValueError(
+                "source_v6_import.segment_writer_limit must be at most workers"
+            )
+
+
 def _local_config_object(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}
@@ -187,6 +224,28 @@ def load_direct_materialization_settings(path: Path) -> DirectMaterializationSet
         fetch_batch_size=section.get("fetch_batch_size", 256),
         worker_chunk_size=section.get("worker_chunk_size", 16),
         max_in_flight_chunks=section.get("max_in_flight_chunks", 30),
+    )
+
+
+def load_source_v6_import_settings(path: Path) -> SourceV6ImportSettings:
+    raw = _local_config_object(path)
+    section = raw.get("source_v6_import")
+    if section is None:
+        return SourceV6ImportSettings()
+    if not isinstance(section, dict):
+        raise ValueError("source_v6_import must be an object")
+    field_names = SourceV6ImportSettings.__dataclass_fields__
+    unknown = sorted(set(section).difference(field_names))
+    if unknown:
+        raise ValueError(
+            "source_v6_import contains unknown keys: " + ", ".join(unknown)
+        )
+    defaults = SourceV6ImportSettings()
+    return SourceV6ImportSettings(
+        **{
+            name: section.get(name, getattr(defaults, name))
+            for name in field_names
+        }
     )
 
 

@@ -39,6 +39,50 @@ def test_parser_rejects_malformed_settings_like_pre_alongside_valid_settings() -
         parse_performance_report(source)
 
 
+@pytest.mark.parametrize(
+    ("name", "broken"),
+    [
+        ("implicit_td", (b"<td>Total PnL, %</td>", b"<td>Total PnL, %")),
+        ("implicit_tr", (b"</tr>", b"")),
+        ("implicit_th", (b"<th>Metric</th>", b"<th>Metric")),
+    ],
+)
+def test_raw_markup_rejects_repairs_a_tree_builder_would_hide(name: str, broken: tuple[bytes, bytes]) -> None:
+    """The cross-check parser must not silently accept lxml's recovery.
+
+    A spec-compliant HTML5 tree builder closes these tags implicitly and agrees
+    with lxml, which is exactly the agreement this parser exists to withhold.
+    """
+    original, replacement = broken
+    source = (FIXTURES / "report_valid.html").read_bytes()
+    assert original in source, f"fixture no longer contains {original!r}"
+    damaged = source.replace(original, replacement, 1)
+
+    with pytest.raises(PerformanceParseError):
+        parse_performance_report(damaged)
+
+
+def test_raw_markup_backend_is_a_tokenizer_not_a_tree_builder() -> None:
+    """Guard the substitution the third review caught: lexbor et al. repair.
+
+    The cross-check has value only while the second parser *disagrees* with
+    lxml about unterminated cells. Asserting the disagreement directly is the
+    only form of this test a tree builder cannot satisfy.
+    """
+    assert performance._raw_markup is performance._stdlib_raw_markup
+    unterminated = "<table><thead><tr><th>Metric<th>Value</tr></thead><tbody><tr><td>a<td>b</tr></tbody></table>"
+    _pre, tables = performance._raw_markup(unterminated)
+
+    headers, rows = tables[0]
+    assert headers == ()
+    assert rows == ()
+
+    # lxml, the tree builder this is cross-checking, recovers all four cells.
+    document = performance.html.fromstring(unterminated)
+    assert [cell.text_content() for cell in document.xpath("//th")] == ["Metric", "Value"]
+    assert [cell.text_content() for cell in document.xpath("//td")] == ["a", "b"]
+
+
 def test_raw_inventory_rejects_structure_before_semantic_dom_can_hide_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

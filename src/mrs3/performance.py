@@ -242,12 +242,33 @@ class _RawMarkupParser(HTMLParser):
             self._table_rows = None
 
 
-def _raw_inventory(source: str) -> _RawInventory:
+_RawMarkup = tuple[list[str], list[tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]]]
+
+
+def _stdlib_raw_markup(source: str) -> _RawMarkup:
+    """Scan the markup with Python's own parser, independent of libxml2.
+
+    This must stay a *tokenizer*, not a tree builder. Its whole purpose is to
+    disagree with lxml when lxml silently repairs malformed markup — an
+    unterminated ``<td>``, a missing ``</tr>``. Any spec-compliant HTML5 tree
+    builder (lexbor, html5lib, libxml2 itself) performs the same implicit-close
+    recovery lxml does, so substituting one here would make the two parses agree
+    on exactly the inputs this cross-check exists to reject. Faster is not a
+    reason to change it; a genuinely independent tokenizer would be.
+    """
     parser = _RawMarkupParser()
     parser.feed(source)
     parser.close()
+    return parser.pre_text, parser.tables
+
+
+_raw_markup = _stdlib_raw_markup
+
+
+def _raw_inventory(source: str) -> _RawInventory:
+    pre_text, raw_tables = _raw_markup(source)
     settings_count = 0
-    for raw in parser.pre_text:
+    for raw in pre_text:
         if not raw:
             continue
         try:
@@ -261,7 +282,7 @@ def _raw_inventory(source: str) -> _RawInventory:
 
     metric_matches: list[tuple[int, tuple[str, ...], tuple[str, ...]]] = []
     trade_matches: list[tuple[int, tuple[str, ...], tuple[datetime, ...]]] = []
-    for headers, rows in parser.tables:
+    for headers, rows in raw_tables:
         metric_candidate = len(headers) >= 2 and headers[:2] == ("Metric", "Value")
         trade_candidate = {"Timestamp", "Symbol", "Action", "PnL"} <= set(headers)
         if not metric_candidate and not trade_candidate:
