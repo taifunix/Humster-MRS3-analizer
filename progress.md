@@ -164,6 +164,44 @@ run where nothing happened but one whose samples did not render.
 The 145th quarantine, an optimizer summary page, still fails. Re-importing the
 CX_GE corpus is required to gain the 144 points; nothing is migrated.
 
+## Surface publication throughput (2026-08-22)
+
+Contract: [surface throughput spec](docs/specs/2026-08-22-source-v6-surface-throughput.md).
+
+Measured on `my_test_CX_GE_fixed`, scope `CXMTUSDT|LONG|15m`, 648 fragments,
+43 MB of payload: metadata + readiness 4.9 s, hydration 49.8 s,
+`materialize_source_v6` 0.1 s, publication **100.4 s**, resident memory 42 MB to
+2,450 MB. That is 239 ms per fragment; the whole 38,160-fragment corpus
+extrapolates to ~2.5 h and ~74 GB resident, so it could not be published at all.
+
+The preflight needs nothing: `preflight_source_v6` returns in 0.00 s and reads
+no HTML, and `canonical_ready_intervals` costs 1.7 s over 38,160 fragments —
+both already work from metadata. `folder1` correctly reports 0 READY scopes
+because its widest grid is 12 of the required 114 point variants; `CX_GE`
+reports 55 of 56.
+
+Publication carried three defects already fixed elsewhere: it re-encoded the
+sealed payload (59 ms each, and the result is byte-identical to what is stored —
+120/120 on payload, codec and `payload_sha256`), inserted one statement per row
+(736 rows/s), and ended by decoding every fragment again to check ids it could
+derive directly (48.1 s of the 100.4 s). Payloads are now copied by SQL from the
+source database, rows are written through `_insert_frame`, and publication
+validates the C3a identity instead of reconstructing objects.
+
+**Publication 100.4 s to 3.0 s (33x)**, same `surface_id`, and the two artifacts
+compared directly: manifest, scope manifests, factual rows and the payload bytes
+of all 648 fragments identical. The file is 43% smaller as a side effect of the
+set-based insert.
+
+Hydration is now the dominant cost and is untouched: `materialize_source_v6`
+still rejects metadata views, so the caller decodes every fragment although
+nothing on the publication path needs a decoded object.
+
+The pass-through is opt-in and **the panel does not pass it yet**. Its single
+production call site, `panel.py:1837`, was being edited by another session, so
+switching it was left out rather than conflict. Until that one argument is
+added the application still takes the 100.4 s path.
+
 ## Next
 
 1. **Blocker before re-importing `my_test_CX_GE_fixed`.** `calculate_metrics`
@@ -179,24 +217,31 @@ CX_GE corpus is required to gain the 144 points; nothing is migrated.
    needs its own spec. Until then the re-import will not produce a surface.
 2. Re-import `my_test_CX_GE_fixed` to pick up the 144 zero-activity runs and
    confirm `safe_to_delete` is no longer held at `NO` by them.
-3. Close the same published-file gap on the import path. ADR-0015 scoped
+3. Pass `source_database` at `panel.py:1837`, the only production caller of
+   `publish_multiscope_surface`. One argument; it is what makes the 33x
+   reachable from the application.
+4. Let `materialize_source_v6` work from metadata. Readiness already does, and
+   after the pass-through above nothing on the publication path needs a decoded
+   fragment — so hydration is pure waste, and it is what makes a full-corpus
+   surface need ~74 GB resident.
+5. Close the same published-file gap on the import path. ADR-0015 scoped
    itself to the merge deliberately: `_publish_segments_single_pass` verifies
    its reduce target and then publishes a repack that receives neither the C3a
    payload readback nor `fragment_metadata`'s header pass, so the import
    publishes with weaker evidence than the merge now does — under the same
    `safe_to_delete=YES`. It needs its own change, not an assumption from
    ADR-0015's wording.
-4. Remove the orphaned segment-merge path (`merge_source_v6_segments`,
+6. Remove the orphaned segment-merge path (`merge_source_v6_segments`,
    `_merge_segment_contents`, `_read_source_v6_segment`, `import_fragment`,
    `import_fragment_batch`) in its own `refactor:` commit — C5 left them
    without a production caller, and ~50 tests still reference them.
-5. Open question from C8: the identity readback is a sequential scan per
+7. Open question from C8: the identity readback is a sequential scan per
    128-id window on both paths, so O(n²/128) in principle. It does not bite on
    import (5.52 s committed against 5.47 s with the metadata-only transaction
    open, at 5,000 fragments). A relation cursor is not the fix — `fetchmany`
    grew resident memory by 2.9 GB on a 4.3 GB corpus. A bounded-memory single
    pass is its own change.
-6. The parse phase is now the dominant remaining cost. Compression level was
+8. The parse phase is now the dominant remaining cost. Compression level was
    measured and rejected. Swapping the raw-markup cross-check to the lexbor
    engine was measured at 3.9x on that step and then **reverted**: lexbor is an
    HTML5 tree builder and performs the same implicit-close recovery as lxml, so
