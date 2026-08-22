@@ -25,6 +25,9 @@ mrs3 = "mrs3.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+mrs3 = ["panel_web/*.html", "panel_web/*.css", "panel_web/*.js"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

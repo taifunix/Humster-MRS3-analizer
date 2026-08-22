@@ -22,6 +22,8 @@ from urllib.parse import parse_qs, urlparse
 import uuid
 import webbrowser
 
+_PANEL_WEB = Path(__file__).with_name("panel_web")
+
 import duckdb
 
 from .analysis_exports import export_analysis_run
@@ -1513,6 +1515,16 @@ class PanelController:
             raise ValueError(f"unsupported browse kind: {kind}")
         paths = self._browse_factory(kind, multiple)
         return tuple(str(path.resolve()) for path in paths)
+
+    def panel_default_root(self) -> str:
+        """Read only the local panel root switch; invalid config stays legacy."""
+        try:
+            document = json.loads(self.default_config.read_text(encoding="utf-8"))
+            panel = document.get("panel") if isinstance(document, dict) else None
+            value = panel.get("default_root") if isinstance(panel, dict) else None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return "legacy"
+        return value if isinstance(value, str) and value in {"static", "legacy"} else "legacy"
 
     def _import_settings(self, payload: Mapping[str, object] | None = None) -> DuckDBImportSettings:
         if payload is None:
@@ -4028,10 +4040,30 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         parsed = urlparse(self.path)
-        if parsed.path == "/":
+        if parsed.path == "/legacy":
             payload = PANEL_HTML.encode("utf-8")
             self._headers(200, "text/html; charset=utf-8", len(payload))
             self.wfile.write(payload)
+            return
+        if parsed.path == "/" and self.server.controller.panel_default_root() == "legacy":
+            payload = PANEL_HTML.encode("utf-8")
+            self._headers(200, "text/html; charset=utf-8", len(payload))
+            self.wfile.write(payload)
+            return
+        static_paths = {"/": "index.html", "/panel-web/app.css": "app.css", "/panel-web/app.js": "app.js"}
+        if parsed.path in static_paths and (parsed.path != "/" or self.server.controller.panel_default_root() == "static"):
+            name = static_paths[parsed.path]
+            try:
+                payload = (_PANEL_WEB / name).read_bytes()
+            except OSError:
+                self._json(404, {"error": "not found"})
+                return
+            content_type = {"index.html": "text/html", "app.css": "text/css", "app.js": "text/javascript"}[name]
+            self._headers(200, f"{content_type}; charset=utf-8", len(payload))
+            self.wfile.write(payload)
+            return
+        if parsed.path == "/api/ui/bootstrap":
+            self._json(200, {"version": "panel-ui-v1", "defaults": {"runner": {"configured": False}}})
             return
         if parsed.path == "/api/status":
             self._json(200, self.server.controller.snapshot())

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MRS3 Control Panel</title>
+  <link rel="stylesheet" href="/panel-web/app.css">
+</head>
+<body>
+  <nav aria-label="MRS3 sections">
+    <strong>MRS3 Control Panel</strong>
+    <a href="#testing">Testing</a>
+    <a href="#source-db">Source DB</a>
+    <a href="#surfaces">Surfaces</a>
+    <a href="#strategies-dd5">Strategies and DD5</a>
+    <button type="button" disabled aria-disabled="true" tabindex="-1">Portfolio</button>
+    <a href="#settings">Settings</a>
+  </nav>
+  <main id="testing" tabindex="-1">
+    <h1>Testing</h1>
+    <p id="status" aria-live="polite">Loading panel status...</p>
+    <section id="source-db" hidden aria-label="Source DB"></section>
+    <section id="surfaces" hidden aria-label="Surfaces"></section>
+    <section id="strategies-dd5" hidden aria-label="Strategies and DD5"></section>
+    <section id="settings" hidden aria-label="Settings"></section>
+  </main>
+  <script src="/panel-web/app.js"></script>
+</body>
+</html>

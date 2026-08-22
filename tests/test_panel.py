@@ -5,6 +5,7 @@ from html.parser import HTMLParser
 import hashlib
 import io
 import json
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 import time
@@ -127,6 +128,144 @@ def test_panel_autofills_performance_inbox_from_completed_workflow() -> None:
     assert "input.value = workflow.inbox_path" in autofill
     render = html.split("function render(data)", 1)[1]
     assert "autofillPerformanceInbox(workflow);" in render
+
+
+@pytest.mark.parametrize(
+    ("config_text", "expected"),
+    [
+        (json.dumps({"panel": {"default_root": "static"}}), "static"),
+        (json.dumps({"panel": {"default_root": "legacy"}}), "legacy"),
+        ("", "legacy"),
+        ("{not-json", "legacy"),
+        (json.dumps({"panel": {"default_root": "other"}}), "legacy"),
+        (json.dumps({"panel": {"default_root": ""}}), "legacy"),
+        (json.dumps({"panel": {"default_root": "STATIC"}}), "legacy"),
+        (json.dumps({"panel": {"default_root": 1}}), "legacy"),
+        (json.dumps({"panel": {"default_root": []}}), "legacy"),
+        (json.dumps({"panel": []}), "legacy"),
+        (json.dumps({"panel": 1}), "legacy"),
+    ],
+)
+def test_panel_root_mode_uses_safe_local_config_fallback(
+    tmp_path: Path, config_text: str, expected: str
+) -> None:
+    config = tmp_path / "config.local.json"
+    if config_text:
+        config.write_text(config_text, encoding="utf-8")
+    controller = PanelController(tmp_path, config, browse_factory=lambda *_: ())
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        body = response.read()
+        assert response.status == 200
+        assert body == (
+            (Path(panel_module.__file__).parent / "panel_web" / "index.html").read_bytes()
+            if expected == "static"
+            else panel_module.PANEL_HTML.encode("utf-8")
+        )
+        connection.request("GET", "/legacy")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read() == panel_module.PANEL_HTML.encode("utf-8")
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_panel_static_routes_and_legacy_compatibility_are_bounded(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"panel": {"default_root": "static"}}), encoding="utf-8")
+    controller = PanelController(tmp_path, config, browse_factory=lambda *_: (tmp_path / "picked",))
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        for path, content_type in (
+            ("/panel-web/app.css", "text/css"),
+            ("/panel-web/app.js", "text/javascript"),
+        ):
+            connection.request("GET", path)
+            response = connection.getresponse()
+            assert response.status == 200
+            assert response.getheader("Content-Type", "").startswith(content_type)
+            assert "; charset=utf-8" in response.getheader("Content-Type", "")
+            asset_name = path.rsplit("/", 1)[-1]
+            assert response.read() == (Path(panel_module.__file__).parent / "panel_web" / asset_name).read_bytes()
+        for path in (
+            "/panel-web/missing",
+            "/panel-web/../panel.py",
+            "/panel-web/%2e%2e/panel.py",
+        ):
+            connection.request("GET", path)
+            response = connection.getresponse()
+            assert response.status >= 400
+            response.read()
+        connection.request("GET", "/api/v2/unknown")
+        response = connection.getresponse()
+        body = response.read()
+        assert response.status >= 400
+        assert body == b'{"error": "not found"}'
+        assert panel_module.PANEL_HTML.encode("utf-8") not in body
+        connection.request("GET", "/legacy")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read() == panel_module.PANEL_HTML.encode("utf-8")
+        connection.request("GET", "/api/status")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["defaults"]["config"] == str(config.resolve())
+        connection.request("GET", "/api/ui/bootstrap")
+        response = connection.getresponse()
+        bootstrap = json.loads(response.read())
+        assert response.status == 200
+        assert "config" not in bootstrap
+        assert "path" not in json.dumps(bootstrap)
+        body = json.dumps({"kind": "directory", "multiple": False}).encode()
+        connection.request(
+            "POST",
+            "/api/browse",
+            body=body,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["paths"] == [str((tmp_path / "picked").resolve())]
+        connection.request("GET", "/", headers={"Host": "evil.example"})
+        response = connection.getresponse()
+        assert response.status == 403
+        response.read()
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_static_panel_shell_contains_only_navigation_contract() -> None:
+    panel_web = Path(panel_module.__file__).parent / "panel_web"
+    html = (panel_web / "index.html").read_text(encoding="utf-8")
+    script = (panel_web / "app.js").read_text(encoding="utf-8")
+    for label in ("Testing", "Source DB", "Surfaces", "Strategies and DD5", "Settings", "Portfolio"):
+        assert label in html
+    for excluded in ("Artefacts", "CSV", "DUCKDB_DIRECT", "credential", "password", "token"):
+        assert excluded.casefold() not in html.casefold()
+        assert excluded.casefold() not in script.casefold()
+    assert "/api/" not in script
+    assert script.encode("utf-8").decode("utf-8") == script
+    assert 'aria-disabled="true"' in html
+    assert 'disabled aria-disabled="true"' in html
+    assert "onclick" not in html
+
+
+def test_panel_package_data_includes_static_assets() -> None:
+    document = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    package_data = document["tool"]["setuptools"]["package-data"]["mrs3"]
+    assert {"panel_web/*.html", "panel_web/*.css", "panel_web/*.js"}.issubset(package_data)
 
 
 def _import_result(tmp_path: Path, *, final_state: str = "COMMITTED", tampered: bool = False) -> ImportJobResult:
@@ -3333,7 +3472,7 @@ def test_http_ui_exposes_persistent_import_settings_and_migration_controls(tmp_p
     thread = __import__("threading").Thread(target=server.serve_forever, daemon=True); thread.start()
     connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
     try:
-        connection.request("GET", "/")
+        connection.request("GET", "/legacy")
         response = connection.getresponse(); parser = _ImportUiParser()
         parser.feed(response.read().decode("utf-8"))
         assert response.status == 200
@@ -3828,7 +3967,7 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
     thread.start()
     connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
     try:
-        connection.request("GET", "/")
+        connection.request("GET", "/legacy")
         response = connection.getresponse()
         html = response.read().decode("utf-8")
         assert response.status == 200
