@@ -139,7 +139,9 @@
     try {
       const result = await remoteRequest('/api/v2/testing/remote/check-paths');
       const available = Object.values(result.paths || {}).filter(Boolean).length;
-      remoteCardStatus(`Проверено каталогов: ${available} / 5.`);
+      const diskFreeBytes = Number(result.disk_free_bytes);
+      const disk = diskFreeBytes > 0 ? `${Math.floor(diskFreeBytes / 1024 ** 3)} GB свободно` : 'диск недоступен';
+      remoteCardStatus(`Проверено каталогов: ${available} / 5 · ${disk}.`);
     } catch (_) { remoteCardStatus('Проверить пути удалённого runner не удалось.'); }
   });
   let remoteProgressPoller = 0;
@@ -378,7 +380,7 @@
     if (!surfaceScopes) return;
     surfaceScopes.replaceChildren();
     for (const group of groups || []) {
-      const details = document.createElement('details'); details.open = true;
+      const details = document.createElement('details');
       const summary = document.createElement('summary'); summary.textContent = `${group.pair} · ${group.side}`;
       details.append(summary);
       for (const item of group.timeframes || []) {

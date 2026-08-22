@@ -242,6 +242,11 @@ def _check_paths_script(config: RemoteRunnerConfig) -> str:
             f"test -d {_shell_quote(getattr(config, name))} "
             "&& printf '1\\n' || printf '0\\n'"
         )
+    lines.append(
+        f"disk_kib=$(df -Pk {_shell_quote(config.reports_root)} 2>/dev/null | "
+        "awk 'NR == 2 { print $4 }'); "
+        "case \"$disk_kib\" in ''|*[!0-9]*) printf '0\\n' ;; *) printf '%s\\n' \"$disk_kib\" ;; esac"
+    )
     return "\n".join(lines)
 
 
@@ -518,10 +523,20 @@ class RemoteTestingService:
 
         output = self._run(_check_paths_script(self.config))
         values = output.split()
-        if len(values) != len(_REMOTE_PATHS) or any(value not in {"0", "1"} for value in values):
+        path_values, disk_kib = values[:len(_REMOTE_PATHS)], values[len(_REMOTE_PATHS):]
+        if (
+            len(path_values) != len(_REMOTE_PATHS)
+            or len(disk_kib) > 1
+            or any(value not in {"0", "1"} for value in path_values)
+            or (disk_kib and not disk_kib[0].isdigit())
+        ):
             raise RemoteTestingError("remote command failed")
-        paths = dict(zip(_REMOTE_PATHS, (value == "1" for value in values)))
-        return {"paths": paths, "source_db_root_exists": paths["source_db_root"]}
+        paths = dict(zip(_REMOTE_PATHS, (value == "1" for value in path_values)))
+        return {
+            "paths": paths,
+            "source_db_root_exists": paths["source_db_root"],
+            "disk_free_bytes": int(disk_kib[0]) * 1024 if disk_kib else 0,
+        }
 
     def _lifecycle(self, action: str) -> dict[str, object]:
         output = self._run(_lifecycle_script(self.config, action=action)).strip()

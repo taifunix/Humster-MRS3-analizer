@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 PANEL_WEB = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web"
@@ -6,6 +7,17 @@ PANEL_WEB = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web"
 
 def _read(name: str) -> str:
     return (PANEL_WEB / name).read_text(encoding="utf-8")
+
+
+def test_static_shell_starts_with_all_accordions_collapsed_and_status_in_header() -> None:
+    html = _read("index.html")
+
+    assert not re.search(r"<details\b[^>]*\bopen(?:\s|>)", html)
+    assert "details.open = true" not in _read("app.js")
+    assert "disk_free_bytes" in _read("app.js")
+    header = html.split('<header class="topbar">', 1)[1].split("</header>", 1)[0]
+    assert 'id="status"' in header
+    assert 'class="global-status topbar-status"' in header
 
 
 def test_static_shell_has_approved_navigation_and_exclusions() -> None:

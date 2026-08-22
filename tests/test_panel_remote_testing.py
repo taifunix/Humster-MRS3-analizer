@@ -212,7 +212,7 @@ def test_check_paths_uses_one_injected_plink_argv_and_returns_only_labels() -> N
 
     def runner(argv: tuple[str, ...]) -> str:
         calls.append(argv)
-        return "1\n1\n0\n1\n1\n"
+        return "1\n1\n0\n1\n1\n1048576\n"
 
     service = RemoteTestingService(load_remote_runner_config(_config()), command_runner=runner)
     result = service.check_paths()
@@ -224,6 +224,7 @@ def test_check_paths_uses_one_injected_plink_argv_and_returns_only_labels() -> N
     assert "-pw" in argv and argv[argv.index("-pw") + 1] == "correct horse battery staple"
     command = argv[-1]
     assert command.count("test -d") == 5
+    assert "df -Pk" in command
     assert result == {
         "paths": {
             "bot_root": True,
@@ -233,9 +234,28 @@ def test_check_paths_uses_one_injected_plink_argv_and_returns_only_labels() -> N
             "reports_archive_root": True,
         },
         "source_db_root_exists": True,
+        "disk_free_bytes": 1048576 * 1024,
     }
     assert "/opt/hb1" not in json.dumps(result)
     assert "correct horse battery staple" not in json.dumps(result)
+
+
+def test_check_paths_reports_free_space_on_reports_filesystem() -> None:
+    def runner(_argv: tuple[str, ...]) -> str:
+        return "1\n1\n1\n1\n1\n1048576\n"
+
+    service = RemoteTestingService(load_remote_runner_config(_config()), command_runner=runner)
+
+    assert service.check_paths()["disk_free_bytes"] == 1048576 * 1024
+
+
+def test_check_paths_keeps_path_result_when_disk_probe_is_unavailable() -> None:
+    def runner(_argv: tuple[str, ...]) -> str:
+        return "1\n1\n1\n1\n1\n"
+
+    service = RemoteTestingService(load_remote_runner_config(_config()), command_runner=runner)
+
+    assert service.check_paths()["disk_free_bytes"] == 0
 
 
 def test_remote_command_failure_is_generic_and_does_not_echo_secret() -> None:
