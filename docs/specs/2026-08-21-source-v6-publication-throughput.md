@@ -317,9 +317,13 @@ behind a `safe_to_delete=YES`.
 Stated here because C9's framing invites the assumption that it does. The C3a
 payload readback runs on `staging`. `compact_v6_database` then rewrites those
 bytes into `compacted`, and `compacted` is what `replace(target)` publishes.
-`compacted` is checked only by `validate_source_v6_database` (schema version and
-fingerprint), a per-table row count, and an id-set and digest comparison — its
-payload bytes are never re-hashed.
+What `compacted` does get is narrower than the readback but not nothing:
+`validate_source_v6_database` (schema version and fingerprint), a per-table row
+count, an id-set and digest comparison, and — through `fragment_metadata` —
+`sha256(header_json) == header_sha256` plus header-against-column agreement for
+every fragment. Exactly one column escapes: `payload_blob`. It is never
+decompressed, its `fragment_id` is never re-derived from it, and its
+`payload_sha256` is never recomputed on the published file.
 
 This is pre-existing and unchanged by C9, and it is recorded rather than fixed.
 It is worth revisiting precisely because C9 changes the economics: verifying
