@@ -1,0 +1,14 @@
+<!doctype html>
+<html><body>
+<pre>{"name":"Source v6 Legacy","exchange":{"name":"Bybit","use_upnl":true},"basic":{"symbol":"ONUSDT","time_frame":"1h","strategy":"mrs2","side":"LONG","use_fix":false,"my_fix_balance":1000,"balance_percentage_long":100},"mrs2":{"ma_long":{"type":"SMA","source":"ohlc4","len":7,"multiplier":0.995},"ma_close_long":{"type":"SMA","source":"ohlc4","len":3,"multiplier":1.003}}}</pre>
+<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+<tr><td>Report range</td><td>2026-01-01 - 2026-01-09</td></tr><tr><td>Initial balance</td><td>1000</td></tr><tr><td>Final balance</td><td>1010</td></tr><tr><td>Total PnL</td><td>10</td></tr>
+</tbody></table>
+<table><thead><tr><th>Timestamp</th><th>Symbol</th><th>Order ID</th><th>Action</th><th>Fee</th><th>PnL</th><th>Balance</th><th>Post Side</th></tr></thead><tbody>
+<tr><td>2026-01-02T01:00:00Z</td><td>ONUSDT</td><td>1</td><td>closed</td><td>0.1</td><td>10</td><td>1010</td><td></td></tr>
+</tbody></table>
+<script>
+const walletSeries = [[1767225600000,"1000"],[1767315600000,"1010"]];
+const equitySeries = [[1767225600000,"1000"],[1767315600000,"1010"]];
+</script>
+</body></html>

@@ -25,6 +25,10 @@ strategies/
 
 # Raw tester exports and temporary files
 *.html
+# Synthetic test fixtures are not raw exports: they are a few KB of hand-written
+# markup the suite cannot run without. Without this three v6 fixtures were
+# ignored and the tests that read them failed on a fresh clone.
+!tests/fixtures/**/*.html
 *.log
 *.tmp
 
