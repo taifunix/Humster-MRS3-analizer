@@ -213,3 +213,14 @@ STAGE_1_GATE=ACCEPTED_BY_ROOT; date=2026-08-20; reviewer=CODE_REVIEW_PASS compac
    that it produces a distinct analysis artifact and expected structure result.
 4. Before syncing Git, review the scoped diffs/commits; local `Input/`,
    `Output/` and `Data/` must remain untracked.
+
+## Parallel panel work (2026-08-22)
+
+Static Control Panel v1 Task 1 is committed as `38980d8` and independently
+reviewed `CODE_REVIEW_PASS`: fixed static root shell, safe
+`panel.default_root` rollback to `/legacy`, package assets, and 146 focused
+panel tests. Next verified slice: Task 2, redacted v2 bootstrap and local-only
+Settings. It must not start processes, contact remote hosts, expose
+credentials, or change legacy APIs. Contract and plan:
+`docs/specs/2026-08-22-panel-static-frontend-v1.md` and
+`docs/superpowers/plans/2026-08-22-panel-static-frontend-v1.md`.
