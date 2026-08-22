@@ -434,8 +434,9 @@ class RemoteSourceDbExecutor:
                 "if [ -e \"$target\" ] || [ -L \"$target\" ]; then printf 'TARGET_EXISTS\\n'; exit 0; fi",
                 "if [ -e \"$stage\" ] || [ -L \"$stage\" ]; then printf 'FAILED\\n'; exit 0; fi",
                 "if [ ! -f \"$importer\" ] || [ -L \"$importer\" ]; then printf 'FAILED\\n'; exit 0; fi",
+                "if ! command -v setsid >/dev/null 2>&1; then printf 'FAILED\\n'; exit 0; fi",
                 "mkdir -- \"$stage\" || { printf 'FAILED\\n'; exit 0; }",
-                "nohup sh \"$importer\" \"$html\" \"$target\" >\"$log_file\" 2>&1 </dev/null &",
+                "nohup setsid sh \"$importer\" \"$html\" \"$target\" >\"$log_file\" 2>&1 </dev/null &",
                 "pid=$!",
                 "case \"$pid\" in ''|*[!0-9]*) printf 'FAILED\\n'; exit 0;; esac",
                 "printf '%s\\n' \"$pid\" >\"$pid_file\" || { printf 'FAILED\\n'; exit 0; }",
@@ -445,18 +446,20 @@ class RemoteSourceDbExecutor:
 
     def _status_script(self, job: _RemoteImportJob) -> str:
         importer = self.config.debian_runner_root.rstrip("/") + "/scripts/import-source-v6-debian.sh"
+        runner = self.config.debian_runner_root.rstrip("/") + "/scripts/import_source_v6_debian.py"
         return "\n".join(
             (
                 "set -eu",
                 f"pid_file={_shell_quote(job.pid_path)}",
                 f"target={_shell_quote(job.remote_db_target)}",
                 f"importer={_shell_quote(importer)}",
+                f"runner={_shell_quote(runner)}",
                 "if [ ! -f \"$pid_file\" ] || [ -L \"$pid_file\" ]; then printf 'FAILED\\n'; exit 0; fi",
                 "pid=$(cat -- \"$pid_file\" 2>/dev/null) || { printf 'FAILED\\n'; exit 0; }",
                 "case \"$pid\" in ''|*[!0-9]*) printf 'FAILED\\n'; exit 0;; esac",
                 "if [ -r \"/proc/$pid/cmdline\" ]; then",
                 "  cmdline=$(tr '\\000' ' ' <\"/proc/$pid/cmdline\" 2>/dev/null || true)",
-                "  case \"$cmdline\" in *\"$importer\"*\"$target\"*) printf 'RUNNING\\n'; exit 0;; esac",
+                "  case \"$cmdline\" in *\"$importer\"*\"$target\"*|*\"$runner\"*\"$target\"*) printf 'RUNNING\\n'; exit 0;; esac",
                 "fi",
                 "if [ ! -f \"$target\" ] || [ -L \"$target\" ]; then printf 'FAILED\\n'; exit 0; fi",
                 "if ! size=$(wc -c <\"$target\"); then printf 'FAILED\\n'; exit 0; fi",
@@ -468,19 +471,21 @@ class RemoteSourceDbExecutor:
 
     def _cancel_script(self, job: _RemoteImportJob) -> str:
         importer = self.config.debian_runner_root.rstrip("/") + "/scripts/import-source-v6-debian.sh"
+        runner = self.config.debian_runner_root.rstrip("/") + "/scripts/import_source_v6_debian.py"
         return "\n".join(
             (
                 "set -eu",
                 f"pid_file={_shell_quote(job.pid_path)}",
                 f"target={_shell_quote(job.remote_db_target)}",
                 f"importer={_shell_quote(importer)}",
+                f"runner={_shell_quote(runner)}",
                 "if [ ! -f \"$pid_file\" ] || [ -L \"$pid_file\" ]; then printf 'FAILED\\n'; exit 0; fi",
                 "pid=$(cat -- \"$pid_file\" 2>/dev/null) || { printf 'FAILED\\n'; exit 0; }",
                 "case \"$pid\" in ''|*[!0-9]*) printf 'FAILED\\n'; exit 0;; esac",
                 "if [ ! -r \"/proc/$pid/cmdline\" ]; then printf 'FAILED\\n'; exit 0; fi",
                 "cmdline=$(tr '\\000' ' ' </proc/$pid/cmdline 2>/dev/null || true)",
-                "case \"$cmdline\" in *\"$importer\"*\"$target\"*) ;; *) printf 'FAILED\\n'; exit 0;; esac",
-                "if kill -TERM \"$pid\" 2>/dev/null; then printf 'CANCELLING\\n'; else printf 'FAILED\\n'; fi",
+                "case \"$cmdline\" in *\"$importer\"*\"$target\"*|*\"$runner\"*\"$target\"*) ;; *) printf 'FAILED\\n'; exit 0;; esac",
+                "if kill -TERM \"-$pid\" 2>/dev/null; then printf 'CANCELLING\\n'; else printf 'FAILED\\n'; fi",
             )
         )
 

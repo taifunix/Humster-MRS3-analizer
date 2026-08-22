@@ -251,7 +251,7 @@ def test_remote_import_start_returns_redacted_running_identity_and_fixed_script(
     script = calls[0][-1]
     assert "mkdir -p" in script and "nohup" in script
     assert "scripts/import-source-v6-debian.sh" in script
-    assert 'nohup sh "$importer" "$html" "$target"' in script
+    assert 'nohup setsid sh "$importer" "$html" "$target"' in script
     assert "TARGET_EXISTS" in script
     assert "pid" in script and "import.log" in script
     encoded = json.dumps(document)
@@ -293,6 +293,7 @@ def test_remote_import_status_verifies_identity_then_returns_redacted_evidence()
     assert "/proc/" in script and "cmdline" in script
     assert "sha256sum" in script and "wc -c" in script
     assert "scripts/import-source-v6-debian.sh" in script
+    assert "import_source_v6_debian.py" in script
     encoded = json.dumps(document)
     assert REMOTE_ROOT not in encoded and REMOTE_TARGET not in encoded
     assert "runner.example.test" not in encoded
@@ -342,7 +343,7 @@ def test_remote_import_cancel_verifies_exact_identity_before_term() -> None:
     script = calls[1][-1]
     assert "cat --" in script
     assert "/proc/" in script and "cmdline" in script
-    assert "kill -TERM \"$pid\"" in script
+    assert "kill -TERM \"-$pid\"" in script
     assert script.index("kill -TERM") > script.index("cmdline")
     assert REMOTE_ROOT not in json.dumps(document)
 
