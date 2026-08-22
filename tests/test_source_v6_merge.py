@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from hashlib import sha256
 from pathlib import Path
 
@@ -318,36 +320,60 @@ def test_merge_result_reports_all_active_fragments_including_non_fixed_lot(tmp_p
     assert {str(row[0]) for row in rows} == expected
 
 
-def test_merge_readback_runs_on_committed_staging_and_publishes_nothing_when_it_fails(
+def _opens_read_only_from_another_process(path: Path) -> bool:
+    """Whether a separate process can open `path` — the worker's actual test.
+
+    DuckDB's in-process instance cache hands a second `connect()` in *this*
+    process a working handle even while the first holds an open transaction, so
+    an in-process probe proves nothing about release. Across processes the file
+    lock is real, and refuses even a read-only open.
+    """
+    probe = subprocess.run(
+        [sys.executable, "-c", f"import duckdb; duckdb.connect(r'{path}', read_only=True)"],
+        capture_output=True,
+        text=True,
+        # DuckDB refuses immediately on Windows rather than blocking on the
+        # writer's lock, but a platform that blocks would hang the suite.
+        timeout=60,
+    )
+    return probe.returncode == 0
+
+
+def test_merge_readback_runs_on_released_staging_and_publishes_nothing_when_it_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pin both halves of the post-commit readback placement.
+    """Pin all three halves of the readback placement.
 
-    The readback was moved past `commit` for throughput, which is only sound
-    because committing writes a `.staging` file that nothing can reach. Two
-    things have to stay true and neither was covered: the readback must still
-    run at all, and a failure past the commit must still leave no target and no
-    staging residue. Deleting the call leaves every other merge test green.
+    The readback was moved past `commit` for throughput (C8) and then out of
+    the copy function entirely (C9), which is only sound because both write to
+    a `.staging` file that nothing can reach. Three things have to stay true:
+    the readback must still run at all, the copy connection must be committed
+    *and released* before it runs — a worker process cannot open a file another
+    process holds, so putting it back inside the copy would fail in production
+    at `workers >= 2` and nowhere else — and a failure must still leave no
+    target and no staging residue.
     """
     first, _ = _fragments()
     source = tmp_path / "source.source-v6.duckdb"
     _db(source, first, "source")
     target = tmp_path / "output.source-v6.duckdb"
 
-    real = source_v6_merge._verify_published_identity
+    real = source_v6_merge.verify_published_identity_parallel
     calls: list[str] = []
 
-    def corrupt_then_verify(connection: duckdb.DuckDBPyConnection) -> None:
-        # `rollback` succeeds only while a transaction is open, so its failure
-        # is the assertion that the copy transaction has already committed.
-        # Move the call back inside the transaction and this raises nothing.
-        with pytest.raises(duckdb.TransactionException):
-            connection.execute("rollback")
-        connection.execute("update compact_fragments set payload_blob = ?", [b"not a payload"])
+    def corrupt_then_verify(path, **options) -> None:
+        assert _opens_read_only_from_another_process(Path(path)), "staging still has a live writer"
+        connection = duckdb.connect(str(path))
+        try:
+            # The committed rows are here, so the copy transaction closed too.
+            assert connection.execute("select count(*) from compact_fragments").fetchone()[0] == 1
+            connection.execute("update compact_fragments set payload_blob = ?", [b"not a payload"])
+        finally:
+            connection.close()
         calls.append("verified")
-        real(connection)
+        real(path, **options)
 
-    monkeypatch.setattr(source_v6_merge, "_verify_published_identity", corrupt_then_verify)
+    monkeypatch.setattr(source_v6_merge, "verify_published_identity_parallel", corrupt_then_verify)
 
     with pytest.raises(SourceV6StorageError, match="readback mismatch"):
         merge_source_v6((source,), target)
@@ -355,3 +381,40 @@ def test_merge_readback_runs_on_committed_staging_and_publishes_nothing_when_it_
     assert calls == ["verified"]
     assert not target.exists()
     assert not list(tmp_path.glob(f".{target.name}.*.staging*"))
+
+
+def test_merge_workers_do_not_change_the_published_artifact(tmp_path: Path) -> None:
+    """C9: `workers` is a throughput knob, never an input to the artifact.
+
+    `merge_source_v6` does not expose `chunk_size`, and the default of 512 is
+    far above any fixture corpus, so a plain `workers=4` merge would
+    short-circuit to the serial path and assert nothing. The wrapper forces
+    `chunk_size=1` so the parallel merge really does fan out to processes.
+    """
+    first, second = _fragments()
+    inputs = []
+    for name, fragment in (("a", first), ("b", second)):
+        path = tmp_path / f"in-{name}.source-v6.duckdb"
+        _db(path, fragment, f"in-{name}")
+        inputs.append(path)
+
+    serial_target = tmp_path / "serial.source-v6.duckdb"
+    parallel_target = tmp_path / "parallel.source-v6.duckdb"
+    # The merge attaches its inputs read-only, so the same two feed both runs
+    # and nothing but the verification width differs between them.
+    serial = merge_source_v6(inputs, serial_target, workers=1)
+
+    real = source_v6_merge.verify_published_identity_parallel
+    fanned: list[int] = []
+
+    def fan_out(path, *, workers: int = 1, chunk_size: int = 1) -> None:
+        fanned.append(workers)
+        real(path, workers=workers, chunk_size=1)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(source_v6_merge, "verify_published_identity_parallel", fan_out)
+        parallel = merge_source_v6(inputs, parallel_target, workers=4)
+
+    assert fanned == [4]
+    assert serial.source_content_digest == parallel.source_content_digest
+    assert _dump_merged(serial_target) == _dump_merged(parallel_target)

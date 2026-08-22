@@ -1637,6 +1637,9 @@ class PanelController:
                 preflight.target_path,
                 preflight=preflight,
                 cancellation_requested=lambda: bool(job["cancel_requested"]),
+                # The same setting the import uses; it reaches only the staging
+                # readback, so it cannot change what the merge publishes.
+                workers=max(1, self._import_settings().workers),
             )
             with self._source_v6_lock:
                 job.update({

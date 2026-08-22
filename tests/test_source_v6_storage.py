@@ -1733,3 +1733,133 @@ def test_compact_database_fails_closed_for_old_fingerprint(tmp_path: Path) -> No
 
     with pytest.raises(SourceV6StorageError, match="fresh|fingerprint"):
         create_v6_database(database)
+
+
+def test_verify_published_identity_parallel_matches_serial_and_catches_corruption(
+    tmp_path: Path,
+) -> None:
+    """C9: the parallel readback is the serial one, split across processes.
+
+    Two fragments and `chunk_size=1`, so `workers=4` really produces more than
+    one slice — with a single fragment the fan-out is short-circuited and this
+    would test the serial path twice.
+
+    Each fragment is corrupted alone and in turn, rather than both at once:
+    corrupting both would still be caught by a fan-out that dropped a slice or
+    ignored a future, since the surviving slice would report the other one.
+    Testing them one at a time is what makes every slice's result load-bearing.
+
+    The corruption is a payload swap with `payload_sha256` repaired to match —
+    the case C3a exists for. Every checksum stays self-consistent, so the
+    parent's column check passes and only re-deriving the id from the stored
+    bytes in a worker can catch it.
+    """
+    target = tmp_path / "verify.source-v6.duckdb"
+    storage.create_v6_database(target)
+    for fragment in (_fragment(), _fragment_b()):
+        storage.import_fragment(
+            target, fragment, preflight_token=storage.preflight_import(target, fragment)
+        )
+
+    for workers in (1, 4):
+        storage.verify_published_identity_parallel(target, workers=workers, chunk_size=1)
+
+    connection = duckdb.connect(str(target))
+    try:
+        payloads = connection.execute(
+            "select fragment_id, payload_blob from compact_fragments order by fragment_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert len(payloads) == 2
+    original = {str(row[0]): bytes(row[1]) for row in payloads}
+
+    for corrupted, donor in ((payloads[0], payloads[1]), (payloads[1], payloads[0])):
+        connection = duckdb.connect(str(target))
+        try:
+            connection.execute(
+                "update compact_fragments set payload_blob = ?, payload_sha256 = ? "
+                "where fragment_id = ?",
+                [bytes(donor[1]), sha256(bytes(donor[1])).hexdigest(), str(corrupted[0])],
+            )
+        finally:
+            connection.close()
+
+        for workers in (1, 4):
+            with pytest.raises(storage.SourceV6StorageError, match="readback mismatch"):
+                storage.verify_published_identity_parallel(
+                    target, workers=workers, chunk_size=1
+                )
+
+        connection = duckdb.connect(str(target))
+        try:
+            restored = original[str(corrupted[0])]
+            connection.execute(
+                "update compact_fragments set payload_blob = ?, payload_sha256 = ? "
+                "where fragment_id = ?",
+                [restored, sha256(restored).hexdigest(), str(corrupted[0])],
+            )
+        finally:
+            connection.close()
+        storage.verify_published_identity_parallel(target, workers=4, chunk_size=1)
+
+
+def test_verify_fragment_slice_rejects_an_id_the_window_does_not_return(
+    tmp_path: Path,
+) -> None:
+    """A short window must fail, not silently verify fewer rows than it asked for.
+
+    Unreachable from the internal callers, which read ids from the same
+    committed snapshot as the payloads. It is pinned anyway because on the
+    parallel path those two reads happen on different connections, and this
+    readback is what authorises `safe_to_delete=YES`: a window that quietly
+    returned nothing would report success having verified nothing.
+    """
+    fragment = _fragment()
+    target = tmp_path / "short.source-v6.duckdb"
+    storage.create_v6_database(target)
+    storage.import_fragment(
+        target, fragment, preflight_token=storage.preflight_import(target, fragment)
+    )
+    present = fragment.fragment_id
+
+    storage.verify_fragment_slice(target, [present])
+    with pytest.raises(storage.SourceV6StorageError, match="readback mismatch"):
+        storage.verify_fragment_slice(target, [present, "0" * 64])
+
+
+def test_verify_published_identity_parallel_still_checks_the_columns(
+    tmp_path: Path,
+) -> None:
+    """The column half is not covered by the payload half, so pin it separately.
+
+    `_assert_canonical_matches_columns` never reads `payload_sha256`,
+    `header_sha256`, `source_sha256` or `source_name`. Corrupting only
+    `payload_sha256` leaves the payload hashing to its id, so every worker
+    passes and the parent's single query is the only thing that can object.
+    """
+    fragment = _fragment()
+    target = tmp_path / "columns.source-v6.duckdb"
+    storage.create_v6_database(target)
+    storage.import_fragment(
+        target, fragment, preflight_token=storage.preflight_import(target, fragment)
+    )
+
+    connection = duckdb.connect(str(target))
+    try:
+        connection.execute("update compact_fragments set payload_sha256 = ?", ["0" * 64])
+    finally:
+        connection.close()
+
+    with pytest.raises(storage.SourceV6StorageError, match="readback mismatch"):
+        storage.verify_published_identity_parallel(target, workers=4, chunk_size=1)
+
+
+def test_verify_published_identity_parallel_rejects_a_non_positive_chunk_size(
+    tmp_path: Path,
+) -> None:
+    """A zero chunk would make `range` raise from inside the slicing instead."""
+    target = tmp_path / "chunk.source-v6.duckdb"
+    storage.create_v6_database(target)
+    with pytest.raises(ValueError, match="chunk_size must be positive"):
+        storage.verify_published_identity_parallel(target, workers=2, chunk_size=0)

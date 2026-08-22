@@ -38,6 +38,8 @@ SEGMENT_FINGERPRINT = "source-v6-import-segment-v1"
 SEGMENT_ATTACH_BATCH = 64
 # Verification windows: DuckDB materialises a full result set per execute.
 _VERIFY_BATCH = 128
+# `ProcessPoolExecutor` raises above this on Windows.
+_MAX_VERIFY_WORKERS = 61
 
 
 class SourceV6StorageError(RuntimeError):
@@ -1218,6 +1220,24 @@ def _verify_published_identity(connection: duckdb.DuckDBPyConnection) -> None:
     its columns covers the rest. Checksums alone would only prove a row is
     self-consistent, not that it is the row that was sealed.
     """
+    _verify_published_columns(connection)
+    # Batched by key: DuckDB materialises a whole result set on execute, so a
+    # single cursor over the corpus would be resident in full regardless of how
+    # it is fetched. Ids are cheap; payloads are pulled a window at a time.
+    ids = [
+        str(row[0])
+        for row in connection.execute("select fragment_id from compact_fragments").fetchall()
+    ]
+    _verify_fragment_payloads(connection, ids)
+
+
+def _verify_published_columns(connection: duckdb.DuckDBPyConnection) -> None:
+    """Check every column against its header in one query.
+
+    Left in the parent process on the parallel path too: this is a single
+    DuckDB statement, which DuckDB already runs across its own threads, and it
+    was measured at 59.3 s against the 1,215 s of payload readback beside it.
+    """
     mismatched = connection.execute(
         "select count(*) from compact_fragments "
         "where sha256(header_json) != header_sha256 "
@@ -1232,13 +1252,18 @@ def _verify_published_identity(connection: duckdb.DuckDBPyConnection) -> None:
     ).fetchone()[0]
     if mismatched:
         raise SourceV6StorageError("compact fragment readback mismatch")
-    # Batched by key: DuckDB materialises a whole result set on execute, so a
-    # single cursor over the corpus would be resident in full regardless of how
-    # it is fetched. Ids are cheap; payloads are pulled a window at a time.
-    ids = [
-        str(row[0])
-        for row in connection.execute("select fragment_id from compact_fragments").fetchall()
-    ]
+
+
+def _verify_fragment_payloads(
+    connection: duckdb.DuckDBPyConnection, ids: Sequence[str]
+) -> None:
+    """Re-derive each fragment id from its stored payload, a window at a time.
+
+    The window bounds resident memory *per process*: 128 compressed payloads
+    plus the one canonical document being checked, rather than the whole
+    corpus. On the parallel path the peak is that times the worker count — at
+    16 workers and the 1.4 MB average canonical size, a few hundred MB.
+    """
     for start in range(0, len(ids), _VERIFY_BATCH):
         chunk = ids[start : start + _VERIFY_BATCH]
         placeholders = ", ".join("?" for _ in chunk)
@@ -1249,6 +1274,12 @@ def _verify_published_identity(connection: duckdb.DuckDBPyConnection) -> None:
             f"where fragment_id in ({placeholders})",
             chunk,
         ).fetchall()
+        # Matches `decode_fragment_slice`. On the parallel path the ids were
+        # scanned on a different connection than the one reading payloads here,
+        # so a row that vanished between them would otherwise be silently
+        # unverified — and this readback is what authorises `safe_to_delete`.
+        if len(rows) != len(chunk):
+            raise SourceV6StorageError("compact fragment readback mismatch")
         for row in rows:
             fragment_id, payload, codec = str(row[0]), row[1], str(row[2])
             if not codec.startswith("json+zlib-v1:"):
@@ -1678,6 +1709,74 @@ def iter_fragments_parallel(
         for future in futures:
             decoded.append(future.result())
     return tuple(fragment for group in decoded for fragment in group)
+
+
+def verify_fragment_slice(path: str | Path, ids: Sequence[str]) -> None:
+    """Verify one explicit id slice; safe to run in a worker process.
+
+    Opens its own read-only connection, so the caller's writer must already be
+    closed: DuckDB will not let a second process open a file held for writing.
+    Returns nothing — the verdict is the absence of an exception, which is what
+    keeps the fan-out cheap compared with C6's decoding.
+    """
+    if not ids:
+        return
+    connection = duckdb.connect(str(path), read_only=True)
+    try:
+        _verify_fragment_payloads(connection, list(ids))
+    finally:
+        connection.close()
+
+
+def verify_published_identity_parallel(
+    path: str | Path, *, workers: int = 1, chunk_size: int = _VERIFY_BATCH * 4
+) -> None:
+    """Run the C3a readback over a closed database, across processes when asked.
+
+    Equivalent to `_verify_published_identity` on an open connection, and the
+    equivalence is what makes `workers` safe to vary: the slices are disjoint
+    id sets, every worker only reads, and nothing is written, so the verdict
+    cannot depend on the worker count.
+
+    The payload half is 96.1% Python — `json.loads` of the canonical document,
+    `zlib.decompress` and `sha256`, in that order of cost — and independent per
+    fragment, which is why splitting it across processes is worth the spawn.
+    The column half stays here: it is one DuckDB statement.
+
+    Not cancellable, and a mismatch does not short-circuit: `with` shuts the
+    pool down with `wait=True`, so queued slices finish before the failure
+    propagates. That wait is load-bearing on Windows — it is what guarantees no
+    worker still holds the staging file open when the caller deletes it.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    connection = duckdb.connect(str(path), read_only=True)
+    try:
+        _require_fresh(_schema_info(connection))
+        _verify_published_columns(connection)
+        ids = [
+            str(row[0])
+            for row in connection.execute("select fragment_id from compact_fragments").fetchall()
+        ]
+    finally:
+        connection.close()
+    if not ids:
+        return
+    if workers < 2 or len(ids) <= chunk_size:
+        verify_fragment_slice(path, ids)
+        return
+    slices = [ids[start : start + chunk_size] for start in range(0, len(ids), chunk_size)]
+    target = str(path)
+    # `workers` reaches here from a user setting, and Windows raises above 61.
+    # Measured throughput plateaus at 16 anyway, so the cap costs nothing real
+    # and turns an abort after the whole copy phase into a slightly narrower run.
+    width = min(workers, len(slices), _MAX_VERIFY_WORKERS)
+    with ProcessPoolExecutor(max_workers=width) as executor:
+        futures = [executor.submit(verify_fragment_slice, target, item) for item in slices]
+        for future in futures:
+            # `result()` re-raises the worker's SourceV6StorageError here, so a
+            # mismatch in any slice fails the whole verification.
+            future.result()
 
 
 def fragment_ids(path: str | Path) -> tuple[str, ...]:

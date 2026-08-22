@@ -27,7 +27,6 @@ from .source_v6_storage import (
     _publish_metadata_rows,
     _schema_info,
     _utc_now,
-    _verify_published_identity,
     SourceV6FragmentMetadata,
     compact_v6_database,
     create_v6_database,
@@ -36,6 +35,7 @@ from .source_v6_storage import (
     fragment_metadata,
     source_content_digest,
     validate_source_v6_database,
+    verify_published_identity_parallel,
 )
 from .source_v6_stitch import persist_batch_resolution, resolve_batch
 
@@ -230,6 +230,11 @@ def _copy_fragments_from_inputs(
     Payload bytes move input-to-target through SQL, and the metadata tables are
     written with one statement each, so neither the corpus nor a per-fragment
     connection is ever materialised.
+
+    This copies and commits but does not verify. The C3a readback is the
+    caller's, immediately after this returns, because it fans out to worker
+    processes and DuckDB refuses to open a file this connection still holds for
+    writing. See C9.
     """
     by_owner: dict[Path, list[str]] = {}
     for fragment in unique:
@@ -298,27 +303,6 @@ def _copy_fragments_from_inputs(
             [source_content_digest(ids)],
         )
         connection.execute("commit")
-        # Deliberately after the commit, for a measured reason whose mechanism
-        # is only partly established, and the two measurements below are on
-        # different artifacts rather than an A/B on one. The readback windows
-        # rows 128 ids at a time. Against the *committed* 59,675-fragment
-        # input database (4.3 GB of payload) one window costs 0.239 s — far too
-        # fast to be reading the payload column, so the scan touches
-        # `fragment_id` and materialises payload only for the 128 matches.
-        # Against rows still open in this transaction, the 63,131-fragment
-        # merge of both corpora did not finish in 40 minutes, parked here under
-        # `py-spy`. The plan is a sequential scan either way, so index
-        # availability is *not* the difference. Transaction-local storage of
-        # the 4.7 GB of payload is the likeliest cause; that is unproven and is
-        # not asserted here.
-        #
-        # Nothing is published by committing here: the target is a `.staging`
-        # file, and publication is the `compacted.replace(target)` in
-        # `merge_source_v6`, which this function's caller reaches only if the
-        # verification below raises nothing. `validate_source_v6_database`
-        # already runs post-commit on the same staging file for the same
-        # reason.
-        _verify_published_identity(connection)
     except Exception:
         try:
             connection.execute("rollback")
@@ -372,8 +356,14 @@ def merge_source_v6(
     output_path: str | Path | None = None,
     cancellation_requested: Callable[[], bool] | None = None,
     fault_injector: Callable[[str], object] | None = None,
+    workers: int = 1,
 ) -> SourceV6MergeResult:
-    """Merge fresh Source v6 DBs into a new target with one writer."""
+    """Merge fresh Source v6 DBs into a new target with one writer.
+
+    `workers` splits the staging readback across processes and nothing else;
+    the published artifact is identical at every worker count. The default of 1
+    keeps the serial path.
+    """
     if input_paths is None:
         input_paths = source_databases
     if target_path is None:
@@ -434,6 +424,17 @@ def merge_source_v6(
             _check_cancelled(cancellation_requested)
             create_v6_database(staging)
             _copy_fragments_from_inputs(staging, unique, owner_by_id, cancellation_requested)
+            # The readback the copy used to run inline. It stays after the
+            # commit for the reason C8 measured, and has moved out here for the
+            # reason C9 measured: it is 1,215 s of the 2,080 s merge and 96.1%
+            # of that is per-fragment Python, so it is worth spreading across
+            # processes — which needs the copy's writer released first.
+            #
+            # Committing is still not publishing: this is the `.staging` file,
+            # publication is the `compacted.replace(target)` below, and the
+            # `finally` removes the staging file if this raises.
+            verify_published_identity_parallel(staging, workers=workers)
+            _check_cancelled(cancellation_requested)
             if fault_injector:
                 fault_injector("after_write")
 

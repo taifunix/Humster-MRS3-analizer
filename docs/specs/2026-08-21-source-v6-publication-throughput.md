@@ -212,6 +212,121 @@ for the same reason. No committed database ever becomes reachable unverified.
 per-input lineage, so a write there is discarded unread. The surviving rewrite
 is set-based under C4 and keeps `insert or ignore`.
 
+### C9 — The merge readback runs across processes
+
+`merge_source_v6` accepts `workers` and verifies the staging file with
+`verify_published_identity_parallel(staging, workers=workers)`. The default is
+`workers=1`, which takes the same serial path as before, so every existing
+caller and test is unchanged; the panel passes the configured
+`duckdb_import.workers`.
+
+The split is measured, on the published 5.6 GB merge artifact (63,131
+fragments, read-only). One 128-id window costs 2.460 s, and 494 windows
+extrapolate to **1,215 s of the 2,080 s merge** — the readback is the single
+largest phase, not a tail. Within one window the SQL fetch is **1.91 s against
+47.56 s of Python for 20 windows, a 3.9% share**; the remaining 96.1%
+decomposes as 64.3% `_assert_canonical_matches_columns` (a `json.loads` of the
+canonical document, which averages 1.4 MB uncompressed), 20.3% `zlib.decompress`
+and 15.4% `sha256`. A `limit 128 offset 5000` window returns in 0.017 s.
+
+Two things follow. The work is CPU-bound Python with no shared state, so it
+parallelises across processes exactly as C6's decoding does — and better, since
+each worker returns a verdict rather than a decoded fragment, so none of the
+pickling that capped C6 at 2.1x applies here. And the C8 open question is
+narrowed rather than closed: the per-window sequential scan is real but is 3.9%
+of the window at this corpus size, so a bounded-memory single pass would recover
+a small fraction of what parallelism recovers. It stays a separate change.
+
+The structure mirrors `iter_fragments_parallel`. `verify_fragment_slice(path,
+ids)` opens its own read-only connection, windows the slice by `_VERIFY_BATCH`
+and raises `SourceV6StorageError` on any mismatch; the parent runs the C3a
+column check once — it is a single DuckDB query, already internally parallel,
+measured at 59.3 s — collects the ids, and fans the slices out.
+
+The parent's **write** connection must be closed before the fan-out, because a
+DuckDB file open for writing cannot be opened by another process. So the
+readback moves out of `_copy_fragments_from_inputs` to its caller, immediately
+after that function returns and its connection is closed. This preserves C8
+exactly: verification still happens after the copy commits, still on the
+`.staging` file, and still before the `compacted.replace(target)` that
+publishes. Both halves are pinned by test — that the copy connection is
+released and committed before verification, and that a readback failure
+publishes nothing.
+
+Worker count does not change the artifact. Slices are disjoint id sets, each
+worker only reads, and the merge's ordering guarantees are unaffected, so
+`workers=N` and `workers=1` must produce the same `source_content_digest`.
+
+Measured A/B on the same 8,192 ids of the merged corpus: **134.2 s serial
+against 19.0 s at 16 workers, 7.1x**. It plateaus there — 8 workers give 5.7x
+and 24 give 6.8x, slightly worse than 16, so the 34 logical processors are not
+the binding constraint and the default is not raised past what was measured.
+The whole verification over all 63,131 fragments runs in **113.9 s at 16
+workers**.
+
+Those two do not reconcile cleanly, and the gap is left open rather than
+explained away. Taking the serial readback as 1,215 s, the full-corpus payload
+speedup implied by 113.9 s is far above the 7.1x the A/B measured on a subset.
+Process-pool startup was the obvious candidate and was measured out: spawning
+16 workers that import `mrs3` costs 1.1 s, about 6% of the 19.0 s subset run,
+nowhere near the difference. The likelier explanation is that the 1,215 s
+figure was extrapolated from windows timed on a cold page cache while the
+parallel runs read a warm one, which would make the serial baseline too
+pessimistic — but the controlled full-corpus A/B that would settle it was not
+run. Treat 7.1x as the measured speedup and 113.9 s as the measured cost of the
+phase; do not multiply the two into a claim about the whole merge.
+
+That 113.9 s includes the 59.3 s column check, which is now more than half of
+the phase and is the next lever rather than this one. It is a single DuckDB
+statement, so it is DuckDB's own parallelism to improve, not a fan-out.
+
+Memory is bounded per process, not globally: one window is 128 compressed
+payloads plus the single canonical document being checked, so the peak is that
+times the worker count — a few hundred MB at 16 workers and the 1.4 MB average
+canonical size.
+
+Re-running the full two-corpus merge with `workers=16` took **543.7 s against
+the 2,080.1 s serial run**, publishing the identical
+`source_content_digest` `a26c00b965680ab50afb72874bd89cb087441b1ca3433d2d1551b6cd4cc4c814`,
+the same 63,131 accepted and 2,403 duplicates. Roughly 1,100 s of that 1,536 s
+difference is the verification saving (1,215 s serial against the 113.9 s
+measured above). The rest is not controlled: the serial run was the first read
+of those 6.1 GB of inputs and the C9 run was not, so the page cache differs.
+The end-to-end number is reported as what the merge now costs — about 9 minutes
+where it was about 35 — not as this change's isolated speedup.
+
+Equivalence is evidence, not inference: every published table was digested
+inside DuckDB and compared between the two artifacts — `compact_fragments`
+63,131, `points` 63,131, `fragment_origins` 65,534, `day_ownership` 1,205,395,
+`import_audit` 63,131, and the three empty tables — all identical. `schema_info`
+differs in `database_id` alone, which `create_v6_database` generates fresh per
+merge; `schema_version`, `fingerprint`, `mutation_generation` and
+`source_content_digest` match. The published byte sizes differ by 256 KB
+(5,643,972,608 against 5,643,710,464), which is DuckDB block allocation and not
+content.
+
+`_verify_fragment_payloads` now also rejects a window that returns fewer rows
+than it asked for, as `decode_fragment_slice` already did. That is not
+reachable today — both reads see the same committed snapshot — but on the
+parallel path the ids are scanned on a different connection than the one
+reading payloads, and a silently short window here would mean unverified rows
+behind a `safe_to_delete=YES`.
+
+### C9 does not close the gap between the verified file and the published file
+
+Stated here because C9's framing invites the assumption that it does. The C3a
+payload readback runs on `staging`. `compact_v6_database` then rewrites those
+bytes into `compacted`, and `compacted` is what `replace(target)` publishes.
+`compacted` is checked only by `validate_source_v6_database` (schema version and
+fingerprint), a per-table row count, and an id-set and digest comparison — its
+payload bytes are never re-hashed.
+
+This is pre-existing and unchanged by C9, and it is recorded rather than fixed.
+It is worth revisiting precisely because C9 changes the economics: verifying
+`compacted` too would have added a second serial ~1,150 s phase to a 2,080 s
+merge, and now costs 114 s. Whether the raw-HTML deletion gate should require
+it is a decision, not a refactor, so it belongs to its own spec.
+
 ## Invariants
 
 - Published `source_content_digest` for a given input set is unchanged from the
