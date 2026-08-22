@@ -3,7 +3,40 @@
   const links = [...document.querySelectorAll('[data-screen-link]')];
   const breadcrumb = document.querySelector('#breadcrumb');
   const status = document.querySelector('#status');
-  document.querySelector('#panel-reload')?.addEventListener('click', () => window.location.reload());
+  const panelReload = document.querySelector('#panel-reload');
+  panelReload?.addEventListener('click', async () => {
+    panelReload.disabled = true;
+    panelReload.textContent = 'Перезапуск…';
+    try {
+      const response = await fetch('/api/v2/panel/restart', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      const result = await response.json();
+      if (!response.ok || !result.restarting) throw new Error(result.error || 'restart failed');
+      window.setTimeout(() => {
+        let attempts = 0;
+        const poll = window.setInterval(async () => {
+          try {
+            const ready = await fetch('/api/v2/bootstrap');
+            if (!ready.ok) throw new Error('panel unavailable');
+            window.clearInterval(poll);
+            window.location.reload();
+          } catch (_) {
+            if (++attempts === 20) {
+              window.clearInterval(poll);
+              panelReload.disabled = false;
+              panelReload.textContent = 'Перезапустить панель';
+              panelReload.title = 'Панель не стала доступна после перезапуска.';
+            }
+          }
+        }, 500);
+      }, 500);
+    } catch (_) {
+      panelReload.disabled = false;
+      panelReload.textContent = 'Перезапустить панель';
+      panelReload.title = 'Перезапуск недоступен: завершите активные задачи панели.';
+    }
+  });
 
   function showScreen(id, moveFocus = false) {
     const active = screens.find((screen) => screen.id === id) || screens[0];

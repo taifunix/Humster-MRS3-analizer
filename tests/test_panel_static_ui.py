@@ -18,7 +18,8 @@ def test_static_shell_starts_with_all_accordions_collapsed_and_status_in_header(
     assert "disk_free_bytes" in _read("app.js")
     header = html.split('<header class="topbar">', 1)[1].split("</header>", 1)[0]
     assert 'id="panel-reload"' in header
-    assert "location.reload()" in js
+    assert "'/api/v2/panel/restart'" in js
+    assert '"/api/v2/bootstrap"' in js
     for text in (
         "Static panel shell loaded.",
         "Запуск ожидает backend.",

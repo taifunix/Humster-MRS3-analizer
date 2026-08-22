@@ -11,6 +11,13 @@ ROOT = Path(__file__).parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "performance"
 
 
+def test_source_v6_debian_shell_runner_prefers_its_virtualenv() -> None:
+    runner = (ROOT / "scripts" / "import-source-v6-debian.sh").read_text(encoding="utf-8")
+
+    assert 'PYTHON="$ROOT/.venv/bin/python"' in runner
+    assert 'exec "$PYTHON" "$SCRIPT_DIR/import_source_v6_debian.py" "$@"' in runner
+
+
 def test_source_v6_debian_runner_fresh_import_and_stitch_input(tmp_path: Path) -> None:
     reports = tmp_path / "reports"
     reports = reports / "nested"

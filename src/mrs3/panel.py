@@ -4566,10 +4566,37 @@ class _PanelServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(
-        self, address: tuple[str, int], controller: PanelController
+        self,
+        address: tuple[str, int],
+        controller: PanelController,
+        *,
+        restart_launcher: Callable[[], None] | None = None,
     ) -> None:
         self.controller = controller
+        self._restart_launcher = restart_launcher or self._launch_restart_helper
         super().__init__(address, _PanelHandler)
+
+    def _launch_restart_helper(self) -> None:
+        script = self.controller.root / "scripts" / "restart_new_panel.bat"
+        if not script.is_file():
+            raise PanelJobError("RESTART_UNAVAILABLE")
+        try:
+            subprocess.Popen(
+                ("cmd.exe", "/c", str(script), str(self.server_port)),
+                cwd=self.controller.root,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:
+            raise PanelJobError("RESTART_UNAVAILABLE") from None
+
+    def restart_panel(self) -> dict[str, bool]:
+        if any(job["state"] not in {"COMMITTED", "CANCELLED", "FAILED"} for job in self.controller.panel_jobs()):
+            raise PanelJobError("RESTART_BLOCKED")
+        self._restart_launcher()
+        stop = threading.Timer(0.15, self.shutdown)
+        stop.daemon = True
+        stop.start()
+        return {"restarting": True}
 
 
 class _PanelHandler(BaseHTTPRequestHandler):
@@ -4766,7 +4793,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/shortlist"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/shortlist"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -4785,7 +4812,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             document = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(document, dict):
                 raise ValueError("JSON body must be an object")
-            if endpoint == "/api/v2/testing/local/fill":
+            if endpoint == "/api/v2/panel/restart":
+                result = self.server.restart_panel()
+            elif endpoint == "/api/v2/testing/local/fill":
                 result = self.server.controller.local_testing_fill(document)
             elif endpoint == "/api/v2/testing/local/start":
                 result = self.server.controller.local_testing_start()
@@ -4909,7 +4938,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 action = str(document.get("action", ""))
                 result = self.server.controller.start(action, document)
         except PanelJobError as error:
-            self._json(409 if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED", "IDEMPOTENCY_CONFLICT"} else 400, {"error": error.code})
+            self._json(409 if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED", "IDEMPOTENCY_CONFLICT", "RESTART_BLOCKED"} else 400, {"error": error.code})
             return
         except RuntimeError as error:
             self._json(409, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})
@@ -4921,13 +4950,17 @@ class _PanelHandler(BaseHTTPRequestHandler):
 
 
 def create_panel_server(
-    host: str, port: int, controller: PanelController
+    host: str,
+    port: int,
+    controller: PanelController,
+    *,
+    restart_launcher: Callable[[], None] | None = None,
 ) -> ThreadingHTTPServer:
     if host.casefold() not in {"127.0.0.1", "localhost"}:
         raise ValueError("control panel must bind to a loopback host")
     if not 0 <= port <= 65535:
         raise ValueError("panel port must be between 0 and 65535")
-    return _PanelServer((host, port), controller)
+    return _PanelServer((host, port), controller, restart_launcher=restart_launcher)
 
 
 def serve_panel(
