@@ -11,13 +11,23 @@ def _read(name: str) -> str:
 
 def test_static_shell_starts_with_all_accordions_collapsed_and_status_in_header() -> None:
     html = _read("index.html")
+    js = _read("app.js")
 
     assert not re.search(r"<details\b[^>]*\bopen(?:\s|>)", html)
     assert "details.open = true" not in _read("app.js")
     assert "disk_free_bytes" in _read("app.js")
     header = html.split('<header class="topbar">', 1)[1].split("</header>", 1)[0]
-    assert 'id="status"' in header
-    assert 'class="global-status topbar-status"' in header
+    assert 'id="panel-reload"' in header
+    assert "location.reload()" in js
+    for text in (
+        "Static panel shell loaded.",
+        "Запуск ожидает backend.",
+        "01 · TWO INDEPENDENT TEST JOBS",
+        "02 · SOURCE V6 FRESH COMPACT",
+        "03 · CANONICAL SURFACES",
+        "04 · ANALYSIS → TESTER → DD5",
+    ):
+        assert text not in html
 
 
 def test_static_shell_has_approved_navigation_and_exclusions() -> None:
@@ -63,7 +73,7 @@ def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() ->
         assert f'id="{runner}-paths"' in html
     assert "Проверить runner и диск" in html
     assert "Сохранить пути" in html
-    assert "Запуск ожидает backend" in html
+    assert 'id="panel-reload"' in html
     assert 'name="host"' not in html
     assert 'name="user"' not in html
     assert "ssh" not in html.lower()

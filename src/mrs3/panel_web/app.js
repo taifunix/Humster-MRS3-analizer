@@ -3,6 +3,7 @@
   const links = [...document.querySelectorAll('[data-screen-link]')];
   const breadcrumb = document.querySelector('#breadcrumb');
   const status = document.querySelector('#status');
+  document.querySelector('#panel-reload')?.addEventListener('click', () => window.location.reload());
 
   function showScreen(id, moveFocus = false) {
     const active = screens.find((screen) => screen.id === id) || screens[0];
