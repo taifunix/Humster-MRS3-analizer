@@ -2,6 +2,7 @@
 setlocal
 cd /d "%~dp0.."
 set PYTHONUTF8=1
+if "%MRS3_PANEL_PORT%"=="" set "MRS3_PANEL_PORT=8765"
 
 if not exist ".venv\Scripts\python.exe" (
   where py >nul 2>nul
@@ -21,7 +22,7 @@ if errorlevel 1 (
   if errorlevel 1 goto error
 )
 
-".venv\Scripts\python.exe" -m mrs3.cli panel --config config.local.json
+".venv\Scripts\python.exe" -m mrs3.cli panel --config config.local.json --port %MRS3_PANEL_PORT%
 if errorlevel 1 goto error
 exit /b 0
 

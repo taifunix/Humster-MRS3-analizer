@@ -1869,6 +1869,16 @@ def test_direct_csv_artifacts_serve_immutable_bytes_after_backing_file_mutation_
         thread.join(timeout=2)
 
 
+def test_panel_root_mode_can_be_forced_to_static_for_the_dedicated_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"panel": {"default_root": "legacy"}}), encoding="utf-8")
+    monkeypatch.setenv("MRS3_PANEL_ROOT", "static")
+
+    assert PanelController(tmp_path, config).panel_default_root() == "static"
+
+
 def test_source_v6_panel_lifecycle_has_bound_token_progress_and_library(tmp_path: Path) -> None:
     fixture_dir = Path(__file__).parent / "fixtures" / "performance"
     reports = tmp_path / "reports"

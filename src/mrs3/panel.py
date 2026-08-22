@@ -1551,6 +1551,8 @@ class PanelController:
 
     def panel_default_root(self) -> str:
         """Read only the local panel root switch; invalid config stays legacy."""
+        if os.environ.get("MRS3_PANEL_ROOT") == "static":
+            return "static"
         try:
             document = json.loads(self.default_config.read_text(encoding="utf-8"))
             panel = document.get("panel") if isinstance(document, dict) else None

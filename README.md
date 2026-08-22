@@ -35,6 +35,10 @@ Copy-Item config.local.json.example config.local.json
 # Локальная панель управления
 .\scripts\start_panel.bat
 
+# New static panel (port 8766); the existing launcher remains unchanged
+.\scripts\start_new_panel.bat
+.\scripts\stop_new_panel.bat
+
 # Построение кандидатов
 .\.venv\Scripts\python.exe -m mrs3.cli select --help
 
