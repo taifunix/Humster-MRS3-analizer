@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -299,6 +300,28 @@ def test_remote_import_status_verifies_identity_then_returns_redacted_evidence()
     assert "runner.example.test" not in encoded
 
 
+def test_remote_import_status_exposes_safe_html_progress_and_elapsed_time() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def command_runner(argv: tuple[str, ...]) -> str:
+        calls.append(argv)
+        return "STARTED\n" if len(calls) == 1 else "RUNNING 12 40 4 1700000000\n"
+
+    executor = RemoteSourceDbExecutor(_remote_config(), command_runner, lambda _argv: None)
+    started = executor.start_import(REMOTE_HTML, REMOTE_TARGET)
+
+    document = executor.status(started["job_id"])
+
+    assert document["state"] == "RUNNING"
+    assert document["phase"] == "REMOTE_IMPORT"
+    assert document["progress"] == {"current": 12, "total": 40, "unit": "reports", "workers": 4}
+    assert document["timing"]["started_at_epoch"] == 1700000000
+    assert document["timing"]["elapsed_seconds"] >= 0
+    assert "--progress" in calls[0][-1]
+    assert "progress_file" in calls[1][-1]
+    assert REMOTE_ROOT not in json.dumps(document)
+
+
 def test_remote_import_delivery_requires_remote_imported_state(tmp_path: Path) -> None:
     executor = RemoteSourceDbExecutor(
         _remote_config(), lambda _argv: "STARTED\n", lambda _argv: None
@@ -307,6 +330,200 @@ def test_remote_import_delivery_requires_remote_imported_state(tmp_path: Path) -
 
     with pytest.raises(RemoteSourceDbError, match="not ready for delivery"):
         executor.deliver_import(started["job_id"], tmp_path / "final.duckdb")
+
+
+def test_remote_import_delivery_reports_transfer_bytes_then_verifies_before_commit(tmp_path: Path) -> None:
+    data = b"verified remote source db"
+
+    class Process:
+        returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    process = Process()
+    calls = 0
+
+    def command_runner(_argv: tuple[str, ...]) -> str:
+        nonlocal calls
+        calls += 1
+        return "STARTED\n" if calls == 1 else f"REMOTE_IMPORTED {len(data)} {hashlib.sha256(data).hexdigest()}\n"
+
+    def transfer_starter(argv: tuple[str, ...]) -> Process:
+        Path(argv[-1]).write_bytes(data)
+        return process
+
+    executor = RemoteSourceDbExecutor(
+        _remote_config(), command_runner, lambda _argv: None, transfer_starter=transfer_starter
+    )
+    started = executor.start_import(REMOTE_HTML, REMOTE_TARGET)
+    assert executor.status(started["job_id"])["state"] == "REMOTE_IMPORTED"
+
+    transferring = executor.start_delivery(started["job_id"], tmp_path / "final.duckdb")
+    assert transferring["phase"] == "TRANSFERRING"
+    assert transferring["progress"] == {"current": len(data), "total": len(data), "unit": "bytes"}
+
+    in_progress = executor.status(started["job_id"])
+    assert in_progress["phase"] == "TRANSFERRING"
+    assert in_progress["progress"] == {"current": len(data), "total": len(data), "unit": "bytes"}
+
+    process.returncode = 0
+    committed = executor.status(started["job_id"])
+    assert committed["state"] == "COMMITTED"
+    assert committed["phase"] == "COMMITTED"
+    assert committed["evidence"]["sha256"] == hashlib.sha256(data).hexdigest()
+    assert (tmp_path / "final.duckdb").read_bytes() == data
+
+
+def test_remote_import_delivery_cancel_terminates_local_transfer_and_removes_partial(tmp_path: Path) -> None:
+    data = b"partial db"
+
+    class Process:
+        terminated = False
+        waited = False
+
+        def poll(self) -> int | None:
+            return 0 if self.waited else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float) -> int:
+            assert timeout > 0
+            self.waited = True
+            return 0
+
+    process = Process()
+    calls = 0
+
+    def command_runner(_argv: tuple[str, ...]) -> str:
+        nonlocal calls
+        calls += 1
+        return "STARTED\n" if calls == 1 else f"REMOTE_IMPORTED {len(data)} {hashlib.sha256(data).hexdigest()}\n"
+
+    def transfer_starter(argv: tuple[str, ...]) -> Process:
+        Path(argv[-1]).write_bytes(data)
+        return process
+
+    executor = RemoteSourceDbExecutor(_remote_config(), command_runner, lambda _argv: None, transfer_starter=transfer_starter)
+    started = executor.start_import(REMOTE_HTML, REMOTE_TARGET)
+    executor.status(started["job_id"])
+    executor.start_delivery(started["job_id"], tmp_path / "final.duckdb")
+
+    cancelled = executor.cancel(started["job_id"])
+
+    assert cancelled["state"] == "CANCELLED"
+    assert process.terminated is True
+    assert process.waited is True
+    assert not tuple(tmp_path.glob("*.part"))
+    assert not (tmp_path / "final.duckdb").exists()
+
+
+def test_remote_import_cancel_never_promotes_completed_race_to_delivery() -> None:
+    data = b"remote evidence"
+    calls = 0
+
+    def command_runner(_argv: tuple[str, ...]) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "STARTED\n"
+        if calls == 2:
+            return "CANCELLING\n"
+        return f"REMOTE_IMPORTED {len(data)} {hashlib.sha256(data).hexdigest()}\n"
+
+    executor = RemoteSourceDbExecutor(_remote_config(), command_runner, lambda _argv: None)
+    started = executor.start_import(REMOTE_HTML, REMOTE_TARGET)
+    assert executor.cancel(started["job_id"])["state"] == "CANCELLING"
+
+    status = executor.status(started["job_id"])
+
+    assert status["state"] == "CANCELLED"
+    assert status["phase"] == "CANCELLED"
+
+
+def test_remote_import_delivery_cancel_kills_after_timeout_and_removes_partial(tmp_path: Path) -> None:
+    data = b"partial db"
+
+    class Process:
+        waits = 0
+        killed = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout: float) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("pscp", timeout)
+            return 0
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = Process()
+    calls = 0
+
+    def command_runner(_argv: tuple[str, ...]) -> str:
+        nonlocal calls
+        calls += 1
+        return "STARTED\n" if calls == 1 else f"REMOTE_IMPORTED {len(data)} {hashlib.sha256(data).hexdigest()}\n"
+
+    def transfer_starter(argv: tuple[str, ...]) -> Process:
+        Path(argv[-1]).write_bytes(data)
+        return process
+
+    executor = RemoteSourceDbExecutor(_remote_config(), command_runner, lambda _argv: None, transfer_starter=transfer_starter)
+    started = executor.start_import(REMOTE_HTML, REMOTE_TARGET)
+    executor.status(started["job_id"])
+    executor.start_delivery(started["job_id"], tmp_path / "final.duckdb")
+
+    assert executor.cancel(started["job_id"])["state"] == "CANCELLED"
+    assert process.killed is True
+    assert not tuple(tmp_path.glob("*.part"))
+
+
+def test_remote_import_delivery_cancel_cleans_partial_when_termination_errors(tmp_path: Path) -> None:
+    data = b"partial db"
+
+    class Process:
+        killed = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            raise OSError("terminate failed")
+
+        def wait(self, timeout: float) -> int:
+            return 0
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = Process()
+    calls = 0
+
+    def command_runner(_argv: tuple[str, ...]) -> str:
+        nonlocal calls
+        calls += 1
+        return "STARTED\n" if calls == 1 else f"REMOTE_IMPORTED {len(data)} {hashlib.sha256(data).hexdigest()}\n"
+
+    def transfer_starter(argv: tuple[str, ...]) -> Process:
+        Path(argv[-1]).write_bytes(data)
+        return process
+
+    executor = RemoteSourceDbExecutor(_remote_config(), command_runner, lambda _argv: None, transfer_starter=transfer_starter)
+    started = executor.start_import(REMOTE_HTML, REMOTE_TARGET)
+    executor.status(started["job_id"])
+    executor.start_delivery(started["job_id"], tmp_path / "final.duckdb")
+
+    assert executor.cancel(started["job_id"])["state"] == "FAILED"
+    assert process.killed is True
+    assert not tuple(tmp_path.glob("*.part"))
 
 
 def test_remote_import_status_fails_closed_when_identity_is_not_owned() -> None:
@@ -371,3 +588,35 @@ def test_controller_rejects_existing_local_target_before_remote_start(tmp_path: 
         })
 
     assert executor.called is False
+
+
+def test_controller_starts_visible_delivery_instead_of_blocking_status_request(tmp_path: Path) -> None:
+    class Executor:
+        delivery_target: Path | None = None
+
+        def start_import(self, _html: str, _remote: str, *, job_id: str) -> dict[str, object]:
+            return {"job_id": job_id, "state": "RUNNING", "phase": "REMOTE_IMPORT", "progress": {}}
+
+        def status(self, job_id: str) -> dict[str, object]:
+            return {"job_id": job_id, "state": "REMOTE_IMPORTED", "phase": "REMOTE_IMPORTED", "progress": {}}
+
+        def start_delivery(self, _job_id: str, target: Path) -> dict[str, object]:
+            self.delivery_target = target
+            return {"job_id": _job_id, "state": "TRANSFERRING", "phase": "TRANSFERRING", "progress": {}}
+
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    executor = Executor()
+    controller._remote_source_executor = executor
+    target = tmp_path / "final.duckdb"
+    started = controller.source_db_remote_start({
+        "remote_html_path": REMOTE_HTML,
+        "remote_db_target": REMOTE_TARGET,
+        "local_target_path": str(target),
+    })
+
+    status = controller.source_db_remote_status(str(started["job_id"]))
+
+    assert status["state"] == "TRANSFERRING"
+    assert executor.delivery_target == target.resolve()

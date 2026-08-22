@@ -129,6 +129,7 @@
         if (input && paths[key]) input.value = paths[key];
       }
       remoteHtml?.addEventListener('change', updateRemoteTarget);
+      await loadSourceCatalog();
       const connection = document.querySelector('.connection-status');
       if (connection) connection.lastChild.textContent = 'LOCAL BACKEND CONNECTED';
       const local = await fetch("/api/v2/testing/local/status").then((response) => response.json());
@@ -264,6 +265,48 @@
     if (target) target.textContent = message;
   }
 
+  function formatDuration(value) {
+    const seconds = Math.max(0, Math.floor(Number(value) || 0));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return hours ? `${hours}\u0447 ${minutes}\u043c` : `${minutes}\u043c ${seconds % 60}\u0441`;
+  }
+
+  function formatBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes < 1024 ** 2) return `${Math.floor(bytes / 1024)} KB`;
+    if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+    return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  }
+
+  function addSourceOption(path) {
+    const source = document.querySelector('#surface-source');
+    if (!source || !path) return;
+    const existing = [...source.options].find((option) => option.value === path);
+    if (existing) { source.value = path; return; }
+    source.append(new Option(path.split(/[\\/]/).pop(), path));
+    source.value = path;
+  }
+
+  async function loadSourceCatalog() {
+    const source = document.querySelector('#surface-source');
+    if (!source) return;
+    const selected = source.value;
+    try {
+      const response = await fetch('/api/v2/source/local/catalog');
+      const result = await response.json();
+      if (!response.ok || !Array.isArray(result.databases)) throw new Error('catalog failed');
+      source.replaceChildren(new Option('\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 Source DB', ''));
+      result.databases.forEach((item) => {
+        if (typeof item?.name === 'string' && typeof item?.path === 'string') source.append(new Option(item.name, item.path));
+      });
+      source.value = [...source.options].some((option) => option.value === selected)
+        ? selected : (source.options[1]?.value || '');
+    } catch (_) {
+      source.replaceChildren(new Option('\u0421\u043f\u0438\u0441\u043e\u043a Source DB \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d', ''));
+    }
+  }
+
   function sourceOperation(card, preflightUrl, startUrl, payload) {
     if (!card) return;
     const buttons = card.querySelectorAll('.button-row button');
@@ -282,8 +325,7 @@
         const progress = job.progress || {};
         sourceStatus(card, `${job.phase}: ${progress.current || 0} / ${progress.total || 0}`);
         if (job.state === 'COMMITTED') {
-          const source = document.querySelector('#surface-source');
-          if (source && jobTarget) source.replaceChildren(new Option(jobTarget.split(/[\\/]/).pop(), jobTarget));
+          addSourceOption(jobTarget);
         }
         if (['COMMITTED', 'FAILED', 'CANCELLED'].includes(job.state) && poller) {
           clearInterval(poller); poller = 0;
@@ -384,17 +426,41 @@
     let remoteSourceJob = '';
     let remoteSourceTarget = '';
     let remoteSourcePoller = 0;
+    const remoteSourceTrack = remoteSourceCard.querySelector('.progress-track span');
     const remoteSourceStatus = (message) => sourceStatus(remoteSourceCard, message);
+    const renderRemoteSourceProgress = (result) => {
+      const progress = result.progress || {};
+      const timing = result.timing || {};
+      const current = Math.max(0, Number(progress.current) || 0);
+      const total = Math.max(0, Number(progress.total) || 0);
+      const percent = total ? Math.min(100, Math.round(current * 100 / total)) : 0;
+      if (remoteSourceTrack) remoteSourceTrack.style.width = `${percent}%`;
+      const elapsed = formatDuration(timing.elapsed_seconds);
+      const stageElapsed = formatDuration(timing.stage_elapsed_seconds || timing.elapsed_seconds);
+      const eta = current && total > current ? ` \u00b7 ETA ${formatDuration((timing.stage_elapsed_seconds || timing.elapsed_seconds || 0) * (total - current) / current)}` : '';
+      if (result.phase === 'REMOTE_IMPORT') {
+        const workers = progress.workers ? ` \u00b7 ${progress.workers} workers` : '';
+        remoteSourceStatus(total
+          ? `\u042d\u0442\u0430\u043f 1/2 \u00b7 HTML: ${current} / ${total} (${percent}%)${workers} \u00b7 ${stageElapsed}${eta} \u00b7 \u0432\u0441\u0435\u0433\u043e ${elapsed}`
+          : `\u042d\u0442\u0430\u043f 1/2 \u00b7 preflight HTML \u00b7 \u0432\u0441\u0435\u0433\u043e ${elapsed}`);
+      } else if (result.phase === 'TRANSFERRING') {
+        remoteSourceStatus(`\u042d\u0442\u0430\u043f 2/2 \u00b7 \u043f\u0435\u0440\u0435\u0434\u0430\u0447\u0430 DB: ${formatBytes(current)} / ${formatBytes(total)} (${percent}%) \u00b7 ${stageElapsed}${eta} \u00b7 \u0432\u0441\u0435\u0433\u043e ${elapsed}`);
+      } else if (result.phase === 'COMMITTED') {
+        if (remoteSourceTrack) remoteSourceTrack.style.width = '100%';
+        remoteSourceStatus(`\u0413\u043e\u0442\u043e\u0432\u043e \u00b7 SHA-256 verified \u00b7 \u0432\u0441\u0435\u0433\u043e ${elapsed}`);
+      } else {
+        remoteSourceStatus(result.phase || result.state || 'REMOTE_IMPORT');
+      }
+    };
     const refreshRemoteSource = async () => {
       if (!remoteSourceJob) return;
       try {
         const response = await fetch(`/api/v2/source/remote/status?job_id=${encodeURIComponent(remoteSourceJob)}`);
         const result = await response.json();
         if (!response.ok) throw new Error('status failed');
-        remoteSourceStatus(result.phase || result.state || 'REMOTE_IMPORT');
+        renderRemoteSourceProgress(result);
         if (result.state === 'COMMITTED') {
-          const source = document.querySelector('#surface-source');
-          if (source && remoteSourceTarget) source.replaceChildren(new Option(remoteSourceTarget.split(/[\\/]/).pop(), remoteSourceTarget));
+          addSourceOption(remoteSourceTarget);
         }
         if (['COMMITTED', 'FAILED', 'CANCELLED'].includes(result.state) && remoteSourcePoller) {
           clearInterval(remoteSourcePoller); remoteSourcePoller = 0;
@@ -417,7 +483,7 @@
         const result = await remoteRequest('/api/v2/source/remote/start', request);
         remoteSourceJob = result.job_id || '';
         remoteSourceTarget = request.local_target_path;
-        remoteSourceStatus(result.phase || result.state || 'REMOTE_IMPORT');
+        renderRemoteSourceProgress(result);
         if (remoteSourceJob) {
           refreshRemoteSource();
           if (remoteSourcePoller) clearInterval(remoteSourcePoller);
@@ -449,6 +515,7 @@
     const target = surfaceCards[1]?.querySelector('.card-status');
     if (target) target.textContent = message;
   };
+  document.querySelector('#surface-source-refresh')?.addEventListener('click', loadSourceCatalog);
   const renderSurfaceScopes = (groups) => {
     if (!surfaceScopes) return;
     surfaceScopes.replaceChildren();

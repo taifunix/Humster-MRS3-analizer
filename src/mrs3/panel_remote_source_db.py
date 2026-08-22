@@ -13,6 +13,7 @@ import secrets
 import subprocess
 import tempfile
 from threading import RLock
+import time
 
 from .panel_remote_testing import RemoteRunnerConfig
 
@@ -76,6 +77,14 @@ class _RemoteImportJob:
     log_path: str
     state: str = "RUNNING"
     evidence: RemoteDbEvidence | None = None
+    progress_current: int = 0
+    progress_total: int = 0
+    progress_workers: int = 0
+    started_at_epoch: int = 0
+    local_target: Path | None = None
+    transfer_temp: Path | None = None
+    transfer_process: object | None = None
+    transfer_started_at_epoch: int = 0
 
 
 def _remote_path(value: object) -> str:
@@ -158,30 +167,9 @@ class RemoteSourceDbService:
             os.close(descriptor)
             temporary = Path(name)
             self._download(request.remote_db_target, temporary)
-            if temporary.is_symlink() or not temporary.is_file():
-                raise RemoteSourceDbError("remote source db transfer failed")
-            actual_size, actual_digest = self._digest(temporary)
-            if actual_size != expected.size_bytes or actual_digest != expected.sha256:
-                raise RemoteSourceDbError("remote source db transfer failed")
-            if target.exists() or target.is_symlink():
-                raise RemoteSourceDbError("source db target already exists")
-            try:
-                # Same-directory hard-link creation is atomic and never replaces
-                # an existing target; the verified temp entry is then removed.
-                os.link(temporary, target)
-            except FileExistsError:
-                raise RemoteSourceDbError("source db target already exists") from None
-            except OSError:
-                raise RemoteSourceDbError("remote source db transfer failed") from None
-            temporary.unlink(missing_ok=True)
+            result = self.publish_temporary(request, expected, temporary)
             temporary = None
-            return {
-                "phase": "COMMITTED",
-                "phases": list(_PHASES),
-                "remote_db": _basename(request.remote_db_target),
-                "local_target": target.name,
-                "evidence": expected.as_dict(),
-            }
+            return result
         except RemoteSourceDbError:
             raise
         except BaseException:
@@ -189,6 +177,33 @@ class RemoteSourceDbService:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+
+    def publish_temporary(
+        self, request: RemoteSourceDbRequest, evidence: RemoteDbEvidence | Mapping[str, object], temporary: Path
+    ) -> dict[str, object]:
+        expected = RemoteDbEvidence.from_value(evidence)
+        target = request.local_target
+        if temporary.is_symlink() or not temporary.is_file():
+            raise RemoteSourceDbError("remote source db transfer failed")
+        actual_size, actual_digest = self._digest(temporary)
+        if actual_size != expected.size_bytes or actual_digest != expected.sha256:
+            raise RemoteSourceDbError("remote source db transfer failed")
+        if target.exists() or target.is_symlink():
+            raise RemoteSourceDbError("source db target already exists")
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            raise RemoteSourceDbError("source db target already exists") from None
+        except OSError:
+            raise RemoteSourceDbError("remote source db transfer failed") from None
+        temporary.unlink(missing_ok=True)
+        return {
+            "phase": "COMMITTED",
+            "phases": list(_PHASES),
+            "remote_db": _basename(request.remote_db_target),
+            "local_target": target.name,
+            "evidence": expected.as_dict(),
+        }
 
     def run(
         self,
@@ -219,14 +234,18 @@ class RemoteSourceDbExecutor:
         config: RemoteRunnerConfig,
         command_runner: Callable[[tuple[str, ...]], str] | None = None,
         file_downloader: Callable[[tuple[str, ...]], object] | None = None,
+        transfer_starter: Callable[[tuple[str, ...]], object] | None = None,
     ) -> None:
         self.config = self._validate_config(config)
         if command_runner is not None and not callable(command_runner):
             raise RemoteSourceDbError("remote command runner unavailable")
         if file_downloader is not None and not callable(file_downloader):
             raise RemoteSourceDbError("remote file downloader unavailable")
+        if transfer_starter is not None and not callable(transfer_starter):
+            raise RemoteSourceDbError("remote file downloader unavailable")
         self._command_runner = command_runner or self._default_command_runner
         self._file_downloader = file_downloader or self._default_file_downloader
+        self._transfer_starter = transfer_starter or self._default_transfer_starter
         self._service = RemoteSourceDbService(
             source_db_root=self.config.source_db_root,
             read_remote_evidence=lambda _path: None,
@@ -317,15 +336,18 @@ class RemoteSourceDbExecutor:
             if marker != "STARTED":
                 raise RemoteSourceDbError("remote source db import failed")
             self._jobs[job_id] = _RemoteImportJob(
-                job_id, html_path, db_target, stage_path, pid_path, log_path
+                job_id, html_path, db_target, stage_path, pid_path, log_path,
+                started_at_epoch=int(time.time()),
             )
             return self._job_document(self._jobs[job_id])
 
     def status(self, job_id: str) -> dict[str, object]:
         with self._job_lock:
             job = self._job(job_id)
-            if job.state == "FAILED":
+            if job.state in {"FAILED", "COMMITTED", "CANCELLED"}:
                 return self._job_document(job)
+            if job.state == "TRANSFERRING":
+                return self._transfer_status(job)
             script = self._status_script(job)
             try:
                 marker = self._strict_marker(self._command_runner(self._plink_argv(script)))
@@ -337,8 +359,22 @@ class RemoteSourceDbExecutor:
                     job.state = "RUNNING"
                 job.evidence = None
                 return self._job_document(job)
+            if marker.startswith("RUNNING "):
+                try:
+                    current, total, workers, started_at = self._parse_running(marker)
+                except RemoteSourceDbError:
+                    job.state = "FAILED"
+                    return self._job_document(job)
+                if job.state != "CANCELLING":
+                    job.state = "RUNNING"
+                job.progress_current = current
+                job.progress_total = total
+                job.progress_workers = workers
+                job.started_at_epoch = started_at
+                job.evidence = None
+                return self._job_document(job)
             if marker == "FAILED":
-                job.state = "FAILED"
+                job.state = "CANCELLED" if job.state == "CANCELLING" else "FAILED"
                 job.evidence = None
                 return self._job_document(job)
             try:
@@ -346,7 +382,7 @@ class RemoteSourceDbExecutor:
             except RemoteSourceDbError:
                 job.state = "FAILED"
             else:
-                job.state = "REMOTE_IMPORTED"
+                job.state = "CANCELLED" if job.state == "CANCELLING" else "REMOTE_IMPORTED"
             return self._job_document(job)
 
     def resume_import(self, job_id: str, remote_html_path: str, remote_db_target: str) -> dict[str, object]:
@@ -363,7 +399,48 @@ class RemoteSourceDbExecutor:
     def cancel(self, job_id: str) -> dict[str, object]:
         with self._job_lock:
             job = self._job(job_id)
-            if job.state in {"FAILED", "REMOTE_IMPORTED"}:
+            if job.state in {"FAILED", "COMMITTED", "CANCELLED"}:
+                return self._job_document(job)
+            if job.state == "REMOTE_IMPORTED":
+                job.state = "CANCELLED"
+                return self._job_document(job)
+            if job.state == "TRANSFERRING":
+                failed = False
+                process = job.transfer_process
+                wait = getattr(process, "wait", None)
+                kill = getattr(process, "kill", None)
+                try:
+                    terminate = getattr(process, "terminate", None)
+                    if not callable(terminate) or not callable(wait):
+                        raise RemoteSourceDbError("remote source db transfer failed")
+                    terminate()
+                    try:
+                        wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        if not callable(kill):
+                            raise RemoteSourceDbError("remote source db transfer failed")
+                        kill()
+                        wait(timeout=5)
+                except (OSError, RemoteSourceDbError, subprocess.TimeoutExpired):
+                    failed = True
+                finally:
+                    try:
+                        if callable(getattr(process, "poll", None)) and process.poll() is None:
+                            if not callable(kill) or not callable(wait):
+                                failed = True
+                            else:
+                                kill()
+                                wait(timeout=5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        failed = True
+                    try:
+                        if job.transfer_temp is not None:
+                            job.transfer_temp.unlink(missing_ok=True)
+                    except OSError:
+                        failed = True
+                    job.transfer_temp = None
+                    job.transfer_process = None
+                    job.state = "FAILED" if failed else "CANCELLED"
                 return self._job_document(job)
             script = self._cancel_script(job)
             try:
@@ -389,6 +466,60 @@ class RemoteSourceDbExecutor:
             result = self._service.deliver(request, job.evidence)
             job.state = "COMMITTED"
             return result
+
+    def start_delivery(self, job_id: str, local_target: Path) -> dict[str, object]:
+        """Start a visible local download of an already verified remote database."""
+        with self._job_lock:
+            job = self._job(job_id)
+            if job.state == "TRANSFERRING":
+                return self._job_document(job)
+            if job.state != "REMOTE_IMPORTED" or job.evidence is None:
+                raise RemoteSourceDbError("remote source db is not ready for delivery")
+            request = self._service.prepare_request(job.remote_html_path, job.remote_db_target, Path(local_target))
+            request.local_target.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(
+                prefix=f".{request.local_target.name}.", suffix=".part", dir=request.local_target.parent
+            )
+            os.close(descriptor)
+            temporary = Path(name)
+            try:
+                process = self._transfer_starter(self._pscp_argv(request.remote_db_target, temporary))
+                if not callable(getattr(process, "poll", None)):
+                    raise RemoteSourceDbError("remote source db transfer failed")
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise RemoteSourceDbError("remote source db transfer failed") from None
+            job.local_target = request.local_target
+            job.transfer_temp = temporary
+            job.transfer_process = process
+            job.transfer_started_at_epoch = int(time.time())
+            job.state = "TRANSFERRING"
+            return self._job_document(job)
+
+    def _transfer_status(self, job: _RemoteImportJob) -> dict[str, object]:
+        temporary, process, target, evidence = job.transfer_temp, job.transfer_process, job.local_target, job.evidence
+        if temporary is None or process is None or target is None or evidence is None:
+            job.state = "FAILED"
+            return self._job_document(job)
+        try:
+            returncode = process.poll()
+            if returncode is None:
+                return self._job_document(job)
+            if returncode != 0:
+                raise RemoteSourceDbError("remote source db transfer failed")
+            request = self._service.prepare_request(job.remote_html_path, job.remote_db_target, target)
+            result = self._service.publish_temporary(request, evidence, temporary)
+        except RemoteSourceDbError:
+            temporary.unlink(missing_ok=True)
+            job.state = "FAILED"
+            return self._job_document(job)
+        job.transfer_temp = None
+        job.state = "COMMITTED"
+        document = self._job_document(job)
+        document.update(result)
+        document["job_id"] = job.job_id
+        document["state"] = "COMMITTED"
+        return document
 
     def _validate_remote_paths(self, remote_html_path: str, remote_db_target: str) -> tuple[str, str]:
         html_path = _remote_path(remote_html_path)
@@ -436,7 +567,8 @@ class RemoteSourceDbExecutor:
                 "if [ ! -f \"$importer\" ] || [ -L \"$importer\" ]; then printf 'FAILED\\n'; exit 0; fi",
                 "if ! command -v setsid >/dev/null 2>&1; then printf 'FAILED\\n'; exit 0; fi",
                 "mkdir -- \"$stage\" || { printf 'FAILED\\n'; exit 0; }",
-                "nohup setsid sh \"$importer\" \"$html\" \"$target\" >\"$log_file\" 2>&1 </dev/null &",
+                "progress_file=\"$stage/progress\"",
+                "nohup setsid sh \"$importer\" \"$html\" \"$target\" --progress \"$progress_file\" >\"$log_file\" 2>&1 </dev/null &",
                 "pid=$!",
                 "case \"$pid\" in ''|*[!0-9]*) printf 'FAILED\\n'; exit 0;; esac",
                 "printf '%s\\n' \"$pid\" >\"$pid_file\" || { printf 'FAILED\\n'; exit 0; }",
@@ -454,12 +586,25 @@ class RemoteSourceDbExecutor:
                 f"target={_shell_quote(job.remote_db_target)}",
                 f"importer={_shell_quote(importer)}",
                 f"runner={_shell_quote(runner)}",
+                f"progress_file={_shell_quote(job.stage_path + '/progress')}",
                 "if [ ! -f \"$pid_file\" ] || [ -L \"$pid_file\" ]; then printf 'FAILED\\n'; exit 0; fi",
                 "pid=$(cat -- \"$pid_file\" 2>/dev/null) || { printf 'FAILED\\n'; exit 0; }",
                 "case \"$pid\" in ''|*[!0-9]*) printf 'FAILED\\n'; exit 0;; esac",
                 "if [ -r \"/proc/$pid/cmdline\" ]; then",
                 "  cmdline=$(tr '\\000' ' ' <\"/proc/$pid/cmdline\" 2>/dev/null || true)",
-                "  case \"$cmdline\" in *\"$importer\"*\"$target\"*|*\"$runner\"*\"$target\"*) printf 'RUNNING\\n'; exit 0;; esac",
+                "  case \"$cmdline\" in",
+                "    *\"$importer\"*\"$target\"*|*\"$runner\"*\"$target\"*)",
+                "      if [ -f \"$progress_file\" ] && [ ! -L \"$progress_file\" ]; then",
+                "        IFS=' ' read -r current total workers started extra <\"$progress_file\" || true",
+                "        if [ -z \"${extra:-}\" ]; then",
+                "          case \"${current:-}:${total:-}:${workers:-}:${started:-}\" in",
+                "            *[!0-9:]*|:*|*::*) ;;",
+                "            *) printf 'RUNNING %s %s %s %s\\n' \"$current\" \"$total\" \"$workers\" \"$started\"; exit 0;;",
+                "          esac",
+                "        fi",
+                "      fi",
+                "      printf 'RUNNING\\n'; exit 0;;",
+                "  esac",
                 "fi",
                 "if [ ! -f \"$target\" ] || [ -L \"$target\" ]; then printf 'FAILED\\n'; exit 0; fi",
                 "if ! size=$(wc -c <\"$target\"); then printf 'FAILED\\n'; exit 0; fi",
@@ -513,21 +658,62 @@ class RemoteSourceDbExecutor:
             raise RemoteSourceDbError("remote source db import failed") from None
 
     @staticmethod
+    def _parse_running(marker: str) -> tuple[int, int, int, int]:
+        match = re.fullmatch(r"RUNNING[ \t]+([0-9]+)[ \t]+([0-9]+)[ \t]+([0-9]+)[ \t]+([0-9]+)", marker)
+        if match is None:
+            raise RemoteSourceDbError("remote source db import failed")
+        current, total, workers, started_at = (int(item) for item in match.groups())
+        if total < current or workers < 1 or started_at < 1:
+            raise RemoteSourceDbError("remote source db import failed")
+        return current, total, workers, started_at
+
+    @staticmethod
     def _job_document(job: _RemoteImportJob) -> dict[str, object]:
         state = job.state
         phase = {
             "RUNNING": "REMOTE_IMPORT",
             "CANCELLING": "REMOTE_IMPORT_CANCEL",
             "REMOTE_IMPORTED": "REMOTE_IMPORTED",
+            "TRANSFERRING": "TRANSFERRING",
+            "COMMITTED": "COMMITTED",
+            "CANCELLED": "CANCELLED",
             "FAILED": "FAILED",
         }[state]
+        if state == "TRANSFERRING":
+            current = 0
+            if job.transfer_temp is not None:
+                try:
+                    current = job.transfer_temp.stat().st_size
+                except OSError:
+                    pass
+            progress: dict[str, object] = {
+                "current": current,
+                "total": job.evidence.size_bytes if job.evidence is not None else 0,
+                "unit": "bytes",
+            }
+        else:
+            progress = {
+                "current": job.progress_current,
+                "total": job.progress_total,
+                "unit": "reports" if job.progress_total else "items",
+                **({"workers": job.progress_workers} if job.progress_workers else {}),
+            }
         document: dict[str, object] = {
             "job_id": job.job_id,
             "state": state,
             "phase": phase,
-            "progress": {"current": 0, "total": 0, "unit": "items"},
+            "progress": progress,
             "error": None if state != "FAILED" else {"code": "REMOTE_IMPORT_FAILED"},
         }
+        if job.started_at_epoch:
+            document["timing"] = {
+                "started_at_epoch": job.started_at_epoch,
+                "elapsed_seconds": max(0, int(time.time()) - job.started_at_epoch),
+            }
+        if job.transfer_started_at_epoch:
+            document.setdefault("timing", {})["stage_elapsed_seconds"] = max(
+                0, int(time.time()) - job.transfer_started_at_epoch
+            )
         if job.evidence is not None:
             document["evidence"] = job.evidence.as_dict()
         return document
@@ -636,3 +822,16 @@ class RemoteSourceDbExecutor:
             raise RemoteSourceDbError("remote file download failed") from None
         if completed.returncode != 0:
             raise RemoteSourceDbError("remote file download failed")
+
+    @staticmethod
+    def _default_transfer_starter(argv: tuple[str, ...]) -> object:
+        try:
+            return subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+            )
+        except BaseException:
+            raise RemoteSourceDbError("remote file download failed") from None

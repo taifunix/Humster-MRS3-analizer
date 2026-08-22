@@ -115,6 +115,38 @@ def test_bootstrap_malformed_or_missing_config_fails_closed(panel_http, content:
     assert "JSONDecodeError" not in encoded
 
 
+def test_source_catalog_lists_only_duckdb_files_from_configured_source_directory(panel_http) -> None:
+    root, config, connection = panel_http
+    source_root = root / "source-db"
+    source_root.mkdir()
+    (source_root / "zeta.duckdb").write_bytes(b"db")
+    (source_root / "alpha.duckdb").write_bytes(b"db")
+    (source_root / "note.txt").write_text("ignore", encoding="utf-8")
+    document = json.loads(config.read_text(encoding="utf-8"))
+    document["duckdb_import"] = {"source_duckdb_path": "source-db/default.duckdb"}
+    config.write_text(json.dumps(document), encoding="utf-8")
+
+    status, body = _request(connection, "GET", "/api/v2/source/local/catalog")
+
+    assert status == 200
+    assert body == {"databases": [
+        {"name": "alpha.duckdb", "path": str(source_root / "alpha.duckdb")},
+        {"name": "zeta.duckdb", "path": str(source_root / "zeta.duckdb")},
+    ]}
+
+
+def test_source_catalog_is_empty_for_invalid_import_settings(panel_http) -> None:
+    _, config, connection = panel_http
+    document = json.loads(config.read_text(encoding="utf-8"))
+    document["duckdb_import"] = {"source_duckdb_path": 42}
+    config.write_text(json.dumps(document), encoding="utf-8")
+
+    status, body = _request(connection, "GET", "/api/v2/source/local/catalog")
+
+    assert status == 200
+    assert body == {"databases": []}
+
+
 def test_bootstrap_does_not_derive_runner_paths_from_invalid_runner_config(panel_http) -> None:
     _, config, connection = panel_http
     config.write_text(json.dumps({"tester_runner": {"bot_root": "private-bot"}}), encoding="utf-8")

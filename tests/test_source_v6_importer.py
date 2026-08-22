@@ -139,6 +139,23 @@ def test_debian_cli_routes_writes_through_shared_importer(tmp_path: Path, monkey
     assert {item["status"] for item in payload["reports"]} == {"COMMITTED"}
 
 
+def test_debian_cli_writes_atomic_report_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reports = _reports(tmp_path)
+    target = tmp_path / "source-v6.duckdb"
+    progress = tmp_path / "job" / "progress"
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"duckdb_import": {"workers": 1}}), encoding="utf-8")
+    cli, script_path = _load_debian_cli()
+    monkeypatch.setattr(sys, "argv", [
+        str(script_path), str(reports), str(target), "--config", str(config), "--progress", str(progress),
+    ])
+
+    assert cli.main() == 0
+    current, total, workers, started = progress.read_text(encoding="ascii").split()
+    assert (current, total, workers) == ("2", "2", "1")
+    assert int(started) > 0
+
+
 def test_debian_cli_discovers_uppercase_html_without_case_sensitive_precheck(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     reports = tmp_path / "reports"
     reports.mkdir()

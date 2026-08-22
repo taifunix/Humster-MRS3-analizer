@@ -22,6 +22,10 @@ Replace the default monolithic embedded panel with a static, local-only frontend
 - Navigation: Testing, Source DB, Surfaces, Strategies and DD5, disabled Portfolio, Settings.
 - Legacy embedded panel remains at `/legacy` during migration; legacy CSV and `DUCKDB_DIRECT` are not linked from the new UI.
 - `GET /api/v2/bootstrap` returns only safe, validated config-derived defaults. It never launches a process, scans artifacts, or exposes SSH credentials.
+- `GET /api/v2/source/local/catalog` lists only non-symlink `*.duckdb` files in
+  the configured local Source DB directory. It is used solely to populate the
+  materializer Source DB selector; validation still happens at surface
+  preflight.
 
 ## Bootstrap contract
 
@@ -63,6 +67,15 @@ temporary download to a fresh local target. Size and SHA-256 must match before
 the local hard-link publication; either existing target is rejected and no
 partial local database is shown as an artifact. The only remote importer command
 is the configured runner's `scripts/import-source-v6-debian.sh HTML_DIR DB`.
+
+The remote import status is observable without exposing paths or credentials.
+Stage 1 reports completed and total preflight HTML reports, worker count and
+elapsed time; the client derives percentage, rate and ETA only when the total
+is non-zero. Stage 2 reports the size of the same-directory temporary local
+download against the verified remote byte count, then reports SHA-256
+verification before atomic publication. The panel shows both stage time and
+overall elapsed time. Missing or malformed progress data is displayed as
+indeterminate progress and never changes the import result.
 
 ## Strategies/DD5 runner scope
 

@@ -1890,17 +1890,42 @@ class PanelController:
         self._remote_source_targets[str(job["job_id"])] = target
         return job
 
+    def source_db_local_catalog(self) -> dict[str, object]:
+        """List only local Source DB candidates from the configured directory."""
+        try:
+            source = self._import_settings().source_duckdb_path
+            root = self._path(source).parent if source is not None else None
+        except (OSError, ValueError):
+            root = None
+        if root is None:
+            return {"databases": []}
+        try:
+            candidates = sorted(
+                (
+                    path for path in root.iterdir()
+                    if path.suffix.casefold() == ".duckdb" and path.is_file() and not path.is_symlink()
+                ),
+                key=lambda path: path.name.casefold(),
+            )
+        except OSError:
+            candidates = []
+        return {"databases": [{"name": path.name, "path": str(path)} for path in candidates]}
+
     def source_db_remote_status(self, job_id: str) -> dict[str, object]:
         executor = self._remote_source_db()
         status = self._tracked_job_or_interrupted(job_id, executor.status)
-        if status.get("state") != "REMOTE_IMPORTED":
-            return status
-        target = self._remote_source_targets.get(job_id)
-        if target is None:
-            raise RemoteSourceDbError("remote source db job not found")
-        delivered = executor.deliver_import(job_id, target)
-        self._remote_source_targets.pop(job_id, None)
-        return self._sync_tracked_panel_job({"job_id": job_id, "state": "COMMITTED", **delivered})
+        if status.get("state") == "REMOTE_IMPORTED":
+            tracked = self._panel_jobs.get(job_id)
+            if tracked.get("state") in {"CANCELLING", "CANCELLED"}:
+                status = executor.cancel(job_id)
+                return self._sync_tracked_panel_job(status)
+            target = self._remote_source_targets.get(job_id)
+            if target is None:
+                raise RemoteSourceDbError("remote source db job not found")
+            status = executor.start_delivery(job_id, target)
+        if status.get("state") in {"COMMITTED", "FAILED", "CANCELLED"}:
+            self._remote_source_targets.pop(job_id, None)
+        return self._sync_tracked_panel_job(status)
 
     def source_db_remote_cancel(self, job_id: str) -> dict[str, object]:
         try:
@@ -4690,6 +4715,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/v2/source/local/jobs":
             self._json(200, {"jobs": self.server.controller.source_db_local_jobs()})
+            return
+        if parsed.path == "/api/v2/source/local/catalog":
+            self._json(200, self.server.controller.source_db_local_catalog())
             return
         if parsed.path == "/api/v2/source/remote/status":
             try:

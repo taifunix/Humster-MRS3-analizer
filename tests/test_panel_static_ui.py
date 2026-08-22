@@ -143,3 +143,21 @@ def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
     assert "['settings-local-runner', 'local_runner_root']" in js
     assert js.index("updateRemoteTarget();") < js.index("['source-remote-html', 'remote_import_html_root']")
     assert "/api/v2/settings/save" in js
+
+
+def test_remote_source_card_renders_two_stage_progress_and_elapsed_time() -> None:
+    js = _read("app.js")
+
+    for text in ("renderRemoteSourceProgress", "SHA-256", "formatDuration", "formatBytes"):
+        assert text in js
+    assert "remoteSourceTrack.style.width" in js
+    assert "stage_elapsed_seconds" in js
+
+
+def test_surface_materializer_loads_the_configured_source_db_catalog() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="surface-source-refresh"' in html
+    assert "loadSourceCatalog" in js
+    assert "'/api/v2/source/local/catalog'" in js

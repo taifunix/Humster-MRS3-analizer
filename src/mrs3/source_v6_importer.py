@@ -330,6 +330,7 @@ def _run_chunks(
     segment_writer_limit: int,
     cancellation_requested: Callable[[], bool] | None,
     worker_fn: Callable[[SourceV6Snapshot], PreparedSourceV6] | None,
+    progress_callback: Callable[[int, int], None] | None,
 ) -> tuple[object, ...]:
     groups = _chunks(snapshots, worker_chunk_size)
     segment_paths = tuple(
@@ -342,6 +343,8 @@ def _run_chunks(
             if cancellation_requested and cancellation_requested():
                 raise SourceV6ImportCancelled("Source v6 import cancelled")
             receipts.append(_write_injected_chunk(group, path, run_token, worker_fn))
+            if progress_callback:
+                progress_callback(sum(item.outcome_count for item in receipts), len(snapshots))
         return tuple(receipts)
 
     iterator = iter(zip(groups, segment_paths))
@@ -376,6 +379,8 @@ def _run_chunks(
                     except BaseException as error:
                         snapshot = group[0]
                         raise SourceV6WorkerFailure(snapshot.input_ordinal, snapshot.relative_path, str(error), "worker") from error
+                if progress_callback:
+                    progress_callback(sum(item.outcome_count for item in receipts), len(snapshots))
                 fill()
         except BaseException:
             for future in pending:
@@ -455,6 +460,7 @@ def import_source_v6(
     cancellation_requested: Callable[[], bool] | None = None,
     fault_injector: Callable[[str], object] | None = None,
     worker_fn: Callable[[SourceV6Snapshot], PreparedSourceV6] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> SourceV6ImportResult:
     if write_batch_size is not None:
         batch_size = write_batch_size
@@ -487,6 +493,7 @@ def import_source_v6(
                 segment_writer_limit=writer_limit,
                 cancellation_requested=cancellation_requested,
                 worker_fn=worker_fn,
+                progress_callback=progress_callback,
             )
             if fault_injector:
                 for _ in receipts:

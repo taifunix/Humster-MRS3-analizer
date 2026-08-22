@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src" if (ROOT / "src").exists() else ROOT))
@@ -25,6 +26,7 @@ def main() -> int:
     parser.add_argument("--export-dir", type=Path, default=None, help="export plateau_report.xlsx from the published surface")
     parser.add_argument("--handoff-manifest", type=Path, default=None, help="write machine-readable import/surface handoff manifest")
     parser.add_argument("--config", type=Path, default=ROOT / "config.local.json", help="config.local.json with duckdb_import.workers")
+    parser.add_argument("--progress", type=Path, default=None, help="write atomic import progress for an owning panel job")
     args = parser.parse_args()
     try:
         settings = load_duckdb_import_settings(args.config)
@@ -37,6 +39,17 @@ def main() -> int:
         else:
             segment_writer_limit = min(segment_writer_limit, settings.workers)
         preflight = preflight_source_v6(args.html, args.database)
+        started_at = int(time.time())
+
+        def write_progress(current: int, total: int) -> None:
+            if args.progress is None:
+                return
+            args.progress.parent.mkdir(parents=True, exist_ok=True)
+            temporary = args.progress.with_name(f".{args.progress.name}.tmp")
+            temporary.write_text(f"{current} {total} {settings.workers} {started_at}\n", encoding="ascii")
+            temporary.replace(args.progress)
+
+        write_progress(0, len(preflight.snapshots))
         import_options = {
             "preflight": preflight,
             "workers": settings.workers,
@@ -47,6 +60,7 @@ def main() -> int:
             # Fact collections are only needed to publish a surface; coverage,
             # readiness and the receipts below read metadata alone.
             "hydrate_fragments": args.surface_dir is not None,
+            "progress_callback": write_progress,
         }
         imported = import_source_v6(args.html, args.database, **import_options)
     except SourceV6WorkerFailure as error:
