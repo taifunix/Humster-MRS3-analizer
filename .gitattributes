@@ -1,0 +1,6 @@
+# Test fixtures are byte-sensitive inputs to a content-addressed pipeline:
+# `source_sha256` is the SHA-256 of the raw report file, so a checkout that
+# rewrote line endings would give the same fixture a different identity on a
+# different machine. `fragment_id` is canonical and unaffected, but pinning the
+# bytes keeps the two from diverging for a confusing reason.
+tests/fixtures/** -text
