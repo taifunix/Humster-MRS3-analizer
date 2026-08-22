@@ -426,11 +426,17 @@ def test_task3_uncovered_tail_is_partial_with_automatic_reason() -> None:
     outgoing = normalize_source_v6((_FIXTURES / "source_v6_fixed_lot_overlap_a.html").read_bytes())
     incoming = normalize_source_v6((_FIXTURES / "source_v6_fixed_lot_overlap_b.html").read_bytes())
     incoming = replace(incoming, actions=(), cycles=(), events=())
+    # This constructs an incoming that carries nothing while the outgoing has an
+    # open tail. It used to assert `COMMITTED` with the seam applied, which
+    # contradicted both this test's own name and ADR-0010: "a fragment whose
+    # start cannot cover the outgoing tail cycle is marked BRIDGE_NOT_COVERED
+    # ... contributes to PARTIAL". Until ADR-0016 the shape was unreachable from
+    # real data, because a report with no facts was quarantined.
     decision = resolve_ownership(outgoing, incoming)
-    assert decision.reason == "INCOMPLETE_SEAM_CYCLE_EXCLUDED"
+    assert decision.reason == "BRIDGE_NOT_COVERED"
     batch = resolve_batch((outgoing, incoming))
-    assert batch.status == "COMMITTED"
-    assert batch.active_fragments == (outgoing, incoming)
+    assert batch.status == "PARTIAL"
+    assert batch.active_fragments == (outgoing,)
 
 
 def test_task3_non_overlapping_interval_is_not_resolved() -> None:
@@ -1260,3 +1266,60 @@ def test_an_empty_fragment_never_wins_an_identical_window_by_hash_order() -> Non
         assert resolution.status == "PARTIAL"
         # But the window belongs to the fragment that observed something.
         assert [fragment.source_name for fragment in resolution.active_fragments] == ["a.html"]
+
+
+def test_an_empty_incoming_fragment_does_not_delete_the_outgoing_open_tail() -> None:
+    """Z5, mirrored. The first guard only looked at the outgoing side.
+
+    Seam exclusion drops the outgoing's open tail because the incoming report is
+    assumed to carry its continuation. An empty incoming carries nothing, so the
+    tail is deleted with nothing replacing it — one cycle, two actions and two
+    events, under a batch reported `COMMITTED`. That is contradictory evidence,
+    not de-duplication: fail closed instead.
+    """
+    from dataclasses import replace
+
+    from mrs3.source_v6 import normalize_source_v6
+    from mrs3.source_v6_stitch import resolve_batch, resolve_ownership
+
+    outgoing = normalize_source_v6(
+        (_FIXTURES / "source_v6_fixed_lot_overlap_a.html").read_bytes(), source_name="a.html"
+    )
+    empty = normalize_source_v6(
+        (_FIXTURES / "source_v6_zero_activity.html").read_bytes(), source_name="zero.html"
+    )
+    day = 86_400_000
+    incoming = replace(
+        empty,
+        report_start_ms=empty.report_start_ms + 3 * day,
+        report_end_ms=empty.report_end_ms + 3 * day,
+    )
+    assert any(not cycle.closed for cycle in outgoing.cycles), "premise: the outgoing has a tail"
+
+    decision = resolve_ownership(outgoing, incoming)
+    assert decision.status == "UNRESOLVED"
+    assert decision.reason == "BRIDGE_NOT_COVERED"
+
+    resolution = resolve_batch((outgoing, incoming))
+    assert resolution.status == "PARTIAL"
+    assert [item.source_name for item in resolution.active_fragments] == ["a.html"]
+    # `persist_batch_resolution` writes fact rows only for RESOLVED and
+    # USE_OLD_WITH_SEAM_EXCLUSION, so an UNRESOLVED decision deactivates
+    # nothing and the outgoing's tail survives intact.
+    assert [item.status for item in resolution.decisions] == ["UNRESOLVED"]
+
+
+def test_batch_ordering_and_persisted_pairing_use_the_same_key() -> None:
+    """The tie-break must not desynchronise `resolve_batch` from `persist_batch_resolution`.
+
+    `resolve_batch` orders by `(start, empty, fragment_id)`; the persist step
+    re-derives the outgoing side by bisecting its own ordering. If the two keys
+    disagree, a decision can be persisted against a different outgoing fragment
+    than the one it was computed from.
+    """
+    import inspect
+
+    from mrs3 import source_v6_stitch
+
+    source = inspect.getsource(source_v6_stitch)
+    assert source.count("_batch_order_key") >= 3, "both orderings must share one key function"

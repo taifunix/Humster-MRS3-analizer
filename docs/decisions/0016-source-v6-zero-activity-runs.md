@@ -72,7 +72,11 @@ Consequences of admitting one:
   batch reported `COMMITTED`. Reproduced against the repository's own
   fixtures. An empty outgoing therefore hands over at the incoming's own
   start — the existing non-seam rule — as `RESOLVED` with
-  `EMPTY_OUTGOING_NOTHING_TO_EXCLUDE`, and every incoming fact survives.
+  `EMPTY_OUTGOING_NOTHING_TO_EXCLUDE`. Every closed incoming cycle survives; an
+  incoming open tail does not, because the non-seam path never kept one. The
+  mirror image needs its own rule: an empty *incoming* cannot continue an
+  outgoing open tail, which ADR-0010 already names `BRIDGE_NOT_COVERED` and
+  routes to `PARTIAL`.
 
   For an identical window, `resolve_batch` seeds ownership with the first
   fragment by `(report_start_ms, fragment_id)`, so hash order could hand the

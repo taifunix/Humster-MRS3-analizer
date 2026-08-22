@@ -425,7 +425,9 @@ def _assert_declared_empty(metrics: Mapping[str, str]) -> None:
     if len(set(balances)) > 1:
         raise PerformanceParseError("zero-activity report changes balance")
     for name in _UNDEFINED_RATIOS:
-        if name in metrics and metrics[name].strip() != "n/a":
+        # Case-insensitive: the corroborating set is deliberately lenient about a
+        # tester rename, so this check should not be defeated by `N/A`.
+        if name in metrics and metrics[name].strip().casefold() != "n/a":
             raise PerformanceParseError(f"zero-activity report computes '{name}'")
 
 

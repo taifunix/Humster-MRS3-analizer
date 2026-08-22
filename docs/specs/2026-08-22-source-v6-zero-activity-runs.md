@@ -99,8 +99,29 @@ incoming evidence nothing replaces: merging the zero-activity fixture with
 `source_v6_fixed_lot_overlap_b.html` excluded that fragment's only cycle and
 reported the batch `COMMITTED`. `resolve_ownership` now returns `RESOLVED` with
 `EMPTY_OUTGOING_NOTHING_TO_EXCLUDE` when the outgoing carries no facts, handing
-over at the incoming's own start under the existing non-seam rule. Every
-incoming fact stays active.
+over at the incoming's own start under the existing non-seam rule. Every closed
+incoming cycle stays active — and an earlier revision claimed *every* incoming
+fact does, which is wrong: the non-seam path keeps an incoming cycle only if it
+is closed, so an incoming open tail is dropped where the seam path would have
+kept it. That asymmetry belongs to the pre-existing `RESOLVED` semantics and is
+recorded rather than changed here.
+
+**Mirrored: an empty incoming.** The first version of this rule looked only at
+the outgoing, and the mirror image destroys facts the same way: seam exclusion
+drops the outgoing's open tail because the incoming is assumed to carry its
+continuation, and an empty incoming carries nothing — one cycle, two actions and
+two events deactivated under a `COMMITTED` batch, reproduced with
+`source_v6_fixed_lot_overlap_a.html` against the shifted zero-activity fixture.
+ADR-0010 already names the outcome: "a fragment whose start cannot cover the
+outgoing tail cycle is marked `BRIDGE_NOT_COVERED` ... contributes to
+`PARTIAL`". `resolve_ownership` now returns that when the incoming carries no
+facts and the outgoing has an open tail. An `UNRESOLVED` decision writes no fact
+rows, so the outgoing keeps everything.
+
+That shape was unreachable from real data before this spec, because a report
+with no facts was quarantined. `test_task3_uncovered_tail_is_partial_with_
+automatic_reason` constructed it synthetically and asserted `COMMITTED`, which
+contradicted both its own name and ADR-0010; it now asserts `PARTIAL`.
 
 **At an identical window.** `resolve_batch` seeds `active` with the first
 fragment by `(report_start_ms, fragment_id)`, so the tie was decided by hash
@@ -118,11 +139,26 @@ fact collections — the behaviour that predates this rule. That is never the
 deciding answer: both places the rule changes an outcome need two or more
 members, and the merge decodes before resolving those.
 
+Both orderings share `_batch_order_key`. `persist_batch_resolution` re-derives
+the outgoing side by bisecting its own ordering, so a second sort key here
+without the same key there would persist a decision against a different
+outgoing fragment than the one it was computed from whenever two fragments
+share a start.
+
+"Carries facts" here means actions, cycles or events — not samples. A fragment
+with a rendered wallet series but no trades therefore takes these rules too,
+even though it parses without `allow_zero_activity`. That is deliberate: such a
+fragment has the same problem, since the seam de-duplicates cycles and it has
+none. It also means the Z5 rules are not gated by the parse flag; the invariant
+below is about the parse path only.
+
 ## Invariants
 
 - A report failing any Z1 criterion is quarantined exactly as before.
-- Non-empty reports take a byte-identical path; `allow_zero_activity` gates
-  only the empty case.
+- Non-empty reports take a byte-identical *parse* path; `allow_zero_activity`
+  gates only the empty case there. The Z5 resolver rules are not gated by it —
+  they key on whether a fragment carries trade facts, so they also apply to
+  pre-existing fragments that have samples but no trades.
 - `fragment_id` remains `sha256(canonical)`. Two empty fragments differing in
   point or settings fingerprint stay distinct, because both are in the
   canonical document.

@@ -102,6 +102,21 @@ def _seam_cycle_sets(outgoing: SourceV6Fragment, incoming: SourceV6Fragment) -> 
     return excluded, retained, old_open
 
 
+def _batch_order_key(fragment: object) -> tuple[int, bool, str]:
+    """Batch order: by start, then facts before emptiness, then id.
+
+    `persist_batch_resolution` re-derives the outgoing side by bisecting its own
+    ordering, so it must sort by exactly this key. If the two drift apart, a
+    decision computed against one outgoing fragment is persisted against
+    another whenever two fragments share a start.
+    """
+    return (
+        fragment.report_start_ms,
+        not _carries_facts(fragment),
+        fragment.fragment_id,
+    )
+
+
 def _carries_facts(fragment: object) -> bool:
     """Whether this fragment holds any fact at all (ADR-0016, Z5).
 
@@ -135,6 +150,19 @@ def resolve_ownership(outgoing: SourceV6Fragment, incoming: SourceV6Fragment, *,
         return Ownership(incoming.fragment_id, incoming.report_start_ms, overlap_hours, "UNRESOLVED", "OVERLAP_BELOW_MINIMUM")
     if overlap_end <= overlap_start:
         return Ownership(incoming.fragment_id, incoming.report_start_ms, overlap_hours, "UNRESOLVED", "NO_OVERLAP")
+    if not _carries_facts(incoming) and any(not cycle.closed for cycle in outgoing.cycles):
+        # ADR-0016 Z5, mirrored. Seam exclusion drops the outgoing's open tail
+        # because the incoming is assumed to carry its continuation; an empty
+        # incoming carries nothing, so the tail would be deleted with nothing
+        # replacing it. ADR-0010 already names this outcome: "a fragment whose
+        # start cannot cover the outgoing tail cycle is marked
+        # BRIDGE_NOT_COVERED ... contributes to PARTIAL". An UNRESOLVED decision
+        # writes no fact rows, so the outgoing keeps everything, and
+        # `calculate_metrics` already understands this reason.
+        return Ownership(
+            incoming.fragment_id, incoming.report_start_ms, overlap_hours,
+            "UNRESOLVED", "BRIDGE_NOT_COVERED",
+        )
     if not _carries_facts(outgoing):
         # ADR-0016 Z5. Seam exclusion exists to stop the same fact being counted
         # twice: ADR-0013 measured 1,121 matching closed cycles across 681
@@ -162,16 +190,7 @@ def resolve_batch(fragments: Sequence[SourceV6Fragment], *, min_overlap_hours: i
     # fragment with the data would be the one reported `AMBIGUOUS_INCOMING`.
     # Among fragments that all carry facts the term is constant and the order is
     # unchanged.
-    ordered = tuple(
-        sorted(
-            unique.values(),
-            key=lambda fragment: (
-                fragment.report_start_ms,
-                not _carries_facts(fragment),
-                fragment.fragment_id,
-            ),
-        )
-    )
+    ordered = tuple(sorted(unique.values(), key=_batch_order_key))
     if not ordered:
         raise SourceV6StitchError("at least one fragment is required")
     active = [ordered[0]]
@@ -253,21 +272,25 @@ def _resolution_request(
     }
     fact_rows: list[tuple[str, str, str, str | None, bool, str | None, str | None]] = []
     seam_status = status == "USE_OLD_WITH_SEAM_EXCLUSION"
+    # On the non-seam path no seam exclusion happened, so labelling a row with
+    # `INCOMPLETE_SEAM_CYCLE_EXCLUDED` would be false audit evidence. The
+    # handover there is at the incoming's own start.
+    inactive_reason = "INCOMPLETE_SEAM_CYCLE_EXCLUDED" if seam_status else "OUTSIDE_OWNED_INTERVAL"
     for action in outgoing.actions:
         active = action.timestamp_ms < boundary and (action.action_id not in old_open_action_ids if seam_status else action.timestamp_ms < incoming.report_start_ms)
-        fact_rows.append(("action", action.action_id, outgoing.fragment_id, outgoing.fragment_id, active, None if active else "INCOMPLETE_SEAM_CYCLE_EXCLUDED", None))
+        fact_rows.append(("action", action.action_id, outgoing.fragment_id, outgoing.fragment_id, active, None if active else inactive_reason, None))
     for event in outgoing.events:
         active = event.timestamp_ms < boundary and (event.action_id not in old_open_action_ids if seam_status else event.timestamp_ms < incoming.report_start_ms)
-        fact_rows.append(("event", event.event_id, outgoing.fragment_id, outgoing.fragment_id, active, None if active else "INCOMPLETE_SEAM_CYCLE_EXCLUDED", None))
+        fact_rows.append(("event", event.event_id, outgoing.fragment_id, outgoing.fragment_id, active, None if active else inactive_reason, None))
     for cycle in outgoing.cycles:
         active = cycle.open_timestamp_ms < boundary and (cycle.cycle_id not in old_open_cycles if seam_status else True)
-        fact_rows.append(("cycle", cycle.cycle_id, outgoing.fragment_id, outgoing.fragment_id, active, None if active else "INCOMPLETE_SEAM_CYCLE_EXCLUDED", None))
+        fact_rows.append(("cycle", cycle.cycle_id, outgoing.fragment_id, outgoing.fragment_id, active, None if active else inactive_reason, None))
     for action in incoming.actions:
         if seam_status:
             active = action.action_id not in excluded_action_ids and (action.timestamp_ms >= boundary or action.action_id in {item for cycle_id in retained_cycles for item in incoming_cycles[cycle_id].action_ids})
         else:
             active = action.timestamp_ms >= incoming.report_start_ms
-        fact_rows.append(("action", action.action_id, incoming.fragment_id, incoming.fragment_id, active, None if active else "INCOMPLETE_SEAM_CYCLE_EXCLUDED", None))
+        fact_rows.append(("action", action.action_id, incoming.fragment_id, incoming.fragment_id, active, None if active else inactive_reason, None))
     active_incoming_action_ids = {
         row[1]
         for row in fact_rows
@@ -276,10 +299,10 @@ def _resolution_request(
     for event in incoming.events:
         action = incoming_actions.get(event.action_id)
         active = bool(action and action.action_id in active_incoming_action_ids) if seam_status else event.timestamp_ms >= incoming.report_start_ms
-        fact_rows.append(("event", event.event_id, incoming.fragment_id, incoming.fragment_id, active, None if active else "INCOMPLETE_SEAM_CYCLE_EXCLUDED", None))
+        fact_rows.append(("event", event.event_id, incoming.fragment_id, incoming.fragment_id, active, None if active else inactive_reason, None))
     for cycle in incoming.cycles:
         active = cycle.cycle_id not in excluded_cycles if seam_status else cycle.closed
-        fact_rows.append(("cycle", cycle.cycle_id, incoming.fragment_id, incoming.fragment_id, active, None if active else "INCOMPLETE_SEAM_CYCLE_EXCLUDED", None))
+        fact_rows.append(("cycle", cycle.cycle_id, incoming.fragment_id, incoming.fragment_id, active, None if active else inactive_reason, None))
     for fragment, series in ((outgoing, "wallet"), (outgoing, "equity"), (incoming, "wallet"), (incoming, "equity")):
         owned = [f"{series}:{sample.timestamp_ms}" for sample in getattr(fragment, f"{series}_samples") if (fragment is outgoing and (sample.timestamp_ms < boundary if seam_status else sample.timestamp_ms < incoming.report_start_ms)) or (fragment is incoming and sample.timestamp_ms >= (boundary if seam_status else incoming.report_start_ms))]
         fact_rows.extend((f"{series}_sample", fact_id, fragment.fragment_id, fragment.fragment_id, True, None, None) for fact_id in owned)
@@ -317,12 +340,10 @@ def persist_batch_resolution(database: str, fragments: Sequence[SourceV6Fragment
     from .source_v6_storage import persist_fragment_resolutions
 
     by_id = {fragment.fragment_id: fragment for fragment in fragments}
-    # active_fragments is already ordered by (report_start_ms, fragment_id), so
-    # the outgoing side is the last entry starting before the incoming one.
-    ordered_active = sorted(
-        resolution.active_fragments,
-        key=lambda fragment: (fragment.report_start_ms, fragment.fragment_id),
-    )
+    # Ordered by the same key `resolve_batch` used, so the outgoing side is the
+    # last entry starting before the incoming one — and is the same fragment the
+    # decision was computed against.
+    ordered_active = sorted(resolution.active_fragments, key=_batch_order_key)
     starts = [fragment.report_start_ms for fragment in ordered_active]
     requests: list[dict[str, object]] = []
     for decision in resolution.decisions:

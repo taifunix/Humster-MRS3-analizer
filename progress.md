@@ -146,13 +146,18 @@ accepted as evidence of emptiness, because a truncated report has none either.
 Opt-in per caller; only `normalize_source_v6` opts in, so ADR-0006's DD5
 candidate contract is untouched.
 
-Two defects were found by review and reproduced against the repository's own
-fixtures before being fixed. A zero-activity outgoing fragment triggered
+Four defects were found by review across two rounds, each reproduced against
+the repository's own fixtures before being fixed. A zero-activity outgoing fragment triggered
 ADR-0013 seam exclusion and deleted the incoming fragment's only cycle while
 reporting the batch `COMMITTED` — seam exclusion de-duplicates, and an empty
 fragment has nothing to de-duplicate. And for an identical window the empty
 fragment took ownership by `fragment_id` sort order, flagging the fragment with
-four real actions as `AMBIGUOUS_INCOMING`. A third was found by the tests
+four real actions as `AMBIGUOUS_INCOMING`. Round two found the mirror image of
+the first — an empty *incoming* deletes the outgoing's open tail, one cycle and
+two actions, also under `COMMITTED` — now `BRIDGE_NOT_COVERED`/`PARTIAL` as
+ADR-0010 already specified; and that the new tie-break had desynchronised
+`resolve_batch` from `persist_batch_resolution`, which re-derives the outgoing
+side by bisecting its own ordering. A further one was found by the tests
 themselves: a report with actions but empty series was admitted, which is not a
 run where nothing happened but one whose samples did not render.
 
@@ -161,26 +166,37 @@ CX_GE corpus is required to gain the 144 points; nothing is migrated.
 
 ## Next
 
-1. Re-import `my_test_CX_GE_fixed` to pick up the 144 zero-activity runs and
+1. **Blocker before re-importing `my_test_CX_GE_fixed`.** `calculate_metrics`
+   raises `wallet/equity series are required` for a point with no samples, and
+   every surface consumer calls it per point with no guard, so a point whose
+   only report is zero-activity aborts the whole surface build rather than that
+   point. Verified through the public entry point:
+   `publish_surface(dir, (zero_activity_fragment,))` raises. The expected shape
+   among the 144 is exactly that — a parameter combination that never trades.
+   What the canonical metrics of a point that never traded should be is a
+   contract decision (ADR-0006's "never invent a value" argues for excluding
+   the point with a recorded reason rather than synthesising zeros), so it
+   needs its own spec. Until then the re-import will not produce a surface.
+2. Re-import `my_test_CX_GE_fixed` to pick up the 144 zero-activity runs and
    confirm `safe_to_delete` is no longer held at `NO` by them.
-2. Close the same published-file gap on the import path. ADR-0015 scoped
+3. Close the same published-file gap on the import path. ADR-0015 scoped
    itself to the merge deliberately: `_publish_segments_single_pass` verifies
    its reduce target and then publishes a repack that receives neither the C3a
    payload readback nor `fragment_metadata`'s header pass, so the import
    publishes with weaker evidence than the merge now does — under the same
    `safe_to_delete=YES`. It needs its own change, not an assumption from
    ADR-0015's wording.
-3. Remove the orphaned segment-merge path (`merge_source_v6_segments`,
+4. Remove the orphaned segment-merge path (`merge_source_v6_segments`,
    `_merge_segment_contents`, `_read_source_v6_segment`, `import_fragment`,
    `import_fragment_batch`) in its own `refactor:` commit — C5 left them
    without a production caller, and ~50 tests still reference them.
-4. Open question from C8: the identity readback is a sequential scan per
+5. Open question from C8: the identity readback is a sequential scan per
    128-id window on both paths, so O(n²/128) in principle. It does not bite on
    import (5.52 s committed against 5.47 s with the metadata-only transaction
    open, at 5,000 fragments). A relation cursor is not the fix — `fetchmany`
    grew resident memory by 2.9 GB on a 4.3 GB corpus. A bounded-memory single
    pass is its own change.
-5. The parse phase is now the dominant remaining cost. Compression level was
+6. The parse phase is now the dominant remaining cost. Compression level was
    measured and rejected. Swapping the raw-markup cross-check to the lexbor
    engine was measured at 3.9x on that step and then **reverted**: lexbor is an
    HTML5 tree builder and performs the same implicit-close recovery as lxml, so
