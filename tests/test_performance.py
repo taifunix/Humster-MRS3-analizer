@@ -211,3 +211,98 @@ def test_parser_rejects_empty_or_invalid_series(replacement: bytes) -> None:
         )
     with pytest.raises(PerformanceParseError):
         parse_performance_report(source)
+
+
+ZERO_ACTIVITY = Path(__file__).parent / "fixtures" / "performance" / "source_v6_zero_activity.html"
+
+
+def test_zero_activity_report_is_rejected_unless_the_caller_opts_in() -> None:
+    """Z1: the relaxation is opt-in, so the v1 store keeps its contract.
+
+    `performance_import` derives DD5 candidates from this parser under
+    ADR-0006; admitting empty runs there would change that contract silently.
+    """
+    with pytest.raises(PerformanceParseError, match="must be non-empty"):
+        parse_performance_report(ZERO_ACTIVITY.read_bytes())
+
+
+def test_zero_activity_report_is_admitted_when_it_declares_emptiness() -> None:
+    """Z1/Z2/Z3: a complete report of a run with no trades parses to zero facts."""
+    parsed = parse_performance_report(ZERO_ACTIVITY.read_bytes(), allow_zero_activity=True)
+    assert parsed.actions == ()
+    assert parsed.wallet_series == ()
+    assert parsed.equity_series == ()
+    assert parsed.inventory.trade_row_count == 0
+    assert parsed.inventory.wallet_sample_count == 0
+    assert parsed.inventory.equity_sample_count == 0
+    # Z3: the window comes from `Report range`, never a sentinel.
+    assert parsed.inventory.minimum_timestamp == datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert parsed.inventory.maximum_timestamp == datetime(2026, 1, 9, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "old, new, message",
+    [
+        # Z1: the two counters that directly contradict emptiness.
+        ("<tr><td>Total Trades</td><td>0</td></tr>", "", "missing 'Total Trades'"),
+        (
+            "<tr><td>Total transactions (buy/sell)</td><td>0</td></tr>",
+            "",
+            "missing 'Total transactions",
+        ),
+        (
+            "<tr><td>Total Trades</td><td>0</td></tr>",
+            "<tr><td>Total Trades</td><td>3</td></tr>",
+            "non-zero 'Total Trades'",
+        ),
+        # Z1: corroboration — present and contradictory is fatal.
+        (
+            "<tr><td>Total fees</td><td>0.00</td></tr>",
+            "<tr><td>Total fees</td><td>0.20</td></tr>",
+            "non-zero 'Total fees'",
+        ),
+        ("<tr><td>Final balance</td><td>1000</td></tr>", "<tr><td>Final balance</td><td>1005</td></tr>", "changes balance"),
+        # Z1: a run with no trades cannot have computed these.
+        (
+            "<tr><td>Sharpe ratio (monthly)</td><td>n/a</td></tr>",
+            "<tr><td>Sharpe ratio (monthly)</td><td>1.4</td></tr>",
+            "computes 'Sharpe ratio",
+        ),
+        # Z3: without a window there is nothing to derive the interval from.
+        ("<tr><td>Report range</td><td>2026-01-01 - 2026-01-09</td></tr>", "", "missing 'Report range'"),
+    ],
+)
+def test_zero_activity_report_needs_every_criterion(old: str, new: str, message: str) -> None:
+    """Each Z1 criterion is pinned by a report that violates only it.
+
+    Absence of data is never evidence of emptiness — a truncated report has no
+    data either — so every one of these must keep the report out.
+    """
+    source = ZERO_ACTIVITY.read_text(encoding="utf-8")
+    assert old in source
+    with pytest.raises(PerformanceParseError, match=message):
+        parse_performance_report(source.replace(old, new).encode("utf-8"), allow_zero_activity=True)
+
+
+def test_zero_activity_flag_does_not_admit_a_missing_series_assignment() -> None:
+    """Z2: only an explicitly empty array is a claim; a missing one is a defect."""
+    source = ZERO_ACTIVITY.read_text(encoding="utf-8").replace("const walletSeries = [];", "")
+    with pytest.raises(PerformanceParseError, match="exactly one walletSeries assignment"):
+        parse_performance_report(source.encode("utf-8"), allow_zero_activity=True)
+
+
+def test_zero_activity_flag_does_not_admit_trades_without_samples() -> None:
+    """Z2: zero must be zero everywhere at once.
+
+    A report with actions but no samples is not a run in which nothing
+    happened; it is a run whose samples did not render.
+    """
+    source = ZERO_ACTIVITY.read_text(encoding="utf-8").replace(
+        "</tbody></table>\n<script>",
+        "<tr><td>2026-01-02T01:00:00Z</td><td>ONUSDT</td><td>1</td><td>closed</td>"
+        "<td>0</td><td>0</td><td>1000</td><td>1</td><td>0</td><td></td></tr>\n</tbody></table>\n<script>",
+    )
+    with pytest.raises(
+        PerformanceParseError, match="must be non-empty for a report with actions"
+    ):
+        parse_performance_report(source.encode("utf-8"), allow_zero_activity=True)

@@ -1863,3 +1863,57 @@ def test_verify_published_identity_parallel_rejects_a_non_positive_chunk_size(
     storage.create_v6_database(target)
     with pytest.raises(ValueError, match="chunk_size must be positive"):
         storage.verify_published_identity_parallel(target, workers=2, chunk_size=0)
+
+
+def _zero_activity_fragment():
+    return normalize_source_v6(
+        (FIXTURE.parent / "source_v6_zero_activity.html").read_bytes(),
+        source_name="zero.html",
+    )
+
+
+def test_day_ownership_labels_an_empty_fragment_and_still_owns_its_days(
+    tmp_path: Path,
+) -> None:
+    """Z4: a tested window with no trades is coverage, and is marked as such.
+
+    Both halves matter. The days must be owned — withholding them would leave a
+    permanent artificial gap for a window that was actually tested — and they
+    must be distinguishable, or a consumer reads an empty window as traded data.
+    """
+    empty = _zero_activity_fragment()
+    target = tmp_path / "empty.source-v6.duckdb"
+    storage.create_v6_database(target)
+    storage.import_fragment(target, empty, preflight_token=storage.preflight_import(target, empty))
+
+    connection = duckdb.connect(str(target), read_only=True)
+    try:
+        rows = connection.execute(
+            "select ownership, count(*) from day_ownership group by ownership"
+        ).fetchall()
+    finally:
+        connection.close()
+    # 2026-01-01 to 2026-01-09 half-open is eight owned days, all marked empty.
+    assert rows == [("ACTIVE_EMPTY", 8)]
+
+
+def test_day_ownership_labels_a_normal_fragment_active(tmp_path: Path) -> None:
+    """Z4's other side: a fragment with facts keeps `ACTIVE`.
+
+    Without this the labelling could invert and the test above would not know.
+    """
+    fragment = _fragment()
+    target = tmp_path / "normal.source-v6.duckdb"
+    storage.create_v6_database(target)
+    storage.import_fragment(
+        target, fragment, preflight_token=storage.preflight_import(target, fragment)
+    )
+
+    connection = duckdb.connect(str(target), read_only=True)
+    try:
+        rows = connection.execute(
+            "select distinct ownership from day_ownership"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [("ACTIVE",)]

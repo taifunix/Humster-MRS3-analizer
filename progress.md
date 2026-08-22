@@ -83,8 +83,8 @@ closed on metadata-only fragments.
 
 Verification for all of the above, including C9:
 `.venv\Scripts\python.exe -m pytest -q` — **1341 passed, 2 skipped** through
-defect 8, **1346 passed, 2 skipped** with defect 9, and **1347 passed,
-2 skipped** with C10 (ADR-0015).
+defect 8, **1346 passed, 2 skipped** with defect 9, **1347 passed, 2 skipped**
+with C10 (ADR-0015), and **1363 passed, 2 skipped** with ADR-0016.
 
 ## Merge of the two real corpora (2026-08-22)
 
@@ -132,17 +132,37 @@ Downloaded to `data/databases/`; byte size matches. The server-side original is
 untouched. This run predates defects 7 and 8 above, so re-importing on the
 fixed runner should be materially faster.
 
+## Zero-activity runs are imported (2026-08-22)
+
+Contract: [zero-activity spec](docs/specs/2026-08-22-source-v6-zero-activity-runs.md),
+[ADR-0016](docs/decisions/0016-source-v6-zero-activity-runs.md).
+
+The 144 `walletSeries`-empty quarantines of `my_test_CX_GE_fixed` were complete
+reports of runs in which no trade occurred, not defects. They are now admitted,
+but only on affirmative evidence: `Total Trades` and `Total transactions
+(buy/sell)` present and zero, corroborating metrics consistent where present,
+and the seven undefined ratios as the literal `n/a`. Absence of data is never
+accepted as evidence of emptiness, because a truncated report has none either.
+Opt-in per caller; only `normalize_source_v6` opts in, so ADR-0006's DD5
+candidate contract is untouched.
+
+Two defects were found by review and reproduced against the repository's own
+fixtures before being fixed. A zero-activity outgoing fragment triggered
+ADR-0013 seam exclusion and deleted the incoming fragment's only cycle while
+reporting the batch `COMMITTED` — seam exclusion de-duplicates, and an empty
+fragment has nothing to de-duplicate. And for an identical window the empty
+fragment took ownership by `fragment_id` sort order, flagging the fragment with
+four real actions as `AMBIGUOUS_INCOMING`. A third was found by the tests
+themselves: a report with actions but empty series was admitted, which is not a
+run where nothing happened but one whose samples did not render.
+
+The 145th quarantine, an optimizer summary page, still fails. Re-importing the
+CX_GE corpus is required to gain the 144 points; nothing is migrated.
+
 ## Next
 
-1. Decide whether zero-trade runs are valid Source v6 fragments. The 145
-   `my_test_CX_GE_fixed` quarantines were inspected on the server and are not
-   defective reports: the tester emits `const walletSeries = [];` and
-   `const equitySeries = [];` for a shift window in which no trade occurred.
-   The importer rejects that as a parse failure, which holds `safe_to_delete`
-   at `NO` for the whole corpus and so blocks raw-HTML deletion. Accepting them
-   needs a contract for what a fragment with no samples means for
-   `report_start_ms`/`report_end_ms`, `day_ownership` and coverage, so it is a
-   spec, not a patch. Re-importing that corpus is not required for correctness.
+1. Re-import `my_test_CX_GE_fixed` to pick up the 144 zero-activity runs and
+   confirm `safe_to_delete` is no longer held at `NO` by them.
 2. Close the same published-file gap on the import path. ADR-0015 scoped
    itself to the merge deliberately: `_publish_segments_single_pass` verifies
    its reduce target and then publishes a repack that receives neither the C3a

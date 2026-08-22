@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 import json
@@ -149,7 +150,7 @@ def _tables(document: object) -> tuple[dict[str, str], tuple[dict[str, str], ...
     return metrics, actions, metric_headers, trade_headers
 
 
-def _raw_series_timestamps(source: str, name: str) -> tuple[datetime, ...]:
+def _raw_series_timestamps(source: str, name: str, *, allow_empty: bool = False) -> tuple[datetime, ...]:
     assignments = list(re.finditer(rf"\b(?:const|let|var)\s+{name}\s*=\s*", source))
     if len(assignments) != 1:
         raise PerformanceParseError(f"exactly one {name} assignment is required")
@@ -157,8 +158,14 @@ def _raw_series_timestamps(source: str, name: str) -> tuple[datetime, ...]:
         raw = json.JSONDecoder().raw_decode(source[assignments[0].end():])[0]
     except json.JSONDecodeError as error:
         raise PerformanceParseError(f"malformed {name} array") from error
-    if not isinstance(raw, list) or not raw:
+    if not isinstance(raw, list):
         raise PerformanceParseError(f"{name} must be non-empty")
+    if not raw:
+        # Z2: an explicitly empty array is a claim, not an absence. The caller
+        # decides whether to honour it; a missing assignment stays fatal above.
+        if not allow_empty:
+            raise PerformanceParseError(f"{name} must be non-empty")
+        return ()
     timestamps: list[datetime] = []
     previous: int | None = None
     for point in raw:
@@ -171,7 +178,7 @@ def _raw_series_timestamps(source: str, name: str) -> tuple[datetime, ...]:
     return tuple(timestamps)
 
 
-def _series(source: str, name: str) -> tuple[tuple[int, Decimal], ...]:
+def _series(source: str, name: str, *, allow_empty: bool = False) -> tuple[tuple[int, Decimal], ...]:
     assignments = list(re.finditer(rf"\b(?:const|let|var)\s+{name}\s*=\s*", source))
     if len(assignments) != 1:
         raise PerformanceParseError(f"exactly one {name} assignment is required")
@@ -179,8 +186,14 @@ def _series(source: str, name: str) -> tuple[tuple[int, Decimal], ...]:
         raw = json.JSONDecoder().raw_decode(source[assignments[0].end():])[0]
     except json.JSONDecodeError as error:
         raise PerformanceParseError(f"malformed {name} array") from error
-    if not isinstance(raw, list) or not raw:
+    if not isinstance(raw, list):
         raise PerformanceParseError(f"{name} must be non-empty")
+    if not raw:
+        # Z2: an explicitly empty array is a claim, not an absence. The caller
+        # decides whether to honour it; a missing assignment stays fatal above.
+        if not allow_empty:
+            raise PerformanceParseError(f"{name} must be non-empty")
+        return ()
     result: list[tuple[int, Decimal]] = []
     previous: int | None = None
     for point in raw:
@@ -265,7 +278,7 @@ def _stdlib_raw_markup(source: str) -> _RawMarkup:
 _raw_markup = _stdlib_raw_markup
 
 
-def _raw_inventory(source: str) -> _RawInventory:
+def _raw_inventory(source: str, *, allow_empty: bool = False) -> _RawInventory:
     pre_text, raw_tables = _raw_markup(source)
     settings_count = 0
     for raw in pre_text:
@@ -323,26 +336,130 @@ def _raw_inventory(source: str) -> _RawInventory:
         trade_headers,
         trade_count,
         action_timestamps,
-        _raw_series_timestamps(source, "walletSeries"),
-        _raw_series_timestamps(source, "equitySeries"),
+        _raw_series_timestamps(source, "walletSeries", allow_empty=allow_empty),
+        _raw_series_timestamps(source, "equitySeries", allow_empty=allow_empty),
     )
 
 
-def parse_performance_report(source: bytes) -> ParsedPerformanceReport:
+# Z1: counters that directly contradict emptiness. Absent is a failure — a
+# report that does not say how many trades it had has declared nothing.
+_REQUIRED_ZERO_COUNTS = ("Total Trades", "Total transactions (buy/sell)")
+# Corroboration. Absent is tolerated so a tester rename does not break the
+# importer; present and non-zero is fatal.
+_CORROBORATING_ZEROS = (
+    "Win Trades", "Los Trades", "Total PnL", "Gross profit", "Gross loss",
+    "Trading volume (USDT)", "Total fees", "Max Drawdown",
+)
+_EQUAL_BALANCES = ("Initial balance", "Final balance", "Min balance", "Max balance")
+# Ratios whose denominator is zero without trades. This is the strongest single
+# signal: a report whose series merely failed to render would still carry
+# computed values here. ADR-0006 already fixed `n/a` as preserved meaning.
+_UNDEFINED_RATIOS = (
+    "Expectancy per trade",
+    "Profit Factor (gross profit/gross loss)",
+    "Risk/Reward (avg win/avg loss)",
+    "Recovery Factor (Total PnL / Max DD)",
+    "Sharpe ratio (monthly)",
+    "Sortino ratio (monthly)",
+    "Calmar ratio (CAGR / Max DD%)",
+)
+
+
+def report_range(metrics: Mapping[str, str]) -> tuple[datetime, datetime]:
+    """Parse the `Report range` header into a half-open UTC day interval.
+
+    The single parser for this header. `source_v6._report_period` builds its
+    millisecond interval on top of it, so the window a fragment claims and the
+    window this report describes can never drift apart.
+    """
+    raw = metrics.get("Report range")
+    if not raw or " - " not in raw:
+        raise PerformanceParseError("report is missing 'Report range'")
+    start_text, end_text = (part.strip() for part in raw.split(" - ", 1))
+    try:
+        start = datetime.combine(date.fromisoformat(start_text), time.min, tzinfo=timezone.utc)
+        end = datetime.combine(date.fromisoformat(end_text), time.min, tzinfo=timezone.utc)
+    except ValueError as error:
+        raise PerformanceParseError(f"invalid report range: {raw!r}") from error
+    if end <= start:
+        raise PerformanceParseError("report range end must be after start")
+    return start, end
+
+
+def _zero(value: str) -> bool:
+    try:
+        return Decimal(value.strip()) == 0
+    except (InvalidOperation, AttributeError):
+        return False
+
+
+def _assert_declared_empty(metrics: Mapping[str, str]) -> None:
+    """Require the report to state that nothing happened (ADR-0016, Z1).
+
+    Absence of data is never accepted as evidence of emptiness: a truncated or
+    corrupt report has no data either. Only an affirmative, mutually consistent
+    declaration is.
+    """
+    for name in _REQUIRED_ZERO_COUNTS:
+        if name not in metrics:
+            raise PerformanceParseError(f"zero-activity report is missing '{name}'")
+        if not _zero(metrics[name]):
+            raise PerformanceParseError(f"zero-activity report reports a non-zero '{name}'")
+    for name in _CORROBORATING_ZEROS:
+        if name in metrics and not _zero(metrics[name]):
+            raise PerformanceParseError(f"zero-activity report reports a non-zero '{name}'")
+    balances = []
+    for name in _EQUAL_BALANCES:
+        if name not in metrics:
+            continue
+        try:
+            value = Decimal(metrics[name].strip())
+        except InvalidOperation as error:
+            raise PerformanceParseError(f"zero-activity report has a malformed '{name}'") from error
+        # `Decimal("nan") != Decimal("nan")`, so a NaN balance would otherwise
+        # survive as a set of distinct members and be reported as a *changed*
+        # balance — rejected, but diagnosed as the wrong defect.
+        if not value.is_finite():
+            raise PerformanceParseError(f"zero-activity report has a malformed '{name}'")
+        balances.append(value)
+    if len(set(balances)) > 1:
+        raise PerformanceParseError("zero-activity report changes balance")
+    for name in _UNDEFINED_RATIOS:
+        if name in metrics and metrics[name].strip() != "n/a":
+            raise PerformanceParseError(f"zero-activity report computes '{name}'")
+
+
+def parse_performance_report(
+    source: bytes, *, allow_zero_activity: bool = False
+) -> ParsedPerformanceReport:
+    """Parse one tester report into settings, metrics, actions and series.
+
+    `allow_zero_activity` admits a run in which nothing happened — see ADR-0016
+    and the Z1 criteria. It is opt-in because the v1 performance store derives
+    DD5 candidates from this parser under ADR-0006, and admitting empty runs
+    there would change that contract as a side effect. Only
+    `normalize_source_v6` opts in.
+    """
     if not isinstance(source, bytes):
         raise PerformanceParseError("source must be bytes")
     try:
         decoded = source.decode("utf-8", errors="strict")
-        raw = _raw_inventory(decoded)
+        raw = _raw_inventory(decoded, allow_empty=allow_zero_activity)
         document = html.fromstring(decoded)
     except (UnicodeDecodeError, etree.ParserError) as error:
         raise PerformanceParseError("malformed UTF-8 or HTML") from error
     settings = _settings(document)
     metrics, actions, metric_headers, trade_headers = _tables(document)
-    wallet = _series(decoded, "walletSeries")
-    equity = _series(decoded, "equitySeries")
+    wallet = _series(decoded, "walletSeries", allow_empty=allow_zero_activity)
+    equity = _series(decoded, "equitySeries", allow_empty=allow_zero_activity)
     if len(wallet) != len(equity):
         raise PerformanceParseError("wallet/equity sample counts must match")
+    if allow_zero_activity and not wallet and not equity and actions:
+        # Z2: zero has to be zero everywhere at once. Actions with no samples
+        # is not a run in which nothing happened — it is a run whose samples
+        # did not render, and the relaxation must not launder that into a
+        # fragment with trades it cannot place in time.
+        raise PerformanceParseError("walletSeries must be non-empty for a report with actions")
     action_times = tuple(_timestamp(row["Timestamp"]) for row in actions)
     wallet_times = tuple(_epoch_timestamp(point[0]) for point in wallet)
     equity_times = tuple(_epoch_timestamp(point[0]) for point in equity)
@@ -362,6 +479,15 @@ def parse_performance_report(source: bytes) -> ParsedPerformanceReport:
     ):
         raise PerformanceParseError("semantic output does not match raw HTML inventory")
     all_times = action_times + wallet_times + equity_times
+    if not all_times:
+        # Z1/Z2: nothing observed at all. Emptiness has to be declared by the
+        # report before it is believed, because a truncated file looks the same.
+        if not (allow_zero_activity and not actions and not wallet and not equity):
+            raise PerformanceParseError("report contains no actions or samples")
+        _assert_declared_empty(metrics)
+        # Z3: the window comes from the header. A sentinel such as the epoch
+        # would propagate into interval comparisons, sorting and `test_run_id`.
+        all_times = report_range(metrics)
     inventory = PerformanceInventory(
         metric_count=len(metrics),
         metric_headers=metric_headers,

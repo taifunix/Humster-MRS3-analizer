@@ -1076,8 +1076,20 @@ _ORIGIN_INSERT = (
     "_publish_origins",
     ("fragment_id", "source_sha256", "source_name", "database_id"),
 )
+# Z4: the label is derived from the stored fact counts rather than passed in,
+# so it cannot disagree with the fragment it describes and no producer has to
+# carry it. Both writers insert `compact_fragments` before these rows, which
+# `test_day_ownership_labels_*` pins — a reordering would silently drop days
+# through this join rather than mislabel them.
+_DAY_OWNERSHIP_LABEL = (
+    "case when fragments.action_count = 0 and fragments.cycle_count = 0 "
+    "and fragments.event_count = 0 and fragments.wallet_sample_count = 0 "
+    "and fragments.equity_sample_count = 0 then 'ACTIVE_EMPTY' else 'ACTIVE' end"
+)
 _DAY_INSERT = (
-    "insert into day_ownership select fragment_id, day, 'ACTIVE', true, null, null from _publish_days",
+    "insert into day_ownership select days.fragment_id, days.day, "
+    f"{_DAY_OWNERSHIP_LABEL}, true, null, null from _publish_days days "
+    "join compact_fragments fragments on fragments.fragment_id = days.fragment_id",
     "_publish_days",
     ("fragment_id", "day"),
 )
@@ -1092,6 +1104,19 @@ _AUDIT_INSERT = (
         "quarantine_count", "reason",
     ),
 )
+
+
+def _day_ownership_label(fragment: SourceV6Fragment) -> str:
+    """`ACTIVE_EMPTY` for a fragment with no facts at all (ADR-0016, Z4).
+
+    A window that was tested and produced nothing is genuine coverage, so the
+    days are owned; it is labelled so no consumer can read it as traded data.
+    """
+    if fragment.actions or fragment.cycles or fragment.events:
+        return "ACTIVE"
+    if fragment.wallet_samples or fragment.equity_samples:
+        return "ACTIVE"
+    return "ACTIVE_EMPTY"
 
 
 def _publish_metadata_rows(
@@ -1463,8 +1488,9 @@ def import_fragment_batch(path: str | Path, items: Iterable[tuple[SourceV6Fragme
             origin_rows.append((fragment.fragment_id, fragment.source_sha256, fragment.source_name, database_id))
             day = datetime.fromtimestamp(fragment.report_start_ms / 1000, timezone.utc).date()
             end = datetime.fromtimestamp(fragment.report_end_ms / 1000, timezone.utc).date()
+            label = _day_ownership_label(fragment)
             while day < end:
-                day_rows.append((fragment.fragment_id, day))
+                day_rows.append((fragment.fragment_id, day, label))
                 day += timedelta(days=1)
             generation += 1
             receipts.append(ImportReceipt("COMMITTED", fragment.fragment_id, database_id, generation, "YES", True, 0))
@@ -1476,7 +1502,7 @@ def import_fragment_batch(path: str | Path, items: Iterable[tuple[SourceV6Fragme
             )
             connection.executemany("insert into fragment_origins values (?, ?, ?, ?)", origin_rows)
             if day_rows:
-                connection.executemany("insert into day_ownership values (?, ?, 'ACTIVE', true, null, null)", day_rows)
+                connection.executemany("insert into day_ownership values (?, ?, ?, true, null, null)", day_rows)
             connection.executemany("insert into import_audit values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", audit_rows)
             _verify_published_identity(connection)
         connection.execute("update schema_info set value = ? where key = 'mutation_generation'", [str(generation)])
@@ -1531,7 +1557,10 @@ def import_fragment(path: str | Path, fragment: SourceV6Fragment, *, preflight_t
         day = datetime.fromtimestamp(fragment.report_start_ms / 1000, timezone.utc).date()
         end = datetime.fromtimestamp(fragment.report_end_ms / 1000, timezone.utc).date()
         while day < end:
-            connection.execute("insert into day_ownership values (?, ?, 'ACTIVE', true, null, null)", [fragment.fragment_id, day])
+            connection.execute(
+                "insert into day_ownership values (?, ?, ?, true, null, null)",
+                [fragment.fragment_id, day, _day_ownership_label(fragment)],
+            )
             day += timedelta(days=1)
         restored = _row_fragment(_select_row(connection, fragment.fragment_id))
         if restored != fragment:

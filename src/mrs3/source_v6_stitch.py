@@ -102,6 +102,24 @@ def _seam_cycle_sets(outgoing: SourceV6Fragment, incoming: SourceV6Fragment) -> 
     return excluded, retained, old_open
 
 
+def _carries_facts(fragment: object) -> bool:
+    """Whether this fragment holds any fact at all (ADR-0016, Z5).
+
+    `resolve_batch` accepts `SourceV6FragmentMetadata` as well as decoded
+    fragments — the merge passes metadata for a single-member group and decodes
+    only when a group has more than one. Metadata carries no fact collections,
+    so emptiness cannot be determined from it; that case answers `True`, which
+    is the behaviour that predates this rule. It is never the deciding answer:
+    both places the rule changes an outcome — the seam in `resolve_ownership`
+    and the tie-break below — are reached only with two or more members, and the
+    merge has decoded by then.
+    """
+    actions = getattr(fragment, "actions", None)
+    if actions is None:
+        return True
+    return bool(actions or fragment.cycles or fragment.events)
+
+
 def resolve_ownership(outgoing: SourceV6Fragment, incoming: SourceV6Fragment, *, min_overlap_hours: int = MIN_OVERLAP_HOURS) -> Ownership:
     if outgoing.point != incoming.point:
         return Ownership(incoming.fragment_id, incoming.report_start_ms, Decimal("0"), "UNRESOLVED", "INCOMPATIBLE_POINT")
@@ -117,6 +135,19 @@ def resolve_ownership(outgoing: SourceV6Fragment, incoming: SourceV6Fragment, *,
         return Ownership(incoming.fragment_id, incoming.report_start_ms, overlap_hours, "UNRESOLVED", "OVERLAP_BELOW_MINIMUM")
     if overlap_end <= overlap_start:
         return Ownership(incoming.fragment_id, incoming.report_start_ms, overlap_hours, "UNRESOLVED", "NO_OVERLAP")
+    if not _carries_facts(outgoing):
+        # ADR-0016 Z5. Seam exclusion exists to stop the same fact being counted
+        # twice: ADR-0013 measured 1,121 matching closed cycles across 681
+        # overlapping pairs, and gives the overlap to the old report because it
+        # already carries them. A zero-activity outgoing carries nothing, so the
+        # premise is absent and excluding the incoming's overlap cycles would
+        # delete evidence that nothing replaces — silently, under a COMMITTED
+        # batch. Hand over at the incoming's own start instead, which is the
+        # existing non-seam rule and keeps every incoming fact.
+        return Ownership(
+            incoming.fragment_id, incoming.report_start_ms, overlap_hours,
+            "RESOLVED", "EMPTY_OUTGOING_NOTHING_TO_EXCLUDE",
+        )
     return Ownership(incoming.fragment_id, outgoing.report_end_ms, overlap_hours, "USE_OLD_WITH_SEAM_EXCLUSION", "INCOMPLETE_SEAM_CYCLE_EXCLUDED", outgoing.report_end_ms)
 
 
@@ -124,7 +155,23 @@ def resolve_batch(fragments: Sequence[SourceV6Fragment], *, min_overlap_hours: i
     unique: dict[str, SourceV6Fragment] = {}
     for fragment in fragments:
         unique.setdefault(fragment.fragment_id, fragment)
-    ordered = tuple(sorted(unique.values(), key=lambda fragment: (fragment.report_start_ms, fragment.fragment_id)))
+    # ADR-0016 Z5: the middle term only breaks ties between fragments sharing a
+    # start, and only when one of them has no facts. `active` is seeded with
+    # `ordered[0]`, so without it an empty fragment could take a window from a
+    # fragment carrying real actions purely because its id sorted lower, and the
+    # fragment with the data would be the one reported `AMBIGUOUS_INCOMING`.
+    # Among fragments that all carry facts the term is constant and the order is
+    # unchanged.
+    ordered = tuple(
+        sorted(
+            unique.values(),
+            key=lambda fragment: (
+                fragment.report_start_ms,
+                not _carries_facts(fragment),
+                fragment.fragment_id,
+            ),
+        )
+    )
     if not ordered:
         raise SourceV6StitchError("at least one fragment is required")
     active = [ordered[0]]

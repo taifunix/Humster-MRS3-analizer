@@ -462,3 +462,40 @@ def test_merge_verifies_the_file_it_publishes_not_the_intermediate(
 
     assert not target.exists()
     assert not list(tmp_path.glob(f".{target.name}.*.staging*"))
+
+
+def test_merge_labels_empty_and_normal_days_through_the_published_insert(
+    tmp_path: Path,
+) -> None:
+    """Z4 on the production writer, which derives the label in SQL.
+
+    `import_fragment` computes the label in Python and is orphaned; the merge
+    and the importer go through `_DAY_INSERT`, which joins the day rows to the
+    stored fact counts. Merging one empty and one normal fragment pins that
+    join: a broken one either mislabels or, because it is an inner join, drops
+    the days entirely.
+    """
+    normal, _ = _fragments()
+    empty = normalize_source_v6(
+        (FIXTURES / "source_v6_zero_activity.html").read_bytes(), source_name="zero.html"
+    )
+    inputs = []
+    for name, fragment in (("normal", normal), ("empty", empty)):
+        path = tmp_path / f"in-{name}.source-v6.duckdb"
+        _db(path, fragment, f"in-{name}")
+        inputs.append(path)
+    target = tmp_path / "labelled.source-v6.duckdb"
+    merge_source_v6(inputs, target)
+
+    connection = duckdb.connect(str(target), read_only=True)
+    try:
+        rows = connection.execute(
+            "select ownership, count(*) from day_ownership group by ownership order by ownership"
+        ).fetchall()
+        owners = connection.execute(
+            "select count(distinct fragment_id) from day_ownership"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert dict(rows) == {"ACTIVE": 8, "ACTIVE_EMPTY": 8}
+    assert owners == 2

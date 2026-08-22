@@ -1194,3 +1194,69 @@ def test_task2_v6_analysis_revalidates_surface_from_fresh_snapshot_before_commit
     monkeypatch.setattr(pipeline_module, "_analyze_points", mutate_then_analyze)
     with pytest.raises(Exception, match="SURFACE_CHANGED"):
         run_source_v6_analysis(surface, selected, AlgorithmConfig.defaults(), algorithm_version="0.7-canonical-phase1", listing_dates=snapshot, listing_dates_sha256=snapshot_hash)
+
+
+def test_an_empty_outgoing_fragment_does_not_exclude_incoming_facts() -> None:
+    """Z5: seam exclusion de-duplicates; there is nothing to de-duplicate here.
+
+    ADR-0013 excludes an incoming overlap cycle because the outgoing report
+    already carries the same fact — "both report windows cannot contribute the
+    same overlap facts". A zero-activity outgoing carries no fact at all, so
+    excluding the incoming's cycle deletes evidence that nothing replaces, and
+    the batch would report `COMMITTED` while doing it.
+    """
+    from mrs3.source_v6 import normalize_source_v6
+    from mrs3.source_v6_stitch import resolve_batch, resolve_ownership
+
+    empty = normalize_source_v6(
+        (_FIXTURES / "source_v6_zero_activity.html").read_bytes(), source_name="zero.html"
+    )
+    incoming = normalize_source_v6(
+        (_FIXTURES / "source_v6_fixed_lot_overlap_b.html").read_bytes(), source_name="b.html"
+    )
+    # The premise of the test: same contract, real overlap, and the incoming
+    # cycle opens inside it — the exact shape that triggers seam exclusion.
+    assert empty.point == incoming.point
+    assert empty.settings_fingerprint == incoming.settings_fingerprint
+    assert (empty.actions, empty.cycles, empty.events) == ((), (), ())
+    assert any(cycle.open_timestamp_ms < empty.report_end_ms for cycle in incoming.cycles)
+
+    decision = resolve_ownership(empty, incoming)
+    assert decision.status == "RESOLVED"
+    assert decision.reason == "EMPTY_OUTGOING_NOTHING_TO_EXCLUDE"
+    assert decision.boundary_ms is None
+
+    resolution = resolve_batch((empty, incoming))
+    assert resolution.status == "COMMITTED"
+    assert {fragment.source_name for fragment in resolution.active_fragments} == {
+        "zero.html",
+        "b.html",
+    }
+
+
+def test_an_empty_fragment_never_wins_an_identical_window_by_hash_order() -> None:
+    """Z5: a tie-break must not hand a tested window to the fragment with no facts.
+
+    `resolve_batch` seeds `active` with the first fragment by
+    `(report_start_ms, fragment_id)`. With identical windows that is decided by
+    hash order, so an empty fragment could take the window and the fragment
+    carrying real actions could be the one reported `AMBIGUOUS_INCOMING`.
+    """
+    from mrs3.source_v6 import normalize_source_v6
+    from mrs3.source_v6_stitch import resolve_batch
+
+    empty = normalize_source_v6(
+        (_FIXTURES / "source_v6_zero_activity.html").read_bytes(), source_name="zero.html"
+    )
+    real = normalize_source_v6(
+        (_FIXTURES / "source_v6_fixed_lot_overlap_a.html").read_bytes(), source_name="a.html"
+    )
+    assert (empty.report_start_ms, empty.report_end_ms) == (real.report_start_ms, real.report_end_ms)
+    assert real.actions and not empty.actions
+
+    for order in ((empty, real), (real, empty)):
+        resolution = resolve_batch(order)
+        # The contradiction is still surfaced rather than resolved silently.
+        assert resolution.status == "PARTIAL"
+        # But the window belongs to the fragment that observed something.
+        assert [fragment.source_name for fragment in resolution.active_fragments] == ["a.html"]

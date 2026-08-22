@@ -8,7 +8,7 @@ in later stages and must not re-parse HTML.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from hashlib import sha256
 import json
@@ -17,7 +17,12 @@ import zlib
 from collections import defaultdict
 from typing import Mapping
 
-from .performance import ParsedPerformanceReport, parse_performance_report
+from .performance import (
+    ParsedPerformanceReport,
+    PerformanceParseError,
+    parse_performance_report,
+    report_range,
+)
 
 
 SOURCE_V6_SCHEMA_VERSION = 1
@@ -479,17 +484,15 @@ def decode_fragment(payload: bytes, *, codec: str = "json+zlib-v1:9", expected_f
 
 
 def _report_period(metrics: Mapping[str, str]) -> tuple[int, int]:
-    raw = metrics.get("Report range")
-    if not raw or " - " not in raw:
-        raise SourceV6Error("report header is missing 'Report range'")
-    start_text, end_text = (part.strip() for part in raw.split(" - ", 1))
+    """Millisecond half-open period from the report header.
+
+    Delegates the parse so this and `PerformanceInventory` cannot disagree
+    about the window: the same header is the only source for both.
+    """
     try:
-        start = datetime.combine(date.fromisoformat(start_text), time.min, tzinfo=timezone.utc)
-        end = datetime.combine(date.fromisoformat(end_text), time.min, tzinfo=timezone.utc)
-    except ValueError as error:
-        raise SourceV6Error(f"invalid report range: {raw!r}") from error
-    if end <= start:
-        raise SourceV6Error("report range end must be after start")
+        start, end = report_range(metrics)
+    except PerformanceParseError as error:
+        raise SourceV6Error(str(error)) from error
     return _timestamp_ms(start), _timestamp_ms(end)
 
 
@@ -592,7 +595,9 @@ def _normalize_with_canonical(source: bytes, *, source_name: str = "") -> tuple[
         raise SourceV6Error("source must be bytes")
     source_hash = sha256(source).hexdigest()
     try:
-        report = parse_performance_report(source)
+        # ADR-0016: the v6 importer is the only caller that admits a run with
+        # no trades. The v1 performance store keeps rejecting them.
+        report = parse_performance_report(source, allow_zero_activity=True)
         point = _point(report.settings)
         report_start_ms, report_end_ms = _effective_report_period(report)
         action_timestamps = tuple(_timestamp_ms(_timestamp(row["Timestamp"])) for row in report.actions)
