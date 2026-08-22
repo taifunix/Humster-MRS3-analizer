@@ -128,3 +128,17 @@ def test_settings_semantic_ids_and_static_js_use_v2_testing_endpoints() -> None:
     assert "let jobTarget = ''" in js
     assert "algorithm_version: document.querySelector('#settings-algorithm')" in js
     assert "fetch('/api/v2/settings/reload')" in js
+
+
+def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    for button_id in ("local-paths-save", "remote-paths-save"):
+        assert f'id="{button_id}"' in html
+    assert "savePathDefaults" in js
+    for path_key in ("local_reports_root", "local_source_db_root", "remote_import_html_root", "local_merge_target"):
+        assert path_key in js
+    assert "['settings-local-runner', 'local_runner_root']" in js
+    assert js.index("updateRemoteTarget();") < js.index("['source-remote-html', 'remote_import_html_root']")
+    assert "/api/v2/settings/save" in js

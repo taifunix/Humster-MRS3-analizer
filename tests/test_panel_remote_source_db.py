@@ -164,6 +164,7 @@ def test_executor_builds_argv_safe_script_and_redacted_document(tmp_path: Path) 
     script = calls[0][-1]
     assert "mkdir -p" in script
     assert "scripts/import-source-v6-debian.sh" in script
+    assert 'if ! sh "$importer" "$html" "$target"' in script
     assert "import_source_v6_debian.py" not in script
     assert "sha256sum" in script and "wc -c" in script
     assert "TARGET_EXISTS" in script
@@ -250,6 +251,7 @@ def test_remote_import_start_returns_redacted_running_identity_and_fixed_script(
     script = calls[0][-1]
     assert "mkdir -p" in script and "nohup" in script
     assert "scripts/import-source-v6-debian.sh" in script
+    assert 'nohup sh "$importer" "$html" "$target"' in script
     assert "TARGET_EXISTS" in script
     assert "pid" in script and "import.log" in script
     encoded = json.dumps(document)

@@ -45,6 +45,12 @@ _PATH_KEYS = frozenset(
         "remote_source_db_root",
         "remote_surface_root",
         "remote_analysis_db_root",
+        "local_merge_source_a",
+        "local_merge_source_b",
+        "local_merge_target",
+        "remote_import_html_root",
+        "remote_import_staging_path",
+        "remote_import_target_path",
         "source_db_root",
         "surface_root",
         "analysis_db_root",
@@ -274,6 +280,33 @@ def _current_panel(path: Path, root: Path) -> tuple[dict[str, Any], dict[str, An
     return document, normalised, text
 
 
+def _sync_runtime_paths(document: dict[str, Any], paths: Mapping[str, str]) -> None:
+    local = document.get("tester_runner")
+    if isinstance(local, Mapping):
+        updated = dict(local)
+        for source, target in {
+            "local_bot_root": "bot_root",
+            "local_runner_root": "strategy_dir",
+            "local_reports_root": "report_dir",
+            "local_output_root": "inbox_root",
+        }.items():
+            if source in paths:
+                updated[target] = paths[source]
+        document["tester_runner"] = updated
+    remote = document.get("remote_runner")
+    if isinstance(remote, Mapping):
+        updated = dict(remote)
+        for source, target in {
+            "remote_bot_root": "bot_root",
+            "remote_runner_root": "debian_runner_root",
+            "remote_reports_root": "reports_root",
+            "remote_reports_archive_root": "reports_archive_root",
+        }.items():
+            if source in paths:
+                updated[target] = paths[source]
+        document["remote_runner"] = updated
+
+
 def _merge_panel(path: Path, root: Path, payload: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any], str | None]:
     document, current, text = _current_panel(path, root)
     submitted = _payload_panel(payload)
@@ -286,6 +319,7 @@ def _merge_panel(path: Path, root: Path, payload: Mapping[str, Any]) -> tuple[di
     panel = _normalise_panel(merged, root)
     result = dict(document)
     result["panel"] = panel
+    _sync_runtime_paths(result, panel["path_defaults"])
     operational = _operational_payload(payload)
     if operational is not None:
         local = dict(result.get("tester_runner", {})); remote = dict(result.get("remote_runner", {}))

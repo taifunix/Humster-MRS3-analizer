@@ -199,6 +199,39 @@ def test_save_preserves_unknown_keys_formats_and_prior_backup_and_reload_persist
     assert PanelController(root, config).panel_default_root() == "static"
 
 
+def test_save_path_defaults_updates_local_and_remote_runtime_paths(panel_http) -> None:
+    _, config, connection = panel_http
+    document = _runner_config()
+    document["remote_runner"] = {
+        "host": "runner.example.test", "user": "tester", "bot_root": "/old/bot",
+        "debian_runner_root": "/old/runner", "reports_root": "/old/reports",
+        "reports_archive_root": "/old/archive",
+    }
+    config.write_text(json.dumps(document), encoding="utf-8")
+    paths = {
+        "local_bot_root": "D:\\MRS3\\bot", "local_runner_root": "D:\\MRS3\\bot\\settings_strategy",
+        "local_reports_root": "D:\\MRS3\\bot\\tester\\report", "local_output_root": "D:\\MRS3\\archive",
+        "remote_bot_root": "/opt/hb1", "remote_runner_root": "/opt/hb1/debian-duckdb-importer",
+        "remote_reports_root": "/opt/hb1/tester/report", "remote_reports_archive_root": "/opt/hb1/archive",
+        "local_merge_source_a": "D:\\MRS3\\source-a.duckdb", "local_merge_source_b": "D:\\MRS3\\source-b.duckdb",
+        "local_merge_target": "D:\\MRS3\\merged.duckdb",
+    }
+
+    status, body = _request(connection, "POST", "/api/v2/settings/save", {"panel": {"path_defaults": paths}})
+
+    assert status == 200 and body["saved"] is True
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert {key: saved["tester_runner"][key] for key in ("bot_root", "strategy_dir", "report_dir", "inbox_root")} == {
+        "bot_root": paths["local_bot_root"], "strategy_dir": paths["local_runner_root"],
+        "report_dir": paths["local_reports_root"], "inbox_root": paths["local_output_root"],
+    }
+    assert {key: saved["remote_runner"][key] for key in ("bot_root", "debian_runner_root", "reports_root", "reports_archive_root")} == {
+        "bot_root": paths["remote_bot_root"], "debian_runner_root": paths["remote_runner_root"],
+        "reports_root": paths["remote_reports_root"], "reports_archive_root": paths["remote_reports_archive_root"],
+    }
+    assert saved["panel"]["path_defaults"] == paths
+
+
 def test_save_operational_settings_updates_the_fields_consumed_by_panel_jobs(panel_http) -> None:
     _, config, connection = panel_http
     payload = {

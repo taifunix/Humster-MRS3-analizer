@@ -49,7 +49,7 @@
       const paths = bootstrap.defaults?.panel?.path_defaults || {};
       const operational = bootstrap.defaults?.operational || {};
       for (const [id, key] of [
-        ['settings-local-runner', 'local_bot_root'], ['settings-remote-runner', 'remote_runner_root'],
+        ['settings-remote-runner', 'remote_runner_root'],
         ['settings-source-root', 'source_db_path'], ['settings-output-root', 'output_root'],
         ['settings-dates', 'listing_dates_path'], ['settings-algorithm', 'algorithm_version'],
         ['settings-workers', 'import_workers'], ['settings-batch', 'transaction_batch_size'],
@@ -84,6 +84,17 @@
       };
       if (remoteHtml && paths.remote_reports_archive_root) remoteHtml.value = paths.remote_reports_archive_root;
       updateRemoteTarget();
+      for (const [id, key] of [
+        ['source-local-html', 'local_reports_root'], ['source-local-target', 'local_source_db_root'],
+        ['source-remote-html', 'remote_import_html_root'], ['source-remote-staging', 'remote_import_staging_path'],
+        ['source-remote-target', 'remote_import_target_path'], ['merge-source-a', 'local_merge_source_a'],
+        ['merge-source-b', 'local_merge_source_b'], ['merge-target', 'local_merge_target'],
+        ['settings-local-runner', 'local_runner_root'], ['settings-remote-runner', 'remote_runner_root'],
+        ['settings-source-root', 'local_source_db_root'], ['settings-output-root', 'local_output_root'],
+      ]) {
+        const input = document.querySelector(`#${id}`);
+        if (input && paths[key]) input.value = paths[key];
+      }
       remoteHtml?.addEventListener('change', updateRemoteTarget);
       const connection = document.querySelector('.connection-status');
       if (connection) connection.lastChild.textContent = 'LOCAL BACKEND CONNECTED';
@@ -307,6 +318,34 @@
     target_path: document.querySelector('#merge-target')?.value || '',
   }));
   const remoteSourceCard = document.querySelector('#source-remote-html')?.closest('.panel-card');
+  const inputValue = (id) => document.querySelector(`#${id}`)?.value || '';
+  const savePathDefaults = async (card, path_defaults) => {
+    try {
+      await remoteRequest('/api/v2/settings/save', { panel: { path_defaults } });
+      sourceStatus(card, 'Пути сохранены в config.local.json.');
+      await loadSafeDefaults();
+    } catch (_) { sourceStatus(card, 'Пути не сохранены. Проверьте значения.'); }
+  };
+  const bindPathSave = (button, card, values) => button?.addEventListener('click', () => savePathDefaults(card, values()));
+  bindPathSave(document.querySelector('#local-paths-save'), document.querySelector('#runner-local'), () => ({
+    local_bot_root: inputValue('local-bot-root'), local_runner_root: inputValue('local-runner-root'),
+    local_reports_root: inputValue('local-reports-root'), local_output_root: inputValue('local-output-root'),
+  }));
+  bindPathSave(document.querySelector('#remote-paths-save'), document.querySelector('#runner-remote'), () => ({
+    remote_bot_root: inputValue('remote-bot-root'), remote_runner_root: inputValue('remote-runner-root'),
+    remote_reports_root: inputValue('remote-reports-root'), remote_reports_archive_root: inputValue('remote-reports-archive-root'),
+  }));
+  bindPathSave(localImportCard?.querySelectorAll('.button-row button')[1], localImportCard, () => ({
+    local_reports_root: inputValue('source-local-html'), local_source_db_root: inputValue('source-local-target'),
+  }));
+  bindPathSave(remoteSourceCard?.querySelectorAll('.button-row button')[1], remoteSourceCard, () => ({
+    remote_import_html_root: inputValue('source-remote-html'), remote_import_staging_path: inputValue('source-remote-staging'),
+    remote_import_target_path: inputValue('source-remote-target'),
+  }));
+  bindPathSave(localMergeCard?.querySelectorAll('.button-row button')[1], localMergeCard, () => ({
+    local_merge_source_a: inputValue('merge-source-a'), local_merge_source_b: inputValue('merge-source-b'),
+    local_merge_target: inputValue('merge-target'),
+  }));
   if (remoteSourceCard) {
     const [check, , start] = remoteSourceCard.querySelectorAll('.button-row button');
     let remoteSourceJob = '';
@@ -601,7 +640,6 @@
       listing_dates_path: document.querySelector('#settings-dates')?.value || '',
     },
   }, operational: {
-    local_bot_root: document.querySelector('#settings-local-runner')?.value || '',
     remote_runner_root: document.querySelector('#settings-remote-runner')?.value || '',
     source_db_path: document.querySelector('#settings-source-root')?.value || '',
     output_root: document.querySelector('#settings-output-root')?.value || '',
