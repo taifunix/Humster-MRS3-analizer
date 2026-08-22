@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import zlib
 from hashlib import sha256
 from pathlib import Path
 
@@ -339,19 +340,19 @@ def _opens_read_only_from_another_process(path: Path) -> bool:
     return probe.returncode == 0
 
 
-def test_merge_readback_runs_on_released_staging_and_publishes_nothing_when_it_fails(
+def test_merge_readback_runs_on_a_released_file_and_publishes_nothing_when_it_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Pin all three halves of the readback placement.
 
-    The readback was moved past `commit` for throughput (C8) and then out of
-    the copy function entirely (C9), which is only sound because both write to
-    a `.staging` file that nothing can reach. Three things have to stay true:
-    the readback must still run at all, the copy connection must be committed
-    *and released* before it runs — a worker process cannot open a file another
-    process holds, so putting it back inside the copy would fail in production
-    at `workers >= 2` and nowhere else — and a failure must still leave no
-    target and no staging residue.
+    The readback moved past `commit` for throughput (C8), then out of the copy
+    function so it could fan out (C9), then onto `compacted` so it describes
+    the file that is published (ADR-0015). Three things have to stay true: it
+    must still run at all, the writer that produced the file it checks must be
+    released before it runs — a worker process cannot open a file another
+    process holds, so a writer left open would fail in production at
+    `workers >= 2` and nowhere else — and a failure must still leave no target
+    and no staging residue.
     """
     first, _ = _fragments()
     source = tmp_path / "source.source-v6.duckdb"
@@ -362,11 +363,12 @@ def test_merge_readback_runs_on_released_staging_and_publishes_nothing_when_it_f
     calls: list[str] = []
 
     def corrupt_then_verify(path, **options) -> None:
-        assert _opens_read_only_from_another_process(Path(path)), "staging still has a live writer"
+        assert _opens_read_only_from_another_process(Path(path)), "the file still has a live writer"
         connection = duckdb.connect(str(path))
         try:
             # The committed rows are here, so the copy transaction closed too.
             assert connection.execute("select count(*) from compact_fragments").fetchone()[0] == 1
+            assert Path(path).name.endswith(".packed"), "the readback must target the published file"
             connection.execute("update compact_fragments set payload_blob = ?", [b"not a payload"])
         finally:
             connection.close()
@@ -418,3 +420,45 @@ def test_merge_workers_do_not_change_the_published_artifact(tmp_path: Path) -> N
     assert fanned == [4]
     assert serial.source_content_digest == parallel.source_content_digest
     assert _dump_merged(serial_target) == _dump_merged(parallel_target)
+
+
+def test_merge_verifies_the_file_it_publishes_not_the_intermediate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0015: the readback must cover `compacted`, the file that survives.
+
+    `compact_v6_database` rewrites the payload bytes into a new file, and that
+    new file is what `replace(target)` publishes. Corrupting a payload during
+    the repack — checksum repaired, so every column check still passes — must
+    fail the merge. While the readback ran on `staging` this corruption
+    published silently behind a `safe_to_delete=YES`.
+    """
+    first, _ = _fragments()
+    source = tmp_path / "source.source-v6.duckdb"
+    _db(source, first, "source")
+    target = tmp_path / "output.source-v6.duckdb"
+
+    real = source_v6_merge.compact_v6_database
+
+    def compact_then_corrupt(source_path, target_path) -> None:
+        real(source_path, target_path)
+        connection = duckdb.connect(str(target_path))
+        try:
+            # A valid payload for a different document: it decompresses, and
+            # its stored checksum matches, so only re-deriving `fragment_id`
+            # from the bytes can object.
+            forged = zlib.compress(b'{"not":"this fragment"}', 9)
+            connection.execute(
+                "update compact_fragments set payload_blob = ?, payload_sha256 = ?",
+                [forged, sha256(forged).hexdigest()],
+            )
+        finally:
+            connection.close()
+
+    monkeypatch.setattr(source_v6_merge, "compact_v6_database", compact_then_corrupt)
+
+    with pytest.raises(SourceV6StorageError, match="readback mismatch"):
+        merge_source_v6((source,), target)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(f".{target.name}.*.staging*"))

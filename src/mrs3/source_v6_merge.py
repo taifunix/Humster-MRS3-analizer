@@ -232,9 +232,11 @@ def _copy_fragments_from_inputs(
     connection is ever materialised.
 
     This copies and commits but does not verify. The C3a readback is the
-    caller's, immediately after this returns, because it fans out to worker
-    processes and DuckDB refuses to open a file this connection still holds for
-    writing. See C9.
+    caller's, and runs on the repacked file it publishes rather than on these
+    rows (ADR-0015) — so the stitch and the `fragment_origins` rewrite consume
+    this output before its payloads have been re-derived. It fans out to worker
+    processes, which is also why it cannot run while this connection is open:
+    DuckDB refuses a cross-process open of a file held for writing.
     """
     by_owner: dict[Path, list[str]] = {}
     for fragment in unique:
@@ -424,16 +426,10 @@ def merge_source_v6(
             _check_cancelled(cancellation_requested)
             create_v6_database(staging)
             _copy_fragments_from_inputs(staging, unique, owner_by_id, cancellation_requested)
-            # The readback the copy used to run inline. It stays after the
-            # commit for the reason C8 measured, and has moved out here for the
-            # reason C9 measured: it is 1,215 s of the 2,080 s merge and 96.1%
-            # of that is per-fragment Python, so it is worth spreading across
-            # processes — which needs the copy's writer released first.
-            #
-            # Committing is still not publishing: this is the `.staging` file,
-            # publication is the `compacted.replace(target)` below, and the
-            # `finally` removes the staging file if this raises.
-            verify_published_identity_parallel(staging, workers=workers)
+            # Kept where the pre-ADR-0015 readback used to sit. Without it a
+            # cancellation during a single-input copy would not be noticed
+            # until after the stitch and the origins rewrite, which are minutes
+            # on the real corpus.
             _check_cancelled(cancellation_requested)
             if fault_injector:
                 fault_injector("after_write")
@@ -505,6 +501,20 @@ def merge_source_v6(
             validate_source_v6_database(staging)
             compact_v6_database(staging, compacted)
             validate_source_v6_database(compacted)
+            # ADR-0015: the C3a readback runs on the file that is published,
+            # not on `staging`. `compact_v6_database` rewrites every payload
+            # byte into this file, and this file is what the rename below
+            # publishes, so verifying `staging` proved something about an
+            # intermediate that is then discarded — while `safe_to_delete=YES`
+            # is a claim about what the operator keeps. It is moved rather than
+            # added: `compacted` is derived from `staging`, so this catches
+            # strictly more, and it also now covers the stitch decisions and
+            # the `fragment_origins` rewrite, which run after the copy.
+            #
+            # C9 is what makes this affordable: 113.9 s parallel against the
+            # ~1,150 s the serial readback cost.
+            verify_published_identity_parallel(compacted, workers=workers)
+            _check_cancelled(cancellation_requested)
             readback = fragment_metadata(compacted)
             connection = duckdb.connect(str(compacted), read_only=True)
             try:

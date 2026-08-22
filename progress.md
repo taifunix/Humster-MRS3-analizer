@@ -83,7 +83,8 @@ closed on metadata-only fragments.
 
 Verification for all of the above, including C9:
 `.venv\Scripts\python.exe -m pytest -q` — **1341 passed, 2 skipped** through
-defect 8, and **1346 passed, 2 skipped** with defect 9.
+defect 8, **1346 passed, 2 skipped** with defect 9, and **1347 passed,
+2 skipped** with C10 (ADR-0015).
 
 ## Merge of the two real corpora (2026-08-22)
 
@@ -142,11 +143,13 @@ fixed runner should be materially faster.
    needs a contract for what a fragment with no samples means for
    `report_start_ms`/`report_end_ms`, `day_ownership` and coverage, so it is a
    spec, not a patch. Re-importing that corpus is not required for correctness.
-2. The C3a payload readback runs on `staging`, never on the `compacted` file
-   that is actually published; `compacted` gets only schema, row-count and
-   digest checks. Pre-existing, but C9 makes closing it cheap (114 s rather
-   than a second ~1,150 s phase). It changes the deletion gate, so it needs its
-   own spec.
+2. Close the same published-file gap on the import path. ADR-0015 scoped
+   itself to the merge deliberately: `_publish_segments_single_pass` verifies
+   its reduce target and then publishes a repack that receives neither the C3a
+   payload readback nor `fragment_metadata`'s header pass, so the import
+   publishes with weaker evidence than the merge now does — under the same
+   `safe_to_delete=YES`. It needs its own change, not an assumption from
+   ADR-0015's wording.
 3. Remove the orphaned segment-merge path (`merge_source_v6_segments`,
    `_merge_segment_contents`, `_read_source_v6_segment`, `import_fragment`,
    `import_fragment_batch`) in its own `refactor:` commit — C5 left them

@@ -169,6 +169,9 @@ accumulated fact rows.
 
 ### C8 — The merge verifies its staging file after the commit, before publication
 
+**Superseded by C10:** the readback moved to the published file. The measured
+reasoning below stands; the file it names does not.
+
 `_copy_fragments_from_inputs` runs the C3a readback *after* `commit`, not
 inside the copy transaction.
 
@@ -213,6 +216,9 @@ per-input lineage, so a write there is discarded unread. The surviving rewrite
 is set-based under C4 and keeps `insert or ignore`.
 
 ### C9 — The merge readback runs across processes
+
+**Partly superseded by C10:** the fan-out and every measurement below stand;
+the call site named below is now `compacted`, not `staging`.
 
 `merge_source_v6` accepts `workers` and verifies the staging file with
 `verify_published_identity_parallel(staging, workers=workers)`. The default is
@@ -312,24 +318,39 @@ parallel path the ids are scanned on a different connection than the one
 reading payloads, and a silently short window here would mean unverified rows
 behind a `safe_to_delete=YES`.
 
-### C9 does not close the gap between the verified file and the published file
+### C10 — The readback runs on the published file
 
-Stated here because C9's framing invites the assumption that it does. The C3a
-payload readback runs on `staging`. `compact_v6_database` then rewrites those
-bytes into `compacted`, and `compacted` is what `replace(target)` publishes.
-What `compacted` does get is narrower than the readback but not nothing:
-`validate_source_v6_database` (schema version and fingerprint), a per-table row
-count, an id-set and digest comparison, and — through `fragment_metadata` —
-`sha256(header_json) == header_sha256` plus header-against-column agreement for
-every fragment. Exactly one column escapes: `payload_blob`. It is never
-decompressed, its `fragment_id` is never re-derived from it, and its
-`payload_sha256` is never recomputed on the published file.
+Recorded by [ADR-0015](../decisions/0015-source-v6-published-file-identity-readback.md).
+An earlier revision of this section documented the gap and left it open; C9
+made closing it affordable, so it is closed.
 
-This is pre-existing and unchanged by C9, and it is recorded rather than fixed.
-It is worth revisiting precisely because C9 changes the economics: verifying
-`compacted` too would have added a second serial ~1,150 s phase to a 2,080 s
-merge, and now costs 114 s. Whether the raw-HTML deletion gate should require
-it is a decision, not a refactor, so it belongs to its own spec.
+The C3a payload readback ran on `staging`. `compact_v6_database` then rewrote
+those bytes into `compacted`, and `compacted` is what `replace(target)`
+publishes. `compacted` was checked by `validate_source_v6_database` (schema
+version and fingerprint), a per-table row count, an id-set and digest
+comparison, and — through `fragment_metadata` — `sha256(header_json) ==
+header_sha256` plus header-against-column agreement for every fragment. One
+column escaped: `payload_blob` was never decompressed, never re-derived and
+never re-hashed on the file that survives.
+
+That is the column the deletion gate rests on. `safe_to_delete=YES` authorises
+deleting the raw HTML the payload was built from, and the proof described a
+temporary file that is then removed.
+
+The readback now runs after `compact_v6_database` and before the rename. It
+**moves** rather than being added: `compacted` is derived from `staging`, so
+corruption in the earlier file reaches the later one and checking the later one
+catches strictly more. Checking both would pay 113.9 s twice for a subset. It
+also now covers the stitch decisions and the `fragment_origins` rewrite, which
+run after the copy and so were previously outside it.
+
+The cost is why this was not done before C9: a second serial readback would
+have added ~1,150 s to a 2,080 s merge. At 113.9 s it is about 2% of the merge.
+
+A corrupt copy is now detected later — after stitching and the repack rather
+than before them — because the file being checked does not exist until then.
+Nothing is published either way: `finally` removes both `staging` and
+`compacted` on any failure, and publication remains the single atomic rename.
 
 ## Invariants
 
