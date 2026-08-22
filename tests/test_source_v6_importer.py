@@ -519,6 +519,17 @@ def test_preflight_is_metadata_only_and_assigns_binary_path_ordinals(tmp_path: P
     assert not hasattr(preflight.snapshots[0], "source_sha256")
 
 
+def test_preflight_excludes_report_optimizer_html(tmp_path: Path) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "trade.html").write_bytes(b"trade")
+    (reports / "report_optimizer_my_test_auto_x.html").write_bytes(b"optimizer")
+
+    preflight = preflight_source_v6(reports, tmp_path / "source-v6.duckdb")
+
+    assert [snapshot.relative_path for snapshot in preflight.snapshots] == ["trade.html"]
+
+
 def test_worker_reads_each_snapshot_once_and_hashes_the_read_bytes(tmp_path: Path) -> None:
     reports = _reports(tmp_path)
     preflight = preflight_source_v6(reports, tmp_path / "source-v6.duckdb")

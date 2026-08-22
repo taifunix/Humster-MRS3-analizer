@@ -139,10 +139,10 @@ def _target_identity(path: Path) -> str | None:
 
 def _discover(root: Path) -> tuple[Path, ...]:
     if root.is_file():
-        return (root,)
+        return () if root.name.casefold().startswith("report_optimizer_") else (root,)
     if not root.is_dir():
         raise SourceV6ImportError(f"HTML root does not exist: {root}")
-    reports = (item for item in root.rglob("*") if item.is_file() and item.suffix.casefold() == ".html")
+    reports = (item for item in root.rglob("*") if item.is_file() and item.suffix.casefold() == ".html" and not item.name.casefold().startswith("report_optimizer_"))
     return tuple(sorted(reports, key=lambda item: item.relative_to(root).as_posix().encode("utf-8")))
 
 
