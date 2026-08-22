@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-*/
 .test-tmp/
 .coverage
 htmlcov/
@@ -10,6 +11,7 @@ htmlcov/
 
 # Local runtime configuration and artifacts
 config.local.json
+.panel-jobs.json
 data/
 output/
 [Dd]ata/

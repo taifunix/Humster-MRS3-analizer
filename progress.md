@@ -202,21 +202,38 @@ production call site, `panel.py:1837`, was being edited by another session, so
 switching it was left out rather than conflict. Until that one argument is
 added the application still takes the 100.4 s path.
 
+## Empty result combinations (2026-08-22)
+
+Contract: [empty result spec](docs/specs/2026-08-22-source-v6-empty-result-combinations.md).
+
+A "point" is a parameter combination — shift, open MA and close MA over one
+symbol, side and timeframe — and since ADR-0016 one of them can be tested and
+produce no trades. `calculate_metrics` raises for a combination with no samples,
+and every consumer called it in a bare loop, so one such combination aborted the
+whole build. Demonstrated: ten healthy combinations published, the same ten plus
+one idle one raised and all eleven were lost.
+
+Empty results are now excluded from the surface rather than zeroed, and recorded
+under `empty_result_points`. Zeroing was the trap: `build_persisted_analysis_facts`
+defaults a missing metric row to `TotalPnLPercent = 0` and
+`MaxDrawdownPercent = 0`, so a combination left in `point_facts` without metrics
+would enter plateau geometry and selection as a 0% return at 0% drawdown — an
+outstanding risk-adjusted result that never happened. ADR-0006 already settled
+the principle: the tester writes `n/a` where a value is undefined, and the
+surface must not invent one.
+
+The multiscope path needed the same rule one stage earlier: it stores facts, not
+metrics, so it published happily and `run_multiscope_analysis` aborted
+afterwards. `materialize_source_v6` now applies the same partition.
+
+Coverage is not lost: the tested days remain in the source database as
+`ACTIVE_EMPTY` under Z4.
+
 ## Next
 
-1. **Blocker before re-importing `my_test_CX_GE_fixed`.** `calculate_metrics`
-   raises `wallet/equity series are required` for a point with no samples, and
-   every surface consumer calls it per point with no guard, so a point whose
-   only report is zero-activity aborts the whole surface build rather than that
-   point. Verified through the public entry point:
-   `publish_surface(dir, (zero_activity_fragment,))` raises. The expected shape
-   among the 144 is exactly that — a parameter combination that never trades.
-   What the canonical metrics of a point that never traded should be is a
-   contract decision (ADR-0006's "never invent a value" argues for excluding
-   the point with a recorded reason rather than synthesising zeros), so it
-   needs its own spec. Until then the re-import will not produce a surface.
-2. Re-import `my_test_CX_GE_fixed` to pick up the 144 zero-activity runs and
-   confirm `safe_to_delete` is no longer held at `NO` by them.
+1. Re-import `my_test_CX_GE_fixed` to pick up the 144 zero-activity runs and
+   confirm `safe_to_delete` is no longer held at `NO` by them. The surface
+   blocker that stood here is fixed (see below).
 3. Pass `source_database` at `panel.py:1837`, the only production caller of
    `publish_multiscope_surface`. One argument; it is what makes the 33x
    reachable from the application.
@@ -277,11 +294,14 @@ STAGE_1_GATE=ACCEPTED_BY_ROOT; date=2026-08-20; reviewer=CODE_REVIEW_PASS compac
 
 ## Parallel panel work (2026-08-22)
 
-Static Control Panel v1 Task 1 is committed as `38980d8` and independently
-reviewed `CODE_REVIEW_PASS`: fixed static root shell, safe
-`panel.default_root` rollback to `/legacy`, package assets, and 146 focused
-panel tests. Next verified slice: Task 2, redacted v2 bootstrap and local-only
-Settings. It must not start processes, contact remote hosts, expose
-credentials, or change legacy APIs. Contract and plan:
-`docs/specs/2026-08-22-panel-static-frontend-v1.md` and
-`docs/superpowers/plans/2026-08-22-panel-static-frontend-v1.md`.
+Static Control Panel v1 is implemented and independently reviewed
+`CODE_REVIEW_PASS`. It replaces the root shell, keeps `/legacy`, and covers
+local testing, guarded remote profile operations, Source DB import/merge,
+READY-only immutable surfaces, fresh analysis → local tester → Performance DB
+and `CALCULATION_ONLY` DD5, plus local settings. Job terminal snapshots and
+tester inbox lineage survive controller restart; interrupted remote importers
+are rehydrated solely for a safe stop attempt. Portfolio remains disabled.
+
+Latest verification: `1523 passed, 2 skipped, 1 warning` via
+`.venv\Scripts\python.exe -m pytest -q`; focused panel suite: `68 passed`.
+Contract and visual evidence: `docs/specs/2026-08-22-panel-static-frontend-v1.md`.

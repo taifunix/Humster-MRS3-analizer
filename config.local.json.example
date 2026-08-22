@@ -106,6 +106,19 @@
     "report_stability_polls": 2,
     "result_report_grace_seconds": 15,
     "metric_tolerance": 0.01
+  },
+  "remote_runner": {
+    "enabled": false,
+    "host": "",
+    "user": "",
+    "port": 22,
+    "password": "",
+    "private_key_path": "",
+    "bot_root": "/opt/hb1",
+    "debian_runner_root": "/opt/hb1/debian-duckdb-importer",
+    "reports_root": "/opt/hb1/tester/report",
+    "source_db_root": "/opt/hb1/debian-duckdb-importer/data/db",
+    "reports_archive_root": "/opt/hb1/debian-duckdb-importer/data/html"
   }
 }
 

@@ -255,7 +255,9 @@ def test_static_panel_shell_contains_only_navigation_contract() -> None:
     for excluded in ("Artefacts", "CSV", "DUCKDB_DIRECT", "credential", "password", "token"):
         assert excluded.casefold() not in html.casefold()
         assert excluded.casefold() not in script.casefold()
-    assert "/api/" not in script
+    assert "/api/v2/" in script
+    assert "/api/ui/" not in script
+    assert "/api/duckdb" not in script
     assert script.encode("utf-8").decode("utf-8") == script
     assert 'aria-disabled="true"' in html
     assert 'disabled aria-disabled="true"' in html
