@@ -11,6 +11,7 @@ htmlcov/
 
 # Local runtime configuration and artifacts
 config.local.json
+config.local.json.bak
 .panel-jobs.json
 data/
 output/
@@ -45,3 +46,5 @@ external-coder/
 .task*
 tmp-strict*/
 posttest_*/
+.pytest-panel-task2.*
+backups/
