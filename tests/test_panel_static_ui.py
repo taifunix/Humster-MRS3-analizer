@@ -89,10 +89,8 @@ def test_source_surfaces_and_strategies_screens_have_approved_workflow_cards() -
         assert label in source
 
     surfaces = html.split('id="surfaces"', 1)[1].split('id="strategies-dd5"', 1)[0]
-    for label in ("Источник", "Preflight", "READY", "Публикация"):
+    for label in ("Source DB", "Coverage preflight", "READY", "surface-publish-card"):
         assert label in surfaces
-    assert 'href="#gaps"' in surfaces
-    assert "n/r - Check gaps" in surfaces
 
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
     for label in (
@@ -161,3 +159,140 @@ def test_surface_materializer_loads_the_configured_source_db_catalog() -> None:
     assert 'id="surface-source-refresh"' in html
     assert "loadSourceCatalog" in js
     assert "'/api/v2/source/local/catalog'" in js
+    assert "source.dispatchEvent(new Event('change'))" in js
+    assert "surfacePreflightRunV2" in js
+    assert "preflight must be started again" in js
+    assert "sourceCatalogRun" in js
+    assert "surfacePublishActive" in js
+    assert "surfaceSource.disabled = true" in js
+    assert "sourceRefresh.disabled = true" in js
+
+
+def test_strategies_loads_the_persisted_valid_surface_catalog() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="analysis-surface"' in html
+    assert "loadSurfaceCatalog" in js
+    assert "'/api/v2/surfaces/catalog'" in js
+
+
+def test_analysis_start_immediately_shows_running_phase_and_elapsed_time() -> None:
+    js = _read("app.js")
+
+    assert "analysisProgress" in js
+    assert "Analysis is running" in js
+    assert "Reading and validating surface" in js
+    assert "analyzeFresh.disabled = true" in js
+    assert "setInterval" in js
+
+
+def test_surface_async_status_keeps_atomic_phases_indeterminate_and_ignores_stale_errors() -> None:
+    js = _read("app.js")
+
+    assert "const determinate = ['HYDRATING', 'MATERIALIZING', 'WRITING', 'VALIDATING'].includes(result.phase);" in js
+    assert "publishProgressV2('running', details, determinate ? result.completed : 0, determinate ? result.total : 0);" in js
+    assert "if (run === surfacePreflightRunV2 && sourcePath === (surfaceSource?.value || ''))" in js
+    assert "result.error || result.phase || 'Analysis failed.'" in js
+
+
+def test_surface_preflight_has_visible_progress_and_reveals_ready_results() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="surface-preflight-progress"' in html
+    assert "renderSurfacePreflightProgress" in js
+    assert "surfaceCards[1].open = true" in js
+    assert "surfaceCards[2].open = true" in js
+    assert "is-running" in js
+    assert "'55%'" not in js
+
+
+def test_surfaces_restore_the_approved_four_stage_accordion_and_scope_table() -> None:
+    html = _read("index.html")
+    css = _read("app.css")
+
+    surfaces = html.split('id="surfaces"', 1)[1].split('id="strategies-dd5"', 1)[0]
+    for control in (
+        'id="surface-source-card"',
+        'id="surface-preflight-card"',
+        'id="surface-ready-card"',
+        'id="surface-publish-card"',
+        'id="scope-filter-pair"',
+        'id="scope-filter-side"',
+        'id="scope-filter-status"',
+        'id="scope-select-all"',
+        'id="scope-select-none"',
+        'id="scope-select-visible"',
+        'id="surface-publish-progress"',
+    ):
+        assert control in surfaces
+    assert ".scope-table" in css
+    assert ".scope-group" in css
+
+
+def test_surface_publish_uses_a_polled_job_and_selection_changes_require_confirmation() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert "'/api/v2/surfaces/publish/start'" in js
+    assert "'/api/v2/surfaces/publish/status'" in js
+    assert "confirmedSurfaceScopesV2" in js
+    assert "surface selection changed; confirm it before publishing" in js
+    assert 'id="surface-target-save"' in html
+    assert 'name="surface_target_path"' in html
+    assert "surface_target_path" in js
+
+
+def test_active_surface_publish_handler_uses_confirmed_snapshot_and_committed_file_path() -> None:
+    js = _read("app.js")
+
+    active = js.split("document.querySelector('#surface-publish-start')?.addEventListener", 1)[1]
+    assert "'/api/v2/surfaces/publish/start'" in active
+    assert "'/api/v2/surfaces/publish'" not in active
+    assert "const selectionSnapshot" in active
+    assert "const outputDir" in active
+    assert "`${outputDir}\\\\${result.target}`" in active
+
+
+def test_surface_timeframe_rows_override_generic_scope_list_label_style() -> None:
+    css = _read("app.css")
+
+    assert ".scope-table .scope-timeframe-row { display: grid;" in css
+    assert "border-radius: 0;" in css
+    assert "color: #e3eaf5;" in css
+    assert ".scope-table { overflow-x: auto;" in css
+
+
+def test_surface_gap_link_opens_a_visible_report_dialog() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="surface-gap-dialog"' in html
+    assert 'id="surface-gap-report"' in html
+    assert "showModal()" in js
+    assert "gapRun !== surfacePreflightRunV2" in js
+    assert "missing_witnesses" in js
+
+
+def test_strategies_screen_keeps_the_approved_dd5_result_stage_and_live_status() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
+    assert 'id="strategy-dd5-card"' in strategies
+    assert 'id="strategy-dd5-status"' in strategies
+    assert "CALCULATION_ONLY" in strategies
+    assert "dd5Status" in js
+
+
+def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="surface-name"' in html
+    assert 'id="analysis-target-save"' in html
+    assert 'data-path-root="analysis_db_root"' in html
+    assert "suggested_filename" in js
+    assert "analysis_db_root" in js
+    assert "dd5Track" in js

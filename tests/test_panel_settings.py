@@ -147,6 +147,44 @@ def test_source_catalog_is_empty_for_invalid_import_settings(panel_http) -> None
     assert body == {"databases": []}
 
 
+def test_surface_catalog_lists_manifest_validated_surfaces_recursively_from_the_configured_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mrs3.panel import PanelController
+
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"duckdb_import": {"source_v6_surface_dir": "data/surfaces"}}), encoding="utf-8")
+    good = tmp_path / "data" / "surfaces" / "CXMT.duckdb" / "CXMT.surface-v6.duckdb"
+    bad = tmp_path / "data" / "surfaces" / "broken.surface-v6.duckdb"
+    good.parent.mkdir(parents=True)
+    good.write_bytes(b"good")
+    bad.write_bytes(b"bad")
+    def validate(path: str | Path, *, decode: bool = True) -> dict[str, str]:
+        assert decode is False
+        if Path(path) == good:
+            return {"surface_id": "valid"}
+        raise ValueError("broken")
+
+    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", validate)
+
+    catalog = PanelController(tmp_path, config).surface_catalog()
+
+    assert catalog == {"surfaces": [{"name": good.name, "path": str(good)}]}
+
+
+def test_surface_publication_path_default_is_accepted_by_settings_save(panel_http) -> None:
+    _, config, connection = panel_http
+
+    status, body = _request(
+        connection, "POST", "/api/v2/settings/save",
+        {"panel": {"path_defaults": {"surface_target_path": "D:\\MRS3\\surfaces"}}},
+    )
+
+    assert status == 200
+    assert body["saved"] is True
+    assert json.loads(config.read_text(encoding="utf-8"))["panel"]["path_defaults"]["surface_target_path"] == "D:\\MRS3\\surfaces"
+
+
 def test_bootstrap_does_not_derive_runner_paths_from_invalid_runner_config(panel_http) -> None:
     _, config, connection = panel_http
     config.write_text(json.dumps({"tester_runner": {"bot_root": "private-bot"}}), encoding="utf-8")

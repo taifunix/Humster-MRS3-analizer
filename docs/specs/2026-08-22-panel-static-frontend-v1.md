@@ -77,6 +77,37 @@ verification before atomic publication. The panel shows both stage time and
 overall elapsed time. Missing or malformed progress data is displayed as
 indeterminate progress and never changes the import result.
 
+Surface coverage preflight remains a read-only synchronous validation. While
+the request is in flight, the panel shows an active phase bar and elapsed
+time; on completion it shows 100%, the scoped count and elapsed time, then
+opens the READY scope result. It never presents synthetic per-scope progress.
+
+Surface publication is an asynchronous local job. Its status returns only the
+phase, selected scope count, fragment work units and final filename: never a
+local source or output path. The progress bar is determinate only for hydrated,
+copied or readback-validated fragments; staging, checkpoint and atomic commit
+are phase-only. A changed selection clears prior confirmation and blocks
+publication until the user confirms it again. The publication directory is a
+safe panel path default (`surface_target_path`) and may be saved explicitly.
+Its filename defaults to `{pair...}_{start}_{end}.surface-v6.duckdb`, remains
+editable, and never exposes the immutable `surface_id` hash; that identity
+stays in the manifest. A selected surface derives an editable Analysis DB
+filename in the saved `analysis_db_root`. An explicitly chosen colliding name
+fails closed; an automatic analysis name uses a readable `-2`, `-3`, … suffix
+for a distinct analysis identity.
+
+The Strategies/DD5 surface selector scans the configured surface library (or
+`data/surfaces` when it is unset) recursively and quickly verifies its
+manifest/scope identity. Full payload verification remains the required first
+step of the analysis operation, so opening the panel does not decode a large
+surface library.
+
+Fresh analysis starts with a visible indeterminate progress bar, the actual
+current entry phase (`Reading and validating surface`) and elapsed time. The
+control is disabled until the synchronous backend operation returns; terminal
+status is either the committed candidate count or the returned error. No
+percentage is shown because this contract does not expose a truthful one yet.
+
 ## Strategies/DD5 runner scope
 
 The Strategies and DD5 screen uses the configured local `tester_runner` only.

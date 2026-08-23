@@ -105,6 +105,10 @@
         if (option) option.value = localTarget.value;
         else surfaceSource.value = localTarget.value;
       }
+      const analysisTarget = document.querySelector('#analysis-target');
+      if (analysisTarget && paths.analysis_db_root && !analysisTarget.value) {
+        analysisTarget.value = paths.analysis_db_root;
+      }
       const remoteHtml = document.querySelector('#source-remote-html');
       const remoteTarget = document.querySelector('#source-remote-staging');
       const remoteLocalTarget = document.querySelector('#source-remote-target');
@@ -130,6 +134,7 @@
       }
       remoteHtml?.addEventListener('change', updateRemoteTarget);
       await loadSourceCatalog();
+      await loadSurfaceCatalog();
       const connection = document.querySelector('.connection-status');
       if (connection) connection.lastChild.textContent = 'LOCAL BACKEND CONNECTED';
       const local = await fetch("/api/v2/testing/local/status").then((response) => response.json());
@@ -281,29 +286,65 @@
 
   function addSourceOption(path) {
     const source = document.querySelector('#surface-source');
-    if (!source || !path) return;
+    if (!source || !path || surfacePublishActive) return;
     const existing = [...source.options].find((option) => option.value === path);
-    if (existing) { source.value = path; return; }
+    const previous = source.value;
+    if (existing) {
+      source.value = path;
+      if (source.value !== previous) source.dispatchEvent(new Event('change'));
+      return;
+    }
     source.append(new Option(path.split(/[\\/]/).pop(), path));
     source.value = path;
+    if (source.value !== previous) source.dispatchEvent(new Event('change'));
   }
 
+  let sourceCatalogRun = 0;
+  let surfacePublishActive = false;
   async function loadSourceCatalog() {
     const source = document.querySelector('#surface-source');
-    if (!source) return;
+    if (!source || surfacePublishActive) return;
+    const run = ++sourceCatalogRun;
     const selected = source.value;
     try {
       const response = await fetch('/api/v2/source/local/catalog');
       const result = await response.json();
       if (!response.ok || !Array.isArray(result.databases)) throw new Error('catalog failed');
+      if (run !== sourceCatalogRun || surfacePublishActive) return;
       source.replaceChildren(new Option('\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 Source DB', ''));
       result.databases.forEach((item) => {
         if (typeof item?.name === 'string' && typeof item?.path === 'string') source.append(new Option(item.name, item.path));
       });
       source.value = [...source.options].some((option) => option.value === selected)
         ? selected : (source.options[1]?.value || '');
+      if (source.value !== selected) source.dispatchEvent(new Event('change'));
     } catch (_) {
+      if (run !== sourceCatalogRun || surfacePublishActive) return;
       source.replaceChildren(new Option('\u0421\u043f\u0438\u0441\u043e\u043a Source DB \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d', ''));
+      if (selected) source.dispatchEvent(new Event('change'));
+    }
+  }
+
+  let surfaceCatalogRun = 0;
+  async function loadSurfaceCatalog() {
+    const selector = document.querySelector('#analysis-surface');
+    if (!selector) return;
+    const run = ++surfaceCatalogRun;
+    const selected = currentSurfacePath || selector.value;
+    try {
+      const response = await fetch('/api/v2/surfaces/catalog');
+      const result = await response.json();
+      if (!response.ok || !Array.isArray(result.surfaces)) throw new Error('catalog failed');
+      if (run !== surfaceCatalogRun) return;
+      selector.replaceChildren(new Option('Выберите VALID surface', ''));
+      result.surfaces.forEach((item) => {
+        if (typeof item?.name === 'string' && typeof item?.path === 'string') selector.append(new Option(item.name, item.path));
+      });
+      selector.value = [...selector.options].some((option) => option.value === selected)
+        ? selected : (selector.options[1]?.value || '');
+      if (selector.value !== selected) selector.dispatchEvent(new Event('change'));
+    } catch (_) {
+      if (run === surfaceCatalogRun) selector.replaceChildren(new Option('Список VALID surface недоступен', ''));
     }
   }
 
@@ -410,6 +451,14 @@
     remote_bot_root: inputValue('remote-bot-root'), remote_runner_root: inputValue('remote-runner-root'),
     remote_reports_root: inputValue('remote-reports-root'), remote_reports_archive_root: inputValue('remote-reports-archive-root'),
   }));
+  bindPathSave(document.querySelector('#surface-target-save'), document.querySelector('#surface-publish-card'), () => ({
+    surface_target_path: inputValue('surface-target'),
+  }));
+  document.querySelector('#analysis-target-save')?.addEventListener('click', () => {
+    const value = inputValue('analysis-target');
+    const target = value.endsWith('.analysis-v6.duckdb') ? value.replace(/[\\/][^\\/]*$/, '') : value;
+    savePathDefaults(document.querySelector('#strategies-dd5 .panel-card'), { analysis_db_root: target });
+  });
   bindPathSave(localImportCard?.querySelectorAll('.button-row button')[1], localImportCard, () => ({
     local_reports_root: inputValue('source-local-html'), local_source_db_root: inputValue('source-local-target'),
   }));
@@ -511,11 +560,21 @@
   let currentSurfacePath = '';
   let surfaceProof = '';
   let selectedSurfaceScopes = [];
+  let surfacePreflightStartedAt = 0;
+  let surfacePreflightTimer = 0;
   const surfaceStatus = (message) => {
     const target = surfaceCards[1]?.querySelector('.card-status');
     if (target) target.textContent = message;
   };
-  document.querySelector('#surface-source-refresh')?.addEventListener('click', loadSourceCatalog);
+  const renderSurfacePreflightProgress = (complete, message) => {
+    const track = document.querySelector('#surface-preflight-progress .progress-track span');
+    if (track) {
+      track.classList.toggle('is-running', !complete);
+      track.style.width = complete ? '100%' : '';
+    }
+    surfaceStatus(message);
+  };
+  document.querySelector('#surface-source-refresh-old')?.addEventListener('click', loadSourceCatalog);
   const renderSurfaceScopes = (groups) => {
     if (!surfaceScopes) return;
     surfaceScopes.replaceChildren();
@@ -548,30 +607,276 @@
       surfaceScopes.append(details);
     }
   };
-  const surfacePreflight = surfaceCards[1]?.querySelector('.button-row button');
+  const surfacePreflight = document.querySelector('#surface-preflight-old');
   if (surfacePreflight) surfacePreflight.addEventListener('click', async () => {
+    if (surfacePreflightTimer) clearInterval(surfacePreflightTimer);
+    surfacePreflightStartedAt = Date.now();
+    if (surfaceCards[1]) surfaceCards[1].open = true;
+    const runningMessage = () => `\u042d\u0442\u0430\u043f 1/1 \u00b7 Coverage preflight \u0432\u044b\u043f\u043e\u043b\u043d\u044f\u0435\u0442\u0441\u044f \u00b7 ${formatDuration((Date.now() - surfacePreflightStartedAt) / 1000)}`;
+    renderSurfacePreflightProgress(false, runningMessage());
+    surfacePreflightTimer = setInterval(() => renderSurfacePreflightProgress(false, runningMessage()), 1000);
     try {
       const result = await remoteRequest('/api/v2/surfaces/preflight', { source_db: surfaceSource?.value || '' });
       surfaceProof = result[['to', 'ken'].join('')]; selectedSurfaceScopes = [];
-      renderSurfaceScopes(result.groups); surfaceStatus(`Coverage preflight: ${(result.rows || []).length} scopes.`);
-    } catch (_) { surfaceStatus('Coverage preflight failed. Check Source DB.'); }
+      renderSurfaceScopes(result.groups);
+      if (surfaceCards[2]) surfaceCards[2].open = true;
+      renderSurfacePreflightProgress(true, `Coverage preflight: ${(result.rows || []).length} scopes \u00b7 ${formatDuration((Date.now() - surfacePreflightStartedAt) / 1000)}.`);
+    } catch (_) { renderSurfacePreflightProgress(false, 'Coverage preflight failed. Check Source DB.'); }
+    finally {
+      if (surfacePreflightTimer) clearInterval(surfacePreflightTimer);
+      surfacePreflightTimer = 0;
+    }
   });
-  const selectReady = surfaceCards[2]?.querySelectorAll('.button-row button')[1];
+  const selectReady = document.querySelector('#surface-select-old');
   if (selectReady) selectReady.addEventListener('click', async () => {
     try {
       const result = await remoteRequest('/api/v2/surfaces/select', { [['preflight', '_to', 'ken'].join('')]: surfaceProof, scope_keys: selectedSurfaceScopes });
       selectedSurfaceScopes = result.scopes || []; surfaceStatus(`${selectedSurfaceScopes.length} READY scopes selected.`);
     } catch (_) { surfaceStatus('Select one or more READY scopes.'); }
   });
-  const surfacePublish = surfaceCards[3]?.querySelector('.button-row button');
+  const surfacePublish = document.querySelector('#surface-publish-old');
   if (surfacePublish) surfacePublish.addEventListener('click', async () => {
     try {
-      const result = await remoteRequest('/api/v2/surfaces/publish', { [['preflight', '_to', 'ken'].join('')]: surfaceProof, scope_keys: selectedSurfaceScopes, target_path: document.querySelector('#surface-target')?.value || '' });
+      let result = await remoteRequest('/api/v2/surfaces/publish/start', { [['preflight', '_to', 'ken'].join('')]: surfaceProof, scope_keys: confirmedSurfaceScopesV2, target_path: document.querySelector('#surface-target')?.value || '' });
+      if (surfacePublishTimerV2) clearInterval(surfacePublishTimerV2);
+      surfacePublishTimerV2 = 0;
+      const phaseTitle = (phase) => ({ QUEUED: 'В очереди', HYDRATING: 'Чтение фрагментов', MATERIALIZING: 'Материализация scopes', STAGING: 'Создание staging surface', WRITING: 'Копирование payload', CHECKPOINT: 'Фиксация surface', VALIDATING: 'Проверка payload', COMMIT: 'Атомарная публикация' }[phase] || phase);
+      while (result.running) {
+        const details = `${phaseTitle(result.phase)}${result.total ? ` · ${result.completed} / ${result.total}` : ''}${result.detail ? ` · ${result.detail}` : ''} · ${formatDuration((Date.now() - started) / 1000)}`;
+        publishProgressV2('running', details, result.completed, result.total);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const response = await fetch('/api/v2/surfaces/publish/status');
+        if (!response.ok) throw new Error('surface status unavailable');
+        result = await response.json();
+      }
+      if (result.phase !== 'COMMITTED') throw new Error('surface publication failed');
       currentSurfacePath = document.querySelector('#surface-target')?.value || '';
       const analysisSurface = document.querySelector('#analysis-surface');
       if (analysisSurface) analysisSurface.replaceChildren(new Option(result.target, currentSurfacePath));
       surfaceStatus(`Surface committed: ${result.target}.`);
     } catch (_) { surfaceStatus('Surface publication failed.'); }
+  });
+  const surfaceScopesV2 = document.querySelector('#surface-ready-card .scope-list');
+  let surfaceGroupsV2 = [];
+  let surfacePreflightTimerV2 = 0;
+  let surfacePreflightRunV2 = 0;
+  let surfacePublishTimerV2 = 0;
+  let confirmedSurfaceScopesV2 = [];
+  let surfaceSelectionRunV2 = 0;
+  const surfaceTextV2 = (selector, value) => { const node = document.querySelector(selector); if (node) node.textContent = value; };
+  const surfaceBadgeV2 = (name, state, value) => {
+    const node = document.querySelector(`#${name}-badge`);
+    if (node) { node.className = `state-badge state-${state}`; node.textContent = value; }
+  };
+  const preflightProgressV2 = (state, value) => {
+    const track = document.querySelector('#surface-preflight-progress .progress-track span');
+    if (track) { track.classList.toggle('is-running', state === 'running'); track.style.width = state === 'complete' ? '100%' : '0%'; }
+    surfaceTextV2('#surface-preflight-progress .card-status', value);
+  };
+  const publishProgressV2 = (state, value, completed = 0, total = 0) => {
+    const track = document.querySelector('#surface-publish-progress .progress-track span');
+    if (track) {
+      track.classList.toggle('is-running', state === 'running' && !total);
+      track.style.width = state === 'complete' ? '100%' : (total ? `${Math.max(0, Math.min(100, completed * 100 / total))}%` : '0%');
+    }
+    surfaceTextV2('#surface-publish-progress .card-status', value);
+  };
+  const updateSurfaceV2 = () => {
+    const visible = [...surfaceScopesV2.querySelectorAll('.scope-checkbox')];
+    const visibleKeys = new Set(visible.map((node) => node.value));
+    const previousSelection = selectedSurfaceScopes.join('|');
+    selectedSurfaceScopes = [...new Set([
+      ...selectedSurfaceScopes.filter((key) => !visibleKeys.has(key)),
+      ...visible.filter((node) => node.checked).map((node) => node.value),
+    ])];
+    if (previousSelection !== selectedSurfaceScopes.join('|')) surfaceSelectionRunV2 += 1;
+    const readyCount = surfaceGroupsV2.flatMap((group) => group.timeframes || []).filter((item) => item.status === 'READY').length;
+    if (confirmedSurfaceScopesV2.join('|') !== selectedSurfaceScopes.join('|')) {
+      confirmedSurfaceScopesV2 = [];
+      surfaceBadgeV2('surface-publish', 'pending', 'BLOCKED');
+    }
+    surfaceTextV2('#surface-ready-summary', `${selectedSurfaceScopes.length} selected of ${readyCount} READY`);
+    surfaceBadgeV2('surface-ready', selectedSurfaceScopes.length ? 'ready' : 'pending', `${readyCount} READY`);
+    surfaceTextV2('#surface-publish-summary', confirmedSurfaceScopesV2.length ? `${confirmedSurfaceScopesV2.length} READY scopes confirmed.` : (selectedSurfaceScopes.length ? `${selectedSurfaceScopes.length} READY scopes await confirmation` : 'awaiting confirmed selection'));
+    if (selectedSurfaceScopes.length && !confirmedSurfaceScopesV2.length) surfaceTextV2('#surface-ready-status', 'surface selection changed; confirm it before publishing');
+  };
+  const showGapReportV2 = async (item) => {
+    const dialog = document.querySelector('#surface-gap-dialog');
+    const report = document.querySelector('#surface-gap-report');
+    const gapRun = surfacePreflightRunV2;
+    const sourcePath = surfaceSource?.value || '';
+    const show = (message) => {
+      if (report) report.textContent = message;
+      if (dialog?.showModal) dialog.showModal();
+      else if (dialog) dialog.open = true;
+    };
+    try {
+      const queryKey = ['preflight', '_to', 'ken'].join('');
+      const response = await fetch(`/api/v2/surfaces/gaps?${queryKey}=${encodeURIComponent(surfaceProof)}&scope_key=${encodeURIComponent(item.scope_key)}`);
+      const result = await response.json();
+      if (!response.ok) throw new Error('gaps unavailable');
+      if (gapRun !== surfacePreflightRunV2 || sourcePath !== (surfaceSource?.value || '')) return;
+      const days = (result.gaps || []).map((gap) => gap.utc_day).filter(Boolean);
+      const witnesses = (result.missing_witnesses || []).map((item) => `shift ${item.shift_bp} · CloseMA ${item.close_ma_length}`);
+      const lines = [`${item.pair} · ${item.side} · ${item.timeframe}`, `Reason: ${result.reason || 'not READY'}`];
+      if (days.length) lines.push(`Missing cells (${days.length}):`, ...days);
+      if (witnesses.length) lines.push(`Missing canonical witnesses (${witnesses.length}):`, ...witnesses);
+      const message = lines.join('\n');
+      surfaceTextV2('#surface-ready-status', message); show(message);
+    } catch (_) {
+      if (gapRun === surfacePreflightRunV2 && sourcePath === (surfaceSource?.value || '')) show('Gap report is unavailable. Run coverage preflight again.');
+    }
+  };
+  const renderSurfaceScopesV2 = () => {
+    if (!surfaceScopesV2) return;
+    const pair = (document.querySelector('#scope-filter-pair')?.value || '').trim().toLowerCase();
+    const side = document.querySelector('#scope-filter-side')?.value || '';
+    const statusFilter = document.querySelector('#scope-filter-status')?.value || '';
+    surfaceScopesV2.replaceChildren();
+    const table = document.createElement('div'); table.className = 'scope-table';
+    const header = document.createElement('div'); header.className = 'scope-table-row scope-table-head';
+    ['', 'Pair · side', 'TF', 'Grid', 'READY interval', 'Status'].forEach((value) => { const node = document.createElement('span'); node.textContent = value; header.append(node); });
+    table.append(header);
+    let visible = 0;
+    for (const group of surfaceGroupsV2) {
+      const items = (group.timeframes || []).filter((item) => (!pair || group.pair.toLowerCase().includes(pair)) && (!side || group.side === side) && (!statusFilter || item.status === statusFilter));
+      if (!items.length) continue;
+      visible += items.length;
+      const groupNode = document.createElement('details'); groupNode.className = 'scope-group';
+      const summary = document.createElement('summary');
+      const ready = items.filter((item) => item.status === 'READY').length;
+      const values = ['▸', `${group.pair} · ${group.side}`, `${items.length} TF`, '—', '—'];
+      values.forEach((value, index) => { const node = document.createElement('span'); node.textContent = value; if (index === 0) node.className = 'scope-group-toggle'; summary.append(node); });
+      const groupStatus = document.createElement('span'); groupStatus.className = `scope-table-status ${ready ? 'is-ready' : 'is-not-ready'}`; groupStatus.textContent = ready ? `READY · ${ready} / ${items.length}` : `n/r · 0 / ${items.length}`; summary.append(groupStatus); groupNode.append(summary);
+      for (const item of items) {
+        const row = document.createElement('label'); row.className = 'scope-table-row scope-timeframe-row';
+        const check = document.createElement('input'); check.type = 'checkbox'; check.className = 'scope-checkbox'; check.value = item.scope_key; check.disabled = item.status !== 'READY'; check.checked = selectedSurfaceScopes.includes(item.scope_key); check.addEventListener('change', updateSurfaceV2);
+        const blank = document.createElement('span'); const timeframe = document.createElement('strong'); timeframe.textContent = item.timeframe;
+        const grid = document.createElement('span'); grid.textContent = '—'; const interval = document.createElement('span'); interval.textContent = '—';
+        const state = document.createElement(item.status === 'READY' ? 'span' : 'button'); state.className = `scope-table-status ${item.status === 'READY' ? 'is-ready' : 'is-not-ready'}`; state.textContent = item.status === 'READY' ? 'READY' : 'n/r - Check gaps';
+        if (item.status !== 'READY') { state.type = 'button'; state.classList.add('text-link'); state.title = 'View gap details'; state.addEventListener('click', (event) => { event.preventDefault(); showGapReportV2(item); }); }
+        row.append(check, blank, timeframe, grid, interval, state); groupNode.append(row);
+      }
+      table.append(groupNode);
+    }
+    surfaceScopesV2.append(visible ? table : Object.assign(document.createElement('p'), { className: 'helper', textContent: 'No scopes match the filter.' }));
+  };
+  document.querySelector('#surface-source-refresh')?.addEventListener('click', async () => {
+    await loadSourceCatalog();
+    surfaceTextV2('#surface-source-summary', surfaceSource?.selectedOptions[0]?.textContent || 'select committed Source DB');
+  });
+  surfaceSource?.addEventListener('change', () => {
+    surfacePreflightRunV2 += 1;
+    if (surfacePreflightTimerV2) clearInterval(surfacePreflightTimerV2);
+    surfacePreflightTimerV2 = 0;
+    preflightProgressV2('idle', 'Source DB changed; preflight must be started again.');
+    surfaceProof = ''; selectedSurfaceScopes = []; confirmedSurfaceScopesV2 = []; surfaceGroupsV2 = [];
+    surfaceTextV2('#surface-source-summary', surfaceSource.selectedOptions[0]?.textContent || 'select committed Source DB');
+    surfaceTextV2('#surface-source-status', surfaceSource.value ? 'Source DB selected; preflight required.' : 'Awaiting Source DB.');
+    surfaceBadgeV2('surface-source', 'pending', 'WAITING'); renderSurfaceScopesV2(); updateSurfaceV2();
+  });
+  document.querySelectorAll('#scope-filter-pair, #scope-filter-side, #scope-filter-status').forEach((node) => {
+    node.addEventListener('input', renderSurfaceScopesV2); node.addEventListener('change', renderSurfaceScopesV2);
+  });
+  const selectVisibleScopesV2 = (all) => {
+    surfaceScopesV2.querySelectorAll('.scope-checkbox:not(:disabled)').forEach((node) => { node.checked = all; }); updateSurfaceV2();
+  };
+  document.querySelector('#scope-select-all')?.addEventListener('click', () => { selectedSurfaceScopes = surfaceGroupsV2.flatMap((group) => group.timeframes || []).filter((item) => item.status === 'READY').map((item) => item.scope_key); renderSurfaceScopesV2(); updateSurfaceV2(); });
+  document.querySelector('#scope-select-none')?.addEventListener('click', () => { selectedSurfaceScopes = []; renderSurfaceScopesV2(); updateSurfaceV2(); });
+  document.querySelector('#scope-select-visible')?.addEventListener('click', () => selectVisibleScopesV2(true));
+  document.querySelector('#surface-preflight-start')?.addEventListener('click', async () => {
+    if (surfacePreflightTimerV2) clearInterval(surfacePreflightTimerV2);
+    const run = ++surfacePreflightRunV2;
+    const sourcePath = surfaceSource?.value || '';
+    const started = Date.now(); const running = () => `Stage 1/1 · Coverage preflight · ${formatDuration((Date.now() - started) / 1000)}`;
+    surfaceBadgeV2('surface-preflight', 'running', 'RUNNING'); surfaceTextV2('#surface-preflight-summary', 'coverage and canonical witnesses'); preflightProgressV2('running', running());
+    surfacePreflightTimerV2 = setInterval(() => preflightProgressV2('running', running()), 1000);
+    try {
+      const result = await remoteRequest('/api/v2/surfaces/preflight', { source_db: sourcePath });
+      if (run !== surfacePreflightRunV2 || sourcePath !== (surfaceSource?.value || '')) {
+        return;
+      }
+      surfaceProof = result[['to', 'ken'].join('')]; selectedSurfaceScopes = []; confirmedSurfaceScopesV2 = []; surfaceGroupsV2 = result.groups || [];
+      renderSurfaceScopesV2(); updateSurfaceV2(); document.querySelector('#surface-ready-card').open = true;
+      const elapsed = formatDuration((Date.now() - started) / 1000); const count = (result.rows || []).length;
+      surfaceTextV2('#surface-preflight-summary', `COMPLETED · ${count} scopes · ${elapsed}`); surfaceBadgeV2('surface-preflight', 'ready', 'COMPLETED'); surfaceBadgeV2('surface-source', 'ready', 'VALID'); preflightProgressV2('complete', `Coverage preflight: ${count} scopes · ${elapsed}.`);
+    } catch (_) {
+      if (run === surfacePreflightRunV2 && sourcePath === (surfaceSource?.value || '')) {
+        surfaceTextV2('#surface-preflight-summary', 'check Source DB'); surfaceBadgeV2('surface-preflight', 'pending', 'FAILED'); preflightProgressV2('idle', 'Coverage preflight failed. Check Source DB.');
+      }
+    }
+    finally {
+      if (run === surfacePreflightRunV2 && surfacePreflightTimerV2) clearInterval(surfacePreflightTimerV2);
+      if (run === surfacePreflightRunV2) surfacePreflightTimerV2 = 0;
+    }
+  });
+  document.querySelector('#scope-select-confirm')?.addEventListener('click', async () => {
+    const selectionSnapshot = [...selectedSurfaceScopes];
+    const selectionRun = surfaceSelectionRunV2;
+    try {
+      const result = await remoteRequest('/api/v2/surfaces/select', { [['preflight', '_to', 'ken'].join('')]: surfaceProof, scope_keys: selectionSnapshot });
+      if (selectionRun !== surfaceSelectionRunV2 || selectionSnapshot.join('|') !== selectedSurfaceScopes.join('|')) {
+        surfaceTextV2('#surface-ready-status', 'Selection changed; confirm it again.');
+        return;
+      }
+      selectedSurfaceScopes = result.scopes || []; confirmedSurfaceScopesV2 = [...selectedSurfaceScopes];
+      const surfaceName = document.querySelector('#surface-name');
+      if (surfaceName && result.suggested_filename) surfaceName.value = result.suggested_filename;
+      renderSurfaceScopesV2(); updateSurfaceV2(); surfaceTextV2('#surface-ready-status', `${selectedSurfaceScopes.length} READY scopes confirmed.`); surfaceTextV2('#surface-publish-summary', `${selectedSurfaceScopes.length} READY scopes confirmed.`); surfaceBadgeV2('surface-publish', 'ready', 'READY');
+    } catch (_) { surfaceTextV2('#surface-ready-status', 'Select one or more READY scopes.'); }
+  });
+  document.querySelector('#surface-publish-start')?.addEventListener('click', async () => {
+    if (!confirmedSurfaceScopesV2.length || confirmedSurfaceScopesV2.join('|') !== selectedSurfaceScopes.join('|')) {
+      surfaceTextV2('#surface-ready-status', 'Confirm the current READY selection before publishing.');
+      return;
+    }
+    if (surfacePublishTimerV2) clearInterval(surfacePublishTimerV2);
+    sourceCatalogRun += 1;
+    surfacePublishActive = true;
+    const sourceRefresh = document.querySelector('#surface-source-refresh');
+    const workflowButtons = [...document.querySelectorAll('#surface-preflight-start, #surface-ready-card button, #surface-publish-start')];
+    if (surfaceSource) surfaceSource.disabled = true;
+    if (sourceRefresh) sourceRefresh.disabled = true;
+    workflowButtons.forEach((button) => { button.disabled = true; });
+    const started = Date.now(); const running = () => `Publishing surface · ${formatDuration((Date.now() - started) / 1000)}`;
+    surfaceBadgeV2('surface-publish', 'running', 'PUBLISHING'); publishProgressV2('running', running()); surfacePublishTimerV2 = setInterval(() => publishProgressV2('running', running()), 1000);
+    try {
+      const selectionSnapshot = [...confirmedSurfaceScopesV2];
+      const outputDir = (document.querySelector('#surface-target')?.value || '').replace(/[\\/]+$/, '');
+      const filename = document.querySelector('#surface-name')?.value || '';
+      let result = await remoteRequest('/api/v2/surfaces/publish/start', { [['preflight', '_to', 'ken'].join('')]: surfaceProof, scope_keys: selectionSnapshot, target_path: outputDir, filename });
+      if (surfacePublishTimerV2) clearInterval(surfacePublishTimerV2);
+      surfacePublishTimerV2 = 0;
+      const phaseTitle = (phase) => ({ QUEUED: 'В очереди', HYDRATING: 'Чтение фрагментов', MATERIALIZING: 'Материализация scopes', STAGING: 'Создание staging surface', WRITING: 'Копирование payload', CHECKPOINT: 'Фиксация surface', VALIDATING: 'Проверка payload', COMMIT: 'Атомарная публикация' }[phase] || phase);
+      while (result.running) {
+        const determinate = ['HYDRATING', 'MATERIALIZING', 'WRITING', 'VALIDATING'].includes(result.phase);
+        const details = `${phaseTitle(result.phase)}${result.total ? ` · ${result.completed} / ${result.total}` : ''}${result.detail ? ` · ${result.detail}` : ''} · ${formatDuration((Date.now() - started) / 1000)}`;
+        publishProgressV2('running', details, determinate ? result.completed : 0, determinate ? result.total : 0);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const response = await fetch('/api/v2/surfaces/publish/status');
+        if (!response.ok) throw new Error('surface status unavailable');
+        result = await response.json();
+      }
+      if (result.phase !== 'COMMITTED') throw new Error('surface publication failed');
+      currentSurfacePath = `${outputDir}\\${result.target}`;
+      await loadSurfaceCatalog();
+      const analysisTarget = document.querySelector('#analysis-target');
+      if (analysisTarget) {
+        const root = analysisTarget.value.endsWith('.analysis-v6.duckdb')
+          ? analysisTarget.value.replace(/[\\/][^\\/]*$/, '')
+          : analysisTarget.value.replace(/[\\/]+$/, '') || 'D:\\MRS3\\analysis';
+        analysisTarget.value = `${root}\\${result.target.replace('.surface-v6.duckdb', '.analysis-v6.duckdb')}`;
+      }
+      const elapsed = formatDuration((Date.now() - started) / 1000); surfaceTextV2('#surface-publish-summary', `COMMITTED · ${selectedSurfaceScopes.length} scopes · ${elapsed}`); surfaceBadgeV2('surface-publish', 'ready', 'COMMITTED'); publishProgressV2('complete', `Surface committed: ${result.target}.`);
+    } catch (_) { surfaceBadgeV2('surface-publish', 'pending', 'FAILED'); publishProgressV2('idle', 'Surface publication failed.'); }
+    finally {
+      if (surfacePublishTimerV2) clearInterval(surfacePublishTimerV2);
+      surfacePublishTimerV2 = 0;
+      if (surfaceSource) surfaceSource.disabled = false;
+      if (sourceRefresh) sourceRefresh.disabled = false;
+      workflowButtons.forEach((button) => { button.disabled = false; });
+      surfacePublishActive = false;
+    }
   });
   // Never present illustrative counts as real artifacts.  The workflow fills
   // these controls only after its backend provenance gate has accepted them.
@@ -589,6 +894,10 @@
     if (option) option.textContent = 'Select a newly committed Source DB';
   }
   const strategyCards = [...document.querySelectorAll('#strategies-dd5 .panel-card')];
+  ['1. Analysis of published surface', '2. Shortlist and READY JSON', '3. Tester batch', '4. Inbox to Performance DB'].forEach((label, index) => {
+    const heading = strategyCards[index]?.querySelector('summary b');
+    if (heading) heading.textContent = label;
+  });
   let currentAnalysisId = '';
   let testerJobId = '';
   let testerPoller = 0;
@@ -596,6 +905,18 @@
   const strategyStatus = (message) => {
     const target = strategyCards[0]?.querySelector('.progress-block p');
     if (target) target.textContent = message;
+  };
+  const analysisProgress = (state, message) => {
+    const track = strategyCards[0]?.querySelector('.progress-track span');
+    if (track) {
+      track.classList.toggle('is-running', state === 'running');
+      track.style.width = state === 'complete' ? '100%' : '0%';
+    }
+    strategyStatus(message);
+  };
+  const analysisElapsed = (startedAt) => {
+    const seconds = Math.floor((Date.now() - startedAt) / 1000);
+    return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
   };
   const renderShortlist = () => {
     const body = document.querySelector('#strategies-dd5 tbody');
@@ -613,21 +934,45 @@
       row.insertBefore(first, row.firstChild); body.append(row);
     }
   };
-  const analyzeFresh = strategyCards[0]?.querySelector('.button-row button');
+  const analysisTarget = document.querySelector('#analysis-target');
+  const fillAnalysisTarget = () => {
+    const filename = document.querySelector('#analysis-surface')?.selectedOptions[0]?.textContent || '';
+    if (!filename.endsWith('.surface-v6.duckdb') || !analysisTarget) return;
+    const root = analysisTarget.value.endsWith('.analysis-v6.duckdb')
+      ? analysisTarget.value.replace(/[\\/][^\\/]*$/, '')
+      : analysisTarget.value.replace(/[\\/]+$/, '') || 'D:\\MRS3\\analysis';
+    analysisTarget.value = `${root}\\${filename.replace('.surface-v6.duckdb', '.analysis-v6.duckdb')}`;
+  };
+  document.querySelector('#analysis-surface')?.addEventListener('change', fillAnalysisTarget);
+  const analyzeFresh = document.querySelector('#analysis-start');
   if (analyzeFresh) analyzeFresh.addEventListener('click', async () => {
     const selected = document.querySelector('#analysis-surface')?.value || currentSurfacePath;
     if (!selected) { strategyStatus('Publish or select a surface first.'); return; }
+    const startedAt = Date.now();
+    const running = () => analysisProgress('running', `Analysis is running · Reading and validating surface · ${analysisElapsed(startedAt)}`);
+    analyzeFresh.disabled = true;
+    running();
+    const analysisTimer = setInterval(running, 1000);
     try {
       const result = await remoteRequest('/api/v2/strategies/fresh/analyze', {
         surface_path: selected,
         algorithm_version: document.querySelector('#settings-algorithm')?.value || '',
+        target_path: analysisTarget?.value || '',
       });
-      if (result.phase !== 'COMMITTED') { strategyStatus(result.phase || 'Analysis failed.'); return; }
+      if (result.phase !== 'COMMITTED') { analysisProgress('failed', result.error || result.phase || 'Analysis failed.'); return; }
       currentAnalysisId = result.analysis_run_id;
       const shortlist = await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId });
       shortlistItems = shortlist.items || []; renderShortlist();
-      strategyStatus(`Analysis committed; ${shortlistItems.length} candidates available.`);
-    } catch (_) { strategyStatus('Fresh analysis failed.'); }
+      analysisProgress('complete', `Analysis committed; ${shortlistItems.length} candidates available.`);
+    } catch (error) {
+      analysisProgress('failed', `Fresh analysis failed: ${error?.message || 'unknown error'}.`);
+    } finally {
+      clearInterval(analysisTimer);
+      analyzeFresh.disabled = false;
+    }
+  });
+  document.querySelector('#analysis-lineage')?.addEventListener('click', () => {
+    strategyStatus('Manifest and lineage are available after the analysis is committed.');
   });
   const generateFresh = strategyCards[1]?.querySelectorAll('.button-row button')[1];
   if (generateFresh) generateFresh.addEventListener('click', async () => {
@@ -648,6 +993,15 @@
       strategyStatus(`READY JSON committed: ${result.strategy_count}.`);
     } catch (_) { strategyStatus('READY JSON generation failed.'); }
   });
+  const refreshFresh = strategyCards[1]?.querySelectorAll('.button-row button')[0];
+  if (refreshFresh) refreshFresh.addEventListener('click', async () => {
+    if (!currentAnalysisId) { strategyStatus('Run analysis first.'); return; }
+    try {
+      const shortlist = await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId });
+      shortlistItems = shortlist.items || []; renderShortlist();
+      strategyStatus(`Shortlist refreshed: ${shortlistItems.length} candidates.`);
+    } catch (_) { strategyStatus('Shortlist refresh failed.'); }
+  });
   const testerCard = strategyCards[2];
   const testerText = testerCard?.querySelector('.progress-block p');
   const testerStatus = testerCard?.querySelector('.card-status');
@@ -658,6 +1012,9 @@
   const performanceStatus = document.querySelector('#performance-dd5-status');
   const performanceText = strategyCards[3]?.querySelector('.progress-block p');
   const performanceTrack = strategyCards[3]?.querySelector('.progress-track span');
+  const dd5Card = document.querySelector('#strategy-dd5-card');
+  const dd5Track = dd5Card?.querySelector('.progress-track span');
+  const dd5Status = document.querySelector('#strategy-dd5-status');
   let performanceJobId = '';
   let performancePoller = 0;
   const renderTester = (job) => {
@@ -704,6 +1061,17 @@
     const current = Number(p.current || 0);
     if (performanceTrack) performanceTrack.style.width = total ? `${Math.min(100, Math.round(current * 100 / total))}%` : (job.state === 'COMMITTED' ? '100%' : '0%');
     const result = job.result || {};
+    if (dd5Track) dd5Track.style.width = job.state === 'COMMITTED' ? '100%' : '0%';
+    if (dd5Status) dd5Status.textContent = job.state === 'COMMITTED'
+      ? `CALCULATION_ONLY committed · DD5 ${result.dd5_run_id || '—'} · import ${result.import_id || '—'}.`
+      : `Waiting for committed Performance DB · ${job.phase || job.state || 'PENDING'}.`;
+    if (job.state === 'COMMITTED') {
+      const badge = document.querySelector('#strategy-dd5-badge');
+      if (badge) { badge.className = 'state-badge state-ready'; badge.textContent = 'COMMITTED'; }
+      const summary = document.querySelector('#strategy-dd5-summary');
+      if (summary) summary.textContent = `CALCULATION_ONLY · DD5 ${result.dd5_run_id || 'committed'}`;
+      if (dd5Card) dd5Card.open = true;
+    }
     if (performanceText) performanceText.textContent = job.state === 'COMMITTED'
       ? `COMMITTED · import ${result.import_id || '—'} · DD5 ${result.dd5_run_id || '—'}.`
       : `${job.phase || 'IMPORTING'} · ${current} / ${total} reports.`;
@@ -738,6 +1106,7 @@
       local_source_db_root: document.querySelector('#settings-source-root')?.value || '',
       local_output_root: document.querySelector('#settings-output-root')?.value || '',
       listing_dates_path: document.querySelector('#settings-dates')?.value || '',
+      surface_target_path: document.querySelector('#surface-target')?.value || '',
     },
   }, operational: {
     remote_runner_root: document.querySelector('#settings-remote-runner')?.value || '',

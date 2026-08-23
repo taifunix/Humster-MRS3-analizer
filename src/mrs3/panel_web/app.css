@@ -96,6 +96,8 @@ summary small { margin-left: 5px; color: var(--muted); font-size: .7rem; font-we
 .progress-block { display: grid; gap: 6px; }
 .progress-track { height: 8px; overflow: hidden; border-radius: 999px; background: #dce4ee; }
 .progress-track span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #4d79ed, #59bb91); }
+.progress-track span.is-running { width: 34%; animation: progress-indeterminate 1.1s ease-in-out infinite; }
+@keyframes progress-indeterminate { from { transform: translateX(-120%); } to { transform: translateX(360%); } }
 .metric-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--line); color: var(--muted); font-size: .8rem; }
 .metric-row strong { color: var(--ink); }
 .text-link { color: var(--blue); font-size: .78rem; font-weight: 750; text-decoration: none; }
@@ -104,6 +106,29 @@ summary small { margin-left: 5px; color: var(--muted); font-size: .7rem; font-we
 .scope-list label { display: flex; align-items: center; gap: 8px; padding: 11px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: .8rem; }
 .scope-list input { width: auto; min-height: 0; }
 .scope-list strong { margin-left: auto; color: var(--ink); }
+.scope-filters { display: grid; grid-template-columns: 1.45fr 1fr 1fr; gap: 9px; }
+.scope-table { overflow-x: auto; overflow-y: hidden; border: 1px solid #526b8b; border-radius: 8px; color: #edf3fc; background: var(--navy); }
+.scope-table-row { display: grid; grid-template-columns: 36px 190px 90px 85px 150px minmax(150px, 1fr); gap: 9px; align-items: center; min-width: 760px; padding: 10px 11px; border-bottom: 1px solid #3b4d69; font-size: .78rem; }
+.scope-table-head { color: #fff; background: #46607f; font-weight: 800; }
+.scope-group { border-bottom: 1px solid #41516c; }
+.scope-group:last-child { border-bottom: 0; }
+.scope-group > summary { display: grid; grid-template-columns: 36px 190px 90px 85px 150px minmax(150px, 1fr); gap: 9px; align-items: center; min-width: 760px; padding: 11px; color: #fff; background: #1c2638; font-size: .8rem; }
+.scope-group > summary::after { display: none; }
+.scope-group-toggle { color: #aebed3; font-size: .9rem; }
+.scope-group[open] .scope-group-toggle { transform: rotate(90deg); }
+.scope-table .scope-timeframe-row { display: grid; padding: 10px 11px; border: 0; border-bottom: 1px solid #35445b; border-radius: 0; color: #e3eaf5; background: #202d43; }
+.scope-table .scope-timeframe-row strong { margin-left: 0; color: #e3eaf5; }
+.scope-timeframe-row:last-child { border-bottom: 0; }
+.scope-table input { width: auto; min-height: 0; }
+.scope-table-status { justify-self: start; font-weight: 750; }
+.scope-table-status.is-ready { color: #5ce0a4; }
+.scope-table-status.is-not-ready { color: #ffb6bd; }
+.scope-table .text-link { border: 0; padding: 0; color: #ffb6bd; background: transparent; text-decoration: underline dotted; text-underline-offset: 3px; cursor: pointer; }
+.gap-dialog { width: min(560px, calc(100% - 32px)); padding: 0; border: 1px solid var(--line); border-radius: 13px; color: var(--ink); box-shadow: var(--shadow); }
+.gap-dialog::backdrop { background: rgb(16 31 54 / 45%); }
+.gap-dialog-body { display: grid; gap: 15px; padding: 22px; }
+.gap-dialog-body p { margin: 0; color: var(--muted); line-height: 1.55; white-space: pre-wrap; }
+@media (max-width: 560px) { .scope-filters { grid-template-columns: 1fr; } }
 .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
 table { width: 100%; border-collapse: collapse; min-width: 620px; font-size: .76rem; }
 th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }

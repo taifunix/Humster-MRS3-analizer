@@ -53,6 +53,7 @@ _PATH_KEYS = frozenset(
         "remote_import_target_path",
         "source_db_root",
         "surface_root",
+        "surface_target_path",
         "analysis_db_root",
         "output_root",
         "listing_dates_path",

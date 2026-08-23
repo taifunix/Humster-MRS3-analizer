@@ -1911,6 +1911,26 @@ class PanelController:
             candidates = []
         return {"databases": [{"name": path.name, "path": str(path)} for path in candidates]}
 
+    def surface_catalog(self) -> dict[str, object]:
+        """List manifest-validated fresh-surface candidates without blocking the UI."""
+        try:
+            configured = self._import_settings().source_v6_surface_dir
+            directory = self._path(configured) if configured else (self.root / "data" / "surfaces")
+            candidates = sorted(
+                (path for path in directory.rglob("*.surface-v6.duckdb") if path.is_file() and not path.is_symlink()),
+                key=lambda path: str(path).casefold(),
+            )
+        except (OSError, ValueError):
+            candidates = []
+        surfaces = []
+        for path in candidates:
+            try:
+                read_multiscope_surface(path, decode=False)
+            except (OSError, ValueError, duckdb.Error):
+                continue
+            surfaces.append({"name": path.name, "path": str(path)})
+        return {"surfaces": surfaces}
+
     def source_db_remote_status(self, job_id: str) -> dict[str, object]:
         executor = self._remote_source_db()
         status = self._tracked_job_or_interrupted(job_id, executor.status)
@@ -1937,7 +1957,11 @@ class PanelController:
 
     def _surfaces(self) -> LocalSurfacesService:
         if self._panel_surfaces is None:
-            self._panel_surfaces = LocalSurfacesService()
+            try:
+                workers = min(16, max(1, int(self._import_settings().workers)))
+            except Exception:
+                workers = 1
+            self._panel_surfaces = LocalSurfacesService(workers=workers)
         return self._panel_surfaces
 
     def surface_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -1963,10 +1987,28 @@ class PanelController:
             raise ValueError("scope_keys must be a list")
         try:
             return self._surfaces().publish(
-                self._required(payload, "preflight_token"), scopes, self._path(self._required(payload, "target_path"))
+                self._required(payload, "preflight_token"), scopes,
+                self._path(self._required(payload, "target_path")),
+                self._optional_string(payload, "filename") or None,
             )
         except Exception:
             raise ValueError("invalid surface request") from None
+
+    def surface_publish_start(self, payload: Mapping[str, object]) -> dict[str, object]:
+        scopes = payload.get("scope_keys")
+        if not isinstance(scopes, list):
+            raise ValueError("scope_keys must be a list")
+        try:
+            return self._surfaces().start_publish(
+                self._required(payload, "preflight_token"), scopes,
+                self._path(self._required(payload, "target_path")),
+                self._optional_string(payload, "filename") or None,
+            )
+        except Exception:
+            raise ValueError("invalid surface request") from None
+
+    def surface_publish_status(self) -> dict[str, object]:
+        return self._surfaces().publish_status()
 
     def _workflow_default(self, name: str, *, side: str | None = None) -> Path:
         try:
@@ -2001,9 +2043,10 @@ class PanelController:
             "listing_dates_path": str(self._workflow_default("listing_dates_path")),
             "config_path": str(self.default_config),
             "algorithm_version": self._workflow_algorithm_version(payload.get("algorithm_version")),
+            "target_path": self._optional_string(payload, "target_path"),
         })
         if result.get("phase") != "COMMITTED":
-            return {"phase": str(result.get("phase", "FAILED"))}
+            return {"phase": str(result.get("phase", "FAILED")), "error": "Analysis failed. Check panel logs."}
         artifact = Path(str(result.get("analysis_path", "")))
         try:
             connection = duckdb.connect(str(artifact), read_only=True)
@@ -2444,7 +2487,9 @@ class PanelController:
             job = {"phase": "RUNNING", "current": 0, "total": 1, "progress": 0.0, "error": None, "cancel_requested": False}
             self._source_v6_job = job
         try:
-            artifact = run_multiscope_analysis(surface, self.root / "Output" / "analysis-v6-compact", self._analysis_config_loader(config_path), listing_dates=self._source_v6_listing_dates_loader(dates_path), algorithm_version=str(payload.get("algorithm_version") or "0.7-canonical-phase1"), workers=max(1, self._import_settings().workers), cancel_check=lambda: bool(job["cancel_requested"]))
+            target_value = self._optional_string(payload, "target_path")
+            target = self._path(target_value) if target_value else None
+            artifact = run_multiscope_analysis(surface, target.parent if target else self.root / "Output" / "analysis-v6-compact", self._analysis_config_loader(config_path), listing_dates=self._source_v6_listing_dates_loader(dates_path), algorithm_version=str(payload.get("algorithm_version") or "0.7-canonical-phase1"), workers=max(1, self._import_settings().workers), cancel_check=lambda: bool(job["cancel_requested"]), filename=target.name if target else None)
             with self._source_v6_lock:
                 job.update({"phase": "COMMITTED", "current": 1, "progress": 1.0, "analysis_path": str(artifact), "analysis_id": artifact.stem})
         except BaseException as error:
@@ -4719,6 +4764,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v2/source/local/catalog":
             self._json(200, self.server.controller.source_db_local_catalog())
             return
+        if parsed.path == "/api/v2/surfaces/catalog":
+            self._json(200, self.server.controller.surface_catalog())
+            return
         if parsed.path == "/api/v2/source/remote/status":
             try:
                 job_id = parse_qs(parsed.query).get("job_id", [""])[0]
@@ -4735,6 +4783,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 }))
             except ValueError:
                 self._json(400, {"error": "invalid surface request"})
+            return
+        if parsed.path == "/api/v2/surfaces/publish/status":
+            self._json(200, self.server.controller.surface_publish_status())
             return
         if parsed.path == "/api/v2/strategies/tester/status":
             try:
@@ -4821,7 +4872,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/shortlist"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/shortlist"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -4878,6 +4929,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.surface_select(document)
             elif endpoint == "/api/v2/surfaces/publish":
                 result = self.server.controller.surface_publish(document)
+            elif endpoint == "/api/v2/surfaces/publish/start":
+                result = self.server.controller.surface_publish_start(document)
             elif endpoint == "/api/v2/strategies/fresh/analyze":
                 result = self.server.controller.strategies_fresh_analyze(document)
             elif endpoint == "/api/v2/strategies/fresh/generate":
@@ -4974,7 +5027,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             self._json(400, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})
             return
-        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs"} else 200, result)
+        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start"} else 200, result)
 
 
 def create_panel_server(
