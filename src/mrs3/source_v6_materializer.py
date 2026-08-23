@@ -9,7 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .source_v6 import SourceV6Fragment, _canonical_json
+from .source_v6 import SourceV6Fragment, _decimal_text
 from .source_v6_coverage import ReadyInterval, canonical_ready_intervals
 from .source_v6_stitch import measure_points
 from .source_v6_storage import decode_fragment_slice, fragment_metadata, source_content_digest
@@ -76,15 +76,10 @@ def analysis_input_row(
     is in hand.
     """
     start_ms, end_ms = window
-    event_times = {
-        event.event_id: event.timestamp_ms
-        for fragment in fragments for event in fragment.events
-    }
-    event_ids = tuple(sorted(set(metrics.events)))
-    if any(
-        event_id not in event_times or not start_ms <= event_times[event_id] < end_ms
-        for event_id in event_ids
-    ):
+    round_trips = tuple(getattr(metrics, "round_trips", ()))
+    event_times = {trip.round_trip_id: trip.timestamp_ms for trip in round_trips}
+    event_ids = tuple(sorted(set(getattr(metrics, "round_trip_ids", metrics.events))))
+    if any(event_id not in event_times or not start_ms <= event_times[event_id] < end_ms for event_id in event_ids):
         raise ValueError(f"point events are outside READY witness: {point_key}")
     return {
         "point_id": point_key,
@@ -94,13 +89,16 @@ def analysis_input_row(
         "shift_bp": point.shift_bp,
         "open_ma": point.open_ma_length,
         "close_ma": point.close_ma_length,
-        "pnl_pct": float(metrics.total_pnl_percent),
-        "dd_pct": float(metrics.max_equity_drawdown_percent),
+        "pnl_pct": _decimal_text(metrics.total_pnl_percent),
+        "dd_pct": _decimal_text(metrics.max_equity_drawdown_percent),
         "trades": metrics.total_trades,
         "wins": metrics.win_trades,
         "losses": metrics.loss_trades,
-        "win_rate_pct": float(metrics.win_rate_percent),
-        "profit_factor": None if metrics.profit_factor is None else float(metrics.profit_factor),
+        "win_rate_pct": _decimal_text(metrics.win_rate_percent),
+        "profit_factor": None if metrics.profit_factor is None else _decimal_text(metrics.profit_factor),
+        "weighted_trades": _decimal_text(metrics.weighted_trades),
+        "max_equity_drawdown": _decimal_text(metrics.max_equity_drawdown),
+        "max_equity_drawdown_source": metrics.max_equity_drawdown_source,
         "event_ids": list(event_ids),
         "event_ids_hash": sha256("|".join(event_ids).encode("utf-8")).hexdigest(),
         "event_mode": "real_independent_events",
@@ -285,14 +283,21 @@ def materialize_source_v6(
         window = _witness_window(witness)
         # Only the requested scopes are measured: measuring the whole input
         # would write other symbols' combinations into this surface's record.
-        _measured, empty = measure_points(members, {
+        measured, empty = measure_points(members, {
             item.point.canonical_key: window for item in members
         })
         empty_results.extend(empty)
         facts = tuple(sorted(members, key=lambda item: item.fragment_id))
         if not facts:
             raise ValueError(f"scope has no facts: {scope_key}")
-        result.append(MaterializedScope(scope_key, facts, witness))
+        rows = tuple(
+            analysis_input_row(point_key, members_for_point[0].point, measured[point_key], members_for_point, window)
+            for point_key, members_for_point in sorted(
+                ((point_key, tuple(item for item in members if item.point.canonical_key == point_key)) for point_key in measured),
+                key=lambda item: item[0],
+            )
+        )
+        result.append(MaterializedScope(scope_key, facts, witness, rows))
     # The digest stays over the whole input: it is the lineage of what was
     # materialized *from*, not of what the requested scopes hold.
     return MaterializedSourceV6(

@@ -5,10 +5,11 @@ from __future__ import annotations
 from bisect import bisect_left
 from dataclasses import dataclass
 from decimal import Decimal
+from hashlib import sha256
 import json
 from typing import Mapping, Sequence
 
-from .source_v6 import NormalizedAction, NormalizedCycle, NormalizedSample, SourceV6Fragment
+from .source_v6 import NormalizedAction, NormalizedCycle, NormalizedSample, SourceV6Fragment, _canonical_json
 
 
 MIN_OVERLAP_HOURS = 96
@@ -78,6 +79,21 @@ class BridgeFacts:
 
 
 @dataclass(frozen=True, slots=True)
+class RoundTrip:
+    round_trip_id: str
+    timestamp_ms: int
+    entry_action_ids: tuple[str, ...]
+    realizing_action_ids: tuple[str, ...]
+    realized_pnl: Decimal
+    realized_size: Decimal
+    peak_position_size: Decimal
+
+    @property
+    def weighted_trades(self) -> Decimal:
+        return self.realized_size / self.peak_position_size if self.peak_position_size else Decimal("0")
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalMetrics:
     total_pnl: Decimal
     total_pnl_percent: Decimal
@@ -94,6 +110,11 @@ class CanonicalMetrics:
     equity_series: tuple[NormalizedSample, ...]
     events: tuple[str, ...]
     period_metrics: tuple["PeriodMetrics", ...] = ()
+    weighted_trades: Decimal = Decimal("0")
+    round_trip_ids: tuple[str, ...] = ()
+    round_trips: tuple[RoundTrip, ...] = ()
+    max_equity_drawdown_source: str = "SERIES"
+    max_equity_drawdown_declared_fragment_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,6 +615,11 @@ def _merge_samples(
 
 
 def _drawdown(series: Sequence[NormalizedSample]) -> tuple[Decimal, Decimal]:
+    maximum, peak_value = _drawdown_details(series)
+    return maximum, (maximum / peak_value * Decimal("100")) if peak_value else Decimal("0")
+
+
+def _drawdown_details(series: Sequence[NormalizedSample]) -> tuple[Decimal, Decimal]:
     if not series:
         raise SourceV6StitchError("required metric series is empty")
     peak = series[0].value
@@ -606,7 +632,80 @@ def _drawdown(series: Sequence[NormalizedSample]) -> tuple[Decimal, Decimal]:
         if drawdown > maximum:
             maximum = drawdown
             peak_value = peak
-    return maximum, (maximum / peak_value * Decimal("100")) if peak_value else Decimal("0")
+    return maximum, peak_value
+
+
+def _round_trip_peak(
+    action_ids: Sequence[str], actions_by_id: Mapping[str, NormalizedAction],
+    cycles_by_action: Mapping[str, NormalizedCycle],
+) -> Decimal:
+    """Return the largest observed position size for the involved position."""
+    cycle_ids = {cycles_by_action[action_id].cycle_id for action_id in action_ids if action_id in cycles_by_action}
+    relevant = [
+        action for action in actions_by_id.values()
+        if action.action_id in action_ids
+        or (cycles_by_action.get(action.action_id) is not None and cycles_by_action[action.action_id].cycle_id in cycle_ids)
+    ]
+    position = Decimal("0")
+    peak = Decimal("0")
+    for action in sorted(relevant, key=lambda item: (item.timestamp_ms, item.action_id)):
+        if action.post_size is not None:
+            position = abs(action.post_size)
+        elif action.size is not None:
+            amount = abs(action.size)
+            if action.action in {"opened", "increased"}:
+                position += amount
+            else:
+                position = max(Decimal("0"), position - amount)
+        peak = max(peak, position)
+    return peak
+
+
+def derive_round_trips(
+    actions: Sequence[NormalizedAction], cycles: Sequence[NormalizedCycle], point_key: str,
+) -> tuple[RoundTrip, ...]:
+    """Build deterministic entry-run/realisation-run decisions from filtered facts."""
+    ordered = tuple(sorted(actions, key=lambda item: (item.timestamp_ms, item.action_id)))
+    actions_by_id = {item.action_id: item for item in ordered}
+    cycles_by_action = {
+        action_id: cycle
+        for cycle in cycles
+        for action_id in cycle.action_ids
+        if action_id in actions_by_id
+    }
+    result: list[RoundTrip] = []
+    entries: list[NormalizedAction] = []
+    realizing: list[NormalizedAction] = []
+
+    def finish() -> None:
+        if not entries or not realizing:
+            return
+        entry_ids = tuple(item.action_id for item in entries)
+        realizing_ids = tuple(item.action_id for item in realizing)
+        realized_pnl = sum((item.pnl for item in realizing), Decimal("0"))
+        realized_size = sum((abs(item.size) for item in realizing if item.size is not None), Decimal("0"))
+        peak = _round_trip_peak((*entry_ids, *realizing_ids), actions_by_id, cycles_by_action)
+        payload = {
+            "version": "source-v6-round-trip-v1",
+            "point_key": point_key,
+            "entry_action_ids": list(entry_ids),
+            "realizing_action_ids": list(realizing_ids),
+        }
+        result.append(RoundTrip(
+            sha256(_canonical_json(payload).encode("utf-8")).hexdigest(),
+            realizing[0].timestamp_ms, entry_ids, realizing_ids, realized_pnl, realized_size, peak,
+        ))
+
+    for action in ordered:
+        if action.action in {"opened", "increased"}:
+            if realizing:
+                finish()
+                entries, realizing = [], []
+            entries.append(action)
+        elif action.action in {"decreased", "closed"} and entries:
+            realizing.append(action)
+    finish()
+    return tuple(result)
 
 
 def calculate_metrics(
@@ -711,24 +810,35 @@ def calculate_metrics(
                 merged[sample.timestamp_ms] = NormalizedSample(sample.timestamp_ms, sample.value + offset, sample.upnl)
         return tuple(merged[timestamp] for timestamp in sorted(merged))
 
-    balance = merge("wallet_samples")
-    equity = merge("equity_samples")
-    if balance:
-        initial_offset = ordered[0].initial_balance - balance[0].value
+    raw_balance = merge("wallet_samples")
+    raw_equity = merge("equity_samples")
+    balance = raw_balance
+    equity = raw_equity
+    if raw_balance:
+        initial_offset = ordered[0].initial_balance - raw_balance[0].value
         if initial_offset:
-            balance = tuple(NormalizedSample(sample.timestamp_ms, sample.value + initial_offset, sample.upnl) for sample in balance)
-            equity = tuple(NormalizedSample(sample.timestamp_ms, sample.value + initial_offset, sample.upnl) for sample in equity)
+            balance = tuple(NormalizedSample(sample.timestamp_ms, sample.value + initial_offset, sample.upnl) for sample in raw_balance)
+            equity = tuple(NormalizedSample(sample.timestamp_ms, sample.value + initial_offset, sample.upnl) for sample in raw_equity)
+    raw_window_balance = raw_balance
+    raw_window_equity = raw_equity
+    if start_ms is not None:
+        raw_window_balance = tuple(sample for sample in raw_window_balance if sample.timestamp_ms >= start_ms)
+        raw_window_equity = tuple(sample for sample in raw_window_equity if sample.timestamp_ms >= start_ms)
+    if end_ms is not None:
+        raw_window_balance = tuple(sample for sample in raw_window_balance if sample.timestamp_ms < end_ms)
+        raw_window_equity = tuple(sample for sample in raw_window_equity if sample.timestamp_ms < end_ms)
     if start_ms is not None:
         balance = tuple(sample for sample in balance if sample.timestamp_ms >= start_ms)
         equity = tuple(sample for sample in equity if sample.timestamp_ms >= start_ms)
     if end_ms is not None:
         balance = tuple(sample for sample in balance if sample.timestamp_ms < end_ms)
         equity = tuple(sample for sample in equity if sample.timestamp_ms < end_ms)
-    if not balance or not equity:
+    if not raw_window_balance or not raw_window_equity:
         raise _empty_series_error(ordered, windowed=start_ms is not None or end_ms is not None)
-    initial = balance[0].value
-    total_pnl = balance[-1].value - initial
-    total_pnl_percent = total_pnl / initial * Decimal("100") if initial else Decimal("0")
+    full_window = start_ms is None or start_ms <= ordered[0].report_start_ms
+    pnl_anchor = ordered[0].initial_balance if full_window else raw_window_balance[0].value
+    total_pnl = raw_window_balance[-1].value - pnl_anchor
+    total_pnl_percent = total_pnl / pnl_anchor * Decimal("100") if pnl_anchor else Decimal("0")
     action_by_fact: dict[str, NormalizedAction] = {}
     period_actions: list[list[NormalizedAction]] = [[] for _ in ordered]
     cycle_by_fact: dict[str, NormalizedCycle] = {}
@@ -757,13 +867,17 @@ def calculate_metrics(
     actions = list(action_by_fact.values())
     cycles = list(cycle_by_fact.values())
     event_ids = list(event_by_fact.values())
-    closed = [cycle for cycle in cycles if cycle.closed]
-    positive = sum((action.pnl for action in actions if action.action == "closed" and action.pnl > 0), Decimal("0"))
-    negative = sum((action.pnl for action in actions if action.action == "closed" and action.pnl < 0), Decimal("0"))
+    # Seam ownership and the selected half-open window are applied above before
+    # either PF or round-trip derivation, so no out-of-window realization can
+    # leak into the published facts.
+    realizing_actions = [action for action in actions if action.action in {"decreased", "closed"}]
+    positive = sum((action.pnl for action in realizing_actions if action.pnl > 0), Decimal("0"))
+    negative = sum((action.pnl for action in realizing_actions if action.pnl < 0), Decimal("0"))
     profit_factor = positive / abs(negative) if negative else None
-    wins = sum(1 for cycle in closed if cycle.realized_pnl > 0)
-    losses = sum(1 for cycle in closed if cycle.realized_pnl < 0)
-    total = wins + losses
+    round_trips = derive_round_trips(actions, cycles, ordered[0].point.canonical_key)
+    wins = sum(1 for trip in round_trips if trip.realized_pnl > 0)
+    losses = sum(1 for trip in round_trips if trip.realized_pnl < 0)
+    total = len(round_trips)
     period_metrics: list[PeriodMetrics] = []
     for index, fragment in enumerate(ordered):
         if index == 0:
@@ -783,13 +897,58 @@ def calculate_metrics(
             balance_dd, balance_dd_pct = _drawdown(period_balance)
             equity_dd, equity_dd_pct = _drawdown(period_equity)
             pnl = final - anchor
-            positive_period = sum((action.pnl for action in period_actions[index] if action.action == "closed" and action.pnl > 0), Decimal("0"))
-            negative_period = sum((action.pnl for action in period_actions[index] if action.action == "closed" and action.pnl < 0), Decimal("0"))
+            positive_period = sum((action.pnl for action in period_actions[index] if action.action in {"decreased", "closed"} and action.pnl > 0), Decimal("0"))
+            negative_period = sum((action.pnl for action in period_actions[index] if action.action in {"decreased", "closed"} and action.pnl < 0), Decimal("0"))
             period_pf = positive_period / abs(negative_period) if negative_period else None
             period_metrics.append(PeriodMetrics(fragment.fragment_id, anchor, final, pnl, pnl / anchor * Decimal("100") if anchor else Decimal("0"), period_pf, period_balance, period_equity, balance_dd, equity_dd, balance_dd_pct, equity_dd_pct))
-    equity_dd = max((period.max_equity_drawdown for period in period_metrics), default=Decimal("0"))
-    balance_dd = max((period.max_realized_drawdown for period in period_metrics), default=Decimal("0"))
-    equity_dd_pct = max((period.max_equity_drawdown_percent for period in period_metrics), default=Decimal("0"))
-    balance_dd_pct = max((period.max_realized_drawdown_percent for period in period_metrics), default=Decimal("0"))
-    win_rate = (Decimal(wins) * Decimal("100") / Decimal(total)) if total else Decimal("0")
-    return CanonicalMetrics(total_pnl, total_pnl_percent, profit_factor, len(closed), wins, losses, win_rate, equity_dd, equity_dd_pct, balance_dd, balance_dd_pct, balance, equity, tuple(dict.fromkeys(event_ids)), tuple(period_metrics))
+    balance_dd, balance_peak = _drawdown_details(raw_window_balance)
+    balance_dd_pct = balance_dd / balance_peak * Decimal("100") if balance_peak else Decimal("0")
+    series_equity_dd, series_equity_peak = _drawdown_details(raw_window_equity)
+    declared_candidates: list[tuple[Decimal, str, Decimal]] = []
+    window_start = start_ms if start_ms is not None else min(fragment.report_start_ms for fragment in ordered)
+    window_end = end_ms if end_ms is not None else max(fragment.report_end_ms for fragment in ordered)
+    for index, fragment in enumerate(ordered):
+        if fragment.stitchability != "STITCHABLE_FIXED_LOT":
+            continue
+        if fragment.report_start_ms < window_start or fragment.report_end_ms > window_end:
+            continue
+        if index == 0:
+            cutoff = min((cycle.open_timestamp_ms for cycle in fragment.cycles if cycle.cycle_id in old_open_by_fragment[index]), default=None)
+            if cutoff is not None and any(sample.timestamp_ms >= cutoff for sample in fragment.equity_samples):
+                continue
+        else:
+            boundary = seam_boundaries[index - 1]
+            if excluded_by_fragment[index] or any(sample.timestamp_ms < boundary for sample in fragment.equity_samples):
+                continue
+        try:
+            declared = Decimal(str(fragment.metrics.get("Max Drawdown", "")))
+        except Exception:
+            continue
+        if not declared.is_finite() or declared < 0:
+            continue
+        _sampled_dd, sampled_peak = _drawdown_details(adjusted_views[index]["equity_samples"])
+        declared_candidates.append((declared, fragment.fragment_id, sampled_peak))
+    # M6 is explicitly max(merged-series DD, admissible declared DD); an exact
+    # maximum tie is still DECLARED and retains every tied fragment id.
+    best_equity_dd = max([series_equity_dd, *(item[0] for item in declared_candidates)])
+    tied_declared = tuple(sorted(item[1] for item in declared_candidates if item[0] == best_equity_dd))
+    if tied_declared:
+        selected_declared = next(item for item in sorted(declared_candidates, key=lambda item: item[1]) if item[1] == tied_declared[0])
+        equity_dd = best_equity_dd
+        equity_peak = selected_declared[2]
+        equity_source = "DECLARED"
+    else:
+        equity_dd = series_equity_dd
+        equity_peak = series_equity_peak
+        equity_source = "SERIES"
+    equity_dd_pct = equity_dd / equity_peak * Decimal("100") if equity_peak else Decimal("0")
+    classified_trades = wins + losses
+    win_rate = (Decimal(wins) * Decimal("100") / Decimal(classified_trades)) if classified_trades else Decimal("0")
+    return CanonicalMetrics(
+        total_pnl, total_pnl_percent, profit_factor, total, wins, losses, win_rate,
+        equity_dd, equity_dd_pct, balance_dd, balance_dd_pct, balance, equity,
+        tuple(dict.fromkeys(event_ids)), tuple(period_metrics),
+        sum((trip.weighted_trades for trip in round_trips), Decimal("0")),
+        tuple(trip.round_trip_id for trip in round_trips), round_trips,
+        equity_source, tied_declared,
+    )

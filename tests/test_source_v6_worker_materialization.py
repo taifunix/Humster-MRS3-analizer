@@ -111,9 +111,11 @@ def test_the_published_surface_is_identical_whichever_path_built_it(
     )
 
     fast, slow = manifest(from_ids), manifest(hydrated)
-    # W8 is the one intended difference: the fast path carries its measurements.
-    assert fast["manifest"].pop("analysis_input_digest")
-    assert "analysis_input_digest" not in slow["manifest"]
+    # W8: both paths carry the same precomputed measurements and digest.
+    assert fast["manifest"]["analysis_input_digest"]
+    assert slow["manifest"]["analysis_input_digest"] == fast["manifest"][
+        "analysis_input_digest"
+    ]
     assert fast == slow
 
 
@@ -145,6 +147,7 @@ def test_no_hydrated_fragment_crosses_the_worker_boundary(tmp_path: Path) -> Non
         "point_id", "symbol", "side", "timeframe", "shift_bp", "open_ma", "close_ma",
         "pnl_pct", "dd_pct", "trades", "wins", "losses", "win_rate_pct",
         "profit_factor", "event_ids", "event_ids_hash", "event_mode",
+        "weighted_trades", "max_equity_drawdown", "max_equity_drawdown_source",
     }
     flattened = json.dumps(verdict, default=str)
     assert "SourceV6Fragment" not in flattened
@@ -272,7 +275,8 @@ def test_the_surface_carries_its_own_measurements(tmp_path: Path) -> None:
     assert rows[idle_key]["trades"] == 0 and rows[idle_key]["event_ids"] == []
     assert rows[idle_key]["profit_factor"] is None
     traded = rows[_grid_with_one_idle()[0][1].point.canonical_key]
-    assert traded["trades"] > 0 and traded["event_ids"]
+    assert traded["trades"] == len(traded["event_ids"])
+    assert traded["weighted_trades"] == "0"
     assert read_multiscope_surface(surface)["analysis_input_digest"] == (
         read_multiscope_surface(surface)["analysis_input_digest"]
     )
@@ -299,14 +303,14 @@ def test_measurements_that_do_not_belong_to_the_facts_are_refused(tmp_path: Path
     connection = duckdb.connect(str(surface))
     try:
         connection.execute(
-            "update point_analysis_input set row_json = replace(row_json, '\"trades\":0', '\"trades\":99') "
+            "update point_analysis_input set row_json = replace(row_json, '\"pnl_pct\":\"0\"', '\"pnl_pct\":\"1\"') "
             "where point_id = ?",
             [idle_key],
         )
     finally:
         connection.close()
 
-    with pytest.raises(ValueError, match="does not match its facts"):
+    with pytest.raises(ValueError, match="surface analysis input does not match its facts"):
         read_multiscope_analysis_input(surface)
 
 
@@ -359,7 +363,7 @@ def test_analysis_reads_the_surface_instead_of_measuring_it_again(
     slow = analysis.run_multiscope_analysis(
         slow_surface, tmp_path / "out-slow", config, listing_dates=listing, workers=1
     )
-    assert decoded == [scope], "a surface without measurements is still analysable"
+    assert decoded == [], "the stored analysis rows must cover both publication paths"
 
     def dump(path):
         connection = duckdb.connect(str(path), read_only=True)

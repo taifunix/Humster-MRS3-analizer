@@ -14,7 +14,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "performance"
 
 
 def _variant(base, shift: int, close: int, tag: str):
-    from mrs3.source_v6 import canonical_fragment_bytes
+    from mrs3.source_v6 import canonical_fragment_bytes, reconstruct_derived_facts
 
     item = replace(
         base,
@@ -22,6 +22,8 @@ def _variant(base, shift: int, close: int, tag: str):
         source_sha256=sha256(tag.encode("ascii")).hexdigest(),
         source_name=f"{tag}.html",
     )
+    cycles, events, open_tail_cycle_ids = reconstruct_derived_facts(item.actions, item.point)
+    item = replace(item, cycles=cycles, events=events, open_tail_cycle_ids=open_tail_cycle_ids)
     return replace(item, fragment_id=sha256(canonical_fragment_bytes(item)).hexdigest())
 
 
@@ -260,10 +262,10 @@ def test_a_surface_without_empty_results_keeps_its_identity(tmp_path: Path) -> N
     healthy, _idle = _healthy_and_empty()
     payload = _payload(publish_surface(tmp_path / "identity", healthy))
     assert payload["surface_id"] == (
-        "90b34734a0d78c15ba41e36e22c65ab9b3722a196c56fd1e596e032d2f0fe5a6"
+        "34eb330199b4594317dd76c1cc814bc34953914fa7adb0497e853d768e2874d6"
     )
     assert payload["frozen_facts_sha256"] == (
-        "dd5e78eb139c942b1d2fe65f1f0f93b2d86d7cf7d766a9fd349fc035f4544af6"
+        "ff5e0fbd8e01c8f0c447be9cc428cb9f4c1bbb8251dd4bdeca5a8244825a3bd7"
     )
     assert payload["empty_result_points"] == []
 

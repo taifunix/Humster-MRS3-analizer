@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
 import os
@@ -28,6 +29,60 @@ FINGERPRINT = "surface-v6-fresh-compact-v2"
 SOURCE_FINGERPRINT = "source-v6-fresh-compact-v2"
 # Bounds the bind list of the pass-through copy, as the merge does.
 _COPY_BATCH = 512
+_ANALYSIS_ROW_FIELDS = frozenset({
+    "point_id", "symbol", "side", "timeframe", "shift_bp", "open_ma", "close_ma",
+    "pnl_pct", "dd_pct", "trades", "wins", "losses", "win_rate_pct", "profit_factor",
+    "weighted_trades", "max_equity_drawdown", "max_equity_drawdown_source",
+    "event_ids", "event_ids_hash", "event_mode",
+})
+_ANALYSIS_ROW_DECIMALS = ("pnl_pct", "dd_pct", "win_rate_pct", "weighted_trades", "max_equity_drawdown")
+
+
+def _validate_analysis_row(row: object) -> dict[str, object]:
+    """Validate the canonical v2 compact analysis-row contract."""
+    if not isinstance(row, dict) or set(row) != _ANALYSIS_ROW_FIELDS:
+        raise ValueError("invalid v2 analysis row fields")
+    for field in ("point_id", "symbol", "side", "timeframe", "event_ids_hash", "event_mode", "max_equity_drawdown_source"):
+        if type(row[field]) is not str or not row[field]:
+            raise ValueError(f"invalid v2 analysis row {field}")
+    if row["side"] not in {"LONG", "SHORT"} or row["event_mode"] != "real_independent_events":
+        raise ValueError("invalid v2 analysis row contract")
+    if row["max_equity_drawdown_source"] not in {"SERIES", "DECLARED"}:
+        raise ValueError("invalid v2 analysis row drawdown source")
+    for field in ("shift_bp", "open_ma", "close_ma", "trades", "wins", "losses"):
+        if type(row[field]) is not int or row[field] < 0:
+            raise ValueError(f"invalid v2 analysis row {field}")
+    for field in _ANALYSIS_ROW_DECIMALS:
+        value = row[field]
+        if type(value) is not str:
+            raise ValueError(f"invalid v2 analysis row {field}")
+        try:
+            parsed = Decimal(value)
+        except (InvalidOperation, ValueError):
+            raise ValueError(f"invalid v2 analysis row {field}") from None
+        if not parsed.is_finite() or value in {"", "+0", "-0"}:
+            raise ValueError(f"invalid v2 analysis row {field}")
+    if row["profit_factor"] is not None:
+        if type(row["profit_factor"]) is not str:
+            raise ValueError("invalid v2 analysis row profit_factor")
+        if row["profit_factor"] in {"", "+0", "-0"}:
+            raise ValueError("invalid v2 analysis row profit_factor")
+        try:
+            if not Decimal(row["profit_factor"]).is_finite():
+                raise ValueError("invalid v2 analysis row profit_factor")
+        except (InvalidOperation, ValueError):
+            raise ValueError("invalid v2 analysis row profit_factor") from None
+    event_ids = row["event_ids"]
+    if type(event_ids) is not list or any(type(item) is not str or not item for item in event_ids):
+        raise ValueError("invalid v2 analysis row event_ids")
+    if event_ids != sorted(set(event_ids)):
+        raise ValueError("invalid v2 analysis row event_ids order")
+    if row["trades"] != len(event_ids) or row["wins"] + row["losses"] > row["trades"]:
+        raise ValueError("invalid v2 analysis row trade counts")
+    expected_hash = sha256("|".join(event_ids).encode("utf-8")).hexdigest()
+    if row["event_ids_hash"] != expected_hash:
+        raise ValueError("invalid v2 analysis row event_ids_hash")
+    return row
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +335,9 @@ def _publish_multiscope_surface(
     digests = {scope.scope_key: _scope_digest(scope) for scope in scopes}
     surface_facts_digest = source_content_digest(item.fragment_id for scope in scopes for item in scope.facts)
     surface_id = sha256(_canonical_json({"source_content_digest": materialized.source_content_digest, "scope_digests": digests}).encode("utf-8")).hexdigest()
+    for scope in scopes:
+        for row in scope.analysis_input:
+            _validate_analysis_row(row)
     analysis_rows = [
         (scope.scope_key, str(row["point_id"]), _canonical_json(row))
         for scope in scopes
@@ -323,8 +381,8 @@ def _publish_multiscope_surface(
                 # difference between "traded nothing" and "traded to zero" is
                 # recorded.
                 ("empty_result_points", _canonical_json(list(materialized.empty_result_points))),
-                # W8: absent when no scope carries rows, so an older surface and
-                # a hydrated-path surface stay exactly what they were.
+                # W8: absent when no scope carries rows; older surfaces without
+                # the v2 analysis table remain readable by the slow path.
                 *((("analysis_input_digest", analysis_input_digest(surface_facts_digest, scopes)),) if analysis_rows else ()),
             ],
             ("key", "value"),
@@ -445,8 +503,8 @@ def read_multiscope_surface(path: str | Path, *, decode: bool = True) -> dict[st
             # E3: a record nobody can read is not a record. Older surfaces
             # predate the key and report none, which is what they held.
             "empty_result_points": json.loads(manifest.get("empty_result_points") or "[]"),
-            # W8: `None` on a surface that carries no precomputed rows, which
-            # is how a consumer knows to measure the facts itself.
+             # W8: `None` on an older surface that carries no precomputed rows,
+             # which is how a consumer knows to measure the facts itself.
             "analysis_input_digest": manifest.get("analysis_input_digest"),
             "scope_count": len(rows),
             "scope_digests": {str(scope_key): str(digest) for scope_key, digest, _witness in rows},
@@ -459,9 +517,8 @@ def read_multiscope_analysis_input(path: str | Path) -> dict[str, dict[str, obje
     """The precomputed analysis rows, verified against the facts (W8, W9).
 
     Returns `{scope_key: {"witness": (start, end), "rows": [...]}}`, or `None`
-    when the surface carries none — an older artifact, or one published from the
-    hydrated path — which tells the caller to measure the facts itself rather
-    than to trust an empty result.
+    when an older surface carries no precomputed rows, which tells the caller to
+    measure the facts itself rather than to trust an empty result.
     """
     connection = duckdb.connect(str(path), read_only=True)
     try:
@@ -481,14 +538,29 @@ def read_multiscope_analysis_input(path: str | Path) -> dict[str, dict[str, obje
     finally:
         connection.close()
     grouped: dict[str, list[dict[str, object]]] = {}
+    stored_point_ids: dict[tuple[str, str], str] = {}
     for scope_key, _point_id, row_json in rows:
-        grouped.setdefault(str(scope_key), []).append(json.loads(str(row_json)))
+        row = json.loads(str(row_json))
+        # A malformed row cannot participate in the provenance digest because
+        # its point key is unavailable; let the strict v2 validator name that
+        # schema failure. Valid rows are grouped and digest-checked first so a
+        # self-consistent mutation reports the facts-binding failure rather
+        # than masking it with a later semantic row check.
+        if not isinstance(row, dict) or "point_id" not in row:
+            _validate_analysis_row(row)
+        grouped.setdefault(str(scope_key), []).append(row)
+        stored_point_ids[(str(scope_key), str(row["point_id"]))] = str(_point_id)
     scopes = tuple(
         SimpleNamespace(scope_key=scope_key, analysis_input=tuple(members))
         for scope_key, members in sorted(grouped.items())
     )
     if analysis_input_digest(str(manifest["surface_facts_digest"]), scopes) != str(stored):
         raise ValueError("surface analysis input does not match its facts")
+    for scope_key, members in grouped.items():
+        for row in members:
+            _validate_analysis_row(row)
+            if stored_point_ids.get((scope_key, str(row["point_id"]))) != str(row["point_id"]):
+                raise ValueError("surface analysis row point id mismatch")
     return {
         scope_key: {"witness": witnesses[scope_key], "rows": members}
         for scope_key, members in grouped.items()
