@@ -198,6 +198,21 @@ def _surface_binding(
     return binding
 
 
+def read_fresh_analysis_identity(analysis_path: Path | str) -> dict[str, object]:
+    """Validate one committed fresh analysis and return what identifies it.
+
+    The panel needs this to reopen an analysis it did not produce in the current
+    session; a file that does not validate must raise rather than be listed.
+    """
+    manifest, analysis_id, _artifact = _read_analysis(Path(analysis_path).resolve())
+    return {
+        "analysis_run_id": analysis_id,
+        "surface_id": str(manifest["surface_id"]),
+        "algorithm_version": str(manifest.get("algorithm_version", "")),
+        "scope_keys": sorted(dict(manifest["scope_digests"])),
+    }
+
+
 def list_fresh_analysis_shortlist(
     analysis_path: Path | str, analysis_run_id: str,
 ) -> dict[str, object]:

@@ -1107,6 +1107,43 @@
       analyzeFresh.disabled = false;
     }
   });
+  const analysisExisting = document.querySelector('#analysis-existing');
+  const analysisOpenStatus = (message) => {
+    const node = document.querySelector('#analysis-open-status');
+    if (node) node.textContent = message;
+  };
+  const loadAnalysisCatalog = async () => {
+    try {
+      const result = await fetch('/api/v2/strategies/analysis/catalog').then((response) => response.json());
+      const rows = result.analyses || [];
+      if (!analysisExisting) return;
+      const previous = analysisExisting.value;
+      analysisExisting.replaceChildren(new Option('Выберите analysis DB', ''));
+      for (const row of rows) {
+        analysisExisting.append(new Option(`${row.name} · ${row.scopes} scopes`, row.path));
+      }
+      if (rows.some((row) => row.path === previous)) analysisExisting.value = previous;
+      analysisOpenStatus(rows.length
+        ? `Готовых analysis DB: ${rows.length}.`
+        : 'Готовых analysis DB не найдено.');
+    } catch (_) { analysisOpenStatus('Список analysis DB недоступен.'); }
+  };
+  document.querySelector('#analysis-existing-refresh')?.addEventListener('click', loadAnalysisCatalog);
+  document.querySelector('#analysis-open')?.addEventListener('click', async () => {
+    const selected = analysisExisting?.value || '';
+    if (!selected) { analysisOpenStatus('Выберите analysis DB.'); return; }
+    try {
+      // Opening registers the run, so its shortlist is readable without a rerun.
+      const opened = await remoteRequest('/api/v2/strategies/fresh/open', { analysis_path: selected });
+      currentAnalysisId = opened.analysis_run_id;
+      applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId }));
+      analysisOpenStatus(`Открыто: ${opened.scopes} scopes · surface ${String(opened.surface_id).slice(0, 12)}.`);
+      analysisProgress('complete', `Analysis opened; ${shortlistItems.length} candidates available.`);
+    } catch (error) {
+      analysisOpenStatus(`Не открыто: ${error?.message || 'unknown error'}.`);
+    }
+  });
+  loadAnalysisCatalog();
   document.querySelector('#analysis-lineage')?.addEventListener('click', () => {
     strategyStatus('Manifest and lineage are available after the analysis is committed.');
   });

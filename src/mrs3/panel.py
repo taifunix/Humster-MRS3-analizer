@@ -122,7 +122,11 @@ from .panel_source_db import LocalSourceDbService
 from .panel_source_jobs import LocalSourceDbJobRunner
 from .panel_surfaces import LocalSurfacesService
 from .panel_testing import LocalTestingService, PanelTestingError
-from .fresh_analysis_strategies import generate_fresh_analysis_strategies, list_fresh_analysis_shortlist
+from .fresh_analysis_strategies import (
+    generate_fresh_analysis_strategies,
+    list_fresh_analysis_shortlist,
+    read_fresh_analysis_identity,
+)
 from .panel_strategy_batch import LocalStrategyBatchService
 from .panel_performance_dd5 import LocalPerformanceDd5Jobs, PerformanceDd5Request
 from .runner.config import RunnerConfig
@@ -2103,6 +2107,67 @@ class PanelController:
             "strategy_count": result.strategy_count,
             "manifest": result.manifest_path.name,
             "output_dir": str(result.manifest_path.parent),
+        }
+
+    def analysis_catalog(self) -> dict[str, object]:
+        """List validated fresh analysis artifacts so an existing run can be reopened.
+
+        Mirrors `surface_catalog`: a file that does not validate is skipped
+        rather than offered, because offering it would only fail on open.
+        """
+        try:
+            defaults = panel_bootstrap(self.default_config, self.root)
+            paths = defaults.get("defaults", {}).get("panel", {}).get("path_defaults", {})
+            configured = paths.get("analysis_db_root") or paths.get("local_analysis_db_root") or ""
+            directory = self._path(configured) if configured else (self.root / "data" / "Analysis")
+            if directory.is_file() or directory.suffix.casefold() == ".duckdb":
+                directory = directory.parent
+            candidates = sorted(
+                (
+                    path for path in directory.rglob("*.analysis-v6.duckdb")
+                    if path.is_file() and not path.is_symlink()
+                ),
+                key=lambda path: str(path).casefold(),
+            )
+        except (OSError, ValueError):
+            candidates = []
+        analyses = []
+        for path in candidates:
+            try:
+                identity = read_fresh_analysis_identity(path)
+            except (OSError, ValueError, KeyError, duckdb.Error):
+                continue
+            analyses.append({
+                "name": path.name,
+                "path": str(path),
+                "analysis_run_id": identity["analysis_run_id"],
+                "surface_id": identity["surface_id"],
+                "scopes": len(identity["scope_keys"]),
+            })
+        return {"analyses": analyses}
+
+    def strategies_fresh_open(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Register a committed analysis so its shortlist can be read without a rerun."""
+        try:
+            path = self._path(self._required(payload, "analysis_path"))
+        except ValueError:
+            raise PanelJobError("ANALYSIS_PATH_REQUIRED") from None
+        try:
+            identity = read_fresh_analysis_identity(path)
+        except (OSError, ValueError, KeyError, duckdb.Error):
+            # A safe code, not the exception text: v2 responses must not carry
+            # local paths, and "invalid settings" tells the operator nothing.
+            raise PanelJobError("ANALYSIS_NOT_READABLE") from None
+        analysis_id = str(identity["analysis_run_id"])
+        self._fresh_analysis_paths[analysis_id] = path
+        # The surface file is not required: generation binds identity from the
+        # analysis manifest, and the physical surface is only an extra check.
+        return {
+            "phase": "COMMITTED",
+            "analysis_run_id": analysis_id,
+            "surface_id": identity["surface_id"],
+            "algorithm_version": identity["algorithm_version"],
+            "scopes": len(identity["scope_keys"]),
         }
 
     def strategies_fresh_shortlist(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -4773,6 +4838,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v2/source/local/catalog":
             self._json(200, self.server.controller.source_db_local_catalog())
             return
+        if parsed.path == "/api/v2/strategies/analysis/catalog":
+            self._json(200, self.server.controller.analysis_catalog())
+            return
         if parsed.path == "/api/v2/surfaces/catalog":
             self._json(200, self.server.controller.surface_catalog())
             return
@@ -4881,7 +4949,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/shortlist"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -4944,6 +5012,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_fresh_analyze(document)
             elif endpoint == "/api/v2/strategies/fresh/generate":
                 result = self.server.controller.strategies_fresh_generate(document)
+            elif endpoint == "/api/v2/strategies/fresh/open":
+                result = self.server.controller.strategies_fresh_open(document)
             elif endpoint == "/api/v2/strategies/fresh/shortlist":
                 result = self.server.controller.strategies_fresh_shortlist(document)
             elif endpoint == "/api/v2/jobs":
