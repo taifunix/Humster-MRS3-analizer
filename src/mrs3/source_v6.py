@@ -651,6 +651,11 @@ def _validate_m7(
         if actual is None:
             raise _m7_mismatch(source_sha256, source_name, declared_name, declared_value, None, fragment_id)
         quantum = Decimal("1").scaleb(declared_value.as_tuple().exponent)
+        # Tester PF is a ratio and can amplify a tiny rounded loss denominator;
+        # keep its accepted absolute drift at one hundredth.
+        tolerance = Decimal("0.01") if name == "Profit Factor" else quantum / 2
+        if abs(actual - declared_value) <= tolerance:
+            return
         rounded = actual.quantize(quantum, rounding=ROUND_HALF_UP)
         if rounded != declared_value:
             raise _m7_mismatch(source_sha256, source_name, declared_name, declared_value, rounded, fragment_id)

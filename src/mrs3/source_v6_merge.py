@@ -33,6 +33,7 @@ from .source_v6_storage import (
     database_info,
     decode_fragment_slice,
     fragment_metadata,
+    quarantine_details,
     source_content_digest,
     validate_source_v6_database,
     verify_published_identity_parallel,
@@ -82,6 +83,7 @@ class _Input:
     identity: tuple[int, int, str]
     fragments: tuple[SourceV6Fragment, ...]
     origins: tuple[tuple[str, str, str, str], ...]
+    quarantines: tuple[dict[str, object], ...]
 
 
 def _content_identity(path: Path) -> tuple[int, int, str]:
@@ -147,10 +149,27 @@ def _read_input(path: Path) -> _Input:
     if info["source_content_digest"] != source_content_digest(item.fragment_id for item in fragments):
         raise SourceV6MergeError(f"merge input source content digest mismatch: {path}")
     origins = _origins(path, info, fragments)
+    quarantines = quarantine_details(path)
     after = _content_identity(path)
     if before != after:
         raise SourceV6MergeError(f"merge input changed while reading: {path}")
-    return _Input(path, after, fragments, origins)
+    return _Input(path, after, fragments, origins, quarantines)
+
+
+def _assert_quarantine_replacements(inputs: Sequence[_Input]) -> None:
+    replacements = {
+        (fragment.fragment_id, fragment.source_name)
+        for item in inputs
+        for fragment in item.fragments
+    }
+    for item in inputs:
+        for quarantine in item.quarantines:
+            identity = (quarantine.get("fragment_id"), quarantine.get("source_name"))
+            if identity not in replacements:
+                raise SourceV6MergeError(
+                    "unresolved quarantine: "
+                    f"fragment_id={identity[0]!r} source_name={identity[1]!r}"
+                )
 
 
 def _merge_token(
@@ -190,6 +209,7 @@ def preflight_source_v6_merge(
     if target.exists():
         raise SourceV6MergeError(f"Source v6 merge target already exists: {target}")
     inputs = tuple(_read_input(path) for path in paths)
+    _assert_quarantine_replacements(inputs)
     identities = tuple(item.identity for item in inputs)
     return SourceV6MergePreflight(_merge_token(paths, target, identities, None), paths, target, identities, None)
 
@@ -224,6 +244,7 @@ def _copy_fragments_from_inputs(
     unique: Sequence[SourceV6FragmentMetadata],
     owner_by_id: Mapping[str, Path],
     cancellation_requested: Callable[[], bool] | None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
     """Copy the winning rows from each input inside DuckDB, in publication order.
 
@@ -242,6 +263,8 @@ def _copy_fragments_from_inputs(
     for fragment in unique:
         by_owner.setdefault(owner_by_id[fragment.fragment_id], []).append(fragment.fragment_id)
 
+    copied = 0
+    total = len(unique)
     connection = duckdb.connect(str(staging))
     attached: list[str] = []
     try:
@@ -266,6 +289,9 @@ def _copy_fragments_from_inputs(
                     f"from {alias}.compact_fragments where fragment_id in ({placeholders})",
                     chunk,
                 )
+                copied += len(chunk)
+                if progress_callback:
+                    progress_callback(copied, total)
         point_rows: list[tuple[object, ...]] = []
         day_rows: list[tuple[object, ...]] = []
         audit_rows: list[tuple[object, ...]] = []
@@ -358,6 +384,7 @@ def merge_source_v6(
     output_path: str | Path | None = None,
     cancellation_requested: Callable[[], bool] | None = None,
     fault_injector: Callable[[str], object] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
     workers: int = 1,
 ) -> SourceV6MergeResult:
     """Merge fresh Source v6 DBs into a new target with one writer.
@@ -386,6 +413,7 @@ def merge_source_v6(
 
     # Read and validate all inputs before acquiring the target writer lock.
     inputs = tuple(_read_input(path) for path in paths)
+    _assert_quarantine_replacements(inputs)
     if preflight is not None:
         if tuple(preflight.input_paths) != paths or preflight.target_path != target:
             raise SourceV6MergeError("merge preflight does not match inputs")
@@ -425,7 +453,9 @@ def merge_source_v6(
         try:
             _check_cancelled(cancellation_requested)
             create_v6_database(staging)
-            _copy_fragments_from_inputs(staging, unique, owner_by_id, cancellation_requested)
+            _copy_fragments_from_inputs(
+                staging, unique, owner_by_id, cancellation_requested, progress_callback
+            )
             # Kept where the pre-ADR-0015 readback used to sit. Without it a
             # cancellation during a single-input copy would not be noticed
             # until after the stitch and the origins rewrite, which are minutes

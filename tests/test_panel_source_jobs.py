@@ -39,10 +39,12 @@ class FakeService:
             raise self.failure
         return self.result
 
-    def execute_import(self, token: str, *, cancellation_requested) -> object:
+    def execute_import(self, token: str, *, cancellation_requested, progress_callback=None) -> object:
         return self._execute("import", token, cancellation_requested)
 
-    def execute_merge(self, token: str, *, cancellation_requested) -> object:
+    def execute_merge(self, token: str, *, cancellation_requested, progress_callback=None) -> object:
+        if progress_callback is not None:
+            progress_callback(2, 4)
         return self._execute("merge", token, cancellation_requested)
 
 
@@ -93,6 +95,71 @@ def test_commit_reports_only_safe_basic_counts_and_no_paths() -> None:
     assert committed["counts"] == {"accepted_count": 3, "input_count": 4}
     assert "target_path" not in committed
     assert "D:/private" not in json.dumps(committed)
+
+
+def test_import_progress_and_evidence_are_published_without_paths() -> None:
+    class ImportService:
+        def execute_import(self, token: str, *, cancellation_requested, progress_callback) -> object:
+            progress_callback(2, 4)
+            return SimpleNamespace(
+                status="COMMITTED",
+                accepted_count=3,
+                quarantined_count=1,
+                source_content_digest="a" * 64,
+                safe_to_delete="NO",
+                quarantine_reasons=("optimizer summary",),
+                target_path=Path("D:/private/source.duckdb"),
+            )
+
+    updates: list[dict[str, object]] = []
+    runner = LocalSourceDbJobRunner(ImportService(), on_update=updates.append)
+    started = runner.start_import("import-token", "target-a")
+    committed = _wait_for(runner, started["job_id"], "COMMITTED")
+
+    assert committed["progress"] == {"current": 4, "total": 4, "unit": "items"}
+    assert any(item["progress"] == {"current": 2, "total": 4, "unit": "items"} for item in updates)
+    assert committed["evidence"] == {
+        "source_content_digest": "a" * 64,
+        "accepted_count": 3,
+        "quarantined_count": 1,
+        "safe_to_delete": "NO",
+        "quarantine_reasons": ["optimizer summary"],
+    }
+    assert "D:/private" not in json.dumps(committed)
+
+
+def test_merge_progress_is_published_without_exposing_paths() -> None:
+    service = FakeService()
+    service.release["merge"].set()
+    service.result = SimpleNamespace(
+        status="COMMITTED",
+        accepted_count=4,
+        input_count=4,
+        source_content_digest="b" * 64,
+        target_path=Path("D:/private/merged.source-v6.duckdb"),
+    )
+    updates: list[dict[str, object]] = []
+    runner = LocalSourceDbJobRunner(service, on_update=updates.append)
+
+    started = runner.start_merge("merge-token", "target-a")
+    committed = _wait_for(runner, started["job_id"], "COMMITTED")
+
+    assert committed["progress"] == {"current": 4, "total": 4, "unit": "items"}
+    assert any(item["phase"] == "MERGING" and item["progress"] == {"current": 2, "total": 4, "unit": "items"} for item in updates)
+    assert "D:/private" not in json.dumps(committed)
+
+
+def test_merge_failure_redacts_input_paths() -> None:
+    service = FakeService()
+    service.release["merge"].set()
+    service.failure = RuntimeError("unresolved quarantine: D:/private/base.source-v6.duckdb")
+    runner = LocalSourceDbJobRunner(service)
+
+    started = runner.start_merge("merge-token", "target-a")
+    failed = _wait_for(runner, started["job_id"], "FAILED")
+
+    assert failed["error"] == {"code": "FAILED"}
+    assert "D:/private" not in json.dumps(failed)
 
 
 def test_failure_is_generic_and_does_not_leak_exception_details() -> None:

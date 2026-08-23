@@ -52,8 +52,18 @@ def test_registry_syncs_worker_completion_and_keeps_runtime_private(tmp_path):
     job = registry.submit("strategies.tester", {}, "worker", job_id="worker-job")
     registry.transition(job["job_id"], "RUNNING")
 
-    saved = registry.sync("worker-job", {"state": "COMMITTED", "phase": "COMMITTED", "progress": {"current": 1, "total": 1}}, runtime={"inbox_path": "private"})
+    saved = registry.sync(
+        "worker-job",
+        {
+            "state": "COMMITTED",
+            "phase": "COMMITTED",
+            "progress": {"current": 1, "total": 1},
+            "evidence": {"safe_to_delete": "YES", "source_content_digest": "a" * 64},
+        },
+        runtime={"inbox_path": "private"},
+    )
 
     assert saved["state"] == "COMMITTED"
+    assert saved["evidence"]["safe_to_delete"] == "YES"
     assert "runtime" not in saved
     assert PanelJobRegistry(tmp_path / "jobs.json").runtime("worker-job") == {"inbox_path": "private"}

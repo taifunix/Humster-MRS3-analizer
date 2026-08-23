@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import zlib
@@ -14,7 +15,7 @@ from mrs3.source_v6 import normalize_source_v6
 from mrs3.source_v6_importer import source_v6_import_lock
 import mrs3.source_v6_merge as source_v6_merge
 
-from mrs3.source_v6_merge import merge_source_v6
+from mrs3.source_v6_merge import SourceV6MergeError, merge_source_v6
 from mrs3.source_v6_storage import (
     SourceV6StorageError,
     create_v6_database,
@@ -31,6 +32,21 @@ FIXTURES = Path(__file__).parent / "fixtures" / "performance"
 def _db(path: Path, fragment, database_id: str) -> None:
     create_v6_database(path, database_id=database_id)
     import_fragment(path, fragment, preflight_token=preflight_import(path, fragment))
+
+
+def _quarantine(path: Path, fragment, *, fragment_id: str | None = None, source_name: str | None = None) -> None:
+    connection = duckdb.connect(str(path))
+    try:
+        reason = "M7 metric mismatch: " + json.dumps(
+            {"fragment_id": fragment_id or fragment.fragment_id, "source_name": source_name or fragment.source_name},
+            separators=(",", ":"),
+        )
+        connection.execute(
+            "insert into quarantine values (?, ?, ?, current_timestamp)",
+            [fragment_id or fragment.fragment_id, "old-source-sha", reason],
+        )
+    finally:
+        connection.close()
 
 
 def _fragments():
@@ -104,9 +120,14 @@ def test_merge_publishes_a_stable_table_layout(tmp_path: Path) -> None:
     _db(right, second, "db-right")
     target = tmp_path / "merged.duckdb"
 
-    result = merge_source_v6([left, right], target)
+    progress: list[tuple[int, int]] = []
+    result = merge_source_v6([left, right], target, progress_callback=lambda current, total: progress.append((current, total)))
 
     assert result.status == "COMMITTED"
+    assert progress == sorted(progress)
+    assert len({total for _, total in progress}) == 1
+    assert progress[-1][0] == progress[-1][1] == 2
+    assert progress and progress[-1] == (2, 2)
     dump = _dump_merged(target)
     ids = {row[0] for row in dump["compact_fragments"]}
     assert ids == {first.fragment_id, second.fragment_id}
@@ -122,6 +143,56 @@ def test_merge_publishes_a_stable_table_layout(tmp_path: Path) -> None:
     again = tmp_path / "merged-again.duckdb"
     merge_source_v6([left, right], again)
     assert _dump_merged(again) == dump
+
+
+def test_merge_resolves_quarantine_with_exact_replacement(tmp_path: Path) -> None:
+    first, second = _fragments()
+    base = tmp_path / "base.source-v6.duckdb"
+    patch = tmp_path / "patch.source-v6.duckdb"
+    _db(base, first, "base")
+    _quarantine(base, second)
+    _db(patch, second, "patch")
+
+    target = tmp_path / "repaired.source-v6.duckdb"
+    result = merge_source_v6((base, patch), target)
+
+    assert result.status == "COMMITTED"
+    assert [item[0] for item in _dump_merged(target)["quarantine"]] == []
+    assert {item.fragment_id for item in iter_fragments(target)} == {first.fragment_id, second.fragment_id}
+
+
+def test_merge_rejects_unresolved_quarantine_instead_of_dropping_it(tmp_path: Path) -> None:
+    first, second = _fragments()
+    base = tmp_path / "base.source-v6.duckdb"
+    _db(base, first, "base")
+    _quarantine(base, second)
+    before = _database_artifact_hashes(base)
+
+    with pytest.raises(SourceV6MergeError, match="unresolved quarantine"):
+        merge_source_v6((base,), tmp_path / "rejected.source-v6.duckdb")
+    assert _database_artifact_hashes(base) == before
+
+
+@pytest.mark.parametrize(
+    "wrong_field", ["fragment_id", "source_name"],
+)
+def test_merge_requires_both_quarantine_identity_fields_to_match(
+    tmp_path: Path, wrong_field: str
+) -> None:
+    first, second = _fragments()
+    base = tmp_path / "base.source-v6.duckdb"
+    patch = tmp_path / "patch.source-v6.duckdb"
+    _db(base, first, "base")
+    _quarantine(
+        base,
+        second,
+        fragment_id="wrong-fragment-id" if wrong_field == "fragment_id" else second.fragment_id,
+        source_name="wrong-source.html" if wrong_field == "source_name" else second.source_name,
+    )
+    _db(patch, second, "patch")
+
+    with pytest.raises(SourceV6MergeError, match="unresolved quarantine"):
+        merge_source_v6((base, patch), tmp_path / "rejected.source-v6.duckdb")
 
 
 def test_merge_deduplicates_fragments_recomputes_global_stitch_and_flattens_origins(tmp_path: Path) -> None:

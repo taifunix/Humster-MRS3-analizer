@@ -54,8 +54,10 @@ Lock these rules before code:
    `max_equity_drawdown_source`. It is canonical JSON: sorted compact keys,
    Decimal strings, integers, explicit `null`, no floats/non-finite values and
    no missing/extra fields.
-6. Any quarantine blocks every scope. The operator fixes/removes the retained
-   source and rebuilds a new DB; no partial or in-place unblock exists.
+6. Any quarantine blocks every scope. A repair merge may rebuild a new DB only
+   when an input replacement proves the same `fragment_id` and `source_name`;
+   unresolved quarantine aborts the merge. No partial or in-place unblock
+   exists.
 
 Before code, record same-host three-run v1 medians: import time,
 materialization/publication time, coordinator/worker peak RSS, Source DB bytes,
@@ -117,9 +119,11 @@ surface bytes and output digests. Record run spread as well as medians.
 
 1. Add failures for independent PnL/fees/PF/conditional-RF mutations and raw
    token precisions.
-2. Validate during normalization before encoding, rounding `ROUND_HALF_UP` to
-   the raw declared exponent. One mismatch becomes one existing quarantine;
-   healthy sibling reports continue.
+2. Validate during normalization before encoding at the raw declared
+   precision. Accept display rounding (including an exact half-unit tie) for
+   PnL and fees, and absolute Profit Factor drift up to `0.01`; larger
+   differences become one existing quarantine, while healthy sibling reports
+   continue.
 3. Add a read-only quarantine-detail helper. Backend preflight marks all scopes
    non-READY; direct materialization rejects before decode/task submission and
    reports the source SHA/name/reason.
@@ -150,6 +154,7 @@ surface bytes and output digests. Record run spread as well as medians.
 
 - UI or `panel_web/` work.
 - Weakening W6.
-- In-place quarantine remediation, migration or dual read.
+- In-place quarantine remediation, migration or dual read. Replacement repair
+  is allowed only through the exact-identity merge rule above.
 - New aggregate states, tables, columns, event storage or benchmark framework.
 - Hydrated-path removal and algorithm-dependent surface data.

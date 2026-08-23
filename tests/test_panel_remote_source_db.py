@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 from pathlib import Path
 import subprocess
@@ -298,6 +299,42 @@ def test_remote_import_status_verifies_identity_then_returns_redacted_evidence()
     encoded = json.dumps(document)
     assert REMOTE_ROOT not in encoded and REMOTE_TARGET not in encoded
     assert "runner.example.test" not in encoded
+
+
+def test_remote_import_status_keeps_importer_evidence_in_the_job_document() -> None:
+    calls: list[tuple[str, ...]] = []
+    data = b"remote evidence"
+    importer_evidence = base64.urlsafe_b64encode(json.dumps({
+        "source_content_digest": "b" * 64,
+        "accepted_count": 4,
+        "quarantined_count": 1,
+        "safe_to_delete": "NO",
+        "coverage_cells": 12,
+        "quarantine_reasons": ["optimizer summary"],
+    }).encode()).decode().rstrip("=")
+
+    def command_runner(argv: tuple[str, ...]) -> str:
+        calls.append(argv)
+        if len(calls) == 1:
+            return "STARTED\n"
+        return f"REMOTE_IMPORTED {len(data)} {hashlib.sha256(data).hexdigest()} {importer_evidence}\n"
+
+    executor = RemoteSourceDbExecutor(_remote_config(), command_runner, lambda _argv: None)
+    started = executor.start_import(REMOTE_HTML, REMOTE_TARGET)
+
+    document = executor.status(started["job_id"])
+
+    assert document["evidence"] == {
+        "size_bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "source_content_digest": "b" * 64,
+        "accepted_count": 4,
+        "quarantined_count": 1,
+        "safe_to_delete": "NO",
+        "coverage_cells": 12,
+        "quarantine_reasons": ["optimizer summary"],
+    }
+    assert "import.log" in calls[1][-1]
 
 
 def test_remote_import_status_exposes_safe_html_progress_and_elapsed_time() -> None:

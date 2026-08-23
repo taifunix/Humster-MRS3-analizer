@@ -255,9 +255,13 @@ fees` sums every action and `Profit Factor` sums every realising action's PnL,
 so together the three cover the series and the action table without repeating
 each other.
 
-Each derived numeric is rounded `ROUND_HALF_UP` to the exponent in the raw
-declared token. A mismatch quarantines that report only, with source identity,
-fragment id, metric, declared and derived values; healthy siblings continue.
+`Total PnL` and `Total fees` are compared at the exponent in the raw declared
+token and accept the display-rounding interval, including an exact half-unit
+tie in either direction. `Profit Factor` accepts an absolute drift of at most
+`0.01`, because a tiny rounded loss denominator can amplify the ratio. Larger
+differences quarantine that report only, with source identity, fragment id,
+metric, declared and derived values; healthy siblings continue. The diagnostic
+derived value remains `ROUND_HALF_UP` at the declared exponent.
 
 When every realising action is profitable and the gross-loss denominator is
 zero, the tester's explicit numeric `0` Profit Factor is preserved as its
@@ -299,8 +303,11 @@ fields are rejected. Analysis reads these rows and never decodes payloads.
 
 Any import quarantine blocks every scope: existing records lack safe
 point/scope attribution, so partial aggregates are forbidden. The caller gets
-the count plus source SHA/name/reason; remediation is fix/remove that retained
-source and rebuild a new database, never an in-place unblock.
+the count plus source SHA/name/reason. A merge may publish a new target only
+when a patch input contains the quarantined fragment's exact `fragment_id` and
+`source_name`; that is a replacement, not a silent drop. Any unresolved
+quarantine aborts the merge. The source databases remain immutable and no
+in-place unblock is allowed.
 
 ## M7a — The overlap seam
 

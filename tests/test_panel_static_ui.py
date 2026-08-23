@@ -143,6 +143,20 @@ def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
     assert "/api/v2/settings/save" in js
 
 
+def test_merge_card_offers_catalog_choices_and_visible_progress() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'list="merge-source-options"' in html
+    assert 'id="merge-source-options"' in html
+    assert 'id="merge-progress"' in html
+    assert "merge-source-options" in js
+    assert "input_paths: [document.querySelector('#merge-source-a')?.value || '', document.querySelector('#merge-source-b')?.value || '']" in js
+    assert "progressTrack.style.width" in js
+    assert "progressTrack.style.width = '100%'" in js
+    assert "card.id === 'local-merge-card'" in js
+
+
 def test_remote_source_card_renders_two_stage_progress_and_elapsed_time() -> None:
     js = _read("app.js")
 
@@ -150,6 +164,9 @@ def test_remote_source_card_renders_two_stage_progress_and_elapsed_time() -> Non
         assert text in js
     assert "remoteSourceTrack.style.width" in js
     assert "stage_elapsed_seconds" in js
+    assert "sourceEvidenceSummary" in js
+    assert "safe_to_delete" in js
+    assert "source_content_digest" in js
 
 
 def test_surface_materializer_loads_the_configured_source_db_catalog() -> None:

@@ -161,6 +161,12 @@ class PanelJobRegistry:
             error = status.get("error")
             if error is None or isinstance(error, dict):
                 job["error"] = json.loads(json.dumps(error))
+            evidence = status.get("evidence")
+            if evidence is None or isinstance(evidence, dict):
+                if evidence is None:
+                    job.pop("evidence", None)
+                else:
+                    job["evidence"] = json.loads(json.dumps(evidence))
             if runtime is not None:
                 if not isinstance(runtime, dict):
                     raise PanelJobError("INVALID_REQUEST")

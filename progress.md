@@ -468,3 +468,45 @@ Pre-Stage-1 repository verification: `1597 passed, 2 skipped, 2 warnings` via
 `.venv\Scripts\python.exe -m pytest -q`. The warnings are the existing tar
 deprecation and unavailable Windows pytest cache; two symlink tests skip on
 this host.
+
+### Materializer and remote panel boundary (2026-08-23)
+
+The static panel's Source v6 surface path is DB-native: selected metadata is
+measured by `materialize_source_v6_from_database`, publication copies sealed
+payloads into a `.surface-v6.duckdb`, and fresh analysis consumes its compact
+`point_analysis_input` rows. The panel's initial surface validation now uses
+`decode=False`, so the analysis button does not decode factual payloads before
+the row-based analysis path.
+
+`data/databases/my_test_CX_GE_fixed.source-v6.duckdb` was repaired through an
+exact replacement merge for the quarantined
+`my_test_run_15426_of_38304_REGNUSDT_45m_2026-07-29.html`. The canonical DB is
+schema 6 / `source-v6-fresh-compact-v2`, contains 38,304 fragments and zero
+quarantine rows; `validate_source_v6_database` and panel surface preflight
+return clean (`56` rows, `7` groups). The pre-repair DB remains recoverable as
+`my_test_CX_GE_fixed.pre-repair-quarantine.source-v6.duckdb`. Optimizer HTML
+remains excluded during Source v6 preflight.
+
+The configured Debian remote paths were checked read-only with the same SSH
+script used by the panel: all five directories exist and the disk probe
+returned a numeric value. The static panel's remote path check was returning
+404 because its POST route was missing from the HTTP allowlist; the route and a
+regression test are now present. `scripts/restart_new_panel.bat` also stops the
+old 8766 listener before starting the canonical static panel, preventing stale
+duplicate processes. A BAT launched from the normal desktop has ordinary
+Windows network access; Codex's restricted shell cannot grant that access to a
+child process, so live SSH checks must be run outside that sandbox.
+
+The repaired CX/GE replacement was reproduced from the remote HTML: 158
+actions produce `gross_profit=398.1348` and `gross_loss=-0.0640`, hence the
+legitimate `Profit Factor=6220.85625`. M7 accepts absolute Profit Factor drift
+up to `0.01` while still rejecting material mutations. Merge now fails closed
+on unresolved quarantine instead of silently dropping it.
+
+The static local merge card now persists all three paths, offers configured
+Source DB candidates through native datalist controls, and renders determinate
+fragment progress with current status polling.
+
+Evidence: Source v6 M7 tests `12 passed`; the panel/materializer/remote focused
+suite is green after the change. The Debian runner needs the same M7 module
+deployed before rebuilding that corpus.

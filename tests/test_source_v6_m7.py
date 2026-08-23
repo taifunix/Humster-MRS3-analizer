@@ -89,6 +89,46 @@ def test_normalization_rejects_profit_factor_mutation() -> None:
         normalize_source_v6(_replace_metric("Profit Factor", "2.4"), source_name="bad-pf.html")
 
 
+def test_m7_accepts_profit_factor_drift_up_to_one_hundredth() -> None:
+    from types import SimpleNamespace
+    from decimal import Decimal
+
+    from mrs3.source_v6 import NormalizedAction, _validate_m7
+
+    actions = (
+        NormalizedAction("win", 1, "ONUSDT", "a", "closed", Decimal("0"), Decimal("398.1348"), None, None, None, "LONG"),
+        NormalizedAction("loss", 2, "ONUSDT", "b", "closed", Decimal("0"), Decimal("-0.0640"), None, None, None, "LONG"),
+    )
+    report = SimpleNamespace(
+        metrics={"Profit Factor": "6220.85"},
+        wallet_series=((1, Decimal("1000")),),
+        equity_series=(),
+    )
+
+    _validate_m7(
+        report,
+        actions,
+        initial_balance=Decimal("1000"),
+        source_sha256="a" * 64,
+        source_name="pf-tolerance.html",
+    )
+
+
+def test_m7_rejects_profit_factor_drift_over_one_hundredth() -> None:
+    from types import SimpleNamespace
+    from decimal import Decimal
+
+    from mrs3.source_v6 import NormalizedAction, SourceV6Error, _validate_m7
+
+    actions = (
+        NormalizedAction("win", 1, "ONUSDT", "a", "closed", Decimal("0"), Decimal("398.1348"), None, None, None, "LONG"),
+        NormalizedAction("loss", 2, "ONUSDT", "b", "closed", Decimal("0"), Decimal("-0.0640"), None, None, None, "LONG"),
+    )
+    report = SimpleNamespace(metrics={"Profit Factor": "6220.84"}, wallet_series=((1, Decimal("1000")),), equity_series=())
+    with pytest.raises(SourceV6Error, match=r"M7.*Profit Factor"):
+        _validate_m7(report, actions, initial_balance=Decimal("1000"), source_sha256="a" * 64, source_name="pf-over-tolerance.html")
+
+
 def test_import_quarantines_only_m7_report_and_exposes_detail(tmp_path: Path) -> None:
     from mrs3.source_v6_importer import import_source_v6, preflight_source_v6
     from mrs3.source_v6_storage import quarantine_details

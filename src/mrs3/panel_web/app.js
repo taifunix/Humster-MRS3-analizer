@@ -439,25 +439,32 @@
   let surfacePublishActive = false;
   async function loadSourceCatalog() {
     const source = document.querySelector('#surface-source');
-    if (!source || surfacePublishActive) return;
+    const mergeOptions = document.querySelector('#merge-source-options');
+    if ((!source && !mergeOptions) || surfacePublishActive) return;
     const run = ++sourceCatalogRun;
-    const selected = source.value;
+    const selected = source?.value || '';
     try {
       const response = await fetch('/api/v2/source/local/catalog');
       const result = await response.json();
       if (!response.ok || !Array.isArray(result.databases)) throw new Error('catalog failed');
       if (run !== sourceCatalogRun || surfacePublishActive) return;
-      source.replaceChildren(new Option('\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 Source DB', ''));
+      source?.replaceChildren(new Option('\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 Source DB', ''));
+      mergeOptions?.replaceChildren();
       result.databases.forEach((item) => {
-        if (typeof item?.name === 'string' && typeof item?.path === 'string') source.append(new Option(item.name, item.path));
+        if (typeof item?.name !== 'string' || typeof item?.path !== 'string') return;
+        source?.append(new Option(item.name, item.path));
+        mergeOptions?.append(new Option(item.name, item.path));
       });
-      source.value = [...source.options].some((option) => option.value === selected)
-        ? selected : (source.options[1]?.value || '');
-      if (source.value !== selected) source.dispatchEvent(new Event('change'));
+      if (source) {
+        source.value = [...source.options].some((option) => option.value === selected)
+          ? selected : (source.options[1]?.value || '');
+        if (source.value !== selected) source.dispatchEvent(new Event('change'));
+      }
     } catch (_) {
       if (run !== sourceCatalogRun || surfacePublishActive) return;
-      source.replaceChildren(new Option('\u0421\u043f\u0438\u0441\u043e\u043a Source DB \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d', ''));
-      if (selected) source.dispatchEvent(new Event('change'));
+      source?.replaceChildren(new Option('\u0421\u043f\u0438\u0441\u043e\u043a Source DB \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d', ''));
+      mergeOptions?.replaceChildren();
+      if (selected && source) source.dispatchEvent(new Event('change'));
     }
   }
 
@@ -492,6 +499,8 @@
     let jobId = '';
     let jobTarget = '';
     let poller = 0;
+    const progressTrack = card.querySelector('.progress-track span');
+    const merge = card.id === 'local-merge-card';
     const refreshJob = async () => {
       if (!jobId) return;
       try {
@@ -500,8 +509,21 @@
         const job = (document.jobs || []).find((item) => item.job_id === jobId);
         if (!job) return;
         const progress = job.progress || {};
-        sourceStatus(card, `${job.phase}: ${progress.current || 0} / ${progress.total || 0}`);
+        const current = Math.max(0, Number(progress.current) || 0);
+        const total = Math.max(0, Number(progress.total) || 0);
+        const percent = total ? Math.min(100, Math.round(current * 100 / total)) : 0;
+        if (progressTrack) {
+          progressTrack.classList.toggle('is-running', !total && !['COMMITTED', 'FAILED', 'CANCELLED'].includes(job.state));
+          progressTrack.style.width = `${percent}%`;
+        }
+        const label = merge ? 'MERGE' : job.phase;
+        sourceStatus(card, total ? `${label}: ${current} / ${total} (${percent}%)` : `${label}: подготовка...`);
         if (job.state === 'COMMITTED') {
+          if (progressTrack) {
+            progressTrack.classList.remove('is-running');
+            progressTrack.style.width = '100%';
+          }
+          sourceStatus(card, `COMMITTED${sourceEvidenceSummary(job.evidence)}`);
           addSourceOption(jobTarget);
         }
         if (['COMMITTED', 'FAILED', 'CANCELLED'].includes(job.state) && poller) {
@@ -557,6 +579,16 @@
       });
       row.append(cancel);
     }
+  }
+
+  function sourceEvidenceSummary(evidence) {
+    if (!evidence) return '';
+    const quarantine = Number(evidence.quarantined_count ?? evidence.quarantined ?? 0);
+    const safe = evidence.safe_to_delete || (quarantine === 0 ? 'YES' : 'NO');
+    const digest = typeof evidence.source_content_digest === 'string'
+      ? ` \u00b7 digest ${evidence.source_content_digest.slice(0, 12)}...` : '';
+    const coverage = Number.isFinite(Number(evidence.coverage_cells)) ? ` \u00b7 coverage ${evidence.coverage_cells}` : '';
+    return ` \u00b7 quarantine ${quarantine} \u00b7 safe_to_delete ${safe}${coverage}${digest}`;
   }
 
   const localImportCard = document.querySelector('#source-local-html')?.closest('.panel-card');
@@ -632,7 +664,7 @@
         remoteSourceStatus(`\u042d\u0442\u0430\u043f 2/2 \u00b7 \u043f\u0435\u0440\u0435\u0434\u0430\u0447\u0430 DB: ${formatBytes(current)} / ${formatBytes(total)} (${percent}%) \u00b7 ${stageElapsed}${eta} \u00b7 \u0432\u0441\u0435\u0433\u043e ${elapsed}`);
       } else if (result.phase === 'COMMITTED') {
         if (remoteSourceTrack) remoteSourceTrack.style.width = '100%';
-        remoteSourceStatus(`\u0413\u043e\u0442\u043e\u0432\u043e \u00b7 SHA-256 verified \u00b7 \u0432\u0441\u0435\u0433\u043e ${elapsed}`);
+        remoteSourceStatus(`\u0413\u043e\u0442\u043e\u0432\u043e \u00b7 SHA-256 verified${sourceEvidenceSummary(result.evidence)} \u00b7 \u0432\u0441\u0435\u0433\u043e ${elapsed}`);
       } else {
         remoteSourceStatus(result.phase || result.state || 'REMOTE_IMPORT');
       }

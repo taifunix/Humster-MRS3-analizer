@@ -1632,7 +1632,7 @@ class PanelController:
         inbox = document.get("inbox_path")
         if isinstance(inbox, str) and inbox:
             runtime["inbox_path"] = inbox
-        public = {key: value for key, value in document.items() if key in {"state", "phase", "progress", "error"}}
+        public = {key: value for key, value in document.items() if key in {"state", "phase", "progress", "error", "evidence"}}
         try:
             self._panel_jobs.sync(job_id, public, runtime=runtime or None)
         except PanelJobError:
@@ -1787,10 +1787,18 @@ class PanelController:
     def _local_source_jobs(self) -> tuple[LocalSourceDbService, LocalSourceDbJobRunner]:
         if self._panel_source_service is None or self._panel_source_jobs is None:
             try:
-                workers = max(1, int(self._import_settings().workers))
+                workers, source_settings, writer_limit = self._source_v6_import_options()
+                import_options = {
+                    "write_batch_size": source_settings.write_batch_size,
+                    "worker_chunk_size": source_settings.worker_chunk_size,
+                    "max_in_flight_chunks": source_settings.max_in_flight_chunks,
+                    "segment_writer_limit": writer_limit,
+                    "hydrate_fragments": True,
+                }
             except Exception:
                 workers = 1
-            self._panel_source_service = LocalSourceDbService(workers=workers)
+                import_options = {}
+            self._panel_source_service = LocalSourceDbService(workers=workers, import_options=import_options)
             self._panel_source_jobs = LocalSourceDbJobRunner(self._panel_source_service, on_update=self._record_special_job)
         return self._panel_source_service, self._panel_source_jobs
 
@@ -2551,7 +2559,7 @@ class PanelController:
         surface = self._path(self._required(payload, "surface_path"))
         if not surface.name.endswith(".surface-v6.duckdb"):
             raise ValueError("fresh Source v6 surface is required")
-        read_multiscope_surface(surface)
+        read_multiscope_surface(surface, decode=False)
         dates_path, config_path = self._path(self._required(payload, "listing_dates_path")), self._path(self._required(payload, "config_path"))
         if not dates_path.is_file() or not config_path.is_file():
             raise ValueError("listing-date snapshot and analysis config files are required")

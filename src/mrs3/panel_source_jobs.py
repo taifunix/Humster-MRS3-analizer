@@ -32,6 +32,7 @@ class _Job:
     total: int = 0
     error: dict[str, str] | None = None
     counts: dict[str, int] = field(default_factory=dict)
+    evidence: dict[str, object] = field(default_factory=dict)
 
 
 class LocalSourceDbJobRunner:
@@ -48,13 +49,13 @@ class LocalSourceDbJobRunner:
         executor = getattr(self.service, "execute_import", None)
         if not callable(executor):
             raise ValueError("local import service is unavailable")
-        return self._start("local-import", executor, token, resource_key, job_id)
+        return self._start("local-import", executor, token, resource_key, job_id, progress=True)
 
     def start_merge(self, token: str, resource_key: str, *, job_id: str | None = None) -> dict[str, object]:
         executor = getattr(self.service, "execute_merge", None)
         if not callable(executor):
             raise ValueError("local merge service is unavailable")
-        return self._start("local-merge", executor, token, resource_key, job_id)
+        return self._start("local-merge", executor, token, resource_key, job_id, progress=True)
 
     def status(self, job_id: str) -> dict[str, object]:
         with self._lock:
@@ -80,6 +81,7 @@ class LocalSourceDbJobRunner:
         token: str,
         resource_key: str,
         job_id: str | None,
+        progress: bool = False,
     ) -> dict[str, object]:
         if not isinstance(token, str) or not token.strip():
             raise ValueError("preflight token is required")
@@ -95,15 +97,18 @@ class LocalSourceDbJobRunner:
             self._resources[resource_key] = job.job_id
             initial = self._snapshot(job)
             try:
-                Thread(target=self._run, args=(job, executor), daemon=True).start()
+                Thread(target=self._run, args=(job, executor, progress), daemon=True).start()
             except BaseException:
                 self._finish(job, "FAILED")
                 raise
             return initial
 
-    def _run(self, job: _Job, executor: Callable[..., object]) -> None:
+    def _run(self, job: _Job, executor: Callable[..., object], progress: bool = False) -> None:
         try:
-            result = executor(job.token, cancellation_requested=job.cancel_event.is_set)
+            kwargs: dict[str, object] = {"cancellation_requested": job.cancel_event.is_set}
+            if progress:
+                kwargs["progress_callback"] = lambda current, total: self._progress(job, current, total)
+            result = executor(job.token, **kwargs)
         except BaseException as error:
             cancelled = job.cancel_event.is_set() or self._cancelled_error(error)
             self._finish(job, "CANCELLED" if cancelled else "FAILED")
@@ -114,9 +119,15 @@ class LocalSourceDbJobRunner:
         elif self._failed_result(result):
             self._finish(job, "FAILED")
         else:
-            self._finish(job, "COMMITTED", self._safe_counts(result))
+            self._finish(job, "COMMITTED", self._safe_counts(result), self._safe_evidence(result))
 
-    def _finish(self, job: _Job, state: str, counts: dict[str, int] | None = None) -> None:
+    def _finish(
+        self,
+        job: _Job,
+        state: str,
+        counts: dict[str, int] | None = None,
+        evidence: dict[str, object] | None = None,
+    ) -> None:
         with self._lock:
             if job.state in _TERMINAL:
                 return
@@ -128,10 +139,17 @@ class LocalSourceDbJobRunner:
                 job.error = None
             elif counts:
                 job.counts = counts
-                total = counts.get("input_count")
-                current = counts.get("accepted_count")
-                job.total = total if total is not None else (current or 0)
-                job.current = job.total if total is not None else (current or 0)
+                if job.operation == "local-merge" and job.total:
+                    job.current = job.total
+                else:
+                    total = counts.get("input_count")
+                    if total is None and {"accepted_count", "quarantined_count"}.issubset(counts):
+                        total = counts["accepted_count"] + counts["quarantined_count"]
+                    current = counts.get("accepted_count")
+                    job.total = total if total is not None else (current or 0)
+                    job.current = job.total if total is not None else (current or 0)
+            if evidence:
+                job.evidence = evidence
             if self._resources.get(job.resource_key) == job.job_id:
                 self._resources.pop(job.resource_key, None)
             snapshot = self._snapshot(job)
@@ -163,7 +181,27 @@ class LocalSourceDbJobRunner:
         }
         if job.counts:
             document["counts"] = dict(job.counts)
+        if job.evidence:
+            document["evidence"] = dict(job.evidence)
         return document
+
+    def _progress(self, job: _Job, current: object, total: object) -> None:
+        if (
+            isinstance(current, bool) or not isinstance(current, int) or current < 0
+            or isinstance(total, bool) or not isinstance(total, int) or total < current
+        ):
+            return
+        with self._lock:
+            if job.state in _TERMINAL:
+                return
+            job.phase = "MERGING" if job.operation == "local-merge" else "IMPORTING"
+            job.current, job.total = current, total
+            snapshot = self._snapshot(job)
+        if self._on_update is not None:
+            try:
+                self._on_update(snapshot)
+            except BaseException:
+                pass
 
     @staticmethod
     def _value(result: object, name: str) -> Any:
@@ -202,3 +240,21 @@ class LocalSourceDbJobRunner:
             if isinstance(value, int) and not isinstance(value, bool):
                 counts[name] = value
         return counts
+
+    @classmethod
+    def _safe_evidence(cls, result: object) -> dict[str, object]:
+        evidence: dict[str, object] = {}
+        digest = cls._value(result, "source_content_digest")
+        if isinstance(digest, str) and len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
+            evidence["source_content_digest"] = digest
+        for name in ("accepted_count", "quarantined_count"):
+            value = cls._value(result, name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                evidence[name] = value
+        safe = cls._value(result, "safe_to_delete")
+        if safe in {"YES", "NO"}:
+            evidence["safe_to_delete"] = safe
+        reasons = cls._value(result, "quarantine_reasons")
+        if isinstance(reasons, (list, tuple)) and all(isinstance(item, str) for item in reasons):
+            evidence["quarantine_reasons"] = list(reasons)
+        return evidence

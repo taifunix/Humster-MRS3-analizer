@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from threading import RLock
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from .source_v6_importer import import_source_v6, preflight_source_v6
 from .source_v6_merge import merge_source_v6, preflight_source_v6_merge
@@ -36,10 +36,11 @@ class LocalSourceDbService:
     token to an operation and creates redacted documents for a controller.
     """
 
-    def __init__(self, *, workers: int = 1) -> None:
+    def __init__(self, *, workers: int = 1, import_options: Mapping[str, object] | None = None) -> None:
         if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
             raise ValueError("workers must be a positive integer")
         self.workers = workers
+        self.import_options = dict(import_options or {})
         self._lock = RLock()
         self._import: _Pending | None = None
         self._merge: _Pending | None = None
@@ -75,7 +76,7 @@ class LocalSourceDbService:
     ) -> object:
         pending = self._current(self._import, token, "import")
         preflight = pending.preflight
-        kwargs: dict[str, object] = {"preflight": preflight, "workers": self.workers}
+        kwargs: dict[str, object] = {"preflight": preflight, "workers": self.workers, **self.import_options}
         if cancellation_requested is not None:
             kwargs["cancellation_requested"] = cancellation_requested
         if fault_injector is not None:
@@ -93,7 +94,10 @@ class LocalSourceDbService:
     ) -> dict[str, object]:
         # Keep the canonical iterable handling (including its string/Path
         # normalization) in the existing merge preflight.
-        preflight = preflight_source_v6_merge(input_paths, target_path)
+        requested = tuple(Path(item).resolve() for item in input_paths)
+        if len(requested) != 2 or len(set(requested)) != 2:
+            raise ValueError("local merge requires two distinct Source DB inputs")
+        preflight = preflight_source_v6_merge(requested, target_path)
         inputs = tuple(getattr(preflight, "input_paths", input_paths))
         with self._lock:
             self._merge = _Pending(str(preflight.token), preflight)
@@ -112,6 +116,7 @@ class LocalSourceDbService:
         *,
         cancellation_requested: Callable[[], bool] | None = None,
         fault_injector: Callable[[str], object] | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> object:
         pending = self._current(self._merge, token, "merge")
         preflight = pending.preflight
@@ -120,6 +125,8 @@ class LocalSourceDbService:
             kwargs["cancellation_requested"] = cancellation_requested
         if fault_injector is not None:
             kwargs["fault_injector"] = fault_injector
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
         return merge_source_v6(
             preflight.input_paths,
             preflight.target_path,

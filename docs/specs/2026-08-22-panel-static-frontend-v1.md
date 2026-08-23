@@ -24,8 +24,8 @@ Replace the default monolithic embedded panel with a static, local-only frontend
 - `GET /api/v2/bootstrap` returns only safe, validated config-derived defaults. It never launches a process, scans artifacts, or exposes SSH credentials.
 - `GET /api/v2/source/local/catalog` lists only non-symlink `*.duckdb` files in
   the configured local Source DB directory. It is used solely to populate the
-  materializer Source DB selector; validation still happens at surface
-  preflight.
+  materializer Source DB selector and the two native merge datalists; validation
+  still happens at surface or merge preflight.
 
 ## Bootstrap contract
 
@@ -76,6 +76,21 @@ download against the verified remote byte count, then reports SHA-256
 verification before atomic publication. The panel shows both stage time and
 overall elapsed time. Missing or malformed progress data is displayed as
 indeterminate progress and never changes the import result.
+
+Local and remote Source DB jobs persist the same safe importer evidence in the
+panel journal: source-content digest, accepted/quarantined counts,
+quarantine reasons, coverage-cell count when supplied, and
+`safe_to_delete`. Paths, credentials and raw report lists are never persisted.
+The local adapter passes the configured Source v6 throughput settings and
+publishes truthful per-report progress. The static panel is the default root;
+`/legacy` remains an explicit compatibility path.
+
+The local merge card accepts two immutable Source v6 inputs and a fresh target.
+Its three path defaults are persisted through the settings endpoint, catalog
+candidates can be selected from either input field, and the merge job publishes
+fragment progress while polling. A merge with quarantine is publishable only
+when every quarantined `(fragment_id, source_name)` has an exact replacement in
+the input set; unresolved quarantine fails closed.
 
 Surface coverage preflight remains a read-only synchronous validation. While
 the request is in flight, the panel shows an active phase bar and elapsed

@@ -119,6 +119,9 @@
     "reports_root": "/opt/hb1/tester/report",
     "source_db_root": "/opt/hb1/debian-duckdb-importer/data/db",
     "reports_archive_root": "/opt/hb1/debian-duckdb-importer/data/html"
+  },
+  "panel": {
+    "default_root": "static"
   }
 }
 

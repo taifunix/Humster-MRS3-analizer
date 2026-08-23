@@ -52,7 +52,16 @@ def test_import_preflight_is_redacted_and_execute_requires_latest_token(
         return SimpleNamespace(status="COMMITTED", target_path=target)
 
     monkeypatch.setattr(source_db, "import_source_v6", fake_import)
-    service = LocalSourceDbService(workers=3)
+    service = LocalSourceDbService(
+        workers=3,
+        import_options={
+            "write_batch_size": 7,
+            "worker_chunk_size": 8,
+            "max_in_flight_chunks": 9,
+            "segment_writer_limit": 3,
+            "hydrate_fragments": True,
+        },
+    )
 
     document = service.preflight_import(tmp_path / "reports", tmp_path / "out" / "source.duckdb")
 
@@ -74,6 +83,11 @@ def test_import_preflight_is_redacted_and_execute_requires_latest_token(
         "target": preflight.database_path,
         "preflight": preflight,
         "workers": 3,
+        "write_batch_size": 7,
+        "worker_chunk_size": 8,
+        "max_in_flight_chunks": 9,
+        "segment_writer_limit": 3,
+        "hydrate_fragments": True,
     }]
 
 
@@ -110,6 +124,24 @@ def test_merge_preflight_is_redacted_and_execute_keeps_inputs_immutable(
         "preflight": preflight,
         "workers": 2,
     }]
+
+
+@pytest.mark.parametrize("inputs", [(), ("one.duckdb",), ("one.duckdb", "one.duckdb")])
+def test_merge_preflight_requires_two_distinct_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inputs: tuple[str, ...]
+) -> None:
+    called = False
+
+    def unexpected_preflight(*args: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("canonical preflight must not receive an invalid panel selection")
+
+    monkeypatch.setattr(source_db, "preflight_source_v6_merge", unexpected_preflight)
+
+    with pytest.raises(ValueError, match="two distinct Source DB inputs"):
+        LocalSourceDbService().preflight_merge(tuple(tmp_path / item for item in inputs), tmp_path / "merged.duckdb")
+    assert called is False
 
 
 def test_service_does_not_expose_surface_publication_or_remote_operations() -> None:

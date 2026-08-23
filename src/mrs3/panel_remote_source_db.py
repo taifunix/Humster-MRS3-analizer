@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import base64
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -31,6 +33,12 @@ class RemoteSourceDbError(ValueError):
 class RemoteDbEvidence:
     size_bytes: int
     sha256: str
+    source_content_digest: str | None = None
+    accepted_count: int | None = None
+    quarantined_count: int | None = None
+    safe_to_delete: str | None = None
+    coverage_cells: int | None = None
+    quarantine_reasons: tuple[str, ...] = ()
 
     @classmethod
     def from_value(cls, value: object) -> "RemoteDbEvidence":
@@ -51,10 +59,43 @@ class RemoteDbEvidence:
             or not _SHA256.fullmatch(digest)
         ):
             raise RemoteSourceDbError("invalid remote source db evidence")
-        return cls(size_bytes, digest)
+        if isinstance(value, cls):
+            optional = {
+                "source_content_digest": value.source_content_digest,
+                "accepted_count": value.accepted_count,
+                "quarantined_count": value.quarantined_count,
+                "safe_to_delete": value.safe_to_delete,
+                "coverage_cells": value.coverage_cells,
+                "quarantine_reasons": value.quarantine_reasons,
+            }
+        else:
+            optional = value if isinstance(value, Mapping) else value.__dict__ if hasattr(value, "__dict__") else {}
+        source_digest = optional.get("source_content_digest")
+        if source_digest is not None and (not isinstance(source_digest, str) or not _SHA256.fullmatch(source_digest)):
+            raise RemoteSourceDbError("invalid remote source db evidence")
+        counts: dict[str, int | None] = {}
+        for name in ("accepted_count", "quarantined_count", "coverage_cells"):
+            number = optional.get(name)
+            if number is not None and (isinstance(number, bool) or not isinstance(number, int) or number < 0):
+                raise RemoteSourceDbError("invalid remote source db evidence")
+            counts[name] = number
+        safe = optional.get("safe_to_delete")
+        if safe is not None and safe not in {"YES", "NO"}:
+            raise RemoteSourceDbError("invalid remote source db evidence")
+        reasons = optional.get("quarantine_reasons", ())
+        if not isinstance(reasons, (list, tuple)) or not all(isinstance(item, str) for item in reasons):
+            raise RemoteSourceDbError("invalid remote source db evidence")
+        return cls(size_bytes, digest, source_digest, counts["accepted_count"], counts["quarantined_count"], safe, counts["coverage_cells"], tuple(reasons))
 
     def as_dict(self) -> dict[str, object]:
-        return {"size_bytes": self.size_bytes, "sha256": self.sha256}
+        document: dict[str, object] = {"size_bytes": self.size_bytes, "sha256": self.sha256}
+        for name in ("source_content_digest", "accepted_count", "quarantined_count", "safe_to_delete", "coverage_cells"):
+            value = getattr(self, name)
+            if value is not None:
+                document[name] = value
+        if self.quarantine_reasons:
+            document["quarantine_reasons"] = list(self.quarantine_reasons)
+        return document
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -579,6 +620,7 @@ class RemoteSourceDbExecutor:
     def _status_script(self, job: _RemoteImportJob) -> str:
         importer = self.config.debian_runner_root.rstrip("/") + "/scripts/import-source-v6-debian.sh"
         runner = self.config.debian_runner_root.rstrip("/") + "/scripts/import_source_v6_debian.py"
+        python = self.config.debian_runner_root.rstrip("/") + "/.venv/bin/python"
         return "\n".join(
             (
                 "set -eu",
@@ -586,6 +628,8 @@ class RemoteSourceDbExecutor:
                 f"target={_shell_quote(job.remote_db_target)}",
                 f"importer={_shell_quote(importer)}",
                 f"runner={_shell_quote(runner)}",
+                f"python={_shell_quote(python)}",
+                f"log_file={_shell_quote(job.log_path)}",
                 f"progress_file={_shell_quote(job.stage_path + '/progress')}",
                 "if [ ! -f \"$pid_file\" ] || [ -L \"$pid_file\" ]; then printf 'FAILED\\n'; exit 0; fi",
                 "pid=$(cat -- \"$pid_file\" 2>/dev/null) || { printf 'FAILED\\n'; exit 0; }",
@@ -610,7 +654,33 @@ class RemoteSourceDbExecutor:
                 "if ! size=$(wc -c <\"$target\"); then printf 'FAILED\\n'; exit 0; fi",
                 "if ! digest=$(sha256sum -- \"$target\"); then printf 'FAILED\\n'; exit 0; fi",
                 "digest=${digest%% *}",
-                "printf 'REMOTE_IMPORTED %s %s\\n' \"$size\" \"$digest\"",
+                "importer_evidence=",
+                "if [ -f \"$log_file\" ] && [ ! -L \"$log_file\" ]; then",
+                "  if [ ! -x \"$python\" ]; then python=python3; fi",
+                "  importer_evidence=$(\"$python\" - \"$log_file\" \"$target\" <<'PY' || true",
+                "import base64, json, sys",
+                "from pathlib import Path",
+                "try:",
+                "    payload = json.loads(next(line for line in reversed(Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()) if line.strip()))",
+                "    reports = payload.get('reports', [])",
+                "    quarantined = int(payload.get('quarantined', sum(item.get('status') == 'QUARANTINED' for item in reports)))",
+                "    reasons = payload.get('quarantine_reasons', [])",
+                "    if not reasons and quarantined:",
+                "        try:",
+                "            import duckdb",
+                "            connection = duckdb.connect(sys.argv[2], read_only=True)",
+                "            try: reasons = [str(row[0]) for row in connection.execute('select reason from quarantine order by created_at_utc').fetchall()]",
+                "            finally: connection.close()",
+                "        except Exception: pass",
+                "    evidence = {'source_content_digest': payload.get('source_content_digest'), 'accepted_count': int(payload.get('accepted_count', len(reports) - quarantined)), 'quarantined_count': quarantined, 'safe_to_delete': payload.get('safe_to_delete', 'YES' if quarantined == 0 else 'NO'), 'coverage_cells': (payload.get('coverage') or {}).get('cells'), 'quarantine_reasons': reasons}",
+                "    evidence = {key: value for key, value in evidence.items() if value is not None}",
+                "    print(base64.urlsafe_b64encode(json.dumps(evidence, separators=(',', ':')).encode()).decode().rstrip('='))",
+                "except Exception:",
+                "    pass",
+                "PY",
+                "  )",
+                "fi",
+                "printf 'REMOTE_IMPORTED %s %s %s\\n' \"$size\" \"$digest\" \"$importer_evidence\"",
             )
         )
 
@@ -649,11 +719,17 @@ class RemoteSourceDbExecutor:
 
     @classmethod
     def _parse_remote_imported(cls, marker: str) -> RemoteDbEvidence:
-        match = re.fullmatch(r"REMOTE_IMPORTED[ \t]+([0-9]+)[ \t]+([0-9a-f]{64})", marker)
+        match = re.fullmatch(r"REMOTE_IMPORTED[ \t]+([0-9]+)[ \t]+([0-9a-f]{64})(?:[ \t]+([A-Za-z0-9_-]+))?", marker)
         if match is None:
             raise RemoteSourceDbError("remote source db import failed")
         try:
-            return RemoteDbEvidence(int(match.group(1)), match.group(2))
+            extra = {}
+            encoded = match.group(3)
+            if encoded:
+                extra = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
+                if not isinstance(extra, Mapping):
+                    raise ValueError
+            return RemoteDbEvidence.from_value({"size_bytes": int(match.group(1)), "sha256": match.group(2), **extra})
         except (TypeError, ValueError):
             raise RemoteSourceDbError("remote source db import failed") from None
 

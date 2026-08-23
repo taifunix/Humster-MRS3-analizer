@@ -246,6 +246,33 @@ def test_panel_static_routes_and_legacy_compatibility_are_bounded(tmp_path: Path
         server.server_close()
 
 
+def test_v2_local_source_service_uses_source_v6_throughput_settings(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(
+        json.dumps({
+            "duckdb_import": {"workers": 3},
+            "source_v6_import": {
+                "write_batch_size": 7,
+                "worker_chunk_size": 8,
+                "max_in_flight_chunks": 9,
+                "segment_writer_limit": 3,
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    service, _ = PanelController(tmp_path, config, browse_factory=lambda *_: ())._local_source_jobs()
+
+    assert service.workers == 3
+    assert service.import_options == {
+        "write_batch_size": 7,
+        "worker_chunk_size": 8,
+        "max_in_flight_chunks": 9,
+        "segment_writer_limit": 3,
+        "hydrate_fragments": True,
+    }
+
+
 def test_static_panel_shell_contains_only_navigation_contract() -> None:
     panel_web = Path(panel_module.__file__).parent / "panel_web"
     html = (panel_web / "index.html").read_text(encoding="utf-8")
@@ -2072,13 +2099,17 @@ def test_fresh_source_v6_analysis_uses_configured_worker_count(tmp_path: Path, m
     dates.write_text("{}", encoding="utf-8")
     analysis.write_text("{}", encoding="utf-8")
     captured: dict[str, object] = {}
-    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", lambda path: {"surface_id": "surface"})
+    monkeypatch.setattr(
+        "mrs3.panel.read_multiscope_surface",
+        lambda path, *, decode=True: captured.update({"decode": decode}) or {"surface_id": "surface"},
+    )
     monkeypatch.setattr("mrs3.panel.run_multiscope_analysis", lambda surface, directory, loaded, **kwargs: captured.update({"surface": surface, "workers": kwargs["workers"], "cancel_check": kwargs["cancel_check"]}) or directory / "result.analysis-v6.duckdb")
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda path: object(), source_v6_listing_dates_loader=lambda path: {"ONUSDT": "2020-01-01"})
 
     result = controller.source_v6_start_fresh_analysis({"surface_path": "surface.surface-v6.duckdb", "listing_dates_path": str(dates), "config_path": str(analysis)})
 
     assert result["phase"] == "COMMITTED"
+    assert captured["decode"] is False
     assert captured["workers"] == 3
     assert callable(captured["cancel_check"])
 
@@ -2091,7 +2122,7 @@ def test_fresh_source_v6_analysis_uses_the_editable_analysis_target(tmp_path: Pa
     analysis.write_text("{}", encoding="utf-8")
     captured: dict[str, object] = {}
     target = tmp_path / "chosen" / "ON_2026-01-01_2026-01-31.analysis-v6.duckdb"
-    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", lambda path: {"surface_id": "surface"})
+    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", lambda path, *, decode=True: {"surface_id": "surface"})
     monkeypatch.setattr(
         "mrs3.panel.run_multiscope_analysis",
         lambda surface, directory, loaded, **kwargs: captured.update({"directory": directory, "filename": kwargs["filename"]}) or target,
@@ -2113,7 +2144,7 @@ def test_fresh_source_v6_analysis_reports_requested_cancellation(tmp_path: Path,
     dates, analysis = tmp_path / "dates.json", tmp_path / "analysis.json"
     dates.write_text("{}", encoding="utf-8")
     analysis.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", lambda path: {"surface_id": "surface"})
+    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", lambda path, *, decode=True: {"surface_id": "surface"})
     monkeypatch.setattr("mrs3.panel.run_multiscope_analysis", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Source v6 analysis cancelled")))
     controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda path: object(), source_v6_listing_dates_loader=lambda path: {})
 
@@ -3519,6 +3550,22 @@ def test_http_duckdb_import_settings_and_preflight_are_dedicated_routes(tmp_path
         connection.request("POST", "/api/duckdb-import/migrate", json.dumps({"target_path": "migrated.duckdb"}).encode(), {"Content-Type": "application/json"})
         migrated = connection.getresponse(); assert migrated.status == 200
         assert json.loads(migrated.read())["source_duckdb_path"] == str((tmp_path / "migrated.duckdb").resolve())
+    finally:
+        connection.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_http_remote_path_check_is_a_dedicated_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    monkeypatch.setattr(controller, "remote_testing_check_paths", lambda: {"paths": {"source_db_root": True}})
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("POST", "/api/v2/testing/remote/check-paths", b"{}", {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read()) == {"paths": {"source_db_root": True}}
     finally:
         connection.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
 
