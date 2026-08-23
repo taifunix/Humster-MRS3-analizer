@@ -8,13 +8,14 @@ from pathlib import Path
 FIXTURE = Path(__file__).parent / "fixtures" / "performance" / "source_v6_fixed_lot_overlap_a.html"
 
 
-def test_fresh_analysis_is_separate_and_binds_the_supplied_gap_rules(tmp_path: Path) -> None:
+def test_fresh_analysis_is_separate_and_binds_the_supplied_gap_rules(tmp_path: Path, monkeypatch) -> None:
     import duckdb
     from mrs3.config import AlgorithmConfig
     from mrs3.source_v6 import canonical_fragment_bytes, normalize_source_v6
     from mrs3.source_v6_coverage import CANONICAL_READINESS_CLOSE_LENGTHS, CANONICAL_READINESS_SHIFTS_BP
     from mrs3.source_v6_materializer import materialize_source_v6
     from mrs3.source_v6_surface_fresh import publish_multiscope_surface
+    import mrs3.source_v6_analysis_fresh as fresh
     from mrs3.source_v6_analysis_fresh import run_multiscope_analysis
 
     base = normalize_source_v6(FIXTURE.read_bytes())
@@ -24,11 +25,15 @@ def test_fresh_analysis_is_separate_and_binds_the_supplied_gap_rules(tmp_path: P
     surface = publish_multiscope_surface(tmp_path / "surfaces", materialize_source_v6(facts, ("ONUSDT|LONG|1h",)))
     default = AlgorithmConfig.defaults()
     changed = replace(default, gap_rules=((30, 551, 10),))
+    read_surface = fresh.read_multiscope_surface
+    decode_calls = []
+    monkeypatch.setattr(fresh, "read_multiscope_surface", lambda path, *, decode=True: decode_calls.append(decode) or read_surface(path, decode=decode))
 
     first = run_multiscope_analysis(surface, tmp_path / "analysis", default, listing_dates={"ONUSDT": "2020-01-01"}, workers=1)
     second = run_multiscope_analysis(surface, tmp_path / "analysis", changed, listing_dates={"ONUSDT": "2020-01-01"}, workers=1)
 
     assert first != second
+    assert decode_calls == [False, False]
     assert first.name.endswith(".analysis-v6.duckdb")
     connection = duckdb.connect(str(second), read_only=True)
     try:
@@ -83,3 +88,36 @@ def test_fresh_analysis_cancellation_prevents_publication(tmp_path: Path) -> Non
     with pytest.raises(RuntimeError, match="cancelled"):
         run_multiscope_analysis(surface, tmp_path / "analysis", AlgorithmConfig.defaults(), listing_dates={"ONUSDT": "2020-01-01"}, cancel_check=lambda: True)
     assert not tuple((tmp_path / "analysis").glob("*.analysis-v6.duckdb"))
+
+
+def test_fresh_analysis_accepts_an_editable_human_filename(tmp_path: Path) -> None:
+    import pytest
+    from mrs3.config import AlgorithmConfig
+    from mrs3.source_v6 import canonical_fragment_bytes, normalize_source_v6
+    from mrs3.source_v6_coverage import CANONICAL_READINESS_CLOSE_LENGTHS, CANONICAL_READINESS_SHIFTS_BP
+    from mrs3.source_v6_analysis_fresh import run_multiscope_analysis
+    from mrs3.source_v6_materializer import materialize_source_v6
+    from mrs3.source_v6_surface_fresh import publish_multiscope_surface
+
+    base = normalize_source_v6(FIXTURE.read_bytes())
+    facts = tuple(
+        replace(item, fragment_id=sha256(canonical_fragment_bytes(item)).hexdigest())
+        for item in (
+            replace(base, point=replace(base.point, shift_bp=shift, close_ma_length=close))
+            for shift in CANONICAL_READINESS_SHIFTS_BP
+            for close in CANONICAL_READINESS_CLOSE_LENGTHS
+        )
+    )
+    surface = publish_multiscope_surface(tmp_path / "surfaces", materialize_source_v6(facts, ("ONUSDT|LONG|1h",)))
+
+    artifact = run_multiscope_analysis(
+        surface, tmp_path / "analysis", AlgorithmConfig.defaults(), listing_dates={"ONUSDT": "2020-01-01"},
+        filename="ON_2026-01-01_2026-01-31.analysis-v6.duckdb",
+    )
+
+    assert artifact.name == "ON_2026-01-01_2026-01-31.analysis-v6.duckdb"
+    with pytest.raises(FileExistsError, match="already exists"):
+        run_multiscope_analysis(
+            surface, tmp_path / "analysis", AlgorithmConfig.defaults(), listing_dates={"ONUSDT": "2020-01-01"},
+            filename="ON_2026-01-01_2026-01-31.analysis-v6.duckdb",
+        )

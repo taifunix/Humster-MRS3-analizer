@@ -6,7 +6,7 @@ from bisect import bisect_left
 from dataclasses import dataclass
 from decimal import Decimal
 import json
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from .source_v6 import NormalizedAction, NormalizedCycle, NormalizedSample, SourceV6Fragment
 
@@ -16,6 +16,40 @@ MIN_OVERLAP_HOURS = 96
 
 class SourceV6StitchError(ValueError):
     pass
+
+
+# Why no sample survived. Only the first may become a flat result: it is the
+# only one in which the tester actually reported nothing.
+GENUINE_ZERO_ACTIVITY = "GENUINE_ZERO_ACTIVITY"
+OPEN_TAIL_FILTER_REMOVED_ALL_DATA = "OPEN_TAIL_FILTER_REMOVED_ALL_DATA"
+WINDOW_EXCLUDES_MEASURABLE_DATA = "WINDOW_EXCLUDES_MEASURABLE_DATA"
+SEAM_OR_CYCLE_RECONSTRUCTION_FAILURE = "SEAM_OR_CYCLE_RECONSTRUCTION_FAILURE"
+
+
+class SourceV6EmptySeriesError(SourceV6StitchError):
+    """No wallet/equity sample survives to be measured, and why.
+
+    Its own type because callers need to tell "this parameter combination
+    cannot be measured" from every other stitch failure without matching on a
+    message. Whether a combination is measurable depends on visibility
+    filtering, seam boundaries, tail truncation and the selected window, so the
+    only exact test is attempting the calculation.
+
+    `reason` exists because the causes are not interchangeable and treating them
+    as one published a corpus of false zeros: every combination of two real
+    surfaces was declared idle, while each fragment held thousands of samples,
+    hundreds of events and hundreds of closed cycles. An emptied series is not
+    an idle bot. `diagnostic` carries what the fragments actually held, so a
+    rejection can say that instead of "0 candidates".
+    """
+
+    def __init__(
+        self, message: str, *, reason: str = SEAM_OR_CYCLE_RECONSTRUCTION_FAILURE,
+        diagnostic: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.diagnostic = dict(diagnostic or {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +213,160 @@ def resolve_ownership(outgoing: SourceV6Fragment, incoming: SourceV6Fragment, *,
     return Ownership(incoming.fragment_id, outgoing.report_end_ms, overlap_hours, "USE_OLD_WITH_SEAM_EXCLUSION", "INCOMPLETE_SEAM_CYCLE_EXCLUDED", outgoing.report_end_ms)
 
 
+EMPTY_RESULT_REASON = "NO_WALLET_OR_EQUITY_SAMPLES"
+
+
+def _fragment_diagnostic(fragments: Sequence[SourceV6Fragment]) -> dict[str, object]:
+    """What the fragments held, for a rejection that can name it."""
+    return {
+        "fragments": len(fragments),
+        "wallet_samples": sum(len(item.wallet_samples) for item in fragments),
+        "equity_samples": sum(len(item.equity_samples) for item in fragments),
+        "actions": sum(len(item.actions) for item in fragments),
+        "events": sum(len(item.events) for item in fragments),
+        "closed_cycles": sum(1 for item in fragments for cycle in item.cycles if cycle.closed),
+        "open_cycles": sum(1 for item in fragments for cycle in item.cycles if not cycle.closed),
+    }
+
+
+def _empty_series_error(
+    fragments: Sequence[SourceV6Fragment], *, windowed: bool
+) -> SourceV6EmptySeriesError:
+    """Name the cause, because only one of them may become a flat result.
+
+    Decided from the facts rather than from where the emptiness was noticed: a
+    combination that reported nothing has no samples to begin with, while one
+    emptied by the open-tail cutoff has plenty. The corpus published on
+    2026-08-22 was entirely the second kind and was recorded as the first.
+    """
+    diagnostic = _fragment_diagnostic(fragments)
+    if not diagnostic["wallet_samples"] and not diagnostic["equity_samples"]:
+        return SourceV6EmptySeriesError(
+            "wallet/equity series are required",
+            reason=GENUINE_ZERO_ACTIVITY, diagnostic=diagnostic,
+        )
+    cutoff = min(
+        (
+            cycle.open_timestamp_ms
+            for item in fragments for cycle in item.cycles
+            if not cycle.closed and cycle.open_timestamp_ms < item.report_end_ms
+        ),
+        default=None,
+    )
+    earliest = min(
+        (sample.timestamp_ms for item in fragments for sample in item.wallet_samples),
+        default=None,
+    )
+    if cutoff is not None and earliest is not None and cutoff <= earliest:
+        return SourceV6EmptySeriesError(
+            "the open-tail cutoff hides every wallet/equity sample",
+            reason=OPEN_TAIL_FILTER_REMOVED_ALL_DATA,
+            diagnostic={**diagnostic, "open_tail_cutoff_ms": cutoff, "first_sample_ms": earliest},
+        )
+    if windowed:
+        return SourceV6EmptySeriesError(
+            "the selected window hides every wallet/equity sample",
+            reason=WINDOW_EXCLUDES_MEASURABLE_DATA, diagnostic=diagnostic,
+        )
+    return SourceV6EmptySeriesError(
+        "wallet/equity series are required",
+        reason=SEAM_OR_CYCLE_RECONSTRUCTION_FAILURE, diagnostic=diagnostic,
+    )
+
+
+def flat_result_metrics() -> CanonicalMetrics:
+    """The metrics of a parameter combination that was tested and never traded.
+
+    Not invented. The tester states them and the importer already verified they
+    agree with each other before admitting the report (ADR-0016, Z1): total PnL
+    zero, gross profit and loss zero, drawdown zero, and the balance unchanged
+    from first to last. What is genuinely undefined is the ratio set, and
+    ADR-0006 settled that those stay `None` rather than becoming a number.
+
+    Keeping the combination measurable is what keeps the canonical grid whole.
+    Removing it published a 113-of-114 grid that the pipeline adapter then
+    rejected with `INCOMPLETE_GRID`, naming neither the reason nor the cell.
+    """
+    zero = Decimal("0")
+    return CanonicalMetrics(
+        total_pnl=zero,
+        total_pnl_percent=zero,
+        profit_factor=None,
+        total_trades=0,
+        win_trades=0,
+        loss_trades=0,
+        win_rate_percent=zero,
+        max_equity_drawdown=zero,
+        max_equity_drawdown_percent=zero,
+        max_realized_drawdown=zero,
+        max_realized_drawdown_percent=zero,
+        balance_series=(),
+        equity_series=(),
+        events=(),
+    )
+
+
+def measure_points(
+    fragments: Sequence[SourceV6Fragment],
+    intervals: dict[str, tuple[int, int]] | None = None,
+) -> tuple[dict[str, CanonicalMetrics], list[dict[str, object]]]:
+    """Measure every parameter combination, including those that never traded.
+
+    Measurability is decided by attempting the calculation rather than by a
+    predicate mirroring it. `calculate_metrics` merges the series, filters them
+    for visibility, drops samples at or after an open tail, drops a later
+    fragment's pre-boundary samples, may truncate on `BRIDGE_NOT_COVERED`, and
+    applies the selected window — all before it checks that anything remains.
+    Two attempts to restate that as a predicate were wrong; the calculation is
+    the only exact answer.
+
+    A combination that never traded gets `flat_result_metrics` and stays in the
+    grid. Every other way of ending up with no samples raises, naming the
+    combination and its reason: a window that hides real data, an open tail that
+    hides it, or a seam that could not be resolved. Collapsing those into a flat
+    result published two entire surfaces of zeros over real trading histories.
+
+    The metrics are returned, so deciding measurability and measuring are the
+    same pass.
+    """
+    by_point: dict[str, list[SourceV6Fragment]] = {}
+    for fragment in fragments:
+        by_point.setdefault(fragment.point.canonical_key, []).append(fragment)
+    measured: dict[str, CanonicalMetrics] = {}
+    empty: list[dict[str, object]] = []
+    for point_key in sorted(by_point):
+        members = tuple(by_point[point_key])
+        window = (intervals or {}).get(point_key)
+        try:
+            measured[point_key] = (
+                calculate_metrics(members, start_ms=window[0], end_ms=window[1])
+                if window
+                else calculate_metrics(members)
+            )
+            continue
+        except SourceV6EmptySeriesError as error:
+            # Only one cause may become a flat result. Treating them as one
+            # published two whole surfaces of false zeros: every combination was
+            # recorded as idle while its fragments held thousands of samples and
+            # hundreds of closed cycles.
+            if error.reason != GENUINE_ZERO_ACTIVITY:
+                raise SourceV6EmptySeriesError(
+                    f"{error} for {point_key}",
+                    reason=error.reason, diagnostic=error.diagnostic,
+                ) from error
+        # Reaching here means `GENUINE_ZERO_ACTIVITY`: no fragment held a
+        # sample to begin with. Telling that from a windowing artefact used to
+        # need a second, unwindowed measurement of every empty combination;
+        # `_empty_series_error` now decides it from the facts in one pass.
+        measured[point_key] = flat_result_metrics()
+        empty.append({
+            "point_key": point_key,
+            "fragment_ids": sorted(item.fragment_id for item in members),
+            "reason": EMPTY_RESULT_REASON,
+        })
+    return measured, empty
+
+
 def resolve_batch(fragments: Sequence[SourceV6Fragment], *, min_overlap_hours: int = MIN_OVERLAP_HOURS) -> BatchResolution:
     unique: dict[str, SourceV6Fragment] = {}
     for fragment in fragments:
@@ -217,7 +405,7 @@ def select_bridge_facts(outgoing: SourceV6Fragment, incoming: SourceV6Fragment) 
     tail_orders = {cycle.order_id for cycle in outgoing.cycles if not cycle.closed}
     bridge_cycles = [cycle for cycle in incoming.cycles if cycle.order_id in tail_orders and cycle.closed]
     cycle_ids = tuple(cycle.cycle_id for cycle in bridge_cycles)
-    action_ids = tuple(action.action_id for action in incoming.actions if action.order_id in {cycle.order_id for cycle in bridge_cycles})
+    action_ids = tuple(action_id for cycle in bridge_cycles for action_id in cycle.action_ids)
     event_ids = tuple(event.event_id for event in incoming.events if event.action_id in set(action_ids))
     if tail_orders and not bridge_cycles:
         raise SourceV6StitchError("BRIDGE_NOT_COVERED")
@@ -537,7 +725,7 @@ def calculate_metrics(
         balance = tuple(sample for sample in balance if sample.timestamp_ms < end_ms)
         equity = tuple(sample for sample in equity if sample.timestamp_ms < end_ms)
     if not balance or not equity:
-        raise SourceV6StitchError("wallet/equity series are required")
+        raise _empty_series_error(ordered, windowed=start_ms is not None or end_ms is not None)
     initial = balance[0].value
     total_pnl = balance[-1].value - initial
     total_pnl_percent = total_pnl / initial * Decimal("100") if initial else Decimal("0")

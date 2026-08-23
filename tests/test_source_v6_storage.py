@@ -759,10 +759,27 @@ def test_parallel_decode_matches_serial_decode(tmp_path: Path) -> None:
     reduce_source_v6_segments(segments, target, run_token="run-a", fan_in=2)
 
     serial = tuple(iter_fragments(target))
-    parallel = storage.iter_fragments_parallel(target, workers=4, chunk_size=2)
+    progress: list[tuple[int, int]] = []
+    parallel = storage.iter_fragments_parallel(
+        target, workers=4, chunk_size=2, progress_callback=lambda completed, total: progress.append((completed, total))
+    )
 
     assert parallel == serial
+    assert progress[0] == (0, len(serial))
+    assert progress[-1] == (len(serial), len(serial))
     assert storage.iter_fragments_parallel(target, workers=1) == serial
+
+
+def test_parallel_selected_ids_matches_requested_subset(tmp_path: Path) -> None:
+    """Selected-scope materialization must not decode another scope's payload."""
+    segments, _fragments = _leaf_segments(tmp_path, 4)
+    target = tmp_path / "source-v6.duckdb"
+    reduce_source_v6_segments(segments, target, run_token="run-a", fan_in=2)
+    ids = storage.fragment_ids(target)
+
+    actual = storage.iter_fragment_ids_parallel(target, (ids[3], ids[1]), workers=2)
+
+    assert [item.fragment_id for item in actual] == [ids[1], ids[3]]
 
 
 def test_point_identity_round_trips_through_its_canonical_key() -> None:

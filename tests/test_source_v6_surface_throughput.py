@@ -171,3 +171,27 @@ def test_publishing_fails_when_the_source_is_missing_a_materialized_fragment(
             tmp_path / "short", materialize_source_v6(facts, (SCOPE,)), source_database=source
         )
     assert not list((tmp_path / "short").glob("*.surface-v6.duckdb"))
+
+
+def test_surface_filename_can_be_a_human_editable_name(tmp_path: Path) -> None:
+    """The digest remains in the manifest; the user-facing filename need not be it."""
+    from mrs3.source_v6_materializer import materialize_source_v6
+    from mrs3.source_v6_surface_fresh import publish_multiscope_surface
+
+    facts = _ready_facts()
+    target = publish_multiscope_surface(
+        tmp_path, materialize_source_v6(facts, (SCOPE,)),
+        filename="ON_2026-01-01_2026-01-31.surface-v6.duckdb",
+    )
+
+    assert target.name == "ON_2026-01-01_2026-01-31.surface-v6.duckdb"
+
+
+def test_surface_default_filename_is_descriptive_not_the_manifest_hash(tmp_path: Path) -> None:
+    from mrs3.source_v6_materializer import materialize_source_v6
+    from mrs3.source_v6_surface_fresh import publish_multiscope_surface, read_multiscope_surface
+
+    target = publish_multiscope_surface(tmp_path, materialize_source_v6(_ready_facts(), (SCOPE,)))
+
+    assert target.name.startswith("ON_")
+    assert read_multiscope_surface(target, decode=False)["surface_id"] not in target.name

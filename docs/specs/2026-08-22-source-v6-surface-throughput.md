@@ -94,6 +94,26 @@ never compared the stored `payload_sha256`), and strictly less about the
 decoded object, which publication does not need to prove: a payload whose
 sha256 is its `fragment_id` decodes to the fragment with that id or to nothing.
 
+### S4 — Panel hydration is parallel but deterministic
+
+The panel preflight remains metadata-only. Publication first selects only the
+stored fragment ids whose scope is READY and explicitly requested, then decodes
+that subset through `iter_fragment_ids_parallel`. It uses the configured import
+worker limit, bounded to 16 processes for Windows stability. Each worker opens
+the Source DB read-only and decodes a disjoint ordered slice; the parent
+restores `fragment_id` order before materialization. Therefore worker count
+changes only elapsed time, never the selected facts, source digest, scope digest
+or surface identity.
+
+The materializer deliberately remains hydrated: its `measure_points` call is
+the E1 authority for distinguishing a genuine idle result from a selected window
+that hides otherwise measurable data. The whole-source digest is supplied from
+the validated Source DB metadata, so selecting a subset does not weaken lineage.
+
+The reader reports completed and total *selected* hydrated fragments. The panel
+may expose that count and the subsequent publisher's real write/readback counts;
+short atomic operations are phase-only, never fabricated percentages.
+
 ## Invariants
 
 - The published surface is byte-for-byte equivalent in content: same

@@ -39,3 +39,22 @@ def test_materializer_rejects_scope_without_ready_witness() -> None:
     fragment = normalize_source_v6(FIXTURE.read_bytes())
     with pytest.raises(ValueError, match="not READY"):
         materialize_source_v6((fragment,), ("ONUSDT|LONG|1h",))
+
+
+def test_materializer_keeps_whole_source_digest_when_given_selected_facts() -> None:
+    from mrs3.source_v6 import normalize_source_v6
+    from mrs3.source_v6_coverage import CANONICAL_READINESS_CLOSE_LENGTHS, CANONICAL_READINESS_SHIFTS_BP
+    from mrs3.source_v6_materializer import materialize_source_v6
+
+    base = normalize_source_v6(FIXTURE.read_bytes())
+    facts = tuple(
+        replace(base, point=replace(base.point, shift_bp=shift, close_ma_length=close))
+        for shift in CANONICAL_READINESS_SHIFTS_BP
+        for close in CANONICAL_READINESS_CLOSE_LENGTHS
+    )
+
+    materialized = materialize_source_v6(
+        facts, ("ONUSDT|LONG|1h",), source_content_digest_value="whole-source-digest"
+    )
+
+    assert materialized.source_content_digest == "whole-source-digest"

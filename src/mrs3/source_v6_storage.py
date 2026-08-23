@@ -7,7 +7,7 @@ stored as physical rows.
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -1717,7 +1717,8 @@ def decode_fragment_slice(path: str | Path, ids: Sequence[str]) -> tuple[SourceV
 
 
 def iter_fragments_parallel(
-    path: str | Path, *, workers: int = 1, chunk_size: int = 256
+    path: str | Path, *, workers: int = 1, chunk_size: int = 256,
+    progress_callback: Callable[[int, int], object] | None = None,
 ) -> tuple[SourceV6Fragment, ...]:
     """Decode every fragment in `fragment_id` order, across processes when asked.
 
@@ -1725,19 +1726,43 @@ def iter_fragments_parallel(
     per fragment, so it parallelises cleanly. The result is identical to
     `iter_fragments` for the same database.
     """
-    ids = fragment_ids(path)
+    return iter_fragment_ids_parallel(
+        path, fragment_ids(path), workers=workers, chunk_size=chunk_size,
+        progress_callback=progress_callback,
+    )
+
+
+def iter_fragment_ids_parallel(
+    path: str | Path, ids: Sequence[str], *, workers: int = 1, chunk_size: int = 256,
+    progress_callback: Callable[[int, int], object] | None = None,
+) -> tuple[SourceV6Fragment, ...]:
+    """Decode exactly `ids` in deterministic order, without reading other payloads."""
+    ids = tuple(sorted(set(str(item) for item in ids)))
     if not ids:
         return ()
+    if progress_callback is not None:
+        progress_callback(0, len(ids))
     if workers < 2 or len(ids) <= chunk_size:
-        return tuple(iter_fragments(path))
+        fragments = decode_fragment_slice(path, ids)
+        if progress_callback is not None:
+            progress_callback(len(fragments), len(ids))
+        return fragments
     slices = [ids[start : start + chunk_size] for start in range(0, len(ids), chunk_size)]
     target = str(path)
-    decoded: list[tuple[SourceV6Fragment, ...]] = []
+    decoded: dict[int, tuple[SourceV6Fragment, ...]] = {}
+    completed = 0
     with ProcessPoolExecutor(max_workers=min(workers, len(slices))) as executor:
-        futures = [executor.submit(decode_fragment_slice, target, item) for item in slices]
-        for future in futures:
-            decoded.append(future.result())
-    return tuple(fragment for group in decoded for fragment in group)
+        futures = {
+            executor.submit(decode_fragment_slice, target, item): (index, len(item))
+            for index, item in enumerate(slices)
+        }
+        for future in as_completed(futures):
+            index, count = futures[future]
+            decoded[index] = future.result()
+            completed += count
+            if progress_callback is not None:
+                progress_callback(completed, len(ids))
+    return tuple(fragment for index in range(len(slices)) for fragment in decoded[index])
 
 
 def verify_fragment_slice(path: str | Path, ids: Sequence[str]) -> None:

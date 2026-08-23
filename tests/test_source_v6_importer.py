@@ -270,10 +270,11 @@ def _concurrency_events(
         workers=workers,
         worker_chunk_size=1,
         max_in_flight_chunks=max_in_flight_chunks,
-        segment_writer_limit=segment_writer_limit,
-        cancellation_requested=None,
-        worker_fn=None,
-    )
+            segment_writer_limit=segment_writer_limit,
+            cancellation_requested=None,
+            worker_fn=None,
+            progress_callback=None,
+        )
     return events
 
 

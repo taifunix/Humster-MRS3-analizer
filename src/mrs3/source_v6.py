@@ -628,18 +628,39 @@ def _normalize_with_canonical(source: bytes, *, source_name: str = "") -> tuple[
             occurrences[key] += 1
             parsed_actions.append(_action(report, point, row, occurrence))
         actions = tuple(sorted(parsed_actions, key=lambda item: (item.timestamp_ms, item.action_id)))
-        cycles_by_key: dict[tuple[str, str], dict[str, object]] = {}
-        for item in actions:
-            key = (item.symbol, item.order_id or item.action_id)
-            cycle = cycles_by_key.setdefault(key, {"actions": [], "open": item.timestamp_ms, "close": None, "pnl": Decimal("0"), "fees": Decimal("0")})
-            cycle["actions"].append(item.action_id)
-            cycle["open"] = min(int(cycle["open"]), item.timestamp_ms)
-            cycle["pnl"] += item.pnl
-            cycle["fees"] += item.fee
-            if item.action == "closed":
-                cycle["close"] = item.timestamp_ms
+        # A cycle is one position, not one order. `Order ID` identifies the
+        # fills of a single order, and a position routinely opens under one
+        # order and closes under another — in the reference report the opening
+        # and closing order ids never once coincide. Grouping by order id
+        # therefore split every position in two: the half holding the `closed`
+        # action looked complete, and the half holding `opened` looked like a
+        # position that never closed. The earliest such phantom then became the
+        # open-tail cutoff and hid every sample of the report.
+        #
+        # `Post Size` states the truth directly: the position is open while it
+        # is above zero and closed the moment it returns to zero. An episode may
+        # begin without an `opened` action, because the position can have been
+        # opened before the report started.
+        episodes: list[dict[str, object]] = []
+        current: dict[str, object] | None = None
+        for item in sorted(actions, key=lambda value: (value.symbol, value.timestamp_ms, value.action_id)):
+            if current is None or current["symbol"] != item.symbol:
+                current = None
+            if current is None:
+                current = {"symbol": item.symbol, "order_id": item.order_id or item.action_id, "actions": [], "open": item.timestamp_ms, "close": None, "pnl": Decimal("0"), "fees": Decimal("0")}
+                episodes.append(current)
+            current["actions"].append(item.action_id)
+            current["pnl"] += item.pnl
+            current["fees"] += item.fee
+            # `Post Size` returning to zero is the tester stating the position is
+            # flat. `closed` states the same thing in words, and older report
+            # layouts omit the column entirely, so both close the episode.
+            if (item.post_size is not None and item.post_size == 0) or item.action == "closed":
+                current["close"] = item.timestamp_ms
+                current = None
         cycles: list[NormalizedCycle] = []
-        for (symbol, order_id), values in cycles_by_key.items():
+        for values in episodes:
+            symbol, order_id = str(values["symbol"]), str(values["order_id"])
             cycle_id = _sha256_text(_canonical_json({"point": point.canonical_key, "symbol": symbol, "order_id": order_id, "action_ids": list(values["actions"]), "open_timestamp_ms": values["open"], "close_timestamp_ms": values["close"], "realized_pnl": values["pnl"], "fees": values["fees"]}))
             cycles.append(NormalizedCycle(cycle_id, symbol, order_id, tuple(values["actions"]), int(values["open"]), values["close"], values["pnl"], values["fees"]))
         cycles.sort(key=lambda item: (item.open_timestamp_ms, item.cycle_id))

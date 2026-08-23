@@ -18,7 +18,7 @@ import duckdb
 import pandas as pd
 
 from .source_v6 import SourceV6Fragment, _canonical_json
-from .source_v6_stitch import CanonicalMetrics, calculate_metrics
+from .source_v6_stitch import CanonicalMetrics, measure_points
 from .source_v6_coverage import coverage_cells
 from .source_v6_coverage import CANONICAL_READINESS_CLOSE_LENGTHS, CANONICAL_READINESS_SHIFTS_BP
 
@@ -48,20 +48,6 @@ class SurfaceScanResult:
     status: str
     surface_id: str | None
     error: str | None = None
-
-
-def _surface_metrics(
-    fragments: Sequence[SourceV6Fragment],
-    intervals: dict[str, tuple[int, int]] | None = None,
-) -> CanonicalMetrics:
-    by_point: dict[str, list[SourceV6Fragment]] = {}
-    for fragment in fragments:
-        by_point.setdefault(fragment.point.canonical_key, []).append(fragment)
-    # A surface can contain many points; top-level metrics are a deterministic
-    # summary of the first point, while point_metrics is authoritative per point.
-    first_key = sorted(by_point)[0]
-    selected = (intervals or {}).get(first_key)
-    return calculate_metrics(tuple(by_point[first_key]), start_ms=selected[0], end_ms=selected[1]) if selected else calculate_metrics(tuple(by_point[first_key]))
 
 
 def _scope_key(fact: Mapping[str, object]) -> str:
@@ -125,10 +111,18 @@ def _payload_frozen_digest(payload: Mapping[str, object]) -> str:
 
 def _surface_payload(
     fragments: Sequence[SourceV6Fragment],
-    metrics: CanonicalMetrics,
     intervals: dict[str, tuple[int, int]] | None = None,
     overlap_tail_decisions: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
+    # E2: a combination that never traded keeps its place in the canonical grid
+    # and carries the flat result the tester declared. It is recorded in
+    # `empty_result_points` so it stays visible as what it is.
+    measured, empty_results = measure_points(fragments, intervals)
+    # A surface can hold many combinations; the top-level metrics are a
+    # deterministic summary of the first by key order, while `point_metrics` is
+    # authoritative per combination. Deciding measurability *is* measuring, so
+    # the summary comes from the same pass rather than being paid for again.
+    metrics = measured[sorted(measured)[0]]
     fragment_ids = sorted(fragment.fragment_id for fragment in fragments)
     points = sorted({fragment.point.canonical_key for fragment in fragments})
     decisions = [dict(item) for item in (overlap_tail_decisions or ())]
@@ -215,8 +209,8 @@ def _surface_payload(
         by_point.setdefault(fragment.point.canonical_key, []).append(fragment)
     point_rows = []
     for key in points:
-        selected = (intervals or {}).get(key)
-        point_metrics = calculate_metrics(tuple(by_point[key]), start_ms=selected[0], end_ms=selected[1]) if selected else calculate_metrics(tuple(by_point[key]))
+        # Already measured above; measuring is how measurability was decided.
+        point_metrics = measured[key]
         point_rows.append({
             "point_key": key,
              "TotalPnLPercent": str(point_metrics.total_pnl_percent),
@@ -232,6 +226,11 @@ def _surface_payload(
              "event_ids_hash": sha256("|".join(sorted(set(point_metrics.events))).encode("utf-8")).hexdigest(),
           })
     content["point_metrics"] = point_rows
+    # E3: the cell above carries a flat result, which on its own is
+    # indistinguishable from a combination that traded back to zero. This is
+    # where that difference is recorded. The tested days survive in the source
+    # database as `ACTIVE_EMPTY` under Z4.
+    content["empty_result_points"] = empty_results
     content["ready_intervals"] = _ready_intervals_payload(content["point_facts"], intervals)
     content["frozen_facts_sha256"] = _payload_frozen_digest(content)
     # Persist analysis evidence at publication; export is strictly read-only.
@@ -254,8 +253,7 @@ def _surface_payload(
 def publish_surface(directory: str | Path, fragments: Sequence[SourceV6Fragment], *, intervals: dict[str, tuple[int, int]] | None = None) -> Path:
     if not fragments:
         raise SourceV6SurfaceError("cannot publish an empty surface")
-    metrics = _surface_metrics(fragments, intervals)
-    payload = _surface_payload(fragments, metrics, intervals)
+    payload = _surface_payload(fragments, intervals)
     output_dir = Path(directory)
     output_dir.mkdir(parents=True, exist_ok=True)
     filename = f"source-v6-p{len(payload['points'])}-{payload['surface_id']}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{uuid4().hex[:8]}.json"
@@ -834,8 +832,7 @@ def publish_surface_db(directory: str | Path, fragments: Sequence[SourceV6Fragme
         raise SourceV6SurfaceError(
             "surface publication requires hydrated fragments, not metadata views"
         )
-    metrics = _surface_metrics(fragments, intervals)
-    payload = _surface_payload(fragments, metrics, intervals, overlap_tail_decisions)
+    payload = _surface_payload(fragments, intervals, overlap_tail_decisions)
     output_dir = Path(directory)
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"source-v6-p{len(payload['points'])}-{payload['surface_id']}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{uuid4().hex[:8]}.duckdb"
@@ -855,7 +852,11 @@ def publish_surface_db(directory: str | Path, fragments: Sequence[SourceV6Fragme
         connection.executemany("insert into frozen_point_facts values (?, ?)", [(str(item["point_key"]), json.dumps(item, sort_keys=True, separators=(",", ":"))) for item in payload["point_facts"]])
         for fragment in payload["fragments"]:
             connection.execute("insert into frozen_fragments values (?, ?)", [fragment["fragment_id"], json.dumps(fragment, sort_keys=True, separators=(",", ":"))])
-            connection.executemany("insert into frozen_events values (?, ?, ?)", [[fragment["fragment_id"], event["event_id"], json.dumps(event, sort_keys=True, separators=(",", ":"))] for event in fragment["events"]])
+            # A fragment with no events is normal now that a combination which
+            # never traded keeps its place in the grid, and DuckDB rejects an
+            # empty `executemany` outright.
+            if fragment["events"]:
+                connection.executemany("insert into frozen_events values (?, ?, ?)", [[fragment["fragment_id"], event["event_id"], json.dumps(event, sort_keys=True, separators=(",", ":"))] for event in fragment["events"]])
         frozen_digest = _frozen_digest(connection)
         connection.execute("insert into manifest values ('frozen_facts_sha256', ?)", [frozen_digest])
         connection.execute("checkpoint")
