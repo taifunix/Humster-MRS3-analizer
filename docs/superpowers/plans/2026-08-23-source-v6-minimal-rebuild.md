@@ -3,7 +3,7 @@
 > **For agentic workers:** execute one stage at a time with TDD, focused
 > verification and independent review before the next stage.
 
-**Status:** Approved — `PLAN_APPROVED` after independent review
+**Status:** Approved — Stages 0–1 complete; Stage 2 in progress
 
 **Goal:** Correct Source v6 metrics and validation in the existing
 import/materialization passes, retain fast sealed-payload publication, and keep
