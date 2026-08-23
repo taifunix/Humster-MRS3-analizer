@@ -363,9 +363,30 @@ Contract and implementation plan are approved for a fresh-only rebuild:
 [ADR-0017](docs/decisions/0017-source-v6-facts-and-metrics-v2.md), and
 [minimal rebuild plan](docs/superpowers/plans/2026-08-23-source-v6-minimal-rebuild.md).
 
-**Next step:** record the three-run v1 baseline specified in Stage 0, then begin
-the atomic facts-only v2 boundary. No v2 performance or correctness claim is
-valid until a post-M7 fresh import has zero quarantines and Stage 4 evidence.
+### Stage 0 v1 same-host baseline (2026-08-23)
+
+Source: 684 HTML reports from the retained 2026-07-15--2026-07-22 archive;
+30 workers; all temporary databases and surfaces were written outside Git.
+
+- Import, three runs: median `111.533 s`; spread `106.608..125.762 s`;
+  Source DB median `30,683,136` bytes, spread `30,683,136..31,207,424`
+  bytes; `684` accepted and `0` quarantined in every run. Identical source
+  digest `935fb9c8270ce43a2510d08b4f2f0e1853aca7efb6a9a88d185ee49fb81551aa`
+  and semantic signature
+  `75c2ebe67dfb7de7281943c053478e736f83cd7ead025cebe0bbd731435e9dba`.
+- ID-only selected materialization plus SQL-copy publication, three runs for
+  READY `AAOIUSDT|LONG|15m`: median `71.160 s`; spread
+  `67.527..72.910 s`; surface `27,537,408` bytes and the same surface id
+  `454f083c1a13e987bb5ee00f030c5e02233f3c292e3f5f279a759a226221f3b8`
+  in every run. Observed coordinator peak RSS
+  median `1,588,150,272` bytes, spread `1,583,542,272..1,591,230,464`;
+  worker peak RSS median `1,083,064,320` bytes, spread
+  `1,012,334,592..1,083,469,824`. Scope digest:
+  `f235abfd91ec20560757f188d284455b2a5dbec4d49df358d757a027d4401d1f`.
+
+**Next step:** begin the atomic facts-only v2 boundary with TDD. No v2
+performance or correctness claim is valid until a post-M7 fresh import has
+zero quarantines and Stage 4 evidence.
 
 Current repository verification: `1597 passed, 2 skipped, 2 warnings` via
 `.venv\Scripts\python.exe -m pytest -q`. The warnings are the existing tar
