@@ -28,6 +28,22 @@ The final Reviewer call still returned findings; the panel validator seam and
 orphan-roundtrip traceability were fixed and focused/full verification rerun.
 No fourth Reviewer call is permitted, so this remains a non-approval artifact
 until a future task with a fresh review budget explicitly reopens review.
+
+## Post-review metric corrections (2026-08-23)
+
+An independent implementation review found that a leading realization could
+remain in `total_pnl` while disappearing from round-trip counts and win rate.
+The metric contract now emits one orphan round trip with empty
+`entry_action_ids`, preserving the M1 allowance for a position opened before a
+visible window; entry-only tails remain excluded. The review also found a
+quadratic peak scan. Cycle peaks are now computed once from the ordered action
+stream and reused by each round trip.
+
+Focused Source v6 verification after the correction: **89 passed, 1 warning**.
+A synthetic derive benchmark scaled approximately linearly: 185/370/740/1480
+actions took 8.8/9.3/19.5/37.6 ms on this host.
+Fresh full verification: `.venv\\Scripts\\python.exe -m pytest -q` — **1629
+passed, 2 skipped, 2 warnings**.
 **Current feature:** Source v6 high-throughput import and merge — implemented,
 measured on both real corpora; the merge readback is now
 parallel (C9): 2,080 s to 544 s on the two-corpus merge, identical artifact.

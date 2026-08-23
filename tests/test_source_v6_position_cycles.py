@@ -82,10 +82,14 @@ def test_the_open_tail_does_not_swallow_the_history_before_it() -> None:
 
     metrics = calculate_metrics((_fragment("source_v6_fixed_lot_overlap_a.html"),))
 
-    # The two leading closes have no entry in this report.  Stage 2 deliberately
-    # excludes such orphan realisations instead of inventing positions for them.
-    assert metrics.total_trades == 0
-    assert metrics.round_trips == ()
+    # The two leading closes are one realisation run for a position opened
+    # before this report.  Keep it as a round trip without inventing an entry.
+    assert metrics.total_trades == 1
+    assert metrics.win_trades == 1
+    assert metrics.loss_trades == 0
+    assert metrics.round_trips[0].entry_action_ids == ()
+    assert metrics.round_trips[0].realized_pnl == Decimal("6")
+    assert metrics.round_trips[0].realizing_action_ids
     assert metrics.balance_series, "their samples are not hidden"
 
 

@@ -90,10 +90,13 @@ reader does not mistake the divergence for an import defect.
 
 Round trips are derived only after seam exclusions and the selected window, from
 actions ordered by `(timestamp_ms, action_id)`. Entries are `opened` and
-`increased`; realisations are `decreased` and `closed`. A leading realisation or
-an entry-only tail emits no round trip. A new entry after a realisation begins a
-new round trip. Its timestamp is its first realisation and its id is SHA-256 of
-canonical JSON `{version, point_key, entry_action_ids, realizing_action_ids}`.
+`increased`; realisations are `decreased` and `closed`. A leading maximal
+realisation run emits one round trip with an empty `entry_action_ids` tuple: it
+represents a position opened before the visible window, without inventing an
+entry action. An entry-only tail emits no round trip. A new entry after a
+realisation begins a new round trip. Its timestamp is its first realisation and
+its id is SHA-256 of canonical JSON
+`{version, point_key, entry_action_ids, realizing_action_ids}`.
 
 ## M3 — Win rate
 

@@ -342,12 +342,12 @@ def test_task3_exact_overlap_ownership_and_task4_metrics() -> None:
     assert ownership.overlap_hours == Decimal("96")
     metrics = calculate_metrics((outgoing, incoming))
     assert metrics.total_pnl == Decimal("5.8")
-    # M2 counts completed entry->realisation round trips; these fixtures have
-    # leading closes and an entry-only tail, not completed round trips.
-    assert metrics.total_trades == 0
+    # Leading closes are one orphan round trip; the later entry-only tail is
+    # intentionally not a round trip.
+    assert metrics.total_trades == 1
     assert metrics.profit_factor == Decimal("2.5")
-    assert (metrics.win_trades, metrics.loss_trades) == (0, 0)
-    assert metrics.win_rate_percent == Decimal("0")
+    assert (metrics.win_trades, metrics.loss_trades) == (1, 0)
+    assert metrics.win_rate_percent == Decimal("100")
     assert metrics.balance_series[-1].value == Decimal("1005.8")
 
 
@@ -368,10 +368,10 @@ def test_task4_selected_interval_excludes_boundary_cycle_opened_before_start() -
     start = report.wallet_samples[2].timestamp_ms
     metrics = calculate_metrics((report,), start_ms=start, end_ms=report.report_end_ms)
     assert all(sample.timestamp_ms >= start for sample in metrics.balance_series)
-    # At +49h the remaining action is a leading close; A's +180h opened/+181h
-    # decreased tail never realizes, so the selected window has no round trip.
-    assert metrics.total_trades == 0
-    assert not metrics.round_trips
+    # At +49h the remaining action is an orphan realization; A's +180h
+    # opened/+181h decreased tail never realizes.
+    assert metrics.total_trades == 1
+    assert metrics.round_trips[0].entry_action_ids == ()
 
 
 def test_task4_stitched_metrics_match_independent_decimal_reference() -> None:
@@ -525,10 +525,10 @@ def test_task4_independent_decimal_reference_reconciles_pnl_dd_pf_and_trades() -
         drawdowns.append(peak - value)
     assert metrics.total_pnl == reference_pnl
     assert metrics.profit_factor == reference_pf
-    # A's +1h/+49h closes are orphan realizations and its +180h opened/+181h
-    # actions are an entry-only tail; B contributes no paired entry at the seam.
-    assert metrics.total_trades == 0
-    assert not metrics.round_trips
+    # A's +1h/+49h closes are one orphan realization run and its
+    # +180h/+181h actions are an entry-only tail.
+    assert metrics.total_trades == 1
+    assert metrics.round_trips[0].entry_action_ids == ()
     assert metrics.max_realized_drawdown == max(drawdowns)
 
 
@@ -599,10 +599,10 @@ def test_task7_old_owned_overlap_excludes_closed_incoming_cycle_and_corrects_lat
     assert owner_for_timestamp(outgoing.report_end_ms, outgoing, incoming) == incoming.fragment_id
 
     metrics = calculate_metrics((outgoing, incoming))
-    # A has only +1h/+49h orphan closes and a +180h opened/+181h decreased tail;
+    # A has one orphan realization run and a +180h opened/+181h decreased tail;
     # the incoming orphan close is removed by old-owned seam exclusion.
-    assert metrics.total_trades == 0
-    assert not metrics.round_trips
+    assert metrics.total_trades == 1
+    assert metrics.round_trips[0].entry_action_ids == ()
     assert metrics.profit_factor == Decimal("2.5")
     assert all(excluded_action.action_id != action_id for action_id in metrics.events)
     old_period, new_period = metrics.period_metrics
@@ -647,9 +647,9 @@ def test_task7_boundary_crossing_incoming_cycle_is_retained_as_new_period() -> N
     assert resolve_ownership(outgoing, incoming).status == "USE_OLD_WITH_SEAM_EXCLUSION"
     metrics = calculate_metrics((outgoing, incoming))
     # The boundary mutation retains B's +180h close, but A's +180h open is at
-    # the outgoing half-open endpoint, so it still has no paired entry.
-    assert metrics.total_trades == 0
-    assert not metrics.round_trips
+    # the outgoing half-open endpoint, so the retained realization is orphaned.
+    assert metrics.total_trades == 1
+    assert metrics.round_trips[0].entry_action_ids == ()
     assert metrics.profit_factor == Decimal("2.75")
     assert action.action_id in metrics.events
     old_period, new_period = metrics.period_metrics

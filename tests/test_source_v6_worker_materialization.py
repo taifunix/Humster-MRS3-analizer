@@ -276,7 +276,9 @@ def test_the_surface_carries_its_own_measurements(tmp_path: Path) -> None:
     assert rows[idle_key]["profit_factor"] is None
     traded = rows[_grid_with_one_idle()[0][1].point.canonical_key]
     assert traded["trades"] == len(traded["event_ids"])
-    assert traded["weighted_trades"] == "0"
+    # The fixture's leading closes are one orphan realization run: size 2 over
+    # its observed peak 1, with no invented entry action.
+    assert traded["weighted_trades"] == "2"
     assert read_multiscope_surface(surface)["analysis_input_digest"] == (
         read_multiscope_surface(surface)["analysis_input_digest"]
     )

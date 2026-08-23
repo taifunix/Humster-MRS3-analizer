@@ -637,18 +637,20 @@ def _drawdown_details(series: Sequence[NormalizedSample]) -> tuple[Decimal, Deci
 
 def _round_trip_peak(
     action_ids: Sequence[str], actions_by_id: Mapping[str, NormalizedAction],
-    cycles_by_action: Mapping[str, NormalizedCycle],
+    cycles_by_action: Mapping[str, NormalizedCycle], cycle_peaks: Mapping[str, Decimal],
 ) -> Decimal:
     """Return the largest observed position size for the involved position."""
     cycle_ids = {cycles_by_action[action_id].cycle_id for action_id in action_ids if action_id in cycles_by_action}
-    relevant = [
-        action for action in actions_by_id.values()
-        if action.action_id in action_ids
-        or (cycles_by_action.get(action.action_id) is not None and cycles_by_action[action.action_id].cycle_id in cycle_ids)
-    ]
+    if cycle_ids:
+        return max((cycle_peaks.get(cycle_id, Decimal("0")) for cycle_id in cycle_ids), default=Decimal("0"))
+    return _position_peak(tuple(actions_by_id[action_id] for action_id in action_ids if action_id in actions_by_id))
+
+
+def _position_peak(actions: Sequence[NormalizedAction]) -> Decimal:
+    """Return the largest observed position size for one ordered cycle."""
     position = Decimal("0")
     peak = Decimal("0")
-    for action in sorted(relevant, key=lambda item: (item.timestamp_ms, item.action_id)):
+    for action in actions:
         if action.post_size is not None:
             position = abs(action.post_size)
         elif action.size is not None:
@@ -673,18 +675,30 @@ def derive_round_trips(
         for action_id in cycle.action_ids
         if action_id in actions_by_id
     }
+    cycle_actions: dict[str, list[NormalizedAction]] = {}
+    for action in ordered:
+        cycle = cycles_by_action.get(action.action_id)
+        if cycle is not None:
+            cycle_actions.setdefault(cycle.cycle_id, []).append(action)
+    cycle_peaks = {cycle_id: _position_peak(items) for cycle_id, items in cycle_actions.items()}
     result: list[RoundTrip] = []
     entries: list[NormalizedAction] = []
     realizing: list[NormalizedAction] = []
 
     def finish() -> None:
-        if not entries or not realizing:
+        if not realizing:
             return
         entry_ids = tuple(item.action_id for item in entries)
         realizing_ids = tuple(item.action_id for item in realizing)
         realized_pnl = sum((item.pnl for item in realizing), Decimal("0"))
         realized_size = sum((abs(item.size) for item in realizing if item.size is not None), Decimal("0"))
-        peak = _round_trip_peak((*entry_ids, *realizing_ids), actions_by_id, cycles_by_action)
+        peak = _round_trip_peak((*entry_ids, *realizing_ids), actions_by_id, cycles_by_action, cycle_peaks)
+        if not entry_ids:
+            orphan_peak = max(
+                (abs(item.size or Decimal("0")) + abs(item.post_size or Decimal("0")) for item in realizing),
+                default=Decimal("0"),
+            )
+            peak = max(peak, orphan_peak)
         payload = {
             "version": "source-v6-round-trip-v1",
             "point_key": point_key,
@@ -702,7 +716,7 @@ def derive_round_trips(
                 finish()
                 entries, realizing = [], []
             entries.append(action)
-        elif action.action in {"decreased", "closed"} and entries:
+        elif action.action in {"decreased", "closed"}:
             realizing.append(action)
     finish()
     return tuple(result)

@@ -44,8 +44,9 @@ Lock these rules before code:
 3. Round trips are built after seam/window filtering from `(timestamp_ms,
    action_id)` order. `opened`/`increased` are entries; `decreased`/`closed`
    realise. A maximal entry run followed by a maximal realisation run is one
-   trip; leading realisations and entry-only tails produce none. Its timestamp
-   is its first realisation and its id hashes canonical point/action-id data.
+   trip; a leading maximal realisation run is one orphan trip with empty entry
+   ids, while an entry-only tail produces none. Its timestamp is its first
+   realisation and its id hashes canonical point/action-id data.
 4. M6 uses merged raw windowed series plus only admissible declared candidates;
    tie rules and peak source are deterministic. M7 checks PnL, fees and Profit
    Factor at raw-token precision; Recovery Factor is conditional.
@@ -93,7 +94,7 @@ surface bytes and output digests. Record run spread as well as medians.
 - Test: metric, position, worker-materialization and fresh-analysis tests
 
 1. Add failing tests for the worked example (`1 position / 2 trips / 1.5
-   weighted / 3 entries`), deterministic ids, leading/tail actions, full and
+   weighted / 3 entries`), deterministic ids, orphan leading/tail actions, full and
    later-window M4, empty window, genuine zero, rebase, merged equity/wallet DD
    and every M6 tie.
 2. Implement round-trip metrics, all-realising-action Profit Factor, raw M4 and

@@ -141,19 +141,21 @@ def test_stage2_round_trips_use_entry_realisation_runs_and_weighted_exposure() -
 
     metrics = calculate_metrics((_fragment(),))
 
-    assert metrics.total_trades == 2
+    assert metrics.total_trades == 3
     assert metrics.weighted_trades == Decimal("1.5")
-    assert (metrics.win_trades, metrics.loss_trades) == (1, 1)
-    assert metrics.win_rate_percent == Decimal("50")
+    assert (metrics.win_trades, metrics.loss_trades) == (2, 1)
+    assert metrics.win_rate_percent == Decimal("200") / Decimal("3")
     assert metrics.profit_factor == Decimal("12")
-    assert len(metrics.round_trip_ids) == 2
-    assert metrics.round_trip_ids == tuple(sorted(metrics.round_trip_ids))
+    assert len(metrics.round_trip_ids) == 3
+    assert len(set(metrics.round_trip_ids)) == 3
+    assert metrics.round_trips[0].entry_action_ids == ()
     # Weighted exposure uses the peak of the reconstructed position/cycle,
-    # while the two round trips are decisions inside that one position.
-    assert metrics.round_trips[0].peak_position_size == Decimal("100")
-    assert metrics.round_trips[0].weighted_trades == Decimal("0.5")
+    # while the two entry-backed round trips are decisions inside that one
+    # position; the orphan trip has zero realized size.
     assert metrics.round_trips[1].peak_position_size == Decimal("100")
-    assert metrics.round_trips[1].weighted_trades == Decimal("1")
+    assert metrics.round_trips[1].weighted_trades == Decimal("0.5")
+    assert metrics.round_trips[2].peak_position_size == Decimal("100")
+    assert metrics.round_trips[2].weighted_trades == Decimal("1")
 
 
 def test_stage2_breakeven_round_trip_does_not_dilute_win_rate() -> None:
@@ -161,9 +163,9 @@ def test_stage2_breakeven_round_trip_does_not_dilute_win_rate() -> None:
 
     metrics = calculate_metrics((_three_trip_fragment(),))
 
-    assert metrics.total_trades == 3
-    assert (metrics.win_trades, metrics.loss_trades) == (1, 1)
-    assert metrics.win_rate_percent == Decimal("50")
+    assert metrics.total_trades == 4
+    assert (metrics.win_trades, metrics.loss_trades) == (2, 1)
+    assert metrics.win_rate_percent == Decimal("200") / Decimal("3")
 
 
 def test_stage2_seam_round_trips_match_independent_derived_reference() -> None:
@@ -180,7 +182,7 @@ def test_stage2_seam_round_trips_match_independent_derived_reference() -> None:
 
     assert expected
     assert decision.overlap_hours == Decimal("96")
-    assert metrics.total_trades == len(expected) == 4
+    assert metrics.total_trades == len(expected) == 5
     assert metrics.round_trip_ids == tuple(trip.round_trip_id for trip in expected)
     assert metrics.weighted_trades == sum(
         (trip.weighted_trades for trip in expected), Decimal("0")
