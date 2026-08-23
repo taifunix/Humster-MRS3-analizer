@@ -405,6 +405,23 @@ focused Stage 1/merge suite — 258 passed; `git diff --check` clean apart from
 existing Windows line-ending warnings. Stage 2 is the next implementation
 slice.
 
+### Stage 2 metrics and compact analysis row (2026-08-23)
+
+Implemented and committed as `9e92897`. The metric pass now derives
+deterministic round trips and weighted exposure from seam-owned actions,
+computes raw-anchor PnL before retaining the publication rebase, uses all
+realising actions for Profit Factor, and combines merged-series and admissible
+declared drawdown with an auditable source/tie set. The same pass emits strict
+v2 Decimal-string analysis rows, including weighted trades and drawdown audit
+fields; hydrated and worker paths carry the same rows and digest without
+payload decoding in analysis.
+
+Evidence: Stage 2 contract/worker/empty/source suite — `105 passed, 1 warning`;
+consumer/storage/fresh-analysis suite — `142 passed, 1 warning`; final
+official implementation review bridge — `CODE_REVIEW_PASS`; `git diff --check`
+clean apart from existing Windows line-ending warnings. Stage 3 M7 validation
+is the next implementation slice.
+
 Pre-Stage-1 repository verification: `1597 passed, 2 skipped, 2 warnings` via
 `.venv\Scripts\python.exe -m pytest -q`. The warnings are the existing tar
 deprecation and unavailable Windows pytest cache; two symlink tests skip on
