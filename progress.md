@@ -213,18 +213,29 @@ and every consumer called it in a bare loop, so one such combination aborted the
 whole build. Demonstrated: ten healthy combinations published, the same ten plus
 one idle one raised and all eleven were lost.
 
-Empty results are now excluded from the surface rather than zeroed, and recorded
-under `empty_result_points`. Zeroing was the trap: `build_persisted_analysis_facts`
-defaults a missing metric row to `TotalPnLPercent = 0` and
-`MaxDrawdownPercent = 0`, so a combination left in `point_facts` without metrics
-would enter plateau geometry and selection as a 0% return at 0% drawdown — an
-outstanding risk-adjusted result that never happened. ADR-0006 already settled
-the principle: the tester writes `n/a` where a value is undefined, and the
-surface must not invent one.
+Such a combination now keeps its cell in the canonical grid and carries the flat
+result the tester itself declared — PnL 0, drawdown 0, no trades, every ratio
+`None` under ADR-0006 — and is recorded under `empty_result_points`.
+
+An earlier revision of this change excluded the cell instead, and that was wrong.
+Exclusion published a 113-of-114 grid, which `load_source_v6_pipeline_input`
+rejects with `INCOMPLETE_GRID` one stage later, naming neither the reason nor the
+cell — a loud publish-time failure turned into a quiet artifact that dies later.
+The objection to keeping it (that `build_persisted_analysis_facts` defaults a
+missing metric row to 0% return at 0% drawdown, an outstanding risk-adjusted
+result that never happened) does not apply: `annotate_eligibility` runs before
+plateau geometry and rejects the cell with `REJECT_PNL_NONPOSITIVE` and
+`REJECT_DD_NONPOSITIVE`. Verified — `plateau_id: None`, `role: UNASSIGNED`. It is
+visible and unselectable, which is what a tested-and-idle combination should be.
+
+A window that hides a *measurable* combination is still an error and raises,
+naming the combination; that is a different fact and must not be flattened into a
+zero.
 
 The multiscope path needed the same rule one stage earlier: it stores facts, not
 metrics, so it published happily and `run_multiscope_analysis` aborted
-afterwards. `materialize_source_v6` now applies the same partition.
+afterwards. `materialize_source_v6` now measures each scope over that scope's
+READY witness — the same window the analysis measures over.
 
 Coverage is not lost: the tested days remain in the source database as
 `ACTIVE_EMPTY` under Z4.
@@ -233,32 +244,32 @@ Coverage is not lost: the tested days remain in the source database as
 
 1. Re-import `my_test_CX_GE_fixed` to pick up the 144 zero-activity runs and
    confirm `safe_to_delete` is no longer held at `NO` by them. The surface
-   blocker that stood here is fixed (see below).
-3. Pass `source_database` at `panel.py:1837`, the only production caller of
+   blocker that stood here is fixed — see "Empty result combinations" above.
+2. Pass `source_database` at `panel.py:1837`, the only production caller of
    `publish_multiscope_surface`. One argument; it is what makes the 33x
    reachable from the application.
-4. Let `materialize_source_v6` work from metadata. Readiness already does, and
+3. Let `materialize_source_v6` work from metadata. Readiness already does, and
    after the pass-through above nothing on the publication path needs a decoded
    fragment — so hydration is pure waste, and it is what makes a full-corpus
    surface need ~74 GB resident.
-5. Close the same published-file gap on the import path. ADR-0015 scoped
+4. Close the same published-file gap on the import path. ADR-0015 scoped
    itself to the merge deliberately: `_publish_segments_single_pass` verifies
    its reduce target and then publishes a repack that receives neither the C3a
    payload readback nor `fragment_metadata`'s header pass, so the import
    publishes with weaker evidence than the merge now does — under the same
    `safe_to_delete=YES`. It needs its own change, not an assumption from
    ADR-0015's wording.
-6. Remove the orphaned segment-merge path (`merge_source_v6_segments`,
+5. Remove the orphaned segment-merge path (`merge_source_v6_segments`,
    `_merge_segment_contents`, `_read_source_v6_segment`, `import_fragment`,
    `import_fragment_batch`) in its own `refactor:` commit — C5 left them
    without a production caller, and ~50 tests still reference them.
-7. Open question from C8: the identity readback is a sequential scan per
+6. Open question from C8: the identity readback is a sequential scan per
    128-id window on both paths, so O(n²/128) in principle. It does not bite on
    import (5.52 s committed against 5.47 s with the metadata-only transaction
    open, at 5,000 fragments). A relation cursor is not the fix — `fetchmany`
    grew resident memory by 2.9 GB on a 4.3 GB corpus. A bounded-memory single
    pass is its own change.
-8. The parse phase is now the dominant remaining cost. Compression level was
+7. The parse phase is now the dominant remaining cost. Compression level was
    measured and rejected. Swapping the raw-markup cross-check to the lexbor
    engine was measured at 3.9x on that step and then **reverted**: lexbor is an
    HTML5 tree builder and performs the same implicit-close recovery as lxml, so
@@ -305,3 +316,58 @@ are rehydrated solely for a safe stop attempt. Portfolio remains disabled.
 Latest verification: `1523 passed, 2 skipped, 1 warning` via
 `.venv\Scripts\python.exe -m pytest -q`; focused panel suite: `68 passed`.
 Contract and visual evidence: `docs/specs/2026-08-22-panel-static-frontend-v1.md`.
+
+## Selected-scope surface materialization (2026-08-22)
+
+The panel now keeps preflight metadata-only and hydrates only payload fragments
+belonging to the explicitly selected READY scopes.  Hydration is deterministic
+and parallel within the existing bounded worker limit; the whole-source lineage
+digest still comes from validated Source DB metadata.  `materialize_source_v6`
+remains hydrated and witness-based, because E1 requires `calculate_metrics` to
+distinguish an actually idle point from data hidden by the selected window.
+
+Evidence: `39 passed in 7.92s` over selected serial/parallel storage readers,
+empty-result E1--E5, materializer, surfaces service and static panel tests;
+independent review `CODE_REVIEW_PASS`.  The heavier throughput suite was not
+claimed as evidence: its terminal invocation exceeded the local tool limit and
+only its own child processes were stopped.  Source backup before this work:
+`backups/surface-contract-before-metadata-materialization-2026-08-22.zip`.
+
+Surface output now defaults to an editable `{pair...}_{start}_{end}` filename;
+the immutable `surface_id` remains only in its manifest.  The Strategies/DD5
+Analysis DB field derives an editable filename below saved `analysis_db_root`
+and that full target is passed to the analysis runner.  Repeated explicit names
+fail closed; automatically generated conflicting analysis names receive a
+readable numeric suffix.  Evidence: `33 passed in 8.99s`, `node --check
+src/mrs3/panel_web/app.js`, `git diff --check`; independent review
+`CODE_REVIEW_PASS`.
+
+The Strategies/DD5 selector now reloads every manifest-validated published
+surface recursively from configured `source_v6_surface_dir`, falling back to
+`data/surfaces`; full payload validation remains immediately before analysis,
+not on panel bootstrap. `surface_target_path` is an approved, persisted panel
+default, so the publication-card save button writes it to `config.local.json`.
+Evidence: `49 passed in 15.64s`, JS syntax check, diff check, live local
+catalog: one surface in `2.4s`; independent review `CODE_REVIEW_PASS`.
+
+Fresh analysis now immediately reports its real entry phase, an indeterminate
+bar and elapsed time; it does not invent a percent because the synchronous
+analysis contract exposes none. The control is restored on every terminal
+result. Evidence: `47 passed in 16.86s`, JS syntax check, diff check,
+independent review `CODE_REVIEW_PASS`.
+
+## Approved: Source v6 facts and metrics v2 (2026-08-23)
+
+Contract and implementation plan are approved for a fresh-only rebuild:
+[metric contract](docs/specs/2026-08-23-source-v6-metric-contract.md),
+[ADR-0017](docs/decisions/0017-source-v6-facts-and-metrics-v2.md), and
+[minimal rebuild plan](docs/superpowers/plans/2026-08-23-source-v6-minimal-rebuild.md).
+
+**Next step:** record the three-run v1 baseline specified in Stage 0, then begin
+the atomic facts-only v2 boundary. No v2 performance or correctness claim is
+valid until a post-M7 fresh import has zero quarantines and Stage 4 evidence.
+
+Current repository verification: `1597 passed, 2 skipped, 2 warnings` via
+`.venv\Scripts\python.exe -m pytest -q`. The warnings are the existing tar
+deprecation and unavailable Windows pytest cache; two symlink tests skip on
+this host.
