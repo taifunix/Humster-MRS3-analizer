@@ -30,7 +30,7 @@ def test_multiscope_surface_publishes_all_facts_and_per_scope_digests(tmp_path: 
         assert connection.execute("select count(*) from scope_manifests").fetchone()[0] == 2
         assert connection.execute("select count(*) from factual_fragments").fetchone()[0] == len(first) + len(second)
         assert connection.execute("select count(*) from manifest where key='source_content_digest'").fetchone()[0] == 1
-        assert connection.execute("select value from manifest where key='source_fingerprint'").fetchone()[0] == "source-v6-fresh-compact-v1"
+        assert connection.execute("select value from manifest where key='source_fingerprint'").fetchone()[0] == "source-v6-fresh-compact-v2"
     finally:
         connection.close()
 

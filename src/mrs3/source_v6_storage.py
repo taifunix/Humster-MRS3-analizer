@@ -23,6 +23,7 @@ import duckdb
 from .source_v6 import (
     EncodedSourceV6Fragment,
     PointIdentity,
+    SOURCE_V6_SCHEMA_VERSION,
     SourceV6Error,
     SourceV6Fragment,
     decode_fragment,
@@ -31,8 +32,8 @@ from .source_v6 import (
 
 
 V6_SCHEMA_VERSION = 6
-V6_FINGERPRINT = "source-v6-fresh-compact-v1"
-SEGMENT_FINGERPRINT = "source-v6-import-segment-v1"
+V6_FINGERPRINT = "source-v6-fresh-compact-v2"
+SEGMENT_FINGERPRINT = "source-v6-import-segment-v2"
 # Each attached segment holds file descriptors; DuckDB fails around 1020 open
 # databases, so a large corpus is copied in bounded groups.
 SEGMENT_ATTACH_BATCH = 64
@@ -1137,7 +1138,7 @@ def _publish_metadata_rows(
 
 
 def _assert_canonical_matches_columns(canonical: bytes, row: Sequence[object]) -> None:
-    """Compare the content-addressed document against the header and columns.
+    """Compare raw content-addressed facts against the header and columns.
 
     Without this the published database is only self-consistent: `fragment_id`
     proves the payload is *a* valid fragment, not that the columns describe
@@ -1145,29 +1146,62 @@ def _assert_canonical_matches_columns(canonical: bytes, row: Sequence[object]) -
     readiness and stitching without ever decoding, so a mismatch would steer
     analysis silently.
 
-    Every analytical field the header carries is compared here, not just the
-    ones the indexed columns duplicate. `stitchability`, the three balances,
-    `settings_fingerprint`, `metrics` and `open_tail_cycle_ids` reach analysis
-    through the header alone; checking them against a column would be checking
-    two halves of the same forgeable row against each other. Only the canonical
-    bytes are content-addressed, so only they can settle the question.
+    W6 deliberately stays on raw JSON: it validates the v2 factual shape and
+    identity without constructing a fragment or reconstructing derived cycles.
+    Consumers that need the derived caches use `_row_fragment`, which performs
+    the full typed readback and cache comparison.
     """
     try:
         document = json.loads(canonical)
         header = json.loads(str(row[11]))
-        point = PointIdentity(**document["point"]).canonical_key
+        expected_keys = {
+            "schema_version", "point", "report_start_ms", "report_end_ms",
+            "initial_balance", "fixed_order_balance", "balance_percentage",
+            "settings_fingerprint", "stitchability", "actions", "wallet_samples",
+            "equity_samples", "metrics",
+        }
+        if (
+            not isinstance(document, dict)
+            or set(document) != expected_keys
+            or type(document["schema_version"]) is not int
+            or document["schema_version"] != SOURCE_V6_SCHEMA_VERSION
+            or not isinstance(document["point"], dict)
+            or not isinstance(document["actions"], list)
+            or not isinstance(document["wallet_samples"], list)
+            or not isinstance(document["equity_samples"], list)
+            or not isinstance(document["metrics"], dict)
+            or not isinstance(header, dict)
+        ):
+            raise SourceV6StorageError("compact fragment readback mismatch")
+        point_document = document["point"]
+        point_keys = {
+            "symbol", "side", "timeframe", "shift_bp", "open_ma_type",
+            "open_ma_source", "open_ma_length", "close_ma_type",
+            "close_ma_source", "close_ma_length",
+        }
+        if set(point_document) != point_keys:
+            raise SourceV6StorageError("compact fragment readback mismatch")
+        point = PointIdentity(**point_document).canonical_key
+        action_count = len(document["actions"])
         counts = (
-            len(document["actions"]),
-            len(document["cycles"]),
-            len(document["events"]),
+            action_count,
+            int(row[7]),
+            action_count,
             len(document["wallet_samples"]),
             len(document["equity_samples"]),
         )
+        open_tail = header.get("open_tail_cycle_ids")
         if (
             point != str(row[3])
             or int(document["report_start_ms"]) != int(row[4])
             or int(document["report_end_ms"]) != int(row[5])
             or counts != tuple(int(item) for item in row[6:11])
+            or (action_count == 0 and counts[1] != 0)
+            or (action_count > 0 and not 1 <= counts[1] <= action_count)
+            or not isinstance(open_tail, list)
+            or len(open_tail) > counts[1]
+            or len(set(open_tail)) != len(open_tail)
+            or any(not _sha256_hex(item) for item in open_tail)
             or header.get("schema_version") != int(document["schema_version"])
             or header.get("point") != point
             or header.get("report_start_ms") != int(document["report_start_ms"])
@@ -1175,8 +1209,8 @@ def _assert_canonical_matches_columns(canonical: bytes, row: Sequence[object]) -
             or header.get("stitchability") != str(document["stitchability"])
             or header.get("settings_fingerprint") != str(document["settings_fingerprint"])
             or header.get("metrics") != dict(document["metrics"])
-            or list(header.get("open_tail_cycle_ids", ())) != list(document["open_tail_cycle_ids"])
-            or Decimal(str(header.get("initial_balance"))) != Decimal(str(document["initial_balance"]))
+            or Decimal(str(header.get("initial_balance")))
+            != Decimal(str(document["initial_balance"]))
             or Decimal(str(header.get("fixed_order_balance")))
             != Decimal(str(document["fixed_order_balance"]))
             or Decimal(str(header.get("balance_percentage")))

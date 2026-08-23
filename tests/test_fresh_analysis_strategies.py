@@ -79,7 +79,7 @@ def _make_analysis(path: Path, *, event_mode: str = "real_independent_events", r
     config_hash = sha256(_canonical_json(_canonical(config)).encode()).hexdigest()
     surface_identity = {
         "surface_id": "SURFACE-1",
-        "surface_fingerprint": "surface-v6-fresh-compact-v1",
+        "surface_fingerprint": "surface-v6-fresh-compact-v2",
         "source_content_digest": "a" * 64,
         "scope_digests": {"BTCUSDT|LONG|1h": "d" * 64},
     }

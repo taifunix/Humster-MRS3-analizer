@@ -155,7 +155,9 @@ def materialize_source_v6_from_database(
     ids, order, witnesses, `empty_result_points` — and different only in where
     the work happens. The serial path hydrates every selected fragment into the
     coordinator to compute metrics it then discards; this one keeps each
-    combination's fragments inside the worker that measured them.
+    combination's fragments inside the worker that measured them. The worker's
+    `decode_fragment_slice` uses `_row_fragment`, so header counts and the
+    open-tail cache are checked exactly before a selected id can reach a surface.
     """
     requested = tuple(sorted(set(scope_keys)))
     if not requested:

@@ -1,6 +1,6 @@
 # MRS3 — current verification
 
-**Updated:** 2026-08-22
+**Updated:** 2026-08-23
 **Current branch:** `main`
 **Current feature:** Source v6 high-throughput import and merge — implemented,
 measured on both real corpora, `CODE_REVIEW_PASS`. The merge readback is now
@@ -388,7 +388,24 @@ Source: 684 HTML reports from the retained 2026-07-15--2026-07-22 archive;
 performance or correctness claim is valid until a post-M7 fresh import has
 zero quarantines and Stage 4 evidence.
 
-Current repository verification: `1597 passed, 2 skipped, 2 warnings` via
+### Stage 1 facts-only payload v2 (2026-08-23)
+
+Implemented in the working tree and accepted by the mandatory independent
+reviewer bridge (`CODE_REVIEW_PASS`, Claude Sonnet 5, medium effort). The
+canonical fragment now persists factual actions only; cycles, events and
+open-tail state are reconstructed deterministically by the typed decode path.
+v1 payloads, source databases and resume tokens are rejected or invalidated by
+the v2 schema/fingerprint boundary. The W6 identity readback validates raw
+factual payloads without reconstructing derived facts, while full materializer
+decode checks all derived header/cache counts, including in-range tampering.
+
+Evidence: `.venv\\Scripts\\python.exe -m pytest -q
+tests/test_source_v6_stage1_v2.py tests/test_source_v6.py` — 85 passed;
+focused Stage 1/merge suite — 258 passed; `git diff --check` clean apart from
+existing Windows line-ending warnings. Stage 2 is the next implementation
+slice.
+
+Pre-Stage-1 repository verification: `1597 passed, 2 skipped, 2 warnings` via
 `.venv\Scripts\python.exe -m pytest -q`. The warnings are the existing tar
 deprecation and unavailable Windows pytest cache; two symlink tests skip on
 this host.

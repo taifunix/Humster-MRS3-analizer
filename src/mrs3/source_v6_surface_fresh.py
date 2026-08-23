@@ -18,14 +18,14 @@ import zlib
 import duckdb
 
 from .locking import OutputDirectoryLock
-from .source_v6 import _canonical_json, decode_fragment, encode_fragment
+from .source_v6 import SOURCE_V6_SCHEMA_VERSION, _canonical_json, decode_fragment, encode_fragment
 from .source_v6_materializer import MaterializedSourceV6
 from .source_v6_coverage import ReadyInterval
-from .source_v6_storage import _insert_frame, source_content_digest
+from .source_v6_storage import SourceV6StorageError, _insert_frame, source_content_digest, validate_source_v6_database
 
 
-FINGERPRINT = "surface-v6-fresh-compact-v1"
-SOURCE_FINGERPRINT = "source-v6-fresh-compact-v1"
+FINGERPRINT = "surface-v6-fresh-compact-v2"
+SOURCE_FINGERPRINT = "source-v6-fresh-compact-v2"
 # Bounds the bind list of the pass-through copy, as the merge does.
 _COPY_BATCH = 512
 
@@ -185,6 +185,12 @@ def verify_surface_payload_slice(path: str, ids: list[str]) -> None:
             canonical = zlib.decompress(blob)
         except zlib.error as error:
             raise ValueError(f"payload is not decodable: {scope_key}") from error
+        try:
+            document = json.loads(canonical.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"payload is not valid Source v6 JSON: {scope_key}") from error
+        if not isinstance(document, dict) or document.get("schema_version") != SOURCE_V6_SCHEMA_VERSION:
+            raise ValueError(f"payload schema is not Source v6 v{SOURCE_V6_SCHEMA_VERSION}: {scope_key}")
         if sha256(canonical).hexdigest() != str(fragment_id):
             raise ValueError(f"payload does not derive its fragment id: {scope_key}")
 
@@ -265,6 +271,11 @@ def _publish_multiscope_surface(
 ) -> Path:
     if not materialized.scopes:
         raise ValueError("cannot publish an empty multi-scope surface")
+    if source_database is not None:
+        try:
+            validate_source_v6_database(source_database)
+        except SourceV6StorageError as error:
+            raise ValueError("unsupported Source v6 source database") from error
     scopes = tuple(sorted(materialized.scopes, key=lambda item: item.scope_key))
     digests = {scope.scope_key: _scope_digest(scope) for scope in scopes}
     surface_facts_digest = source_content_digest(item.fragment_id for scope in scopes for item in scope.facts)

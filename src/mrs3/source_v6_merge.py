@@ -160,7 +160,7 @@ def _merge_token(
     target_identity: tuple[int, int, str] | None,
 ) -> str:
     payload = {
-        "format": "source-v6-fresh-compact-v1-merge",
+        "format": "source-v6-fresh-compact-v2-merge",
         "inputs": [(str(path), list(identity)) for path, identity in zip(input_paths, input_identities)],
         "target": str(target_path),
         "target_identity": None if target_identity is None else list(target_identity),

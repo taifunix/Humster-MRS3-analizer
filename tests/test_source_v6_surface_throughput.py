@@ -21,7 +21,7 @@ def _ready_facts():
     row. `fragment_id` is recomputed afterwards: both fields are part of the
     canonical document.
     """
-    from mrs3.source_v6 import canonical_fragment_bytes, normalize_source_v6
+    from mrs3.source_v6 import canonical_fragment_bytes, normalize_source_v6, reconstruct_derived_facts
     from mrs3.source_v6_coverage import (
         CANONICAL_READINESS_CLOSE_LENGTHS,
         CANONICAL_READINESS_SHIFTS_BP,
@@ -37,9 +37,13 @@ def _ready_facts():
                 source_sha256=sha256(f"{shift}:{close}".encode("ascii")).hexdigest(),
                 source_name=f"variant-{shift}-{close}.html",
             )
+            cycles, events, open_tail_cycle_ids = reconstruct_derived_facts(variant.actions, variant.point)
             facts.append(
                 replace(
                     variant,
+                    cycles=cycles,
+                    events=events,
+                    open_tail_cycle_ids=open_tail_cycle_ids,
                     fragment_id=sha256(canonical_fragment_bytes(variant)).hexdigest(),
                 )
             )

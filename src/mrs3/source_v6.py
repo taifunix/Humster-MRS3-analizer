@@ -25,7 +25,7 @@ from .performance import (
 )
 
 
-SOURCE_V6_SCHEMA_VERSION = 1
+SOURCE_V6_SCHEMA_VERSION = 2
 # Strict inverse of str(int): rejects "+5", " 5 ", "3_0", "-0", "05", "007".
 _INTEGER_FIELD = re.compile(r"0|-?[1-9][0-9]*")
 EXECUTION_FINGERPRINT_VERSION = "execution_compatibility_fingerprint_v1"
@@ -340,27 +340,6 @@ def _action_payload(action: NormalizedAction) -> dict[str, object]:
     }
 
 
-def _cycle_payload(cycle: NormalizedCycle) -> dict[str, object]:
-    return {
-        "cycle_id": cycle.cycle_id,
-        "symbol": cycle.symbol,
-        "order_id": cycle.order_id,
-        "action_ids": list(cycle.action_ids),
-        "open_timestamp_ms": cycle.open_timestamp_ms,
-        "close_timestamp_ms": cycle.close_timestamp_ms,
-        "realized_pnl": cycle.realized_pnl,
-        "fees": cycle.fees,
-    }
-
-
-def _event_payload(event: NormalizedEvent) -> dict[str, object]:
-    return {
-        "event_id": event.event_id,
-        "timestamp_ms": event.timestamp_ms,
-        "action_id": event.action_id,
-    }
-
-
 def _sample_payload(sample: NormalizedSample) -> dict[str, object]:
     return {
         "timestamp_ms": sample.timestamp_ms,
@@ -382,11 +361,8 @@ def canonical_fragment_payload(fragment: SourceV6Fragment) -> dict[str, object]:
         "settings_fingerprint": fragment.settings_fingerprint,
         "stitchability": fragment.stitchability,
         "actions": [_action_payload(item) for item in fragment.actions],
-        "cycles": [_cycle_payload(item) for item in fragment.cycles],
-        "events": [_event_payload(item) for item in fragment.events],
         "wallet_samples": [_sample_payload(item) for item in fragment.wallet_samples],
         "equity_samples": [_sample_payload(item) for item in fragment.equity_samples],
-        "open_tail_cycle_ids": list(fragment.open_tail_cycle_ids),
         "metrics": dict(fragment.metrics),
     }
 
@@ -402,6 +378,8 @@ def canonical_fragment_id(fragment: SourceV6Fragment) -> str:
 def encode_fragment(fragment: SourceV6Fragment, *, compression_level: int = 9) -> EncodedSourceV6Fragment:
     if not 0 <= compression_level <= 9:
         raise SourceV6Error("compression level must be between 0 and 9")
+    if fragment.schema_version != SOURCE_V6_SCHEMA_VERSION:
+        raise SourceV6Error("unsupported Source v6 fragment schema")
     canonical = canonical_fragment_bytes(fragment)
     fragment_id = sha256(canonical).hexdigest()
     if fragment.fragment_id != fragment_id:
@@ -411,6 +389,14 @@ def encode_fragment(fragment: SourceV6Fragment, *, compression_level: int = 9) -
 
 def _fragment_from_payload(payload: Mapping[str, object]) -> SourceV6Fragment:
     try:
+        expected_keys = {
+            "schema_version", "point", "report_start_ms", "report_end_ms",
+            "initial_balance", "fixed_order_balance", "balance_percentage",
+            "settings_fingerprint", "stitchability", "actions", "wallet_samples",
+            "equity_samples", "metrics",
+        }
+        if set(payload) != expected_keys or type(payload["schema_version"]) is not int or payload["schema_version"] != SOURCE_V6_SCHEMA_VERSION:
+            raise SourceV6Error("unsupported canonical fragment schema")
         point = PointIdentity(**payload["point"])
         actions = tuple(
             NormalizedAction(**{
@@ -422,15 +408,7 @@ def _fragment_from_payload(payload: Mapping[str, object]) -> SourceV6Fragment:
                 "post_size": None if row["post_size"] is None else Decimal(str(row["post_size"])),
             }) for row in payload["actions"]
         )
-        cycles = tuple(
-            NormalizedCycle(**{
-                **row,
-                "action_ids": tuple(row["action_ids"]),
-                "realized_pnl": Decimal(str(row["realized_pnl"])),
-                "fees": Decimal(str(row["fees"])),
-            }) for row in payload["cycles"]
-        )
-        events = tuple(NormalizedEvent(**row) for row in payload["events"])
+        cycles, events, open_tail_cycle_ids = reconstruct_derived_facts(actions, point)
         wallet = tuple(NormalizedSample(**{
             **row,
             "value": Decimal(str(row["value"])),
@@ -450,8 +428,10 @@ def _fragment_from_payload(payload: Mapping[str, object]) -> SourceV6Fragment:
             balance_percentage=Decimal(str(payload["balance_percentage"])),
             settings_fingerprint=str(payload["settings_fingerprint"]), stitchability=str(payload["stitchability"]),
             actions=actions, cycles=cycles, events=events, wallet_samples=wallet, equity_samples=equity,
-            open_tail_cycle_ids=tuple(payload["open_tail_cycle_ids"]), metrics=dict(payload["metrics"]),
+            open_tail_cycle_ids=open_tail_cycle_ids, metrics=dict(payload["metrics"]),
         )
+    except SourceV6Error:
+        raise
     except (KeyError, TypeError, ValueError, InvalidOperation) as error:
         raise SourceV6Error("invalid canonical fragment payload") from error
 
@@ -565,6 +545,54 @@ def _action(report: ParsedPerformanceReport, point: PointIdentity, row: Mapping[
     return NormalizedAction(action_id, _timestamp_ms(timestamp), material["symbol"], order_id, action, fee, pnl, balance, size, post_size, post_side)
 
 
+def reconstruct_derived_facts(
+    actions: tuple[NormalizedAction, ...], point: PointIdentity
+) -> tuple[tuple[NormalizedCycle, ...], tuple[NormalizedEvent, ...], tuple[str, ...]]:
+    """Build the non-factual cycle/event caches deterministically from actions."""
+    episodes: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+    for item in sorted(actions, key=lambda value: (value.symbol, value.timestamp_ms, value.action_id)):
+        if current is None or current["symbol"] != item.symbol:
+            current = None
+        if current is None:
+            current = {
+                "symbol": item.symbol,
+                "order_id": item.order_id or item.action_id,
+                "actions": [],
+                "open": item.timestamp_ms,
+                "close": None,
+                "pnl": Decimal("0"),
+                "fees": Decimal("0"),
+            }
+            episodes.append(current)
+        current["actions"].append(item.action_id)
+        current["pnl"] += item.pnl
+        current["fees"] += item.fee
+        if (item.post_size is not None and item.post_size == 0) or item.action == "closed":
+            current["close"] = item.timestamp_ms
+            current = None
+    cycles: list[NormalizedCycle] = []
+    for values in episodes:
+        symbol, order_id = str(values["symbol"]), str(values["order_id"])
+        cycle_id = _sha256_text(_canonical_json({
+            "point": point.canonical_key,
+            "symbol": symbol,
+            "order_id": order_id,
+            "action_ids": list(values["actions"]),
+            "open_timestamp_ms": values["open"],
+            "close_timestamp_ms": values["close"],
+            "realized_pnl": values["pnl"],
+            "fees": values["fees"],
+        }))
+        cycles.append(NormalizedCycle(
+            cycle_id, symbol, order_id, tuple(values["actions"]), int(values["open"]),
+            values["close"], values["pnl"], values["fees"],
+        ))
+    cycles.sort(key=lambda item: (item.open_timestamp_ms, item.cycle_id))
+    events = tuple(NormalizedEvent(item.action_id, item.timestamp_ms, item.action_id) for item in actions)
+    return tuple(cycles), events, tuple(cycle.cycle_id for cycle in cycles if not cycle.closed)
+
+
 def normalize_source_v6(source: bytes, *, source_name: str = "") -> SourceV6Fragment:
     """Normalize one report; see `normalize_and_encode_source_v6` for imports."""
     return _normalize_with_canonical(source, source_name=source_name)[1]
@@ -641,30 +669,7 @@ def _normalize_with_canonical(source: bytes, *, source_name: str = "") -> tuple[
         # is above zero and closed the moment it returns to zero. An episode may
         # begin without an `opened` action, because the position can have been
         # opened before the report started.
-        episodes: list[dict[str, object]] = []
-        current: dict[str, object] | None = None
-        for item in sorted(actions, key=lambda value: (value.symbol, value.timestamp_ms, value.action_id)):
-            if current is None or current["symbol"] != item.symbol:
-                current = None
-            if current is None:
-                current = {"symbol": item.symbol, "order_id": item.order_id or item.action_id, "actions": [], "open": item.timestamp_ms, "close": None, "pnl": Decimal("0"), "fees": Decimal("0")}
-                episodes.append(current)
-            current["actions"].append(item.action_id)
-            current["pnl"] += item.pnl
-            current["fees"] += item.fee
-            # `Post Size` returning to zero is the tester stating the position is
-            # flat. `closed` states the same thing in words, and older report
-            # layouts omit the column entirely, so both close the episode.
-            if (item.post_size is not None and item.post_size == 0) or item.action == "closed":
-                current["close"] = item.timestamp_ms
-                current = None
-        cycles: list[NormalizedCycle] = []
-        for values in episodes:
-            symbol, order_id = str(values["symbol"]), str(values["order_id"])
-            cycle_id = _sha256_text(_canonical_json({"point": point.canonical_key, "symbol": symbol, "order_id": order_id, "action_ids": list(values["actions"]), "open_timestamp_ms": values["open"], "close_timestamp_ms": values["close"], "realized_pnl": values["pnl"], "fees": values["fees"]}))
-            cycles.append(NormalizedCycle(cycle_id, symbol, order_id, tuple(values["actions"]), int(values["open"]), values["close"], values["pnl"], values["fees"]))
-        cycles.sort(key=lambda item: (item.open_timestamp_ms, item.cycle_id))
-        events = tuple(NormalizedEvent(item.action_id, item.timestamp_ms, item.action_id) for item in actions)
+        cycles, events, open_tail_cycle_ids = reconstruct_derived_facts(actions, point)
         wallet = tuple(NormalizedSample(timestamp, value, Decimal("0")) for timestamp, value in report.wallet_series)
         wallet_timestamps = tuple(timestamp for timestamp, _ in report.wallet_series)
         equity_timestamps = tuple(timestamp for timestamp, _ in report.equity_series)
@@ -685,11 +690,11 @@ def _normalize_with_canonical(source: bytes, *, source_name: str = "") -> tuple[
             _fingerprint(report, point, initial, fixed, percentage),
             stitchability,
             actions,
-            tuple(cycles),
+            cycles,
             events,
             wallet,
             equity,
-            tuple(cycle.cycle_id for cycle in cycles if not cycle.closed),
+            open_tail_cycle_ids,
             dict(report.metrics),
         )
         canonical = canonical_fragment_bytes(fragment)

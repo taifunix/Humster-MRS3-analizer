@@ -11,7 +11,7 @@ import duckdb
 import pytest
 
 import mrs3.source_v6_storage as storage
-from mrs3.source_v6 import canonical_fragment_id, encode_fragment, normalize_source_v6
+from mrs3.source_v6 import canonical_fragment_id, encode_fragment, normalize_source_v6, reconstruct_derived_facts
 from mrs3.source_v6_storage import (
     SourceV6SegmentOutcome,
     SourceV6SegmentReceipt,
@@ -51,6 +51,8 @@ def _unique_fragment(index: int):
         source_sha256=sha256(f"source-{index}".encode()).hexdigest(),
         point=replace(fragment.point, shift_bp=fragment.point.shift_bp + index),
     )
+    cycles, events, open_tail_cycle_ids = reconstruct_derived_facts(fragment.actions, fragment.point)
+    fragment = replace(fragment, cycles=cycles, events=events, open_tail_cycle_ids=open_tail_cycle_ids)
     return replace(fragment, fragment_id=canonical_fragment_id(fragment))
 
 
@@ -101,7 +103,7 @@ def test_sealed_segment_has_exact_schema_and_fingerprint(tmp_path: Path) -> None
         assert connection.execute(
             "select fingerprint, sealed, checkpointed from segment_manifest"
         ).fetchone() == (
-            "source-v6-import-segment-v1",
+            "source-v6-import-segment-v2",
             True,
             True,
         )
@@ -1222,7 +1224,7 @@ def test_fresh_v6_schema_has_identity_and_generation(tmp_path: Path) -> None:
     assert dbid == "db-test"
     assert database_info(database) == {
         "schema_version": "6",
-        "fingerprint": "source-v6-fresh-compact-v1",
+        "fingerprint": "source-v6-fresh-compact-v2",
         "database_id": "db-test",
         "mutation_generation": "0",
         "source_content_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -1665,9 +1667,9 @@ def test_decimal_text_preserves_edge_values(value: Decimal, expected: str) -> No
 def test_canonical_decimal_text_and_fragment_identity_are_golden() -> None:
     from mrs3.source_v6 import PointIdentity, SourceV6Fragment, canonical_fragment_bytes, canonical_fragment_id
 
-    expected_fragment_id = "5f1a80bdf299fac24e15bcf3f9b2e59f08ba23af2695c50358e5ffa91dd6ca76"
+    expected_fragment_id = "670898607d39ccd195e9b9a109be919be0abbc67f73cb9ae4f2fcecad5b31461"
     fragment = SourceV6Fragment(
-        schema_version=1,
+        schema_version=2,
         fragment_id=expected_fragment_id,
         source_sha256="source-sha",
         source_name="golden.html",
@@ -1689,13 +1691,13 @@ def test_canonical_decimal_text_and_fragment_identity_are_golden() -> None:
     )
 
     assert canonical_fragment_bytes(fragment) == (
-        b'{"actions":[],"balance_percentage":"0","cycles":[],"equity_samples":[],'
-        b'"events":[],"fixed_order_balance":"150","initial_balance":"-4.6530000000000000000000000117",'
-        b'"metrics":{"label":"golden"},"open_tail_cycle_ids":[],"point":{'
+        b'{"actions":[],"balance_percentage":"0","equity_samples":[],"fixed_order_balance":"150",'
+        b'"initial_balance":"-4.6530000000000000000000000117",'
+        b'"metrics":{"label":"golden"},"point":{'
         b'"close_ma_length":20,"close_ma_source":"close","close_ma_type":"SMA",'
         b'"open_ma_length":10,"open_ma_source":"close","open_ma_type":"SMA",'
         b'"shift_bp":50,"side":"LONG","symbol":"BTCUSDT","timeframe":"1h"},'
-        b'"report_end_ms":2,"report_start_ms":1,"schema_version":1,"settings_fingerprint":'
+        b'"report_end_ms":2,"report_start_ms":1,"schema_version":2,"settings_fingerprint":'
         b'"settings","stitchability":"STITCHABLE","wallet_samples":[]}'
     )
     assert canonical_fragment_id(fragment) == expected_fragment_id
@@ -1712,7 +1714,7 @@ def test_compact_database_has_indexed_fragment_rows_and_sorted_content_digest(tm
 
     assert tuple(item.fragment_id for item in iter_fragments(database)) == tuple(sorted((first.fragment_id, second.fragment_id)))
     info = database_info(database)
-    assert info["fingerprint"] == "source-v6-fresh-compact-v1"
+    assert info["fingerprint"] == "source-v6-fresh-compact-v2"
     assert info["source_content_digest"] == source_content_digest((first.fragment_id, second.fragment_id))
     connection = duckdb.connect(str(database), read_only=True)
     try:

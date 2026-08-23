@@ -39,7 +39,7 @@ def test_fresh_analysis_is_separate_and_binds_the_supplied_gap_rules(tmp_path: P
     try:
         manifest = dict(connection.execute("select key, value from manifest").fetchall())
         assert manifest["fingerprint"] == "analysis-v6-fresh-compact-v1"
-        assert manifest["surface_fingerprint"] == "surface-v6-fresh-compact-v1"
+        assert manifest["surface_fingerprint"] == "surface-v6-fresh-compact-v2"
         assert manifest["algorithm_config_sha256"] != dict(duckdb.connect(str(first), read_only=True).execute("select key, value from manifest").fetchall())["algorithm_config_sha256"]
         assert connection.execute("select count(*) from points").fetchone()[0] == len(facts)
     finally:

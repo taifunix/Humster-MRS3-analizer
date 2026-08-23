@@ -157,7 +157,7 @@ def _snapshot(root: Path, path: Path, input_ordinal: int) -> SourceV6Snapshot:
 
 def _token(root: Path, database: Path, snapshots: tuple[SourceV6Snapshot, ...], target_identity: str | None) -> str:
     document = {
-        "format": "source-v6-fresh-compact-v1",
+        "format": "source-v6-fresh-compact-v2",
         "root": str(root.resolve()),
         "target": str(database.resolve()),
         "target_identity": target_identity,

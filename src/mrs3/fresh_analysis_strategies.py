@@ -28,11 +28,10 @@ from .lots import LotMethod, allocate_lots
 from .pipeline import _canonical
 from .strategy_json import generate_strategy, validate_strategy, validate_unique_names
 from .source_v6 import _canonical_json
-from .source_v6_surface_fresh import read_multiscope_surface
+from .source_v6_surface_fresh import FINGERPRINT as SURFACE_FINGERPRINT, read_multiscope_surface
 
 
 FINGERPRINT = "analysis-v6-fresh-compact-v1"
-SURFACE_FINGERPRINT = "surface-v6-fresh-compact-v1"
 EVENT_MODE = "real_independent_events"
 GENERATOR_SCHEMA = f"{V6_READY_GENERATOR_SCHEMA}-fresh-compact"
 _TABLES = ("points", "structures")
