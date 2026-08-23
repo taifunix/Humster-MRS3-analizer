@@ -12,7 +12,7 @@ from typing import Callable, Sequence
 from .source_v6 import SourceV6Fragment, _decimal_text
 from .source_v6_coverage import ReadyInterval, canonical_ready_intervals
 from .source_v6_stitch import measure_points
-from .source_v6_storage import decode_fragment_slice, fragment_metadata, source_content_digest
+from .source_v6_storage import decode_fragment_slice, fragment_metadata, quarantine_details, source_content_digest
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +161,15 @@ def materialize_source_v6_from_database(
     if not requested:
         raise ValueError("at least one scope is required")
     database = str(Path(source_database))
+    quarantines = quarantine_details(database)
+    if quarantines:
+        detail = quarantines[0]
+        raise ValueError(
+            "Source v6 database has quarantine: "
+            f"source_sha256={detail['source_sha256']} "
+            f"source_name={detail.get('source_name') or '<unknown>'} "
+            f"reason={detail['reason']}"
+        )
     views = tuple(metadata) if metadata is not None else fragment_metadata(database)
     witnesses = {item.scope_key: item for item in canonical_ready_intervals(views)}
     groups = _point_groups(views, requested)

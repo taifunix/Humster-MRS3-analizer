@@ -20,6 +20,7 @@ from .source_v6_materializer import materialize_source_v6, materialize_source_v6
 from .source_v6_storage import (
     fragment_metadata,
     iter_fragment_ids_parallel,
+    quarantine_details,
     source_content_digest,
     validate_source_v6_database,
 )
@@ -91,6 +92,7 @@ class LocalSurfacesService:
         readiness: Callable[..., Sequence[object]] | None = None,
         missing_cells: Callable[..., Sequence[object]] | None = None,
         read_fragments: Callable[[str | Path], Sequence[object]] | None = None,
+        read_quarantine: Callable[[str | Path], Sequence[Mapping[str, object]]] | None = None,
         materialize: Callable[[Sequence[object], Sequence[str]], object] | None = None,
         publish: Callable[..., object] | None = None,
         workers: int = 1,
@@ -100,6 +102,7 @@ class LocalSurfacesService:
         self._readiness = readiness or canonical_ready_intervals
         self._missing_cells = missing_cells or canonical_missing_cells
         self._read_fragments = read_fragments
+        self._read_quarantine = read_quarantine or quarantine_details
         self._workers = max(1, int(workers))
         self._materialize = materialize or materialize_source_v6
         self._publish = publish or publish_multiscope_surface
@@ -110,6 +113,7 @@ class LocalSurfacesService:
     def preflight(self, source_db: str | Path) -> dict[str, object]:
         source = Path(source_db)
         info = self._validate_source(source)
+        quarantines = tuple(self._read_quarantine(source))
         metadata = tuple(self._read_metadata(source))
         digest = (
             str(info["source_content_digest"])
@@ -131,7 +135,7 @@ class LocalSurfacesService:
                 "pair": key.split("|", 2)[0],
                 "side": key.split("|", 2)[1],
                 "timeframe": key.split("|", 2)[2],
-                "status": "READY" if key in ready_scopes else _NOT_READY,
+                "status": "READY" if key in ready_scopes and not quarantines else _NOT_READY,
             }
             for key in scope_keys
         )
@@ -148,7 +152,10 @@ class LocalSurfacesService:
                     "timeframes": [row for row in rows if row["pair"] == pair and row["side"] == side],
                 }
             )
-        return {"phase": "PREFLIGHT_READY", "token": token, "rows": list(rows), "groups": groups}
+        return {
+            "phase": "PREFLIGHT_READY", "token": token, "rows": list(rows), "groups": groups,
+            "quarantines": list(quarantines),
+        }
 
     def gaps(self, token: str, scope: object) -> dict[str, object]:
         pending = self._current(token)

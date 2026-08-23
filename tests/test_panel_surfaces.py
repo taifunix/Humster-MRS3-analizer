@@ -31,7 +31,13 @@ def _metadata(symbol: str, side: str, timeframe: str) -> SimpleNamespace:
     )
 
 
-def _service(tmp_path: Path, *, ready: tuple[ReadyInterval, ...] = (), missing_result: tuple[CoverageCell, ...] | None = None):
+def _service(
+    tmp_path: Path,
+    *,
+    ready: tuple[ReadyInterval, ...] = (),
+    missing_result: tuple[CoverageCell, ...] | None = None,
+    quarantines: tuple[dict[str, object], ...] = (),
+):
     source_db = (tmp_path / "private" / "committed-source.duckdb").resolve()
     calls: dict[str, object] = {"validated": [], "metadata": [], "ready": [], "gaps": [], "materialize": [], "publish": []}
     metadata = (_metadata("BTCUSDT", "LONG", "1h"), _metadata("ETHUSDT", "SHORT", "4h"))
@@ -56,6 +62,9 @@ def _service(tmp_path: Path, *, ready: tuple[ReadyInterval, ...] = (), missing_r
     def read_fragments(path: Path):
         return fragments
 
+    def read_quarantine(path: Path):
+        return quarantines
+
     def materialize(items, scope_keys):
         calls["materialize"].append((tuple(items), tuple(scope_keys)))
         return SimpleNamespace(scopes=tuple(scope_keys))
@@ -70,10 +79,24 @@ def _service(tmp_path: Path, *, ready: tuple[ReadyInterval, ...] = (), missing_r
         readiness=readiness,
         missing_cells=missing,
         read_fragments=read_fragments,
+        read_quarantine=read_quarantine,
         materialize=materialize,
         publish=publish,
     )
     return service, source_db, calls
+
+
+def test_preflight_quarantine_blocks_ready_with_injected_validator(tmp_path: Path) -> None:
+    service, source_db, _ = _service(
+        tmp_path,
+        ready=(ReadyInterval("BTCUSDT|LONG|1h", date(2026, 1, 1), date(2026, 1, 2)),),
+        quarantines=({"source_sha256": "a" * 64, "source_name": "bad.html", "reason": "M7", "fragment_id": "b" * 64},),
+    )
+
+    result = service.preflight(source_db)
+
+    assert result["quarantines"]
+    assert all(row["status"] != "READY" for row in result["rows"])
 
 
 def test_preflight_redacts_source_path_and_replaces_token(tmp_path: Path) -> None:

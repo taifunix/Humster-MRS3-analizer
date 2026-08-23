@@ -592,10 +592,11 @@ def write_source_v6_segment(
                 for outcome in ordered
             ],
         )
-        connection.executemany(
-            "insert into segment_compact_rows values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [(ordinal, *row) for ordinal, row in rows],
-        )
+        if rows:
+            connection.executemany(
+                "insert into segment_compact_rows values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(ordinal, *row) for ordinal, row in rows],
+            )
         connection.execute(
             "insert into segment_manifest values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
@@ -833,6 +834,13 @@ def _record_segment_quarantines(
             started = _utc_now()
             reason = outcome.reason or "quarantined"
             fragment_id = outcome.fragment_id or str(outcome.source_sha256)
+            if reason.startswith("M7 metric mismatch: "):
+                try:
+                    evidence = json.loads(reason.partition(": ")[2])
+                except json.JSONDecodeError:
+                    evidence = {}
+                if isinstance(evidence, dict) and evidence.get("fragment_id"):
+                    fragment_id = str(evidence["fragment_id"])
             connection.execute(
                 "insert into quarantine values (?, ?, ?, ?)",
                 [fragment_id, outcome.source_sha256, reason, started],
@@ -1672,6 +1680,46 @@ class SourceV6FragmentMetadata:
     stitchability: str
     open_tail_cycle_ids: tuple[str, ...]
     metrics: Mapping[str, str]
+
+
+def quarantine_details(path: str | Path) -> tuple[dict[str, object], ...]:
+    """Return quarantine evidence without opening or decoding payload blobs."""
+    connection = duckdb.connect(str(path), read_only=True)
+    try:
+        _require_fresh(_schema_info(connection))
+        rows = connection.execute(
+            "select fragment_id, source_sha256, reason, created_at_utc "
+            "from quarantine order by created_at_utc, source_sha256"
+        ).fetchall()
+    except duckdb.Error as error:
+        raise SourceV6StorageError(f"cannot read Source v6 quarantine: {error}") from error
+    finally:
+        connection.close()
+    result: list[dict[str, object]] = []
+    for fragment_id, source_sha256, reason, created_at_utc in rows:
+        source_name: str | None = None
+        evidence_fragment_id: str | None = None
+        text = str(reason)
+        prefix, separator, encoded = text.partition(": ")
+        if prefix == "M7 metric mismatch" and separator:
+            try:
+                evidence = json.loads(encoded)
+            except json.JSONDecodeError:
+                evidence = {}
+            if isinstance(evidence, dict):
+                source_name = str(evidence.get("source_name")) if evidence.get("source_name") is not None else None
+                if evidence.get("fragment_id"):
+                    evidence_fragment_id = str(evidence["fragment_id"])
+        result.append(
+            {
+                "fragment_id": evidence_fragment_id or str(fragment_id),
+                "source_sha256": str(source_sha256),
+                "source_name": source_name,
+                "reason": text,
+                "created_at_utc": str(created_at_utc),
+            }
+        )
+    return tuple(result)
 
 
 def fragment_metadata(path: str | Path) -> tuple[SourceV6FragmentMetadata, ...]:

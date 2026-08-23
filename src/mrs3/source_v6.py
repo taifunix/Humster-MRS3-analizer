@@ -593,6 +593,119 @@ def reconstruct_derived_facts(
     return tuple(cycles), events, tuple(cycle.cycle_id for cycle in cycles if not cycle.closed)
 
 
+def _m7_metric(metrics: Mapping[str, str], names: tuple[str, ...]) -> tuple[str, Decimal | None] | None:
+    for name in names:
+        if name in metrics:
+            raw = str(metrics[name]).strip()
+            if raw.casefold() == "n/a":
+                return name, None
+            return name, _finite_decimal(raw, f"declared {name}")
+    return None
+
+
+def _m7_mismatch(
+    source_sha256: str, source_name: str, metric: str, declared: object, derived: object,
+    fragment_id: str = "",
+) -> SourceV6Error:
+    details = json.dumps(
+        {
+            "source_sha256": source_sha256,
+            "source_name": source_name,
+            "fragment_id": fragment_id,
+            "metric": metric,
+            "declared": None if declared is None else _decimal_text(Decimal(str(declared))),
+            "derived": None if derived is None else _decimal_text(Decimal(str(derived))),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return SourceV6Error(f"M7 metric mismatch: {details}")
+
+
+def _validate_m7(
+    report: ParsedPerformanceReport,
+    actions: tuple[NormalizedAction, ...],
+    *,
+    initial_balance: Decimal,
+    source_sha256: str,
+    source_name: str,
+    fragment_id: str = "",
+) -> None:
+    """Check independent tester declarations before a fragment is encoded."""
+    # The parser rejects action-bearing reports with an empty wallet series;
+    # keep this guard defensive so a malformed caller cannot escape as IndexError.
+    if not report.wallet_series:
+        return
+
+    def check(name: str, actual: Decimal | None, declared: tuple[str, Decimal | None] | None) -> None:
+        if declared is None:
+            # Sparse seam fragments may omit tester summaries; absence is not a
+            # declaration and must not invent a value or quarantine a valid fact.
+            return
+        declared_name, declared_value = declared
+        if declared_value is None:
+            if actual is not None:
+                raise _m7_mismatch(source_sha256, source_name, declared_name, None, actual, fragment_id)
+            return
+        if actual is None:
+            raise _m7_mismatch(source_sha256, source_name, declared_name, declared_value, None, fragment_id)
+        quantum = Decimal("1").scaleb(declared_value.as_tuple().exponent)
+        rounded = actual.quantize(quantum, rounding=ROUND_HALF_UP)
+        if rounded != declared_value:
+            raise _m7_mismatch(source_sha256, source_name, declared_name, declared_value, rounded, fragment_id)
+
+    wallet = report.wallet_series
+    # M4 anchors PnL to the declared initial balance; the first wallet sample
+    # may already include an opening fee and therefore is not that anchor.
+    total_pnl = wallet[-1][1] - initial_balance
+    total_fees = sum((item.fee for item in actions), Decimal("0"))
+    realizing = tuple(item for item in actions if item.action in {"decreased", "closed"})
+    gross_profit = sum((item.pnl for item in realizing if item.pnl > 0), Decimal("0"))
+    gross_loss = sum((item.pnl for item in realizing if item.pnl < 0), Decimal("0"))
+    profit_factor = gross_profit / abs(gross_loss) if gross_loss else None
+    declared_total_pnl = _m7_metric(report.metrics, ("Total PnL", "TotalPnL"))
+    check("Total PnL", total_pnl, declared_total_pnl)
+    check("Total fees", total_fees, _m7_metric(report.metrics, ("Total fees", "TotalFees")))
+    declared_profit_factor = _m7_metric(
+        report.metrics, ("Profit Factor", "Profit Factor (gross profit/gross loss)")
+    )
+    # The tester emits numeric zero for a positive-only run where the ratio has
+    # no finite denominator; preserve that explicit convention.
+    if not (profit_factor is None and declared_profit_factor is not None and declared_profit_factor[1] == 0):
+        check("Profit Factor", profit_factor, declared_profit_factor)
+    recovery = _m7_metric(report.metrics, ("Recovery Factor", "Recovery Factor (Total PnL / Max DD)"))
+    declared_max_drawdown = _m7_metric(report.metrics, ("Max Drawdown", "Max DD"))
+    raw_recovery_pnl = total_pnl
+    equity_peak = report.equity_series[0][1] if report.equity_series else None
+    raw_equity_drawdown = Decimal("0")
+    if equity_peak is not None:
+        for _, value in report.equity_series:
+            if value > equity_peak:
+                equity_peak = value
+            elif equity_peak - value > raw_equity_drawdown:
+                raw_equity_drawdown = equity_peak - value
+    if (
+        recovery is not None
+        and recovery[1] is not None
+        and declared_max_drawdown is not None
+        and declared_max_drawdown[1] is not None
+        and raw_equity_drawdown > 0
+    ):
+        # Tester recovery uses raw M4 PnL and sampled equity drawdown; the
+        # displayed Max DD and Total PnL are rounded declarations. If the
+        # declared DD is not the sampled DD, M6's declared-candidate rule means
+        # this fragment has no independent RF denominator to validate.
+        dd_quantum = Decimal("1").scaleb(declared_max_drawdown[1].as_tuple().exponent)
+        if raw_equity_drawdown.quantize(dd_quantum, rounding=ROUND_HALF_UP) == declared_max_drawdown[1]:
+            quantum = Decimal("1").scaleb(recovery[1].as_tuple().exponent)
+            rounded = (raw_recovery_pnl / raw_equity_drawdown).quantize(quantum, rounding=ROUND_HALF_UP)
+            if abs(rounded - recovery[1]) > quantum:
+                raise _m7_mismatch(
+                    source_sha256, source_name, recovery[0], recovery[1], rounded, fragment_id
+                )
+
+
 def normalize_source_v6(source: bytes, *, source_name: str = "") -> SourceV6Fragment:
     """Normalize one report; see `normalize_and_encode_source_v6` for imports."""
     return _normalize_with_canonical(source, source_name=source_name)[1]
@@ -698,6 +811,14 @@ def _normalize_with_canonical(source: bytes, *, source_name: str = "") -> tuple[
             dict(report.metrics),
         )
         canonical = canonical_fragment_bytes(fragment)
+        _validate_m7(
+            report,
+            actions,
+            initial_balance=initial,
+            source_sha256=source_hash,
+            source_name=source_name,
+            fragment_id=sha256(canonical).hexdigest(),
+        )
         return canonical, SourceV6Fragment(
             fragment.schema_version,
             sha256(canonical).hexdigest(),

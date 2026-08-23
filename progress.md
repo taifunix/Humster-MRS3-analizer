@@ -2,8 +2,34 @@
 
 **Updated:** 2026-08-23
 **Current branch:** `main`
+
+## Source v6 facts/metrics v2 Stage 3–4 (2026-08-23)
+
+M7 validates declarations during normalization before encoding. PnL uses the
+M4 raw anchor (final wallet sample minus declared initial balance), fees sum all
+actions, Profit Factor sums realising actions, and Recovery Factor is conditional
+on a sampled DD-compatible declaration. Quarantine details are read-only and a
+quarantined database blocks every scope at panel preflight and materialization.
+
+Fresh baseline evidence: 684/684 reports committed, 0 quarantined, source
+content digest `9612e26abc51b6e36f49ce3a73159358abdcd1a412747a235c70ffaa82fec940`.
+The three-run import median is **68.712 s**, database size **24,653,824 bytes**,
+and all three semantic signatures match the clean v2 database. Against the
+recorded v1 medians (111.533 s, 30,683,136 bytes), this is faster and smaller.
+
+Clean materialization with workers 1 and 4 produced the same analysis digest
+`358ec8ba55a2888fe9b12ba38c82c915ecd5767b447a0a53a267e5bd1a55496c`, 684
+compact rows, and zero empty results. Full workers=30 materialize + SQL-copy
+publication ran three times at a **10.640 s** median, 684 rows/facts and
+**23,867,392 bytes** (v1 median 71.160 s and 27,537,408 bytes). The full suite
+is green: `.venv\\Scripts\\python.exe -m pytest -q` — **1629 passed, 2 skipped**.
+
+The final Reviewer call still returned findings; the panel validator seam and
+orphan-roundtrip traceability were fixed and focused/full verification rerun.
+No fourth Reviewer call is permitted, so this remains a non-approval artifact
+until a future task with a fresh review budget explicitly reopens review.
 **Current feature:** Source v6 high-throughput import and merge — implemented,
-measured on both real corpora, `CODE_REVIEW_PASS`. The merge readback is now
+measured on both real corpora; the merge readback is now
 parallel (C9): 2,080 s to 544 s on the two-corpus merge, identical artifact.
 
 ## Source v6 import throughput (2026-08-21)

@@ -256,13 +256,27 @@ Each derived numeric is rounded `ROUND_HALF_UP` to the exponent in the raw
 declared token. A mismatch quarantines that report only, with source identity,
 fragment id, metric, declared and derived values; healthy siblings continue.
 
+When every realising action is profitable and the gross-loss denominator is
+zero, the tester's explicit numeric `0` Profit Factor is preserved as its
+undefined-ratio convention; it is not replaced with an invented infinity.
+If a sparse seam fragment omits one of these tester summary fields entirely,
+there is no declaration to compare and the raw absence is preserved; no metric
+is fabricated and the checks apply whenever the tester emits the field.
+
 **Not verified:** drawdown, because M6 now adopts the declared value where
 admissible, and because the sampled series legitimately differs elsewhere;
 trades and win rate, because M2 and M3 deliberately use a different unit.
 
 `Recovery Factor` is a separate conditional consistency check for a numeric,
 positive-drawdown single fragment; it is not a fourth mandatory extraction
-check. Zero activity follows ADR-0016's declared unavailable forms.
+check. The check uses the raw M4 PnL (final wallet sample minus the declared
+initial balance) and raw equity drawdown. It
+runs only when the declared Max DD rounds to the sampled equity drawdown,
+because M6 may intentionally select a different admissible declared DD
+candidate. The published tester value may differ by one unit of its raw
+exponent after display rounding; that one-unit boundary is accepted, while
+larger mutations quarantine the report. Zero activity follows ADR-0016's
+declared unavailable forms.
 
 ## Format and materialization boundary
 

@@ -3,7 +3,9 @@
 > **For agentic workers:** execute one stage at a time with TDD, focused
 > verification and independent review before the next stage.
 
-**Status:** Approved — Stages 0–2 complete; Stage 3 in progress
+**Status:** Implemented and acceptance-gated — Stages 0–4 complete; Reviewer
+bridge budget exhausted with final findings reconciled, so no `CODE_REVIEW_PASS`
+claim is made.
 
 **Goal:** Correct Source v6 metrics and validation in the existing
 import/materialization passes, retain fast sealed-payload publication, and keep
