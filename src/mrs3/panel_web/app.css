@@ -166,3 +166,12 @@ tbody th { font-weight: 750; }
   .accordion > summary { padding: 16px; }
   .accordion > .details-content, .card-body { padding: 16px; }
 }
+
+/* Shortlist: a Pair - Side group row that opens into its TF rows. */
+.shortlist-table tbody tr.is-group > th,
+.shortlist-table tbody tr.is-group > td { background: rgba(107, 140, 255, 0.08); font-weight: 600; }
+.shortlist-table tbody tr.is-timeframe > th { padding-left: 2.1rem; font-weight: 400; }
+.shortlist-table tbody tr.is-timeframe[hidden] { display: none; }
+.shortlist-table td.count-zero { opacity: 0.45; }
+.shortlist-table td.count-ready { color: var(--accent-ready, #1a7f5a); font-weight: 600; }
+.shortlist-disclosure { background: none; border: 0; cursor: pointer; padding: 0 0.4rem; font: inherit; color: inherit; }

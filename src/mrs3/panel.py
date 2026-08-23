@@ -2077,13 +2077,21 @@ class PanelController:
         analysis_path = self._fresh_analysis_paths.get(analysis_id)
         if analysis_path is None:
             raise ValueError("fresh analysis is not available in this panel session")
+        # The operator chose where the JSON batch lands; the previous fixed
+        # location was invisible in the panel, so the batch could not be found.
+        requested = payload.get("output_dir")
+        output_dir = (
+            self._path(str(requested))
+            if isinstance(requested, str) and requested.strip()
+            else self.root / "Output" / "strategies" / analysis_id
+        )
         result = generate_fresh_analysis_strategies(
             analysis_path,
             analysis_id,
             candidates,
             [tuple(item) for item in scopes],
             self._workflow_default("strategy_templates", side=next(iter(scope_sides))),
-            self.root / "Output" / "strategies" / analysis_id,
+            output_dir,
             config,
             surface_path=self._fresh_analysis_surfaces.get(analysis_id),
         )
@@ -2094,6 +2102,7 @@ class PanelController:
             "surface_id": result.surface_id,
             "strategy_count": result.strategy_count,
             "manifest": result.manifest_path.name,
+            "output_dir": str(result.manifest_path.parent),
         }
 
     def strategies_fresh_shortlist(self, payload: Mapping[str, object]) -> dict[str, object]:

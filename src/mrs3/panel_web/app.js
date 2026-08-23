@@ -1,3 +1,139 @@
+  const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
+  let shortlistGroups = [];
+  const selectedScopeKeys = new Set();
+  const expandedPairs = new Set();
+  const shortlistBadge = (kind, text) => {
+    const badge = document.querySelector('#shortlist-badge');
+    if (!badge) return;
+    badge.className = `state-badge state-${kind}`;
+    badge.textContent = text;
+  };
+  const selectedCandidateIds = () => shortlistGroups
+    .filter((group) => selectedScopeKeys.has(group.scope_key))
+    .flatMap((group) => group.candidate_ids || []);
+  const pairGroups = () => {
+    const byPair = new Map();
+    for (const group of shortlistGroups) {
+      const key = `${group.pair}|${group.side}`;
+      const entry = byPair.get(key) || {
+        key, pair: group.pair, side: group.side, timeframes: [],
+        counts: Object.fromEntries(ORDER_BUCKETS.map((bucket) => [bucket, 0])), ready: 0, total: 0,
+      };
+      entry.timeframes.push(group);
+      for (const bucket of ORDER_BUCKETS) entry.counts[bucket] += Number(group.counts?.[bucket] || 0);
+      entry.ready += Number(group.ready || 0);
+      entry.total += Number(group.total || 0);
+      byPair.set(key, entry);
+    }
+    return [...byPair.values()];
+  };
+  const countCell = (value, ready) => {
+    const cell = document.createElement('td');
+    cell.textContent = value ? String(value) : '—';
+    if (!value) cell.classList.add('count-zero');
+    else if (ready) cell.classList.add('count-ready');
+    return cell;
+  };
+  const updateShortlistSummary = () => {
+    const summary = document.querySelector('#shortlist-summary');
+    const ready = shortlistGroups.reduce((sum, group) => sum + Number(group.ready || 0), 0);
+    const total = shortlistGroups.reduce((sum, group) => sum + Number(group.total || 0), 0);
+    const picked = selectedCandidateIds().length;
+    if (summary) {
+      summary.textContent = total
+        ? `${shortlistGroups.length} scopes · ${ready} READY из ${total} · выбрано ${picked}`
+        : 'ожидание анализа';
+    }
+    if (!total) shortlistBadge('pending', 'WAITING');
+    else if (picked) shortlistBadge('ready', `${picked} SELECTED`);
+    else shortlistBadge('ready', `${ready} READY`);
+  };
+  const renderShortlist = () => {
+    const body = document.querySelector('#shortlist-body');
+    const empty = document.querySelector('#shortlist-empty');
+    if (!body) return;
+    body.replaceChildren();
+    // Two levels, as the agreed screen defines: a Pair - Side row that opens
+    // into its TF rows. Each candidate is counted into the bucket of its own
+    // order count, never into the last column.
+    for (const pair of pairGroups()) {
+      const open = expandedPairs.has(pair.key);
+      const row = document.createElement('tr');
+      row.className = 'is-group';
+      const pick = document.createElement('td');
+      const disclosure = document.createElement('button');
+      disclosure.type = 'button';
+      disclosure.className = 'shortlist-disclosure';
+      disclosure.textContent = open ? '⌄' : '›';
+      disclosure.setAttribute('aria-expanded', open ? 'true' : 'false');
+      disclosure.setAttribute('aria-label', `TF ${pair.pair} ${pair.side}`);
+      disclosure.addEventListener('click', () => {
+        if (open) expandedPairs.delete(pair.key); else expandedPairs.add(pair.key);
+        renderShortlist();
+      });
+      const selectable = pair.timeframes.filter((group) => group.ready > 0);
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.disabled = selectable.length === 0;
+      box.checked = selectable.length > 0 && selectable.every((group) => selectedScopeKeys.has(group.scope_key));
+      box.indeterminate = !box.checked && selectable.some((group) => selectedScopeKeys.has(group.scope_key));
+      box.setAttribute('aria-label', `${pair.pair} ${pair.side}`);
+      box.addEventListener('change', () => {
+        for (const group of selectable) {
+          if (box.checked) selectedScopeKeys.add(group.scope_key); else selectedScopeKeys.delete(group.scope_key);
+        }
+        renderShortlist();
+      });
+      pick.append(disclosure, box);
+      const name = document.createElement('th');
+      name.scope = 'row';
+      name.textContent = `${pair.pair} · ${pair.side}`;
+      const timeframes = document.createElement('td');
+      timeframes.textContent = `${pair.timeframes.length} TF`;
+      row.append(pick, name, timeframes);
+      for (const bucket of ORDER_BUCKETS) row.append(countCell(pair.counts[bucket], false));
+      row.append(countCell(pair.ready, true), countCell(pair.total, false));
+      body.append(row);
+      for (const group of pair.timeframes) {
+        const child = document.createElement('tr');
+        child.className = 'is-timeframe';
+        child.hidden = !open;
+        const childPick = document.createElement('td');
+        const childBox = document.createElement('input');
+        childBox.type = 'checkbox';
+        childBox.value = group.scope_key;
+        childBox.disabled = !(group.ready > 0);
+        childBox.checked = selectedScopeKeys.has(group.scope_key);
+        childBox.setAttribute('aria-label', `${group.pair} ${group.side} ${group.timeframe}`);
+        childBox.addEventListener('change', () => {
+          if (childBox.checked) selectedScopeKeys.add(group.scope_key); else selectedScopeKeys.delete(group.scope_key);
+          renderShortlist();
+        });
+        childPick.append(childBox);
+        const childName = document.createElement('th');
+        childName.scope = 'row';
+        childName.textContent = '';
+        const childTf = document.createElement('td');
+        childTf.textContent = group.timeframe;
+        child.append(childPick, childName, childTf);
+        for (const bucket of ORDER_BUCKETS) child.append(countCell(group.counts?.[bucket], false));
+        child.append(countCell(group.ready, true), countCell(group.total, false));
+        body.append(child);
+      }
+    }
+    if (empty) empty.hidden = shortlistGroups.length > 0;
+    updateShortlistSummary();
+  };
+  const applyShortlist = (payload) => {
+    shortlistItems = payload.items || [];
+    shortlistGroups = payload.groups || [];
+    const live = new Set(shortlistGroups.map((group) => group.scope_key));
+    for (const key of [...selectedScopeKeys]) if (!live.has(key)) selectedScopeKeys.delete(key);
+    if (expandedPairs.size === 0) {
+      for (const group of shortlistGroups) expandedPairs.add(`${group.pair}|${group.side}`);
+    }
+    renderShortlist();
+  };
 (() => {
   const screens = [...document.querySelectorAll('.screen')];
   const links = [...document.querySelectorAll('[data-screen-link]')];
@@ -962,7 +1098,7 @@
       if (result.phase !== 'COMMITTED') { analysisProgress('failed', result.error || result.phase || 'Analysis failed.'); return; }
       currentAnalysisId = result.analysis_run_id;
       const shortlist = await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId });
-      shortlistItems = shortlist.items || []; renderShortlist();
+      applyShortlist(shortlist);
       analysisProgress('complete', `Analysis committed; ${shortlistItems.length} candidates available.`);
     } catch (error) {
       analysisProgress('failed', `Fresh analysis failed: ${error?.message || 'unknown error'}.`);
@@ -974,33 +1110,55 @@
   document.querySelector('#analysis-lineage')?.addEventListener('click', () => {
     strategyStatus('Manifest and lineage are available after the analysis is committed.');
   });
-  const generateFresh = strategyCards[1]?.querySelectorAll('.button-row button')[1];
+  const generateStatus = (message) => {
+    const node = document.querySelector('#shortlist-generate-status');
+    if (node) node.textContent = message;
+    strategyStatus(message);
+  };
+  const generateFresh = document.querySelector('#shortlist-generate');
   if (generateFresh) generateFresh.addEventListener('click', async () => {
-    const selected = [...document.querySelectorAll('#strategies-dd5 tbody input:checked')]
-      .map((box) => shortlistItems.find((item) => item.candidate_id === box.value)).filter(Boolean);
-    const sides = new Set(selected.map((item) => item.side));
-    if (!currentAnalysisId || !selected.length || sides.size !== 1) {
-      strategyStatus('Select READY candidates of one side.'); return;
-    }
+    const scopes = shortlistGroups.filter((group) => selectedScopeKeys.has(group.scope_key));
+    const candidateIds = selectedCandidateIds();
+    const sides = new Set(scopes.map((group) => group.side));
+    if (!currentAnalysisId) { generateStatus('Сначала запустите анализ.'); return; }
+    if (!candidateIds.length) { generateStatus('Отметьте scope с READY-кандидатами.'); return; }
+    // The batch template is chosen by side, so a mixed batch has no template.
+    if (sides.size !== 1) { generateStatus(`Выберите scopes одной стороны: ${[...sides].join(', ')}.`); return; }
+    generateFresh.disabled = true;
+    generateStatus(`READY JSON: ${candidateIds.length} candidates...`);
     try {
       const result = await remoteRequest('/api/v2/strategies/fresh/generate', {
         analysis_run_id: currentAnalysisId,
-        candidate_ids: selected.map((item) => item.candidate_id),
-        selected_scopes: [...new Map(selected.map((item) => [`${item.pair}|${item.side}|${item.timeframe}`, [item.pair, item.side, item.timeframe]])).values()],
+        candidate_ids: candidateIds,
+        selected_scopes: scopes.map((group) => [group.pair, group.side, group.timeframe]),
+        output_dir: document.querySelector('#strategies-output')?.value || '',
       });
       const batch = document.querySelector('#tester-batch');
       if (batch) batch.replaceChildren(new Option(`${result.strategy_count} READY JSON · ${result.manifest}`, currentAnalysisId));
-      strategyStatus(`READY JSON committed: ${result.strategy_count}.`);
-    } catch (_) { strategyStatus('READY JSON generation failed.'); }
+      const output = document.querySelector('#strategies-output');
+      if (output && result.output_dir) output.value = result.output_dir;
+      generateStatus(`READY JSON committed: ${result.strategy_count}.`);
+    } catch (error) {
+      generateStatus(`READY JSON не создан: ${error?.message || 'unknown error'}.`);
+    } finally {
+      generateFresh.disabled = false;
+    }
   });
-  const refreshFresh = strategyCards[1]?.querySelectorAll('.button-row button')[0];
+  const refreshFresh = document.querySelector('#shortlist-refresh');
   if (refreshFresh) refreshFresh.addEventListener('click', async () => {
-    if (!currentAnalysisId) { strategyStatus('Run analysis first.'); return; }
+    if (!currentAnalysisId) { strategyStatus('Сначала запустите анализ.'); return; }
     try {
-      const shortlist = await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId });
-      shortlistItems = shortlist.items || []; renderShortlist();
-      strategyStatus(`Shortlist refreshed: ${shortlistItems.length} candidates.`);
-    } catch (_) { strategyStatus('Shortlist refresh failed.'); }
+      applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId }));
+      strategyStatus(`Shortlist: ${shortlistItems.length} candidates.`);
+    } catch (error) { strategyStatus(`Shortlist ошибка: ${error?.message || 'unknown error'}.`); }
+  });
+  document.querySelector('#shortlist-select-all')?.addEventListener('click', () => {
+    for (const group of shortlistGroups) if (group.ready > 0) selectedScopeKeys.add(group.scope_key);
+    renderShortlist();
+  });
+  document.querySelector('#shortlist-select-none')?.addEventListener('click', () => {
+    selectedScopeKeys.clear();
+    renderShortlist();
   });
   const testerCard = strategyCards[2];
   const testerText = testerCard?.querySelector('.progress-block p');

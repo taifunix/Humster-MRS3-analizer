@@ -179,7 +179,14 @@ def test_fresh_shortlist_returns_only_safe_candidate_summary(tmp_path: Path) -> 
     analysis_id, _ = _make_analysis(tmp_path / "run.analysis-v6.duckdb")
     result = list_fresh_analysis_shortlist(tmp_path / "run.analysis-v6.duckdb", analysis_id)
 
-    assert result == {"analysis_run_id": analysis_id, "items": [{
+    assert result["analysis_run_id"] == analysis_id
+    assert result["items"] == [{
         "candidate_id": "STR-READY", "pair": "BTCUSDT", "side": "LONG",
         "timeframe": "1h", "order_count": 2, "status": "READY_MRS3_STRUCTURE",
-    }]}
+    }]
+    # The grouped view carries counts only; no order, point or lot detail leaks.
+    assert result["groups"] == [{
+        "scope_key": "BTCUSDT|LONG|1h", "pair": "BTCUSDT", "side": "LONG", "timeframe": "1h",
+        "counts": {"1ORD": 0, "2ORD": 1, "3ORD": 0, "4ORD": 0},
+        "ready": 1, "total": 1, "candidate_ids": ["STR-READY"],
+    }]

@@ -35,6 +35,13 @@ FINGERPRINT = "analysis-v6-fresh-compact-v1"
 EVENT_MODE = "real_independent_events"
 GENERATOR_SCHEMA = f"{V6_READY_GENERATOR_SCHEMA}-fresh-compact"
 _TABLES = ("points", "structures")
+# Only `structures` holds generatable candidates. `base_one_order` holds the
+# selected single-order *points* — no structure id, no orders — so they are
+# counted and shown, never offered as a READY JSON choice.
+_CANDIDATE_TABLES = ("structures",)
+_BASE_TABLE = "base_one_order"
+_ORDER_BUCKETS = (1, 2, 3, 4)
+_READY_STATUS = "READY_MRS3_STRUCTURE"
 _HASH_FIELDS = ("source_content_digest", "algorithm_config_sha256", "listing_dates_sha256")
 
 
@@ -201,17 +208,29 @@ def list_fresh_analysis_shortlist(
         raise ValueError("fresh analysis run identity mismatch")
     connection = duckdb.connect(str(analysis_file), read_only=True)
     try:
+        scope_keys = sorted(dict(manifest["scope_digests"]))
         rows = [
-            row for scope in sorted(dict(manifest["scope_digests"]))
-            for row in _rows(connection, "structures", scope)
+            row for scope in scope_keys
+            for table in _CANDIDATE_TABLES
+            for row in _rows(connection, table, scope)
+        ]
+        # The one-order base selection is a real result of the analysis, so the
+        # `1ORD` column must not stay permanently empty; it is a point, not a
+        # structure, so it cannot be generated here.
+        base_rows = [
+            row for scope in scope_keys for row in _rows(connection, _BASE_TABLE, scope)
         ]
     finally:
         connection.close()
-    items = []
+    items: list[dict[str, object]] = []
+    seen: set[str] = set()
     for row in rows:
         candidate_id = str(row.get("candidate_id", row.get("structure_id", ""))).strip()
         if not candidate_id:
             raise ValueError("fresh structure has no candidate identity")
+        if candidate_id in seen:
+            raise ValueError(f"fresh analysis has duplicate candidate identity: {candidate_id}")
+        seen.add(candidate_id)
         items.append({
             "candidate_id": candidate_id,
             "pair": str(row.get("symbol", "")),
@@ -220,7 +239,63 @@ def list_fresh_analysis_shortlist(
             "order_count": int(row.get("order_count", 0)),
             "status": str(row.get("status", "")),
         })
-    return {"analysis_run_id": analysis_id, "items": sorted(items, key=lambda item: item["candidate_id"])}
+    items.sort(key=lambda item: str(item["candidate_id"]))
+    base = [
+        {
+            "pair": str(row.get("symbol", "")),
+            "side": str(row.get("side", "")).upper(),
+            "timeframe": str(row.get("timeframe", "")),
+        }
+        for row in base_rows
+    ]
+    return {
+        "analysis_run_id": analysis_id,
+        "items": items,
+        "groups": _shortlist_groups(items, base),
+    }
+
+
+def _shortlist_groups(
+    items: Sequence[Mapping[str, object]], base: Sequence[Mapping[str, object]] = (),
+) -> list[dict[str, object]]:
+    """One row per Pair · Side · TF, counted into the bucket of its own order count.
+
+    The panel's table is headed `1ORD..4ORD`, so the counts have to come from the
+    data. Sending one flat candidate list left the panel guessing, and it guessed
+    by writing every order count into the last column.
+    """
+    grouped: dict[tuple[str, str, str], dict[str, object]] = {}
+    for item in items:
+        key = (str(item["pair"]), str(item["side"]), str(item["timeframe"]))
+        group = grouped.setdefault(key, {
+            "scope_key": "|".join(key),
+            "pair": key[0], "side": key[1], "timeframe": key[2],
+            "counts": {f"{order}ORD": 0 for order in _ORDER_BUCKETS},
+            "ready": 0, "total": 0, "candidate_ids": [],
+        })
+        group["total"] = int(group["total"]) + 1
+        bucket = f"{int(item['order_count'])}ORD"
+        counts = group["counts"]
+        # A candidate outside the canonical buckets is still counted in `total`,
+        # so the row never claims fewer candidates than it has.
+        if bucket in counts:
+            counts[bucket] = int(counts[bucket]) + 1
+        if str(item["status"]) == _READY_STATUS:
+            group["ready"] = int(group["ready"]) + 1
+            group["candidate_ids"].append(str(item["candidate_id"]))
+    for row in base:
+        key = (str(row["pair"]), str(row["side"]), str(row["timeframe"]))
+        group = grouped.setdefault(key, {
+            "scope_key": "|".join(key),
+            "pair": key[0], "side": key[1], "timeframe": key[2],
+            "counts": {f"{order}ORD": 0 for order in _ORDER_BUCKETS},
+            "ready": 0, "total": 0, "candidate_ids": [],
+        })
+        group["counts"]["1ORD"] = int(group["counts"]["1ORD"]) + 1
+        group["total"] = int(group["total"]) + 1
+    for group in grouped.values():
+        group["candidate_ids"] = sorted(group["candidate_ids"])
+    return [grouped[key] for key in sorted(grouped)]
 
 
 def generate_fresh_analysis_strategies(
@@ -261,7 +336,8 @@ def generate_fresh_analysis_strategies(
             scope_set,
         )
         all_structures = [
-            row for scope in scopes for row in _rows(connection, "structures", "|".join(scope))
+            row for scope in scopes for table in _CANDIDATE_TABLES
+            for row in _rows(connection, table, "|".join(scope))
         ]
     finally:
         connection.close()
@@ -274,7 +350,7 @@ def generate_fresh_analysis_strategies(
         if identity in all_by_id:
             raise ValueError(f"fresh analysis has duplicate candidate identity: {identity}")
         all_by_id[identity] = raw
-        if raw.get("status") == "READY_MRS3_STRUCTURE":
+        if raw.get("status") == _READY_STATUS:
             orders = raw.get("orders")
             if not isinstance(orders, (list, tuple)) or not orders or not all(isinstance(item, Mapping) for item in orders):
                 raise ValueError("READY fresh candidate has malformed orders")
