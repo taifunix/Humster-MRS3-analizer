@@ -6,6 +6,7 @@ import itertools
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
+import numpy as np
 
 from .config import AlgorithmConfig
 
@@ -36,6 +37,9 @@ STRUCTURE_COLUMNS = [
     "min_close_support",
     "source_eff_mean",
     "low_sample_depth_count",
+    "plateau_point_count",
+    "base_point_trades",
+    "plateau_total_trades",
     "Order1EventCount",
     "Order2EventCount",
     "Order3EventCount",
@@ -613,27 +617,124 @@ def select_base_one_order(
     plateaus: pd.DataFrame,
     config: AlgorithmConfig,
 ) -> pd.DataFrame:
-    """Replay at most one frozen BASE per pair+side from per-Plateau facts.
-
-    Each Plateau BASE was frozen during representative selection from
-    continuity-usable representatives whose source point is standalone-eligible;
-    this replay never re-enumerates arbitrary Plateau standalone points.
-    """
-    empty = pd.DataFrame(columns=[*points.columns, "selection_type"])
+    """Replay frozen BASE facts and select the fixed 1ORD role slots."""
+    empty = pd.DataFrame(columns=[*points.columns, "selection_type", "selection_role"])
     if plateaus.empty:
         return empty
     if "base_1ord_point_id" not in plateaus.columns:
         raise ValueError("plateaus are missing frozen operational facts")
+    identity_columns = ["point_id", "symbol", "side", "timeframe"]
+    missing_point_columns = sorted(set(identity_columns).difference(points.columns))
+    if missing_point_columns:
+        raise ValueError(f"points are missing exact identity columns: {missing_point_columns}")
+    identities = points[identity_columns].astype(str)
+    duplicate_identities = identities.loc[identities.duplicated(keep=False)]
+    if not duplicate_identities.empty:
+        duplicate = duplicate_identities.iloc[0]
+        scope = f"{duplicate['symbol']}|{duplicate['side']}|{duplicate['timeframe']}"
+        point_id = duplicate["point_id"]
+        raise ValueError(
+            f"duplicate exact identity for point {point_id}; "
+            f"missing or duplicated plateau member {point_id} in scope {scope}"
+        )
+    required = {"plateau_id", "symbol", "side", "timeframe", "all_point_ids", "ready"}
+    missing = sorted(required.difference(plateaus.columns))
+    if missing:
+        raise ValueError(f"plateaus are missing frozen selection columns: {missing}")
     base_rows = plateaus.loc[
         plateaus["ready"] & plateaus["base_1ord_point_id"].notna()
-    ]
+    ].copy()
     local_rows: list[pd.Series] = []
+    seen_bases: set[tuple[str, str]] = set()
+    if "event_mode" not in points:
+        raise ValueError("event_mode is required")
+    event_modes = points["event_mode"].astype("string").str.strip()
+    if event_modes.isna().any():
+        raise ValueError("event_mode is required")
+    modes = set(event_modes)
+    if len(modes) != 1:
+        raise ValueError("mixed event modes are not allowed")
+    mode = modes.pop()
+    if mode not in {"legacy_trades_proxy", "real_independent_events"}:
+        raise ValueError("unknown event mode")
+    legacy_event_mode = mode == "legacy_trades_proxy"
+    real_event_mode = mode == "real_independent_events"
+    if real_event_mode:
+        missing_diagnostics = sorted(
+            {"plateau_point_count", "plateau_event_count"}.difference(plateaus.columns)
+        )
+        if missing_diagnostics:
+            raise ValueError(
+                "real_independent_events selection is missing admission diagnostics: "
+                f"{missing_diagnostics}"
+            )
+    has_admission_diagnostics = (not legacy_event_mode) and {
+        "plateau_point_count", "plateau_event_count"
+    }.issubset(plateaus.columns)
     for row in base_rows.itertuples(index=False):
-        point_id = str(row.base_1ord_point_id)
-        matches = points.loc[points["point_id"].eq(point_id)]
+        scope = f"{row.symbol}|{row.side}|{row.timeframe}"
+        frozen_id = row.base_1ord_point_id
+        if pd.isna(frozen_id) or not str(frozen_id).strip():
+            raise ValueError(f"frozen BASE point is missing in scope {scope}")
+        point_id = str(frozen_id)
+        scope_base = (scope, point_id)
+        if scope_base in seen_bases:
+            raise ValueError(f"frozen base point {point_id} is duplicated in scope {scope}")
+        seen_bases.add(scope_base)
+        matches = points.loc[
+            points["point_id"].astype(str).eq(point_id)
+            & points["symbol"].astype(str).eq(str(row.symbol))
+            & points["side"].astype(str).eq(str(row.side))
+            & points["timeframe"].astype(str).eq(str(row.timeframe))
+        ]
         if len(matches) != 1:
-            raise ValueError(f"frozen base point {point_id} is missing or duplicated")
-        local_rows.append(matches.iloc[0].copy())
+            raise ValueError(f"frozen base point {point_id} is missing or duplicated in scope {scope}")
+        point = matches.iloc[0].copy()
+        if str(point.get("plateau_id")) != str(row.plateau_id):
+            raise ValueError(f"frozen base point {point_id} has plateau mismatch in scope {scope}")
+        raw_member_ids = row.all_point_ids
+        if not isinstance(raw_member_ids, (list, tuple)):
+            raise ValueError(f"frozen base point {point_id} has invalid plateau members in scope {scope}")
+        all_point_ids = tuple(str(value) for value in raw_member_ids)
+        if not all_point_ids or any(not value or value == "nan" for value in all_point_ids):
+            raise ValueError(f"frozen base point {point_id} has invalid plateau members in scope {scope}")
+        if len(all_point_ids) != len(set(all_point_ids)):
+            raise ValueError(f"frozen base point {point_id} has duplicate plateau members in scope {scope}")
+        if point_id not in all_point_ids:
+            raise ValueError(f"frozen base point {point_id} has membership mismatch in scope {scope}")
+        if not isinstance(point.get("standalone_eligible"), (bool, np.bool_)):
+            raise ValueError(f"frozen base point {point_id} has corrupt standalone eligibility in scope {scope}")
+        if not point["standalone_eligible"]:
+            raise ValueError(f"frozen base point {point_id} is not standalone-eligible in scope {scope}")
+        member_rows = []
+        for member_id in all_point_ids:
+            member_matches = points.loc[
+                points["point_id"].astype(str).eq(member_id)
+                & points["symbol"].astype(str).eq(str(row.symbol))
+                & points["side"].astype(str).eq(str(row.side))
+                & points["timeframe"].astype(str).eq(str(row.timeframe))
+            ]
+            if len(member_matches) != 1:
+                raise ValueError(f"frozen base point {point_id} has missing or duplicated plateau member {member_id} in scope {scope}")
+            member = member_matches.iloc[0]
+            if str(member.get("plateau_id")) != str(row.plateau_id):
+                raise ValueError(f"frozen base point {point_id} has plateau mismatch for member {member_id} in scope {scope}")
+            member_rows.append(member)
+        member_points = pd.DataFrame(member_rows)
+        point_count = len(all_point_ids)
+        event_count = getattr(row, "plateau_event_count", None)
+        if has_admission_diagnostics:
+            if isinstance(event_count, bool) or not isinstance(event_count, int) or event_count < 0:
+                raise ValueError(f"invalid plateau_event_count for scope {scope}")
+            plateau_trades = int(member_points["trades"].sum())
+            if event_count > plateau_trades:
+                raise ValueError(f"invalid plateau_event_count for scope {scope}")
+            if point_count < config.min_plateau_points or event_count < config.min_plateau_events_per_month:
+                continue
+        point["plateau_point_count"] = point_count
+        point["base_point_trades"] = int(point["trades"])
+        point["plateau_total_trades"] = int(member_points["trades"].sum())
+        local_rows.append(point)
     if not local_rows:
         return empty
     local = pd.DataFrame(local_rows)
@@ -642,16 +743,54 @@ def select_base_one_order(
             local["pnl_pct"] * float(config.target_dd_pct) / local["dd_pct"]
         )
     selected_rows: list[pd.Series] = []
-    for _, group in local.groupby(["symbol", "side"], sort=True):
-        selected_rows.append(
-            group.sort_values(
-                ["pnl_dd5_theoretical", "pnl_pct", "trades", "dd_pct", "point_id"],
-                ascending=[False, False, False, True, True],
-                kind="mergesort",
-            ).iloc[0]
-        )
+    group_columns = ["symbol", "side", "timeframe"]
+    for _, group in local.groupby(group_columns, sort=True):
+        if legacy_event_mode:
+            selected_rows.append(_ranked_base_point(group))
+        else:
+            selected_rows.extend(_select_base_roles(group, config, has_admission_diagnostics))
     selected = pd.DataFrame(selected_rows).reset_index(drop=True)
     selected["selection_type"] = "BASE_1ORD"
+    return selected
+
+
+def _ranked_base_point(pool: pd.DataFrame) -> pd.Series:
+    """Pick one legacy candidate with a scope-aware deterministic tie-break."""
+    order = [
+        "pnl_dd5_theoretical", "pnl_pct", "trades", "dd_pct", "point_id",
+        "symbol", "side", "timeframe",
+    ]
+    ascending = [False, False, False, True, True, True, True, True]
+    return pool.sort_values(order, ascending=ascending, kind="mergesort").iloc[0].copy()
+
+
+def _select_base_roles(
+    group: pd.DataFrame, config: AlgorithmConfig, use_admission_diagnostics: bool
+) -> list[pd.Series]:
+    """Select each fixed role from one already-admitted exact-scope pool."""
+    remaining = group.copy()
+    if not use_admission_diagnostics:
+        chosen = _ranked_base_point(remaining)
+        chosen["selection_role"] = "ECONOMY_1"
+        return [chosen]
+    values = sorted(int(value) for value in group["plateau_point_count"])
+    middle = len(values) // 2
+    median = float(values[middle]) if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+    selected: list[pd.Series] = []
+    for role in (
+        "ECONOMY_1", "STABILITY_1", "STABILITY_2", "ECONOMY_2", "FALLBACK_1",
+    ):
+        if len(selected) >= config.base_one_order_slots:
+            break
+        pool = remaining
+        if role in {"STABILITY_1", "STABILITY_2"}:
+            pool = remaining.loc[remaining["plateau_point_count"].ge(median)]
+        if pool.empty:
+            continue
+        chosen = _ranked_base_point(pool)
+        chosen["selection_role"] = role
+        selected.append(chosen)
+        remaining = remaining.drop(index=chosen.name)
     return selected
 
 
@@ -707,6 +846,29 @@ def _structure_id(
 
 
 def _order_from_point(point: pd.Series, close_support: float) -> dict[str, object]:
+    def diagnostic(name: str, fallback: object) -> int:
+        if name not in point:
+            if point.get("event_mode") == "real_independent_events":
+                raise ValueError(
+                    f"selected point {point.get('point_id', '<unknown>')} is missing plateau diagnostics: {name}"
+                )
+            return int(fallback)
+        value = point[name]
+        try:
+            missing = bool(pd.isna(value))
+        except (TypeError, ValueError):
+            missing = False
+        if missing:
+            raise ValueError(
+                f"selected point {point.get('point_id', '<unknown>')} is missing plateau diagnostics: {name}"
+            )
+        try:
+            return int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"selected point {point.get('point_id', '<unknown>')} has invalid plateau diagnostic: {name}"
+            ) from error
+
     point_event_count = point.get("point_event_count")
     if pd.isna(point_event_count):
         if point.get("event_mode") == "real_independent_events":
@@ -722,6 +884,9 @@ def _order_from_point(point: pd.Series, close_support: float) -> dict[str, objec
         "source_dd_pct": float(point["dd_pct"]),
         "source_efficiency": float(point["efficiency"]),
         "trades": int(point["trades"]),
+        "plateau_point_count": diagnostic("plateau_point_count", 1),
+        "base_point_trades": diagnostic("base_point_trades", point["trades"]),
+        "plateau_total_trades": diagnostic("plateau_total_trades", point["trades"]),
         "point_event_count": int(point_event_count),
         "close_support": float(close_support),
         "standalone_eligible": bool(point["standalone_eligible"]),
@@ -833,6 +998,21 @@ def build_structures(
                         "low_sample_depth_count": sum(
                             not bool(order["standalone_eligible"])
                             for order in numbered_orders[1:]
+                        ),
+                        "plateau_point_count": (
+                            numbered_orders[0]["plateau_point_count"]
+                            if order_count == 1
+                            else tuple(order["plateau_point_count"] for order in numbered_orders)
+                        ),
+                        "base_point_trades": (
+                            numbered_orders[0]["base_point_trades"]
+                            if order_count == 1
+                            else tuple(order["base_point_trades"] for order in numbered_orders)
+                        ),
+                        "plateau_total_trades": (
+                            numbered_orders[0]["plateau_total_trades"]
+                            if order_count == 1
+                            else tuple(order["plateau_total_trades"] for order in numbered_orders)
                         ),
                         "Order1EventCount": int(numbered_orders[0]["point_event_count"]) if len(numbered_orders) >= 1 else None,
                         "Order2EventCount": int(numbered_orders[1]["point_event_count"]) if len(numbered_orders) >= 2 else None,

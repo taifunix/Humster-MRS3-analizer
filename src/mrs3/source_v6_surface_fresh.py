@@ -33,14 +33,19 @@ _ANALYSIS_ROW_FIELDS = frozenset({
     "point_id", "symbol", "side", "timeframe", "shift_bp", "open_ma", "close_ma",
     "pnl_pct", "dd_pct", "trades", "wins", "losses", "win_rate_pct", "profit_factor",
     "weighted_trades", "max_equity_drawdown", "max_equity_drawdown_source",
-    "event_ids", "event_ids_hash", "event_mode",
+    "event_ids", "event_ids_hash", "event_mode", "events_last_30d",
 })
 _ANALYSIS_ROW_DECIMALS = ("pnl_pct", "dd_pct", "win_rate_pct", "weighted_trades", "max_equity_drawdown")
 
 
 def _validate_analysis_row(row: object) -> dict[str, object]:
     """Validate the canonical v2 compact analysis-row contract."""
-    if not isinstance(row, dict) or set(row) != _ANALYSIS_ROW_FIELDS:
+    if not isinstance(row, dict):
+        raise ValueError("invalid v2 analysis row fields")
+    missing = _ANALYSIS_ROW_FIELDS.difference(row)
+    if "events_last_30d" in missing:
+        raise ValueError("analysis row is missing events_last_30d; re-materialize the Source v6 surface")
+    if set(row) != _ANALYSIS_ROW_FIELDS:
         raise ValueError("invalid v2 analysis row fields")
     for field in ("point_id", "symbol", "side", "timeframe", "event_ids_hash", "event_mode", "max_equity_drawdown_source"):
         if type(row[field]) is not str or not row[field]:
@@ -52,6 +57,8 @@ def _validate_analysis_row(row: object) -> dict[str, object]:
     for field in ("shift_bp", "open_ma", "close_ma", "trades", "wins", "losses"):
         if type(row[field]) is not int or row[field] < 0:
             raise ValueError(f"invalid v2 analysis row {field}")
+    if type(row["events_last_30d"]) is not int or not 0 <= row["events_last_30d"] <= row["trades"]:
+        raise ValueError("invalid v2 analysis row events_last_30d")
     for field in _ANALYSIS_ROW_DECIMALS:
         value = row[field]
         if type(value) is not str:
@@ -337,7 +344,14 @@ def _publish_multiscope_surface(
     surface_id = sha256(_canonical_json({"source_content_digest": materialized.source_content_digest, "scope_digests": digests}).encode("utf-8")).hexdigest()
     for scope in scopes:
         for row in scope.analysis_input:
-            _validate_analysis_row(row)
+            try:
+                _validate_analysis_row(row)
+            except ValueError as error:
+                if "missing events_last_30d" in str(error):
+                    raise ValueError(
+                        f"{scope.scope_key}|{row.get('point_id', '<unknown>')}: {error}"
+                    ) from error
+                raise
     analysis_rows = [
         (scope.scope_key, str(row["point_id"]), _canonical_json(row))
         for scope in scopes
@@ -558,7 +572,14 @@ def read_multiscope_analysis_input(path: str | Path) -> dict[str, dict[str, obje
         raise ValueError("surface analysis input does not match its facts")
     for scope_key, members in grouped.items():
         for row in members:
-            _validate_analysis_row(row)
+            try:
+                _validate_analysis_row(row)
+            except ValueError as error:
+                if "missing events_last_30d" in str(error):
+                    raise ValueError(
+                        f"{scope_key}|{row.get('point_id', '<unknown>')}: {error}"
+                    ) from error
+                raise
             if stored_point_ids.get((scope_key, str(row["point_id"]))) != str(row["point_id"]):
                 raise ValueError("surface analysis row point id mismatch")
     return {

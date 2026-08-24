@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 from decimal import Decimal
+
+import pytest
 
 
 def _fragment(*, declared_dd: str = "50"):
@@ -252,6 +255,63 @@ def test_stage2_analysis_row_uses_canonical_decimal_audit_fields() -> None:
     assert row["max_equity_drawdown_source"] == "DECLARED"
     assert isinstance(row["pnl_pct"], str)
     assert not any(isinstance(value, float) for value in row.values())
+    assert row["events_last_30d"] == 3
+
+
+@pytest.mark.parametrize(
+    ("timestamp_ms", "expected"),
+    ((10 * 24 * 60 * 60 * 1000 - 1, 0), (10 * 24 * 60 * 60 * 1000, 1), (10 * 24 * 60 * 60 * 1000 + 1, 1)),
+)
+def test_stage2_events_last_30d_uses_explicit_half_open_cutoff(
+    timestamp_ms: int, expected: int,
+) -> None:
+    from mrs3.source_v6_materializer import analysis_input_row
+    from mrs3.source_v6_stitch import calculate_metrics
+
+    fragment = _fragment()
+    metrics = calculate_metrics((fragment,))
+    trip = replace(metrics.round_trips[0], round_trip_id="boundary", timestamp_ms=timestamp_ms)
+    metrics = replace(metrics, round_trip_ids=("boundary",), round_trips=(trip,))
+
+    row = analysis_input_row(
+        fragment.point.canonical_key, fragment.point, metrics, (fragment,), (0, 40 * 24 * 60 * 60 * 1000)
+    )
+
+    assert row["events_last_30d"] == expected
+
+
+def test_stage2_events_last_30d_rejects_event_at_window_end() -> None:
+    from mrs3.source_v6_materializer import analysis_input_row
+    from mrs3.source_v6_stitch import calculate_metrics
+
+    fragment = _fragment()
+    metrics = calculate_metrics((fragment,))
+    trip = replace(metrics.round_trips[0], round_trip_id="end", timestamp_ms=40 * 24 * 60 * 60 * 1000)
+    metrics = replace(metrics, round_trip_ids=("end",), round_trips=(trip,))
+
+    with pytest.raises(ValueError, match="outside READY witness"):
+        analysis_input_row(
+            fragment.point.canonical_key, fragment.point, metrics, (fragment,), (0, 40 * 24 * 60 * 60 * 1000)
+        )
+
+
+def test_stage2_events_last_30d_short_window_counts_the_whole_window() -> None:
+    from mrs3.source_v6_materializer import analysis_input_row
+    from mrs3.source_v6_stitch import calculate_metrics
+
+    fragment = _fragment()
+    metrics = calculate_metrics((fragment,))
+    trips = tuple(
+        replace(metrics.round_trips[index], round_trip_id=f"short-{index}", timestamp_ms=timestamp)
+        for index, timestamp in enumerate((100, 199))
+    )
+    metrics = replace(metrics, round_trip_ids=tuple(trip.round_trip_id for trip in trips), round_trips=trips)
+
+    row = analysis_input_row(
+        fragment.point.canonical_key, fragment.point, metrics, (fragment,), (100, 200)
+    )
+
+    assert row["events_last_30d"] == 2
 
 
 def test_stage2_row_validator_rejects_missing_extra_and_float_fields() -> None:
@@ -268,9 +328,49 @@ def test_stage2_row_validator_rejects_missing_extra_and_float_fields() -> None:
         {**row, "profit_factor": ""},
         {**row, "profit_factor": "+0"},
         {**row, "profit_factor": "-0"},
+        {**row, "trades": True},
+        {**row, "events_last_30d": "3"},
+        {**row, "pnl_pct": Decimal("1")},
+        {**row, "profit_factor": 1},
+        {**row, "event_ids": tuple(row["event_ids"])},
+        {**row, "event_ids": [1]},
+        None,
     ):
         try:
             _validate_analysis_row(invalid)
         except ValueError:
             continue
         raise AssertionError("invalid v2 analysis row was accepted")
+
+
+def test_stage2_missing_monthly_count_names_scope_and_point_for_rematerialization(tmp_path) -> None:
+    from mrs3.source_v6_coverage import ReadyInterval
+    from mrs3.source_v6_materializer import (
+        MaterializedFactRef,
+        MaterializedScope,
+        MaterializedSourceV6,
+        analysis_input_row,
+    )
+    from mrs3.source_v6_stitch import calculate_metrics
+    from mrs3.source_v6_surface_fresh import publish_multiscope_surface
+
+    fragment = _fragment()
+    row = analysis_input_row(
+        fragment.point.canonical_key, fragment.point, calculate_metrics((fragment,)), (fragment,), (0, 100)
+    )
+    row.pop("events_last_30d")
+    scope_key = "BTCUSDT|LONG|1h"
+    materialized = MaterializedSourceV6(
+        "source-digest",
+        (
+            MaterializedScope(
+                scope_key,
+                (MaterializedFactRef("f" * 64, fragment.point.canonical_key),),
+                ReadyInterval(scope_key, date(2020, 1, 1), date(2020, 1, 2)),
+                (row,),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"BTCUSDT\|LONG\|1h\|BTCUSDT\|LONG\|1h.*re-materialize"):
+        publish_multiscope_surface(tmp_path, materialized, filename="invalid.surface-v6.duckdb")

@@ -23,6 +23,7 @@ from mrs3.selection import (
     require_complete_operational_facts,
     select_base_one_order,
     validate_frozen_operational_facts,
+    _order_from_point,
     validate_order_tuple,
 )
 
@@ -60,6 +61,7 @@ def _point(
         "economic_pass": True,
         "standalone_eligible": standalone,
         "depth_eligible": depth,
+        "event_mode": "legacy_trades_proxy",
     }
 
 
@@ -160,6 +162,21 @@ def test_real_event_representative_rejects_missing_point_event_count() -> None:
 
     with pytest.raises(ValueError, match="point_event_count"):
         choose_equivalent_default(rows, AlgorithmConfig.defaults())
+
+
+@pytest.mark.parametrize("value", [None, float("nan")])
+def test_real_order_rejects_missing_plateau_diagnostics_descriptively(value: object) -> None:
+    point = pd.Series({
+        **_point("REAL", "P1", shift_bp=190),
+        "event_mode": "real_independent_events",
+        "plateau_point_count": value,
+        "base_point_trades": 20,
+        "plateau_total_trades": 20,
+        "point_event_count": 1,
+    })
+
+    with pytest.raises(ValueError, match="REAL.*plateau diagnostics"):
+        _order_from_point(point, 1.0)
 
 
 @pytest.mark.parametrize(
@@ -284,6 +301,21 @@ def test_base_one_order_uses_dd5_after_plateau_local_equivalence() -> None:
     assert selected.iloc[0]["selection_type"] == "BASE_1ORD"
 
 
+def test_base_one_order_skips_ready_plateau_without_frozen_base() -> None:
+    points = pd.DataFrame([
+        _point("NO_BASE", "P1", shift_bp=190, standalone=False),
+        _point("BASE", "P2", shift_bp=230),
+    ])
+    plateaus = pd.DataFrame([
+        {**_plateau("P1", ("NO_BASE",)), "base_1ord_point_id": None},
+        {**_plateau("P2", ("BASE",)), "base_1ord_point_id": "BASE"},
+    ])
+
+    selected = select_base_one_order(points, plateaus, AlgorithmConfig.defaults())
+
+    assert list(selected["point_id"]) == ["BASE"]
+
+
 def test_base_one_order_fallback_uses_configured_target_drawdown() -> None:
     points = pd.DataFrame(
         [_point("P1", "P1", shift_bp=230, pnl=100, efficiency=10)]
@@ -295,6 +327,274 @@ def test_base_one_order_fallback_uses_configured_target_drawdown() -> None:
     selected = select_base_one_order(points, updated, config)
 
     assert selected.iloc[0]["pnl_dd5_theoretical"] == pytest.approx(70.0)
+
+
+def test_base_one_order_selects_roles_per_exact_scope_with_frozen_pool() -> None:
+    points = []
+    plateaus = []
+    for index, size in enumerate((2, 2, 3, 10, 11), start=1):
+        point_id = f"P{index}"
+        member_ids = tuple(f"P{index}_{member}" for member in range(size))
+        for member, member_id in enumerate(member_ids):
+            points.append(_point(member_id, point_id, shift_bp=70 + index * 100 + member, pnl=100 - index, efficiency=10))
+        plateaus.append({
+            **_plateau(point_id, member_ids),
+            "base_1ord_point_id": member_ids[0],
+            "plateau_point_count": size,
+            "plateau_event_count": 20,
+        })
+    config = replace(
+        AlgorithmConfig.defaults(), min_plateau_points=2, min_plateau_events_per_month=0,
+    )
+    for point in points:
+        point["event_mode"] = "real_independent_events"
+
+    selected = select_base_one_order(
+        pd.DataFrame([{**point, "event_mode": "real_independent_events"} for point in points]),
+        pd.DataFrame(plateaus),
+        config,
+    )
+
+    assert list(selected["selection_role"]) == [
+        "ECONOMY_1", "STABILITY_1", "STABILITY_2", "ECONOMY_2",
+    ]
+    assert list(selected["point_id"]) == ["P3_0", "P4_0", "P5_0", "P1_0"]
+
+
+def test_base_one_order_primary_then_fallback_trace() -> None:
+    sizes = (15, 23, 12, 7)
+    points = []
+    plateaus = []
+    for index, size in enumerate(sizes, start=1):
+        plateau_id = f"P{index}"
+        member_ids = tuple(f"{plateau_id}_{member}" for member in range(size))
+        for member_id in member_ids:
+            points.append({
+                **_point(member_id, plateau_id, shift_bp=100 + index, pnl=100 - index, efficiency=10),
+                "pnl_dd5_theoretical": float(5 - index),
+            })
+        plateaus.append({
+            **_plateau(plateau_id, member_ids),
+            "base_1ord_point_id": member_ids[0],
+            "plateau_point_count": size,
+            "plateau_event_count": 20,
+        })
+
+    selected = select_base_one_order(
+        pd.DataFrame([{**point, "event_mode": "real_independent_events"} for point in points]),
+        pd.DataFrame(plateaus),
+        replace(AlgorithmConfig.defaults(), min_plateau_points=2, min_plateau_events_per_month=0),
+    )
+
+    assert list(selected["selection_role"]) == [
+        "ECONOMY_1", "STABILITY_1", "ECONOMY_2", "FALLBACK_1",
+    ]
+    assert list(selected["plateau_point_count"]) == list(sizes)
+
+
+def test_base_one_order_frozen_median_is_once_and_equality_is_inclusive() -> None:
+    sizes = (3, 5, 7, 9)
+    points = []
+    plateaus = []
+    for index, size in enumerate(sizes, start=1):
+        plateau_id = f"P{index}"
+        member_ids = tuple(f"{plateau_id}_{member}" for member in range(size))
+        for member_id in member_ids:
+            points.append({
+                **_point(member_id, plateau_id, shift_bp=100 + index, pnl=100 - index, efficiency=10),
+                "pnl_dd5_theoretical": float(5 - index),
+            })
+        plateaus.append({
+            **_plateau(plateau_id, member_ids),
+            "base_1ord_point_id": member_ids[0],
+            "plateau_point_count": size,
+            "plateau_event_count": 20,
+        })
+
+    selected = select_base_one_order(
+        pd.DataFrame([{**point, "event_mode": "real_independent_events"} for point in points]),
+        pd.DataFrame(plateaus),
+        replace(AlgorithmConfig.defaults(), min_plateau_points=2, min_plateau_events_per_month=0),
+    )
+
+    # median is 6; stability roles may only use the 7/9 pools, and 3/5 are still E pools.
+    assert list(selected["plateau_point_count"]) == [3, 7, 9, 5]
+
+
+@pytest.mark.parametrize("slots, expected", [(1, 1), (2, 2), (3, 3), (4, 4)])
+def test_base_one_order_underfills_without_repeating_candidates(slots: int, expected: int) -> None:
+    points = []
+    plateaus = []
+    for index, size in enumerate((3, 4), start=1):
+        plateau_id = f"P{index}"
+        member_ids = tuple(f"{plateau_id}_{member}" for member in range(size))
+        points.extend(
+            _point(member_id, plateau_id, shift_bp=100 + index, pnl=100 - index, efficiency=10)
+            for member_id in member_ids
+        )
+        plateaus.append({
+            **_plateau(plateau_id, member_ids),
+            "base_1ord_point_id": member_ids[0],
+            "plateau_point_count": size,
+            "plateau_event_count": 20,
+        })
+    config = replace(
+        AlgorithmConfig.defaults(),
+        min_plateau_points=2,
+        min_plateau_events_per_month=0,
+        base_one_order_slots=slots,
+    )
+
+    selected = select_base_one_order(
+        pd.DataFrame([{**point, "event_mode": "real_independent_events"} for point in points]),
+        pd.DataFrame(plateaus),
+        config,
+    )
+
+    assert len(selected) == min(expected, 2)
+    assert selected["point_id"].is_unique
+
+
+def test_base_one_order_is_deterministic_under_shuffle_and_ties() -> None:
+    points = []
+    plateaus = []
+    for index, size in enumerate((3, 3, 7), start=1):
+        plateau_id = f"P{index}"
+        member_ids = tuple(f"{plateau_id}_{member}" for member in range(size))
+        points.extend(
+            _point(member_id, plateau_id, shift_bp=100, pnl=100, efficiency=10)
+            for member_id in member_ids
+        )
+        plateaus.append({
+            **_plateau(plateau_id, member_ids),
+            "base_1ord_point_id": member_ids[0],
+            "plateau_point_count": size,
+            "plateau_event_count": 20,
+        })
+    config = replace(AlgorithmConfig.defaults(), min_plateau_points=2, min_plateau_events_per_month=0)
+    real_points = pd.DataFrame([
+        {**point, "event_mode": "real_independent_events"} for point in points
+    ])
+    expected = select_base_one_order(real_points, pd.DataFrame(plateaus), config)
+    shuffled = select_base_one_order(
+        real_points.sample(frac=1, random_state=7).reset_index(drop=True),
+        pd.DataFrame(plateaus).sample(frac=1, random_state=11).reset_index(drop=True),
+        config,
+    )
+
+    assert list(shuffled["point_id"]) == list(expected["point_id"])
+    assert list(shuffled["selection_role"]) == list(expected["selection_role"])
+
+
+def test_base_one_order_rejects_duplicate_exact_identity_globally() -> None:
+    duplicate = _point("DUP", "P1", shift_bp=100)
+    points = pd.DataFrame([duplicate, {**duplicate, "plateau_id": "P2"}])
+    plateaus = pd.DataFrame([
+        {**_plateau("P1", ("DUP",)), "base_1ord_point_id": "DUP"},
+    ])
+
+    with pytest.raises(ValueError, match="duplicate exact identity"):
+        select_base_one_order(points, plateaus, AlgorithmConfig.defaults())
+
+
+def test_base_one_order_rejects_missing_frozen_member_in_exact_scope() -> None:
+    points = pd.DataFrame([{
+        **_point("BASE", "P1", shift_bp=190),
+        "event_mode": "real_independent_events",
+    }])
+    plateaus = pd.DataFrame([{
+        **_plateau("P1", ("BASE", "MISSING")),
+        "base_1ord_point_id": "BASE",
+        "plateau_point_count": 2,
+        "plateau_event_count": 20,
+    }])
+
+    with pytest.raises(ValueError, match=r"missing or duplicated plateau member MISSING.*AAAUSDT\|LONG\|2h"):
+        select_base_one_order(points, plateaus, AlgorithmConfig.defaults())
+
+
+def test_base_one_order_rejects_duplicate_frozen_member_in_exact_scope() -> None:
+    points = pd.DataFrame([
+        {**_point("BASE", "P1", shift_bp=190), "event_mode": "real_independent_events"},
+        {**_point("M1", "P1", shift_bp=230), "event_mode": "real_independent_events"},
+        {**_point("M1", "P1", shift_bp=270), "event_mode": "real_independent_events"},
+    ])
+    plateaus = pd.DataFrame([{
+        **_plateau("P1", ("BASE", "M1")),
+        "base_1ord_point_id": "BASE",
+        "plateau_point_count": 2,
+        "plateau_event_count": 20,
+    }])
+
+    with pytest.raises(ValueError, match=r"missing or duplicated plateau member M1.*AAAUSDT\|LONG\|2h"):
+        select_base_one_order(points, plateaus, AlgorithmConfig.defaults())
+
+
+def test_base_one_order_legacy_proxy_does_not_validate_monthly_integer() -> None:
+    points = pd.DataFrame([{
+        **_point("BASE", "P1", shift_bp=190),
+        "event_mode": "legacy_trades_proxy",
+    }])
+    plateaus = pd.DataFrame([{
+        **_plateau("P1", ("BASE",)),
+        "base_1ord_point_id": "BASE",
+        "plateau_point_count": 1,
+        "plateau_event_count": "N/A_LEGACY_PROXY",
+    }])
+
+    selected = select_base_one_order(points, plateaus, AlgorithmConfig.defaults())
+
+    assert list(selected["point_id"]) == ["BASE"]
+
+
+def test_base_one_order_real_events_require_admission_diagnostics() -> None:
+    points = pd.DataFrame([{
+        **_point("BASE", "P1", shift_bp=190),
+        "event_mode": "real_independent_events",
+    }])
+    plateaus = pd.DataFrame([{
+        **_plateau("P1", ("BASE",)),
+        "base_1ord_point_id": "BASE",
+        "plateau_point_count": 1,
+    }])
+
+    with pytest.raises(ValueError, match="real_independent_events.*plateau_event_count"):
+        select_base_one_order(points, plateaus, AlgorithmConfig.defaults())
+
+
+def test_base_one_order_legacy_proxy_keeps_one_candidate_per_exact_scope() -> None:
+    first = {**_point("BASE_2H", "P2H", shift_bp=190), "event_mode": "legacy_trades_proxy"}
+    second = {
+        **_point("BASE_1H", "P1H", shift_bp=230),
+        "timeframe": "1h",
+        "event_mode": "legacy_trades_proxy",
+    }
+    plateaus = pd.DataFrame([
+        {**_plateau("P2H", ("BASE_2H",)), "base_1ord_point_id": "BASE_2H"},
+        {
+            **_plateau("P1H", ("BASE_1H",)),
+            "timeframe": "1h",
+            "base_1ord_point_id": "BASE_1H",
+        },
+    ])
+
+    selected = select_base_one_order(
+        pd.DataFrame([first, second]), plateaus, AlgorithmConfig.defaults()
+    )
+
+    assert list(selected["point_id"]) == ["BASE_1H", "BASE_2H"]
+
+
+@pytest.mark.parametrize("mode", [None, "unsupported"])
+def test_base_one_order_rejects_missing_or_unknown_event_mode(mode: object) -> None:
+    point = _point("BASE", "P1", shift_bp=190)
+    point["event_mode"] = mode
+    plateaus = pd.DataFrame([{
+        **_plateau("P1", ("BASE",)), "base_1ord_point_id": "BASE",
+    }])
+
+    with pytest.raises(ValueError, match="event_mode is required|unknown event mode"):
+        select_base_one_order(pd.DataFrame([point]), plateaus, AlgorithmConfig.defaults())
 
 
 def _structure_fixture(

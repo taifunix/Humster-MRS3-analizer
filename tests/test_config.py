@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from decimal import Decimal
+from hashlib import sha256
 import json
 from pathlib import Path
 import re
@@ -520,6 +521,147 @@ def test_defaults_match_tracked_example() -> None:
     assert default.supported_link_min == Decimal("0.75")
     assert default.plateau_envelope_min == Decimal("0.75")
     assert default.shift_factors[-1][0] == 550
+
+
+def test_base_one_order_defaults_and_absent_section_use_safe_defaults(tmp_path) -> None:
+    defaults = AlgorithmConfig.defaults()
+
+    assert defaults.min_plateau_points == 3
+    assert defaults.min_plateau_events_per_month == 20
+    assert defaults.base_one_order_slots == 4
+
+    path = tmp_path / "config.json"
+    path.write_text("{}", encoding="utf-8")
+
+    assert AlgorithmConfig.from_json(path) == defaults
+
+
+def test_base_one_order_fields_load_from_complete_section(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "base_one_order": {
+                    "min_plateau_points": 7,
+                    "min_plateau_events_per_month": 42,
+                    "slots": 2,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = AlgorithmConfig.from_json(path)
+
+    assert loaded.min_plateau_points == 7
+    assert loaded.min_plateau_events_per_month == 42
+    assert loaded.base_one_order_slots == 2
+
+
+def test_base_one_order_partial_section_defaults_missing_fields(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"base_one_order": {"min_plateau_points": 5}}),
+        encoding="utf-8",
+    )
+
+    loaded = AlgorithmConfig.from_json(path)
+
+    assert loaded.min_plateau_points == 5
+    assert loaded.min_plateau_events_per_month == 20
+    assert loaded.base_one_order_slots == 4
+
+
+def test_base_one_order_examples_have_expected_keys_and_mapping() -> None:
+    expected = {"min_plateau_points", "min_plateau_events_per_month", "slots"}
+
+    for name in ("config.example.json", "config.local.json.example"):
+        raw = json.loads(Path(name).read_text(encoding="utf-8"))
+        section = raw["base_one_order"]
+
+        assert set(section) == expected
+
+    loaded = AlgorithmConfig.from_json(Path("config.example.json"))
+    section = json.loads(Path("config.example.json").read_text(encoding="utf-8"))["base_one_order"]
+    assert loaded.min_plateau_points == section["min_plateau_points"]
+    assert loaded.min_plateau_events_per_month == section["min_plateau_events_per_month"]
+    assert loaded.base_one_order_slots == section["slots"]
+
+
+def test_base_one_order_rejects_malformed_section(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"base_one_order": []}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="base_one_order must be an object"):
+        AlgorithmConfig.from_json(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("min_plateau_points", 1, "min_plateau_points"),
+        ("min_plateau_points", True, "min_plateau_points"),
+        ("min_plateau_events_per_month", -1, "min_plateau_events_per_month"),
+        ("min_plateau_events_per_month", False, "min_plateau_events_per_month"),
+        ("base_one_order_slots", 0, "base_one_order_slots"),
+        ("base_one_order_slots", 5, "base_one_order_slots"),
+        ("base_one_order_slots", True, "base_one_order_slots"),
+        ("base_one_order_slots", 1.5, "base_one_order_slots"),
+    ],
+)
+def test_base_one_order_rejects_invalid_integer_values(
+    field: str, value: object, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        replace(AlgorithmConfig.defaults(), **{field: value})
+
+
+def test_base_one_order_rejects_invalid_json_integer_values(tmp_path) -> None:
+    for field, value in (("min_plateau_points", True), ("min_plateau_events_per_month", 1.5), ("slots", "4")):
+        path = tmp_path / f"{field}.json"
+        path.write_text(json.dumps({"base_one_order": {field: value}}), encoding="utf-8")
+
+        with pytest.raises(ValueError, match=field if field != "slots" else "base_one_order_slots"):
+            AlgorithmConfig.from_json(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("min_plateau_points", True, "min_plateau_points"),
+        ("min_plateau_events_per_month", False, "min_plateau_events_per_month"),
+        ("slots", True, "base_one_order_slots"),
+    ],
+)
+def test_base_one_order_rejects_boolean_json_values(
+    tmp_path, field: str, value: bool, message: str
+) -> None:
+    path = tmp_path / f"{field}.json"
+    path.write_text(json.dumps({"base_one_order": {field: value}}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        AlgorithmConfig.from_json(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("min_plateau_points", 4),
+        ("min_plateau_events_per_month", 21),
+        ("base_one_order_slots", 3),
+    ],
+)
+def test_base_one_order_values_change_canonical_config_hash(field: str, value: int) -> None:
+    from mrs3.pipeline import _canonical
+
+    def digest(config: AlgorithmConfig) -> str:
+        canonical = json.dumps(_canonical(config), sort_keys=True, separators=(",", ":"))
+        return sha256(canonical.encode("utf-8")).hexdigest()
+
+    default = AlgorithmConfig.defaults()
+    changed = replace(default, **{field: value})
+
+    assert digest(changed) != digest(default)
 
 
 def test_from_json_accepts_canonical_fields(tmp_path) -> None:

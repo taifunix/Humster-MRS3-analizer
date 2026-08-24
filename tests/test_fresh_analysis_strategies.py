@@ -68,6 +68,9 @@ def _order(point: dict[str, object], number: int) -> dict[str, object]:
         "source_dd_pct": point["dd_pct"],
         "source_efficiency": point["efficiency"],
         "trades": point["trades"],
+        "plateau_point_count": point.get("plateau_point_count", 1),
+        "base_point_trades": point.get("base_point_trades", point["trades"]),
+        "plateau_total_trades": point.get("plateau_total_trades", point["trades"]),
         "close_support": 1.0,
         "standalone_eligible": True,
         "depth_eligible": True,
@@ -102,6 +105,9 @@ def _make_analysis(path: Path, *, event_mode: str = "real_independent_events", r
         "common_close_ma": 9,
         "order_count": 2,
         "orders": [_order(point_a, 1), _order(point_b, 2)],
+        "plateau_point_count": [3, 4],
+        "base_point_trades": [10, 11],
+        "plateau_total_trades": [30, 40],
         "status": "READY_MRS3_STRUCTURE" if ready else "DEFERRED",
     }
     manifest = {**identity, "analysis_id": analysis_id}
@@ -150,6 +156,143 @@ def test_fresh_adapter_generates_only_selected_ready_candidate_and_binds_hashes(
     strategy = json.loads(next(result.strategies_path.glob("*.json")).read_text(encoding="utf-8"))
     assert strategy["provenance"]["candidate_identity"] == "STR-READY"
     assert strategy["provenance"]["analysis_id"] == analysis_id
+
+
+def test_fresh_strategy_provenance_keeps_only_plateau_diagnostics(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+
+    analysis_id, _ = _make_analysis(tmp_path / "run.analysis-v6.duckdb")
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+
+    result = generate_fresh_analysis_strategies(
+        tmp_path / "run.analysis-v6.duckdb",
+        analysis_id,
+        ["STR-READY"],
+        [("BTCUSDT", "LONG", "1h")],
+        template,
+        tmp_path / "out",
+        AlgorithmConfig.defaults(),
+    )
+    strategy = json.loads((result.strategies_path / "BTCUSDT_1h_LONG_2ORD_CMA9_STR-READY_EQUAL.json").read_text())
+
+    assert {
+        key: strategy["provenance"][key]
+        for key in ("plateau_point_count", "base_point_trades", "plateau_total_trades")
+    } == {
+        "plateau_point_count": [3, 4],
+        "base_point_trades": [10, 11],
+        "plateau_total_trades": [30, 40],
+    }
+    assert not any("event_count" in key.lower() for key in strategy["provenance"])
+
+
+def test_plateau_diagnostics_accept_order_aligned_tuples() -> None:
+    from mrs3.fresh_analysis_strategies import _plateau_diagnostics
+
+    assert _plateau_diagnostics({
+        "order_count": 2,
+        "orders": ({}, {}),
+        "plateau_point_count": (3, 4),
+        "base_point_trades": (10, 11),
+        "plateau_total_trades": (30, 40),
+    }) == {
+        "plateau_point_count": (3, 4),
+        "base_point_trades": (10, 11),
+        "plateau_total_trades": (30, 40),
+    }
+
+
+def test_fresh_base_structure_publishes_one_equal_variant(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    connection = duckdb.connect(str(database))
+    try:
+        point = _point("BTCUSDT|LONG|1h|100|3|9", 100, 3, "event-a")
+        connection.execute(
+            "insert into structures values (?, ?)",
+            [
+                "BTCUSDT|LONG|1h",
+                json.dumps({
+                    "structure_id": "BASE-READY",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "timeframe": "1h",
+                    "common_close_ma": 9,
+                    "order_count": 1,
+                    "orders": [_order(point, 1)],
+                    "plateau_point_count": 3,
+                    "base_point_trades": 10,
+                    "plateau_total_trades": 30,
+                    "status": "READY_MRS3_STRUCTURE",
+                }, sort_keys=True, separators=(",", ":")),
+            ],
+        )
+    finally:
+        connection.close()
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+
+    result = generate_fresh_analysis_strategies(
+        database,
+        analysis_id,
+        ["BASE-READY"],
+        [("BTCUSDT", "LONG", "1h")],
+        template,
+        tmp_path / "out",
+        AlgorithmConfig.defaults(),
+    )
+
+    assert result.strategy_count == 1
+    assert [path.name for path in result.strategies_path.glob("*.json")] == [
+        "BTCUSDT_1h_LONG_1ORD_CMA9_BASE-READY_EQUAL.json"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("plateau_point_count", 3),
+        ("base_point_trades", [10]),
+        ("plateau_total_trades", [30, "40"]),
+    ],
+)
+def test_fresh_generation_rejects_malformed_multiorder_diagnostics(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    connection = duckdb.connect(str(database))
+    try:
+        raw = connection.execute(
+            "select payload_json from structures where scope_key=?",
+            ["BTCUSDT|LONG|1h"],
+        ).fetchone()[0]
+        structure = json.loads(raw)
+        structure[field] = value
+        connection.execute(
+            "update structures set payload_json=? where scope_key=?",
+            [json.dumps(structure, sort_keys=True, separators=(",", ":")), "BTCUSDT|LONG|1h"],
+        )
+    finally:
+        connection.close()
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="diagnostic"):
+        generate_fresh_analysis_strategies(
+            database,
+            analysis_id,
+            ["STR-READY"],
+            [("BTCUSDT", "LONG", "1h")],
+            template,
+            tmp_path / "out",
+            AlgorithmConfig.defaults(),
+        )
 
 
 @pytest.mark.parametrize("event_mode", ["legacy_trades_proxy", "mixed"])

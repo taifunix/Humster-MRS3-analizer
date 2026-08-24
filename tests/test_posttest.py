@@ -142,6 +142,70 @@ def test_compare_posttest_accepts_tester_runner_column_names() -> None:
     assert tables.normalized.iloc[0]["pnl30_dd5"] == Decimal("15.00")
 
 
+def test_compare_posttest_preserves_plateau_diagnostics_in_final_order() -> None:
+    raw = pd.DataFrame(
+        [{
+            "strategy_name": "A",
+            "total_pnl_pct": 20.0,
+            "max_drawdown_pct": 10.0,
+            "win_rate": 80.0,
+            "profit_factor": 2.0,
+            "total_trades": 20,
+            "days_in_test": 20,
+        }]
+    )
+    variants = pd.DataFrame([{
+        "strategy_name": "A",
+        "lots": '["1.000000000000", "0.000000000000"]',
+        "order_count": 2,
+        "plateau_point_count": [3, 4],
+        "base_point_trades": [10, 11],
+        "plateau_total_trades": [30, 40],
+    }])
+
+    tables = compare_posttest(raw, variants, AlgorithmConfig.defaults())
+
+    comparison = tables.comparison.iloc[0]
+    assert comparison["plateau_point_count"] == [3, 4]
+    assert comparison["base_point_trades"] == [10, 11]
+    assert comparison["plateau_total_trades"] == [30, 40]
+    assert tables.comparison.columns.tolist().index("order_count") < tables.comparison.columns.tolist().index("plateau_point_count")
+
+
+def test_compare_posttest_reads_plateau_diagnostics_from_embedded_settings() -> None:
+    settings = {
+        "name": "A",
+        "basic": {"use_long": True},
+        "mrs3": {
+            "ma_long": [{"lot_x": 1.0, "multiplier": 0.99}],
+            "ma_close_long": {"len": 9},
+        },
+        "provenance": {
+            "plateau_point_count": 3,
+            "base_point_trades": 10,
+            "plateau_total_trades": 30,
+        },
+    }
+    raw = pd.DataFrame([{
+        "strategy_name": "A",
+        "total_pnl_pct": 20.0,
+        "max_drawdown_pct": 10.0,
+        "win_rate": 80.0,
+        "profit_factor": 2.0,
+        "total_trades": 20,
+        "days_in_test": 20,
+        "strategy_settings_json": json.dumps(settings),
+    }])
+    variants = pd.DataFrame([{"strategy_name": "A", "lots": '["1.0"]'}])
+
+    tables = compare_posttest(raw, variants, AlgorithmConfig.defaults())
+
+    comparison = tables.comparison.iloc[0]
+    assert comparison["plateau_point_count"] == 3
+    assert comparison["base_point_trades"] == 10
+    assert comparison["plateau_total_trades"] == 30
+
+
 def test_compare_posttest_measures_holding_until_full_close_only() -> None:
     raw = pd.DataFrame(
         [

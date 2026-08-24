@@ -351,6 +351,9 @@ class AlgorithmConfig:
     close_multiplier_long: Decimal = Decimal("1.003")
     close_multiplier_short: Decimal = Decimal("0.997")
     min_point_events: int = 3
+    min_plateau_points: int = 3
+    min_plateau_events_per_month: int = 20
+    base_one_order_slots: int = 4
 
     def __post_init__(self) -> None:
         missing_base = sorted(set(DEFAULT_BASE_COLUMNS).difference(self.base_columns))
@@ -520,6 +523,26 @@ class AlgorithmConfig:
             raise ValueError("close_multiplier_short must be between zero and one")
         if self.min_point_events < 1:
             raise ValueError("min_point_events must be at least one")
+        if (
+            isinstance(self.min_plateau_points, bool)
+            or not isinstance(self.min_plateau_points, int)
+            or self.min_plateau_points < 2
+        ):
+            raise ValueError("min_plateau_points must be an integer at least 2")
+        if (
+            isinstance(self.min_plateau_events_per_month, bool)
+            or not isinstance(self.min_plateau_events_per_month, int)
+            or self.min_plateau_events_per_month < 0
+        ):
+            raise ValueError(
+                "min_plateau_events_per_month must be a non-negative integer"
+            )
+        if (
+            isinstance(self.base_one_order_slots, bool)
+            or not isinstance(self.base_one_order_slots, int)
+            or not 1 <= self.base_one_order_slots <= 4
+        ):
+            raise ValueError("base_one_order_slots must be an integer from 1 to 4")
 
     @classmethod
     def defaults(cls) -> "AlgorithmConfig":
@@ -528,6 +551,9 @@ class AlgorithmConfig:
     @classmethod
     def from_json(cls, path: Path) -> "AlgorithmConfig":
         raw = json.loads(path.read_text(encoding="utf-8"))
+        base_one_order = raw.get("base_one_order", {})
+        if not isinstance(base_one_order, dict):
+            raise ValueError("base_one_order must be an object")
         base_rates = _base_rates_from_json(raw.get("base_rate_tf", cls().base_rates))
         columns = raw.get("columns", {})
         base = dict(DEFAULT_BASE_COLUMNS)
@@ -631,4 +657,9 @@ class AlgorithmConfig:
                 str(raw.get("close_multiplier", {}).get("short", 0.997))
             ),
             min_point_events=int(raw.get("event_filter", {}).get("min_point_events", 3)),
+            min_plateau_points=base_one_order.get("min_plateau_points", 3),
+            min_plateau_events_per_month=base_one_order.get(
+                "min_plateau_events_per_month", 20
+            ),
+            base_one_order_slots=base_one_order.get("slots", 4),
         )

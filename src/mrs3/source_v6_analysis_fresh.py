@@ -17,7 +17,7 @@ import duckdb
 import pandas as pd
 
 from .locking import OutputDirectoryLock
-from .pipeline import ALGORITHM_VERSION, _analyze_points, _canonical
+from .pipeline import ALGORITHM_VERSION, _analyze_points, _base_structure, _canonical
 from .source_v6 import _canonical_json
 from .source_v6_materializer import analysis_input_row
 from .source_v6_stitch import measure_points
@@ -31,6 +31,7 @@ from .source_v6_surface_fresh import (
 
 FINGERPRINT = "analysis-v6-fresh-compact-v1"
 _TABLES = ("points", "refine_requests", "plateaus", "close_profiles", "base_one_order", "structures", "structure_diagnostics")
+_ADMISSION_ONLY_FIELDS = frozenset({"events_last_30d", "plateau_event_count"})
 
 
 def _analysis_frame_row(row: Mapping[str, object], window: tuple, listing_dates: Mapping[str, object]) -> dict[str, object]:
@@ -60,6 +61,7 @@ def _analysis_frame_row(row: Mapping[str, object], window: tuple, listing_dates:
         "win_rate_pct": float(row["win_rate_pct"]),
         "profit_factor": None if profit_factor is None else float(profit_factor),
         "point_event_count": len(event_ids), "_event_ids": event_ids,
+        "events_last_30d": int(row["events_last_30d"]),
         "event_ids_hash": str(row["event_ids_hash"]), "event_mode": str(row["event_mode"]),
         "report_start": pd.Timestamp(start), "report_end": pd.Timestamp(end),
         "listing_date": pd.to_datetime(listing_dates[symbol], utc=True),
@@ -112,7 +114,31 @@ def _scope_rows(
 
 
 def _frames(stages: object) -> dict[str, list[dict[str, object]]]:
-    return {name: _records(getattr(stages, name)) for name in _TABLES}
+    frames = {}
+    for name in _TABLES:
+        records = _records(getattr(stages, name))
+        frames[name] = records if name == "plateaus" else [_strip_admission_fields(row) for row in records]
+    # Fresh analysis publishes BASE candidates through the canonical structure
+    # frame. The legacy pipeline's in-memory ``stages.structures`` remains
+    # multi-order-only; this projection is deliberately fresh-path-only.
+    base_records = [
+        _strip_admission_fields({key: _jsonable(value) for key, value in _base_structure(point).items()})
+        for _, point in getattr(stages, "base_one_order").iterrows()
+    ]
+    frames["structures"].extend(sorted(base_records, key=lambda row: str(row["structure_id"])))
+    return frames
+
+
+def _strip_admission_fields(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _strip_admission_fields(item)
+            for key, item in value.items()
+            if key not in _ADMISSION_ONLY_FIELDS
+        }
+    if isinstance(value, list):
+        return [_strip_admission_fields(item) for item in value]
+    return value
 
 
 def _records(frame: pd.DataFrame) -> list[dict[str, object]]:

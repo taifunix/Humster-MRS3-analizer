@@ -12,7 +12,7 @@ from openpyxl import load_workbook
 
 from mrs3.config import AlgorithmConfig
 from mrs3.models import Side
-from mrs3.pipeline import PipelineInput, SelectionInputs, _pair_history, _write_json_atomic, run_published_pipeline, run_selection
+from mrs3.pipeline import ALGORITHM_VERSION, PipelineInput, SelectionInputs, _apply_package_event_unions, _pair_history, _write_json_atomic, run_published_pipeline, run_selection
 from tests.factories import write_selection_inputs
 from tests.test_package_loader import write_real_package
 
@@ -69,7 +69,7 @@ def test_published_pipeline_scopes_listing_dates_and_fails_closed(monkeypatch: p
 
     result = run_published_pipeline(PipelineInput("surface", points), Path("dates.csv"), Side.LONG, AlgorithmConfig.defaults())
 
-    assert result.algorithm_version == "0.7-canonical-phase1"
+    assert result.algorithm_version == ALGORITHM_VERSION
     assert result.algorithm_config["listing_dates"] == {"AAAUSDT": "2020-01-01T00:00:00+00:00"}
     monkeypatch.setattr(pipeline, "load_listing_dates", lambda _: {})
     with pytest.raises(ValueError, match="missing listing dates"):
@@ -113,6 +113,10 @@ def test_pipeline_builds_two_plateaus_and_validated_json(tmp_path: Path) -> None
     assert set(result.plateaus["plateau_event_count"]) == {"N/A_LEGACY_PROXY"}
     assert set(result.plateaus["plateau_event_ids_hash"]) == {"N/A_LEGACY_PROXY"}
     assert result.manifest["event_eligible_point_count"] == int(result.points["event_eligible"].sum())
+    assert result.lot_variants.loc[
+        result.lot_variants["variant_type"].eq("BASE_1ORD"),
+        ["plateau_point_count", "base_point_trades", "plateau_total_trades"],
+    ].notna().all().all()
     assert (inputs.output_dir / "audit.xlsx").exists()
     workbook = load_workbook(inputs.output_dir / "audit.xlsx", read_only=True)
     assert workbook.sheetnames == [
@@ -285,6 +289,136 @@ def test_pipeline_real_plateau_union_includes_event_ineligible_geometry_point(
     assert plateau.plateau_event_ids_hash == hashlib.sha256(
         "|".join(expected_events).encode("utf-8")
     ).hexdigest()
+
+
+def test_pipeline_monthly_event_scalar_missing_fails_plateau_admission() -> None:
+    points = pd.DataFrame([
+        {"point_id": "A", "event_mode": "real_independent_events", "_event_ids": ("e1",), "events_last_30d": None},
+        {"point_id": "B", "event_mode": "real_independent_events", "_event_ids": ("e2",), "events_last_30d": 1},
+    ])
+    plateaus = pd.DataFrame([{
+        "plateau_id": "P1",
+        "all_point_ids": ("A", "B"),
+        "status": "MRS3_USABLE",
+        "ready": True,
+    }])
+
+    result = _apply_package_event_unions(points, plateaus)
+
+    assert result.loc[0, "plateau_event_count"] is None
+    assert result.loc[0, "status"] == "INSUFFICIENT_INDEPENDENT_EVENTS"
+    assert not bool(result.loc[0, "ready"])
+
+
+def test_pipeline_monthly_event_count_sums_points_without_deduplicating_ids() -> None:
+    points = pd.DataFrame([
+        {
+            "point_id": "A",
+            "event_mode": "real_independent_events",
+            "_event_ids": ("shared",),
+            "events_last_30d": 3,
+        },
+        {
+            "point_id": "B",
+            "event_mode": "real_independent_events",
+            "_event_ids": ("shared",),
+            "events_last_30d": 4,
+        },
+    ])
+    plateaus = pd.DataFrame([{
+        "plateau_id": "P1",
+        "all_point_ids": ("A", "B"),
+        "status": "MRS3_USABLE",
+        "ready": True,
+    }])
+
+    result = _apply_package_event_unions(points, plateaus)
+
+    assert result.loc[0, "plateau_event_count"] == 7
+    assert result.loc[0, "plateau_event_ids_hash"] == hashlib.sha256(
+        b"shared"
+    ).hexdigest()
+
+
+def test_pipeline_monthly_event_scalar_invalidates_only_its_plateau() -> None:
+    points = pd.DataFrame([
+        {
+            "point_id": "A",
+            "event_mode": "real_independent_events",
+            "_event_ids": ("e1",),
+            "events_last_30d": None,
+        },
+        {
+            "point_id": "B",
+            "event_mode": "real_independent_events",
+            "_event_ids": ("e2",),
+            "events_last_30d": 1,
+        },
+        {
+            "point_id": "C",
+            "event_mode": "real_independent_events",
+            "_event_ids": ("e3",),
+            "events_last_30d": 4,
+        },
+    ])
+    plateaus = pd.DataFrame([
+        {
+            "plateau_id": "P1",
+            "all_point_ids": ("A", "B"),
+            "status": "MRS3_USABLE",
+            "ready": True,
+        },
+        {
+            "plateau_id": "P2",
+            "all_point_ids": ("C",),
+            "status": "MRS3_USABLE",
+            "ready": True,
+        },
+    ])
+
+    result = _apply_package_event_unions(points, plateaus)
+
+    assert pd.isna(result.loc[0, "plateau_event_count"])
+    assert result.loc[0, "status"] == "INSUFFICIENT_INDEPENDENT_EVENTS"
+    assert not bool(result.loc[0, "ready"])
+    assert result.loc[1, "plateau_event_count"] == 4
+    assert result.loc[1, "status"] == "MRS3_USABLE"
+    assert bool(result.loc[1, "ready"])
+
+
+def test_pipeline_rejects_mixed_event_modes_before_plateau_union() -> None:
+    points = pd.DataFrame([
+        {
+            "point_id": "A",
+            "event_mode": "legacy_trades_proxy",
+            "_event_ids": (),
+        },
+        {
+            "point_id": "B",
+            "event_mode": "real_independent_events",
+            "_event_ids": ("e1",),
+        },
+    ])
+    plateaus = pd.DataFrame([{
+        "plateau_id": "P1",
+        "all_point_ids": ("A", "B"),
+        "status": "MRS3_USABLE",
+        "ready": True,
+    }])
+
+    with pytest.raises(ValueError, match="mixed event modes"):
+        _apply_package_event_unions(points, plateaus)
+
+
+@pytest.mark.parametrize("mode", [None, "unsupported"])
+def test_pipeline_rejects_missing_or_unknown_event_mode(mode: object) -> None:
+    points = pd.DataFrame([{"point_id": "A", "event_mode": mode}])
+    plateaus = pd.DataFrame([{
+        "plateau_id": "P1", "all_point_ids": ("A",), "status": "MRS3_USABLE", "ready": True,
+    }])
+
+    with pytest.raises(ValueError, match="event_mode is required|unknown event mode"):
+        _apply_package_event_unions(points, plateaus)
 
 
 def test_same_inputs_produce_identical_digest_rows_and_json(tmp_path: Path) -> None:

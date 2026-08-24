@@ -6,6 +6,8 @@ Humster MRS3 Analyzer — локальный, детерминированный
 
 **Текущий статус:** код v0.6 перенесён в корневой пакет как baseline; продуктовая работа начинается с v0.7. Реальная эффективность MRS3 пока не доказана: до завершения materialization и tick-tests любые source-метрики — только диагностика.
 
+BASE 1ORD selection (`docs/specs/2026-08-24-base-1ord-selection.md`) implemented and verified on the fresh CXMT corpus under `0.7-canonical-phase1-base-1ord-v3`; it publishes reproducible 1ORD BASE structures. This does not establish realized MRS3 PnL or replace tick-tests.
+
 ## Пользовательский результат
 
 Для одного сравнимого периода и одной стороны рынка пользователь получает:

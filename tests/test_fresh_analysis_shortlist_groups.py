@@ -43,8 +43,8 @@ def _base_selection() -> dict:
     return _point("BTCUSDT|LONG|1h|100|3|9", 100, 3, "event-a")
 
 
-def test_the_one_order_column_is_not_permanently_empty(tmp_path: Path) -> None:
-    """The base selection is a real result and must be counted, not hidden."""
+def test_point_only_base_table_does_not_create_a_one_order_candidate(tmp_path: Path) -> None:
+    """The point-only BASE table cannot create a selectable structure."""
     from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
 
     database = tmp_path / "run.analysis-v6.duckdb"
@@ -53,8 +53,8 @@ def test_the_one_order_column_is_not_permanently_empty(tmp_path: Path) -> None:
 
     result = list_fresh_analysis_shortlist(database, analysis_id)
 
-    assert result["groups"][0]["counts"]["1ORD"] == 1
-    # It is a point, not a structure, so it cannot be generated and is not offered.
+    assert result["groups"][0]["counts"]["1ORD"] == 0
+    assert result["groups"][0]["total"] == 1
     assert result["groups"][0]["candidate_ids"] == ["STR-READY"]
 
 
@@ -72,9 +72,36 @@ def test_the_shortlist_is_grouped_with_a_count_per_order_bucket(tmp_path: Path) 
     group = result["groups"][0]
     assert (group["pair"], group["side"], group["timeframe"]) == ("BTCUSDT", "LONG", "1h")
     # The bucket a candidate belongs to is its own order count, never the last column.
-    assert group["counts"] == {"1ORD": 1, "2ORD": 1, "3ORD": 0, "4ORD": 0}
-    assert group["ready"] == 1 and group["total"] == 2
+    assert group["counts"] == {"1ORD": 0, "2ORD": 1, "3ORD": 0, "4ORD": 0}
+    assert group["ready"] == 1 and group["total"] == 1
     assert group["candidate_ids"] == ["STR-READY"]
+
+
+def test_a_base_structure_is_selectable_without_base_table_evidence(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _surface = _make_analysis(database)
+    _add_rows(
+        database,
+        "structures",
+        [{
+            "structure_id": "BASE-READY",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "timeframe": "1h",
+            "common_close_ma": 9,
+            "order_count": 1,
+            "orders": [],
+            "status": "READY_MRS3_STRUCTURE",
+        }],
+    )
+
+    result = list_fresh_analysis_shortlist(database, analysis_id)
+
+    group = result["groups"][0]
+    assert group["counts"]["1ORD"] == 1
+    assert group["candidate_ids"] == ["BASE-READY", "STR-READY"]
 
 
 def test_a_candidate_that_is_not_ready_is_counted_but_not_offered(tmp_path: Path) -> None:

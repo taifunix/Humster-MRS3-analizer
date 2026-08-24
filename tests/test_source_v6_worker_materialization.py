@@ -143,11 +143,13 @@ def test_no_hydrated_fragment_crosses_the_worker_boundary(tmp_path: Path) -> Non
     # W7: the row is scalars and event ids. The balance and equity series stay
     # in the worker, which is what keeps the boundary small.
     assert row["point_id"] == idle_key and row["trades"] == 0
+    assert row["events_last_30d"] == 0
     assert set(row) == {
         "point_id", "symbol", "side", "timeframe", "shift_bp", "open_ma", "close_ma",
         "pnl_pct", "dd_pct", "trades", "wins", "losses", "win_rate_pct",
         "profit_factor", "event_ids", "event_ids_hash", "event_mode",
         "weighted_trades", "max_equity_drawdown", "max_equity_drawdown_source",
+        "events_last_30d",
     }
     flattened = json.dumps(verdict, default=str)
     assert "SourceV6Fragment" not in flattened

@@ -41,6 +41,11 @@
     "isolated_peak_relative": 0.9,
     "equivalent_tolerance": 0.05
   },
+  "base_one_order": {
+    "min_plateau_points": 3,
+    "min_plateau_events_per_month": 20,
+    "slots": 4
+  },
   "close_support": {"core_min": 0.9, "supported_min": 0.75},
   "gap": {
     "middle_zone_start_bp": 150,

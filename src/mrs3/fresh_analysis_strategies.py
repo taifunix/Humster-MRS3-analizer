@@ -35,14 +35,54 @@ FINGERPRINT = "analysis-v6-fresh-compact-v1"
 EVENT_MODE = "real_independent_events"
 GENERATOR_SCHEMA = f"{V6_READY_GENERATOR_SCHEMA}-fresh-compact"
 _TABLES = ("points", "structures")
-# Only `structures` holds generatable candidates. `base_one_order` holds the
-# selected single-order *points* — no structure id, no orders — so they are
-# counted and shown, never offered as a READY JSON choice.
 _CANDIDATE_TABLES = ("structures",)
-_BASE_TABLE = "base_one_order"
 _ORDER_BUCKETS = (1, 2, 3, 4)
 _READY_STATUS = "READY_MRS3_STRUCTURE"
 _HASH_FIELDS = ("source_content_digest", "algorithm_config_sha256", "listing_dates_sha256")
+_PLATEAU_DIAGNOSTIC_COLUMNS = (
+    "plateau_point_count",
+    "base_point_trades",
+    "plateau_total_trades",
+)
+
+
+def _plateau_diagnostics(structure: Mapping[str, object]) -> dict[str, object]:
+    """Validate the persisted scalar/list shape before publishing provenance."""
+    try:
+        order_count = int(structure["order_count"])
+        orders = structure["orders"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("fresh structure has invalid diagnostic context") from error
+    if not isinstance(orders, (list, tuple)) or len(orders) != order_count:
+        raise ValueError("fresh structure has invalid diagnostic context")
+    diagnostics: dict[str, object] = {}
+    missing: list[str] = []
+    malformed: list[str] = []
+    for column in _PLATEAU_DIAGNOSTIC_COLUMNS:
+        if column not in structure:
+            missing.append(column)
+            continue
+        value = structure[column]
+        if order_count == 1:
+            valid = type(value) is int and value >= 0
+        else:
+            valid = (
+                isinstance(value, (list, tuple))
+                and len(value) == order_count
+                and all(type(item) is int and item >= 0 for item in value)
+            )
+        if not valid:
+            malformed.append(column)
+            continue
+        diagnostics[column] = value
+    if missing:
+        raise ValueError(
+            "fresh structure is missing plateau diagnostics; re-materialize analysis: "
+            f"{missing}"
+        )
+    if malformed:
+        raise ValueError(f"fresh structure has malformed plateau diagnostics: {malformed}")
+    return diagnostics
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,12 +269,6 @@ def list_fresh_analysis_shortlist(
             for table in _CANDIDATE_TABLES
             for row in _rows(connection, table, scope)
         ]
-        # The one-order base selection is a real result of the analysis, so the
-        # `1ORD` column must not stay permanently empty; it is a point, not a
-        # structure, so it cannot be generated here.
-        base_rows = [
-            row for scope in scope_keys for row in _rows(connection, _BASE_TABLE, scope)
-        ]
     finally:
         connection.close()
     items: list[dict[str, object]] = []
@@ -255,23 +289,15 @@ def list_fresh_analysis_shortlist(
             "status": str(row.get("status", "")),
         })
     items.sort(key=lambda item: str(item["candidate_id"]))
-    base = [
-        {
-            "pair": str(row.get("symbol", "")),
-            "side": str(row.get("side", "")).upper(),
-            "timeframe": str(row.get("timeframe", "")),
-        }
-        for row in base_rows
-    ]
     return {
         "analysis_run_id": analysis_id,
         "items": items,
-        "groups": _shortlist_groups(items, base),
+        "groups": _shortlist_groups(items),
     }
 
 
 def _shortlist_groups(
-    items: Sequence[Mapping[str, object]], base: Sequence[Mapping[str, object]] = (),
+    items: Sequence[Mapping[str, object]],
 ) -> list[dict[str, object]]:
     """One row per Pair · Side · TF, counted into the bucket of its own order count.
 
@@ -298,16 +324,6 @@ def _shortlist_groups(
         if str(item["status"]) == _READY_STATUS:
             group["ready"] = int(group["ready"]) + 1
             group["candidate_ids"].append(str(item["candidate_id"]))
-    for row in base:
-        key = (str(row["pair"]), str(row["side"]), str(row["timeframe"]))
-        group = grouped.setdefault(key, {
-            "scope_key": "|".join(key),
-            "pair": key[0], "side": key[1], "timeframe": key[2],
-            "counts": {f"{order}ORD": 0 for order in _ORDER_BUCKETS},
-            "ready": 0, "total": 0, "candidate_ids": [],
-        })
-        group["counts"]["1ORD"] = int(group["counts"]["1ORD"]) + 1
-        group["total"] = int(group["total"]) + 1
     for group in grouped.values():
         group["candidate_ids"] = sorted(group["candidate_ids"])
     return [grouped[key] for key in sorted(grouped)]
@@ -416,7 +432,12 @@ def generate_fresh_analysis_strategies(
     variants: list[dict[str, object]] = []
     for structure in structures:
         candidate_identity = str(structure.get("candidate_id", structure["structure_id"]))
-        provenance = {**common, "candidate_identity": candidate_identity}
+        diagnostics = _plateau_diagnostics(structure)
+        provenance = {
+            **common,
+            **diagnostics,
+            "candidate_identity": candidate_identity,
+        }
         methods = (LotMethod.EQUAL,) if int(structure["order_count"]) == 1 else (LotMethod.EQUAL, LotMethod.INCOME)
         for method in methods:
             strategy = generate_strategy(
@@ -429,6 +450,7 @@ def generate_fresh_analysis_strategies(
             variants.append({
                 "strategy_name": strategy["name"], "structure_id": structure["structure_id"],
                 "lot_method": method.value, "json_filename": f"{strategy['name']}.json", "variant_type": "MRS3",
+                **diagnostics,
             })
     validate_unique_names(generated)
     target.mkdir(parents=True, exist_ok=True)

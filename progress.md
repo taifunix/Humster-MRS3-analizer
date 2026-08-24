@@ -3,6 +3,15 @@
 **Updated:** 2026-08-24
 **Current branch:** `main`
 
+## BASE 1ORD selection (2026-08-24)
+
+Implemented algorithm `0.7-canonical-phase1-base-1ord-v3`. Fresh CXMT corpus
+evidence (`workers=30/30/8`) produced 26 BASE candidates: 15m `[8,12,12,4]`,
+5m `[15,23,12,7]`, 1h `[3,10,13,8]`, 30m `[5,31,7,3]`, 45m `[5,16,20,14]`,
+4h `[6,4,3]`, 2h `[27,3]`, 3h `[4]`; only 5m size 7 was appended as
+`FALLBACK_1`. Full verification: `1736 passed, 2 skipped, 2 warnings`.
+This is selection evidence, not tick-test or realized MRS3 PnL evidence.
+
 ## Panel Web trust/design alignment (2026-08-24)
 
 Merged into `main` at `2a40518` after independent `CODE_REVIEW_PASS`.

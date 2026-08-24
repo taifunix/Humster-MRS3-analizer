@@ -34,6 +34,13 @@ class PosttestArtifacts:
     manifest: Path
 
 
+_PLATEAU_DIAGNOSTIC_COLUMNS = (
+    "plateau_point_count",
+    "base_point_trades",
+    "plateau_total_trades",
+)
+
+
 def _decimal(value: object) -> Decimal:
     return Decimal(str(value))
 
@@ -339,6 +346,7 @@ def _final_comparison_columns(frame: pd.DataFrame) -> pd.DataFrame:
         "side",
         "timeframe",
         "order_count",
+        *_PLATEAU_DIAGNOSTIC_COLUMNS,
         "common_close_ma",
         "first_shift_bp",
         "shift_bp_vector",
@@ -626,6 +634,12 @@ def _strategy_order_metadata(strategy: Mapping[str, object]) -> dict[str, object
         "order_count": len(orders),
         "common_close_ma": close_ma,
         "first_shift_bp": int(shifts[0]) if has_shift_multipliers else None,
+        **{
+            column: strategy["provenance"][column]
+            for column in _PLATEAU_DIAGNOSTIC_COLUMNS
+            if isinstance(strategy.get("provenance"), Mapping)
+            and column in strategy["provenance"]
+        },
     }
 
 
@@ -871,7 +885,11 @@ def compare_posttest(
     if variants["strategy_name"].duplicated().any():
         raise ValueError("variant strategy names must be unique")
     variant_columns = ["strategy_name", "lots"]
-    for column in ("shift_bp_vector", "side", "order_count", "common_close_ma", "first_shift_bp"):
+    variant_metadata_columns = (
+        "shift_bp_vector", "side", "order_count", "common_close_ma", "first_shift_bp",
+        *_PLATEAU_DIAGNOSTIC_COLUMNS,
+    )
+    for column in variant_metadata_columns:
         if column in variants.columns and column not in raw.columns:
             variant_columns.append(column)
     merged = raw.merge(variants[variant_columns], on="strategy_name", how="left", validate="one_to_one")
@@ -879,7 +897,7 @@ def compare_posttest(
         embedded_variants = _variants_from_tester_strategy_settings(raw)
         if embedded_variants is not None:
             embedded_by_name = embedded_variants.set_index("strategy_name")
-            for column in ("shift_bp_vector", "side", "order_count", "common_close_ma", "first_shift_bp"):
+            for column in variant_metadata_columns:
                 if column in embedded_by_name.columns and column not in merged.columns:
                     merged[column] = merged["strategy_name"].map(embedded_by_name[column])
     if merged["lots"].isna().any():

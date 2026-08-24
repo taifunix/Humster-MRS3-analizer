@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
+from numbers import Real
 from typing import Mapping
 
 import pandas as pd
@@ -33,7 +34,7 @@ from .strategy_json import (
 )
 
 
-ALGORITHM_VERSION = "0.7-canonical-phase1"
+ALGORITHM_VERSION = "0.7-canonical-phase1-base-1ord-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +235,9 @@ def _base_structure(point: pd.Series) -> dict[str, object]:
         "source_dd_pct": float(point["dd_pct"]),
         "source_efficiency": float(point["efficiency"]),
         "trades": int(point["trades"]),
+        "plateau_point_count": int(point.get("plateau_point_count", 1)),
+        "base_point_trades": int(point.get("base_point_trades", point["trades"])),
+        "plateau_total_trades": int(point.get("plateau_total_trades", point["trades"])),
         "close_support": 1.0,
         "standalone_eligible": bool(point["standalone_eligible"]),
         "depth_eligible": bool(point["depth_eligible"]),
@@ -246,6 +250,9 @@ def _base_structure(point: pd.Series) -> dict[str, object]:
         "common_close_ma": int(point["close_ma"]),
         "order_count": 1,
         "orders": (order,),
+        "plateau_point_count": int(point.get("plateau_point_count", 1)),
+        "base_point_trades": int(point.get("base_point_trades", point["trades"])),
+        "plateau_total_trades": int(point.get("plateau_total_trades", point["trades"])),
         "status": "READY_MRS3_STRUCTURE",
     }
 
@@ -321,6 +328,14 @@ def _build_variants(
                 "order_count": structure["order_count"],
                 "lots": tuple(str(lot) for lot in lots),
                 "json_filename": filename,
+                **{
+                    column: structure.get(column)
+                    for column in (
+                        "plateau_point_count",
+                        "base_point_trades",
+                        "plateau_total_trades",
+                    )
+                },
             }
         )
         generated.append(strategy)
@@ -343,6 +358,9 @@ def _build_variants(
             "order_count",
             "lots",
             "json_filename",
+            "plateau_point_count",
+            "base_point_trades",
+            "plateau_total_trades",
         ],
     )
     return variants, generated
@@ -402,10 +420,26 @@ def _recalibration_table(config: AlgorithmConfig) -> pd.DataFrame:
 def _apply_package_event_unions(
     points: pd.DataFrame, plateaus: pd.DataFrame
 ) -> pd.DataFrame:
+    """Attach plateau event counts, summing monthly point counts when present."""
+    if points.empty:
+        return plateaus
     if plateaus.empty:
         return plateaus
+    if "event_mode" not in points:
+        raise ValueError("event_mode is required")
+    event_modes = points["event_mode"].astype("string").str.strip()
+    if event_modes.isna().any():
+        raise ValueError("event_mode is required")
+    modes = set(event_modes)
+    if len(modes) != 1:
+        raise ValueError("mixed event modes are not allowed")
+    if not modes <= {"legacy_trades_proxy", "real_independent_events"}:
+        raise ValueError("unknown event mode")
     output = plateaus.copy()
-    mode = str(points["event_mode"].iloc[0])
+    output["plateau_point_count"] = output["all_point_ids"].map(
+        lambda values: len(set(str(value) for value in values))
+    )
+    mode = modes.pop()
     if mode == "legacy_trades_proxy":
         output["plateau_event_count"] = "N/A_LEGACY_PROXY"
         output["plateau_event_ids_hash"] = "N/A_LEGACY_PROXY"
@@ -419,6 +453,19 @@ def _apply_package_event_unions(
     point_events = dict(
         zip(points["point_id"].astype(str), points["_event_ids"], strict=True)
     )
+    has_monthly_counts = "events_last_30d" in points
+    recent_events: dict[str, int] = {}
+    if has_monthly_counts:
+        for row in points.itertuples(index=False):
+            value = row.events_last_30d
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not float(value).is_integer()
+                or value < 0
+            ):
+                continue
+            recent_events[str(row.point_id)] = int(value)
     unions = [
         sorted(
             {
@@ -429,12 +476,55 @@ def _apply_package_event_unions(
         )
         for point_ids in output["all_point_ids"]
     ]
-    output["plateau_event_count"] = [len(event_ids) for event_ids in unions]
+    if has_monthly_counts:
+        plateau_counts: list[int | None] = []
+        invalid_plateaus: list[bool] = []
+        for point_ids in output["all_point_ids"]:
+            member_ids = tuple(str(point_id) for point_id in point_ids)
+            invalid = any(point_id not in recent_events for point_id in member_ids)
+            invalid_plateaus.append(invalid)
+            plateau_counts.append(
+                None
+                if invalid
+                else sum(recent_events[point_id] for point_id in member_ids)
+            )
+        output["plateau_event_count"] = plateau_counts
+        output.loc[invalid_plateaus, "status"] = "INSUFFICIENT_INDEPENDENT_EVENTS"
+        output.loc[invalid_plateaus, "ready"] = False
+    else:
+        output["plateau_event_count"] = [
+            len({
+                event_id
+                for point_id in point_ids
+                for event_id in point_events.get(str(point_id), ())
+            })
+            for point_ids in output["all_point_ids"]
+        ]
     output["plateau_event_ids_hash"] = [
         hashlib.sha256("|".join(event_ids).encode("utf-8")).hexdigest()
         for event_ids in unions
     ]
     return output
+
+
+def _attach_plateau_diagnostics(points: pd.DataFrame, plateaus: pd.DataFrame) -> pd.DataFrame:
+    points = points.copy()
+    if plateaus.empty:
+        return points
+    by_point: dict[str, tuple[int, int]] = {}
+    for row in plateaus.itertuples(index=False):
+        member_ids = {str(value) for value in row.all_point_ids}
+        total_trades = int(points.loc[points["point_id"].astype(str).isin(member_ids), "trades"].sum())
+        for point_id in member_ids:
+            by_point[point_id] = (int(row.plateau_point_count), total_trades)
+    points["plateau_point_count"] = points["point_id"].astype(str).map(
+        lambda point_id: by_point.get(point_id, (None, None))[0]
+    )
+    points["plateau_total_trades"] = points["point_id"].astype(str).map(
+        lambda point_id: by_point.get(point_id, (None, None))[1]
+    )
+    points["base_point_trades"] = points["trades"].astype(int)
+    return points
 
 
 def _analyze_points(points: pd.DataFrame, config: AlgorithmConfig) -> _AnalysisStages:
@@ -443,6 +533,7 @@ def _analyze_points(points: pd.DataFrame, config: AlgorithmConfig) -> _AnalysisS
     refine_requests = _aggregate_refine_requests(raw_missing)
     plateau_points, plateaus = build_plateaus(refined, config)
     plateaus = _apply_package_event_unions(plateau_points, plateaus)
+    plateau_points = _attach_plateau_diagnostics(plateau_points, plateaus)
     isolated = find_isolated_peaks(plateau_points, config)
     plateaus, close_profiles = build_close_profiles(plateau_points, plateaus, config)
     base_one_order = select_base_one_order(plateau_points, plateaus, config)

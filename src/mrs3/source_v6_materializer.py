@@ -81,6 +81,10 @@ def analysis_input_row(
     event_ids = tuple(sorted(set(getattr(metrics, "round_trip_ids", metrics.events))))
     if any(event_id not in event_times or not start_ms <= event_times[event_id] < end_ms for event_id in event_ids):
         raise ValueError(f"point events are outside READY witness: {point_key}")
+    cutoff_ms = max(start_ms, end_ms - 30 * 24 * 60 * 60 * 1000)
+    events_last_30d = sum(
+        cutoff_ms <= event_times[event_id] < end_ms for event_id in event_ids
+    )
     return {
         "point_id": point_key,
         "symbol": point.symbol,
@@ -102,6 +106,7 @@ def analysis_input_row(
         "event_ids": list(event_ids),
         "event_ids_hash": sha256("|".join(event_ids).encode("utf-8")).hexdigest(),
         "event_mode": "real_independent_events",
+        "events_last_30d": events_last_30d,
     }
 
 
