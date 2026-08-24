@@ -149,6 +149,8 @@ def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
     assert 'remote_html_path: document.querySelector' in js
     assert 'remote_db_target: document.querySelector' in js
     assert "/api/v2/settings/save" in js
+    assert js.index("['source-remote-html', 'remote_import_html_root']") < js.index("if (remoteHtml && !remoteHtml.value")
+    assert "remoteHtml?.addEventListener('change', () => updateRemoteTarget(true))" in js
 
 
 def test_merge_card_offers_catalog_choices_and_visible_progress() -> None:

@@ -268,15 +268,13 @@
       const remoteHtml = document.querySelector('#source-remote-html');
       const remoteTarget = document.querySelector('#source-remote-staging');
       const remoteLocalTarget = document.querySelector('#source-remote-target');
-      const updateRemoteTarget = () => {
-        if (remoteTarget && paths.remote_source_db_root) remoteTarget.value = `${paths.remote_source_db_root.replace(/\/$/, '')}/${sourceName(remoteHtml?.value || '')}`;
-        if (remoteLocalTarget && paths.local_source_db_root) {
+      const updateRemoteTarget = (force = false) => {
+        if (remoteTarget && paths.remote_source_db_root && (force || !remoteTarget.value)) remoteTarget.value = `${paths.remote_source_db_root.replace(/\/$/, '')}/${sourceName(remoteHtml?.value || '')}`;
+        if (remoteLocalTarget && paths.local_source_db_root && (force || !remoteLocalTarget.value)) {
           const root = paths.local_source_db_root.replace(/[\\/][^\\/]*$/, '');
           remoteLocalTarget.value = `${root}\\${sourceName(remoteHtml?.value || '')}`;
         }
       };
-      if (remoteHtml && paths.remote_reports_archive_root) remoteHtml.value = paths.remote_reports_archive_root;
-      updateRemoteTarget();
       for (const [id, key] of [
         ['source-local-html', 'local_reports_root'], ['source-local-target', 'local_source_db_root'],
         ['source-remote-html', 'remote_import_html_root'], ['source-remote-staging', 'remote_import_staging_path'],
@@ -288,7 +286,9 @@
         const input = document.querySelector(`#${id}`);
         if (input && paths[key]) input.value = paths[key];
       }
-      remoteHtml?.addEventListener('change', updateRemoteTarget);
+      if (remoteHtml && !remoteHtml.value && paths.remote_reports_archive_root) remoteHtml.value = paths.remote_reports_archive_root;
+      updateRemoteTarget();
+      remoteHtml?.addEventListener('change', () => updateRemoteTarget(true));
       await loadSourceCatalog();
       await loadSurfaceCatalog();
       const connection = document.querySelector('.connection-status');
