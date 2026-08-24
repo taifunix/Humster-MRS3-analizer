@@ -265,9 +265,21 @@
       if (analysisTarget && paths.analysis_db_root && !analysisTarget.value) {
         analysisTarget.value = paths.analysis_db_root;
       }
+      const remoteHtml = document.querySelector('#source-remote-html');
+      const remoteTarget = document.querySelector('#source-remote-staging');
       const remoteLocalTarget = document.querySelector('#source-remote-target');
+      const updateRemoteTarget = () => {
+        if (remoteTarget && paths.remote_source_db_root) remoteTarget.value = `${paths.remote_source_db_root.replace(/\/$/, '')}/${sourceName(remoteHtml?.value || '')}`;
+        if (remoteLocalTarget && paths.local_source_db_root) {
+          const root = paths.local_source_db_root.replace(/[\\/][^\\/]*$/, '');
+          remoteLocalTarget.value = `${root}\\${sourceName(remoteHtml?.value || '')}`;
+        }
+      };
+      if (remoteHtml && paths.remote_reports_archive_root) remoteHtml.value = paths.remote_reports_archive_root;
+      updateRemoteTarget();
       for (const [id, key] of [
         ['source-local-html', 'local_reports_root'], ['source-local-target', 'local_source_db_root'],
+        ['source-remote-html', 'remote_import_html_root'], ['source-remote-staging', 'remote_import_staging_path'],
         ['source-remote-target', 'remote_import_target_path'], ['merge-source-a', 'local_merge_source_a'],
         ['merge-source-b', 'local_merge_source_b'], ['merge-target', 'local_merge_target'],
         ['settings-local-runner', 'local_runner_root'],
@@ -276,6 +288,7 @@
         const input = document.querySelector(`#${id}`);
         if (input && paths[key]) input.value = paths[key];
       }
+      remoteHtml?.addEventListener('change', updateRemoteTarget);
       await loadSourceCatalog();
       await loadSurfaceCatalog();
       const connection = document.querySelector('.connection-status');
@@ -594,7 +607,7 @@
     input_paths: [document.querySelector('#merge-source-a')?.value || '', document.querySelector('#merge-source-b')?.value || ''],
     target_path: document.querySelector('#merge-target')?.value || '',
   }));
-  const remoteSourceCard = document.querySelector('#source-remote-target')?.closest('.panel-card');
+  const remoteSourceCard = document.querySelector('#source-remote-html')?.closest('.panel-card');
   const inputValue = (id) => document.querySelector(`#${id}`)?.value || '';
   const savePathDefaults = async (card, path_defaults) => {
     try {
@@ -619,12 +632,16 @@
   bindPathSave(localImportCard?.querySelectorAll('.button-row button')[1], localImportCard, () => ({
     local_reports_root: inputValue('source-local-html'), local_source_db_root: inputValue('source-local-target'),
   }));
+  bindPathSave(remoteSourceCard?.querySelectorAll('.button-row button')[1], remoteSourceCard, () => ({
+    remote_import_html_root: inputValue('source-remote-html'), remote_import_staging_path: inputValue('source-remote-staging'),
+    remote_import_target_path: inputValue('source-remote-target'),
+  }));
   bindPathSave(localMergeCard?.querySelectorAll('.button-row button')[1], localMergeCard, () => ({
     local_merge_source_a: inputValue('merge-source-a'), local_merge_source_b: inputValue('merge-source-b'),
     local_merge_target: inputValue('merge-target'),
   }));
   if (remoteSourceCard) {
-    const [check, start] = remoteSourceCard.querySelectorAll('.button-row button');
+    const [check, , start] = remoteSourceCard.querySelectorAll('.button-row button');
     let remoteSourceJob = '';
     let remoteSourceTarget = '';
     let remoteSourcePoller = 0;
@@ -676,7 +693,8 @@
     if (start) start.addEventListener('click', async () => {
       try {
         const request = {
-          remote_html_subdir: document.querySelector('#source-remote-html')?.value || '',
+          remote_html_path: document.querySelector('#source-remote-html')?.value || '',
+          remote_db_target: document.querySelector('#source-remote-staging')?.value || '',
           local_target_path: document.querySelector('#source-remote-target')?.value || '',
         };
         const result = await remoteRequest('/api/v2/source/remote/start', request);
