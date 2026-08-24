@@ -11,6 +11,11 @@ Panel verification: **341 passed**; full project verification: **1668 passed,
 remain in the working tree; a pre-merge archive is stored at
 `backups/main-dirty-before-panel-merge-2026-08-24-102131.zip`.
 
+The remote Source DB card now accepts a relative report-folder selector under
+the configured archive root (`c6b7d8b`); absolute and traversal selectors are
+rejected server-side. Independent review: `CODE_REVIEW_PASS`. Panel
+verification after this fix: **345 passed**.
+
 ## Source v6 facts/metrics v2 Stage 3–4 (2026-08-23)
 
 M7 validates declarations during normalization before encoding. PnL uses the
