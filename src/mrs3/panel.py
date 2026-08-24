@@ -1889,8 +1889,8 @@ class PanelController:
         target = self._path(self._required(payload, "local_target_path"))
         if target.exists() or target.is_symlink():
             raise ValueError("local source db target already exists")
-        remote_html = str(payload.get("remote_html_path", "")).strip()
-        remote_target = str(payload.get("remote_db_target", "")).strip()
+        remote_html = str(payload.get("remote_html_path") or "").strip()
+        remote_target = str(payload.get("remote_db_target") or "").strip()
         if not remote_html or not remote_target:
             config = getattr(executor, "config", None)
             reports_root = getattr(config, "reports_archive_root", "")
@@ -1898,7 +1898,7 @@ class PanelController:
             if not isinstance(reports_root, str) or not isinstance(source_root, str) or not reports_root or not source_root:
                 raise RemoteSourceDbError("invalid remote source db request")
             remote_html = reports_root.rstrip("/")
-            remote_target = f"{source_root.rstrip('/')}/{target.name}"
+            remote_target = source_root.rstrip("/") + "/" + target.name
         job = self._start_tracked_panel_job(
             "source.remote-import", {"operation": "remote-import"},
             (f"source:{self._panel_resource(str(target).casefold())}",),

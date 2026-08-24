@@ -683,3 +683,31 @@ def test_controller_derives_remote_source_paths_from_server_config(tmp_path: Pat
     controller.source_db_remote_start({"local_target_path": str(target)})
 
     assert calls == [("/opt/hb1/reports-archive", "/opt/hb1/source-db/run-set.source-v6.duckdb")]
+
+
+def test_controller_derives_remote_source_paths_when_legacy_fields_are_null(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class Executor:
+        config = SimpleNamespace(
+            reports_archive_root="/opt/hb1/reports-archive",
+            source_db_root="/opt/hb1/source-db",
+        )
+
+        def start_import(self, remote_html: str, remote_target: str, *, job_id: str) -> dict[str, object]:
+            calls.append((remote_html, remote_target))
+            return {"job_id": job_id, "state": "RUNNING", "phase": "REMOTE_IMPORT", "progress": {}}
+
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    controller._remote_source_executor = Executor()
+    target = tmp_path / "run-set.source-v6.duckdb"
+
+    controller.source_db_remote_start({
+        "local_target_path": str(target),
+        "remote_html_path": None,
+        "remote_db_target": None,
+    })
+
+    assert calls == [("/opt/hb1/reports-archive", "/opt/hb1/source-db/run-set.source-v6.duckdb")]
