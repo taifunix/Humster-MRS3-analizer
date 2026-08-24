@@ -311,6 +311,25 @@ def test_dd5_atomic_workbook_uses_direct_target_and_required_sheets(tmp_path: Pa
     assert set(json.loads(config_json)) == {field.name for field in __import__("dataclasses").fields(AlgorithmConfig)}
 
 
+def test_dd5_atomic_failure_before_replace_preserves_existing_workbook(tmp_path: Path, monkeypatch) -> None:
+    request = _request(tmp_path)
+    imported = import_performance_batch(request)
+    with duckdb.connect(str(request.database)) as connection:
+        connection.execute(
+            "update strategy_versions set settings_json = ?",
+            [json.dumps({"mrs3": {"ma_long": [{"lot_x": 1}]}})],
+        )
+    target = tmp_path / "workbooks" / "existing.dd5.xlsx"
+    target.parent.mkdir()
+    target.write_bytes(b"previous workbook")
+    import mrs3.performance_dd5 as performance_dd5
+
+    monkeypatch.setattr(performance_dd5, "_verify_workbook", lambda path: (_ for _ in ()).throw(ValueError("bad staged workbook")))
+    with pytest.raises(ValueError, match="bad staged workbook"):
+        run_performance_dd5_atomic(request.database, imported.import_id, target, AlgorithmConfig.defaults())
+    assert target.read_bytes() == b"previous workbook"
+
+
 def test_dd5_rejects_stored_metric_mismatch_beyond_declared_precision(
     tmp_path: Path,
 ) -> None:

@@ -449,12 +449,13 @@ class LocalPerformanceDd5Jobs:
         with self._lock:
             result_document = {
                 "import_id": result.import_id,
-                "database": str(result.database),
+                "database_name": result.database.name,
                 "database_status": result.database_status,
             } if isinstance(result, PerformanceImportPanelResult) else {
                 "import_id": result.import_id,
                 "dd5_run_id": result.dd5_run_id,
                 "dd5_mode": result.dd5_mode,
+                "workbook_name": result.artifacts.workbook.name,
             }
             self._jobs[job_id].update(state="COMMITTED", phase="COMMITTED", error=None, result=result_document)
             snapshot = dict(self._jobs[job_id])

@@ -198,6 +198,18 @@ def test_performance_database_allocator_never_overwrites_existing_db(tmp_path: P
     assert first.read_bytes() == b""
 
 
+def test_performance_database_allocator_handles_many_collisions_and_rejects_paths(tmp_path: Path) -> None:
+    root = tmp_path / "performance"
+    base = allocate_performance_database(root, ("BTCUSDT",), "2026-02-01", "2026-09-06")
+    base.touch()
+    for suffix in (2, 3, 4):
+        (root / f"BTC_01.02-06.09_{suffix}.performance-v6.duckdb").touch()
+    chosen = allocate_performance_database(root, ("BTCUSDT",), "2026-02-01", "2026-09-06")
+    assert chosen.name == "BTC_01.02-06.09_5.performance-v6.duckdb"
+    with pytest.raises(ValueError):
+        performance_database_name(("../escape",), "2026-02-01", "2026-09-06")
+
+
 def test_import_service_is_independent_and_copies_audit_sidecar(tmp_path: Path) -> None:
     request = _request(tmp_path)
     root = tmp_path / "data" / "performanceDB"
