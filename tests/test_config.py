@@ -64,6 +64,24 @@ def test_panel_path_defaults_reject_traversal(tmp_path) -> None:
         load_panel_path_settings(path)
 
 
+def test_panel_path_defaults_reject_drive_relative_paths(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(json.dumps({"panel_paths": {"analysis_root": "C:outside"}}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="panel_paths.analysis_root"):
+        load_panel_path_settings(path)
+
+
+def test_panel_path_defaults_prefer_explicit_values_over_legacy_keys(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(json.dumps({
+        "panel_paths": {"analysis_dir": "new/Analysis"},
+        "duckdb_import": {"analysis_duckdb_path": "old/Analysis/run.duckdb"},
+    }), encoding="utf-8")
+
+    assert load_panel_path_settings(path).analysis_root == Path("new/Analysis")
+
+
 def test_panel_path_defaults_match_tracked_examples() -> None:
     expected = {
         "analysis_root": "data/Analysis",

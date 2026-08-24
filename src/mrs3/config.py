@@ -90,7 +90,7 @@ def _panel_relative_path(value: object, name: str) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"panel_paths.{name} must be a relative path")
     candidate = Path(value.strip().replace("\\", "/"))
-    if candidate.is_absolute() or ".." in candidate.parts or "." in candidate.parts:
+    if candidate.is_absolute() or ":" in candidate.parts[0] or ".." in candidate.parts or "." in candidate.parts:
         raise ValueError(f"panel_paths.{name} must be a relative path")
     return candidate
 
@@ -103,12 +103,15 @@ def load_panel_path_settings(path: Path) -> PanelPathSettings:
     if section is not None and not isinstance(section, dict):
         raise ValueError("panel_paths must be an object")
     values = {field: getattr(defaults, field) for field in PanelPathSettings.__dataclass_fields__}
+    configured_fields: set[str] = set()
     if isinstance(section, dict):
         unknown = sorted(set(section).difference(_PANEL_PATH_KEYS))
         if unknown:
             raise ValueError("panel_paths contains unknown keys: " + ", ".join(unknown))
         for key, value in section.items():
-            values[_PANEL_PATH_KEYS[key]] = _panel_relative_path(value, _PANEL_PATH_KEYS[key])
+            field = _PANEL_PATH_KEYS[key]
+            configured_fields.add(field)
+            values[field] = _panel_relative_path(value, field)
 
     # Legacy tester_runner keys remain valid until a panel_paths value replaces them.
     tester = raw.get("tester_runner")
@@ -118,13 +121,20 @@ def load_panel_path_settings(path: Path) -> PanelPathSettings:
             ("tester_strategy_dir", "strategy_dir"),
             ("tester_config", "tester_config"),
         ):
-            if field not in (section or {}) and isinstance(tester.get(key), str) and tester[key].strip():
+            if field not in configured_fields and isinstance(tester.get(key), str) and tester[key].strip():
                 values[field] = Path(tester[key])
     importer = raw.get("duckdb_import")
-    if "analysis_root" not in (section or {}) and isinstance(importer, dict):
+    if "analysis_root" not in configured_fields and isinstance(importer, dict):
         analysis = importer.get("analysis_duckdb_path")
         if isinstance(analysis, str) and analysis.strip():
             values["analysis_root"] = Path(analysis).parent
+    panel = raw.get("panel")
+    if "analysis_root" not in configured_fields and isinstance(panel, dict):
+        paths = panel.get("path_defaults")
+        if isinstance(paths, dict):
+            analysis = paths.get("analysis_db_root") or paths.get("local_analysis_db_root")
+            if isinstance(analysis, str) and analysis.strip():
+                values["analysis_root"] = Path(analysis)
     return PanelPathSettings(**values)
 
 

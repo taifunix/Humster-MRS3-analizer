@@ -2176,7 +2176,7 @@ class PanelController:
                 continue
             analyses.append({
                 "name": path.name,
-                "path": str(path),
+                "analysis_ref": path.relative_to(directory).as_posix(),
                 "analysis_run_id": identity["analysis_run_id"],
                 "surface_id": identity["surface_id"],
                 "scopes": len(identity["scope_keys"]),
@@ -2185,10 +2185,24 @@ class PanelController:
 
     def strategies_fresh_open(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Register a committed analysis so its shortlist can be read without a rerun."""
+        root = self._panel_path("analysis_root")
+        if root.is_file() or root.suffix.casefold() == ".duckdb":
+            root = root.parent
+        reference = payload.get("analysis_ref")
+        if isinstance(reference, str) and reference.strip():
+            candidate = Path(reference.strip().replace("\\", "/"))
+            if candidate.is_absolute() or ".." in candidate.parts:
+                raise PanelJobError("ANALYSIS_PATH_NOT_ALLOWED")
+            path = (root / candidate).resolve()
+        else:
+            try:
+                path = self._path(self._required(payload, "analysis_path"))
+            except ValueError:
+                raise PanelJobError("ANALYSIS_PATH_REQUIRED") from None
         try:
-            path = self._path(self._required(payload, "analysis_path"))
+            path.relative_to(root.resolve())
         except ValueError:
-            raise PanelJobError("ANALYSIS_PATH_REQUIRED") from None
+            raise PanelJobError("ANALYSIS_PATH_NOT_ALLOWED") from None
         try:
             identity = read_fresh_analysis_identity(path)
         except (OSError, ValueError, KeyError, duckdb.Error):
@@ -3172,7 +3186,7 @@ class PanelController:
     def _analysis_path(self) -> Path:
         analysis = self._import_settings().analysis_duckdb_path
         if analysis is None:
-            return self._panel_path("analysis_root")
+            raise ValueError("analysis_duckdb_path must be configured")
         return self._path(analysis)
 
     def _with_analysis(self, read_only: bool, callback: Callable[[duckdb.DuckDBPyConnection], object]) -> object:
