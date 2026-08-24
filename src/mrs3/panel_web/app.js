@@ -239,7 +239,6 @@
       const paths = bootstrap.defaults?.panel?.path_defaults || {};
       const operational = bootstrap.defaults?.operational || {};
       for (const [id, key] of [
-        ['settings-remote-runner', 'remote_runner_root'],
         ['settings-source-root', 'source_db_path'], ['settings-output-root', 'output_root'],
         ['settings-dates', 'listing_dates_path'], ['settings-algorithm', 'algorithm_version'],
         ['settings-workers', 'import_workers'], ['settings-batch', 'transaction_batch_size'],
@@ -283,7 +282,7 @@
         ['source-remote-html', 'remote_import_html_root'], ['source-remote-staging', 'remote_import_staging_path'],
         ['source-remote-target', 'remote_import_target_path'], ['merge-source-a', 'local_merge_source_a'],
         ['merge-source-b', 'local_merge_source_b'], ['merge-target', 'local_merge_target'],
-        ['settings-local-runner', 'local_runner_root'], ['settings-remote-runner', 'remote_runner_root'],
+        ['settings-local-runner', 'local_runner_root'],
         ['settings-source-root', 'local_source_db_root'], ['settings-output-root', 'local_output_root'],
       ]) {
         const input = document.querySelector(`#${id}`);
@@ -1372,15 +1371,13 @@
     default_root: document.querySelector('#settings-default-root')?.value || 'static',
     path_defaults: {
       local_runner_root: document.querySelector('#settings-local-runner')?.value || '',
-      remote_runner_root: document.querySelector('#settings-remote-runner')?.value || '',
-      local_source_db_root: document.querySelector('#settings-source-root')?.value || '',
+       local_source_db_root: document.querySelector('#settings-source-root')?.value || '',
       local_output_root: document.querySelector('#settings-output-root')?.value || '',
       listing_dates_path: document.querySelector('#settings-dates')?.value || '',
       surface_target_path: document.querySelector('#surface-target')?.value || '',
     },
   }, operational: {
-    remote_runner_root: document.querySelector('#settings-remote-runner')?.value || '',
-    source_db_path: document.querySelector('#settings-source-root')?.value || '',
+     source_db_path: document.querySelector('#settings-source-root')?.value || '',
     output_root: document.querySelector('#settings-output-root')?.value || '',
     listing_dates_path: document.querySelector('#settings-dates')?.value || '',
     algorithm_version: document.querySelector('#settings-algorithm')?.value || '',
