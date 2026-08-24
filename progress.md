@@ -1,7 +1,15 @@
 # MRS3 — current verification
 
-**Updated:** 2026-08-23
+**Updated:** 2026-08-24
 **Current branch:** `main`
+
+## Panel Web trust/design alignment (2026-08-24)
+
+Merged into `main` at `2a40518` after independent `CODE_REVIEW_PASS`.
+Panel verification: **341 passed**; full project verification: **1668 passed,
+2 skipped, 2 warnings**. The untracked BASE/1ORD specification and panel plans
+remain in the working tree; a pre-merge archive is stored at
+`backups/main-dirty-before-panel-merge-2026-08-24-102131.zip`.
 
 ## Source v6 facts/metrics v2 Stage 3–4 (2026-08-23)
 
