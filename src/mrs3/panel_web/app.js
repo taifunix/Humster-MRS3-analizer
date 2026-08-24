@@ -143,21 +143,39 @@
   const breadcrumb = document.querySelector('#breadcrumb');
   const status = document.querySelector('#status');
   const panelReload = document.querySelector('#panel-reload');
+  const showRequestError = (error) => {
+    if (status) status.textContent = error?.message || 'Backend request failed.';
+  };
+  const requestJson = async (endpoint, options = {}) => {
+    try {
+      const response = await fetch(endpoint, options);
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.toLowerCase().includes('application/json')) {
+        throw new Error(response.ok ? 'Backend returned invalid JSON.' : 'Server validation failed.');
+      }
+      let result;
+      try { result = await response.json(); } catch (_) { throw new Error('Backend returned invalid JSON.'); }
+      if (!response.ok) throw new Error('Server validation failed.');
+      return result;
+    } catch (error) {
+      const safe = error instanceof TypeError ? new Error('Backend connection unavailable.') : error;
+      showRequestError(safe);
+      throw safe;
+    }
+  };
   panelReload?.addEventListener('click', async () => {
     panelReload.disabled = true;
     panelReload.textContent = 'Перезапуск…';
     try {
-      const response = await fetch('/api/v2/panel/restart', {
+      const result = await requestJson('/api/v2/panel/restart', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
       });
-      const result = await response.json();
-      if (!response.ok || !result.restarting) throw new Error(result.error || 'restart failed');
+      if (!result.restarting) throw new Error('Server validation failed.');
       window.setTimeout(() => {
         let attempts = 0;
         const poll = window.setInterval(async () => {
           try {
-            const ready = await fetch('/api/v2/bootstrap');
-            if (!ready.ok) throw new Error('panel unavailable');
+            await requestJson('/api/v2/bootstrap');
             window.clearInterval(poll);
             window.location.reload();
           } catch (_) {
@@ -210,7 +228,7 @@
 
   async function loadSafeDefaults() {
     try {
-      const bootstrap = await fetch("/api/v2/bootstrap").then((response) => response.json());
+      const bootstrap = await requestJson('/api/v2/bootstrap');
       const root = bootstrap.defaults?.panel?.default_root;
       const selector = document.querySelector('#settings-default-root');
       if (selector && (root === 'legacy' || root === 'static')) selector.value = root;
@@ -276,7 +294,7 @@
       await loadSurfaceCatalog();
       const connection = document.querySelector('.connection-status');
       if (connection) connection.lastChild.textContent = 'LOCAL BACKEND CONNECTED';
-      const local = await fetch("/api/v2/testing/local/status").then((response) => response.json());
+      const local = await requestJson('/api/v2/testing/local/status');
       const target = document.querySelector('#runner-local .card-status');
       if (target) target.textContent = local.preflight_ok
         ? `Runner ready · ${Math.floor((local.disk_free_bytes || 0) / 1024 ** 3)} GB free`
@@ -288,7 +306,7 @@
 
   async function loadRemoteStatus() {
     try {
-      const remote = await fetch("/api/v2/testing/remote/status").then((response) => response.json());
+      const remote = await requestJson('/api/v2/testing/remote/status');
       const target = document.querySelector('#runner-remote .card-status');
       if (target) target.textContent = remote.configured
         ? `Удалённый runner настроен (${remote.auth_method}).`
@@ -299,12 +317,9 @@
   }
 
   async function remoteRequest(endpoint, body = {}) {
-    const response = await fetch(endpoint, {
+    return requestJson(endpoint, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || 'remote request failed');
-    return result;
   }
 
   const remoteCardStatus = (message) => {
@@ -337,7 +352,7 @@
   let remoteProgressPoller = 0;
   const refreshRemoteProgress = async () => {
     try {
-      const progress = await fetch('/api/v2/testing/remote/progress').then((response) => response.json());
+      const progress = await requestJson('/api/v2/testing/remote/progress');
       if (progress.total) remoteCardStatus(`Тестирование: ${progress.current} / ${progress.total} (${progress.percent}%).`);
     } catch (_) { /* Keep the last known status while a remote job is active. */ }
   };
@@ -366,15 +381,13 @@
   if (localFill) localFill.addEventListener('click', async () => {
     const value = (id) => document.querySelector(id)?.value || '';
     try {
-      const response = await fetch("/api/v2/testing/local/fill", {
+      const result = await requestJson('/api/v2/testing/local/fill', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           symbols: value('#local-pair'), side: value('#local-side'),
           start: value('#local-start-date'), end: value('#local-end-date'),
         }),
       });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'fill failed');
       const target = document.querySelector('#runner-local .card-status');
       if (target) target.textContent = `config_tester.json заполнен: ${result.strategy_name}, ${result.symbols.join(', ')}.`;
     } catch (_) {
@@ -392,10 +405,9 @@
     if (!button) continue;
     button.addEventListener('click', async () => {
       try {
-        const response = await fetch(`/api/v2/testing/local/${action}`, {
+        await requestJson(`/api/v2/testing/local/${action}`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
         });
-        if (!response.ok) throw new Error('request failed');
         const target = document.querySelector('#runner-local .card-status');
         if (target) target.textContent = message;
       } catch (_) {
@@ -447,9 +459,8 @@
     const run = ++sourceCatalogRun;
     const selected = source?.value || '';
     try {
-      const response = await fetch('/api/v2/source/local/catalog');
-      const result = await response.json();
-      if (!response.ok || !Array.isArray(result.databases)) throw new Error('catalog failed');
+      const result = await requestJson('/api/v2/source/local/catalog');
+      if (!Array.isArray(result.databases)) throw new Error('Server validation failed.');
       if (run !== sourceCatalogRun || surfacePublishActive) return;
       source?.replaceChildren(new Option('\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 Source DB', ''));
       mergeOptions?.replaceChildren();
@@ -478,9 +489,8 @@
     const run = ++surfaceCatalogRun;
     const selected = currentSurfacePath || selector.value;
     try {
-      const response = await fetch('/api/v2/surfaces/catalog');
-      const result = await response.json();
-      if (!response.ok || !Array.isArray(result.surfaces)) throw new Error('catalog failed');
+      const result = await requestJson('/api/v2/surfaces/catalog');
+      if (!Array.isArray(result.surfaces)) throw new Error('Server validation failed.');
       if (run !== surfaceCatalogRun) return;
       selector.replaceChildren(new Option('Выберите VALID surface', ''));
       result.surfaces.forEach((item) => {
@@ -507,8 +517,7 @@
     const refreshJob = async () => {
       if (!jobId) return;
       try {
-        const response = await fetch('/api/v2/source/local/jobs');
-        const document = await response.json();
+        const document = await requestJson('/api/v2/source/local/jobs');
         const job = (document.jobs || []).find((item) => item.job_id === jobId);
         if (!job) return;
         const progress = job.progress || {};
@@ -536,11 +545,9 @@
     };
     if (preflight) preflight.addEventListener('click', async () => {
       try {
-        const response = await fetch(preflightUrl, {
+        const result = await requestJson(preflightUrl, {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload()),
         });
-        const result = await response.json();
-        if (!response.ok) throw new Error('preflight failed');
         preflightId = result[['to', 'ken'].join('')];
         sourceStatus(card, `Preflight готов: ${result.total || 0} HTML.`);
       } catch (_) {
@@ -551,11 +558,9 @@
       if (!preflightId) { sourceStatus(card, 'Сначала выполните preflight.'); return; }
       try {
         const request = { ...payload(), [['preflight', '_to', 'ken'].join('')]: preflightId };
-        const response = await fetch(startUrl, {
+        const result = await requestJson(startUrl, {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request),
         });
-        const result = await response.json();
-        if (!response.ok) throw new Error('start failed');
         jobId = result.job_id || '';
         jobTarget = request.target_path || '';
         sourceStatus(card, `Запущено: ${result.operation}.`);
@@ -571,10 +576,9 @@
       cancel.addEventListener('click', async () => {
         if (!jobId) { sourceStatus(card, 'Нет активной операции для остановки.'); return; }
         try {
-          const response = await fetch('/api/v2/source/local/cancel', {
+          await requestJson('/api/v2/source/local/cancel', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: jobId }),
           });
-          if (!response.ok) throw new Error('cancel failed');
           sourceStatus(card, 'Запрошена остановка операции.');
         } catch (_) {
           sourceStatus(card, 'Операцию остановить не удалось.');
@@ -617,10 +621,6 @@
   bindPathSave(document.querySelector('#local-paths-save'), document.querySelector('#runner-local'), () => ({
     local_bot_root: inputValue('local-bot-root'), local_runner_root: inputValue('local-runner-root'),
     local_reports_root: inputValue('local-reports-root'), local_output_root: inputValue('local-output-root'),
-  }));
-  bindPathSave(document.querySelector('#remote-paths-save'), document.querySelector('#runner-remote'), () => ({
-    remote_bot_root: inputValue('remote-bot-root'), remote_runner_root: inputValue('remote-runner-root'),
-    remote_reports_root: inputValue('remote-reports-root'), remote_reports_archive_root: inputValue('remote-reports-archive-root'),
   }));
   bindPathSave(document.querySelector('#surface-target-save'), document.querySelector('#surface-publish-card'), () => ({
     surface_target_path: inputValue('surface-target'),
@@ -675,9 +675,7 @@
     const refreshRemoteSource = async () => {
       if (!remoteSourceJob) return;
       try {
-        const response = await fetch(`/api/v2/source/remote/status?job_id=${encodeURIComponent(remoteSourceJob)}`);
-        const result = await response.json();
-        if (!response.ok) throw new Error('status failed');
+        const result = await requestJson(`/api/v2/source/remote/status?job_id=${encodeURIComponent(remoteSourceJob)}`);
         renderRemoteSourceProgress(result);
         if (result.state === 'COMMITTED') {
           addSourceOption(remoteSourceTarget);
@@ -767,7 +765,7 @@
           gaps.addEventListener('click', async () => {
             try {
               const query = `${['preflight', '_to', 'ken'].join('')}=${encodeURIComponent(surfaceProof)}&scope_key=${encodeURIComponent(item.scope_key)}`;
-              const result = await fetch(`/api/v2/surfaces/gaps?${query}`).then((response) => response.json());
+              const result = await requestJson(`/api/v2/surfaces/gaps?${query}`);
               surfaceStatus(`Gaps ${item.timeframe}: ${(result.gaps || []).length}.`);
             } catch (_) { surfaceStatus('Gap report is unavailable.'); }
           });
@@ -816,9 +814,7 @@
         const details = `${phaseTitle(result.phase)}${result.total ? ` · ${result.completed} / ${result.total}` : ''}${result.detail ? ` · ${result.detail}` : ''} · ${formatDuration((Date.now() - started) / 1000)}`;
         publishProgressV2('running', details, result.completed, result.total);
         await new Promise((resolve) => setTimeout(resolve, 500));
-        const response = await fetch('/api/v2/surfaces/publish/status');
-        if (!response.ok) throw new Error('surface status unavailable');
-        result = await response.json();
+        result = await requestJson('/api/v2/surfaces/publish/status');
       }
       if (result.phase !== 'COMMITTED') throw new Error('surface publication failed');
       currentSurfacePath = document.querySelector('#surface-target')?.value || '';
@@ -898,9 +894,7 @@
     };
     try {
       const queryKey = ['preflight', '_to', 'ken'].join('');
-      const response = await fetch(`/api/v2/surfaces/gaps?${queryKey}=${encodeURIComponent(surfaceProof)}&scope_key=${encodeURIComponent(item.scope_key)}`);
-      const result = await response.json();
-      if (!response.ok) throw new Error('gaps unavailable');
+      const result = await requestJson(`/api/v2/surfaces/gaps?${queryKey}=${encodeURIComponent(surfaceProof)}&scope_key=${encodeURIComponent(item.scope_key)}`);
       if (gapRun !== surfacePreflightRunV2 || sourcePath !== (surfaceSource?.value || '')) return;
       const days = (result.gaps || []).map((gap) => gap.utc_day).filter(Boolean);
       const witnesses = (result.missing_witnesses || []).map((item) => `shift ${item.shift_bp} · CloseMA ${item.close_ma_length}`);
@@ -1059,9 +1053,7 @@
         const details = `${phaseTitle(result.phase)}${result.total ? ` · ${result.completed} / ${result.total}` : ''}${result.detail ? ` · ${result.detail}` : ''} · ${formatDuration((Date.now() - started) / 1000)}`;
         publishProgressV2('running', details, determinate ? result.completed : 0, determinate ? result.total : 0);
         await new Promise((resolve) => setTimeout(resolve, 500));
-        const response = await fetch('/api/v2/surfaces/publish/status');
-        if (!response.ok) throw new Error('surface status unavailable');
-        result = await response.json();
+        result = await requestJson('/api/v2/surfaces/publish/status');
       }
       if (result.phase !== 'COMMITTED') throw new Error('surface publication failed');
       currentSurfacePath = `${outputDir}\\${result.target}`;
@@ -1167,7 +1159,7 @@
   };
   const loadAnalysisCatalog = async () => {
     try {
-      const result = await fetch('/api/v2/strategies/analysis/catalog').then((response) => response.json());
+      const result = await requestJson('/api/v2/strategies/analysis/catalog');
       const rows = result.analyses || [];
       if (!analysisExisting) return;
       const previous = analysisExisting.value;
@@ -1279,7 +1271,7 @@
   const pollTester = async () => {
     if (!testerJobId) return;
     try {
-      const job = await fetch(`/api/v2/strategies/tester/status?job_id=${encodeURIComponent(testerJobId)}`).then((response) => response.json());
+      const job = await requestJson('/api/v2/strategies/tester/status?job_id=' + encodeURIComponent(testerJobId));
       renderTester(job);
       if (['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) {
         window.clearInterval(testerPoller); testerPoller = 0;
@@ -1288,6 +1280,7 @@
   };
   if (testerStart) testerStart.addEventListener('click', async () => {
     if (!currentAnalysisId) { strategyStatus('Сначала сформируйте READY JSON.'); return; }
+    testerStart.disabled = true;
     try {
       const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId } });
       testerJobId = result.job?.job_id || '';
@@ -1295,6 +1288,7 @@
       renderTester(result.job); await pollTester();
       window.clearInterval(testerPoller); testerPoller = window.setInterval(pollTester, 1000);
     } catch (_) { if (testerStatus) testerStatus.textContent = 'Не удалось запустить локальный tester batch.'; }
+    finally { testerStart.disabled = false; }
   });
   if (testerStop) testerStop.addEventListener('click', async () => {
     if (!testerJobId) return;
@@ -1328,13 +1322,14 @@
   const pollPerformance = async () => {
     if (!performanceJobId) return;
     try {
-      const job = await fetch(`/api/v2/strategies/performance-dd5/status?job_id=${encodeURIComponent(performanceJobId)}`).then((response) => response.json());
+      const job = await requestJson(`/api/v2/strategies/performance-dd5/status?job_id=${encodeURIComponent(performanceJobId)}`);
       renderPerformance(job);
-      if (['COMMITTED', 'FAILED'].includes(job.state)) { window.clearInterval(performancePoller); performancePoller = 0; }
+      if (['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) { window.clearInterval(performancePoller); performancePoller = 0; }
     } catch (_) { if (performanceStatus) performanceStatus.textContent = 'Статус Performance DB недоступен.'; }
   };
   if (performanceStart) performanceStart.addEventListener('click', async () => {
     if (!testerJobId) return;
+    performanceStart.disabled = true;
     if (performanceStatus) performanceStatus.textContent = 'Создание Performance DB и DD5…';
     try {
       const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.performance-dd5', request: { tester_job_id: testerJobId, delete_html: Boolean(document.querySelector('#delete-tested-html')?.checked) } });
@@ -1344,7 +1339,34 @@
       renderPerformance(job); await pollPerformance();
       window.clearInterval(performancePoller); performancePoller = window.setInterval(pollPerformance, 1000);
     } catch (_) { if (performanceStatus) performanceStatus.textContent = 'Performance DB или DD5 не прошли проверку.'; }
+    finally { performanceStart.disabled = false; }
   });
+  const recoverJobs = async () => {
+    try {
+      const snapshot = await requestJson('/api/v2/jobs');
+      const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
+      const tester = [...jobs].reverse().find((job) => job.kind === 'strategies.tester');
+      const performance = [...jobs].reverse().find((job) => job.kind === 'strategies.performance-dd5');
+      if (tester && typeof tester.job_id === 'string') {
+        const job = tester;
+        testerJobId = job.job_id;
+        renderTester(job);
+        if (!['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) {
+          await pollTester();
+          window.clearInterval(testerPoller); testerPoller = window.setInterval(pollTester, 1000);
+        }
+      }
+      if (performance && typeof performance.job_id === 'string') {
+        const job = performance;
+        performanceJobId = job.job_id;
+        renderPerformance(job);
+        if (!['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) {
+          await pollPerformance();
+          window.clearInterval(performancePoller); performancePoller = window.setInterval(pollPerformance, 1000);
+        }
+      }
+    } catch (_) { /* requestJson already exposed a safe visible error. */ }
+  };
   const settingsStatus = document.querySelector('#settings-status');
   const settingsPayload = () => ({ panel: {
     default_root: document.querySelector('#settings-default-root')?.value || 'static',
@@ -1377,7 +1399,7 @@
     save?.addEventListener('click', async () => {
       try {
         if (index === 0) {
-          const result = await fetch('/api/v2/settings/reload').then((response) => response.json());
+          const result = await requestJson('/api/v2/settings/reload');
           if (!result.valid) throw new Error('reload failed');
           await loadSafeDefaults();
           if (settingsStatus) settingsStatus.textContent = 'Settings defaults reloaded.';
@@ -1390,4 +1412,5 @@
   });
   loadSafeDefaults();
   loadRemoteStatus();
+  recoverJobs();
 })();

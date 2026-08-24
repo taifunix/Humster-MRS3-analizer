@@ -365,6 +365,25 @@ def test_surface_table_reuses_one_grid_template_for_header_groups_and_timeframes
     assert "grid-template-columns: var(--scope-grid-template)" in css
 
 
+def test_shared_request_json_and_job_recovery_keep_errors_and_busy_state_truthful() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="status"' in html
+    assert "const requestJson = async (endpoint, options = {})" in js
+    assert "if (!response.ok) throw new Error('Server validation failed.')" in js
+    assert "Backend connection unavailable." in js
+    assert "testerStart.disabled = true;" in js
+    assert "finally { testerStart.disabled = false; }" in js
+    assert "performanceStart.disabled = true;" in js
+    assert "finally { performanceStart.disabled = false; }" in js
+    assert "const recoverJobs = async () =>" in js
+    assert "requestJson('/api/v2/jobs')" in js
+    assert "recoverJobs();" in js
+    assert 'id="remote-paths"' not in html
+    assert "remote-paths-save" not in js
+
+
 def test_bulk_shortlist_actions_do_not_touch_pair_expansion_state() -> None:
     js = _read("app.js")
 

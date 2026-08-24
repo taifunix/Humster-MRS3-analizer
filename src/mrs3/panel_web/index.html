@@ -37,6 +37,7 @@
         <div class="connection-status" role="status" aria-live="polite">
           <span class="status-dot" aria-hidden="true"></span>BACKEND CONNECTION PENDING
         </div>
+        <p id="status" class="global-status" role="status" aria-live="polite">Backend request status: waiting.</p>
         <button id="panel-reload" type="button" class="button button-secondary panel-reload">Перезапустить панель</button>
       </header>
 
@@ -75,7 +76,6 @@
               <div class="field-group"><label for="remote-side">Сторона</label><select id="remote-side" name="remote_side"><option>SHORT</option><option>LONG</option></select></div>
               <div class="field-grid"><div class="field-group"><label for="remote-start-date">Начало</label><input id="remote-start-date" name="remote_start_date" type="date" value="2026-07-15"></div><div class="field-group"><label for="remote-end-date">Конец</label><input id="remote-end-date" name="remote_end_date" type="date" value="2026-08-06"></div></div>
               <div class="button-row"><button type="button" id="remote-check" class="button button-primary">Проверить runner и диск</button><button type="button" id="remote-start" class="button button-secondary">Старт</button><button type="button" id="remote-stop" class="button button-secondary">Стоп</button></div>
-              <details id="remote-paths" class="nested-details"><summary>Пути удалённого задания <small>defaults из config</small></summary><div class="details-content"><div class="field-group"><label for="remote-bot-root">Папка бота</label><input id="remote-bot-root" name="remote_bot_root" type="text" value="/opt/hb1"></div><div class="field-group"><label for="remote-runner-root">Папка runner</label><input id="remote-runner-root" name="remote_runner_root" type="text" value="/opt/hb1/debian-duckdb-importer"></div><div class="field-group"><label for="remote-reports-root">Папка отчётов</label><input id="remote-reports-root" name="remote_reports_root" type="text" value="/opt/hb1/tester/report"></div><div class="field-group"><label for="remote-reports-archive-root">Куда переносить готовое</label><input id="remote-reports-archive-root" name="remote_reports_archive_root" type="text" value="/opt/hb1/debian-duckdb-importer/data/html"></div><div class="button-row"><button type="button" class="button button-secondary" data-pending="Пути удалённого runner проверяются backend">Проверить пути</button><button id="remote-paths-save" type="button" class="button button-secondary">Сохранить пути</button></div></div></details>
               <div class="progress-block"><div class="progress-track"><span style="width:0%"></span></div><p>Ожидание проверки runner.</p></div>
               <p class="card-status" role="status" aria-live="polite">Удалённый runner ещё не проверен.</p>
             </div>
