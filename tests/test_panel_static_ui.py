@@ -430,6 +430,8 @@ def test_testing_screen_does_not_expose_remote_runner_paths() -> None:
 
     testing = html.split('id="runner-remote"', 1)[1].split('</article>', 1)[0]
     assert 'id="remote-paths"' not in testing
+    for field in ("remote-bot-root", "remote-runner-root", "remote-reports-root", "remote-reports-archive-root"):
+        assert f'id="{field}"' not in html
 
 
 def test_settings_does_not_render_or_submit_remote_runner_path() -> None:
@@ -439,8 +441,6 @@ def test_settings_does_not_render_or_submit_remote_runner_path() -> None:
     assert 'id="settings-remote-runner"' not in html
     payload = js.split("const settingsPayload =", 1)[1].split("const settingsButtons", 1)[0]
     assert "remote_runner_root" not in payload
-    for field in ("remote-bot-root", "remote-runner-root", "remote-reports-root", "remote-reports-archive-root"):
-        assert f'id="{field}"' not in html
 
 
 def test_request_json_distinguishes_non_json_and_server_validation_safely() -> None:
