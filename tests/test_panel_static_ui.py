@@ -314,6 +314,17 @@ def test_strategies_screen_keeps_the_approved_dd5_result_stage_and_live_status()
     assert "dd5Status" in js
 
 
+def test_dd5_screen_removes_non_contract_manifest_and_path_controls() -> None:
+    html = _read("index.html")
+    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
+
+    assert "Manifest и lineage" not in strategies
+    assert "Export final shortlist" not in strategies
+    assert 'id="strategies-output"' not in strategies
+    assert 'id="tester-batch"' not in strategies
+    assert 'id="tester-output"' not in strategies
+
+
 def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() -> None:
     html = _read("index.html")
     js = _read("app.js")
