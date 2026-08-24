@@ -300,6 +300,9 @@ def test_save_path_defaults_updates_local_and_remote_runtime_paths(panel_http) -
         "reports_root": paths["remote_reports_root"], "reports_archive_root": paths["remote_reports_archive_root"],
     }
     assert saved["panel"]["path_defaults"] == paths
+    status, bootstrap = _request(connection, "GET", "/api/v2/bootstrap")
+    assert status == 200
+    assert bootstrap["defaults"]["panel"]["path_defaults"] == paths
 
 
 def test_panel_restart_endpoint_relaunches_only_without_active_jobs(tmp_path: Path) -> None:
