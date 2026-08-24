@@ -1891,6 +1891,19 @@ class PanelController:
             raise ValueError("local source db target already exists")
         remote_html = str(payload.get("remote_html_path") or "").strip()
         remote_target = str(payload.get("remote_db_target") or "").strip()
+        remote_html_subdir = payload.get("remote_html_subdir")
+        if remote_html_subdir is not None:
+            if not isinstance(remote_html_subdir, str):
+                raise RemoteSourceDbError("invalid remote source db request")
+            remote_html_subdir = remote_html_subdir.strip()
+            if remote_html_subdir.startswith(("/", "\\")):
+                raise RemoteSourceDbError("invalid remote source db request")
+            remote_html_subdir = remote_html_subdir.strip("/")
+            if remote_html_subdir and any(
+                not part or part in {".", ".."} or "\\" in part
+                for part in remote_html_subdir.split("/")
+            ):
+                raise RemoteSourceDbError("invalid remote source db request")
         if not remote_html or not remote_target:
             config = getattr(executor, "config", None)
             reports_root = getattr(config, "reports_archive_root", "")
@@ -1898,6 +1911,8 @@ class PanelController:
             if not isinstance(reports_root, str) or not isinstance(source_root, str) or not reports_root or not source_root:
                 raise RemoteSourceDbError("invalid remote source db request")
             remote_html = reports_root.rstrip("/")
+            if remote_html_subdir:
+                remote_html = f"{remote_html}/{remote_html_subdir}"
             remote_target = source_root.rstrip("/") + "/" + target.name
         job = self._start_tracked_panel_job(
             "source.remote-import", {"operation": "remote-import"},

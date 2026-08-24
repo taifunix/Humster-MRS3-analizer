@@ -675,7 +675,10 @@
     });
     if (start) start.addEventListener('click', async () => {
       try {
-        const request = { local_target_path: document.querySelector('#source-remote-target')?.value || '' };
+        const request = {
+          remote_html_subdir: document.querySelector('#source-remote-html')?.value || '',
+          local_target_path: document.querySelector('#source-remote-target')?.value || '',
+        };
         const result = await remoteRequest('/api/v2/source/remote/start', request);
         remoteSourceJob = result.job_id || '';
         remoteSourceTarget = request.local_target_path;

@@ -142,9 +142,9 @@ def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
     for path_key in ("local_reports_root", "local_source_db_root", "local_merge_target"):
         assert path_key in js
     assert "['settings-local-runner', 'local_runner_root']" in js
-    assert 'id="source-remote-html"' not in html
+    assert 'id="source-remote-html"' in html
     assert 'id="source-remote-staging"' not in html
-    assert 'remote_html_path: document.querySelector' not in js
+    assert 'remote_html_subdir: document.querySelector' in js
     assert 'remote_db_target: document.querySelector' not in js
     assert "/api/v2/settings/save" in js
 

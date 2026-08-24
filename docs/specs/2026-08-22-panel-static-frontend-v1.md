@@ -56,13 +56,15 @@ are separate explicit actions. The browser receives only the selected side,
 symbols and strategy name, never local absolute paths.
 
 The remote profile lives only in ignored `config.local.json` under
-`remote_runner`. It contains connection material plus canonical remote paths;
-only redacted configuration status and opaque path-check results reach the
-browser. Remote commands are fixed, argv-based operations and stop only a
-process proven to run the configured `hb_c` binary.
+`remote_runner`. It contains connection material plus canonical remote roots;
+the browser may submit a relative report-folder selector, but never needs to
+receive or construct the canonical roots. Remote commands are fixed,
+argv-based operations and stop only a process proven to run the configured
+`hb_c` binary.
 
-Remote Source DB import is two-stage: a verified background Debian import into
-a new target below `remote_runner.source_db_root`, followed by a same-directory
+Remote Source DB import is two-stage: a verified background Debian import from
+the selected folder below `remote_runner.reports_archive_root` into a new
+target below `remote_runner.source_db_root`, followed by a same-directory
 temporary download to a fresh local target. Size and SHA-256 must match before
 the local hard-link publication; either existing target is rejected and no
 partial local database is shown as an artifact. The only remote importer command
