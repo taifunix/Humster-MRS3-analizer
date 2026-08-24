@@ -11,7 +11,11 @@ import duckdb
 import pytest
 
 from mrs3.config import AlgorithmConfig
-from mrs3.performance_dd5 import regenerate_performance_dd5, run_performance_dd5
+from mrs3.performance_dd5 import (
+    regenerate_performance_dd5,
+    run_performance_dd5,
+    run_performance_dd5_atomic,
+)
 from mrs3.performance_import import import_performance_batch
 from tests.test_performance_import import (
     _canonical,
@@ -273,9 +277,36 @@ def test_dd5_artifacts_can_be_regenerated_from_stored_run(tmp_path: Path) -> Non
     )
     assert regenerated.dd5_run_id == original.dd5_run_id
     assert regenerated.workbook.exists()
+
+
+def test_dd5_atomic_workbook_uses_direct_target_and_required_sheets(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    imported = import_performance_batch(request)
+    with duckdb.connect(str(request.database)) as connection:
+        connection.execute(
+            "update strategy_versions set settings_json = ?",
+            [json.dumps({"mrs3": {"ma_long": [{"lot_x": 1}]}})],
+        )
+    target = tmp_path / "workbooks" / "BTC_ETH_01.02-06.09.performance-v6.dd5.xlsx"
+
+    artifacts = run_performance_dd5_atomic(
+        request.database, imported.import_id, target, AlgorithmConfig.defaults()
+    )
+
+    assert artifacts.workbook == target.resolve()
+    assert artifacts.manifest_json["dd5_mode"] == "CALCULATION_ONLY"
+    assert set(pd.ExcelFile(target).sheet_names) == {
+        "00_Selection_Summary",
+        "01_Finalists",
+        "16_Raw_MRS3_Results",
+        "17_DD5_Normalized",
+        "18_Final_Comparison",
+        "19_Position_Holding_Cycles",
+        "20_Position_Holding_Exclusions",
+    }
     with duckdb.connect(str(request.database), read_only=True) as connection:
         config_json = connection.execute(
-            "select config_json from dd5_runs where dd5_run_id = ?", [original.dd5_run_id]
+            "select config_json from dd5_runs where dd5_run_id = ?", [artifacts.dd5_run_id]
         ).fetchone()[0]
     assert set(json.loads(config_json)) == {field.name for field in __import__("dataclasses").fields(AlgorithmConfig)}
 

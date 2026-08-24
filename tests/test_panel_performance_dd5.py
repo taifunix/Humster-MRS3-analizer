@@ -13,8 +13,12 @@ from mrs3.panel import PanelController
 from mrs3.panel_performance_dd5 import (
     LocalPerformanceDd5Service,
     LocalPerformanceDd5Jobs,
+    LocalPerformanceImportService,
     PanelPerformanceDd5Error,
     PerformanceDd5Request,
+    PerformanceImportPanelRequest,
+    allocate_performance_database,
+    performance_database_name,
 )
 
 
@@ -176,3 +180,44 @@ def test_controller_returns_reconciled_dd5_job_when_worker_does_not_survive_rest
 
     assert status["state"] == "FAILED"
     assert status["error"] == {"code": "INTERRUPTED"}
+
+
+def test_performance_database_name_is_pair_and_tester_period_based() -> None:
+    assert performance_database_name(
+        ("ETHUSDT", "BTCUSDT", "BTCUSDT"), "2026-02-01", "2026-09-06"
+    ) == "BTC_ETH_01.02-06.09.performance-v6.duckdb"
+
+
+def test_performance_database_allocator_never_overwrites_existing_db(tmp_path: Path) -> None:
+    root = tmp_path / "data" / "performanceDB"
+    first = allocate_performance_database(root, ("BTCUSDT",), "2026-02-01", "2026-09-06")
+    first.touch()
+    second = allocate_performance_database(root, ("BTCUSDT",), "2026-02-01", "2026-09-06")
+    assert first.name.endswith(".performance-v6.duckdb")
+    assert second.name.endswith("_2.performance-v6.duckdb")
+    assert first.read_bytes() == b""
+
+
+def test_import_service_is_independent_and_copies_audit_sidecar(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    root = tmp_path / "data" / "performanceDB"
+    calls: list[str] = []
+
+    def importer(import_request, *, progress=None):
+        calls.append("import")
+        _audit(request)
+        return SimpleNamespace(import_id="import-1", quarantined_count=0)
+
+    result = LocalPerformanceImportService(import_batch=importer).run(
+        PerformanceImportPanelRequest(
+            inbox=request.inbox,
+            performance_db_root=root,
+            pair_names=("BTCUSDT",),
+            test_start="2026-02-01",
+            test_end="2026-09-06",
+        )
+    )
+    assert calls == ["import"]
+    assert result.database.name == "BTC_01.02-06.09.performance-v6.duckdb"
+    assert result.database_status == "COMMITTED"
+    assert (root / result.database.stem / "import_audit.v4.json").is_file()

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from pathlib import Path
+import re
+import shutil
 import tempfile
 import time
 from typing import Callable
@@ -42,6 +45,7 @@ class PerformanceImportRequest:
     workers: int = DEFAULT_PERFORMANCE_WORKERS
     transaction_batch_size: int = DEFAULT_TRANSACTION_BATCH_SIZE
     cancellation_requested: Callable[[], bool] | None = None
+    audit_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.workers, bool) or not isinstance(self.workers, int) or self.workers < 1:
@@ -79,6 +83,67 @@ class PerformanceImportProgress:
 
 
 _TESTER_EXCHANGE_MARKER = "tester"
+
+
+def _period_date(value: object, field: str) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            for pattern in ("%d.%m.%Y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(text, pattern).date()
+                except ValueError:
+                    continue
+    raise ValueError(f"{field} must be an ISO date")
+
+
+def performance_database_name(
+    pair_names: Sequence[object], test_start: object, test_end: object
+) -> str:
+    """Build the stable Performance v6 filename without touching the filesystem."""
+    if isinstance(pair_names, (str, bytes, bytearray)):
+        raise ValueError("pair_names must be a sequence")
+    pairs: set[str] = set()
+    for raw in pair_names:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("pair name is invalid")
+        pair = raw.strip().upper()
+        if pair.endswith("USDT"):
+            pair = pair[:-4]
+        if not pair or not re.fullmatch(r"[A-Z0-9][A-Z0-9_.-]*", pair):
+            raise ValueError("pair name is invalid")
+        pairs.add(pair)
+    if not pairs:
+        raise ValueError("pair_names must not be empty")
+    start = _period_date(test_start, "test_start")
+    end = _period_date(test_end, "test_end")
+    if end < start:
+        raise ValueError("test_end precedes test_start")
+    period = f"{start:%d.%m}-{end:%d.%m}"
+    return f"{'_'.join(sorted(pairs))}_{period}.performance-v6.duckdb"
+
+
+def allocate_performance_database(
+    root: Path, pair_names: Sequence[object], test_start: object, test_end: object
+) -> Path:
+    """Choose a fresh DB target, retaining old artifacts on collisions."""
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    base = Path(performance_database_name(pair_names, test_start, test_end))
+    candidate = root / base.name
+    suffix = 1
+    extension = ".performance-v6.duckdb"
+    stem = base.name[: -len(extension)]
+    while candidate.exists():
+        suffix += 1
+        candidate = root / f"{stem}_{suffix}{extension}"
+    return candidate
 
 
 def _canonical(value: object) -> bytes:
@@ -236,6 +301,17 @@ def _write_checklist(inbox: Path, rows: list[dict[str, str]]) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _sync_audit_sidecar(request: PerformanceImportRequest) -> None:
+    if request.audit_dir is None:
+        return
+    target = Path(request.audit_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    for name in ("import_audit.v4.json", "html_delete_checklist.v4.csv"):
+        source = Path(request.inbox) / name
+        if source.is_file():
+            shutil.copyfile(source, target / name)
 
 
 def _base_audit(
@@ -830,6 +906,7 @@ def import_performance_batch(
     )
     if request.cancellation_requested is not None and request.cancellation_requested():
         _write_audit(inbox, _base_audit(manifest, import_id, audit_entries, "CANCELLED", phases))
+        _sync_audit_sidecar(request)
         _emit_performance_progress(
             progress,
             stage="CANCELLED",
@@ -853,6 +930,7 @@ def import_performance_batch(
         except PerformanceImportError as error:
             status = "CANCELLED" if "cancelled" in str(error) else "FAILED"
             _write_audit(inbox, _base_audit(manifest, import_id, audit_entries, status, phases))
+            _sync_audit_sidecar(request)
             _emit_performance_progress(
                 progress,
                 stage=status,
@@ -866,6 +944,7 @@ def import_performance_batch(
             raise
         except Exception as error:
             _write_audit(inbox, _base_audit(manifest, import_id, audit_entries, "FAILED", phases))
+            _sync_audit_sidecar(request)
             raise PerformanceImportError("performance import preparation failed") from error
         for position, (index, (result_status, result)) in enumerate(
             zip(parse_indices, parse_results, strict=True), start=1
@@ -903,6 +982,7 @@ def import_performance_batch(
     if quarantined:
         _write_audit(inbox, _base_audit(manifest, import_id, audit_entries, "QUARANTINED", phases))
         _write_checklist(inbox, [{"manifest_entry_id": str(entry.get("manifest_entry_id", "")), "report_path": str(entry.get("report_path", "")), "source_html_sha256": str(entry.get("source_report_sha256", "")), "status": "QUARANTINED", "safe_to_delete": "NO", "cleanup_state": "RETAIN", "deleted_at_utc": ""} for entry in manifest["entries"]])
+        _sync_audit_sidecar(request)
         _emit_performance_progress(
             progress,
             stage="QUARANTINED",
@@ -919,6 +999,7 @@ def import_performance_batch(
     except Exception as error:
         _write_audit(inbox, _base_audit(manifest, import_id, audit_entries, "FAILED", phases))
         _write_checklist(inbox, [{"manifest_entry_id": str(entry.get("manifest_entry_id", "")), "report_path": str(entry.get("report_path", "")), "source_html_sha256": str(entry.get("source_report_sha256", "")), "status": "FAILED", "safe_to_delete": "NO", "cleanup_state": "RETAIN", "deleted_at_utc": ""} for entry in manifest["entries"]])
+        _sync_audit_sidecar(request)
         raise PerformanceImportError("database initialization failed") from error
     publication_items = [item for item in prepared if item is not None]
     if len(publication_items) != len(prepared):
@@ -948,6 +1029,7 @@ def import_performance_batch(
         phases["READBACK_VERIFIED"] = readback_seconds
     except Exception as error:
         _write_audit(inbox, _base_audit(manifest, import_id, audit_entries, "FAILED", phases))
+        _sync_audit_sidecar(request)
         raise error if isinstance(error, PerformanceImportError) else PerformanceImportError(str(error)) from error
     _emit_performance_progress(
         progress,
@@ -972,6 +1054,7 @@ def import_performance_batch(
         })
     _write_audit(inbox, _base_audit(manifest, import_id, audit_entries, "COMMITTED", phases))
     _write_checklist(inbox, [{"manifest_entry_id": str(item["entry"]["manifest_entry_id"]), "report_path": str(item["entry"]["report_path"]), "source_html_sha256": str(item["source_hash"]), "status": item["import_status"], "safe_to_delete": "YES", "cleanup_state": "DELETE_READY", "deleted_at_utc": ""} for item in publication_items])
+    _sync_audit_sidecar(request)
     _emit_performance_progress(
         progress,
         stage="READBACK_VERIFIED",
@@ -1039,11 +1122,13 @@ def resume_performance_cleanup(request: PerformanceImportRequest) -> None:
             raise PerformanceImportError("report hash mismatch immediately before delete")
         row["cleanup_state"] = "DELETING"
         _write_checklist(inbox, rows)
+        _sync_audit_sidecar(request)
         with duckdb.connect(str(request.database)) as connection:
             connection.execute("update import_files set cleanup_state = 'DELETING' where import_id = ? and manifest_entry_id = ?", [audit["import_id"], row["manifest_entry_id"]])
         report.unlink(missing_ok=True)
         row["cleanup_state"] = "DELETED"
         row["deleted_at_utc"] = datetime.now(timezone.utc).isoformat()
         _write_checklist(inbox, rows)
+        _sync_audit_sidecar(request)
         with duckdb.connect(str(request.database)) as connection:
             connection.execute("update import_files set cleanup_state = 'DELETED', deleted_at_utc = ? where import_id = ? and manifest_entry_id = ?", [row["deleted_at_utc"], audit["import_id"], row["manifest_entry_id"]])

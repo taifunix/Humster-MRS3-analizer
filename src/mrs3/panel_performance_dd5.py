@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import shutil
 from threading import RLock, Thread
 from typing import Callable
 from uuid import uuid4
@@ -13,10 +14,14 @@ from uuid import uuid4
 from .config import AlgorithmConfig
 from .performance_dd5 import run_performance_dd5
 from .performance_import import (
+    PerformanceImportError,
     PerformanceImportRequest,
+    allocate_performance_database,
     import_performance_batch,
+    performance_database_name,
     resume_performance_cleanup,
 )
+from .performance_dd5 import run_performance_dd5_atomic
 
 
 class PanelPerformanceDd5Error(ValueError):
@@ -30,6 +35,38 @@ class PerformanceDd5Request:
     output_dir: Path
     config: AlgorithmConfig
     delete_html: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceImportPanelRequest:
+    inbox: Path
+    performance_db_root: Path
+    pair_names: tuple[str, ...] | None = None
+    test_start: object | None = None
+    test_end: object | None = None
+    delete_html: bool = False
+    workers: int = 4
+    transaction_batch_size: int = 50_000
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceImportPanelResult:
+    import_id: str
+    database: Path
+    audit_dir: Path
+    database_status: str
+    imported_count: int = 0
+    skipped_count: int = 0
+    quarantined_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceDd5CalculationRequest:
+    database: Path
+    import_id: str
+    workbooks_root: Path
+    config: AlgorithmConfig
+    performance_db_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,22 +142,128 @@ def _reject_legacy(value: object) -> None:
     visit(value)
 
 
-class LocalPerformanceDd5Service:
-    """Preflight, import, calculate DD5, and optionally clean up HTML."""
+def _manifest_values(manifest: Mapping[str, object], *names: str) -> object:
+    for name in names:
+        value = manifest.get(name)
+        if value is not None:
+            return value
+    for container_name in ("tester_period", "test_period", "period", "dates"):
+        container = manifest.get(container_name)
+        if isinstance(container, Mapping):
+            for name in names:
+                value = container.get(name)
+                if value is not None:
+                    return value
+    return None
+
+
+def _manifest_pair_names(inbox: Path, manifest: Mapping[str, object]) -> tuple[str, ...]:
+    pairs: list[str] = []
+    raw_pairs = manifest.get("pair_names", manifest.get("pairs", manifest.get("symbols")))
+    if isinstance(raw_pairs, Sequence) and not isinstance(raw_pairs, (str, bytes, bytearray)):
+        pairs.extend(item for item in raw_pairs if isinstance(item, str))
+    entries = manifest.get("entries")
+    if isinstance(entries, Sequence) and not isinstance(entries, (str, bytes, bytearray)):
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            for key in ("pair", "symbol", "pair_name"):
+                value = entry.get(key)
+                if isinstance(value, str):
+                    pairs.append(value)
+            strategy_path = entry.get("strategy_path")
+            if not isinstance(strategy_path, str):
+                continue
+            candidate = (inbox / strategy_path).resolve()
+            try:
+                candidate.relative_to(inbox.resolve())
+            except ValueError:
+                continue
+            try:
+                strategy = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(strategy, Mapping):
+                basic = strategy.get("basic")
+                if isinstance(basic, Mapping) and isinstance(basic.get("symbol"), str):
+                    pairs.append(basic["symbol"])
+    return tuple(pairs)
+
+
+def _copy_sidecars(inbox: Path, audit_dir: Path) -> None:
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("import_audit.v4.json", "html_delete_checklist.v4.csv"):
+        source = inbox / name
+        if source.is_file():
+            shutil.copyfile(source, audit_dir / name)
+
+
+class LocalPerformanceImportService:
+    """Import one committed tester inbox into a fresh, named Performance DB."""
 
     def __init__(
         self,
         *,
         import_batch: Callable[..., object] = import_performance_batch,
-        run_dd5: Callable[..., object] = run_performance_dd5,
         cleanup: Callable[..., object] = resume_performance_cleanup,
     ) -> None:
         self.import_batch = import_batch
-        self.run_dd5 = run_dd5
         self.cleanup = cleanup
 
-    def preflight(self, request: PerformanceDd5Request) -> dict[str, object]:
-        manifest = _read_json(Path(request.inbox) / "inbox_manifest.json", "inbox manifest")
+    def run(
+        self,
+        request: PerformanceImportPanelRequest,
+        *,
+        progress: Callable[[object], object] | None = None,
+    ) -> PerformanceImportPanelResult:
+        inbox = Path(request.inbox).resolve()
+        manifest = _read_json(inbox / "inbox_manifest.json", "inbox manifest")
+        self._preflight_manifest(manifest)
+        pair_names = request.pair_names or _manifest_pair_names(inbox, manifest)
+        start = request.test_start or _manifest_values(manifest, "test_start", "start", "period_start")
+        end = request.test_end or _manifest_values(manifest, "test_end", "end", "period_end")
+        try:
+            database = allocate_performance_database(request.performance_db_root, pair_names, start, end)
+        except (TypeError, ValueError) as error:
+            raise PanelPerformanceDd5Error(str(error)) from error
+        audit_dir = database.parent / database.stem
+        import_request = PerformanceImportRequest(
+            inbox,
+            database,
+            workers=request.workers,
+            transaction_batch_size=request.transaction_batch_size,
+            audit_dir=audit_dir,
+        )
+        try:
+            imported = self.import_batch(import_request, progress=progress)
+        except (PerformanceImportError, OSError, ValueError) as error:
+            raise PanelPerformanceDd5Error("Performance import failed") from error
+        import_id = _value(imported, "import_id")
+        quarantined = _value(imported, "quarantined_count")
+        if not isinstance(import_id, str) or not import_id.strip():
+            raise PanelPerformanceDd5Error("performance import did not return an import_id")
+        if isinstance(quarantined, bool) or not isinstance(quarantined, int):
+            raise PanelPerformanceDd5Error("performance import returned an invalid quarantine count")
+        batch_id = manifest.get("batch_id")
+        LocalPerformanceDd5Service._verify_audit(inbox, import_id, batch_id)
+        _copy_sidecars(inbox, audit_dir)
+        if quarantined != 0:
+            raise PanelPerformanceDd5Error("Performance import requires zero quarantine")
+        if request.delete_html:
+            self.cleanup(import_request)
+            _copy_sidecars(inbox, audit_dir)
+        return PerformanceImportPanelResult(
+            import_id,
+            database,
+            audit_dir,
+            "COMMITTED",
+            int(_value(imported, "imported_count") or 0),
+            int(_value(imported, "skipped_count") or 0),
+            quarantined,
+        )
+
+    @staticmethod
+    def _preflight_manifest(manifest: Mapping[str, object]) -> None:
         if manifest.get("schema_version") != 1:
             raise PanelPerformanceDd5Error("inbox manifest schema_version must be 1")
         _reject_legacy(manifest)
@@ -145,6 +288,27 @@ class LocalPerformanceDd5Service:
                 raise PanelPerformanceDd5Error("v6 provenance strategy hashes do not cover the batch")
         if any(not isinstance(value, str) or len(value) != 64 for value in hashes.values()):
             raise PanelPerformanceDd5Error("v6 provenance strategy hash is invalid")
+
+
+class LocalPerformanceDd5Service:
+    """Preflight, import, calculate DD5, and optionally clean up HTML."""
+
+    def __init__(
+        self,
+        *,
+        import_batch: Callable[..., object] = import_performance_batch,
+        run_dd5: Callable[..., object] = run_performance_dd5,
+        cleanup: Callable[..., object] = resume_performance_cleanup,
+    ) -> None:
+        self.import_batch = import_batch
+        self.run_dd5 = run_dd5
+        self.cleanup = cleanup
+
+    def preflight(self, request: PerformanceDd5Request) -> dict[str, object]:
+        manifest = _read_json(Path(request.inbox) / "inbox_manifest.json", "inbox manifest")
+        LocalPerformanceImportService._preflight_manifest(manifest)
+        provenance = manifest["v6_provenance"]
+        assert isinstance(provenance, Mapping)
         return dict(provenance)
 
     def run(
@@ -182,6 +346,40 @@ class LocalPerformanceDd5Service:
         if request.delete_html:
             self.cleanup(import_request)
         return PerformanceDd5Result(import_id, dd5_run_id, mode, artifacts)
+
+    def calculate(
+        self,
+        request: PerformanceDd5CalculationRequest,
+    ) -> PerformanceDd5Result:
+        database = Path(request.database).resolve()
+        root = Path(request.workbooks_root).resolve()
+        if not database.is_file():
+            raise PanelPerformanceDd5Error("committed Performance DB is missing")
+        if request.performance_db_root is not None:
+            try:
+                database.relative_to(Path(request.performance_db_root).resolve())
+            except ValueError as error:
+                raise PanelPerformanceDd5Error("Performance DB is outside configured root") from error
+        target = root / f"{database.stem}.dd5.xlsx"
+        try:
+            artifacts = run_performance_dd5_atomic(
+                database, request.import_id, target, request.config
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            raise PanelPerformanceDd5Error("DD5 calculation failed") from error
+        manifest = _read_json(artifacts.manifest, "DD5 manifest")
+        if (
+            manifest.get("import_id") != request.import_id
+            or manifest.get("dd5_run_id") != artifacts.dd5_run_id
+            or manifest.get("dd5_mode") != "CALCULATION_ONLY"
+        ):
+            raise PanelPerformanceDd5Error("DD5 export identity is invalid")
+        return PerformanceDd5Result(
+            request.import_id,
+            artifacts.dd5_run_id,
+            "CALCULATION_ONLY",
+            artifacts,
+        )
 
     @staticmethod
     def _verify_audit(inbox: Path, import_id: str, batch_id: object) -> None:
@@ -249,10 +447,16 @@ class LocalPerformanceDd5Jobs:
             self._updated(snapshot)
             return
         with self._lock:
-            self._jobs[job_id].update(
-                state="COMMITTED", phase="COMMITTED", error=None,
-                result={"import_id": result.import_id, "dd5_run_id": result.dd5_run_id, "dd5_mode": result.dd5_mode},
-            )
+            result_document = {
+                "import_id": result.import_id,
+                "database": str(result.database),
+                "database_status": result.database_status,
+            } if isinstance(result, PerformanceImportPanelResult) else {
+                "import_id": result.import_id,
+                "dd5_run_id": result.dd5_run_id,
+                "dd5_mode": result.dd5_mode,
+            }
+            self._jobs[job_id].update(state="COMMITTED", phase="COMMITTED", error=None, result=result_document)
             snapshot = dict(self._jobs[job_id])
         self._updated(snapshot)
 
@@ -262,3 +466,15 @@ class LocalPerformanceDd5Jobs:
                 self._on_update(document)
             except BaseException:
                 pass
+
+
+class LocalPerformanceImportJobs(LocalPerformanceDd5Jobs):
+    """Background wrapper for import-only panel jobs."""
+
+    def __init__(
+        self,
+        *,
+        service: LocalPerformanceImportService | None = None,
+        on_update: Callable[[dict[str, object]], None] | None = None,
+    ) -> None:
+        super().__init__(run=(service or LocalPerformanceImportService()).run, on_update=on_update)
