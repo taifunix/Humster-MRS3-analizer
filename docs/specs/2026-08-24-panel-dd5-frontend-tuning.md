@@ -123,6 +123,73 @@ command.
 остаётся обязательной перед анализом; bootstrap не сканирует и не запускает
 процессы.
 
+### Fresh analysis: запуск и открытие
+
+Эти два endpoint уже зарегистрированы в `panel.py`; их контракт не следует
+заменять новым URL или обходить через legacy API.
+
+`POST /api/v2/strategies/fresh/analyze` принимает только серверно
+проверенную опубликованную surface и профиль анализа:
+
+```json
+{
+  "surface_path": "<configured surface reference>",
+  "algorithm_version": "0.7-canonical-phase1",
+  "target_path": "<optional configured data\\Analysis target>"
+}
+```
+
+`surface_path` и `target_path` — совместимые имена полей существующего
+controller route, а не разрешение браузеру выбрать произвольный OS path.
+Frontend передаёт значение, полученное из validated surface catalog; backend
+применяет свой `_path`/root allowlist и default listing-dates/config. В новом
+DD5 UI target path не является editable control: по умолчанию используется
+`data\\Analysis`.
+
+Синхронный ответ при commit:
+
+```json
+{"phase":"COMMITTED","analysis_run_id":"RUN"}
+```
+
+При ошибке route возвращает terminal safe response без exception text или
+локальных путей:
+
+```json
+{"phase":"FAILED","error":"Analysis failed. Check panel logs."}
+```
+
+Пока запрос выполняется, UI показывает фактическую фазу и elapsed time с
+indeterminate progress; backend не обещает процент и не придумывает work-unit
+count. Ошибка transport или HTTP 4xx также переводит карточку в `FAILED` и
+разблокирует controls. Это synchronous analysis route, поэтому для него нет
+фиктивного polling endpoint; отдельный cancel применим только к job routes.
+
+`POST /api/v2/strategies/fresh/open` регистрирует уже committed analysis из
+validated catalog без rerun:
+
+```json
+{"analysis_path":"<catalogued data\\Analysis artifact>"}
+```
+
+Успешный ответ существующего route:
+
+```json
+{
+  "phase":"COMMITTED",
+  "analysis_run_id":"RUN",
+  "surface_id":"SURFACE",
+  "algorithm_version":"0.7-canonical-phase1",
+  "scopes": 0
+}
+```
+
+`ANALYSIS_PATH_REQUIRED` и `ANALYSIS_NOT_READABLE` возвращаются как stable
+`PanelJobError` codes с HTTP 400; invalid JSON/path validation даёт generic
+`{"error":"invalid settings"}`. После `COMMITTED` UI запрашивает обычный
+shortlist для возвращённого `analysis_run_id`. Ни analyze, ни open не
+возвращают raw source credentials или произвольный artifact path.
+
 ### Shortlist (после 1ORD/BASE gate)
 
 Зарезервированный контракт отдельной Phase 2 стадии:
@@ -236,6 +303,99 @@ remote source paths или BASE/1ORD artifacts.
 `delete_html=true` разрешён только после committed import, zero quarantine,
 `safe_to_delete=YES` и успешного требуемого readback/DD5 gate. При ошибке
 reports не удаляются, а UI получает audit/error token.
+
+### Общий lifecycle jobs
+
+Все долгие tester/import/DD5 операции проходят существующий dispatcher
+`POST /api/v2/jobs`; новые split kinds не получают отдельные ad-hoc URL.
+Запрос создаёт idempotent job и возвращает HTTP 202:
+
+```json
+{
+  "kind":"strategies.performance.import",
+  "request":{"tester_job_id":"JOB","delete_html":false},
+  "idempotency_key":"IMPORT-REQUEST-1",
+  "resource_keys":["performance:JOB"]
+}
+```
+
+Ответ dispatcher:
+
+```json
+{
+  "job": {
+    "job_id":"JOB",
+    "kind":"strategies.performance.import",
+    "state":"QUEUED",
+    "phase":"QUEUED",
+    "progress":{"current":0,"total":0,"unit":"items"},
+    "artifacts":[],
+    "error":null,
+    "logs":[]
+  }
+}
+```
+
+Для уже tracked special jobs (`strategies.tester.start` и совместимого
+combined job) тот же response envelope может быть `RUNNING`; terminal result
+содержит только safe evidence, IDs, counts и artifact tokens. Повтор с тем же
+`idempotency_key` и тем же request возвращает тот же job; другой fingerprint
+даёт `IDEMPOTENCY_CONFLICT`. Busy/capacity errors — stable 409 codes
+`RESOURCE_BUSY`/`JOB_CAPACITY_EXHAUSTED`; malformed input — 400
+`INVALID_REQUEST`.
+
+Canonical polling/reattach после reload — `GET /api/v2/jobs`, response
+`{"jobs":[...]}`. Для уже существующих special owners сохраняются также
+`GET /api/v2/strategies/tester/status?job_id=JOB` и
+`GET /api/v2/strategies/performance-dd5/status?job_id=JOB`; эти routes
+возвращают redacted snapshot без `inbox_path` и других controller-only paths.
+Snapshot содержит `job_id`, `state`, `phase`, `progress`, `error`, safe
+`evidence` и tokens, если они уже выданы.
+
+Допустимый state machine:
+
+`QUEUED → RUNNING → COMMITTED | FAILED`
+
+и cancellation:
+
+`QUEUED → CANCELLED`, `RUNNING → CANCELLING → CANCELLED | FAILED`.
+
+Существующий Stop для tester использует тот же dispatcher:
+
+```json
+{"kind":"strategies.tester.cancel","request":{"job_id":"JOB"}}
+```
+
+Split Performance import и DD5 jobs должны использовать тот же
+server-owned cancel operation с проверкой owner/job kind; не вводить отдельный
+browser URL, raw subprocess command или path argument. Stop terminal job не
+меняет его результат и возвращает stable `CANCEL_NOT_ALLOWED`/`NOT_FOUND`.
+При загрузке registry незавершённые snapshots, для которых worker не может
+быть восстановлен, переводятся в `FAILED` с кодом `INTERRUPTED`; terminal
+`COMMITTED`/`CANCELLED`/`FAILED` snapshots сохраняются и доступны после
+reload/re-attach. Job журнал хранит только redacted public snapshot; runtime
+recovery data не возвращается browser.
+
+### Безопасное открытие audit/workbook
+
+Сохраняется существующий route:
+
+```http
+GET /api/artifact?name=<opaque-artifact-token>
+```
+
+Query `name` — историческое имя параметра route, но его значение всегда
+server-issued opaque token (`audit_token`, `workbook_token` или другой
+разрешённый artifact token), а не filename, абсолютный путь или OS command.
+`artifact(token)` разрешает token только в server-side allowlist фиксированных
+roots. Неизвестный, просроченный или выданный для другого job token даёт 404
+без раскрытия пути. Успех отдаёт binary attachment с безопасным display
+filename, `Cache-Control: no-store` и `X-Content-Type-Options: nosniff`.
+
+Performance import выдаёт `audit_token`, DD5 выдаёт `workbook_token`; UI не
+собирает URL из `database_name`/`workbook_name` и не получает физический path.
+Таким образом, audit sidecar и direct workbook path остаются backend-owned, а
+кнопки **Открыть audit** и **Открыть workbook** используют только этот route.
 
 ### DD5 calculation и workbook
 
