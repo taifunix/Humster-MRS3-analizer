@@ -28,6 +28,11 @@
     }
     return [...byPair.values()];
   };
+  const valueCell = (value, fallback) => {
+    const cell = document.createElement('td');
+    cell.textContent = value === null || value === undefined || value === '' ? fallback : String(value);
+    return cell;
+  };
   const countCell = (value, ready) => {
     const cell = document.createElement('td');
     cell.textContent = value ? String(value) : '—';
@@ -94,7 +99,7 @@
       timeframes.textContent = `${pair.timeframes.length} TF`;
       row.append(pick, name, timeframes);
       for (const bucket of ORDER_BUCKETS) row.append(countCell(pair.counts[bucket], false));
-      row.append(countCell(pair.ready, true), countCell(pair.total, false));
+      row.append(valueCell(undefined, '—'), countCell(pair.ready, true), valueCell(undefined, 0), countCell(pair.total, false), valueCell(undefined, '—'));
       body.append(row);
       for (const group of pair.timeframes) {
         const child = document.createElement('tr');
@@ -120,7 +125,7 @@
         childTf.textContent = group.timeframe;
         child.append(childPick, childName, childTf);
         for (const bucket of ORDER_BUCKETS) child.append(countCell(group.counts?.[bucket], false));
-        child.append(countCell(group.ready, true), countCell(group.total, false));
+        child.append(valueCell(group.plateau_count, '—'), countCell(group.ready, true), valueCell(group.deferred, 0), countCell(group.total, false), valueCell(group.period, '—'));
         body.append(child);
       }
     }
@@ -1078,10 +1083,8 @@
   // Never present illustrative counts as real artifacts.  The workflow fills
   // these controls only after its backend provenance gate has accepted them.
   const analysisSurface = document.querySelector('#analysis-surface');
-  const testerBatch = document.querySelector('#tester-batch');
   const shortlistBody = document.querySelector('#strategies-dd5 tbody');
   if (analysisSurface) analysisSurface.replaceChildren(new Option('Awaiting a committed surface', ''));
-  if (testerBatch) testerBatch.replaceChildren(new Option('Awaiting READY JSON', ''));
   if (shortlistBody) shortlistBody.replaceChildren();
   document.querySelectorAll('#strategies-dd5 .progress-block p').forEach((item) => {
     item.textContent = 'Awaiting the preceding committed stage.';
@@ -1164,9 +1167,10 @@
       const previous = analysisExisting.value;
       analysisExisting.replaceChildren(new Option('Выберите analysis DB', ''));
       for (const row of rows) {
-        analysisExisting.append(new Option(`${row.name} · ${row.scopes} scopes`, row.path));
+        const analysisRef = row.analysis_ref || '';
+        if (analysisRef) analysisExisting.append(new Option(`${row.name} · ${row.scopes} scopes`, analysisRef));
       }
-      if (rows.some((row) => row.path === previous)) analysisExisting.value = previous;
+      if (rows.some((row) => row?.analysis_ref === previous)) analysisExisting.value = previous;
       analysisOpenStatus(rows.length
         ? `Готовых analysis DB: ${rows.length}.`
         : 'Готовых analysis DB не найдено.');
@@ -1178,7 +1182,7 @@
     if (!selected) { analysisOpenStatus('Выберите analysis DB.'); return; }
     try {
       // Opening registers the run, so its shortlist is readable without a rerun.
-      const opened = await remoteRequest('/api/v2/strategies/fresh/open', { analysis_path: selected });
+      const opened = await remoteRequest('/api/v2/strategies/fresh/open', { analysis_ref: selected });
       currentAnalysisId = opened.analysis_run_id;
       applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId }));
       analysisOpenStatus(`Открыто: ${opened.scopes} scopes · surface ${String(opened.surface_id).slice(0, 12)}.`);
@@ -1188,9 +1192,6 @@
     }
   });
   loadAnalysisCatalog();
-  document.querySelector('#analysis-lineage')?.addEventListener('click', () => {
-    strategyStatus('Manifest and lineage are available after the analysis is committed.');
-  });
   const generateStatus = (message) => {
     const node = document.querySelector('#shortlist-generate-status');
     if (node) node.textContent = message;
@@ -1212,12 +1213,7 @@
         analysis_run_id: currentAnalysisId,
         candidate_ids: candidateIds,
         selected_scopes: scopes.map((group) => [group.pair, group.side, group.timeframe]),
-        output_dir: document.querySelector('#strategies-output')?.value || '',
       });
-      const batch = document.querySelector('#tester-batch');
-      if (batch) batch.replaceChildren(new Option(`${result.strategy_count} READY JSON · ${result.manifest}`, currentAnalysisId));
-      const output = document.querySelector('#strategies-output');
-      if (output && result.output_dir) output.value = result.output_dir;
       generateStatus(`READY JSON committed: ${result.strategy_count}.`);
     } catch (error) {
       generateStatus(`READY JSON не создан: ${error?.message || 'unknown error'}.`);
@@ -1234,7 +1230,13 @@
     } catch (error) { strategyStatus(`Shortlist ошибка: ${error?.message || 'unknown error'}.`); }
   });
   document.querySelector('#shortlist-select-all')?.addEventListener('click', () => {
+    selectedScopeKeys.clear();
     for (const group of shortlistGroups) if (group.ready > 0) selectedScopeKeys.add(group.scope_key);
+    renderShortlist();
+  });
+  document.querySelector('#shortlist-select-active')?.addEventListener('click', () => {
+    selectedScopeKeys.clear();
+    for (const group of shortlistGroups) if (Number(group.ready_after_filters ?? group.ready ?? 0) > 0) selectedScopeKeys.add(group.scope_key);
     renderShortlist();
   });
   document.querySelector('#shortlist-select-none')?.addEventListener('click', () => {
@@ -1247,6 +1249,22 @@
   const testerTrack = testerCard?.querySelector('.progress-track span');
   const testerStart = document.querySelector('#tester-start');
   const testerStop = document.querySelector('#tester-stop');
+  const testerStartDate = document.querySelector('#tester-start-date');
+  const testerEndDate = document.querySelector('#tester-end-date');
+  const validIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+  const shiftDateMonths = (value, months) => {
+    if (!validIsoDate(value)) return '';
+    const [year, month, day] = value.split('-').map(Number);
+    const target = new Date(Date.UTC(year, month - 1 + months, 1));
+    const lastDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+    target.setUTCDate(Math.min(day, lastDay));
+    return target.toISOString().slice(0, 10);
+  };
+  [1, 2, 3].forEach((months) => document.querySelector(`#tester-range-${months}m`)?.addEventListener('click', () => {
+    const anchor = testerEndDate?.value || new Date().toISOString().slice(0, 10);
+    if (testerEndDate && !testerEndDate.value) testerEndDate.value = anchor;
+    if (testerStartDate) testerStartDate.value = shiftDateMonths(anchor, -months);
+  }));
   const performanceStart = document.querySelector('#performance-dd5-start');
   const performanceStatus = document.querySelector('#performance-dd5-status');
   const performanceText = strategyCards[3]?.querySelector('.progress-block p');
@@ -1279,9 +1297,13 @@
   };
   if (testerStart) testerStart.addEventListener('click', async () => {
     if (!currentAnalysisId) { strategyStatus('Сначала сформируйте READY JSON.'); return; }
+    const startDate = testerStartDate?.value || '';
+    const endDate = testerEndDate?.value || '';
+    if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Укажите корректные даты начала и конца тестирования.'; return; }
+    if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Дата начала не может быть позже даты конца.'; return; }
     testerStart.disabled = true;
     try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId } });
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId, start_date: document.querySelector('#tester-start-date')?.value || startDate, end_date: document.querySelector('#tester-end-date')?.value || endDate } });
       testerJobId = result.job?.job_id || '';
       if (!testerJobId) throw new Error('missing job');
       renderTester(result.job); await pollTester();

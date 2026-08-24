@@ -104,7 +104,7 @@ def test_source_surfaces_and_strategies_screens_have_approved_workflow_cards() -
         "CALCULATION_ONLY",
     ):
         assert label in strategies
-    assert "Source PnL" in strategies
+    assert "Source PnL" not in strategies
 
 
 def test_settings_semantic_ids_and_static_js_use_v2_testing_endpoints() -> None:
@@ -325,6 +325,103 @@ def test_dd5_screen_removes_non_contract_manifest_and_path_controls() -> None:
     assert 'id="tester-output"' not in strategies
 
 
+def test_dd5_screen_has_no_dead_control_handlers_or_payload_fields() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    for text in ("analysis-lineage", "strategies-output", "tester-batch", "tester-output"):
+        assert text not in html
+        assert text not in js
+
+
+def test_analysis_catalog_uses_relative_analysis_ref_for_open() -> None:
+    js = _read("app.js")
+
+    assert "row.analysis_ref" in js
+    assert "analysis_ref: selected" in js
+    assert "row.path" not in js
+
+
+def test_tester_dates_and_local_ranges_are_sent_only_on_tester_start() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    for control in ("tester-start-date", "tester-end-date", "tester-range-1m", "tester-range-2m", "tester-range-3m"):
+        assert f'id="{control}"' in html
+    assert "start_date" in js and "end_date" in js
+    assert "startDate > endDate" in js
+    tester_request = js.split("kind: 'strategies.tester.start'", 1)[1].split("});", 1)[0]
+    assert "tester-start-date" in tester_request
+    assert "tester-end-date" in tester_request
+    for marker in ("shortlist", "analyze", "generate"):
+        assert f"tester-range-{marker}" not in js
+
+
+def test_shortlist_active_selection_uses_ready_after_filters_without_http() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="shortlist-select-active"' in html
+    assert "ready_after_filters" in js
+    active = js.split("#shortlist-select-active", 1)[1].split("const testerCard", 1)[0]
+    assert "remoteRequest" not in active
+    assert "expandedPairs" not in active
+    assert "selectedScopeKeys" in active
+
+
+def test_shortlist_bulk_handlers_preserve_non_selection_state() -> None:
+    js = _read("app.js")
+
+    handlers = js.split("document.querySelector('#shortlist-select-all')", 1)[1].split("const testerCard", 1)[0]
+    assert handlers.count("renderShortlist();") == 3
+    assert "remoteRequest" not in handlers
+    assert "expandedPairs.add" not in handlers
+    assert "expandedPairs.delete" not in handlers
+    assert "tester-start-date" not in handlers
+    assert "tester-end-date" not in handlers
+
+
+def test_tester_date_guard_is_iso_validated_before_network_request() -> None:
+    js = _read("app.js")
+
+    tester = js.split("if (testerStart) testerStart.addEventListener", 1)[1].split("if (testerStop)", 1)[0]
+    assert "validIsoDate" in tester
+    assert "!validIsoDate(startDate) || !validIsoDate(endDate)" in tester
+    assert "start_date" in tester and "end_date" in tester
+    stop = js.split("if (testerStop) testerStop.addEventListener", 1)[1].split("const renderPerformance", 1)[0]
+    assert "start_date" not in stop and "end_date" not in stop
+
+
+def test_shortlist_table_has_phase_one_optional_group_columns_and_fallbacks() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    shortlist = html.split('class="shortlist-table"', 1)[1].split("</table>", 1)[0]
+    assert shortlist.split("</thead>", 1)[0].count("<th ") == 12
+    for field in ("plateau_count", "period", "deferred"):
+        assert f"group.{field}" in js
+    assert "—" in js or "вЂ”" in js
+
+
+def test_shortlist_rows_append_order_buckets_before_new_columns() -> None:
+    js = _read("app.js")
+
+    render = js.split("const renderShortlist", 1)[1].split("const applyShortlist", 1)[0]
+    assert render.count("for (const bucket of ORDER_BUCKETS)") == 2
+    assert "for (const bucket of ORDER_BUCKETS) row.append" in render
+    assert "for (const bucket of ORDER_BUCKETS) child.append" in render
+    assert "row.append(valueCell(undefined" in render
+    assert "child.append(valueCell(group.plateau_count" in render
+
+
+def test_tester_range_shortcuts_are_local_only() -> None:
+    js = _read("app.js")
+
+    ranges = js.split("[1, 2, 3].forEach", 1)[1].split("const performanceStart", 1)[0]
+    assert "testerStartDate" in ranges and "testerEndDate" in ranges
+    assert "remoteRequest" not in ranges and "fetch(" not in ranges
+
+
 def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() -> None:
     html = _read("index.html")
     js = _read("app.js")
@@ -353,7 +450,7 @@ def test_shortlist_keeps_native_nine_columns_and_independent_selection_controls(
     js = _read("app.js")
 
     shortlist = html.split('class="shortlist-table"', 1)[1].split("</table>", 1)[0]
-    assert shortlist.split("</thead>", 1)[0].count("<th ") == 9
+    assert shortlist.split("</thead>", 1)[0].count("<th ") == 12
     assert "shortlist-group-checkbox" in js
     assert "shortlist-tf-checkbox" in js
     assert "Select all READY TFs" in js
