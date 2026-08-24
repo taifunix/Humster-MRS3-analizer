@@ -1144,9 +1144,10 @@ def run_batch(
             provenance=provenance,
         )
         advance("INBOX_CAPTURED")
-        cleanup_completed_batch(config)
-        shutil.rmtree(report_snapshot_dir, ignore_errors=True)
-        advance("RAW_ARTIFACTS_REMOVED")
+        if not config.preserve_raw_artifacts:
+            cleanup_completed_batch(config)
+            shutil.rmtree(report_snapshot_dir, ignore_errors=True)
+            advance("RAW_ARTIFACTS_REMOVED")
         advance("COMPLETED", inbox_path=inbox_path)
         if completion is None:
             raise RuntimeError("batch completion was not recorded")

@@ -2234,14 +2234,31 @@ class PanelController:
         return self._strategy_batch_service
 
     def strategies_tester_start(self, payload: Mapping[str, object]) -> dict[str, object]:
+        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end"})
+        if unexpected:
+            raise ValueError("tester start request contains unsupported fields")
         analysis_id = self._required(payload, "analysis_run_id")
+        start_date = payload.get("start_date", payload.get("test_start"))
+        end_date = payload.get("end_date", payload.get("test_end"))
+        if "start_date" in payload and "test_start" in payload and payload["start_date"] != payload["test_start"]:
+            raise ValueError("start_date and test_start disagree")
+        if "end_date" in payload and "test_end" in payload and payload["end_date"] != payload["test_end"]:
+            raise ValueError("end_date and test_end disagree")
+        if start_date is None or end_date is None:
+            raise ValueError("start_date and end_date are required")
         manifest = self._fresh_strategy_manifests.get(analysis_id)
         if manifest is None:
             raise ValueError("fresh strategy batch is not available in this panel session")
         return self._start_tracked_panel_job(
-            "strategies.tester", {"analysis_run_id": analysis_id},
+            "strategies.tester", {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date},
             ("strategies.tester",),
-            lambda job_id: self._strategy_batch().start(manifest, job_id=job_id),
+            lambda job_id: self._strategy_batch().start(
+                manifest,
+                analysis_run_id=analysis_id,
+                start_date=start_date,
+                end_date=end_date,
+                job_id=job_id,
+            ),
         )
 
     def strategies_tester_status(self, job_id: str) -> dict[str, object]:

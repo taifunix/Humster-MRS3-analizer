@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import date
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import shutil
 from threading import Event, RLock, Thread
 from uuid import uuid4
 
 from .runner.config import RunnerConfig
+from .runner.files import prepare_batch_files
+from .runner.process import stop_bot as _stop_bot
 from .runner.workflow import run_batch as _run_batch
 from .runner.workflow import validate_runtime_preflight
 
@@ -32,6 +36,7 @@ class _Job:
     job_id: str
     manifest: ValidatedStrategyManifest
     output_csv: Path
+    runner_config: object
     cancel: Event = field(default_factory=Event)
     state: str = "RUNNING"
     phase: str = "RUNNING"
@@ -80,6 +85,8 @@ def _strategy_digest(document: dict[str, object]) -> str:
 
 
 def _strategy_source(manifest_path: Path) -> Path:
+    if manifest_path.parent.name == ".mrs3":
+        return manifest_path.parent.parent.resolve()
     sibling = manifest_path.parent / "strategies"
     if sibling.is_dir():
         return sibling.resolve()
@@ -190,30 +197,99 @@ def _publish_reports(config: RunnerConfig, inbox: Path) -> None:
 class LocalStrategyBatchService:
     """Run a validated READY batch in a daemon thread with redacted status."""
 
-    def __init__(self, config: RunnerConfig, *, run_batch=_run_batch, on_update=None) -> None:
+    def __init__(self, config: RunnerConfig, *, run_batch=_run_batch, stop_bot=_stop_bot, on_update=None) -> None:
         self.config = config
         self._run_batch = run_batch
+        self._stop_bot = stop_bot
         self._on_update = on_update
         self._lock = RLock()
         self._jobs: dict[str, _Job] = {}
 
-    def start(self, manifest_path: Path, *, job_id: str | None = None) -> dict[str, object]:
+    @staticmethod
+    def _dates(start_date: object, end_date: object) -> tuple[str, str] | None:
+        if start_date is None and end_date is None:
+            return None
+        if not isinstance(start_date, str) or not isinstance(end_date, str):
+            raise StrategyBatchValidationError("start_date and end_date must be ISO dates")
+        try:
+            start = date.fromisoformat(start_date)
+            end = date.fromisoformat(end_date)
+        except ValueError:
+            raise StrategyBatchValidationError("start_date and end_date must be ISO dates") from None
+        if start.isoformat() != start_date or end.isoformat() != end_date:
+            raise StrategyBatchValidationError("start_date and end_date must be ISO dates")
+        if start > end:
+            raise StrategyBatchValidationError("start_date must be on or before end_date")
+        return start_date, end_date
+
+    @staticmethod
+    def _write_tester_dates(config: RunnerConfig, start_date: str, end_date: str) -> RunnerConfig:
+        target = (config.bot_root / "config_tester.json").resolve()
+        seed = target
+        if not seed.is_file() and config.tester_config.is_file():
+            seed = config.tester_config
+        try:
+            document = json.loads(seed.read_text(encoding="utf-8")) if seed.is_file() else {}
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise StrategyBatchValidationError("tester config is invalid") from error
+        if not isinstance(document, dict):
+            raise StrategyBatchValidationError("tester config must be an object")
+        document["StartDate"] = start_date
+        document["EndDate"] = end_date
+        temporary = target.with_name(target.name + ".tmp")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, target)
+        except OSError as error:
+            temporary.unlink(missing_ok=True)
+            raise StrategyBatchValidationError("tester config cannot be written") from error
+        return replace(config, tester_config=target, preserve_raw_artifacts=True)
+
+    def start(
+        self,
+        manifest_path: Path,
+        *,
+        analysis_run_id: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        job_id: str | None = None,
+    ) -> dict[str, object]:
         validated = validate_strategy_manifest(Path(manifest_path))
-        validate_runtime_preflight(self.config)
+        if analysis_run_id is not None and validated.analysis_run_id != analysis_run_id:
+            raise StrategyBatchValidationError("strategy batch does not match analysis run")
+        dates = self._dates(start_date, end_date)
         job_id = job_id or str(uuid4())
-        inbox_root = Path(getattr(self.config, "inbox_root", Path.cwd() / ".mrs3-panel-inbox"))
-        output = inbox_root / f"{job_id}.csv"
-        job = _Job(
-            job_id,
-            validated,
-            output,
-            progress={"current": 0, "total": int(validated.provenance["strategy_count"]), "unit": "strategies"},
-        )
         with self._lock:
             if any(item.state not in {"COMMITTED", "CANCELLED", "FAILED"} for item in self._jobs.values()):
                 raise StrategyBatchValidationError("local tester batch is already running")
             if not isinstance(job_id, str) or not job_id.strip() or job_id in self._jobs:
                 raise StrategyBatchValidationError("local tester job id is invalid")
+            runtime_config: object = self.config
+            if dates is not None:
+                if not isinstance(self.config, RunnerConfig):
+                    raise StrategyBatchValidationError("tester config is unavailable")
+                validate_runtime_preflight(self.config)
+                runtime_config = self._write_tester_dates(self.config, *dates)
+                prepare_batch_files(runtime_config, validated.strategy_source)
+            else:
+                validate_runtime_preflight(self.config)
+            inbox_root = Path(getattr(self.config, "inbox_root", Path.cwd() / ".mrs3-panel-inbox"))
+            output = inbox_root / f"{job_id}.csv"
+            job = _Job(
+                job_id,
+                validated,
+                output,
+                runtime_config,
+                progress={
+                    "sent": 0,
+                    "running": 0,
+                    "result": 0,
+                    "checked": 0,
+                    "retries": 0,
+                    "total": int(validated.provenance["strategy_count"]),
+                },
+            )
             self._jobs[job_id] = job
         try:
             Thread(target=self._run, args=(job,), daemon=True, name="mrs3-panel-strategy-batch").start()
@@ -239,9 +315,10 @@ class LocalStrategyBatchService:
             return self._snapshot(job)
 
     def _run(self, job: _Job) -> None:
+        terminal: str
         try:
             result = self._run_batch(
-                self.config,
+                job.runner_config,
                 job.manifest.strategy_source,
                 job.output_csv,
                 provenance=job.manifest.provenance,
@@ -250,20 +327,28 @@ class LocalStrategyBatchService:
             with self._lock:
                 cancelled = job.cancel.is_set()
             if cancelled:
-                self._finish(job, "CANCELLED")
-                return
-            if inbox is not None:
+                terminal = "CANCELLED"
+            elif inbox is not None:
                 inbox = Path(inbox).resolve()
-                _publish_reports(self.config, inbox)
+                _publish_reports(job.runner_config, inbox)
+                with self._lock:
+                    job.inbox_path = inbox
             with self._lock:
-                job.inbox_path = inbox
-                total = int(job.manifest.provenance["strategy_count"])
-                job.progress = {"sent": total, "running": 0, "result": total, "checked": total, "retries": 0, "total": total}
-            self._finish(job, "COMMITTED")
+                cancelled = job.cancel.is_set()
+                if not cancelled:
+                    total = int(job.manifest.provenance["strategy_count"])
+                    job.progress = {"sent": total, "running": 0, "result": total, "checked": total, "retries": 0, "total": total}
+            terminal = "CANCELLED" if cancelled else "COMMITTED"
         except BaseException:
             with self._lock:
                 cancelled = job.cancel.is_set()
-            self._finish(job, "CANCELLED" if cancelled else "FAILED")
+            terminal = "CANCELLED" if cancelled else "FAILED"
+        finally:
+            try:
+                self._stop_bot(job.runner_config)
+            except BaseException:
+                pass
+            self._finish(job, terminal)
 
     def _finish(self, job: _Job, state: str) -> None:
         with self._lock:
