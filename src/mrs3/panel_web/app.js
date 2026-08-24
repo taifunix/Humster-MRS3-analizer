@@ -1,5 +1,6 @@
   const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   let shortlistGroups = [];
+  let shortlistItems = [];
   const selectedScopeKeys = new Set();
   const expandedPairs = new Set();
   const shortlistBadge = (kind, text) => {
@@ -9,7 +10,7 @@
     badge.textContent = text;
   };
   const selectedCandidateIds = () => shortlistGroups
-    .filter((group) => selectedScopeKeys.has(group.scope_key))
+    .filter((group) => selectedScopeKeys.has(group.scope_key) && Number(group.ready || 0) > 0)
     .flatMap((group) => group.candidate_ids || []);
   const pairGroups = () => {
     const byPair = new Map();
@@ -66,18 +67,19 @@
       disclosure.className = 'shortlist-disclosure';
       disclosure.textContent = open ? '⌄' : '›';
       disclosure.setAttribute('aria-expanded', open ? 'true' : 'false');
-      disclosure.setAttribute('aria-label', `TF ${pair.pair} ${pair.side}`);
+      disclosure.setAttribute('aria-label', `Expand/collapse ${pair.pair} ${pair.side} TFs`);
       disclosure.addEventListener('click', () => {
         if (open) expandedPairs.delete(pair.key); else expandedPairs.add(pair.key);
         renderShortlist();
       });
-      const selectable = pair.timeframes.filter((group) => group.ready > 0);
+      const selectable = pair.timeframes.filter((group) => Number(group.ready || 0) > 0);
       const box = document.createElement('input');
       box.type = 'checkbox';
       box.disabled = selectable.length === 0;
       box.checked = selectable.length > 0 && selectable.every((group) => selectedScopeKeys.has(group.scope_key));
       box.indeterminate = !box.checked && selectable.some((group) => selectedScopeKeys.has(group.scope_key));
-      box.setAttribute('aria-label', `${pair.pair} ${pair.side}`);
+      box.className = 'shortlist-group-checkbox';
+      box.setAttribute('aria-label', `Select all READY TFs in ${pair.pair} ${pair.side}`);
       box.addEventListener('change', () => {
         for (const group of selectable) {
           if (box.checked) selectedScopeKeys.add(group.scope_key); else selectedScopeKeys.delete(group.scope_key);
@@ -101,10 +103,11 @@
         const childPick = document.createElement('td');
         const childBox = document.createElement('input');
         childBox.type = 'checkbox';
+        childBox.className = 'shortlist-tf-checkbox';
         childBox.value = group.scope_key;
-        childBox.disabled = !(group.ready > 0);
+        childBox.disabled = !(Number(group.ready || 0) > 0);
         childBox.checked = selectedScopeKeys.has(group.scope_key);
-        childBox.setAttribute('aria-label', `${group.pair} ${group.side} ${group.timeframe}`);
+        childBox.setAttribute('aria-label', `Select READY ${group.pair} ${group.side} ${group.timeframe}`);
         childBox.addEventListener('change', () => {
           if (childBox.checked) selectedScopeKeys.add(group.scope_key); else selectedScopeKeys.delete(group.scope_key);
           renderShortlist();
@@ -826,6 +829,7 @@
   });
   const surfaceScopesV2 = document.querySelector('#surface-ready-card .scope-list');
   let surfaceGroupsV2 = [];
+  const expandedSurfacePairs = new Set();
   let surfacePreflightTimerV2 = 0;
   let surfacePreflightRunV2 = 0;
   let surfacePublishTimerV2 = 0;
@@ -849,15 +853,22 @@
     }
     surfaceTextV2('#surface-publish-progress .card-status', value);
   };
+  const surfaceFiltersV2 = () => ({
+    pair: (document.querySelector('#scope-filter-pair')?.value || '').trim().toLowerCase(),
+    side: document.querySelector('#scope-filter-side')?.value || '',
+    status: document.querySelector('#scope-filter-status')?.value || '',
+  });
+  const surfaceItemMatchesFiltersV2 = (group, item, filters = surfaceFiltersV2()) => (
+    (!filters.pair || String(group.pair).toLowerCase().includes(filters.pair))
+    && (!filters.side || group.side === filters.side)
+    && (!filters.status || item.status === filters.status)
+  );
+  const filteredReadySurfaceKeysV2 = () => surfaceGroupsV2.flatMap((group) => (
+    (group.timeframes || [])
+      .filter((item) => item.status === 'READY' && surfaceItemMatchesFiltersV2(group, item))
+      .map((item) => item.scope_key)
+  ));
   const updateSurfaceV2 = () => {
-    const visible = [...surfaceScopesV2.querySelectorAll('.scope-checkbox')];
-    const visibleKeys = new Set(visible.map((node) => node.value));
-    const previousSelection = selectedSurfaceScopes.join('|');
-    selectedSurfaceScopes = [...new Set([
-      ...selectedSurfaceScopes.filter((key) => !visibleKeys.has(key)),
-      ...visible.filter((node) => node.checked).map((node) => node.value),
-    ])];
-    if (previousSelection !== selectedSurfaceScopes.join('|')) surfaceSelectionRunV2 += 1;
     const readyCount = surfaceGroupsV2.flatMap((group) => group.timeframes || []).filter((item) => item.status === 'READY').length;
     if (confirmedSurfaceScopesV2.join('|') !== selectedSurfaceScopes.join('|')) {
       confirmedSurfaceScopesV2 = [];
@@ -867,6 +878,13 @@
     surfaceBadgeV2('surface-ready', selectedSurfaceScopes.length ? 'ready' : 'pending', `${readyCount} READY`);
     surfaceTextV2('#surface-publish-summary', confirmedSurfaceScopesV2.length ? `${confirmedSurfaceScopesV2.length} READY scopes confirmed.` : (selectedSurfaceScopes.length ? `${selectedSurfaceScopes.length} READY scopes await confirmation` : 'awaiting confirmed selection'));
     if (selectedSurfaceScopes.length && !confirmedSurfaceScopesV2.length) surfaceTextV2('#surface-ready-status', 'surface selection changed; confirm it before publishing');
+  };
+  const setSelectedSurfaceScopesV2 = (keys) => {
+    const next = [...new Set(keys)];
+    if (next.join('|') === selectedSurfaceScopes.join('|')) return;
+    selectedSurfaceScopes = next;
+    surfaceSelectionRunV2 += 1;
+    updateSurfaceV2();
   };
   const showGapReportV2 = async (item) => {
     const dialog = document.querySelector('#surface-gap-dialog');
@@ -897,9 +915,11 @@
   };
   const renderSurfaceScopesV2 = () => {
     if (!surfaceScopesV2) return;
-    const pair = (document.querySelector('#scope-filter-pair')?.value || '').trim().toLowerCase();
-    const side = document.querySelector('#scope-filter-side')?.value || '';
-    const statusFilter = document.querySelector('#scope-filter-status')?.value || '';
+    const filters = surfaceFiltersV2();
+    for (const groupNode of surfaceScopesV2.querySelectorAll('.scope-group')) {
+      if (groupNode.open && groupNode.dataset.groupKey) expandedSurfacePairs.add(groupNode.dataset.groupKey);
+      else if (!groupNode.open && groupNode.dataset.groupKey) expandedSurfacePairs.delete(groupNode.dataset.groupKey);
+    }
     surfaceScopesV2.replaceChildren();
     const table = document.createElement('div'); table.className = 'scope-table';
     const header = document.createElement('div'); header.className = 'scope-table-row scope-table-head';
@@ -907,10 +927,16 @@
     table.append(header);
     let visible = 0;
     for (const group of surfaceGroupsV2) {
-      const items = (group.timeframes || []).filter((item) => (!pair || group.pair.toLowerCase().includes(pair)) && (!side || group.side === side) && (!statusFilter || item.status === statusFilter));
+      const items = (group.timeframes || []).filter((item) => surfaceItemMatchesFiltersV2(group, item, filters));
       if (!items.length) continue;
       visible += items.length;
       const groupNode = document.createElement('details'); groupNode.className = 'scope-group';
+      const groupKey = `${group.pair}|${group.side}`;
+      groupNode.dataset.groupKey = groupKey;
+      groupNode.open = expandedSurfacePairs.has(groupKey);
+      groupNode.addEventListener('toggle', () => {
+        if (groupNode.open) expandedSurfacePairs.add(groupKey); else expandedSurfacePairs.delete(groupKey);
+      });
       const summary = document.createElement('summary');
       const ready = items.filter((item) => item.status === 'READY').length;
       const values = ['▸', `${group.pair} · ${group.side}`, `${items.length} TF`, '—', '—'];
@@ -918,7 +944,7 @@
       const groupStatus = document.createElement('span'); groupStatus.className = `scope-table-status ${ready ? 'is-ready' : 'is-not-ready'}`; groupStatus.textContent = ready ? `READY · ${ready} / ${items.length}` : `n/r · 0 / ${items.length}`; summary.append(groupStatus); groupNode.append(summary);
       for (const item of items) {
         const row = document.createElement('label'); row.className = 'scope-table-row scope-timeframe-row';
-        const check = document.createElement('input'); check.type = 'checkbox'; check.className = 'scope-checkbox'; check.value = item.scope_key; check.disabled = item.status !== 'READY'; check.checked = selectedSurfaceScopes.includes(item.scope_key); check.addEventListener('change', updateSurfaceV2);
+        const check = document.createElement('input'); check.type = 'checkbox'; check.className = 'scope-checkbox'; check.value = item.scope_key; check.disabled = item.status !== 'READY'; check.checked = selectedSurfaceScopes.includes(item.scope_key); check.addEventListener('change', () => setSelectedSurfaceScopesV2(check.checked ? [...selectedSurfaceScopes, check.value] : selectedSurfaceScopes.filter((key) => key !== check.value)));
         const blank = document.createElement('span'); const timeframe = document.createElement('strong'); timeframe.textContent = item.timeframe;
         const grid = document.createElement('span'); grid.textContent = '—'; const interval = document.createElement('span'); interval.textContent = '—';
         const state = document.createElement(item.status === 'READY' ? 'span' : 'button'); state.className = `scope-table-status ${item.status === 'READY' ? 'is-ready' : 'is-not-ready'}`; state.textContent = item.status === 'READY' ? 'READY' : 'n/r - Check gaps';
@@ -946,12 +972,24 @@
   document.querySelectorAll('#scope-filter-pair, #scope-filter-side, #scope-filter-status').forEach((node) => {
     node.addEventListener('input', renderSurfaceScopesV2); node.addEventListener('change', renderSurfaceScopesV2);
   });
-  const selectVisibleScopesV2 = (all) => {
-    surfaceScopesV2.querySelectorAll('.scope-checkbox:not(:disabled)').forEach((node) => { node.checked = all; }); updateSurfaceV2();
+  const selectFilteredScopesV2 = () => {
+    setSelectedSurfaceScopesV2([...selectedSurfaceScopes, ...filteredReadySurfaceKeysV2()]);
+    renderSurfaceScopesV2();
   };
-  document.querySelector('#scope-select-all')?.addEventListener('click', () => { selectedSurfaceScopes = surfaceGroupsV2.flatMap((group) => group.timeframes || []).filter((item) => item.status === 'READY').map((item) => item.scope_key); renderSurfaceScopesV2(); updateSurfaceV2(); });
-  document.querySelector('#scope-select-none')?.addEventListener('click', () => { selectedSurfaceScopes = []; renderSurfaceScopesV2(); updateSurfaceV2(); });
-  document.querySelector('#scope-select-visible')?.addEventListener('click', () => selectVisibleScopesV2(true));
+  const selectFilteredButtonV2 = document.querySelector('#scope-select-visible');
+  if (selectFilteredButtonV2) {
+    selectFilteredButtonV2.textContent = 'Выбрать отфильтрованные READY';
+    selectFilteredButtonV2.setAttribute('aria-label', 'Выбрать отфильтрованные READY scopes');
+    selectFilteredButtonV2.addEventListener('click', selectFilteredScopesV2);
+  }
+  document.querySelector('#scope-select-all')?.addEventListener('click', () => {
+    setSelectedSurfaceScopesV2(surfaceGroupsV2.flatMap((group) => group.timeframes || []).filter((item) => item.status === 'READY').map((item) => item.scope_key));
+    renderSurfaceScopesV2();
+  });
+  document.querySelector('#scope-select-none')?.addEventListener('click', () => {
+    setSelectedSurfaceScopesV2([]);
+    renderSurfaceScopesV2();
+  });
   document.querySelector('#surface-preflight-start')?.addEventListener('click', async () => {
     if (surfacePreflightTimerV2) clearInterval(surfacePreflightTimerV2);
     const run = ++surfacePreflightRunV2;
@@ -964,7 +1002,7 @@
       if (run !== surfacePreflightRunV2 || sourcePath !== (surfaceSource?.value || '')) {
         return;
       }
-      surfaceProof = result[['to', 'ken'].join('')]; selectedSurfaceScopes = []; confirmedSurfaceScopesV2 = []; surfaceGroupsV2 = result.groups || [];
+       surfaceProof = result[['to', 'ken'].join('')]; setSelectedSurfaceScopesV2([]); confirmedSurfaceScopesV2 = []; surfaceGroupsV2 = result.groups || [];
       renderSurfaceScopesV2(); updateSurfaceV2(); document.querySelector('#surface-ready-card').open = true;
       const elapsed = formatDuration((Date.now() - started) / 1000); const count = (result.rows || []).length;
       surfaceTextV2('#surface-preflight-summary', `COMPLETED · ${count} scopes · ${elapsed}`); surfaceBadgeV2('surface-preflight', 'ready', 'COMPLETED'); surfaceBadgeV2('surface-source', 'ready', 'VALID'); preflightProgressV2('complete', `Coverage preflight: ${count} scopes · ${elapsed}.`);
@@ -987,7 +1025,7 @@
         surfaceTextV2('#surface-ready-status', 'Selection changed; confirm it again.');
         return;
       }
-      selectedSurfaceScopes = result.scopes || []; confirmedSurfaceScopesV2 = [...selectedSurfaceScopes];
+      setSelectedSurfaceScopesV2(result.scopes || []); confirmedSurfaceScopesV2 = [...selectedSurfaceScopes];
       const surfaceName = document.querySelector('#surface-name');
       if (surfaceName && result.suggested_filename) surfaceName.value = result.suggested_filename;
       renderSurfaceScopesV2(); updateSurfaceV2(); surfaceTextV2('#surface-ready-status', `${selectedSurfaceScopes.length} READY scopes confirmed.`); surfaceTextV2('#surface-publish-summary', `${selectedSurfaceScopes.length} READY scopes confirmed.`); surfaceBadgeV2('surface-publish', 'ready', 'READY');
@@ -1069,7 +1107,6 @@
   let currentAnalysisId = '';
   let testerJobId = '';
   let testerPoller = 0;
-  let shortlistItems = [];
   const strategyStatus = (message) => {
     const target = strategyCards[0]?.querySelector('.progress-block p');
     if (target) target.textContent = message;
@@ -1085,22 +1122,6 @@
   const analysisElapsed = (startedAt) => {
     const seconds = Math.floor((Date.now() - startedAt) / 1000);
     return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
-  };
-  const renderShortlist = () => {
-    const body = document.querySelector('#strategies-dd5 tbody');
-    if (!body) return;
-    body.replaceChildren();
-    for (const item of shortlistItems) {
-      const row = document.createElement('tr');
-      const first = document.createElement('th'); first.scope = 'row';
-      const box = document.createElement('input'); box.type = 'checkbox'; box.value = item.candidate_id;
-      box.disabled = item.status !== 'READY_MRS3_STRUCTURE';
-      first.append(box, ` ${item.pair} · ${item.side}`);
-      for (const value of [item.timeframe, '—', '—', '—', String(item.order_count), item.status]) {
-        const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
-      }
-      row.insertBefore(first, row.firstChild); body.append(row);
-    }
   };
   const analysisTarget = document.querySelector('#analysis-target');
   const fillAnalysisTarget = () => {

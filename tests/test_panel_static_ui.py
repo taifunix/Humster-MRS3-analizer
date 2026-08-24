@@ -313,3 +313,90 @@ def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() 
     assert "suggested_filename" in js
     assert "analysis_db_root" in js
     assert "dd5Track" in js
+
+
+def test_shortlist_has_one_grouped_renderer_and_shared_candidate_state() -> None:
+    js = _read("app.js")
+
+    assert js.count("const renderShortlist =") == 1
+    assert js.count("let shortlistItems = [];") == 1
+    assert js.index("let shortlistItems = [];") < js.index("const renderShortlist = () =>")
+    assert "for (const item of shortlistItems)" not in js
+    assert "shortlistItems = payload.items || [];" in js
+    assert "applyShortlist(shortlist)" in js
+
+
+def test_shortlist_keeps_native_nine_columns_and_independent_selection_controls() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    shortlist = html.split('class="shortlist-table"', 1)[1].split("</table>", 1)[0]
+    assert shortlist.split("</thead>", 1)[0].count("<th ") == 9
+    assert "shortlist-group-checkbox" in js
+    assert "shortlist-tf-checkbox" in js
+    assert "Select all READY TFs" in js
+    assert "Expand/collapse" in js
+    assert "const selectable = pair.timeframes.filter((group) => Number(group.ready || 0) > 0);" in js
+
+
+def test_surface_selection_is_model_driven_and_preserves_open_groups() -> None:
+    js = _read("app.js")
+
+    update = js.split("const updateSurfaceV2", 1)[1].split("const showGapReportV2", 1)[0]
+    assert "querySelectorAll" not in update
+    assert "const filteredReadySurfaceKeysV2" in js
+    assert "selectFilteredScopesV2" in js
+    assert "setSelectedSurfaceScopesV2([...selectedSurfaceScopes, ...filteredReadySurfaceKeysV2()]);" in js
+    assert "scope-select-visible" in js
+    assert "Выбрать отфильтрованные READY" in js
+    assert "const expandedSurfacePairs = new Set();" in js
+    assert "expandedSurfacePairs.has(groupKey)" in js
+    assert "groupNode.addEventListener('toggle'" in js
+
+
+def test_bulk_shortlist_actions_do_not_touch_pair_expansion_state() -> None:
+    js = _read("app.js")
+
+    for selector in ("#shortlist-select-all", "#shortlist-select-none", "#shortlist-refresh"):
+        segment = js.split(f"document.querySelector('{selector}')", 1)[1].split("});", 1)[0]
+        assert "expandedPairs" not in segment
+
+
+def test_shared_json_requests_fail_safely_and_busy_job_controls_cleanup() -> None:
+    js = _read("app.js")
+
+    assert "const requestJson = async" in js
+    helper = js.split("const requestJson = async", 1)[1].split("const remoteRequest", 1)[0]
+    assert "response.ok" in helper
+    assert "response.json()" in helper
+    assert "Backend connection unavailable." in helper
+    assert "requestJson('/api/v2/source/local/catalog')" in js
+    assert "requestJson('/api/v2/strategies/tester/status?job_id=" in js
+    assert "testerStart.disabled = true" in js
+    assert "finally" in js
+    assert "testerStart.disabled = false" in js
+    assert "performanceStart.disabled = true" in js
+    assert "performanceStart.disabled = false" in js
+
+
+def test_reload_recovers_only_server_job_snapshots() -> None:
+    js = _read("app.js")
+
+    assert "const recoverJobs = async" in js
+    recovery = js.split("const recoverJobs = async", 1)[1].split("const settingsStatus", 1)[0]
+    assert "requestJson('/api/v2/jobs')" in recovery
+    assert "job.kind === 'strategies.tester'" in recovery
+    assert "job.kind === 'strategies.performance-dd5'" in recovery
+    assert "renderTester(job)" in recovery
+    assert "renderPerformance(job)" in recovery
+    assert "job.state =" not in recovery
+    assert "recoverJobs();" in js
+
+
+def test_testing_screen_does_not_expose_remote_runner_paths() -> None:
+    html = _read("index.html")
+
+    testing = html.split('id="runner-remote"', 1)[1].split('</article>', 1)[0]
+    assert 'id="remote-paths"' not in testing
+    for field in ("remote-bot-root", "remote-runner-root", "remote-reports-root", "remote-reports-archive-root"):
+        assert f'id="{field}"' not in html
