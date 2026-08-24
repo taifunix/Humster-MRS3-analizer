@@ -5,6 +5,7 @@ import base64
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -657,3 +658,28 @@ def test_controller_starts_visible_delivery_instead_of_blocking_status_request(t
 
     assert status["state"] == "TRANSFERRING"
     assert executor.delivery_target == target.resolve()
+
+
+def test_controller_derives_remote_source_paths_from_server_config(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class Executor:
+        config = SimpleNamespace(
+            reports_archive_root="/opt/hb1/reports-archive",
+            source_db_root="/opt/hb1/source-db",
+        )
+
+        def start_import(self, remote_html: str, remote_target: str, *, job_id: str) -> dict[str, object]:
+            calls.append((remote_html, remote_target))
+            return {"job_id": job_id, "state": "RUNNING", "phase": "REMOTE_IMPORT", "progress": {}}
+
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    executor = Executor()
+    controller._remote_source_executor = executor
+    target = tmp_path / "run-set.source-v6.duckdb"
+
+    controller.source_db_remote_start({"local_target_path": str(target)})
+
+    assert calls == [("/opt/hb1/reports-archive", "/opt/hb1/source-db/run-set.source-v6.duckdb")]
