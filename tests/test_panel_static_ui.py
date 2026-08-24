@@ -72,6 +72,7 @@ def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() ->
         assert f'id="{runner}-start-date"' in html
         assert f'id="{runner}-end-date"' in html
     assert 'id="local-paths"' in html
+    assert 'id="remote-paths"' not in html
     assert "Проверить runner и диск" in html
     assert "Сохранить пути" in html
     assert 'id="panel-reload"' in html
