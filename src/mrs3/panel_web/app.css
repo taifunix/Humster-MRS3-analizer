@@ -107,16 +107,17 @@ summary small { margin-left: 5px; color: var(--muted); font-size: .7rem; font-we
 .scope-list input { width: auto; min-height: 0; }
 .scope-list strong { margin-left: auto; color: var(--ink); }
 .scope-filters { display: grid; grid-template-columns: 1.45fr 1fr 1fr; gap: 9px; }
-.scope-table { overflow-x: auto; overflow-y: hidden; border: 1px solid #526b8b; border-radius: 8px; color: #edf3fc; background: var(--navy); }
-.scope-table-row { display: grid; grid-template-columns: 36px 190px 90px 85px 150px minmax(150px, 1fr); gap: 9px; align-items: center; min-width: 760px; padding: 10px 11px; border-bottom: 1px solid #3b4d69; font-size: .78rem; }
+.scope-table { --scope-grid-template: 36px 190px 90px 85px 150px minmax(150px, 1fr); overflow-x: auto; overflow-y: hidden; border: 1px solid #526b8b; border-radius: 8px; color: #edf3fc; background: var(--navy); }
+.scope-table-row, .scope-group > summary, .scope-table .scope-timeframe-row { display: grid; grid-template-columns: var(--scope-grid-template); gap: 9px; align-items: center; min-width: 760px; }
+.scope-table-row { padding: 10px 11px; border-bottom: 1px solid #3b4d69; font-size: .78rem; }
 .scope-table-head { color: #fff; background: #46607f; font-weight: 800; }
 .scope-group { border-bottom: 1px solid #41516c; }
 .scope-group:last-child { border-bottom: 0; }
-.scope-group > summary { display: grid; grid-template-columns: 36px 190px 90px 85px 150px minmax(150px, 1fr); gap: 9px; align-items: center; min-width: 760px; padding: 11px; color: #fff; background: #1c2638; font-size: .8rem; }
+.scope-group > summary { padding: 11px; color: #fff; background: #1c2638; font-size: .8rem; }
 .scope-group > summary::after { display: none; }
 .scope-group-toggle { color: #aebed3; font-size: .9rem; }
 .scope-group[open] .scope-group-toggle { transform: rotate(90deg); }
-.scope-table .scope-timeframe-row { display: grid; padding: 10px 11px; border: 0; border-bottom: 1px solid #35445b; border-radius: 0; color: #e3eaf5; background: #202d43; }
+.scope-table .scope-timeframe-row { padding: 10px 11px; border: 0; border-bottom: 1px solid #35445b; border-radius: 0; color: #e3eaf5; background: #202d43; }
 .scope-table .scope-timeframe-row strong { margin-left: 0; color: #e3eaf5; }
 .scope-timeframe-row:last-child { border-bottom: 0; }
 .scope-table input { width: auto; min-height: 0; }

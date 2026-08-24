@@ -19,7 +19,7 @@ def test_static_shell_starts_with_all_accordions_collapsed_and_status_in_header(
     header = html.split('<header class="topbar">', 1)[1].split("</header>", 1)[0]
     assert 'id="panel-reload"' in header
     assert "'/api/v2/panel/restart'" in js
-    assert '"/api/v2/bootstrap"' in js
+    assert "requestJson('/api/v2/bootstrap')" in js
     for text in (
         "Static panel shell loaded.",
         "Запуск ожидает backend.",
@@ -66,7 +66,7 @@ def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() ->
 
     assert 'id="runner-local"' in html
     assert 'id="runner-remote"' in html
-    for runner in ("local", "remote"):
+    for runner in ("local",):
         assert f'id="{runner}-pair"' in html
         assert f'id="{runner}-side"' in html
         assert f'id="{runner}-start-date"' in html
@@ -78,6 +78,7 @@ def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() ->
     assert 'name="host"' not in html
     assert 'name="user"' not in html
     assert "ssh" not in html.lower()
+    assert 'id="remote-paths"' not in html
 
 
 def test_source_surfaces_and_strategies_screens_have_approved_workflow_cards() -> None:
@@ -116,25 +117,26 @@ def test_settings_semantic_ids_and_static_js_use_v2_testing_endpoints() -> None:
     assert 'aria-live="polite"' in html
     assert 'value="legacy"' in html
     assert 'value="static"' in html
-    assert 'fetch("/api/v2/bootstrap")' in js
-    assert 'fetch("/api/v2/testing/local/status")' in js
-    assert 'fetch("/api/v2/testing/remote/status")' in js
-    assert 'fetch("/api/v2/testing/local/fill"' in js
+    assert "requestJson('/api/v2/bootstrap')" in js
+    assert "requestJson('/api/v2/testing/local/status')" in js
+    assert "requestJson('/api/v2/testing/remote/status')" in js
+    assert "requestJson('/api/v2/testing/local/fill'" in js
     assert '`/api/v2/testing/local/${action}`' in js
     assert "/api/ui/" not in js
     assert "duckdb-direct" not in js
     assert "title.tabIndex = -1" in js
     assert "let jobTarget = ''" in js
     assert "algorithm_version: document.querySelector('#settings-algorithm')" in js
-    assert "fetch('/api/v2/settings/reload')" in js
+    assert "requestJson('/api/v2/settings/reload')" in js
 
 
 def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
     html = _read("index.html")
     js = _read("app.js")
 
-    for button_id in ("local-paths-save", "remote-paths-save"):
+    for button_id in ("local-paths-save",):
         assert f'id="{button_id}"' in html
+    assert 'id="remote-paths-save"' not in html
     assert "savePathDefaults" in js
     for path_key in ("local_reports_root", "local_source_db_root", "remote_import_html_root", "local_merge_target"):
         assert path_key in js
@@ -278,7 +280,8 @@ def test_surface_timeframe_rows_override_generic_scope_list_label_style() -> Non
     assert ".scope-table .scope-timeframe-row { display: grid;" in css
     assert "border-radius: 0;" in css
     assert "color: #e3eaf5;" in css
-    assert ".scope-table { overflow-x: auto;" in css
+    assert ".scope-table { --scope-grid-template:" in css
+    assert "overflow-x: auto;" in css
 
 
 def test_surface_gap_link_opens_a_visible_report_dialog() -> None:
@@ -354,6 +357,14 @@ def test_surface_selection_is_model_driven_and_preserves_open_groups() -> None:
     assert "groupNode.addEventListener('toggle'" in js
 
 
+def test_surface_table_reuses_one_grid_template_for_header_groups_and_timeframes() -> None:
+    css = _read("app.css")
+
+    assert "--scope-grid-template:" in css
+    assert ".scope-table-row, .scope-group > summary, .scope-table .scope-timeframe-row" in css
+    assert "grid-template-columns: var(--scope-grid-template)" in css
+
+
 def test_bulk_shortlist_actions_do_not_touch_pair_expansion_state() -> None:
     js = _read("app.js")
 
@@ -371,7 +382,7 @@ def test_shared_json_requests_fail_safely_and_busy_job_controls_cleanup() -> Non
     assert "response.json()" in helper
     assert "Backend connection unavailable." in helper
     assert "requestJson('/api/v2/source/local/catalog')" in js
-    assert "requestJson('/api/v2/strategies/tester/status?job_id=" in js
+    assert "requestJson('/api/v2/strategies/tester/status?job_id='" in js
     assert "testerStart.disabled = true" in js
     assert "finally" in js
     assert "testerStart.disabled = false" in js
@@ -400,3 +411,26 @@ def test_testing_screen_does_not_expose_remote_runner_paths() -> None:
     assert 'id="remote-paths"' not in testing
     for field in ("remote-bot-root", "remote-runner-root", "remote-reports-root", "remote-reports-archive-root"):
         assert f'id="{field}"' not in html
+
+
+def test_request_json_distinguishes_non_json_and_server_validation_safely() -> None:
+    js = _read("app.js")
+
+    helper = js.split("const requestJson = async", 1)[1].split("const remoteRequest", 1)[0]
+    assert "content-type" in helper
+    assert "application/json" in helper
+    assert "Backend returned invalid JSON." in helper
+    assert "Server validation failed." in helper
+    assert "Backend connection unavailable." in helper
+
+
+def test_status_and_dynamic_controls_have_accessible_announcements() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="status"' in html
+    assert 'role="status"' in html
+    assert 'aria-live="polite"' in html
+    assert 'caption class="sr-only"' in html
+    assert 'aria-expanded' in js
+    assert 'aria-label' in js
