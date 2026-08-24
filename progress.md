@@ -523,3 +523,19 @@ fragment progress with current status polling.
 Evidence: Source v6 M7 tests `12 passed`; the panel/materializer/remote focused
 suite is green after the change. The Debian runner needs the same M7 module
 deployed before rebuilding that corpus.
+
+### Restored legacy remote Source DB panel scenario (2026-08-24)
+
+Commits `c1ea7e5`, `c09f58f` and `7712199` restore the previous remote import
+workflow: the panel again exposes editable runner HTML, remote staging DB and
+local target fields, saves those paths, and starts imports with the legacy
+`remote_html_path` / `remote_db_target` / `local_target_path` payload. Saved
+paths round-trip through `/api/v2/settings/save` and bootstrap; changing the
+HTML folder refreshes derived targets. Remote paths remain validated against
+configured roots, while the local output target keeps the prior operator-
+selected behavior and is used by verified delivery.
+
+Evidence: all panel tests (`test_panel*.py`) — `345 passed, 1 warning`;
+settings/remote/static focused slice — `96 passed, 1 warning`; mandatory
+reviewer — `CODE_REVIEW_PASS`; `py_compile`, `node --check` and `git diff
+--check` clean apart from the existing Windows pytest-cache warning.
