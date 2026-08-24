@@ -54,6 +54,84 @@ DEFAULT_SIDE_COLUMNS = {
 
 
 @dataclass(frozen=True, slots=True)
+class PanelPathSettings:
+    """Server-owned roots used by the static panel."""
+
+    analysis_root: Path = Path("data/Analysis")
+    strategies_root: Path = Path("Output/strategies")
+    performance_db_root: Path = Path("data/performanceDB")
+    workbooks_root: Path = Path("data/workbooks")
+    tester_report_dir: Path = Path("tester/report/my_test")
+    tester_strategy_dir: Path = Path("settings_strategy")
+    tester_config: Path = Path("config_tester.json")
+
+
+PanelPaths = PanelPathSettings
+
+
+_PANEL_PATH_KEYS = {
+    "analysis_root": "analysis_root",
+    "analysis_dir": "analysis_root",
+    "strategies_root": "strategies_root",
+    "strategies_dir": "strategies_root",
+    "performance_db_root": "performance_db_root",
+    "performance_db_dir": "performance_db_root",
+    "workbooks_root": "workbooks_root",
+    "workbooks_dir": "workbooks_root",
+    "tester_report_dir": "tester_report_dir",
+    "tester_reports": "tester_report_dir",
+    "tester_strategy_dir": "tester_strategy_dir",
+    "tester_strategies": "tester_strategy_dir",
+    "tester_config": "tester_config",
+}
+
+
+def _panel_relative_path(value: object, name: str) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"panel_paths.{name} must be a relative path")
+    candidate = Path(value.strip().replace("\\", "/"))
+    if candidate.is_absolute() or ".." in candidate.parts or "." in candidate.parts:
+        raise ValueError(f"panel_paths.{name} must be a relative path")
+    return candidate
+
+
+def load_panel_path_settings(path: Path) -> PanelPathSettings:
+    """Load fixed panel roots, retaining values from older config layouts."""
+    raw = _local_config_object(path)
+    defaults = PanelPathSettings()
+    section = raw.get("panel_paths")
+    if section is not None and not isinstance(section, dict):
+        raise ValueError("panel_paths must be an object")
+    values = {field: getattr(defaults, field) for field in PanelPathSettings.__dataclass_fields__}
+    if isinstance(section, dict):
+        unknown = sorted(set(section).difference(_PANEL_PATH_KEYS))
+        if unknown:
+            raise ValueError("panel_paths contains unknown keys: " + ", ".join(unknown))
+        for key, value in section.items():
+            values[_PANEL_PATH_KEYS[key]] = _panel_relative_path(value, _PANEL_PATH_KEYS[key])
+
+    # Legacy tester_runner keys remain valid until a panel_paths value replaces them.
+    tester = raw.get("tester_runner")
+    if isinstance(tester, dict):
+        for field, key in (
+            ("tester_report_dir", "report_dir"),
+            ("tester_strategy_dir", "strategy_dir"),
+            ("tester_config", "tester_config"),
+        ):
+            if field not in (section or {}) and isinstance(tester.get(key), str) and tester[key].strip():
+                values[field] = Path(tester[key])
+    importer = raw.get("duckdb_import")
+    if "analysis_root" not in (section or {}) and isinstance(importer, dict):
+        analysis = importer.get("analysis_duckdb_path")
+        if isinstance(analysis, str) and analysis.strip():
+            values["analysis_root"] = Path(analysis).parent
+    return PanelPathSettings(**values)
+
+
+load_panel_paths = load_panel_path_settings
+
+
+@dataclass(frozen=True, slots=True)
 class DuckDBImportSettings:
     source_duckdb_path: Path | None = None
     analysis_duckdb_path: Path | None = None

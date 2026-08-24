@@ -126,6 +126,15 @@
       "SHORT": "input/MRS_3_SHORT.json"
     }
   },
+  "panel_paths": {
+    "analysis_root": "data/Analysis",
+    "strategies_root": "Output/strategies",
+    "performance_db_root": "data/performanceDB",
+    "workbooks_root": "data/workbooks",
+    "tester_report_dir": "tester/report/my_test",
+    "tester_strategy_dir": "settings_strategy",
+    "tester_config": "config_tester.json"
+  },
   "canonical_shifts_bp": [
     30,
     40,

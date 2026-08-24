@@ -96,6 +96,18 @@ def test_bootstrap_reports_only_safe_capabilities_and_redacts_runner_and_remote(
         assert secret not in encoded
 
 
+def test_panel_helpers_use_server_owned_fixed_roots_without_request_paths(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"panel_paths": {
+        "analysis_root": "custom/Analysis",
+        "strategies_root": "custom/strategies",
+    }}), encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+
+    assert controller._panel_path("analysis_root") == (tmp_path / "custom/Analysis").resolve()
+    assert controller._panel_path("strategies_root") == (tmp_path / "custom/strategies").resolve()
+
+
 @pytest.mark.parametrize(
     "content", ["", "{not-json", json.dumps([]), json.dumps({"tester_runner": []})]
 )

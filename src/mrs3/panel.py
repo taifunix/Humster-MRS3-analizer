@@ -41,7 +41,7 @@ from .analysis_storage import (
     publish_analysis_run,
     require_canonical_operational_surface,
 )
-from .config import AlgorithmConfig
+from .config import AlgorithmConfig, load_panel_path_settings
 from .config import (
     DirectMaterializationSettings,
     DuckDBImportSettings,
@@ -1226,6 +1226,15 @@ class PanelController:
             candidate = self.root / candidate
         return candidate.resolve()
 
+    def _panel_path(self, name: str) -> Path:
+        """Resolve one server-owned fixed root; requests cannot override it."""
+        settings = load_panel_path_settings(self.default_config)
+        try:
+            value = getattr(settings, name)
+        except AttributeError:
+            raise ValueError("panel path is unavailable") from None
+        return self._path(value)
+
     def _workflow_defaults(self) -> dict[str, object]:
         try:
             document = json.loads(self.default_config.read_text(encoding="utf-8"))
@@ -2147,10 +2156,7 @@ class PanelController:
         rather than offered, because offering it would only fail on open.
         """
         try:
-            defaults = panel_bootstrap(self.default_config, self.root)
-            paths = defaults.get("defaults", {}).get("panel", {}).get("path_defaults", {})
-            configured = paths.get("analysis_db_root") or paths.get("local_analysis_db_root") or ""
-            directory = self._path(configured) if configured else (self.root / "data" / "Analysis")
+            directory = self._panel_path("analysis_root")
             if directory.is_file() or directory.suffix.casefold() == ".duckdb":
                 directory = directory.parent
             candidates = sorted(
@@ -3166,8 +3172,8 @@ class PanelController:
     def _analysis_path(self) -> Path:
         analysis = self._import_settings().analysis_duckdb_path
         if analysis is None:
-            raise ValueError("analysis_duckdb_path must be configured")
-        return analysis
+            return self._panel_path("analysis_root")
+        return self._path(analysis)
 
     def _with_analysis(self, read_only: bool, callback: Callable[[duckdb.DuckDBPyConnection], object]) -> object:
         try:
