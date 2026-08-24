@@ -5,10 +5,13 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import json
 from pathlib import Path
+import shutil
+import tempfile
 import uuid
 
 import duckdb
 import pandas as pd
+from openpyxl import load_workbook
 
 from .config import AlgorithmConfig
 from .models import Side
@@ -35,6 +38,15 @@ _DECIMAL_CONFIG_FIELDS = {
 }
 
 _PERSISTED_DECIMAL_PLACES = Decimal("0.000000000001")
+_REQUIRED_WORKBOOK_SHEETS = frozenset({
+    "00_Selection_Summary",
+    "01_Finalists",
+    "16_Raw_MRS3_Results",
+    "17_DD5_Normalized",
+    "18_Final_Comparison",
+    "19_Position_Holding_Cycles",
+    "20_Position_Holding_Exclusions",
+})
 
 
 def _config_json(config: AlgorithmConfig) -> str:
@@ -364,12 +376,9 @@ def _read_persisted_results(database: Path, dd5_run_id: str, import_id: str, con
     return tables
 
 
-def run_performance_dd5(
-    database: Path,
-    import_id: str,
-    output_dir: Path,
-    config: AlgorithmConfig,
-) -> PerformanceDd5Artifacts:
+def _persist_dd5(
+    database: Path, import_id: str, config: AlgorithmConfig
+) -> tuple[str, object]:
     database = Path(database).resolve()
     rows = _read_rows(database, import_id)
     raw = pd.DataFrame(rows).drop(columns=["lots"])
@@ -377,21 +386,7 @@ def run_performance_dd5(
         [{"strategy_name": row["strategy_name"], "lots": row["lots"]} for row in rows]
     )
     tables = compare_posttest(raw, variants, config)
-    output_dir = Path(output_dir).resolve()
-
     dd5_run_id = uuid.uuid4().hex
-    manifest_json: dict[str, object] = {
-        "database": database.name,
-        "import_id": import_id,
-        "dd5_run_id": dd5_run_id,
-        "raw_result_count": len(tables.raw),
-        "profit_factor_unavailable_count": int((tables.raw["profit_factor_status"] != "AVAILABLE").sum()),
-        "pareto_count": int(tables.comparison["pareto"].sum()),
-        "target_dd_pct": str(config.target_dd_pct),
-        "dd5_mode": "CALCULATION_ONLY",
-        "scaled_strategy_count": 0,
-        "scaled_strategies_require_retest": False,
-    }
     with duckdb.connect(str(database)) as connection:
         connection.execute("begin transaction")
         try:
@@ -435,7 +430,102 @@ def run_performance_dd5(
 
     _verify_dd5_readback(database, dd5_run_id, import_id, len(tables.normalized))
     tables = _read_persisted_results(database, dd5_run_id, import_id, config)
+    return dd5_run_id, tables
+
+
+def _manifest_json(
+    database: Path, import_id: str, dd5_run_id: str, tables: object, config: AlgorithmConfig
+) -> dict[str, object]:
+    return {
+        "database": database.name,
+        "import_id": import_id,
+        "dd5_run_id": dd5_run_id,
+        "raw_result_count": len(tables.raw),
+        "profit_factor_unavailable_count": int((tables.raw["profit_factor_status"] != "AVAILABLE").sum()),
+        "pareto_count": int(tables.comparison["pareto"].sum()),
+        "target_dd_pct": str(config.target_dd_pct),
+        "dd5_mode": "CALCULATION_ONLY",
+        "scaled_strategy_count": 0,
+        "scaled_strategies_require_retest": False,
+    }
+
+
+def run_performance_dd5(
+    database: Path,
+    import_id: str,
+    output_dir: Path,
+    config: AlgorithmConfig,
+) -> PerformanceDd5Artifacts:
+    database = Path(database).resolve()
+    if Path(output_dir).suffix.casefold() == ".xlsx":
+        return run_performance_dd5_atomic(database, import_id, output_dir, config)
+    dd5_run_id, tables = _persist_dd5(database, import_id, config)
     return regenerate_performance_dd5(database, dd5_run_id, output_dir)
+
+
+def _verify_committed_import(database: Path, import_id: str) -> None:
+    try:
+        with duckdb.connect(str(database), read_only=True) as connection:
+            schema = connection.execute(
+                "select value from schema_info where key = 'schema_version'"
+            ).fetchone()
+            row = connection.execute(
+                "select status, quarantined_count from import_runs where import_id = ?",
+                [import_id],
+            ).fetchone()
+    except Exception as error:
+        raise ValueError("DD5 requires a readable Performance DB") from error
+    if schema != ("1",) or row != ("COMMITTED", 0):
+        raise ValueError("DD5 requires committed zero-quarantine import evidence")
+
+
+def _verify_workbook(path: Path) -> None:
+    workbook = None
+    try:
+        workbook = load_workbook(path, read_only=True)
+        actual = frozenset(workbook.sheetnames)
+    except Exception as error:
+        raise ValueError("DD5 workbook readback failed") from error
+    finally:
+        if workbook is not None:
+            workbook.close()
+    if not _REQUIRED_WORKBOOK_SHEETS.issubset(actual):
+        raise ValueError("DD5 workbook readback failed")
+
+
+def run_performance_dd5_atomic(
+    database: Path,
+    import_id: str,
+    workbook_path: Path,
+    config: AlgorithmConfig,
+) -> PerformanceDd5Artifacts:
+    """Persist DD5, stage the workbook, then replace only its fixed target."""
+    database = Path(database).resolve()
+    target = Path(workbook_path).resolve()
+    _verify_committed_import(database, import_id)
+    dd5_run_id, tables = _persist_dd5(database, import_id, config)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{target.stem}.stage-", dir=target.parent))
+    csv_target = target.with_name(f"{target.stem}.csv")
+    manifest_path = target.with_name(f"{target.stem}.manifest.json")
+    manifest_json = _manifest_json(database, import_id, dd5_run_id, tables, config)
+    try:
+        write_posttest_outputs(tables, staging)
+        staged_workbook = staging / "posttest.xlsx"
+        _verify_workbook(staged_workbook)
+        staged_workbook.replace(target)
+        _verify_workbook(target)
+        staged_csv = staging / "posttest_csv"
+        if csv_target.exists():
+            shutil.rmtree(csv_target)
+        staged_csv.replace(csv_target)
+        manifest_path.write_text(
+            json.dumps(manifest_json, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    return PerformanceDd5Artifacts(target, csv_target, manifest_path, manifest_json, dd5_run_id)
 
 
 def regenerate_performance_dd5(

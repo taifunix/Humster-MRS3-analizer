@@ -41,7 +41,7 @@ from .analysis_storage import (
     publish_analysis_run,
     require_canonical_operational_surface,
 )
-from .config import AlgorithmConfig
+from .config import AlgorithmConfig, load_panel_path_settings
 from .config import (
     DirectMaterializationSettings,
     DuckDBImportSettings,
@@ -128,7 +128,14 @@ from .fresh_analysis_strategies import (
     read_fresh_analysis_identity,
 )
 from .panel_strategy_batch import LocalStrategyBatchService
-from .panel_performance_dd5 import LocalPerformanceDd5Jobs, PerformanceDd5Request
+from .panel_performance_dd5 import (
+    LocalPerformanceDd5Jobs,
+    LocalPerformanceDd5Service,
+    LocalPerformanceImportJobs,
+    PerformanceDd5CalculationRequest,
+    PerformanceDd5Request,
+    PerformanceImportPanelRequest,
+)
 from .runner.config import RunnerConfig
 
 
@@ -1163,6 +1170,8 @@ class PanelController:
         self._strategy_batch_service: LocalStrategyBatchService | None = None
         self._strategy_batch_inboxes: dict[str, Path] = {}
         self._performance_dd5_jobs: LocalPerformanceDd5Jobs | None = None
+        self._performance_import_jobs: LocalPerformanceImportJobs | None = None
+        self._performance_database_jobs: LocalPerformanceDd5Jobs | None = None
         self._reconcile_interrupted_remote_source_jobs()
         self._job: _Job | None = None
         # Keep only artifact paths created by this controller instance.  The
@@ -1225,6 +1234,15 @@ class PanelController:
         if not candidate.is_absolute():
             candidate = self.root / candidate
         return candidate.resolve()
+
+    def _panel_path(self, name: str) -> Path:
+        """Resolve one server-owned fixed root; requests cannot override it."""
+        settings = load_panel_path_settings(self.default_config)
+        try:
+            value = getattr(settings, name)
+        except AttributeError:
+            raise ValueError("panel path is unavailable") from None
+        return self._path(value)
 
     def _workflow_defaults(self) -> dict[str, object]:
         try:
@@ -1592,6 +1610,10 @@ class PanelController:
             return self.strategies_tester_start(request)
         if kind == "strategies.tester.cancel" and isinstance(request, Mapping):
             return self.strategies_tester_cancel(self._required(request, "job_id"))
+        if kind == "strategies.performance.import" and isinstance(request, Mapping):
+            return self.strategies_performance_import(request)
+        if kind == "strategies.dd5.start" and isinstance(request, Mapping):
+            return self.strategies_dd5_start(request)
         if kind == "strategies.performance-dd5" and isinstance(request, Mapping):
             return self.strategies_performance_dd5(request)
         idempotency_key = payload.get("idempotency_key")
@@ -2147,10 +2169,7 @@ class PanelController:
         rather than offered, because offering it would only fail on open.
         """
         try:
-            defaults = panel_bootstrap(self.default_config, self.root)
-            paths = defaults.get("defaults", {}).get("panel", {}).get("path_defaults", {})
-            configured = paths.get("analysis_db_root") or paths.get("local_analysis_db_root") or ""
-            directory = self._path(configured) if configured else (self.root / "data" / "Analysis")
+            directory = self._panel_path("analysis_root")
             if directory.is_file() or directory.suffix.casefold() == ".duckdb":
                 directory = directory.parent
             candidates = sorted(
@@ -2170,7 +2189,7 @@ class PanelController:
                 continue
             analyses.append({
                 "name": path.name,
-                "path": str(path),
+                "analysis_ref": path.relative_to(directory).as_posix(),
                 "analysis_run_id": identity["analysis_run_id"],
                 "surface_id": identity["surface_id"],
                 "scopes": len(identity["scope_keys"]),
@@ -2179,10 +2198,24 @@ class PanelController:
 
     def strategies_fresh_open(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Register a committed analysis so its shortlist can be read without a rerun."""
+        root = self._panel_path("analysis_root")
+        if root.is_file() or root.suffix.casefold() == ".duckdb":
+            root = root.parent
+        reference = payload.get("analysis_ref")
+        if isinstance(reference, str) and reference.strip():
+            candidate = Path(reference.strip().replace("\\", "/"))
+            if candidate.is_absolute() or ".." in candidate.parts:
+                raise PanelJobError("ANALYSIS_PATH_NOT_ALLOWED")
+            path = (root / candidate).resolve()
+        else:
+            try:
+                path = self._path(self._required(payload, "analysis_path"))
+            except ValueError:
+                raise PanelJobError("ANALYSIS_PATH_REQUIRED") from None
         try:
-            path = self._path(self._required(payload, "analysis_path"))
+            path.relative_to(root.resolve())
         except ValueError:
-            raise PanelJobError("ANALYSIS_PATH_REQUIRED") from None
+            raise PanelJobError("ANALYSIS_PATH_NOT_ALLOWED") from None
         try:
             identity = read_fresh_analysis_identity(path)
         except (OSError, ValueError, KeyError, duckdb.Error):
@@ -2214,14 +2247,31 @@ class PanelController:
         return self._strategy_batch_service
 
     def strategies_tester_start(self, payload: Mapping[str, object]) -> dict[str, object]:
+        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end"})
+        if unexpected:
+            raise ValueError("tester start request contains unsupported fields")
         analysis_id = self._required(payload, "analysis_run_id")
+        start_date = payload.get("start_date", payload.get("test_start"))
+        end_date = payload.get("end_date", payload.get("test_end"))
+        if "start_date" in payload and "test_start" in payload and payload["start_date"] != payload["test_start"]:
+            raise ValueError("start_date and test_start disagree")
+        if "end_date" in payload and "test_end" in payload and payload["end_date"] != payload["test_end"]:
+            raise ValueError("end_date and test_end disagree")
+        if start_date is None or end_date is None:
+            raise ValueError("start_date and end_date are required")
         manifest = self._fresh_strategy_manifests.get(analysis_id)
         if manifest is None:
             raise ValueError("fresh strategy batch is not available in this panel session")
         return self._start_tracked_panel_job(
-            "strategies.tester", {"analysis_run_id": analysis_id},
+            "strategies.tester", {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date},
             ("strategies.tester",),
-            lambda job_id: self._strategy_batch().start(manifest, job_id=job_id),
+            lambda job_id: self._strategy_batch().start(
+                manifest,
+                analysis_run_id=analysis_id,
+                start_date=start_date,
+                end_date=end_date,
+                job_id=job_id,
+            ),
         )
 
     def strategies_tester_status(self, job_id: str) -> dict[str, object]:
@@ -2239,10 +2289,11 @@ class PanelController:
         return self._sync_tracked_panel_job(result)
 
     def strategies_performance_dd5(self, payload: Mapping[str, object]) -> dict[str, object]:
-        job_id = self._required(payload, "tester_job_id")
-        delete_html = payload.get("delete_html", False)
-        if not isinstance(delete_html, bool):
-            raise ValueError("delete_html must be a boolean")
+        """Compatibility adapter for the pre-v2 combined action."""
+        import_job = self.strategies_performance_import(payload)
+        return import_job
+
+    def _tester_inbox(self, job_id: str) -> Path:
         inbox = self._strategy_batch_inboxes.get(job_id)
         if inbox is None:
             try:
@@ -2250,21 +2301,117 @@ class PanelController:
                 inbox = Path(saved) if isinstance(saved, str) else None
             except PanelJobError:
                 inbox = None
-        if inbox is None:
+        if inbox is None or not inbox.is_dir():
             raise ValueError("committed tester inbox is not available")
-        output = self.root / "Output" / "dd5" / job_id
-        database = self.root / "Output" / "performance" / f"{job_id}.duckdb"
-        if self._performance_dd5_jobs is None:
-            self._performance_dd5_jobs = LocalPerformanceDd5Jobs(on_update=self._record_special_job)
-        request = PerformanceDd5Request(
-            inbox=inbox, database=database, output_dir=output,
-            config=self._analysis_config_loader(self.default_config), delete_html=delete_html,
+        return inbox.resolve()
+
+    def _tester_dates(self, job_id: str) -> tuple[str, str]:
+        job = self._panel_jobs.get(job_id)
+        request = job.get("request")
+        if not isinstance(request, dict):
+            raise ValueError("tester dates are not available")
+        start, end = request.get("start_date"), request.get("end_date")
+        if not isinstance(start, str) or not isinstance(end, str):
+            raise ValueError("tester dates are not available")
+        return start, end
+
+    def strategies_performance_import(self, payload: Mapping[str, object]) -> dict[str, object]:
+        job_id = self._required(payload, "tester_job_id")
+        delete_html = payload.get("delete_html", False)
+        if not isinstance(delete_html, bool):
+            raise ValueError("delete_html must be a boolean")
+        inbox = self._tester_inbox(job_id)
+        start, end = self._tester_dates(job_id)
+        if self._performance_import_jobs is None:
+            self._performance_import_jobs = LocalPerformanceImportJobs(on_update=self._record_special_job)
+        request = PerformanceImportPanelRequest(
+            inbox=inbox,
+            performance_db_root=self._panel_path("performance_db_root"),
+            test_start=start,
+            test_end=end,
+            delete_html=delete_html,
         )
         return self._start_tracked_panel_job(
-            "strategies.performance-dd5", {"tester_job_id": job_id},
-            ("strategies.performance-dd5",),
-            lambda tracked_id: self._performance_dd5_jobs.start(request, job_id=tracked_id),
+            "strategies.performance.import", {"tester_job_id": job_id, "delete_html": delete_html},
+            (f"tester:{job_id}", "performance-db"),
+            lambda tracked_id: self._performance_import_jobs.start(request, job_id=tracked_id),
         )
+
+    def strategies_performance_import_status(self, job_id: str) -> dict[str, object]:
+        if self._performance_import_jobs is None:
+            return self._panel_jobs.get(job_id)
+        return self._tracked_job_or_interrupted(job_id, self._performance_import_jobs.status)
+
+    def performance_database_catalog(self) -> dict[str, object]:
+        root = self._panel_path("performance_db_root")
+        root.mkdir(parents=True, exist_ok=True)
+        entries: list[dict[str, object]] = []
+        for database in sorted(root.glob("*.performance-v6.duckdb")):
+            try:
+                with duckdb.connect(str(database), read_only=True) as connection:
+                    schema = connection.execute("select value from schema_info where key = 'schema_version'").fetchone()
+                    row = connection.execute(
+                        "select import_id from import_runs where status = 'COMMITTED' and quarantined_count = 0 order by finished_at_utc desc limit 1"
+                    ).fetchone()
+                if schema != ("1",) or not row or not isinstance(row[0], str):
+                    continue
+            except Exception:
+                continue
+            entries.append({
+                "database_name": database.name,
+                "relative_path": str(database.relative_to(self.root)).replace("/", "\\"),
+                "import_id": row[0],
+                "audit_relative_path": str((database.parent / database.stem / "import_audit.v4.json").relative_to(self.root)).replace("/", "\\"),
+                "workbook_name": f"{database.stem}.dd5.xlsx",
+            })
+        return {"databases": entries}
+
+    def _performance_database(self, name: object) -> tuple[Path, dict[str, object]]:
+        if not isinstance(name, str) or not name or Path(name).name != name or not name.endswith(".performance-v6.duckdb"):
+            raise ValueError("invalid Performance DB")
+        entry = next((item for item in self.performance_database_catalog()["databases"] if item["database_name"] == name), None)
+        if not isinstance(entry, dict):
+            raise ValueError("Performance DB is unavailable")
+        return self._panel_path("performance_db_root") / name, entry
+
+    def strategies_dd5_start(self, payload: Mapping[str, object]) -> dict[str, object]:
+        database, entry = self._performance_database(payload.get("database_name"))
+        import_id = payload.get("import_id", entry["import_id"])
+        if not isinstance(import_id, str) or import_id != entry["import_id"]:
+            raise ValueError("Performance import identity does not match")
+        if self._performance_database_jobs is None:
+            service = LocalPerformanceDd5Service()
+            self._performance_database_jobs = LocalPerformanceDd5Jobs(
+                run=lambda request, progress=None: service.calculate(request),
+                on_update=self._record_special_job,
+            )
+        request = PerformanceDd5CalculationRequest(
+            database=database,
+            import_id=import_id,
+            workbooks_root=self._panel_path("workbooks_root"),
+            performance_db_root=self._panel_path("performance_db_root"),
+            config=self._analysis_config_loader(self.default_config),
+        )
+        return self._start_tracked_panel_job(
+            "strategies.dd5.start", {"database_name": database.name, "import_id": import_id},
+            (f"performance-db:{database.name}", "workbooks"),
+            lambda tracked_id: self._performance_database_jobs.start(request, job_id=tracked_id),
+        )
+
+    def strategies_dd5_status(self, job_id: str) -> dict[str, object]:
+        if self._performance_database_jobs is None:
+            return self._panel_jobs.get(job_id)
+        return self._tracked_job_or_interrupted(job_id, self._performance_database_jobs.status)
+
+    def performance_artifact(self, database_name: object, kind: object) -> Path | None:
+        database, _ = self._performance_database(database_name)
+        if kind == "audit":
+            candidate = database.parent / database.stem / "import_audit.v4.json"
+        elif kind == "workbook":
+            candidate = self._panel_path("workbooks_root") / f"{database.stem}.dd5.xlsx"
+        else:
+            raise ValueError("invalid performance artifact")
+        return candidate if candidate.is_file() else None
 
     def strategies_performance_dd5_status(self, job_id: str) -> dict[str, object]:
         if self._performance_dd5_jobs is None:
@@ -3167,7 +3314,7 @@ class PanelController:
         analysis = self._import_settings().analysis_duckdb_path
         if analysis is None:
             raise ValueError("analysis_duckdb_path must be configured")
-        return analysis
+        return self._path(analysis)
 
     def _with_analysis(self, read_only: bool, callback: Callable[[duckdb.DuckDBPyConnection], object]) -> object:
         try:
@@ -4872,6 +5019,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v2/strategies/analysis/catalog":
             self._json(200, self.server.controller.analysis_catalog())
             return
+        if parsed.path == "/api/v2/strategies/performance/catalog":
+            try:
+                self._json(200, self.server.controller.performance_database_catalog())
+            except ValueError:
+                self._json(400, {"error": "invalid performance db request"})
+            return
         if parsed.path == "/api/v2/surfaces/catalog":
             self._json(200, self.server.controller.surface_catalog())
             return
@@ -4908,6 +5061,46 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(200, self.server.controller.strategies_performance_dd5_status(job_id))
             except (KeyError, ValueError):
                 self._json(400, {"error": "invalid performance db request"})
+            return
+        if parsed.path == "/api/v2/strategies/performance/import/status":
+            try:
+                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
+                self._json(200, self.server.controller.strategies_performance_import_status(job_id))
+            except (KeyError, ValueError):
+                self._json(400, {"error": "invalid performance import request"})
+            return
+        if parsed.path == "/api/v2/strategies/dd5/status":
+            try:
+                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
+                self._json(200, self.server.controller.strategies_dd5_status(job_id))
+            except (KeyError, ValueError):
+                self._json(400, {"error": "invalid DD5 request"})
+            return
+        if parsed.path == "/api/v2/strategies/performance/artifact":
+            query = parse_qs(parsed.query)
+            try:
+                artifact = self.server.controller.performance_artifact(
+                    query.get("database_name", [""])[0], query.get("kind", [""])[0]
+                )
+            except ValueError:
+                artifact = None
+            if artifact is None:
+                self._json(404, {"error": "performance artifact is not available"})
+                return
+            filename, data = artifact.name, None
+            size = artifact.stat().st_size
+            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(size))
+            disposition = "inline" if query.get("kind", [""])[0] == "audit" else "attachment"
+            self.send_header("Content-Disposition", f'{disposition}; filename="{filename.replace(chr(34), "")}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            with artifact.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    self.wfile.write(chunk)
             return
         if parsed.path == "/api/ui/bootstrap":
             self._json(200, {"version": "panel-ui-v1", "defaults": {"runner": {"configured": False}}})

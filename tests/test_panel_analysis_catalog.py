@@ -40,6 +40,8 @@ def test_the_catalog_lists_a_committed_analysis(tmp_path: Path) -> None:
     entry = result["analyses"][0]
     assert entry["analysis_run_id"] == analysis_id
     assert entry["scopes"] == 1
+    assert entry["analysis_ref"] == "run.analysis-v6.duckdb"
+    assert "path" not in entry
 
 
 def test_an_artifact_that_is_not_a_fresh_analysis_is_skipped(tmp_path: Path) -> None:
@@ -86,3 +88,21 @@ def test_opening_a_file_that_is_not_an_analysis_names_the_reason(tmp_path: Path)
     with pytest.raises(PanelJobError) as missing:
         controller.strategies_fresh_open({})
     assert missing.value.code == "ANALYSIS_PATH_REQUIRED"
+
+
+def test_open_accepts_catalog_reference_but_rejects_path_outside_root(tmp_path: Path) -> None:
+    from mrs3.panel_jobs import PanelJobError
+
+    directory = tmp_path / "analysis"
+    directory.mkdir()
+    path = directory / "run.analysis-v6.duckdb"
+    analysis_id, _surface = _make_analysis(path)
+    controller = _controller(tmp_path)
+
+    opened = controller.strategies_fresh_open({"analysis_ref": path.name})
+    assert opened["analysis_run_id"] == analysis_id
+
+    outside = tmp_path / "outside.analysis-v6.duckdb"
+    with pytest.raises(PanelJobError) as raised:
+        controller.strategies_fresh_open({"analysis_path": str(outside)})
+    assert raised.value.code == "ANALYSIS_PATH_NOT_ALLOWED"

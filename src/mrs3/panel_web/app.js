@@ -28,6 +28,11 @@
     }
     return [...byPair.values()];
   };
+  const valueCell = (value, fallback) => {
+    const cell = document.createElement('td');
+    cell.textContent = value === null || value === undefined || value === '' ? fallback : String(value);
+    return cell;
+  };
   const countCell = (value, ready) => {
     const cell = document.createElement('td');
     cell.textContent = value ? String(value) : '—';
@@ -94,7 +99,7 @@
       timeframes.textContent = `${pair.timeframes.length} TF`;
       row.append(pick, name, timeframes);
       for (const bucket of ORDER_BUCKETS) row.append(countCell(pair.counts[bucket], false));
-      row.append(countCell(pair.ready, true), countCell(pair.total, false));
+      row.append(valueCell(undefined, '—'), countCell(pair.ready, true), valueCell(undefined, 0), countCell(pair.total, false), valueCell(undefined, '—'));
       body.append(row);
       for (const group of pair.timeframes) {
         const child = document.createElement('tr');
@@ -120,7 +125,7 @@
         childTf.textContent = group.timeframe;
         child.append(childPick, childName, childTf);
         for (const bucket of ORDER_BUCKETS) child.append(countCell(group.counts?.[bucket], false));
-        child.append(countCell(group.ready, true), countCell(group.total, false));
+        child.append(valueCell(group.plateau_count, '—'), countCell(group.ready, true), valueCell(group.deferred, 0), countCell(group.total, false), valueCell(group.period, '—'));
         body.append(child);
       }
     }
@@ -1078,10 +1083,8 @@
   // Never present illustrative counts as real artifacts.  The workflow fills
   // these controls only after its backend provenance gate has accepted them.
   const analysisSurface = document.querySelector('#analysis-surface');
-  const testerBatch = document.querySelector('#tester-batch');
   const shortlistBody = document.querySelector('#strategies-dd5 tbody');
   if (analysisSurface) analysisSurface.replaceChildren(new Option('Awaiting a committed surface', ''));
-  if (testerBatch) testerBatch.replaceChildren(new Option('Awaiting READY JSON', ''));
   if (shortlistBody) shortlistBody.replaceChildren();
   document.querySelectorAll('#strategies-dd5 .progress-block p').forEach((item) => {
     item.textContent = 'Awaiting the preceding committed stage.';
@@ -1090,7 +1093,14 @@
     const option = surfaceSource.querySelector('option');
     if (option) option.textContent = 'Select a newly committed Source DB';
   }
-  const strategyCards = [...document.querySelectorAll('#strategies-dd5 .panel-card')];
+  const v2Cards = [...document.querySelectorAll('#strategies-dd5 > .panel-performance-v2, #strategies-dd5 > #strategy-dd5-card-v2')];
+  const strategyStack = document.querySelector('#strategies-dd5 .stack');
+  v2Cards.forEach((card) => strategyStack?.append(card));
+  const legacyPerformanceCard = document.querySelector('#performance-dd5-start')?.closest('details');
+  if (legacyPerformanceCard) legacyPerformanceCard.hidden = true;
+  const legacyDd5Card = document.querySelector('#strategy-dd5-card');
+  if (legacyDd5Card) legacyDd5Card.hidden = true;
+  const strategyCards = [...document.querySelectorAll('#strategies-dd5 .panel-card')].filter((card) => !card.classList.contains('panel-performance-v2'));
   ['1. Analysis of published surface', '2. Shortlist and READY JSON', '3. Tester batch', '4. Inbox to Performance DB'].forEach((label, index) => {
     const heading = strategyCards[index]?.querySelector('summary b');
     if (heading) heading.textContent = label;
@@ -1164,9 +1174,10 @@
       const previous = analysisExisting.value;
       analysisExisting.replaceChildren(new Option('Выберите analysis DB', ''));
       for (const row of rows) {
-        analysisExisting.append(new Option(`${row.name} · ${row.scopes} scopes`, row.path));
+        const analysisRef = row.analysis_ref || '';
+        if (analysisRef) analysisExisting.append(new Option(`${row.name} · ${row.scopes} scopes`, analysisRef));
       }
-      if (rows.some((row) => row.path === previous)) analysisExisting.value = previous;
+      if (rows.some((row) => row?.analysis_ref === previous)) analysisExisting.value = previous;
       analysisOpenStatus(rows.length
         ? `Готовых analysis DB: ${rows.length}.`
         : 'Готовых analysis DB не найдено.');
@@ -1178,7 +1189,7 @@
     if (!selected) { analysisOpenStatus('Выберите analysis DB.'); return; }
     try {
       // Opening registers the run, so its shortlist is readable without a rerun.
-      const opened = await remoteRequest('/api/v2/strategies/fresh/open', { analysis_path: selected });
+      const opened = await remoteRequest('/api/v2/strategies/fresh/open', { analysis_ref: selected });
       currentAnalysisId = opened.analysis_run_id;
       applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId }));
       analysisOpenStatus(`Открыто: ${opened.scopes} scopes · surface ${String(opened.surface_id).slice(0, 12)}.`);
@@ -1188,9 +1199,6 @@
     }
   });
   loadAnalysisCatalog();
-  document.querySelector('#analysis-lineage')?.addEventListener('click', () => {
-    strategyStatus('Manifest and lineage are available after the analysis is committed.');
-  });
   const generateStatus = (message) => {
     const node = document.querySelector('#shortlist-generate-status');
     if (node) node.textContent = message;
@@ -1212,12 +1220,7 @@
         analysis_run_id: currentAnalysisId,
         candidate_ids: candidateIds,
         selected_scopes: scopes.map((group) => [group.pair, group.side, group.timeframe]),
-        output_dir: document.querySelector('#strategies-output')?.value || '',
       });
-      const batch = document.querySelector('#tester-batch');
-      if (batch) batch.replaceChildren(new Option(`${result.strategy_count} READY JSON · ${result.manifest}`, currentAnalysisId));
-      const output = document.querySelector('#strategies-output');
-      if (output && result.output_dir) output.value = result.output_dir;
       generateStatus(`READY JSON committed: ${result.strategy_count}.`);
     } catch (error) {
       generateStatus(`READY JSON не создан: ${error?.message || 'unknown error'}.`);
@@ -1234,7 +1237,13 @@
     } catch (error) { strategyStatus(`Shortlist ошибка: ${error?.message || 'unknown error'}.`); }
   });
   document.querySelector('#shortlist-select-all')?.addEventListener('click', () => {
+    selectedScopeKeys.clear();
     for (const group of shortlistGroups) if (group.ready > 0) selectedScopeKeys.add(group.scope_key);
+    renderShortlist();
+  });
+  document.querySelector('#shortlist-select-active')?.addEventListener('click', () => {
+    selectedScopeKeys.clear();
+    for (const group of shortlistGroups) if (Number(group.ready_after_filters ?? group.ready ?? 0) > 0) selectedScopeKeys.add(group.scope_key);
     renderShortlist();
   });
   document.querySelector('#shortlist-select-none')?.addEventListener('click', () => {
@@ -1247,6 +1256,22 @@
   const testerTrack = testerCard?.querySelector('.progress-track span');
   const testerStart = document.querySelector('#tester-start');
   const testerStop = document.querySelector('#tester-stop');
+  const testerStartDate = document.querySelector('#tester-start-date');
+  const testerEndDate = document.querySelector('#tester-end-date');
+  const validIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+  const shiftDateMonths = (value, months) => {
+    if (!validIsoDate(value)) return '';
+    const [year, month, day] = value.split('-').map(Number);
+    const target = new Date(Date.UTC(year, month - 1 + months, 1));
+    const lastDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+    target.setUTCDate(Math.min(day, lastDay));
+    return target.toISOString().slice(0, 10);
+  };
+  [1, 2, 3].forEach((months) => document.querySelector(`#tester-range-${months}m`)?.addEventListener('click', () => {
+    const anchor = testerEndDate?.value || new Date().toISOString().slice(0, 10);
+    if (testerEndDate && !testerEndDate.value) testerEndDate.value = anchor;
+    if (testerStartDate) testerStartDate.value = shiftDateMonths(anchor, -months);
+  }));
   const performanceStart = document.querySelector('#performance-dd5-start');
   const performanceStatus = document.querySelector('#performance-dd5-status');
   const performanceText = strategyCards[3]?.querySelector('.progress-block p');
@@ -1266,6 +1291,7 @@
     if (testerStatus) testerStatus.textContent = `Tester: ${job.state || 'RUNNING'}. ${detail}`;
     if (testerStop) testerStop.disabled = !testerJobId || ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
     if (performanceStart) performanceStart.disabled = job.state !== 'COMMITTED';
+    if (document.querySelector('#performance-import-start')) document.querySelector('#performance-import-start').disabled = job.state !== 'COMMITTED';
   };
   const pollTester = async () => {
     if (!testerJobId) return;
@@ -1279,9 +1305,13 @@
   };
   if (testerStart) testerStart.addEventListener('click', async () => {
     if (!currentAnalysisId) { strategyStatus('Сначала сформируйте READY JSON.'); return; }
+    const startDate = testerStartDate?.value || '';
+    const endDate = testerEndDate?.value || '';
+    if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Укажите корректные даты начала и конца тестирования.'; return; }
+    if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Дата начала не может быть позже даты конца.'; return; }
     testerStart.disabled = true;
     try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId } });
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId, start_date: document.querySelector('#tester-start-date')?.value || startDate, end_date: document.querySelector('#tester-end-date')?.value || endDate } });
       testerJobId = result.job?.job_id || '';
       if (!testerJobId) throw new Error('missing job');
       renderTester(result.job); await pollTester();
@@ -1366,6 +1396,116 @@
       }
     } catch (_) { /* requestJson already exposed a safe visible error. */ }
   };
+  const importStartV2 = document.querySelector('#performance-import-start');
+  const importStatusV2 = document.querySelector('#performance-import-status');
+  const importProgressV2 = document.querySelector('#performance-import-progress');
+  const dbSelectV2 = document.querySelector('#performance-db-select');
+  const auditOpenV2 = document.querySelector('#performance-audit-open');
+  const dd5StartV2 = document.querySelector('#dd5-start');
+  const workbookOpenV2 = document.querySelector('#dd5-workbook-open');
+  const dd5StatusV2 = document.querySelector('#strategy-dd5-status-v2');
+  const workbookPathV2 = document.createElement('input');
+  workbookPathV2.type = 'text'; workbookPathV2.readOnly = true; workbookPathV2.setAttribute('aria-label', 'Workbook path'); workbookPathV2.placeholder = 'data\\workbooks\\<Performance DB>.dd5.xlsx';
+  document.querySelector('#dd5-workbook-open')?.before(workbookPathV2);
+  let importJobV2 = '';
+  let dd5JobV2 = '';
+  let selectedDbV2 = '';
+  const refreshPerformanceCatalog = async () => {
+    try {
+      const document = await requestJson('/api/v2/strategies/performance/catalog');
+      const databases = Array.isArray(document.databases) ? document.databases : [];
+      if (dbSelectV2) {
+        dbSelectV2.replaceChildren(new Option('Выберите базу', ''));
+        databases.forEach((item) => dbSelectV2.add(new Option(item.database_name, item.database_name)));
+        if (selectedDbV2 && databases.some((item) => item.database_name === selectedDbV2)) dbSelectV2.value = selectedDbV2;
+      }
+      return databases;
+    } catch (_) { return []; }
+  };
+  const selectedDbDocument = () => dbSelectV2?.selectedOptions?.[0]?.value || selectedDbV2;
+  dbSelectV2?.addEventListener('change', () => {
+    selectedDbV2 = dbSelectV2.value;
+    workbookPathV2.value = selectedDbV2 ? `data\\workbooks\\${selectedDbV2.replace(/\.duckdb$/, '.dd5.xlsx')}` : '';
+    if (auditOpenV2) auditOpenV2.disabled = !selectedDbV2;
+    if (dd5StartV2) dd5StartV2.disabled = !selectedDbV2;
+    if (workbookOpenV2) workbookOpenV2.disabled = !selectedDbV2;
+  });
+  auditOpenV2?.addEventListener('click', () => {
+    const databaseName = selectedDbDocument();
+    if (databaseName) window.open(`/api/v2/strategies/performance/artifact?database_name=${encodeURIComponent(databaseName)}&kind=audit`, '_blank', 'noopener');
+  });
+  workbookOpenV2?.addEventListener('click', () => {
+    const databaseName = selectedDbDocument();
+    if (databaseName) window.open(`/api/v2/strategies/performance/artifact?database_name=${encodeURIComponent(databaseName)}&kind=workbook`, '_blank', 'noopener');
+  });
+  importStartV2?.addEventListener('click', async () => {
+    if (!testerJobId) return;
+    importStartV2.disabled = true;
+    if (importStatusV2) importStatusV2.textContent = 'Импорт Performance DB…';
+    try {
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.performance.import', request: { tester_job_id: testerJobId, delete_html: Boolean(document.querySelector('#delete-tested-html-v2')?.checked) } });
+      importJobV2 = result.job?.job_id || '';
+      if (!importJobV2) throw new Error('missing job');
+      const poll = async () => {
+        const job = await requestJson(`/api/v2/strategies/performance/import/status?job_id=${encodeURIComponent(importJobV2)}`);
+        const p = job.progress || {};
+        if (importProgressV2) importProgressV2.textContent = `${job.phase || 'IMPORTING'} · ${p.current || 0} / ${p.total || 0} reports.`;
+        if (importStatusV2) importStatusV2.textContent = `Performance DB: ${job.state || 'RUNNING'}.`;
+        if (['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) {
+        if (String(job.state) === 'COMMITTED' && job.result?.database_name) { selectedDbV2 = job.result.database_name; await refreshPerformanceCatalog(); if (dbSelectV2) { dbSelectV2.value = selectedDbV2; dbSelectV2.dispatchEvent(new Event('change')); } }
+          return true;
+        }
+        return false;
+      };
+      if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
+    } catch (_) { if (importStatusV2) importStatusV2.textContent = 'Импорт Performance DB не прошёл проверку.'; }
+    finally { importStartV2.disabled = false; }
+  });
+  dd5StartV2?.addEventListener('click', async () => {
+    const databaseName = selectedDbDocument();
+    if (!databaseName) return;
+    dd5StartV2.disabled = true;
+    try {
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.dd5.start', request: { database_name: databaseName } });
+      dd5JobV2 = result.job?.job_id || '';
+      const poll = async () => {
+        const job = await requestJson(`/api/v2/strategies/dd5/status?job_id=${encodeURIComponent(dd5JobV2)}`);
+        if (dd5StatusV2) dd5StatusV2.textContent = `DD5: ${job.state || 'RUNNING'}. ${job.result?.workbook_name || ''}`;
+        if (['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) return true;
+        return false;
+      };
+      if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
+    } catch (_) { if (dd5StatusV2) dd5StatusV2.textContent = 'DD5 не прошёл проверку.'; }
+    finally { dd5StartV2.disabled = false; }
+  });
+  const recoverSplitJobs = async () => {
+    try {
+      const snapshot = await requestJson('/api/v2/jobs');
+      const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
+      const importJob = [...jobs].reverse().find((job) => job.kind === 'strategies.performance.import');
+      const dd5Job = [...jobs].reverse().find((job) => job.kind === 'strategies.dd5.start');
+      if (importJob?.job_id) {
+        importJobV2 = importJob.job_id;
+        const poll = async () => {
+          const job = await requestJson(`/api/v2/strategies/performance/import/status?job_id=${encodeURIComponent(importJobV2)}`);
+          if (importStatusV2) importStatusV2.textContent = `Performance DB: ${job.state || 'RUNNING'}.`;
+          if (String(job.state) === 'COMMITTED' && job.result?.database_name) { selectedDbV2 = job.result.database_name; await refreshPerformanceCatalog(); if (dbSelectV2) { dbSelectV2.value = selectedDbV2; dbSelectV2.dispatchEvent(new Event('change')); } }
+          return ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
+        };
+        if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
+      }
+      if (dd5Job?.job_id) {
+        dd5JobV2 = dd5Job.job_id;
+        const poll = async () => {
+          const job = await requestJson(`/api/v2/strategies/dd5/status?job_id=${encodeURIComponent(dd5JobV2)}`);
+          if (dd5StatusV2) dd5StatusV2.textContent = `DD5: ${job.state || 'RUNNING'}. ${job.result?.workbook_name || ''}`;
+          return ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
+        };
+        if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
+      }
+    } catch (_) { /* stale jobs remain visible through the server registry */ }
+  };
+  refreshPerformanceCatalog();
   const settingsStatus = document.querySelector('#settings-status');
   const settingsPayload = () => ({ panel: {
     default_root: document.querySelector('#settings-default-root')?.value || 'static',
@@ -1410,4 +1550,5 @@
   loadSafeDefaults();
   loadRemoteStatus();
   recoverJobs();
+  recoverSplitJobs();
 })();

@@ -20,7 +20,82 @@ from mrs3.config import (
     load_source_v6_import_settings,
     save_duckdb_import_settings,
     save_direct_materialization_settings,
+    PanelPathSettings,
+    load_panel_path_settings,
 )
+
+
+def test_panel_path_defaults_are_fixed_and_relative(tmp_path) -> None:
+    settings = load_panel_path_settings(tmp_path / "missing.json")
+
+    assert settings == PanelPathSettings()
+    assert settings.analysis_root == Path("data/Analysis")
+    assert settings.strategies_root == Path("Output/strategies")
+    assert settings.performance_db_root == Path("data/performanceDB")
+    assert settings.workbooks_root == Path("data/workbooks")
+    assert settings.tester_report_dir == Path("tester/report/my_test")
+    assert settings.tester_strategy_dir == Path("settings_strategy")
+    assert settings.tester_config == Path("config_tester.json")
+
+
+def test_panel_path_defaults_keep_legacy_config_values(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(json.dumps({
+        "tester_runner": {
+            "report_dir": "old/reports",
+            "strategy_dir": "old/strategies",
+            "tester_config": "old/config.json",
+        },
+        "duckdb_import": {"analysis_duckdb_path": "old/Analysis/analysis.duckdb"},
+    }), encoding="utf-8")
+
+    settings = load_panel_path_settings(path)
+
+    assert settings.tester_report_dir == Path("old/reports")
+    assert settings.tester_strategy_dir == Path("old/strategies")
+    assert settings.tester_config == Path("old/config.json")
+    assert settings.analysis_root == Path("old/Analysis")
+
+
+def test_panel_path_defaults_reject_traversal(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(json.dumps({"panel_paths": {"analysis_root": "../outside"}}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="panel_paths.analysis_root"):
+        load_panel_path_settings(path)
+
+
+def test_panel_path_defaults_reject_drive_relative_paths(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(json.dumps({"panel_paths": {"analysis_root": "C:outside"}}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="panel_paths.analysis_root"):
+        load_panel_path_settings(path)
+
+
+def test_panel_path_defaults_prefer_explicit_values_over_legacy_keys(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    path.write_text(json.dumps({
+        "panel_paths": {"analysis_dir": "new/Analysis"},
+        "duckdb_import": {"analysis_duckdb_path": "old/Analysis/run.duckdb"},
+    }), encoding="utf-8")
+
+    assert load_panel_path_settings(path).analysis_root == Path("new/Analysis")
+
+
+def test_panel_path_defaults_match_tracked_examples() -> None:
+    expected = {
+        "analysis_root": "data/Analysis",
+        "strategies_root": "Output/strategies",
+        "performance_db_root": "data/performanceDB",
+        "workbooks_root": "data/workbooks",
+        "tester_report_dir": "tester/report/my_test",
+        "tester_strategy_dir": "settings_strategy",
+        "tester_config": "config_tester.json",
+    }
+    for filename in ("config.example.json", "config.local.json.example"):
+        raw = json.loads(Path(filename).read_text(encoding="utf-8"))
+        assert raw["panel_paths"] == expected
 
 
 def test_source_v6_import_batch_size_uses_its_own_bounded_setting(tmp_path) -> None:

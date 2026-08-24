@@ -98,6 +98,7 @@ class RunnerConfig:
     report_stability_polls: int = 2
     result_report_grace_seconds: float = 15.0
     metric_tolerance: Decimal = Decimal("0.01")
+    preserve_raw_artifacts: bool = False
 
     @classmethod
     def from_json(cls, path: Path) -> RunnerConfig:

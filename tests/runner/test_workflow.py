@@ -527,7 +527,7 @@ def test_active_output_lock_rejects_a_second_runner(tmp_path: Path) -> None:
 
 
 def test_failed_reconciliation_preserves_reports_and_logs(tmp_path: Path) -> None:
-    config = _config(tmp_path)
+    config = replace(_config(tmp_path), preserve_raw_artifacts=True)
     source = tmp_path / "generated"
     _strategy(source, "A")
     client = BatchClient(config, mismatch=True)
@@ -542,6 +542,7 @@ def test_failed_reconciliation_preserves_reports_and_logs(tmp_path: Path) -> Non
 
     assert result.inbox_path is not None
     assert output.exists()
+    assert (config.report_dir / "A.html").is_file()
     state = json.loads((output.parent / "results.state.json").read_text(encoding="utf-8"))
     assert state["state"] == "COMPLETED"
 

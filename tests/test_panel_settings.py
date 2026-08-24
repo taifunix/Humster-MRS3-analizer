@@ -96,6 +96,38 @@ def test_bootstrap_reports_only_safe_capabilities_and_redacts_runner_and_remote(
         assert secret not in encoded
 
 
+def test_panel_helpers_use_server_owned_fixed_roots_without_request_paths(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"panel_paths": {
+        "analysis_root": "custom/Analysis",
+        "strategies_root": "custom/strategies",
+    }}), encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+
+    assert controller._panel_path("analysis_root") == (tmp_path / "custom/Analysis").resolve()
+    assert controller._panel_path("strategies_root") == (tmp_path / "custom/strategies").resolve()
+    assert controller._panel_path("strategies_root") != (tmp_path / "attacker").resolve()
+
+
+def test_analysis_path_requires_configured_database_file(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"panel_paths": {"analysis_root": "data/Analysis"}}), encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+
+    with pytest.raises(ValueError, match="analysis_duckdb_path must be configured"):
+        controller._analysis_path()
+
+
+def test_analysis_path_resolves_configured_database_file(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({
+        "duckdb_import": {"analysis_duckdb_path": "data/Analysis/run.duckdb"},
+    }), encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+
+    assert controller._analysis_path() == (tmp_path / "data/Analysis/run.duckdb").resolve()
+
+
 @pytest.mark.parametrize(
     "content", ["", "{not-json", json.dumps([]), json.dumps({"tester_runner": []})]
 )
