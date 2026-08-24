@@ -66,12 +66,12 @@ def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() ->
 
     assert 'id="runner-local"' in html
     assert 'id="runner-remote"' in html
-    for runner in ("local",):
+    for runner in ("local", "remote"):
         assert f'id="{runner}-pair"' in html
         assert f'id="{runner}-side"' in html
         assert f'id="{runner}-start-date"' in html
         assert f'id="{runner}-end-date"' in html
-        assert f'id="{runner}-paths"' in html
+    assert 'id="local-paths"' in html
     assert "Проверить runner и диск" in html
     assert "Сохранить пути" in html
     assert 'id="panel-reload"' in html
@@ -415,8 +415,9 @@ def test_reload_recovers_only_server_job_snapshots() -> None:
     assert "const recoverJobs = async" in js
     recovery = js.split("const recoverJobs = async", 1)[1].split("const settingsStatus", 1)[0]
     assert "requestJson('/api/v2/jobs')" in recovery
-    assert "job.kind === 'strategies.tester'" in recovery
+    assert "job.kind === 'strategies.tester.start'" in recovery
     assert "job.kind === 'strategies.performance-dd5'" in recovery
+    assert "kind: 'strategies.tester.start'" in js
     assert "renderTester(job)" in recovery
     assert "renderPerformance(job)" in recovery
     assert "job.state =" not in recovery

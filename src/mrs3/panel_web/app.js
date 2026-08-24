@@ -1345,7 +1345,7 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const tester = [...jobs].reverse().find((job) => job.kind === 'strategies.tester');
+      const tester = [...jobs].reverse().find((job) => job.kind === 'strategies.tester.start');
       const performance = [...jobs].reverse().find((job) => job.kind === 'strategies.performance-dd5');
       if (tester && typeof tester.job_id === 'string') {
         const job = tester;
