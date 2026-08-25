@@ -277,16 +277,12 @@ is fabricated and the checks apply whenever the tester emits the field.
 admissible, and because the sampled series legitimately differs elsewhere;
 trades and win rate, because M2 and M3 deliberately use a different unit.
 
-`Recovery Factor` is a separate conditional consistency check for a numeric,
-positive-drawdown single fragment; it is not a fourth mandatory extraction
-check. The check uses the same M7 PnL source (declared final balance when
-available, otherwise the final wallet sample) and raw equity drawdown. It
-runs only when the declared Max DD rounds to the sampled equity drawdown,
-because M6 may intentionally select a different admissible declared DD
-candidate. The published tester value may differ by one unit of its raw
-exponent after display rounding; that one-unit boundary is accepted, while
-larger mutations quarantine the report. Zero activity follows ADR-0016's
-declared unavailable forms.
+`Recovery Factor` is informational only and is not an M7 admission check.
+The tester calculates its denominator with internal precision that is not
+available in the HTML payload; reproducing it from the displayed equity and
+drawdown values can therefore reject an otherwise verified report. It is not
+used by materialization or the analysis contract. Zero activity follows
+ADR-0016's declared unavailable forms.
 
 ## Format and materialization boundary
 

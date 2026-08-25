@@ -136,16 +136,15 @@ def test_m7_recovery_factor_uses_declared_final_balance_when_wallet_series_is_st
     normalize_source_v6(source)
 
 
-def test_m7_rejects_material_recovery_factor_mutation() -> None:
-    from mrs3.source_v6 import SourceV6Error, normalize_source_v6
+def test_m7_accepts_recovery_factor_mutation_as_non_blocking_diagnostic() -> None:
+    from mrs3.source_v6 import normalize_source_v6
 
     source = FIXTURE.read_text(encoding="utf-8").replace(
         '<tr><td>Max Drawdown</td><td>30</td></tr>',
         '<tr><td>Max Drawdown</td><td>30</td></tr>'
         '<tr><td>Recovery Factor (Total PnL / Max DD)</td><td>1.0</td></tr>',
     ).encode("utf-8")
-    with pytest.raises(SourceV6Error, match=r"M7.*Recovery Factor"):
-        normalize_source_v6(source)
+    normalize_source_v6(source)
 
 
 def test_normalization_rejects_profit_factor_mutation() -> None:

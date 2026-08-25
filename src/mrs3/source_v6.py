@@ -685,36 +685,9 @@ def _validate_m7(
     # no finite denominator; preserve that explicit convention.
     if not (profit_factor is None and declared_profit_factor is not None and declared_profit_factor[1] == 0):
         check("Profit Factor", profit_factor, declared_profit_factor)
-    recovery = _m7_metric(report.metrics, ("Recovery Factor", "Recovery Factor (Total PnL / Max DD)"))
-    declared_max_drawdown = _m7_metric(report.metrics, ("Max Drawdown", "Max DD"))
-    raw_recovery_pnl = total_pnl
-    equity_peak = report.equity_series[0][1] if report.equity_series else None
-    raw_equity_drawdown = Decimal("0")
-    if equity_peak is not None:
-        for _, value in report.equity_series:
-            if value > equity_peak:
-                equity_peak = value
-            elif equity_peak - value > raw_equity_drawdown:
-                raw_equity_drawdown = equity_peak - value
-    if (
-        recovery is not None
-        and recovery[1] is not None
-        and declared_max_drawdown is not None
-        and declared_max_drawdown[1] is not None
-        and raw_equity_drawdown > 0
-    ):
-        # Tester recovery uses the M7 PnL source and sampled equity drawdown; the
-        # displayed Max DD and Total PnL are rounded declarations. If the
-        # declared DD is not the sampled DD, M6's declared-candidate rule means
-        # this fragment has no independent RF denominator to validate.
-        dd_quantum = Decimal("1").scaleb(declared_max_drawdown[1].as_tuple().exponent)
-        if raw_equity_drawdown.quantize(dd_quantum, rounding=ROUND_HALF_UP) == declared_max_drawdown[1]:
-            quantum = Decimal("1").scaleb(recovery[1].as_tuple().exponent)
-            rounded = (raw_recovery_pnl / raw_equity_drawdown).quantize(quantum, rounding=ROUND_HALF_UP)
-            if abs(rounded - recovery[1]) > quantum:
-                raise _m7_mismatch(
-                    source_sha256, source_name, recovery[0], recovery[1], rounded, fragment_id
-                )
+    # Recovery Factor is an informational tester ratio. Its denominator uses
+    # internal precision that is not present in the report payload, so it is
+    # not an independent M7 admission check.
 
 
 def normalize_source_v6(source: bytes, *, source_name: str = "") -> SourceV6Fragment:

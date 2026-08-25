@@ -60,6 +60,22 @@ wallet-series metrics are unchanged. ADR-0018 records the boundary.
 Focused verification: `.venv\\Scripts\\python.exe -m pytest -q
 tests/test_source_v6_m7.py tests/test_source_v6.py` — `88 passed`.
 
+## M7 Recovery Factor admission boundary (2026-08-26)
+
+`Recovery Factor` is informational and no longer quarantines a Source v6
+report: the tester's internal denominator precision is not contained in the
+HTML payload. M7 continues to reject mismatched `Total PnL`, `Total fees` and
+`Profit Factor`.
+
+Targeted recovery imported only the affected reports and produced clean
+two-symbol merge kits under `data/databases/repair-kits-2026-08-26/`:
+NVDL/TSLL, LLY/TQQQ, BABA/SNOW and APLD/TSEM each contain 10,944 fragments,
+zero quarantines and no other symbols.
+
+Focused verification: `.venv\\Scripts\\python.exe -m pytest -q
+tests/test_source_v6_m7.py tests/test_source_v6_bundle.py` - `19 passed`;
+each resulting DB passed `validate_source_v6_database`.
+
 ## Panel Web reliable batch recovery (2026-08-25)
 
 The panel now keeps READY JSON generation failed when publication raises an
