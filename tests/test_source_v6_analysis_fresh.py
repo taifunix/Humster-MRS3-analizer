@@ -202,15 +202,18 @@ def test_fresh_analysis_is_separate_and_binds_the_supplied_gap_rules(tmp_path: P
     surface = publish_multiscope_surface(tmp_path / "surfaces", materialize_source_v6(facts, ("ONUSDT|LONG|1h",)))
     default = AlgorithmConfig.defaults()
     changed = replace(default, gap_rules=((30, 551, 10),))
+    admission_changed = replace(default, multi_order_min_plateau_points=4)
     read_surface = fresh.read_multiscope_surface
     decode_calls = []
     monkeypatch.setattr(fresh, "read_multiscope_surface", lambda path, *, decode=True: decode_calls.append(decode) or read_surface(path, decode=decode))
 
     first = run_multiscope_analysis(surface, tmp_path / "analysis", default, listing_dates={"ONUSDT": "2020-01-01"}, workers=1)
     second = run_multiscope_analysis(surface, tmp_path / "analysis", changed, listing_dates={"ONUSDT": "2020-01-01"}, workers=1)
+    third = run_multiscope_analysis(surface, tmp_path / "analysis", admission_changed, listing_dates={"ONUSDT": "2020-01-01"}, workers=1)
 
     assert first != second
-    assert decode_calls == [False, False]
+    assert first != third
+    assert decode_calls == [False, False, False]
     assert first.name.endswith(".analysis-v6.duckdb")
     connection = duckdb.connect(str(second), read_only=True)
     try:
@@ -218,6 +221,7 @@ def test_fresh_analysis_is_separate_and_binds_the_supplied_gap_rules(tmp_path: P
         assert manifest["fingerprint"] == "analysis-v6-fresh-compact-v1"
         assert manifest["surface_fingerprint"] == "surface-v6-fresh-compact-v2"
         assert manifest["algorithm_config_sha256"] != dict(duckdb.connect(str(first), read_only=True).execute("select key, value from manifest").fetchall())["algorithm_config_sha256"]
+        assert manifest["algorithm_config_sha256"] != dict(duckdb.connect(str(third), read_only=True).execute("select key, value from manifest").fetchall())["algorithm_config_sha256"]
         assert connection.execute("select count(*) from points").fetchone()[0] == len(facts)
     finally:
         connection.close()

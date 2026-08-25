@@ -1,7 +1,20 @@
 # MRS3 — current verification
 
 **Updated:** 2026-08-25
-**Current branch:** `main`
+**Current branch:** `feat/multi-order-plateau-admission`
+
+## Multi-order plateau admission (2026-08-25)
+
+For `real_independent_events`, 2ORD--4ORD construction now admits a plateau
+only when its frozen point-count and monthly event-count meet configurable
+`multi_order_admission` limits (defaults: 3 and 20). The check is before
+combinations, preserves legacy-proxy behaviour, and fails closed for missing
+real-event diagnostics on `ready=true` plateaus. It changes the algorithm
+configuration hash and therefore requires a new analysis; source/surface
+materialization and Phase 2 remain unchanged.
+
+Focused verification:
+`.venv\\Scripts\\python.exe -m pytest tests/test_config.py tests/test_selection.py tests/test_source_v6_analysis_fresh.py -q` -- `239 passed`.
 
 ## Filtered Shortlist bucket counts (2026-08-25)
 

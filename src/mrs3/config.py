@@ -442,6 +442,8 @@ class AlgorithmConfig:
     min_plateau_points: int = 3
     min_plateau_events_per_month: int = 20
     base_one_order_slots: int = 4
+    multi_order_min_plateau_points: int = 3
+    multi_order_min_plateau_events_per_month: int = 20
 
     def __post_init__(self) -> None:
         missing_base = sorted(set(DEFAULT_BASE_COLUMNS).difference(self.base_columns))
@@ -631,6 +633,20 @@ class AlgorithmConfig:
             or not 1 <= self.base_one_order_slots <= 4
         ):
             raise ValueError("base_one_order_slots must be an integer from 1 to 4")
+        if (
+            isinstance(self.multi_order_min_plateau_points, bool)
+            or not isinstance(self.multi_order_min_plateau_points, int)
+            or self.multi_order_min_plateau_points < 2
+        ):
+            raise ValueError("multi_order_min_plateau_points must be an integer at least 2")
+        if (
+            isinstance(self.multi_order_min_plateau_events_per_month, bool)
+            or not isinstance(self.multi_order_min_plateau_events_per_month, int)
+            or self.multi_order_min_plateau_events_per_month < 0
+        ):
+            raise ValueError(
+                "multi_order_min_plateau_events_per_month must be a non-negative integer"
+            )
 
     @classmethod
     def defaults(cls) -> "AlgorithmConfig":
@@ -642,6 +658,9 @@ class AlgorithmConfig:
         base_one_order = raw.get("base_one_order", {})
         if not isinstance(base_one_order, dict):
             raise ValueError("base_one_order must be an object")
+        multi_order_admission = raw.get("multi_order_admission", {})
+        if not isinstance(multi_order_admission, dict):
+            raise ValueError("multi_order_admission must be an object")
         base_rates = _base_rates_from_json(raw.get("base_rate_tf", cls().base_rates))
         columns = raw.get("columns", {})
         base = dict(DEFAULT_BASE_COLUMNS)
@@ -750,4 +769,10 @@ class AlgorithmConfig:
                 "min_plateau_events_per_month", 20
             ),
             base_one_order_slots=base_one_order.get("slots", 4),
+            multi_order_min_plateau_points=multi_order_admission.get(
+                "min_plateau_points", 3
+            ),
+            multi_order_min_plateau_events_per_month=multi_order_admission.get(
+                "min_plateau_events_per_month", 20
+            ),
         )

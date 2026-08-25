@@ -739,6 +739,35 @@ def test_base_one_order_values_change_canonical_config_hash(field: str, value: i
     assert digest(changed) != digest(default)
 
 
+def test_multi_order_admission_defaults_load_and_change_canonical_config_hash(tmp_path) -> None:
+    from mrs3.pipeline import _canonical
+
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "multi_order_admission": {
+                    "min_plateau_points": 5,
+                    "min_plateau_events_per_month": 42,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    default = AlgorithmConfig.defaults()
+    loaded = AlgorithmConfig.from_json(path)
+    digest = lambda config: sha256(
+        json.dumps(_canonical(config), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    assert default.multi_order_min_plateau_points == 3
+    assert default.multi_order_min_plateau_events_per_month == 20
+    assert loaded.multi_order_min_plateau_points == 5
+    assert loaded.multi_order_min_plateau_events_per_month == 42
+    assert digest(loaded) != digest(default)
+
+
 def test_from_json_accepts_canonical_fields(tmp_path) -> None:
     path = tmp_path / "config.json"
     path.write_text(

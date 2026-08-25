@@ -903,6 +903,16 @@ def build_structures(
     points = points.copy()
     if "event_eligible" not in points:
         points["event_eligible"] = points["economic_pass"]
+    event_modes = points["event_mode"].astype("string").str.strip()
+    if event_modes.isna().any():
+        raise ValueError("event_mode is required")
+    modes = set(event_modes)
+    if len(modes) != 1:
+        raise ValueError("mixed event modes are not allowed")
+    mode = modes.pop()
+    if mode not in {"legacy_trades_proxy", "real_independent_events"}:
+        raise ValueError("unknown event mode")
+    admitted_plateau_ids: set[str] | None = None
     usable_status = {"PRIMARY_CLOSE", "CORE_CLOSE", "SUPPORTED_CLOSE"}
     usable = close_profiles.loc[
         close_profiles["status"].isin(usable_status)
@@ -910,6 +920,37 @@ def build_structures(
         & close_profiles["continuity_status"].eq("USABLE")
         & close_profiles["usable"].eq(True)
     ].copy()
+    ready_plateaus = plateaus.loc[plateaus["ready"].eq(True)]
+    if mode == "real_independent_events" and not ready_plateaus.empty:
+        missing_diagnostics = sorted(
+            {"plateau_point_count", "plateau_event_count"}.difference(plateaus.columns)
+        )
+        if missing_diagnostics:
+            raise ValueError(
+                "real_independent_events multi-order admission is missing diagnostics: "
+                f"{missing_diagnostics}"
+            )
+        admitted_plateau_ids = set()
+        for row in ready_plateaus.itertuples(index=False):
+            point_count = getattr(row, "plateau_point_count")
+            event_count = getattr(row, "plateau_event_count")
+            if (
+                isinstance(point_count, bool)
+                or not isinstance(point_count, (int, np.integer))
+                or point_count < 0
+            ):
+                raise ValueError(f"invalid plateau_point_count for plateau {row.plateau_id}")
+            if (
+                isinstance(event_count, bool)
+                or not isinstance(event_count, (int, np.integer))
+                or event_count < 0
+            ):
+                raise ValueError(f"invalid plateau_event_count for plateau {row.plateau_id}")
+            if (
+                point_count >= config.multi_order_min_plateau_points
+                and event_count >= config.multi_order_min_plateau_events_per_month
+            ):
+                admitted_plateau_ids.add(str(row.plateau_id))
     structure_rows: list[dict[str, object]] = []
     diagnostic_rows: list[dict[str, object]] = []
 
@@ -928,6 +969,9 @@ def build_structures(
         }
         candidates_by_plateau: dict[str, list[pd.Series]] = {}
         for plateau_id in sorted(support_by_plateau):
+            if admitted_plateau_ids is not None and plateau_id not in admitted_plateau_ids:
+                candidates_by_plateau[plateau_id] = []
+                continue
             candidates = points.loc[
                 points["point_id"].eq(point_by_plateau[plateau_id])
                 & points["economic_pass"]

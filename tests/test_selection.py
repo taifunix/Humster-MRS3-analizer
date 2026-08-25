@@ -629,6 +629,47 @@ def test_two_three_four_orders_are_generated_independently() -> None:
     assert set(structures["order_count"]) == {2, 3, 4}
 
 
+def test_multi_order_admission_excludes_below_threshold_real_event_plateau() -> None:
+    points, plateaus, profiles = _structure_fixture()
+    points["event_mode"] = "real_independent_events"
+    points["plateau_point_count"] = 3
+    points["base_point_trades"] = points["trades"]
+    points["plateau_total_trades"] = points["trades"]
+    points["point_event_count"] = 20
+    plateaus["plateau_point_count"] = 3
+    plateaus["plateau_event_count"] = [19, 20, 20, 20]
+
+    structures, _ = build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+    used_plateaus = {
+        str(order["plateau_id"]) for orders in structures["orders"] for order in orders
+    }
+    assert "P1" not in used_plateaus
+    assert {"P2", "P3"}.issubset(used_plateaus)
+
+
+def test_multi_order_admission_requires_real_event_diagnostics() -> None:
+    points, plateaus, profiles = _structure_fixture()
+    points["event_mode"] = "real_independent_events"
+    points["plateau_point_count"] = 3
+    points["base_point_trades"] = points["trades"]
+    points["plateau_total_trades"] = points["trades"]
+    points["point_event_count"] = 20
+    plateaus["plateau_point_count"] = 3
+
+    with pytest.raises(ValueError, match="real_independent_events.*plateau_event_count"):
+        build_structures(points, plateaus, profiles, AlgorithmConfig.defaults())
+
+
+def test_multi_order_admission_requires_diagnostics_without_usable_close_profiles() -> None:
+    points, plateaus, profiles = _structure_fixture()
+    points["event_mode"] = "real_independent_events"
+    plateaus["plateau_point_count"] = 3
+
+    with pytest.raises(ValueError, match="real_independent_events.*plateau_event_count"):
+        build_structures(points, plateaus, profiles.iloc[0:0], AlgorithmConfig.defaults())
+
+
 def test_structures_use_one_representative_per_plateau_and_close_ma() -> None:
     points = pd.DataFrame(
         [

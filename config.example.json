@@ -58,6 +58,10 @@
     "min_plateau_events_per_month": 20,
     "slots": 4
   },
+  "multi_order_admission": {
+    "min_plateau_points": 3,
+    "min_plateau_events_per_month": 20
+  },
   "close_support": {"core_min": 0.9, "supported_min": 0.6},
   "gap": {
     "middle_zone_start_bp": 150,
