@@ -72,7 +72,7 @@
       const disclosure = document.createElement('button');
       disclosure.type = 'button';
       disclosure.className = 'shortlist-disclosure';
-      disclosure.textContent = open ? '⌄' : '›';
+      disclosure.textContent = open ? '▼' : '▶';
       disclosure.setAttribute('aria-expanded', open ? 'true' : 'false');
       disclosure.setAttribute('aria-label', `Expand/collapse ${pair.pair} ${pair.side} TFs`);
       disclosure.addEventListener('click', () => {
@@ -1263,13 +1263,9 @@
   if (phase2Filters && refreshFresh?.parentElement) {
     const actions = refreshFresh.parentElement;
     phase2Filters.open = true;
-    const filtersTitle = phase2Filters.querySelector('summary');
-    if (filtersTitle) {
-      const filtersTitleElement = document.createElement('strong');
-      filtersTitleElement.className = 'phase2-filters-title';
-      filtersTitleElement.textContent = filtersTitle.textContent;
-      filtersTitle.replaceWith(filtersTitleElement);
-    }
+    phase2Filters.querySelector('summary')?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') event.preventDefault();
+    });
     const selection = document.createElement('div'); selection.className = 'button-row';
     ['#shortlist-select-all', '#shortlist-select-active', '#shortlist-select-none'].forEach((id) => { const button = document.querySelector(id); if (button) selection.append(button); });
     actions.after(phase2Filters); phase2Filters.after(selection);

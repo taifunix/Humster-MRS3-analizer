@@ -13,10 +13,10 @@ unchanged. Focused panel tests, JS syntax and diff checks pass.
 ## Shortlist filter presentation (2026-08-25)
 
 Phase 2 filters are permanently visible with a bold heading and spaced labels;
-their interaction no longer exposes a collapse control. TF selection checkboxes
-are indented beneath the Pair/Side row. This is presentation-only: filters,
-counts and all current columns are unchanged. Focused panel tests, JS syntax
-and diff checks pass.
+their native summary remains visible as the title but cannot collapse. TF
+selection checkboxes are indented beneath the Pair/Side row. This is
+presentation-only: filters, counts and all current columns are unchanged.
+Focused panel tests, JS syntax and diff checks pass.
 
 ## M7 final-balance PnL validation (2026-08-25)
 

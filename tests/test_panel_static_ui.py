@@ -379,18 +379,20 @@ def test_shortlist_keeps_phase_two_filters_visible_and_indents_tf_rows() -> None
     js = _read("app.js")
 
     assert "phase2Filters.open = true;" in js
-    assert "filtersTitle.replaceWith(filtersTitleElement);" in js
-    assert ".phase2-filters-title" in css
+    assert "filtersTitle.replaceWith(filtersTitleElement);" not in js
+    assert ".phase2-filters > summary { display: block; margin-bottom: 12px; font-size: .94rem; font-weight: 700; pointer-events: none; }" in css
     assert ".shortlist-table tbody tr.is-timeframe > td:first-child { padding-left: 2.1rem; }" in css
 
 
 def test_shortlist_controls_match_requested_compact_typography() -> None:
     css = _read("app.css")
+    js = _read("app.js")
 
     assert "#shortlist-summary { display: none; }" in css
-    assert ".phase2-filters-title { display: block; margin-bottom: 12px; font-size: .94rem; font-weight: 700; }" in css
-    assert ".shortlist-group-checkbox { width: 11px; min-width: 11px; height: 11px; min-height: 11px; vertical-align: middle; }" in css
-    assert ".shortlist-disclosure { display: inline-flex; align-items: center; justify-content: center; vertical-align: middle;" in css
+    assert ".shortlist-group-checkbox, .shortlist-tf-checkbox { width: 16px; min-width: 16px; height: 16px; min-height: 16px; vertical-align: middle; }" in css
+    assert "disclosure.textContent = open ? '▼' : '▶';" in js
+    assert "if (event.key === 'Enter' || event.key === ' ') event.preventDefault();" in js
+    assert ".shortlist-disclosure { display: inline-flex; align-items: center; justify-content: center; vertical-align: middle; position: relative; top: -1px;" in css
 
 
 def test_shortlist_bulk_handlers_preserve_non_selection_state() -> None:
