@@ -16,8 +16,6 @@ make their current non-mutating view the sole source for READY JSON generation.
 - The Shortlist card follows the approved mockup: Refresh and audit actions,
   expandable `Phase 2 structural filters`, scope selection actions, then the
   grouped Pair/Side/TF table.
-- Its review table keeps all current columns, but uses the mockup's compact
-  dark palette, centred count cells and left-aligned Pair/Side values.
 - The checkboxes are `source_pnl`, `efficiency`, `close_support`, and
   `point_event_count`; unchecked is the default.
 - `POST /api/v2/strategies/fresh/shortlist` accepts all four boolean flags and
@@ -59,5 +57,3 @@ make their current non-mutating view the sole source for READY JSON generation.
    ID.
 5. The static panel renders the approved control order and grouped table, and
    the XLS workbook contains the required sheets.
-6. The expandable filters are open by default and appear between the Refresh /
-   audit actions and scope-selection actions.
