@@ -1262,6 +1262,14 @@
   const phase2Filters = document.querySelector('.phase2-filters');
   if (phase2Filters && refreshFresh?.parentElement) {
     const actions = refreshFresh.parentElement;
+    phase2Filters.open = true;
+    const filtersTitle = phase2Filters.querySelector('summary');
+    if (filtersTitle) {
+      const filtersTitleElement = document.createElement('strong');
+      filtersTitleElement.className = 'phase2-filters-title';
+      filtersTitleElement.textContent = filtersTitle.textContent;
+      filtersTitle.replaceWith(filtersTitleElement);
+    }
     const selection = document.createElement('div'); selection.className = 'button-row';
     ['#shortlist-select-all', '#shortlist-select-active', '#shortlist-select-none'].forEach((id) => { const button = document.querySelector(id); if (button) selection.append(button); });
     actions.after(phase2Filters); phase2Filters.after(selection);

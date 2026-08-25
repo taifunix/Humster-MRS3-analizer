@@ -14,7 +14,8 @@ make their current non-mutating view the sole source for READY JSON generation.
 ## Scope
 
 - The Shortlist card follows the approved mockup: Refresh and audit actions,
-  expandable `Phase 2 structural filters`, scope selection actions, then the
+  a permanently visible bold `Phase 2 structural filters` block, scope
+  selection actions, then the
   grouped Pair/Side/TF table.
 - The checkboxes are `source_pnl`, `efficiency`, `close_support`, and
   `point_event_count`; unchecked is the default.
@@ -57,3 +58,5 @@ make their current non-mutating view the sole source for READY JSON generation.
    ID.
 5. The static panel renders the approved control order and grouped table, and
    the XLS workbook contains the required sheets.
+6. Phase 2 filters do not collapse; their labels have vertical spacing, and TF
+   selection checkboxes are indented beneath their Pair/Side group.

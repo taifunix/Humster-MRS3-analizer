@@ -374,6 +374,16 @@ def test_shortlist_active_selection_uses_ready_after_filters_without_http() -> N
     assert "ready_after_filters" in js
 
 
+def test_shortlist_keeps_phase_two_filters_visible_and_indents_tf_rows() -> None:
+    css = _read("app.css")
+    js = _read("app.js")
+
+    assert "phase2Filters.open = true;" in js
+    assert "filtersTitle.replaceWith(filtersTitleElement);" in js
+    assert ".phase2-filters-title" in css
+    assert ".shortlist-table tbody tr.is-timeframe > td:first-child { padding-left: 2.1rem; }" in css
+
+
 def test_shortlist_bulk_handlers_preserve_non_selection_state() -> None:
     js = _read("app.js")
 
