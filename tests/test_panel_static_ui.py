@@ -384,6 +384,15 @@ def test_shortlist_keeps_phase_two_filters_visible_and_indents_tf_rows() -> None
     assert ".shortlist-table tbody tr.is-timeframe > td:first-child { padding-left: 2.1rem; }" in css
 
 
+def test_shortlist_controls_match_requested_compact_typography() -> None:
+    css = _read("app.css")
+
+    assert "#shortlist-summary { display: none; }" in css
+    assert ".phase2-filters-title { display: block; margin-bottom: 12px; font-size: .94rem; font-weight: 700; }" in css
+    assert ".shortlist-group-checkbox { width: 11px; min-width: 11px; height: 11px; min-height: 11px; vertical-align: middle; }" in css
+    assert ".shortlist-disclosure { display: inline-flex; align-items: center; justify-content: center; vertical-align: middle;" in css
+
+
 def test_shortlist_bulk_handlers_preserve_non_selection_state() -> None:
     js = _read("app.js")
 

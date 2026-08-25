@@ -60,3 +60,5 @@ make their current non-mutating view the sole source for READY JSON generation.
    the XLS workbook contains the required sheets.
 6. Phase 2 filters do not collapse; their labels have vertical spacing, and TF
    selection checkboxes are indented beneath their Pair/Side group.
+7. The Phase 2 title uses the Shortlist title typography; Pair/Side controls
+   keep a compact group checkbox and a vertically centred disclosure arrow.

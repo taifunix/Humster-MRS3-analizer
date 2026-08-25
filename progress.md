@@ -3,6 +3,13 @@
 **Updated:** 2026-08-25
 **Current branch:** `main`
 
+## Shortlist control alignment (2026-08-25)
+
+The secondary Shortlist information caption is hidden. The Phase 2 heading now
+matches Shortlist typography; Pair/Side uses an 11px checkbox and a doubled,
+vertically centred disclosure arrow. Filter logic and table columns remain
+unchanged. Focused panel tests, JS syntax and diff checks pass.
+
 ## Shortlist filter presentation (2026-08-25)
 
 Phase 2 filters are permanently visible with a bold heading and spaced labels;
