@@ -6,9 +6,17 @@
 ## Shortlist control alignment (2026-08-25)
 
 The secondary Shortlist information caption is hidden. The Phase 2 heading now
-matches Shortlist typography; Pair/Side uses an 11px checkbox and a doubled,
-vertically centred disclosure arrow. Filter logic and table columns remain
+matches Shortlist typography; Pair/Side and TF use the same 16px checkbox and
+a vertically centred disclosure arrow. Filter logic and table columns remain
 unchanged. Focused panel tests, JS syntax and diff checks pass.
+
+### Phase 2 live refresh (2026-08-25)
+
+The Phase 2 checkboxes now call the same filtered Shortlist refresh used by the
+Refresh action. Previously their state reached the server only after a manual
+Refresh click, so visible counts did not change immediately. The Pair/Side
+triangle is reduced to `0.9rem`; no data contract changes. Focused panel tests,
+JS syntax and diff checks pass.
 
 ## Shortlist filter presentation (2026-08-25)
 

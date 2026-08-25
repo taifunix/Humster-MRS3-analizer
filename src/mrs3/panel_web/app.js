@@ -1281,12 +1281,16 @@
     });
     refreshFresh.parentElement.append(audit);
   }
-  if (refreshFresh) refreshFresh.addEventListener('click', async () => {
+  const refreshShortlist = async () => {
     if (!currentAnalysisId) { strategyStatus('Сначала запустите анализ.'); return; }
     try {
       applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId, filters: shortlistFilters() }));
       strategyStatus(`Shortlist: ${shortlistItems.length} candidates.`);
     } catch (error) { strategyStatus(`Shortlist ошибка: ${error?.message || 'unknown error'}.`); }
+  };
+  if (refreshFresh) refreshFresh.addEventListener('click', refreshShortlist);
+  document.querySelectorAll('.phase2-filters input[type="checkbox"]').forEach((node) => {
+    node.addEventListener('change', refreshShortlist);
   });
   document.querySelector('#shortlist-select-all')?.addEventListener('click', () => {
     selectedScopeKeys.clear();

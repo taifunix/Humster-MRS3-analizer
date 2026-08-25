@@ -395,6 +395,16 @@ def test_shortlist_controls_match_requested_compact_typography() -> None:
     assert ".shortlist-disclosure { display: inline-flex; align-items: center; justify-content: center; vertical-align: middle; position: relative; top: -1px;" in css
 
 
+def test_phase_two_checkbox_change_refreshes_the_shortlist() -> None:
+    css = _read("app.css")
+    js = _read("app.js")
+
+    assert "font-size: .9rem" in css
+    assert "const refreshShortlist = async () =>" in js
+    assert "document.querySelectorAll('.phase2-filters input[type=\"checkbox\"]').forEach((node) => {" in js
+    assert "node.addEventListener('change', refreshShortlist);" in js
+
+
 def test_shortlist_bulk_handlers_preserve_non_selection_state() -> None:
     js = _read("app.js")
 

@@ -63,3 +63,5 @@ make their current non-mutating view the sole source for READY JSON generation.
 7. The Phase 2 title uses the Shortlist title typography; Pair/Side controls
    use the same checkbox size for group and TF rows, plus a vertically centred
    triangle disclosure arrow.
+8. Changing any Phase 2 checkbox immediately refreshes the Shortlist through
+   the same server-side filtered view as the Refresh action.
