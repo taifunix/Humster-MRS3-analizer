@@ -337,7 +337,7 @@ def test_fresh_shortlist_returns_only_safe_candidate_summary(tmp_path: Path) -> 
 
 
 def test_fresh_phase2_source_pnl_defers_only_a_dominated_candidate(tmp_path: Path) -> None:
-    from mrs3.fresh_analysis_strategies import filter_fresh_analysis_candidates
+    from mrs3.fresh_analysis_strategies import filter_fresh_analysis_candidates, list_fresh_analysis_shortlist
 
     database = tmp_path / "run.analysis-v6.duckdb"
     analysis_id, _ = _make_analysis(database)
@@ -362,3 +362,21 @@ def test_fresh_phase2_source_pnl_defers_only_a_dominated_candidate(tmp_path: Pat
 
     assert rows["STR-BETTER"]["filter_status"] == "READY_AFTER_FILTERS"
     assert rows["STR-READY"]["deferred_by_candidate_id"] == "STR-BETTER"
+
+    shortlist = list_fresh_analysis_shortlist(database, analysis_id, {"source_pnl": True})
+    assert shortlist["groups"][0]["counts"] == {"1ORD": 0, "2ORD": 1, "3ORD": 0, "4ORD": 0}
+    assert shortlist["groups"][0]["ready_after_filters"] == 1
+    assert shortlist["groups"][0]["deferred"] == 1
+
+
+def test_filtered_shortlist_counts_preexisting_non_ready_candidate_as_deferred(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database, ready=False)
+
+    group = list_fresh_analysis_shortlist(database, analysis_id, {"source_pnl": True})["groups"][0]
+    assert group["counts"] == {"1ORD": 0, "2ORD": 0, "3ORD": 0, "4ORD": 0}
+    assert group["ready_after_filters"] == 0
+    assert group["deferred"] == 1
+    assert group["total"] == 1

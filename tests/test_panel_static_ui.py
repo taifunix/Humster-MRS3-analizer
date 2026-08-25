@@ -405,6 +405,10 @@ def test_phase_two_checkbox_change_refreshes_the_shortlist() -> None:
     assert "node.addEventListener('change', refreshShortlist);" in js
 
 
+def test_accordion_status_badges_align_to_the_right() -> None:
+    assert ".accordion > summary > .state-badge { margin-left: auto; }" in _read("app.css")
+
+
 def test_shortlist_bulk_handlers_preserve_non_selection_state() -> None:
     js = _read("app.js")
 

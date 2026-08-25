@@ -474,17 +474,17 @@ def _shortlist_groups(
         group["total"] = int(group["total"]) + 1
         bucket = f"{int(item['order_count'])}ORD"
         counts = group["counts"]
-        # A candidate outside the canonical buckets is still counted in `total`,
-        # so the row never claims fewer candidates than it has.
-        if bucket in counts:
+        # With active Phase 2 filters, bucket columns represent candidates that
+        # remain READY; ALL and DEFERRED retain the complete context.
+        if bucket in counts and item.get("filter_status", "READY_AFTER_FILTERS") == "READY_AFTER_FILTERS":
             counts[bucket] = int(counts[bucket]) + 1
         if str(item["status"]) == _READY_STATUS:
             group["ready"] = int(group["ready"]) + 1
             if item.get("filter_status", "READY_AFTER_FILTERS") == "READY_AFTER_FILTERS":
                 group["ready_after_filters"] = int(group["ready_after_filters"]) + 1
                 group["candidate_ids"].append(str(item["candidate_id"]))
-            else:
-                group["deferred"] = int(group["deferred"]) + 1
+        if "filter_status" in item and item["filter_status"] != "READY_AFTER_FILTERS":
+            group["deferred"] = int(group["deferred"]) + 1
     for group in grouped.values():
         group["candidate_ids"] = sorted(group["candidate_ids"])
         if not any("filter_status" in item for item in items):

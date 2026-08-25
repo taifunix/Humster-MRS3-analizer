@@ -3,6 +3,14 @@
 **Updated:** 2026-08-25
 **Current branch:** `main`
 
+## Filtered Shortlist bucket counts (2026-08-25)
+
+Phase 2 previously updated only READY/DEFERRED while the `1ORD`–`4ORD` table
+counts remained unfiltered. With active filters, those bucket counts now show
+only remaining READY candidates; `DEFERRED` and `ALL` stay as the full
+context. Accordion status badges are right-aligned. Focused fresh-analysis and
+panel tests, JS syntax and diff checks pass.
+
 ## Shortlist control alignment (2026-08-25)
 
 The secondary Shortlist information caption is hidden. The Phase 2 heading now

@@ -90,6 +90,7 @@ summary small { margin-left: 5px; color: var(--muted); font-size: .7rem; font-we
 .details-content { padding-top: 15px; }
 .accordion > summary { padding: 19px 21px; color: var(--ink); }
 .accordion > summary > span:first-child { display: grid; gap: 4px; }
+.accordion > summary > .state-badge { margin-left: auto; }
 .accordion > summary b { font-size: .94rem; }
 .accordion > summary small { margin: 0; font-size: .75rem; }
 .accordion > .details-content { border-top: 1px solid var(--line); }

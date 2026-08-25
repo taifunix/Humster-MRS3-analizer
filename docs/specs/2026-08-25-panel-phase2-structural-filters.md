@@ -17,6 +17,8 @@ make their current non-mutating view the sole source for READY JSON generation.
   a permanently visible bold `Phase 2 structural filters` block, scope
   selection actions, then the
   grouped Pair/Side/TF table.
+- With active filters, `1ORD` through `4ORD` count only candidates remaining
+  READY; `DEFERRED` and `ALL` retain the unfiltered context.
 - The checkboxes are `source_pnl`, `efficiency`, `close_support`, and
   `point_event_count`; unchecked is the default.
 - `POST /api/v2/strategies/fresh/shortlist` accepts all four boolean flags and
@@ -65,3 +67,5 @@ make their current non-mutating view the sole source for READY JSON generation.
    triangle disclosure arrow.
 8. Changing any Phase 2 checkbox immediately refreshes the Shortlist through
    the same server-side filtered view as the Refresh action.
+9. A filtered group has `sum(1ORD..4ORD) = READY` for canonical order buckets;
+   `DEFERRED` plus `READY` reconciles with `ALL`.
