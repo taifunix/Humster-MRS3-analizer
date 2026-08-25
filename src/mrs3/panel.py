@@ -14,6 +14,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -127,7 +128,7 @@ from .fresh_analysis_strategies import (
     list_fresh_analysis_shortlist,
     read_fresh_analysis_identity,
 )
-from .panel_strategy_batch import LocalStrategyBatchService
+from .panel_strategy_batch import LocalStrategyBatchService, StrategyBatchValidationError, validate_strategy_manifest
 from .panel_performance_dd5 import (
     LocalPerformanceDd5Jobs,
     LocalPerformanceDd5Service,
@@ -137,6 +138,8 @@ from .panel_performance_dd5 import (
     PerformanceImportPanelRequest,
 )
 from .runner.config import RunnerConfig
+from .runner.inbox import capture_verified_inbox
+from .runner.workflow import BatchPlan, _load_saved_result_evidence, _load_saved_results, plan_batch, run_batch
 
 
 _DIRECT_MATERIALIZER_VERSION = CANONICAL_MATERIALIZER_VERSION
@@ -1167,12 +1170,14 @@ class PanelController:
         self._fresh_analysis_paths: dict[str, Path] = {}
         self._fresh_analysis_surfaces: dict[str, Path] = {}
         self._fresh_strategy_manifests: dict[str, Path] = {}
+        self._fresh_generation_job: dict[str, object] | None = None
         self._strategy_batch_service: LocalStrategyBatchService | None = None
         self._strategy_batch_inboxes: dict[str, Path] = {}
         self._performance_dd5_jobs: LocalPerformanceDd5Jobs | None = None
         self._performance_import_jobs: LocalPerformanceImportJobs | None = None
         self._performance_database_jobs: LocalPerformanceDd5Jobs | None = None
         self._reconcile_interrupted_remote_source_jobs()
+        self._reconcile_interrupted_tester_jobs()
         self._job: _Job | None = None
         # Keep only artifact paths created by this controller instance.  The
         # dashboard must never discover data by scanning user directories.
@@ -1365,12 +1370,13 @@ class PanelController:
                     raise ValueError(f"inbox is incomplete: {field} is invalid")
             paths: dict[str, Path] = {}
             for field in ("strategy_path", "report_path"):
-                relative = Path(entry[field])
-                if relative.is_absolute() or ".." in relative.parts:
+                value = Path(entry[field])
+                if ".." in value.parts:
                     raise ValueError("inbox is incomplete: path is outside inbox")
-                candidate = (inbox / relative).resolve()
+                candidate = value.resolve() if value.is_absolute() else (inbox / value).resolve()
                 try:
-                    candidate.relative_to(inbox.resolve())
+                    if not value.is_absolute():
+                        candidate.relative_to(inbox.resolve())
                 except ValueError as error:
                     raise ValueError("inbox is incomplete: path is outside inbox") from error
                 if not candidate.is_file():
@@ -1378,14 +1384,15 @@ class PanelController:
                 paths[field] = candidate
             if _sha256(paths["report_path"].read_bytes()) != entry["source_report_sha256"]:
                 raise ValueError("inbox is incomplete: report hash mismatch")
-            strategy_bytes = paths["strategy_path"].read_bytes()
-            if _sha256(strategy_bytes) != entry["source_strategy_sha256"]:
-                raise ValueError("inbox is incomplete: strategy hash mismatch")
             try:
-                strategy = json.loads(strategy_bytes.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError) as error:
+                strategy = json.loads(paths["strategy_path"].read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ValueError("inbox is incomplete: invalid strategy JSON") from error
-            if not isinstance(strategy, dict) or _sha256(_canonical(strategy)) != entry["strategy_version_id"]:
+            if not isinstance(strategy, dict):
+                raise ValueError("inbox is incomplete: strategy JSON is not an object")
+            if _sha256(paths["strategy_path"].read_bytes()) != entry["source_strategy_sha256"]:
+                raise ValueError("inbox is incomplete: strategy hash mismatch")
+            if _sha256(_canonical(strategy)) != entry["strategy_version_id"]:
                 raise ValueError("inbox is incomplete: strategy version hash mismatch")
         if sorted(names) != sorted(expected_names):
             raise ValueError("inbox is incomplete: strategy names do not match")
@@ -1602,6 +1609,13 @@ class PanelController:
 
     def panel_jobs(self) -> list[dict]:
         return self._panel_jobs.list()
+
+    def has_active_panel_jobs(self) -> bool:
+        if any(job["state"] not in {"COMMITTED", "CANCELLED", "FAILED"} for job in self.panel_jobs()):
+            return True
+        return (
+            self._strategy_batch_service is not None and self._strategy_batch_service.has_active_job()
+        ) or bool(self._fresh_generation_job and self._fresh_generation_job.get("running"))
 
     def panel_job_submit(self, payload: Mapping[str, object]) -> dict:
         kind = payload.get("kind")
@@ -2089,8 +2103,107 @@ class PanelController:
             if isinstance(configured, str) and configured.strip():
                 return configured.strip()
         except Exception:
-            pass
+                pass
         return "0.7-canonical-phase1"
+
+    def _reconcile_interrupted_tester_jobs(self) -> None:
+        """Restore a batch only from its durable completed inbox, never its progress counter."""
+        try:
+            config = RunnerConfig.from_json(self.default_config)
+            inbox_root = Path(config.inbox_root).resolve()
+        except Exception:
+            return
+        for job in self._panel_jobs.list():
+            if job.get("kind") not in {"strategies.tester", "strategies.tester.start"} or job.get("state") != "FAILED":
+                continue
+            job_id = job.get("job_id")
+            if not isinstance(job_id, str):
+                continue
+            state_path = inbox_root / f"{job_id}.state.json"
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                inbox = Path(state["inbox_path"]).resolve()
+                manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+                expected = state["expected_names"]
+                entries = manifest["entries"]
+                if (
+                    state.get("state") != "COMPLETED"
+                    or not isinstance(expected, list)
+                    or not isinstance(entries, list)
+                    or {entry.get("strategy_name") for entry in entries if isinstance(entry, dict)} != set(expected)
+                    or len(entries) != len(expected)
+                    or manifest.get("schema_version") != 1
+                ):
+                    continue
+                inbox.relative_to(inbox_root)
+                self._validate_performance_inbox(inbox)
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            try:
+                self._panel_jobs.recover_committed(job_id, runtime={"inbox_path": str(inbox)})
+            except PanelJobError:
+                pass
+            continue
+        self._resume_interrupted_tester_finalization()
+
+    def _resume_interrupted_tester_finalization(self) -> None:
+        """Finish only an already verified batch; never resubmit a strategy after restart."""
+        try:
+            config = RunnerConfig.from_json(self.default_config)
+        except Exception:
+            return
+        for job in self._panel_jobs.list():
+            if job.get("kind") not in {"strategies.tester", "strategies.tester.start"} or job.get("error") != {"code": "INTERRUPTED"}:
+                continue
+            job_id = job.get("job_id")
+            if not isinstance(job_id, str):
+                continue
+            state_path = Path(config.inbox_root) / f"{job_id}.state.json"
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                source = Path(state["strategy_source"])
+                output = Path(state["output_csv"])
+                provenance = state["v6_provenance"]
+                retry_incomplete_capture = (
+                    state.get("state") == "FAILED"
+                    and isinstance(state.get("error"), str)
+                    and state["error"].startswith("InboxCaptureError: inbox already exists:")
+                )
+                if state.get("state") != "STOPPED_FOR_CLEANUP" and not retry_incomplete_capture:
+                    continue
+                if not isinstance(provenance, Mapping):
+                    continue
+                if plan_batch(config, source, output, hydrate_resume=True).resume_remaining_names:
+                    continue
+                inbox_root = Path(config.inbox_root).resolve()
+                incomplete_inbox = (inbox_root / job_id).resolve()
+                incomplete_inbox.relative_to(inbox_root)
+                if incomplete_inbox.exists():
+                    if (incomplete_inbox / "inbox_manifest.json").is_file():
+                        continue
+                    shutil.rmtree(incomplete_inbox)
+                self._panel_jobs.recover_running(job_id)
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError, PanelJobError):
+                continue
+            threading.Thread(
+                target=self._finish_interrupted_tester_inbox,
+                args=(job_id, config, source, output, dict(provenance)),
+                name="mrs3-panel-tester-inbox-recovery",
+                daemon=True,
+            ).start()
+
+    def _finish_interrupted_tester_inbox(
+        self, job_id: str, config: RunnerConfig, source: Path, output: Path, provenance: dict[str, object]
+    ) -> None:
+        try:
+            result = run_batch(config, source, output, provenance=provenance)
+            inbox = Path(result.inbox_path).resolve()
+            self._panel_jobs.recover_committed(job_id, runtime={"inbox_path": str(inbox)})
+        except Exception:
+            try:
+                self._panel_jobs.sync(job_id, {"state": "FAILED", "phase": "FAILED", "error": {"code": "INBOX_RECOVERY_FAILED"}})
+            except PanelJobError:
+                pass
 
     def strategies_fresh_analyze(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Run the only supported fresh multi-scope analysis contour."""
@@ -2129,19 +2242,56 @@ class PanelController:
         scope_sides = {str(item[1]).upper() for item in scopes}
         if len(scope_sides) != 1:
             raise ValueError("fresh strategy generation requires one side per batch")
+        analysis_id = self._required(payload, "analysis_run_id")
+        if analysis_id not in self._fresh_analysis_paths:
+            raise ValueError("fresh analysis is not available in this panel session")
+        with self._lock:
+            if self._fresh_generation_job and self._fresh_generation_job["running"]:
+                raise ValueError("READY JSON generation is already running")
+            job = {"job_id": uuid.uuid4().hex, "phase": "RUNNING", "running": True}
+            self._fresh_generation_job = job
+        thread_payload = {
+            "analysis_run_id": analysis_id,
+            "candidate_ids": list(candidates),
+            "selected_scopes": [list(item) for item in scopes],
+        }
+        requested = payload.get("output_dir")
+        if isinstance(requested, str):
+            thread_payload["output_dir"] = requested
+        threading.Thread(
+            target=self._run_fresh_strategy_generation,
+            args=(job, thread_payload),
+            name="mrs3-panel-fresh-strategies",
+            daemon=True,
+        ).start()
+        return dict(job)
+
+    def _run_fresh_strategy_generation(self, job: dict[str, object], payload: Mapping[str, object]) -> None:
+        try:
+            result = self._generate_fresh_strategies(payload)
+        except Exception:
+            with self._lock:
+                job.update(phase="FAILED", running=False, error="READY JSON generation failed. Check panel logs.")
+        else:
+            with self._lock:
+                job.update(result, phase="COMMITTED", running=False)
+
+    def strategies_fresh_generation_status(self, job_id: str) -> dict[str, object]:
+        with self._lock:
+            if self._fresh_generation_job is None or self._fresh_generation_job["job_id"] != job_id:
+                raise ValueError("fresh strategy generation job is not available")
+            return dict(self._fresh_generation_job)
+
+    def _generate_fresh_strategies(self, payload: Mapping[str, object]) -> dict[str, object]:
+        candidates = payload["candidate_ids"]
+        scopes = payload["selected_scopes"]
+        assert isinstance(candidates, list)
+        assert isinstance(scopes, list)
+        scope_sides = {str(item[1]).upper() for item in scopes}
         config = self._analysis_config_loader(self.default_config)
         analysis_id = self._required(payload, "analysis_run_id")
         analysis_path = self._fresh_analysis_paths.get(analysis_id)
-        if analysis_path is None:
-            raise ValueError("fresh analysis is not available in this panel session")
-        # The operator chose where the JSON batch lands; the previous fixed
-        # location was invisible in the panel, so the batch could not be found.
-        requested = payload.get("output_dir")
-        output_dir = (
-            self._path(str(requested))
-            if isinstance(requested, str) and requested.strip()
-            else self.root / "Output" / "strategies" / analysis_id
-        )
+        output_dir = self.root / "Output"
         result = generate_fresh_analysis_strategies(
             analysis_path,
             analysis_id,
@@ -2160,6 +2310,35 @@ class PanelController:
             "strategy_count": result.strategy_count,
             "manifest": result.manifest_path.name,
             "output_dir": str(result.manifest_path.parent),
+        }
+
+    def _fresh_strategy_manifest(self, analysis_id: str | None = None) -> Path:
+        candidates = []
+        if analysis_id and analysis_id in self._fresh_strategy_manifests:
+            candidates.append(self._fresh_strategy_manifests[analysis_id])
+        candidates.extend((
+            self.root / "Output" / "strategy_manifest.json",
+            self.root / "Output" / "strategies" / "strategy_manifest.json",
+        ))
+        for candidate in candidates:
+            try:
+                validated = validate_strategy_manifest(candidate)
+            except StrategyBatchValidationError:
+                continue
+            if analysis_id is not None and validated.analysis_run_id != analysis_id:
+                continue
+            self._fresh_strategy_manifests[validated.analysis_run_id] = validated.manifest_path
+            return validated.manifest_path
+        raise ValueError("fresh strategy batch is not available")
+
+    def strategies_fresh_batch(self) -> dict[str, object]:
+        manifest = self._fresh_strategy_manifest()
+        validated = validate_strategy_manifest(manifest)
+        hashes = validated.provenance.get("strategy_json_sha256", {})
+        return {
+            "phase": "COMMITTED",
+            "analysis_run_id": validated.analysis_run_id,
+            "strategy_count": len(hashes) if isinstance(hashes, Mapping) else 0,
         }
 
     def analysis_catalog(self) -> dict[str, object]:
@@ -2259,11 +2438,9 @@ class PanelController:
             raise ValueError("end_date and test_end disagree")
         if start_date is None or end_date is None:
             raise ValueError("start_date and end_date are required")
-        manifest = self._fresh_strategy_manifests.get(analysis_id)
-        if manifest is None:
-            raise ValueError("fresh strategy batch is not available in this panel session")
+        manifest = self._fresh_strategy_manifest(analysis_id)
         return self._start_tracked_panel_job(
-            "strategies.tester", {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date},
+            "strategies.tester.start", {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date},
             ("strategies.tester",),
             lambda job_id: self._strategy_batch().start(
                 manifest,
@@ -2279,6 +2456,48 @@ class PanelController:
         if result.get("state") == "COMMITTED" and isinstance(result.get("inbox_path"), str):
             self._strategy_batch_inboxes[job_id] = Path(result["inbox_path"])
         return {key: value for key, value in result.items() if key != "inbox_path"}
+
+    def strategies_tester_verify_inbox(self, job_id: str) -> dict[str, object]:
+        config = RunnerConfig.from_json(self.default_config)
+        inbox_root = Path(config.inbox_root).resolve()
+        inbox = (inbox_root / job_id).resolve()
+        inbox.relative_to(inbox_root)
+        manifest_path = inbox / "inbox_manifest.json"
+        provenance: Mapping[str, object] | None = None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            entries = manifest["entries"]
+            saved_provenance = manifest.get("v6_provenance")
+            if isinstance(saved_provenance, Mapping):
+                provenance = saved_provenance
+            sources_missing = not isinstance(entries, list)
+        except (OSError, ValueError, TypeError):
+            sources_missing = True
+        if sources_missing:
+            state = json.loads((inbox_root / f"{job_id}.state.json").read_text(encoding="utf-8"))
+            expected = tuple(state["expected_names"])
+            source = Path(state["strategy_source"])
+            output = Path(state["output_csv"])
+            if provenance is None:
+                generation = self._fresh_strategy_manifest()
+                provenance = validate_strategy_manifest(generation).provenance
+            results = _load_saved_results(output)
+            evidence = _load_saved_result_evidence(output)
+            reports = {name: evidence[name][0] for name in expected}
+            if {result.strategy_names[0] for result in results} != set(expected) or not all(path.is_file() for path in reports.values()):
+                raise ValueError("verified reports are incomplete")
+            if inbox.exists():
+                shutil.rmtree(inbox)
+            plan = BatchPlan(source, expected, tuple(f"{name}.json" for name in expected), tuple(), tuple(), tuple(), tuple())
+            snapshot = (inbox_root / f".{job_id}.tester-config.snapshot").read_bytes()
+            capture_verified_inbox(config, output, plan, results, reports, tester_config_bytes=snapshot, provenance=provenance)
+        self._validate_performance_inbox(inbox)
+        try:
+            self._panel_jobs.recover_committed(job_id, runtime={"inbox_path": str(inbox)})
+        except PanelJobError:
+            if self._panel_jobs.get(job_id).get("state") != "COMMITTED":
+                raise
+        return self.strategies_tester_status(job_id)
 
     def strategies_tester_cancel(self, job_id: str) -> dict[str, object]:
         try:
@@ -2308,9 +2527,16 @@ class PanelController:
     def _tester_dates(self, job_id: str) -> tuple[str, str]:
         job = self._panel_jobs.get(job_id)
         request = job.get("request")
-        if not isinstance(request, dict):
-            raise ValueError("tester dates are not available")
-        start, end = request.get("start_date"), request.get("end_date")
+        start = request.get("start_date") if isinstance(request, dict) else None
+        end = request.get("end_date") if isinstance(request, dict) else None
+        if not isinstance(start, str) or not isinstance(end, str):
+            config = RunnerConfig.from_json(self.default_config)
+            snapshot = Path(config.inbox_root) / f".{job_id}.tester-config.snapshot"
+            try:
+                saved = json.loads(snapshot.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise ValueError("tester dates are not available") from error
+            start, end = saved.get("StartDate"), saved.get("EndDate")
         if not isinstance(start, str) or not isinstance(end, str):
             raise ValueError("tester dates are not available")
         return start, end
@@ -2408,7 +2634,7 @@ class PanelController:
         if kind == "audit":
             candidate = database.parent / database.stem / "import_audit.v4.json"
         elif kind == "workbook":
-            candidate = self._panel_path("workbooks_root") / f"{database.stem}.dd5.xlsx"
+            candidate = self._panel_path("workbooks_root") / database.stem / f"{database.stem}.dd5.xlsx"
         else:
             raise ValueError("invalid performance artifact")
         return candidate if candidate.is_file() else None
@@ -4912,7 +5138,7 @@ class _PanelServer(ThreadingHTTPServer):
             raise PanelJobError("RESTART_UNAVAILABLE") from None
 
     def restart_panel(self) -> dict[str, bool]:
-        if any(job["state"] not in {"COMMITTED", "CANCELLED", "FAILED"} for job in self.controller.panel_jobs()):
+        if self.controller.has_active_panel_jobs():
             raise PanelJobError("RESTART_BLOCKED")
         self._restart_launcher()
         stop = threading.Timer(0.15, self.shutdown)
@@ -5048,6 +5274,19 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v2/surfaces/publish/status":
             self._json(200, self.server.controller.surface_publish_status())
             return
+        if parsed.path == "/api/v2/strategies/fresh/generate/status":
+            try:
+                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
+                self._json(200, self.server.controller.strategies_fresh_generation_status(job_id))
+            except ValueError:
+                self._json(400, {"error": "invalid fresh strategy generation request"})
+            return
+        if parsed.path == "/api/v2/strategies/fresh/batch":
+            try:
+                self._json(200, self.server.controller.strategies_fresh_batch())
+            except ValueError:
+                self._json(404, {"error": "fresh strategy batch is not available"})
+            return
         if parsed.path == "/api/v2/strategies/tester/status":
             try:
                 job_id = parse_qs(parsed.query).get("job_id", [""])[0]
@@ -5173,7 +5412,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -5194,6 +5433,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 raise ValueError("JSON body must be an object")
             if endpoint == "/api/v2/panel/restart":
                 result = self.server.restart_panel()
+            elif endpoint == "/api/v2/strategies/tester/verify-inbox":
+                result = self.server.controller.strategies_tester_verify_inbox(self.server.controller._required(document, "job_id"))
             elif endpoint == "/api/v2/testing/local/fill":
                 result = self.server.controller.local_testing_fill(document)
             elif endpoint == "/api/v2/testing/local/start":
@@ -5328,7 +5569,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(409, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})
             return
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-            self._json(400, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})
+            self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
             return
         self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start"} else 200, result)
 

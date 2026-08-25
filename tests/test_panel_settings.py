@@ -380,6 +380,53 @@ def test_panel_restart_endpoint_rejects_active_jobs(tmp_path: Path) -> None:
         thread.join(timeout=2)
 
 
+def test_panel_restart_endpoint_rejects_live_tester_not_yet_in_registry(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps(_runner_config()), encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+
+    class LiveTester:
+        def has_active_job(self) -> bool:
+            return True
+
+    controller._strategy_batch_service = LiveTester()  # type: ignore[assignment]
+    launched: list[bool] = []
+    server = create_panel_server("127.0.0.1", 0, controller, restart_launcher=lambda: launched.append(True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        status, _ = _request(connection, "POST", "/api/v2/panel/restart", {})
+        assert status == 409
+        assert launched == []
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_panel_restart_endpoint_rejects_live_ready_json_generation(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps(_runner_config()), encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    controller._fresh_generation_job = {"running": True}
+    launched: list[bool] = []
+    server = create_panel_server("127.0.0.1", 0, controller, restart_launcher=lambda: launched.append(True))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        status, _ = _request(connection, "POST", "/api/v2/panel/restart", {})
+        assert status == 409
+        assert launched == []
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_save_operational_settings_updates_the_fields_consumed_by_panel_jobs(panel_http) -> None:
     _, config, connection = panel_http
     payload = {

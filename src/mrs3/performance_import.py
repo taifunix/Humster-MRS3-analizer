@@ -46,12 +46,15 @@ class PerformanceImportRequest:
     transaction_batch_size: int = DEFAULT_TRANSACTION_BATCH_SIZE
     cancellation_requested: Callable[[], bool] | None = None
     audit_dir: Path | None = None
+    allow_quarantine: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.workers, bool) or not isinstance(self.workers, int) or self.workers < 1:
             raise ValueError("performance import workers must be a positive integer")
         if self.workers > MAX_PERFORMANCE_WORKERS:
             object.__setattr__(self, "workers", MAX_PERFORMANCE_WORKERS)
+        if not isinstance(self.allow_quarantine, bool):
+            raise ValueError("performance import allow_quarantine must be a boolean")
         if (
             isinstance(self.transaction_batch_size, bool)
             or not isinstance(self.transaction_batch_size, int)
@@ -160,29 +163,6 @@ def _json_value(value: object) -> object:
     if isinstance(value, dict):
         return {str(key): _json_value(item) for key, item in value.items()}
     return value
-
-
-def _settings_match(expected: dict[str, object], actual: dict[str, object], source_exchange_name: str) -> bool:
-    if _canonical(actual) == _canonical(expected):
-        return True
-    expected_exchange = expected.get("exchange")
-    actual_exchange = actual.get("exchange")
-    if not isinstance(expected_exchange, dict) or not isinstance(actual_exchange, dict):
-        return False
-    expected_name = expected_exchange.get("name")
-    actual_name = actual_exchange.get("name")
-    if not isinstance(expected_name, str) or not isinstance(actual_name, str):
-        return False
-    source_normalized = source_exchange_name.strip().casefold()
-    if expected_name.strip().casefold() != source_normalized:
-        return False
-    if actual_name.strip().casefold() not in {source_normalized, _TESTER_EXCHANGE_MARKER}:
-        return False
-    normalized_actual = dict(actual)
-    normalized_exchange = dict(actual_exchange)
-    normalized_exchange["name"] = expected_name
-    normalized_actual["exchange"] = normalized_exchange
-    return _canonical(normalized_actual) == _canonical(expected)
 
 
 def _sha256(data: bytes) -> str:
@@ -341,11 +321,12 @@ def _base_audit(
 
 def _safe_report_path(inbox: Path, value: str) -> Path:
     relative = Path(value)
-    if relative.is_absolute() or ".." in relative.parts:
+    if ".." in relative.parts:
         raise PerformanceImportError("report path is outside inbox")
-    candidate = (inbox / relative).resolve()
+    candidate = relative.resolve() if relative.is_absolute() else (inbox / relative).resolve()
     try:
-        candidate.relative_to(inbox.resolve())
+        if not relative.is_absolute():
+            candidate.relative_to(inbox.resolve())
     except ValueError as error:
         raise PerformanceImportError("report path is outside inbox") from error
     return candidate
@@ -408,12 +389,15 @@ def _validate_inbox_manifest(inbox: Path, manifest: dict[str, object]) -> None:
 
 
 def _prepare_entry(inbox: Path, manifest_entry: dict[str, object]) -> dict[str, object]:
-    report_path = inbox / str(manifest_entry["report_path"])
-    strategy_path = inbox / str(manifest_entry["strategy_path"])
+    report_path = _safe_report_path(inbox, str(manifest_entry["report_path"]))
+    strategy_path = _safe_report_path(inbox, str(manifest_entry["strategy_path"]))
     report_bytes = report_path.read_bytes()
     if _sha256(report_bytes) != manifest_entry.get("source_report_sha256"):
         raise PerformanceImportError("source report hash mismatch")
-    strategy_bytes = strategy_path.read_bytes()
+    try:
+        strategy_bytes = strategy_path.read_bytes()
+    except OSError as error:
+        raise PerformanceImportError("source strategy is missing") from error
     if _sha256(strategy_bytes) != manifest_entry.get("source_strategy_sha256"):
         raise PerformanceImportError("source strategy hash mismatch")
     strategy = _read_json(strategy_path)
@@ -422,23 +406,19 @@ def _prepare_entry(inbox: Path, manifest_entry: dict[str, object]) -> dict[str, 
     strategy_id = _sha256(_canonical(strategy))
     if strategy_id != manifest_entry.get("strategy_version_id"):
         raise PerformanceImportError("strategy version hash mismatch")
-    exchange = strategy.get("exchange")
-    exchange_name = exchange.get("name") if isinstance(exchange, dict) else None
-    if not isinstance(exchange_name, str) or not exchange_name.strip():
-        raise PerformanceImportError("strategy exchange.name is missing")
     manifest_exchange_name = manifest_entry.get("exchange_name")
-    if (
-        not isinstance(manifest_exchange_name, str)
-        or not manifest_exchange_name.strip()
-        or manifest_exchange_name.strip().casefold() != exchange_name.strip().casefold()
-    ):
-        raise PerformanceImportError("manifest exchange.name does not match strategy exchange.name")
     parsed = parse_performance_report(report_bytes)
+    if not isinstance(manifest_exchange_name, str) or not manifest_exchange_name.strip():
+        raise PerformanceImportError("manifest exchange.name is missing")
+    exchange_name = manifest_exchange_name
+    report_exchange = parsed.settings.get("exchange")
+    report_exchange_name = report_exchange.get("name") if isinstance(report_exchange, dict) else None
+    if isinstance(report_exchange_name, str) and report_exchange_name.strip().casefold() not in {
+        exchange_name.strip().casefold(), _TESTER_EXCHANGE_MARKER,
+    }:
+        raise PerformanceImportError("report exchange.name does not match manifest")
     if parsed.settings.get("name") != manifest_entry.get("strategy_name"):
         raise PerformanceImportError("strategy name mismatch")
-    settings = strategy["settings"] if "settings" in strategy else strategy
-    if not isinstance(settings, dict) or not _settings_match(settings, parsed.settings, exchange_name):
-        raise PerformanceImportError("parsed HTML settings mismatch inbox strategy settings")
     contract_id, commission_json = _canonical_contract(_read_json(inbox / "inbox_manifest.json"))
     start = parsed.inventory.minimum_timestamp
     end = parsed.inventory.maximum_timestamp
@@ -525,7 +505,10 @@ def _validated_source_bytes(inbox: Path, manifest_entry: dict[str, object]) -> t
     report_bytes = report_path.read_bytes()
     if _sha256(report_bytes) != manifest_entry.get("source_report_sha256"):
         raise PerformanceImportError("source report hash mismatch")
-    strategy_bytes = strategy_path.read_bytes()
+    try:
+        strategy_bytes = strategy_path.read_bytes()
+    except OSError as error:
+        raise PerformanceImportError("source strategy is missing") from error
     if _sha256(strategy_bytes) != manifest_entry.get("source_strategy_sha256"):
         raise PerformanceImportError("source strategy hash mismatch")
     strategy = _read_json(strategy_path)
@@ -979,7 +962,7 @@ def import_performance_batch(
                 )
     phases["PARSE_PREPARE"] = time.monotonic() - parse_started
     quarantined = sum(entry["status"] == "QUARANTINED" for entry in audit_entries)
-    if quarantined:
+    if quarantined and not request.allow_quarantine:
         _write_audit(inbox, _base_audit(manifest, import_id, audit_entries, "QUARANTINED", phases))
         _write_checklist(inbox, [{"manifest_entry_id": str(entry.get("manifest_entry_id", "")), "report_path": str(entry.get("report_path", "")), "source_html_sha256": str(entry.get("source_report_sha256", "")), "status": "QUARANTINED", "safe_to_delete": "NO", "cleanup_state": "RETAIN", "deleted_at_utc": ""} for entry in manifest["entries"]])
         _sync_audit_sidecar(request)
@@ -1002,7 +985,7 @@ def import_performance_batch(
         _sync_audit_sidecar(request)
         raise PerformanceImportError("database initialization failed") from error
     publication_items = [item for item in prepared if item is not None]
-    if len(publication_items) != len(prepared):
+    if len(publication_items) != len(prepared) and not request.allow_quarantine:
         raise PerformanceImportError("prepared items are missing before publication")
     try:
         transaction_started = time.monotonic()
@@ -1036,14 +1019,16 @@ def import_performance_batch(
         stage="TRANSACTIONAL_IMPORT",
         completed=total,
         total=total,
-        quarantined=0,
+        quarantined=quarantined,
         scheduled=scheduled,
         prepared=len(publication_items),
         imported=imported,
         skipped=skipped,
         phase_seconds=dict(phases),
     )
-    for audit_entry, item in zip(audit_entries, publication_items, strict=True):
+    audit_by_entry_id = {str(entry.get("manifest_entry_id")): entry for entry in audit_entries}
+    for item in publication_items:
+        audit_entry = audit_by_entry_id[str(item["entry"]["manifest_entry_id"])]
         audit_entry.update({
             "status": item["import_status"],
             "source_html_sha256": item["source_hash"],
@@ -1052,22 +1037,23 @@ def import_performance_batch(
             "action_count": item["action_count"],
             "equity_sample_count": item["equity_sample_count"],
         })
-    _write_audit(inbox, _base_audit(manifest, import_id, audit_entries, "COMMITTED", phases))
-    _write_checklist(inbox, [{"manifest_entry_id": str(item["entry"]["manifest_entry_id"]), "report_path": str(item["entry"]["report_path"]), "source_html_sha256": str(item["source_hash"]), "status": item["import_status"], "safe_to_delete": "YES", "cleanup_state": "DELETE_READY", "deleted_at_utc": ""} for item in publication_items])
+    audit_status = "PARTIAL_COMMITTED" if quarantined else "COMMITTED"
+    _write_audit(inbox, _base_audit(manifest, import_id, audit_entries, audit_status, phases))
+    _write_checklist(inbox, [{"manifest_entry_id": str(entry.get("manifest_entry_id", "")), "report_path": str(entry.get("report_path", "")), "source_html_sha256": str(entry.get("source_report_sha256", "")), "status": str(audit_by_entry_id[str(entry.get("manifest_entry_id", ""))].get("status", "QUARANTINED")), "safe_to_delete": "NO" if quarantined else "YES", "cleanup_state": "RETAIN" if quarantined else "DELETE_READY", "deleted_at_utc": ""} for entry in manifest["entries"]])
     _sync_audit_sidecar(request)
     _emit_performance_progress(
         progress,
         stage="READBACK_VERIFIED",
         completed=total,
         total=total,
-        quarantined=0,
+        quarantined=quarantined,
         scheduled=scheduled,
         prepared=len(publication_items),
         imported=imported,
         skipped=skipped,
         phase_seconds=dict(phases),
     )
-    return PerformanceImportResult(import_id, imported, skipped, phases=phases)
+    return PerformanceImportResult(import_id, imported, skipped, quarantined, phases)
 
 
 def resume_performance_cleanup(request: PerformanceImportRequest) -> None:
@@ -1078,6 +1064,13 @@ def resume_performance_cleanup(request: PerformanceImportRequest) -> None:
     audit = _read_json(inbox / "import_audit.v4.json")
     if not isinstance(audit, dict) or audit.get("schema_version") != 4 or audit.get("status") != "COMMITTED" or audit.get("quarantine_count") != 0:
         raise PerformanceImportError("cleanup requires valid v4 audit evidence")
+    manifest = _read_json(inbox / "inbox_manifest.json")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("entries"), list):
+        raise PerformanceImportError("cleanup requires valid inbox manifest")
+    manifest_reports = {
+        str(entry.get("manifest_entry_id")): str(entry.get("report_path"))
+        for entry in manifest["entries"] if isinstance(entry, dict)
+    }
     audit_entries = {str(entry.get("manifest_entry_id")): entry for entry in audit.get("entries", []) if isinstance(entry, dict)}
     eligible: list[tuple[dict[str, str], Path]] = []
     try:
@@ -1088,6 +1081,8 @@ def resume_performance_cleanup(request: PerformanceImportRequest) -> None:
             for row in rows:
                 if row["safe_to_delete"] != "YES" or row["cleanup_state"] not in {"DELETE_READY", "DELETING", "DELETED"}:
                     continue
+                if row["report_path"] != manifest_reports.get(row["manifest_entry_id"]):
+                    raise PerformanceImportError("cleanup report path differs from manifest")
                 report = _safe_report_path(inbox, row["report_path"])
                 evidence = audit_entries.get(row["manifest_entry_id"])
                 if evidence is None or evidence.get("status") not in {"IMPORTED", "SKIPPED"} or evidence.get("source_html_sha256") != row["source_html_sha256"]:

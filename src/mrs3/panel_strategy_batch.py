@@ -306,6 +306,10 @@ class LocalStrategyBatchService:
             self._refresh_progress(job)
             return self._snapshot(job)
 
+    def has_active_job(self) -> bool:
+        with self._lock:
+            return any(job.state not in {"COMMITTED", "CANCELLED", "FAILED"} for job in self._jobs.values())
+
     def cancel(self, job_id: str) -> dict[str, object]:
         with self._lock:
             job = self._get(job_id)

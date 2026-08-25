@@ -332,4 +332,5 @@ def test_fresh_shortlist_returns_only_safe_candidate_summary(tmp_path: Path) -> 
         "scope_key": "BTCUSDT|LONG|1h", "pair": "BTCUSDT", "side": "LONG", "timeframe": "1h",
         "counts": {"1ORD": 0, "2ORD": 1, "3ORD": 0, "4ORD": 0},
         "ready": 1, "total": 1, "candidate_ids": ["STR-READY"],
+        "plateau_count": 0, "period": None,
     }]

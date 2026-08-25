@@ -77,6 +77,23 @@ def test_the_shortlist_is_grouped_with_a_count_per_order_bucket(tmp_path: Path) 
     assert group["candidate_ids"] == ["STR-READY"]
 
 
+def test_shortlist_group_reports_distinct_plateaus_and_available_period(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    _add_rows(database, "plateaus", [{"plateau_id": "P1"}, {"plateau_id": "P1"}, {"plateau_id": "P2"}])
+    _add_rows(database, "points", [
+        {"point_id": "first", "report_start": "2026-05-01T00:00:00+00:00", "report_end": "2026-09-30T00:00:00+00:00"},
+        {"point_id": "last", "report_start": "2026-05-04T00:00:00+00:00", "report_end": "2026-10-08T00:00:00+00:00"},
+    ])
+
+    group = list_fresh_analysis_shortlist(database, analysis_id)["groups"][0]
+
+    assert group["plateau_count"] == 2
+    assert group["period"] == "01.05-08.10"
+
+
 def test_a_base_structure_is_selectable_without_base_table_evidence(tmp_path: Path) -> None:
     from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
 

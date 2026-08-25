@@ -96,6 +96,14 @@ fragment progress while polling. A merge with quarantine is publishable only
 when every quarantined `(fragment_id, source_name)` has an exact replacement in
 the input set; unresolved quarantine fails closed.
 
+The operator-only patch merge is not available from the panel. It publishes
+only when every quarantine row has an exact replacement in the immutable input
+set; otherwise it fails closed.
+
+The Source DB screen reserves a separate `Manual merge` subsection below the
+normal local merge. It describes the coverage-only patch merge but has no
+settings or start control until that operator contract is specified.
+
 Surface coverage preflight remains a read-only synchronous validation. While
 the request is in flight, the panel shows an active phase bar and elapsed
 time; on completion it shows 100%, the scoped count and elapsed time, then
@@ -133,8 +141,48 @@ The Strategies and DD5 screen uses the configured local `tester_runner` only.
 Its immutable fresh READY JSON manifest is passed into the local runner with
 complete v6 provenance; the resulting inbox is the sole input to Performance
 DB and `CALCULATION_ONLY` DD5.  Remote strategy testing is intentionally not
-shown or started in this version.  HTML cleanup is opt-in and permitted only
+shown or started in this version.  READY JSON creation is a panel-local
+background job: the start request returns promptly, and the panel polls its
+`RUNNING`, `COMMITTED`, or `FAILED` status so a dropped browser connection
+cannot be displayed as a failed generation.  HTML cleanup is opt-in and permitted only
 after a committed zero-quarantine import and verified DD5 export.
+
+`Generate READY JSON` replaces the single operator batch in
+`Output/strategies`: before publication the previous contents of that exact
+directory are removed, and the new JSON files are written there.  Its
+provenance manifest is validated from disk when the panel starts, so choosing a
+tester period and starting the batch does not depend on the browser session
+that generated the JSON.
+
+The completed tester manifest records verified direct paths to original JSON
+and tester HTML rather than duplicating payloads. Performance DB reads and
+hashes those files directly; opted-in cleanup deletes original HTML only after
+a zero-quarantine committed import.
+
+The Performance DB selector has an explicit `Обновить список` control. It
+re-reads the existing Performance DB catalog without restarting the panel.
+
+An operator may run a separate explicit partial import for investigation: it
+publishes only reports that passed parsing, records the rejected reports as
+quarantine, marks the audit `PARTIAL_COMMITTED`, and never enables HTML cleanup.
+The normal panel import remains zero-quarantine only.
+
+Panel restart is rejected while either a tracked panel job or the live local
+tester service has a non-terminal batch.  If a process nevertheless exits
+after the runner has durably completed its inbox, startup may recover only
+that validated completed inbox; a progress counter alone is never success.
+When the runner had already verified every report and stopped only for inbox
+capture, startup may finish that capture without resubmitting any strategy;
+otherwise the interrupted batch remains failed and cannot unlock Performance
+DB.  The Tester status explicitly reports this `RECOVERING_INBOX` phase; an
+incomplete inbox without a manifest is replaced only after that verified
+resume check succeeds.
+
+The grouped shortlist exposes the analysis facts available for each
+`Pair + Side + TF`: order buckets, the distinct persisted `plateau_id` count,
+and the available report interval formatted as `DD.MM-DD.MM`.  It never
+substitutes tester dates for that interval or presents source PnL as tested
+strategy PnL.  Tester date controls remain in the Tester batch card.
 
 ## Invariants
 

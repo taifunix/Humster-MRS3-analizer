@@ -75,6 +75,7 @@ class SourceV6MergePreflight:
     target_path: Path
     input_identities: tuple[tuple[int, int, str], ...]
     target_identity: tuple[int, int, str] | None
+    allow_unresolved_quarantine: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +194,7 @@ def preflight_source_v6_merge(
     *,
     source_paths: Iterable[str | Path] | None = None,
     output_path: str | Path | None = None,
+    allow_unresolved_quarantine: bool = False,
 ) -> SourceV6MergePreflight:
     if input_paths is None:
         input_paths = source_paths
@@ -209,9 +211,13 @@ def preflight_source_v6_merge(
     if target.exists():
         raise SourceV6MergeError(f"Source v6 merge target already exists: {target}")
     inputs = tuple(_read_input(path) for path in paths)
-    _assert_quarantine_replacements(inputs)
+    if not allow_unresolved_quarantine:
+        _assert_quarantine_replacements(inputs)
     identities = tuple(item.identity for item in inputs)
-    return SourceV6MergePreflight(_merge_token(paths, target, identities, None), paths, target, identities, None)
+    return SourceV6MergePreflight(
+        _merge_token(paths, target, identities, None), paths, target, identities, None,
+        allow_unresolved_quarantine,
+    )
 
 
 source_v6_merge_preflight = preflight_source_v6_merge
@@ -386,6 +392,7 @@ def merge_source_v6(
     fault_injector: Callable[[str], object] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     workers: int = 1,
+    allow_unresolved_quarantine: bool = False,
 ) -> SourceV6MergeResult:
     """Merge fresh Source v6 DBs into a new target with one writer.
 
@@ -413,10 +420,13 @@ def merge_source_v6(
 
     # Read and validate all inputs before acquiring the target writer lock.
     inputs = tuple(_read_input(path) for path in paths)
-    _assert_quarantine_replacements(inputs)
+    if not allow_unresolved_quarantine:
+        _assert_quarantine_replacements(inputs)
     if preflight is not None:
         if tuple(preflight.input_paths) != paths or preflight.target_path != target:
             raise SourceV6MergeError("merge preflight does not match inputs")
+        if preflight.allow_unresolved_quarantine != allow_unresolved_quarantine:
+            raise SourceV6MergeError("merge preflight quarantine policy does not match")
         if _merge_token(paths, target, tuple(item.identity for item in inputs), None) != preflight.token:
             raise SourceV6MergeError("stale Source v6 merge preflight")
     fragments_by_id: dict[str, SourceV6FragmentMetadata] = {}

@@ -73,6 +73,8 @@ input, select { width: 100%; min-height: 39px; padding: 8px 10px; border: 1px so
 input:hover, select:hover { border-color: #99adca; }
 .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .button-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.check { display: inline-flex; align-items: center; gap: 8px; width: fit-content; color: var(--ink); font-size: .78rem; font-weight: 700; }
+.check input[type="checkbox"] { width: 16px; min-width: 16px; height: 16px; min-height: 16px; margin: 0; padding: 0; }
 .button { min-height: 36px; padding: 8px 12px; border: 1px solid transparent; border-radius: 7px; font-size: .76rem; font-weight: 750; cursor: pointer; }
 .button-primary { color: #fff; background: var(--blue); }
 .button-primary:hover { background: #2c59d2; }
@@ -176,3 +178,9 @@ tbody th { font-weight: 750; }
 .shortlist-table td.count-zero { opacity: 0.45; }
 .shortlist-table td.count-ready { color: var(--accent-ready, #1a7f5a); font-weight: 600; }
 .shortlist-disclosure { background: none; border: 0; cursor: pointer; padding: 0 0.4rem; font: inherit; color: inherit; }
+.shortlist-table { min-width: 980px; table-layout: fixed; }
+.shortlist-table th:nth-child(1), .shortlist-table td:nth-child(1) { width: 58px; }
+.shortlist-table th:nth-child(2), .shortlist-table td:nth-child(2) { width: 190px; }
+.shortlist-table th:nth-child(3), .shortlist-table td:nth-child(3) { width: 68px; }
+.shortlist-table th:nth-child(n+4):nth-child(-n+11), .shortlist-table td:nth-child(n+4):nth-child(-n+11) { width: 62px; text-align: right; }
+.shortlist-table th:nth-child(12), .shortlist-table td:nth-child(12) { width: 100px; }

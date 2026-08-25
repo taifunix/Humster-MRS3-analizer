@@ -1,6 +1,6 @@
 # MRS3 — current verification
 
-**Updated:** 2026-08-24
+**Updated:** 2026-08-25
 **Current branch:** `main`
 
 ## M7 final-balance PnL validation (2026-08-25)
@@ -15,6 +15,19 @@ wallet-series metrics are unchanged. ADR-0018 records the boundary.
 
 Focused verification: `.venv\\Scripts\\python.exe -m pytest -q
 tests/test_source_v6_m7.py tests/test_source_v6.py` — `88 passed`.
+
+## Panel Web reliable batch recovery (2026-08-25)
+
+The panel now keeps READY JSON generation failed when publication raises an
+error, rejects restart while that generation is active, and restores a tester
+batch after restart only after complete inbox validation, including the direct
+strategy JSON file, raw hash and canonical version ID. Performance import
+applies the same strategy provenance validation before both parsing and
+known-evidence skips. The operator patch merge no longer bypasses unresolved
+quarantine replacement checks.
+
+Focused verification: panel suite `112 passed`; provenance/merge checks `10
+passed`. Independent re-review: `CODE_REVIEW_PASS`.
 
 ## BASE 1ORD selection (2026-08-24)
 

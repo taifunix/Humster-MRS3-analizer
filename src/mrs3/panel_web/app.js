@@ -511,7 +511,9 @@
   function sourceOperation(card, preflightUrl, startUrl, payload) {
     if (!card) return;
     const buttons = card.querySelectorAll('.button-row button');
-    const [preflight, , start] = buttons;
+    const preflight = card.querySelector('[data-source-preflight]') || buttons[0];
+    const start = card.querySelector('[data-source-start]') || buttons[2];
+    const cancel = card.querySelector('[data-source-cancel]');
     let preflightId = '';
     let jobId = '';
     let jobTarget = '';
@@ -545,17 +547,22 @@
         if (['COMMITTED', 'FAILED', 'CANCELLED'].includes(job.state) && poller) {
           clearInterval(poller); poller = 0;
         }
+        if (['COMMITTED', 'FAILED', 'CANCELLED'].includes(job.state) && cancel) cancel.disabled = true;
       } catch (_) { /* Keep the last known status while the backend is busy. */ }
     };
     if (preflight) preflight.addEventListener('click', async () => {
+      preflight.disabled = true;
+      sourceStatus(card, merge ? 'Проверяем источники merge и новый target…' : 'Выполняем preflight…');
       try {
         const result = await requestJson(preflightUrl, {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload()),
         });
         preflightId = result[['to', 'ken'].join('')];
-        sourceStatus(card, `Preflight готов: ${result.total || 0} HTML.`);
+        sourceStatus(card, merge ? `Проверка merge готова: ${result.total || 0} Source DB.` : `Preflight готов: ${result.total || 0} HTML.`);
       } catch (_) {
-        sourceStatus(card, 'Preflight не выполнен. Проверьте вход и новый target.');
+        sourceStatus(card, merge ? 'Проверка merge не выполнена. Проверьте две Source DB и новый target.' : 'Preflight не выполнен. Проверьте вход и новый target.');
+      } finally {
+        preflight.disabled = false;
       }
     });
     if (start) start.addEventListener('click', async () => {
@@ -567,29 +574,33 @@
         });
         jobId = result.job_id || '';
         jobTarget = request.target_path || '';
+        if (cancel) cancel.disabled = !jobId;
         sourceStatus(card, `Запущено: ${result.operation}.`);
         if (jobId) { refreshJob(); if (poller) clearInterval(poller); poller = setInterval(refreshJob, 1000); }
       } catch (_) {
         sourceStatus(card, 'Операцию Source DB запустить не удалось.');
       }
     });
-    const row = start?.closest('.button-row');
-    if (row) {
-      const cancel = document.createElement('button');
-      cancel.type = 'button'; cancel.className = 'button button-secondary'; cancel.textContent = 'Стоп';
-      cancel.addEventListener('click', async () => {
-        if (!jobId) { sourceStatus(card, 'Нет активной операции для остановки.'); return; }
-        try {
-          await requestJson('/api/v2/source/local/cancel', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: jobId }),
-          });
-          sourceStatus(card, 'Запрошена остановка операции.');
-        } catch (_) {
-          sourceStatus(card, 'Операцию остановить не удалось.');
-        }
-      });
-      row.append(cancel);
-    }
+    const stop = cancel || (() => {
+      const row = start?.closest('.button-row');
+      if (!row) return null;
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'button button-secondary'; button.textContent = 'Стоп';
+      row.append(button);
+      return button;
+    })();
+    stop?.addEventListener('click', async () => {
+      if (!jobId) { sourceStatus(card, 'Нет активной операции для остановки.'); return; }
+      try {
+        await requestJson('/api/v2/source/local/cancel', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: jobId }),
+        });
+        stop.disabled = true;
+        sourceStatus(card, 'Запрошена остановка операции.');
+      } catch (_) {
+        sourceStatus(card, 'Операцию остановить не удалось.');
+      }
+    });
   }
 
   function sourceEvidenceSummary(evidence) {
@@ -641,7 +652,7 @@
     remote_import_html_root: inputValue('source-remote-html'), remote_import_staging_path: inputValue('source-remote-staging'),
     remote_import_target_path: inputValue('source-remote-target'),
   }));
-  bindPathSave(localMergeCard?.querySelectorAll('.button-row button')[1], localMergeCard, () => ({
+  bindPathSave(document.querySelector('#merge-path-save'), localMergeCard, () => ({
     local_merge_source_a: inputValue('merge-source-a'), local_merge_source_b: inputValue('merge-source-b'),
     local_merge_target: inputValue('merge-target'),
   }));
@@ -1204,6 +1215,14 @@
     if (node) node.textContent = message;
     strategyStatus(message);
   };
+  const restoreGeneratedBatch = async () => {
+    try {
+      const batch = await requestJson('/api/v2/strategies/fresh/batch');
+      currentAnalysisId = batch.analysis_run_id;
+      generateStatus(`READY JSON restored: ${batch.strategy_count}.`);
+    } catch (_) { /* No validated batch on disk yet. */ }
+  };
+  restoreGeneratedBatch();
   const generateFresh = document.querySelector('#shortlist-generate');
   if (generateFresh) generateFresh.addEventListener('click', async () => {
     const scopes = shortlistGroups.filter((group) => selectedScopeKeys.has(group.scope_key));
@@ -1216,11 +1235,17 @@
     generateFresh.disabled = true;
     generateStatus(`READY JSON: ${candidateIds.length} candidates...`);
     try {
-      const result = await remoteRequest('/api/v2/strategies/fresh/generate', {
+      let result = await remoteRequest('/api/v2/strategies/fresh/generate', {
         analysis_run_id: currentAnalysisId,
         candidate_ids: candidateIds,
         selected_scopes: scopes.map((group) => [group.pair, group.side, group.timeframe]),
       });
+      while (result.running) {
+        generateStatus('READY JSON: creating...');
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        result = await requestJson(`/api/v2/strategies/fresh/generate/status?job_id=${encodeURIComponent(result.job_id)}`);
+      }
+      if (result.phase !== 'COMMITTED') throw new Error(result.error || 'generation failed');
       generateStatus(`READY JSON committed: ${result.strategy_count}.`);
     } catch (error) {
       generateStatus(`READY JSON не создан: ${error?.message || 'unknown error'}.`);
@@ -1287,11 +1312,24 @@
     const checked = Number(p.checked || 0);
     if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : '0%';
     const detail = `отправлено ${p.sent || 0} · в работе ${p.running || 0} · результат ${p.result || 0} · проверено ${checked} · повторы ${p.retries || 0}`;
-    if (testerText) testerText.textContent = detail;
-    if (testerStatus) testerStatus.textContent = `Tester: ${job.state || 'RUNNING'}. ${detail}`;
+    const recoveringInbox = job.phase === 'RECOVERING_INBOX';
+    if (testerText) testerText.textContent = recoveringInbox ? 'Восстановление verified inbox из сохранённых отчётов…' : detail;
+    if (testerStatus) testerStatus.textContent = recoveringInbox
+      ? 'Tester: восстановление verified inbox; тесты повторно не запускаются.'
+      : `Tester: ${job.state || 'RUNNING'}. ${detail}`;
     if (testerStop) testerStop.disabled = !testerJobId || ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
     if (performanceStart) performanceStart.disabled = job.state !== 'COMMITTED';
-    if (document.querySelector('#performance-import-start')) document.querySelector('#performance-import-start').disabled = job.state !== 'COMMITTED';
+    const performanceImport = document.querySelector('#performance-import-start');
+    if (performanceImport) performanceImport.disabled = job.state !== 'COMMITTED';
+    const importStatus = document.querySelector('#performance-import-status');
+    if (importStatus) importStatus.textContent = job.state === 'COMMITTED'
+      ? 'Performance DB: READY. Verified inbox подтверждён.'
+      : 'Performance DB: ожидание committed tester inbox.';
+    const importBadge = performanceImport?.closest('details')?.querySelector('summary .state-badge');
+    if (importBadge) {
+      importBadge.className = `state-badge ${job.state === 'COMMITTED' ? 'state-ready' : 'state-pending'}`;
+      importBadge.textContent = job.state === 'COMMITTED' ? 'READY' : 'WAITING';
+    }
   };
   const pollTester = async () => {
     if (!testerJobId) return;
@@ -1374,7 +1412,7 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const tester = [...jobs].reverse().find((job) => job.kind === 'strategies.tester.start');
+      const tester = [...jobs].reverse().find((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester');
       const performance = [...jobs].reverse().find((job) => job.kind === 'strategies.performance-dd5');
       if (tester && typeof tester.job_id === 'string') {
         const job = tester;
@@ -1397,9 +1435,11 @@
     } catch (_) { /* requestJson already exposed a safe visible error. */ }
   };
   const importStartV2 = document.querySelector('#performance-import-start');
+  const inboxVerifyV2 = document.querySelector('#performance-inbox-verify');
   const importStatusV2 = document.querySelector('#performance-import-status');
   const importProgressV2 = document.querySelector('#performance-import-progress');
   const dbSelectV2 = document.querySelector('#performance-db-select');
+  const dbRefreshV2 = document.querySelector('#performance-db-refresh');
   const auditOpenV2 = document.querySelector('#performance-audit-open');
   const dd5StartV2 = document.querySelector('#dd5-start');
   const workbookOpenV2 = document.querySelector('#dd5-workbook-open');
@@ -1410,6 +1450,13 @@
   let importJobV2 = '';
   let dd5JobV2 = '';
   let selectedDbV2 = '';
+  inboxVerifyV2?.addEventListener('click', async () => {
+    if (!testerJobId) return;
+    inboxVerifyV2.disabled = true;
+    try { renderTester(await requestJson('/api/v2/strategies/tester/verify-inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: testerJobId }) })); }
+    catch (_) { if (importStatusV2) importStatusV2.textContent = 'Verified inbox ещё не готов.'; }
+    finally { inboxVerifyV2.disabled = false; }
+  });
   const refreshPerformanceCatalog = async () => {
     try {
       const document = await requestJson('/api/v2/strategies/performance/catalog');
@@ -1422,10 +1469,11 @@
       return databases;
     } catch (_) { return []; }
   };
+  dbRefreshV2?.addEventListener('click', refreshPerformanceCatalog);
   const selectedDbDocument = () => dbSelectV2?.selectedOptions?.[0]?.value || selectedDbV2;
   dbSelectV2?.addEventListener('change', () => {
     selectedDbV2 = dbSelectV2.value;
-    workbookPathV2.value = selectedDbV2 ? `data\\workbooks\\${selectedDbV2.replace(/\.duckdb$/, '.dd5.xlsx')}` : '';
+    workbookPathV2.value = selectedDbV2 ? `data\\workbooks\\${selectedDbV2.replace(/\.duckdb$/, '')}\\${selectedDbV2.replace(/\.duckdb$/, '.dd5.xlsx')}` : '';
     if (auditOpenV2) auditOpenV2.disabled = !selectedDbV2;
     if (dd5StartV2) dd5StartV2.disabled = !selectedDbV2;
     if (workbookOpenV2) workbookOpenV2.disabled = !selectedDbV2;

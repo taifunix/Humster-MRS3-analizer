@@ -173,6 +173,21 @@ def test_merge_rejects_unresolved_quarantine_instead_of_dropping_it(tmp_path: Pa
     assert _database_artifact_hashes(base) == before
 
 
+def test_operator_patch_merge_can_drop_unresolved_quarantine(tmp_path: Path) -> None:
+    first, second = _fragments()
+    base = tmp_path / "base.source-v6.duckdb"
+    patch = tmp_path / "patch.source-v6.duckdb"
+    _db(base, first, "base")
+    _quarantine(base, second)
+    _db(patch, second, "patch")
+
+    target = tmp_path / "patched.source-v6.duckdb"
+    result = merge_source_v6((base, patch), target, allow_unresolved_quarantine=True)
+
+    assert result.status == "COMMITTED"
+    assert [item[0] for item in _dump_merged(target)["quarantine"]] == []
+
+
 @pytest.mark.parametrize(
     "wrong_field", ["fragment_id", "source_name"],
 )

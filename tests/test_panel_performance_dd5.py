@@ -16,6 +16,7 @@ from mrs3.panel_performance_dd5 import (
     LocalPerformanceImportService,
     PanelPerformanceDd5Error,
     PerformanceDd5Request,
+    PerformanceDd5CalculationRequest,
     PerformanceImportPanelRequest,
     allocate_performance_database,
     performance_database_name,
@@ -233,3 +234,23 @@ def test_import_service_is_independent_and_copies_audit_sidecar(tmp_path: Path) 
     assert result.database.name == "BTC_01.02-06.09.performance-v6.duckdb"
     assert result.database_status == "COMMITTED"
     assert (root / result.database.stem / "import_audit.v4.json").is_file()
+
+
+def test_dd5_workbook_uses_a_folder_named_after_its_performance_database(tmp_path: Path, monkeypatch) -> None:
+    database = tmp_path / "performance" / "BTC_01.02-06.09.performance-v6.duckdb"
+    database.parent.mkdir()
+    database.touch()
+    manifest = tmp_path / "dd5_manifest.json"
+    manifest.write_text(json.dumps({"import_id": "import-1", "dd5_run_id": "dd5-1", "dd5_mode": "CALCULATION_ONLY"}), encoding="utf-8")
+    captured: dict[str, Path] = {}
+
+    def calculate(_database, _import_id, target, _config):
+        captured["target"] = target
+        return SimpleNamespace(manifest=manifest, dd5_run_id="dd5-1")
+
+    monkeypatch.setattr("mrs3.panel_performance_dd5.run_performance_dd5_atomic", calculate)
+    LocalPerformanceDd5Service().calculate(PerformanceDd5CalculationRequest(
+        database=database, import_id="import-1", workbooks_root=tmp_path / "workbooks", config=AlgorithmConfig.defaults(),
+    ))
+
+    assert captured["target"] == tmp_path / "workbooks" / database.stem / f"{database.stem}.dd5.xlsx"

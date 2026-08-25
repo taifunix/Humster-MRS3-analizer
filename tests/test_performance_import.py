@@ -70,6 +70,34 @@ def _count(database: Path, table: str) -> int:
         return connection.execute(f"select count(*) from {table}").fetchone()[0]
 
 
+def test_import_rejects_report_when_strategy_json_is_gone(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    next((request.inbox / "strategies").glob("*.json")).unlink()
+
+    result = import_performance_batch(request)
+
+    assert result.imported_count == 0
+    assert result.quarantined_count == 1
+
+
+def test_operator_import_can_commit_valid_reports_with_quarantine(tmp_path: Path) -> None:
+    request = _request_with_entries(tmp_path, 2)
+    report = request.inbox / "reports" / "entry-2.html"
+    report.write_bytes(report.read_bytes().replace(b"walletSeries", b"missingSeries"))
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"][1]["source_report_sha256"] = hashlib.sha256(report.read_bytes()).hexdigest()
+    manifest_path.write_bytes(_canonical(manifest))
+
+    result = import_performance_batch(PerformanceImportRequest(request.inbox, request.database, allow_quarantine=True))
+
+    assert result.imported_count == 1
+    assert result.quarantined_count == 1
+    assert _count(request.database, "backtest_runs") == 1
+    audit = json.loads((request.inbox / "import_audit.v4.json").read_text(encoding="utf-8"))
+    assert audit["status"] == "PARTIAL_COMMITTED"
+
+
 def _replace_strategy(request: PerformanceImportRequest, strategy: dict[str, object]) -> None:
     strategy_path = next((request.inbox / "strategies").glob("*.json"))
     strategy_path.write_bytes(_canonical(strategy))
@@ -302,7 +330,7 @@ def test_conflict_keeps_html_and_database_unchanged(tmp_path: Path) -> None:
     assert _count(request.database, "backtest_runs") == 1
 
 
-def test_settings_mismatch_is_quarantined(tmp_path: Path) -> None:
+def test_strategy_json_mismatch_does_not_block_report_import(tmp_path: Path) -> None:
     request = _request(tmp_path)
     strategy_path = next((request.inbox / "strategies").glob("*.json"))
     strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
@@ -317,9 +345,8 @@ def test_settings_mismatch_is_quarantined(tmp_path: Path) -> None:
 
     result = import_performance_batch(request)
 
-    assert result.quarantined_count == 1
-    audit = json.loads((request.inbox / "import_audit.v4.json").read_text(encoding="utf-8"))
-    assert "settings" in audit["entries"][0]["error_message"]
+    assert result.imported_count == 1
+    assert result.quarantined_count == 0
 
 
 def test_flat_strategy_settings_compare_full_object_including_exchange(tmp_path: Path) -> None:
@@ -539,7 +566,7 @@ def test_cleanup_rejects_report_path_outside_inbox(tmp_path: Path) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    with pytest.raises(PerformanceImportError, match="inbox"):
+    with pytest.raises(PerformanceImportError, match="manifest"):
         resume_performance_cleanup(request)
     assert outside.is_file()
 

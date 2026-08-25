@@ -135,6 +135,8 @@ def capture_verified_inbox(
             if extract_html_strategy_name(report_path) != name:
                 raise InboxCaptureError(f"HTML strategy name differs for {name}")
             source = plan.strategy_source / f"{name}.json"
+            if not source.is_file():
+                source = config.strategy_dir / f"{name}.json"
             try:
                 strategy = json.loads(source.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -147,25 +149,22 @@ def capture_verified_inbox(
                 raise InboxCaptureError(f"strategy exchange.name is missing for {name}")
             strategy_bytes = _canonical_json(strategy)
             strategy_id = sha256(strategy_bytes).hexdigest()
-            strategy_target = inbox / "strategies" / f"{strategy_id}.json"
-            strategy_bytes = _atomic_bytes(strategy_target, strategy_bytes)
+            source_strategy_hash = sha256(source.read_bytes()).hexdigest()
             report_hash = sha256(report_bytes).hexdigest()
             entry_id = sha256(
                 _canonical_json({"strategy": strategy_id, "report": report_hash, "run": result.run_id})
             ).hexdigest()[:32]
-            final_report = inbox / "reports" / f"{entry_id}.html"
-            copied_report_bytes = _atomic_bytes(final_report, report_bytes)
             entries.append(
                 {
                     "manifest_entry_id": entry_id,
                     "strategy_name": name,
                     "strategy_version_id": strategy_id,
-                    "strategy_path": str(strategy_target.relative_to(inbox)).replace("\\", "/"),
-                    "report_path": str(final_report.relative_to(inbox)).replace("\\", "/"),
+                    "strategy_path": str(source.resolve()),
+                    "report_path": str(report_path.resolve()),
                     "wizard_run_id": result.run_id,
                     "exchange_name": exchange_name,
-                    "source_strategy_sha256": sha256(strategy_bytes).hexdigest(),
-                    "source_report_sha256": sha256(copied_report_bytes).hexdigest(),
+                    "source_strategy_sha256": source_strategy_hash,
+                    "source_report_sha256": report_hash,
                 }
             )
         manifest = {
@@ -175,6 +174,7 @@ def capture_verified_inbox(
             "tester_config_sha256": tester_config_hash,
             "commission_contract": contract,
             "commission_contract_id": contract_id,
+            "source_mode": "direct",
             "entries": entries,
         }
         if provenance is not None:

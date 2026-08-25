@@ -86,7 +86,8 @@ def test_source_surfaces_and_strategies_screens_have_approved_workflow_cards() -
     html = _read("index.html")
 
     source = html.split('id="source-db"', 1)[1].split('id="surfaces"', 1)[0]
-    assert source.count("<details") == 3
+    assert source.count("<details") == 4
+    assert "Manual merge" in source
     for label in ("Локальный импорт", "Удалённый импорт", "Локальный merge"):
         assert label in source
 
@@ -202,6 +203,14 @@ def test_strategies_loads_the_persisted_valid_surface_catalog() -> None:
     assert 'id="analysis-surface"' in html
     assert "loadSurfaceCatalog" in js
     assert "'/api/v2/surfaces/catalog'" in js
+
+
+def test_performance_database_catalog_has_a_manual_refresh_control() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="performance-db-refresh"' in html
+    assert "dbRefreshV2?.addEventListener('click', refreshPerformanceCatalog);" in js
 
 
 def test_analysis_start_immediately_shows_running_phase_and_elapsed_time() -> None:

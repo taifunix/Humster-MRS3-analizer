@@ -6,11 +6,11 @@ from pathlib import Path
 
 import pytest
 
-import mrs3.runner.inbox as runner_inbox
 from mrs3.runner.config import RunnerConfig
 from mrs3.runner.inbox import InboxCaptureError, capture_verified_inbox
 from mrs3.runner.results import WizardResult
 from mrs3.runner.workflow import BatchPlan
+from mrs3.panel import PanelController
 
 
 def _config(tmp_path: Path, *, complete: bool = True) -> RunnerConfig:
@@ -58,7 +58,7 @@ def _inputs(tmp_path: Path, config: RunnerConfig) -> tuple[Path, BatchPlan, Wiza
     return tmp_path / "results.csv", plan, wizard, report
 
 
-def test_capture_copies_exact_html_strategy_and_fee_contract(tmp_path: Path) -> None:
+def test_capture_keeps_source_paths_and_panel_validates_direct_inbox(tmp_path: Path) -> None:
     config = _config(tmp_path)
     output, plan, wizard, report = _inputs(tmp_path, config)
 
@@ -67,10 +67,26 @@ def test_capture_copies_exact_html_strategy_and_fee_contract(tmp_path: Path) -> 
     manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
     assert manifest["commission_contract"]["MakerFee"] == "0.0002"
     entry = manifest["entries"][0]
-    assert (inbox / entry["report_path"]).read_bytes() == report.read_bytes()
+    assert Path(entry["report_path"]).resolve() == report.resolve()
     assert entry["strategy_name"] == "A"
     assert entry["exchange_name"] == "Bybit"
-    assert (inbox / entry["strategy_path"]).read_bytes() == b'{"exchange":{"name":"Bybit"},"name":"A","settings":[]}'
+    assert Path(entry["strategy_path"]).resolve() == (plan.strategy_source / "A.json").resolve()
+    PanelController._validate_performance_inbox(inbox)
+
+
+def test_capture_uses_installed_strategy_when_generated_file_is_gone(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    output, plan, wizard, report = _inputs(tmp_path, config)
+    config.strategy_dir.mkdir(parents=True)
+    installed = config.strategy_dir / "A.json"
+    installed.write_bytes((plan.strategy_source / "A.json").read_bytes())
+    (plan.strategy_source / "A.json").unlink()
+
+    inbox = capture_verified_inbox(config, output, plan, (wizard,), {"A": report})
+
+    entry = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))["entries"][0]
+    assert Path(entry["strategy_path"]).resolve() == installed.resolve()
+    PanelController._validate_performance_inbox(inbox)
 
 
 def test_capture_accepts_html_escaped_strategy_settings_pre(tmp_path: Path) -> None:
@@ -84,7 +100,7 @@ def test_capture_accepts_html_escaped_strategy_settings_pre(tmp_path: Path) -> N
     inbox = capture_verified_inbox(config, output, plan, (wizard,), {"A": report})
 
     entry = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))["entries"][0]
-    assert (inbox / entry["report_path"]).read_text(encoding="utf-8") == report.read_text(
+    assert Path(entry["report_path"]).read_text(encoding="utf-8") == report.read_text(
         encoding="utf-8"
     )
 
@@ -127,32 +143,18 @@ def test_capture_rejects_duplicate_verified_results(tmp_path: Path) -> None:
         capture_verified_inbox(config, output, plan, (wizard, wizard), {"A": report})
 
 
-def test_capture_manifest_hashes_destination_bytes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_capture_manifest_hashes_source_bytes(tmp_path: Path) -> None:
     config = _config(tmp_path)
     output, plan, wizard, report = _inputs(tmp_path, config)
-    atomic_copy = runner_inbox._atomic_bytes
-
-    def corrupt_copy(target: Path, data: bytes) -> bytes:
-        if target.name == "inbox_manifest.json":
-            return atomic_copy(target, data)
-        copied = b"corrupted:" + data
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(copied)
-        return copied
-
-    monkeypatch.setattr(runner_inbox, "_atomic_bytes", corrupt_copy)
-
     inbox = capture_verified_inbox(config, output, plan, (wizard,), {"A": report})
 
     manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
     entry = manifest["entries"][0]
     assert entry["source_strategy_sha256"] == sha256(
-        (inbox / entry["strategy_path"]).read_bytes()
+        Path(entry["strategy_path"]).read_bytes()
     ).hexdigest()
     assert entry["source_report_sha256"] == sha256(
-        (inbox / entry["report_path"]).read_bytes()
+        Path(entry["report_path"]).read_bytes()
     ).hexdigest()
 
 

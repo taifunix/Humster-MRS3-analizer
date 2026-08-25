@@ -7,6 +7,7 @@ Analysis DuckDB, read CSV, or recompute source facts.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -269,6 +270,12 @@ def list_fresh_analysis_shortlist(
             for table in _CANDIDATE_TABLES
             for row in _rows(connection, table, scope)
         ]
+        scope_facts = {
+            scope: _shortlist_scope_facts(
+                _rows(connection, "plateaus", scope), _rows(connection, "points", scope)
+            )
+            for scope in scope_keys
+        }
     finally:
         connection.close()
     items: list[dict[str, object]] = []
@@ -292,12 +299,36 @@ def list_fresh_analysis_shortlist(
     return {
         "analysis_run_id": analysis_id,
         "items": items,
-        "groups": _shortlist_groups(items),
+        "groups": _shortlist_groups(items, scope_facts),
     }
 
 
+def _shortlist_scope_facts(
+    plateaus: Sequence[Mapping[str, object]], points: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    plateau_ids = {str(row["plateau_id"]) for row in plateaus if row.get("plateau_id")}
+    starts = [_parse_report_date(row.get("report_start")) for row in points]
+    ends = [_parse_report_date(row.get("report_end")) for row in points]
+    starts = [value for value in starts if value is not None]
+    ends = [value for value in ends if value is not None]
+    period = None
+    if starts and ends:
+        start, end = min(starts), max(ends)
+        period = f"{start:%d.%m}-{end:%d.%m}"
+    return {"plateau_count": len(plateau_ids), "period": period}
+
+
+def _parse_report_date(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _shortlist_groups(
-    items: Sequence[Mapping[str, object]],
+    items: Sequence[Mapping[str, object]], scope_facts: Mapping[str, Mapping[str, object]],
 ) -> list[dict[str, object]]:
     """One row per Pair · Side · TF, counted into the bucket of its own order count.
 
@@ -313,6 +344,7 @@ def _shortlist_groups(
             "pair": key[0], "side": key[1], "timeframe": key[2],
             "counts": {f"{order}ORD": 0 for order in _ORDER_BUCKETS},
             "ready": 0, "total": 0, "candidate_ids": [],
+            **scope_facts.get("|".join(key), {"plateau_count": 0, "period": None}),
         })
         group["total"] = int(group["total"]) + 1
         bucket = f"{int(item['order_count'])}ORD"

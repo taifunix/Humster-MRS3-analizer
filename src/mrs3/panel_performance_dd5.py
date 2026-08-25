@@ -174,11 +174,13 @@ def _manifest_pair_names(inbox: Path, manifest: Mapping[str, object]) -> tuple[s
             strategy_path = entry.get("strategy_path")
             if not isinstance(strategy_path, str):
                 continue
-            candidate = (inbox / strategy_path).resolve()
-            try:
-                candidate.relative_to(inbox.resolve())
-            except ValueError:
-                continue
+            raw = Path(strategy_path)
+            candidate = raw.resolve() if raw.is_absolute() else (inbox / raw).resolve()
+            if not raw.is_absolute():
+                try:
+                    candidate.relative_to(inbox.resolve())
+                except ValueError:
+                    continue
             try:
                 strategy = json.loads(candidate.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -360,7 +362,7 @@ class LocalPerformanceDd5Service:
                 database.relative_to(Path(request.performance_db_root).resolve())
             except ValueError as error:
                 raise PanelPerformanceDd5Error("Performance DB is outside configured root") from error
-        target = root / f"{database.stem}.dd5.xlsx"
+        target = root / database.stem / f"{database.stem}.dd5.xlsx"
         try:
             artifacts = run_performance_dd5_atomic(
                 database, request.import_id, target, request.config

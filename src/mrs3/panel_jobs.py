@@ -182,6 +182,26 @@ class PanelJobRegistry:
             value = job.get("runtime", {})
             return json.loads(json.dumps(value)) if isinstance(value, dict) else {}
 
+    def recover_committed(self, job_id: str, *, runtime: dict) -> dict:
+        """Commit only a restart-interrupted job whose owner revalidated its artifacts."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            recoverable = job is not None and (job.get("state") == "FAILED" or (job.get("state") == "RUNNING" and job.get("phase") == "RECOVERING_INBOX"))
+            if not recoverable:
+                raise PanelJobError("INVALID_REQUEST")
+            job.update(state="COMMITTED", phase="COMMITTED", error=None, runtime=json.loads(json.dumps(runtime)))
+            self._save()
+            return self._copy(job)
+
+    def recover_running(self, job_id: str) -> dict:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None or job.get("state") != "FAILED" or job.get("error") not in ({"code": "INTERRUPTED"}, None):
+                raise PanelJobError("INVALID_REQUEST")
+            job.update(state="RUNNING", phase="RECOVERING_INBOX", error=None)
+            self._save()
+            return self._copy(job)
+
     def append_log(self, job_id: str, message: str) -> list[str]:
         with self.lock:
             job = self.jobs.get(job_id)
