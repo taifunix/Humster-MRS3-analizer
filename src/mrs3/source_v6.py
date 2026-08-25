@@ -661,9 +661,15 @@ def _validate_m7(
             raise _m7_mismatch(source_sha256, source_name, declared_name, declared_value, rounded, fragment_id)
 
     wallet = report.wallet_series
-    # M4 anchors PnL to the declared initial balance; the first wallet sample
-    # may already include an opening fee and therefore is not that anchor.
-    total_pnl = wallet[-1][1] - initial_balance
+    # M7 checks the tester's declared report total. Its chart can end before
+    # the tester's final balance is settled, so use that declaration when present.
+    declared_final_balance = _m7_metric(report.metrics, ("Final balance", "FinalBalance"))
+    ending_balance = (
+        declared_final_balance[1]
+        if declared_final_balance is not None and declared_final_balance[1] is not None
+        else wallet[-1][1]
+    )
+    total_pnl = ending_balance - initial_balance
     total_fees = sum((item.fee for item in actions), Decimal("0"))
     realizing = tuple(item for item in actions if item.action in {"decreased", "closed"})
     gross_profit = sum((item.pnl for item in realizing if item.pnl > 0), Decimal("0"))
@@ -697,7 +703,7 @@ def _validate_m7(
         and declared_max_drawdown[1] is not None
         and raw_equity_drawdown > 0
     ):
-        # Tester recovery uses raw M4 PnL and sampled equity drawdown; the
+        # Tester recovery uses the M7 PnL source and sampled equity drawdown; the
         # displayed Max DD and Total PnL are rounded declarations. If the
         # declared DD is not the sampled DD, M6's declared-candidate rule means
         # this fragment has no independent RF denominator to validate.

@@ -249,11 +249,14 @@ Three checks, chosen because they do not overlap:
 | `Total fees` | 257/257 | a lost or duplicated **action** |
 | `Profit Factor` | 257/257 | a wrong `pnl` on any realising action |
 
-`Total PnL` is computed from the endpoints of the balance curve and therefore
-cannot notice an action lost in the middle — the endpoints still agree. `Total
-fees` sums every action and `Profit Factor` sums every realising action's PnL,
-so together the three cover the series and the action table without repeating
-each other.
+For M7, `Total PnL` is `Final balance - Initial balance` when the tester
+declares `Final balance`; only a sparse report that omits it falls back to the
+last wallet sample. This is intentionally distinct from M4: a tester report's
+wallet chart may end before final settlement (or differ from it), while its
+summary `Final balance` and `Total PnL` describe the same completed report.
+The check therefore validates the tester declaration, not the chart endpoint.
+`Total fees` sums every action and `Profit Factor` sums every realising action's
+PnL, so together they cover the action table without repeating each other.
 
 `Total PnL` and `Total fees` are compared at the exponent in the raw declared
 token and accept the display-rounding interval, including an exact half-unit
@@ -276,8 +279,8 @@ trades and win rate, because M2 and M3 deliberately use a different unit.
 
 `Recovery Factor` is a separate conditional consistency check for a numeric,
 positive-drawdown single fragment; it is not a fourth mandatory extraction
-check. The check uses the raw M4 PnL (final wallet sample minus the declared
-initial balance) and raw equity drawdown. It
+check. The check uses the same M7 PnL source (declared final balance when
+available, otherwise the final wallet sample) and raw equity drawdown. It
 runs only when the declared Max DD rounds to the sampled equity drawdown,
 because M6 may intentionally select a different admissible declared DD
 candidate. The published tester value may differ by one unit of its raw

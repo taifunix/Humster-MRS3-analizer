@@ -56,7 +56,73 @@ def test_m7_total_pnl_anchors_to_declared_initial_balance() -> None:
     normalize_source_v6(source)
 
 
-def test_m7_recovery_factor_uses_raw_wallet_and_equity_series() -> None:
+def test_m7_total_pnl_uses_declared_final_balance_when_wallet_series_is_stale() -> None:
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from mrs3.source_v6 import _validate_m7
+
+    report = SimpleNamespace(
+        metrics={"Total PnL": "5.80", "Final balance": "1005.80"},
+        wallet_series=((1, Decimal("1000")), (2, Decimal("1004.80"))),
+        equity_series=(),
+    )
+
+    _validate_m7(
+        report,
+        (),
+        initial_balance=Decimal("1000"),
+        source_sha256="a" * 64,
+        source_name="stale-wallet.html",
+    )
+
+
+def test_m7_falls_back_to_last_wallet_sample_without_final_balance() -> None:
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from mrs3.source_v6 import _validate_m7
+
+    report = SimpleNamespace(
+        metrics={"Total PnL": "4.80"},
+        wallet_series=((1, Decimal("1000")), (2, Decimal("1004.80"))),
+        equity_series=(),
+    )
+
+    _validate_m7(
+        report,
+        (),
+        initial_balance=Decimal("1000"),
+        source_sha256="a" * 64,
+        source_name="wallet-fallback.html",
+    )
+
+
+def test_m7_recovery_factor_uses_declared_final_balance_and_equity_series() -> None:
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from mrs3.source_v6 import _validate_m7
+
+    report = SimpleNamespace(
+        metrics={
+            "Total PnL": "5.80", "Final balance": "1005.80",
+            "Max Drawdown": "30", "Recovery Factor": "0.1933",
+        },
+        wallet_series=((1, Decimal("1000")), (2, Decimal("1004.80"))),
+        equity_series=((1, Decimal("1000")), (2, Decimal("970"))),
+    )
+
+    _validate_m7(
+        report,
+        (),
+        initial_balance=Decimal("1000"),
+        source_sha256="a" * 64,
+        source_name="stale-wallet-recovery.html",
+    )
+
+
+def test_m7_recovery_factor_uses_declared_final_balance_when_wallet_series_is_stale() -> None:
     from mrs3.source_v6 import normalize_source_v6
 
     source = FIXTURE.read_text(encoding="utf-8").replace(

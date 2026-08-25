@@ -3,6 +3,19 @@
 **Updated:** 2026-08-24
 **Current branch:** `main`
 
+## M7 final-balance PnL validation (2026-08-25)
+
+The `my_test_APLD_TSEM_fixed_0.997net` import quarantined 1,009 reports:
+1,007 `Total PnL` mismatches and 2 Recovery Factor mismatches. The tester's
+`Final balance - Initial balance` matches its declared `Total PnL`, but its
+last `walletSeries` point can differ in either direction. M7 now validates PnL
+against declared final balance when present, falling back to the final wallet
+sample only for sparse reports without that declaration; M4 materialized
+wallet-series metrics are unchanged. ADR-0018 records the boundary.
+
+Focused verification: `.venv\\Scripts\\python.exe -m pytest -q
+tests/test_source_v6_m7.py tests/test_source_v6.py` — `88 passed`.
+
 ## BASE 1ORD selection (2026-08-24)
 
 Implemented algorithm `0.7-canonical-phase1-base-1ord-v3`. Fresh CXMT corpus
@@ -28,10 +41,12 @@ verification after this fix: **345 passed**.
 ## Source v6 facts/metrics v2 Stage 3–4 (2026-08-23)
 
 M7 validates declarations during normalization before encoding. PnL uses the
-M4 raw anchor (final wallet sample minus declared initial balance), fees sum all
-actions, Profit Factor sums realising actions, and Recovery Factor is conditional
-on a sampled DD-compatible declaration. Quarantine details are read-only and a
-quarantined database blocks every scope at panel preflight and materialization.
+declared Final balance minus declared initial balance when Final balance is
+available, falling back to the final wallet sample only for sparse reports;
+fees sum all actions, Profit Factor sums realising actions, and Recovery Factor
+is conditional on a sampled DD-compatible declaration. Quarantine details are
+read-only and a quarantined database blocks every scope at panel preflight and
+materialization.
 
 Fresh baseline evidence: 684/684 reports committed, 0 quarantined, source
 content digest `9612e26abc51b6e36f49ce3a73159358abdcd1a412747a235c70ffaa82fec940`.
