@@ -1258,6 +1258,29 @@
       generateFresh.disabled = false;
     }
   });
+  const generateRuns = document.querySelector('#shortlist-generate-runs');
+  if (generateRuns) generateRuns.addEventListener('click', async () => {
+    const scopes = shortlistGroups.filter((group) => selectedScopeKeys.has(group.scope_key));
+    const startDate = document.querySelector('#tester-start-date')?.value || '';
+    const endDate = document.querySelector('#tester-end-date')?.value || '';
+    if (!currentAnalysisId) { generateStatus('Сначала запустите анализ.'); return; }
+    if (!scopes.length) { generateStatus('Отметьте scope с READY-кандидатами.'); return; }
+    if (!validIsoDate(startDate) || !validIsoDate(endDate) || startDate > endDate) { generateStatus('Укажите корректные даты тестирования.'); return; }
+    generateRuns.disabled = true;
+    generateStatus('Run files: creating...');
+    try {
+      const result = await remoteRequest('/api/v2/strategies/fresh/runs', {
+        analysis_run_id: currentAnalysisId, filters: shortlistFilters(),
+        selected_scopes: scopes.map((group) => [group.pair, group.side, group.timeframe]),
+        start_date: startDate, end_date: endDate,
+      });
+      generateStatus(`Run files ready: ${result.run_count}.`);
+    } catch (error) {
+      generateStatus(`Run files не созданы: ${error?.message || 'unknown error'}.`);
+    } finally {
+      generateRuns.disabled = false;
+    }
+  });
   const refreshFresh = document.querySelector('#shortlist-refresh');
   const phase2Filters = document.querySelector('.phase2-filters');
   if (phase2Filters && refreshFresh?.parentElement) {

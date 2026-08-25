@@ -3,6 +3,16 @@
 **Updated:** 2026-08-25
 **Current branch:** `feat/multi-order-plateau-admission`
 
+## Tester run files (2026-08-26)
+
+The Shortlist button creates up to five isolated tester snapshots from
+server-recomputed `READY_AFTER_FILTERS` candidates. It clears only the exact
+`<bot_root>/tester/runs` target, sets `use_runs=true`, and copies Tester batch
+dates plus `max_parallel_submissions`; `run_tester.bat` remains manual.
+
+Focused verification: `.venv\\Scripts\\python.exe -m pytest
+tests/test_tester_run_files.py tests/test_panel_fresh_strategies.py -q`.
+
 ## Multi-order plateau admission (2026-08-25)
 
 For `real_independent_events`, 2ORD--4ORD construction now admits a plateau

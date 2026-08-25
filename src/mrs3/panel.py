@@ -124,10 +124,12 @@ from .panel_source_jobs import LocalSourceDbJobRunner
 from .panel_surfaces import LocalSurfacesService
 from .panel_testing import LocalTestingService, PanelTestingError
 from .fresh_analysis_strategies import (
+    filter_fresh_analysis_candidates,
     generate_fresh_analysis_strategies,
     list_fresh_analysis_shortlist,
     read_fresh_analysis_identity,
 )
+from .tester_run_files import publish_run_snapshots
 from .panel_strategy_batch import LocalStrategyBatchService, StrategyBatchValidationError, validate_strategy_manifest
 from .panel_performance_dd5 import (
     LocalPerformanceDd5Jobs,
@@ -2266,6 +2268,39 @@ class PanelController:
             daemon=True,
         ).start()
         return dict(job)
+
+    def strategies_fresh_generate_runs(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Publish up to five filtered candidates as tester run snapshots."""
+        if set(payload).difference({"analysis_run_id", "filters", "selected_scopes", "start_date", "end_date"}):
+            raise ValueError("tester run request contains unsupported fields")
+        scopes = payload.get("selected_scopes")
+        if not isinstance(scopes, list) or not all(
+            isinstance(item, list) and len(item) == 3 and all(isinstance(value, str) for value in item)
+            for item in scopes
+        ):
+            raise ValueError("selected_scopes must be a list")
+        start_date, end_date = payload.get("start_date"), payload.get("end_date")
+        if not isinstance(start_date, str) or not isinstance(end_date, str):
+            raise ValueError("start_date and end_date are required")
+        analysis_id = self._required(payload, "analysis_run_id")
+        analysis_path = self._fresh_analysis_paths.get(analysis_id)
+        if analysis_path is None:
+            raise ValueError("fresh analysis is not available in this panel session")
+        selected = {(pair, side.upper(), timeframe) for pair, side, timeframe in scopes}
+        filtered = filter_fresh_analysis_candidates(analysis_path, analysis_id, self._phase2_filters(payload))
+        structures = sorted(
+            (row for row in filtered.rows if row.get("filter_status") == "READY_AFTER_FILTERS" and
+             (str(row.get("symbol", "")), str(row.get("side", "")).upper(), str(row.get("timeframe", ""))) in selected),
+            key=lambda row: str(row["candidate_id"]),
+        )[:5]
+        if not structures:
+            raise ValueError("no READY candidates match the selected scopes")
+        runner = RunnerConfig.from_json(self.default_config)
+        result = publish_run_snapshots(
+            self.root / "Input" / "run_snapshot_2.json", runner.bot_root, runner.tester_config, structures,
+            start_date, end_date, runner.max_parallel_submissions, self._analysis_config_loader(self.default_config),
+        )
+        return {"phase": "COMMITTED", "analysis_run_id": analysis_id, **result}
 
     def _run_fresh_strategy_generation(self, job: dict[str, object], payload: Mapping[str, object]) -> None:
         try:
@@ -5437,7 +5472,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -5502,6 +5537,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_fresh_analyze(document)
             elif endpoint == "/api/v2/strategies/fresh/generate":
                 result = self.server.controller.strategies_fresh_generate(document)
+            elif endpoint == "/api/v2/strategies/fresh/runs":
+                result = self.server.controller.strategies_fresh_generate_runs(document)
             elif endpoint == "/api/v2/strategies/fresh/open":
                 result = self.server.controller.strategies_fresh_open(document)
             elif endpoint == "/api/v2/strategies/fresh/shortlist":

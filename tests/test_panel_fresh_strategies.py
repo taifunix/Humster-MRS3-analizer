@@ -9,6 +9,46 @@ from mrs3.config import AlgorithmConfig
 from mrs3.panel import PanelController
 
 
+def test_panel_exposes_run_file_generation_action() -> None:
+    panel_source = Path("src/mrs3/panel.py").read_text(encoding="utf-8")
+    panel_html = Path("src/mrs3/panel_web/index.html").read_text(encoding="utf-8")
+    web_source = Path("src/mrs3/panel_web/app.js").read_text(encoding="utf-8")
+
+    assert 'id="shortlist-generate-runs"' in panel_html
+    assert "/api/v2/strategies/fresh/runs" in panel_source
+    assert "#shortlist-generate-runs" in web_source
+
+
+def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"; config.write_text("{}", encoding="utf-8")
+    template = tmp_path / "Input" / "run_snapshot_2.json"; template.parent.mkdir()
+    template.write_text(json.dumps({
+        "settings": [{"name": "template", "basic": {"strategy": "mrs3", "symbol": "OLD", "time_frame": "5m", "use_long": True, "use_short": False}, "mrs3": {
+            "ma_long": [{"id": 1, "len": 1, "multiplier": 1.0, "lot_x": 0.0}], "ma_short": [],
+            "ma_close_long": {"len": 1, "multiplier": 1.0}, "ma_close_short": {"len": 1, "multiplier": 1.0},
+        }}], "tester_config": {},
+    }), encoding="utf-8")
+    tester_config = tmp_path / "bot" / "tester" / "config_tester.json"; tester_config.parent.mkdir(parents=True)
+    tester_config.write_text('{"use_runs": false}', encoding="utf-8")
+    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(
+        bot_root=tmp_path / "bot", tester_config=tester_config, max_parallel_submissions=7,
+    ))
+    rows = tuple({
+        "candidate_id": f"C{index}", "structure_id": f"S{index}", "symbol": "BTCUSDT", "side": "LONG",
+        "timeframe": "1h", "order_count": 1, "common_close_ma": 7, "filter_status": "READY_AFTER_FILTERS",
+        "orders": ({"point_id": f"P{index}", "plateau_id": "PLAT", "open_ma": 5, "shift_bp": 100, "close_support": 1.0, "source_pnl_pct": 10},),
+    } for index in range(6))
+    monkeypatch.setattr("mrs3.panel.filter_fresh_analysis_candidates", lambda *_args: SimpleNamespace(rows=rows))
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
+
+    result = controller.strategies_fresh_generate_runs({"analysis_run_id": "a" * 64, "filters": {}, "selected_scopes": [["BTCUSDT", "LONG", "1h"]], "start_date": "2026-08-01", "end_date": "2026-08-18"})
+
+    assert result["run_count"] == 5
+    assert len(list((tmp_path / "bot" / "tester" / "runs").glob("*.json"))) == 5
+    assert json.loads(tester_config.read_text(encoding="utf-8"))["use_runs"] is True
+
+
 def test_fresh_generation_uses_config_workflow_defaults_not_browser_paths(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.local.json"
     config.write_text(json.dumps({
