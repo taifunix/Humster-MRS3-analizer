@@ -3,6 +3,14 @@
 **Updated:** 2026-08-25
 **Current branch:** `main`
 
+## Shortlist visual alignment (2026-08-25)
+
+The Phase 2 Shortlist now follows the approved restored DD5 mockup: filters
+are expanded between audit and scope-selection actions, while the grouped table
+uses its compact dark review palette and alignment. Current added columns
+(`Плато`, `DEFERRED`, `Период`) remain intact. Evidence: static panel and
+fresh-strategy tests pass; JavaScript syntax and diff checks are clean.
+
 ## M7 final-balance PnL validation (2026-08-25)
 
 The `my_test_APLD_TSEM_fixed_0.997net` import quarantined 1,009 reports:

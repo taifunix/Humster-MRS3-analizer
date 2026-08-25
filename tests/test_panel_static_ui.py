@@ -374,6 +374,18 @@ def test_shortlist_active_selection_uses_ready_after_filters_without_http() -> N
     assert "ready_after_filters" in js
 
 
+def test_shortlist_uses_the_approved_filters_actions_and_dark_table_layout() -> None:
+    html = _read("index.html")
+    css = _read("app.css")
+    js = _read("app.js")
+
+    assert "shortlist-card--legacy" in css
+    assert "#1c2638" in css and "#46607f" in css
+    assert ".shortlist-card--legacy .shortlist-table td:nth-child(n+4):nth-child(-n+11) { text-align: center; }" in css
+    assert "phase2Filters.open = true;" in js
+    assert "actions.after(phase2Filters); phase2Filters.after(selection);" in js
+
+
 def test_shortlist_bulk_handlers_preserve_non_selection_state() -> None:
     js = _read("app.js")
 
