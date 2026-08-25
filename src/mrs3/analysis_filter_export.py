@@ -284,3 +284,20 @@ def export_filter_audit(
         )
     tables["DEFERRED_COMBINED"] = _table(deferred_rows)
     return write_audit_workbook(tables, _target_path(output_path))
+
+
+def export_fresh_filter_audit(result: object, output_path: Path | str) -> Path:
+    """Export an already validated fresh Phase 2 result without reopening legacy DBs."""
+    enabled = _criteria(_result_field(result, "criteria", ()))
+    rows = _sorted_rows(_result_field(result, "rows", ()), enabled)
+    tables: dict[str, pd.DataFrame] = {
+        "Summary": pd.DataFrame({"metric": ("input_count", "active_criteria", "ready_count", "deferred_count"), "value": (
+            _result_field(result, "input_count", len(rows)), _display_criteria(enabled),
+            _result_field(result, "ready_count", 0), _result_field(result, "deferred_count", 0),
+        )}),
+        "READY_AFTER_FILTERS": _table(row for row in rows if _is_ready(row)),
+    }
+    for criterion in enabled:
+        tables[_CRITERIA[criterion]] = _table(_sorted_rows(_criterion_rows(result, criterion), enabled))
+    tables["DEFERRED_COMBINED"] = _table(row for row in rows if not _is_ready(row))
+    return write_audit_workbook(tables, _target_path(output_path))

@@ -6,7 +6,9 @@ Analysis DuckDB, read CSV, or recompute source facts.
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import datetime
 from hashlib import sha256
 import json
@@ -23,6 +25,17 @@ from .analysis_strategies import (
     _template,
     _v6_strategy_digest,
     normalize_analysis_scopes,
+)
+from .analysis_shortlist import (
+    CRITERIA,
+    FilterResult,
+    _Candidate,
+    _audit_row,
+    _comparison_key,
+    _decimal,
+    _dominates,
+    _enabled_criteria,
+    _standalone_rows,
 )
 from .config import AlgorithmConfig
 from .lots import LotMethod, allocate_lots
@@ -254,14 +267,120 @@ def read_fresh_analysis_identity(analysis_path: Path | str) -> dict[str, object]
     }
 
 
+def filter_fresh_analysis_candidates(
+    analysis_path: Path | str,
+    analysis_run_id: str,
+    criteria: Mapping[str, object] | Sequence[str] | None,
+) -> FilterResult:
+    """Evaluate the immutable fresh READY candidates with Phase 2 Pareto rules."""
+    analysis_file = Path(analysis_path).resolve()
+    manifest, analysis_id, _ = _read_analysis(analysis_file)
+    if str(analysis_run_id) != analysis_id:
+        raise ValueError("fresh analysis run identity mismatch")
+    if isinstance(criteria, Mapping) and (
+        set(criteria).difference(CRITERIA) or any(type(value) is not bool for value in criteria.values())
+    ):
+        raise ValueError("Phase 2 filters must be named booleans")
+    enabled = _enabled_criteria(criteria)
+    scope_keys = sorted(dict(manifest["scope_digests"]))
+    scopes = {
+        (parts[0], parts[1].upper(), parts[2])
+        for scope in scope_keys
+        if len(parts := scope.split("|")) == 3
+    }
+    if len(scopes) != len(scope_keys):
+        raise ValueError("fresh analysis has malformed scope identity")
+    connection = duckdb.connect(str(analysis_file), read_only=True)
+    try:
+        points = _validate_points(
+            [row for scope in scope_keys for row in _rows(connection, "points", scope)], scopes
+        )
+        structures = [
+            row for scope in scope_keys for row in _rows(connection, "structures", scope)
+            if row.get("status") == _READY_STATUS
+        ]
+    finally:
+        connection.close()
+    point_events = {
+        str(row["point_id"]): int(row["point_event_count"])
+        for row in points.to_dict("records")
+    }
+    candidates: list[_Candidate] = []
+    for structure in structures:
+        candidate_id = str(structure.get("candidate_id", structure.get("structure_id", ""))).strip()
+        orders = structure.get("orders")
+        if not candidate_id or not isinstance(orders, list) or not orders:
+            raise ValueError("READY fresh candidate has malformed orders")
+        if int(structure.get("order_count", 0)) != len(orders):
+            raise ValueError("READY fresh candidate order count disagrees with orders")
+        values: dict[str, list[Decimal | int]] = {name: [] for name in CRITERIA}
+        for order in orders:
+            if not isinstance(order, Mapping):
+                raise ValueError("READY fresh candidate has malformed order")
+            point_id = str(order.get("point_id", ""))
+            if point_id not in point_events:
+                raise ValueError("READY fresh candidate references unknown point")
+            values["source_pnl"].append(_decimal(order.get("source_pnl_pct"), "source_pnl_pct"))
+            values["efficiency"].append(_decimal(order.get("source_efficiency"), "source_efficiency"))
+            values["close_support"].append(_decimal(order.get("close_support"), "close_support"))
+            values["point_event_count"].append(point_events[point_id])
+        candidates.append(_Candidate(
+            candidate_id,
+            str(structure.get("structure_id", "")),
+            _comparison_key(structure, candidate_id, False),
+            {name: tuple(value) for name, value in values.items()},
+            dict(structure),
+        ))
+    grouped: dict[str, list[_Candidate]] = defaultdict(list)
+    for candidate in candidates:
+        grouped[candidate.comparison_key].append(candidate)
+    standalone = {
+        name: tuple(
+            row for key in sorted(grouped)
+            for row in _standalone_rows(tuple(grouped[key]), name)
+        )
+        for name in enabled
+    }
+    combined = tuple(sorted(
+        (
+            _audit_row(min(dominators, key=lambda item: (item.structure_id, item.candidate_id)), deferred, ",".join(enabled))
+            for group in grouped.values()
+            for deferred in group
+            if (dominators := [candidate for candidate in group if _dominates(candidate, deferred, enabled)])
+        ),
+        key=lambda row: (str(row["comparison_key"]), str(row["candidate_id"])),
+    ))
+    deferred_by = {str(row["candidate_id"]): row for row in combined}
+    sizes = Counter(candidate.comparison_key for candidate in candidates)
+    rows = tuple(
+        {
+            **candidate.payload,
+            "candidate_id": candidate.candidate_id,
+            "comparison_key": candidate.comparison_key,
+            "comparison_group_size": sizes[candidate.comparison_key],
+            "filter_status": "DEFERRED_REDUNDANT" if candidate.candidate_id in deferred_by else "READY_AFTER_FILTERS",
+            "deferred_by": deferred_by.get(candidate.candidate_id, {}).get("deferred_by"),
+            "deferred_by_candidate_id": deferred_by.get(candidate.candidate_id, {}).get("deferred_by_candidate_id"),
+            "enabled_criteria": list(enabled),
+        }
+        for candidate in sorted(candidates, key=lambda item: (item.comparison_key, item.candidate_id))
+    )
+    return FilterResult(
+        analysis_id, str(manifest["surface_id"]), enabled, rows, standalone, combined,
+        len(candidates), len(candidates) - len(combined), len(combined), len(sizes),
+        sum(size for size in sizes.values() if size > 1),
+    )
+
+
 def list_fresh_analysis_shortlist(
-    analysis_path: Path | str, analysis_run_id: str,
+    analysis_path: Path | str, analysis_run_id: str, criteria: Mapping[str, object] | Sequence[str] | None = None,
 ) -> dict[str, object]:
     """Return safe grouped candidate summaries from one immutable fresh analysis."""
     analysis_file = Path(analysis_path).resolve()
     manifest, analysis_id, _ = _read_analysis(analysis_file)
     if str(analysis_run_id) != analysis_id:
         raise ValueError("fresh analysis run identity mismatch")
+    filtered = filter_fresh_analysis_candidates(analysis_file, analysis_id, criteria) if criteria is not None else None
     connection = duckdb.connect(str(analysis_file), read_only=True)
     try:
         scope_keys = sorted(dict(manifest["scope_digests"]))
@@ -280,6 +399,7 @@ def list_fresh_analysis_shortlist(
         connection.close()
     items: list[dict[str, object]] = []
     seen: set[str] = set()
+    by_candidate = {str(row["candidate_id"]): row for row in filtered.rows} if filtered else {}
     for row in rows:
         candidate_id = str(row.get("candidate_id", row.get("structure_id", ""))).strip()
         if not candidate_id:
@@ -287,19 +407,24 @@ def list_fresh_analysis_shortlist(
         if candidate_id in seen:
             raise ValueError(f"fresh analysis has duplicate candidate identity: {candidate_id}")
         seen.add(candidate_id)
-        items.append({
+        phase2 = by_candidate.get(candidate_id)
+        item = {
             "candidate_id": candidate_id,
             "pair": str(row.get("symbol", "")),
             "side": str(row.get("side", "")).upper(),
             "timeframe": str(row.get("timeframe", "")),
             "order_count": int(row.get("order_count", 0)),
             "status": str(row.get("status", "")),
-        })
+        }
+        if filtered is not None:
+            item["filter_status"] = phase2["filter_status"] if phase2 else "DEFERRED"
+        items.append(item)
     items.sort(key=lambda item: str(item["candidate_id"]))
     return {
         "analysis_run_id": analysis_id,
         "items": items,
         "groups": _shortlist_groups(items, scope_facts),
+        "active_criteria": list(filtered.criteria) if filtered else [],
     }
 
 
@@ -343,7 +468,7 @@ def _shortlist_groups(
             "scope_key": "|".join(key),
             "pair": key[0], "side": key[1], "timeframe": key[2],
             "counts": {f"{order}ORD": 0 for order in _ORDER_BUCKETS},
-            "ready": 0, "total": 0, "candidate_ids": [],
+            "ready": 0, "ready_after_filters": 0, "deferred": 0, "total": 0, "candidate_ids": [],
             **scope_facts.get("|".join(key), {"plateau_count": 0, "period": None}),
         })
         group["total"] = int(group["total"]) + 1
@@ -355,9 +480,16 @@ def _shortlist_groups(
             counts[bucket] = int(counts[bucket]) + 1
         if str(item["status"]) == _READY_STATUS:
             group["ready"] = int(group["ready"]) + 1
-            group["candidate_ids"].append(str(item["candidate_id"]))
+            if item.get("filter_status", "READY_AFTER_FILTERS") == "READY_AFTER_FILTERS":
+                group["ready_after_filters"] = int(group["ready_after_filters"]) + 1
+                group["candidate_ids"].append(str(item["candidate_id"]))
+            else:
+                group["deferred"] = int(group["deferred"]) + 1
     for group in grouped.values():
         group["candidate_ids"] = sorted(group["candidate_ids"])
+        if not any("filter_status" in item for item in items):
+            group.pop("ready_after_filters")
+            group.pop("deferred")
     return [grouped[key] for key in sorted(grouped)]
 
 
@@ -371,6 +503,7 @@ def generate_fresh_analysis_strategies(
     config: AlgorithmConfig,
     *,
     surface_path: Path | str | None = None,
+    filters: Mapping[str, object] | Sequence[str] | None = None,
 ) -> FreshAnalysisStrategies:
     """Generate EQUAL/INCOME JSON for exact READY candidates in one fresh run."""
     analysis_file = Path(analysis_path).resolve()
@@ -420,7 +553,13 @@ def generate_fresh_analysis_strategies(
             candidate = dict(raw)
             candidate["orders"] = tuple(dict(item) for item in orders)
             ready_by_id[identity] = candidate
-    selected = tuple(sorted({str(item).strip() for item in candidate_ids if str(item).strip()}))
+    filter_result = filter_fresh_analysis_candidates(analysis_file, analysis_id, filters) if filters is not None else None
+    selected = tuple(sorted(
+        str(row["candidate_id"])
+        for row in filter_result.rows
+        if row["filter_status"] == "READY_AFTER_FILTERS"
+        and (str(row.get("symbol", "")), str(row.get("side", "")).upper(), str(row.get("timeframe", ""))) in scope_set
+    )) if filter_result else tuple(sorted({str(item).strip() for item in candidate_ids if str(item).strip()}))
     if not selected:
         raise ValueError("no READY candidate selected")
     absent = sorted(set(selected).difference(all_by_id))
@@ -458,6 +597,7 @@ def generate_fresh_analysis_strategies(
         "listing_dates_sha256": str(manifest["listing_dates_sha256"]),
         "event_mode": EVENT_MODE,
         "selected_scopes": [list(scope) for scope in scopes],
+        "phase2_filters": list(filter_result.criteria) if filter_result else [],
         "generator_schema_version": GENERATOR_SCHEMA,
     }
     generated: list[dict[str, object]] = []

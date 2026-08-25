@@ -2,6 +2,7 @@
   let shortlistGroups = [];
   let shortlistItems = [];
   const selectedScopeKeys = new Set();
+  const shortlistFilters = () => ({ source_pnl: !!document.querySelector('#shortlist-filter-source-pnl')?.checked, efficiency: !!document.querySelector('#shortlist-filter-efficiency')?.checked, close_support: !!document.querySelector('#shortlist-filter-close-support')?.checked, point_event_count: !!document.querySelector('#shortlist-filter-point-event-count')?.checked });
   const expandedPairs = new Set();
   const shortlistBadge = (kind, text) => {
     const badge = document.querySelector('#shortlist-badge');
@@ -10,7 +11,7 @@
     badge.textContent = text;
   };
   const selectedCandidateIds = () => shortlistGroups
-    .filter((group) => selectedScopeKeys.has(group.scope_key) && Number(group.ready || 0) > 0)
+    .filter((group) => selectedScopeKeys.has(group.scope_key) && Number(group.ready_after_filters ?? group.ready ?? 0) > 0)
     .flatMap((group) => group.candidate_ids || []);
   const pairGroups = () => {
     const byPair = new Map();
@@ -18,11 +19,12 @@
       const key = `${group.pair}|${group.side}`;
       const entry = byPair.get(key) || {
         key, pair: group.pair, side: group.side, timeframes: [],
-        counts: Object.fromEntries(ORDER_BUCKETS.map((bucket) => [bucket, 0])), ready: 0, total: 0,
+        counts: Object.fromEntries(ORDER_BUCKETS.map((bucket) => [bucket, 0])), ready: 0, deferred: 0, total: 0,
       };
       entry.timeframes.push(group);
       for (const bucket of ORDER_BUCKETS) entry.counts[bucket] += Number(group.counts?.[bucket] || 0);
-      entry.ready += Number(group.ready || 0);
+      entry.ready += Number(group.ready_after_filters ?? group.ready ?? 0);
+      entry.deferred += Number(group.deferred || 0);
       entry.total += Number(group.total || 0);
       byPair.set(key, entry);
     }
@@ -42,7 +44,7 @@
   };
   const updateShortlistSummary = () => {
     const summary = document.querySelector('#shortlist-summary');
-    const ready = shortlistGroups.reduce((sum, group) => sum + Number(group.ready || 0), 0);
+    const ready = shortlistGroups.reduce((sum, group) => sum + Number(group.ready_after_filters ?? group.ready ?? 0), 0);
     const total = shortlistGroups.reduce((sum, group) => sum + Number(group.total || 0), 0);
     const picked = selectedCandidateIds().length;
     if (summary) {
@@ -77,7 +79,7 @@
         if (open) expandedPairs.delete(pair.key); else expandedPairs.add(pair.key);
         renderShortlist();
       });
-      const selectable = pair.timeframes.filter((group) => Number(group.ready || 0) > 0);
+      const selectable = pair.timeframes.filter((group) => Number(group.ready_after_filters ?? group.ready ?? 0) > 0);
       const box = document.createElement('input');
       box.type = 'checkbox';
       box.disabled = selectable.length === 0;
@@ -100,6 +102,7 @@
       row.append(pick, name, timeframes);
       for (const bucket of ORDER_BUCKETS) row.append(countCell(pair.counts[bucket], false));
       row.append(valueCell(undefined, '—'), countCell(pair.ready, true), valueCell(undefined, 0), countCell(pair.total, false), valueCell(undefined, '—'));
+      row.children[9].textContent = pair.deferred ? String(pair.deferred) : '0';
       body.append(row);
       for (const group of pair.timeframes) {
         const child = document.createElement('tr');
@@ -110,7 +113,7 @@
         childBox.type = 'checkbox';
         childBox.className = 'shortlist-tf-checkbox';
         childBox.value = group.scope_key;
-        childBox.disabled = !(Number(group.ready || 0) > 0);
+        childBox.disabled = !(Number(group.ready_after_filters ?? group.ready ?? 0) > 0);
         childBox.checked = selectedScopeKeys.has(group.scope_key);
         childBox.setAttribute('aria-label', `Select READY ${group.pair} ${group.side} ${group.timeframe}`);
         childBox.addEventListener('change', () => {
@@ -126,6 +129,7 @@
         child.append(childPick, childName, childTf);
         for (const bucket of ORDER_BUCKETS) child.append(countCell(group.counts?.[bucket], false));
         child.append(valueCell(group.plateau_count, '—'), countCell(group.ready, true), valueCell(group.deferred, 0), countCell(group.total, false), valueCell(group.period, '—'));
+        child.children[8].textContent = Number(group.ready_after_filters ?? group.ready ?? 0) || 'вЂ”';
         body.append(child);
       }
     }
@@ -1238,6 +1242,7 @@
       let result = await remoteRequest('/api/v2/strategies/fresh/generate', {
         analysis_run_id: currentAnalysisId,
         candidate_ids: candidateIds,
+        filters: shortlistFilters(),
         selected_scopes: scopes.map((group) => [group.pair, group.side, group.timeframe]),
       });
       while (result.running) {
@@ -1254,16 +1259,34 @@
     }
   });
   const refreshFresh = document.querySelector('#shortlist-refresh');
+  const phase2Filters = document.querySelector('.phase2-filters');
+  if (phase2Filters && refreshFresh?.parentElement) {
+    const actions = refreshFresh.parentElement;
+    const selection = document.createElement('div'); selection.className = 'button-row';
+    ['#shortlist-select-all', '#shortlist-select-active', '#shortlist-select-none'].forEach((id) => { const button = document.querySelector(id); if (button) selection.append(button); });
+    actions.after(phase2Filters); phase2Filters.after(selection);
+  }
+  if (refreshFresh?.parentElement) {
+    const audit = document.createElement('button');
+    audit.id = 'shortlist-audit'; audit.type = 'button'; audit.className = 'button button-secondary'; audit.textContent = 'Export filter audit';
+    audit.addEventListener('click', async () => {
+      if (!currentAnalysisId) return;
+      const response = await fetch('/api/v2/strategies/fresh/shortlist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ analysis_run_id: currentAnalysisId, filters: shortlistFilters(), audit: true }) });
+      const result = await response.json(); if (!response.ok) throw new Error(result.error || 'audit failed');
+      strategyStatus(`Filter audit: ${result.filename}`);
+    });
+    refreshFresh.parentElement.append(audit);
+  }
   if (refreshFresh) refreshFresh.addEventListener('click', async () => {
     if (!currentAnalysisId) { strategyStatus('Сначала запустите анализ.'); return; }
     try {
-      applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId }));
+      applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId, filters: shortlistFilters() }));
       strategyStatus(`Shortlist: ${shortlistItems.length} candidates.`);
     } catch (error) { strategyStatus(`Shortlist ошибка: ${error?.message || 'unknown error'}.`); }
   });
   document.querySelector('#shortlist-select-all')?.addEventListener('click', () => {
     selectedScopeKeys.clear();
-    for (const group of shortlistGroups) if (group.ready > 0) selectedScopeKeys.add(group.scope_key);
+    for (const group of shortlistGroups) if (Number(group.ready_after_filters ?? group.ready ?? 0) > 0) selectedScopeKeys.add(group.scope_key);
     renderShortlist();
   });
   document.querySelector('#shortlist-select-active')?.addEventListener('click', () => {

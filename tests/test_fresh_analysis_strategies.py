@@ -334,3 +334,31 @@ def test_fresh_shortlist_returns_only_safe_candidate_summary(tmp_path: Path) -> 
         "ready": 1, "total": 1, "candidate_ids": ["STR-READY"],
         "plateau_count": 0, "period": None,
     }]
+
+
+def test_fresh_phase2_source_pnl_defers_only_a_dominated_candidate(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import filter_fresh_analysis_candidates
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    connection = duckdb.connect(str(database))
+    try:
+        original = json.loads(connection.execute("select payload_json from structures").fetchone()[0])
+        better = {
+            **original,
+            "structure_id": "STR-BETTER",
+            "candidate_id": "STR-BETTER",
+            "orders": [{**order, "source_pnl_pct": float(order["source_pnl_pct"]) + 1} for order in original["orders"]],
+        }
+        connection.execute(
+            "insert into structures values (?, ?)",
+            ["BTCUSDT|LONG|1h", json.dumps(better, sort_keys=True, separators=(",", ":"))],
+        )
+    finally:
+        connection.close()
+
+    result = filter_fresh_analysis_candidates(database, analysis_id, {"source_pnl": True})
+    rows = {row["candidate_id"]: row for row in result.rows}
+
+    assert rows["STR-BETTER"]["filter_status"] == "READY_AFTER_FILTERS"
+    assert rows["STR-READY"]["deferred_by_candidate_id"] == "STR-BETTER"

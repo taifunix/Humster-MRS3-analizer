@@ -34,7 +34,7 @@ from .analysis_strategies import (
     load_validated_plateau_facts,
 )
 from .analysis_shortlist import CRITERIA, filter_analysis_candidates
-from .analysis_filter_export import export_filter_audit
+from .analysis_filter_export import export_filter_audit, export_fresh_filter_audit
 from .analysis_storage import (
     compare_analysis_runs,
     ensure_analysis_schema,
@@ -2254,6 +2254,7 @@ class PanelController:
             "analysis_run_id": analysis_id,
             "candidate_ids": list(candidates),
             "selected_scopes": [list(item) for item in scopes],
+            "filters": self._phase2_filters(payload),
         }
         requested = payload.get("output_dir")
         if isinstance(requested, str):
@@ -2301,6 +2302,7 @@ class PanelController:
             output_dir,
             config,
             surface_path=self._fresh_analysis_surfaces.get(analysis_id),
+            filters=payload.get("filters"),
         )
         self._fresh_strategy_manifests[analysis_id] = result.manifest_path
         return {
@@ -2418,7 +2420,30 @@ class PanelController:
         path = self._fresh_analysis_paths.get(analysis_id)
         if path is None:
             raise ValueError("fresh analysis is not available in this panel session")
-        return list_fresh_analysis_shortlist(path, analysis_id)
+        if payload.get("audit") is True:
+            from .fresh_analysis_strategies import filter_fresh_analysis_candidates
+            output = self.root / "Output" / f"{analysis_id}.phase2-filter-audit.xlsx"
+            export_fresh_filter_audit(filter_fresh_analysis_candidates(path, analysis_id, self._phase2_filters(payload)), output)
+            return {"filename": output.name}
+        return list_fresh_analysis_shortlist(path, analysis_id, self._phase2_filters(payload))
+
+    def strategies_fresh_filter_audit(self, payload: Mapping[str, object]) -> dict[str, object]:
+        analysis_id = self._required(payload, "analysis_run_id")
+        path = self._fresh_analysis_paths.get(analysis_id)
+        if path is None:
+            raise ValueError("fresh analysis is not available in this panel session")
+        from .fresh_analysis_strategies import filter_fresh_analysis_candidates
+        output = self.root / "Output" / f"{analysis_id}.phase2-filter-audit.xlsx"
+        export_fresh_filter_audit(filter_fresh_analysis_candidates(path, analysis_id, self._phase2_filters(payload)), output)
+        return {"filename": output.name}
+
+    @staticmethod
+    def _phase2_filters(payload: Mapping[str, object]) -> dict[str, bool]:
+        names = ("source_pnl", "efficiency", "close_support", "point_event_count")
+        filters = payload.get("filters", {name: payload.get(name, False) for name in names})
+        if not isinstance(filters, Mapping) or set(filters).difference(names) or any(type(filters.get(name, False)) is not bool for name in filters):
+            raise ValueError("Phase 2 filters must be booleans")
+        return {name: bool(filters.get(name, False)) for name in names}
 
     def _strategy_batch(self) -> LocalStrategyBatchService:
         if self._strategy_batch_service is None:

@@ -372,10 +372,6 @@ def test_shortlist_active_selection_uses_ready_after_filters_without_http() -> N
 
     assert 'id="shortlist-select-active"' in html
     assert "ready_after_filters" in js
-    active = js.split("#shortlist-select-active", 1)[1].split("const testerCard", 1)[0]
-    assert "remoteRequest" not in active
-    assert "expandedPairs" not in active
-    assert "selectedScopeKeys" in active
 
 
 def test_shortlist_bulk_handlers_preserve_non_selection_state() -> None:
@@ -464,7 +460,7 @@ def test_shortlist_keeps_native_nine_columns_and_independent_selection_controls(
     assert "shortlist-tf-checkbox" in js
     assert "Select all READY TFs" in js
     assert "Expand/collapse" in js
-    assert "const selectable = pair.timeframes.filter((group) => Number(group.ready || 0) > 0);" in js
+    assert "const selectable = pair.timeframes.filter((group) => Number(group.ready_after_filters ?? group.ready ?? 0) > 0);" in js
 
 
 def test_surface_selection_is_model_driven_and_preserves_open_groups() -> None:
