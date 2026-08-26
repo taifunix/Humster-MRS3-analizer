@@ -533,7 +533,7 @@ def test_shared_request_json_and_job_recovery_keep_errors_and_busy_state_truthfu
     assert "Backend connection unavailable." in js
     assert "const setTesterControls = (busy)" in js
     assert "if (testerRunsStart) testerRunsStart.disabled = busy;" in js
-    assert "const verifiedInbox = !runs && job.state === 'COMMITTED';" in js
+    assert "const verifiedInbox = job.state === 'COMMITTED' && job.inbox_ready === true;" in js
     assert "performanceStart.disabled = true;" in js
     assert "finally { performanceStart.disabled = false; }" in js
     assert "const recoverJobs = async () =>" in js
@@ -576,10 +576,11 @@ def test_reload_recovers_only_server_job_snapshots() -> None:
     assert "requestJson('/api/v2/jobs')" in recovery
     assert "job.kind === 'strategies.tester.start'" in recovery
     assert "job.kind === 'strategies.performance-dd5'" in recovery
+    assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
     assert "kind: 'strategies.tester.start'" in js
-    assert "renderTester(job)" in recovery
+    assert "renderTester(testerIsTerminal(job) ? {...job, progress: {}} : job)" in recovery
     assert "renderPerformance(job)" in recovery
-    assert "job.state =" not in recovery
+    assert "job.state = " not in recovery
     assert "recoverJobs();" in js
 
 

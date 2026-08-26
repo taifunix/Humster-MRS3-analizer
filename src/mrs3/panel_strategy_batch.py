@@ -144,17 +144,7 @@ def validate_strategy_manifest(manifest_path: Path) -> ValidatedStrategyManifest
             raise StrategyBatchValidationError(f"strategy JSON must be an object: {filename}")
         if document.get("name") != Path(filename).stem:
             raise StrategyBatchValidationError(f"strategy filename does not match name: {filename}")
-        provenance = document.get("provenance")
-        if not isinstance(provenance, dict):
-            raise StrategyBatchValidationError(f"strategy provenance is missing: {filename}")
-        if provenance.get("analysis_run_id") != analysis_run_id:
-            raise StrategyBatchValidationError(f"strategy provenance does not match analysis run: {filename}")
-        if provenance.get("generation_manifest_sha256") != generation_hash:
-            raise StrategyBatchValidationError(f"strategy generation hash does not match: {filename}")
-        if provenance.get("event_mode") != event_mode:
-            raise StrategyBatchValidationError(f"strategy event mode does not match: {filename}")
-        declared = provenance.get("strategy_json_sha256")
-        if declared != expected_hash or _strategy_digest(document) != expected_hash:
+        if _strategy_digest(document) != expected_hash:
             raise StrategyBatchValidationError(f"strategy JSON hash mismatch: {filename}")
 
     provenance = dict(raw)

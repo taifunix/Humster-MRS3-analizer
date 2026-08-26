@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from mrs3.runner.config import RunnerConfig
-from mrs3.runner.inbox import InboxCaptureError, capture_verified_inbox
+from mrs3.runner.inbox import InboxCaptureError, capture_run_snapshot_inbox, capture_verified_inbox
 from mrs3.runner.results import WizardResult
 from mrs3.runner.workflow import BatchPlan
 from mrs3.panel import PanelController
@@ -195,6 +195,27 @@ def test_capture_persists_v6_provenance(tmp_path: Path) -> None:
     inbox = capture_verified_inbox(config, output, plan, (wizard,), {"A": report}, provenance=provenance)
     manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
     assert manifest["v6_provenance"] == provenance
+
+
+def test_capture_run_snapshots_keeps_original_report_for_guarded_cleanup(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    report = tmp_path / "my_test_runs" / "run.html"
+    report.parent.mkdir()
+    report.write_bytes((Path(__file__).parents[1] / "fixtures" / "performance" / "report_import.html").read_bytes())
+    strategy = {"name": "MRS3 Demo", "exchange": {"name": "Bybit"}, "basic": {"symbol": "ONUSDT", "time_frame": "1h"}}
+    digest = sha256(json.dumps(strategy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    provenance = {"analysis_run_id": "a" * 64, "generation_manifest_sha256": "b" * 64, "strategy_json_sha256": {"MRS3 Demo.json": digest}}
+
+    inbox = capture_run_snapshot_inbox(
+        config, "runs-job", {"MRS3 Demo": strategy}, {"MRS3 Demo": report},
+        tester_config_bytes=config.tester_config.read_bytes(), provenance=provenance,
+        test_start="2026-08-01", test_end="2026-08-18",
+    )
+
+    manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["run_mode"] == "RUNS" and manifest["test_start"] == "2026-08-01"
+    assert Path(manifest["entries"][0]["report_path"]).resolve() == report.resolve()
+    PanelController._validate_performance_inbox(inbox)
 
 
 def test_capture_rejects_incomplete_v6_provenance(tmp_path: Path) -> None:

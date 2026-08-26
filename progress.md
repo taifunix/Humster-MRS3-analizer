@@ -5,8 +5,8 @@
 
 ## Tester run files (2026-08-26)
 
-The Shortlist button creates up to five isolated tester snapshots from
-server-recomputed `READY_AFTER_FILTERS` candidates. It clears only the exact
+The Shortlist button creates isolated tester snapshots for every selected
+server-recomputed `READY_AFTER_FILTERS` candidate. It clears only the exact
 `<bot_root>/tester/runs` target, sets `use_runs=true`, and copies Tester batch
 dates plus `max_parallel_submissions`; `run_tester.bat` remains manual.
 The bot-exported run template may have a UTF-8 BOM and trailing commas; those
@@ -22,8 +22,16 @@ Ordinary READY batches and isolated RUNS share one panel job resource. RUNS
 requires generated snapshots, clears only `tester/report/my_test_runs`, starts
 `run_tester.bat` non-interactively, and reports generated HTML count every 15
 seconds. Snapshots use `name_comment=runs`, keeping their reports out of the
-ordinary READY report directory. Next step: focused panel verification and
-independent review before integration.
+ordinary READY report directory. After every expected RUNS report is present,
+the panel captures a verified inbox from immutable snapshot settings and report
+hashes; Performance DB accepts that inbox exactly as it accepts an ordinary
+batch. The common `delete_html` cleanup removes the original mode-specific
+reports only after a zero-quarantine committed import. Focused verification:
+`87 passed` across run files, inbox, panel and Performance DB tests; independent
+review is still required before integration.
+
+Reload no longer restores a terminal tester job into the live Tester batch
+status or progress bar; only an active job is reattached.
 
 ## Multi-order plateau admission (2026-08-25)
 
@@ -110,6 +118,17 @@ quarantine replacement checks.
 
 Focused verification: panel suite `112 passed`; provenance/merge checks `10
 passed`. Independent re-review: `CODE_REVIEW_PASS`.
+
+## READY JSON template-only payload (2026-08-26)
+
+`Generate READY JSON` now emits only the selected tester-template fields and
+computed strategy settings. Per-strategy provenance is no longer copied into
+the bot payload; the immutable strategy manifest retains the analysis lineage,
+candidate mapping and exact JSON hashes used by batch validation. The generator
+does not read or modify `config_tester.json`.
+
+Focused verification: fresh-generation, manifest validation and v6 generation
+tests — `63 passed`.
 
 ## BASE 1ORD selection (2026-08-24)
 

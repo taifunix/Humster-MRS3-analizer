@@ -154,11 +154,10 @@ def test_fresh_adapter_generates_only_selected_ready_candidate_and_binds_hashes(
     assert len(manifest["analysis_artifact_sha256"]) == 64
     assert len(manifest["analysis_manifest_sha256"]) == 64
     strategy = json.loads(next(result.strategies_path.glob("*.json")).read_text(encoding="utf-8"))
-    assert strategy["provenance"]["candidate_identity"] == "STR-READY"
-    assert strategy["provenance"]["analysis_id"] == analysis_id
+    assert "provenance" not in strategy
 
 
-def test_fresh_strategy_provenance_keeps_only_plateau_diagnostics(tmp_path: Path) -> None:
+def test_fresh_strategy_payload_excludes_provenance_and_manifest_keeps_lineage(tmp_path: Path) -> None:
     from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
 
     analysis_id, _ = _make_analysis(tmp_path / "run.analysis-v6.duckdb")
@@ -175,16 +174,15 @@ def test_fresh_strategy_provenance_keeps_only_plateau_diagnostics(tmp_path: Path
         AlgorithmConfig.defaults(),
     )
     strategy = json.loads((result.strategies_path / "BTCUSDT_1h_LONG_2ORD_CMA9_STR-READY_EQUAL.json").read_text())
+    manifest = json.loads(result.manifest_path.read_text())
 
-    assert {
-        key: strategy["provenance"][key]
-        for key in ("plateau_point_count", "base_point_trades", "plateau_total_trades")
-    } == {
-        "plateau_point_count": [3, 4],
-        "base_point_trades": [10, 11],
-        "plateau_total_trades": [30, 40],
+    assert "provenance" not in strategy
+    assert manifest["candidate_identity_to_strategy_names"] == {
+        "STR-READY": [
+            "BTCUSDT_1h_LONG_2ORD_CMA9_STR-READY_EQUAL",
+            "BTCUSDT_1h_LONG_2ORD_CMA9_STR-READY_INCOME",
+        ]
     }
-    assert not any("event_count" in key.lower() for key in strategy["provenance"])
 
 
 def test_plateau_diagnostics_accept_order_aligned_tuples() -> None:

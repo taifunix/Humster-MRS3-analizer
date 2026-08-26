@@ -768,7 +768,7 @@ def test_generate_analysis_strategies_rejects_candidate_absent_from_run(
         )
 
 
-def test_generate_v6_analysis_strategies_exports_only_committed_ready_with_provenance(
+def test_generate_v6_analysis_strategies_exports_only_committed_ready_with_manifest_lineage(
     tmp_path: Path, monkeypatch,
 ) -> None:
     from mrs3.analysis_strategies import generate_v6_analysis_strategies
@@ -840,8 +840,9 @@ def test_generate_v6_analysis_strategies_exports_only_committed_ready_with_prove
     assert manifest["event_mode"] == "real_independent_events"
     assert manifest["candidate_identities"] == ["C_READY"]
     strategy = json.loads(next(result.strategies_path.glob("*.json")).read_text(encoding="utf-8"))
-    assert strategy["provenance"]["source_surface_id"] == "SURFACE_V6"
-    assert strategy["provenance"]["generation_manifest_sha256"] == manifest["generation_manifest_sha256"]
+    assert "provenance" not in strategy
+    assert manifest["source_surface_id"] == "SURFACE_V6"
+    assert len(manifest["generation_manifest_sha256"]) == 64
 
 
 def _v6_provenance_stub(config: AlgorithmConfig) -> tuple[dict[str, object], str]:

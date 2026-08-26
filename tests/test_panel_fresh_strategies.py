@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 from time import monotonic, sleep
 from types import SimpleNamespace
@@ -49,8 +50,8 @@ def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -
 
     result = controller.strategies_fresh_generate_runs({"analysis_run_id": "a" * 64, "filters": {}, "selected_scopes": [["BTCUSDT", "LONG", "1h"]], "start_date": "2026-08-01", "end_date": "2026-08-18"})
 
-    assert result["run_count"] == 5
-    assert len(list((tmp_path / "bot" / "tester" / "runs").glob("*.json"))) == 5
+    assert result["run_count"] == 6
+    assert len(list((tmp_path / "bot" / "tester" / "runs").glob("*.json"))) == 6
     assert json.loads(tester_config.read_text(encoding="utf-8"))["use_runs"] is True
 
 
@@ -111,12 +112,16 @@ def test_fresh_batch_is_recovered_from_output_after_panel_restart(tmp_path: Path
     }
 
 
-def test_generation_status_fails_after_generation_error(tmp_path: Path, monkeypatch) -> None:
+def test_generation_status_keeps_safe_generation_error(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
+    config.write_text(json.dumps({
+        "panel_workflow": {
+            "strategy_templates": {"LONG": "input/long.json", "SHORT": "input/short.json"},
+        },
+    }), encoding="utf-8")
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
     controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
-    monkeypatch.setattr("mrs3.panel.generate_fresh_analysis_strategies", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError()))
+    monkeypatch.setattr("mrs3.panel.generate_fresh_analysis_strategies", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("panel workflow default is unavailable")))
 
     started = controller.strategies_fresh_generate({
         "analysis_run_id": "a" * 64, "candidate_ids": ["candidate"],
@@ -129,6 +134,8 @@ def test_generation_status_fails_after_generation_error(tmp_path: Path, monkeypa
         result = controller.strategies_fresh_generation_status(str(started["job_id"]))
 
     assert result["phase"] == "FAILED"
+    assert result["error"] == "READY JSON generation failed: template is unavailable"
+    assert "workflow default" not in result["error"]
 
 
 def test_performance_cleanup_requires_boolean_confirmation(tmp_path: Path) -> None:
@@ -155,6 +162,16 @@ def test_tester_job_uses_the_ui_recovery_kind(tmp_path: Path, monkeypatch) -> No
     assert captured["kind"] == "strategies.tester.start"
 
 
+def test_committed_tester_inbox_readiness_survives_panel_reload(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    job = controller._panel_jobs.submit("strategies.tester.runs", {}, "tester", ("strategies.tester",))
+    controller._panel_jobs.transition(job["job_id"], "RUNNING")
+
+    controller._record_special_job({"job_id": job["job_id"], "state": "COMMITTED", "inbox_path": str(tmp_path / "inbox")})
+
+    assert controller._panel_jobs.get(job["job_id"])["inbox_ready"] is True
+
+
 def test_runs_tester_rejects_an_empty_runs_directory(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.local.json"
     config.write_text("{}", encoding="utf-8")
@@ -175,8 +192,15 @@ def test_runs_tester_rejects_an_empty_runs_directory(tmp_path: Path, monkeypatch
 def test_runs_tester_clears_only_its_report_directory_and_counts_html(tmp_path: Path) -> None:
     root = tmp_path / "bot"
     runs = root / "tester" / "runs"; runs.mkdir(parents=True)
-    for name in ("001.json", "002.json"):
-        (runs / name).write_text("{}", encoding="utf-8")
+    entries = []
+    for index, name in enumerate(("one", "two"), start=1):
+        filename = f"{index:03d}.json"; snapshot = {"settings": [{"name": name, "exchange": {"name": "Bybit"}}]}
+        path = runs / filename; path.write_text(json.dumps(snapshot), encoding="utf-8")
+        entries.append({"filename": filename, "strategy_name": name, "snapshot_sha256": sha256(path.read_bytes()).hexdigest(), "strategy_sha256": sha256(json.dumps(snapshot["settings"][0], sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
+    manifest = {"schema_version": 1, "analysis_run_id": "a" * 64, "test_start": "2026-08-01", "test_end": "2026-08-18", "entries": entries}
+    manifest["generation_manifest_sha256"] = sha256(json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    (root / "tester" / "runs_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    tester_config = root / "tester" / "config_tester.json"; tester_config.write_text("{}", encoding="utf-8")
     (root / "run_tester.bat").write_text("@echo off\n", encoding="utf-8")
     report = root / "tester" / "report" / "my_test_runs"; report.mkdir(parents=True)
     (report / "old.html").write_text("old", encoding="utf-8")
@@ -186,17 +210,19 @@ def test_runs_tester_clears_only_its_report_directory_and_counts_html(tmp_path: 
         def terminate(self): raise AssertionError("completed process must not be terminated")
 
     def launch(_root):
-        for name in ("one.html", "two.html"):
-            (report / name).write_text("report", encoding="utf-8")
+        for name in ("one", "two"):
+            (report / f"{name}.html").write_text(f'<pre>{{"name":"{name}","basic":{{"symbol":"ONUSDT"}},"exchange":{{"name":"Bybit"}}}}</pre>', encoding="utf-8")
         return Process()
 
-    service = LocalRunsBatchService(SimpleNamespace(bot_root=root), launcher=launch)
+    inbox = tmp_path / "inbox"; inbox.mkdir()
+    service = LocalRunsBatchService(SimpleNamespace(bot_root=root, tester_config=tester_config), launcher=launch, capture_inbox=lambda *_args, **_kwargs: inbox)
     service.start("runs-job")
     deadline = monotonic() + 3
     while service.status("runs-job")["state"] == "RUNNING" and monotonic() < deadline:
         sleep(0.01)
     result = service.status("runs-job")
     assert result["state"] == "COMMITTED"
+    assert result["inbox_path"] == str(inbox)
     assert result["progress"] == {"current": 2, "total": 2, "unit": "reports"}
     assert not (report / "old.html").exists()
 

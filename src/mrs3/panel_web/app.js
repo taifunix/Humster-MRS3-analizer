@@ -1128,6 +1128,12 @@
   let currentAnalysisId = '';
   let testerJobId = '';
   let testerPoller = 0;
+  const setTesterReadyCount = (count) => {
+    const badge = strategyCards[2]?.querySelector('summary .state-badge');
+    if (!badge) return;
+    badge.className = `state-badge ${count ? 'state-ready' : 'state-pending'}`;
+    badge.textContent = count ? `${count} READY` : 'WAITING';
+  };
   const strategyStatus = (message) => {
     const target = strategyCards[0]?.querySelector('.progress-block p');
     if (target) target.textContent = message;
@@ -1227,6 +1233,7 @@
     try {
       const batch = await requestJson('/api/v2/strategies/fresh/batch');
       currentAnalysisId = batch.analysis_run_id;
+      setTesterReadyCount(Number(batch.strategy_count || 0));
       generateStatus(`READY JSON restored: ${batch.strategy_count}.`);
     } catch (_) { /* No validated batch on disk yet. */ }
   };
@@ -1255,6 +1262,7 @@
         result = await requestJson(`/api/v2/strategies/fresh/generate/status?job_id=${encodeURIComponent(result.job_id)}`);
       }
       if (result.phase !== 'COMMITTED') throw new Error(result.error || 'generation failed');
+      setTesterReadyCount(Number(result.strategy_count || 0));
       generateStatus(`READY JSON committed: ${result.strategy_count}.`);
     } catch (error) {
       generateStatus(`READY JSON не создан: ${error?.message || 'unknown error'}.`);
@@ -1380,7 +1388,7 @@
     if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : '0%';
     const detail = runs
       ? `готово ${checked} из ${total} отчётов`
-      : `отправлено ${p.sent || 0} · в работе ${p.running || 0} · результат ${p.result || 0} · проверено ${checked} · повторы ${p.retries || 0}`;
+      : `отправлено ${p.sent || 0} · в работе ${p.running || 0} · результат ${p.result || 0} · проверено ${checked} · осталось ${Math.max(0, total - checked)} · повторы ${p.retries || 0}`;
     const recoveringInbox = job.phase === 'RECOVERING_INBOX';
     if (testerText) testerText.textContent = recoveringInbox ? 'Восстановление verified inbox из сохранённых отчётов…' : detail;
     if (testerStatus) testerStatus.textContent = recoveringInbox
@@ -1388,7 +1396,7 @@
       : `Tester: ${job.state || 'RUNNING'}. ${detail}`;
     if (testerStop) testerStop.disabled = !testerJobId || ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
     setTesterControls(!testerIsTerminal(job));
-    const verifiedInbox = !runs && job.state === 'COMMITTED';
+    const verifiedInbox = job.state === 'COMMITTED' && job.inbox_ready === true;
     if (performanceStart) performanceStart.disabled = !verifiedInbox;
     const performanceImport = document.querySelector('#performance-import-start');
     if (performanceImport) performanceImport.disabled = !verifiedInbox;
@@ -1501,16 +1509,14 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const tester = [...jobs].reverse().find((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester.runs' || job.kind === 'strategies.tester');
+      const testerJobs = [...jobs].reverse().filter((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester.runs' || job.kind === 'strategies.tester');
+      const tester = testerJobs.find((job) => !testerIsTerminal(job)) || testerJobs.find((job) => job.state === 'COMMITTED' && job.inbox_ready === true);
       const performance = [...jobs].reverse().find((job) => job.kind === 'strategies.performance-dd5');
       if (tester && typeof tester.job_id === 'string') {
         const job = tester;
         testerJobId = job.job_id;
-        renderTester(job);
-        if (!['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) {
-          await pollTester();
-          startTesterPolling(job.kind === 'strategies.tester.runs' ? 15000 : 1000);
-        }
+        renderTester(testerIsTerminal(job) ? {...job, progress: {}} : job);
+        if (!testerIsTerminal(job)) { await pollTester(); startTesterPolling(job.kind === 'strategies.tester.runs' ? 15000 : 1000); }
       }
       if (performance && typeof performance.job_id === 'string') {
         const job = performance;

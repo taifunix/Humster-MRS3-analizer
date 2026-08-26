@@ -237,7 +237,11 @@ IDs; `output_dir` и любой произвольный путь запреще
 ```
 
 Сервер очищает только разрешённый `Output\strategies`, сохраняя `.mrs3`;
-tester JSON пишутся прямо в корень, а manifest — только в
+tester JSON пишутся прямо в корень и содержат только поля выбранного шаблона
+тестера и вычисленные параметры стратегии. Lineage, hashes, candidate IDs и
+прочие служебные данные хранятся только в manifest. `Generate READY JSON` не
+читает и не изменяет `config_tester.json`: этот файл используется только при
+последующем запуске tester batch. Manifest пишется только в
 `Output\strategies\.mrs3\strategy_manifest.json`. Нельзя создавать
 `analysis_id` subfolder в strategy root. Tester копирует только `*.json` из
 корня; manifest не становится tester strategy.
@@ -271,23 +275,33 @@ reload остаются явными операциями.
 ### Tester RUNS
 
 `Generate READY JSON` and `Generate Run files` belong to the Tester batch card.
-Run snapshot generation sets `tester_config.name_comment` to `runs`; with the
-existing global `name_comment=my_test` the bot writes only to
+Run snapshot generation sets `tester_config.use_runs=true` and
+`tester_config.name_comment` to `runs`; with the existing global
+`name_comment=my_test` the bot writes only to
 `bot_root\tester\report\my_test_runs`.
 
 ```json
 {"kind":"strategies.tester.runs","request":{}}
 ```
 
-The server accepts no browser paths or commands. It requires one or more JSON
+The server accepts no browser paths or commands. It generates one snapshot for
+every selected `READY_AFTER_FILTERS` candidate and requires one or more JSON
 snapshots in the exact `bot_root\tester\runs` directory, otherwise returns
 `RUNS_EMPTY`. Before launch it deletes only the exact `my_test_runs` report
-directory, then invokes `run_tester.bat` non-interactively. Progress is the
-number of completed HTML reports over the immutable snapshot count; RUNS polls
-every 15 seconds. RUNS and ordinary tester batches share the same
+directory, then invokes `run_tester.bat` non-interactively. Once every expected
+HTML is present, the server validates report names against the immutable
+snapshot manifest and captures a verified inbox just as it does for an ordinary
+tester batch. Progress is the number of completed HTML reports over the
+immutable snapshot count; RUNS polls every 15 seconds. RUNS and ordinary tester batches share the same
 `strategies.tester` job resource, so either start control is disabled while the
 other job is active. A zero-exit tester with fewer reports than snapshots ends
 as `RUNS_INCOMPLETE` rather than committed.
+
+`Inbox → Performance DB` accepts the committed verified inbox of either mode;
+the selected tester job remains the sole import source. `Удалить HTML после
+успешного импорта` uses the common cleanup path, so it deletes the original
+reports from `my_test` or `my_test_runs` only after a zero-quarantine committed
+Performance DB import.
 
 ### Performance import и audit sidecar
 
@@ -370,6 +384,9 @@ Canonical polling/reattach после reload — `GET /api/v2/jobs`, response
 `GET /api/v2/strategies/tester/status?job_id=JOB` и
 `GET /api/v2/strategies/performance-dd5/status?job_id=JOB`; эти routes
 возвращают redacted snapshot без `inbox_path` и других controller-only paths.
+После reload UI reattaches к незавершённому tester job. Единственное terminal
+исключение — committed tester job с `inbox_ready=true`: UI восстанавливает
+доступность Performance DB, но не восстанавливает старый progress.
 Snapshot содержит `job_id`, `state`, `phase`, `progress`, `error`, safe
 `evidence` и tokens, если они уже выданы.
 

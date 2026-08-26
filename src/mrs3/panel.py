@@ -1677,6 +1677,8 @@ class PanelController:
         if isinstance(inbox, str) and inbox:
             runtime["inbox_path"] = inbox
         public = {key: value for key, value in document.items() if key in {"state", "phase", "progress", "error", "evidence"}}
+        if document.get("state") == "COMMITTED" and runtime:
+            public["inbox_ready"] = True
         try:
             self._panel_jobs.sync(job_id, public, runtime=runtime or None)
         except PanelJobError:
@@ -2276,7 +2278,7 @@ class PanelController:
         return dict(job)
 
     def strategies_fresh_generate_runs(self, payload: Mapping[str, object]) -> dict[str, object]:
-        """Publish up to five filtered candidates as tester run snapshots."""
+        """Publish the selected filtered candidates as tester run snapshots."""
         if set(payload).difference({"analysis_run_id", "filters", "selected_scopes", "start_date", "end_date"}):
             raise ValueError("tester run request contains unsupported fields")
         scopes = payload.get("selected_scopes")
@@ -2298,22 +2300,25 @@ class PanelController:
             (row for row in filtered.rows if row.get("filter_status") == "READY_AFTER_FILTERS" and
              (str(row.get("symbol", "")), str(row.get("side", "")).upper(), str(row.get("timeframe", ""))) in selected),
             key=lambda row: str(row["candidate_id"]),
-        )[:5]
+        )
         if not structures:
             raise ValueError("no READY candidates match the selected scopes")
         runner = RunnerConfig.from_json(self.default_config)
         result = publish_run_snapshots(
             self.root / "Input" / "run_snapshot_2.json", runner.bot_root, runner.tester_config, structures,
             start_date, end_date, runner.max_parallel_submissions, self._analysis_config_loader(self.default_config),
+            analysis_run_id=analysis_id,
         )
         return {"phase": "COMMITTED", "analysis_run_id": analysis_id, **result}
 
     def _run_fresh_strategy_generation(self, job: dict[str, object], payload: Mapping[str, object]) -> None:
         try:
             result = self._generate_fresh_strategies(payload)
-        except Exception:
+        except Exception as error:
             with self._lock:
-                job.update(phase="FAILED", running=False, error="READY JSON generation failed. Check panel logs.")
+                message = str(error).casefold()
+                detail = "template is unavailable" if "template" in message or "workflow default" in message else "generation request is invalid"
+                job.update(phase="FAILED", running=False, error=f"READY JSON generation failed: {detail}")
         else:
             with self._lock:
                 job.update(result, phase="COMMITTED", running=False)
@@ -2541,6 +2546,7 @@ class PanelController:
         result = self._tracked_job_or_interrupted(job_id, status)
         if result.get("state") == "COMMITTED" and isinstance(result.get("inbox_path"), str):
             self._strategy_batch_inboxes[job_id] = Path(result["inbox_path"])
+            result["inbox_ready"] = True
         return {key: value for key, value in result.items() if key != "inbox_path"}
 
     def strategies_tester_verify_inbox(self, job_id: str) -> dict[str, object]:
@@ -2617,6 +2623,12 @@ class PanelController:
         request = job.get("request")
         start = request.get("start_date") if isinstance(request, dict) else None
         end = request.get("end_date") if isinstance(request, dict) else None
+        if not isinstance(start, str) or not isinstance(end, str):
+            try:
+                manifest = json.loads((self._tester_inbox(job_id) / "inbox_manifest.json").read_text(encoding="utf-8"))
+                start, end = manifest.get("test_start"), manifest.get("test_end")
+            except (OSError, ValueError, TypeError):
+                start, end = None, None
         if not isinstance(start, str) or not isinstance(end, str):
             config = RunnerConfig.from_json(self.default_config)
             snapshot = Path(config.inbox_root) / f".{job_id}.tester-config.snapshot"

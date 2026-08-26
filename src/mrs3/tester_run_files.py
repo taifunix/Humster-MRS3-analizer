@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -79,6 +80,7 @@ def render_run_snapshot(
     rendered["tester_config"]["StartDate"] = _timestamp(start_date)
     rendered["tester_config"]["EndDate"] = _timestamp(end_date)
     rendered["tester_config"]["max_parallel_runs"] = max_parallel_runs
+    rendered["tester_config"]["use_runs"] = True
     # The tester derives its report directory from the global and snapshot
     # comments.  Keep RUNS reports isolated from ordinary READY batches.
     rendered["tester_config"]["name_comment"] = "runs"
@@ -106,6 +108,10 @@ def _write_json(path: Path, document: Mapping[str, object]) -> None:
     os.replace(temporary, path)
 
 
+def _digest(value: object) -> str:
+    return sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def publish_run_snapshots(
     template_path: Path | str,
     bot_root: Path | str,
@@ -115,10 +121,14 @@ def publish_run_snapshots(
     end_date: str,
     max_parallel_runs: int,
     config: AlgorithmConfig,
+    *,
+    analysis_run_id: str,
 ) -> dict[str, object]:
-    """Replace the exact tester runs directory with one to five snapshots."""
-    if not 1 <= len(structures) <= 5:
-        raise ValueError("tester run generation requires from one to five candidates")
+    """Replace the exact tester runs directory with all selected snapshots."""
+    if not structures:
+        raise ValueError("tester run generation requires at least one candidate")
+    if not isinstance(analysis_run_id, str) or len(analysis_run_id) != 64:
+        raise ValueError("analysis_run_id must be a SHA-256 hash")
     root = Path(bot_root).resolve()
     runs = _inside(root / "tester" / "runs", root, "tester runs directory")
     tester_config = _inside(Path(tester_config_path), root, "tester config")
@@ -143,6 +153,27 @@ def publish_run_snapshots(
     _write_json(tester_config, config_document)
     names: list[str] = []
     for index, (name, snapshot) in enumerate(rendered, start=1):
-        _write_json(runs / f"{index:03d}_{name}.json", snapshot)
+        filename = f"{index:03d}_{name}.json"
+        path = runs / filename
+        _write_json(path, snapshot)
         names.append(name)
+    entries = []
+    for index, (name, snapshot) in enumerate(rendered, start=1):
+        filename = f"{index:03d}_{name}.json"
+        settings = snapshot["settings"][0]
+        entries.append({
+            "filename": filename,
+            "strategy_name": name,
+            "snapshot_sha256": sha256((runs / filename).read_bytes()).hexdigest(),
+            "strategy_sha256": _digest(settings),
+        })
+    unsigned = {
+        "schema_version": 1,
+        "analysis_run_id": analysis_run_id,
+        "test_start": start_date,
+        "test_end": end_date,
+        "entries": entries,
+    }
+    manifest = {**unsigned, "generation_manifest_sha256": _digest(unsigned)}
+    _write_json(_inside(root / "tester" / "runs_manifest.json", root, "tester runs manifest"), manifest)
     return {"run_count": len(names), "run_names": names}

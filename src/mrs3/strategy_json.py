@@ -56,10 +56,9 @@ def generate_strategy(
     lots: Sequence[Decimal],
     method: LotMethod,
     config: AlgorithmConfig,
-    *,
-    provenance: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     generated = deepcopy(dict(template))
+    generated.pop("provenance", None)
     side = Side(str(structure["side"]))
     orders = tuple(structure["orders"])
     if len(orders) != int(structure["order_count"]) or len(lots) != len(orders):
@@ -93,8 +92,6 @@ def generate_strategy(
         if side is Side.LONG
         else config.close_multiplier_short
     )
-    if provenance is not None:
-        generated["provenance"] = deepcopy(dict(provenance))
     json.dumps(generated, ensure_ascii=False, allow_nan=False)
     return generated
 

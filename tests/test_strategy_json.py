@@ -120,8 +120,10 @@ def _source_points(structure: dict[str, object]) -> pd.DataFrame:
 
 def test_long_json_multiplier_flags_and_template_preservation() -> None:
     structure = _structure(Side.LONG)
+    template = _template()
+    template["provenance"] = {"unused": ["must not reach tester"]}
     generated = generate_strategy(
-        _template(),
+        template,
         structure,
         (Decimal("1"),),
         LotMethod.EQUAL,
@@ -134,6 +136,7 @@ def test_long_json_multiplier_flags_and_template_preservation() -> None:
     assert generated["mrs3"]["ma_long"][0]["multiplier"] == 0.973
     assert generated["mrs3"]["ma_close_long"]["multiplier"] == 1.003
     assert generated["unrelated"] == {"preserve": "exactly"}
+    assert "provenance" not in generated
 
 
 def test_short_json_multiplier_and_close_multiplier() -> None:

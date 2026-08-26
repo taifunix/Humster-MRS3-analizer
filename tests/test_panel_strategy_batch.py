@@ -29,21 +29,11 @@ def _strategy(name: str, analysis_id: str, generation_hash: str) -> dict[str, ob
         "name": name,
         "exchange": {"name": "Bybit"},
         "basic": {"symbol": "BTCUSDT", "use_long": True, "use_short": False},
-        "provenance": {
-            "analysis_run_id": analysis_id,
-            "generation_manifest_sha256": generation_hash,
-            "event_mode": "real_independent_events",
-        },
     }
 
 
 def _strategy_digest(strategy: dict[str, object]) -> str:
-    value = json.loads(json.dumps(strategy))
-    provenance = value["provenance"]
-    assert isinstance(provenance, dict)
-    provenance.pop("strategy_json_sha256", None)
-    provenance.pop("generation_manifest_sha256", None)
-    return sha256(_canonical(value)).hexdigest()
+    return sha256(_canonical(strategy)).hexdigest()
 
 
 def _manifest(tmp_path: Path, *, strategy_count: int = 1) -> Path:
@@ -62,13 +52,11 @@ def _manifest(tmp_path: Path, *, strategy_count: int = 1) -> Path:
     hashes: dict[str, str] = {}
     for name in names:
         document = _strategy(name, analysis_id, "")
-        document["provenance"]["strategy_json_sha256"] = _strategy_digest(document)
-        hashes[f"{name}.json"] = str(document["provenance"]["strategy_json_sha256"])
+        hashes[f"{name}.json"] = _strategy_digest(document)
     generation_unsigned["strategy_json_sha256"] = hashes
     generation_hash = sha256(_canonical(generation_unsigned)).hexdigest()
     for name in names:
         document = _strategy(name, analysis_id, generation_hash)
-        document["provenance"]["strategy_json_sha256"] = hashes[f"{name}.json"]
         (strategies / f"{name}.json").write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
     generation_unsigned["generation_manifest_sha256"] = generation_hash
     manifest = tmp_path / "strategy_manifest.json"

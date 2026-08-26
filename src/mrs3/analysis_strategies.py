@@ -539,24 +539,22 @@ def generate_v6_analysis_strategies(
     variants: list[dict[str, object]] = []
     for structure in structures:
         candidate_identity = str(structure.get("candidate_id", structure["structure_id"]))
-        provenance = {**common, "candidate_identity": candidate_identity}
         methods = (LotMethod.EQUAL,) if int(structure["order_count"]) == 1 else (LotMethod.EQUAL, LotMethod.INCOME)
         for method in methods:
-            strategy = generate_strategy(template, structure, allocate_lots(structure["orders"], method, config), method, config, provenance=provenance)
+            strategy = generate_strategy(template, structure, allocate_lots(structure["orders"], method, config), method, config)
             validate_strategy(strategy, structure, points, config)
-            strategy["provenance"]["strategy_json_sha256"] = _v6_strategy_digest(strategy)
             generated.append(strategy)
-            variants.append({"strategy_name": strategy["name"], "structure_id": structure["structure_id"], "lot_method": method.value, "json_filename": f"{strategy['name']}.json", "variant_type": "MRS3"})
+            variants.append({"strategy_name": strategy["name"], "structure_id": structure["structure_id"], "lot_method": method.value, "json_filename": f"{strategy['name']}.json", "variant_type": "MRS3", "candidate_identity": candidate_identity})
     if not generated:
         raise ValueError("no READY candidate selected")
     validate_unique_names(generated)
     target.mkdir(parents=True, exist_ok=True)
-    strategy_hashes = {str(row["json_filename"]): str(strategy["provenance"]["strategy_json_sha256"]) for row, strategy in zip(variants, generated, strict=True)}
+    strategy_hashes = {str(row["json_filename"]): _v6_strategy_digest(strategy) for row, strategy in zip(variants, generated, strict=True)}
     candidate_identity_to_strategy_names: dict[str, list[str]] = {}
-    for strategy in generated:
+    for row in variants:
         candidate_identity_to_strategy_names.setdefault(
-            str(strategy["provenance"]["candidate_identity"]), []
-        ).append(str(strategy["name"]))
+            str(row["candidate_identity"]), []
+        ).append(str(row["strategy_name"]))
     manifest_unsigned = {
         "format_version": 2,
         "generator_schema_version": V6_READY_GENERATOR_SCHEMA,
@@ -575,7 +573,7 @@ def generate_v6_analysis_strategies(
         "canonical_config_sha256": common["canonical_config_sha256"],
         "algorithm_config_sha256": common["algorithm_config_sha256"],
         "listing_dates_sha256": common["listing_dates_sha256"],
-        "candidate_identities": sorted({str(item["candidate_identity"]) for item in (strategy["provenance"] for strategy in generated)}),
+        "candidate_identities": sorted(candidate_identity_to_strategy_names),
         "candidate_identity_to_strategy_names": {
             key: sorted(value) for key, value in sorted(candidate_identity_to_strategy_names.items())
         },
@@ -584,8 +582,6 @@ def generate_v6_analysis_strategies(
         "template_sha256": sha256(template_file.read_bytes()).hexdigest(),
     }
     generation_hash = sha256(_canonical_v6_json(manifest_unsigned).encode("utf-8")).hexdigest()
-    for strategy in generated:
-        strategy["provenance"]["generation_manifest_sha256"] = generation_hash
     strategies = _publish_strategies(target, pd.DataFrame(variants), generated)
     manifest = {**manifest_unsigned, "generation_manifest_sha256": generation_hash}
     manifest_path = target / "strategy_manifest.json"

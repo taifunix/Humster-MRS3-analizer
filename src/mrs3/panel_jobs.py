@@ -167,6 +167,8 @@ class PanelJobRegistry:
                     job.pop("evidence", None)
                 else:
                     job["evidence"] = json.loads(json.dumps(evidence))
+            if status.get("inbox_ready") is True:
+                job["inbox_ready"] = True
             if runtime is not None:
                 if not isinstance(runtime, dict):
                     raise PanelJobError("INVALID_REQUEST")

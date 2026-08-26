@@ -205,3 +205,74 @@ def capture_verified_inbox(
 
         shutil.rmtree(inbox, ignore_errors=True)
         raise
+
+
+def capture_run_snapshot_inbox(
+    config: RunnerConfig,
+    job_id: str,
+    snapshots: Mapping[str, Mapping[str, object]],
+    reports: Mapping[str, Path],
+    *,
+    tester_config_bytes: bytes,
+    provenance: Mapping[str, object],
+    test_start: str,
+    test_end: str,
+) -> Path:
+    """Capture one completed RUNS job in the same immutable inbox format."""
+    names = tuple(sorted(snapshots))
+    if not names or set(reports) != set(names):
+        raise InboxCaptureError("RUNS reports do not match expected strategies")
+    contract, contract_id, tester_config_hash = _commission_contract(config, tester_config_bytes)
+    inbox = config.inbox_root.resolve() / job_id
+    if inbox.exists():
+        raise InboxCaptureError(f"inbox already exists: {inbox}")
+    entries: list[dict[str, object]] = []
+    try:
+        for name in names:
+            strategy = snapshots[name]
+            exchange = strategy.get("exchange")
+            exchange_name = exchange.get("name") if isinstance(exchange, Mapping) else None
+            if strategy.get("name") != name or not isinstance(exchange_name, str) or not exchange_name.strip():
+                raise InboxCaptureError("RUNS snapshot strategy is invalid")
+            report_path = reports[name]
+            if not report_path.is_file() or extract_html_strategy_name(report_path) != name:
+                raise InboxCaptureError("RUNS HTML report does not match snapshot")
+            strategy_bytes = _atomic_bytes(inbox / "strategies" / f"{name}.json", _canonical_json(strategy))
+            report_bytes = report_path.read_bytes()
+            strategy_id = sha256(_canonical_json(strategy)).hexdigest()
+            report_hash = sha256(report_bytes).hexdigest()
+            entries.append({
+                "manifest_entry_id": sha256(_canonical_json({"strategy": strategy_id, "report": report_hash, "run": job_id})).hexdigest()[:32],
+                "strategy_name": name,
+                "strategy_version_id": strategy_id,
+                "strategy_path": str((inbox / "strategies" / f"{name}.json").resolve()),
+                "report_path": str(report_path.resolve()),
+                "wizard_run_id": f"runs:{job_id}:{name}",
+                "exchange_name": exchange_name,
+                "source_strategy_sha256": sha256(strategy_bytes).hexdigest(),
+                "source_report_sha256": report_hash,
+            })
+        strategy_hashes = provenance.get("strategy_json_sha256")
+        if not isinstance(strategy_hashes, Mapping) or set(strategy_hashes) != {f"{name}.json" for name in names}:
+            raise InboxCaptureError("RUNS provenance does not cover snapshots")
+        manifest = {
+            "schema_version": 1,
+            "batch_id": job_id,
+            "expected_strategy_names": list(names),
+            "tester_config_sha256": tester_config_hash,
+            "commission_contract": contract,
+            "commission_contract_id": contract_id,
+            "source_mode": "direct",
+            "run_mode": "RUNS",
+            "test_start": test_start,
+            "test_end": test_end,
+            "entries": entries,
+            "v6_provenance": json.loads(json.dumps(dict(provenance), sort_keys=True)),
+        }
+        _atomic_bytes(inbox / "inbox_manifest.json", _canonical_json(manifest))
+        return inbox
+    except BaseException:
+        import shutil
+
+        shutil.rmtree(inbox, ignore_errors=True)
+        raise
