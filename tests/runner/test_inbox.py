@@ -58,7 +58,7 @@ def _inputs(tmp_path: Path, config: RunnerConfig) -> tuple[Path, BatchPlan, Wiza
     return tmp_path / "results.csv", plan, wizard, report
 
 
-def test_capture_keeps_source_paths_and_panel_validates_direct_inbox(tmp_path: Path) -> None:
+def test_capture_stages_strategy_and_panel_validates_direct_inbox(tmp_path: Path) -> None:
     config = _config(tmp_path)
     output, plan, wizard, report = _inputs(tmp_path, config)
 
@@ -70,7 +70,8 @@ def test_capture_keeps_source_paths_and_panel_validates_direct_inbox(tmp_path: P
     assert Path(entry["report_path"]).resolve() == report.resolve()
     assert entry["strategy_name"] == "A"
     assert entry["exchange_name"] == "Bybit"
-    assert Path(entry["strategy_path"]).resolve() == (plan.strategy_source / "A.json").resolve()
+    assert Path(entry["strategy_path"]).resolve() == (inbox / "strategies" / "A.json").resolve()
+    assert (inbox / "strategies" / "A.json").read_bytes() == (plan.strategy_source / "A.json").read_bytes()
     PanelController._validate_performance_inbox(inbox)
 
 
@@ -85,7 +86,18 @@ def test_capture_uses_installed_strategy_when_generated_file_is_gone(tmp_path: P
     inbox = capture_verified_inbox(config, output, plan, (wizard,), {"A": report})
 
     entry = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))["entries"][0]
-    assert Path(entry["strategy_path"]).resolve() == installed.resolve()
+    assert Path(entry["strategy_path"]).resolve() == (inbox / "strategies" / "A.json").resolve()
+    assert (inbox / "strategies" / "A.json").read_bytes() == installed.read_bytes()
+    PanelController._validate_performance_inbox(inbox)
+
+
+def test_captured_inbox_survives_source_strategy_removal(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    output, plan, wizard, report = _inputs(tmp_path, config)
+
+    inbox = capture_verified_inbox(config, output, plan, (wizard,), {"A": report})
+    (plan.strategy_source / "A.json").unlink()
+
     PanelController._validate_performance_inbox(inbox)
 
 

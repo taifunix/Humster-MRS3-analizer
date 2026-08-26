@@ -138,7 +138,8 @@ def capture_verified_inbox(
             if not source.is_file():
                 source = config.strategy_dir / f"{name}.json"
             try:
-                strategy = json.loads(source.read_text(encoding="utf-8"))
+                source_bytes = source.read_bytes()
+                strategy = json.loads(source_bytes.decode("utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise InboxCaptureError(f"invalid strategy JSON for {name}") from error
             if not isinstance(strategy, dict):
@@ -149,7 +150,9 @@ def capture_verified_inbox(
                 raise InboxCaptureError(f"strategy exchange.name is missing for {name}")
             strategy_bytes = _canonical_json(strategy)
             strategy_id = sha256(strategy_bytes).hexdigest()
-            source_strategy_hash = sha256(source.read_bytes()).hexdigest()
+            staged_strategy = inbox / "strategies" / f"{name}.json"
+            staged_bytes = _atomic_bytes(staged_strategy, source_bytes)
+            source_strategy_hash = sha256(staged_bytes).hexdigest()
             report_hash = sha256(report_bytes).hexdigest()
             entry_id = sha256(
                 _canonical_json({"strategy": strategy_id, "report": report_hash, "run": result.run_id})
@@ -159,7 +162,7 @@ def capture_verified_inbox(
                     "manifest_entry_id": entry_id,
                     "strategy_name": name,
                     "strategy_version_id": strategy_id,
-                    "strategy_path": str(source.resolve()),
+                    "strategy_path": str(staged_strategy.resolve()),
                     "report_path": str(report_path.resolve()),
                     "wizard_run_id": result.run_id,
                     "exchange_name": exchange_name,

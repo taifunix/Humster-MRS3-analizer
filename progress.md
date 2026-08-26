@@ -715,6 +715,20 @@ HTML folder refreshes derived targets. Remote paths remain validated against
 configured roots, while the local output target keeps the prior operator-
 selected behavior and is used by verified delivery.
 
+### Self-contained tester inbox strategies (2026-08-26)
+
+The failed `PANW_PLTR` Performance DB import was traced to its committed
+manifest pointing at the inaccessible/deleted `Output\\strategies` files.
+The exact 196 strategy hashes were still present in the tester's
+`settings_strategy` directory. The repaired inbox now stages those bytes under
+its own `strategies` directory, and the import completed with `196/196`
+imported and zero quarantine.
+
+`capture_verified_inbox` now stages every ordinary tester strategy in the
+immutable inbox at capture time, matching the existing v6 inbox contract and
+making the flow independent of `Output\\strategies` lifetime or batch size.
+Focused inbox evidence: `15 passed`.
+
 Evidence: all panel tests (`test_panel*.py`) — `345 passed, 1 warning`;
 settings/remote/static focused slice — `96 passed, 1 warning`; mandatory
 reviewer — `CODE_REVIEW_PASS`; `py_compile`, `node --check` and `git diff
