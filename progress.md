@@ -3,6 +3,21 @@
 **Updated:** 2026-08-26
 **Current branch:** `main`
 
+## READY JSON validation recovery (2026-08-26)
+
+READY generation now validates Phase 2 filters before registering its running
+job, so a malformed request cannot leave the next generation permanently busy.
+The fresh-generation endpoint returns a path-safe validation reason and the
+panel displays it instead of collapsing it to `Server validation failed.`.
+
+Evidence: fresh-strategy and static-panel tests `65 passed`; `node --check`
+and `git diff --check` clean apart from existing Windows line-ending warnings.
+
+The live failure also had a local filesystem cause: `Output\\strategies` had
+inheritance disabled and denied the configured panel account. Re-enabling
+inheritance restored the existing parent ACL; a live NVDL shortlist generation
+then committed `4/4` strategies successfully.
+
 ## Performance DB display rounding (2026-08-26)
 
 Performance import admission now tolerates tester display drift using inclusive

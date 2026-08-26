@@ -165,7 +165,7 @@
       let result;
       try { result = await response.json(); } catch (_) { throw new Error('Backend returned invalid JSON.'); }
       if (!response.ok) {
-        const code = typeof result?.error === 'string' && /^[A-Z_]+$/.test(result.error) ? result.error : 'Server validation failed.';
+        const code = typeof result?.error === 'string' && (endpoint.startsWith('/api/v2/strategies/fresh/') || /^[A-Z_]+$/.test(result.error)) ? result.error : 'Server validation failed.';
         throw new Error(code);
       }
       return result;

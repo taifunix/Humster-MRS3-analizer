@@ -2285,6 +2285,7 @@ class PanelController:
         analysis_id = self._required(payload, "analysis_run_id")
         if analysis_id not in self._fresh_analysis_paths:
             raise ValueError("fresh analysis is not available in this panel session")
+        phase2_filters = self._phase2_filters(payload)
         with self._lock:
             if self._fresh_generation_job and self._fresh_generation_job["running"]:
                 raise ValueError("READY JSON generation is already running")
@@ -2294,7 +2295,7 @@ class PanelController:
             "analysis_run_id": analysis_id,
             "candidate_ids": list(candidates),
             "selected_scopes": [list(item) for item in scopes],
-            "filters": self._phase2_filters(payload),
+            "filters": phase2_filters,
         }
         requested = payload.get("output_dir")
         if isinstance(requested, str):
@@ -5699,7 +5700,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(409, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})
             return
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-            self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
+            if endpoint == "/api/v2/strategies/fresh/generate":
+                self._json(400, {"error": _fresh_generation_error(error)})
+            else:
+                self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
             return
         self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start"} else 200, result)
 

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from http.client import HTTPConnection
 import json
 from hashlib import sha256
 from pathlib import Path
+import threading
 from time import monotonic, sleep
 from types import SimpleNamespace
 
+import pytest
+
 from mrs3.config import AlgorithmConfig
-from mrs3.panel import PanelController
+from mrs3.panel import PanelController, create_panel_server
 from mrs3.panel_jobs import PanelJobError
 from mrs3.panel_tester_runs import LocalRunsBatchService
 
@@ -23,6 +27,52 @@ def test_panel_exposes_run_file_generation_action() -> None:
     assert 'id="tester-start-runs"' in panel_html
     assert "strategies.tester.runs" in web_source
     assert "Проверить и запустить стратегии" in panel_html
+
+
+def test_generation_validation_does_not_poison_the_next_request(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
+
+    with pytest.raises(ValueError, match="Phase 2 filters must be booleans"):
+        controller.strategies_fresh_generate({
+            "analysis_run_id": "a" * 64,
+            "candidate_ids": ["candidate"],
+            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
+            "filters": {"source_pnl": "true"},
+        })
+
+    assert controller._fresh_generation_job is None
+
+
+def test_http_generation_validation_reports_actionable_reason(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        payload = json.dumps({
+            "analysis_run_id": "a" * 64,
+            "candidate_ids": ["candidate"],
+            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
+            "filters": {"source_pnl": "true"},
+        }).encode("utf-8")
+        connection.request("POST", "/api/v2/strategies/fresh/generate", payload, {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 400
+    assert body == {"error": "Phase 2 filters must be booleans"}
 
 
 def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -> None:
