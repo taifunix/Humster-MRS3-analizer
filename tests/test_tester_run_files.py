@@ -15,7 +15,7 @@ def test_publish_run_snapshots_replaces_runs_and_configures_tester(tmp_path: Pat
         "settings": [{"name": "template", "basic": {"strategy": "mrs3", "symbol": "OLD", "time_frame": "5m", "use_long": True, "use_short": False}, "mrs3": {
             "ma_long": [{"id": 1, "len": 1, "multiplier": 1.0, "lot_x": 0.0}], "ma_short": [],
             "ma_close_long": {"len": 1, "multiplier": 1.0}, "ma_close_short": {"len": 1, "multiplier": 1.0},
-        }}], "tester_config": {"StartDate": "old", "EndDate": "old", "max_parallel_runs": 1},
+        }}], "tester_config": {"MakerFee": 0.00001, "StartDate": "old", "EndDate": "old", "max_parallel_runs": 1},
     }), encoding="utf-8")
     bot_root = tmp_path / "bot"; runs = bot_root / "tester" / "runs"; runs.mkdir(parents=True)
     (runs / "old.json").write_text("old", encoding="utf-8")
@@ -28,7 +28,8 @@ def test_publish_run_snapshots_replaces_runs_and_configures_tester(tmp_path: Pat
     snapshot = json.loads(files[0].read_text(encoding="utf-8")); settings = snapshot["settings"][0]
     assert settings["basic"]["symbol"] == "BTCUSDT" and settings["basic"]["time_frame"] == "1h"
     assert settings["mrs3"]["ma_long"][0] == {"id": 1, "len": 5, "multiplier": 0.99, "lot_x": 1.0}
-    assert snapshot["tester_config"] == {"StartDate": "2026-08-01T00:00:00", "EndDate": "2026-08-18T00:00:00", "max_parallel_runs": 7}
+    assert snapshot["tester_config"] == {"MakerFee": 0.00001, "StartDate": "2026-08-01T00:00:00", "EndDate": "2026-08-18T00:00:00", "max_parallel_runs": 7}
+    assert '"MakerFee": 0.00001' in files[0].read_text(encoding="utf-8")
     assert json.loads(tester_config.read_text(encoding="utf-8"))["use_runs"] is True
 
 

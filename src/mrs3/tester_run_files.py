@@ -98,7 +98,8 @@ def _inside(path: Path, root: Path, label: str) -> Path:
 
 def _write_json(path: Path, document: Mapping[str, object]) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    rendered = json.dumps(document, ensure_ascii=False, indent=2).replace('"MakerFee": 1e-05', '"MakerFee": 0.00001')
+    temporary.write_text(rendered + "\n", encoding="utf-8")
     os.replace(temporary, path)
 
 

@@ -11,6 +11,8 @@ server-recomputed `READY_AFTER_FILTERS` candidates. It clears only the exact
 dates plus `max_parallel_submissions`; `run_tester.bat` remains manual.
 The bot-exported run template may have a UTF-8 BOM and trailing commas; those
 are accepted only while reading that template.
+Generated snapshots serialize the template's default MakerFee as decimal
+`0.00001`, rather than scientific notation.
 
 Focused verification: `.venv\\Scripts\\python.exe -m pytest
 tests/test_tester_run_files.py tests/test_panel_fresh_strategies.py -q`.
