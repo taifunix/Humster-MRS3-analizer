@@ -104,12 +104,13 @@ win_rate_pct = win_trades / total_trades * 100
 The maximum percentage drawdown from another sample is not substituted for
 `max_drawdown_pct`. Canonical values must agree with declared report values at
 the declared decimal precision, except that tester display fields are compared
-after `ROUND_HALF_UP` at these tolerances: absolute `Total PnL` and
-`Max Drawdown` to the nearest integer; relative `Total PnL, %` and
-`Max Drawdown, %` to one decimal percentage point. These tolerances apply only
-to admission; the precise series-derived values remain stored. An empty,
+using the nearest-unit display interval (an inclusive half-unit tolerance):
+absolute `Total PnL` and `Max Drawdown` use one unit; relative `Total PnL, %`
+and `Max Drawdown, %` use 0.1 percentage point. These tolerances apply only to
+admission; the precise series-derived values remain stored. An empty,
 mismatched, non-finite or non-monotonic series, nonpositive initial balance,
-non-integral count, or declared mismatch quarantines the report.
+non-integral count, or declared mismatch outside its interval quarantines the
+report.
 
 `Profit Factor (gross profit/gross loss)=n/a` is the only permitted unavailable
 typed metric: store `profit_factor=NULL` and

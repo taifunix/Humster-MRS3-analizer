@@ -5,17 +5,18 @@
 ## Decision
 
 During Performance DB import, compare tester display fields to their immutable
-series-derived values after `ROUND_HALF_UP` using these quanta: absolute
-`Total PnL` and `Max Drawdown` to the nearest integer; relative `Total PnL, %`
-and `Max Drawdown, %` to one decimal percentage point. Keep the unrounded
-derived values as the canonical metrics stored in the database.
+series-derived values using the nearest-unit display interval with an
+inclusive half-unit tolerance: absolute `Total PnL` and `Max Drawdown` use one
+unit; relative `Total PnL, %` and `Max Drawdown, %` use 0.1 percentage point.
+Keep the unrounded derived values as the canonical metrics stored in the
+database.
 
 ## Rationale
 
 The tester's HTML summary and sampled equity series can use different internal
 precision. Small display drift must not quarantine an otherwise valid report,
-while the importer must continue to reject differences that cross the selected
-rounding boundary. Other metrics retain their declared decimal precision and
+while the importer must continue to reject differences outside the selected
+rounding interval. Other metrics retain their declared decimal precision and
 validation rules.
 
 ## Consequences

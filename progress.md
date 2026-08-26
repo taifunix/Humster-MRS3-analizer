@@ -5,13 +5,13 @@
 
 ## Performance DB display rounding (2026-08-26)
 
-Performance import admission now tolerates tester display drift with
-`ROUND_HALF_UP`: absolute `Total PnL` and `Max Drawdown` are compared to the
-nearest integer, while their percentage fields use one decimal percentage
-point. Precise series-derived values stored in the database are unchanged.
-The two previously quarantined PANW reports pass the updated validation in
-isolation. Focused verification: `.venv\\Scripts\\python.exe -m pytest
-tests/test_performance_metrics.py tests/test_performance_import.py -q` -- `44
+Performance import admission now tolerates tester display drift using inclusive
+nearest-unit intervals: absolute `Total PnL` and `Max Drawdown` use one unit,
+while their percentage fields use 0.1 percentage point. Precise series-derived
+values stored in the database are unchanged. The two previously quarantined
+PANW reports pass the updated validation in isolation. Focused verification:
+`.venv\\Scripts\\python.exe -m pytest tests/test_performance_metrics.py
+tests/test_performance_import.py tests/test_performance_dd5.py -q` -- `59
 passed`. A full inbox re-import remains pending because its referenced
 `Output\\strategies` JSON files are currently absent.
 

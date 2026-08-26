@@ -87,9 +87,14 @@ def _validate_declared(
         if label in _TENTH_ROUNDED_DECLARED_LABELS
         else Decimal("1").scaleb(declared.as_tuple().exponent)
     )
+    if (
+        label in _INTEGER_ROUNDED_DECLARED_LABELS
+        or label in _TENTH_ROUNDED_DECLARED_LABELS
+    ):
+        if abs(actual - declared) <= quantum / Decimal("2"):
+            return
     rounded = actual.quantize(quantum, rounding=ROUND_HALF_UP)
-    expected = declared.quantize(quantum, rounding=ROUND_HALF_UP)
-    if rounded != expected:
+    if rounded != declared:
         raise PreciseMetricError(f"derived {label} does not match declared metrics")
 
 
