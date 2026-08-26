@@ -32,6 +32,18 @@ def test_publish_run_snapshots_replaces_runs_and_configures_tester(tmp_path: Pat
     assert json.loads(tester_config.read_text(encoding="utf-8"))["use_runs"] is True
 
 
+def test_publish_run_snapshots_reads_bot_template_with_bom_and_trailing_comma(tmp_path: Path) -> None:
+    template = tmp_path / "run_snapshot.json"
+    template.write_bytes(b'\xef\xbb\xbf{"settings":[{"name":"template","basic":{"strategy":"mrs3","symbol":"OLD","time_frame":"5m","use_long":true,"use_short":false},"mrs3":{"ma_long":[{"id":1,"len":1,"multiplier":1.0,"lot_x":0.0}],"ma_short":[],"ma_close_long":{"len":1,"multiplier":1.0},"ma_close_short":{"len":1,"multiplier":1.0}}}],"tester_config":{},}')
+    bot_root = tmp_path / "bot"; tester_config = bot_root / "tester" / "config_tester.json"; tester_config.parent.mkdir(parents=True)
+    tester_config.write_text("{}", encoding="utf-8")
+    structure = {"candidate_id": "C", "structure_id": "S", "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "order_count": 1, "common_close_ma": 7, "orders": ({"point_id": "P", "plateau_id": "PLAT", "open_ma": 5, "shift_bp": 100, "close_support": 1.0, "source_pnl_pct": 10},)}
+
+    result = publish_run_snapshots(template, bot_root, tester_config, [structure], "2026-08-01", "2026-08-18", 1, AlgorithmConfig.defaults())
+
+    assert result["run_count"] == 1
+
+
 def test_publish_run_snapshots_refuses_a_runs_directory_symlink(tmp_path: Path, monkeypatch) -> None:
     bot_root = tmp_path / "bot"; runs = bot_root / "tester" / "runs"; runs.mkdir(parents=True)
     tester_config = bot_root / "tester" / "config_tester.json"; tester_config.write_text("{}", encoding="utf-8")

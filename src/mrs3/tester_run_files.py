@@ -22,6 +22,28 @@ def _timestamp(value: str) -> str:
         raise ValueError("tester run dates must be ISO dates") from error
 
 
+def _bot_template_json(value: str) -> object:
+    """Accept the BOM and trailing commas emitted by the bot's template export."""
+    cleaned: list[str] = []
+    quoted = escaped = False
+    for index, char in enumerate(value):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char == ",":
+            next_char = next((item for item in value[index + 1:] if not item.isspace()), "")
+            if next_char in "}]":
+                continue
+        cleaned.append(char)
+    return json.loads("".join(cleaned))
+
+
 def render_run_snapshot(
     template_path: Path | str,
     structure: Mapping[str, object],
@@ -36,7 +58,7 @@ def render_run_snapshot(
     if _timestamp(start_date) > _timestamp(end_date):
         raise ValueError("tester run start date must not exceed end date")
     try:
-        snapshot = json.loads(Path(template_path).read_text(encoding="utf-8"))
+        snapshot = _bot_template_json(Path(template_path).read_text(encoding="utf-8-sig"))
         settings = snapshot["settings"]
         tester_config = snapshot["tester_config"]
         if not isinstance(settings, list) or len(settings) != 1 or not isinstance(settings[0], dict):
