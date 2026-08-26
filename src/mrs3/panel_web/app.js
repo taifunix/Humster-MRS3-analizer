@@ -610,7 +610,9 @@
   function sourceEvidenceSummary(evidence) {
     if (!evidence) return '';
     const quarantine = Number(evidence.quarantined_count ?? evidence.quarantined ?? 0);
-    const safe = evidence.safe_to_delete || (quarantine === 0 ? 'YES' : 'NO');
+    const safeValue = evidence.safe_to_delete || (quarantine === 0 ? 'YES' : 'NO');
+    const accepted = Number(evidence.accepted_count);
+    const safe = `${safeValue}${Number.isInteger(accepted) && accepted >= 0 ? ` \u00b7 imported ${accepted}` : ''}`;
     const digest = typeof evidence.source_content_digest === 'string'
       ? ` \u00b7 digest ${evidence.source_content_digest.slice(0, 12)}...` : '';
     const coverage = Number.isFinite(Number(evidence.coverage_cells)) ? ` \u00b7 coverage ${evidence.coverage_cells}` : '';

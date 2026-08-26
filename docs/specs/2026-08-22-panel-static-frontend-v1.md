@@ -85,6 +85,9 @@ Local and remote Source DB jobs persist the same safe importer evidence in the
 panel journal: source-content digest, accepted/quarantined counts,
 quarantine reasons, coverage-cell count when supplied, and
 `safe_to_delete`. Paths, credentials and raw report lists are never persisted.
+After a verified remote transfer is published locally, the terminal card shows
+that retained importer evidence (`imported`, `quarantine`, and
+`safe_to_delete`) without reopening the downloaded DuckDB file.
 The local adapter passes the configured Source v6 throughput settings and
 publishes truthful per-report progress. The static panel is the default root;
 `/legacy` remains an explicit compatibility path.

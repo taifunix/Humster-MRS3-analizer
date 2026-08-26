@@ -176,6 +176,8 @@ def test_remote_source_card_renders_two_stage_progress_and_elapsed_time() -> Non
     assert "remoteSourceTrack.style.width" in js
     assert "stage_elapsed_seconds" in js
     assert "sourceEvidenceSummary" in js
+    assert "accepted_count" in js
+    assert "imported ${accepted}" in js
     assert "safe_to_delete" in js
     assert "source_content_digest" in js
 
