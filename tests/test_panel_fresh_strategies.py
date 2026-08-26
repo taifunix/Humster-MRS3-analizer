@@ -46,22 +46,47 @@ def test_generation_validation_does_not_poison_the_next_request(tmp_path: Path) 
     assert controller._fresh_generation_job is None
 
 
-def test_http_generation_validation_reports_actionable_reason(tmp_path: Path) -> None:
+def test_generation_thread_start_failure_does_not_poison_the_next_request(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.local.json"
     config.write_text("{}", encoding="utf-8")
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
     controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
+
+    class FailingThread:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("thread capacity unavailable")
+
+    monkeypatch.setattr("mrs3.panel.threading.Thread", FailingThread)
+
+    with pytest.raises(RuntimeError, match="thread capacity unavailable"):
+        controller.strategies_fresh_generate({
+            "analysis_run_id": "a" * 64,
+            "candidate_ids": ["candidate"],
+            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
+            "filters": {},
+        })
+
+    assert controller._fresh_generation_job is None
+
+
+def test_http_generation_start_failure_reports_actionable_reason(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+
+    def fail_start(_payload):
+        raise RuntimeError("thread capacity unavailable")
+
+    monkeypatch.setattr(controller, "strategies_fresh_generate", fail_start)
     server = create_panel_server("127.0.0.1", 0, controller)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
     try:
-        payload = json.dumps({
-            "analysis_run_id": "a" * 64,
-            "candidate_ids": ["candidate"],
-            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
-            "filters": {"source_pnl": "true"},
-        }).encode("utf-8")
+        payload = json.dumps({}).encode("utf-8")
         connection.request("POST", "/api/v2/strategies/fresh/generate", payload, {"Content-Type": "application/json"})
         response = connection.getresponse()
         body = json.loads(response.read().decode("utf-8"))
@@ -71,8 +96,8 @@ def test_http_generation_validation_reports_actionable_reason(tmp_path: Path) ->
         server.server_close()
         thread.join(timeout=2)
 
-    assert response.status == 400
-    assert body == {"error": "Phase 2 filters must be booleans"}
+    assert response.status == 409
+    assert body == {"error": "thread capacity unavailable"}
 
 
 def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -> None:

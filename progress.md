@@ -9,8 +9,10 @@ READY generation now validates Phase 2 filters before registering its running
 job, so a malformed request cannot leave the next generation permanently busy.
 The fresh-generation endpoint returns a path-safe validation reason and the
 panel displays it instead of collapsing it to `Server validation failed.`.
+Thread-start failures follow the same path and clear the pending job before
+returning the safe reason.
 
-Evidence: fresh-strategy and static-panel tests `65 passed`; `node --check`
+Evidence: fresh-strategy and static-panel tests `66 passed`; `node --check`
 and `git diff --check` clean apart from existing Windows line-ending warnings.
 
 The live failure also had a local filesystem cause: `Output\\strategies` had

@@ -2300,12 +2300,19 @@ class PanelController:
         requested = payload.get("output_dir")
         if isinstance(requested, str):
             thread_payload["output_dir"] = requested
-        threading.Thread(
+        thread = threading.Thread(
             target=self._run_fresh_strategy_generation,
             args=(job, thread_payload),
             name="mrs3-panel-fresh-strategies",
             daemon=True,
-        ).start()
+        )
+        try:
+            thread.start()
+        except RuntimeError:
+            with self._lock:
+                if self._fresh_generation_job is job:
+                    self._fresh_generation_job = None
+            raise
         return dict(job)
 
     def strategies_fresh_generate_runs(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -5697,7 +5704,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(409 if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED", "IDEMPOTENCY_CONFLICT", "RESTART_BLOCKED"} else 400, {"error": error.code})
             return
         except RuntimeError as error:
-            self._json(409, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})
+            self._json(409, {"error": _fresh_generation_error(error)} if endpoint == "/api/v2/strategies/fresh/generate" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
             return
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             if endpoint == "/api/v2/strategies/fresh/generate":
