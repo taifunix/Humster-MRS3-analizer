@@ -141,6 +141,40 @@ def test_derive_precise_metrics_rejects_declared_mismatch_beyond_rounding() -> N
         )
 
 
+def test_derive_precise_metrics_accepts_tester_display_rounding() -> None:
+    declared = {
+        "Initial balance": "1000.00",
+        "Final balance": "1152.10",
+        "Total PnL": "152.07",
+        "Total PnL, %": "15.23",
+        "Max Drawdown": "58.07",
+        "Max Drawdown, %": "4.90",
+        "Win Rate, %": "75.00",
+    }
+    metrics = derive_precise_metrics(
+        Decimal("1000"),
+        [Decimal("1000"), Decimal("1100"), Decimal("1152.0981003978")],
+        [Decimal("1000"), Decimal("1184.424901468"), Decimal("1126.386411388")],
+        3,
+        4,
+        timestamps=[1, 2, 3],
+        declared_metrics=declared,
+    )
+
+    assert metrics.max_drawdown == Decimal("58.038490080")
+    declared["Max Drawdown"] = "59.00"
+    with pytest.raises(PreciseMetricError, match="max drawdown"):
+        derive_precise_metrics(
+            Decimal("1000"),
+            [Decimal("1000"), Decimal("1100"), Decimal("1152.0981003978")],
+            [Decimal("1000"), Decimal("1184.424901468"), Decimal("1126.386411388")],
+            3,
+            4,
+            timestamps=[1, 2, 3],
+            declared_metrics=declared,
+        )
+
+
 def test_derive_precise_metrics_rejects_missing_or_invalid_trade_counts() -> None:
     with pytest.raises(PreciseMetricError, match="total_trades"):
         derive_precise_metrics(

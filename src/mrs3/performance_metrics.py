@@ -29,6 +29,10 @@ _DECLARED_KEYS = {
     "max_drawdown_pct": ("Max Drawdown, %", "MaxDrawdownPercent"),
     "win_rate_pct": ("Win Rate, %", "WinRate"),
 }
+_INTEGER_ROUNDED_DECLARED_LABELS = frozenset(
+    {"total PnL", "max drawdown"}
+)
+_TENTH_ROUNDED_DECLARED_LABELS = frozenset({"total PnL, %", "max drawdown, %"})
 
 
 def _decimal(value: object, label: str) -> Decimal:
@@ -76,9 +80,16 @@ def _validate_declared(
     declared: Decimal,
     label: str,
 ) -> None:
-    quantum = Decimal("1").scaleb(declared.as_tuple().exponent)
+    quantum = (
+        Decimal("1")
+        if label in _INTEGER_ROUNDED_DECLARED_LABELS
+        else Decimal("0.1")
+        if label in _TENTH_ROUNDED_DECLARED_LABELS
+        else Decimal("1").scaleb(declared.as_tuple().exponent)
+    )
     rounded = actual.quantize(quantum, rounding=ROUND_HALF_UP)
-    if rounded != declared:
+    expected = declared.quantize(quantum, rounding=ROUND_HALF_UP)
+    if rounded != expected:
         raise PreciseMetricError(f"derived {label} does not match declared metrics")
 
 

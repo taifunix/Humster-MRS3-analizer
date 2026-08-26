@@ -1,7 +1,19 @@
 # MRS3 — current verification
 
 **Updated:** 2026-08-26
-**Current branch:** `feat/multi-order-plateau-admission`
+**Current branch:** `main`
+
+## Performance DB display rounding (2026-08-26)
+
+Performance import admission now tolerates tester display drift with
+`ROUND_HALF_UP`: absolute `Total PnL` and `Max Drawdown` are compared to the
+nearest integer, while their percentage fields use one decimal percentage
+point. Precise series-derived values stored in the database are unchanged.
+The two previously quarantined PANW reports pass the updated validation in
+isolation. Focused verification: `.venv\\Scripts\\python.exe -m pytest
+tests/test_performance_metrics.py tests/test_performance_import.py -q` -- `44
+passed`. A full inbox re-import remains pending because its referenced
+`Output\\strategies` JSON files are currently absent.
 
 ## Tester run files (2026-08-26)
 
