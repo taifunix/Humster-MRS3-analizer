@@ -100,6 +100,28 @@ def test_http_generation_start_failure_reports_actionable_reason(tmp_path: Path,
     assert body == {"error": "thread capacity unavailable"}
 
 
+def test_http_generation_reports_missing_content_type(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("POST", "/api/v2/strategies/fresh/generate", b"{}")
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 415
+    assert body == {"error": "Content-Type must be application/json"}
+
+
 def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.local.json"; config.write_text("{}", encoding="utf-8")
     template = tmp_path / "Input" / "run_snapshot_2.json"; template.parent.mkdir()

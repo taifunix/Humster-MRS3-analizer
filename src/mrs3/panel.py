@@ -5548,20 +5548,27 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
+        fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
         if content_type.strip().casefold() != "application/json":
-            self._json(415, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "Content-Type must be application/json"})
+            self._json(415, {"error": "Content-Type must be application/json"} if fresh_generation else (
+                {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "Content-Type must be application/json"}
+            ))
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            self._json(400, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "invalid Content-Length"})
+            self._json(400, {"error": "invalid Content-Length"} if fresh_generation else (
+                {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "invalid Content-Length"}
+            ))
             return
         if length <= 0 or length > 65536:
-            self._json(400, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "JSON body must be between 1 and 65536 bytes"})
+            self._json(400, {"error": "JSON body must be between 1 and 65536 bytes"} if fresh_generation else (
+                {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "JSON body must be between 1 and 65536 bytes"}
+            ))
             return
         try:
             document = json.loads(self.rfile.read(length).decode("utf-8"))

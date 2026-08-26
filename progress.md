@@ -750,3 +750,16 @@ Evidence: all panel tests (`test_panel*.py`) — `345 passed, 1 warning`;
 settings/remote/static focused slice — `96 passed, 1 warning`; mandatory
 reviewer — `CODE_REVIEW_PASS`; `py_compile`, `node --check` and `git diff
 --check` clean apart from the existing Windows pytest-cache warning.
+
+### READY JSON request diagnostics (2026-08-26)
+
+The static panel has one listener on `127.0.0.1:8766`; the restart script
+replaced it with the current process before this check. For
+`/api/v2/strategies/fresh/generate`, malformed early HTTP requests now report
+their actual cause (`Content-Type`, malformed `Content-Length`, or invalid
+body size) rather than the misleading generic `invalid settings`. This closes
+the last generic-error path before strategy generation begins.
+
+Evidence: focused fresh-strategy/static-panel suite — `67 passed`; live
+post-restart probe returned `415 Content-Type must be application/json` as
+expected; independent review — `CODE_REVIEW_PASS`; `git diff --check` clean.
