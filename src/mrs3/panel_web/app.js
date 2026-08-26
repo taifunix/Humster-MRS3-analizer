@@ -164,7 +164,10 @@
       }
       let result;
       try { result = await response.json(); } catch (_) { throw new Error('Backend returned invalid JSON.'); }
-      if (!response.ok) throw new Error('Server validation failed.');
+      if (!response.ok) {
+        const code = typeof result?.error === 'string' && /^[A-Z_]+$/.test(result.error) ? result.error : 'Server validation failed.';
+        throw new Error(code);
+      }
       return result;
     } catch (error) {
       const safe = error instanceof TypeError ? new Error('Backend connection unavailable.') : error;
@@ -1217,9 +1220,8 @@
   });
   loadAnalysisCatalog();
   const generateStatus = (message) => {
-    const node = document.querySelector('#shortlist-generate-status');
+    const node = document.querySelector('#tester-status');
     if (node) node.textContent = message;
-    strategyStatus(message);
   };
   const restoreGeneratedBatch = async () => {
     try {
@@ -1336,6 +1338,7 @@
   const testerStatus = testerCard?.querySelector('.card-status');
   const testerTrack = testerCard?.querySelector('.progress-track span');
   const testerStart = document.querySelector('#tester-start');
+  const testerRunsStart = document.querySelector('#tester-start-runs');
   const testerStop = document.querySelector('#tester-stop');
   const testerStartDate = document.querySelector('#tester-start-date');
   const testerEndDate = document.querySelector('#tester-end-date');
@@ -1362,29 +1365,41 @@
   const dd5Status = document.querySelector('#strategy-dd5-status');
   let performanceJobId = '';
   let performancePoller = 0;
+  const testerIsTerminal = (job) => ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
+  const setTesterControls = (busy) => {
+    if (testerStart) testerStart.disabled = busy;
+    if (testerRunsStart) testerRunsStart.disabled = busy;
+    if (generateFresh) generateFresh.disabled = busy;
+    if (generateRuns) generateRuns.disabled = busy;
+  };
   const renderTester = (job) => {
     const p = job.progress || {};
     const total = Number(p.total || job.strategy_count || 0);
-    const checked = Number(p.checked || 0);
+    const runs = job.mode === 'RUNS' || job.kind === 'strategies.tester.runs';
+    const checked = Number(runs ? p.current || 0 : p.checked || 0);
     if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : '0%';
-    const detail = `отправлено ${p.sent || 0} · в работе ${p.running || 0} · результат ${p.result || 0} · проверено ${checked} · повторы ${p.retries || 0}`;
+    const detail = runs
+      ? `готово ${checked} из ${total} отчётов`
+      : `отправлено ${p.sent || 0} · в работе ${p.running || 0} · результат ${p.result || 0} · проверено ${checked} · повторы ${p.retries || 0}`;
     const recoveringInbox = job.phase === 'RECOVERING_INBOX';
     if (testerText) testerText.textContent = recoveringInbox ? 'Восстановление verified inbox из сохранённых отчётов…' : detail;
     if (testerStatus) testerStatus.textContent = recoveringInbox
       ? 'Tester: восстановление verified inbox; тесты повторно не запускаются.'
       : `Tester: ${job.state || 'RUNNING'}. ${detail}`;
     if (testerStop) testerStop.disabled = !testerJobId || ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
-    if (performanceStart) performanceStart.disabled = job.state !== 'COMMITTED';
+    setTesterControls(!testerIsTerminal(job));
+    const verifiedInbox = !runs && job.state === 'COMMITTED';
+    if (performanceStart) performanceStart.disabled = !verifiedInbox;
     const performanceImport = document.querySelector('#performance-import-start');
-    if (performanceImport) performanceImport.disabled = job.state !== 'COMMITTED';
+    if (performanceImport) performanceImport.disabled = !verifiedInbox;
     const importStatus = document.querySelector('#performance-import-status');
-    if (importStatus) importStatus.textContent = job.state === 'COMMITTED'
+    if (importStatus) importStatus.textContent = verifiedInbox
       ? 'Performance DB: READY. Verified inbox подтверждён.'
       : 'Performance DB: ожидание committed tester inbox.';
     const importBadge = performanceImport?.closest('details')?.querySelector('summary .state-badge');
     if (importBadge) {
-      importBadge.className = `state-badge ${job.state === 'COMMITTED' ? 'state-ready' : 'state-pending'}`;
-      importBadge.textContent = job.state === 'COMMITTED' ? 'READY' : 'WAITING';
+      importBadge.className = `state-badge ${verifiedInbox ? 'state-ready' : 'state-pending'}`;
+      importBadge.textContent = verifiedInbox ? 'READY' : 'WAITING';
     }
   };
   const pollTester = async () => {
@@ -1397,21 +1412,39 @@
       }
     } catch (_) { if (testerStatus) testerStatus.textContent = 'Статус tester недоступен.'; }
   };
+  const startTesterPolling = (interval) => {
+    window.clearInterval(testerPoller);
+    testerPoller = window.setInterval(pollTester, interval);
+  };
   if (testerStart) testerStart.addEventListener('click', async () => {
     if (!currentAnalysisId) { strategyStatus('Сначала сформируйте READY JSON.'); return; }
     const startDate = testerStartDate?.value || '';
     const endDate = testerEndDate?.value || '';
     if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Укажите корректные даты начала и конца тестирования.'; return; }
     if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Дата начала не может быть позже даты конца.'; return; }
-    testerStart.disabled = true;
+    setTesterControls(true);
     try {
       const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId, start_date: document.querySelector('#tester-start-date')?.value || startDate, end_date: document.querySelector('#tester-end-date')?.value || endDate } });
       testerJobId = result.job?.job_id || '';
       if (!testerJobId) throw new Error('missing job');
       renderTester(result.job); await pollTester();
-      window.clearInterval(testerPoller); testerPoller = window.setInterval(pollTester, 1000);
-    } catch (_) { if (testerStatus) testerStatus.textContent = 'Не удалось запустить локальный tester batch.'; }
-    finally { testerStart.disabled = false; }
+      startTesterPolling(1000);
+    } catch (_) { if (testerStatus) testerStatus.textContent = 'Не удалось запустить локальный tester batch.'; setTesterControls(false); }
+  });
+  if (testerRunsStart) testerRunsStart.addEventListener('click', async () => {
+    setTesterControls(true);
+    try {
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.runs', request: {} });
+      testerJobId = result.job?.job_id || '';
+      if (!testerJobId) throw new Error('missing job');
+      renderTester(result.job); await pollTester();
+      startTesterPolling(15000);
+    } catch (error) {
+      if (testerStatus) testerStatus.textContent = error?.message === 'RUNS_EMPTY'
+        ? 'Папка runs пуста, сначала сгенерируйте файлы.'
+        : 'Не удалось запустить tester RUNS.';
+      setTesterControls(false);
+    }
   });
   if (testerStop) testerStop.addEventListener('click', async () => {
     if (!testerJobId) return;
@@ -1468,7 +1501,7 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const tester = [...jobs].reverse().find((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester');
+      const tester = [...jobs].reverse().find((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester.runs' || job.kind === 'strategies.tester');
       const performance = [...jobs].reverse().find((job) => job.kind === 'strategies.performance-dd5');
       if (tester && typeof tester.job_id === 'string') {
         const job = tester;
@@ -1476,7 +1509,7 @@
         renderTester(job);
         if (!['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) {
           await pollTester();
-          window.clearInterval(testerPoller); testerPoller = window.setInterval(pollTester, 1000);
+          startTesterPolling(job.kind === 'strategies.tester.runs' ? 15000 : 1000);
         }
       }
       if (performance && typeof performance.job_id === 'string') {

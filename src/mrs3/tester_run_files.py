@@ -79,6 +79,9 @@ def render_run_snapshot(
     rendered["tester_config"]["StartDate"] = _timestamp(start_date)
     rendered["tester_config"]["EndDate"] = _timestamp(end_date)
     rendered["tester_config"]["max_parallel_runs"] = max_parallel_runs
+    # The tester derives its report directory from the global and snapshot
+    # comments.  Keep RUNS reports isolated from ordinary READY batches.
+    rendered["tester_config"]["name_comment"] = "runs"
     return name, rendered
 
 

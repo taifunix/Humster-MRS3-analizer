@@ -268,6 +268,27 @@ tester, переносит READY JSON в `bot_root\settings_strategy` и зап�
 Status сохраняет `sent/running/result/checked/retries`, Stop и re-attach после
 reload остаются явными операциями.
 
+### Tester RUNS
+
+`Generate READY JSON` and `Generate Run files` belong to the Tester batch card.
+Run snapshot generation sets `tester_config.name_comment` to `runs`; with the
+existing global `name_comment=my_test` the bot writes only to
+`bot_root\tester\report\my_test_runs`.
+
+```json
+{"kind":"strategies.tester.runs","request":{}}
+```
+
+The server accepts no browser paths or commands. It requires one or more JSON
+snapshots in the exact `bot_root\tester\runs` directory, otherwise returns
+`RUNS_EMPTY`. Before launch it deletes only the exact `my_test_runs` report
+directory, then invokes `run_tester.bat` non-interactively. Progress is the
+number of completed HTML reports over the immutable snapshot count; RUNS polls
+every 15 seconds. RUNS and ordinary tester batches share the same
+`strategies.tester` job resource, so either start control is disabled while the
+other job is active. A zero-exit tester with fewer reports than snapshots ends
+as `RUNS_INCOMPLETE` rather than committed.
+
 ### Performance import и audit sidecar
 
 ```http

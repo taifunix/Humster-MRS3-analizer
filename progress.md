@@ -1,6 +1,6 @@
 # MRS3 — current verification
 
-**Updated:** 2026-08-25
+**Updated:** 2026-08-26
 **Current branch:** `feat/multi-order-plateau-admission`
 
 ## Tester run files (2026-08-26)
@@ -16,6 +16,14 @@ Generated snapshots serialize the template's default MakerFee as decimal
 
 Focused verification: `.venv\\Scripts\\python.exe -m pytest
 tests/test_tester_run_files.py tests/test_panel_fresh_strategies.py -q`.
+
+The Tester batch card now owns both generation actions and their status.
+Ordinary READY batches and isolated RUNS share one panel job resource. RUNS
+requires generated snapshots, clears only `tester/report/my_test_runs`, starts
+`run_tester.bat` non-interactively, and reports generated HTML count every 15
+seconds. Snapshots use `name_comment=runs`, keeping their reports out of the
+ordinary READY report directory. Next step: focused panel verification and
+independent review before integration.
 
 ## Multi-order plateau admission (2026-08-25)
 

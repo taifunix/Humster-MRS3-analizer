@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 from mrs3.config import AlgorithmConfig
 from mrs3.panel import PanelController
+from mrs3.panel_jobs import PanelJobError
+from mrs3.panel_tester_runs import LocalRunsBatchService
 
 
 def test_panel_exposes_run_file_generation_action() -> None:
@@ -17,6 +19,9 @@ def test_panel_exposes_run_file_generation_action() -> None:
     assert 'id="shortlist-generate-runs"' in panel_html
     assert "/api/v2/strategies/fresh/runs" in panel_source
     assert "#shortlist-generate-runs" in web_source
+    assert 'id="tester-start-runs"' in panel_html
+    assert "strategies.tester.runs" in web_source
+    assert "Проверить и запустить стратегии" in panel_html
 
 
 def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -> None:
@@ -148,6 +153,66 @@ def test_tester_job_uses_the_ui_recovery_kind(tmp_path: Path, monkeypatch) -> No
     controller.strategies_tester_start({"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31"})
 
     assert captured["kind"] == "strategies.tester.start"
+
+
+def test_runs_tester_rejects_an_empty_runs_directory(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    bot_root = tmp_path / "bot"
+    (bot_root / "tester" / "runs").mkdir(parents=True)
+    (bot_root / "run_tester.bat").write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(bot_root=bot_root))
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+
+    try:
+        controller.strategies_tester_runs_start({})
+    except ValueError as error:
+        assert str(error) == "RUNS_EMPTY"
+    else:
+        raise AssertionError("empty runs directory must be rejected")
+
+
+def test_runs_tester_clears_only_its_report_directory_and_counts_html(tmp_path: Path) -> None:
+    root = tmp_path / "bot"
+    runs = root / "tester" / "runs"; runs.mkdir(parents=True)
+    for name in ("001.json", "002.json"):
+        (runs / name).write_text("{}", encoding="utf-8")
+    (root / "run_tester.bat").write_text("@echo off\n", encoding="utf-8")
+    report = root / "tester" / "report" / "my_test_runs"; report.mkdir(parents=True)
+    (report / "old.html").write_text("old", encoding="utf-8")
+
+    class Process:
+        def poll(self): return 0
+        def terminate(self): raise AssertionError("completed process must not be terminated")
+
+    def launch(_root):
+        for name in ("one.html", "two.html"):
+            (report / name).write_text("report", encoding="utf-8")
+        return Process()
+
+    service = LocalRunsBatchService(SimpleNamespace(bot_root=root), launcher=launch)
+    service.start("runs-job")
+    deadline = monotonic() + 3
+    while service.status("runs-job")["state"] == "RUNNING" and monotonic() < deadline:
+        sleep(0.01)
+    result = service.status("runs-job")
+    assert result["state"] == "COMMITTED"
+    assert result["progress"] == {"current": 2, "total": 2, "unit": "reports"}
+    assert not (report / "old.html").exists()
+
+
+def test_runs_and_regular_tester_share_the_panel_job_resource(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"; config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    job = controller._panel_jobs.submit("strategies.tester.start", {}, "regular", ("strategies.tester",))
+    controller._panel_jobs.transition(job["job_id"], "RUNNING")
+
+    try:
+        controller.strategies_tester_runs_start({})
+    except PanelJobError as error:
+        assert error.code == "RESOURCE_BUSY"
+    else:
+        raise AssertionError("RUNS must not overlap the ordinary tester batch")
 
 
 def test_completed_tester_batch_is_recovered_after_panel_restart(tmp_path: Path, monkeypatch) -> None:

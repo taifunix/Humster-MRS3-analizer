@@ -529,10 +529,11 @@ def test_shared_request_json_and_job_recovery_keep_errors_and_busy_state_truthfu
 
     assert 'id="status"' in html
     assert "const requestJson = async (endpoint, options = {})" in js
-    assert "if (!response.ok) throw new Error('Server validation failed.')" in js
+    assert "const code = typeof result?.error === 'string'" in js
     assert "Backend connection unavailable." in js
-    assert "testerStart.disabled = true;" in js
-    assert "finally { testerStart.disabled = false; }" in js
+    assert "const setTesterControls = (busy)" in js
+    assert "if (testerRunsStart) testerRunsStart.disabled = busy;" in js
+    assert "const verifiedInbox = !runs && job.state === 'COMMITTED';" in js
     assert "performanceStart.disabled = true;" in js
     assert "finally { performanceStart.disabled = false; }" in js
     assert "const recoverJobs = async () =>" in js
@@ -560,9 +561,9 @@ def test_shared_json_requests_fail_safely_and_busy_job_controls_cleanup() -> Non
     assert "Backend connection unavailable." in helper
     assert "requestJson('/api/v2/source/local/catalog')" in js
     assert "requestJson('/api/v2/strategies/tester/status?job_id='" in js
-    assert "testerStart.disabled = true" in js
+    assert "setTesterControls(true)" in js
     assert "finally" in js
-    assert "testerStart.disabled = false" in js
+    assert "setTesterControls(false)" in js
     assert "performanceStart.disabled = true" in js
     assert "performanceStart.disabled = false" in js
 

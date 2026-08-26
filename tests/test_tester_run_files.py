@@ -28,9 +28,10 @@ def test_publish_run_snapshots_replaces_runs_and_configures_tester(tmp_path: Pat
     snapshot = json.loads(files[0].read_text(encoding="utf-8")); settings = snapshot["settings"][0]
     assert settings["basic"]["symbol"] == "BTCUSDT" and settings["basic"]["time_frame"] == "1h"
     assert settings["mrs3"]["ma_long"][0] == {"id": 1, "len": 5, "multiplier": 0.99, "lot_x": 1.0}
-    assert snapshot["tester_config"] == {"MakerFee": 0.00001, "StartDate": "2026-08-01T00:00:00", "EndDate": "2026-08-18T00:00:00", "max_parallel_runs": 7}
+    assert snapshot["tester_config"] == {"MakerFee": 0.00001, "StartDate": "2026-08-01T00:00:00", "EndDate": "2026-08-18T00:00:00", "max_parallel_runs": 7, "name_comment": "runs"}
     assert '"MakerFee": 0.00001' in files[0].read_text(encoding="utf-8")
     assert json.loads(tester_config.read_text(encoding="utf-8"))["use_runs"] is True
+    assert snapshot["tester_config"]["name_comment"] == "runs"
 
 
 def test_publish_run_snapshots_reads_bot_template_with_bom_and_trailing_comma(tmp_path: Path) -> None:

@@ -131,6 +131,7 @@ from .fresh_analysis_strategies import (
 )
 from .tester_run_files import publish_run_snapshots
 from .panel_strategy_batch import LocalStrategyBatchService, StrategyBatchValidationError, validate_strategy_manifest
+from .panel_tester_runs import LocalRunsBatchService
 from .panel_performance_dd5 import (
     LocalPerformanceDd5Jobs,
     LocalPerformanceDd5Service,
@@ -1174,6 +1175,7 @@ class PanelController:
         self._fresh_strategy_manifests: dict[str, Path] = {}
         self._fresh_generation_job: dict[str, object] | None = None
         self._strategy_batch_service: LocalStrategyBatchService | None = None
+        self._runs_batch_service: LocalRunsBatchService | None = None
         self._strategy_batch_inboxes: dict[str, Path] = {}
         self._performance_dd5_jobs: LocalPerformanceDd5Jobs | None = None
         self._performance_import_jobs: LocalPerformanceImportJobs | None = None
@@ -1617,6 +1619,8 @@ class PanelController:
             return True
         return (
             self._strategy_batch_service is not None and self._strategy_batch_service.has_active_job()
+        ) or (
+            self._runs_batch_service is not None and self._runs_batch_service.has_active_job()
         ) or bool(self._fresh_generation_job and self._fresh_generation_job.get("running"))
 
     def panel_job_submit(self, payload: Mapping[str, object]) -> dict:
@@ -1624,6 +1628,8 @@ class PanelController:
         request = payload.get("request")
         if kind == "strategies.tester.start" and isinstance(request, Mapping):
             return self.strategies_tester_start(request)
+        if kind == "strategies.tester.runs" and isinstance(request, Mapping):
+            return self.strategies_tester_runs_start(request)
         if kind == "strategies.tester.cancel" and isinstance(request, Mapping):
             return self.strategies_tester_cancel(self._required(request, "job_id"))
         if kind == "strategies.performance.import" and isinstance(request, Mapping):
@@ -2485,6 +2491,11 @@ class PanelController:
             self._strategy_batch_service = LocalStrategyBatchService(RunnerConfig.from_json(self.default_config), on_update=self._record_special_job)
         return self._strategy_batch_service
 
+    def _runs_batch(self) -> LocalRunsBatchService:
+        if self._runs_batch_service is None:
+            self._runs_batch_service = LocalRunsBatchService(RunnerConfig.from_json(self.default_config), on_update=self._record_special_job)
+        return self._runs_batch_service
+
     def strategies_tester_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end"})
         if unexpected:
@@ -2511,8 +2522,23 @@ class PanelController:
             ),
         )
 
+    def strategies_tester_runs_start(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if payload:
+            raise ValueError("tester RUNS request contains unsupported fields")
+        try:
+            return self._start_tracked_panel_job(
+                "strategies.tester.runs", {}, ("strategies.tester",),
+                lambda job_id: self._runs_batch().start(job_id),
+            )
+        except ValueError as error:
+            if str(error) == "RUNS_EMPTY":
+                raise PanelJobError("RUNS_EMPTY") from None
+            raise
+
     def strategies_tester_status(self, job_id: str) -> dict[str, object]:
-        result = self._tracked_job_or_interrupted(job_id, self._strategy_batch().status)
+        tracked = self._panel_jobs.get(job_id)
+        status = self._runs_batch().status if tracked.get("kind") == "strategies.tester.runs" else self._strategy_batch().status
+        result = self._tracked_job_or_interrupted(job_id, status)
         if result.get("state") == "COMMITTED" and isinstance(result.get("inbox_path"), str):
             self._strategy_batch_inboxes[job_id] = Path(result["inbox_path"])
         return {key: value for key, value in result.items() if key != "inbox_path"}
@@ -2561,7 +2587,9 @@ class PanelController:
 
     def strategies_tester_cancel(self, job_id: str) -> dict[str, object]:
         try:
-            result = self._strategy_batch().cancel(job_id)
+            tracked = self._panel_jobs.get(job_id)
+            cancel = self._runs_batch().cancel if tracked.get("kind") == "strategies.tester.runs" else self._strategy_batch().cancel
+            result = cancel(job_id)
         except KeyError:
             return self._panel_jobs.get(job_id)
         self._panel_jobs.cancel(job_id)
