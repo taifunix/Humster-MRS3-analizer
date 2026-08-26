@@ -5558,6 +5558,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "Content-Type must be application/json"}
             ))
             return
+        max_body_length = 1_048_576 if fresh_generation else 65_536
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -5565,8 +5566,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "invalid Content-Length"}
             ))
             return
-        if length <= 0 or length > 65536:
-            self._json(400, {"error": "JSON body must be between 1 and 65536 bytes"} if fresh_generation else (
+        if length <= 0 or length > max_body_length:
+            self._json(400, {"error": f"JSON body must be between 1 and {max_body_length} bytes"} if fresh_generation else (
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "JSON body must be between 1 and 65536 bytes"}
             ))
             return

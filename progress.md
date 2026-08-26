@@ -763,3 +763,9 @@ the last generic-error path before strategy generation begins.
 Evidence: focused fresh-strategy/static-panel suite — `67 passed`; live
 post-restart probe returned `415 Content-Type must be application/json` as
 expected; independent review — `CODE_REVIEW_PASS`; `git diff --check` clean.
+
+The READY JSON endpoint now accepts up to 1 MiB because a checked READY
+selection can legitimately exceed the generic 64 KiB API limit. The live
+70 KiB probe reached candidate validation, proving it no longer fails on body
+size; all other endpoints retain the 64 KiB limit. Focused evidence: `68
+passed`; independent review — `CODE_REVIEW_PASS`.
