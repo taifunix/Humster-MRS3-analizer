@@ -68,7 +68,7 @@ def test_fresh_generation_uses_config_workflow_defaults_not_browser_paths(tmp_pa
     def generate(*args, **kwargs):
         captured["args"] = args
         return SimpleNamespace(
-            analysis_run_id="a" * 64, surface_id="surface", strategy_count=1,
+            run_id="a" * 64, surface_id="surface", strategy_count=1,
             manifest_path=tmp_path / "output" / "strategy_manifest.json",
         )
 
@@ -134,8 +134,31 @@ def test_generation_status_keeps_safe_generation_error(tmp_path: Path, monkeypat
         result = controller.strategies_fresh_generation_status(str(started["job_id"]))
 
     assert result["phase"] == "FAILED"
-    assert result["error"] == "READY JSON generation failed: template is unavailable"
-    assert "workflow default" not in result["error"]
+    assert result["error"] == "READY JSON generation failed: panel workflow default is unavailable"
+
+
+def test_generation_status_redacts_path_from_permission_error(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"panel_workflow": {"strategy_templates": {"LONG": "input/long.json"}}}), encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
+    monkeypatch.setattr(
+        "mrs3.panel.generate_fresh_analysis_strategies",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError(13, "Access is denied", tmp_path / "Output" / "strategies")),
+    )
+
+    started = controller.strategies_fresh_generate({
+        "analysis_run_id": "a" * 64, "candidate_ids": ["candidate"],
+        "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
+    })
+    deadline = monotonic() + 1
+    result = controller.strategies_fresh_generation_status(str(started["job_id"]))
+    while result["running"] and monotonic() < deadline:
+        sleep(0.01)
+        result = controller.strategies_fresh_generation_status(str(started["job_id"]))
+
+    assert result["error"] == "READY JSON generation failed: permission denied while publishing strategy files"
+    assert str(tmp_path) not in result["error"]
 
 
 def test_performance_cleanup_requires_boolean_confirmation(tmp_path: Path) -> None:

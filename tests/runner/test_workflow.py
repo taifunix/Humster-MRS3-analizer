@@ -250,7 +250,7 @@ def test_reconciliation_waits_for_transient_tester_log_mismatch(
     result = WizardResult("run", "", ("A",), {}, "/tester-report/my_test/A.html", "A.html", "", "")
     calls = 0
 
-    monkeypatch.setattr(runner_workflow, "load_wizard_results", lambda _: (result,))
+    monkeypatch.setattr(runner_workflow, "load_wizard_results", lambda _path, **_kwargs: (result,))
     def reconcile(*_: object) -> pd.DataFrame:
         nonlocal calls
         calls += 1
@@ -263,6 +263,27 @@ def test_reconciliation_waits_for_transient_tester_log_mismatch(
 
     assert len(frame) == 1
     assert calls == config.report_stability_polls + 1
+
+
+def test_reconciliation_uses_verified_snapshot_for_blank_chart_url(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    source = tmp_path / "generated"
+    _strategy(source, "A")
+    plan = plan_batch(config, source)
+    snapshot = tmp_path / "A.html"
+    snapshot.write_text('<pre>{"name":"A","basic":{}}</pre>', encoding="utf-8")
+    config.wizard_result.write_text(
+        json.dumps(
+            [{"runId": "run-a", "strategies": ["A"], "stats": {}, "chartUrl": ""}]
+        ),
+        encoding="utf-8",
+    )
+
+    frame = runner_workflow._wait_for_stable_reconciliation(
+        plan, (), config, {"A": snapshot}
+    )
+
+    assert frame.iloc[0]["strategy_name"] == "A"
 
 
 def test_all_reusable_resume_commits_without_starting_bot(
@@ -744,7 +765,9 @@ def test_verified_batch_converts_one_name_mismatch_to_single_strategy_collision(
 ) -> None:
     config = _config(tmp_path)
     result = WizardResult("run", "", ("A",), {}, "/tester-report/my_test/A.html", "A.html", "", "")
-    monkeypatch.setattr(runner_workflow, "load_wizard_results", lambda _: (result,))
+    monkeypatch.setattr(
+        runner_workflow, "load_wizard_results", lambda _path, **_kwargs: (result,)
+    )
     monkeypatch.setattr(
         runner_workflow,
         "reconcile_results",

@@ -61,6 +61,29 @@ def test_supplied_json_maps_adm1_to_exact_report() -> None:
     assert result.report_name == REPORT_NAME
 
 
+def test_verified_snapshot_supplies_report_name_for_blank_chart_url(tmp_path: Path) -> None:
+    result_file = tmp_path / "wizard_result.json"
+    result_file.write_text(
+        json.dumps(
+            [
+                {
+                    "runId": "run-1",
+                    "strategies": ["A"],
+                    "stats": {},
+                    "chartUrl": "",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = load_wizard_results(
+        result_file, fallback_report_names={"A": "A.html"}
+    )[0]
+
+    assert result.report_name == "A.html"
+
+
 def test_reconciliation_rejects_a_different_embedded_strategy_name(tmp_path: Path) -> None:
     report = tmp_path / "A.html"
     report.write_text(

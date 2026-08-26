@@ -407,6 +407,59 @@ def test_controlled_monitor_baselines_stale_row_even_if_wizard_entry_appears_lat
     assert client.launches == 1
 
 
+def test_controlled_monitor_accepts_fresh_snapshot_with_reused_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(_config(tmp_path), report_stability_polls=1)
+    config.report_dir.mkdir(parents=True)
+    report = config.report_dir / "fresh.html"
+    report.write_text("fresh", encoding="utf-8")
+    config.wizard_result.parent.mkdir(parents=True, exist_ok=True)
+    config.wizard_result.write_text(
+        json.dumps(
+            [{"runId": "reused", "strategies": ["A"], "chartUrl": "/tester-report/my_test/old.html"}]
+        ),
+        encoding="utf-8",
+    )
+
+    class FreshCollector:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def discard(self, _: str) -> None:
+            pass
+
+        def snapshot_for(self, _: str) -> Path:
+            return report
+
+    class ReusedResultClient:
+        def launch_strategy(self, _: str) -> None:
+            pass
+
+        def list_strategies(self) -> tuple[StrategyRow, ...]:
+            return (_row(RowState.RESULT, run_id="reused"),)
+
+    monkeypatch.setattr(runner_monitor, "_ReportSnapshotCollector", FreshCollector)
+
+    completion = monitor_controlled_batch(
+        ReusedResultClient(),
+        ("A",),
+        config.wizard_result,
+        config.report_dir,
+        config,
+        snapshot_report_dir=tmp_path / "snapshots",
+    )
+
+    assert completion.strategies["A"].completed
+    assert completion.strategies["A"].report_path == report
+
+
 def test_controlled_monitor_enforces_attempt_budget_from_previous_restart(
     tmp_path: Path,
 ) -> None:

@@ -497,9 +497,9 @@ def _monitor_controlled_batch_loop(
             if entry is None:
                 continue
             entry_run_id = str(entry.get("runId"))
-            if entry_run_id in baseline_run_ids[name]:
-                continue
             report = collector.snapshot_for(name) if collector is not None else None
+            if entry_run_id in baseline_run_ids[name] and report is None:
+                continue
             if report is None and collector is None:
                 report = _report_path(entry, report_dir)
             if (

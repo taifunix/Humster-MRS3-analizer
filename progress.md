@@ -5,6 +5,24 @@
 
 ## Tester run files (2026-08-26)
 
+## READY JSON failure diagnostics (2026-08-26)
+
+The panel preserves an actionable, path-safe cause when asynchronous READY
+JSON generation fails. Permission failures identify publication access, missing
+files identify the template/artifact boundary, and validation failures retain
+their contract message. Focused verification: `14 passed` in
+`tests/test_panel_fresh_strategies.py`.
+
+## Tester snapshot completion recovery (2026-08-26)
+
+If the tester returns an empty `chartUrl`, final reconciliation uses a report
+name only when the controlled batch has already captured a fresh,
+embedded-name-verified snapshot for that exact strategy. A reused tester
+`runId` no longer suppresses such fresh evidence. Otherwise the existing
+strict result validation remains in force. Focused verification:
+`.venv\\Scripts\\python.exe -m pytest tests/runner/test_monitor.py
+tests/runner/test_results.py tests/runner/test_workflow.py -q` — `63 passed`.
+
 The Shortlist button creates isolated tester snapshots for every selected
 server-recomputed `READY_AFTER_FILTERS` candidate. It clears only the exact
 `<bot_root>/tester/runs` target, sets `use_runs=true`, and copies Tester batch

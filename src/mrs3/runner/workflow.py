@@ -155,7 +155,12 @@ def _validated_results_for_names(
 ) -> tuple[WizardResult, ...]:
     """Return only single-strategy results backed by matching valid HTML."""
     try:
-        results = load_wizard_results(config.wizard_result)
+        results = load_wizard_results(
+            config.wizard_result,
+            fallback_report_names={
+                name: path.name for name, path in (report_paths or {}).items()
+            },
+        )
     except Exception:
         return ()
     by_name = {
@@ -206,9 +211,18 @@ def _wait_for_stable_reconciliation(
     while time.monotonic() < deadline:
         try:
             reconcile_kwargs = {"report_paths": report_paths} if report_paths else {}
+            fallback_report_names = {
+                name: path.name for name, path in (report_paths or {}).items()
+            }
             frame = reconcile_results(
                 plan.expected_names,
-                _merge_wizard_results(saved, load_wizard_results(config.wizard_result)),
+                _merge_wizard_results(
+                    saved,
+                    load_wizard_results(
+                        config.wizard_result,
+                        fallback_report_names=fallback_report_names,
+                    ),
+                ),
                 config.report_dir,
                 config.metric_tolerance,
                 **reconcile_kwargs,
@@ -239,9 +253,15 @@ def _wait_for_verified_batch_results(
     while time.monotonic() < deadline:
         try:
             reconcile_kwargs = {"report_paths": report_paths} if report_paths else {}
+            fallback_report_names = {
+                name: path.name for name, path in (report_paths or {}).items()
+            }
             current = tuple(
                 result
-                for result in load_wizard_results(config.wizard_result)
+                for result in load_wizard_results(
+                    config.wizard_result,
+                    fallback_report_names=fallback_report_names,
+                )
                 if len(result.strategy_names) == 1 and result.strategy_names[0] in expected
             )
             if {result.strategy_names[0] for result in current} != expected:

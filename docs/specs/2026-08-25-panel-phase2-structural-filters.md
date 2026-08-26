@@ -69,3 +69,8 @@ make their current non-mutating view the sole source for READY JSON generation.
    the same server-side filtered view as the Refresh action.
 9. A filtered group has `sum(1ORD..4ORD) = READY` for canonical order buckets;
    `DEFERRED` plus `READY` reconciles with `ALL`.
+10. A failed READY JSON job reports its actionable cause but never exposes a
+    local filesystem path.
+11. A completed tester row with an empty `chartUrl` is accepted only when its
+    fresh, embedded-name-verified snapshot HTML is available; a reused tester
+    `runId` does not discard that fresh snapshot.

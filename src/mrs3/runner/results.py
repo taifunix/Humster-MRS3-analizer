@@ -64,7 +64,9 @@ def _report_basename(chart_url: str) -> str:
     return path.name
 
 
-def load_wizard_results(path: Path) -> tuple[WizardResult, ...]:
+def load_wizard_results(
+    path: Path, *, fallback_report_names: Mapping[str, str] | None = None
+) -> tuple[WizardResult, ...]:
     try:
         document = json.loads(
             path.read_text(encoding="utf-8"), parse_float=Decimal, parse_int=Decimal
@@ -97,7 +99,19 @@ def load_wizard_results(path: Path) -> tuple[WizardResult, ...]:
             raise ResultParseError(f"wizard result {run_id} has invalid stats")
         if not isinstance(chart_url, str):
             raise ResultParseError(f"wizard result {run_id} has no chartUrl")
-        report_name = _report_basename(chart_url)
+        fallback_name = (
+            fallback_report_names.get(strategies[0])
+            if not chart_url
+            and len(strategies) == 1
+            and fallback_report_names is not None
+            else None
+        )
+        if fallback_name is not None and (
+            Path(fallback_name).name != fallback_name
+            or not fallback_name.casefold().endswith(".html")
+        ):
+            raise ResultParseError(f"unsafe fallback report name: {fallback_name}")
+        report_name = fallback_name or _report_basename(chart_url)
         results.append(
             WizardResult(
                 run_id=run_id,

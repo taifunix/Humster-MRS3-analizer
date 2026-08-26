@@ -165,6 +165,20 @@ def _safe_direct_error(message: str | None) -> str | None:
     return message
 
 
+def _fresh_generation_error(error: BaseException) -> str:
+    """Return the actionable part of a READY-generation failure without paths."""
+    if isinstance(error, PermissionError):
+        return "permission denied while publishing strategy files"
+    if isinstance(error, FileNotFoundError):
+        return "required strategy template or analysis artifact is unavailable"
+    message = str(error).strip()
+    if not message:
+        return "generation request failed"
+    if _DIRECT_WINDOWS_PATH_PATTERN.search(message) or _DIRECT_ABSOLUTE_PATH_PATTERN.search(message):
+        return "generation failed while accessing a local file"
+    return message
+
+
 def _direct_error_message(error: BaseException) -> str:
     if isinstance(error, DirectMaterializationError):
         message = _safe_direct_error(str(error))
@@ -2316,9 +2330,7 @@ class PanelController:
             result = self._generate_fresh_strategies(payload)
         except Exception as error:
             with self._lock:
-                message = str(error).casefold()
-                detail = "template is unavailable" if "template" in message or "workflow default" in message else "generation request is invalid"
-                job.update(phase="FAILED", running=False, error=f"READY JSON generation failed: {detail}")
+                job.update(phase="FAILED", running=False, error=f"READY JSON generation failed: {_fresh_generation_error(error)}")
         else:
             with self._lock:
                 job.update(result, phase="COMMITTED", running=False)
@@ -2353,7 +2365,7 @@ class PanelController:
         self._fresh_strategy_manifests[analysis_id] = result.manifest_path
         return {
             "phase": "COMMITTED",
-            "analysis_run_id": result.analysis_run_id,
+            "analysis_run_id": result.run_id,
             "surface_id": result.surface_id,
             "strategy_count": result.strategy_count,
             "manifest": result.manifest_path.name,
