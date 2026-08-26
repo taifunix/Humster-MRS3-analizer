@@ -195,6 +195,24 @@ def test_committed_tester_inbox_readiness_survives_panel_reload(tmp_path: Path) 
     assert controller._panel_jobs.get(job["job_id"])["inbox_ready"] is True
 
 
+def test_existing_committed_tester_inbox_is_marked_ready_on_panel_reload(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    inbox_root = tmp_path / "inbox"
+    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=inbox_root))
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    job = controller._panel_jobs.submit("strategies.tester.start", {}, "tester", job_id="batch-1")
+    controller._panel_jobs.transition(job["job_id"], "RUNNING")
+    inbox = inbox_root / job["job_id"]
+    controller._panel_jobs.transition(job["job_id"], "FAILED")
+    controller._panel_jobs.recover_committed(job["job_id"], runtime={"inbox_path": str(inbox)})
+    monkeypatch.setattr(controller, "_validate_performance_inbox", lambda _inbox: None)
+
+    controller._reconcile_interrupted_tester_jobs()
+
+    assert controller._panel_jobs.get(job["job_id"])["inbox_ready"] is True
+
+
 def test_runs_tester_rejects_an_empty_runs_directory(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.local.json"
     config.write_text("{}", encoding="utf-8")

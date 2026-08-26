@@ -2138,10 +2138,26 @@ class PanelController:
         except Exception:
             return
         for job in self._panel_jobs.list():
-            if job.get("kind") not in {"strategies.tester", "strategies.tester.start"} or job.get("state") != "FAILED":
+            if job.get("kind") not in {"strategies.tester", "strategies.tester.start", "strategies.tester.runs"}:
                 continue
             job_id = job.get("job_id")
             if not isinstance(job_id, str):
+                continue
+            if job.get("state") == "COMMITTED" and job.get("inbox_ready") is not True:
+                try:
+                    runtime = self._panel_jobs.runtime(job_id)
+                    inbox = Path(runtime["inbox_path"]).resolve()
+                    inbox.relative_to(inbox_root)
+                    self._validate_performance_inbox(inbox)
+                    self._panel_jobs.sync(
+                        job_id,
+                        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+                        runtime={"inbox_path": str(inbox)},
+                    )
+                except (KeyError, OSError, TypeError, ValueError, PanelJobError):
+                    pass
+                continue
+            if job.get("state") != "FAILED":
                 continue
             state_path = inbox_root / f"{job_id}.state.json"
             try:

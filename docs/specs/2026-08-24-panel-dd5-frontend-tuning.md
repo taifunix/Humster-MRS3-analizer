@@ -494,6 +494,10 @@ request не принимаются, а display path не заменяет artif
 8. Static resources и artifact-open имеют allowlist; traversal, raw paths,
    credentials и OS commands fail closed.
 
+9. A completed tester batch may republish reports only from its own verified
+   `.<batch_id>.report_snapshots` directory; any other external report path
+   remains invalid.
+
 ## Acceptance evidence
 
 Task 0 обязан оставить только эту спецификацию и один узкий static contract

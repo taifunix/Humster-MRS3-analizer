@@ -5,6 +5,18 @@
 
 ## Tester run files (2026-08-26)
 
+## Verified snapshot republish (2026-08-26)
+
+An ordinary tester batch may republish a completed report from only its own
+`.<batch_id>.report_snapshots` directory. This preserves the strict inbox path
+boundary while allowing the worker to finish `COMMITTED` and unlock Performance
+DB import after verified snapshot capture. Focused verification:
+`.venv\\Scripts\\python.exe -m pytest tests/test_panel_strategy_batch.py
+tests/test_panel_fresh_strategies.py tests/test_panel_jobs.py
+tests/test_panel_static_ui.py -q` — `81 passed`.
+On panel reload, an existing committed tester job now revalidates its persisted
+inbox and restores `inbox_ready`, so the Performance DB action is not lost.
+
 ## READY JSON failure diagnostics (2026-08-26)
 
 The panel preserves an actionable, path-safe cause when asynchronous READY

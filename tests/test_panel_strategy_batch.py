@@ -330,6 +330,45 @@ def test_start_passes_v6_provenance_and_preserves_inbox_reports_by_default(tmp_p
     assert (report_dir / "S0.html").read_text(encoding="utf-8") == report
 
 
+def test_start_republishes_report_from_its_verified_snapshot_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = _manifest(tmp_path)
+    bot_root = tmp_path / "bot"
+    report_dir = bot_root / "tester" / "report" / "my_test"
+    report_dir.mkdir(parents=True)
+    config = RunnerConfig(
+        bot_root=bot_root,
+        executable_path=bot_root / "hb_c.exe",
+        base_url="http://127.0.0.1:8087",
+        port=8087,
+        strategy_dir=bot_root / "settings_strategy",
+        report_dir=report_dir,
+        wizard_result=bot_root / "tester" / "wizard_result.json",
+        wizard_progress=bot_root / "tester" / "wizard_progress.json",
+        tester_config=bot_root / "tester" / "tester_config.json",
+        inbox_root=tmp_path / "inbox-root",
+    )
+    inbox = tmp_path / "inbox" / "batch"
+    snapshot = inbox.parent / ".batch.report_snapshots"
+    snapshot.mkdir(parents=True)
+    report = '<pre>{"name":"S0"}</pre>'
+    source = snapshot / "S0.html"
+    source.write_text(report, encoding="utf-8")
+    inbox.mkdir()
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "entries": [{"strategy_name": "S0", "report_path": str(source.resolve())}],
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(strategy_batch, "validate_runtime_preflight", lambda _config: None)
+    service = LocalStrategyBatchService(config, run_batch=lambda *_args, **_kwargs: _FakeResult(inbox, tmp_path / "progress.json"))
+    job_id = str(service.start(manifest)["job_id"])
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and service.status(job_id)["state"] == "RUNNING":
+        time.sleep(0.01)
+
+    assert service.status(job_id)["state"] == "COMMITTED"
+    assert (report_dir / "S0.html").read_text(encoding="utf-8") == report
+
+
 def test_cancel_is_cooperative_and_does_not_expose_exception_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = _manifest(tmp_path)
     started = Event()

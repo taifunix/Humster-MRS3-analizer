@@ -156,9 +156,15 @@ def validate_strategy_manifest(manifest_path: Path) -> ValidatedStrategyManifest
 def _safe_report_path(root: Path, relative: object) -> Path:
     if not isinstance(relative, str) or not relative.strip():
         raise RuntimeError("inbox report path is invalid")
-    candidate = (root / relative).resolve()
+    value = Path(relative)
+    candidate = value.resolve() if value.is_absolute() else (root / value).resolve()
     try:
-        candidate.relative_to(root.resolve())
+        allowed_root = (
+            (root.parent / f".{root.name}.report_snapshots").resolve()
+            if value.is_absolute()
+            else root.resolve()
+        )
+        candidate.relative_to(allowed_root)
     except ValueError as exc:
         raise RuntimeError("inbox report path is invalid") from exc
     if not candidate.is_file():
