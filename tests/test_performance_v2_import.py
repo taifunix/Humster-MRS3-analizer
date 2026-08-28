@@ -131,15 +131,25 @@ def _inbox(tmp_path: Path, names: tuple[str, ...] = ("alpha",), *, orders: int =
     return inbox, report_root, snapshot
 
 
-def _request(tmp_path: Path, *, names: tuple[str, ...] = ("alpha",), orders: int = 1, mode: str = "ADD") -> tuple[PerformanceV2ImportRequest, bytes]:
+def _request(
+    tmp_path: Path,
+    *,
+    names: tuple[str, ...] = ("alpha",),
+    orders: int = 1,
+    mode: str = "ADD",
+    initialize_db: bool = True,
+) -> tuple[PerformanceV2ImportRequest, bytes]:
     inbox, report_root, snapshot = _inbox(tmp_path, names, orders=orders)
     config = PerformanceV2Config(tmp_path / "v2", workers=4)
-    return PerformanceV2ImportRequest(inbox, report_root, config, mode=mode), snapshot
+    request = PerformanceV2ImportRequest(inbox, report_root, config, mode=mode)
+    if initialize_db:
+        _db(request)
+    return request, snapshot
 
 
 def _db(request: PerformanceV2ImportRequest) -> Path:
     target = performance_v2_database_path(request.config)
-    target.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(str(target)) as connection:
         initialize_performance_v2(connection)
     return target
@@ -276,7 +286,7 @@ def test_replace_rollback_restores_old_result_after_delete_failure(tmp_path: Pat
 
 
 def test_lock_conflict_does_not_read_inbox_or_create_staging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    request, _ = _request(tmp_path)
+    request, _ = _request(tmp_path, initialize_db=False)
     target = _db(request)
     held = duckdb.connect(str(target))
     import mrs3.performance_v2_import as import_module
@@ -288,3 +298,63 @@ def test_lock_conflict_does_not_read_inbox_or_create_staging(tmp_path: Path, mon
     finally:
         held.close()
     assert not (request.config.database_root / ".staging").exists()
+
+
+def test_missing_target_fails_before_connect_and_does_not_create_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request, _ = _request(tmp_path, initialize_db=False)
+    import mrs3.performance_v2_import as import_module
+    monkeypatch.setattr(import_module.duckdb, "connect", lambda *args, **kwargs: pytest.fail("connect called"))
+
+    with pytest.raises(PerformanceV2ImportError, match="target does not exist"):
+        import_performance_v2(request)
+
+    target = performance_v2_database_path(request.config)
+    assert not target.exists()
+    assert not request.config.database_root.exists()
+    assert not (request.config.database_root / "import_audit.v2.json").exists()
+
+
+def test_empty_target_fails_schema_gate_without_staging_or_audit(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, initialize_db=False)
+    target = performance_v2_database_path(request.config)
+    target.parent.mkdir(parents=True)
+    target.touch()
+
+    with pytest.raises(PerformanceV2ImportError, match="schema version 2"):
+        import_performance_v2(request)
+
+    assert target.exists()
+    assert not (request.config.database_root / ".staging").exists()
+    assert not (request.config.database_root / "import_audit.v2.json").exists()
+
+
+def test_invalid_schema_fails_before_staging_or_audit(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, initialize_db=False)
+    target = performance_v2_database_path(request.config)
+    target.parent.mkdir(parents=True)
+    with duckdb.connect(str(target)) as connection:
+        connection.execute("create table not_v2 (value integer)")
+
+    with pytest.raises(PerformanceV2ImportError, match="schema version 2"):
+        import_performance_v2(request)
+
+    assert not (request.config.database_root / ".staging").exists()
+    assert not (request.config.database_root / "import_audit.v2.json").exists()
+
+
+def test_absent_target_is_not_reported_as_lock_conflict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    request, _ = _request(tmp_path, initialize_db=False)
+    import mrs3.performance_v2_import as import_module
+    monkeypatch.setattr(
+        import_module.duckdb,
+        "connect",
+        lambda *args, **kwargs: (_ for _ in ()).throw(duckdb.IOException("lock")),
+    )
+
+    with pytest.raises(PerformanceV2ImportError, match="target does not exist") as error:
+        import_performance_v2(request)
+
+    assert not isinstance(error.value, PerformanceV2LockedError)
+    assert not request.config.database_root.exists()

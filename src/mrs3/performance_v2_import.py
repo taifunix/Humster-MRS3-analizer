@@ -26,7 +26,6 @@ from .performance_v2_input import (
 from .performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
-    initialize_performance_v2,
     performance_v2_database_path,
     require_performance_v2,
 )
@@ -649,7 +648,10 @@ def import_performance_v2(request: PerformanceV2ImportRequest) -> PerformanceV2I
         target = performance_v2_database_path(config)
     except (ValueError, TypeError) as error:
         raise PerformanceV2ImportError("invalid Performance v2 target") from error
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.is_file() or target.stat().st_size == 0:
+        raise PerformanceV2ImportError(
+            "Performance v2 target does not exist or does not have schema version 2"
+        )
     connection: duckdb.DuckDBPyConnection | None = None
     staging: Path | None = None
     lock_acquired = False
@@ -660,13 +662,14 @@ def import_performance_v2(request: PerformanceV2ImportRequest) -> PerformanceV2I
         try:
             connection = duckdb.connect(str(target))
         except duckdb.Error as error:
-            raise PerformanceV2LockedError("Performance v2 database is locked") from error
-        lock_acquired = True
+            if "lock" in str(error).casefold():
+                raise PerformanceV2LockedError("Performance v2 database is locked") from error
+            raise PerformanceV2ImportError("Performance v2 target does not have schema version 2") from error
         try:
-            initialize_performance_v2(connection)
             require_performance_v2(connection)
         except (PerformanceV2StoreError, duckdb.Error) as error:
             raise PerformanceV2ImportError("Performance v2 target does not have schema version 2") from error
+        lock_acquired = True
         prepared = read_performance_v2_inbox(request.inbox, request.report_root, config=config)
         staging = create_v2_parser_staging(config.database_root, prepared)
         parsed = _parse_reports(staging, prepared, config)
