@@ -3,6 +3,15 @@
 **Updated:** 2026-08-28
 **Current branch:** `main`
 
+The 2026-08-28 main-branch commit audit is complete. Relevant work is now
+split into `de0ee4c` (Fast TEST contour), `b58f22d` (inode-preserving strategy
+publication), `edc5d40` (16-worker Performance import defaults), `4a2bab8`
+(Fast TEST implementation plan), and `23575e8` (unified Performance v2
+specification, ADR and vertical-slice plan). The v2 implementation remains
+pending by design. The current focused verification is 255 passed tests plus
+`node --check src/mrs3/panel_web/app.js`; no runtime or generated artifacts
+were committed.
+
 Unified Performance Analytics v2 design is approved and recorded in
 `docs/specs/2026-08-28-unified-performance-analytics-v2.md` and ADR-0020. The
 approved boundary is one Performance DuckDB, one current replaceable result per
