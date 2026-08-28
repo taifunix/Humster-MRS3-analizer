@@ -187,6 +187,7 @@ def test_visible_performance_card_targets_only_v2_import_job_and_status() -> Non
     card = html.split('class="panel-card accordion panel-performance-v2"', 1)[1].split("</details>", 1)[0]
     handler = js.split("importStartV2?.addEventListener", 1)[1].split("const recoverSplitJobs", 1)[0]
     recovery = js.split("const recoverSplitJobs = async", 1)[1].split("const settingsStatus", 1)[0]
+    v2_slice = js.split("const importStartV2", 1)[1].split("const settingsStatus", 1)[0]
 
     assert 'id="performance-import-start"' in card
     assert "delete-tested-html-v2" not in card
@@ -200,6 +201,7 @@ def test_visible_performance_card_targets_only_v2_import_job_and_status() -> Non
     assert "dd5-workbook" not in handler
     assert "strategies.performance.v2.import" in recovery
     assert "/api/v2/strategies/performance-v2/import/status" in recovery
+    assert "refreshPerformanceCatalog();" not in v2_slice
 
 
 def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_path: Path, monkeypatch) -> None:

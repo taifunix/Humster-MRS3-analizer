@@ -1657,7 +1657,6 @@
       }
     } catch (_) { /* stale jobs remain visible through the server registry */ }
   };
-  refreshPerformanceCatalog();
   const settingsStatus = document.querySelector('#settings-status');
   const settingsPayload = () => ({ panel: {
     default_root: document.querySelector('#settings-default-root')?.value || 'static',
