@@ -12,7 +12,7 @@ from openpyxl import load_workbook
 
 from mrs3.config import AlgorithmConfig
 from mrs3.models import Side
-from mrs3.pipeline import ALGORITHM_VERSION, PipelineInput, SelectionInputs, _apply_package_event_unions, _pair_history, _write_json_atomic, run_published_pipeline, run_selection
+from mrs3.pipeline import ALGORITHM_VERSION, PipelineInput, SelectionInputs, _apply_package_event_unions, _pair_history, _publish_strategies, _write_json_atomic, run_published_pipeline, run_selection
 from tests.factories import write_selection_inputs
 from tests.test_package_loader import write_real_package
 
@@ -509,8 +509,13 @@ def test_rerun_replaces_strategy_directory_without_stale_json(tmp_path: Path) ->
         tmp_path / "output",
     )
     first = run_selection(inputs, config)
+    target = inputs.output_dir / "strategies"
+    target_identity = (target.stat().st_dev, target.stat().st_ino)
     stale = inputs.output_dir / "strategies" / "STALE.json"
     stale.write_text('{"name":"STALE"}', encoding="utf-8")
+    stale_dir = inputs.output_dir / "strategies" / "stale-directory"
+    stale_dir.mkdir()
+    (stale_dir / "nested.json").write_text('{"stale":true}', encoding="utf-8")
 
     second = run_selection(inputs, config)
 
@@ -519,3 +524,74 @@ def test_rerun_replaces_strategy_directory_without_stale_json(tmp_path: Path) ->
     assert len(first.generated_strategies) == len(second.generated_strategies)
     assert actual == expected
     assert not stale.exists()
+    assert not stale_dir.exists()
+    assert (target.stat().st_dev, target.stat().st_ino) == target_identity
+
+
+def test_strategy_publication_rolls_back_after_install_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = tmp_path / "output"
+    target = output / "strategies"
+    target.mkdir(parents=True)
+    (target / "OLD.json").write_text('{"name":"OLD"}', encoding="utf-8")
+    stale_dir = target / "old-directory"
+    stale_dir.mkdir()
+    (stale_dir / "nested.json").write_text("old", encoding="utf-8")
+    identity = (target.stat().st_dev, target.stat().st_ino)
+    variants = pd.DataFrame([{"json_filename": "NEW-1.json"}, {"json_filename": "NEW-2.json"}])
+    generated = [{"name": "NEW-1"}, {"name": "NEW-2"}]
+    original_replace = Path.replace
+    failed = False
+
+    def fail_second_install(self: Path, destination: Path) -> Path:
+        nonlocal failed
+        if self.name == "NEW-2.json" and destination.parent == target and not failed:
+            failed = True
+            raise OSError("injected install failure")
+        return original_replace(self, destination)
+
+    monkeypatch.setattr(Path, "replace", fail_second_install)
+    with pytest.raises(OSError, match="injected install failure"):
+        _publish_strategies(output, variants, generated)
+
+    assert failed
+    assert sorted(path.name for path in target.iterdir()) == ["OLD.json", "old-directory"]
+    assert (target / "OLD.json").read_bytes() == b'{"name":"OLD"}'
+    assert (stale_dir / "nested.json").read_bytes() == b"old"
+    assert not (target / "NEW-1.json").exists()
+    assert not (target / "NEW-2.json").exists()
+    assert (target.stat().st_dev, target.stat().st_ino) == identity
+    assert not list(output.glob(".strategies.mrs3-stage-*"))
+    assert not (output / ".strategies.mrs3-backup").exists()
+
+
+def test_strategy_publication_retains_backup_when_rollback_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = tmp_path / "output"
+    target = output / "strategies"
+    target.mkdir(parents=True)
+    old = target / "OLD.json"
+    old.write_bytes(b"old")
+    variants = pd.DataFrame([{"json_filename": "NEW.json"}])
+    original_replace = Path.replace
+    install_failed = False
+    restore_failed = False
+
+    def fail_restore(self: Path, destination: Path) -> Path:
+        nonlocal install_failed, restore_failed
+        if self.name == "NEW.json" and destination.parent == target and not install_failed:
+            install_failed = True
+            raise OSError("injected install failure")
+        if self.name == "OLD.json" and destination.parent == target and install_failed and not restore_failed:
+            restore_failed = True
+            raise OSError("injected restore failure")
+        return original_replace(self, destination)
+
+    monkeypatch.setattr(Path, "replace", fail_restore)
+    with pytest.raises(OSError, match="injected install failure"):
+        _publish_strategies(output, variants, [{"name": "NEW"}])
+
+    backup = output / ".strategies.mrs3-backup"
+    assert install_failed and restore_failed
+    assert (backup / "OLD.json").read_bytes() == b"old"
+    assert not list(output.glob(".strategies.mrs3-stage-*"))
+    with pytest.raises(RuntimeError, match="strategy backup requires recovery"):
+        _publish_strategies(output, variants, [{"name": "NEW"}])

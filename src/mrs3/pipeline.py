@@ -276,31 +276,53 @@ def _publish_strategies(
     if backup.exists():
         raise RuntimeError(f"strategy backup requires recovery: {backup}")
     staging = Path(tempfile.mkdtemp(prefix=".strategies.mrs3-stage-", dir=output_dir))
-    moved_existing = False
-    installed = False
+    moved_existing: list[str] = []
+    installed: list[str] = []
+    rollback_failed = False
     try:
         for row, strategy in zip(
             lot_variants.itertuples(index=False), generated, strict=True
         ):
             _write_json_atomic(staging / row.json_filename, strategy)
-        if target.exists():
-            if not target.is_dir():
-                raise RuntimeError(f"strategy output is not a directory: {target}")
-            target.replace(backup)
-            moved_existing = True
-        staging.replace(target)
-        installed = True
-        if moved_existing:
-            shutil.rmtree(backup)
+
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            raise RuntimeError(f"strategy output is not a directory: {target}")
+        target.mkdir(parents=True, exist_ok=True)
+        backup.mkdir()
+        for existing in sorted(target.iterdir(), key=lambda path: path.name):
+            existing.replace(backup / existing.name)
+            moved_existing.append(existing.name)
+        expected_names = {str(row.json_filename) for row in lot_variants.itertuples(index=False)}
+        for staged in sorted(staging.iterdir(), key=lambda path: path.name):
+            staged.replace(target / staged.name)
+            installed.append(staged.name)
+        if set(installed) != expected_names:
+            raise RuntimeError("strategy publication installed an unexpected file set")
+        shutil.rmtree(backup)
         return target
-    except Exception:
-        if moved_existing and backup.exists() and not target.exists():
-            backup.replace(target)
+    except BaseException:
+        for name in installed:
+            current = target / name
+            if current.exists() or current.is_symlink():
+                try:
+                    if current.is_dir() and not current.is_symlink():
+                        shutil.rmtree(current)
+                    else:
+                        current.unlink()
+                except OSError:
+                    rollback_failed = True
+        for name in moved_existing:
+            previous = backup / name
+            if previous.exists() or previous.is_symlink():
+                try:
+                    previous.replace(target / name)
+                except OSError:
+                    rollback_failed = True
         raise
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-        if installed and backup.exists():
+        if backup.exists() and not rollback_failed:
             shutil.rmtree(backup)
 
 
