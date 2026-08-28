@@ -6,11 +6,13 @@ from pathlib import Path
 
 import duckdb
 
+from .config import PanelPathSettings
+
 
 _SCHEMA_VERSION = "2"
 _DATABASE_NAME = "strategy_performance.duckdb"
 _MAX_WORKERS = 64
-_V1_PERFORMANCE_ROOT = Path("data/performanceDB")
+_DEFAULT_V1_PERFORMANCE_ROOT = PanelPathSettings().performance_db_root
 
 
 class PerformanceV2StoreError(ValueError):
@@ -23,7 +25,7 @@ class PerformanceV2Config:
     workers: int = 16
     max_html_bytes: int = 67_108_864
     max_actions_per_report: int = 1_000_000
-    v1_database_root: Path = _V1_PERFORMANCE_ROOT
+    v1_database_root: Path = _DEFAULT_V1_PERFORMANCE_ROOT
 
     def __post_init__(self) -> None:
         for name in ("database_root", "v1_database_root"):
@@ -39,7 +41,9 @@ class PerformanceV2Config:
             object.__setattr__(self, "workers", _MAX_WORKERS)
 
 
-def load_performance_v2_config(path: Path) -> PerformanceV2Config:
+def load_performance_v2_config(
+    path: Path, *, v1_database_root: Path | None = None
+) -> PerformanceV2Config:
     """Load only the additive v2 namespace from its dedicated configuration."""
     path = Path(path)
     try:
@@ -62,12 +66,17 @@ def load_performance_v2_config(path: Path) -> PerformanceV2Config:
         or ".." in relative_root.parts
     ):
         raise ValueError("unified_performance_v2.database_root must be a relative path")
+    runtime_v1_root = _DEFAULT_V1_PERFORMANCE_ROOT if v1_database_root is None else v1_database_root
+    if not isinstance(runtime_v1_root, Path):
+        raise ValueError("unified_performance_v2.v1_database_root must be a path")
+    if not runtime_v1_root.is_absolute():
+        runtime_v1_root = path.parent / runtime_v1_root
     return PerformanceV2Config(
         database_root=(path.parent / relative_root),
         workers=section.get("workers", 16),
         max_html_bytes=section.get("max_html_bytes", 67_108_864),
         max_actions_per_report=section.get("max_actions_per_report", 1_000_000),
-        v1_database_root=path.parent / _V1_PERFORMANCE_ROOT,
+        v1_database_root=runtime_v1_root,
     )
 
 
@@ -231,6 +240,33 @@ CREATE INDEX IF NOT EXISTS strategy_actions_result_timestamp_idx ON strategy_act
 CREATE INDEX IF NOT EXISTS strategy_equity_result_timestamp_idx ON strategy_equity(result_id, timestamp_utc);
 """
 
+_EXPECTED_TABLES = frozenset(
+    {
+        "schema_info",
+        "strategies",
+        "analysis_plateaus",
+        "strategy_orders",
+        "strategy_results",
+        "strategy_actions",
+        "strategy_equity",
+        "window_metrics",
+        "import_runs",
+        "import_files",
+    }
+)
+_EXPECTED_SEQUENCES = frozenset(
+    {
+        "performance_v2_strategy_id_seq",
+        "performance_v2_result_id_seq",
+        "performance_v2_import_run_id_seq",
+        "performance_v2_import_file_id_seq",
+    }
+)
+_EXPECTED_MARKERS = {
+    "schema_version": _SCHEMA_VERSION,
+    "database_kind": "unified_performance_v2",
+}
+
 
 def _schema_version(connection: duckdb.DuckDBPyConnection) -> str | None:
     exists = connection.execute(
@@ -238,29 +274,49 @@ def _schema_version(connection: duckdb.DuckDBPyConnection) -> str | None:
     ).fetchone()[0]
     if not exists:
         return None
-    row = connection.execute("select value from schema_info where key = 'schema_version'").fetchone()
+    try:
+        row = connection.execute("select value from schema_info where key = 'schema_version'").fetchone()
+    except duckdb.Error as error:
+        raise PerformanceV2StoreError("Performance database has invalid schema markers") from error
     return None if row is None else row[0]
 
 
-def _catalog_is_empty(connection: duckdb.DuckDBPyConnection) -> bool:
-    user_tables = connection.execute(
+def _catalog_objects(connection: duckdb.DuckDBPyConnection) -> tuple[frozenset[str], frozenset[str]]:
+    tables = frozenset(
+        row[0]
+        for row in connection.execute(
         """
-        select count(*)
+        select table_name
         from information_schema.tables
         where table_schema not in ('information_schema', 'pg_catalog')
         """
-    ).fetchone()[0]
-    user_sequences = connection.execute("select count(*) from duckdb_sequences()").fetchone()[0]
-    return not user_tables and not user_sequences
+        ).fetchall()
+    )
+    sequences = frozenset(row[0] for row in connection.execute("select sequence_name from duckdb_sequences()").fetchall())
+    return tables, sequences
+
+
+def _catalog_is_empty(connection: duckdb.DuckDBPyConnection) -> bool:
+    tables, sequences = _catalog_objects(connection)
+    return not tables and not sequences
+
+
+def _schema_markers(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
+    try:
+        return dict(connection.execute("select key, value from schema_info").fetchall())
+    except duckdb.Error as error:
+        raise PerformanceV2StoreError("Performance database has invalid schema markers") from error
 
 
 def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     """Fail closed unless the connection already contains the v2 schema."""
     if _schema_version(connection) != _SCHEMA_VERSION:
         raise PerformanceV2StoreError("Performance database does not have schema version 2")
-    kind = connection.execute("select value from schema_info where key = 'database_kind'").fetchone()
-    if kind != ("unified_performance_v2",):
+    if _schema_markers(connection) != _EXPECTED_MARKERS:
         raise PerformanceV2StoreError("Performance database is not unified performance v2")
+    tables, sequences = _catalog_objects(connection)
+    if tables != _EXPECTED_TABLES or sequences != _EXPECTED_SEQUENCES:
+        raise PerformanceV2StoreError("Performance database has an unexpected catalog")
 
 
 def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
@@ -270,7 +326,6 @@ def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
         raise PerformanceV2StoreError("Performance database has an unsupported schema version")
     if version == _SCHEMA_VERSION:
         require_performance_v2(connection)
-        connection.execute(_SCHEMA)
         return
     if not _catalog_is_empty(connection):
         raise PerformanceV2StoreError("Performance v2 target catalog is not empty")
@@ -278,5 +333,5 @@ def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(_SCHEMA)
     connection.executemany(
         "insert into schema_info (key, value) values (?, ?)",
-        [("schema_version", _SCHEMA_VERSION), ("database_kind", "unified_performance_v2")],
+        list(_EXPECTED_MARKERS.items()),
     )

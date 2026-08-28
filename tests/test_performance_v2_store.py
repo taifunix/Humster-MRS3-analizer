@@ -50,6 +50,20 @@ def test_config_uses_the_fixed_owned_target_and_ignores_v1_namespace(tmp_path: P
     )
 
 
+def test_config_rejects_nonstandard_runtime_v1_root_before_any_duckdb_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_performance_v2_config(
+        _config(tmp_path / "config.performance.json"),
+        v1_database_root=Path("data"),
+    )
+
+    monkeypatch.setattr(duckdb, "connect", lambda *args, **kwargs: pytest.fail("DuckDB must not connect"))
+
+    with pytest.raises(ValueError, match="v1"):
+        performance_v2_database_path(config)
+
+
 @pytest.mark.parametrize(
     "root",
     [
@@ -124,6 +138,26 @@ def test_foreign_database_is_rejected_without_mutation() -> None:
             ("legacy_id",)
         ]
         assert connection.execute("select count(*) from information_schema.tables where table_name = 'schema_info'").fetchone() == (0,)
+
+
+def test_forged_v2_markers_with_foreign_catalog_object_are_rejected_without_mutation() -> None:
+    with duckdb.connect(":memory:") as connection:
+        connection.execute("create table schema_info (key varchar primary key, value varchar not null)")
+        connection.executemany(
+            "insert into schema_info values (?, ?)",
+            [("schema_version", "2"), ("database_kind", "unified_performance_v2")],
+        )
+        connection.execute("create table foreign_facts (value integer)")
+
+        with pytest.raises(PerformanceV2StoreError, match="catalog"):
+            initialize_performance_v2(connection)
+
+        assert connection.execute("select key, value from schema_info order by key").fetchall() == [
+            ("database_kind", "unified_performance_v2"),
+            ("schema_version", "2"),
+        ]
+        assert connection.execute("select count(*) from information_schema.tables where table_name = 'foreign_facts'").fetchone() == (1,)
+        assert connection.execute("select count(*) from information_schema.tables where table_name = 'strategies'").fetchone() == (0,)
 
 
 def test_schema_enforces_order_plateau_and_single_result_invariants() -> None:
