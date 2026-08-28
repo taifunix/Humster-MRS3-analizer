@@ -26,6 +26,7 @@ from .performance_v2_input import (
 from .performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
+    initialize_performance_v2,
     performance_v2_database_path,
     require_performance_v2,
 )
@@ -671,6 +672,12 @@ def import_performance_v2(request: PerformanceV2ImportRequest) -> PerformanceV2I
             require_performance_v2(connection)
         except (PerformanceV2StoreError, duckdb.Error) as error:
             raise PerformanceV2ImportError("Performance v2 target does not have schema version 2") from error
+        # Migrate additive v2 columns only after the existing target has passed
+        # the lock and schema gates; this cannot create a missing database.
+        try:
+            initialize_performance_v2(connection)
+        except (PerformanceV2StoreError, duckdb.Error) as error:
+            raise PerformanceV2ImportError("Performance v2 target migration failed") from error
         lock_acquired = True
         prepared = read_performance_v2_inbox(request.inbox, request.report_root, config=config)
         staging = create_v2_parser_staging(config.database_root, prepared)

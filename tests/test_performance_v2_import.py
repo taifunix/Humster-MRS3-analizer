@@ -261,6 +261,39 @@ def test_replace_switches_current_result_and_keeps_one_result(tmp_path: Path) ->
     assert (request.inbox / "inbox_manifest.json").read_bytes()
 
 
+def test_replace_upgrades_pre_task5_window_schema_before_rebuilding_children(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    import_performance_v2(request)
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target)) as connection:
+        strategy_id = connection.execute(
+            "select strategy_id from strategies where strategy_name = 'alpha'"
+        ).fetchone()[0]
+        connection.execute("alter table window_metrics drop column holding_seconds")
+        connection.execute("alter table window_metrics drop column time_in_market_pct")
+    _rewrite_report(request, FIXTURE.read_bytes().replace(b"1009.9", b"1019.9"))
+
+    result = import_performance_v2(
+        PerformanceV2ImportRequest(
+            request.inbox,
+            request.report_root,
+            request.config,
+            mode="REPLACE",
+            replacement_strategy_ids={"alpha": strategy_id},
+        )
+    )
+
+    assert result.imported_count == 1
+    with duckdb.connect(str(target), read_only=True) as connection:
+        columns = {
+            row[0]
+            for row in connection.execute(
+                "select column_name from information_schema.columns where table_name = 'window_metrics'"
+            ).fetchall()
+        }
+        assert {"holding_seconds", "time_in_market_pct"} <= columns
+
+
 def test_replace_rollback_restores_old_result_after_delete_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     request, _ = _request(tmp_path)
     import_performance_v2(request)
