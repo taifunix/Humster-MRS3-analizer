@@ -1113,7 +1113,7 @@
     const option = surfaceSource.querySelector('option');
     if (option) option.textContent = 'Select a newly committed Source DB';
   }
-  const v2Cards = [...document.querySelectorAll('#strategies-dd5 > .panel-performance-v2, #strategies-dd5 > #strategy-dd5-card-v2')];
+  const v2Cards = [...document.querySelectorAll('#strategies-dd5 > .panel-performance-v2')];
   const strategyStack = document.querySelector('#strategies-dd5 .stack');
   v2Cards.forEach((card) => strategyStack?.append(card));
   const legacyPerformanceCard = document.querySelector('#performance-dd5-start')?.closest('details');
@@ -1376,6 +1376,32 @@
   let performanceJobId = '';
   let fastSourceJobId = '';
   let performancePoller = 0;
+  const dbSelectV2 = document.querySelector('#performance-db-select');
+  const dbRefreshV2 = document.querySelector('#performance-db-refresh');
+  const auditOpenV2 = document.querySelector('#performance-audit-open');
+  let selectedDbV2 = '';
+  const refreshPerformanceCatalog = async () => {
+    try {
+      const document = await requestJson('/api/v2/strategies/performance/catalog');
+      const databases = Array.isArray(document.databases) ? document.databases : [];
+      if (dbSelectV2) {
+        dbSelectV2.replaceChildren(new Option('Выберите базу', ''));
+        databases.forEach((item) => dbSelectV2.add(new Option(item.database_name, item.database_name)));
+        if (selectedDbV2 && databases.some((item) => item.database_name === selectedDbV2)) dbSelectV2.value = selectedDbV2;
+      }
+      return databases;
+    } catch (_) { return []; }
+  };
+  dbRefreshV2?.addEventListener('click', refreshPerformanceCatalog);
+  const selectedDbDocument = () => dbSelectV2?.selectedOptions?.[0]?.value || selectedDbV2;
+  dbSelectV2?.addEventListener('change', () => {
+    selectedDbV2 = dbSelectV2.value;
+    if (auditOpenV2) auditOpenV2.disabled = !selectedDbV2;
+  });
+  auditOpenV2?.addEventListener('click', () => {
+    const databaseName = selectedDbDocument();
+    if (databaseName) window.open(`/api/v2/strategies/performance/artifact?database_name=${encodeURIComponent(databaseName)}&kind=audit`, '_blank', 'noopener');
+  });
   const testerIsTerminal = (job) => ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
   const setTesterControls = (busy) => {
     if (testerStart) testerStart.disabled = busy;
@@ -1573,18 +1599,7 @@
   const inboxVerifyV2 = document.querySelector('#performance-inbox-verify');
   const importStatusV2 = document.querySelector('#performance-import-status');
   const importProgressV2 = document.querySelector('#performance-import-progress');
-  const dbSelectV2 = document.querySelector('#performance-db-select');
-  const dbRefreshV2 = document.querySelector('#performance-db-refresh');
-  const auditOpenV2 = document.querySelector('#performance-audit-open');
-  const dd5StartV2 = document.querySelector('#dd5-start');
-  const workbookOpenV2 = document.querySelector('#dd5-workbook-open');
-  const dd5StatusV2 = document.querySelector('#strategy-dd5-status-v2');
-  const workbookPathV2 = document.createElement('input');
-  workbookPathV2.type = 'text'; workbookPathV2.readOnly = true; workbookPathV2.setAttribute('aria-label', 'Workbook path'); workbookPathV2.placeholder = 'data\\workbooks\\<Performance DB>.dd5.xlsx';
-  document.querySelector('#dd5-workbook-open')?.before(workbookPathV2);
   let importJobV2 = '';
-  let dd5JobV2 = '';
-  let selectedDbV2 = '';
   const renderImportV2 = (job) => {
     const p = job.progress || {};
     const total = Number(p.total || 0);
@@ -1606,35 +1621,6 @@
     catch (error) { if (importStatusV2) importStatusV2.textContent = `Проверка не выполнена: ${error?.message || 'unknown error'}.`; }
     finally { inboxVerifyV2.disabled = false; }
   });
-  const refreshPerformanceCatalog = async () => {
-    try {
-      const document = await requestJson('/api/v2/strategies/performance/catalog');
-      const databases = Array.isArray(document.databases) ? document.databases : [];
-      if (dbSelectV2) {
-        dbSelectV2.replaceChildren(new Option('Выберите базу', ''));
-        databases.forEach((item) => dbSelectV2.add(new Option(item.database_name, item.database_name)));
-        if (selectedDbV2 && databases.some((item) => item.database_name === selectedDbV2)) dbSelectV2.value = selectedDbV2;
-      }
-      return databases;
-    } catch (_) { return []; }
-  };
-  dbRefreshV2?.addEventListener('click', refreshPerformanceCatalog);
-  const selectedDbDocument = () => dbSelectV2?.selectedOptions?.[0]?.value || selectedDbV2;
-  dbSelectV2?.addEventListener('change', () => {
-    selectedDbV2 = dbSelectV2.value;
-    workbookPathV2.value = selectedDbV2 ? `data\\workbooks\\${selectedDbV2.replace(/\.duckdb$/, '')}\\${selectedDbV2.replace(/\.duckdb$/, '.dd5.xlsx')}` : '';
-    if (auditOpenV2) auditOpenV2.disabled = !selectedDbV2;
-    if (dd5StartV2) dd5StartV2.disabled = !selectedDbV2;
-    if (workbookOpenV2) workbookOpenV2.disabled = !selectedDbV2;
-  });
-  auditOpenV2?.addEventListener('click', () => {
-    const databaseName = selectedDbDocument();
-    if (databaseName) window.open(`/api/v2/strategies/performance/artifact?database_name=${encodeURIComponent(databaseName)}&kind=audit`, '_blank', 'noopener');
-  });
-  workbookOpenV2?.addEventListener('click', () => {
-    const databaseName = selectedDbDocument();
-    if (databaseName) window.open(`/api/v2/strategies/performance/artifact?database_name=${encodeURIComponent(databaseName)}&kind=workbook`, '_blank', 'noopener');
-  });
   importStartV2?.addEventListener('click', async () => {
     if (!testerJobId) return;
     importStartV2.disabled = true;
@@ -1655,43 +1641,16 @@
     } catch (_) { if (importStatusV2) importStatusV2.textContent = 'Импорт Performance v2 не прошёл проверку.'; }
     finally { importStartV2.disabled = false; }
   });
-  dd5StartV2?.addEventListener('click', async () => {
-    const databaseName = selectedDbDocument();
-    if (!databaseName) return;
-    dd5StartV2.disabled = true;
-    try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.dd5.start', request: { database_name: databaseName } });
-      dd5JobV2 = result.job?.job_id || '';
-      const poll = async () => {
-        const job = await requestJson(`/api/v2/strategies/dd5/status?job_id=${encodeURIComponent(dd5JobV2)}`);
-        if (dd5StatusV2) dd5StatusV2.textContent = `DD5: ${job.state || 'RUNNING'}. ${job.result?.workbook_name || ''}`;
-        if (['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) return true;
-        return false;
-      };
-      if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
-    } catch (_) { if (dd5StatusV2) dd5StatusV2.textContent = 'DD5 не прошёл проверку.'; }
-    finally { dd5StartV2.disabled = false; }
-  });
   const recoverSplitJobs = async () => {
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
       const importJob = [...jobs].reverse().find((job) => job.kind === 'strategies.performance.v2.import');
-      const dd5Job = [...jobs].reverse().find((job) => job.kind === 'strategies.dd5.start');
       if (importJob?.job_id) {
         importJobV2 = importJob.job_id;
         const poll = async () => {
           const job = await requestJson(`/api/v2/strategies/performance-v2/import/status?job_id=${encodeURIComponent(importJobV2)}`);
           renderImportV2(job);
-          return ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
-        };
-        if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
-      }
-      if (dd5Job?.job_id) {
-        dd5JobV2 = dd5Job.job_id;
-        const poll = async () => {
-          const job = await requestJson(`/api/v2/strategies/dd5/status?job_id=${encodeURIComponent(dd5JobV2)}`);
-          if (dd5StatusV2) dd5StatusV2.textContent = `DD5: ${job.state || 'RUNNING'}. ${job.result?.workbook_name || ''}`;
           return ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
         };
         if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }

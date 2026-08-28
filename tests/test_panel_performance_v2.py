@@ -185,16 +185,19 @@ def test_visible_performance_card_targets_only_v2_import_job_and_status() -> Non
     html = (panel_web / "index.html").read_text(encoding="utf-8")
     js = (panel_web / "app.js").read_text(encoding="utf-8")
     card = html.split('class="panel-card accordion panel-performance-v2"', 1)[1].split("</details>", 1)[0]
-    handler = js.split("importStartV2?.addEventListener", 1)[1].split("dd5StartV2?.addEventListener", 1)[0]
+    handler = js.split("importStartV2?.addEventListener", 1)[1].split("const recoverSplitJobs", 1)[0]
     recovery = js.split("const recoverSplitJobs = async", 1)[1].split("const settingsStatus", 1)[0]
 
     assert 'id="performance-import-start"' in card
     assert "delete-tested-html-v2" not in card
     assert "performance-db-refresh" not in card
     assert "performance-audit-open" not in card
+    assert 'id="strategy-dd5-card-v2"' not in html
     assert "strategies.performance.v2.import" in handler
     assert "/api/v2/strategies/performance-v2/import/status" in handler
     assert "strategies.performance.import" not in handler
+    assert "strategies.dd5.start" not in handler
+    assert "dd5-workbook" not in handler
     assert "strategies.performance.v2.import" in recovery
     assert "/api/v2/strategies/performance-v2/import/status" in recovery
 
@@ -260,6 +263,13 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
         assert response.status == 200
         assert document["state"] == "COMMITTED"
         assert document["result"]["database_path"].endswith("strategy_performance.duckdb")
+
+        restarted = PanelController(tmp_path, config_path)
+        persisted = restarted.strategies_performance_v2_import_status(v2_job_id)
+        assert persisted["state"] == "COMMITTED"
+        assert persisted["result"]["imported_count"] == 2
+        assert persisted["result"]["audit_path"].endswith("import_audit.v2.json")
+        assert "windows" not in persisted["result"]
     finally:
         server.shutdown()
         server.server_close()

@@ -1694,6 +1694,18 @@ class PanelController:
             self._panel_jobs.transition(job_id, "FAILED")
             raise
 
+    @staticmethod
+    def _performance_v2_result_snapshot(document: Mapping[str, object]) -> dict[str, object]:
+        result = document.get("result")
+        if not isinstance(result, Mapping):
+            return {}
+        keys = (
+            "import_id", "status", "imported_count", "skipped_count", "rejected_count",
+            "database_path", "audit_path", "strategy_count", "order_count",
+            "plateau_count", "result_count", "window_count",
+        )
+        return {key: result[key] for key in keys if key in result}
+
     def _record_special_job(self, document: dict[str, object]) -> None:
         """Persist worker completion without exposing controller-only artifact paths."""
         job_id = document.get("job_id")
@@ -1704,6 +1716,14 @@ class PanelController:
         if isinstance(inbox, str) and inbox:
             runtime["inbox_path"] = inbox
         public = {key: value for key, value in document.items() if key in {"state", "phase", "progress", "error", "evidence"}}
+        try:
+            tracked = self._panel_jobs.get(job_id)
+        except PanelJobError:
+            return
+        if tracked.get("kind") == "strategies.performance.v2.import" and document.get("state") == "COMMITTED":
+            result = self._performance_v2_result_snapshot(document)
+            if result:
+                public["result"] = result
         if document.get("state") == "COMMITTED" and runtime:
             public["inbox_ready"] = True
         try:
