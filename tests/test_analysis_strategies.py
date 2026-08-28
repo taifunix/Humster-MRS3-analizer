@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -833,7 +834,8 @@ def test_generate_v6_analysis_strategies_exports_only_committed_ready_with_manif
     template = tmp_path / "template.json"
     template.write_text(json.dumps(_template()), encoding="utf-8")
 
-    result = generate_v6_analysis_strategies("surface.duckdb", run_id, ["C_READY"], [("BTCUSDT", "LONG", "1h")], template, tmp_path / "out", config)
+    runtime_config = replace(config, close_multiplier_long=config.close_multiplier_long + 1)
+    result = generate_v6_analysis_strategies("surface.duckdb", run_id, ["C_READY"], [("BTCUSDT", "LONG", "1h")], template, tmp_path / "out", runtime_config)
 
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert result.strategy_count == 2
@@ -921,7 +923,7 @@ def test_generate_v6_manifest_maps_candidate_identity_to_every_variant(tmp_path:
     assert manifest["candidate_identity_to_strategy_names"] == {"C_READY": names}
 
 
-@pytest.mark.parametrize("failure", ["state", "mode", "missing_provenance", "manifest_hash", "frozen_hash", "config_hash", "listing_hash", "wrong_scope", "interval", "event_hash", "event_count", "no_ready"])
+@pytest.mark.parametrize("failure", ["state", "mode", "missing_provenance", "manifest_hash", "frozen_hash", "listing_hash", "wrong_scope", "interval", "event_hash", "event_count", "no_ready"])
 def test_generate_v6_rejects_invalid_run_provenance_and_ready_input(tmp_path: Path, monkeypatch, failure: str) -> None:
     from copy import deepcopy
     from mrs3.analysis_strategies import generate_v6_analysis_strategies
@@ -939,8 +941,6 @@ def test_generate_v6_rejects_invalid_run_provenance_and_ready_input(tmp_path: Pa
         result["metadata"]["source_manifest_sha256"] = "x" * 64
     elif failure == "frozen_hash":
         result["metadata"]["source_frozen_facts_sha256"] = "x" * 64
-    elif failure == "config_hash":
-        result["metadata"]["algorithm_config_sha256"] = "c" * 64
     elif failure == "listing_hash":
         result["metadata"]["listing_dates_sha256"] = "x" * 64
     elif failure == "interval":

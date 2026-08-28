@@ -1346,6 +1346,8 @@
   const testerStatus = testerCard?.querySelector('.card-status');
   const testerTrack = testerCard?.querySelector('.progress-track span');
   const testerStart = document.querySelector('#tester-start');
+  const testerFastStart = document.querySelector('#tester-start-fast');
+  const testerFastRetry = document.querySelector('#tester-retry-fast');
   const testerRunsStart = document.querySelector('#tester-start-runs');
   const testerStop = document.querySelector('#tester-stop');
   const testerStartDate = document.querySelector('#tester-start-date');
@@ -1372,10 +1374,13 @@
   const dd5Track = dd5Card?.querySelector('.progress-track span');
   const dd5Status = document.querySelector('#strategy-dd5-status');
   let performanceJobId = '';
+  let fastSourceJobId = '';
   let performancePoller = 0;
   const testerIsTerminal = (job) => ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
   const setTesterControls = (busy) => {
     if (testerStart) testerStart.disabled = busy;
+    if (testerFastStart) testerFastStart.disabled = busy;
+    if (testerFastRetry) testerFastRetry.disabled = busy || !fastSourceJobId;
     if (testerRunsStart) testerRunsStart.disabled = busy;
     if (generateFresh) generateFresh.disabled = busy;
     if (generateRuns) generateRuns.disabled = busy;
@@ -1384,18 +1389,23 @@
     const p = job.progress || {};
     const total = Number(p.total || job.strategy_count || 0);
     const runs = job.mode === 'RUNS' || job.kind === 'strategies.tester.runs';
-    const checked = Number(runs ? p.current || 0 : p.checked || 0);
+    const fast = job.mode === 'FAST' || String(job.kind || '').startsWith('strategies.tester.fast');
+    const checked = Number(runs || fast ? p.current || 0 : p.checked || 0);
     if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : '0%';
     const detail = runs
       ? `готово ${checked} из ${total} отчётов`
+      : fast
+        ? `готово ${checked} из ${total} отчётов · FAILED ${(job.evidence?.failed_names || []).length}`
       : `отправлено ${p.sent || 0} · в работе ${p.running || 0} · результат ${p.result || 0} · проверено ${checked} · осталось ${Math.max(0, total - checked)} · повторы ${p.retries || 0}`;
     const recoveringInbox = job.phase === 'RECOVERING_INBOX';
+    if (fast && testerIsTerminal(job) && (job.evidence?.failed_names || []).length) fastSourceJobId = job.job_id || fastSourceJobId;
     if (testerText) testerText.textContent = recoveringInbox ? 'Восстановление verified inbox из сохранённых отчётов…' : detail;
     if (testerStatus) testerStatus.textContent = recoveringInbox
       ? 'Tester: восстановление verified inbox; тесты повторно не запускаются.'
-      : `Tester: ${job.state || 'RUNNING'}. ${detail}`;
+      : `${fast ? 'FAST TEST' : 'Tester'}: ${fast ? (job.phase || job.state || 'RUNNING') : (job.state || 'RUNNING')}. ${detail}`;
     if (testerStop) testerStop.disabled = !testerJobId || ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
     setTesterControls(!testerIsTerminal(job));
+    if (testerFastRetry) testerFastRetry.disabled = !fast || !fastSourceJobId || !['PARTIAL', 'CANCELLED'].includes(job.phase) || !testerIsTerminal(job) || Number(job.evidence?.failed_names?.length || 0) === 0;
     const verifiedInbox = job.state === 'COMMITTED' && job.inbox_ready === true;
     if (performanceStart) performanceStart.disabled = !verifiedInbox;
     const performanceImport = document.querySelector('#performance-import-start');
@@ -1438,6 +1448,31 @@
       renderTester(result.job); await pollTester();
       startTesterPolling(1000);
     } catch (_) { if (testerStatus) testerStatus.textContent = 'Не удалось запустить локальный tester batch.'; setTesterControls(false); }
+  });
+  if (testerFastStart) testerFastStart.addEventListener('click', async () => {
+    if (!currentAnalysisId) { strategyStatus('Сначала сформируйте READY JSON.'); return; }
+    const startDate = testerStartDate?.value || '';
+    const endDate = testerEndDate?.value || '';
+    if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Укажите корректные даты начала и конца тестирования.'; return; }
+    if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Дата начала не может быть позже даты конца.'; return; }
+    fastSourceJobId = '';
+    setTesterControls(true);
+    try {
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.fast.start', request: { analysis_run_id: currentAnalysisId, start_date: startDate, end_date: endDate } });
+      testerJobId = result.job?.job_id || '';
+      if (!testerJobId) throw new Error('missing job');
+      renderTester(result.job); await pollTester(); startTesterPolling(1000);
+    } catch (error) { if (testerStatus) testerStatus.textContent = `Fast TEST не запущен: ${error?.message || 'ошибка'}.`; setTesterControls(false); }
+  });
+  if (testerFastRetry) testerFastRetry.addEventListener('click', async () => {
+    if (!fastSourceJobId) return;
+    setTesterControls(true);
+    try {
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.fast.retry', request: { job_id: fastSourceJobId } });
+      testerJobId = result.job?.job_id || '';
+      if (!testerJobId) throw new Error('missing job');
+      renderTester(result.job); await pollTester(); startTesterPolling(1000);
+    } catch (error) { if (testerStatus) testerStatus.textContent = `Повтор Fast TEST не запущен: ${error?.message || 'ошибка'}.`; setTesterControls(false); }
   });
   if (testerRunsStart) testerRunsStart.addEventListener('click', async () => {
     setTesterControls(true);
@@ -1509,13 +1544,18 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const testerJobs = [...jobs].reverse().filter((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester.runs' || job.kind === 'strategies.tester');
-      const tester = testerJobs.find((job) => !testerIsTerminal(job)) || testerJobs.find((job) => job.state === 'COMMITTED' && job.inbox_ready === true);
+      const testerJobs = [...jobs].reverse().filter((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester.runs' || job.kind === 'strategies.tester' || job.kind === 'strategies.tester.fast.start' || job.kind === 'strategies.tester.fast.retry');
+      const tester = testerJobs.find((job) => {
+        const fast = String(job.kind || '').startsWith('strategies.tester.fast');
+        const hasVerified = Object.keys(job.evidence?.verified_reports || {}).length > 0;
+        return !testerIsTerminal(job) || (fast && (hasVerified || ['PARTIAL', 'CANCELLED'].includes(job.phase))) || (job.state === 'COMMITTED' && job.inbox_ready === true);
+      });
       const performance = [...jobs].reverse().find((job) => job.kind === 'strategies.performance-dd5');
       if (tester && typeof tester.job_id === 'string') {
         const job = tester;
         testerJobId = job.job_id;
-        renderTester(testerIsTerminal(job) ? {...job, progress: {}} : job);
+        const fastJob = String(job.kind || '').startsWith('strategies.tester.fast');
+        renderTester(testerIsTerminal(job) && !fastJob ? {...job, progress: {}} : job);
         if (!testerIsTerminal(job)) { await pollTester(); startTesterPolling(job.kind === 'strategies.tester.runs' ? 15000 : 1000); }
       }
       if (performance && typeof performance.job_id === 'string') {
@@ -1546,10 +1586,14 @@
   let dd5JobV2 = '';
   let selectedDbV2 = '';
   inboxVerifyV2?.addEventListener('click', async () => {
-    if (!testerJobId) return;
+    if (!testerJobId) {
+      if (importStatusV2) importStatusV2.textContent = 'Проверка невозможна: tester job не найден.';
+      return;
+    }
     inboxVerifyV2.disabled = true;
+    if (importStatusV2) importStatusV2.textContent = 'Проверка verified inbox…';
     try { renderTester(await requestJson('/api/v2/strategies/tester/verify-inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: testerJobId }) })); }
-    catch (_) { if (importStatusV2) importStatusV2.textContent = 'Verified inbox ещё не готов.'; }
+    catch (error) { if (importStatusV2) importStatusV2.textContent = `Проверка не выполнена: ${error?.message || 'unknown error'}.`; }
     finally { inboxVerifyV2.disabled = false; }
   });
   const refreshPerformanceCatalog = async () => {

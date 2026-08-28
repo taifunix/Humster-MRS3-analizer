@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -155,6 +156,70 @@ def test_fresh_adapter_generates_only_selected_ready_candidate_and_binds_hashes(
     assert len(manifest["analysis_manifest_sha256"]) == 64
     strategy = json.loads(next(result.strategies_path.glob("*.json")).read_text(encoding="utf-8"))
     assert "provenance" not in strategy
+
+
+def test_fresh_generation_does_not_block_on_runtime_config_hash(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+
+    analysis_id, _ = _make_analysis(tmp_path / "run.analysis-v6.duckdb")
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+    defaults = AlgorithmConfig.defaults()
+    runtime_config = replace(
+        defaults,
+        close_multiplier_long=defaults.close_multiplier_long + 1,
+    )
+
+    result = generate_fresh_analysis_strategies(
+        tmp_path / "run.analysis-v6.duckdb",
+        analysis_id,
+        ["STR-READY"],
+        [("BTCUSDT", "LONG", "1h")],
+        template,
+        tmp_path / "out",
+        runtime_config,
+    )
+
+    assert result.strategy_count == 2
+
+
+def test_generation_manifest_persists_order_plateau_diagnostics(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+
+    analysis_id, _ = _make_analysis(tmp_path / "run.analysis-v6.duckdb")
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+
+    result = generate_fresh_analysis_strategies(
+        tmp_path / "run.analysis-v6.duckdb",
+        analysis_id,
+        ["STR-READY"],
+        [("BTCUSDT", "LONG", "1h")],
+        template,
+        tmp_path / "out",
+        AlgorithmConfig.defaults(),
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["candidate_diagnostics"]["STR-READY"] == {
+        "order_count": 2,
+        "orders": [
+            {
+                "order_id": 1,
+                "plateau_id": "P100",
+                "plateau_point_count": 3,
+                "base_point_trades": 10,
+                "plateau_total_trades": 30,
+            },
+            {
+                "order_id": 2,
+                "plateau_id": "P300",
+                "plateau_point_count": 4,
+                "base_point_trades": 11,
+                "plateau_total_trades": 40,
+            },
+        ],
+    }
 
 
 def test_fresh_strategy_payload_excludes_provenance_and_manifest_keeps_lineage(tmp_path: Path) -> None:

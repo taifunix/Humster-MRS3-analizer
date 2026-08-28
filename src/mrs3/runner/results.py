@@ -169,13 +169,13 @@ def _extract_settings(document: object) -> dict[str, object]:
     return candidates[0]
 
 
-def extract_html_strategy_name(path: Path) -> str | None:
-    """Read the embedded strategy name without constructing an HTML DOM."""
+def extract_html_strategy_settings(path: Path) -> dict[str, object] | None:
+    """Read the single embedded strategy settings object without a DOM."""
     try:
         source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
-    candidates: list[str] = []
+    candidates: list[dict[str, object]] = []
     for raw in re.findall(r"<pre\b[^>]*>(.*?)</pre\s*>", source, flags=re.IGNORECASE | re.DOTALL):
         try:
             settings = json.loads(stdlib_html.unescape(raw).strip())
@@ -184,8 +184,14 @@ def extract_html_strategy_name(path: Path) -> str | None:
         name = settings.get("name") if isinstance(settings, dict) else None
         basic = settings.get("basic") if isinstance(settings, dict) else None
         if isinstance(name, str) and name and isinstance(basic, dict):
-            candidates.append(name)
+            candidates.append(settings)
     return candidates[0] if len(candidates) == 1 else None
+
+
+def extract_html_strategy_name(path: Path) -> str | None:
+    """Read the embedded strategy name without constructing an HTML DOM."""
+    settings = extract_html_strategy_settings(path)
+    return str(settings["name"]) if settings is not None else None
 
 
 def _extract_trades(document: object) -> tuple[dict[str, str], ...]:

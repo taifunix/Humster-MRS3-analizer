@@ -32,6 +32,23 @@ def test_lightweight_strategy_name_reads_only_embedded_settings(tmp_path: Path) 
     assert extract_html_strategy_name(report) == "FAST"
 
 
+def test_lightweight_settings_reader_returns_the_embedded_object(tmp_path: Path) -> None:
+    import mrs3.runner.results as runner_results
+
+    report = tmp_path / "report.html"
+    report.write_text(
+        '<html><body><pre>{"name":"FAST","basic":{"symbol":"BTCUSDT"}}</pre></body></html>',
+        encoding="utf-8",
+    )
+
+    extractor = getattr(runner_results, "extract_html_strategy_settings", None)
+    assert callable(extractor)
+    assert extractor(report) == {
+        "name": "FAST",
+        "basic": {"symbol": "BTCUSDT"},
+    }
+
+
 def test_reconciliation_uses_embedded_name_without_full_html_parser(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

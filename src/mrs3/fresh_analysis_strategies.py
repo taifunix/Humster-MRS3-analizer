@@ -39,7 +39,6 @@ from .analysis_shortlist import (
 )
 from .config import AlgorithmConfig
 from .lots import LotMethod, allocate_lots
-from .pipeline import _canonical
 from .strategy_json import generate_strategy, validate_strategy, validate_unique_names
 from .source_v6 import _canonical_json
 from .source_v6_surface_fresh import FINGERPRINT as SURFACE_FINGERPRINT, read_multiscope_surface
@@ -97,6 +96,30 @@ def _plateau_diagnostics(structure: Mapping[str, object]) -> dict[str, object]:
     if malformed:
         raise ValueError(f"fresh structure has malformed plateau diagnostics: {malformed}")
     return diagnostics
+
+
+def _candidate_diagnostics(structure: Mapping[str, object]) -> dict[str, object]:
+    values = _plateau_diagnostics(structure)
+    orders = structure["orders"]
+    order_count = int(structure["order_count"])
+
+    def at(name: str, index: int) -> int:
+        value = values[name]
+        return int(value if order_count == 1 else value[index])
+
+    return {
+        "order_count": order_count,
+        "orders": [
+            {
+                "order_id": int(order["id"]),
+                "plateau_id": str(order["plateau_id"]),
+                "plateau_point_count": at("plateau_point_count", index),
+                "base_point_trades": at("base_point_trades", index),
+                "plateau_total_trades": at("plateau_total_trades", index),
+            }
+            for index, order in enumerate(orders)
+        ],
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,9 +539,6 @@ def generate_fresh_analysis_strategies(
     missing_scopes = sorted("|".join(scope) for scope in scopes if "|".join(scope) not in scope_digests)
     if missing_scopes:
         raise ValueError(f"selected scope is absent from fresh analysis: {missing_scopes}")
-    config_hash = _canonical_digest(_canonical(config))
-    if config_hash != str(manifest["algorithm_config_sha256"]):
-        raise ValueError("analysis config hash does not match fresh analysis")
     surface_binding = _surface_binding(
         manifest,
         None if surface_path is None else Path(surface_path).resolve(),
@@ -602,9 +622,11 @@ def generate_fresh_analysis_strategies(
     }
     generated: list[dict[str, object]] = []
     variants: list[dict[str, object]] = []
+    candidate_diagnostics: dict[str, dict[str, object]] = {}
     for structure in structures:
         candidate_identity = str(structure.get("candidate_id", structure["structure_id"]))
         diagnostics = _plateau_diagnostics(structure)
+        candidate_diagnostics[candidate_identity] = _candidate_diagnostics(structure)
         methods = (LotMethod.EQUAL,) if int(structure["order_count"]) == 1 else (LotMethod.EQUAL, LotMethod.INCOME)
         for method in methods:
             strategy = generate_strategy(
@@ -626,12 +648,14 @@ def generate_fresh_analysis_strategies(
     }
     candidate_names: dict[str, list[str]] = {}
     for row in variants:
-        candidate_names.setdefault(str(row["candidate_identity"]), []).append(str(row["strategy_name"]))
+        candidate_identity = str(row["candidate_identity"])
+        candidate_names.setdefault(candidate_identity, []).append(str(row["strategy_name"]))
     manifest_unsigned: dict[str, object] = {
         "format_version": 1,
         **common,
         "candidate_identities": list(selected),
         "candidate_identity_to_strategy_names": {key: sorted(value) for key, value in sorted(candidate_names.items())},
+        "candidate_diagnostics": {key: candidate_diagnostics[key] for key in sorted(candidate_diagnostics)},
         "strategy_json_sha256": strategy_hashes,
         "strategy_count": len(generated),
         "template_sha256": _file_digest(template_file),

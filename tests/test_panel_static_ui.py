@@ -368,6 +368,20 @@ def test_tester_dates_and_local_ranges_are_sent_only_on_tester_start() -> None:
         assert f"tester-range-{marker}" not in js
 
 
+def test_tester_card_exposes_independent_fast_test_controls() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="tester-start-fast"' in html
+    assert "Fast TEST" in html
+    assert 'id="tester-retry-fast"' in html
+    assert "Проверить / повторить FAILED" in html
+    assert "strategies.tester.fast.start" in js
+    assert "strategies.tester.fast.retry" in js
+    assert "strategies.tester.fast.start" in js
+    assert "setTesterControls(!testerIsTerminal(job))" in js
+
+
 def test_shortlist_active_selection_uses_ready_after_filters_without_http() -> None:
     html = _read("index.html")
     js = _read("app.js")
@@ -576,12 +590,25 @@ def test_reload_recovers_only_server_job_snapshots() -> None:
     assert "requestJson('/api/v2/jobs')" in recovery
     assert "job.kind === 'strategies.tester.start'" in recovery
     assert "job.kind === 'strategies.performance-dd5'" in recovery
+    assert "const tester = testerJobs.find" in recovery
+    assert "Object.keys(job.evidence?.verified_reports || {}).length" in recovery
     assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
     assert "kind: 'strategies.tester.start'" in js
-    assert "renderTester(testerIsTerminal(job) ? {...job, progress: {}} : job)" in recovery
+    assert "renderTester(testerIsTerminal(job) && !fastJob" in recovery
     assert "renderPerformance(job)" in recovery
     assert "job.state = " not in recovery
     assert "recoverJobs();" in js
+
+
+def test_inbox_verify_does_not_fail_silently() -> None:
+    js = _read("app.js")
+    handler = js.split("inboxVerifyV2?.addEventListener", 1)[1].split("const refreshPerformanceCatalog", 1)[0]
+
+    assert "if (!testerJobId) {" in handler
+    assert "Проверка невозможна: tester job не найден." in handler
+    assert "Проверка verified inbox" in handler
+    assert "catch (error)" in handler
+    assert "error?.message || 'unknown error'" in handler
 
 
 def test_testing_screen_does_not_expose_remote_runner_paths() -> None:

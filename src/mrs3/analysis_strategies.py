@@ -11,7 +11,7 @@ import pandas as pd
 
 from .config import AlgorithmConfig
 from .lots import LotMethod, allocate_lots
-from .pipeline import _base_structure, _canonical, _publish_strategies, _write_json_atomic
+from .pipeline import _base_structure, _publish_strategies, _write_json_atomic
 from .analysis_storage import require_canonical_operational_surface
 from .published_surface import load_published_surface
 from .analysis_shortlist import filter_analysis_candidates
@@ -502,9 +502,6 @@ def generate_v6_analysis_strategies(
     metadata, scope = _v6_require_provenance(result, analysis_run_id)
     if normalize_analysis_scopes(selected_scopes) != ((scope["symbol"], scope["side"], scope["timeframe"]),):
         raise ValueError("selected scopes do not match the v6 analysis run")
-    config_value = _canonical_v6_json(_canonical(config))
-    if sha256(config_value.encode("utf-8")).hexdigest() != str(metadata["algorithm_config_sha256"]):
-        raise ValueError("analysis config hash does not match the v6 run")
     points, ready = _v6_points_and_structures(result, metadata, scope)
     selected = {str(item).strip() for item in candidate_ids if str(item).strip()}
     if not selected:

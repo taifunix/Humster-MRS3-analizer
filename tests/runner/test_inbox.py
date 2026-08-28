@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import mrs3.runner.inbox as inbox_module
 from mrs3.runner.config import RunnerConfig
 from mrs3.runner.inbox import InboxCaptureError, capture_run_snapshot_inbox, capture_verified_inbox
 from mrs3.runner.results import WizardResult
@@ -228,6 +229,135 @@ def test_capture_run_snapshots_keeps_original_report_for_guarded_cleanup(tmp_pat
     assert manifest["run_mode"] == "RUNS" and manifest["test_start"] == "2026-08-01"
     assert Path(manifest["entries"][0]["report_path"]).resolve() == report.resolve()
     PanelController._validate_performance_inbox(inbox)
+
+
+def test_capture_run_snapshot_inbox_supports_fast_mode(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    report = tmp_path / "my_test_runs" / "run.html"
+    report.parent.mkdir()
+    report.write_bytes((Path(__file__).parents[1] / "fixtures" / "performance" / "report_import.html").read_bytes())
+    strategy = {"name": "MRS3 Demo", "exchange": {"name": "Bybit"}, "basic": {"symbol": "ONUSDT", "time_frame": "1h"}}
+    digest = sha256(json.dumps(strategy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    provenance = {"analysis_run_id": "a" * 64, "generation_manifest_sha256": "b" * 64, "strategy_json_sha256": {"MRS3 Demo.json": digest}}
+
+    inbox = capture_run_snapshot_inbox(
+        config, "fast-job", {"MRS3 Demo": strategy}, {"MRS3 Demo": report},
+        tester_config_bytes=config.tester_config.read_bytes(), provenance=provenance,
+        test_start="2026-08-01", test_end="2026-08-18", run_mode="FAST", workers=2,
+    )
+
+    manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["run_mode"] == "FAST"
+
+
+def test_capture_run_snapshot_caps_worker_pool_and_keeps_entry_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config(tmp_path)
+    names = tuple(f"A{index:02d}" for index in range(17))
+    reports: dict[str, Path] = {}
+    snapshots: dict[str, dict[str, object]] = {}
+    hashes: dict[str, str] = {}
+    for name in names:
+        strategy = {"name": name, "exchange": {"name": "Bybit"}, "basic": {"symbol": "ONUSDT"}}
+        snapshots[name] = strategy
+        payload = json.dumps(strategy, sort_keys=True, separators=(",", ":")).encode()
+        hashes[f"{name}.json"] = sha256(payload).hexdigest()
+        report = tmp_path / f"{name}.html"
+        report.write_text(f"<pre>{payload.decode()}</pre>", encoding="utf-8")
+        reports[name] = report
+    observed: list[int] = []
+
+    class Executor:
+        def __init__(self, max_workers: int) -> None:
+            observed.append(max_workers)
+
+        def __enter__(self) -> "Executor":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def map(self, function: object, values: tuple[str, ...]) -> list[dict[str, object]]:
+            return [function(value) for value in values]  # type: ignore[operator]
+
+    monkeypatch.setattr(inbox_module, "ThreadPoolExecutor", Executor)
+    inbox = capture_run_snapshot_inbox(
+        config,
+        "worker-cap",
+        snapshots,
+        reports,
+        tester_config_bytes=config.tester_config.read_bytes(),
+        provenance={"analysis_run_id": "a" * 64, "generation_manifest_sha256": "b" * 64, "strategy_json_sha256": hashes},
+        test_start="2026-08-01",
+        test_end="2026-08-18",
+        workers=100,
+    )
+
+    manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    assert observed == [16]
+    assert [entry["strategy_name"] for entry in manifest["entries"]] == list(names)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"workers": 0}, "positive integer"),
+        ({"workers": True}, "positive integer"),
+        ({"run_mode": "OTHER"}, "unsupported .*run mode"),
+    ],
+)
+def test_capture_run_snapshot_rejects_invalid_worker_or_mode(tmp_path: Path, kwargs: dict[str, object], message: str) -> None:
+    config = _config(tmp_path)
+    _output, _plan, _wizard, report = _inputs(tmp_path, config)
+    strategy = {"name": "A", "exchange": {"name": "Bybit"}, "basic": {"symbol": "ONUSDT"}}
+    digest = sha256(json.dumps(strategy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    with pytest.raises(InboxCaptureError, match=message):
+        capture_run_snapshot_inbox(
+            config,
+            "invalid-capture",
+            {"A": strategy},
+            {"A": report},
+            tester_config_bytes=config.tester_config.read_bytes(),
+            provenance={"analysis_run_id": "a" * 64, "generation_manifest_sha256": "b" * 64, "strategy_json_sha256": {"A.json": digest}},
+            test_start="2026-08-01",
+            test_end="2026-08-18",
+            **kwargs,
+        )
+
+
+def test_capture_run_snapshot_parallel_writes_are_independent(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    names = tuple(f"P{index}" for index in range(4))
+    snapshots: dict[str, dict[str, object]] = {}
+    reports: dict[str, Path] = {}
+    hashes: dict[str, str] = {}
+    for name in names:
+        strategy = {"name": name, "exchange": {"name": "Bybit"}, "basic": {"symbol": "ONUSDT"}}
+        snapshots[name] = strategy
+        payload = json.dumps(strategy, sort_keys=True, separators=(",", ":")).encode()
+        hashes[f"{name}.json"] = sha256(payload).hexdigest()
+        report = tmp_path / f"{name}.html"
+        report.write_bytes(b"<pre>" + payload + b"</pre>")
+        reports[name] = report
+
+    inbox = capture_run_snapshot_inbox(
+        config,
+        "parallel-capture",
+        snapshots,
+        reports,
+        tester_config_bytes=config.tester_config.read_bytes(),
+        provenance={"analysis_run_id": "a" * 64, "generation_manifest_sha256": "b" * 64, "strategy_json_sha256": hashes},
+        test_start="2026-08-01",
+        test_end="2026-08-18",
+        workers=4,
+    )
+
+    manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    entries = manifest["entries"]
+    assert [entry["strategy_name"] for entry in entries] == list(names)
+    for entry in entries:
+        source = reports[entry["strategy_name"]]
+        assert entry["source_report_sha256"] == sha256(source.read_bytes()).hexdigest()
+        assert (inbox / "strategies" / f"{entry['strategy_name']}.json").is_file()
 
 
 def test_capture_rejects_incomplete_v6_provenance(tmp_path: Path) -> None:

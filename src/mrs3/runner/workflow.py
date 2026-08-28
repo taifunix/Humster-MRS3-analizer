@@ -747,11 +747,14 @@ def _wait_for_exact_batch(
     config: RunnerConfig,
     *,
     allow_result_rows: bool = False,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[StrategyRow, ...]:
     expected = set(expected_names)
     deadline = time.monotonic() + config.startup_timeout_seconds
     last_names: set[str] = set()
     while time.monotonic() < deadline:
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("tester batch startup cancelled")
         rows = client.list_strategies()
         last_names = {row.name for row in rows}
         expected_rows = tuple(row for row in rows if row.name in expected)

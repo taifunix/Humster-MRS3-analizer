@@ -112,6 +112,48 @@ def test_controlled_monitor_limits_initial_window_and_refills_after_verified_res
     assert all(item.completed for item in completion.strategies.values())
 
 
+def test_controlled_monitor_can_finish_partially_and_continue_after_exhaustion(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        max_parallel_submissions=2,
+        max_strategy_attempts=4,
+        result_report_grace_seconds=0.002,
+        batch_timeout_seconds=1.0,
+        stall_timeout_seconds=1.0,
+    )
+
+    class MissingClient(ControlledClient):
+        def launch_strategy(self, name: str) -> None:
+            if name != "MISSING":
+                super().launch_strategy(name)
+                return
+            self.launches.append(name)
+            run_id = f"run-{len(self.launches)}"
+            self._states[name] = RowState.RESULT
+            self._run_ids[name] = run_id
+            self.config.wizard_result.parent.mkdir(parents=True, exist_ok=True)
+            entries = json.loads(self.config.wizard_result.read_text(encoding="utf-8")) if self.config.wizard_result.exists() else []
+            entries.append({"runId": run_id, "strategies": [name], "chartUrl": f"/tester-report/my_test/{name}.html"})
+            self.config.wizard_result.write_text(json.dumps(entries), encoding="utf-8")
+
+    client = MissingClient(config, ("MISSING", "GOOD"))
+    completion = monitor_controlled_batch(
+        client,
+        ("MISSING", "GOOD"),
+        config.wizard_result,
+        config.report_dir,
+        config,
+        allow_partial=True,
+    )
+
+    assert completion.failed_names == ("MISSING",)
+    assert completion.strategies["MISSING"].attempts == 4
+    assert completion.strategies["GOOD"].completed is True
+    assert client.launches.count("GOOD") == 1
+
+
 def test_controlled_monitor_serializes_names_with_same_html_collision_key(
     tmp_path: Path,
 ) -> None:
@@ -249,6 +291,27 @@ def test_snapshot_collector_survives_a_partially_written_report(
     collector.capture_once()
 
     assert collector.snapshot_for("A").read_text(encoding="utf-8") == "complete"
+
+
+def test_snapshot_collector_removes_stable_source_after_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    report = report_dir / "stable.html"
+    monkeypatch.setattr(
+        runner_monitor, "_report_strategy_name", lambda path: path.read_text(encoding="utf-8")
+    )
+    collector = runner_monitor._ReportSnapshotCollector(
+        ("A",), report_dir, tmp_path / "snapshots", remove_source_reports=True
+    )
+
+    report.write_text("A", encoding="utf-8")
+    collector.capture_once()
+    collector.capture_once()
+
+    assert not report.exists()
+    assert collector.snapshot_for("A") is not None
 
 
 def test_snapshot_collector_ignores_reports_older_than_the_batch(

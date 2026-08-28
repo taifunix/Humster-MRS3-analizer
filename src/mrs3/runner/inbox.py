@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 import json
 from decimal import Decimal, InvalidOperation
@@ -9,6 +10,8 @@ from typing import Mapping
 
 from .config import RunnerConfig
 from .results import WizardResult, extract_html_strategy_name as _extract_html_strategy_name
+
+MAX_INBOX_CAPTURE_WORKERS = 16
 
 
 class InboxCaptureError(RuntimeError):
@@ -220,18 +223,24 @@ def capture_run_snapshot_inbox(
     provenance: Mapping[str, object],
     test_start: str,
     test_end: str,
+    run_mode: str = "RUNS",
+    workers: int = 1,
 ) -> Path:
-    """Capture one completed RUNS job in the same immutable inbox format."""
+    """Capture one completed tester job in the immutable inbox format."""
     names = tuple(sorted(snapshots))
     if not names or set(reports) != set(names):
-        raise InboxCaptureError("RUNS reports do not match expected strategies")
+        raise InboxCaptureError("tester reports do not match expected strategies")
+    if run_mode not in {"RUNS", "FAST"}:
+        raise InboxCaptureError("unsupported tester run mode")
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise InboxCaptureError("inbox workers must be a positive integer")
     contract, contract_id, tester_config_hash = _commission_contract(config, tester_config_bytes)
     inbox = config.inbox_root.resolve() / job_id
     if inbox.exists():
         raise InboxCaptureError(f"inbox already exists: {inbox}")
     entries: list[dict[str, object]] = []
     try:
-        for name in names:
+        def capture(name: str) -> dict[str, object]:
             strategy = snapshots[name]
             exchange = strategy.get("exchange")
             exchange_name = exchange.get("name") if isinstance(exchange, Mapping) else None
@@ -244,7 +253,7 @@ def capture_run_snapshot_inbox(
             report_bytes = report_path.read_bytes()
             strategy_id = sha256(_canonical_json(strategy)).hexdigest()
             report_hash = sha256(report_bytes).hexdigest()
-            entries.append({
+            return {
                 "manifest_entry_id": sha256(_canonical_json({"strategy": strategy_id, "report": report_hash, "run": job_id})).hexdigest()[:32],
                 "strategy_name": name,
                 "strategy_version_id": strategy_id,
@@ -254,7 +263,10 @@ def capture_run_snapshot_inbox(
                 "exchange_name": exchange_name,
                 "source_strategy_sha256": sha256(strategy_bytes).hexdigest(),
                 "source_report_sha256": report_hash,
-            })
+            }
+
+        with ThreadPoolExecutor(max_workers=min(workers, MAX_INBOX_CAPTURE_WORKERS, len(names))) as executor:
+            entries.extend(executor.map(capture, names))
         strategy_hashes = provenance.get("strategy_json_sha256")
         if not isinstance(strategy_hashes, Mapping) or set(strategy_hashes) != {f"{name}.json" for name in names}:
             raise InboxCaptureError("RUNS provenance does not cover snapshots")
@@ -266,7 +278,7 @@ def capture_run_snapshot_inbox(
             "commission_contract": contract,
             "commission_contract_id": contract_id,
             "source_mode": "direct",
-            "run_mode": "RUNS",
+            "run_mode": run_mode,
             "test_start": test_start,
             "test_end": test_end,
             "entries": entries,

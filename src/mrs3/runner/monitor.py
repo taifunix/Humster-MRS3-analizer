@@ -54,6 +54,7 @@ class BatchCompletion:
     strategies: dict[str, StrategyCompletion]
     polls: int
     elapsed_seconds: float
+    failed_names: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -71,6 +72,7 @@ class _Tracker:
     missing_report_polls: int = 0
     missing_report_since: float | None = None
     completed: bool = False
+    failed: bool = False
 
     def __post_init__(self) -> None:
         if self.percentages is None:
@@ -158,14 +160,19 @@ def _report_strategy_name(path: Path) -> str | None:
 
 
 class _ReportSnapshotCollector:
-    """Preserve stable report revisions before the closed tester overwrites them."""
+    """Preserve stable report revisions, optionally removing their source files."""
 
     def __init__(
-        self, expected_names: tuple[str, ...], report_dir: Path, snapshot_dir: Path
+        self,
+        expected_names: tuple[str, ...],
+        report_dir: Path,
+        snapshot_dir: Path,
+        remove_source_reports: bool = False,
     ) -> None:
         self._expected_names = set(expected_names)
         self._report_dir = report_dir
         self._snapshot_dir = snapshot_dir
+        self._remove_source_reports = remove_source_reports
         self._observed: dict[Path, tuple[tuple[int, int], int]] = {}
         self._captured: set[tuple[Path, tuple[int, int]]] = set()
         self._inspected: set[tuple[Path, tuple[int, int]]] = set()
@@ -260,6 +267,16 @@ class _ReportSnapshotCollector:
             self._captured.add(key)
             with self._lock:
                 self._snapshots[name] = target
+            if self._remove_source_reports:
+                try:
+                    current = report.stat()
+                except OSError:
+                    current = None
+                if current is not None and (current.st_size, current.st_mtime_ns) == signature:
+                    try:
+                        report.unlink()
+                    except OSError:
+                        pass
 
 
 def _progress_snapshot(
@@ -275,12 +292,13 @@ def _progress_snapshot(
             "percent": tracker.percentages[-1] if tracker.percentages else None,
         }
         for tracker in ordered
-        if not tracker.completed
+        if not tracker.completed and not tracker.failed
     ]
     return {
         "expected_count": len(ordered),
         "submitted_count": len(ordered) if submitted_count is None else submitted_count,
         "completed_count": sum(tracker.completed for tracker in ordered),
+        "failed_count": sum(tracker.failed for tracker in ordered),
         "waiting_count": sum(
             tracker.state in {None, RowState.TEST} for tracker in ordered
         ),
@@ -382,6 +400,7 @@ def _monitor_controlled_batch_loop(
     initial_attempt_counts: Mapping[str, int] | None = None,
     attempts_callback: Callable[[dict[str, int]], None] | None = None,
     collector: _ReportSnapshotCollector | None = None,
+    allow_partial: bool = False,
 ) -> BatchCompletion:
     """Submit a bounded tester window and recover rows returned to TEST."""
     if not expected_names or len(set(expected_names)) != len(expected_names):
@@ -446,13 +465,13 @@ def _monitor_controlled_batch_loop(
 
     while True:
         active_count = sum(
-            name in launched_names and not tracker.completed
+            name in launched_names and not tracker.completed and not tracker.failed
             for name, tracker in trackers.items()
         )
         occupied_keys = {
             keys[name]
             for name, tracker in trackers.items()
-            if name in launched_names and not tracker.completed
+            if name in launched_names and not tracker.completed and not tracker.failed
         }
         while pending and active_count < config.max_parallel_submissions:
             pending_index = next(
@@ -471,7 +490,7 @@ def _monitor_controlled_batch_loop(
         polls += 1
         activity = False
         for name, tracker in trackers.items():
-            if tracker.attempts == 0 or tracker.completed:
+            if tracker.attempts == 0 or tracker.completed or tracker.failed:
                 continue
             row = rows.get(name)
             if row is None:
@@ -562,10 +581,12 @@ def _monitor_controlled_batch_loop(
             retry_reasons[reason] = retry_reasons.get(reason, 0) + 1
             launch(name)
             activity = True
-        if exhausted:
+        if exhausted and not allow_partial:
             raise BatchRetryExhausted(
                 "tester retry limit exceeded for strategies: " + ", ".join(sorted(exhausted))
             )
+        for name in exhausted:
+            trackers[name].failed = True
 
         now = time.monotonic()
         if activity:
@@ -581,7 +602,7 @@ def _monitor_controlled_batch_loop(
                     retry_reasons=retry_reasons,
                 )
             )
-        if all(tracker.completed for tracker in trackers.values()):
+        if all(tracker.completed or tracker.failed for tracker in trackers.values()):
             by_report: dict[Path, list[str]] = {}
             for name, tracker in trackers.items():
                 if tracker.report_path is not None:
@@ -600,6 +621,7 @@ def _monitor_controlled_batch_loop(
                 strategies={name: tracker.frozen() for name, tracker in trackers.items()},
                 polls=polls,
                 elapsed_seconds=now - started,
+                failed_names=tuple(sorted(name for name, tracker in trackers.items() if tracker.failed)),
             )
         if now - started >= config.batch_timeout_seconds:
             incomplete = ", ".join(
@@ -626,9 +648,17 @@ def monitor_controlled_batch(
     snapshot_report_dir: Path | None = None,
     initial_attempt_counts: Mapping[str, int] | None = None,
     attempts_callback: Callable[[dict[str, int]], None] | None = None,
+    *,
+    allow_partial: bool = False,
+    remove_source_reports: bool = False,
 ) -> BatchCompletion:
     collector = (
-        _ReportSnapshotCollector(expected_names, report_dir, snapshot_report_dir)
+        _ReportSnapshotCollector(
+            expected_names,
+            report_dir,
+            snapshot_report_dir,
+            remove_source_reports,
+        )
         if snapshot_report_dir is not None
         else None
     )
@@ -648,6 +678,7 @@ def monitor_controlled_batch(
             initial_attempt_counts=initial_attempt_counts,
             attempts_callback=attempts_callback,
             collector=collector,
+            allow_partial=allow_partial,
         )
     finally:
         if collector is not None:
