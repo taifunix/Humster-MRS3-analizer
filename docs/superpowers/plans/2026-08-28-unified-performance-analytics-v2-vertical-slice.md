@@ -33,7 +33,7 @@
 
 **Stop condition:** Do not implement any v2 code while this gate is not `PASS`.
 
-- [ ] **Step 1: Inspect the current v1 allocator and catalog without changing files.**
+- [x] **Step 1: Inspect the current v1 allocator and catalog without changing files.**
 
   Run:
 
@@ -44,7 +44,7 @@
   ```
 
 
-- [ ] **Step 2: Confirm this currently observed relative-path evidence, then re-check any local override.**
+- [x] **Step 2: Confirm this currently observed relative-path evidence, then re-check any local override.**
 
   | Check | Observed value |
   | --- | --- |
@@ -57,11 +57,19 @@
 
   Before implementation, resolve the operator's local root configuration and stop if it overrides either relative path into an overlap. Do not store machine-specific absolute paths in Git documentation.
 
-- [ ] **Step 3: Enforce the gate in the future v2 path helper.**
+- [x] **Step 3: Record the future v2 path-helper gate (implementation in Task 1).**
+
+  The helper implementation is deferred to Task 1 because Gate 0 is
+  read-only. Gate 0 evidence confirms the planned target is isolated before
+  any v2 connection is opened.
 
   The helper must reject the target *before* `duckdb.connect` when it equals a v1 file, is below the v1 catalog root, or resolves through a symlink/reparse point outside the configured v2 root. V2 never opens a v1 file.
 
-- [ ] **Step 4: Commit the evidence only after the table says `NONE`.**
+- [x] **Step 4: Commit the evidence only after the table says `NONE`.**
+
+  Evidence is recorded in the plan's SDD ledger. The initial sandbox blocked
+  branch creation; the worktree is now writable through the approved Git
+  operation, so this evidence can be committed before Task 1.
 
   ```powershell
   git add docs/superpowers/plans/2026-08-28-unified-performance-analytics-v2-vertical-slice.md
