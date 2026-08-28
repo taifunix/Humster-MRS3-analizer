@@ -10,6 +10,7 @@ import duckdb
 _SCHEMA_VERSION = "2"
 _DATABASE_NAME = "strategy_performance.duckdb"
 _MAX_WORKERS = 64
+_V1_PERFORMANCE_ROOT = Path("data/performanceDB")
 
 
 class PerformanceV2StoreError(ValueError):
@@ -22,11 +23,14 @@ class PerformanceV2Config:
     workers: int = 16
     max_html_bytes: int = 67_108_864
     max_actions_per_report: int = 1_000_000
+    v1_database_root: Path = _V1_PERFORMANCE_ROOT
 
     def __post_init__(self) -> None:
-        if not isinstance(self.database_root, Path):
-            raise ValueError("unified_performance_v2.database_root must be a path")
-        object.__setattr__(self, "database_root", self.database_root.resolve())
+        for name in ("database_root", "v1_database_root"):
+            value = getattr(self, name)
+            if not isinstance(value, Path):
+                raise ValueError(f"unified_performance_v2.{name} must be a path")
+            object.__setattr__(self, name, value.resolve())
         for name in ("workers", "max_html_bytes", "max_actions_per_report"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -63,6 +67,7 @@ def load_performance_v2_config(path: Path) -> PerformanceV2Config:
         workers=section.get("workers", 16),
         max_html_bytes=section.get("max_html_bytes", 67_108_864),
         max_actions_per_report=section.get("max_actions_per_report", 1_000_000),
+        v1_database_root=path.parent / _V1_PERFORMANCE_ROOT,
     )
 
 
@@ -70,8 +75,13 @@ def performance_v2_database_path(config: PerformanceV2Config) -> Path:
     """Return the one v2 target without opening DuckDB or creating its root."""
     root = config.database_root.resolve()
     target = (root / _DATABASE_NAME).resolve()
-    v1_root = (root.parent / "performanceDB").resolve()
-    if root.is_relative_to(v1_root) or target.is_relative_to(v1_root):
+    v1_root = config.v1_database_root.resolve()
+    if (
+        root.is_relative_to(v1_root)
+        or v1_root.is_relative_to(root)
+        or target.is_relative_to(v1_root)
+        or v1_root.is_relative_to(target)
+    ):
         raise ValueError("Performance v2 target overlaps the v1 performance root")
     if target.name.endswith(".performance-v6.duckdb") or not target.is_relative_to(root):
         raise ValueError("Performance v2 target is not inside its owned root")
@@ -232,6 +242,18 @@ def _schema_version(connection: duckdb.DuckDBPyConnection) -> str | None:
     return None if row is None else row[0]
 
 
+def _catalog_is_empty(connection: duckdb.DuckDBPyConnection) -> bool:
+    user_tables = connection.execute(
+        """
+        select count(*)
+        from information_schema.tables
+        where table_schema not in ('information_schema', 'pg_catalog')
+        """
+    ).fetchone()[0]
+    user_sequences = connection.execute("select count(*) from duckdb_sequences()").fetchone()[0]
+    return not user_tables and not user_sequences
+
+
 def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     """Fail closed unless the connection already contains the v2 schema."""
     if _schema_version(connection) != _SCHEMA_VERSION:
@@ -250,6 +272,8 @@ def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
         require_performance_v2(connection)
         connection.execute(_SCHEMA)
         return
+    if not _catalog_is_empty(connection):
+        raise PerformanceV2StoreError("Performance v2 target catalog is not empty")
     connection.execute("create table schema_info (key varchar primary key, value varchar not null)")
     connection.execute(_SCHEMA)
     connection.executemany(

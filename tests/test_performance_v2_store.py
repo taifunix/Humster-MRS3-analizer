@@ -50,7 +50,17 @@ def test_config_uses_the_fixed_owned_target_and_ignores_v1_namespace(tmp_path: P
     )
 
 
-def test_legacy_root_is_rejected_before_any_duckdb_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "root",
+    [
+        Path("data/performanceDB"),
+        Path("data/performanceDB/v2"),
+        Path("data"),
+    ],
+)
+def test_legacy_root_is_rejected_before_any_duckdb_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root: Path
+) -> None:
     called = False
 
     def forbidden_connect(*args: object, **kwargs: object) -> None:
@@ -61,7 +71,12 @@ def test_legacy_root_is_rejected_before_any_duckdb_connection(tmp_path: Path, mo
     monkeypatch.setattr(duckdb, "connect", forbidden_connect)
 
     with pytest.raises(ValueError, match="v1"):
-        performance_v2_database_path(PerformanceV2Config(tmp_path / "data" / "performanceDB"))
+        performance_v2_database_path(
+            PerformanceV2Config(
+                tmp_path / root,
+                v1_database_root=tmp_path / "data" / "performanceDB",
+            )
+        )
 
     assert not called
 
@@ -96,6 +111,19 @@ def test_v1_schema_is_rejected_without_mutation() -> None:
 
         assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("1",)
         assert connection.execute("select count(*) from information_schema.tables where table_name = 'strategies'").fetchone() == (0,)
+
+
+def test_foreign_database_is_rejected_without_mutation() -> None:
+    with duckdb.connect(":memory:") as connection:
+        connection.execute("create table strategies (legacy_id integer primary key)")
+
+        with pytest.raises(PerformanceV2StoreError, match="not empty"):
+            initialize_performance_v2(connection)
+
+        assert connection.execute("select column_name from information_schema.columns where table_name = 'strategies'").fetchall() == [
+            ("legacy_id",)
+        ]
+        assert connection.execute("select count(*) from information_schema.tables where table_name = 'schema_info'").fetchone() == (0,)
 
 
 def test_schema_enforces_order_plateau_and_single_result_invariants() -> None:
