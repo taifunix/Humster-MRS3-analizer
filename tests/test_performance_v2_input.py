@@ -253,6 +253,31 @@ def test_staging_failure_leaves_replaced_foreign_directory(tmp_path: Path, monke
     assert (foreign / "foreign-payload").read_text(encoding="utf-8") == "keep"
 
 
+def test_cleanup_survives_swap_after_initial_ownership_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    owned = create_v2_parser_staging(tmp_path / "v2", prepared)
+    original_verify = input_module._verify_staging_marker
+
+    def swap_after_verify(staging: Path, *, expected_staging: Path | None = None) -> None:
+        if expected_staging is None:
+            original_verify(staging)
+        else:
+            original_verify(staging, expected_staging=expected_staging)
+        if expected_staging is None:
+            shutil.rmtree(staging)
+            staging.mkdir()
+            (staging / "foreign-payload").write_text("keep", encoding="utf-8")
+
+    monkeypatch.setattr(input_module, "_verify_staging_marker", swap_after_verify)
+    with pytest.raises(PerformanceV2InputError, match="ownership"):
+        remove_v2_parser_staging(owned)
+    assert not owned.exists()
+    tombstones = [path for path in owned.parent.iterdir() if path.is_dir()]
+    assert len(tombstones) == 1
+    assert (tombstones[0] / "foreign-payload").read_text(encoding="utf-8") == "keep"
+
+
 def test_identity_rejects_non_integral_shift_and_invalid_order_ids() -> None:
     strategy = _strategy("bad")
     identity = adapt_strategy_identity(strategy)

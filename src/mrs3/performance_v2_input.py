@@ -704,7 +704,7 @@ def _write_staging_marker(staging: Path, staging_root: Path) -> None:
         raise PerformanceV2InputError("could not write v2 staging ownership marker") from error
 
 
-def _verify_staging_marker(staging: Path) -> None:
+def _verify_staging_marker(staging: Path, *, expected_staging: Path | None = None) -> None:
     marker = staging / _STAGING_MARKER
     if _is_reparse(marker) or not marker.is_file():
         raise PerformanceV2InputError("v2 staging ownership marker is missing")
@@ -716,7 +716,7 @@ def _verify_staging_marker(staging: Path) -> None:
         raise PerformanceV2InputError("v2 staging ownership marker is invalid")
     payload = "\n".join(lines[:4])
     expected_root = str(staging.parent.resolve())
-    expected_staging = str(staging.resolve())
+    expected_staging = str((staging if expected_staging is None else expected_staging).resolve())
     if lines[1] != expected_root or lines[2] != expected_staging or not hmac.compare_digest(
         lines[4], hmac.new(_STAGING_OWNER_SECRET, payload.encode("utf-8"), "sha256").hexdigest()
     ):
@@ -768,6 +768,20 @@ def create_v2_parser_staging(v2_root: Path | object, prepared: PreparedV2Input) 
         raise
 
 
+def _move_staging_to_tombstone(staging: Path) -> Path:
+    """Atomically detach one verified staging path before recursive removal."""
+    for _ in range(5):
+        tombstone = staging.parent / f".v2-cleanup-{uuid4().hex}"
+        try:
+            staging.rename(tombstone)
+            return tombstone
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise PerformanceV2InputError("could not atomically move v2 staging directory") from error
+    raise PerformanceV2InputError("could not allocate fresh v2 staging tombstone")
+
+
 def remove_v2_parser_staging(staging: Path) -> None:
     """Remove one owned staging directory; never remove the staging root."""
     path = Path(staging)
@@ -779,7 +793,9 @@ def remove_v2_parser_staging(staging: Path) -> None:
     if not resolved.exists():
         return
     _verify_staging_marker(resolved)
-    shutil.rmtree(resolved, ignore_errors=False)
+    tombstone = _move_staging_to_tombstone(resolved)
+    _verify_staging_marker(tombstone, expected_staging=resolved)
+    shutil.rmtree(tombstone, ignore_errors=False)
 
 
 __all__ = [
