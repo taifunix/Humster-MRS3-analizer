@@ -149,9 +149,9 @@ whole transaction back and preserves inbox files.
 ## 8. Parallel Preparation and Progress
 
 Preparation is independent and may use a bounded `ProcessPoolExecutor`. The
-default worker count is 4 and the documented maximum is 8. Results are buffered
-and sorted by manifest index before identity decisions, so completion order
-cannot change stored facts or audits.
+default worker count is 16 and the documented maximum is 16. Results are
+buffered and sorted by manifest index before identity decisions, so completion
+order cannot change stored facts or audits.
 
 The observable progress stages are:
 

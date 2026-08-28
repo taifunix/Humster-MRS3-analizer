@@ -12,6 +12,8 @@ import pytest
 import mrs3.performance_import as performance_import
 
 from mrs3.performance_import import (
+    DEFAULT_PERFORMANCE_WORKERS,
+    MAX_PERFORMANCE_WORKERS,
     PerformanceImportError,
     PerformanceImportProgress,
     PerformanceImportRequest,
@@ -22,6 +24,16 @@ from mrs3.performance_store import initialize_performance_database
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "performance" / "report_import.html"
+
+
+def test_performance_import_defaults_to_sixteen_workers_and_caps_at_sixteen(tmp_path: Path) -> None:
+    default = PerformanceImportRequest(tmp_path / "inbox", tmp_path / "database.duckdb")
+    capped = PerformanceImportRequest(tmp_path / "inbox", tmp_path / "database.duckdb", workers=64)
+
+    assert DEFAULT_PERFORMANCE_WORKERS == 16
+    assert MAX_PERFORMANCE_WORKERS == 16
+    assert default.workers == 16
+    assert capped.workers == 16
 
 
 def _canonical(value: object) -> bytes:

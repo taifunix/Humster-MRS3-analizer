@@ -23,6 +23,12 @@ from mrs3.panel_performance_dd5 import (
 )
 
 
+def test_performance_import_panel_defaults_to_sixteen_workers(tmp_path: Path) -> None:
+    request = PerformanceImportPanelRequest(tmp_path / "inbox", tmp_path / "performance")
+
+    assert request.workers == 16
+
+
 def _request(tmp_path: Path, *, delete_html: bool = False) -> PerformanceDd5Request:
     inbox = tmp_path / "inbox"
     inbox.mkdir()

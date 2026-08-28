@@ -33,8 +33,8 @@ class PerformanceImportError(RuntimeError):
     """Raised when an evidence batch cannot be imported safely."""
 
 
-DEFAULT_PERFORMANCE_WORKERS = 4
-MAX_PERFORMANCE_WORKERS = 8
+DEFAULT_PERFORMANCE_WORKERS = 16
+MAX_PERFORMANCE_WORKERS = 16
 DEFAULT_TRANSACTION_BATCH_SIZE = 50_000
 
 

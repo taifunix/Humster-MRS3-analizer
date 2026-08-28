@@ -41,6 +41,7 @@
 - В legacy-run разрешён только единый `event_mode=legacy_trades_proxy`: `point_event_count=TotalTrades` для каждой строки. Нельзя смешивать его с real independent events.
 - Не считать сумму MRS2 Source PnL фактическим PnL MRS3. Финальные выводы требуют реального tick-test и DD5 retest.
 - Hook `Анализатор Портфеля`: прежде чем менять portfolio module, читать `PRD.md` и `docs/specs/2026-08-09-portfolio-analyzer-v04.md`; реализовывать Layer A можно отдельно, но simulation требует trade timestamps, limiter contract, L2 и margin data.
+- Для ресурсоемких процессов, таких как парсинг большого количества отчетов, валидация, дедуп, импорт, экспорт, упаковка, распаковка при возможности применять обработку в многопоточном режиме, стандартный вариант по умолчанию 16 потоков.
 
 ## Документация по ходу работы
 

@@ -45,7 +45,7 @@ class PerformanceImportPanelRequest:
     test_start: object | None = None
     test_end: object | None = None
     delete_html: bool = False
-    workers: int = 4
+    workers: int = 16
     transaction_batch_size: int = 50_000
 
 
