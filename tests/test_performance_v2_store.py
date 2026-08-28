@@ -64,6 +64,29 @@ def test_config_rejects_nonstandard_runtime_v1_root_before_any_duckdb_connection
         performance_v2_database_path(config)
 
 
+def test_sibling_local_config_v1_root_is_authoritative_before_duckdb_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _config(tmp_path / "config.performance.json")
+    (tmp_path / "config.local.json").write_text(
+        json.dumps({"panel_paths": {"performance_db_root": "data/performance-v2"}}),
+        encoding="utf-8",
+    )
+    called = False
+
+    def forbidden_connect(*args: object, **kwargs: object) -> None:
+        nonlocal called
+        called = True
+        raise AssertionError("DuckDB must not open an overlapping v1 path")
+
+    monkeypatch.setattr(duckdb, "connect", forbidden_connect)
+
+    with pytest.raises(ValueError, match="v1"):
+        performance_v2_database_path(load_performance_v2_config(config_path))
+
+    assert not called
+
+
 @pytest.mark.parametrize(
     "root",
     [
@@ -164,6 +187,17 @@ def test_v2_schema_rejects_a_forged_extra_index() -> None:
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
         connection.execute("create index foreign_strategy_symbol_idx on strategies(symbol)")
+
+        with pytest.raises(PerformanceV2StoreError, match="catalog"):
+            require_performance_v2(connection)
+
+
+def test_v2_schema_rejects_forged_schema_qualified_catalog_objects() -> None:
+    with duckdb.connect(":memory:") as connection:
+        initialize_performance_v2(connection)
+        connection.execute("create schema forged")
+        connection.execute("create table forged.strategies (value integer)")
+        connection.execute("create sequence forged.performance_v2_strategy_id_seq")
 
         with pytest.raises(PerformanceV2StoreError, match="catalog"):
             require_performance_v2(connection)

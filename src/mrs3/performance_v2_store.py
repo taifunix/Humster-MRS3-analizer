@@ -6,7 +6,7 @@ from pathlib import Path
 
 import duckdb
 
-from .config import PanelPathSettings
+from .config import PanelPathSettings, load_panel_path_settings
 
 
 _SCHEMA_VERSION = "2"
@@ -66,7 +66,11 @@ def load_performance_v2_config(
         or ".." in relative_root.parts
     ):
         raise ValueError("unified_performance_v2.database_root must be a relative path")
-    runtime_v1_root = _DEFAULT_V1_PERFORMANCE_ROOT if v1_database_root is None else v1_database_root
+    runtime_v1_root = (
+        load_panel_path_settings(path.with_name("config.local.json")).performance_db_root
+        if v1_database_root is None
+        else v1_database_root
+    )
     if not isinstance(runtime_v1_root, Path):
         raise ValueError("unified_performance_v2.v1_database_root must be a path")
     if not runtime_v1_root.is_absolute():
@@ -241,7 +245,8 @@ CREATE INDEX IF NOT EXISTS strategy_equity_result_timestamp_idx ON strategy_equi
 """
 
 _EXPECTED_TABLES = frozenset(
-    {
+    ("main", name)
+    for name in {
         "schema_info",
         "strategies",
         "analysis_plateaus",
@@ -255,7 +260,8 @@ _EXPECTED_TABLES = frozenset(
     }
 )
 _EXPECTED_SEQUENCES = frozenset(
-    {
+    ("main", name)
+    for name in {
         "performance_v2_strategy_id_seq",
         "performance_v2_result_id_seq",
         "performance_v2_import_run_id_seq",
@@ -292,16 +298,18 @@ def _catalog_objects(
     connection: duckdb.DuckDBPyConnection,
 ) -> tuple[frozenset[str], frozenset[str], frozenset[tuple[str, str]]]:
     tables = frozenset(
-        row[0]
+        row
         for row in connection.execute(
         """
-        select table_name
+        select table_schema, table_name
         from information_schema.tables
         where table_schema not in ('information_schema', 'pg_catalog')
         """
         ).fetchall()
     )
-    sequences = frozenset(row[0] for row in connection.execute("select sequence_name from duckdb_sequences()").fetchall())
+    sequences = frozenset(
+        connection.execute("select schema_name, sequence_name from duckdb_sequences()").fetchall()
+    )
     indexes = frozenset(
         connection.execute(
             "select schema_name, index_name from duckdb_indexes() where sql is not null"
