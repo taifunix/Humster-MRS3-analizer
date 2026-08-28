@@ -11,9 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
+import hmac
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 from typing import Mapping
 from uuid import uuid4
@@ -226,6 +228,9 @@ _COMMISSION_FIELDS = (
 )
 _DEFAULT_MAX_HTML_BYTES = 67_108_864
 _HASH_SIZE = 64
+_STAGING_MARKER = ".v2-staging-owner"
+_STAGING_MARKER_VERSION = "performance-v2-staging-owner-v1"
+_STAGING_OWNER_SECRET = secrets.token_bytes(32)
 
 
 def _is_reparse(path: Path) -> bool:
@@ -687,6 +692,34 @@ def _staging_root(v2_root: Path | object) -> Path:
     return staging
 
 
+def _write_staging_marker(staging: Path, staging_root: Path) -> None:
+    token = secrets.token_hex(32)
+    payload = "\n".join((_STAGING_MARKER_VERSION, str(staging_root.resolve()), token))
+    signature = hmac.new(_STAGING_OWNER_SECRET, payload.encode("utf-8"), "sha256").hexdigest()
+    try:
+        (staging / _STAGING_MARKER).write_text(f"{payload}\n{signature}\n", encoding="ascii")
+    except OSError as error:
+        raise PerformanceV2InputError("could not write v2 staging ownership marker") from error
+
+
+def _verify_staging_marker(staging: Path) -> None:
+    marker = staging / _STAGING_MARKER
+    if _is_reparse(marker) or not marker.is_file():
+        raise PerformanceV2InputError("v2 staging ownership marker is missing")
+    try:
+        lines = marker.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise PerformanceV2InputError("v2 staging ownership marker is invalid") from error
+    if len(lines) != 4 or lines[0] != _STAGING_MARKER_VERSION:
+        raise PerformanceV2InputError("v2 staging ownership marker is invalid")
+    payload = "\n".join(lines[:3])
+    expected_root = str(staging.parent.resolve())
+    if lines[1] != expected_root or not hmac.compare_digest(
+        lines[3], hmac.new(_STAGING_OWNER_SECRET, payload.encode("utf-8"), "sha256").hexdigest()
+    ):
+        raise PerformanceV2InputError("v2 staging ownership marker does not belong to this process/root")
+
+
 def _copy_verified(source: Path, target: Path, expected_hash: str, label: str, max_bytes: int | None = None) -> None:
     try:
         data = source.read_bytes()
@@ -715,6 +748,7 @@ def create_v2_parser_staging(v2_root: Path | object, prepared: PreparedV2Input) 
     else:
         raise PerformanceV2InputError("could not allocate fresh v2 staging directory")
     try:
+        _write_staging_marker(staging, staging_root)
         for entry in prepared.entries:
             if entry.strategy_path.name != f"{entry.strategy_name}.json":
                 raise PerformanceV2InputError("strategy filename does not match strategy name")
@@ -736,6 +770,7 @@ def remove_v2_parser_staging(staging: Path) -> None:
         raise PerformanceV2InputError("staging path is outside the v2 staging directory")
     if not resolved.exists():
         return
+    _verify_staging_marker(resolved)
     shutil.rmtree(resolved, ignore_errors=False)
 
 

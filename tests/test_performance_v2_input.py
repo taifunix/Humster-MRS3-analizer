@@ -197,11 +197,23 @@ def test_staging_is_fresh_bounded_and_removed(tmp_path: Path) -> None:
     root = tmp_path / "v2"
     staging = create_v2_parser_staging(root, prepared)
     assert staging.parent == root / ".staging"
+    assert (staging / ".v2-staging-owner").is_file()
     assert (staging / "strategies" / "BTC-demo.json").is_file()
     assert (staging / "reports" / "BTC-demo.html").is_file()
     assert staging != create_v2_parser_staging(root, prepared)
     remove_v2_parser_staging(staging)
     assert not staging.exists()
+
+
+def test_cleanup_rejects_unrelated_staging_directory(tmp_path: Path) -> None:
+    foreign = tmp_path / "foreign" / ".staging" / "not-v2"
+    foreign.mkdir(parents=True)
+    payload = foreign / "payload"
+    payload.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(PerformanceV2InputError, match="ownership"):
+        remove_v2_parser_staging(foreign)
+    assert payload.read_text(encoding="utf-8") == "keep"
 
 
 def test_identity_rejects_non_integral_shift_and_invalid_order_ids() -> None:
