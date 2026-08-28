@@ -7,8 +7,10 @@ The 2026-08-28 main-branch commit audit is complete. Relevant work is now
 split into `de0ee4c` (Fast TEST contour), `b58f22d` (inode-preserving strategy
 publication), `edc5d40` (16-worker Performance import defaults), `4a2bab8`
 (Fast TEST implementation plan), and `23575e8` (unified Performance v2
-specification, ADR and vertical-slice plan). The v2 implementation remains
-pending by design. The current focused verification is 255 passed tests plus
+specification, ADR and vertical-slice plan). The v2 vertical slice (Tasks 1–6)
+is implemented and independently reviewed; the full v2 pipeline remains
+pending; aggregate verification is 81 focused v2 tests and 334 v1
+non-disturbance tests plus
 `node --check src/mrs3/panel_web/app.js`; no runtime or generated artifacts
 were committed.
 
@@ -18,16 +20,44 @@ approved boundary is one Performance DuckDB, one current replaceable result per
 strategy, shared order-to-plateau facts, arbitrary flat-boundary UPNL-relative
 A/B windows, an ordered filter/Pareto pipeline, panel/XLSX/Portfolio Optimizer
 outputs, transactional discard/add/replace and a durable `RETEST` tag whose
-handler runs the common RUNS-to-inbox-to-replacement chain. No code or schema
-has been changed yet. Next step is an implementation plan for schema v2 and the
-minimum vertical slice; the later RUNS redesign must reuse the common FAST
-Performance inbox contract.
+handler runs the common RUNS-to-inbox-to-replacement chain. The reviewed
+vertical-slice code and schema are now committed. Next step is the deferred full
+v2 pipeline; the later RUNS redesign must reuse the common FAST Performance
+inbox contract.
 
 Performance DB import now defaults to 16 preparation processes and caps the
 request at 16; DuckDB publication remains a single transactional writer.
 Focused verification: `.venv\\Scripts\\python.exe -m pytest
 tests/test_performance_import.py tests/test_panel_performance_dd5.py -q` —
 `48 passed`.
+
+## Unified Performance Analytics v2 vertical slice (2026-08-28)
+
+Tasks 1–6 of the approved v2 vertical-slice plan are implemented and
+independently reviewed. Accepted commits are `3686af7` (Task 1), `ead1ded`
+(Task 2), `5475dae` (Task 3), `f69737a` (Task 4), `a154015` (Task 5), and
+`91381ce` (Task 6); each received Terra Medium `CODE_REVIEW_PASS`.
+
+Focused v2 verification:
+`.venv\\Scripts\\python.exe -m pytest -q
+tests/test_performance_v2_store.py tests/test_performance_v2_input.py
+tests/test_performance_v2_html.py tests/test_performance_v2_import.py
+tests/test_performance_v2_windows.py tests/test_panel_performance_v2.py` —
+`81 passed in 17.05s`.
+
+V1 non-disturbance verification:
+`.venv\\Scripts\\python.exe -m pytest -q tests/test_performance.py
+tests/test_performance_store.py tests/test_performance_import.py
+tests/test_performance_metrics.py tests/test_performance_dd5.py
+tests/test_panel_performance_dd5.py tests/runner/test_inbox.py tests/test_panel.py
+tests/test_panel_static_ui.py tests/test_integration_contract.py` —
+`334 passed in 139.69s`.
+
+`node --check src/mrs3/panel_web/app.js` and `git diff --check` passed. The
+vertical slice is implemented and verified; the full v2 pipeline is pending.
+Source metrics are not MRS3 strategy, tick-test, DD5, or portfolio results.
+Next increment: implement the explicitly deferred v2 scope under its approved
+contracts, without deleting v1 runtime/storage or widening result claims.
 
 Fast TEST now writes the HTML profile into the tester config's nested
 `report` object as well as legacy top-level keys. Balance/equity series remain

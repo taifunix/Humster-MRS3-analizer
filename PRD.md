@@ -192,5 +192,30 @@ one current replaceable tester result per logical strategy, order-to-plateau
 facts, arbitrary UPNL-relative A/B windows, configurable ordered filters/Pareto,
 panel/XLSX finalists and Portfolio Optimizer input. A durable `RETEST` tag drives
 one RUNS handler that replaces successful results through the common FAST inbox
-contract. Implementation and acceptance evidence are pending; no v1 migration
-is required because no production Performance DB exists.
+contract.
+
+Status: **vertical slice implemented and verified; full v2 pipeline pending**.
+Tasks 1–6 provide the v2-owned schema/config guard, shared FAST/RUNS inbox
+adapter and immutable staging, current-report parser, atomic ADD/REPLACE import,
+relative UPNL window cache, and an isolated Panel import/status action. Terra
+Medium independently reviewed each accepted task with `CODE_REVIEW_PASS`.
+The focused v2 suite passed 81 tests, the v1 non-disturbance suite passed 334
+tests, and the Panel JavaScript syntax check passed. No v1 migration is required
+because no production Performance DB exists.
+
+Explicitly deferred from this vertical slice:
+
+- `strategy_tags`, `DISCARDED`, and the durable `RETEST` handler. Its next
+  phase must add a Panel date-range interface and reject each request unless
+  `listing_date <= test_start < test_end`, with `listing_date` read from
+  `dates.xlsx` for every selected symbol;
+- source HTML cleanup outside v2 temporary staging;
+- DD5 proxy UI and any scaled-result claim;
+- built-in filters, Pareto, selection runs/results, XLSX, and Portfolio
+  Optimizer input;
+- deletion of v1 runtime and storage;
+- `point_id`, arbitrary filter expressions, and portfolio simulation.
+
+This status does not claim a completed MRS3 strategy, a tick-test result, a DD5
+result, or a portfolio result; source metrics remain source analytics until the
+deferred evidence-producing stages are implemented and verified.
