@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import shutil
 
@@ -276,6 +277,35 @@ def test_cleanup_survives_swap_after_initial_ownership_check(tmp_path: Path, mon
     tombstones = [path for path in owned.parent.iterdir() if path.is_dir()]
     assert len(tombstones) == 1
     assert (tombstones[0] / "foreign-payload").read_text(encoding="utf-8") == "keep"
+
+
+def test_cleanup_survives_swap_after_post_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    owned = create_v2_parser_staging(tmp_path / "v2", prepared)
+    foreign = owned.parent / "foreign-after-verification"
+    swap_attempted = False
+
+    def swap_tombstone(tombstone: Path) -> None:
+        nonlocal swap_attempted
+        swap_attempted = True
+        try:
+            tombstone.rename(foreign)
+            tombstone.mkdir()
+        except OSError:
+            if os.name != "nt":
+                raise
+            foreign.mkdir()
+        (foreign / "foreign-payload").write_text("keep", encoding="utf-8")
+
+    monkeypatch.setattr(input_module, "_before_tombstone_delete", swap_tombstone, raising=False)
+    if os.name == "nt":
+        remove_v2_parser_staging(owned)
+    else:
+        with pytest.raises(PerformanceV2InputError, match="tombstone"):
+            remove_v2_parser_staging(owned)
+    assert swap_attempted
+    assert (foreign / "foreign-payload").read_text(encoding="utf-8") == "keep"
 
 
 def test_identity_rejects_non_integral_shift_and_invalid_order_ids() -> None:

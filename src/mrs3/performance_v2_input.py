@@ -782,6 +782,115 @@ def _move_staging_to_tombstone(staging: Path) -> Path:
     raise PerformanceV2InputError("could not allocate fresh v2 staging tombstone")
 
 
+def _before_tombstone_delete(tombstone: Path) -> None:
+    """Test seam immediately before handle-bound tombstone deletion."""
+
+
+def _delete_tombstone_with_fd(tombstone: Path) -> None:
+    if not getattr(shutil, "_use_fd_functions", False) or not hasattr(os, "O_DIRECTORY"):
+        raise PerformanceV2InputError("handle-bound tombstone cleanup is unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    parent_fd: int | None = None
+    tombstone_fd: int | None = None
+    try:
+        parent_fd = os.open(tombstone.parent, flags)
+        tombstone_fd = os.open(tombstone.name, flags, dir_fd=parent_fd)
+        _before_tombstone_delete(tombstone)
+        # This removes children through the opened directory handle.  The
+        # final attempt to remove ``.`` itself is intentionally ignored.
+        shutil.rmtree(".", dir_fd=tombstone_fd, ignore_errors=True)
+        if os.listdir(tombstone_fd):
+            raise PerformanceV2InputError("v2 staging tombstone cleanup is incomplete")
+        try:
+            current = os.stat(tombstone.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise PerformanceV2InputError("v2 staging tombstone was replaced") from error
+        if not os.path.samestat(current, os.fstat(tombstone_fd)):
+            raise PerformanceV2InputError("v2 staging tombstone was replaced")
+        try:
+            os.rmdir(tombstone.name, dir_fd=parent_fd)
+        except OSError as error:
+            raise PerformanceV2InputError("could not remove v2 staging tombstone") from error
+    finally:
+        if tombstone_fd is not None:
+            os.close(tombstone_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _delete_tombstone_with_windows_handle(tombstone: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    set_file_info = kernel32.SetFileInformationByHandle
+    set_file_info.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    set_file_info.restype = wintypes.BOOL
+
+    handle = create_file(
+        str(tombstone),
+        0x00010000,  # DELETE
+        0x00000001 | 0x00000002,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        error = ctypes.get_last_error()
+        raise PerformanceV2InputError("handle-bound tombstone cleanup is unavailable") from OSError(error, "CreateFileW")
+    try:
+        _before_tombstone_delete(tombstone)
+        cleanup_error: OSError | None = None
+        try:
+            shutil.rmtree(tombstone)
+        except OSError as error:
+            cleanup_error = error
+        if cleanup_error is not None and not isinstance(cleanup_error, PermissionError):
+            raise PerformanceV2InputError("v2 staging tombstone cleanup failed") from cleanup_error
+        if tombstone.exists() and any(tombstone.iterdir()):
+            raise PerformanceV2InputError("v2 staging tombstone cleanup is incomplete")
+
+        class FileDispositionInfo(ctypes.Structure):
+            _fields_ = [("delete_file", wintypes.BOOLEAN)]
+
+        disposition = FileDispositionInfo(1)
+        if not set_file_info(handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+            error = ctypes.get_last_error()
+            raise PerformanceV2InputError("could not remove v2 staging tombstone") from OSError(
+                error, "SetFileInformationByHandle"
+            )
+    finally:
+        if not close_handle(handle):
+            error = ctypes.get_last_error()
+            raise PerformanceV2InputError("could not close v2 staging tombstone handle") from OSError(
+                error, "CloseHandle"
+            )
+    if tombstone.exists():
+        raise PerformanceV2InputError("v2 staging tombstone was not removed")
+
+
+def _delete_tombstone(tombstone: Path) -> None:
+    if os.name == "nt":
+        _delete_tombstone_with_windows_handle(tombstone)
+    else:
+        _delete_tombstone_with_fd(tombstone)
+
+
 def remove_v2_parser_staging(staging: Path) -> None:
     """Remove one owned staging directory; never remove the staging root."""
     path = Path(staging)
@@ -795,7 +904,7 @@ def remove_v2_parser_staging(staging: Path) -> None:
     _verify_staging_marker(resolved)
     tombstone = _move_staging_to_tombstone(resolved)
     _verify_staging_marker(tombstone, expected_staging=resolved)
-    shutil.rmtree(tombstone, ignore_errors=False)
+    _delete_tombstone(tombstone)
 
 
 __all__ = [
