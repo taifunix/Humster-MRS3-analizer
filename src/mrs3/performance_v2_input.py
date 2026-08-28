@@ -759,7 +759,12 @@ def create_v2_parser_staging(v2_root: Path | object, prepared: PreparedV2Input) 
             _copy_verified(entry.report_path, staging / "reports" / entry.report_path.name, entry.report_sha256, "HTML report", prepared.max_html_bytes)
         return staging
     except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        # Fail closed if the path was replaced while staging: cleanup must not
+        # turn an ownership failure into recursive deletion of foreign data.
+        try:
+            remove_v2_parser_staging(staging)
+        except Exception:
+            pass
         raise
 
 

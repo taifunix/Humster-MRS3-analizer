@@ -3,6 +3,7 @@ from __future__ import annotations
 from hashlib import sha256
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -231,6 +232,25 @@ def test_cleanup_rejects_replayed_marker_in_same_staging_root(tmp_path: Path) ->
         remove_v2_parser_staging(foreign)
     assert payload.read_text(encoding="utf-8") == "keep"
     remove_v2_parser_staging(owned)
+
+
+def test_staging_failure_leaves_replaced_foreign_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    original = input_module._write_staging_marker
+
+    def replace_after_marker(staging: Path, staging_root: Path) -> None:
+        original(staging, staging_root)
+        shutil.rmtree(staging)
+        staging.mkdir()
+        (staging / "foreign-payload").write_text("keep", encoding="utf-8")
+        raise PerformanceV2InputError("injected staging failure")
+
+    monkeypatch.setattr(input_module, "_write_staging_marker", replace_after_marker)
+    with pytest.raises(PerformanceV2InputError, match="injected"):
+        create_v2_parser_staging(tmp_path / "v2", prepared)
+    foreign = next((tmp_path / "v2" / ".staging").iterdir())
+    assert (foreign / "foreign-payload").read_text(encoding="utf-8") == "keep"
 
 
 def test_identity_rejects_non_integral_shift_and_invalid_order_ids() -> None:
