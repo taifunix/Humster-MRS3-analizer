@@ -209,6 +209,8 @@ CREATE TABLE IF NOT EXISTS window_metrics (
     profit_factor DECIMAL(38,12),
     trade_count INTEGER,
     win_rate_pct DECIMAL(38,12),
+    holding_seconds DECIMAL(38,12),
+    time_in_market_pct DECIMAL(38,12),
     calculated_at_utc TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (result_id, requested_start_utc, requested_end_utc, metrics_version),
     CHECK (requested_end_utc >= requested_start_utc)
@@ -351,6 +353,8 @@ def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     if version is not None and version != _SCHEMA_VERSION:
         raise PerformanceV2StoreError("Performance database has an unsupported schema version")
     if version == _SCHEMA_VERSION:
+        connection.execute("alter table window_metrics add column if not exists holding_seconds decimal(38,12)")
+        connection.execute("alter table window_metrics add column if not exists time_in_market_pct decimal(38,12)")
         require_performance_v2(connection)
         return
     if not _catalog_is_empty(connection):

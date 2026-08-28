@@ -162,6 +162,8 @@ _METRIC_COLUMNS = (
     "profit_factor",
     "trade_count",
     "win_rate_pct",
+    "holding_seconds",
+    "time_in_market_pct",
 )
 
 
@@ -195,7 +197,7 @@ def _decimal(value: object, field: str) -> Decimal:
 
 def _metric_from_row(row: tuple[Any, ...]) -> WindowMetrics:
     values = list(row)
-    for index in (8, 9, 10, 11, 12, 13, 14, 15, 17):
+    for index in (8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19):
         if values[index] is not None:
             values[index] = _decimal(values[index], _METRIC_COLUMNS[index])
     if values[16] is not None:
@@ -273,18 +275,14 @@ def _round_trips(actions: tuple[_Action, ...]) -> tuple[_RoundTrip, ...]:
         if action.kind in {"opened", "increased"}:
             if current is None:
                 current = _RoundTrip([], [])
-            elif current.realisations:
-                trips.append(current)
-                current = _RoundTrip([], [])
             current.entries.append(action)
-            continue
-        if action.kind not in {"decreased", "closed"}:
-            continue
-        if current is None:
-            current = _RoundTrip([], [])
-        current.realisations.append(action)
-        if action.kind == "closed" or action.post_size == 0:
-            trips.append(current)
+        elif action.kind in {"decreased", "closed"}:
+            if current is None:
+                current = _RoundTrip([], [])
+            current.realisations.append(action)
+        if current is not None and action.post_size == 0:
+            if current.realisations:
+                trips.append(current)
             current = None
     if current is not None and current.realisations:
         trips.append(current)
@@ -412,7 +410,8 @@ def get_or_calculate_window(
     source = _load_source(connection, result_id)
     metrics = _calculate(result_id, start, end, version, *source)
     _persist(connection, metrics)
-    return metrics
+    persisted = _cached(connection, result_id, start, end, version)
+    return metrics if persisted is None else persisted
 
 
 def get_or_calculate_window_pair(

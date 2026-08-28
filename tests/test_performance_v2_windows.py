@@ -9,6 +9,8 @@ import pytest
 from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_windows import (
     METRICS_VERSION,
+    _Action,
+    _round_trips,
     WindowMetrics,
     compare_window_pair_geometrically,
     get_or_calculate_window,
@@ -130,8 +132,8 @@ def test_overlapping_nested_and_disjoint_pair_is_independently_cached(tmp_path) 
     ("start", "end", "reason"),
     [
         ("2025-01-01T00:00:00Z", "2025-01-02T00:00:00Z", "OUT_OF_RANGE"),
-            ("2026-01-01T00:00:00Z", "2026-01-02T06:00:00Z", "NO_FLAT_END"),
-            ("2026-01-03T00:00:00Z", "2026-01-03T00:00:00Z", "COLLAPSED"),
+        ("2026-01-01T00:00:00Z", "2026-01-02T06:00:00Z", "NO_FLAT_END"),
+        ("2026-01-03T00:00:00Z", "2026-01-03T00:00:00Z", "COLLAPSED"),
     ],
 )
 def test_unavailable_outcomes_are_cacheable(tmp_path, start, end, reason) -> None:
@@ -185,7 +187,9 @@ def test_upnl_metrics_are_scale_invariant_and_partial_fills_form_round_trips(tmp
     second_connection, second_id = _db(tmp_path / "two", scale=Decimal("10"))
     try:
         first = get_or_calculate_window(first_connection, first_id, "2026-01-01", "2026-01-05")
+        cached = get_or_calculate_window(first_connection, first_id, "2026-01-01", "2026-01-05")
         second = get_or_calculate_window(second_connection, second_id, "2026-01-01", "2026-01-05")
+        assert first == cached
         assert first.trade_count == second.trade_count == 2
         assert first.growth_factor == second.growth_factor
         assert first.return_pct == second.return_pct
@@ -197,6 +201,44 @@ def test_upnl_metrics_are_scale_invariant_and_partial_fills_form_round_trips(tmp
     finally:
         first_connection.close()
         second_connection.close()
+
+
+def test_partial_close_then_increase_stays_one_position_episode() -> None:
+    actions = tuple(
+        _Action(index, datetime(2026, 1, 1, hour=index, tzinfo=UTC), kind, Decimal(post_size), Decimal(pnl), Decimal("0"))
+        for index, (kind, post_size, pnl) in enumerate(
+            (("opened", "1", "0"), ("decreased", "0.5", "2"), ("increased", "1", "0"), ("closed", "0", "3"))
+        )
+    )
+    trips = _round_trips(actions)
+    assert len(trips) == 1
+    assert len(trips[0].entries) == 2
+    assert len(trips[0].realisations) == 2
+
+
+def test_replace_child_cleanup_removes_cached_window(tmp_path) -> None:
+    from mrs3.performance_v2_import import _prepare_replace_children
+
+    connection, result_id = _db(tmp_path)
+    try:
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        end = datetime(2026, 1, 5, tzinfo=UTC)
+        connection.execute(
+            """insert into window_metrics (
+               result_id, requested_start_utc, requested_end_utc, metrics_version,
+               effective_start_utc, effective_end_utc, availability_status, unavailable_reason,
+               growth_factor, return_pct, daily_log_return, daily_growth_pct, max_drawdown_pct,
+               return_dd_ratio, fees_pct, profit_factor, trade_count, win_rate_pct,
+               holding_seconds, time_in_market_pct, calculated_at_utc)
+               values (?, ?, ?, ?, ?, ?, 'AVAILABLE', null, 1, 0, 0, 0, 0, null, 0, null, 1, 100, 3600, 10, ?)""",
+            [result_id, start, end, METRICS_VERSION, start, end, start],
+        )
+        connection.execute("begin")
+        _prepare_replace_children(connection, (result_id,))
+        connection.execute("commit")
+        assert connection.execute("select count(*) from window_metrics").fetchone() == (0,)
+    finally:
+        connection.close()
 
 
 def test_geometric_comparison_rejects_zero_negative_and_unavailable_inputs() -> None:

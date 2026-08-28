@@ -348,6 +348,8 @@ _REPLACE_CHILD_DDL = {
             profit_factor decimal(38,12),
             trade_count integer,
             win_rate_pct decimal(38,12),
+            holding_seconds decimal(38,12),
+            time_in_market_pct decimal(38,12),
             calculated_at_utc timestamptz not null,
             primary key (result_id, requested_start_utc, requested_end_utc, metrics_version),
             check (requested_end_utc >= requested_start_utc)
