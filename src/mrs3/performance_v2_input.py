@@ -694,7 +694,9 @@ def _staging_root(v2_root: Path | object) -> Path:
 
 def _write_staging_marker(staging: Path, staging_root: Path) -> None:
     token = secrets.token_hex(32)
-    payload = "\n".join((_STAGING_MARKER_VERSION, str(staging_root.resolve()), token))
+    payload = "\n".join(
+        (_STAGING_MARKER_VERSION, str(staging_root.resolve()), str(staging.resolve()), token)
+    )
     signature = hmac.new(_STAGING_OWNER_SECRET, payload.encode("utf-8"), "sha256").hexdigest()
     try:
         (staging / _STAGING_MARKER).write_text(f"{payload}\n{signature}\n", encoding="ascii")
@@ -710,12 +712,13 @@ def _verify_staging_marker(staging: Path) -> None:
         lines = marker.read_text(encoding="ascii").splitlines()
     except (OSError, UnicodeError) as error:
         raise PerformanceV2InputError("v2 staging ownership marker is invalid") from error
-    if len(lines) != 4 or lines[0] != _STAGING_MARKER_VERSION:
+    if len(lines) != 5 or lines[0] != _STAGING_MARKER_VERSION:
         raise PerformanceV2InputError("v2 staging ownership marker is invalid")
-    payload = "\n".join(lines[:3])
+    payload = "\n".join(lines[:4])
     expected_root = str(staging.parent.resolve())
-    if lines[1] != expected_root or not hmac.compare_digest(
-        lines[3], hmac.new(_STAGING_OWNER_SECRET, payload.encode("utf-8"), "sha256").hexdigest()
+    expected_staging = str(staging.resolve())
+    if lines[1] != expected_root or lines[2] != expected_staging or not hmac.compare_digest(
+        lines[4], hmac.new(_STAGING_OWNER_SECRET, payload.encode("utf-8"), "sha256").hexdigest()
     ):
         raise PerformanceV2InputError("v2 staging ownership marker does not belong to this process/root")
 

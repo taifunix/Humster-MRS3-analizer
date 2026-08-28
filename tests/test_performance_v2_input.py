@@ -216,6 +216,23 @@ def test_cleanup_rejects_unrelated_staging_directory(tmp_path: Path) -> None:
     assert payload.read_text(encoding="utf-8") == "keep"
 
 
+def test_cleanup_rejects_replayed_marker_in_same_staging_root(tmp_path: Path) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    root = tmp_path / "v2"
+    owned = create_v2_parser_staging(root, prepared)
+    foreign = owned.parent / "foreign"
+    foreign.mkdir()
+    (foreign / ".v2-staging-owner").write_bytes((owned / ".v2-staging-owner").read_bytes())
+    payload = foreign / "payload"
+    payload.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(PerformanceV2InputError, match="ownership"):
+        remove_v2_parser_staging(foreign)
+    assert payload.read_text(encoding="utf-8") == "keep"
+    remove_v2_parser_staging(owned)
+
+
 def test_identity_rejects_non_integral_shift_and_invalid_order_ids() -> None:
     strategy = _strategy("bad")
     identity = adapt_strategy_identity(strategy)
