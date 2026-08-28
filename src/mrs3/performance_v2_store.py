@@ -353,9 +353,9 @@ def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     if version is not None and version != _SCHEMA_VERSION:
         raise PerformanceV2StoreError("Performance database has an unsupported schema version")
     if version == _SCHEMA_VERSION:
+        require_performance_v2(connection)
         connection.execute("alter table window_metrics add column if not exists holding_seconds decimal(38,12)")
         connection.execute("alter table window_metrics add column if not exists time_in_market_pct decimal(38,12)")
-        require_performance_v2(connection)
         return
     if not _catalog_is_empty(connection):
         raise PerformanceV2StoreError("Performance v2 target catalog is not empty")

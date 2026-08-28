@@ -320,7 +320,9 @@ def _calculate(
             result_id, start, end, version, effective_start, effective_end, "UNAVAILABLE", "COLLAPSED",
             None, None, None, None, None, None, None, None, None, None,
         )
-    scoped_actions = tuple(item for item in actions if effective_start <= item.timestamp <= effective_end)
+    # The flat action at W0 established the wallet/equity baseline; its fee and
+    # realised PnL belong to the preceding interval, not this window.
+    scoped_actions = tuple(item for item in actions if effective_start < item.timestamp <= effective_end)
     realising = tuple(item for item in scoped_actions if item.kind in {"decreased", "closed"})
     if not realising:
         return WindowMetrics(

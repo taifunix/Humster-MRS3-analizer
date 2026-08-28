@@ -190,7 +190,7 @@ def test_upnl_metrics_are_scale_invariant_and_partial_fills_form_round_trips(tmp
         cached = get_or_calculate_window(first_connection, first_id, "2026-01-01", "2026-01-05")
         second = get_or_calculate_window(second_connection, second_id, "2026-01-01", "2026-01-05")
         assert first == cached
-        assert first.trade_count == second.trade_count == 2
+        assert first.trade_count == second.trade_count == 1
         assert first.growth_factor == second.growth_factor
         assert first.return_pct == second.return_pct
         assert first.max_drawdown_pct == second.max_drawdown_pct
@@ -201,6 +201,17 @@ def test_upnl_metrics_are_scale_invariant_and_partial_fills_form_round_trips(tmp
     finally:
         first_connection.close()
         second_connection.close()
+
+
+def test_flat_start_boundary_close_is_excluded_from_window_facts(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    try:
+        window = get_or_calculate_window(connection, result_id, "2026-01-01", "2026-01-05")
+        assert window.effective_start_utc == datetime(2026, 1, 3, tzinfo=UTC)
+        assert window.trade_count == 1
+        assert window.holding_seconds == Decimal("43200.000000000000")
+    finally:
+        connection.close()
 
 
 def test_partial_close_then_increase_stays_one_position_episode() -> None:
