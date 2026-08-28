@@ -141,6 +141,8 @@ from .panel_performance_dd5 import (
     PerformanceDd5Request,
     PerformanceImportPanelRequest,
 )
+from .panel_performance_v2 import LocalPerformanceV2Jobs, PerformanceV2PanelRequest
+from .performance_v2_store import load_performance_v2_config
 from .runner.config import RunnerConfig
 from .runner.inbox import capture_verified_inbox
 from .runner.workflow import BatchPlan, _load_saved_result_evidence, _load_saved_results, plan_batch, run_batch
@@ -1196,6 +1198,7 @@ class PanelController:
         self._performance_dd5_jobs: LocalPerformanceDd5Jobs | None = None
         self._performance_import_jobs: LocalPerformanceImportJobs | None = None
         self._performance_database_jobs: LocalPerformanceDd5Jobs | None = None
+        self._performance_v2_jobs: LocalPerformanceV2Jobs | None = None
         self._reconcile_interrupted_remote_source_jobs()
         self._reconcile_interrupted_tester_jobs()
         self._job: _Job | None = None
@@ -1656,6 +1659,8 @@ class PanelController:
             return self.strategies_tester_cancel(self._required(request, "job_id"))
         if kind == "strategies.performance.import" and isinstance(request, Mapping):
             return self.strategies_performance_import(request)
+        if kind == "strategies.performance.v2.import" and isinstance(request, Mapping):
+            return self.strategies_performance_v2_import(request)
         if kind == "strategies.dd5.start" and isinstance(request, Mapping):
             return self.strategies_dd5_start(request)
         if kind == "strategies.performance-dd5" and isinstance(request, Mapping):
@@ -2787,6 +2792,73 @@ class PanelController:
         if self._performance_import_jobs is None:
             return self._panel_jobs.get(job_id)
         return self._tracked_job_or_interrupted(job_id, self._performance_import_jobs.status)
+
+    @staticmethod
+    def _performance_v2_window(payload: Mapping[str, object], name: str) -> tuple[object, object] | None:
+        value = payload.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"{name} must contain start and end")
+        if any(not isinstance(item, str) or not item.strip() for item in value):
+            raise ValueError(f"{name} timestamps are invalid")
+        return value[0].strip(), value[1].strip()
+
+    def _performance_v2_config(self):
+        return load_performance_v2_config(
+            self.default_config.with_name("config.performance.json"),
+            v1_database_root=self._panel_path("performance_db_root"),
+        )
+
+    def strategies_performance_v2_import(self, payload: Mapping[str, object]) -> dict[str, object]:
+        allowed = {"tester_job_id", "mode", "replacement_strategy_ids", "window_a", "window_b"}
+        if set(payload).difference(allowed):
+            raise ValueError("Performance v2 import request contains unsupported fields")
+        tester_job_id = self._required(payload, "tester_job_id")
+        tester_job = self._panel_jobs.get(tester_job_id)
+        if tester_job.get("state") != "COMMITTED" or tester_job.get("inbox_ready") is not True:
+            raise ValueError("Performance v2 import requires a committed tester inbox")
+        mode = payload.get("mode", "ADD")
+        if not isinstance(mode, str) or mode not in {"ADD", "REPLACE"}:
+            raise ValueError("Performance v2 import mode must be ADD or REPLACE")
+        replacement = payload.get("replacement_strategy_ids")
+        if replacement is not None and (
+            not isinstance(replacement, Mapping)
+            or any(
+                not isinstance(name, str)
+                or not name.strip()
+                or isinstance(strategy_id, bool)
+                or not isinstance(strategy_id, int)
+                for name, strategy_id in replacement.items()
+            )
+        ):
+            raise ValueError("replacement_strategy_ids must be a mapping")
+        window_a = self._performance_v2_window(payload, "window_a")
+        window_b = self._performance_v2_window(payload, "window_b")
+        if (window_a is None) != (window_b is None):
+            raise ValueError("window_a and window_b must be supplied together")
+        if self._performance_v2_jobs is None:
+            self._performance_v2_jobs = LocalPerformanceV2Jobs(on_update=self._record_special_job)
+        request = PerformanceV2PanelRequest(
+            inbox=self._tester_inbox(tester_job_id),
+            report_root=self._panel_path("tester_report_dir"),
+            config=self._performance_v2_config(),
+            mode=mode,
+            replacement_strategy_ids=replacement,
+            window_a=window_a,
+            window_b=window_b,
+        )
+        return self._start_tracked_panel_job(
+            "strategies.performance.v2.import",
+            {"tester_job_id": tester_job_id, "mode": mode},
+            (f"tester:{tester_job_id}", "performance-v2-db"),
+            lambda tracked_id: self._performance_v2_jobs.start(request, job_id=tracked_id),
+        )
+
+    def strategies_performance_v2_import_status(self, job_id: str) -> dict[str, object]:
+        if self._performance_v2_jobs is None:
+            return self._panel_jobs.get(job_id)
+        return self._tracked_job_or_interrupted(job_id, self._performance_v2_jobs.status)
 
     def performance_database_catalog(self) -> dict[str, object]:
         root = self._panel_path("performance_db_root")
@@ -5527,6 +5599,13 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(200, self.server.controller.strategies_performance_import_status(job_id))
             except (KeyError, ValueError):
                 self._json(400, {"error": "invalid performance import request"})
+            return
+        if parsed.path == "/api/v2/strategies/performance-v2/import/status":
+            try:
+                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
+                self._json(200, self.server.controller.strategies_performance_v2_import_status(job_id))
+            except (KeyError, ValueError):
+                self._json(400, {"error": "invalid Performance v2 import request"})
             return
         if parsed.path == "/api/v2/strategies/dd5/status":
             try:

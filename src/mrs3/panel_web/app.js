@@ -1585,6 +1585,16 @@
   let importJobV2 = '';
   let dd5JobV2 = '';
   let selectedDbV2 = '';
+  const renderImportV2 = (job) => {
+    const p = job.progress || {};
+    const total = Number(p.total || 0);
+    const current = Number(p.current || 0);
+    if (importProgressV2) importProgressV2.textContent = `${job.phase || 'IMPORTING'} · ${current} / ${total} reports.`;
+    const result = job.result || {};
+    if (importStatusV2) importStatusV2.textContent = job.state === 'COMMITTED'
+      ? `Performance v2: COMMITTED · imported ${result.imported_count || 0} · skipped ${result.skipped_count || 0} · rejected ${result.rejected_count || 0} · target ${result.database_path || '—'} · audit ${result.audit_path || '—'}.`
+      : `Performance v2: ${job.state || 'RUNNING'}.`;
+  };
   inboxVerifyV2?.addEventListener('click', async () => {
     if (!testerJobId) {
       if (importStatusV2) importStatusV2.textContent = 'Проверка невозможна: tester job не найден.';
@@ -1628,24 +1638,21 @@
   importStartV2?.addEventListener('click', async () => {
     if (!testerJobId) return;
     importStartV2.disabled = true;
-    if (importStatusV2) importStatusV2.textContent = 'Импорт Performance DB…';
+    if (importStatusV2) importStatusV2.textContent = 'Импорт Performance v2…';
     try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.performance.import', request: { tester_job_id: testerJobId, delete_html: Boolean(document.querySelector('#delete-tested-html-v2')?.checked) } });
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.performance.v2.import', request: { tester_job_id: testerJobId } });
       importJobV2 = result.job?.job_id || '';
       if (!importJobV2) throw new Error('missing job');
       const poll = async () => {
-        const job = await requestJson(`/api/v2/strategies/performance/import/status?job_id=${encodeURIComponent(importJobV2)}`);
-        const p = job.progress || {};
-        if (importProgressV2) importProgressV2.textContent = `${job.phase || 'IMPORTING'} · ${p.current || 0} / ${p.total || 0} reports.`;
-        if (importStatusV2) importStatusV2.textContent = `Performance DB: ${job.state || 'RUNNING'}.`;
+        const job = await requestJson(`/api/v2/strategies/performance-v2/import/status?job_id=${encodeURIComponent(importJobV2)}`);
+        renderImportV2(job);
         if (['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) {
-        if (String(job.state) === 'COMMITTED' && job.result?.database_name) { selectedDbV2 = job.result.database_name; await refreshPerformanceCatalog(); if (dbSelectV2) { dbSelectV2.value = selectedDbV2; dbSelectV2.dispatchEvent(new Event('change')); } }
           return true;
         }
         return false;
       };
       if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
-    } catch (_) { if (importStatusV2) importStatusV2.textContent = 'Импорт Performance DB не прошёл проверку.'; }
+    } catch (_) { if (importStatusV2) importStatusV2.textContent = 'Импорт Performance v2 не прошёл проверку.'; }
     finally { importStartV2.disabled = false; }
   });
   dd5StartV2?.addEventListener('click', async () => {
@@ -1669,14 +1676,13 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const importJob = [...jobs].reverse().find((job) => job.kind === 'strategies.performance.import');
+      const importJob = [...jobs].reverse().find((job) => job.kind === 'strategies.performance.v2.import');
       const dd5Job = [...jobs].reverse().find((job) => job.kind === 'strategies.dd5.start');
       if (importJob?.job_id) {
         importJobV2 = importJob.job_id;
         const poll = async () => {
-          const job = await requestJson(`/api/v2/strategies/performance/import/status?job_id=${encodeURIComponent(importJobV2)}`);
-          if (importStatusV2) importStatusV2.textContent = `Performance DB: ${job.state || 'RUNNING'}.`;
-          if (String(job.state) === 'COMMITTED' && job.result?.database_name) { selectedDbV2 = job.result.database_name; await refreshPerformanceCatalog(); if (dbSelectV2) { dbSelectV2.value = selectedDbV2; dbSelectV2.dispatchEvent(new Event('change')); } }
+          const job = await requestJson(`/api/v2/strategies/performance-v2/import/status?job_id=${encodeURIComponent(importJobV2)}`);
+          renderImportV2(job);
           return ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
         };
         if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
