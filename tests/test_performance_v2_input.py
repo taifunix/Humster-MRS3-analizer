@@ -336,7 +336,7 @@ def test_staging_rejects_duplicate_report_basenames(tmp_path: Path) -> None:
     second_strategy_path = inbox / "strategies" / "other.json"
     second_strategy_bytes = json.dumps(second_strategy, separators=(",", ":")).encode()
     second_strategy_path.write_bytes(second_strategy_bytes)
-    second_report_path = report_root / "other" / "BTC-demo.html"
+    second_report_path = report_root / "other" / "btc-demo.html"
     second_report_path.parent.mkdir()
     second_report_path.write_bytes(b"<html>other</html>")
     manifest_path = inbox / "inbox_manifest.json"

@@ -754,7 +754,7 @@ def create_v2_parser_staging(v2_root: Path | object, prepared: PreparedV2Input) 
         _write_staging_marker(staging, staging_root)
         report_basenames: set[str] = set()
         for entry in prepared.entries:
-            report_basename = entry.report_path.name
+            report_basename = entry.report_path.name.casefold()
             if report_basename in report_basenames:
                 raise PerformanceV2InputError("duplicate report basename in v2 staging")
             report_basenames.add(report_basename)
