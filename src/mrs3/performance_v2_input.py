@@ -752,6 +752,12 @@ def create_v2_parser_staging(v2_root: Path | object, prepared: PreparedV2Input) 
         raise PerformanceV2InputError("could not allocate fresh v2 staging directory")
     try:
         _write_staging_marker(staging, staging_root)
+        report_basenames: set[str] = set()
+        for entry in prepared.entries:
+            report_basename = entry.report_path.name
+            if report_basename in report_basenames:
+                raise PerformanceV2InputError("duplicate report basename in v2 staging")
+            report_basenames.add(report_basename)
         for entry in prepared.entries:
             if entry.strategy_path.name != f"{entry.strategy_name}.json":
                 raise PerformanceV2InputError("strategy filename does not match strategy name")
@@ -782,11 +788,103 @@ def _move_staging_to_tombstone(staging: Path) -> Path:
     raise PerformanceV2InputError("could not allocate fresh v2 staging tombstone")
 
 
+def _windows_file_information_api():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    get_file_info = kernel32.GetFileInformationByHandle
+    get_file_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation)]
+    get_file_info.restype = wintypes.BOOL
+    set_file_info = getattr(kernel32, "SetFileInformationByHandle", None)
+    if set_file_info is not None:
+        set_file_info.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        set_file_info.restype = wintypes.BOOL
+    return ctypes, wintypes, create_file, close_handle, get_file_info, set_file_info, ByHandleFileInformation
+
+
+def _windows_handle_identity(handle: object, api: tuple[object, ...]) -> tuple[int, int]:
+    ctypes, wintypes, _create_file, _close_handle, get_file_info, _set_file_info, info_type = api
+    info = info_type()
+    if not get_file_info(handle, ctypes.byref(info)):
+        error = ctypes.get_last_error()
+        raise PerformanceV2InputError("could not inspect v2 staging directory identity") from OSError(
+            error, "GetFileInformationByHandle"
+        )
+    return (
+        int(info.volume_serial_number),
+        (int(info.file_index_high) << 32) | int(info.file_index_low),
+    )
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    if os.name != "nt":
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            raise PerformanceV2InputError("could not inspect v2 staging directory identity") from error
+        return int(info.st_dev), int(info.st_ino)
+
+    api = _windows_file_information_api()
+    ctypes, wintypes, create_file, close_handle, _get_file_info, _set_file_info, _info_type = api
+    handle = create_file(
+        str(path),
+        0x00000080,  # FILE_READ_ATTRIBUTES
+        0x00000001 | 0x00000002 | 0x00000004,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        error = ctypes.get_last_error()
+        raise PerformanceV2InputError("could not inspect v2 staging directory identity") from OSError(error, "CreateFileW")
+    try:
+        return _windows_handle_identity(handle, api)
+    finally:
+        if not close_handle(handle):
+            error = ctypes.get_last_error()
+            raise PerformanceV2InputError("could not close v2 staging identity handle") from OSError(error, "CloseHandle")
+
+
 def _before_tombstone_delete(tombstone: Path) -> None:
     """Test seam immediately before handle-bound tombstone deletion."""
 
 
-def _delete_tombstone_with_fd(tombstone: Path) -> None:
+def _before_tombstone_handle(tombstone: Path) -> None:
+    """Test seam immediately before acquiring a tombstone handle."""
+
+
+def _delete_tombstone_with_fd(tombstone: Path, expected_identity: tuple[int, int]) -> None:
     if not getattr(shutil, "_use_fd_functions", False) or not hasattr(os, "O_DIRECTORY"):
         raise PerformanceV2InputError("handle-bound tombstone cleanup is unavailable")
     flags = os.O_RDONLY | os.O_DIRECTORY
@@ -795,6 +893,8 @@ def _delete_tombstone_with_fd(tombstone: Path) -> None:
     try:
         parent_fd = os.open(tombstone.parent, flags)
         tombstone_fd = os.open(tombstone.name, flags, dir_fd=parent_fd)
+        if _stat_identity(os.fstat(tombstone_fd)) != expected_identity:
+            raise PerformanceV2InputError("v2 staging tombstone identity does not match")
         _before_tombstone_delete(tombstone)
         # This removes children through the opened directory handle.  The
         # final attempt to remove ``.`` itself is intentionally ignored.
@@ -818,28 +918,9 @@ def _delete_tombstone_with_fd(tombstone: Path) -> None:
             os.close(parent_fd)
 
 
-def _delete_tombstone_with_windows_handle(tombstone: Path) -> None:
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    create_file.restype = wintypes.HANDLE
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = [wintypes.HANDLE]
-    close_handle.restype = wintypes.BOOL
-    set_file_info = kernel32.SetFileInformationByHandle
-    set_file_info.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
-    set_file_info.restype = wintypes.BOOL
+def _delete_tombstone_with_windows_handle(tombstone: Path, expected_identity: tuple[int, int]) -> None:
+    api = _windows_file_information_api()
+    ctypes, wintypes, create_file, close_handle, _get_file_info, set_file_info, _info_type = api
 
     handle = create_file(
         str(tombstone),
@@ -854,6 +935,8 @@ def _delete_tombstone_with_windows_handle(tombstone: Path) -> None:
         error = ctypes.get_last_error()
         raise PerformanceV2InputError("handle-bound tombstone cleanup is unavailable") from OSError(error, "CreateFileW")
     try:
+        if _windows_handle_identity(handle, api) != expected_identity:
+            raise PerformanceV2InputError("v2 staging tombstone identity does not match")
         _before_tombstone_delete(tombstone)
         cleanup_error: OSError | None = None
         try:
@@ -864,6 +947,9 @@ def _delete_tombstone_with_windows_handle(tombstone: Path) -> None:
             raise PerformanceV2InputError("v2 staging tombstone cleanup failed") from cleanup_error
         if tombstone.exists() and any(tombstone.iterdir()):
             raise PerformanceV2InputError("v2 staging tombstone cleanup is incomplete")
+
+        if set_file_info is None:
+            raise PerformanceV2InputError("handle-bound tombstone cleanup is unavailable")
 
         class FileDispositionInfo(ctypes.Structure):
             _fields_ = [("delete_file", wintypes.BOOLEAN)]
@@ -884,11 +970,16 @@ def _delete_tombstone_with_windows_handle(tombstone: Path) -> None:
         raise PerformanceV2InputError("v2 staging tombstone was not removed")
 
 
-def _delete_tombstone(tombstone: Path) -> None:
+def _stat_identity(info: os.stat_result) -> tuple[int, int]:
+    return int(info.st_dev), int(info.st_ino)
+
+
+def _delete_tombstone(tombstone: Path, expected_identity: tuple[int, int]) -> None:
+    _before_tombstone_handle(tombstone)
     if os.name == "nt":
-        _delete_tombstone_with_windows_handle(tombstone)
+        _delete_tombstone_with_windows_handle(tombstone, expected_identity)
     else:
-        _delete_tombstone_with_fd(tombstone)
+        _delete_tombstone_with_fd(tombstone, expected_identity)
 
 
 def remove_v2_parser_staging(staging: Path) -> None:
@@ -901,10 +992,11 @@ def remove_v2_parser_staging(staging: Path) -> None:
         raise PerformanceV2InputError("staging path is outside the v2 staging directory")
     if not resolved.exists():
         return
+    original_identity = _directory_identity(resolved)
     _verify_staging_marker(resolved)
     tombstone = _move_staging_to_tombstone(resolved)
     _verify_staging_marker(tombstone, expected_staging=resolved)
-    _delete_tombstone(tombstone)
+    _delete_tombstone(tombstone, original_identity)
 
 
 __all__ = [

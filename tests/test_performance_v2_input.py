@@ -308,6 +308,64 @@ def test_cleanup_survives_swap_after_post_verification(tmp_path: Path, monkeypat
     assert (foreign / "foreign-payload").read_text(encoding="utf-8") == "keep"
 
 
+def test_cleanup_rejects_replayed_marker_before_handle_acquisition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    owned = create_v2_parser_staging(tmp_path / "v2", prepared)
+    marker_bytes = (owned / ".v2-staging-owner").read_bytes()
+    foreign_path: Path | None = None
+
+    def swap_before_handle(tombstone: Path) -> None:
+        nonlocal foreign_path
+        foreign_path = tombstone
+        shutil.rmtree(tombstone)
+        tombstone.mkdir()
+        (tombstone / ".v2-staging-owner").write_bytes(marker_bytes)
+        (tombstone / "foreign-payload").write_text("keep", encoding="utf-8")
+
+    monkeypatch.setattr(input_module, "_before_tombstone_handle", swap_before_handle, raising=False)
+    with pytest.raises(PerformanceV2InputError, match="identity"):
+        remove_v2_parser_staging(owned)
+    assert foreign_path is not None
+    assert (foreign_path / "foreign-payload").read_text(encoding="utf-8") == "keep"
+
+
+def test_staging_rejects_duplicate_report_basenames(tmp_path: Path) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    second_strategy = _strategy("other", side="SHORT")
+    second_strategy_path = inbox / "strategies" / "other.json"
+    second_strategy_bytes = json.dumps(second_strategy, separators=(",", ":")).encode()
+    second_strategy_path.write_bytes(second_strategy_bytes)
+    second_report_path = report_root / "other" / "BTC-demo.html"
+    second_report_path.parent.mkdir()
+    second_report_path.write_bytes(b"<html>other</html>")
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    second_entry = {
+        **manifest["entries"][0],
+        "manifest_entry_id": "f" * 32,
+        "strategy_name": "other",
+        "strategy_path": str(second_strategy_path),
+        "report_path": str(second_report_path),
+        "strategy_version_id": sha256(json.dumps(second_strategy, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        "source_strategy_sha256": sha256(second_strategy_bytes).hexdigest(),
+        "source_report_sha256": sha256(second_report_path.read_bytes()).hexdigest(),
+    }
+    manifest["expected_strategy_names"].append("other")
+    manifest["entries"].append(second_entry)
+    manifest["v6_provenance"]["candidate_identity_to_strategy_names"]["candidate-2"] = ["other"]
+    manifest["v6_provenance"]["candidate_diagnostics"]["candidate-2"] = {
+        "order_count": 1,
+        "orders": [{"order_id": 1, "plateau_id": "P2", "plateau_point_count": 4,
+                     "base_point_trades": 20, "plateau_total_trades": 80}],
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    with pytest.raises(PerformanceV2InputError, match="duplicate report basename"):
+        create_v2_parser_staging(tmp_path / "v2", prepared)
+    assert not any((tmp_path / "v2" / ".staging").iterdir())
+
+
 def test_identity_rejects_non_integral_shift_and_invalid_order_ids() -> None:
     strategy = _strategy("bad")
     identity = adapt_strategy_identity(strategy)
