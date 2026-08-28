@@ -266,6 +266,13 @@ _EXPECTED_MARKERS = {
     "schema_version": _SCHEMA_VERSION,
     "database_kind": "unified_performance_v2",
 }
+_EXPECTED_INDEXES = frozenset(
+    {
+        ("main", "strategy_results_strategy_id_idx"),
+        ("main", "strategy_actions_result_timestamp_idx"),
+        ("main", "strategy_equity_result_timestamp_idx"),
+    }
+)
 
 
 def _schema_version(connection: duckdb.DuckDBPyConnection) -> str | None:
@@ -281,7 +288,9 @@ def _schema_version(connection: duckdb.DuckDBPyConnection) -> str | None:
     return None if row is None else row[0]
 
 
-def _catalog_objects(connection: duckdb.DuckDBPyConnection) -> tuple[frozenset[str], frozenset[str]]:
+def _catalog_objects(
+    connection: duckdb.DuckDBPyConnection,
+) -> tuple[frozenset[str], frozenset[str], frozenset[tuple[str, str]]]:
     tables = frozenset(
         row[0]
         for row in connection.execute(
@@ -293,12 +302,17 @@ def _catalog_objects(connection: duckdb.DuckDBPyConnection) -> tuple[frozenset[s
         ).fetchall()
     )
     sequences = frozenset(row[0] for row in connection.execute("select sequence_name from duckdb_sequences()").fetchall())
-    return tables, sequences
+    indexes = frozenset(
+        connection.execute(
+            "select schema_name, index_name from duckdb_indexes() where sql is not null"
+        ).fetchall()
+    )
+    return tables, sequences, indexes
 
 
 def _catalog_is_empty(connection: duckdb.DuckDBPyConnection) -> bool:
-    tables, sequences = _catalog_objects(connection)
-    return not tables and not sequences
+    tables, sequences, indexes = _catalog_objects(connection)
+    return not tables and not sequences and not indexes
 
 
 def _schema_markers(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
@@ -314,8 +328,12 @@ def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
         raise PerformanceV2StoreError("Performance database does not have schema version 2")
     if _schema_markers(connection) != _EXPECTED_MARKERS:
         raise PerformanceV2StoreError("Performance database is not unified performance v2")
-    tables, sequences = _catalog_objects(connection)
-    if tables != _EXPECTED_TABLES or sequences != _EXPECTED_SEQUENCES:
+    tables, sequences, indexes = _catalog_objects(connection)
+    if (
+        tables != _EXPECTED_TABLES
+        or sequences != _EXPECTED_SEQUENCES
+        or indexes != _EXPECTED_INDEXES
+    ):
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
 
 

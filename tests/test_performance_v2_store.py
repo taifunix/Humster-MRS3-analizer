@@ -160,6 +160,15 @@ def test_forged_v2_markers_with_foreign_catalog_object_are_rejected_without_muta
         assert connection.execute("select count(*) from information_schema.tables where table_name = 'strategies'").fetchone() == (0,)
 
 
+def test_v2_schema_rejects_a_forged_extra_index() -> None:
+    with duckdb.connect(":memory:") as connection:
+        initialize_performance_v2(connection)
+        connection.execute("create index foreign_strategy_symbol_idx on strategies(symbol)")
+
+        with pytest.raises(PerformanceV2StoreError, match="catalog"):
+            require_performance_v2(connection)
+
+
 def test_schema_enforces_order_plateau_and_single_result_invariants() -> None:
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
