@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import re
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from .performance_v2_store import PerformanceV2Config
 
 from .performance import (
     PerformanceInventory,
@@ -16,7 +20,6 @@ from .performance import (
     _timestamp,
     parse_performance_report,
 )
-from .performance_v2_store import PerformanceV2Config
 
 
 class PerformanceV2HtmlError(ValueError):
@@ -40,6 +43,11 @@ CURRENT_ACTION_HEADERS = (
 )
 _ACTION_HEADER_MARKERS = frozenset(("Timestamp", "Symbol", "Action", "PnL"))
 _INTEGER = re.compile(r"^[+-]?\d+$")
+
+
+class _PerformanceV2Limits(Protocol):
+    max_html_bytes: int
+    max_actions_per_report: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,14 +246,24 @@ def _typed_series(
     return tuple((_epoch_timestamp(timestamp), value) for timestamp, value in series)
 
 
+def _validate_limits(limits: object) -> _PerformanceV2Limits:
+    max_html_bytes = getattr(limits, "max_html_bytes", None)
+    max_actions = getattr(limits, "max_actions_per_report", None)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+        for value in (max_html_bytes, max_actions)
+    ):
+        raise PerformanceV2HtmlError("limits must provide positive integer limits")
+    return limits  # type: ignore[return-value]
+
+
 def parse_current_performance_v2_html(
     data: bytes, limits: PerformanceV2Config
 ) -> ParsedPerformanceV2Report:
     """Parse current tester bytes without opening paths or mutating state."""
     if not isinstance(data, bytes):
         raise PerformanceV2HtmlError("report data must be bytes")
-    if not isinstance(limits, PerformanceV2Config):
-        raise PerformanceV2HtmlError("limits must be PerformanceV2Config")
+    limits = _validate_limits(limits)
     if len(data) > limits.max_html_bytes:
         raise PerformanceV2HtmlError("HTML report exceeds max_html_bytes")
     _check_current_header(data)

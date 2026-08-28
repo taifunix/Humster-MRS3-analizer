@@ -1,7 +1,10 @@
 from datetime import datetime, timezone
 from decimal import Decimal
+import os
 import pickle
 from pathlib import Path
+import subprocess
+import sys
 
 import duckdb
 import pytest
@@ -112,3 +115,36 @@ def test_parsed_report_can_cross_a_process_pool_boundary() -> None:
     assert restored == parsed
     with pytest.raises(TypeError):
         parsed.settings["new"] = "value"  # type: ignore[index]
+
+
+def test_parser_loads_and_runs_without_a_duckdb_runtime_import() -> None:
+    script = f"""
+import builtins
+from pathlib import Path
+from types import SimpleNamespace
+
+real_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name == "duckdb" or name.startswith("duckdb."):
+        raise AssertionError("parser imported duckdb")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+from mrs3.performance_v2_html import parse_current_performance_v2_html
+
+data = Path({str(CURRENT)!r}).read_bytes()
+parse_current_performance_v2_html(
+    data,
+    SimpleNamespace(max_html_bytes=len(data), max_actions_per_report=10),
+)
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
