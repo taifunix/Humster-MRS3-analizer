@@ -116,6 +116,7 @@ analysis runs и lineage согласно уже реализованной
 | Pending production acceptance | [Strategy performance DuckDB governing spec](docs/specs/2026-08-14-strategy-performance-duckdb.md) | transactional performance import, DB-only DD5 and safe cleanup | [ADR-0004](docs/decisions/0004-strategy-performance-evidence-store.md) |
 | Planned | [Panel Phase 2 structural filters](docs/specs/2026-08-25-panel-phase2-structural-filters.md) | immutable fresh-analysis shortlist filtering, server-authoritative READY generation and audit | event filter and shortlist, Panel Web |
 | Implemented / verified | [Tester run files](docs/specs/2026-08-25-tester-run-files.md) | five isolated tester snapshots from filtered READY candidates; manual `run_tester.bat` execution | Panel Web, local tester runner |
+| Planned — approved design | [Panel Fast Strategy Test](docs/specs/2026-08-27-panel-fast-strategy-test.md) | independent bounded strategy batches, partial completion and failed-only recovery without verified inbox/import audit | READY generation manifest, Panel Web, local tester primitives |
 | Implemented / verified | [Multi-order plateau admission](docs/specs/2026-08-25-multi-order-plateau-admission.md) | pre-combination 2ORD--4ORD structural width and independent-event admission | canonical Phase 1, event filter and shortlist |
 | Active implementation contract | [Performance report import to DuckDB](docs/specs/2026-08-14-performance-report-import-duckdb.md) | immutable HTML-report import, canonical metrics, transaction, idempotency and cleanup | Strategy performance DuckDB, ADR-0004--0006 |
 | Active implementation contract | [DD5 calculation and finalist selection](docs/specs/2026-08-14-dd5-finalist-selection.md) | DD5 formulas, scoped filters, Pareto, finalists and XLSX contract | Performance report import to DuckDB |
@@ -181,3 +182,15 @@ policy is implemented and independently reviewed. The full real-pair metric
 audit is in [.codex/task6-recovery-overlap-report.md](.codex/task6-recovery-overlap-report.md):
 all 684 pairs resolved old-owned and verified two local periods, local PnL,
 maximum period DD% and retained-action Profit Factor.
+
+## Unified Performance Analytics v2 (2026-08-28)
+
+The approved [v2 specification](docs/specs/2026-08-28-unified-performance-analytics-v2.md)
+and [ADR-0020](docs/decisions/0020-unified-performance-analytics-v2.md) replace
+the planned data model for new Performance work: one appendable local database,
+one current replaceable tester result per logical strategy, order-to-plateau
+facts, arbitrary UPNL-relative A/B windows, configurable ordered filters/Pareto,
+panel/XLSX finalists and Portfolio Optimizer input. A durable `RETEST` tag drives
+one RUNS handler that replaces successful results through the common FAST inbox
+contract. Implementation and acceptance evidence are pending; no v1 migration
+is required because no production Performance DB exists.

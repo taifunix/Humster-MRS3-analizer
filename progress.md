@@ -1,7 +1,90 @@
 # MRS3 — current verification
 
-**Updated:** 2026-08-26
+**Updated:** 2026-08-28
 **Current branch:** `main`
+
+Unified Performance Analytics v2 design is approved and recorded in
+`docs/specs/2026-08-28-unified-performance-analytics-v2.md` and ADR-0020. The
+approved boundary is one Performance DuckDB, one current replaceable result per
+strategy, shared order-to-plateau facts, arbitrary flat-boundary UPNL-relative
+A/B windows, an ordered filter/Pareto pipeline, panel/XLSX/Portfolio Optimizer
+outputs, transactional discard/add/replace and a durable `RETEST` tag whose
+handler runs the common RUNS-to-inbox-to-replacement chain. No code or schema
+has been changed yet. Next step is an implementation plan for schema v2 and the
+minimum vertical slice; the later RUNS redesign must reuse the common FAST
+Performance inbox contract.
+
+Performance DB import now defaults to 16 preparation processes and caps the
+request at 16; DuckDB publication remains a single transactional writer.
+Focused verification: `.venv\\Scripts\\python.exe -m pytest
+tests/test_performance_import.py tests/test_panel_performance_dd5.py -q` —
+`48 passed`.
+
+Fast TEST now writes the HTML profile into the tester config's nested
+`report` object as well as legacy top-level keys. Balance/equity series remain
+enabled and position statistics are disabled for the minimal import profile.
+Focused verification: `tests/test_panel_fast_strategy_test.py` — `11 passed`.
+
+READY generation no longer blocks when the runtime algorithm-config hash
+differs from the historical analysis hash. The analysis hash is retained as
+lineage metadata; generated JSON uses the supplied runtime config and keeps
+the existing strategy validation. Focused verification:
+`.venv\\Scripts\\python.exe -m pytest tests/test_analysis_strategies.py
+tests/test_fresh_analysis_strategies.py tests/test_panel_fresh_strategies.py -q`
+— `75 passed`.
+
+## Fast Strategy Test design (2026-08-27)
+
+The independent **Fast TEST стратегии** contour is approved and documented in
+`docs/specs/2026-08-27-panel-fast-strategy-test.md`. Its implementation plan is
+`docs/superpowers/plans/2026-08-27-panel-fast-strategy-test.md`.
+
+The new path will retain bounded `strategy_batch_size` chunks, the existing
+low-level `max_parallel_submissions` rolling window and four total automatic
+attempts. It will not call the old `runner.workflow.run_batch`, create verified
+inboxes or write `data/import_audit`. A partial run continues later chunks and
+leaves exactly failed strategy JSON in `<bot_root>\settings_strategy`; one
+recovery action first accepts matching manual reports, then grants one extra
+attempt to each remaining failure.
+
+Implementation is in progress. Task 1 now persists per-order plateau diagnostics
+in the generation manifest; Task 2 supports partial controlled monitoring and
+HTML settings extraction; Task 3 provides the independent bounded Fast TEST
+service; Task 4 wires `strategies.tester.fast.start/retry` through the panel;
+Task 5 adds the two Fast TEST controls and reload recovery. Focused verification
+currently passes 154 tests; the dedicated runner suite passes 118 tests plus
+one platform skip. The independent review returned `CODE_REVIEW_PASS` after
+the period, recovery and UI fixes. A real disposable-tester smoke is still
+pending.
+
+The READY publisher now preserves the existing `Output\\strategies` directory
+instead of replacing it, so its ACL survives regeneration; staged files are
+installed with rollback on failure. Focused verification after this fix:
+`.venv\\Scripts\\python.exe -m pytest tests/test_pipeline.py
+tests/test_analysis_strategies.py tests/test_fresh_analysis_strategies.py -q`
+— `69 passed`.
+
+Fast TEST now removes a source HTML only after a stable snapshot is captured
+and its size/mtime signature is rechecked. The legacy `run_batch` path keeps
+its previous report-preservation behavior. Focused runner verification:
+`.venv\\Scripts\\python.exe -m pytest tests/runner/test_monitor.py tests/test_panel_fast_strategy_test.py tests/runner/test_workflow.py tests/runner/test_results.py -q`
+— `76 passed`.
+
+The quadratic Fast TEST post-run deduplication pass was removed. Stable
+`verified_reports` snapshot filenames are now authoritative, so completed batches
+do not reread every HTML for every strategy. The interrupted 3917-report run
+retains all 3917 manifest-referenced files; its stale runtime state is not
+treated as a committed job. Fast-to-Performance-DB integration remains a
+separate follow-up contract.
+
+Reload recovery now prefers a Fast job with persisted `verified_reports` over an
+older committed tester inbox. The Tester card and `Проверить` action therefore
+use the reports currently present in `tester/report/my_test` instead of reviving
+the historical 196-report status. Focused static/Fast verification: `72 passed`.
+
+The Performance DB `Проверить` button now reports immediate verification state
+and surfaces missing-job/API errors instead of returning silently. The current
+Fast inbox can therefore be observed while its verified snapshot is captured.
 
 ## READY JSON validation recovery (2026-08-26)
 
