@@ -133,8 +133,6 @@ from .tester_run_files import publish_run_snapshots
 from .panel_strategy_batch import LocalStrategyBatchService, StrategyBatchValidationError, validate_strategy_manifest
 from .panel_tester_runs import LocalRunsBatchService
 from .panel_fast_strategy_test import (
-    FastStrategyTestError,
-    LocalFastStrategyTestService,
     LocalSingleModeStrategyTestService,
 )
 from .panel_performance_dd5 import (
@@ -1197,7 +1195,6 @@ class PanelController:
         self._fresh_generation_job: dict[str, object] | None = None
         self._strategy_batch_service: LocalStrategyBatchService | None = None
         self._runs_batch_service: LocalRunsBatchService | None = None
-        self._fast_strategy_test_service: LocalFastStrategyTestService | None = None
         self._single_mode_strategy_test_service: LocalSingleModeStrategyTestService | None = None
         self._strategy_batch_inboxes: dict[str, Path] = {}
         self._performance_dd5_jobs: LocalPerformanceDd5Jobs | None = None
@@ -1686,8 +1683,6 @@ class PanelController:
         ) or (
             self._runs_batch_service is not None and self._runs_batch_service.has_active_job()
         ) or (
-            self._fast_strategy_test_service is not None and self._fast_strategy_test_service.has_active_job()
-        ) or (
             self._single_mode_strategy_test_service is not None and self._single_mode_strategy_test_service.has_active_job()
         ) or bool(self._fresh_generation_job and self._fresh_generation_job.get("running"))
 
@@ -1698,10 +1693,8 @@ class PanelController:
             return self.strategies_tester_start(request)
         if kind == "strategies.tester.runs" and isinstance(request, Mapping):
             return self.strategies_tester_runs_start(request)
-        if kind == "strategies.tester.fast.start" and isinstance(request, Mapping):
-            return self.strategies_tester_fast_start(request)
-        if kind == "strategies.tester.fast.retry" and isinstance(request, Mapping):
-            return self.strategies_tester_fast_retry(request)
+        if isinstance(kind, str) and kind.startswith("strategies.tester.") and ".fast." in kind:
+            raise PanelJobError("UNSUPPORTED_ROUTE")
         if kind == "strategies.tester.cancel" and isinstance(request, Mapping):
             return self.strategies_tester_cancel(self._required(request, "job_id"))
         if kind == "strategies.performance.import" and isinstance(request, Mapping):
@@ -1802,7 +1795,7 @@ class PanelController:
             document = status(job_id)
             self._record_special_job(document)
             return self._sync_tracked_panel_job(document)
-        except (KeyError, RemoteSourceDbError, FastStrategyTestError):
+        except (KeyError, RemoteSourceDbError, ValueError):
             return self._panel_jobs.get(job_id)
 
     def local_testing_status(self) -> dict[str, object]:
@@ -2229,8 +2222,7 @@ class PanelController:
                     runtime = self._panel_jobs.runtime(job_id)
                     inbox = Path(runtime["inbox_path"]).resolve()
                     inbox.relative_to(inbox_root)
-                    request = job.get("request")
-                    is_single_mode = isinstance(request, Mapping) and request.get("mode") == "SINGLE_MODE"
+                    is_single_mode = job.get("kind") == "strategies.tester.start"
                     if is_single_mode:
                         self._validate_metadata_inbox(inbox)
                     else:
@@ -2623,13 +2615,6 @@ class PanelController:
             self._runs_batch_service = LocalRunsBatchService(RunnerConfig.from_json(self.default_config), on_update=self._record_special_job)
         return self._runs_batch_service
 
-    def _fast_strategy_test(self) -> LocalFastStrategyTestService:
-        if self._fast_strategy_test_service is None:
-            self._fast_strategy_test_service = LocalFastStrategyTestService(
-                RunnerConfig.from_json(self.default_config), on_update=self._record_special_job
-            )
-        return self._fast_strategy_test_service
-
     def _single_mode_strategy_test(self) -> LocalSingleModeStrategyTestService:
         if self._single_mode_strategy_test_service is None:
             self._single_mode_strategy_test_service = LocalSingleModeStrategyTestService(
@@ -2676,43 +2661,9 @@ class PanelController:
                 raise PanelJobError("RUNS_EMPTY") from None
             raise
 
-    def strategies_tester_fast_start(self, payload: Mapping[str, object]) -> dict[str, object]:
-        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date"})
-        if unexpected:
-            raise ValueError("Fast TEST request contains unsupported fields")
-        analysis_id = self._required(payload, "analysis_run_id")
-        start_date = self._required(payload, "start_date")
-        end_date = self._required(payload, "end_date")
-        manifest = self._fresh_strategy_manifest(analysis_id)
-        return self._start_tracked_panel_job(
-            "strategies.tester.fast.start",
-            {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date},
-            ("strategies.tester",),
-            lambda job_id: self._fast_strategy_test().start(
-                manifest,
-                analysis_run_id=analysis_id,
-                start_date=start_date,
-                end_date=end_date,
-                job_id=job_id,
-            ),
-        )
-
-    def strategies_tester_fast_retry(self, payload: Mapping[str, object]) -> dict[str, object]:
-        if set(payload) != {"job_id"}:
-            raise ValueError("Fast TEST retry request contains unsupported fields")
-        source_job_id = self._required(payload, "job_id")
-        return self._start_tracked_panel_job(
-            "strategies.tester.fast.retry",
-            {"source_job_id": source_job_id},
-            ("strategies.tester",),
-            lambda job_id: self._fast_strategy_test().retry(source_job_id, job_id=job_id),
-        )
-
     def strategies_tester_status(self, job_id: str) -> dict[str, object]:
         tracked = self._panel_jobs.get(job_id)
-        if tracked.get("kind") in {"strategies.tester.fast.start", "strategies.tester.fast.retry"}:
-            status = self._fast_strategy_test().status
-        elif tracked.get("kind") == "strategies.tester.start" and isinstance(tracked.get("request"), Mapping) and tracked["request"].get("mode") == "SINGLE_MODE":
+        if tracked.get("kind") == "strategies.tester.start":
             status = self._single_mode_strategy_test().status
         elif tracked.get("kind") == "strategies.tester.runs":
             status = self._runs_batch().status
@@ -2728,10 +2679,9 @@ class PanelController:
         config = RunnerConfig.from_json(self.default_config)
         inbox_root = Path(config.inbox_root).resolve()
         tracked = self._panel_jobs.get(job_id)
-        request = tracked.get("request")
-        is_single_mode = tracked.get("kind") == "strategies.tester.start" and isinstance(request, Mapping) and request.get("mode") == "SINGLE_MODE"
-        if is_single_mode or tracked.get("kind") in {"strategies.tester.fast.start", "strategies.tester.fast.retry"}:
-            service = self._single_mode_strategy_test() if is_single_mode else self._fast_strategy_test()
+        is_single_mode = tracked.get("kind") == "strategies.tester.start"
+        if is_single_mode:
+            service = self._single_mode_strategy_test()
             inbox = service.capture_inbox(job_id)
             service.mark_inbox_ready(job_id, inbox)
             self._strategy_batch_inboxes[job_id] = inbox
@@ -2754,7 +2704,7 @@ class PanelController:
                     runtime=runtime,
                 )
             else:
-                raise ValueError("Fast TEST job is not ready for inbox verification")
+                raise ValueError("tester job is not ready for inbox verification")
             return self.strategies_tester_status(job_id)
         inbox = (inbox_root / job_id).resolve()
         inbox.relative_to(inbox_root)
@@ -2797,9 +2747,7 @@ class PanelController:
     def strategies_tester_cancel(self, job_id: str) -> dict[str, object]:
         try:
             tracked = self._panel_jobs.get(job_id)
-            if tracked.get("kind") in {"strategies.tester.fast.start", "strategies.tester.fast.retry"}:
-                cancel = self._fast_strategy_test().cancel
-            elif tracked.get("kind") == "strategies.tester.start" and isinstance(tracked.get("request"), Mapping) and tracked["request"].get("mode") == "SINGLE_MODE":
+            if tracked.get("kind") == "strategies.tester.start":
                 cancel = self._single_mode_strategy_test().cancel
             elif tracked.get("kind") == "strategies.tester.runs":
                 cancel = self._runs_batch().cancel

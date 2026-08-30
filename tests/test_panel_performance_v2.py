@@ -222,7 +222,7 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
     )
     controller = PanelController(tmp_path, config_path)
     job = controller._panel_jobs.submit(
-        "strategies.tester.fast.start", {"analysis_run_id": "a", "start_date": "2026-01-01", "end_date": "2026-01-09"},
+        "strategies.tester.start", {"mode": "SINGLE_MODE", "analysis_run_id": "a", "start_date": "2026-01-01", "end_date": "2026-01-09"},
         "tester-v2", ("strategies.tester",), job_id="tester-v2",
     )
     controller._panel_jobs.transition("tester-v2", "RUNNING")
@@ -280,7 +280,7 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
 def test_v2_panel_controller_rejects_committed_job_without_verified_inbox(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     controller._panel_jobs.submit(
-        "strategies.tester.fast.start", {}, "tester", (), job_id="tester"
+        "strategies.tester.start", {"mode": "SINGLE_MODE"}, "tester", (), job_id="tester"
     )
     controller._panel_jobs.transition("tester", "RUNNING")
     controller._panel_jobs.sync("tester", {"state": "COMMITTED", "phase": "COMMITTED"})

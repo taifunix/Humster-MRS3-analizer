@@ -22,6 +22,10 @@ def test_panel_keeps_runs_backend_but_hides_legacy_run_controls() -> None:
     web_source = Path("src/mrs3/panel_web/app.js").read_text(encoding="utf-8")
 
     assert "/api/v2/strategies/fresh/runs" in panel_source
+    assert "strategies.tester.fast.start" not in panel_source
+    assert "strategies.tester.fast.retry" not in panel_source
+    assert "self._fast_strategy_test" not in panel_source
+    assert "LocalFastStrategyTestService" not in panel_source
     assert 'id="shortlist-generate-runs"' not in panel_html
     assert 'id="tester-start-runs"' not in panel_html
     assert "strategies.tester.runs" not in web_source
@@ -305,33 +309,15 @@ def test_tester_job_uses_the_ui_recovery_kind(tmp_path: Path, monkeypatch) -> No
     assert captured["kind"] == "strategies.tester.start"
 
 
-def test_fast_tester_job_uses_own_kind_and_shared_resource(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("kind", ("strategies.tester.fast.start", "strategies.tester.fast.retry"))
+def test_fast_tester_routes_are_removed(tmp_path: Path, kind: str) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    captured: dict[str, object] = {}
-    monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "strategy_manifest.json")
-    monkeypatch.setattr(controller, "_start_tracked_panel_job", lambda kind, request, resources, start: captured.update(kind=kind, request=request, resources=resources))
-
-    controller.strategies_tester_fast_start({"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31"})
-
-    assert captured == {
-        "kind": "strategies.tester.fast.start",
-        "request": {"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31"},
-        "resources": ("strategies.tester",),
-    }
-
-
-def test_fast_and_old_tester_jobs_cannot_own_the_resource_together(tmp_path: Path, monkeypatch) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    job = controller._panel_jobs.submit("strategies.tester.start", {}, "ordinary", ("strategies.tester",))
-    controller._panel_jobs.transition(job["job_id"], "RUNNING")
-    monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "strategy_manifest.json")
-
-    with pytest.raises(PanelJobError, match="RESOURCE_BUSY"):
+    with pytest.raises(PanelJobError, match="UNSUPPORTED_ROUTE"):
         controller.panel_job_submit({
-            "kind": "strategies.tester.fast.start",
-            "request": {"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31"},
+            "kind": kind,
+            "request": {},
+            "idempotency_key": "removed-fast-route",
+            "resource_keys": [],
         })
 
 
@@ -356,20 +342,22 @@ def test_existing_committed_tester_inbox_is_marked_ready_on_panel_reload(tmp_pat
     inbox = inbox_root / job["job_id"]
     controller._panel_jobs.transition(job["job_id"], "FAILED")
     controller._panel_jobs.recover_committed(job["job_id"], runtime={"inbox_path": str(inbox)})
-    monkeypatch.setattr(controller, "_validate_performance_inbox", lambda _inbox: None)
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
 
     controller._reconcile_interrupted_tester_jobs()
 
     assert controller._panel_jobs.get(job["job_id"])["inbox_ready"] is True
 
 
-def test_fast_verify_routes_through_existing_performance_inbox_button(tmp_path: Path, monkeypatch) -> None:
+def test_single_mode_verify_routes_through_existing_performance_inbox_button(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.local.json"
     config.write_text("{}", encoding="utf-8")
-    inbox = tmp_path / "inbox" / "fast-job"
+    inbox = tmp_path / "inbox" / "single-job"
     inbox.mkdir(parents=True)
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    job = controller._panel_jobs.submit("strategies.tester.fast.start", {}, "fast", ("strategies.tester",), job_id="fast-job")
+    job = controller._panel_jobs.submit(
+        "strategies.tester.start", {"mode": "SINGLE_MODE"}, "single", ("strategies.tester",), job_id="single-job"
+    )
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
     monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=tmp_path / "inbox"))
     def forbidden_full_validation(_inbox: Path) -> None:
@@ -377,24 +365,24 @@ def test_fast_verify_routes_through_existing_performance_inbox_button(tmp_path: 
 
     monkeypatch.setattr(controller, "_validate_performance_inbox", forbidden_full_validation)
 
-    class FastService:
+    class SingleModeService:
         def capture_inbox(self, job_id: str) -> Path:
-            assert job_id == "fast-job"
+            assert job_id == "single-job"
             return inbox
 
         def mark_inbox_ready(self, job_id: str, path: Path) -> None:
-            assert job_id == "fast-job" and path == inbox
+            assert job_id == "single-job" and path == inbox
 
         def status(self, job_id: str) -> dict[str, object]:
             return {"job_id": job_id, "state": "COMMITTED", "phase": "COMMITTED", "evidence": {}, "progress": {}, "inbox_path": str(inbox)}
 
-    monkeypatch.setattr(controller, "_fast_strategy_test", lambda: FastService())
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SingleModeService())
 
-    result = controller.strategies_tester_verify_inbox("fast-job")
+    result = controller.strategies_tester_verify_inbox("single-job")
 
     assert result["state"] == "COMMITTED"
     assert result["inbox_ready"] is True
-    assert controller._panel_jobs.runtime("fast-job")["inbox_path"] == str(inbox)
+    assert controller._panel_jobs.runtime("single-job")["inbox_path"] == str(inbox)
 
 
 def test_runs_tester_rejects_an_empty_runs_directory(tmp_path: Path, monkeypatch) -> None:
