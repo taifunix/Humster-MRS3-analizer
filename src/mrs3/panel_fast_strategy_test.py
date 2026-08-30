@@ -11,10 +11,13 @@ from pathlib import Path
 import re
 import shutil
 from threading import Event, RLock, Thread
+import time
 from typing import Callable, Mapping
 from uuid import uuid4
 
 from .panel_strategy_batch import ValidatedStrategyManifest, validate_strategy_manifest
+from .performance import PerformanceParseError, _raw_markup, _series
+from .performance_v2_html import CURRENT_ACTION_HEADERS
 from .runner.config import RunnerConfig
 from .runner.files import validate_runner_paths
 from .runner.http import TesterHttpClient
@@ -64,6 +67,33 @@ def _client(config: RunnerConfig) -> TesterHttpClient:
     return TesterHttpClient(config.base_url, timeout=config.request_timeout_seconds)
 
 
+_CURRENT_METRIC_HEADERS = ("Metric", "Value")
+
+
+def _has_current_performance_v2_layout(source: str) -> bool:
+    """Check the native report shape without importing its full contents."""
+    try:
+        _, tables = _raw_markup(source)
+    except (TypeError, ValueError):
+        return False
+
+    action_tables = [headers for headers, _rows in tables if headers == CURRENT_ACTION_HEADERS]
+    metric_tables = [
+        headers
+        for headers, _rows in tables
+        if len(headers) >= len(_CURRENT_METRIC_HEADERS)
+        and headers[: len(_CURRENT_METRIC_HEADERS)] == _CURRENT_METRIC_HEADERS
+    ]
+    if len(action_tables) != 1 or not metric_tables:
+        return False
+    try:
+        wallet = _series(source, "walletSeries")
+        equity = _series(source, "equitySeries")
+    except PerformanceParseError:
+        return False
+    return tuple(point[0] for point in wallet) == tuple(point[0] for point in equity)
+
+
 def _dates(start_date: object, end_date: object) -> tuple[str, str]:
     if not isinstance(start_date, str) or not isinstance(end_date, str):
         raise FastStrategyTestError("start_date and end_date must be ISO dates")
@@ -108,7 +138,7 @@ def _install_names(source: Path, target: Path, names: tuple[str, ...]) -> None:
         shutil.copy2(source_file, target / filename)
 
 
-def _write_fast_tester_config(config: RunnerConfig, start: str, end: str) -> None:
+def _write_fast_tester_config(config: RunnerConfig, start: str, end: str, *, single_mode: bool = False) -> None:
     path = Path(config.tester_config).resolve()
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -128,7 +158,7 @@ def _write_fast_tester_config(config: RunnerConfig, start: str, end: str) -> Non
         "include_position_stats": False,
         "enable_timing_logs": False,
     }
-    document.update({"StartDate": start, "EndDate": end, "use_runs": False, **report_settings})
+    document.update({"StartDate": start, "EndDate": end, "use_runs": False, "single_mode": single_mode, **report_settings})
     report = document.get("report")
     if report is None:
         report = {}
@@ -361,7 +391,8 @@ class LocalFastStrategyTestService:
         snapshot_dir: Path | None = None
         try:
             if job.single_mode:
-                self._set_phase(job, "MANIFEST_VALIDATION", batch_number=0, batch_total=0)
+                self._run_native(job)
+                return
             _write_fast_tester_config(runtime_config, job.start_date, job.end_date)
             if not job.preserve_reports:
                 _clear_directory(job.report_dir, expected=self.config.bot_root / "tester" / "report" / "my_test")
@@ -541,6 +572,9 @@ class LocalFastStrategyTestService:
                     client.close()
                 except BaseException:
                     pass
+
+    def _run_native(self, job: _Job) -> None:
+        raise FastStrategyTestError("native SINGLE_MODE runner is unavailable")
 
     def start(
         self,
@@ -864,3 +898,166 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
     def __init__(self, config: RunnerConfig, **kwargs: object) -> None:
         kwargs["single_mode"] = True
         super().__init__(config, **kwargs)
+
+    @staticmethod
+    def _native_status(value: object) -> str:
+        if isinstance(value, Mapping):
+            for key in ("status", "state"):
+                candidate = value.get(key)
+                if isinstance(candidate, str):
+                    value = candidate
+                    break
+        source = str(value)
+        match = re.search(
+            r'class=["\'][^"\']*stat-value[^"\']*["\'][^>]*>\s*([^<]+)',
+            source,
+            flags=re.IGNORECASE,
+        )
+        text = match.group(1) if match else re.sub(r"<[^>]+>", " ", source)
+        text = " ".join(html.unescape(text).split()).casefold()
+        for status in ("running", "completed", "idle"):
+            if re.search(rf"\b{status}\b", text):
+                return status
+        return "unknown"
+
+    @staticmethod
+    def _native_reports(report_dir: Path, expected: set[str]) -> dict[str, Path]:
+        found: dict[str, Path] = {}
+        for report in sorted(report_dir.glob("*.html"), key=lambda path: path.name):
+            if report.is_symlink() or not report.is_file():
+                continue
+            try:
+                source = report.read_text(encoding="utf-8")
+                modified = report.stat().st_mtime_ns
+            except (OSError, UnicodeDecodeError):
+                continue
+            settings = extract_html_strategy_settings(report)
+            name = settings.get("name") if isinstance(settings, Mapping) else None
+            if (
+                not isinstance(name, str)
+                or name not in expected
+                or not _has_current_performance_v2_layout(source)
+            ):
+                continue
+            previous = found.get(name)
+            if previous is None or (modified, report.name) > (previous.stat().st_mtime_ns, previous.name):
+                found[name] = report
+        return found
+
+    def _wait_for_native_idle(self, job: _Job, client: object, config: RunnerConfig, batch_number: int, batch_total: int) -> None:
+        deadline = time.monotonic() + config.batch_timeout_seconds
+        saw_running = False
+        stable_idle = 0
+        while True:
+            if job.cancel.is_set():
+                raise _FastCancelled()
+            if not hasattr(client, "tester_status"):
+                raise FastStrategyTestError("native SINGLE_MODE client has no status endpoint")
+            status = self._native_status(client.tester_status())
+            if status == "running":
+                saw_running = True
+                stable_idle = 0
+            elif saw_running and status in {"idle", "completed"}:
+                stable_idle += 1
+            else:
+                stable_idle = 0
+            self._set_phase(
+                job,
+                "BOT_RUN",
+                batch_number=batch_number,
+                batch_total=batch_total,
+                native_status=status,
+                active=0 if status in {"idle", "completed"} else 1,
+            )
+            if saw_running and stable_idle >= config.report_stability_polls:
+                return
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError("native SINGLE_MODE tester did not reach stable Idle/Completed")
+            time.sleep(config.poll_interval_seconds)
+
+    def _run_native_batch(self, job: _Job, names: tuple[str, ...], config: RunnerConfig, batch_number: int, batch_total: int) -> dict[str, Path]:
+        client: object | None = None
+        try:
+            self._stop_bot(config)
+            _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
+            _install_names(job.manifest.strategy_source, job.strategy_dir, names)
+            config.wizard_result.unlink(missing_ok=True)
+            config.wizard_progress.unlink(missing_ok=True)
+            self._set_phase(job, "BOT_START", batch_number=batch_number, batch_total=batch_total)
+            self._start_bot(config)
+            client = self._client_factory(config)
+            if not hasattr(client, "run_tester"):
+                raise FastStrategyTestError("native SINGLE_MODE client has no Run endpoint")
+            self._set_phase(job, "BOT_RUN", batch_number=batch_number, batch_total=batch_total)
+            for name in names:
+                job.attempt_counts[name] = job.attempt_counts.get(name, 0) + 1
+            client.run_tester()
+            self._wait_for_native_idle(job, client, config, batch_number, batch_total)
+            self._set_phase(job, "REPORT_COLLECTION", batch_number=batch_number, batch_total=batch_total)
+            return self._native_reports(job.report_dir, set(names))
+        finally:
+            try:
+                self._stop_bot(config)
+            finally:
+                if client is not None and hasattr(client, "close"):
+                    try:
+                        client.close()
+                    except BaseException:
+                        pass
+
+    def _run_native(self, job: _Job) -> None:
+        config = job.runtime_config or self.config
+        if not job.preserve_reports:
+            _clear_directory(job.report_dir, expected=self.config.bot_root / "tester" / "report" / "my_test")
+        job.report_dir.mkdir(parents=True, exist_ok=True)
+        _write_fast_tester_config(config, job.start_date, job.end_date, single_mode=True)
+        batches = [
+            job.run_names[index : index + config.strategy_batch_size]
+            for index in range(0, len(job.run_names), config.strategy_batch_size)
+        ]
+        self._set_progress(job, current=0, total=len(job.expected_names), batch_current=0, batch_total=len(batches), active=0, retries=0, failed=0)
+        self._write_manifest(job)
+        for batch_number, names in enumerate(batches, start=1):
+            pending = names
+            while pending:
+                self._set_phase(job, "BATCH_PREPARE", batch_number=batch_number, batch_total=len(batches), current=len(job.verified_reports), failed=len(job.failed_names))
+                reports = self._run_native_batch(job, pending, config, batch_number, len(batches))
+                for name, report in reports.items():
+                    job.verified_reports[name] = report.name
+                    job.failed_names.discard(name)
+                missing = tuple(name for name in pending if name not in reports)
+                self._set_progress(job, current=len(job.verified_reports), active=0, retries=sum(max(0, value - 1) for value in job.attempt_counts.values()), failed=len(missing))
+                if not missing:
+                    break
+                job.failed_names.update(missing)
+                exhausted = tuple(
+                    name
+                    for name in missing
+                    if job.attempt_counts.get(name, 0)
+                    >= job.attempt_limits.get(name, config.max_strategy_attempts)
+                )
+                if exhausted:
+                    raise BatchRetryExhausted(
+                        "native SINGLE_MODE reports missing after retries: " + ", ".join(exhausted)
+                    )
+                self._set_phase(job, "RETRY_MISSING", batch_number=batch_number, batch_total=len(batches), current=len(job.verified_reports), failed=len(missing))
+                pending = missing
+            self._write_manifest(job)
+
+        incomplete = tuple(name for name in job.expected_names if name not in job.verified_reports)
+        if incomplete:
+            job.failed_names.update(incomplete)
+            raise BatchRetryExhausted(
+                "native SINGLE_MODE reports missing after retries: " + ", ".join(incomplete)
+            )
+        _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
+        job.phase = "INBOX_CREATION"
+        self._write_manifest(job)
+        self.capture_inbox(job.job_id)
+        job.state = "COMMITTED"
+        job.phase = "INBOX_READY"
+        self._write_manifest(job)
+        job.phase = "COMMITTED"
+        self._write_manifest(job)
+        self._set_progress(job, current=len(job.verified_reports), active=0, failed=0)

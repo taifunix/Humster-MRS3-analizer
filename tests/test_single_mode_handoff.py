@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import mrs3.panel_performance_v2 as performance_v2
 from mrs3.performance_v2_input import PerformanceV2InputError, read_performance_v2_inbox
 from mrs3.performance_v2_store import PerformanceV2Config, load_performance_v2_config
 from mrs3.panel_fast_strategy_test import LocalSingleModeStrategyTestService
+from mrs3.panel_fast_strategy_test import _write_fast_tester_config
 from mrs3.panel_performance_v2 import _cleanup_performance_sources
 from mrs3.panel_performance_v2 import _safe_cleanup_message
 from mrs3.panel_performance_v2 import LocalPerformanceV2Service
@@ -21,6 +23,33 @@ from mrs3.runner.config import RunnerConfig
 from mrs3.runner.http import RowState
 from mrs3.runner.monitor import BatchCompletion, BatchRetryExhausted, StrategyCompletion
 from mrs3.runner.inbox import capture_run_snapshot_inbox
+
+
+def _native_report(name: str, suffix: str = "") -> str:
+    return (
+        f'<pre>{{"name":"{name}","basic":{{"symbol":"BTCUSDT","time_frame":"1h"}}}}</pre>'
+        '<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>'
+        '<tr><td>Report range</td><td>2026-01-01 - 2026-01-02</td></tr>'
+        '</tbody></table>'
+        '<table><thead><tr><th>Timestamp</th><th>Symbol</th><th>Order ID</th>'
+        '<th>Action</th><th>Fee</th><th>PnL</th><th>Balance</th><th>Size</th>'
+        '<th>Post Size</th><th>Post Side</th></tr></thead><tbody>'
+        '<tr><td>2026-01-01T00:00:00Z</td><td>BTCUSDT</td><td>1</td><td>opened</td>'
+        '<td>0</td><td>0</td><td>1000</td><td>1</td><td>1</td><td>long</td></tr>'
+        '</tbody></table>'
+        '<script>const walletSeries = [[1767225600000,"1000"]];'
+        'const equitySeries = [[1767225600000,"1000"]];</script>'
+        f'<p>{suffix}</p>'
+    )
+
+
+def _wait_terminal(service: LocalSingleModeStrategyTestService, job_id: str) -> dict[str, object]:
+    for _ in range(500):
+        status = service.status(job_id)
+        if status["state"] != "RUNNING":
+            return status
+        time.sleep(0.005)
+    raise AssertionError("single mode did not finish")
 
 
 def _strategy(name: str = "A") -> dict[str, object]:
@@ -77,31 +106,33 @@ def _runner_config(tmp_path: Path) -> RunnerConfig:
     )
 
 
-def _generation(tmp_path: Path) -> tuple[Path, tuple[str, ...]]:
+def _generation(tmp_path: Path, count: int = 1) -> tuple[Path, tuple[str, ...]]:
     root = tmp_path / "generation"
     source = root / "strategies"
     source.mkdir(parents=True)
-    name = "A"
-    strategy = _strategy(name)
-    strategy_bytes = _canonical(strategy)
-    (source / f"{name}.json").write_bytes(strategy_bytes)
+    names = tuple("A" if count == 1 else f"S{index}" for index in range(count))
+    hashes = {}
+    for name in names:
+        strategy_bytes = _canonical(_strategy(name))
+        (source / f"{name}.json").write_bytes(strategy_bytes)
+        hashes[f"{name}.json"] = sha256(strategy_bytes).hexdigest()
     unsigned = {
         "format_version": 1,
         "analysis_run_id": "a" * 64,
         "event_mode": "real_independent_events",
-        "strategy_count": 1,
-        "strategy_json_sha256": {f"{name}.json": sha256(strategy_bytes).hexdigest()},
-        "candidate_identities": [name],
-        "candidate_identity_to_strategy_names": {name: [name]},
+        "strategy_count": count,
+        "strategy_json_sha256": hashes,
+        "candidate_identities": list(names),
+        "candidate_identity_to_strategy_names": {name: [name] for name in names},
         "candidate_diagnostics": {name: {"order_count": 1, "orders": [{
-            "order_id": 1, "plateau_id": "P-A", "plateau_point_count": 3,
+            "order_id": 1, "plateau_id": f"P-{name}", "plateau_point_count": 3,
             "base_point_trades": 20, "plateau_total_trades": 20,
-        }]}},
+        }]} for name in names},
     }
     unsigned["generation_manifest_sha256"] = sha256(_canonical(unsigned)).hexdigest()
     manifest = root / "strategy_manifest.json"
     manifest.write_text(json.dumps(unsigned), encoding="utf-8")
-    return manifest, (name,)
+    return manifest, names
 
 
 def test_single_mode_capture_keeps_sources_in_place_and_writes_metadata_only_inbox(tmp_path: Path) -> None:
@@ -142,6 +173,264 @@ def test_single_mode_capture_keeps_sources_in_place_and_writes_metadata_only_inb
     assert entry["source_strategy_sha256"] == sha256(strategy_bytes).hexdigest()
     assert manifest["run_mode"] == "SINGLE_MODE"
     assert strategy_path.read_bytes() == strategy_bytes
+
+
+def test_single_mode_config_flag_is_scoped_to_native_helper(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+
+    _write_fast_tester_config(config, "2026-08-01", "2026-08-31", single_mode=True)
+    assert json.loads(config.tester_config.read_text(encoding="utf-8"))["single_mode"] is True
+
+    _write_fast_tester_config(config, "2026-08-01", "2026-08-31")
+    assert json.loads(config.tester_config.read_text(encoding="utf-8"))["single_mode"] is False
+
+
+def test_native_single_mode_installs_each_batch_before_one_native_run_and_creates_inbox(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path, 3)
+    config = replace(_runner_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=2, stall_timeout_seconds=2)
+    events: list[object] = []
+
+    class NativeClient:
+        def __init__(self, expected: tuple[str, ...]) -> None:
+            self.expected = expected
+            self.statuses = iter(("Running", "Idle", "Idle"))
+
+        def run_tester(self) -> None:
+            events.append("run")
+            for name in self.expected:
+                (config.report_dir / f"{name}.html").write_text(_native_report(name), encoding="utf-8")
+
+        def tester_status(self) -> str:
+            value = next(self.statuses)
+            events.append(f"status:{value}")
+            return f'<span class="stat-value">{value}</span>'
+
+        def close(self) -> None:
+            events.append("close")
+
+    expected_for_client: list[tuple[str, ...]] = []
+
+    def start(_: RunnerConfig) -> object:
+        installed = tuple(sorted(path.stem for path in config.strategy_dir.glob("*.json")))
+        events.append(("start", installed))
+        return object()
+
+    def client_factory(_: RunnerConfig) -> NativeClient:
+        client = NativeClient(expected_for_client.pop(0))
+        events.append(("client", client.expected))
+        return client
+
+    def stop(_: RunnerConfig) -> None:
+        events.append("stop")
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("native SINGLE_MODE must not use wizard machinery")
+
+    expected_for_client.extend((names[:2], names[2:]))
+    service = LocalSingleModeStrategyTestService(
+        config,
+        start_bot=start,
+        stop_bot=stop,
+        client_factory=client_factory,
+        wait_for_exact_batch=forbidden,
+        monitor=forbidden,
+    )
+    started = service.start(manifest, analysis_run_id="a" * 64, start_date="2026-08-01", end_date="2026-08-31", job_id="native-order")
+    status = _wait_terminal(service, str(started["job_id"]))
+
+    assert status["state"] == "COMMITTED", status
+    assert status["inbox_ready"] is True
+    assert [(entry[0], entry[1]) for entry in events if isinstance(entry, tuple) and entry[0] == "start"] == [
+        ("start", names[:2]),
+        ("start", names[2:]),
+    ]
+    assert events.count("run") == 2
+    assert all("wizard" not in str(event).casefold() for event in events)
+    assert (Path(status["inbox_path"]) / "inbox_manifest.json").is_file()
+
+
+def test_native_single_mode_chooses_newest_complete_report_for_embedded_name(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path, 1)
+    config = replace(_runner_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=2, stall_timeout_seconds=2)
+
+    class NativeClient:
+        def __init__(self) -> None:
+            self.statuses = iter(("Running", "Completed", "Completed"))
+
+        def run_tester(self) -> None:
+            old = config.report_dir / "old-name.html"
+            new = config.report_dir / "new-name.html"
+            old.write_text(_native_report(names[0], " old"), encoding="utf-8")
+            new.write_text(_native_report(names[0], " new"), encoding="utf-8")
+            os.utime(old, (1, 1))
+            os.utime(new, (2, 2))
+
+        def tester_status(self) -> str:
+            return f'<span class="stat-value">{next(self.statuses)}</span>'
+
+        def close(self) -> None:
+            pass
+
+    service = LocalSingleModeStrategyTestService(
+        config,
+        start_bot=lambda _: None,
+        stop_bot=lambda _: None,
+        client_factory=lambda _: NativeClient(),
+        wait_for_exact_batch=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wizard launch")),
+        monitor=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wizard monitor")),
+    )
+    started = service.start(manifest, analysis_run_id="a" * 64, start_date="2026-08-01", end_date="2026-08-31", job_id="native-newest")
+    status = _wait_terminal(service, str(started["job_id"]))
+
+    assert status["state"] == "COMMITTED", status
+    assert status["evidence"]["verified_reports"] == {names[0]: "new-name.html"}
+    assert (config.report_dir / "old-name.html").is_file()
+    assert (config.report_dir / "new-name.html").is_file()
+
+
+def test_native_single_mode_retries_marker_only_report_then_rejects_it(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path, 1)
+    config = replace(
+        _runner_config(tmp_path),
+        poll_interval_seconds=0.001,
+        batch_timeout_seconds=2,
+        stall_timeout_seconds=2,
+        max_strategy_attempts=2,
+    )
+    runs = 0
+
+    class NativeClient:
+        def __init__(self) -> None:
+            self.statuses = iter(("Running", "Idle", "Idle"))
+
+        def run_tester(self) -> None:
+            nonlocal runs
+            runs += 1
+            (config.report_dir / f"{names[0]}.html").write_text(
+                '<p>Metric Timestamp Post Size Post Side walletSeries</p>'
+                f'<pre>{{"name":"{names[0]}","basic":{{"symbol":"BTCUSDT","time_frame":"1h"}}}}</pre>',
+                encoding="utf-8",
+            )
+
+        def tester_status(self) -> str:
+            return f'<span class="stat-value">{next(self.statuses)}</span>'
+
+        def close(self) -> None:
+            pass
+
+    service = LocalSingleModeStrategyTestService(
+        config,
+        start_bot=lambda _: None,
+        stop_bot=lambda _: None,
+        client_factory=lambda _: NativeClient(),
+        wait_for_exact_batch=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wizard launch")),
+        monitor=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wizard monitor")),
+    )
+    started = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="native-marker-only",
+    )
+    status = _wait_terminal(service, str(started["job_id"]))
+
+    assert status["state"] == "FAILED", status
+    assert status["error"]["code"] == "SINGLE_MODE_RETRIES_EXHAUSTED"
+    assert runs == 2
+
+
+@pytest.mark.parametrize("series_name", ("walletSeries", "equitySeries"))
+def test_native_single_mode_retries_malformed_series_then_rejects_it(
+    tmp_path: Path, series_name: str
+) -> None:
+    manifest, names = _generation(tmp_path, 1)
+    config = replace(
+        _runner_config(tmp_path),
+        poll_interval_seconds=0.001,
+        batch_timeout_seconds=2,
+        stall_timeout_seconds=2,
+        max_strategy_attempts=2,
+    )
+    runs = 0
+
+    class NativeClient:
+        def __init__(self) -> None:
+            self.statuses = iter(("Running", "Idle", "Idle"))
+
+        def run_tester(self) -> None:
+            nonlocal runs
+            runs += 1
+            report = _native_report(names[0]).replace(
+                f'const {series_name} = [[1767225600000,"1000"]];',
+                f"const {series_name} = malformed;",
+            )
+            (config.report_dir / f"{names[0]}.html").write_text(report, encoding="utf-8")
+
+        def tester_status(self) -> str:
+            return f'<span class="stat-value">{next(self.statuses)}</span>'
+
+        def close(self) -> None:
+            pass
+
+    service = LocalSingleModeStrategyTestService(
+        config,
+        start_bot=lambda _: None,
+        stop_bot=lambda _: None,
+        client_factory=lambda _: NativeClient(),
+        wait_for_exact_batch=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wizard launch")),
+        monitor=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wizard monitor")),
+    )
+    started = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id=f"native-malformed-{series_name}",
+    )
+    status = _wait_terminal(service, str(started["job_id"]))
+
+    assert status["state"] == "FAILED", status
+    assert status["error"]["code"] == "SINGLE_MODE_RETRIES_EXHAUSTED"
+    assert runs == 2
+
+
+def test_native_single_mode_retries_only_missing_reports_then_fails_terminally(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path, 2)
+    config = replace(_runner_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=2, stall_timeout_seconds=2, max_strategy_attempts=2)
+    runs: list[tuple[str, ...]] = []
+
+    class NativeClient:
+        def __init__(self, expected: tuple[str, ...]) -> None:
+            self.expected = expected
+            self.statuses = iter(("Running", "Idle", "Idle"))
+
+        def run_tester(self) -> None:
+            runs.append(tuple(sorted(path.stem for path in config.strategy_dir.glob("*.json"))))
+
+        def tester_status(self) -> str:
+            return f'<span class="stat-value">{next(self.statuses)}</span>'
+
+        def close(self) -> None:
+            pass
+
+    service = LocalSingleModeStrategyTestService(
+        config,
+        start_bot=lambda _: None,
+        stop_bot=lambda _: None,
+        client_factory=lambda _: NativeClient(tuple(sorted(path.stem for path in config.strategy_dir.glob("*.json")))),
+        wait_for_exact_batch=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wizard launch")),
+        monitor=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wizard monitor")),
+    )
+    started = service.start(manifest, analysis_run_id="a" * 64, start_date="2026-08-01", end_date="2026-08-31", job_id="native-failed")
+    status = _wait_terminal(service, str(started["job_id"]))
+
+    assert status["state"] == "FAILED", status
+    assert status["phase"] == "FAILED", status
+    assert status["inbox_ready"] is False
+    assert status["evidence"]["failed_names"] == list(names)
+    assert status["error"]["code"] == "SINGLE_MODE_RETRIES_EXHAUSTED"
+    assert runs == [names, names]
 
 
 def test_v2_accepts_external_strategy_only_under_trusted_output_root(tmp_path: Path) -> None:
@@ -278,27 +567,27 @@ def test_v2_rejects_external_strategy_for_direct_inbox(tmp_path: Path) -> None:
 
 def test_single_mode_auto_captures_metadata_inbox_and_marks_ready(tmp_path: Path) -> None:
     manifest, names = _generation(tmp_path)
-    config = _runner_config(tmp_path)
+    config = replace(_runner_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=2, stall_timeout_seconds=2)
 
-    def monitor(_: object, expected: tuple[str, ...], *_args: object, **_kwargs: object) -> BatchCompletion:
-        reports = {}
-        for name in expected:
-            report = config.report_dir / f"{name}.html"
-            report.parent.mkdir(parents=True, exist_ok=True)
-            report.write_text(
-                f'<p>Test period: 2026-08-01 - 2026-08-31</p><pre>{{"name":"{name}","basic":{{"symbol":"BTCUSDT","time_frame":"1h"}}}}</pre>',
-                encoding="utf-8",
-            )
-            reports[name] = StrategyCompletion(name, RowState.RESULT, (), f"run-{name}", report, True, 1)
-        return BatchCompletion(strategies=reports, polls=1, elapsed_seconds=0)
+    class NativeClient:
+        def __init__(self) -> None:
+            self.statuses = iter(("Running", "Idle", "Idle"))
+
+        def run_tester(self) -> None:
+            report = config.report_dir / f"{names[0]}.html"
+            report.write_text(_native_report(names[0]), encoding="utf-8")
+
+        def tester_status(self) -> str:
+            return f'<span class="stat-value">{next(self.statuses)}</span>'
+
+        def close(self) -> None:
+            pass
 
     service = LocalSingleModeStrategyTestService(
         config,
         start_bot=lambda _: object(),
         stop_bot=lambda _: None,
-        client_factory=lambda _: object(),
-        wait_for_exact_batch=lambda *_args, **_kwargs: (),
-        monitor=monitor,
+        client_factory=lambda _: NativeClient(),
     )
     started = service.start(
         manifest,

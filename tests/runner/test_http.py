@@ -52,6 +52,30 @@ def test_wizard_post_uses_decoded_config_and_plain_strategy_name() -> None:
     assert all(request.url.path != "/htmx/tester/run" for request in requests)
 
 
+def test_native_single_mode_uses_run_and_status_endpoints() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST" and request.url.path == "/htmx/tester/run":
+            return httpx.Response(200, text="started")
+        if request.method == "GET" and request.url.path == "/htmx/tester/status":
+            return httpx.Response(200, text='<span class="stat-value">Running</span>')
+        return httpx.Response(404)
+
+    client = TesterHttpClient(
+        "http://127.0.0.1:8087", transport=httpx.MockTransport(handler)
+    )
+
+    client.run_tester()
+    assert "Running" in client.tester_status()
+
+    assert [request.url.path for request in requests] == [
+        "/htmx/tester/run",
+        "/htmx/tester/status",
+    ]
+
+
 def test_strategy_table_parses_ready_running_and_result_rows() -> None:
     rows = parse_strategy_table(
         (FIXTURES / "tester_table.html").read_text(encoding="utf-8")

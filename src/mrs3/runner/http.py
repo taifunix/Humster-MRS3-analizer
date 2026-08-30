@@ -187,6 +187,15 @@ class TesterHttpClient:
         response.raise_for_status()
         return parse_strategy_table(response.text)
 
+    def run_tester(self) -> None:
+        response = self._client.post("/htmx/tester/run")
+        response.raise_for_status()
+
+    def tester_status(self) -> str:
+        response = self._client.get("/htmx/tester/status")
+        response.raise_for_status()
+        return response.text
+
     def launch_strategy(self, name: str) -> WizardLaunch:
         encoded = b64encode(name.encode("utf-8")).decode("ascii")
         response = self._client.get("/htmx/tester/wizard", params={"single": encoded})

@@ -22,6 +22,15 @@ Fresh evidence: 366 passed across v2/native/panel tests, 338 passed in the v1
 non-disturbance suite, `node --check src/mrs3/panel_web/app.js`, and
 `git diff --check`; final Terra disposition is `CODE_REVIEW_PASS`.
 
+Task 8 now executes native `SINGLE_MODE` batches through one `/htmx/tester/run`
+POST and `/htmx/tester/status` polling cycle per attempt.  It installs each
+bounded batch before startup, maps the newest complete current HTML by embedded
+strategy name, retries only missing reports, and fails terminally without a
+native PARTIAL commit; successful completion still creates the metadata-only
+inbox.  Fresh evidence: runner/native and retained monitor suites — `58 passed`;
+v2/panel regression slice — `104 passed`; `py_compile`, `node --check
+src/mrs3/panel_web/app.js`, and `git diff --check` passed.
+
 The 2026-08-28 main-branch commit audit is complete. Relevant work is now
 split into `de0ee4c` (Fast TEST contour), `b58f22d` (inode-preserving strategy
 publication), `edc5d40` (16-worker Performance import defaults), `4a2bab8`
