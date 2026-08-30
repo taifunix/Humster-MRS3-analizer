@@ -1,7 +1,26 @@
 # MRS3 — current verification
 
-**Updated:** 2026-08-28
-**Current branch:** `main`
+**Updated:** 2026-08-30
+**Current branch:** `feat/unified-performance-v2`
+
+## Current unified Performance v2 handoff (2026-08-30)
+
+The native `SINGLE_MODE` tester handoff is the active path and is implemented
+through commits `952bc22..3f535f4`. It creates a metadata-only inbox: strategy
+JSON remains in the trusted `Output/strategies` root and current HTML remains
+in `tester/report/my_test`; the manifest records exact paths, source hashes,
+dates, commission and provenance. The v2 importer is the only authoritative
+full source/identity/report/plateau validation before staging and DB commit.
+
+After v2 `COMMITTED`, cleanup is limited to the approved exact tester/report
+and `Output/strategies` roots. Inbox metadata and the v2 audit remain
+provenance; cleanup failure leaves the DB committed and reports a path-safe
+warning. The old Fast TEST panel dispatch/API/retry contour is removed, while
+the Runs backend/API remains available with its UI hidden.
+
+Fresh evidence: 366 passed across v2/native/panel tests, 338 passed in the v1
+non-disturbance suite, `node --check src/mrs3/panel_web/app.js`, and
+`git diff --check`; final Terra disposition is `CODE_REVIEW_PASS`.
 
 The 2026-08-28 main-branch commit audit is complete. Relevant work is now
 split into `de0ee4c` (Fast TEST contour), `b58f22d` (inode-preserving strategy
@@ -22,8 +41,8 @@ A/B windows, an ordered filter/Pareto pipeline, panel/XLSX/Portfolio Optimizer
 outputs, transactional discard/add/replace and a durable `RETEST` tag whose
 handler runs the common RUNS-to-inbox-to-replacement chain. The reviewed
 vertical-slice code and schema are now committed. Next step is the deferred full
-v2 pipeline; the later RUNS redesign must reuse the common FAST Performance
-inbox contract.
+v2 pipeline; the later RUNS redesign must reuse the same metadata-only,
+trusted-path and importer contract.
 
 Performance DB import now defaults to 16 preparation processes and caps the
 request at 16; DuckDB publication remains a single transactional writer.
@@ -72,11 +91,16 @@ the existing strategy validation. Focused verification:
 tests/test_fresh_analysis_strategies.py tests/test_panel_fresh_strategies.py -q`
 — `75 passed`.
 
-## Fast Strategy Test design (2026-08-27)
+## Retired Fast Strategy Test design (2026-08-27)
 
 The independent **Fast TEST стратегии** contour is approved and documented in
 `docs/specs/2026-08-27-panel-fast-strategy-test.md`. Its implementation plan is
 `docs/superpowers/plans/2026-08-27-panel-fast-strategy-test.md`.
+
+This section is historical, not an active panel feature. Native `SINGLE_MODE`
+is now active; Fast start/retry dispatch, API handlers and panel service
+ownership were removed in `3f535f4`. The bounded implementation remains only
+as shared runner machinery required by the Single mode service.
 
 The new path will retain bounded `strategy_batch_size` chunks, the existing
 low-level `max_parallel_submissions` rolling window and four total automatic
@@ -86,7 +110,7 @@ leaves exactly failed strategy JSON in `<bot_root>\settings_strategy`; one
 recovery action first accepts matching manual reports, then grants one extra
 attempt to each remaining failure.
 
-Implementation is in progress. Task 1 now persists per-order plateau diagnostics
+Historical implementation details follow. Task 1 persisted per-order plateau diagnostics
 in the generation manifest; Task 2 supports partial controlled monitoring and
 HTML settings extraction; Task 3 provides the independent bounded Fast TEST
 service; Task 4 wires `strategies.tester.fast.start/retry` through the panel;

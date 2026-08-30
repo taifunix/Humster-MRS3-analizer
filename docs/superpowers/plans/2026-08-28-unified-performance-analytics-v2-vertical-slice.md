@@ -319,7 +319,7 @@ substitution outside that root, and symlink/reparse escapes remain rejected.
 
 - [ ] **Step 3: Make the UI cutover isolated.**
 
-  The visible `Inbox → Performance DB` card targets the v2 job only after the E2E test is green. Do not remove v1 routes or tests. Do not label any proxy as a tested result.
+  The visible `Inbox → Performance DB` card targets the v2 job only after the E2E test is green. Native `SINGLE_MODE` is the active tester path; Fast UI and active panel routes are removed, while the Runs backend/API remains available with its UI hidden. Keep unrelated v1 routes/tests untouched. Do not label any proxy as a tested result.
 
 - [ ] **Step 4: Verify and commit.**
 
@@ -357,7 +357,7 @@ substitution outside that root, and symlink/reparse escapes remain rejected.
 
 - [ ] **Step 4: Update only verified documentation and commit.**
 
-  `progress.md` records the exact evidence and the next increment. `PRD.md` becomes `vertical slice implemented; full v2 pipeline pending`. Do not rewrite the approved spec or ADR.
+  `progress.md` and `PRD.md` record the exact handoff evidence, commits `952bc22..3f535f4`, and final `CODE_REVIEW_PASS`; the broader v2 pipeline remains pending. Do not rewrite the approved spec or ADR.
 
   ```powershell
   git add progress.md PRD.md
@@ -370,7 +370,7 @@ substitution outside that root, and symlink/reparse escapes remain rejected.
   phase must add a panel date-range interface and reject each request unless
   `listing_date <= test_start < test_end`, with `listing_date` read from
   `dates.xlsx` for every selected symbol;
-- source HTML cleanup outside v2 temporary staging;
+- cleanup of source paths outside the exact approved post-commit roots;
 - DD5 proxy UI and any scaled-result claim;
 - built-in filters, Pareto, selection runs/results, XLSX and Portfolio Optimizer input;
 - deletion of v1 runtime and storage;

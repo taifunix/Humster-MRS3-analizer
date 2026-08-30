@@ -116,7 +116,7 @@ analysis runs и lineage согласно уже реализованной
 | Pending production acceptance | [Strategy performance DuckDB governing spec](docs/specs/2026-08-14-strategy-performance-duckdb.md) | transactional performance import, DB-only DD5 and safe cleanup | [ADR-0004](docs/decisions/0004-strategy-performance-evidence-store.md) |
 | Planned | [Panel Phase 2 structural filters](docs/specs/2026-08-25-panel-phase2-structural-filters.md) | immutable fresh-analysis shortlist filtering, server-authoritative READY generation and audit | event filter and shortlist, Panel Web |
 | Implemented / verified | [Tester run files](docs/specs/2026-08-25-tester-run-files.md) | five isolated tester snapshots from filtered READY candidates; manual `run_tester.bat` execution | Panel Web, local tester runner |
-| Planned — approved design | [Panel Fast Strategy Test](docs/specs/2026-08-27-panel-fast-strategy-test.md) | independent bounded strategy batches, partial completion and failed-only recovery without verified inbox/import audit | READY generation manifest, Panel Web, local tester primitives |
+| Retired / superseded | [Panel Fast Strategy Test](docs/specs/2026-08-27-panel-fast-strategy-test.md) | historical bounded strategy-batch design; active panel dispatch/API/retry contour removed, with shared runner machinery retained for native `SINGLE_MODE` | READY generation manifest, local tester primitives |
 | Implemented / verified | [Multi-order plateau admission](docs/specs/2026-08-25-multi-order-plateau-admission.md) | pre-combination 2ORD--4ORD structural width and independent-event admission | canonical Phase 1, event filter and shortlist |
 | Active implementation contract | [Performance report import to DuckDB](docs/specs/2026-08-14-performance-report-import-duckdb.md) | immutable HTML-report import, canonical metrics, transaction, idempotency and cleanup | Strategy performance DuckDB, ADR-0004--0006 |
 | Active implementation contract | [DD5 calculation and finalist selection](docs/specs/2026-08-14-dd5-finalist-selection.md) | DD5 formulas, scoped filters, Pareto, finalists and XLSX contract | Performance report import to DuckDB |
@@ -191,17 +191,24 @@ the planned data model for new Performance work: one appendable local database,
 one current replaceable tester result per logical strategy, order-to-plateau
 facts, arbitrary UPNL-relative A/B windows, configurable ordered filters/Pareto,
 panel/XLSX finalists and Portfolio Optimizer input. A durable `RETEST` tag drives
-one RUNS handler that replaces successful results through the common FAST inbox
-contract.
+one RUNS handler that replaces successful results through the same trusted
+metadata-only inbox contract.
 
-Status: **vertical slice implemented and verified; full v2 pipeline pending**.
-Tasks 1–6 provide the v2-owned schema/config guard, shared FAST/RUNS inbox
-adapter and immutable staging, current-report parser, atomic ADD/REPLACE import,
-relative UPNL window cache, and an isolated Panel import/status action. Terra
-Medium independently reviewed each accepted task with `CODE_REVIEW_PASS`.
-The focused v2 suite passed 81 tests, the v1 non-disturbance suite passed 334
-tests, and the Panel JavaScript syntax check passed. No v1 migration is required
-because no production Performance DB exists.
+Status: **native SINGLE_MODE handoff and v2 vertical slice implemented and
+verified; broader v2 pipeline pending**. Native `SINGLE_MODE` creates one
+metadata-only inbox whose strategy JSON stays under trusted `Output/strategies`
+and whose current HTML stays under `tester/report/my_test`; the manifest records
+exact paths, source hashes, dates, commission and provenance. The v2 importer
+is the only authoritative full validation before staging/DB commit. After a
+successful v2 `COMMITTED`, cleanup is limited to exact approved source roots;
+inbox metadata and v2 audit remain provenance, and cleanup failure is a warning
+on the committed result. Runs backend/API remains available while its UI is
+hidden; Fast panel dispatch/API/retry was removed. The accepted handoff spans
+commits `952bc22..3f535f4` and final Terra disposition is `CODE_REVIEW_PASS`.
+Fresh evidence is 366 passed across v2/native/panel tests, 338 passed in the v1
+non-disturbance suite, plus `node --check src/mrs3/panel_web/app.js` and
+`git diff --check`. No v1 migration is required because no production
+Performance DB exists.
 
 Explicitly deferred from this vertical slice:
 
@@ -209,7 +216,7 @@ Explicitly deferred from this vertical slice:
   phase must add a Panel date-range interface and reject each request unless
   `listing_date <= test_start < test_end`, with `listing_date` read from
   `dates.xlsx` for every selected symbol;
-- source HTML cleanup outside v2 temporary staging;
+- cleanup of source paths outside the exact approved post-commit roots;
 - DD5 proxy UI and any scaled-result claim;
 - built-in filters, Pareto, selection runs/results, XLSX, and Portfolio
   Optimizer input;
