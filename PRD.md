@@ -190,9 +190,10 @@ and [ADR-0020](docs/decisions/0020-unified-performance-analytics-v2.md) replace
 the planned data model for new Performance work: one appendable local database,
 one current replaceable tester result per logical strategy, order-to-plateau
 facts, arbitrary UPNL-relative A/B windows, configurable ordered filters/Pareto,
-panel/XLSX finalists and Portfolio Optimizer input. A durable `RETEST` tag drives
-one RUNS handler that replaces successful results through the same trusted
-metadata-only inbox contract.
+panel/XLSX finalists and Portfolio Optimizer input. The active native
+`SINGLE_MODE` path uses a trusted metadata-only inbox. The retained hidden Runs
+backend/API currently uses its direct inbox; any future `RETEST` replacement
+handler must explicitly adopt the trusted v2 importer contract.
 
 Status: **native SINGLE_MODE handoff and v2 vertical slice implemented and
 verified; broader v2 pipeline pending**. Native `SINGLE_MODE` creates one
