@@ -19,6 +19,17 @@ class InboxCaptureError(RuntimeError):
     """Raised when immutable tester evidence cannot be captured safely."""
 
 
+def _is_reparse(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
+def _reject_reparse_components(path: Path) -> None:
+    raw = Path(path).absolute()
+    for current in (*reversed(raw.parents), raw):
+        if _is_reparse(current):
+            raise InboxCaptureError("refusing to replace an inbox path containing a symlink or reparse point")
+
+
 _COMMISSION_FIELDS = (
     "MakerFee",
     "TakerFee",
@@ -245,12 +256,15 @@ def capture_run_snapshot_inbox(
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise InboxCaptureError("inbox workers must be a positive integer")
     contract, contract_id, tester_config_hash = _commission_contract(config, tester_config_bytes)
+    _reject_reparse_components(config.inbox_root)
     inbox_root = config.inbox_root.resolve()
     inbox = inbox_root / job_id
+    _reject_reparse_components(inbox)
     if inbox.exists():
         if not replace_existing:
             raise InboxCaptureError(f"inbox already exists: {inbox}")
-        if inbox.is_symlink() or not inbox.is_dir() or inbox.parent != inbox_root:
+        _reject_reparse_components(inbox)
+        if not inbox.is_dir() or inbox.parent != inbox_root:
             raise InboxCaptureError("refusing to replace an unsafe inbox path")
         shutil.rmtree(inbox)
     entries: list[dict[str, object]] = []
@@ -314,7 +328,5 @@ def capture_run_snapshot_inbox(
         _atomic_bytes(inbox / "inbox_manifest.json", _canonical_json(manifest))
         return inbox
     except BaseException:
-        import shutil
-
         shutil.rmtree(inbox, ignore_errors=True)
         raise

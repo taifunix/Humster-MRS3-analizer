@@ -250,6 +250,40 @@ def test_capture_run_snapshot_inbox_supports_fast_mode(tmp_path: Path) -> None:
     assert manifest["run_mode"] == "FAST"
 
 
+def test_single_mode_replace_rejects_reparse_inbox_before_recursive_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _output, plan, _wizard, report = _inputs(tmp_path, config)
+    strategy = json.loads((plan.strategy_source / "A.json").read_text(encoding="utf-8"))
+    inbox = config.inbox_root / "single-job"
+    inbox.mkdir(parents=True)
+    stale = inbox / "stale.txt"
+    stale.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(inbox_module, "_is_reparse", lambda path: path == inbox)
+
+    with pytest.raises(InboxCaptureError, match="reparse"):
+        capture_run_snapshot_inbox(
+            config,
+            "single-job",
+            {"A": strategy},
+            {"A": report},
+            tester_config_bytes=config.tester_config.read_bytes(),
+            provenance={
+                "analysis_run_id": "a" * 64,
+                "generation_manifest_sha256": "b" * 64,
+                "strategy_json_sha256": {"A.json": "c" * 64},
+            },
+            test_start="2026-08-01",
+            test_end="2026-08-18",
+            run_mode="SINGLE_MODE",
+            strategy_paths={"A": plan.strategy_source / "A.json"},
+            replace_existing=True,
+        )
+
+    assert stale.read_text(encoding="utf-8") == "keep"
+
+
 def test_capture_run_snapshot_caps_worker_pool_and_keeps_entry_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(tmp_path)
     names = tuple(f"A{index:02d}" for index in range(17))
