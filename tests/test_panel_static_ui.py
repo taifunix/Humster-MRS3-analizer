@@ -602,6 +602,26 @@ def test_inbox_verify_does_not_fail_silently() -> None:
     assert "error?.message || 'unknown error'" in handler
 
 
+def test_performance_import_keeps_typed_backend_error_reason() -> None:
+    js = _read("app.js")
+    handler = js.split("importStartV2?.addEventListener", 1)[1].split("const recoverSplitJobs", 1)[0]
+
+    assert "catch (error)" in handler
+    assert "error?.code" in handler
+    assert "error?.message" in handler
+    assert "Импорт Performance v2 не прошёл проверку.'" not in handler
+
+
+def test_performance_cleanup_warning_formats_code_and_message() -> None:
+    js = _read("app.js")
+    render = js.split("const renderImportV2", 1)[1].split("inboxVerifyV2?.addEventListener", 1)[0]
+
+    assert "typeof warning === 'object'" in render
+    assert "warning.code" in render
+    assert "warning.message" in render
+    assert "${warning}." not in render
+
+
 def test_testing_screen_does_not_expose_remote_runner_paths() -> None:
     html = _read("index.html")
 

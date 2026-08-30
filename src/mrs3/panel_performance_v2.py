@@ -135,6 +135,8 @@ def _cleanup_exact_directory(path: Path, *tail: str) -> None:
     for child in resolved.iterdir():
         if child.is_symlink() or not child.is_dir():
             child.unlink()
+        elif _is_reparse(child):
+            raise ValueError("cleanup child is a symlink or reparse point")
         else:
             shutil.rmtree(child)
 

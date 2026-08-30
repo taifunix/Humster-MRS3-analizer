@@ -155,6 +155,16 @@
   const showRequestError = (error) => {
     if (status) status.textContent = error?.message || 'Backend request failed.';
   };
+  const formatErrorReason = (value, fallback = 'request failed') => {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (value && typeof value === 'object') {
+      const code = typeof value.code === 'string' ? value.code.trim() : '';
+      const message = typeof value.message === 'string' ? value.message.trim() : '';
+      if (code && message && code !== message) return `${code}: ${message}`;
+      if (message || code) return message || code;
+    }
+    return fallback;
+  };
   const requestJson = async (endpoint, options = {}) => {
     try {
       const response = await fetch(endpoint, options);
@@ -166,7 +176,14 @@
       try { result = await response.json(); } catch (_) { throw new Error('Backend returned invalid JSON.'); }
       if (!response.ok) {
         const code = typeof result?.error === 'string' && (endpoint.startsWith('/api/v2/strategies/fresh/') || /^[A-Z_]+$/.test(result.error)) ? result.error : 'Server validation failed.';
-        throw new Error(code);
+        const payload = result?.error;
+        const typedCode = payload && typeof payload === 'object' && typeof payload.code === 'string' ? payload.code : code;
+        const typedMessage = payload && typeof payload === 'object' && typeof payload.message === 'string'
+          ? payload.message
+          : typeof result?.message === 'string' ? result.message : code;
+        const failure = new Error(typedMessage || typedCode);
+        failure.code = typedCode;
+        throw failure;
       }
       return result;
     } catch (error) {
@@ -1445,11 +1462,14 @@
     if (importProgressV2) importProgressV2.textContent = `${job.phase || 'IMPORTING'} · ${current} / ${total} reports.`;
     const result = job.result || {};
     const warning = result.cleanup_warning || job.cleanup_warning;
-    const error = job.error?.code ? ` ${job.error.code}: ${job.error.message || ''}` : '';
+    const warningText = warning && typeof warning === 'object'
+      ? formatErrorReason({ code: warning.code, message: warning.message }, 'cleanup failed')
+      : formatErrorReason(warning, '');
+    const error = job.error ? ` ${formatErrorReason(job.error)}` : '';
     if (importStatusV2) importStatusV2.textContent = job.state === 'COMMITTED'
       ? `Performance v2: COMMITTED · imported ${result.imported_count || 0} · skipped ${result.skipped_count || 0} · rejected ${result.rejected_count || 0} · target ${result.database_path || '—'} · audit ${result.audit_path || '—'}.`
       : `Performance v2: ${job.phase || job.state || 'RUNNING'}.${error}`;
-    if (warning && importStatusV2 && job.state === 'COMMITTED') importStatusV2.textContent += ` Cleanup warning: ${warning}.`;
+    if (warningText && importStatusV2 && job.state === 'COMMITTED') importStatusV2.textContent += ` Cleanup warning: ${warningText}.`;
   };
   inboxVerifyV2?.addEventListener('click', async () => {
     if (!testerJobId) {
@@ -1479,7 +1499,10 @@
         return false;
       };
       if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
-    } catch (_) { if (importStatusV2) importStatusV2.textContent = 'Импорт Performance v2 не прошёл проверку.'; }
+    } catch (error) {
+      const reason = formatErrorReason({ code: error?.code, message: error?.message });
+      if (importStatusV2) importStatusV2.textContent = `Импорт Performance v2 не прошёл проверку: ${reason}.`;
+    }
     finally { importStartV2.disabled = !inboxReadyV2; }
   });
   const recoverSplitJobs = async () => {

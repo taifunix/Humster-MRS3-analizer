@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import mrs3.panel_performance_v2 as performance_v2
 from mrs3.performance_v2_input import PerformanceV2InputError, read_performance_v2_inbox
 from mrs3.performance_v2_store import PerformanceV2Config, load_performance_v2_config
 from mrs3.panel_fast_strategy_test import LocalSingleModeStrategyTestService
@@ -420,3 +421,17 @@ def test_cleanup_warning_hides_windows_paths_with_spaces() -> None:
     assert _safe_cleanup_message(
         RuntimeError(r"cannot remove C:\Users\Alice Example\Output\strategies")
     ) == "cannot remove <path>"
+
+
+def test_cleanup_refuses_reparse_child_before_recursive_delete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report_root = tmp_path / "bot" / "tester" / "report" / "my_test"
+    child = report_root / "junction-like-child"
+    child.mkdir(parents=True)
+    (child / "keep.txt").write_text("keep", encoding="utf-8")
+    real_is_reparse = performance_v2._is_reparse
+    monkeypatch.setattr(performance_v2, "_is_reparse", lambda path: path == child or real_is_reparse(path))
+
+    with pytest.raises(ValueError, match="symlink or reparse"):
+        performance_v2._cleanup_exact_directory(report_root, "tester", "report", "my_test")
+
+    assert (child / "keep.txt").is_file()
