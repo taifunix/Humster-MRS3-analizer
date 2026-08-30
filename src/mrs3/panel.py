@@ -132,7 +132,11 @@ from .fresh_analysis_strategies import (
 from .tester_run_files import publish_run_snapshots
 from .panel_strategy_batch import LocalStrategyBatchService, StrategyBatchValidationError, validate_strategy_manifest
 from .panel_tester_runs import LocalRunsBatchService
-from .panel_fast_strategy_test import FastStrategyTestError, LocalFastStrategyTestService
+from .panel_fast_strategy_test import (
+    FastStrategyTestError,
+    LocalFastStrategyTestService,
+    LocalSingleModeStrategyTestService,
+)
 from .panel_performance_dd5 import (
     LocalPerformanceDd5Jobs,
     LocalPerformanceDd5Service,
@@ -1194,6 +1198,7 @@ class PanelController:
         self._strategy_batch_service: LocalStrategyBatchService | None = None
         self._runs_batch_service: LocalRunsBatchService | None = None
         self._fast_strategy_test_service: LocalFastStrategyTestService | None = None
+        self._single_mode_strategy_test_service: LocalSingleModeStrategyTestService | None = None
         self._strategy_batch_inboxes: dict[str, Path] = {}
         self._performance_dd5_jobs: LocalPerformanceDd5Jobs | None = None
         self._performance_import_jobs: LocalPerformanceImportJobs | None = None
@@ -1421,6 +1426,46 @@ class PanelController:
             raise ValueError("inbox is incomplete: strategy names do not match")
 
     @staticmethod
+    def _validate_metadata_inbox(inbox: Path) -> None:
+        """Perform only the handoff check; v2 importer owns source validation."""
+        try:
+            document = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError("metadata inbox is incomplete: invalid manifest") from error
+        if not isinstance(document, dict) or document.get("schema_version") != 1:
+            raise ValueError("metadata inbox is incomplete: schema_version must be 1")
+        if document.get("run_mode") != "SINGLE_MODE" or document.get("source_mode") != "metadata_only":
+            raise ValueError("metadata inbox is incomplete: unsupported handoff mode")
+        expected = document.get("expected_strategy_names")
+        entries = document.get("entries")
+        if (
+            not isinstance(expected, list)
+            or not expected
+            or any(not isinstance(name, str) or not name for name in expected)
+            or len(set(expected)) != len(expected)
+            or not isinstance(entries, list)
+            or len(entries) != len(expected)
+        ):
+            raise ValueError("metadata inbox is incomplete: strategy names are invalid")
+        if document.get("inbox_ready") is not True or (inbox / "strategies").exists() or (inbox / "strategies").is_symlink():
+            raise ValueError("metadata inbox is incomplete: inbox is not ready")
+        names: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("metadata inbox is incomplete: entry is invalid")
+            name = entry.get("strategy_name")
+            if not isinstance(name, str) or not name or name in names:
+                raise ValueError("metadata inbox is incomplete: strategy names do not match")
+            names.add(name)
+            for field in ("strategy_path", "report_path"):
+                value = entry.get(field)
+                path = Path(value) if isinstance(value, str) and value else None
+                if path is None or path.is_symlink() or not path.is_file():
+                    raise ValueError(f"metadata inbox is incomplete: {field} is missing")
+        if names != set(expected):
+            raise ValueError("metadata inbox is incomplete: strategy names do not match")
+
+    @staticmethod
     def _optional_string(payload: Mapping[str, object], name: str) -> str:
         value = payload.get(name)
         return value.strip() if isinstance(value, str) else ""
@@ -1642,6 +1687,8 @@ class PanelController:
             self._runs_batch_service is not None and self._runs_batch_service.has_active_job()
         ) or (
             self._fast_strategy_test_service is not None and self._fast_strategy_test_service.has_active_job()
+        ) or (
+            self._single_mode_strategy_test_service is not None and self._single_mode_strategy_test_service.has_active_job()
         ) or bool(self._fresh_generation_job and self._fresh_generation_job.get("running"))
 
     def panel_job_submit(self, payload: Mapping[str, object]) -> dict:
@@ -1703,6 +1750,7 @@ class PanelController:
             "import_id", "status", "imported_count", "skipped_count", "rejected_count",
             "database_path", "audit_path", "strategy_count", "order_count",
             "plateau_count", "result_count", "window_count",
+            "cleanup_warning",
         )
         return {key: result[key] for key in keys if key in result}
 
@@ -2181,7 +2229,12 @@ class PanelController:
                     runtime = self._panel_jobs.runtime(job_id)
                     inbox = Path(runtime["inbox_path"]).resolve()
                     inbox.relative_to(inbox_root)
-                    self._validate_performance_inbox(inbox)
+                    request = job.get("request")
+                    is_single_mode = isinstance(request, Mapping) and request.get("mode") == "SINGLE_MODE"
+                    if is_single_mode:
+                        self._validate_metadata_inbox(inbox)
+                    else:
+                        self._validate_performance_inbox(inbox)
                     self._panel_jobs.sync(
                         job_id,
                         {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
@@ -2577,6 +2630,13 @@ class PanelController:
             )
         return self._fast_strategy_test_service
 
+    def _single_mode_strategy_test(self) -> LocalSingleModeStrategyTestService:
+        if self._single_mode_strategy_test_service is None:
+            self._single_mode_strategy_test_service = LocalSingleModeStrategyTestService(
+                RunnerConfig.from_json(self.default_config), on_update=self._record_special_job
+            )
+        return self._single_mode_strategy_test_service
+
     def strategies_tester_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end"})
         if unexpected:
@@ -2592,9 +2652,9 @@ class PanelController:
             raise ValueError("start_date and end_date are required")
         manifest = self._fresh_strategy_manifest(analysis_id)
         return self._start_tracked_panel_job(
-            "strategies.tester.start", {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date},
+            "strategies.tester.start", {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "mode": "SINGLE_MODE"},
             ("strategies.tester",),
-            lambda job_id: self._strategy_batch().start(
+            lambda job_id: self._single_mode_strategy_test().start(
                 manifest,
                 analysis_run_id=analysis_id,
                 start_date=start_date,
@@ -2652,6 +2712,8 @@ class PanelController:
         tracked = self._panel_jobs.get(job_id)
         if tracked.get("kind") in {"strategies.tester.fast.start", "strategies.tester.fast.retry"}:
             status = self._fast_strategy_test().status
+        elif tracked.get("kind") == "strategies.tester.start" and isinstance(tracked.get("request"), Mapping) and tracked["request"].get("mode") == "SINGLE_MODE":
+            status = self._single_mode_strategy_test().status
         elif tracked.get("kind") == "strategies.tester.runs":
             status = self._runs_batch().status
         else:
@@ -2666,10 +2728,12 @@ class PanelController:
         config = RunnerConfig.from_json(self.default_config)
         inbox_root = Path(config.inbox_root).resolve()
         tracked = self._panel_jobs.get(job_id)
-        if str(tracked.get("kind", "")).startswith("strategies.tester.fast"):
-            inbox = self._fast_strategy_test().capture_inbox(job_id)
-            self._validate_performance_inbox(inbox)
-            self._fast_strategy_test().mark_inbox_ready(job_id, inbox)
+        request = tracked.get("request")
+        is_single_mode = tracked.get("kind") == "strategies.tester.start" and isinstance(request, Mapping) and request.get("mode") == "SINGLE_MODE"
+        if is_single_mode or tracked.get("kind") in {"strategies.tester.fast.start", "strategies.tester.fast.retry"}:
+            service = self._single_mode_strategy_test() if is_single_mode else self._fast_strategy_test()
+            inbox = service.capture_inbox(job_id)
+            service.mark_inbox_ready(job_id, inbox)
             self._strategy_batch_inboxes[job_id] = inbox
             runtime = {"inbox_path": str(inbox)}
             state = self._panel_jobs.get(job_id)["state"]
@@ -2723,7 +2787,6 @@ class PanelController:
             plan = BatchPlan(source, expected, tuple(f"{name}.json" for name in expected), tuple(), tuple(), tuple(), tuple())
             snapshot = (inbox_root / f".{job_id}.tester-config.snapshot").read_bytes()
             capture_verified_inbox(config, output, plan, results, reports, tester_config_bytes=snapshot, provenance=provenance)
-        self._validate_performance_inbox(inbox)
         try:
             self._panel_jobs.recover_committed(job_id, runtime={"inbox_path": str(inbox)})
         except PanelJobError:
@@ -2736,6 +2799,8 @@ class PanelController:
             tracked = self._panel_jobs.get(job_id)
             if tracked.get("kind") in {"strategies.tester.fast.start", "strategies.tester.fast.retry"}:
                 cancel = self._fast_strategy_test().cancel
+            elif tracked.get("kind") == "strategies.tester.start" and isinstance(tracked.get("request"), Mapping) and tracked["request"].get("mode") == "SINGLE_MODE":
+                cancel = self._single_mode_strategy_test().cancel
             elif tracked.get("kind") == "strategies.tester.runs":
                 cancel = self._runs_batch().cancel
             else:
@@ -2859,14 +2924,16 @@ class PanelController:
             raise ValueError("window_a and window_b must be supplied together")
         if self._performance_v2_jobs is None:
             self._performance_v2_jobs = LocalPerformanceV2Jobs(on_update=self._record_special_job)
+        performance_config = self._performance_v2_config()
         request = PerformanceV2PanelRequest(
             inbox=self._tester_inbox(tester_job_id),
             report_root=self._panel_path("tester_report_dir"),
-            config=self._performance_v2_config(),
+            config=performance_config,
             mode=mode,
             replacement_strategy_ids=replacement,
             window_a=window_a,
             window_b=window_b,
+            strategy_root=performance_config.strategy_root,
         )
         return self._start_tracked_panel_job(
             "strategies.performance.v2.import",

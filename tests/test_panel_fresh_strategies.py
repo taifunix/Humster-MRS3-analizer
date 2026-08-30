@@ -16,17 +16,17 @@ from mrs3.panel_jobs import PanelJobError
 from mrs3.panel_tester_runs import LocalRunsBatchService
 
 
-def test_panel_exposes_run_file_generation_action() -> None:
+def test_panel_keeps_runs_backend_but_hides_legacy_run_controls() -> None:
     panel_source = Path("src/mrs3/panel.py").read_text(encoding="utf-8")
     panel_html = Path("src/mrs3/panel_web/index.html").read_text(encoding="utf-8")
     web_source = Path("src/mrs3/panel_web/app.js").read_text(encoding="utf-8")
 
-    assert 'id="shortlist-generate-runs"' in panel_html
     assert "/api/v2/strategies/fresh/runs" in panel_source
-    assert "#shortlist-generate-runs" in web_source
-    assert 'id="tester-start-runs"' in panel_html
-    assert "strategies.tester.runs" in web_source
-    assert "Проверить и запустить стратегии" in panel_html
+    assert 'id="shortlist-generate-runs"' not in panel_html
+    assert 'id="tester-start-runs"' not in panel_html
+    assert "strategies.tester.runs" not in web_source
+    assert 'id="tester-start"' in panel_html
+    assert "SINGLE_MODE" in panel_html
 
 
 def test_generation_validation_does_not_poison_the_next_request(tmp_path: Path) -> None:
@@ -372,7 +372,10 @@ def test_fast_verify_routes_through_existing_performance_inbox_button(tmp_path: 
     job = controller._panel_jobs.submit("strategies.tester.fast.start", {}, "fast", ("strategies.tester",), job_id="fast-job")
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
     monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=tmp_path / "inbox"))
-    monkeypatch.setattr(controller, "_validate_performance_inbox", lambda _inbox: None)
+    def forbidden_full_validation(_inbox: Path) -> None:
+        raise AssertionError("verify must defer full validation to the v2 importer")
+
+    monkeypatch.setattr(controller, "_validate_performance_inbox", forbidden_full_validation)
 
     class FastService:
         def capture_inbox(self, job_id: str) -> Path:

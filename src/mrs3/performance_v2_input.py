@@ -381,6 +381,11 @@ def _root_from_config(value: object) -> Path | None:
     return None
 
 
+def _strategy_root_from_config(value: object) -> Path | None:
+    candidate = getattr(value, "strategy_root", None)
+    return Path(candidate) if candidate is not None else None
+
+
 def _contained_path(raw: object, root: Path, label: str) -> Path:
     if not isinstance(raw, str) or not raw.strip():
         raise PerformanceV2InputError(f"{label} is missing")
@@ -413,6 +418,27 @@ def _contained_path(raw: object, root: Path, label: str) -> Path:
     except ValueError as error:
         raise PerformanceV2InputError(f"{label} is outside its trusted root") from error
     return resolved
+
+
+def _strategy_path(
+    raw: object,
+    inbox: Path,
+    trusted_root: Path | None,
+    *,
+    allow_external: bool,
+) -> Path:
+    """Resolve an inbox-local path or an external path below Output/strategies."""
+    if not allow_external:
+        return _contained_path(raw, inbox, "strategy path")
+    try:
+        return _contained_path(raw, inbox, "strategy path")
+    except PerformanceV2InputError as inbox_error:
+        if trusted_root is None:
+            raise PerformanceV2InputError("strategy path is outside its trusted root") from inbox_error
+        try:
+            return _contained_path(raw, trusted_root, "strategy path")
+        except PerformanceV2InputError as external_error:
+            raise PerformanceV2InputError("strategy path is outside its trusted root") from external_error
 
 
 def _sha256(data: bytes) -> str:
@@ -510,6 +536,7 @@ def read_performance_v2_inbox(
     config: object | None = None,
     max_html_bytes: int | None = None,
     report_root: Path | None = None,
+    strategy_root: Path | None = None,
 ) -> PreparedV2Input:
     """Validate an immutable inbox and return a compact typed description."""
     raw_inbox = Path(inbox)
@@ -532,6 +559,15 @@ def read_performance_v2_inbox(
     if tester_report_root is None:
         raise PerformanceV2InputError("configured tester report root is required")
     report_root = Path(tester_report_root).resolve()
+    if strategy_root is None and config is not None:
+        strategy_root = _strategy_root_from_config(config)
+    if strategy_root is not None:
+        raw_strategy_root = Path(strategy_root)
+        if _is_reparse(raw_strategy_root):
+            raise PerformanceV2InputError("trusted strategy root cannot be a symlink or reparse point")
+        trusted_strategy_root = raw_strategy_root.resolve()
+    else:
+        trusted_strategy_root = None
     limit = max_html_bytes if max_html_bytes is not None else getattr(config, "max_html_bytes", _DEFAULT_MAX_HTML_BYTES)
     if type(limit) is not int or limit <= 0:
         raise PerformanceV2InputError("max_html_bytes must be a positive integer")
@@ -559,7 +595,7 @@ def read_performance_v2_inbox(
             raise PerformanceV2InputError("inbox manifest entries are missing or incomplete")
         contract, contract_id, tester_hash = _commission(manifest)
         run_mode = manifest.get("run_mode", "FAST")
-        if run_mode not in {"FAST", "RUNS"}:
+        if run_mode not in {"FAST", "RUNS", "SINGLE_MODE"}:
             raise PerformanceV2InputError("unsupported inbox run mode")
         raw_entry_mappings: list[Mapping[str, object]] = []
         seen_names: set[str] = set()
@@ -571,7 +607,12 @@ def read_performance_v2_inbox(
             if name in seen_names:
                 raise PerformanceV2InputError("duplicate manifest strategy name")
             seen_names.add(name)
-            strategy_path = _contained_path(raw.get("strategy_path"), inbox, "strategy path")
+            strategy_path = _strategy_path(
+                raw.get("strategy_path"),
+                inbox,
+                trusted_strategy_root,
+                allow_external=run_mode == "SINGLE_MODE",
+            )
             report_path = _contained_path(raw.get("report_path"), report_root, "report path")
             if strategy_path in seen_paths:
                 raise PerformanceV2InputError("duplicate manifest strategy path")
@@ -618,7 +659,12 @@ def read_performance_v2_inbox(
         plateau_by_key: dict[tuple[str, str], PlateauFact] = {}
         for raw in raw_entry_mappings:
             name = str(raw["strategy_name"])
-            strategy_path = _contained_path(raw["strategy_path"], inbox, "strategy path")
+            strategy_path = _strategy_path(
+                raw["strategy_path"],
+                inbox,
+                trusted_strategy_root,
+                allow_external=run_mode == "SINGLE_MODE",
+            )
             report_path = _contained_path(raw["report_path"], report_root, "report path")
             strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
             identity = adapt_strategy_identity(strategy, strategy_name=name, order_plateau_diagnostics=diagnostics_by_name[name])

@@ -1116,10 +1116,6 @@
   const v2Cards = [...document.querySelectorAll('#strategies-dd5 > .panel-performance-v2')];
   const strategyStack = document.querySelector('#strategies-dd5 .stack');
   v2Cards.forEach((card) => strategyStack?.append(card));
-  const legacyPerformanceCard = document.querySelector('#performance-dd5-start')?.closest('details');
-  if (legacyPerformanceCard) legacyPerformanceCard.hidden = true;
-  const legacyDd5Card = document.querySelector('#strategy-dd5-card');
-  if (legacyDd5Card) legacyDd5Card.hidden = true;
   const strategyCards = [...document.querySelectorAll('#strategies-dd5 .panel-card')].filter((card) => !card.classList.contains('panel-performance-v2'));
   ['1. Analysis of published surface', '2. Shortlist and READY JSON', '3. Tester batch', '4. Inbox to Performance DB'].forEach((label, index) => {
     const heading = strategyCards[index]?.querySelector('summary b');
@@ -1270,29 +1266,6 @@
       generateFresh.disabled = false;
     }
   });
-  const generateRuns = document.querySelector('#shortlist-generate-runs');
-  if (generateRuns) generateRuns.addEventListener('click', async () => {
-    const scopes = shortlistGroups.filter((group) => selectedScopeKeys.has(group.scope_key));
-    const startDate = document.querySelector('#tester-start-date')?.value || '';
-    const endDate = document.querySelector('#tester-end-date')?.value || '';
-    if (!currentAnalysisId) { generateStatus('Сначала запустите анализ.'); return; }
-    if (!scopes.length) { generateStatus('Отметьте scope с READY-кандидатами.'); return; }
-    if (!validIsoDate(startDate) || !validIsoDate(endDate) || startDate > endDate) { generateStatus('Укажите корректные даты тестирования.'); return; }
-    generateRuns.disabled = true;
-    generateStatus('Run files: creating...');
-    try {
-      const result = await remoteRequest('/api/v2/strategies/fresh/runs', {
-        analysis_run_id: currentAnalysisId, filters: shortlistFilters(),
-        selected_scopes: scopes.map((group) => [group.pair, group.side, group.timeframe]),
-        start_date: startDate, end_date: endDate,
-      });
-      generateStatus(`Run files ready: ${result.run_count}.`);
-    } catch (error) {
-      generateStatus(`Run files не созданы: ${error?.message || 'unknown error'}.`);
-    } finally {
-      generateRuns.disabled = false;
-    }
-  });
   const refreshFresh = document.querySelector('#shortlist-refresh');
   const phase2Filters = document.querySelector('.phase2-filters');
   if (phase2Filters && refreshFresh?.parentElement) {
@@ -1346,9 +1319,6 @@
   const testerStatus = testerCard?.querySelector('.card-status');
   const testerTrack = testerCard?.querySelector('.progress-track span');
   const testerStart = document.querySelector('#tester-start');
-  const testerFastStart = document.querySelector('#tester-start-fast');
-  const testerFastRetry = document.querySelector('#tester-retry-fast');
-  const testerRunsStart = document.querySelector('#tester-start-runs');
   const testerStop = document.querySelector('#tester-stop');
   const testerStartDate = document.querySelector('#tester-start-date');
   const testerEndDate = document.querySelector('#tester-end-date');
@@ -1366,84 +1336,44 @@
     if (testerEndDate && !testerEndDate.value) testerEndDate.value = anchor;
     if (testerStartDate) testerStartDate.value = shiftDateMonths(anchor, -months);
   }));
-  const performanceStart = document.querySelector('#performance-dd5-start');
-  const performanceStatus = document.querySelector('#performance-dd5-status');
-  const performanceText = strategyCards[3]?.querySelector('.progress-block p');
-  const performanceTrack = strategyCards[3]?.querySelector('.progress-track span');
-  const dd5Card = document.querySelector('#strategy-dd5-card');
-  const dd5Track = dd5Card?.querySelector('.progress-track span');
-  const dd5Status = document.querySelector('#strategy-dd5-status');
-  let performanceJobId = '';
-  let fastSourceJobId = '';
-  let performancePoller = 0;
-  const dbSelectV2 = document.querySelector('#performance-db-select');
-  const dbRefreshV2 = document.querySelector('#performance-db-refresh');
-  const auditOpenV2 = document.querySelector('#performance-audit-open');
-  let selectedDbV2 = '';
-  const refreshPerformanceCatalog = async () => {
-    try {
-      const document = await requestJson('/api/v2/strategies/performance/catalog');
-      const databases = Array.isArray(document.databases) ? document.databases : [];
-      if (dbSelectV2) {
-        dbSelectV2.replaceChildren(new Option('Выберите базу', ''));
-        databases.forEach((item) => dbSelectV2.add(new Option(item.database_name, item.database_name)));
-        if (selectedDbV2 && databases.some((item) => item.database_name === selectedDbV2)) dbSelectV2.value = selectedDbV2;
-      }
-      return databases;
-    } catch (_) { return []; }
-  };
-  dbRefreshV2?.addEventListener('click', refreshPerformanceCatalog);
-  const selectedDbDocument = () => dbSelectV2?.selectedOptions?.[0]?.value || selectedDbV2;
-  dbSelectV2?.addEventListener('change', () => {
-    selectedDbV2 = dbSelectV2.value;
-    if (auditOpenV2) auditOpenV2.disabled = !selectedDbV2;
-  });
-  auditOpenV2?.addEventListener('click', () => {
-    const databaseName = selectedDbDocument();
-    if (databaseName) window.open(`/api/v2/strategies/performance/artifact?database_name=${encodeURIComponent(databaseName)}&kind=audit`, '_blank', 'noopener');
-  });
   const testerIsTerminal = (job) => ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
   const setTesterControls = (busy) => {
     if (testerStart) testerStart.disabled = busy;
-    if (testerFastStart) testerFastStart.disabled = busy;
-    if (testerFastRetry) testerFastRetry.disabled = busy || !fastSourceJobId;
-    if (testerRunsStart) testerRunsStart.disabled = busy;
+    if (testerStop) testerStop.disabled = busy ? false : true;
     if (generateFresh) generateFresh.disabled = busy;
-    if (generateRuns) generateRuns.disabled = busy;
   };
   const renderTester = (job) => {
     const p = job.progress || {};
     const total = Number(p.total || job.strategy_count || 0);
-    const runs = job.mode === 'RUNS' || job.kind === 'strategies.tester.runs';
-    const fast = job.mode === 'FAST' || String(job.kind || '').startsWith('strategies.tester.fast');
-    const checked = Number(runs || fast ? p.current || 0 : p.checked || 0);
-    if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : '0%';
-    const detail = runs
-      ? `готово ${checked} из ${total} отчётов`
-      : fast
-        ? `готово ${checked} из ${total} отчётов · FAILED ${(job.evidence?.failed_names || []).length}`
-      : `отправлено ${p.sent || 0} · в работе ${p.running || 0} · результат ${p.result || 0} · проверено ${checked} · осталось ${Math.max(0, total - checked)} · повторы ${p.retries || 0}`;
-    const recoveringInbox = job.phase === 'RECOVERING_INBOX';
-    if (fast && testerIsTerminal(job) && (job.evidence?.failed_names || []).length) fastSourceJobId = job.job_id || fastSourceJobId;
-    if (testerText) testerText.textContent = recoveringInbox ? 'Восстановление verified inbox из сохранённых отчётов…' : detail;
-    if (testerStatus) testerStatus.textContent = recoveringInbox
-      ? 'Tester: восстановление verified inbox; тесты повторно не запускаются.'
-      : `${fast ? 'FAST TEST' : 'Tester'}: ${fast ? (job.phase || job.state || 'RUNNING') : (job.state || 'RUNNING')}. ${detail}`;
-    if (testerStop) testerStop.disabled = !testerJobId || ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
+    const singleMode = job.mode === 'SINGLE_MODE' || (job.kind === 'strategies.tester.start' && job.request?.mode === 'SINGLE_MODE');
+    const runs = false;
+    const checked = Number(p.current || p.checked || 0);
+    if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : (job.state === 'COMMITTED' ? '100%' : '0%');
+    const failed = Array.isArray(job.evidence?.failed_names) ? job.evidence.failed_names.length : 0;
+    const stage = p.stage || job.phase || job.state || 'RUNNING';
+    const detail = singleMode
+      ? `${stage} · batch ${p.batch_number || 0}/${p.batch_total || 0} · reports ${checked}/${total} · retries ${p.retries || 0} · failed ${failed}`
+      : runs
+        ? `${stage} · reports ${checked}/${total}`
+        : `${stage} · reports ${checked}/${total}`;
+    const ready = job.state === 'COMMITTED' && job.inbox_ready === true;
+    inboxReadyV2 = ready;
+    if (testerText) testerText.textContent = detail;
+    if (testerStatus) {
+      const error = job.error?.code ? ` ${job.error.code}: ${job.error.message || ''}` : '';
+      testerStatus.textContent = `${singleMode ? 'SINGLE_MODE' : 'Tester'}: ${detail}.${error}`;
+    }
+    if (testerStop) testerStop.disabled = !testerJobId || testerIsTerminal(job);
     setTesterControls(!testerIsTerminal(job));
-    if (testerFastRetry) testerFastRetry.disabled = !fast || !fastSourceJobId || !['PARTIAL', 'CANCELLED'].includes(job.phase) || !testerIsTerminal(job) || Number(job.evidence?.failed_names?.length || 0) === 0;
-    const verifiedInbox = job.state === 'COMMITTED' && job.inbox_ready === true;
-    if (performanceStart) performanceStart.disabled = !verifiedInbox;
-    const performanceImport = document.querySelector('#performance-import-start');
-    if (performanceImport) performanceImport.disabled = !verifiedInbox;
-    const importStatus = document.querySelector('#performance-import-status');
-    if (importStatus) importStatus.textContent = verifiedInbox
-      ? 'Performance DB: READY. Verified inbox подтверждён.'
-      : 'Performance DB: ожидание committed tester inbox.';
-    const importBadge = performanceImport?.closest('details')?.querySelector('summary .state-badge');
-    if (importBadge) {
-      importBadge.className = `state-badge ${verifiedInbox ? 'state-ready' : 'state-pending'}`;
-      importBadge.textContent = verifiedInbox ? 'READY' : 'WAITING';
+    if (inboxVerifyV2) inboxVerifyV2.disabled = !ready;
+    if (importStartV2) importStartV2.disabled = !ready;
+    if (importStatusV2) importStatusV2.textContent = ready
+      ? 'Performance v2: READY · metadata manifest captured.'
+      : 'Performance v2: waiting for inbox_ready=true.';
+    const badge = importStartV2?.closest('details')?.querySelector('summary .state-badge');
+    if (badge) {
+      badge.className = `state-badge ${ready ? 'state-ready' : 'state-pending'}`;
+      badge.textContent = ready ? 'READY' : 'WAITING';
     }
   };
   const pollTester = async () => {
@@ -1451,67 +1381,29 @@
     try {
       const job = await requestJson('/api/v2/strategies/tester/status?job_id=' + encodeURIComponent(testerJobId));
       renderTester(job);
-      if (['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) {
-        window.clearInterval(testerPoller); testerPoller = 0;
-      }
-    } catch (_) { if (testerStatus) testerStatus.textContent = 'Статус tester недоступен.'; }
+      if (testerIsTerminal(job)) { window.clearInterval(testerPoller); testerPoller = 0; }
+    } catch (error) {
+      if (testerStatus) testerStatus.textContent = `Tester status unavailable: ${error?.message || 'request failed'}.`;
+    }
   };
   const startTesterPolling = (interval) => {
     window.clearInterval(testerPoller);
     testerPoller = window.setInterval(pollTester, interval);
   };
   if (testerStart) testerStart.addEventListener('click', async () => {
-    if (!currentAnalysisId) { strategyStatus('Сначала сформируйте READY JSON.'); return; }
+    if (!currentAnalysisId) { strategyStatus('Generate READY JSON first.'); return; }
     const startDate = testerStartDate?.value || '';
     const endDate = testerEndDate?.value || '';
-    if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Укажите корректные даты начала и конца тестирования.'; return; }
-    if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Дата начала не может быть позже даты конца.'; return; }
+    if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Enter valid tester start and end dates.'; return; }
+    if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Tester start date must not be after end date.'; return; }
     setTesterControls(true);
     try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId, start_date: document.querySelector('#tester-start-date')?.value || startDate, end_date: document.querySelector('#tester-end-date')?.value || endDate } });
-      testerJobId = result.job?.job_id || '';
-      if (!testerJobId) throw new Error('missing job');
-      renderTester(result.job); await pollTester();
-      startTesterPolling(1000);
-    } catch (_) { if (testerStatus) testerStatus.textContent = 'Не удалось запустить локальный tester batch.'; setTesterControls(false); }
-  });
-  if (testerFastStart) testerFastStart.addEventListener('click', async () => {
-    if (!currentAnalysisId) { strategyStatus('Сначала сформируйте READY JSON.'); return; }
-    const startDate = testerStartDate?.value || '';
-    const endDate = testerEndDate?.value || '';
-    if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Укажите корректные даты начала и конца тестирования.'; return; }
-    if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Дата начала не может быть позже даты конца.'; return; }
-    fastSourceJobId = '';
-    setTesterControls(true);
-    try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.fast.start', request: { analysis_run_id: currentAnalysisId, start_date: startDate, end_date: endDate } });
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId, start_date: startDate, end_date: endDate } });
       testerJobId = result.job?.job_id || '';
       if (!testerJobId) throw new Error('missing job');
       renderTester(result.job); await pollTester(); startTesterPolling(1000);
-    } catch (error) { if (testerStatus) testerStatus.textContent = `Fast TEST не запущен: ${error?.message || 'ошибка'}.`; setTesterControls(false); }
-  });
-  if (testerFastRetry) testerFastRetry.addEventListener('click', async () => {
-    if (!fastSourceJobId) return;
-    setTesterControls(true);
-    try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.fast.retry', request: { job_id: fastSourceJobId } });
-      testerJobId = result.job?.job_id || '';
-      if (!testerJobId) throw new Error('missing job');
-      renderTester(result.job); await pollTester(); startTesterPolling(1000);
-    } catch (error) { if (testerStatus) testerStatus.textContent = `Повтор Fast TEST не запущен: ${error?.message || 'ошибка'}.`; setTesterControls(false); }
-  });
-  if (testerRunsStart) testerRunsStart.addEventListener('click', async () => {
-    setTesterControls(true);
-    try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.runs', request: {} });
-      testerJobId = result.job?.job_id || '';
-      if (!testerJobId) throw new Error('missing job');
-      renderTester(result.job); await pollTester();
-      startTesterPolling(15000);
     } catch (error) {
-      if (testerStatus) testerStatus.textContent = error?.message === 'RUNS_EMPTY'
-        ? 'Папка runs пуста, сначала сгенерируйте файлы.'
-        : 'Не удалось запустить tester RUNS.';
+      if (testerStatus) testerStatus.textContent = `SINGLE_MODE tester failed to start: ${error?.message || 'request failed'}.`;
       setTesterControls(false);
     }
   });
@@ -1520,78 +1412,21 @@
     try {
       const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.cancel', request: { job_id: testerJobId } });
       renderTester(result.job || {});
-    } catch (_) { if (testerStatus) testerStatus.textContent = 'Не удалось остановить tester batch.'; }
-  });
-  const renderPerformance = (job) => {
-    const p = job.progress || {};
-    const total = Number(p.total || 0);
-    const current = Number(p.current || 0);
-    if (performanceTrack) performanceTrack.style.width = total ? `${Math.min(100, Math.round(current * 100 / total))}%` : (job.state === 'COMMITTED' ? '100%' : '0%');
-    const result = job.result || {};
-    if (dd5Track) dd5Track.style.width = job.state === 'COMMITTED' ? '100%' : '0%';
-    if (dd5Status) dd5Status.textContent = job.state === 'COMMITTED'
-      ? `CALCULATION_ONLY committed · DD5 ${result.dd5_run_id || '—'} · import ${result.import_id || '—'}.`
-      : `Waiting for committed Performance DB · ${job.phase || job.state || 'PENDING'}.`;
-    if (job.state === 'COMMITTED') {
-      const badge = document.querySelector('#strategy-dd5-badge');
-      if (badge) { badge.className = 'state-badge state-ready'; badge.textContent = 'COMMITTED'; }
-      const summary = document.querySelector('#strategy-dd5-summary');
-      if (summary) summary.textContent = `CALCULATION_ONLY · DD5 ${result.dd5_run_id || 'committed'}`;
-      if (dd5Card) dd5Card.open = true;
+    } catch (error) {
+      if (testerStatus) testerStatus.textContent = `Tester stop failed: ${error?.message || 'request failed'}.`;
     }
-    if (performanceText) performanceText.textContent = job.state === 'COMMITTED'
-      ? `COMMITTED · import ${result.import_id || '—'} · DD5 ${result.dd5_run_id || '—'}.`
-      : `${job.phase || 'IMPORTING'} · ${current} / ${total} reports.`;
-    if (performanceStatus) performanceStatus.textContent = `Performance DB и DD5: ${job.state || 'RUNNING'}.`;
-  };
-  const pollPerformance = async () => {
-    if (!performanceJobId) return;
-    try {
-      const job = await requestJson(`/api/v2/strategies/performance-dd5/status?job_id=${encodeURIComponent(performanceJobId)}`);
-      renderPerformance(job);
-      if (['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) { window.clearInterval(performancePoller); performancePoller = 0; }
-    } catch (_) { if (performanceStatus) performanceStatus.textContent = 'Статус Performance DB недоступен.'; }
-  };
-  if (performanceStart) performanceStart.addEventListener('click', async () => {
-    if (!testerJobId) return;
-    performanceStart.disabled = true;
-    if (performanceStatus) performanceStatus.textContent = 'Создание Performance DB и DD5…';
-    try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.performance-dd5', request: { tester_job_id: testerJobId, delete_html: Boolean(document.querySelector('#delete-tested-html')?.checked) } });
-      const job = result.job || {};
-      performanceJobId = job.job_id || '';
-      if (!performanceJobId) throw new Error('missing job');
-      renderPerformance(job); await pollPerformance();
-      window.clearInterval(performancePoller); performancePoller = window.setInterval(pollPerformance, 1000);
-    } catch (_) { if (performanceStatus) performanceStatus.textContent = 'Performance DB или DD5 не прошли проверку.'; }
-    finally { performanceStart.disabled = false; }
   });
   const recoverJobs = async () => {
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const testerJobs = [...jobs].reverse().filter((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester.runs' || job.kind === 'strategies.tester' || job.kind === 'strategies.tester.fast.start' || job.kind === 'strategies.tester.fast.retry');
-      const tester = testerJobs.find((job) => {
-        const fast = String(job.kind || '').startsWith('strategies.tester.fast');
-        const hasVerified = Object.keys(job.evidence?.verified_reports || {}).length > 0;
-        return !testerIsTerminal(job) || (fast && (hasVerified || ['PARTIAL', 'CANCELLED'].includes(job.phase))) || (job.state === 'COMMITTED' && job.inbox_ready === true);
-      });
-      const performance = [...jobs].reverse().find((job) => job.kind === 'strategies.performance-dd5');
+      const testerJobs = [...jobs].reverse().filter((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester');
+      const tester = testerJobs.find((job) => !testerIsTerminal(job) || (job.state === 'COMMITTED' && job.inbox_ready === true));
       if (tester && typeof tester.job_id === 'string') {
         const job = tester;
         testerJobId = job.job_id;
-        const fastJob = String(job.kind || '').startsWith('strategies.tester.fast');
-        renderTester(testerIsTerminal(job) && !fastJob ? {...job, progress: {}} : job);
-        if (!testerIsTerminal(job)) { await pollTester(); startTesterPolling(job.kind === 'strategies.tester.runs' ? 15000 : 1000); }
-      }
-      if (performance && typeof performance.job_id === 'string') {
-        const job = performance;
-        performanceJobId = job.job_id;
-        renderPerformance(job);
-        if (!['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state)) {
-          await pollPerformance();
-          window.clearInterval(performancePoller); performancePoller = window.setInterval(pollPerformance, 1000);
-        }
+        renderTester(job);
+        if (!testerIsTerminal(job)) { await pollTester(); startTesterPolling(1000); }
       }
     } catch (_) { /* requestJson already exposed a safe visible error. */ }
   };
@@ -1600,15 +1435,21 @@
   const importStatusV2 = document.querySelector('#performance-import-status');
   const importProgressV2 = document.querySelector('#performance-import-progress');
   let importJobV2 = '';
+  let inboxReadyV2 = false;
+  if (inboxVerifyV2) inboxVerifyV2.disabled = true;
+  if (importStartV2) importStartV2.disabled = true;
   const renderImportV2 = (job) => {
     const p = job.progress || {};
     const total = Number(p.total || 0);
     const current = Number(p.current || 0);
     if (importProgressV2) importProgressV2.textContent = `${job.phase || 'IMPORTING'} · ${current} / ${total} reports.`;
     const result = job.result || {};
+    const warning = result.cleanup_warning || job.cleanup_warning;
+    const error = job.error?.code ? ` ${job.error.code}: ${job.error.message || ''}` : '';
     if (importStatusV2) importStatusV2.textContent = job.state === 'COMMITTED'
       ? `Performance v2: COMMITTED · imported ${result.imported_count || 0} · skipped ${result.skipped_count || 0} · rejected ${result.rejected_count || 0} · target ${result.database_path || '—'} · audit ${result.audit_path || '—'}.`
-      : `Performance v2: ${job.state || 'RUNNING'}.`;
+      : `Performance v2: ${job.phase || job.state || 'RUNNING'}.${error}`;
+    if (warning && importStatusV2 && job.state === 'COMMITTED') importStatusV2.textContent += ` Cleanup warning: ${warning}.`;
   };
   inboxVerifyV2?.addEventListener('click', async () => {
     if (!testerJobId) {
@@ -1619,7 +1460,7 @@
     if (importStatusV2) importStatusV2.textContent = 'Проверка verified inbox…';
     try { renderTester(await requestJson('/api/v2/strategies/tester/verify-inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: testerJobId }) })); }
     catch (error) { if (importStatusV2) importStatusV2.textContent = `Проверка не выполнена: ${error?.message || 'unknown error'}.`; }
-    finally { inboxVerifyV2.disabled = false; }
+    finally { inboxVerifyV2.disabled = !inboxReadyV2; }
   });
   importStartV2?.addEventListener('click', async () => {
     if (!testerJobId) return;
@@ -1639,7 +1480,7 @@
       };
       if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
     } catch (_) { if (importStatusV2) importStatusV2.textContent = 'Импорт Performance v2 не прошёл проверку.'; }
-    finally { importStartV2.disabled = false; }
+    finally { importStartV2.disabled = !inboxReadyV2; }
   });
   const recoverSplitJobs = async () => {
     try {

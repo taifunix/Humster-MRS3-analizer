@@ -2,9 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` or `superpowers:subagent-driven-development` task-by-task. Every implementation task must use `ponytail:ponytail` at full level. Steps use checkbox syntax for tracking.
 
-**Goal:** Add the smallest independent v2 Performance DB flow: a committed FAST/RUNS inbox is imported read-only into one isolated DuckDB with typed strategy/plateau facts, one current result, and cached safe UPNL-relative windows.
+**Goal:** Add the smallest independent v2 Performance DB flow: a committed native `SINGLE_MODE`/RUNS handoff is imported from one metadata-only inbox into one isolated DuckDB with typed strategy/plateau facts, one current result, and cached safe UPNL-relative windows.
 
-**Architecture:** v2 is a new, isolated runtime. It consumes the existing committed inbox without changing it, copies bounded input bytes only to a v2-owned temporary staging directory, parses reports in parallel, and publishes through one DuckDB writer transaction. A separate panel action calls v2; v1 Performance/DD5 remains untouched until an explicit later cutover.
+**Architecture:** v2 is a new, isolated runtime. Native `SINGLE_MODE` creates one metadata-only inbox: strategy JSON remains in the trusted `Output/strategies` root and current HTML remains in `tester/report/my_test`; v2 validates their recorded hashes before copying bounded bytes to a v2-owned temporary staging directory, parses reports in parallel, and publishes through one DuckDB writer transaction. Cleanup of those exact source roots is attempted only after DB `COMMITTED`; a warning never rolls back the DB. A separate panel action calls v2; v1 Performance/DD5 remains untouched until an explicit later cutover.
+
+The former contract that every `strategy_path` must point inside the inbox is
+superseded for native `SINGLE_MODE`. External strategy paths are accepted only
+when the server-configured trusted root is `Output/strategies`; `..`, absolute
+substitution outside that root, and symlink/reparse escapes remain rejected.
 
 **Tech Stack:** Python 3.11, stdlib concurrency/path handling, DuckDB, existing `lxml` report tooling, static panel JavaScript, pytest.
 
@@ -13,9 +18,9 @@
 ## Global Constraints
 
 - Use `ponytail:ponytail` at full level: no new dependency, no speculative abstraction, no second inbox or mode-specific manifest.
-- Do not modify `performance_store.py`, `performance_import.py`, `performance.py`, `performance_metrics.py`, `performance_dd5.py`, `panel_performance_dd5.py`, or `runner/inbox.py`.
+- Do not modify `performance_store.py`, `performance_import.py`, `performance.py`, `performance_metrics.py`, or `performance_dd5.py`; `runner/inbox.py` is modified only for the metadata-only native handoff.
 - Do not migrate or dual-read schema v1. Existing v1 code is a historical, untouched compatibility path.
-- Source committed inboxes and source HTML are read-only; this slice never deletes them.
+- Source inboxes are read-only during import. After a successful v2 DB commit, only the exact tester report and `Output/strategies` directories may be cleared; inbox metadata and v2 audit remain provenance.
 - The only v2 database is `<v2-owned-root>/strategy_performance.duckdb`; it has one writer.
 - Expensive report parsing uses the configured `unified_performance_v2.workers`, default 16, clamp 1..64. Workers never open DuckDB or write files.
 - Only current HTML reports are accepted. The exact action header tuple is `Timestamp, Symbol, Order ID, Action, Fee, PnL, Balance, Size, Post Size, Post Side`.
@@ -159,11 +164,11 @@
 
 - [ ] **Step 1: Write failing adapter tests.**
 
-  Use one FAST inbox and one RUNS inbox. Verify that both reach the same adapter, a 1ORD and a 2ORD strategy share plateau `P1` without duplication, missing plateau evidence and conflicting facts reject, and `point_id` or full strategy JSON never enter the prepared record.
+  Use one native `SINGLE_MODE` metadata-only inbox and one RUNS inbox. Verify that both reach the same adapter, a 1ORD and a 2ORD strategy share plateau `P1` without duplication, missing plateau evidence and conflicting facts reject, and `point_id` or full strategy JSON never enter the prepared record.
 
 - [ ] **Step 2: Test trust boundaries before parsing.**
 
-  Manifest-derived strategy paths must be contained inside the committed inbox; report paths must be contained inside the configured tester-report root. Reject `..`, absolute substitution, symlinks/reparse escapes and oversized HTML before workers. Snapshot the complete inbox bytes and assert identity after both success and failure.
+  Metadata-only `SINGLE_MODE` strategy paths may be external only under the trusted `Output/strategies` root; report paths must be contained inside the configured tester-report root. Reject `..`, absolute substitution, symlinks/reparse escapes and oversized HTML before workers. Snapshot the complete inbox bytes and assert identity after both success and failure.
 
 - [ ] **Step 3: Implement the read-only adapter.**
 
@@ -244,7 +249,7 @@
 
 - [ ] **Step 5: Keep audit and cleanup minimal.**
 
-  Write only a v2-owned terminal audit after releasing the lock. Source inboxes, source HTML and their existing audit/quarantine artifacts remain untouched. This vertical slice never deletes HTML; it removes only its own staging directory.
+  Write only a v2-owned terminal audit after releasing the lock. Cleanup runs only after DB `COMMITTED`, removes exact tester/report and `Output/strategies` contents (and stale `Output/strategy_manifest.json`), and reports a path-safe cleanup warning without changing the committed DB. Inbox metadata and audit remain untouched.
 
 - [ ] **Step 6: Verify and commit.**
 

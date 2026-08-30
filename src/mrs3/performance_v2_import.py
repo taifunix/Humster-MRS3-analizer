@@ -48,6 +48,7 @@ class PerformanceV2ImportRequest:
     mode: str
     replacement_strategy_ids: Mapping[str, int]
     expected_strategy_identities: Mapping[str, object] | None
+    strategy_root: Path | None
 
     def __init__(
         self,
@@ -61,6 +62,7 @@ class PerformanceV2ImportRequest:
         replacement_strategy_ids: Mapping[str, int] | None = None,
         strategy_id_mapping: Mapping[str, int] | None = None,
         expected_strategy_identities: Mapping[str, object] | None = None,
+        strategy_root: Path | None = None,
     ) -> None:
         if inbox is None:
             inbox = inbox_path
@@ -86,6 +88,7 @@ class PerformanceV2ImportRequest:
         object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "replacement_strategy_ids", dict(mapping))
         object.__setattr__(self, "expected_strategy_identities", expected_strategy_identities)
+        object.__setattr__(self, "strategy_root", None if strategy_root is None else Path(strategy_root))
 
     @property
     def inbox_path(self) -> Path:
@@ -679,7 +682,12 @@ def import_performance_v2(request: PerformanceV2ImportRequest) -> PerformanceV2I
         except (PerformanceV2StoreError, duckdb.Error) as error:
             raise PerformanceV2ImportError("Performance v2 target migration failed") from error
         lock_acquired = True
-        prepared = read_performance_v2_inbox(request.inbox, request.report_root, config=config)
+        prepared = read_performance_v2_inbox(
+            request.inbox,
+            request.report_root,
+            config=config,
+            strategy_root=request.strategy_root,
+        )
         staging = create_v2_parser_staging(config.database_root, prepared)
         parsed = _parse_reports(staging, prepared, config)
         import_id = uuid4().hex

@@ -26,6 +26,7 @@ class PerformanceV2Config:
     max_html_bytes: int = 67_108_864
     max_actions_per_report: int = 1_000_000
     v1_database_root: Path = _DEFAULT_V1_PERFORMANCE_ROOT
+    strategy_root: Path | None = None
 
     def __post_init__(self) -> None:
         for name in ("database_root", "v1_database_root"):
@@ -33,6 +34,10 @@ class PerformanceV2Config:
             if not isinstance(value, Path):
                 raise ValueError(f"unified_performance_v2.{name} must be a path")
             object.__setattr__(self, name, value.resolve())
+        if self.strategy_root is not None:
+            if not isinstance(self.strategy_root, Path):
+                raise ValueError("unified_performance_v2.strategy_root must be a path")
+            object.__setattr__(self, "strategy_root", self.strategy_root.resolve())
         for name in ("workers", "max_html_bytes", "max_actions_per_report"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -75,12 +80,24 @@ def load_performance_v2_config(
         raise ValueError("unified_performance_v2.v1_database_root must be a path")
     if not runtime_v1_root.is_absolute():
         runtime_v1_root = path.parent / runtime_v1_root
+    strategy_root = section.get("strategy_root", "Output/strategies")
+    if not isinstance(strategy_root, str) or not strategy_root.strip():
+        raise ValueError("unified_performance_v2.strategy_root must be a relative path")
+    relative_strategy_root = Path(strategy_root.strip().replace("\\", "/"))
+    if (
+        relative_strategy_root.is_absolute()
+        or ":" in relative_strategy_root.parts[0]
+        or "." in relative_strategy_root.parts
+        or ".." in relative_strategy_root.parts
+    ):
+        raise ValueError("unified_performance_v2.strategy_root must be a relative path")
     return PerformanceV2Config(
         database_root=(path.parent / relative_root),
         workers=section.get("workers", 16),
         max_html_bytes=section.get("max_html_bytes", 67_108_864),
         max_actions_per_report=section.get("max_actions_per_report", 1_000_000),
         v1_database_root=runtime_v1_root,
+        strategy_root=path.parent / relative_strategy_root,
     )
 
 

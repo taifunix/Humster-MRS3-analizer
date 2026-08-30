@@ -19,7 +19,7 @@ from .runner.config import RunnerConfig
 from .runner.files import validate_runner_paths
 from .runner.http import TesterHttpClient
 from .runner.inbox import InboxCaptureError, capture_run_snapshot_inbox
-from .runner.monitor import BatchCompletion, monitor_controlled_batch
+from .runner.monitor import BatchCompletion, BatchRetryExhausted, monitor_controlled_batch
 from .runner.process import start_bot as _start_bot, stop_bot as _stop_bot
 from .runner.results import extract_html_strategy_settings
 from .runner.workflow import _wait_for_exact_batch
@@ -57,6 +57,7 @@ class _Job:
     thread: Thread | None = None
     preserve_reports: bool = False
     inbox_path: Path | None = None
+    single_mode: bool = False
 
 
 def _client(config: RunnerConfig) -> TesterHttpClient:
@@ -146,7 +147,7 @@ def _write_fast_tester_config(config: RunnerConfig, start: str, end: str) -> Non
 
 
 def _safe_name(value: object) -> str:
-    if not isinstance(value, str) or not value or Path(value).name != value:
+    if not isinstance(value, str) or not value or value in {".", ".."} or Path(value).name != value:
         raise FastStrategyTestError("strategy name is invalid")
     return value
 
@@ -237,6 +238,7 @@ class LocalFastStrategyTestService:
         wait_for_exact_batch: Callable[..., object] = _wait_for_exact_batch,
         monitor: Callable[..., BatchCompletion] = monitor_controlled_batch,
         on_update: Callable[[dict[str, object]], None] | None = None,
+        single_mode: bool = False,
     ) -> None:
         self.config = config
         self._start_bot = start_bot
@@ -245,6 +247,7 @@ class LocalFastStrategyTestService:
         self._wait_for_exact_batch = wait_for_exact_batch
         self._monitor = monitor
         self._on_update = on_update
+        self.single_mode = single_mode
         self._lock = RLock()
         self._jobs: dict[str, _Job] = {}
 
@@ -285,7 +288,8 @@ class LocalFastStrategyTestService:
                 "job_id": job.job_id,
                 "state": job.state,
                 "phase": job.phase,
-                "mode": "FAST",
+                "mode": "SINGLE_MODE" if job.single_mode else "FAST",
+                "inbox_ready": job.inbox_path is not None and job.state == "COMMITTED",
                 "progress": dict(job.progress),
                 "evidence": {
                     "failed_names": sorted(job.failed_names),
@@ -304,10 +308,17 @@ class LocalFastStrategyTestService:
             job.progress.update(values)
         self._emit(job)
 
+    def _set_phase(self, job: _Job, phase: str, **values: object) -> None:
+        """Publish a named native handoff phase with its current counters."""
+        with self._lock:
+            job.phase = phase
+            job.progress.update(values)
+        self._emit(job)
+
     def _write_manifest(self, job: _Job) -> None:
         document = {
             "format_version": 1,
-            "mode": "FAST",
+            "mode": "SINGLE_MODE" if job.single_mode else "FAST",
             "job_id": job.job_id,
             "analysis_run_id": job.manifest.analysis_run_id,
             "generation_manifest_path": str(job.manifest_path),
@@ -325,8 +336,13 @@ class LocalFastStrategyTestService:
             "verified_reports": dict(sorted(job.verified_reports.items())),
             "failed_names": sorted(job.failed_names),
             "phase": job.phase,
+            "inbox_ready": job.inbox_path is not None and job.state == "COMMITTED",
         }
-        target = job.report_dir / "fast_test_manifest.json"
+        # Native handoff uses the shared tester manifest name so the runtime
+        # does not grow a second mode-specific persistence contract.
+        target = job.report_dir / (
+            "tester_manifest.json" if job.single_mode else "fast_test_manifest.json"
+        )
         temporary = target.with_name(target.name + ".tmp")
         try:
             temporary.write_text(json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -344,6 +360,8 @@ class LocalFastStrategyTestService:
         runtime_config = job.runtime_config or self.config
         snapshot_dir: Path | None = None
         try:
+            if job.single_mode:
+                self._set_phase(job, "MANIFEST_VALIDATION", batch_number=0, batch_total=0)
             _write_fast_tester_config(runtime_config, job.start_date, job.end_date)
             if not job.preserve_reports:
                 _clear_directory(job.report_dir, expected=self.config.bot_root / "tester" / "report" / "my_test")
@@ -359,24 +377,32 @@ class LocalFastStrategyTestService:
             for batch_number, names in enumerate(batches, start=1):
                 if job.cancel.is_set():
                     break
+                if job.single_mode:
+                    self._set_phase(job, "BATCH_PREPARE", batch_number=batch_number, batch_total=len(batches))
                 self._stop_bot(runtime_config)
                 _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
                 _install_names(job.manifest.strategy_source, job.strategy_dir, names)
                 runtime_config.wizard_result.unlink(missing_ok=True)
                 runtime_config.wizard_progress.unlink(missing_ok=True)
                 self._set_progress(job, batch_current=batch_number, active=0)
+                if job.single_mode:
+                    self._set_phase(job, "BOT_START", batch_number=batch_number, batch_total=len(batches))
                 self._start_bot(runtime_config)
                 client = self._client_factory(runtime_config)
+                if job.single_mode:
+                    self._set_phase(job, "BOT_RUN", batch_number=batch_number, batch_total=len(batches))
                 self._wait_for_exact_batch(client, names, runtime_config, cancel_check=job.cancel.is_set)
 
                 def progress(snapshot: dict[str, object]) -> None:
                     if job.cancel.is_set():
                         raise _FastCancelled()
-                    self._set_progress(
+                    retry_count = int(snapshot.get("retry_count", 0))
+                    self._set_phase(
                         job,
+                        "RETRY_MISSING" if job.single_mode and retry_count else "REPORT_COLLECTION",
                         current=len(job.verified_reports) + int(snapshot.get("completed_count", 0)),
                         active=int(snapshot.get("active_total", 0)),
-                        retries=sum(max(0, value - 1) for value in job.attempt_counts.values()) + int(snapshot.get("retry_count", 0)),
+                        retries=sum(max(0, value - 1) for value in job.attempt_counts.values()) + retry_count,
                     )
 
                 groups: dict[int, tuple[str, ...]] = {}
@@ -396,7 +422,7 @@ class LocalFastStrategyTestService:
                         attempts_callback=lambda counts: job.attempt_counts.update(counts),
                         snapshot_report_dir=snapshot_dir,
                         remove_source_reports=True,
-                        allow_partial=True,
+                        allow_partial=not job.single_mode,
                     )
                     for name, result in completion.strategies.items():
                         job.attempt_counts[name] = max(job.attempt_counts.get(name, 0), result.attempts)
@@ -419,6 +445,15 @@ class LocalFastStrategyTestService:
                     retries=sum(max(0, value - 1) for value in job.attempt_counts.values()),
                     failed=len(job.failed_names),
                 )
+                if job.single_mode:
+                    self._set_phase(
+                        job,
+                        "REPORT_COLLECTION",
+                        batch_number=batch_number,
+                        batch_total=len(batches),
+                        current=len(job.verified_reports),
+                        failed=len(job.failed_names),
+                    )
 
             job.failed_names.difference_update(job.verified_reports)
             incomplete = tuple(name for name in job.expected_names if name not in job.verified_reports)
@@ -426,14 +461,37 @@ class LocalFastStrategyTestService:
                 final_phase = "CANCELLED"
                 job.failed_names.update(incomplete)
             elif incomplete:
-                final_phase = "PARTIAL"
+                final_phase = "FAILED" if job.single_mode else "PARTIAL"
                 job.failed_names.update(incomplete)
             else:
                 final_phase = "COMMITTED"
             self._publish_incomplete(job, tuple(sorted(job.failed_names if final_phase == "PARTIAL" else incomplete)))
             job.phase = final_phase
-            self._write_manifest(job)
-            job.state = "CANCELLED" if final_phase == "CANCELLED" else "COMMITTED"
+            if job.single_mode and final_phase == "FAILED":
+                self._set_phase(job, "FAILED", current=len(job.verified_reports), failed=len(job.failed_names))
+            if not (final_phase == "COMMITTED" and job.single_mode):
+                self._write_manifest(job)
+            if final_phase == "COMMITTED" and job.single_mode:
+                # A complete native run owns the handoff.  The inbox contains
+                # metadata only; source JSON/HTML stay at their exact owners.
+                self._set_phase(job, "INBOX_CREATION", current=len(job.verified_reports), failed=0)
+                self._write_manifest(job)
+                self.capture_inbox(job.job_id)
+                job.state = "COMMITTED"
+                self._set_phase(job, "INBOX_READY", inbox_ready=True, current=len(job.verified_reports), failed=0)
+                self._write_manifest(job)
+            job.state = (
+                "CANCELLED"
+                if final_phase == "CANCELLED"
+                else "FAILED"
+                if final_phase == "FAILED"
+                else "COMMITTED"
+            )
+            if final_phase == "COMMITTED" and job.single_mode:
+                job.phase = "COMMITTED"
+                self._write_manifest(job)
+            elif job.single_mode:
+                self._write_manifest(job)
             self._set_progress(job, current=len(job.verified_reports), active=0, failed=len(job.failed_names))
         except BaseException as error:
             try:
@@ -454,13 +512,26 @@ class LocalFastStrategyTestService:
                     with self._lock:
                         job.state = "FAILED"
                         job.phase = "FAILED"
-                        job.error = {"code": "FAST_TEST_FAILED", "message": _safe_error_message(cancel_error)}
+                        job.error = {"code": "SINGLE_MODE_TEST_FAILED" if job.single_mode else "FAST_TEST_FAILED", "message": _safe_error_message(cancel_error)}
                     self._emit(job)
             else:
                 with self._lock:
                     job.state = "FAILED"
                     job.phase = "FAILED"
-                    job.error = {"code": "FAST_TEST_FAILED", "message": _safe_error_message(error)}
+                    if job.single_mode:
+                        job.failed_names.update(name for name in job.expected_names if name not in job.verified_reports)
+                    code = (
+                        "SINGLE_MODE_RETRIES_EXHAUSTED"
+                        if job.single_mode and isinstance(error, BatchRetryExhausted)
+                        else "SINGLE_MODE_TEST_FAILED"
+                        if job.single_mode
+                        else "FAST_TEST_FAILED"
+                    )
+                    job.error = {"code": code, "message": _safe_error_message(error)}
+                try:
+                    self._write_manifest(job)
+                except BaseException:
+                    pass
                 self._emit(job)
         finally:
             if snapshot_dir is not None and snapshot_dir.exists() and not snapshot_dir.is_symlink():
@@ -493,23 +564,37 @@ class LocalFastStrategyTestService:
                 raise FastStrategyTestError("Fast TEST is already running")
             if identifier in self._jobs:
                 raise FastStrategyTestError("Fast TEST job id is already used")
-            job = _Job(identifier, Path(manifest_path).resolve(), manifest, names, names, *dates, report_dir, strategy_dir)
+            job = _Job(identifier, Path(manifest_path).resolve(), manifest, names, names, *dates, report_dir, strategy_dir, single_mode=self.single_mode)
             self._jobs[identifier] = job
             job.progress = {"current": 0, "total": len(names), "batch_current": 0, "batch_total": 0, "active": 0, "retries": 0, "failed": 0}
-            job.thread = Thread(target=self._run, args=(job,), daemon=True, name="mrs3-panel-fast-strategy-test")
+            job.thread = Thread(
+                target=self._run,
+                args=(job,),
+                daemon=True,
+                name="mrs3-panel-single-mode" if self.single_mode else "mrs3-panel-fast-strategy-test",
+            )
             job.thread.start()
             return self._snapshot(job)
 
     def _load_persisted_job(self, job_id: str) -> _Job | None:
-        path = self.config.report_dir / "fast_test_manifest.json"
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        paths = [self.config.report_dir / "tester_manifest.json"] if self.single_mode else []
+        if self.single_mode:
+            # Read the pre-release name as a harmless recovery fallback.
+            paths.append(self.config.report_dir / "single_mode_manifest.json")
+        paths.append(self.config.report_dir / "fast_test_manifest.json")
+        document = None
+        for path in paths:
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            break
+        if document is None:
             return None
         if not isinstance(document, Mapping) or document.get("job_id") != job_id:
             return None
         phase = document.get("phase")
-        if phase not in {"PARTIAL", "CANCELLED"}:
+        if phase not in {"PARTIAL", "FAILED", "CANCELLED"}:
             return None
         generation_path = document.get("generation_manifest_path")
         if not isinstance(generation_path, str):
@@ -546,14 +631,23 @@ class LocalFastStrategyTestService:
             failed_names = {_safe_name(name) for name in failed}
         except (FastStrategyTestError, ValueError, OSError, TypeError):
             return None
-        job = _Job(job_id, Path(generation_path).resolve(), manifest, expected, tuple(name for name in expected if name not in verified_reports), start, end, report_dir, strategy_dir, attempt_counts=attempt_counts, verified_reports=verified_reports, failed_names=failed_names, preserve_reports=True, state="COMMITTED", phase=str(phase))
+        single_mode = document.get("mode") == "SINGLE_MODE"
+        job = _Job(job_id, Path(generation_path).resolve(), manifest, expected, tuple(name for name in expected if name not in verified_reports), start, end, report_dir, strategy_dir, attempt_counts=attempt_counts, verified_reports=verified_reports, failed_names=failed_names, preserve_reports=True, state="FAILED" if phase == "FAILED" and single_mode else "COMMITTED", phase=str(phase), single_mode=single_mode)
         return job
 
     def _load_persisted_job_for_inbox(self, job_id: str) -> _Job | None:
-        path = self.config.report_dir / "fast_test_manifest.json"
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        paths = [self.config.report_dir / "tester_manifest.json"] if self.single_mode else []
+        if self.single_mode:
+            paths.append(self.config.report_dir / "single_mode_manifest.json")
+        paths.append(self.config.report_dir / "fast_test_manifest.json")
+        document = None
+        for path in paths:
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            break
+        if document is None:
             return None
         if not isinstance(document, Mapping) or document.get("job_id") != job_id:
             return None
@@ -587,7 +681,7 @@ class LocalFastStrategyTestService:
         return _Job(
             job_id, Path(generation_path).resolve(), manifest, expected, expected, start, end,
             report_dir, strategy_dir, verified_reports=verified_reports, preserve_reports=True,
-            state="COMMITTED", phase="COMMITTED",
+            state="COMMITTED", phase="COMMITTED", single_mode=document.get("mode") == "SINGLE_MODE",
         )
 
     def capture_inbox(self, job_id: str) -> Path:
@@ -599,11 +693,14 @@ class LocalFastStrategyTestService:
                 raise FastStrategyTestError("Fast TEST has no completed reports")
             with self._lock:
                 self._jobs.setdefault(job_id, job)
-        if job.phase not in {"RUNNING", "COMMITTED"} or set(job.verified_reports) != set(job.expected_names):
+        if job.phase not in {"RUNNING", "COMMITTED", "CAPTURING_INBOX", "INBOX_CREATION"} or set(job.verified_reports) != set(job.expected_names):
             raise FastStrategyTestError("Fast TEST reports are incomplete")
-        target = self.config.inbox_root.resolve() / job_id
-        if (target / "inbox_manifest.json").is_file():
-            return target
+        inbox_root = self.config.inbox_root.resolve()
+        target = inbox_root / job_id
+        if target.parent != inbox_root or target == inbox_root:
+            raise FastStrategyTestError("inbox job path is unsafe")
+        # Verification is idempotent but rebuilds the metadata snapshot so a
+        # manual retry after reload records current source hashes and paths.
         snapshots: dict[str, Mapping[str, object]] = {}
         reports: dict[str, Path] = {}
         for name in job.expected_names:
@@ -625,8 +722,13 @@ class LocalFastStrategyTestService:
                 provenance=job.manifest.provenance,
                 test_start=job.start_date,
                 test_end=job.end_date,
-                run_mode="FAST",
+                run_mode="SINGLE_MODE" if job.single_mode else "FAST",
                 workers=min(16, self.config.max_parallel_submissions),
+                strategy_paths={
+                    name: job.manifest.strategy_source / f"{name}.json"
+                    for name in job.expected_names
+                } if job.single_mode else None,
+                replace_existing=job.single_mode,
             )
         except (InboxCaptureError, OSError) as error:
             raise FastStrategyTestError(str(error)) from error
@@ -653,7 +755,7 @@ class LocalFastStrategyTestService:
                     self._jobs[source_job_id] = source_job
             if source_job is None:
                 raise FastStrategyTestError("Fast TEST job not found") from None
-            if source_job.state not in {"COMMITTED", "CANCELLED"} or source_job.phase not in {"PARTIAL", "CANCELLED"}:
+            if source_job.state not in {"COMMITTED", "CANCELLED", "FAILED"} or source_job.phase not in {"PARTIAL", "FAILED", "CANCELLED"}:
                 raise FastStrategyTestError("Fast TEST job has no recoverable failures")
             identifier = _safe_name(job_id or str(uuid4()))
             if identifier in self._jobs:
@@ -704,6 +806,7 @@ class LocalFastStrategyTestService:
                 verified_reports=dict(source_job.verified_reports),
                 failed_names=set(failed),
                 preserve_reports=True,
+                single_mode=source_job.single_mode,
             )
             job.progress = {
                 "current": len(job.verified_reports),
@@ -721,7 +824,12 @@ class LocalFastStrategyTestService:
                 self._write_manifest(job)
                 job.state = "COMMITTED"
                 return self._snapshot(job)
-            job.thread = Thread(target=self._run, args=(job,), daemon=True, name="mrs3-panel-fast-strategy-test")
+            job.thread = Thread(
+                target=self._run,
+                args=(job,),
+                daemon=True,
+                name="mrs3-panel-single-mode" if self.single_mode else "mrs3-panel-fast-strategy-test",
+            )
             job.thread.start()
             return self._snapshot(job)
 
@@ -748,3 +856,11 @@ class LocalFastStrategyTestService:
                 job.phase = "CANCELLING"
         self._emit(job)
         return self._snapshot(job)
+
+
+class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
+    """Native single-mode tester handoff used by the Performance v2 flow."""
+
+    def __init__(self, config: RunnerConfig, **kwargs: object) -> None:
+        kwargs["single_mode"] = True
+        super().__init__(config, **kwargs)

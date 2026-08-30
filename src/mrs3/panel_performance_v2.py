@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+import re
+import shutil
 from threading import RLock, Thread
 from typing import Callable, Mapping
 from uuid import uuid4
@@ -31,6 +33,23 @@ from .performance_v2_windows import (
 Window = tuple[datetime | str, datetime | str]
 
 
+def _is_reparse(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
+def _safe_cleanup_message(error: BaseException) -> str:
+    message = str(error).strip() or type(error).__name__
+    message = re.sub(r"(?i)(?:[A-Za-z]:[\\/]|/).*$", "<path>", message)
+    return message[:512]
+
+
+def _safe_import_error(error: BaseException) -> dict[str, str]:
+    return {
+        "code": "PERFORMANCE_V2_IMPORT_FAILED",
+        "message": _safe_cleanup_message(error),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class PerformanceV2PanelRequest:
     inbox: Path
@@ -40,6 +59,7 @@ class PerformanceV2PanelRequest:
     replacement_strategy_ids: Mapping[str, int] | None = None
     window_a: Window | None = None
     window_b: Window | None = None
+    strategy_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +76,7 @@ class PerformanceV2PanelResult:
     plateau_count: int
     result_count: int
     windows: tuple[dict[str, object], ...] = ()
+    cleanup_warning: Mapping[str, str] | None = None
 
     @property
     def window_count(self) -> int:
@@ -96,6 +117,40 @@ def _pair_document(
     }
 
 
+def _cleanup_exact_directory(path: Path, *tail: str) -> None:
+    """Remove only the contents of one known tester/output directory."""
+    raw = Path(path).absolute()
+    current = Path(raw.anchor)
+    for part in raw.parts[1:]:
+        current /= part
+        if current.exists() and _is_reparse(current):
+            raise ValueError("cleanup target contains a symlink or reparse point")
+    resolved = raw.resolve()
+    if tuple(resolved.parts[-len(tail):]) != tail:
+        raise ValueError("cleanup target is outside the configured exact path")
+    if not resolved.exists():
+        return
+    if not resolved.is_dir() or resolved.is_symlink():
+        raise ValueError("cleanup target is not a real directory")
+    for child in resolved.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            child.unlink()
+        else:
+            shutil.rmtree(child)
+
+
+def _cleanup_performance_sources(report_root: Path, strategy_root: Path) -> None:
+    _cleanup_exact_directory(report_root, "tester", "report", "my_test")
+    _cleanup_exact_directory(strategy_root, "Output", "strategies")
+    stale_manifest = strategy_root.resolve().parent / "strategy_manifest.json"
+    if stale_manifest.is_symlink():
+        raise ValueError("cleanup manifest is a symlink")
+    if stale_manifest.exists():
+        if not stale_manifest.is_file():
+            raise ValueError("cleanup manifest is not a regular file")
+        stale_manifest.unlink()
+
+
 class LocalPerformanceV2Service:
     """Import one committed inbox, then cache the requested A/B windows."""
 
@@ -129,6 +184,7 @@ class LocalPerformanceV2Service:
                 request.config,
                 mode=request.mode,
                 replacement_strategy_ids=request.replacement_strategy_ids,
+                strategy_root=request.strategy_root,
             )
         )
         if not imported.committed or imported.database_path is None:
@@ -158,6 +214,15 @@ class LocalPerformanceV2Service:
                     "completed": counts["result_count"],
                     "total": counts["result_count"],
                 })
+        cleanup_warning: Mapping[str, str] | None = None
+        if request.strategy_root is not None:
+            try:
+                _cleanup_performance_sources(request.report_root, request.strategy_root)
+            except Exception as error:
+                cleanup_warning = {
+                    "code": "CLEANUP_FAILED",
+                    "message": _safe_cleanup_message(error),
+                }
         return PerformanceV2PanelResult(
             imported.import_id,
             imported.status,
@@ -167,6 +232,7 @@ class LocalPerformanceV2Service:
             target,
             imported.audit_path,
             windows=tuple(windows),
+            cleanup_warning=cleanup_warning,
             **counts,
         )
 
@@ -249,9 +315,9 @@ class LocalPerformanceV2Jobs:
                 }
         try:
             result = self.service.run(request, progress=progress)
-        except BaseException:
+        except BaseException as error:
             with self._lock:
-                self._jobs[job_id].update(state="FAILED", phase="FAILED", error={"code": "FAILED"})
+                self._jobs[job_id].update(state="FAILED", phase="FAILED", error=_safe_import_error(error))
                 snapshot = dict(self._jobs[job_id])
             self._updated(snapshot)
             return
@@ -269,6 +335,7 @@ class LocalPerformanceV2Jobs:
             "result_count": result.result_count,
             "window_count": result.window_count,
             "windows": list(result.windows),
+            "cleanup_warning": result.cleanup_warning,
         }
         with self._lock:
             self._jobs[job_id].update(

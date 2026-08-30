@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Mapping
 
@@ -225,19 +226,33 @@ def capture_run_snapshot_inbox(
     test_end: str,
     run_mode: str = "RUNS",
     workers: int = 1,
+    strategy_paths: Mapping[str, Path] | None = None,
+    replace_existing: bool = False,
 ) -> Path:
-    """Capture one completed tester job in the immutable inbox format."""
+    """Capture one completed tester job in the immutable inbox format.
+
+    ``SINGLE_MODE`` deliberately stores strategy paths as metadata.  The
+    generated JSON remains owned by ``Output/strategies`` and is hashed again
+    by the v2 importer before staging.
+    """
     names = tuple(sorted(snapshots))
     if not names or set(reports) != set(names):
         raise InboxCaptureError("tester reports do not match expected strategies")
-    if run_mode not in {"RUNS", "FAST"}:
+    if not isinstance(job_id, str) or not job_id or job_id in {".", ".."} or Path(job_id).name != job_id:
+        raise InboxCaptureError("inbox job id is unsafe")
+    if run_mode not in {"RUNS", "FAST", "SINGLE_MODE"}:
         raise InboxCaptureError("unsupported tester run mode")
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise InboxCaptureError("inbox workers must be a positive integer")
     contract, contract_id, tester_config_hash = _commission_contract(config, tester_config_bytes)
-    inbox = config.inbox_root.resolve() / job_id
+    inbox_root = config.inbox_root.resolve()
+    inbox = inbox_root / job_id
     if inbox.exists():
-        raise InboxCaptureError(f"inbox already exists: {inbox}")
+        if not replace_existing:
+            raise InboxCaptureError(f"inbox already exists: {inbox}")
+        if inbox.is_symlink() or not inbox.is_dir() or inbox.parent != inbox_root:
+            raise InboxCaptureError("refusing to replace an unsafe inbox path")
+        shutil.rmtree(inbox)
     entries: list[dict[str, object]] = []
     try:
         def capture(name: str) -> dict[str, object]:
@@ -249,7 +264,18 @@ def capture_run_snapshot_inbox(
             report_path = reports[name]
             if not report_path.is_file() or extract_html_strategy_name(report_path) != name:
                 raise InboxCaptureError("RUNS HTML report does not match snapshot")
-            strategy_bytes = _atomic_bytes(inbox / "strategies" / f"{name}.json", _canonical_json(strategy))
+            if strategy_paths is not None:
+                source = Path(strategy_paths.get(name, ""))
+                if source.is_symlink() or not source.is_file():
+                    raise InboxCaptureError("SINGLE_MODE strategy source is invalid")
+                strategy_bytes = source.read_bytes()
+                strategy_path = source.resolve()
+            else:
+                strategy_bytes = _canonical_json(strategy)
+                strategy_path = inbox / "strategies" / f"{name}.json"
+                if run_mode == "SINGLE_MODE":
+                    raise InboxCaptureError("SINGLE_MODE strategy source is required")
+                strategy_bytes = _atomic_bytes(strategy_path, strategy_bytes)
             report_bytes = report_path.read_bytes()
             strategy_id = sha256(_canonical_json(strategy)).hexdigest()
             report_hash = sha256(report_bytes).hexdigest()
@@ -257,7 +283,7 @@ def capture_run_snapshot_inbox(
                 "manifest_entry_id": sha256(_canonical_json({"strategy": strategy_id, "report": report_hash, "run": job_id})).hexdigest()[:32],
                 "strategy_name": name,
                 "strategy_version_id": strategy_id,
-                "strategy_path": str((inbox / "strategies" / f"{name}.json").resolve()),
+                "strategy_path": str(strategy_path),
                 "report_path": str(report_path.resolve()),
                 "wizard_run_id": f"runs:{job_id}:{name}",
                 "exchange_name": exchange_name,
@@ -277,10 +303,11 @@ def capture_run_snapshot_inbox(
             "tester_config_sha256": tester_config_hash,
             "commission_contract": contract,
             "commission_contract_id": contract_id,
-            "source_mode": "direct",
+            "source_mode": "metadata_only" if run_mode == "SINGLE_MODE" else "direct",
             "run_mode": run_mode,
             "test_start": test_start,
             "test_end": test_end,
+            "inbox_ready": True,
             "entries": entries,
             "v6_provenance": json.loads(json.dumps(dict(provenance), sort_keys=True)),
         }

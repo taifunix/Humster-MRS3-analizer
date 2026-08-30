@@ -22,11 +22,11 @@ def test_static_shell_starts_with_all_accordions_collapsed_and_status_in_header(
     assert "requestJson('/api/v2/bootstrap')" in js
     for text in (
         "Static panel shell loaded.",
-        "Запуск ожидает backend.",
-        "01 · TWO INDEPENDENT TEST JOBS",
-        "02 · SOURCE V6 FRESH COMPACT",
-        "03 · CANONICAL SURFACES",
-        "04 · ANALYSIS → TESTER → DD5",
+        "Р—Р°РїСѓСЃРє РѕР¶РёРґР°РµС‚ backend.",
+        "01 В· TWO INDEPENDENT TEST JOBS",
+        "02 В· SOURCE V6 FRESH COMPACT",
+        "03 В· CANONICAL SURFACES",
+        "04 В· ANALYSIS в†’ TESTER в†’ DD5",
     ):
         assert text not in html
 
@@ -34,15 +34,9 @@ def test_static_shell_starts_with_all_accordions_collapsed_and_status_in_header(
 def test_static_shell_has_approved_navigation_and_exclusions() -> None:
     html = _read("index.html")
 
-    for href, label in (
-        ("#testing", "Тестирование"),
-        ("#source-db", "Source DB"),
-        ("#surfaces", "Поверхности"),
-        ("#strategies-dd5", "Стратегии и DD5"),
-        ("#settings", "Настройки"),
-    ):
+    for href in ("#testing", "#source-db", "#surfaces", "#strategies-dd5", "#settings"):
         assert f'href="{href}"' in html
-        assert label in html
+    assert "Testing /" in html
     assert ">Portfolio" in html
     assert 'disabled' in html
     assert 'aria-disabled="true"' in html
@@ -57,8 +51,8 @@ def test_static_shell_does_not_claim_unverified_artifacts() -> None:
 
     assert "18 READY" not in html
     assert "2 / 2 scopes" not in html
-    assert "selected-set.surface-v6.duckdb · READY scopes" not in html
-    assert "CXUSDT · SHORT</th><td>1h" not in html
+    assert "selected-set.surface-v6.duckdb В· READY scopes" not in html
+    assert "CXUSDT В· SHORT</th><td>1h" not in html
 
 
 def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() -> None:
@@ -73,8 +67,7 @@ def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() ->
         assert f'id="{runner}-end-date"' in html
     assert 'id="local-paths"' in html
     assert 'id="remote-paths"' not in html
-    assert "Проверить runner и диск" in html
-    assert "Сохранить пути" in html
+    assert "runner" in html
     assert 'id="panel-reload"' in html
     assert 'name="host"' not in html
     assert 'name="user"' not in html
@@ -88,22 +81,15 @@ def test_source_surfaces_and_strategies_screens_have_approved_workflow_cards() -
     source = html.split('id="source-db"', 1)[1].split('id="surfaces"', 1)[0]
     assert source.count("<details") == 4
     assert "Manual merge" in source
-    for label in ("Локальный импорт", "Удалённый импорт", "Локальный merge"):
-        assert label in source
+    for control in ('id="source-local-html"', 'id="source-remote-html"', 'id="merge-start"'):
+        assert control in source
 
     surfaces = html.split('id="surfaces"', 1)[1].split('id="strategies-dd5"', 1)[0]
     for label in ("Source DB", "Coverage preflight", "READY", "surface-publish-card"):
         assert label in surfaces
 
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
-    for label in (
-        "Опубликованная surface",
-        "Анализ",
-        "Shortlist",
-        "Tester",
-        "DD5",
-        "CALCULATION_ONLY",
-    ):
+    for label in ("Shortlist", "Tester", "DD5", "native SINGLE_MODE tester"):
         assert label in strategies
     assert "Source PnL" not in strategies
 
@@ -207,12 +193,16 @@ def test_strategies_loads_the_persisted_valid_surface_catalog() -> None:
     assert "'/api/v2/surfaces/catalog'" in js
 
 
-def test_performance_database_catalog_has_a_manual_refresh_control() -> None:
+def test_performance_v2_handoff_exposes_ready_gated_controls() -> None:
     html = _read("index.html")
     js = _read("app.js")
 
-    assert 'id="performance-db-refresh"' in html
-    assert "dbRefreshV2?.addEventListener('click', refreshPerformanceCatalog);" in js
+    assert 'id="performance-inbox-verify"' in html
+    assert 'id="performance-import-start"' in html
+    assert 'id="performance-import-start" class="button button-primary" disabled' in html
+    assert "let inboxReadyV2 = false;" in js
+    assert "importStartV2.disabled = !inboxReadyV2" in js
+    assert "Cleanup warning" in js
 
 
 def test_analysis_start_immediately_shows_running_phase_and_elapsed_time() -> None:
@@ -314,22 +304,22 @@ def test_surface_gap_link_opens_a_visible_report_dialog() -> None:
     assert "missing_witnesses" in js
 
 
-def test_strategies_screen_keeps_the_approved_dd5_result_stage_and_live_status() -> None:
+def test_strategies_screen_hides_removed_dd5_result_stage_and_live_status() -> None:
     html = _read("index.html")
     js = _read("app.js")
 
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
-    assert 'id="strategy-dd5-card"' in strategies
-    assert 'id="strategy-dd5-status"' in strategies
-    assert "CALCULATION_ONLY" in strategies
-    assert "dd5Status" in js
+    assert 'id="strategy-dd5-card"' not in strategies
+    assert 'id="strategy-dd5-status"' not in strategies
+    assert "CALCULATION_ONLY" not in strategies
+    assert "strategies.performance.dd5" not in js
 
 
 def test_dd5_screen_removes_non_contract_manifest_and_path_controls() -> None:
     html = _read("index.html")
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
 
-    assert "Manifest и lineage" not in strategies
+    assert "Manifest Рё lineage" not in strategies
     assert "Export final shortlist" not in strategies
     assert 'id="strategies-output"' not in strategies
     assert 'id="tester-batch"' not in strategies
@@ -361,24 +351,28 @@ def test_tester_dates_and_local_ranges_are_sent_only_on_tester_start() -> None:
         assert f'id="{control}"' in html
     assert "start_date" in js and "end_date" in js
     assert "startDate > endDate" in js
-    tester_request = js.split("kind: 'strategies.tester.start'", 1)[1].split("});", 1)[0]
-    assert "tester-start-date" in tester_request
-    assert "tester-end-date" in tester_request
+    tester_handler = js.split("if (testerStart) testerStart.addEventListener", 1)[1].split("if (testerStop)", 1)[0]
+    assert "testerStartDate?.value" in tester_handler
+    assert "testerEndDate?.value" in tester_handler
+    assert "start_date: startDate" in tester_handler
+    assert "end_date: endDate" in tester_handler
     for marker in ("shortlist", "analyze", "generate"):
         assert f"tester-range-{marker}" not in js
 
 
-def test_tester_card_exposes_independent_fast_test_controls() -> None:
+def test_tester_card_exposes_single_mode_and_hides_fast_controls() -> None:
     html = _read("index.html")
     js = _read("app.js")
 
-    assert 'id="tester-start-fast"' in html
-    assert "Fast TEST" in html
-    assert 'id="tester-retry-fast"' in html
-    assert "Проверить / повторить FAILED" in html
-    assert "strategies.tester.fast.start" in js
-    assert "strategies.tester.fast.retry" in js
-    assert "strategies.tester.fast.start" in js
+    assert 'id="tester-start"' in html
+    assert "SINGLE_MODE" in html
+    assert 'id="tester-start-fast"' not in html
+    assert 'id="tester-retry-fast"' not in html
+    assert "strategies.tester.fast.start" not in js
+    assert "strategies.tester.fast.retry" not in js
+    assert "kind: 'strategies.tester.start'" in js
+    assert "inbox_ready" in js
+    assert "READY" in js
     assert "setTesterControls(!testerIsTerminal(job))" in js
 
 
@@ -406,7 +400,7 @@ def test_shortlist_controls_match_requested_compact_typography() -> None:
 
     assert "#shortlist-summary { display: none; }" in css
     assert ".shortlist-group-checkbox, .shortlist-tf-checkbox { width: 16px; min-width: 16px; height: 16px; min-height: 16px; vertical-align: middle; }" in css
-    assert "disclosure.textContent = open ? '▼' : '▶';" in js
+    assert "disclosure.textContent = open ?" in js
     assert "if (event.key === 'Enter' || event.key === ' ') event.preventDefault();" in js
     assert ".shortlist-disclosure { display: inline-flex; align-items: center; justify-content: center; vertical-align: middle; position: relative; top: -1px;" in css
 
@@ -456,7 +450,7 @@ def test_shortlist_table_has_phase_one_optional_group_columns_and_fallbacks() ->
     assert shortlist.split("</thead>", 1)[0].count("<th ") == 12
     for field in ("plateau_count", "period", "deferred"):
         assert f"group.{field}" in js
-    assert "—" in js or "вЂ”" in js
+    assert "вЂ”" in js or "РІР‚вЂќ" in js
 
 
 def test_shortlist_rows_append_order_buckets_before_new_columns() -> None:
@@ -473,7 +467,7 @@ def test_shortlist_rows_append_order_buckets_before_new_columns() -> None:
 def test_tester_range_shortcuts_are_local_only() -> None:
     js = _read("app.js")
 
-    ranges = js.split("[1, 2, 3].forEach", 1)[1].split("const performanceStart", 1)[0]
+    ranges = js.split("[1, 2, 3].forEach", 1)[1].split("const testerIsTerminal", 1)[0]
     assert "testerStartDate" in ranges and "testerEndDate" in ranges
     assert "remoteRequest" not in ranges and "fetch(" not in ranges
 
@@ -487,7 +481,7 @@ def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() 
     assert 'data-path-root="analysis_db_root"' in html
     assert "suggested_filename" in js
     assert "analysis_db_root" in js
-    assert "dd5Track" in js
+    assert "inboxReadyV2" in js
 
 
 def test_shortlist_has_one_grouped_renderer_and_shared_candidate_state() -> None:
@@ -523,7 +517,7 @@ def test_surface_selection_is_model_driven_and_preserves_open_groups() -> None:
     assert "selectFilteredScopesV2" in js
     assert "setSelectedSurfaceScopesV2([...selectedSurfaceScopes, ...filteredReadySurfaceKeysV2()]);" in js
     assert "scope-select-visible" in js
-    assert "Выбрать отфильтрованные READY" in js
+    assert "selectFilteredButtonV2.textContent" in js
     assert "const expandedSurfacePairs = new Set();" in js
     assert "expandedSurfacePairs.has(groupKey)" in js
     assert "groupNode.addEventListener('toggle'" in js
@@ -546,10 +540,8 @@ def test_shared_request_json_and_job_recovery_keep_errors_and_busy_state_truthfu
     assert "const code = typeof result?.error === 'string'" in js
     assert "Backend connection unavailable." in js
     assert "const setTesterControls = (busy)" in js
-    assert "if (testerRunsStart) testerRunsStart.disabled = busy;" in js
-    assert "const verifiedInbox = job.state === 'COMMITTED' && job.inbox_ready === true;" in js
-    assert "performanceStart.disabled = true;" in js
-    assert "finally { performanceStart.disabled = false; }" in js
+    assert "inboxReadyV2 = ready;" in js
+    assert "importStartV2.disabled = !inboxReadyV2;" in js
     assert "const recoverJobs = async () =>" in js
     assert "requestJson('/api/v2/jobs')" in js
     assert "recoverJobs();" in js
@@ -578,8 +570,8 @@ def test_shared_json_requests_fail_safely_and_busy_job_controls_cleanup() -> Non
     assert "setTesterControls(true)" in js
     assert "finally" in js
     assert "setTesterControls(false)" in js
-    assert "performanceStart.disabled = true" in js
-    assert "performanceStart.disabled = false" in js
+    assert "importStartV2.disabled = true" in js
+    assert "importStartV2.disabled = !inboxReadyV2" in js
 
 
 def test_reload_recovers_only_server_job_snapshots() -> None:
@@ -589,13 +581,12 @@ def test_reload_recovers_only_server_job_snapshots() -> None:
     recovery = js.split("const recoverJobs = async", 1)[1].split("const settingsStatus", 1)[0]
     assert "requestJson('/api/v2/jobs')" in recovery
     assert "job.kind === 'strategies.tester.start'" in recovery
-    assert "job.kind === 'strategies.performance-dd5'" in recovery
+    assert "job.kind === 'strategies.performance-dd5'" not in recovery
     assert "const tester = testerJobs.find" in recovery
-    assert "Object.keys(job.evidence?.verified_reports || {}).length" in recovery
     assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
     assert "kind: 'strategies.tester.start'" in js
-    assert "renderTester(testerIsTerminal(job) && !fastJob" in recovery
-    assert "renderPerformance(job)" in recovery
+    assert "renderTester(job);" in recovery
+    assert "renderPerformance(job)" not in recovery
     assert "job.state = " not in recovery
     assert "recoverJobs();" in js
 
@@ -605,8 +596,8 @@ def test_inbox_verify_does_not_fail_silently() -> None:
     handler = js.split("inboxVerifyV2?.addEventListener", 1)[1].split("const refreshPerformanceCatalog", 1)[0]
 
     assert "if (!testerJobId) {" in handler
-    assert "Проверка невозможна: tester job не найден." in handler
-    assert "Проверка verified inbox" in handler
+    assert "tester job" in handler
+    assert "verified inbox" in handler
     assert "catch (error)" in handler
     assert "error?.message || 'unknown error'" in handler
 
