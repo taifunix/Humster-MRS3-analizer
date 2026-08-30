@@ -284,6 +284,49 @@ def test_single_mode_replace_rejects_reparse_inbox_before_recursive_delete(
     assert stale.read_text(encoding="utf-8") == "keep"
 
 
+def test_capture_failure_preserves_reparse_inbox_and_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _output, plan, _wizard, report = _inputs(tmp_path, config)
+    strategy = json.loads((plan.strategy_source / "A.json").read_text(encoding="utf-8"))
+    inbox = config.inbox_root / "single-job"
+    reparse = False
+
+    def is_reparse(path: Path) -> bool:
+        return reparse and path == inbox
+
+    def fail_atomic(target: Path, _data: bytes) -> bytes:
+        nonlocal reparse
+        target.parent.mkdir(parents=True, exist_ok=True)
+        (target.parent / "preserved.txt").write_text("keep", encoding="utf-8")
+        reparse = True
+        raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(inbox_module, "_is_reparse", is_reparse)
+    monkeypatch.setattr(inbox_module, "_atomic_bytes", fail_atomic)
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        capture_run_snapshot_inbox(
+            config,
+            "single-job",
+            {"A": strategy},
+            {"A": report},
+            tester_config_bytes=config.tester_config.read_bytes(),
+            provenance={
+                "analysis_run_id": "a" * 64,
+                "generation_manifest_sha256": "b" * 64,
+                "strategy_json_sha256": {"A.json": "c" * 64},
+            },
+            test_start="2026-08-01",
+            test_end="2026-08-18",
+            run_mode="SINGLE_MODE",
+            strategy_paths={"A": plan.strategy_source / "A.json"},
+        )
+
+    assert (inbox / "preserved.txt").read_text(encoding="utf-8") == "keep"
+
+
 def test_capture_run_snapshot_caps_worker_pool_and_keeps_entry_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(tmp_path)
     names = tuple(f"A{index:02d}" for index in range(17))

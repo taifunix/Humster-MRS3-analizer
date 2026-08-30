@@ -328,5 +328,11 @@ def capture_run_snapshot_inbox(
         _atomic_bytes(inbox / "inbox_manifest.json", _canonical_json(manifest))
         return inbox
     except BaseException:
-        shutil.rmtree(inbox, ignore_errors=True)
+        try:
+            _reject_reparse_components(config.inbox_root)
+            _reject_reparse_components(inbox)
+        except InboxCaptureError:
+            pass
+        else:
+            shutil.rmtree(inbox, ignore_errors=True)
         raise
