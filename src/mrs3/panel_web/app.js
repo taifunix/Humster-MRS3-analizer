@@ -1528,6 +1528,142 @@
       }
     } catch (_) { /* stale jobs remain visible through the server registry */ }
   };
+
+  const performanceV2WindowSelect = document.querySelector('#performance-v2-window-strategy');
+  const performanceV2WindowRefresh = document.querySelector('#performance-v2-window-refresh');
+  const performanceV2WindowCalculate = document.querySelector('#performance-v2-window-calculate');
+  const performanceV2WindowStatus = document.querySelector('#performance-v2-window-status');
+  const performanceV2WindowResult = document.querySelector('#performance-v2-window-result');
+  let performanceV2Strategies = [];
+
+  // datetime-local has no timezone. The value is explicitly UTC in this card,
+  // so preserve its fields and append Z without Date/browser timezone conversion.
+  const performanceV2UtcValue = (value) => value ? `${value}Z` : '';
+  const performanceV2LocalValue = (value) => {
+    if (!value) return '';
+    return String(value).replace(/(?:Z|\+00:00)$/, '').slice(0, 19);
+  };
+  const performanceV2SetWindowBounds = (strategy) => {
+    const start = performanceV2LocalValue(strategy?.report_start_utc);
+    const end = performanceV2LocalValue(strategy?.report_end_utc);
+    for (const [id, value] of [
+      ['performance-v2-window-a-start', start], ['performance-v2-window-a-end', end],
+      ['performance-v2-window-b-start', start], ['performance-v2-window-b-end', end],
+    ]) {
+      const input = document.querySelector(`#${id}`);
+      if (input) input.value = value;
+    }
+  };
+  const performanceV2MetricText = (value, suffix = '') => value === null || value === undefined || value === '' ? '—' : `${value}${suffix}`;
+  const performanceV2DateText = (value) => performanceV2MetricText(value);
+  const performanceV2AppendRow = (table, label, value) => {
+    const row = document.createElement('tr');
+    const heading = document.createElement('th');
+    heading.scope = 'row';
+    heading.textContent = label;
+    const cell = document.createElement('td');
+    cell.textContent = value;
+    row.append(heading, cell);
+    table.append(row);
+  };
+  const performanceV2WindowTable = (title, window) => {
+    const section = document.createElement('section');
+    const heading = document.createElement('h3');
+    heading.textContent = title;
+    const table = document.createElement('table');
+    const body = document.createElement('tbody');
+    table.append(body);
+    performanceV2AppendRow(body, 'Requested start (UTC)', performanceV2DateText(window?.requested_start_utc));
+    performanceV2AppendRow(body, 'Requested end (UTC)', performanceV2DateText(window?.requested_end_utc));
+    performanceV2AppendRow(body, 'Effective start (UTC)', performanceV2DateText(window?.effective_start_utc));
+    performanceV2AppendRow(body, 'Effective end (UTC)', performanceV2DateText(window?.effective_end_utc));
+    performanceV2AppendRow(body, 'Availability', performanceV2MetricText(window?.availability_status));
+    performanceV2AppendRow(body, 'Availability reason', performanceV2MetricText(window?.unavailable_reason));
+    for (const [key, label, suffix] of [
+      ['return_pct', 'Return', '%'],
+      ['daily_growth_pct', 'Daily growth', '%'],
+      ['max_drawdown_pct', 'Max DD', '%'],
+      ['return_dd_ratio', 'Return / DD', ''],
+      ['fees_pct', 'Fees', '%'],
+      ['profit_factor', 'Profit factor', ''],
+      ['trade_count', 'Trades', ''],
+      ['win_rate_pct', 'Win rate', '%'],
+      ['holding_seconds', 'Holding time', ' s'],
+      ['time_in_market_pct', 'Time in market', '%'],
+    ]) performanceV2AppendRow(body, label, performanceV2MetricText(window?.[key], suffix));
+    section.append(heading, table);
+    return section;
+  };
+  const renderPerformanceV2Windows = (payload) => {
+    if (!performanceV2WindowResult) return;
+    performanceV2WindowResult.replaceChildren();
+    for (const [title, metricWindow] of [['Window A', payload?.window_a], ['Window B', payload?.window_b]]) {
+      if (metricWindow) performanceV2WindowResult.append(performanceV2WindowTable(title, metricWindow));
+    }
+    const comparison = payload?.comparison;
+    if (!comparison) return;
+    const section = document.createElement('section');
+    const heading = document.createElement('h3');
+    heading.textContent = 'Comparison';
+    const table = document.createElement('table');
+    const body = document.createElement('tbody');
+    table.append(body);
+    performanceV2AppendRow(body, 'Status', performanceV2MetricText(comparison.status));
+    performanceV2AppendRow(body, 'Growth factor ratio', performanceV2MetricText(comparison.growth_factor_ratio));
+    performanceV2AppendRow(body, 'Daily log return ratio', performanceV2MetricText(comparison.log_return_ratio));
+    section.append(heading, table);
+    performanceV2WindowResult.append(section);
+  };
+  const loadPerformanceV2Catalog = async () => {
+    if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = 'Loading Performance v2 strategies…';
+    try {
+      const result = await requestJson('/api/v2/strategies/performance-v2/catalog');
+      performanceV2Strategies = Array.isArray(result.strategies) ? result.strategies : [];
+      if (performanceV2WindowSelect) {
+        performanceV2WindowSelect.replaceChildren(new Option('Select a strategy', ''));
+        for (const strategy of performanceV2Strategies) {
+          const name = strategy.strategy_name || `Strategy ${strategy.strategy_id}`;
+          const details = [strategy.symbol, strategy.side, strategy.timeframe].filter(Boolean).join(' · ');
+          performanceV2WindowSelect.append(new Option(details ? `${name} · ${details}` : name, String(strategy.strategy_id)));
+        }
+        performanceV2WindowSelect.value = performanceV2Strategies[0] ? String(performanceV2Strategies[0].strategy_id) : '';
+      }
+      performanceV2SetWindowBounds(performanceV2Strategies[0]);
+      if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = performanceV2Strategies.length
+        ? `${performanceV2Strategies.length} Performance v2 strategies loaded.`
+        : 'No active Performance v2 strategies found.';
+    } catch (error) {
+      if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = `Strategy catalog unavailable: ${error?.message || 'request failed'}.`;
+    }
+  };
+  performanceV2WindowRefresh?.addEventListener('click', loadPerformanceV2Catalog);
+  performanceV2WindowSelect?.addEventListener('change', () => {
+    performanceV2SetWindowBounds(performanceV2Strategies.find((strategy) => String(strategy.strategy_id) === performanceV2WindowSelect.value));
+  });
+  performanceV2WindowCalculate?.addEventListener('click', async () => {
+    const strategyId = Number(performanceV2WindowSelect?.value || 0);
+    const value = (id) => document.querySelector(`#${id}`)?.value || '';
+    const aStart = value('performance-v2-window-a-start');
+    const aEnd = value('performance-v2-window-a-end');
+    const bStart = value('performance-v2-window-b-start');
+    const bEnd = value('performance-v2-window-b-end');
+    if (!strategyId || [aStart, aEnd, bStart, bEnd].some((item) => !item)) {
+      if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = 'Select a strategy and complete both UTC windows.';
+      return;
+    }
+    if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = 'Calculating Performance v2 windows…';
+    try {
+      const result = await remoteRequest('/api/v2/strategies/performance-v2/windows', {
+        strategy_id: strategyId,
+        window_a: [performanceV2UtcValue(aStart), performanceV2UtcValue(aEnd)],
+        window_b: [performanceV2UtcValue(bStart), performanceV2UtcValue(bEnd)],
+      });
+      renderPerformanceV2Windows(result);
+      if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = 'Performance v2 A/B calculation complete.';
+    } catch (error) {
+      if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = `Performance v2 calculation failed: ${error?.message || 'request failed'}.`;
+    }
+  });
   const settingsStatus = document.querySelector('#settings-status');
   const settingsPayload = () => ({ panel: {
     default_root: document.querySelector('#settings-default-root')?.value || 'static',

@@ -632,6 +632,19 @@ def test_performance_import_renders_the_existing_progress_bar() -> None:
     assert "track.style.width" in render
 
 
+def test_performance_v2_window_analysis_uses_native_utc_controls() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="performance-v2-window-strategy"' in html
+    for field in ("performance-v2-window-a-start", "performance-v2-window-a-end", "performance-v2-window-b-start", "performance-v2-window-b-end"):
+        assert f'id="{field}" type="datetime-local" step="1"' in html
+    assert "UTC" in html.split('id="performance-v2-window-card"', 1)[1].split("</details>", 1)[0]
+    assert "/api/v2/strategies/performance-v2/catalog" in js
+    assert "/api/v2/strategies/performance-v2/windows" in js
+    assert "`${value}Z`" in js
+
+
 def test_testing_screen_does_not_expose_remote_runner_paths() -> None:
     html = _read("index.html")
 

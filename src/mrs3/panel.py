@@ -8,6 +8,7 @@ from decimal import Decimal
 import hashlib
 from hashlib import sha256
 import inspect
+import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -24,6 +25,7 @@ import uuid
 import webbrowser
 
 _PANEL_WEB = Path(__file__).with_name("panel_web")
+_LOGGER = logging.getLogger(__name__)
 
 import duckdb
 
@@ -143,8 +145,15 @@ from .panel_performance_dd5 import (
     PerformanceDd5Request,
     PerformanceImportPanelRequest,
 )
-from .panel_performance_v2 import LocalPerformanceV2Jobs, PerformanceV2PanelRequest
-from .performance_v2_store import load_performance_v2_config
+from .panel_performance_v2 import (
+    LocalPerformanceV2Jobs,
+    PerformanceV2ApiError,
+    PerformanceV2PanelRequest,
+    calculate_performance_v2_windows,
+    performance_v2_catalog,
+    _parse_window_payload,
+)
+from .performance_v2_store import load_performance_v2_config, performance_v2_database_path, require_performance_v2
 from .runner.config import RunnerConfig
 from .runner.inbox import capture_verified_inbox
 from .runner.workflow import BatchPlan, _load_saved_result_evidence, _load_saved_results, plan_batch, run_batch
@@ -2899,6 +2908,36 @@ class PanelController:
             return self._panel_jobs.get(job_id)
         return self._tracked_job_or_interrupted(job_id, self._performance_v2_jobs.status)
 
+    def performance_v2_catalog(self) -> dict[str, object]:
+        config = self._performance_v2_config()
+        target = performance_v2_database_path(config)
+        if not target.is_file():
+            return {"strategies": []}
+        try:
+            with duckdb.connect(str(target), read_only=True) as connection:
+                require_performance_v2(connection)
+                return performance_v2_catalog(connection)
+        except PerformanceV2ApiError:
+            raise
+        except (duckdb.Error, OSError) as error:
+            raise ValueError("Performance v2 database is unavailable") from error
+
+    def strategies_performance_v2_catalog(self) -> dict[str, object]:
+        return self.performance_v2_catalog()
+
+    def performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if not isinstance(payload, Mapping):
+            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="request must be an object")
+        strategy_id, window_a, window_b = _parse_window_payload(payload)
+        config = self._performance_v2_config()
+        target = performance_v2_database_path(config)
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
+        return calculate_performance_v2_windows(target, strategy_id, window_a, window_b)
+
+    def strategies_performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
+        return self.performance_v2_windows(payload)
+
     def performance_database_catalog(self) -> dict[str, object]:
         root = self._panel_path("performance_db_root")
         root.mkdir(parents=True, exist_ok=True)
@@ -5582,6 +5621,17 @@ class _PanelHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json(400, {"error": "invalid performance db request"})
             return
+        if parsed.path == "/api/v2/strategies/performance-v2/catalog":
+            try:
+                self._json(200, self.server.controller.strategies_performance_v2_catalog())
+            except PerformanceV2ApiError as error:
+                self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+            except ValueError:
+                self._json(400, {"error": "invalid Performance v2 catalog request"})
+            except Exception:
+                _LOGGER.exception("Performance v2 catalog failed")
+                self._json(500, {"error": {"code": "INTERNAL", "message": "Performance v2 catalog failed"}})
+            return
         if parsed.path == "/api/v2/surfaces/catalog":
             self._json(200, self.server.controller.surface_catalog())
             return
@@ -5751,27 +5801,28 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         endpoint = urlparse(self.path).path
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open"}:
+        performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
         if content_type.strip().casefold() != "application/json":
-            self._json(415, {"error": "Content-Type must be application/json"} if fresh_generation else (
+            self._json(400 if performance_v2_windows_endpoint else 415, {"error": {"code": "INVALID_REQUEST", "message": "Content-Type must be application/json"}} if performance_v2_windows_endpoint else ({"error": "Content-Type must be application/json"} if fresh_generation else (
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "Content-Type must be application/json"}
-            ))
+            )))
             return
         max_body_length = 1_048_576 if fresh_generation else 65_536
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            self._json(400, {"error": "invalid Content-Length"} if fresh_generation else (
+            self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid Content-Length"}} if performance_v2_windows_endpoint else ({"error": "invalid Content-Length"} if fresh_generation else (
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "invalid Content-Length"}
-            ))
+            )))
             return
         if length <= 0 or length > max_body_length:
-            self._json(400, {"error": f"JSON body must be between 1 and {max_body_length} bytes"} if fresh_generation else (
+            self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid JSON body length"}} if performance_v2_windows_endpoint else ({"error": f"JSON body must be between 1 and {max_body_length} bytes"} if fresh_generation else (
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "JSON body must be between 1 and 65536 bytes"}
-            ))
+            )))
             return
         try:
             document = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -5829,6 +5880,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_fresh_open(document)
             elif endpoint == "/api/v2/strategies/fresh/shortlist":
                 result = self.server.controller.strategies_fresh_shortlist(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/windows":
+                result = self.server.controller.strategies_performance_v2_windows(document)
             elif endpoint == "/api/v2/jobs":
                 result = {"job": self.server.controller.panel_job_submit(document)}
             elif endpoint == "/api/v2/settings/validate":
@@ -5913,15 +5966,26 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except PanelJobError as error:
             self._json(409 if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED", "IDEMPOTENCY_CONFLICT", "RESTART_BLOCKED"} else 400, {"error": error.code})
             return
+        except PerformanceV2ApiError as error:
+            self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+            return
         except RuntimeError as error:
             self._json(409, {"error": _fresh_generation_error(error)} if endpoint == "/api/v2/strategies/fresh/generate" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
             return
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-            if endpoint == "/api/v2/strategies/fresh/generate":
+            if performance_v2_windows_endpoint:
+                self._json(400, {"error": {"code": "INVALID_REQUEST", "message": str(error)}})
+            elif endpoint == "/api/v2/strategies/fresh/generate":
                 self._json(400, {"error": _fresh_generation_error(error)})
             else:
                 self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
             return
+        except Exception:
+            if performance_v2_windows_endpoint:
+                _LOGGER.exception("Performance v2 window calculation failed")
+                self._json(500, {"error": {"code": "INTERNAL", "message": "Performance v2 calculation failed"}})
+                return
+            raise
         self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start"} else 200, result)
 
 

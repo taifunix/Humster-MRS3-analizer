@@ -921,6 +921,22 @@ expected; independent review — `CODE_REVIEW_PASS`; `git diff --check` clean.
 
 ### Unified Performance DB v2 import (2026-08-31)
 
+### Performance v2 single-strategy A/B analysis (2026-08-31)
+
+Phase 2 is implemented: the panel now lists ACTIVE strategies from the v2
+database, pre-fills UTC bounds, and calculates two safe UPNL-relative windows
+for one authoritative current result. Valid unavailable windows return a
+normal result; strict invalid input is typed `400`; unavailable/stale strategy
+is typed `404`; cache conflict and writer lock are typed `409`. The only
+database mutation is the existing versioned `window_metrics` cache.
+
+Verification: focused v2 selector `84 passed in 13.55s`; panel/integration
+`154 passed`; v1 non-disturbance `109 passed`; `node --check` and
+`git diff --check` passed. Live smoke on the imported DB left
+strategies/results/actions/equity at `1633/1633/741189/9305765`, added one
+cache row, and measured 354 ms first calculation / 70 ms cache hit.
+Independent Opus review: `CODE_REVIEW_PASS`.
+
 Native SINGLE_MODE now creates a metadata inbox that refers to the tested HTML
 and `Output\\strategies` files without copying either directory. Import stages
 and hash-verifies HTML once, parses it with the configured worker count, and

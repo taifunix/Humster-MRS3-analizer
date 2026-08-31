@@ -195,8 +195,8 @@ panel/XLSX finalists and Portfolio Optimizer input. The active native
 backend/API currently uses its direct inbox; any future `RETEST` replacement
 handler must explicitly adopt the trusted v2 importer contract.
 
-Status: **native SINGLE_MODE handoff and v2 vertical slice implemented and
-verified; broader v2 pipeline pending**. Native `SINGLE_MODE` creates one
+Status: **native SINGLE_MODE handoff, v2 vertical slice and one-strategy A/B
+window analysis implemented and verified; broader v2 pipeline pending**. Native `SINGLE_MODE` creates one
 metadata-only inbox whose strategy JSON stays under trusted `Output/strategies`
 and whose current HTML stays under `tester/report/my_test`; the manifest records
 exact paths, source hashes, dates, commission and provenance. The v2 importer
@@ -223,6 +223,13 @@ Explicitly deferred from this vertical slice:
   Optimizer input;
 - deletion of v1 runtime and storage;
 - `point_id`, arbitrary filter expressions, and portfolio simulation.
+
+The delivered A/B panel is intentionally limited to one ACTIVE strategy at a
+time. It resolves the authoritative current result server-side, accepts two
+strict UTC windows, and writes only the versioned `window_metrics` cache.
+Batch analytics, filters/Pareto, selections, XLSX, tags/discard, RETEST,
+Portfolio input, DD5 proxy UI, Runs UI and Fast/legacy behavior remain
+deferred.
 
 This status does not claim a completed MRS3 strategy, a tick-test result, a DD5
 result, or a portfolio result; source metrics remain source analytics until the

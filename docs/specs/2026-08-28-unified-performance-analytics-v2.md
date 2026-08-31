@@ -1,6 +1,6 @@
 # Unified Performance Analytics v2
 
-**Status:** vertical slice implemented; Phase 2 analytics pending
+**Status:** vertical slice and single-strategy A/B analysis implemented
 **Date:** 2026-08-28
 **Decision:** [ADR-0020](../decisions/0020-unified-performance-analytics-v2.md)
 
@@ -197,6 +197,36 @@ ratios.
 Its identity is `(result_id, requested_start, requested_end)`. It stores the
 requested/effective boundaries, relative metrics, availability status and
 calculation timestamp. Replacing a result deletes its dependent cache.
+
+## Phase 2: one-strategy A/B analysis
+
+The first Phase 2 vertical is a separate interactive analysis action, never an
+import side effect. It accepts one `ACTIVE` `strategy_id`; the server resolves
+the result only through `strategies.current_result_id` joined to the same
+strategy row. The client never submits a result id, database path, or calculator
+version.
+
+`GET /api/v2/strategies/performance-v2/catalog` returns active strategies with
+their authoritative current result and report bounds, ordered by strategy name
+and id. `POST /api/v2/strategies/performance-v2/windows` accepts the strategy
+id plus independent A/B pairs. Every timestamp is ISO-8601 UTC with uppercase
+`Z` or `+00:00`; naive and non-UTC offsets are rejected. Responses canonicalize
+timestamps to `Z` and encode `Decimal` values as strings.
+
+Each interval requires `start < end`; A and B may be identical, overlapping,
+nested or disjoint. Equity samples use the closed effective interval and
+actions use `(effective_start, effective_end]`. A wholly out-of-range request
+returns typed `OUT_OF_RANGE` data, not an HTTP error. Valid unavailable windows
+remain normal result data. The window cache key is exactly
+`(result_id, requested_start_utc, requested_end_utc, metrics_version)`.
+
+The window request uses one short DuckDB transaction for both cache entries.
+It returns typed `409` only for an actual writer lock or an unresolved cache
+transaction conflict; it does not retry, wait, create a worker pool, or mutate
+strategy/result/action/equity facts. The import request's legacy
+`window_a`/`window_b` fields remain deprecated no-ops for compatibility;
+`window_count` remains zero. DD5 proxy, filters, Pareto, XLSX, tags, RETEST,
+Portfolio input, Runs UI and Fast remain out of this vertical.
 
 ## DD5 proxy
 

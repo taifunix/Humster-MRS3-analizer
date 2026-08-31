@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 import re
@@ -21,16 +21,72 @@ from .performance_v2_import import (
 )
 from .performance_v2_store import (
     PerformanceV2Config,
+    performance_v2_database_path,
     require_performance_v2,
 )
 from .performance_v2_windows import (
+    METRICS_VERSION,
     WindowMetrics,
+    _cached,
     compare_window_pair_geometrically,
     get_or_calculate_window_pair,
 )
 
 
 Window = tuple[datetime | str, datetime | str]
+
+
+class PerformanceV2ApiError(ValueError):
+    """An expected API failure with a stable client-facing status/code."""
+
+    def __init__(self, code: str, *, status: int, message: str | None = None) -> None:
+        self.code = code
+        self.status = status
+        super().__init__(message or code)
+
+
+def _parse_api_timestamp(value: object, field: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{field} must be UTC ISO-8601")
+    if not (value.endswith("Z") or value.endswith("+00:00")):
+        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{field} must be UTC ISO-8601")
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{field} must be UTC ISO-8601") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{field} must be UTC ISO-8601")
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_window_payload(payload: Mapping[str, object]) -> tuple[int, Window, Window]:
+    if set(payload) != {"strategy_id", "window_a", "window_b"}:
+        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="unsupported Performance v2 window fields")
+    strategy_id = payload["strategy_id"]
+    if isinstance(strategy_id, bool) or not isinstance(strategy_id, int) or strategy_id <= 0:
+        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="strategy_id must be a positive integer")
+
+    windows: list[Window] = []
+    for name in ("window_a", "window_b"):
+        value = payload[name]
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{name} must contain exactly two timestamps")
+        start = _parse_api_timestamp(value[0], f"{name}.start")
+        end = _parse_api_timestamp(value[1], f"{name}.end")
+        if start >= end:
+            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{name} start must be before end")
+        windows.append((start, end))
+    return strategy_id, windows[0], windows[1]
+
+
+def _canonical_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _is_duckdb_lock_error(error: duckdb.IOException) -> bool:
+    message = str(error).casefold()
+    return "could not set lock on file" in message or "conflicting lock is held" in message
 
 
 def _is_reparse(path: Path) -> bool:
@@ -85,7 +141,7 @@ class PerformanceV2PanelResult:
 
 def _json_value(value: object) -> object:
     if isinstance(value, datetime):
-        return value.isoformat()
+        return _canonical_utc(value)
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, Path):
@@ -97,6 +153,58 @@ def _json_value(value: object) -> object:
     return value
 
 
+def resolve_active_strategy(
+    connection: duckdb.DuckDBPyConnection, strategy_id: int
+) -> tuple[int, int, dict[str, object]]:
+    """Resolve one ACTIVE strategy and its current result in one join."""
+    row = connection.execute(
+        """
+        select s.strategy_id, r.result_id, s.strategy_name, s.symbol, s.side,
+               s.timeframe, s.order_count, r.report_start_utc, r.report_end_utc
+          from strategies s
+          join strategy_results r
+            on r.result_id = s.current_result_id
+           and r.strategy_id = s.strategy_id
+         where s.strategy_id = ? and s.lifecycle_status = 'ACTIVE'
+        """,
+        [strategy_id],
+    ).fetchone()
+    if row is None:
+        raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="strategy is not available")
+    return int(row[0]), int(row[1]), {
+        "strategy_id": int(row[0]),
+        "strategy_name": str(row[2]),
+        "symbol": str(row[3]),
+        "side": str(row[4]),
+        "timeframe": str(row[5]),
+        "order_count": int(row[6]),
+        "result_id": int(row[1]),
+        "report_start_utc": row[7],
+        "report_end_utc": row[8],
+    }
+
+
+def performance_v2_catalog(connection: duckdb.DuckDBPyConnection) -> dict[str, object]:
+    """Return active strategies whose current result belongs to that strategy."""
+    rows = connection.execute(
+        """
+        select s.strategy_id, r.result_id, s.strategy_name, s.symbol, s.side,
+               s.timeframe, s.order_count, r.report_start_utc, r.report_end_utc
+          from strategies s
+          join strategy_results r
+            on r.result_id = s.current_result_id
+           and r.strategy_id = s.strategy_id
+         where s.lifecycle_status = 'ACTIVE'
+         order by s.strategy_name, s.strategy_id
+        """
+    ).fetchall()
+    keys = ("strategy_id", "result_id", "strategy_name", "symbol", "side", "timeframe", "order_count", "report_start_utc", "report_end_utc")
+    strategies = [{key: _json_value(value) for key, value in zip(keys, row)} for row in rows]
+    for strategy in strategies:
+        strategy["current_result_id"] = strategy["result_id"]
+    return {"strategies": strategies}
+
+
 def _window_document(metrics: WindowMetrics) -> dict[str, object]:
     return _json_value(asdict(metrics))  # type: ignore[return-value]
 
@@ -105,16 +213,115 @@ def _pair_document(
     strategy_id: int,
     result_id: int,
     pair: tuple[WindowMetrics, WindowMetrics],
+    *,
+    report_start_utc: datetime | None = None,
+    report_end_utc: datetime | None = None,
     compare_func: Callable[..., object] = compare_window_pair_geometrically,
 ) -> dict[str, object]:
     comparison = compare_func(pair[0], pair[1])
-    return {
+    document: dict[str, object] = {
         "strategy_id": strategy_id,
         "result_id": result_id,
         "window_a": _window_document(pair[0]),
         "window_b": _window_document(pair[1]),
         "comparison": _json_value(asdict(comparison)),
     }
+    if report_start_utc is not None:
+        document["report_start_utc"] = _canonical_utc(report_start_utc)
+    if report_end_utc is not None:
+        document["report_end_utc"] = _canonical_utc(report_end_utc)
+    return document
+
+
+def _read_persisted_window_pair(
+    database_path: Path,
+    strategy_id: int,
+    window_a: Window,
+    window_b: Window,
+) -> dict[str, object]:
+    """Read exact cache keys after a transaction conflict; never calculate."""
+    with duckdb.connect(str(database_path), read_only=True) as connection:
+        require_performance_v2(connection)
+        _, result_id, identity = resolve_active_strategy(connection, strategy_id)
+        pair = (
+            _cached(connection, result_id, window_a[0], window_a[1], METRICS_VERSION),
+            _cached(connection, result_id, window_b[0], window_b[1], METRICS_VERSION),
+        )
+        if pair[0] is None or pair[1] is None:
+            raise PerformanceV2ApiError(
+                "PERFORMANCE_V2_CACHE_CONFLICT",
+                status=409,
+                message="window cache transaction conflict",
+            )
+        return _pair_document(
+            strategy_id,
+            result_id,
+            (pair[0], pair[1]),
+            report_start_utc=identity["report_start_utc"],
+            report_end_utc=identity["report_end_utc"],
+        )
+
+
+def calculate_performance_v2_windows(
+    database_path: Path,
+    strategy_id: int,
+    window_a: Window,
+    window_b: Window,
+    *,
+    window_pair_func: Callable[..., tuple[WindowMetrics, WindowMetrics]] | None = None,
+    compare_func: Callable[..., object] | None = None,
+) -> dict[str, object]:
+    """Calculate/cache A and B in one write transaction for one active strategy."""
+    window_pair_func = window_pair_func or get_or_calculate_window_pair
+    compare_func = compare_func or compare_window_pair_geometrically
+    try:
+        connection = duckdb.connect(str(database_path), read_only=False)
+    except duckdb.IOException as error:
+        if _is_duckdb_lock_error(error):
+            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
+        raise
+    connection_open = True
+    try:
+        require_performance_v2(connection)
+        _, result_id, identity = resolve_active_strategy(connection, strategy_id)
+        try:
+            connection.execute("begin transaction")
+            pair = window_pair_func(connection, result_id, window_a, window_b)
+            connection.execute("commit")
+        except duckdb.TransactionException:
+            try:
+                connection.execute("rollback")
+            except duckdb.Error:
+                pass
+            finally:
+                connection.close()
+                connection_open = False
+            return _read_persisted_window_pair(database_path, strategy_id, window_a, window_b)
+        except duckdb.IOException as error:
+            try:
+                connection.execute("rollback")
+            except duckdb.Error:
+                pass
+            if _is_duckdb_lock_error(error):
+                raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
+            raise
+        except BaseException:
+            try:
+                connection.execute("rollback")
+            except duckdb.Error:
+                pass
+            raise
+        return _pair_document(
+            strategy_id,
+            result_id,
+            pair,
+            report_start_utc=identity["report_start_utc"],
+            report_end_utc=identity["report_end_utc"],
+            compare_func=compare_func,
+        )
+    finally:
+        if connection_open:
+            connection.close()
 
 
 def _cleanup_exact_directory(path: Path, *tail: str) -> None:
@@ -354,8 +561,12 @@ class LocalPerformanceV2Jobs:
 
 
 __all__ = [
+    "PerformanceV2ApiError",
     "LocalPerformanceV2Jobs",
     "LocalPerformanceV2Service",
     "PerformanceV2PanelRequest",
     "PerformanceV2PanelResult",
+    "calculate_performance_v2_windows",
+    "performance_v2_catalog",
+    "resolve_active_strategy",
 ]
