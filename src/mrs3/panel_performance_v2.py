@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from pathlib import Path
 import re
 import shutil
@@ -153,6 +153,87 @@ def _json_value(value: object) -> object:
     return value
 
 
+def _fixed_decimal(value: Decimal, places: int) -> str:
+    quantized = value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    if quantized.is_zero():
+        quantized = quantized.copy_abs()
+    return format(quantized, "f")
+
+
+def _normalization_30d(metrics: WindowMetrics) -> dict[str, object]:
+    """Return the duration-normalized values without changing raw metrics."""
+    start, end = metrics.effective_start_utc, metrics.effective_end_utc
+    if not isinstance(start, datetime) or not isinstance(end, datetime):
+        return {
+            "period_days": 30,
+            "status": "invalid_duration",
+            "observed_days": None,
+            "growth_factor": None,
+            "return_pct": None,
+            "trade_rate": None,
+        }
+    try:
+        elapsed = end - start
+        elapsed_microseconds = (
+            elapsed.days * 86_400_000_000
+            + elapsed.seconds * 1_000_000
+            + elapsed.microseconds
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        elapsed_microseconds = 0
+    if elapsed_microseconds <= 0:
+        return {
+            "period_days": 30,
+            "status": "invalid_duration",
+            "observed_days": None,
+            "growth_factor": None,
+            "return_pct": None,
+            "trade_rate": None,
+        }
+
+    with localcontext() as context:
+        context.prec = 34
+        context.rounding = ROUND_HALF_UP
+        observed_days = Decimal(elapsed_microseconds) / Decimal(86_400_000_000)
+        result: dict[str, object] = {
+            "period_days": 30,
+            "status": "ok" if observed_days >= 1 else "too_short",
+            "observed_days": _fixed_decimal(observed_days, 6),
+            "growth_factor": None,
+            "return_pct": None,
+            "trade_rate": None,
+        }
+        if observed_days < 1:
+            return result
+
+        try:
+            growth = metrics.growth_factor
+            if growth is None:
+                raise ValueError("missing growth factor")
+            growth = growth if isinstance(growth, Decimal) else Decimal(str(growth))
+            if not growth.is_finite() or growth < 0:
+                raise ValueError("invalid growth factor")
+            if growth == 0:
+                result["growth_factor"] = "0.00000000"
+                result["return_pct"] = "-100.0000"
+            else:
+                growth_30d = (Decimal(30) * growth.ln() / observed_days).exp()
+                if not growth_30d.is_finite() or growth_30d >= Decimal("1e18"):
+                    raise ValueError("invalid 30-day growth factor")
+                result["growth_factor"] = _fixed_decimal(growth_30d, 8)
+                result["return_pct"] = _fixed_decimal((growth_30d - 1) * 100, 4)
+        except (ArithmeticError, TypeError, ValueError):
+            pass
+
+        trade_count = metrics.trade_count
+        if isinstance(trade_count, int) and not isinstance(trade_count, bool) and trade_count >= 0:
+            try:
+                result["trade_rate"] = _fixed_decimal(Decimal(trade_count) * 30 / observed_days, 4)
+            except (ArithmeticError, TypeError, ValueError):
+                pass
+        return result
+
+
 def resolve_active_strategy(
     connection: duckdb.DuckDBPyConnection, strategy_id: int
 ) -> tuple[int, int, dict[str, object]]:
@@ -206,7 +287,9 @@ def performance_v2_catalog(connection: duckdb.DuckDBPyConnection) -> dict[str, o
 
 
 def _window_document(metrics: WindowMetrics) -> dict[str, object]:
-    return _json_value(asdict(metrics))  # type: ignore[return-value]
+    document = _json_value(asdict(metrics))  # type: ignore[assignment]
+    document["normalization_30d"] = _normalization_30d(metrics)
+    return document  # type: ignore[return-value]
 
 
 def _pair_document(

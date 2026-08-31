@@ -1530,6 +1530,10 @@
   };
 
   const performanceV2WindowSelect = document.querySelector('#performance-v2-window-strategy');
+  const performanceV2WindowCard = document.querySelector('#performance-v2-window-card');
+  const performanceV2WindowAEntire = document.querySelector('#performance-v2-window-a-entire');
+  const performanceV2WindowB2w = document.querySelector('#performance-v2-window-b-2w');
+  const performanceV2WindowB1w = document.querySelector('#performance-v2-window-b-1w');
   const performanceV2WindowRefresh = document.querySelector('#performance-v2-window-refresh');
   const performanceV2WindowCalculate = document.querySelector('#performance-v2-window-calculate');
   const performanceV2WindowStatus = document.querySelector('#performance-v2-window-status');
@@ -1554,66 +1558,123 @@
       if (input) input.value = value;
     }
   };
-  const performanceV2MetricText = (value, suffix = '') => value === null || value === undefined || value === '' ? '—' : `${value}${suffix}`;
-  const performanceV2DateText = (value) => performanceV2MetricText(value);
-  const performanceV2AppendRow = (table, label, value) => {
-    const row = document.createElement('tr');
-    const heading = document.createElement('th');
-    heading.scope = 'row';
-    heading.textContent = label;
-    const cell = document.createElement('td');
-    cell.textContent = value;
-    row.append(heading, cell);
-    table.append(row);
+  const performanceV2SelectedStrategy = () => performanceV2Strategies.find((strategy) => String(strategy.strategy_id) === performanceV2WindowSelect?.value);
+  const performanceV2SetRange = (windowName, start, end) => {
+    for (const [suffix, value] of [['start', start], ['end', end]]) {
+      const input = document.querySelector(`#performance-v2-window-${windowName}-${suffix}`);
+      if (input) input.value = performanceV2LocalValue(value instanceof Date ? value.toISOString() : value);
+    }
   };
-  const performanceV2WindowTable = (title, window) => {
-    const section = document.createElement('section');
-    const heading = document.createElement('h3');
-    heading.textContent = title;
+  const performanceV2ReportRange = () => {
+    const strategy = performanceV2SelectedStrategy();
+    if (!strategy?.report_start_utc || !strategy?.report_end_utc) {
+      if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = 'Сначала выберите стратегию из каталога.';
+      return null;
+    }
+    return [new Date(strategy.report_start_utc), new Date(strategy.report_end_utc)];
+  };
+  const performanceV2MetricText = (value, suffix = '') => value === null || value === undefined || value === '' ? '—' : `${value}${suffix}`;
+  const performanceV2RawLabel = (label) => `${label} [raw; не нормализуется по длительности]`;
+  const performanceV2MetricDefinitions = [
+    ['requested_start_utc', 'Запрошенное начало (UTC)', '', 'neutral'],
+    ['requested_end_utc', 'Запрошенный конец (UTC)', '', 'neutral'],
+    ['effective_start_utc', 'Фактическое начало (UTC)', '', 'neutral'],
+    ['effective_end_utc', 'Фактический конец (UTC)', '', 'neutral'],
+    ['availability_status', 'Доступность', '', 'neutral'],
+    ['unavailable_reason', 'Причина недоступности', '', 'neutral'],
+    ['normalization_status', 'Статус эквивалента 30 дней', '', 'normalization_status'],
+    ['observed_days', 'Наблюдаемая длительность (дни)', '', 'normalization'],
+    ['return_pct', 'Доходность — эквивалент 30 дней', '%', 'normalization'],
+    ['growth_factor', 'Фактор роста — эквивалент 30 дней', '', 'normalization'],
+    ['trade_rate', 'Темп сделок — эквивалент на 30 дней', '', 'normalization'],
+    ['growth_factor', performanceV2RawLabel('Фактор роста'), '', 'raw'],
+    ['return_pct', performanceV2RawLabel('Доходность'), '%', 'raw'],
+    ['daily_growth_pct', performanceV2RawLabel('Дневной рост'), '%', 'raw'],
+    ['max_drawdown_pct', performanceV2RawLabel('Макс. просадка'), '%', 'raw'],
+    ['return_dd_ratio', performanceV2RawLabel('Доходность / DD'), '', 'raw'],
+    ['fees_pct', performanceV2RawLabel('Комиссии'), '%', 'raw'],
+    ['profit_factor', performanceV2RawLabel('Profit Factor'), '', 'raw'],
+    ['trade_count', performanceV2RawLabel('Сделки'), '', 'raw'],
+    ['win_rate_pct', performanceV2RawLabel('Win rate'), '%', 'raw'],
+    ['holding_seconds', performanceV2RawLabel('Время удержания'), ' с', 'raw'],
+    ['time_in_market_pct', performanceV2RawLabel('Время в рынке'), '%', 'raw'],
+  ];
+  const performanceV2NormalizationStatus = (window) => {
+    const status = window?.normalization_30d?.status;
+    return status === 'ok' ? 'ok — готово'
+      : status === 'too_short' ? 'too_short — окно короче одного дня'
+      : status === 'invalid_duration' ? 'invalid_duration — некорректная длительность'
+      : '—';
+  };
+  const performanceV2NormalizationText = (window, key, suffix = '') => {
+    const normalization = window?.normalization_30d;
+    if (!normalization || (key !== 'observed_days' && normalization.status !== 'ok')) return '—';
+    return performanceV2MetricText(normalization[key], suffix);
+  };
+  const performanceV2MetricValue = (window, key, suffix, kind) => {
+    if (kind === 'normalization_status') return performanceV2NormalizationStatus(window);
+    if (kind === 'normalization') return performanceV2NormalizationText(window, key, suffix);
+    return performanceV2MetricText(window?.[key], suffix);
+  };
+  const performanceV2Change = (windowA, windowB, key, suffix, kind) => {
+    if (kind === 'neutral' || kind === 'raw' && !['return_pct', 'daily_growth_pct', 'max_drawdown_pct', 'return_dd_ratio', 'fees_pct', 'profit_factor', 'win_rate_pct'].includes(key)) return { text: '—', className: '' };
+    const value = (window) => kind === 'normalization' ? window?.normalization_30d?.[key] : window?.[key];
+    const a = Number(value(windowA));
+    const b = Number(value(windowB));
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return { text: '—', className: '' };
+    const delta = b - a;
+    if (delta === 0) return { text: '0', className: '' };
+    const lowerIsBetter = kind === 'raw' && ['max_drawdown_pct', 'fees_pct'].includes(key);
+    const className = (delta > 0) !== lowerIsBetter ? 'positive' : 'negative';
+    const text = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 4 }).format(delta);
+    return { text: `${delta > 0 ? '+' : ''}${text}${suffix === '%' ? ' п.п.' : ''}`, className };
+  };
+  const performanceV2WindowTable = (windowA, windowB) => {
     const table = document.createElement('table');
+    const head = document.createElement('thead');
+    const headerRow = document.createElement('tr');
+    for (const label of ['Наименование', 'Значение в окне A', 'Значение в окне Б', 'Изменение']) {
+      const cell = document.createElement('th');
+      cell.scope = 'col';
+      cell.textContent = label;
+      headerRow.append(cell);
+    }
+    head.append(headerRow);
     const body = document.createElement('tbody');
-    table.append(body);
-    performanceV2AppendRow(body, 'Requested start (UTC)', performanceV2DateText(window?.requested_start_utc));
-    performanceV2AppendRow(body, 'Requested end (UTC)', performanceV2DateText(window?.requested_end_utc));
-    performanceV2AppendRow(body, 'Effective start (UTC)', performanceV2DateText(window?.effective_start_utc));
-    performanceV2AppendRow(body, 'Effective end (UTC)', performanceV2DateText(window?.effective_end_utc));
-    performanceV2AppendRow(body, 'Availability', performanceV2MetricText(window?.availability_status));
-    performanceV2AppendRow(body, 'Availability reason', performanceV2MetricText(window?.unavailable_reason));
-    for (const [key, label, suffix] of [
-      ['return_pct', 'Return', '%'],
-      ['daily_growth_pct', 'Daily growth', '%'],
-      ['max_drawdown_pct', 'Max DD', '%'],
-      ['return_dd_ratio', 'Return / DD', ''],
-      ['fees_pct', 'Fees', '%'],
-      ['profit_factor', 'Profit factor', ''],
-      ['trade_count', 'Trades', ''],
-      ['win_rate_pct', 'Win rate', '%'],
-      ['holding_seconds', 'Holding time', ' s'],
-      ['time_in_market_pct', 'Time in market', '%'],
-    ]) performanceV2AppendRow(body, label, performanceV2MetricText(window?.[key], suffix));
-    section.append(heading, table);
-    return section;
+    for (const [key, label, suffix, kind] of performanceV2MetricDefinitions) {
+      const row = document.createElement('tr');
+      const heading = document.createElement('th');
+      heading.scope = 'row';
+      heading.textContent = label;
+      if (kind === 'raw') heading.classList.add('performance-v2-raw');
+      const aCell = document.createElement('td');
+      aCell.textContent = performanceV2MetricValue(windowA, key, suffix, kind);
+      const bCell = document.createElement('td');
+      bCell.textContent = performanceV2MetricValue(windowB, key, suffix, kind);
+      const changeCell = document.createElement('td');
+      const change = performanceV2Change(windowA, windowB, key, suffix, kind);
+      changeCell.textContent = change.text;
+      if (change.className) changeCell.classList.add(change.className);
+      row.append(heading, aCell, bCell, changeCell);
+      body.append(row);
+    }
+    table.append(head, body);
+    return table;
+  };
+  const performanceV2WindowCaveat = () => {
+    const caveat = document.createElement('p');
+    caveat.className = 'performance-v2-caveat';
+    caveat.textContent = 'Эквивалент 30 дней — математический эквивалент исходного окна при постоянной ставке; это не прогноз, не tick-test и не PnL MRS3.';
+    return caveat;
   };
   const renderPerformanceV2Windows = (payload) => {
     if (!performanceV2WindowResult) return;
-    performanceV2WindowResult.replaceChildren();
-    for (const [title, metricWindow] of [['Window A', payload?.window_a], ['Window B', payload?.window_b]]) {
-      if (metricWindow) performanceV2WindowResult.append(performanceV2WindowTable(title, metricWindow));
-    }
-    const comparison = payload?.comparison;
-    if (!comparison) return;
-    const section = document.createElement('section');
-    const heading = document.createElement('h3');
-    heading.textContent = 'Comparison';
-    const table = document.createElement('table');
-    const body = document.createElement('tbody');
-    table.append(body);
-    performanceV2AppendRow(body, 'Status', performanceV2MetricText(comparison.status));
-    performanceV2AppendRow(body, 'Growth factor ratio', performanceV2MetricText(comparison.growth_factor_ratio));
-    performanceV2AppendRow(body, 'Daily log return ratio', performanceV2MetricText(comparison.log_return_ratio));
-    section.append(heading, table);
-    performanceV2WindowResult.append(section);
+    performanceV2WindowResult.replaceChildren(performanceV2WindowCaveat());
+    const windowA = payload?.window_a;
+    const windowB = payload?.window_b;
+    if (windowA || windowB) performanceV2WindowResult.append(performanceV2WindowTable(windowA, windowB));
   };
+  if (performanceV2WindowResult) performanceV2WindowResult.append(performanceV2WindowCaveat());
   const loadPerformanceV2Catalog = async () => {
     if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = 'Loading Performance v2 strategies…';
     try {
@@ -1637,6 +1698,21 @@
     }
   };
   performanceV2WindowRefresh?.addEventListener('click', loadPerformanceV2Catalog);
+  performanceV2WindowCard?.addEventListener('toggle', () => {
+    if (performanceV2WindowCard.open && !performanceV2Strategies.length) loadPerformanceV2Catalog();
+  });
+  performanceV2WindowAEntire?.addEventListener('click', () => {
+    const range = performanceV2ReportRange();
+    if (range) performanceV2SetRange('a', range[0], range[1]);
+  });
+  const performanceV2SetRecentWindow = (days) => {
+    const range = performanceV2ReportRange();
+    if (!range) return;
+    const start = new Date(Math.max(range[0].getTime(), range[1].getTime() - days * 86_400_000));
+    performanceV2SetRange('b', start, range[1]);
+  };
+  performanceV2WindowB2w?.addEventListener('click', () => performanceV2SetRecentWindow(14));
+  performanceV2WindowB1w?.addEventListener('click', () => performanceV2SetRecentWindow(7));
   performanceV2WindowSelect?.addEventListener('change', () => {
     performanceV2SetWindowBounds(performanceV2Strategies.find((strategy) => String(strategy.strategy_id) === performanceV2WindowSelect.value));
   });

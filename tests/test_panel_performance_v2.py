@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from hashlib import sha256
 from http.client import HTTPConnection
+from decimal import Decimal
 import json
 from pathlib import Path
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import duckdb
 import pytest
@@ -21,12 +22,109 @@ from mrs3.panel_performance_v2 import (
     PerformanceV2ApiError,
     PerformanceV2PanelRequest,
     LocalPerformanceV2Service,
+    _normalization_30d,
+    _window_document,
     calculate_performance_v2_windows,
 )
+from mrs3.performance_v2_windows import WindowMetrics
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "performance" / "report_current_v2.html"
 UTC = timezone.utc
+
+
+def _metrics_for_normalization(
+    start: datetime,
+    end: datetime | None,
+    *,
+    growth: object = Decimal("1.1"),
+    trade_count: object = 5,
+) -> WindowMetrics:
+    return WindowMetrics(
+        1, start, start + datetime.resolution, "test", start, end, "AVAILABLE", None,
+        growth, Decimal("1.2345"), Decimal(".01"), Decimal("1.02"), Decimal("3.4"),
+        Decimal("2.3"), Decimal(".4"), Decimal("1.5"), trade_count, Decimal("50"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("days", "expected_growth", "expected_return", "expected_trade_rate"),
+    [
+        (10, "1.33100000", "33.1000", "15.0000"),
+        (30, "1.10000000", "10.0000", "5.0000"),
+        (60, "1.04880885", "4.8809", "2.5000"),
+    ],
+)
+def test_normalization_30d_uses_effective_duration(days, expected_growth, expected_return, expected_trade_rate) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    result = _normalization_30d(_metrics_for_normalization(start, start + timedelta(days=days)))
+    assert result == {
+        "period_days": 30,
+        "status": "ok",
+        "observed_days": f"{days}.000000",
+        "growth_factor": expected_growth,
+        "return_pct": expected_return,
+        "trade_rate": expected_trade_rate,
+    }
+
+
+@pytest.mark.parametrize(
+    ("end", "status", "observed_days"),
+    [
+        (datetime(2026, 1, 1, tzinfo=UTC), "invalid_duration", None),
+        (datetime(2026, 1, 1, tzinfo=UTC) + timedelta(microseconds=86_399_999_999), "too_short", "1.000000"),
+        (None, "invalid_duration", None),
+    ],
+)
+def test_normalization_30d_status_and_observed_days(end, status, observed_days) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    result = _normalization_30d(_metrics_for_normalization(start, end))
+    assert result["status"] == status
+    assert result["observed_days"] == observed_days
+    assert result["growth_factor"] is None
+    assert result["return_pct"] is None
+    assert result["trade_rate"] is None
+
+
+@pytest.mark.parametrize("growth", [None, Decimal("-1"), Decimal("NaN"), Decimal("Infinity")])
+def test_normalization_30d_bad_growth_is_null_without_affecting_trade_rate(growth) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = start + timedelta(days=30)
+    result = _normalization_30d(_metrics_for_normalization(start, end, growth=growth, trade_count=3))
+    assert result["growth_factor"] is None
+    assert result["return_pct"] is None
+    assert result["trade_rate"] == "3.0000"
+
+
+def test_normalization_30d_zero_and_overflow_growth_and_bad_trade_count() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = start + timedelta(days=30)
+    zero = _normalization_30d(_metrics_for_normalization(start, end, growth=Decimal("0"), trade_count=0))
+    assert zero["growth_factor"] == "0.00000000"
+    assert zero["return_pct"] == "-100.0000"
+    assert zero["trade_rate"] == "0.0000"
+
+    overflow = _normalization_30d(_metrics_for_normalization(start, end, growth=Decimal("1e18"), trade_count=-1))
+    assert overflow["growth_factor"] is None
+    assert overflow["return_pct"] is None
+    assert overflow["trade_rate"] is None
+
+
+def test_normalization_30d_is_additive_to_window_document() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    metrics = _metrics_for_normalization(start, start + timedelta(days=30))
+    document = _window_document(metrics)
+    assert document["growth_factor"] == "1.1"
+    assert document["return_pct"] == "1.2345"
+    assert document["trade_count"] == 5
+    assert document["normalization_30d"] == {
+        "period_days": 30,
+        "status": "ok",
+        "observed_days": "30.000000",
+        "growth_factor": "1.10000000",
+        "return_pct": "10.0000",
+        "trade_rate": "5.0000",
+    }
 
 
 def _db(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, int]:

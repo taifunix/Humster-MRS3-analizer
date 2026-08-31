@@ -937,6 +937,17 @@ strategies/results/actions/equity at `1633/1633/741189/9305765`, added one
 cache row, and measured 354 ms first calculation / 70 ms cache hit.
 Independent Opus review: `CODE_REVIEW_PASS`.
 
+Manual A/B output now keeps one four-column comparison table (metric, window A,
+window B, change), semantic delta colours, and period shortcuts.  Response
+serialization additionally derives a 30-day equivalent from each window's own
+effective timestamps without changing the stored window cache: return and
+growth factor are duration-normalized, trade rate is shown per 30 days, while
+drawdown, fees, PF and similar metrics remain explicitly raw.  Windows shorter
+than one day or with invalid duration show a status instead of a misleading
+normalized value.  Evidence: `97 passed` focused, `154 passed` panel and
+integration regression, `node --check`, `git diff --check`; reviewer:
+`CODE_REVIEW_PASS`.
+
 Native SINGLE_MODE now creates a metadata inbox that refers to the tested HTML
 and `Output\\strategies` files without copying either directory. Import stages
 and hash-verifies HTML once, parses it with the configured worker count, and

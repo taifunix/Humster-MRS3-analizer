@@ -643,6 +643,45 @@ def test_performance_v2_window_analysis_uses_native_utc_controls() -> None:
     assert "/api/v2/strategies/performance-v2/catalog" in js
     assert "/api/v2/strategies/performance-v2/windows" in js
     assert "`${value}Z`" in js
+    assert "performanceV2WindowCard?.addEventListener('toggle'" in js
+    for control in ("performance-v2-window-a-entire", "performance-v2-window-b-2w", "performance-v2-window-b-1w"):
+        assert f'id="{control}"' in html
+    assert "performanceV2SetRecentWindow(14)" in js
+    assert "performanceV2SetRecentWindow(7)" in js
+    assert "Math.max(range[0].getTime(), range[1].getTime() - days * 86_400_000)" in js
+
+
+def test_performance_v2_window_analysis_renders_server_normalization_in_one_four_column_table() -> None:
+    js = _read("app.js")
+    render = js.split("const performanceV2MetricDefinitions", 1)[1].split("const loadPerformanceV2Catalog", 1)[0]
+
+    assert render.count("document.createElement('table')") == 1
+    assert "['Наименование', 'Значение в окне A', 'Значение в окне Б', 'Изменение']" in render
+    assert "performanceV2MetricDefinitions" in render
+    assert "performanceV2Change" in render
+    assert "performanceV2Numeric" not in render
+    assert "Math.log" not in render and "Math.exp" not in render
+    assert "classList.add(change.className)" in render
+    for metric in ("observed_days", "return_pct", "growth_factor", "trade_rate"):
+        assert f"['{metric}'," in js
+    for metric in ("return_pct", "daily_growth_pct", "return_dd_ratio", "profit_factor", "win_rate_pct", "trade_count"):
+        assert f"['{metric}'," in js
+    for metric in ("max_drawdown_pct", "fees_pct", "holding_seconds", "time_in_market_pct"):
+        assert f"['{metric}'," in js
+    for label in (
+        "Статус эквивалента 30 дней", "Наблюдаемая длительность (дни)",
+        "Доходность — эквивалент 30 дней", "Фактор роста — эквивалент 30 дней",
+        "Темп сделок — эквивалент на 30 дней", "raw; не нормализуется по длительности",
+        "Запрошенное начало (UTC)", "Фактический конец (UTC)", "Причина недоступности",
+    ):
+        assert label in js
+    assert "window?.normalization_30d" in js
+    assert "status === 'ok'" in js
+    assert "status === 'too_short'" in js
+    assert "status === 'invalid_duration'" in js
+    assert "Эквивалент 30 дней — математический эквивалент исходного окна при постоянной ставке; это не прогноз, не tick-test и не PnL MRS3." in js
+    assert "batch" not in render.lower()
+    assert "rank" not in render.lower()
 
 
 def test_testing_screen_does_not_expose_remote_runner_paths() -> None:

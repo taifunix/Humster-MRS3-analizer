@@ -213,6 +213,45 @@ id plus independent A/B pairs. Every timestamp is ISO-8601 UTC with uppercase
 `Z` or `+00:00`; naive and non-UTC offsets are rejected. Responses canonicalize
 timestamps to `Z` and encode `Decimal` values as strings.
 
+The manual card may offer date shortcuts derived only from those authoritative
+report bounds: Window A "entire period" uses both bounds; Window B "last week"
+and "last two weeks" end at the report end and clamp their start to the report
+start. They only fill the existing UTC fields and never trigger a calculation.
+
+### 30-day equivalent for unequal manual windows
+
+The manual A/B response adds `normalization_30d` to each returned window. It
+is calculated on the server from the `effective_start_utc` and
+`effective_end_utc` stored in that same `WindowMetrics` row; it never uses the
+requested dates or browser time. It is additive: the raw `window_metrics`
+cache, schema and all pre-existing response fields remain unchanged.
+
+`observed_days` is the effective elapsed microseconds divided by 86,400,000,000
+as a `Decimal`. With a full-precision duration of at least one day, the server
+returns a constant-rate 30-day equivalent:
+
+```text
+growth_factor_30d = exp(30 * ln(growth_factor) / observed_days)
+return_pct_30d = 100 * (growth_factor_30d - 1)
+trade_rate_30d = trade_count * 30 / observed_days
+```
+
+The object has fixed-scale decimal strings: six places for `observed_days`,
+eight for `growth_factor`, and four for `return_pct` and `trade_rate`; rounding
+is `ROUND_HALF_UP`. `status` is `ok`, `too_short` (positive duration below one
+day) or `invalid_duration` (missing/non-positive duration). `observed_days`
+remains available for `too_short`; normalized values are then null. Invalid or
+negative growth factors, overflow, or a 30-day growth factor at least `10^18`
+make both normalized growth and return null. A zero growth factor maps to zero
+growth and `-100%` return. A bad trade count affects only `trade_rate`.
+
+Only growth/return and the trade rate are normalized. Fees stay raw because
+their current denominator is the window's opening wallet; max drawdown, profit
+factor, win rate, holding time and time in market are path- or ratio-dependent
+raw metrics. The UI must always label those rows as not duration-normalized and
+state that the 30-day values are a mathematical constant-rate equivalent of a
+source window, not a forecast, tick test or MRS3 PnL.
+
 Each interval requires `start < end`; A and B may be identical, overlapping,
 nested or disjoint. Equity samples use the closed effective interval and
 actions use `(effective_start, effective_end]`. A wholly out-of-range request
