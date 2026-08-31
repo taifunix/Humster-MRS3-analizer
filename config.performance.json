@@ -4,6 +4,14 @@
     "strategy_root": "Output/strategies",
     "workers": 16,
     "max_html_bytes": 67108864,
-    "max_actions_per_report": 1000000
+    "max_actions_per_report": 1000000,
+    "finalist_selection": {
+      "ab_final_days": 14,
+      "ab_return_floor_pct": 5,
+      "ab_return_divisor": 10,
+      "ab_win_rate_floor_pct": 58,
+      "ab_trade_rate_divisor": 7,
+      "plateau_points_pareto_pnl_multiplier": 2
+    }
   }
 }
