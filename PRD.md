@@ -196,7 +196,8 @@ backend/API currently uses its direct inbox; any future `RETEST` replacement
 handler must explicitly adopt the trusted v2 importer contract.
 
 Status: **native SINGLE_MODE handoff, v2 vertical slice and one-strategy A/B
-window analysis implemented and verified; broader v2 pipeline pending**. Native `SINGLE_MODE` creates one
+window analysis implemented and verified; finalist-selection Stage 2 specified,
+with a UI-only preview; broader v2 pipeline pending**. Native `SINGLE_MODE` creates one
 metadata-only inbox whose strategy JSON stays under trusted `Output/strategies`
 and whose current HTML stays under `tester/report/my_test`; the manifest records
 exact paths, source hashes, dates, commission and provenance. The v2 importer
@@ -219,7 +220,9 @@ Explicitly deferred from this vertical slice:
   `dates.xlsx` for every selected symbol;
 - cleanup of source paths outside the exact approved post-commit roots;
 - DD5 proxy UI and any scaled-result claim;
-- built-in filters, Pareto, selection runs/results, XLSX, and Portfolio
+- executable built-in filters, Pareto and XLSX; their stateless Stage 2
+  contract is [Performance v2 finalist selection and XLSX](docs/specs/2026-08-31-performance-v2-finalist-selection.md);
+- persisted selection runs/results, tags, discard, RETEST and Portfolio
   Optimizer input;
 - deletion of v1 runtime and storage;
 - `point_id`, arbitrary filter expressions, and portfolio simulation.

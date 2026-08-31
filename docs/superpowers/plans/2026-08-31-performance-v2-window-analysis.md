@@ -37,6 +37,15 @@ Baseline before this phase:
 4. Verify the baseline selector plus panel/v1 non-disturbance suites, perform a
    live smoke on the existing DB, and obtain `CODE_REVIEW_PASS` before commit.
 
+## Presentation follow-up (2026-08-31)
+
+The manual A/B table shows the server-provided `trade_rate_30d` as
+**«Сделок / 30д»**. Display values round to at most two decimal places, while
+the API and DuckDB retain their existing precision; holding time displays in
+minutes. The catalog also supplies the selected strategy's Pair, Side,
+Timeframe, Close MA and ordered Open MA / shift / multiplier / lot parameters
+for a read-only summary above the comparison.
+
 ## Non-goals
 
 No DD5 proxy UI, filters, Pareto, selections, XLSX, tags, discard, RETEST,

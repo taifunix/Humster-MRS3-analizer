@@ -297,16 +297,15 @@ the enabled stage order and stage parameters. Parser processes and DuckDB query
 threads use the same limit in separate phases; DuckDB publication keeps one
 writer.
 
-`selection_runs` stores the requested windows and exact pipeline config.
-`selection_results` stores one row per input strategy with selected flag, rank,
-eliminating stage, reason, cached window references, DD5 proxy, plateau summary
-and a compact stage trace. A `portfolio_optimizer_input` view exposes selected
-strategies, order parameters, analytics parameters and results for one selected
-run.
-
-One analysis produces the panel table and one workbook with summary, finalists,
-all candidates, A/B metrics, filter trace, plateau context, DD5 proxy and
-Portfolio Optimizer input sheets.
+The accepted first Stage 2 delivery is deliberately stateless: the operator
+submits the ordered built-in stages and receives one XLSX from current v2 facts.
+It retains all requested Pair + Side candidates and the per-stage trace, but it
+does not persist selection runs/results, tags, or a Portfolio Optimizer input.
+The precise Stage 2 contract is
+[Performance v2 finalist selection and XLSX](2026-08-31-performance-v2-finalist-selection.md).
+Persisted `selection_runs`/`selection_results`, panel result history and the
+Portfolio Optimizer input are Stage 3 work after the real XLSX rules are
+accepted.
 
 ## Strategy lifecycle, tags and replacement
 

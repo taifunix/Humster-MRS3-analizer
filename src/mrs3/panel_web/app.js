@@ -1538,6 +1538,7 @@
   const performanceV2WindowCalculate = document.querySelector('#performance-v2-window-calculate');
   const performanceV2WindowStatus = document.querySelector('#performance-v2-window-status');
   const performanceV2WindowResult = document.querySelector('#performance-v2-window-result');
+  const performanceV2WindowStrategyDetails = document.querySelector('#performance-v2-window-strategy-details');
   let performanceV2Strategies = [];
 
   // datetime-local has no timezone. The value is explicitly UTC in this card,
@@ -1573,7 +1574,14 @@
     }
     return [new Date(strategy.report_start_utc), new Date(strategy.report_end_utc)];
   };
-  const performanceV2MetricText = (value, suffix = '') => value === null || value === undefined || value === '' ? '—' : `${value}${suffix}`;
+  const performanceV2MetricText = (value, suffix = '') => {
+    if (value === null || value === undefined || value === '') return '—';
+    const number = Number(value);
+    const text = Number.isFinite(number)
+      ? new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(number)
+      : String(value);
+    return `${text}${suffix}`;
+  };
   const performanceV2RawLabel = (label) => `${label} [raw; не нормализуется по длительности]`;
   const performanceV2MetricDefinitions = [
     ['requested_start_utc', 'Запрошенное начало (UTC)', '', 'neutral'],
@@ -1586,7 +1594,7 @@
     ['observed_days', 'Наблюдаемая длительность (дни)', '', 'normalization'],
     ['return_pct', 'Доходность — эквивалент 30 дней', '%', 'normalization'],
     ['growth_factor', 'Фактор роста — эквивалент 30 дней', '', 'normalization'],
-    ['trade_rate', 'Темп сделок — эквивалент на 30 дней', '', 'normalization'],
+    ['trade_rate', 'Сделок / 30д', '', 'normalization'],
     ['growth_factor', performanceV2RawLabel('Фактор роста'), '', 'raw'],
     ['return_pct', performanceV2RawLabel('Доходность'), '%', 'raw'],
     ['daily_growth_pct', performanceV2RawLabel('Дневной рост'), '%', 'raw'],
@@ -1596,7 +1604,7 @@
     ['profit_factor', performanceV2RawLabel('Profit Factor'), '', 'raw'],
     ['trade_count', performanceV2RawLabel('Сделки'), '', 'raw'],
     ['win_rate_pct', performanceV2RawLabel('Win rate'), '%', 'raw'],
-    ['holding_seconds', performanceV2RawLabel('Время удержания'), ' с', 'raw'],
+    ['holding_seconds', performanceV2RawLabel('Время удержания (мин)'), ' мин', 'raw_minutes'],
     ['time_in_market_pct', performanceV2RawLabel('Время в рынке'), '%', 'raw'],
   ];
   const performanceV2NormalizationStatus = (window) => {
@@ -1614,10 +1622,16 @@
   const performanceV2MetricValue = (window, key, suffix, kind) => {
     if (kind === 'normalization_status') return performanceV2NormalizationStatus(window);
     if (kind === 'normalization') return performanceV2NormalizationText(window, key, suffix);
+    if (kind === 'raw_minutes') {
+      const value = window?.[key];
+      if (value === null || value === undefined || value === '') return '—';
+      const minutes = Number(value) / 60;
+      return Number.isFinite(minutes) ? performanceV2MetricText(minutes, suffix) : '—';
+    }
     return performanceV2MetricText(window?.[key], suffix);
   };
   const performanceV2Change = (windowA, windowB, key, suffix, kind) => {
-    if (kind === 'neutral' || kind === 'raw' && !['return_pct', 'daily_growth_pct', 'max_drawdown_pct', 'return_dd_ratio', 'fees_pct', 'profit_factor', 'win_rate_pct'].includes(key)) return { text: '—', className: '' };
+    if (kind === 'neutral' || String(kind ?? '').startsWith('raw') && !['return_pct', 'daily_growth_pct', 'max_drawdown_pct', 'return_dd_ratio', 'fees_pct', 'profit_factor', 'win_rate_pct'].includes(key)) return { text: '—', className: '' };
     const value = (window) => kind === 'normalization' ? window?.normalization_30d?.[key] : window?.[key];
     const a = Number(value(windowA));
     const b = Number(value(windowB));
@@ -1626,7 +1640,7 @@
     if (delta === 0) return { text: '0', className: '' };
     const lowerIsBetter = kind === 'raw' && ['max_drawdown_pct', 'fees_pct'].includes(key);
     const className = (delta > 0) !== lowerIsBetter ? 'positive' : 'negative';
-    const text = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 4 }).format(delta);
+    const text = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(delta);
     return { text: `${delta > 0 ? '+' : ''}${text}${suffix === '%' ? ' п.п.' : ''}`, className };
   };
   const performanceV2WindowTable = (windowA, windowB) => {
@@ -1646,7 +1660,7 @@
       const heading = document.createElement('th');
       heading.scope = 'row';
       heading.textContent = label;
-      if (kind === 'raw') heading.classList.add('performance-v2-raw');
+      if (String(kind ?? '').startsWith('raw')) heading.classList.add('performance-v2-raw');
       const aCell = document.createElement('td');
       aCell.textContent = performanceV2MetricValue(windowA, key, suffix, kind);
       const bCell = document.createElement('td');
@@ -1666,6 +1680,24 @@
     caveat.className = 'performance-v2-caveat';
     caveat.textContent = 'Эквивалент 30 дней — математический эквивалент исходного окна при постоянной ставке; это не прогноз, не tick-test и не PnL MRS3.';
     return caveat;
+  };
+  const performanceV2StrategyDetails = (strategy) => {
+    if (!performanceV2WindowStrategyDetails) return;
+    performanceV2WindowStrategyDetails.replaceChildren();
+    if (!strategy) {
+      performanceV2WindowStrategyDetails.textContent = 'Выберите стратегию, чтобы увидеть параметры.';
+      return;
+    }
+    const summary = document.createElement('p');
+    summary.textContent = [strategy.symbol, strategy.side, strategy.timeframe, `Close MA ${strategy.close_ma_len ?? '—'}`].filter(Boolean).join(' · ');
+    performanceV2WindowStrategyDetails.append(summary);
+    const orders = document.createElement('ul');
+    for (const order of strategy.orders || []) {
+      const item = document.createElement('li');
+      item.textContent = `Ордер ${order.order_id ?? '—'}: Open MA ${order.open_ma_len ?? '—'} · Shift ${order.shift_bp ?? '—'} bp · Multiplier ${performanceV2MetricText(order.open_multiplier)} · Lot x ${performanceV2MetricText(order.lot_x)}`;
+      orders.append(item);
+    }
+    if (orders.children.length) performanceV2WindowStrategyDetails.append(orders);
   };
   const renderPerformanceV2Windows = (payload) => {
     if (!performanceV2WindowResult) return;
@@ -1689,7 +1721,12 @@
         }
         performanceV2WindowSelect.value = performanceV2Strategies[0] ? String(performanceV2Strategies[0].strategy_id) : '';
       }
-      performanceV2SetWindowBounds(performanceV2Strategies[0]);
+      if (performanceV2Strategies.length) {
+        performanceV2SetWindowBounds(performanceV2Strategies[0]);
+        performanceV2StrategyDetails(performanceV2Strategies[0]);
+      } else {
+        performanceV2StrategyDetails(null);
+      }
       if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = performanceV2Strategies.length
         ? `${performanceV2Strategies.length} Performance v2 strategies loaded.`
         : 'No active Performance v2 strategies found.';
@@ -1714,7 +1751,9 @@
   performanceV2WindowB2w?.addEventListener('click', () => performanceV2SetRecentWindow(14));
   performanceV2WindowB1w?.addEventListener('click', () => performanceV2SetRecentWindow(7));
   performanceV2WindowSelect?.addEventListener('change', () => {
-    performanceV2SetWindowBounds(performanceV2Strategies.find((strategy) => String(strategy.strategy_id) === performanceV2WindowSelect.value));
+    const strategy = performanceV2Strategies.find((item) => String(item.strategy_id) === performanceV2WindowSelect.value);
+    performanceV2SetWindowBounds(strategy);
+    performanceV2StrategyDetails(strategy);
   });
   performanceV2WindowCalculate?.addEventListener('click', async () => {
     const strategyId = Number(performanceV2WindowSelect?.value || 0);
@@ -1740,6 +1779,65 @@
       if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = `Performance v2 calculation failed: ${error?.message || 'request failed'}.`;
     }
   });
+  const selectionPreviewOrder = document.querySelector('#performance-v2-selection-order');
+  const selectionPreviewStatus = document.querySelector('#performance-v2-selection-status');
+  const selectionPreviewBadge = document.querySelector('#performance-v2-selection-badge');
+  const selectionPreviewStages = selectionPreviewOrder
+    ? [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')]
+    : [];
+  let selectionPreviewDirty = false;
+
+  const renderSelectionPreviewOrder = () => {
+    if (!selectionPreviewOrder) return;
+    [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')].forEach((stage, index, stages) => {
+      const position = stage.querySelector('[data-selection-position]');
+      const up = stage.querySelector('[data-selection-move="up"]');
+      const down = stage.querySelector('[data-selection-move="down"]');
+      if (position) position.textContent = String(index + 1);
+      if (up) up.disabled = index === 0;
+      if (down) down.disabled = index === stages.length - 1;
+    });
+  };
+
+  const markSelectionPreviewDirty = () => {
+    selectionPreviewDirty = true;
+    if (selectionPreviewBadge) {
+      selectionPreviewBadge.textContent = 'CHANGED';
+      selectionPreviewBadge.classList.remove('state-pending');
+      selectionPreviewBadge.classList.add('state-ready');
+    }
+    if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Preview: изменения сохранены только на экране; расчёт не запускался.';
+  };
+
+  selectionPreviewOrder?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-selection-move]');
+    const stage = button?.closest('[data-selection-stage]');
+    if (!button || !stage) return;
+    const target = button.dataset.selectionMove === 'up'
+      ? stage.previousElementSibling
+      : stage.nextElementSibling;
+    if (!target?.matches('[data-selection-stage]')) return;
+    selectionPreviewOrder.insertBefore(stage, button.dataset.selectionMove === 'up' ? target : target.nextElementSibling);
+    renderSelectionPreviewOrder();
+    markSelectionPreviewDirty();
+  });
+
+  selectionPreviewStages.forEach((stage) => {
+    stage.querySelector('input[type="checkbox"]')?.addEventListener('change', markSelectionPreviewDirty);
+  });
+  document.querySelectorAll('[data-selection-scope]').forEach((input) => {
+    input.addEventListener('change', markSelectionPreviewDirty);
+  });
+  document.querySelectorAll('#performance-v2-selection-pair, #performance-v2-selection-side').forEach((input) => {
+    input.addEventListener('change', markSelectionPreviewDirty);
+  });
+  document.querySelector('#performance-v2-selection-xls')?.addEventListener('click', () => {
+    if (selectionPreviewStatus) selectionPreviewStatus.textContent = selectionPreviewDirty
+      ? 'Preview: XLSX расчёт пока не подключён; текущий draft не отправлен на сервер.'
+      : 'Preview: расчёт не запускался; сначала измените настройки или подключите расчёт.';
+  });
+  renderSelectionPreviewOrder();
+
   const settingsStatus = document.querySelector('#settings-status');
   const settingsPayload = () => ({ panel: {
     default_root: document.querySelector('#settings-default-root')?.value || 'static',

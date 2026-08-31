@@ -25,6 +25,7 @@ from mrs3.panel_performance_v2 import (
     _normalization_30d,
     _window_document,
     calculate_performance_v2_windows,
+    performance_v2_catalog,
 )
 from mrs3.performance_v2_windows import WindowMetrics
 
@@ -147,6 +148,16 @@ def _db(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, int]:
         [strategy_id, now, datetime(2026, 1, 5, tzinfo=UTC), now],
     ).fetchone()[0]
     connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
+    connection.execute(
+        """insert into analysis_plateaus (analysis_run_id, plateau_id, plateau_point_count, plateau_total_trades)
+           values ('run', 'P1', 12, 34)"""
+    )
+    connection.execute(
+        """insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier,
+           shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades)
+           values (?, 1, 7, 0.995, 125, 1, 'run', 'P1', 8)""",
+        [strategy_id],
+    )
     connection.executemany(
         "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
@@ -447,6 +458,11 @@ def test_v2_catalog_and_windows_http_are_typed_and_repeatable(tmp_path: Path) ->
         status, catalog = _http_json(connection, "GET", "/api/v2/strategies/performance-v2/catalog")
         assert status == 200
         assert catalog["strategies"][0]["result_id"] == result_id
+        assert catalog["strategies"][0]["close_ma_len"] == 3
+        assert catalog["strategies"][0]["orders"] == [{
+            "order_id": 1, "open_ma_len": 7, "open_multiplier": "0.995000000000",
+            "shift_bp": 125, "lot_x": "1.000000000000",
+        }]
         status, first = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/windows", payload)
         assert status == 200
         assert first["result_id"] == result_id
@@ -463,6 +479,54 @@ def test_v2_catalog_and_windows_http_are_typed_and_repeatable(tmp_path: Path) ->
         assert connection.execute("select count(*) from window_metrics").fetchone() == (2,)
         for table, count in facts.items():
             assert connection.execute(f"select count(*) from {table}").fetchone() == (count,)
+
+
+def test_v2_catalog_ignores_active_strategy_without_current_result(tmp_path: Path) -> None:
+    connection, _ = _db(tmp_path)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    orphan_id = connection.execute(
+        """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+           order_count, analysis_run_id, candidate_identity, lifecycle_status,
+           created_at_utc, updated_at_utc) values ('orphan', 'BTCUSDT', 'LONG', '1h',
+           3, 1, 'run', 'orphan', 'ACTIVE', ?, ?) returning strategy_id""",
+        [now, now],
+    ).fetchone()[0]
+    connection.execute(
+        """insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier,
+           shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades)
+           values (?, 1, 7, 0.995, 125, 1, 'run', 'P1', 8)""",
+        [orphan_id],
+    )
+
+    catalog = performance_v2_catalog(connection)
+
+    assert [strategy["strategy_name"] for strategy in catalog["strategies"]] == ["alpha"]
+
+
+def test_v2_catalog_returns_empty_orders_for_current_strategy(tmp_path: Path) -> None:
+    connection, _ = _db(tmp_path)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    strategy_id = connection.execute(
+        """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+           order_count, analysis_run_id, candidate_identity, lifecycle_status,
+           created_at_utc, updated_at_utc) values ('empty', 'BTCUSDT', 'LONG', '1h',
+           3, 1, 'run', 'empty', 'ACTIVE', ?, ?) returning strategy_id""",
+        [now, now],
+    ).fetchone()[0]
+    result_id = connection.execute(
+        """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
+           commission_rate, initial_balance, final_balance, total_pnl, total_pnl_pct,
+           max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc)
+           values (?, ?, ?, 'Bybit', .0004, 100, 110, 10, 10, 0, 0, 2, 2, ?) returning result_id""",
+        [strategy_id, now, datetime(2026, 1, 5, tzinfo=UTC), now],
+    ).fetchone()[0]
+    connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
+
+    catalog = performance_v2_catalog(connection)
+
+    assert catalog["strategies"][0]["strategy_name"] == "alpha"
+    assert catalog["strategies"][1]["strategy_name"] == "empty"
+    assert catalog["strategies"][1]["orders"] == []
 
 
 @pytest.mark.parametrize(

@@ -937,6 +937,30 @@ strategies/results/actions/equity at `1633/1633/741189/9305765`, added one
 cache row, and measured 354 ms first calculation / 70 ms cache hit.
 Independent Opus review: `CODE_REVIEW_PASS`.
 
+### Performance v2 finalist-selection Stage 2 design and UI preview (2026-08-31)
+
+The Panel now has a preview-only `6. Парето и фильтры` card: Pair + Side,
+editable stage order, enable checkboxes and a per-stage Pair + Side or Pair +
+Side + timeframe scope. The first four stages are enabled by default; the two
+plateau-points Pareto stages occupy positions 5 and 6; Near-tie ranking and the
+former global grouping block are hidden. No preview interaction calculates or
+changes the database.
+
+The selected strategy details for manual A/B analysis now show Close MA and
+ordered Open MA/shift/multiplier/lot parameters; normalized values display at
+two decimal places, trade rate is per 30 days, and holding duration is minutes.
+The v2 catalog serves this metadata. Focused evidence before this documentation
+update: `87 passed` for `tests/test_panel_static_ui.py` and
+`tests/test_panel_performance_v2.py`, `node --check src/mrs3/panel_web/app.js`,
+and a live BABAUSDT LONG catalog probe after panel restart.
+
+The accepted next implementation contract is
+`docs/specs/2026-08-31-performance-v2-finalist-selection.md`; its executable
+plan is `docs/superpowers/plans/2026-08-31-performance-v2-finalist-selection.md`.
+Stage 2 will calculate all visible built-in stages from current Performance DB
+v2 facts and download an XLSX without persisted selection runs, tags, discard
+or RETEST. Those lifecycle items are explicitly Stage 3.
+
 Manual A/B output now keeps one four-column comparison table (metric, window A,
 window B, change), semantic delta colours, and period shortcuts.  Response
 serialization additionally derives a 30-day equivalent from each window's own

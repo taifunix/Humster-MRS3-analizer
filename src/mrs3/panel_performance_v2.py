@@ -270,7 +270,7 @@ def performance_v2_catalog(connection: duckdb.DuckDBPyConnection) -> dict[str, o
     rows = connection.execute(
         """
         select s.strategy_id, r.result_id, s.strategy_name, s.symbol, s.side,
-               s.timeframe, s.order_count, r.report_start_utc, r.report_end_utc
+               s.timeframe, s.close_ma_len, s.order_count, r.report_start_utc, r.report_end_utc
           from strategies s
           join strategy_results r
             on r.result_id = s.current_result_id
@@ -279,10 +279,26 @@ def performance_v2_catalog(connection: duckdb.DuckDBPyConnection) -> dict[str, o
          order by s.strategy_name, s.strategy_id
         """
     ).fetchall()
-    keys = ("strategy_id", "result_id", "strategy_name", "symbol", "side", "timeframe", "order_count", "report_start_utc", "report_end_utc")
+    keys = ("strategy_id", "result_id", "strategy_name", "symbol", "side", "timeframe", "close_ma_len", "order_count", "report_start_utc", "report_end_utc")
     strategies = [{key: _json_value(value) for key, value in zip(keys, row)} for row in rows]
+    orders_by_strategy: dict[int, list[dict[str, object]]] = {int(strategy["strategy_id"]): [] for strategy in strategies}
+    if orders_by_strategy:
+        placeholders = ", ".join("?" for _ in orders_by_strategy)
+        order_rows = connection.execute(
+            f"""
+            select strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x
+              from strategy_orders
+             where strategy_id in ({placeholders})
+             order by strategy_id, order_id
+            """,
+            list(orders_by_strategy),
+        ).fetchall()
+        order_keys = ("order_id", "open_ma_len", "open_multiplier", "shift_bp", "lot_x")
+        for strategy_id, *values in order_rows:
+            orders_by_strategy[int(strategy_id)].append({key: _json_value(value) for key, value in zip(order_keys, values)})
     for strategy in strategies:
         strategy["current_result_id"] = strategy["result_id"]
+        strategy["orders"] = orders_by_strategy[int(strategy["strategy_id"])]
     return {"strategies": strategies}
 
 

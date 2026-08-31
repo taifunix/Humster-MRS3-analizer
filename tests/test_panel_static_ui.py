@@ -205,6 +205,56 @@ def test_performance_v2_handoff_exposes_ready_gated_controls() -> None:
     assert "Cleanup warning" in js
 
 
+def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_without_recalculation() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
+    assert 'id="performance-v2-selection-card"' in strategies
+    assert "6. Парето и фильтры" in strategies
+    expected_stage_order = [
+        "filter_holding_outlier",
+        "filter_low_trades",
+        "ab_deterioration",
+        "pareto_dd5_balanced",
+        "pareto_plateau_points_per_order",
+        "pareto_plateau_points_total",
+        "pareto_efficiency_shift",
+        "pareto_dd5_holding",
+        "pareto_dd5_close_ma",
+        "pareto_dd5_first_shift",
+        "pareto_conditional_close_ma",
+        "pareto_primary",
+        "pareto_dd5_capital",
+    ]
+    assert re.findall(r'data-selection-stage="([^"]+)"', strategies) == expected_stage_order
+    for stage_id in expected_stage_order:
+        assert f'data-selection-stage="{stage_id}"' in strategies
+    for stage_id in ("filter_holding_outlier", "filter_low_trades", "ab_deterioration", "pareto_dd5_balanced"):
+        stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
+        assert stage and '<input type="checkbox" checked>' in stage.group(1)
+    for stage_id in set(expected_stage_order) - {"filter_holding_outlier", "filter_low_trades", "ab_deterioration", "pareto_dd5_balanced"}:
+        stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
+        assert stage and '<input type="checkbox" checked>' not in stage.group(1)
+    assert "near_tie_rank" not in strategies
+    assert "data-selection-group" not in strategies
+    for stage_id in expected_stage_order[:4]:
+        stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
+        assert stage and 'data-selection-scope="pair_side"' in stage.group(1)
+    for stage_id in expected_stage_order[4:]:
+        stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
+        assert stage and 'data-selection-scope="pair_side_timeframe"' in stage.group(1)
+    assert 'id="performance-v2-selection-pair"' in strategies
+    assert 'id="performance-v2-selection-side"' in strategies
+    assert 'id="performance-v2-selection-xls"' in strategies
+    assert "Смотреть результаты в xls" in strategies
+    assert "selectionPreviewDirty" in js
+    assert "data-selection-move" in js
+    assert "selectionPreviewStages" in js
+    assert "selection_preview" not in js
+    assert "/api/v2/strategies/performance-v2/selection" not in js
+
+
 def test_analysis_start_immediately_shows_running_phase_and_elapsed_time() -> None:
     js = _read("app.js")
 
@@ -671,17 +721,42 @@ def test_performance_v2_window_analysis_renders_server_normalization_in_one_four
     for label in (
         "Статус эквивалента 30 дней", "Наблюдаемая длительность (дни)",
         "Доходность — эквивалент 30 дней", "Фактор роста — эквивалент 30 дней",
-        "Темп сделок — эквивалент на 30 дней", "raw; не нормализуется по длительности",
+        "Сделок / 30д", "Время удержания (мин)", "raw; не нормализуется по длительности",
         "Запрошенное начало (UTC)", "Фактический конец (UTC)", "Причина недоступности",
     ):
         assert label in js
+    assert "maximumFractionDigits: 2" in render
+    assert "performanceV2StrategyDetails" in js
+    assert "const minutes = Number(value) / 60;" in js
+    assert "batch" not in render.lower()
+    assert "rank" not in render.lower()
+
+
+def test_performance_v2_window_analysis_has_selected_strategy_parameters() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    render = js.split("const performanceV2MetricDefinitions", 1)[1].split("const loadPerformanceV2Catalog", 1)[0]
+
+    card = html.split('id="performance-v2-window-card"', 1)[1].split("</details>", 1)[0]
+    assert 'id="performance-v2-window-strategy-details"' in card
+    assert "strategy.close_ma_len ?? '—'" in js
     assert "window?.normalization_30d" in js
     assert "status === 'ok'" in js
     assert "status === 'too_short'" in js
+
+
+def test_performance_v2_window_analysis_keeps_missing_values_as_dash() -> None:
+    js = _read("app.js")
+
+    assert "if (kind === 'raw_minutes')" in js
+    assert "if (value === null || value === undefined || value === '') return '—';" in js
+    assert "String(kind ?? '').startsWith('raw')" in js
+    assert "order.order_id ?? '—'" in js
+    assert "order.open_ma_len ?? '—'" in js
+    assert "order.shift_bp ?? '—'" in js
+    assert "performanceV2StrategyDetails(null);" in js
     assert "status === 'invalid_duration'" in js
     assert "Эквивалент 30 дней — математический эквивалент исходного окна при постоянной ставке; это не прогноз, не tick-test и не PnL MRS3." in js
-    assert "batch" not in render.lower()
-    assert "rank" not in render.lower()
 
 
 def test_testing_screen_does_not_expose_remote_runner_paths() -> None:
