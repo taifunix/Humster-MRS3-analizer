@@ -8,6 +8,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 import pytest
+from openpyxl import load_workbook
 
 from mrs3.performance_v2_selection import (
     PerformanceV2SelectionError,
@@ -15,6 +16,8 @@ from mrs3.performance_v2_selection import (
     load_selection_candidates,
     load_selection_config,
     parse_selection_request,
+    run_selection,
+    write_selection_workbook,
 )
 from mrs3.performance_v2_store import initialize_performance_v2
 
@@ -235,3 +238,98 @@ def test_loader_leaves_incomplete_order_and_empty_candidate_facts_blank(tmp_path
     assert zero_dd["scaled_lot_sum"] is None
     assert "strategy_id" in empty.columns
     assert empty.empty
+
+
+def _selection_row(name: str, **values: object) -> dict[str, object]:
+    return {
+        "strategy_id": 1 if name == "winner" else 2,
+        "strategy_name": name,
+        "timeframe": "1h",
+        "order_count": 1,
+        "dd5_proxy": Decimal("10") if name == "winner" else Decimal("5"),
+        "first_shift_bp": 200 if name == "winner" else 100,
+        "capital_proxy": Decimal("1") if name == "winner" else Decimal("2"),
+        "capital_efficiency": Decimal("10") if name == "winner" else Decimal("2.5"),
+        "holding_p95_minutes": Decimal("10") if name == "winner" else Decimal("20"),
+        "close_ma_len": 3 if name == "winner" else 5,
+        "total_trades": 100,
+        "order_1_plateau_point_count": 20 if name == "winner" else 10,
+        "total_plateau_point_count": 20 if name == "winner" else 10,
+        **values,
+    }
+
+
+@pytest.mark.parametrize("stage_id", [
+    "pareto_dd5_balanced", "pareto_plateau_points_per_order", "pareto_plateau_points_total",
+    "pareto_efficiency_shift", "pareto_dd5_holding", "pareto_dd5_close_ma",
+    "pareto_dd5_first_shift", "pareto_primary", "pareto_dd5_capital",
+])
+def test_pareto_stages_eliminate_dominated_candidate(stage_id: str) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": stage_id, "enabled": True, "scope": "pair_side"},
+    ]})
+
+    result = run_selection(pd.DataFrame([_selection_row("winner"), _selection_row("loser")]), request)
+    result = result.set_index("strategy_name")
+
+    assert not result.loc["winner", f"eliminated_by_{stage_id}"]
+    assert result.loc["loser", f"eliminated_by_{stage_id}"]
+    assert not result.loc["loser", "finalist"]
+
+
+def test_ab_insufficient_data_does_not_eliminate() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
+    ]})
+    frame = pd.DataFrame([_selection_row("winner")])
+
+    result = run_selection(frame, request)
+
+    assert result.loc[0, "finalist"]
+    assert result.loc[0, "elimination_reason"] == "AB_NOT_EVALUATED_INSUFFICIENT_DATA"
+
+
+@pytest.mark.parametrize(("stage_id", "field", "values"), [
+    ("filter_holding_outlier", "holding_p95_minutes", [10, 10, 10, 100]),
+    ("filter_low_trades", "total_trades", [100, 100, 100, 1]),
+])
+def test_iqr_filters_eliminate_only_outlier(stage_id: str, field: str, values: list[int]) -> None:
+    rows = [_selection_row(f"row-{index}", strategy_id=index, **{field: value}) for index, value in enumerate(values)]
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": stage_id, "enabled": True, "scope": "pair_side"},
+    ]})
+
+    result = run_selection(pd.DataFrame(rows), request).set_index("strategy_name")
+
+    assert result.loc["row-3", f"eliminated_by_{stage_id}"]
+    assert result["finalist"].sum() == 3
+
+
+def test_conditional_close_ma_needs_more_than_three_survivors() -> None:
+    rows = [_selection_row(f"row-{index}", strategy_id=index, close_ma_len=3 + index,
+                           capital_efficiency=Decimal(10 - index)) for index in range(4)]
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pareto_conditional_close_ma", "enabled": True, "scope": "pair_side"},
+    ]})
+
+    result = run_selection(pd.DataFrame(rows), request)
+
+    assert result["eliminated_by_pareto_conditional_close_ma"].sum() == 3
+
+
+def test_workbook_keeps_all_candidates_and_only_one_ab_column(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row("winner"), _selection_row("loser")]), request)
+
+    path = write_selection_workbook(result, tmp_path / "finalists.xlsx")
+    book = load_workbook(path, data_only=True)
+    headers = [cell.value for cell in book["All candidates"][1]]
+
+    assert book.sheetnames == ["All candidates", "Finalists"]
+    assert headers.count("ab_pnl_change_30d_pct") == 1
+    assert sum(header.startswith("ab_") for header in headers if isinstance(header, str)) == 1
+    assert "eliminated_by_pareto_dd5_capital" in headers
+    assert book["All candidates"].max_row == 3
+    assert book["Finalists"].max_row == 2

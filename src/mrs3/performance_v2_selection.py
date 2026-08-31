@@ -13,6 +13,7 @@ import duckdb
 import pandas as pd
 
 from .performance_v2_windows import WindowMetrics, get_or_calculate_window_pair
+from .audit import write_audit_workbook
 
 StageScope = Literal["pair_side", "pair_side_timeframe"]
 
@@ -38,6 +39,8 @@ _CANDIDATE_COLUMNS = (
     "total_trades", "daily_log_return", "risk_scale", "dd5_proxy", "holding_p95_minutes",
     "ab_pnl_change_30d_pct", "first_shift_bp", "scaled_lot_sum", "capital_proxy",
     "capital_efficiency", "total_plateau_point_count",
+    "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct",
+    "ab_trade_rate_a_30d", "ab_trade_rate_b_30d",
     *(f"order_{order}_{field}" for order in range(1, 5) for field in (
         "open_ma_len", "open_multiplier", "shift_bp", "lot_x", "plateau_point_count",
     )),
@@ -221,23 +224,36 @@ def _return_30d(metrics: WindowMetrics) -> Decimal | None:
         return None
 
 
-def _ab_pnl_change_30d(
+def _trade_rate_30d(metrics: WindowMetrics) -> Decimal | None:
+    if not metrics.available or metrics.trade_count is None:
+        return None
+    start, end = metrics.effective_start_utc, metrics.effective_end_utc
+    if start is None or end is None:
+        return None
+    days = Decimal(str((end - start).total_seconds())) / Decimal(86_400)
+    return Decimal(metrics.trade_count) * 30 / days if days >= 1 else None
+
+
+def _ab_metrics(
     connection: duckdb.DuckDBPyConnection,
     result_id: int,
     report_start: datetime,
     report_end: datetime,
     config: SelectionConfig,
-) -> Decimal | None:
+) -> dict[str, Decimal | None]:
     split = report_end - timedelta(days=config.ab_final_days)
     if split <= report_start:
-        return None
+        return {key: None for key in ("ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")}
     metrics_a, metrics_b = get_or_calculate_window_pair(
         connection, result_id, (report_start, split), (split, report_end)
     )
     return_a, return_b = _return_30d(metrics_a), _return_30d(metrics_b)
-    if return_a is None or return_b is None or return_a <= 0:
-        return None
-    return (return_b / return_a - 1) * 100
+    return {
+        "ab_pnl_change_30d_pct": None if return_a is None or return_b is None or return_a <= 0 else (return_b / return_a - 1) * 100,
+        "ab_return_a_30d_pct": return_a, "ab_return_b_30d_pct": return_b,
+        "ab_win_rate_b_pct": metrics_b.win_rate_pct, "ab_trade_rate_a_30d": _trade_rate_30d(metrics_a),
+        "ab_trade_rate_b_30d": _trade_rate_30d(metrics_b),
+    }
 
 
 def load_selection_candidates(
@@ -286,7 +302,7 @@ def load_selection_candidates(
                 "total_trades": int(total_trades), "daily_log_return": daily_log,
                 "risk_scale": risk_scale, "dd5_proxy": daily_log * risk_scale if daily_log is not None and risk_scale is not None else None,
                 "holding_p95_minutes": holding_p95.get(result_id),
-                "ab_pnl_change_30d_pct": _ab_pnl_change_30d(connection, result_id, report_start, report_end, config),
+                **_ab_metrics(connection, result_id, report_start, report_end, config),
                 "first_shift_bp": None, "scaled_lot_sum": None, "capital_proxy": None,
                 "capital_efficiency": None, "total_plateau_point_count": None,
             }
@@ -321,3 +337,125 @@ def load_selection_candidates(
         if len(points) == candidate["order_count"]:
             candidate["total_plateau_point_count"] = sum(points)
     return pd.DataFrame.from_records(list(candidates.values())).reindex(columns=_CANDIDATE_COLUMNS)
+
+
+_PARETO_OBJECTIVES = {
+    "pareto_dd5_balanced": (("dd5_proxy", "first_shift_bp"), ("capital_proxy", "holding_p95_minutes", "close_ma_len")),
+    "pareto_efficiency_shift": (("capital_efficiency", "first_shift_bp"), ()),
+    "pareto_dd5_holding": (("dd5_proxy",), ("holding_p95_minutes",)),
+    "pareto_dd5_close_ma": (("dd5_proxy",), ("close_ma_len",)),
+    "pareto_dd5_first_shift": (("dd5_proxy", "first_shift_bp"), ()),
+    "pareto_conditional_close_ma": (("capital_efficiency",), ("close_ma_len",)),
+    "pareto_primary": (("dd5_proxy",), ("capital_proxy",)),
+    "pareto_dd5_capital": (("dd5_proxy",), ("capital_proxy",)),
+}
+
+
+def _present(value: object) -> bool:
+    return value is not None and not pd.isna(value)
+
+
+def _dominates(other: pd.Series, candidate: pd.Series, maximize: tuple[str, ...], minimize: tuple[str, ...]) -> bool:
+    columns = (*maximize, *minimize)
+    if any(column not in other or not _present(other[column]) or not _present(candidate[column]) for column in columns):
+        return False
+    no_worse = all(other[column] >= candidate[column] for column in maximize) and all(
+        other[column] <= candidate[column] for column in minimize
+    )
+    return no_worse and (any(other[column] > candidate[column] for column in maximize) or any(
+        other[column] < candidate[column] for column in minimize
+    ))
+
+
+def _scope_groups(frame: pd.DataFrame, scope: StageScope):
+    return frame.groupby([] if scope == "pair_side" else ["timeframe"], dropna=False, sort=False) if scope != "pair_side" else [(None, frame)]
+
+
+def _ab_eliminates(row: pd.Series, config: SelectionConfig) -> bool | None:
+    fields = ("ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")
+    if any(field not in row or not _present(row[field]) for field in fields):
+        return None
+    a, b, win_b, trades_a, trades_b = (row[field] for field in fields)
+    return (
+        b <= config.ab_return_floor_pct
+        or (a > 0 and b <= a / config.ab_return_divisor)
+        or win_b < config.ab_win_rate_floor_pct
+        or (trades_a > 0 and trades_b <= trades_a / config.ab_trade_rate_divisor)
+    )
+
+
+def run_selection(
+    candidates: pd.DataFrame, request: SelectionRequest, config: SelectionConfig = SelectionConfig()
+) -> pd.DataFrame:
+    """Apply the submitted stages in order; input candidates remain fully represented."""
+    result = candidates.copy().sort_values(["strategy_name", "strategy_id"], kind="stable").reset_index(drop=True)
+    result["finalist"] = True
+    result["elimination_reason"] = None
+    for stage in request.stages:
+        column = f"eliminated_by_{stage.id}"
+        result[column] = False
+        if not stage.enabled:
+            continue
+        survivors = result.loc[result["finalist"]]
+        for _, group in _scope_groups(survivors, stage.scope):
+            if stage.id in {"filter_holding_outlier", "filter_low_trades"}:
+                metric = "holding_p95_minutes" if stage.id == "filter_holding_outlier" else "total_trades"
+                values = pd.to_numeric(group[metric], errors="coerce").dropna()
+                if values.empty:
+                    continue
+                q1, q3 = values.quantile(.25), values.quantile(.75)
+                threshold = q3 + 1.5 * (q3 - q1) if stage.id == "filter_holding_outlier" else q1 - 1.5 * (q3 - q1)
+                failed = group[metric] > threshold if stage.id == "filter_holding_outlier" else group[metric] < threshold
+                eliminated = group.index[failed.fillna(False)]
+            elif stage.id == "ab_deterioration":
+                eliminated = []
+                for index, row in group.iterrows():
+                    decision = _ab_eliminates(row, config)
+                    if decision is None:
+                        result.at[index, "elimination_reason"] = "AB_NOT_EVALUATED_INSUFFICIENT_DATA"
+                    elif decision:
+                        eliminated.append(index)
+            else:
+                eliminated = []
+                if stage.id == "pareto_conditional_close_ma" and len(group) <= 3:
+                    continue
+                for index, candidate in group.iterrows():
+                    for other_index, other in group.iterrows():
+                        if index == other_index:
+                            continue
+                        if stage.id.startswith("pareto_plateau_points"):
+                            if other["order_count"] != candidate["order_count"] or not _present(other["dd5_proxy"]) or not _present(candidate["dd5_proxy"]):
+                                continue
+                            if other["dd5_proxy"] < candidate["dd5_proxy"] * config.plateau_points_pareto_pnl_multiplier:
+                                continue
+                            points = (tuple(f"order_{order}_plateau_point_count" for order in range(1, int(candidate["order_count"]) + 1))
+                                      if stage.id.endswith("per_order") else ("total_plateau_point_count",))
+                            if all(_present(other[column]) and _present(candidate[column]) and other[column] >= candidate[column] for column in points):
+                                eliminated.append(index); break
+                        else:
+                            maximize, minimize = _PARETO_OBJECTIVES[stage.id]
+                            if _dominates(other, candidate, maximize, minimize):
+                                eliminated.append(index); break
+            if len(eliminated):
+                result.loc[eliminated, column] = True
+                result.loc[eliminated, "finalist"] = False
+                result.loc[eliminated, "elimination_reason"] = stage.id.upper()
+    return result
+
+
+def write_selection_workbook(result: pd.DataFrame, path: Path) -> Path:
+    """Write the one disposable selection workbook; internal A/B facts stay internal."""
+    display = result.drop(columns=[
+        column for column in result.columns
+        if column.startswith("ab_") and column != "ab_pnl_change_30d_pct"
+    ], errors="ignore").copy()
+    if "ab_pnl_change_30d_pct" not in display:
+        display["ab_pnl_change_30d_pct"] = None
+    for column in display.columns:
+        if column.endswith("_id") or "count" in column or column.endswith("_bp"):
+            continue
+        display[column] = display[column].map(
+            lambda value: value.quantize(Decimal(".01")) if isinstance(value, Decimal) else value
+        )
+    finalists = display.loc[display["finalist"]].copy()
+    return write_audit_workbook({"All candidates": display, "Finalists": finalists}, Path(path))

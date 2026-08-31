@@ -1831,10 +1831,26 @@
   document.querySelectorAll('#performance-v2-selection-pair, #performance-v2-selection-side').forEach((input) => {
     input.addEventListener('change', markSelectionPreviewDirty);
   });
-  document.querySelector('#performance-v2-selection-xls')?.addEventListener('click', () => {
-    if (selectionPreviewStatus) selectionPreviewStatus.textContent = selectionPreviewDirty
-      ? 'Preview: XLSX расчёт пока не подключён; текущий draft не отправлен на сервер.'
-      : 'Preview: расчёт не запускался; сначала измените настройки или подключите расчёт.';
+  document.querySelector('#performance-v2-selection-xls')?.addEventListener('click', async () => {
+    const stages = [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')].map((stage) => ({
+      id: stage.dataset.selectionStage,
+      enabled: !!stage.querySelector('input[type="checkbox"]')?.checked,
+      scope: stage.querySelector('[data-selection-scope]')?.value,
+    }));
+    try {
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Формируем XLSX…';
+      const response = await fetch('/api/v2/strategies/performance-v2/selection', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: document.querySelector('#performance-v2-selection-pair')?.value || '', side: document.querySelector('#performance-v2-selection-side')?.value || '', stages }),
+      });
+      if (!response.ok) throw new Error((await response.json()).error?.message || 'selection failed');
+      const url = URL.createObjectURL(await response.blob());
+      Object.assign(document.createElement('a'), { href: url, download: 'performance-v2-finalists.xlsx' }).click();
+      URL.revokeObjectURL(url); selectionPreviewDirty = false;
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'XLSX сформирован и скачан.';
+    } catch (error) {
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = `XLSX не сформирован: ${error.message || 'ошибка запроса'}`;
+    }
   });
   renderSelectionPreviewOrder();
 

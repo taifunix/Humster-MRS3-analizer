@@ -330,6 +330,17 @@ def test_visible_performance_card_targets_only_v2_import_job_and_status() -> Non
     assert "refreshPerformanceCatalog();" not in v2_slice
 
 
+def test_selection_button_posts_the_current_panel_snapshot_for_xlsx() -> None:
+    panel_web = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web"
+    js = (panel_web / "app.js").read_text(encoding="utf-8")
+    handler = js.split("#performance-v2-selection-xls')?.addEventListener", 1)[1].split("renderSelectionPreviewOrder", 1)[0]
+
+    assert "/api/v2/strategies/performance-v2/selection" in handler
+    assert "data-selection-stage" in handler
+    assert "data-selection-scope" in handler
+    assert "response.blob" in handler
+
+
 def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_path: Path, monkeypatch) -> None:
     def forbidden(*_args, **_kwargs):
         raise AssertionError("v1 Performance/DD5/workbook service was called")
@@ -479,6 +490,31 @@ def test_v2_catalog_and_windows_http_are_typed_and_repeatable(tmp_path: Path) ->
         assert connection.execute("select count(*) from window_metrics").fetchone() == (2,)
         for table, count in facts.items():
             assert connection.execute(f"select count(*) from {table}").fetchone() == (count,)
+
+
+def test_selection_http_downloads_xlsx_without_selection_state(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST", "/api/v2/strategies/performance-v2/selection",
+            body=json.dumps({"symbol": "BTCUSDT", "side": "LONG", "stages": []}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = response.read()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        assert "attachment; filename=\"performance-v2-finalists-BTCUSDT-LONG.xlsx\"" == response.getheader("Content-Disposition")
+        assert body.startswith(b"PK")
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("select count(*) from information_schema.tables where table_name like 'selection_%'").fetchone() == (0,)
 
 
 def test_v2_catalog_ignores_active_strategy_without_current_result(tmp_path: Path) -> None:
