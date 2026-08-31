@@ -244,13 +244,15 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     for stage_id in expected_stage_order[4:]:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and 'data-selection-scope="pair_side_timeframe"' in stage.group(1)
-    assert 'id="performance-v2-selection-pair"' in strategies
+    assert '<select id="performance-v2-selection-pair">' in strategies
     assert 'id="performance-v2-selection-side"' in strategies
     assert 'id="performance-v2-selection-xls"' in strategies
     assert "Смотреть результаты в xls" in strategies
     assert "selectionPreviewDirty" in js
     assert "data-selection-move" in js
     assert "selectionPreviewStages" in js
+    assert "syncPerformanceV2SelectionScope" in js
+    assert "performanceV2SelectionCard?.addEventListener('toggle'" in js
     assert "selection_preview" not in js
     click_handler = js.split("#performance-v2-selection-xls')?.addEventListener", 1)[1].split("renderSelectionPreviewOrder();", 1)[0]
     dirty_handler = js.split("const markSelectionPreviewDirty", 1)[1].split("selectionPreviewOrder?.addEventListener", 1)[0]

@@ -1539,6 +1539,9 @@
   const performanceV2WindowStatus = document.querySelector('#performance-v2-window-status');
   const performanceV2WindowResult = document.querySelector('#performance-v2-window-result');
   const performanceV2WindowStrategyDetails = document.querySelector('#performance-v2-window-strategy-details');
+  const performanceV2SelectionCard = document.querySelector('#performance-v2-selection-card');
+  const performanceV2SelectionPair = document.querySelector('#performance-v2-selection-pair');
+  const performanceV2SelectionSide = document.querySelector('#performance-v2-selection-side');
   let performanceV2Strategies = [];
 
   // datetime-local has no timezone. The value is explicitly UTC in this card,
@@ -1707,11 +1710,27 @@
     if (windowA || windowB) performanceV2WindowResult.append(performanceV2WindowTable(windowA, windowB));
   };
   if (performanceV2WindowResult) performanceV2WindowResult.append(performanceV2WindowCaveat());
+  const syncPerformanceV2SelectionScope = () => {
+    if (!performanceV2SelectionPair || !performanceV2SelectionSide) return;
+    const selectedPair = performanceV2SelectionPair.value;
+    const selectedSide = performanceV2SelectionSide.value;
+    const pairs = [...new Set(performanceV2Strategies.map((strategy) => strategy.symbol).filter(Boolean))].sort();
+    performanceV2SelectionPair.replaceChildren(new Option('Выберите пару', ''));
+    for (const pair of pairs) performanceV2SelectionPair.append(new Option(pair, pair));
+    performanceV2SelectionPair.value = pairs.includes(selectedPair) ? selectedPair : '';
+    const sides = [...new Set(performanceV2Strategies
+      .filter((strategy) => !performanceV2SelectionPair.value || strategy.symbol === performanceV2SelectionPair.value)
+      .map((strategy) => strategy.side).filter(Boolean))].sort();
+    performanceV2SelectionSide.replaceChildren(new Option('Все стороны', ''));
+    for (const side of sides) performanceV2SelectionSide.append(new Option(side, side));
+    performanceV2SelectionSide.value = sides.includes(selectedSide) ? selectedSide : '';
+  };
   const loadPerformanceV2Catalog = async () => {
     if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = 'Loading Performance v2 strategies…';
     try {
       const result = await requestJson('/api/v2/strategies/performance-v2/catalog');
       performanceV2Strategies = Array.isArray(result.strategies) ? result.strategies : [];
+      syncPerformanceV2SelectionScope();
       if (performanceV2WindowSelect) {
         performanceV2WindowSelect.replaceChildren(new Option('Select a strategy', ''));
         for (const strategy of performanceV2Strategies) {
@@ -1737,6 +1756,9 @@
   performanceV2WindowRefresh?.addEventListener('click', loadPerformanceV2Catalog);
   performanceV2WindowCard?.addEventListener('toggle', () => {
     if (performanceV2WindowCard.open && !performanceV2Strategies.length) loadPerformanceV2Catalog();
+  });
+  performanceV2SelectionCard?.addEventListener('toggle', () => {
+    if (performanceV2SelectionCard.open && !performanceV2Strategies.length) loadPerformanceV2Catalog();
   });
   performanceV2WindowAEntire?.addEventListener('click', () => {
     const range = performanceV2ReportRange();
@@ -1828,8 +1850,12 @@
   document.querySelectorAll('[data-selection-scope]').forEach((input) => {
     input.addEventListener('change', markSelectionPreviewDirty);
   });
-  document.querySelectorAll('#performance-v2-selection-pair, #performance-v2-selection-side').forEach((input) => {
-    input.addEventListener('change', markSelectionPreviewDirty);
+  performanceV2SelectionPair?.addEventListener('change', () => {
+    syncPerformanceV2SelectionScope();
+    markSelectionPreviewDirty();
+  });
+  performanceV2SelectionSide?.addEventListener('change', () => {
+    markSelectionPreviewDirty();
   });
   document.querySelector('#performance-v2-selection-xls')?.addEventListener('click', async () => {
     const stages = [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')].map((stage) => ({
