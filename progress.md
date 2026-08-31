@@ -937,6 +937,36 @@ strategies/results/actions/equity at `1633/1633/741189/9305765`, added one
 cache row, and measured 354 ms first calculation / 70 ms cache hit.
 Independent Opus review: `CODE_REVIEW_PASS`.
 
+### Performance v2 finalist-selection Stage 2 executable export (2026-08-31)
+
+The preview is now executable. On `Смотреть результаты в xls`, the Panel sends
+the current Pair + Side, checkbox state, stage order and per-stage scope to the
+local v2 endpoint. It reads only ACTIVE current Performance DB v2 rows,
+derives DD5_PROXY calculation facts, holding p95, ordered plateau point counts
+and default A/B facts, then applies the 13 closed built-in filters/Pareto stages
+strictly in submitted order. `pair_side_timeframe` splits comparisons by
+timeframe; missing facts never eliminate or dominate; unavailable A/B records
+remain finalists with `AB_NOT_EVALUATED_INSUFFICIENT_DATA`.
+
+The endpoint returns one in-memory attachment with `All candidates` and
+`Finalists` sheets. Both retain a single exported A/B field
+`ab_pnl_change_30d_pct`; all other A/B support fields remain internal. The
+workbook retains every requested Pair + Side candidate, ordered plateau facts,
+per-stage booleans, finalist flag and elimination reason. The run writes no
+`selection_*` tables, tags, lifecycle state, discard, RETEST or history; those
+remain Stage 3.
+
+Focused acceptance evidence: `126 passed` for
+`tests/test_performance_v2_selection.py`,
+`tests/test_panel_performance_v2.py` and `tests/test_panel_static_ui.py`, plus
+`node --check src/mrs3/panel_web/app.js` and `git diff --check`. The HTTP test
+proves a `POST /api/v2/strategies/performance-v2/selection` returns an XLSX
+attachment and leaves no selection tables. Independent Opus review:
+`CODE_REVIEW_PASS`. Full suite evidence: `2023 passed, 2 skipped` plus seven
+local-testing cases that initially lacked the ignored local `Input/` templates
+in this worktree; the same seven passed after a local ignored junction exposed
+the existing templates (`7 passed`).
+
 ### Performance v2 finalist-selection Stage 2 design and UI preview (2026-08-31)
 
 The Panel now has a preview-only `6. Парето и фильтры` card: Pair + Side,

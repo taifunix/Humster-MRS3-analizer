@@ -252,7 +252,10 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "data-selection-move" in js
     assert "selectionPreviewStages" in js
     assert "selection_preview" not in js
-    assert "/api/v2/strategies/performance-v2/selection" not in js
+    click_handler = js.split("#performance-v2-selection-xls')?.addEventListener", 1)[1].split("renderSelectionPreviewOrder();", 1)[0]
+    dirty_handler = js.split("const markSelectionPreviewDirty", 1)[1].split("selectionPreviewOrder?.addEventListener", 1)[0]
+    assert "fetch('/api/v2/strategies/performance-v2/selection'" in click_handler
+    assert "fetch(" not in dirty_handler
 
 
 def test_analysis_start_immediately_shows_running_phase_and_elapsed_time() -> None:

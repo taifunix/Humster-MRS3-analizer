@@ -10,6 +10,10 @@
 
 **Spec:** `docs/specs/2026-08-31-performance-v2-finalist-selection.md`
 
+**Status (2026-08-31):** Implemented in `ea83d75`, `bc92ee3` and `9aec1b5`.
+Focused acceptance tests, static UI syntax check and independent final review
+passed; Stage 3 persistence remains deliberately deferred.
+
 ## Global constraints
 
 - Read only ACTIVE current Performance DB v2 facts; never v1, HTML, CSV or Analysis DB lineage.

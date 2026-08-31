@@ -333,3 +333,66 @@ def test_workbook_keeps_all_candidates_and_only_one_ab_column(tmp_path: Path) ->
     assert "eliminated_by_pareto_dd5_capital" in headers
     assert book["All candidates"].max_row == 3
     assert book["Finalists"].max_row == 2
+
+
+def test_scope_timeframe_prevents_cross_timeframe_pareto_comparison() -> None:
+    frame = pd.DataFrame([
+        _selection_row("winner", timeframe="1h"),
+        _selection_row("loser", timeframe="3h"),
+    ])
+    pair_side = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side"},
+    ]})
+    timeframe = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side_timeframe"},
+    ]})
+
+    all_scope = run_selection(frame, pair_side).set_index("strategy_name")
+    split_scope = run_selection(frame, timeframe).set_index("strategy_name")
+
+    assert not all_scope.loc["loser", "finalist"]
+    assert split_scope["finalist"].all()
+
+
+def test_stage_order_changes_survivors_and_keeps_first_elimination_trace() -> None:
+    failing_dominator = _selection_row(
+        "a", dd5_proxy=Decimal("10"), capital_proxy=Decimal("1"), ab_return_a_30d_pct=Decimal("10"), ab_return_b_30d_pct=Decimal("4"),
+        ab_win_rate_b_pct=Decimal("60"), ab_trade_rate_a_30d=Decimal("10"), ab_trade_rate_b_30d=Decimal("10"),
+    )
+    passing_dominated = _selection_row(
+        "b", strategy_id=3, dd5_proxy=Decimal("5"), capital_proxy=Decimal("2"),
+        ab_return_a_30d_pct=Decimal("10"), ab_return_b_30d_pct=Decimal("10"),
+        ab_win_rate_b_pct=Decimal("60"), ab_trade_rate_a_30d=Decimal("10"), ab_trade_rate_b_30d=Decimal("10"),
+    )
+    ab_first = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
+        {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side"},
+    ]})
+    pareto_first = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": stage.id, "enabled": stage.enabled, "scope": stage.scope}
+        for stage in reversed(ab_first.stages)
+    ]})
+
+    first = run_selection(pd.DataFrame([failing_dominator, passing_dominated]), ab_first).set_index("strategy_name")
+    second = run_selection(pd.DataFrame([failing_dominator, passing_dominated]), pareto_first).set_index("strategy_name")
+
+    assert first.index[first["finalist"]].tolist() == ["b"]
+    assert second.index[second["finalist"]].tolist() == []
+    assert first.loc["a", "eliminated_by_ab_deterioration"]
+    assert not first.loc["a", "eliminated_by_pareto_dd5_capital"]
+    assert second.loc["b", "eliminated_by_pareto_dd5_capital"]
+    assert not second.loc["b", "eliminated_by_ab_deterioration"]
+    assert second.loc["a", "eliminated_by_ab_deterioration"]
+    assert not second.loc["a", "eliminated_by_pareto_dd5_capital"]
+
+
+def test_missing_pareto_objective_neither_dominates_nor_is_eliminated() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _selection_row("missing", capital_proxy=None), _selection_row("complete"),
+    ]), request)
+
+    assert result["finalist"].all()
+    assert not result["eliminated_by_pareto_dd5_capital"].any()

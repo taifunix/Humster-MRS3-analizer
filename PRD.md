@@ -195,9 +195,9 @@ panel/XLSX finalists and Portfolio Optimizer input. The active native
 backend/API currently uses its direct inbox; any future `RETEST` replacement
 handler must explicitly adopt the trusted v2 importer contract.
 
-Status: **native SINGLE_MODE handoff, v2 vertical slice and one-strategy A/B
-window analysis implemented and verified; finalist-selection Stage 2 specified,
-with a UI-only preview; broader v2 pipeline pending**. Native `SINGLE_MODE` creates one
+Status: **native SINGLE_MODE handoff, v2 vertical slice, one-strategy A/B
+window analysis and stateless finalist-selection Stage 2 implemented and verified;
+broader v2 pipeline pending**. Native `SINGLE_MODE` creates one
 metadata-only inbox whose strategy JSON stays under trusted `Output/strategies`
 and whose current HTML stays under `tester/report/my_test`; the manifest records
 exact paths, source hashes, dates, commission and provenance. The v2 importer
@@ -220,8 +220,6 @@ Explicitly deferred from this vertical slice:
   `dates.xlsx` for every selected symbol;
 - cleanup of source paths outside the exact approved post-commit roots;
 - DD5 proxy UI and any scaled-result claim;
-- executable built-in filters, Pareto and XLSX; their stateless Stage 2
-  contract is [Performance v2 finalist selection and XLSX](docs/specs/2026-08-31-performance-v2-finalist-selection.md);
 - persisted selection runs/results, tags, discard, RETEST and Portfolio
   Optimizer input;
 - deletion of v1 runtime and storage;
@@ -229,10 +227,12 @@ Explicitly deferred from this vertical slice:
 
 The delivered A/B panel is intentionally limited to one ACTIVE strategy at a
 time. It resolves the authoritative current result server-side, accepts two
-strict UTC windows, and writes only the versioned `window_metrics` cache.
-Batch analytics, filters/Pareto, selections, XLSX, tags/discard, RETEST,
-Portfolio input, DD5 proxy UI, Runs UI and Fast/legacy behavior remain
-deferred.
+strict UTC windows, and writes only the versioned `window_metrics` cache. The
+finalist Stage 2 button reads current ACTIVE v2 candidates for one selected
+Pair + Side, applies its submitted 13 built-in stages in UI order and returns a
+disposable XLSX; it creates no selection state. Batch analytics beyond this,
+tags/discard, RETEST, Portfolio input, DD5 proxy UI, Runs UI and Fast/legacy
+behavior remain deferred.
 
 This status does not claim a completed MRS3 strategy, a tick-test result, a DD5
 result, or a portfolio result; source metrics remain source analytics until the
