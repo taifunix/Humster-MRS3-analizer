@@ -47,10 +47,9 @@ def test_parser_accepts_only_the_current_typed_layout() -> None:
     [
         (b"<th>Post Size</th>", b"", "Post Size"),
         (b"<th>Post Side</th>", b"", "Post Side"),
-        (b"<th>Post Side</th>", b"<th>Post Side</th><th>Unexpected</th>", "exact"),
     ],
 )
-def test_parser_requires_exact_current_action_header(
+def test_parser_requires_required_current_action_headers(
     needle: bytes, replacement: bytes, message: str
 ) -> None:
     source = _current().replace(needle, replacement, 1)
@@ -58,10 +57,31 @@ def test_parser_requires_exact_current_action_header(
         parse_current_performance_v2_html(source, _limits())
 
 
+def test_parser_accepts_current_action_table_with_extra_columns() -> None:
+    source = _current().replace(
+        b"<th>Post Side</th>", b"<th>Post Side</th><th>Side</th><th>Price</th><th>Cost</th>", 1
+    )
+    source = source.replace(
+        b"<td>long</td></tr>", b"<td>long</td><td>buy</td><td>1</td><td>1</td></tr>", 1
+    )
+    source = source.replace(
+        b"<td></td></tr>", b"<td></td><td>sell</td><td>1</td><td>1</td></tr>", 1
+    )
+
+    assert parse_current_performance_v2_html(source, _limits()).actions[0].order_id == 1
+
+
+def test_parser_does_not_treat_report_order_id_as_strategy_order_slot() -> None:
+    source = _current().replace(b"<td>1</td><td>opened</td>", b"<td>2</td><td>opened</td>", 1)
+    source = source.replace(b"<td>1</td><td>closed</td>", b"<td>2</td><td>closed</td>", 1)
+
+    assert parse_current_performance_v2_html(source, _limits()).actions[0].order_id == 2
+
+
 def test_parser_rejects_legacy_layout_even_when_v1_accepts_it() -> None:
     source = (FIXTURES / "report_import.html").read_bytes()
     parse_performance_report(source)
-    with pytest.raises(PerformanceV2HtmlError, match="exact current action header"):
+    with pytest.raises(PerformanceV2HtmlError, match="required current action header"):
         parse_current_performance_v2_html(source, _limits())
 
 
@@ -73,7 +93,6 @@ def test_parser_rejects_legacy_layout_even_when_v1_accepts_it() -> None:
         (b"<td>999.95</td><td>1</td><td>1</td><td>long</td>", b"<td>999.95</td><td>1</td><td>-1</td><td>long</td>", "Post Size.*negative"),
         (b"<td>1</td><td>long</td>", b"<td>1</td><td></td>", "Post Side"),
         (b"<td>ONUSDT</td><td>1</td>", b"<td>BTCUSDT</td><td>1</td>", "symbol"),
-        (b"<td>ONUSDT</td><td>1</td>", b"<td>ONUSDT</td><td>2</td>", "order"),
     ],
 )
 def test_parser_rejects_invalid_typed_action_fields(

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+import mrs3.performance_v2_import as import_module
 
 from mrs3.performance_v2_import import (
     PerformanceV2ImportError,
@@ -164,6 +165,29 @@ def _rewrite_report(request: PerformanceV2ImportRequest, replacement: bytes) -> 
     manifest_path.write_text(json.dumps(manifest))
 
 
+def test_append_rows_uses_duckdb_native_dataframe_append() -> None:
+    class AppendOnlyConnection:
+        def __init__(self) -> None:
+            self.connection = duckdb.connect(":memory:")
+            self.connection.execute("create table rows_to_append (id integer, amount decimal(38, 12))")
+
+        def append(self, table: str, frame) -> None:
+            self.connection.append(table, frame)
+
+        def executemany(self, *_args: object) -> None:
+            raise AssertionError("large report rows must not use executemany")
+
+    connection = AppendOnlyConnection()
+    import_module._append_rows(
+        connection, "rows_to_append", ("id", "amount"), [(1, Decimal("1.25")), (2, Decimal("2.50"))]
+    )
+
+    assert connection.connection.execute("select * from rows_to_append order by id").fetchall() == [
+        (1, Decimal("1.250000000000")),
+        (2, Decimal("2.500000000000")),
+    ]
+
+
 def test_add_publishes_multiple_strategies_and_one_current_result_each(tmp_path: Path) -> None:
     request, snapshot = _request(tmp_path, names=("alpha", "beta"), orders=2)
     inbox_bytes = (request.inbox / "inbox_manifest.json").read_bytes()
@@ -181,6 +205,29 @@ def test_add_publishes_multiple_strategies_and_one_current_result_each(tmp_path:
         assert connection.execute("select count(*) from strategies where current_result_id is not null").fetchone() == (2,)
     assert (request.inbox / "inbox_manifest.json").read_bytes() == inbox_bytes
     assert snapshot
+
+
+def test_import_reports_parse_progress_for_each_completed_report(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    events: list[tuple[str, int, int]] = []
+
+    import_performance_v2(
+        request,
+        progress=lambda stage, completed, total: events.append((stage, completed, total)),
+    )
+
+    assert events[0] == ("PARSING", 0, 2)
+    assert [completed for stage, completed, total in events if stage == "PARSING"] == [0, 1, 2]
+    assert events[-1] == ("PUBLISHING", 2, 2)
+
+
+def test_add_accepts_tester_report_order_ids_outside_mrs3_order_slots(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    report = FIXTURE.read_bytes().replace(b"<td>1</td><td>opened</td>", b"<td>2</td><td>opened</td>", 1)
+    report = report.replace(b"<td>1</td><td>closed</td>", b"<td>2</td><td>closed</td>", 1)
+    _rewrite_report(request, report)
+
+    assert import_performance_v2(request).imported_count == 1
 
 
 def test_identical_current_payload_is_skipped_and_changed_add_is_rejected(tmp_path: Path) -> None:

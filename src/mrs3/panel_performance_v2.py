@@ -179,6 +179,10 @@ class LocalPerformanceV2Service:
             raise ValueError("v2 import mode must be ADD or REPLACE")
         if progress is not None:
             progress({"stage": "IMPORTING", "completed": 0, "total": 0})
+        def import_progress(stage: str, completed: int, total: int) -> None:
+            if progress is not None:
+                progress({"stage": stage, "completed": completed, "total": total})
+
         imported = self.import_func(
             PerformanceV2ImportRequest(
                 request.inbox,
@@ -187,12 +191,12 @@ class LocalPerformanceV2Service:
                 mode=request.mode,
                 replacement_strategy_ids=request.replacement_strategy_ids,
                 strategy_root=request.strategy_root,
-            )
+            ),
+            progress=import_progress,
         )
         if not imported.committed or imported.database_path is None:
             raise ValueError("Performance v2 import did not commit")
         target = Path(imported.database_path).resolve()
-        windows: list[dict[str, object]] = []
         with duckdb.connect(str(target), read_only=False) as connection:
             require_performance_v2(connection)
             counts = {
@@ -201,15 +205,6 @@ class LocalPerformanceV2Service:
                 "plateau_count": int(connection.execute("select count(*) from analysis_plateaus").fetchone()[0]),
                 "result_count": int(connection.execute("select count(*) from strategy_results").fetchone()[0]),
             }
-            current = connection.execute(
-                "select strategy_id, current_result_id from strategies "
-                "where current_result_id is not null order by strategy_id"
-            ).fetchall()
-            for strategy_id, result_id in current:
-                pair = self._window_pair(connection, int(result_id), request)
-                if pair is None:
-                    continue
-                windows.append(_pair_document(int(strategy_id), int(result_id), pair, self.compare_func))
             if progress is not None:
                 progress({
                     "stage": "READBACK_VERIFIED",
@@ -233,7 +228,7 @@ class LocalPerformanceV2Service:
             imported.rejected_count,
             target,
             imported.audit_path,
-            windows=tuple(windows),
+            windows=(),
             cleanup_warning=cleanup_warning,
             **counts,
         )

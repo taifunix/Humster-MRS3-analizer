@@ -23,7 +23,7 @@ substitution outside that root, and symlink/reparse escapes remain rejected.
 - Source inboxes are read-only during import. After a successful v2 DB commit, only the exact tester report and `Output/strategies` directories may be cleared; inbox metadata and v2 audit remain provenance.
 - The only v2 database is `<v2-owned-root>/strategy_performance.duckdb`; it has one writer.
 - Expensive report parsing uses the configured `unified_performance_v2.workers`, default 16, clamp 1..64. Workers never open DuckDB or write files.
-- Only current HTML reports are accepted. The exact action header tuple is `Timestamp, Symbol, Order ID, Action, Fee, PnL, Balance, Size, Post Size, Post Side`.
+- Only current HTML reports are accepted. Their action table must contain `Timestamp, Symbol, Order ID, Action, Fee, PnL, Balance, Size, Post Size, Post Side`; harmless additional tester columns and column order are accepted.
 - UPNL is mandatory; cross-window objectives are relative/geometric. DD5, tags, discard, RETEST, filters, Pareto, XLSX, Portfolio view and `point_id` are out of this slice.
 - Run tests only with `.venv\Scripts\python.exe -m pytest`.
 
@@ -201,11 +201,11 @@ substitution outside that root, and symlink/reparse escapes remain rejected.
 
 - [ ] **Step 1: Write parser tests first.**
 
-  Test exact header acceptance, missing `Post Size`, missing `Post Side`, extra header, legacy layout accepted by v1 but rejected by v2, non-integer Order ID, non-finite values, negative Post Size, empty Post Side with non-zero Post Size, action limit, symbol/order mismatch, and `use_upnl=false`.
+  Test required-header acceptance with extra tester columns, missing `Post Size`, missing `Post Side`, legacy layout accepted by v1 but rejected by v2, non-integer Order ID, non-finite values, negative Post Size, empty Post Side with non-zero Post Size, action limit, symbol mismatch, and `use_upnl=false`.
 
 - [ ] **Step 2: Implement a v2-owned parser boundary.**
 
-  Exact header equality is required. Coerce UTC timestamps, finite `Decimal` values and integer order IDs in v2. Existing `parse_performance_report` may be called only as a read-only helper for lossless inventory/series; do not edit v1 when it lacks a v2 field.
+  Require the named action fields, while allowing other tester columns and their order. Coerce UTC timestamps, finite `Decimal` values and positive integer report Order IDs in v2. Existing `parse_performance_report` may be called only as a read-only helper for lossless inventory/series; do not edit v1 when it lacks a v2 field.
 
 - [ ] **Step 3: Protect worker purity.**
 

@@ -2212,7 +2212,7 @@ class PanelController:
         except Exception:
             return
         for job in self._panel_jobs.list():
-            if job.get("kind") not in {"strategies.tester", "strategies.tester.start", "strategies.tester.runs"}:
+            if job.get("kind") not in {"strategies.tester", "strategies.tester.start", "strategies.tester.native.start", "strategies.tester.runs"}:
                 continue
             job_id = job.get("job_id")
             if not isinstance(job_id, str):
@@ -2222,7 +2222,7 @@ class PanelController:
                     runtime = self._panel_jobs.runtime(job_id)
                     inbox = Path(runtime["inbox_path"]).resolve()
                     inbox.relative_to(inbox_root)
-                    is_single_mode = job.get("kind") == "strategies.tester.start"
+                    is_single_mode = job.get("kind") in {"strategies.tester.start", "strategies.tester.native.start"}
                     if is_single_mode:
                         self._validate_metadata_inbox(inbox)
                     else:
@@ -2271,7 +2271,7 @@ class PanelController:
         except Exception:
             return
         for job in self._panel_jobs.list():
-            if job.get("kind") not in {"strategies.tester", "strategies.tester.start"} or job.get("error") != {"code": "INTERRUPTED"}:
+            if job.get("kind") not in {"strategies.tester", "strategies.tester.start", "strategies.tester.native.start"} or job.get("error") != {"code": "INTERRUPTED"}:
                 continue
             job_id = job.get("job_id")
             if not isinstance(job_id, str):
@@ -2663,7 +2663,7 @@ class PanelController:
 
     def strategies_tester_status(self, job_id: str) -> dict[str, object]:
         tracked = self._panel_jobs.get(job_id)
-        if tracked.get("kind") == "strategies.tester.start":
+        if tracked.get("kind") in {"strategies.tester.start", "strategies.tester.native.start"}:
             status = self._single_mode_strategy_test().status
         elif tracked.get("kind") == "strategies.tester.runs":
             status = self._runs_batch().status
@@ -2679,10 +2679,14 @@ class PanelController:
         config = RunnerConfig.from_json(self.default_config)
         inbox_root = Path(config.inbox_root).resolve()
         tracked = self._panel_jobs.get(job_id)
-        is_single_mode = tracked.get("kind") == "strategies.tester.start"
+        is_single_mode = tracked.get("kind") in {"strategies.tester.start", "strategies.tester.native.start"}
         if is_single_mode:
             service = self._single_mode_strategy_test()
-            inbox = service.capture_inbox(job_id)
+            inbox = (
+                service.capture_inbox(job_id, force_single_mode=True)
+                if tracked.get("kind") == "strategies.tester.native.start"
+                else service.capture_inbox(job_id)
+            )
             service.mark_inbox_ready(job_id, inbox)
             self._strategy_batch_inboxes[job_id] = inbox
             runtime = {"inbox_path": str(inbox)}
@@ -2875,7 +2879,7 @@ class PanelController:
         performance_config = self._performance_v2_config()
         request = PerformanceV2PanelRequest(
             inbox=self._tester_inbox(tester_job_id),
-            report_root=self._panel_path("tester_report_dir"),
+            report_root=RunnerConfig.from_json(self.default_config).report_dir,
             config=performance_config,
             mode=mode,
             replacement_strategy_ids=replacement,

@@ -627,13 +627,14 @@ def read_performance_v2_inbox(
             if not report_path.is_file() or _is_reparse(report_path):
                 raise PerformanceV2InputError("report path is not a regular file")
             strategy_bytes = strategy_path.read_bytes()
-            report_bytes = report_path.read_bytes()
-            if len(report_bytes) > limit:
+            try:
+                report_size = report_path.stat().st_size
+            except OSError as error:
+                raise PerformanceV2InputError("report path is not a regular file") from error
+            if report_size > limit:
                 raise PerformanceV2InputError("HTML report exceeds configured size limit")
             if _sha256(strategy_bytes) != raw["source_strategy_sha256"]:
                 raise PerformanceV2InputError("source strategy hash mismatch")
-            if _sha256(report_bytes) != raw["source_report_sha256"]:
-                raise PerformanceV2InputError("source report hash mismatch")
             try:
                 strategy = json.loads(strategy_bytes.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -807,7 +808,6 @@ def create_v2_parser_staging(v2_root: Path | object, prepared: PreparedV2Input) 
         for entry in prepared.entries:
             if entry.strategy_path.name != f"{entry.strategy_name}.json":
                 raise PerformanceV2InputError("strategy filename does not match strategy name")
-            _copy_verified(entry.strategy_path, staging / "strategies" / entry.strategy_path.name, entry.strategy_sha256, "strategy")
             _copy_verified(entry.report_path, staging / "reports" / entry.report_path.name, entry.report_sha256, "HTML report", prepared.max_html_bytes)
         return staging
     except BaseException:

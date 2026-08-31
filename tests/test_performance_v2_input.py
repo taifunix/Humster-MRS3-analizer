@@ -193,6 +193,19 @@ def test_trust_boundary_and_size_are_checked_before_staging(tmp_path: Path) -> N
         read_performance_v2_inbox(inbox, report_root, max_html_bytes=2)
 
 
+def test_report_hash_is_verified_during_staging_without_a_pre_staging_read(tmp_path: Path) -> None:
+    inbox, report_root = _inbox(tmp_path, orders=1)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"][0]["source_report_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    prepared = read_performance_v2_inbox(inbox, report_root)
+
+    with pytest.raises(PerformanceV2InputError, match="changed during staging"):
+        create_v2_parser_staging(tmp_path / "v2", prepared)
+
+
 def test_staging_is_fresh_bounded_and_removed(tmp_path: Path) -> None:
     inbox, report_root = _inbox(tmp_path, orders=1)
     prepared = read_performance_v2_inbox(inbox, report_root)
@@ -200,7 +213,7 @@ def test_staging_is_fresh_bounded_and_removed(tmp_path: Path) -> None:
     staging = create_v2_parser_staging(root, prepared)
     assert staging.parent == root / ".staging"
     assert (staging / ".v2-staging-owner").is_file()
-    assert (staging / "strategies" / "BTC-demo.json").is_file()
+    assert not (staging / "strategies").exists()
     assert (staging / "reports" / "BTC-demo.html").is_file()
     assert staging != create_v2_parser_staging(root, prepared)
     remove_v2_parser_staging(staging)

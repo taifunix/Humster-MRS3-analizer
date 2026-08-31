@@ -718,7 +718,7 @@ class LocalFastStrategyTestService:
             state="COMMITTED", phase="COMMITTED", single_mode=document.get("mode") == "SINGLE_MODE",
         )
 
-    def capture_inbox(self, job_id: str) -> Path:
+    def capture_inbox(self, job_id: str, *, force_single_mode: bool = False) -> Path:
         with self._lock:
             job = self._jobs.get(job_id)
         if job is None:
@@ -727,6 +727,8 @@ class LocalFastStrategyTestService:
                 raise FastStrategyTestError("Fast TEST has no completed reports")
             with self._lock:
                 self._jobs.setdefault(job_id, job)
+        if force_single_mode:
+            job.single_mode = True
         if job.phase not in {"RUNNING", "COMMITTED", "CAPTURING_INBOX", "INBOX_CREATION"} or set(job.verified_reports) != set(job.expected_names):
             raise FastStrategyTestError("Fast TEST reports are incomplete")
         inbox_root = self.config.inbox_root.resolve()

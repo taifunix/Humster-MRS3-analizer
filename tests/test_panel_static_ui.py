@@ -581,6 +581,8 @@ def test_reload_recovers_only_server_job_snapshots() -> None:
     recovery = js.split("const recoverJobs = async", 1)[1].split("const settingsStatus", 1)[0]
     assert "requestJson('/api/v2/jobs')" in recovery
     assert "job.kind === 'strategies.tester.start'" in recovery
+    assert "job.kind === 'strategies.tester.native.start'" in recovery
+    assert "job.kind === 'strategies.tester.native.start' && job.state === 'COMMITTED'" in recovery
     assert "job.kind === 'strategies.performance-dd5'" not in recovery
     assert "const tester = testerJobs.find" in recovery
     assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
@@ -620,6 +622,14 @@ def test_performance_cleanup_warning_formats_code_and_message() -> None:
     assert "warning.code" in render
     assert "warning.message" in render
     assert "${warning}." not in render
+
+
+def test_performance_import_renders_the_existing_progress_bar() -> None:
+    js = _read("app.js")
+    render = js.split("const renderImportV2", 1)[1].split("inboxVerifyV2?.addEventListener", 1)[0]
+
+    assert "#performance-import-progress .progress-track span" in render
+    assert "track.style.width" in render
 
 
 def test_testing_screen_does_not_expose_remote_runner_paths() -> None:

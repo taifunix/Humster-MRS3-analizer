@@ -145,7 +145,10 @@ Balance, Size, Post Size, Post Side
 ```
 
 There is no legacy fallback. Missing `Post Size` makes the report invalid for
-v2 import. Position state is authoritative from `Post Size`; flat means zero.
+v2 import. The table may carry additional tester columns or order its columns
+differently; the listed fields are read by name. `Order ID` identifies an
+action/order in the tester report, not an MRS3 strategy-order slot. Position
+state is authoritative from `Post Size`; flat means zero.
 Actions are ordered by `(timestamp_utc, action_index)`.
 
 ## Arbitrary safe windows

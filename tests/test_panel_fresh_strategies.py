@@ -331,13 +331,14 @@ def test_committed_tester_inbox_readiness_survives_panel_reload(tmp_path: Path) 
     assert controller._panel_jobs.get(job["job_id"])["inbox_ready"] is True
 
 
-def test_existing_committed_tester_inbox_is_marked_ready_on_panel_reload(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("kind", ("strategies.tester.start", "strategies.tester.native.start"))
+def test_existing_committed_tester_inbox_is_marked_ready_on_panel_reload(tmp_path: Path, monkeypatch, kind: str) -> None:
     config = tmp_path / "config.local.json"
     config.write_text("{}", encoding="utf-8")
     inbox_root = tmp_path / "inbox"
     monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=inbox_root))
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    job = controller._panel_jobs.submit("strategies.tester.start", {}, "tester", job_id="batch-1")
+    job = controller._panel_jobs.submit(kind, {}, "tester", job_id="batch-1")
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
     inbox = inbox_root / job["job_id"]
     controller._panel_jobs.transition(job["job_id"], "FAILED")
@@ -383,6 +384,39 @@ def test_single_mode_verify_routes_through_existing_performance_inbox_button(tmp
     assert result["state"] == "COMMITTED"
     assert result["inbox_ready"] is True
     assert controller._panel_jobs.runtime("single-job")["inbox_path"] == str(inbox)
+
+
+def test_pre_v2_native_tester_job_rebuilds_its_metadata_inbox(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    inbox = tmp_path / "inbox" / "native-job"
+    inbox.mkdir(parents=True)
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    job = controller._panel_jobs.submit(
+        "strategies.tester.native.start", {}, "native", ("strategies.tester",), job_id="native-job"
+    )
+    controller._panel_jobs.transition(job["job_id"], "RUNNING")
+    controller._panel_jobs.transition(job["job_id"], "COMMITTED")
+    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=tmp_path / "inbox"))
+
+    class SingleModeService:
+        def capture_inbox(self, job_id: str, *, force_single_mode: bool = False) -> Path:
+            assert job_id == "native-job"
+            assert force_single_mode is True
+            return inbox
+
+        def mark_inbox_ready(self, job_id: str, path: Path) -> None:
+            assert job_id == "native-job" and path == inbox
+
+        def status(self, job_id: str) -> dict[str, object]:
+            return {"job_id": job_id, "state": "COMMITTED", "phase": "COMMITTED", "evidence": {}, "progress": {}, "inbox_path": str(inbox)}
+
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SingleModeService())
+
+    result = controller.strategies_tester_verify_inbox("native-job")
+
+    assert result["state"] == "COMMITTED"
+    assert result["inbox_ready"] is True
 
 
 def test_runs_tester_rejects_an_empty_runs_directory(tmp_path: Path, monkeypatch) -> None:

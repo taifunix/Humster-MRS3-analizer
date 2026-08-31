@@ -147,16 +147,14 @@ def _check_current_header(data: bytes) -> None:
     if len(candidates) != 1:
         raise PerformanceV2HtmlError("exactly one current action table is required")
     headers = candidates[0]
-    if headers != CURRENT_ACTION_HEADERS:
-        missing = [header for header in CURRENT_ACTION_HEADERS if header not in headers]
-        if missing:
-            raise PerformanceV2HtmlError(
-                f"exact current action header is required; missing current action header: {missing[0]}"
-            )
-        raise PerformanceV2HtmlError("exact current action header is required")
+    missing = [header for header in CURRENT_ACTION_HEADERS if header not in headers]
+    if missing:
+        raise PerformanceV2HtmlError(
+            f"required current action header is missing: {missing[0]}"
+        )
 
 
-def _settings_identity(settings: Mapping[str, object]) -> tuple[str, set[int] | None]:
+def _settings_identity(settings: Mapping[str, object]) -> str:
     exchange = settings.get("exchange")
     if not isinstance(exchange, Mapping) or exchange.get("use_upnl") is not True:
         raise PerformanceV2HtmlError("current Performance v2 reports require use_upnl=true")
@@ -167,34 +165,14 @@ def _settings_identity(settings: Mapping[str, object]) -> tuple[str, set[int] | 
     if not isinstance(symbol, str) or not symbol.strip():
         raise PerformanceV2HtmlError("settings symbol is missing")
 
-    mrs3 = settings.get("mrs3")
-    if not isinstance(mrs3, Mapping):
-        return symbol.strip(), None
-    active_key = "ma_short" if basic.get("use_short") is True and basic.get("use_long") is not True else "ma_long"
-    configured = mrs3.get(active_key)
-    if not isinstance(configured, (list, tuple)):
-        return symbol.strip(), None
-    order_ids: set[int] = set()
-    for entry in configured:
-        if not isinstance(entry, Mapping):
-            raise PerformanceV2HtmlError("settings order entry is malformed")
-        raw_id = entry.get("id")
-        if type(raw_id) is not int or raw_id < 1:
-            raise PerformanceV2HtmlError("settings order IDs are malformed")
-        order_ids.add(raw_id)
-    expected = set(range(1, len(configured) + 1))
-    if order_ids != expected:
-        raise PerformanceV2HtmlError("settings order IDs are not consecutive")
-    return symbol.strip(), order_ids
+    return symbol.strip()
 
 
 def _typed_actions(
     rows: tuple[dict[str, str], ...],
     symbol: str,
-    configured_order_ids: set[int] | None,
 ) -> tuple[ParsedPerformanceV2Action, ...]:
     result: list[ParsedPerformanceV2Action] = []
-    observed_order_ids: set[int] = set()
     for action_index, row in enumerate(rows):
         try:
             timestamp = _timestamp(row["Timestamp"])
@@ -204,7 +182,6 @@ def _typed_actions(
         if row_symbol != symbol:
             raise PerformanceV2HtmlError("action symbol does not match settings symbol")
         order_id = _order_id(row["Order ID"])
-        observed_order_ids.add(order_id)
         action = row["Action"].strip().casefold()
         if not action:
             raise PerformanceV2HtmlError("action name is empty")
@@ -233,10 +210,6 @@ def _typed_actions(
                 balance,
             )
         )
-    if configured_order_ids is not None and not observed_order_ids <= configured_order_ids:
-        raise PerformanceV2HtmlError("action Order ID does not match settings orders")
-    if configured_order_ids is None and observed_order_ids != set(range(1, max(observed_order_ids, default=0) + 1)):
-        raise PerformanceV2HtmlError("action Order IDs are not consecutive")
     return tuple(sorted(result, key=lambda item: (item.timestamp_utc, item.action_index)))
 
 
@@ -273,8 +246,8 @@ def parse_current_performance_v2_html(
         raise PerformanceV2HtmlError(str(error)) from error
     if len(parsed.actions) > limits.max_actions_per_report:
         raise PerformanceV2HtmlError("report exceeds action limit")
-    symbol, configured_order_ids = _settings_identity(parsed.settings)
-    actions = _typed_actions(parsed.actions, symbol, configured_order_ids)
+    symbol = _settings_identity(parsed.settings)
+    actions = _typed_actions(parsed.actions, symbol)
     return ParsedPerformanceV2Report(
         _freeze(parsed.settings),  # type: ignore[arg-type]
         _FrozenMapping(parsed.metrics),

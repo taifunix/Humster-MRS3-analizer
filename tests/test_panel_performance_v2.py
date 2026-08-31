@@ -15,7 +15,6 @@ from mrs3.performance_v2_store import (
     initialize_performance_v2,
     performance_v2_database_path,
 )
-from mrs3.performance_v2_windows import compare_window_pair_geometrically, get_or_calculate_window_pair
 from mrs3.panel import PanelController, create_panel_server
 from mrs3.panel_performance_v2 import PerformanceV2PanelRequest, LocalPerformanceV2Service
 
@@ -127,12 +126,10 @@ def _request(tmp_path: Path) -> tuple[PerformanceV2PanelRequest, dict[Path, byte
         inbox=inbox,
         report_root=reports,
         config=config,
-        window_a=("2026-01-01T00:00:00Z", "2026-01-09T00:00:00Z"),
-        window_b=("2026-01-01T00:00:00Z", "2026-01-03T12:00:00Z"),
     ), snapshot
 
 
-def test_v2_panel_service_imports_committed_inbox_and_caches_ab_without_v1(tmp_path: Path) -> None:
+def test_v2_panel_service_imports_committed_inbox_without_eager_window_calculation(tmp_path: Path) -> None:
     request, before = _request(tmp_path)
     result = LocalPerformanceV2Service().run(request)
 
@@ -144,9 +141,8 @@ def test_v2_panel_service_imports_committed_inbox_and_caches_ab_without_v1(tmp_p
     assert result.plateau_count == 2
     assert result.result_count == 2
     assert result.audit_path is not None and result.audit_path.is_file()
-    assert len(result.windows) == 2
     with duckdb.connect(str(request.config.database_root / "strategy_performance.duckdb"), read_only=True) as connection:
-        assert connection.execute("select count(*) from window_metrics").fetchone() == (4,)
+        assert connection.execute("select count(*) from window_metrics").fetchone() == (0,)
         assert connection.execute("select count(*) from strategies").fetchone() == (2,)
         assert connection.execute("select count(*) from strategy_orders").fetchone() == (3,)
         assert connection.execute("select count(*) from strategy_results").fetchone() == (2,)
@@ -154,30 +150,6 @@ def test_v2_panel_service_imports_committed_inbox_and_caches_ab_without_v1(tmp_p
         path.relative_to(request.inbox): path.read_bytes()
         for path in request.inbox.rglob("*") if path.is_file()
     } == before
-
-
-def test_v2_panel_service_uses_injected_window_pair_and_comparison(tmp_path: Path) -> None:
-    request, _ = _request(tmp_path)
-    pair_calls: list[tuple[int, object, object]] = []
-    compare_calls: list[tuple[object, object]] = []
-
-    def window_pair(connection, result_id, window_a, window_b):
-        pair_calls.append((result_id, window_a, window_b))
-        return get_or_calculate_window_pair(connection, result_id, window_a, window_b)
-
-    def compare(window_a, window_b):
-        compare_calls.append((window_a, window_b))
-        return compare_window_pair_geometrically(window_a, window_b)
-
-    result = LocalPerformanceV2Service(
-        window_pair_func=window_pair,
-        compare_func=compare,
-    ).run(request)
-
-    assert len(pair_calls) == len(compare_calls) == 2
-    assert all(call[1:] == (request.window_a, request.window_b) for call in pair_calls)
-    assert all(left.result_id == right.result_id for left, right in compare_calls)
-    assert result.window_count == 2
 
 
 def test_visible_performance_card_targets_only_v2_import_job_and_status() -> None:
@@ -215,11 +187,12 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
     monkeypatch.setattr(panel_module, "LocalPerformanceDd5Service", forbidden)
     request, _ = _request(tmp_path)
     config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps({"panel_paths": {"tester_report_dir": "tester-reports"}}), encoding="utf-8")
+    config_path.write_text(json.dumps({"panel_paths": {"tester_report_dir": "wrong-reports"}}), encoding="utf-8")
     (tmp_path / "config.performance.json").write_text(
         json.dumps({"unified_performance_v2": {"database_root": "performance-v2", "workers": 1}}),
         encoding="utf-8",
     )
+    monkeypatch.setattr(panel_module.RunnerConfig, "from_json", lambda _path: type("Runner", (), {"report_dir": request.report_root})())
     controller = PanelController(tmp_path, config_path)
     job = controller._panel_jobs.submit(
         "strategies.tester.start", {"mode": "SINGLE_MODE", "analysis_run_id": "a", "start_date": "2026-01-01", "end_date": "2026-01-09"},
@@ -232,8 +205,8 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
         "kind": "strategies.performance.v2.import",
         "request": {
             "tester_job_id": "tester-v2",
-            "window_a": list(request.window_a),
-            "window_b": list(request.window_b),
+            "window_a": ["2026-01-01T00:00:00Z", "2026-01-09T00:00:00Z"],
+            "window_b": ["2026-01-01T00:00:00Z", "2026-01-03T12:00:00Z"],
         },
     })
     v2_job_id = started["job_id"]
@@ -248,7 +221,7 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
     assert status["result"]["database_path"].endswith("strategy_performance.duckdb")
     assert status["result"]["audit_path"].endswith("import_audit.v2.json")
     assert status["result"]["order_count"] == 3
-    assert status["result"]["window_count"] == 2
+    assert status["result"]["window_count"] == 0
 
     # The controller's new route is independently exposed by the HTTP server.
     server = create_panel_server("127.0.0.1", 0, controller)

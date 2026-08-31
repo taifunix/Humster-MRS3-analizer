@@ -1362,7 +1362,7 @@
   const renderTester = (job) => {
     const p = job.progress || {};
     const total = Number(p.total || job.strategy_count || 0);
-    const singleMode = job.mode === 'SINGLE_MODE' || (job.kind === 'strategies.tester.start' && job.request?.mode === 'SINGLE_MODE');
+    const singleMode = job.mode === 'SINGLE_MODE' || job.kind === 'strategies.tester.native.start' || (job.kind === 'strategies.tester.start' && job.request?.mode === 'SINGLE_MODE');
     const runs = false;
     const checked = Number(p.current || p.checked || 0);
     if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : (job.state === 'COMMITTED' ? '100%' : '0%');
@@ -1374,6 +1374,7 @@
         ? `${stage} · reports ${checked}/${total}`
         : `${stage} · reports ${checked}/${total}`;
     const ready = job.state === 'COMMITTED' && job.inbox_ready === true;
+    const canRebuildInbox = singleMode && job.state === 'COMMITTED';
     inboxReadyV2 = ready;
     if (testerText) testerText.textContent = detail;
     if (testerStatus) {
@@ -1382,7 +1383,7 @@
     }
     if (testerStop) testerStop.disabled = !testerJobId || testerIsTerminal(job);
     setTesterControls(!testerIsTerminal(job));
-    if (inboxVerifyV2) inboxVerifyV2.disabled = !ready;
+    if (inboxVerifyV2) inboxVerifyV2.disabled = !canRebuildInbox;
     if (importStartV2) importStartV2.disabled = !ready;
     if (importStatusV2) importStatusV2.textContent = ready
       ? 'Performance v2: READY · metadata manifest captured.'
@@ -1437,8 +1438,8 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const testerJobs = [...jobs].reverse().filter((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester');
-      const tester = testerJobs.find((job) => !testerIsTerminal(job) || (job.state === 'COMMITTED' && job.inbox_ready === true));
+      const testerJobs = [...jobs].reverse().filter((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester.native.start' || job.kind === 'strategies.tester');
+      const tester = testerJobs.find((job) => !testerIsTerminal(job) || (job.kind === 'strategies.tester.native.start' && job.state === 'COMMITTED') || (job.state === 'COMMITTED' && job.inbox_ready === true));
       if (tester && typeof tester.job_id === 'string') {
         const job = tester;
         testerJobId = job.job_id;
@@ -1459,6 +1460,12 @@
     const p = job.progress || {};
     const total = Number(p.total || 0);
     const current = Number(p.current || 0);
+    const track = document.querySelector('#performance-import-progress .progress-track span');
+    if (track) {
+      const done = job.state === 'COMMITTED';
+      track.classList.toggle('is-running', !total && !done && !['FAILED', 'CANCELLED'].includes(job.state));
+      track.style.width = done ? '100%' : (total ? `${Math.max(0, Math.min(100, current * 100 / total))}%` : '0%');
+    }
     if (importProgressV2) importProgressV2.textContent = `${job.phase || 'IMPORTING'} · ${current} / ${total} reports.`;
     const result = job.result || {};
     const warning = result.cleanup_warning || job.cleanup_warning;

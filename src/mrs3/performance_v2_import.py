@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 from uuid import uuid4
 
 import duckdb
+import pandas as pd
 
 from .performance import PerformanceParseError, report_range
 from .performance_v2_html import ParsedPerformanceV2Report, parse_current_performance_v2_html
@@ -38,6 +39,15 @@ class PerformanceV2ImportError(RuntimeError):
 
 class PerformanceV2LockedError(PerformanceV2ImportError):
     """Raised when another process owns the v2 DuckDB writer lock."""
+
+
+ProgressCallback = Callable[[str, int, int], object]
+_APPEND_BATCH_ROWS = 20_000
+_ACTION_COLUMNS = (
+    "result_id", "action_index", "timestamp_utc", "symbol", "order_id", "action",
+    "size", "post_size", "post_side", "pnl", "fee", "balance", "raw_action_json",
+)
+_EQUITY_COLUMNS = ("result_id", "sample_index", "timestamp_utc", "wallet", "equity")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -135,13 +145,41 @@ def _parse_staged_report(path: Path, limits: PerformanceV2Config) -> ParsedPerfo
     return parse_current_performance_v2_html(path.read_bytes(), limits)
 
 
-def _parse_reports(staging: Path, prepared: PreparedV2Input, config: PerformanceV2Config) -> tuple[ParsedPerformanceV2Report, ...]:
+def _append_rows(
+    connection: duckdb.DuckDBPyConnection,
+    table: str,
+    columns: tuple[str, ...],
+    rows: list[tuple[object, ...]],
+) -> None:
+    if rows:
+        connection.append(table, pd.DataFrame.from_records(rows, columns=columns))
+
+
+def _parse_reports(
+    staging: Path,
+    prepared: PreparedV2Input,
+    config: PerformanceV2Config,
+    progress: ProgressCallback | None = None,
+) -> tuple[ParsedPerformanceV2Report, ...]:
     paths = tuple(staging / "reports" / entry.report_path.name for entry in prepared.entries)
     workers = min(config.workers, len(paths))
+    if progress is not None:
+        progress("PARSING", 0, len(paths))
     if workers == 1:
-        return tuple(_parse_staged_report(path, config) for path in paths)
+        parsed = []
+        for path in paths:
+            parsed.append(_parse_staged_report(path, config))
+            if progress is not None:
+                progress("PARSING", len(parsed), len(paths))
+        return tuple(parsed)
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        return tuple(executor.map(_parse_staged_report, paths, (config,) * len(paths)))
+        futures = {executor.submit(_parse_staged_report, path, config): index for index, path in enumerate(paths)}
+        parsed: list[ParsedPerformanceV2Report | None] = [None] * len(paths)
+        for completed, future in enumerate(as_completed(futures), start=1):
+            parsed[futures[future]] = future.result()
+            if progress is not None:
+                progress("PARSING", completed, len(paths))
+    return tuple(item for item in parsed if item is not None)
 
 
 def _decimal_metric(metrics: Mapping[str, str], *names: str, default: Decimal | None = None) -> Decimal | None:
@@ -176,9 +214,6 @@ def _validate_report(entry: PreparedV2Entry, report: ParsedPerformanceV2Report) 
     basic = report.settings.get("basic")
     if not isinstance(basic, Mapping) or str(basic.get("symbol", "")).strip() != entry.identity.symbol:
         raise PerformanceV2ImportError(f"report symbol does not match strategy {entry.strategy_name!r}")
-    expected_order_ids = {order.order_id for order in entry.identity.orders}
-    if any(action.order_id not in expected_order_ids for action in report.actions):
-        raise PerformanceV2ImportError(f"report order does not match strategy {entry.strategy_name!r}")
 
 
 def _load_existing(connection: duckdb.DuckDBPyConnection, names: tuple[str, ...]) -> tuple[dict[str, tuple[object, ...]], dict[int, list[tuple[object, ...]]], dict[int, tuple[object, ...]], dict[str, set[str]]]:
@@ -527,22 +562,20 @@ def _publish(
                 action_rows.append((result_id, action.action_index, action.timestamp_utc, action.symbol,
                                     action.order_id, action.action, action.size, action.post_size, action.post_side,
                                     action.pnl, action.fee, action.balance, None))
+            if len(action_rows) >= _APPEND_BATCH_ROWS:
+                _append_rows(connection, "strategy_actions", _ACTION_COLUMNS, action_rows)
+                action_rows.clear()
             for sample_index, (timestamp, wallet) in enumerate(report.wallet_series):
                 equity = report.equity_series[sample_index][1]
                 equity_rows.append((result_id, sample_index, timestamp, wallet, equity))
+            if len(equity_rows) >= _APPEND_BATCH_ROWS:
+                _append_rows(connection, "strategy_equity", _EQUITY_COLUMNS, equity_rows)
+                equity_rows.clear()
             result_files.append((entry.report_path.name, report_hash(entry), entry.report_path.stat().st_size, len(report.actions), len(report.equity_series), "REPLACED" if decision == "REPLACE" else "IMPORTED"))
             imported += 1
 
-        if action_rows:
-            connection.execute("create temp table v2_import_actions (result_id bigint, action_index integer, timestamp_utc timestamptz, symbol varchar, order_id integer, action varchar, size decimal(38,12), post_size decimal(38,12), post_side varchar, pnl decimal(38,12), fee decimal(38,12), balance decimal(38,12), raw_action_json varchar)")
-            connection.executemany("insert into v2_import_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", action_rows)
-            connection.execute("insert into strategy_actions select * from v2_import_actions")
-            connection.execute("drop table v2_import_actions")
-        if equity_rows:
-            connection.execute("create temp table v2_import_equity (result_id bigint, sample_index integer, timestamp_utc timestamptz, wallet decimal(38,12), equity decimal(38,12))")
-            connection.executemany("insert into v2_import_equity values (?, ?, ?, ?, ?)", equity_rows)
-            connection.execute("insert into strategy_equity select * from v2_import_equity")
-            connection.execute("drop table v2_import_equity")
+        _append_rows(connection, "strategy_actions", _ACTION_COLUMNS, action_rows)
+        _append_rows(connection, "strategy_equity", _EQUITY_COLUMNS, equity_rows)
 
         connection.executemany(
             """insert into import_files (import_run_id, source_filename, source_html_sha256, source_size_bytes,
@@ -646,7 +679,11 @@ def _write_audit(config: PerformanceV2Config, request: PerformanceV2ImportReques
     return path
 
 
-def import_performance_v2(request: PerformanceV2ImportRequest) -> PerformanceV2ImportResult:
+def import_performance_v2(
+    request: PerformanceV2ImportRequest,
+    *,
+    progress: ProgressCallback | None = None,
+) -> PerformanceV2ImportResult:
     if not isinstance(request, PerformanceV2ImportRequest):
         raise TypeError("request must be PerformanceV2ImportRequest")
     config = request.config
@@ -689,7 +726,9 @@ def import_performance_v2(request: PerformanceV2ImportRequest) -> PerformanceV2I
             strategy_root=request.strategy_root,
         )
         staging = create_v2_parser_staging(config.database_root, prepared)
-        parsed = _parse_reports(staging, prepared, config)
+        parsed = _parse_reports(staging, prepared, config, progress)
+        if progress is not None:
+            progress("PUBLISHING", len(parsed), len(parsed))
         import_id = uuid4().hex
         imported, skipped, rejected = _publish(connection, request, prepared, parsed, import_id)
         result = PerformanceV2ImportResult(import_id, "COMMITTED", imported, skipped, rejected, target)

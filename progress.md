@@ -919,6 +919,22 @@ Evidence: focused fresh-strategy/static-panel suite — `67 passed`; live
 post-restart probe returned `415 Content-Type must be application/json` as
 expected; independent review — `CODE_REVIEW_PASS`; `git diff --check` clean.
 
+### Unified Performance DB v2 import (2026-08-31)
+
+Native SINGLE_MODE now creates a metadata inbox that refers to the tested HTML
+and `Output\\strategies` files without copying either directory. Import stages
+and hash-verifies HTML once, parses it with the configured worker count, and
+uses DuckDB dataframe appends for action/equity batches. It no longer performs
+eager A/B-window calculations during import. The panel progress track receives
+the live parse count and reaches 100% on commit.
+
+Live evidence: `b26ac4db5f0b49c5a2fc17bd4561e4bd` committed `1633/1633`
+reports with zero rejected/skipped. The target contains 1,633 strategies,
+4,517 orders, 741,189 actions and 9,305,765 equity samples; audit is
+`COMMITTED`. The completed import cleared the tester report directory and
+`Output\\strategies` as requested. Focused tests: `143 passed` for the v2/panel
+slice and `53 passed` for static-panel UI after the progress-track check.
+
 The READY JSON endpoint now accepts up to 1 MiB because a checked READY
 selection can legitimately exceed the generic 64 KiB API limit. The live
 70 KiB probe reached candidate validation, proving it no longer fails on body
