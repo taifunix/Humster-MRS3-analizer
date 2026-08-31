@@ -1,6 +1,6 @@
 # Unified Performance Analytics v2
 
-**Status:** approved design, implementation pending
+**Status:** vertical slice implemented; Phase 2 analytics pending
 **Date:** 2026-08-28
 **Decision:** [ADR-0020](../decisions/0020-unified-performance-analytics-v2.md)
 

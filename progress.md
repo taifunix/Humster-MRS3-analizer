@@ -1,7 +1,7 @@
 # MRS3 — current verification
 
-**Updated:** 2026-08-30
-**Current branch:** `feat/unified-performance-v2`
+**Updated:** 2026-08-31
+**Current branch:** `main`
 
 ## Current unified Performance v2 handoff (2026-08-30)
 

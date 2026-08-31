@@ -15,6 +15,26 @@ substitution outside that root, and symlink/reparse escapes remain rejected.
 
 **Spec:** `docs/specs/2026-08-28-unified-performance-analytics-v2.md`; `docs/decisions/0020-unified-performance-analytics-v2.md`
 
+## Actual implementation status (2026-08-31)
+
+The checkboxes below are the original task-by-task delivery record. The
+following status is authoritative, based on accepted commits, focused tests and
+the live `1633/1633` `COMMITTED` import recorded in `progress.md`:
+
+| Plan task | Actual status and evidence |
+| --- | --- |
+| Gate 0 | Complete: v1/v2 path intersection recorded as `NONE`. |
+| Task 1 | Complete — `3686af7`: isolated schema/config. |
+| Task 2 | Complete — `ead1ded`: trusted metadata inbox adapter/staging. |
+| Task 3 | Complete — `5475dae`: current-HTML parser boundary. |
+| Task 4 | Complete — `f69737a`: atomic ADD/REPLACE importer. |
+| Task 5 | Complete — `a154015`: calculation/cache boundary. Import deliberately performs no eager A/B calculation; the visible analysis is Phase 2. |
+| Task 6 | Complete — `91381ce`: native `SINGLE_MODE` inbox-to-v2 panel cutover. The original cached-A/B-import assertion is superseded by `window_count=0` in the fast import contract. |
+| Task 7 | Historical vertical-slice review/evidence is recorded in `progress.md`. Follow-up review of later optimization commit `5643399` is tracked separately. |
+
+Phase 2 starts with the omitted user-facing A/B window analysis. Tags, discard,
+RETEST, filters/Pareto, XLSX and Portfolio input remain explicitly deferred.
+
 ## Global Constraints
 
 - Use `ponytail:ponytail` at full level: no new dependency, no speculative abstraction, no second inbox or mode-specific manifest.

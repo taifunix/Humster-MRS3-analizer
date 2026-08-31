@@ -129,6 +129,12 @@ def test_config_defaults_workers_to_sixteen(tmp_path: Path) -> None:
     assert load_performance_v2_config(_config(tmp_path / "config.performance.json")).workers == 16
 
 
+def test_versioned_performance_config_keeps_the_sixteen_worker_default() -> None:
+    config_path = Path(__file__).resolve().parents[1] / "config.performance.json"
+
+    assert load_performance_v2_config(config_path).workers == 16
+
+
 def test_initialize_is_idempotent_and_requires_schema_v2() -> None:
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)

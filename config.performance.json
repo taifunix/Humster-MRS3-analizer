@@ -2,7 +2,7 @@
   "unified_performance_v2": {
     "database_root": "data/performance-v2",
     "strategy_root": "Output/strategies",
-    "workers": 27,
+    "workers": 16,
     "max_html_bytes": 67108864,
     "max_actions_per_report": 1000000
   }
