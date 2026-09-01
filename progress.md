@@ -939,6 +939,16 @@ Independent Opus review: `CODE_REVIEW_PASS`.
 
 ### Performance v2 finalist-selection Stage 2 executable export (2026-08-31)
 
+The selection panel additionally has an explicit pre-XLSX counter refresh. It
+returns the current ordered stage snapshot as `eliminated` and `remaining` for
+the chosen Pair + Side, and displays it immediately before the stage move
+buttons. Counters are invalidated by any Pair, Side, checkbox, scope or order
+edit; an in-flight stale response is discarded. The preview is read-only: it
+does not generate a workbook or mutate Performance DB v2.
+
+Evidence: focused selection/panel/static suite `130 passed`; `node --check`,
+`git diff --check`; independent Opus re-review `CODE_REVIEW_PASS`.
+
 The preview is now executable. On `Смотреть результаты в xls`, the Panel sends
 the current Pair + Side, checkbox state, stage order and per-stage scope to the
 local v2 endpoint. It reads only ACTIVE current Performance DB v2 rows,

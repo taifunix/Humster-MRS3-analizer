@@ -160,6 +160,7 @@ from .performance_v2_selection import (
     load_selection_candidates,
     load_selection_config,
     parse_selection_request,
+    prepare_selection_window_cache,
     run_selection,
     write_selection_workbook,
 )
@@ -2947,7 +2948,7 @@ class PanelController:
     def strategies_performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
         return self.performance_v2_windows(payload)
 
-    def strategies_performance_v2_selection(self, payload: Mapping[str, object]) -> tuple[str, bytes]:
+    def _performance_v2_selection_result(self, payload: Mapping[str, object]):
         if not isinstance(payload, Mapping):
             raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="request must be an object")
         try:
@@ -2955,18 +2956,39 @@ class PanelController:
             selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
         except PerformanceV2SelectionError as error:
             raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=str(error)) from error
-        target = performance_v2_database_path(self._performance_v2_config())
+        performance_config = self._performance_v2_config()
+        target = performance_v2_database_path(performance_config)
         if not target.is_file():
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
         try:
             with duckdb.connect(str(target)) as connection:
+                connection.execute(f"set threads to {performance_config.workers}")
                 require_performance_v2(connection)
-                result = run_selection(load_selection_candidates(connection, request, selection_config), request, selection_config)
-            with tempfile.TemporaryDirectory() as directory:
-                workbook = write_selection_workbook(result, Path(directory) / "finalists.xlsx")
-                return f"performance-v2-finalists-{request.symbol}-{request.side}.xlsx", workbook.read_bytes()
+                result = run_selection(load_selection_candidates(connection, request, selection_config, cache_only=True), request, selection_config)
+            return request, result
         except duckdb.Error as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
+
+    def strategies_performance_v2_selection(self, payload: Mapping[str, object]) -> tuple[str, bytes]:
+        request, result = self._performance_v2_selection_result(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = write_selection_workbook(result, Path(directory) / "finalists.xlsx")
+            return f"performance-v2-finalists-{request.symbol}-{request.side}.xlsx", workbook.read_bytes()
+
+    def strategies_performance_v2_selection_preview(self, payload: Mapping[str, object]) -> dict[str, object]:
+        _, result = self._performance_v2_selection_result(payload)
+        return {"stages": result.attrs["stage_counts"]}
+
+    def strategies_performance_v2_recalculate(self, payload: Mapping[str, object]) -> dict[str, object]:
+        try:
+            request = parse_selection_request({"symbol": payload.get("symbol"), "side": payload.get("side"), "stages": []})
+            config = load_selection_config(self.default_config.with_name("config.performance.json"))
+            performance_config = self._performance_v2_config()
+            target = performance_v2_database_path(performance_config)
+            prepare_selection_window_cache(target, request, config, performance_config.workers)
+            return {"status": "READY"}
+        except (PerformanceV2SelectionError, OSError, duckdb.Error) as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_RECALCULATE_FAILED", status=400, message=str(error)) from error
 
     def performance_database_catalog(self) -> dict[str, object]:
         root = self._panel_path("performance_db_root")
@@ -5833,7 +5855,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/recalculate"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -5915,6 +5937,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_performance_v2_windows(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection":
                 result = self.server.controller.strategies_performance_v2_selection(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/selection-preview":
+                result = self.server.controller.strategies_performance_v2_selection_preview(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/recalculate":
+                result = self.server.controller.strategies_performance_v2_recalculate(document)
             elif endpoint == "/api/v2/jobs":
                 result = {"job": self.server.controller.panel_job_submit(document)}
             elif endpoint == "/api/v2/settings/validate":

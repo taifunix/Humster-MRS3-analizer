@@ -5,14 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 from typing import Literal, Mapping
 
 import duckdb
+import numpy as np
 import pandas as pd
 
-from .performance_v2_windows import WindowMetrics, get_or_calculate_window_pair
+from .performance_v2_windows import METRICS_VERSION, WindowMetrics, _cached, _calculate, _load_source, _persist, get_or_calculate_window_pair
 from .audit import write_audit_workbook
 
 StageScope = Literal["pair_side", "pair_side_timeframe"]
@@ -36,7 +38,7 @@ _SCOPES = frozenset(("pair_side", "pair_side_timeframe"))
 _CANDIDATE_COLUMNS = (
     "strategy_id", "strategy_name", "symbol", "side", "timeframe", "close_ma_len", "order_count",
     "result_id", "total_pnl", "total_pnl_pct", "max_drawdown", "max_drawdown_pct", "total_fees",
-    "total_trades", "daily_log_return", "risk_scale", "dd5_proxy", "holding_p95_minutes",
+    "total_trades", "pnl_30d_pct", "profit_factor", "win_rate_pct", "risk_scale", "dd5_proxy", "holding_p95_minutes",
     "ab_pnl_change_30d_pct", "first_shift_bp", "scaled_lot_sum", "capital_proxy",
     "capital_efficiency", "total_plateau_point_count",
     "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct",
@@ -256,10 +258,59 @@ def _ab_metrics(
     }
 
 
+def _cached_selection_metrics(connection: duckdb.DuckDBPyConnection, result_id: int, report_start: datetime, report_end: datetime, config: SelectionConfig) -> tuple[WindowMetrics | None, dict[str, Decimal | None]]:
+    full = _cached(connection, result_id, report_start, report_end, METRICS_VERSION)
+    split = report_end - timedelta(days=config.ab_final_days)
+    if split <= report_start:
+        return (full, {key: None for key in ("ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")})
+    a = _cached(connection, result_id, report_start, split, METRICS_VERSION)
+    b = _cached(connection, result_id, split, report_end, METRICS_VERSION)
+    if a is None or b is None:
+        return (full, {key: None for key in ("ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")})
+    return (full, _ab_metrics(connection, result_id, report_start, report_end, config))
+
+
+def _selection_window_job(database: str, result_id: int, report_start: datetime, report_end: datetime, final_days: int) -> tuple[WindowMetrics, ...]:
+    """Compute default selection windows through a read-only worker connection."""
+    split = report_end - timedelta(days=final_days)
+    windows = ((report_start, report_end), (report_start, split), (split, report_end)) if split > report_start else ((report_start, report_end),)
+    with duckdb.connect(database, read_only=True) as connection:
+        connection.execute("set threads to 1")
+        cached = [_cached(connection, result_id, start, end, METRICS_VERSION) for start, end in windows]
+        if all(cached):
+            return tuple(cached)
+        source = _load_source(connection, result_id)
+        return tuple(metric or _calculate(result_id, start, end, METRICS_VERSION, *source) for metric, (start, end) in zip(cached, windows))
+
+
+def _selection_window_job_from_args(args: tuple[str, int, datetime, datetime, int]) -> tuple[WindowMetrics, ...]:
+    return _selection_window_job(*args)
+
+
+def prepare_selection_window_cache(database: Path, request: SelectionRequest, config: SelectionConfig, workers: int) -> None:
+    """Warm default windows in independent readers, then persist them through one writer."""
+    with duckdb.connect(str(database), read_only=True) as connection:
+        rows = connection.execute(
+            """select r.result_id, r.report_start_utc, r.report_end_utc from strategies s
+                 join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
+                where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""",
+            [request.symbol, request.side],
+        ).fetchall()
+    if not rows:
+        return
+    jobs = [(str(database), int(result_id), report_start, report_end, config.ab_final_days) for result_id, report_start, report_end in rows]
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as executor:
+        metrics = [metric for result in executor.map(_selection_window_job_from_args, jobs) for metric in result]
+    with duckdb.connect(str(database)) as connection:
+        for metric in metrics:
+            _persist(connection, metric)
+
+
 def load_selection_candidates(
     connection: duckdb.DuckDBPyConnection,
     request: SelectionRequest,
     config: SelectionConfig = SelectionConfig(),
+    *, cache_only: bool = False,
 ) -> pd.DataFrame:
     """Load all current ACTIVE candidates for one Pair + Side without filtering them."""
     holding_p95 = _holding_p95_minutes(connection, request)
@@ -288,9 +339,13 @@ def load_selection_candidates(
         candidate = candidates.get(int(strategy_id))
         if candidate is None:
             result_id = int(result_id)
-            daily_log = get_or_calculate_window_pair(
-                connection, result_id, (report_start, report_end), (report_start, report_end)
-            )[0].daily_log_return
+            if cache_only:
+                full_metrics, ab_metrics = _cached_selection_metrics(connection, result_id, report_start, report_end, config)
+            else:
+                full_metrics = get_or_calculate_window_pair(connection, result_id, (report_start, report_end), (report_start, report_end))[0]
+                ab_metrics = _ab_metrics(connection, result_id, report_start, report_end, config)
+            daily_log = None if full_metrics is None else full_metrics.daily_log_return
+            pnl_30d = None if full_metrics is None else _return_30d(full_metrics)
             drawdown = _decimal_or_none(max_drawdown_pct)
             risk_scale = Decimal(5) / drawdown if drawdown is not None and drawdown > 0 else None
             candidate = {
@@ -299,10 +354,12 @@ def load_selection_candidates(
                 "order_count": int(order_count), "result_id": result_id, "total_pnl": _decimal_or_none(total_pnl),
                 "total_pnl_pct": _decimal_or_none(total_pnl_pct), "max_drawdown": _decimal_or_none(max_drawdown),
                 "max_drawdown_pct": drawdown, "total_fees": _decimal_or_none(total_fees),
-                "total_trades": int(total_trades), "daily_log_return": daily_log,
-                "risk_scale": risk_scale, "dd5_proxy": daily_log * risk_scale if daily_log is not None and risk_scale is not None else None,
+                "total_trades": int(total_trades), "pnl_30d_pct": pnl_30d,
+                "profit_factor": None if full_metrics is None else full_metrics.profit_factor,
+                "win_rate_pct": None if full_metrics is None else full_metrics.win_rate_pct,
+                "risk_scale": risk_scale, "dd5_proxy": pnl_30d * risk_scale if pnl_30d is not None and risk_scale is not None else None,
                 "holding_p95_minutes": holding_p95.get(result_id),
-                **_ab_metrics(connection, result_id, report_start, report_end, config),
+                **ab_metrics,
                 "first_shift_bp": None, "scaled_lot_sum": None, "capital_proxy": None,
                 "capital_efficiency": None, "total_plateau_point_count": None,
             }
@@ -367,6 +424,51 @@ def _dominates(other: pd.Series, candidate: pd.Series, maximize: tuple[str, ...]
     ))
 
 
+def _pareto_eliminated(group: pd.DataFrame, maximize: tuple[str, ...], minimize: tuple[str, ...]) -> list[object]:
+    """Return dominated indexes without Python row-pair iteration."""
+    columns = (*maximize, *minimize)
+    values = group.loc[:, columns].to_numpy(dtype=object)
+    valid = ~pd.isna(values).any(axis=1)
+    comparable = values[valid]
+    comparable_indexes = group.index[valid]
+    eliminated: list[object] = []
+    for candidate_index, candidate in enumerate(comparable):
+        no_worse = np.ones(len(comparable), dtype=bool)
+        strictly_better = np.zeros(len(comparable), dtype=bool)
+        for column_index in range(len(maximize)):
+            no_worse &= comparable[:, column_index] >= candidate[column_index]
+            strictly_better |= comparable[:, column_index] > candidate[column_index]
+        for column_index in range(len(maximize), len(columns)):
+            no_worse &= comparable[:, column_index] <= candidate[column_index]
+            strictly_better |= comparable[:, column_index] < candidate[column_index]
+        no_worse[candidate_index] = False
+        if np.any(no_worse & strictly_better):
+            eliminated.append(comparable_indexes[candidate_index])
+    return eliminated
+
+
+def _plateau_pareto_eliminated(group: pd.DataFrame, stage_id: str, config: SelectionConfig) -> list[object]:
+    eliminated: list[object] = []
+    for _, same_order_count in group.groupby("order_count", sort=False):
+        points = (
+            tuple(f"order_{order}_plateau_point_count" for order in range(1, int(same_order_count["order_count"].iloc[0]) + 1))
+            if stage_id.endswith("per_order") else ("total_plateau_point_count",)
+        )
+        columns = ("dd5_proxy", *points)
+        values = same_order_count.loc[:, columns].to_numpy(dtype=object)
+        valid = ~pd.isna(values).any(axis=1)
+        comparable = values[valid]
+        comparable_indexes = same_order_count.index[valid]
+        for candidate_index, candidate in enumerate(comparable):
+            dominates = comparable[:, 0] >= candidate[0] * config.plateau_points_pareto_pnl_multiplier
+            for column_index in range(1, len(columns)):
+                dominates &= comparable[:, column_index] >= candidate[column_index]
+            dominates[candidate_index] = False
+            if np.any(dominates):
+                eliminated.append(comparable_indexes[candidate_index])
+    return eliminated
+
+
 def _scope_groups(frame: pd.DataFrame, scope: StageScope):
     return frame.groupby([] if scope == "pair_side" else ["timeframe"], dropna=False, sort=False) if scope != "pair_side" else [(None, frame)]
 
@@ -391,10 +493,12 @@ def run_selection(
     result = candidates.copy().sort_values(["strategy_name", "strategy_id"], kind="stable").reset_index(drop=True)
     result["finalist"] = True
     result["elimination_reason"] = None
+    stage_counts: dict[str, dict[str, int | bool]] = {}
     for stage in request.stages:
         column = f"eliminated_by_{stage.id}"
         result[column] = False
         if not stage.enabled:
+            stage_counts[stage.id] = {"enabled": False, "eliminated": 0, "remaining": int(result["finalist"].sum())}
             continue
         survivors = result.loc[result["finalist"]]
         for _, group in _scope_groups(survivors, stage.scope):
@@ -416,30 +520,20 @@ def run_selection(
                     elif decision:
                         eliminated.append(index)
             else:
-                eliminated = []
                 if stage.id == "pareto_conditional_close_ma" and len(group) <= 3:
+                    stage_counts[stage.id] = {"enabled": True, "eliminated": 0, "remaining": int(result["finalist"].sum())}
                     continue
-                for index, candidate in group.iterrows():
-                    for other_index, other in group.iterrows():
-                        if index == other_index:
-                            continue
-                        if stage.id.startswith("pareto_plateau_points"):
-                            if other["order_count"] != candidate["order_count"] or not _present(other["dd5_proxy"]) or not _present(candidate["dd5_proxy"]):
-                                continue
-                            if other["dd5_proxy"] < candidate["dd5_proxy"] * config.plateau_points_pareto_pnl_multiplier:
-                                continue
-                            points = (tuple(f"order_{order}_plateau_point_count" for order in range(1, int(candidate["order_count"]) + 1))
-                                      if stage.id.endswith("per_order") else ("total_plateau_point_count",))
-                            if all(_present(other[column]) and _present(candidate[column]) and other[column] >= candidate[column] for column in points):
-                                eliminated.append(index); break
-                        else:
-                            maximize, minimize = _PARETO_OBJECTIVES[stage.id]
-                            if _dominates(other, candidate, maximize, minimize):
-                                eliminated.append(index); break
+                eliminated = (
+                    _plateau_pareto_eliminated(group, stage.id, config)
+                    if stage.id.startswith("pareto_plateau_points")
+                    else _pareto_eliminated(group, *_PARETO_OBJECTIVES[stage.id])
+                )
             if len(eliminated):
                 result.loc[eliminated, column] = True
                 result.loc[eliminated, "finalist"] = False
                 result.loc[eliminated, "elimination_reason"] = stage.id.upper()
+        stage_counts[stage.id] = {"enabled": True, "eliminated": int(result[column].sum()), "remaining": int(result["finalist"].sum())}
+    result.attrs["stage_counts"] = stage_counts
     return result
 
 
@@ -448,9 +542,12 @@ def write_selection_workbook(result: pd.DataFrame, path: Path) -> Path:
     display = result.drop(columns=[
         column for column in result.columns
         if column.startswith("ab_") and column != "ab_pnl_change_30d_pct"
-    ], errors="ignore").copy()
+    ] + ["result_id", "total_pnl", "max_drawdown", "total_fees", "risk_scale", "scaled_lot_sum", "daily_log_return"], errors="ignore").copy()
     if "ab_pnl_change_30d_pct" not in display:
         display["ab_pnl_change_30d_pct"] = None
+    for column in ("pnl_30d_pct", "profit_factor", "win_rate_pct"):
+        if column not in display:
+            display[column] = None
     for column in display.columns:
         if column.endswith("_id") or "count" in column or column.endswith("_bp"):
             continue
@@ -458,4 +555,15 @@ def write_selection_workbook(result: pd.DataFrame, path: Path) -> Path:
             lambda value: value.quantize(Decimal(".01")) if isinstance(value, Decimal) else value
         )
     finalists = display.loc[display["finalist"]].copy()
+    display = display.rename(columns={
+        "strategy_id": "Strategy ID", "strategy_name": "Стратегия", "symbol": "Пара", "side": "Сторона",
+        "timeframe": "ТФ", "close_ma_len": "Close MA", "order_count": "Ордеров",
+        "total_pnl_pct": "PnL, %", "max_drawdown_pct": "DD, %", "total_trades": "Сделок",
+        "pnl_30d_pct": "PnL/30д, %", "dd5_proxy": "PnL DD5 / 30д, %", "profit_factor": "Profit Factor",
+        "win_rate_pct": "Win rate, %", "holding_p95_minutes": "Holding p95, мин",
+        "capital_proxy": "Capital proxy", "capital_efficiency": "Эффективность капитала",
+        "ab_pnl_change_30d_pct": "Изменение PnL/30д A/B, %", "first_shift_bp": "Shift 1, bp",
+        "total_plateau_point_count": "Точек плато, всего", "finalist": "Финалист", "elimination_reason": "Причина исключения",
+    })
+    finalists.columns = display.columns
     return write_audit_workbook({"All candidates": display, "Finalists": finalists}, Path(path))

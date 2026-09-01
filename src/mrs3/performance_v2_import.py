@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 from pathlib import Path
 from typing import Callable, Mapping
@@ -152,7 +152,21 @@ def _append_rows(
     rows: list[tuple[object, ...]],
 ) -> None:
     if rows:
-        connection.append(table, pd.DataFrame.from_records(rows, columns=columns))
+        connection.append(
+            table,
+            pd.DataFrame.from_records(
+                [
+                    tuple(
+                        format(value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_UP), "f")
+                        if isinstance(value, Decimal)
+                        else value
+                        for value in row
+                    )
+                    for row in rows
+                ],
+                columns=columns,
+            ),
+        )
 
 
 def _parse_reports(

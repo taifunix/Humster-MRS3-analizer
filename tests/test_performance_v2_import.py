@@ -188,6 +188,37 @@ def test_append_rows_uses_duckdb_native_dataframe_append() -> None:
     ]
 
 
+def test_append_rows_rounds_long_decimal_before_dataframe_type_inference() -> None:
+    class CaptureConnection:
+        frame = None
+
+        def append(self, _table: str, frame) -> None:
+            self.frame = frame
+
+    connection = CaptureConnection()
+
+    import_module._append_rows(
+        connection,
+        "rows_to_append",
+        ("id", "amount"),
+        [(1, Decimal("-29.769149208741522230595327812"))],
+    )
+
+    assert connection.frame.iloc[0]["amount"] == "-29.769149208742"
+
+    target = duckdb.connect(":memory:")
+    target.execute("create table rows_to_append (id integer, amount decimal(38, 12))")
+    import_module._append_rows(
+        target,
+        "rows_to_append",
+        ("id", "amount"),
+        [(1, Decimal("-29.769149208741522230595327812"))],
+    )
+    assert target.execute("select amount from rows_to_append").fetchone() == (
+        Decimal("-29.769149208742"),
+    )
+
+
 def test_add_publishes_multiple_strategies_and_one_current_result_each(tmp_path: Path) -> None:
     request, snapshot = _request(tmp_path, names=("alpha", "beta"), orders=2)
     inbox_bytes = (request.inbox / "inbox_manifest.json").read_bytes()

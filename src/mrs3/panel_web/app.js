@@ -1808,6 +1808,7 @@
     ? [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')]
     : [];
   let selectionPreviewDirty = false;
+  let selectionPreviewRevision = 0;
 
   const renderSelectionPreviewOrder = () => {
     if (!selectionPreviewOrder) return;
@@ -1823,12 +1824,32 @@
 
   const markSelectionPreviewDirty = () => {
     selectionPreviewDirty = true;
+    selectionPreviewRevision += 1;
     if (selectionPreviewBadge) {
       selectionPreviewBadge.textContent = 'CHANGED';
       selectionPreviewBadge.classList.remove('state-pending');
       selectionPreviewBadge.classList.add('state-ready');
     }
     if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Preview: изменения сохранены только на экране; расчёт не запускался.';
+    selectionPreviewStages.forEach((stage) => {
+      const summary = stage.querySelector('.selection-stage-summary');
+      if (summary) summary.textContent = 'Нужен расчёт';
+    });
+  };
+
+  const selectionStages = () => [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')].map((stage) => ({
+    id: stage.dataset.selectionStage,
+    enabled: !!stage.querySelector('input[type="checkbox"]')?.checked,
+    scope: stage.querySelector('[data-selection-scope]')?.value,
+  }));
+  const selectionPayload = () => ({ symbol: performanceV2SelectionPair?.value || '', side: performanceV2SelectionSide?.value || '', stages: selectionStages() });
+  const renderSelectionCounts = (counts) => {
+    selectionPreviewStages.forEach((stage) => {
+      let summary = stage.querySelector('.selection-stage-summary');
+      if (!summary) { summary = document.createElement('span'); summary.className = 'selection-stage-summary'; stage.querySelector('.selection-stage-controls')?.before(summary); }
+      const count = counts[stage.dataset.selectionStage];
+      summary.textContent = count ? (count.enabled ? `Исключено ${count.eliminated} · осталось ${count.remaining}` : 'Не применялся') : '—';
+    });
   };
 
   selectionPreviewOrder?.addEventListener('click', (event) => {
@@ -1857,17 +1878,46 @@
   performanceV2SelectionSide?.addEventListener('change', () => {
     markSelectionPreviewDirty();
   });
+  const selectionPreviewButton = document.querySelector('#performance-v2-selection-preview');
+  selectionPreviewButton?.addEventListener('click', async () => {
+    const revision = selectionPreviewRevision;
+    selectionPreviewButton.disabled = true;
+    try {
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Обновляем счётчики…';
+      const response = await fetch('/api/v2/strategies/performance-v2/selection-preview', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(selectionPayload()),
+      });
+      if (!response.ok) throw new Error((await response.json()).error?.message || 'preview failed');
+      const payload = await response.json();
+      if (revision !== selectionPreviewRevision) return;
+      renderSelectionCounts(payload.stages || {});
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Счётчики обновлены.';
+    } catch (error) {
+      if (revision !== selectionPreviewRevision) return;
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Счётчики не обновлены: ${error.message || 'ошибка запроса'}`;
+    } finally {
+      selectionPreviewButton.disabled = false;
+    }
+  });
+  document.querySelector('#performance-v2-selection-recalculate')?.addEventListener('click', async () => {
+    try {
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Пересчитываем факты…';
+      const response = await fetch('/api/v2/strategies/performance-v2/recalculate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: performanceV2SelectionPair?.value || '', side: performanceV2SelectionSide?.value || '' }),
+      });
+      if (!response.ok) throw new Error((await response.json()).error?.message || 'recalculation failed');
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Факты пересчитаны; XLSX готовится быстро.';
+    } catch (error) {
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Пересчёт не выполнен: ${error.message || 'ошибка запроса'}`;
+    }
+  });
   document.querySelector('#performance-v2-selection-xls')?.addEventListener('click', async () => {
-    const stages = [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')].map((stage) => ({
-      id: stage.dataset.selectionStage,
-      enabled: !!stage.querySelector('input[type="checkbox"]')?.checked,
-      scope: stage.querySelector('[data-selection-scope]')?.value,
-    }));
     try {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Формируем XLSX…';
       const response = await fetch('/api/v2/strategies/performance-v2/selection', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: document.querySelector('#performance-v2-selection-pair')?.value || '', side: document.querySelector('#performance-v2-selection-side')?.value || '', stages }),
+        body: JSON.stringify(selectionPayload()),
       });
       if (!response.ok) throw new Error((await response.json()).error?.message || 'selection failed');
       const url = URL.createObjectURL(await response.blob());

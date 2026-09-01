@@ -336,8 +336,9 @@ def test_selection_button_posts_the_current_panel_snapshot_for_xlsx() -> None:
     handler = js.split("#performance-v2-selection-xls')?.addEventListener", 1)[1].split("renderSelectionPreviewOrder", 1)[0]
 
     assert "/api/v2/strategies/performance-v2/selection" in handler
-    assert "data-selection-stage" in handler
-    assert "data-selection-scope" in handler
+    assert "selectionPayload()" in handler
+    assert "data-selection-stage" in js
+    assert "data-selection-scope" in js
     assert "response.blob" in handler
 
 
@@ -515,6 +516,33 @@ def test_selection_http_downloads_xlsx_without_selection_state(tmp_path: Path) -
         thread.join(timeout=2)
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute("select count(*) from information_schema.tables where table_name like 'selection_%'").fetchone() == (0,)
+
+
+def test_selection_preview_returns_current_stage_counts(tmp_path: Path) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+
+    preview = controller.strategies_performance_v2_selection_preview({
+        "symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "filter_low_trades", "enabled": True, "scope": "pair_side"},
+            {"id": "pareto_dd5_capital", "enabled": False, "scope": "pair_side"},
+        ],
+    })
+
+    assert preview["stages"]["filter_low_trades"] == {"enabled": True, "eliminated": 0, "remaining": 1}
+    assert preview["stages"]["pareto_dd5_capital"] == {"enabled": False, "eliminated": 0, "remaining": 1}
+
+
+def test_selection_still_exports_when_parallel_cache_warmup_fails(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    import mrs3.panel as panel_module
+    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *_args: (_ for _ in ()).throw(OSError("warmup unavailable")))
+
+    filename, workbook = controller.strategies_performance_v2_selection(
+        {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+    )
+
+    assert filename.endswith(".xlsx")
+    assert workbook.startswith(b"PK")
 
 
 def test_v2_catalog_ignores_active_strategy_without_current_result(tmp_path: Path) -> None:

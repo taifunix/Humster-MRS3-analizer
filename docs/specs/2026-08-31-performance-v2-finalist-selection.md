@@ -1,6 +1,6 @@
 # Performance v2 finalist selection and XLSX
 
-**Status:** Accepted design; implementation pending
+**Status:** Accepted design; Stage 2 implementation in progress
 **Date:** 2026-08-31
 **Depends on:** [Unified Performance Analytics v2](2026-08-28-unified-performance-analytics-v2.md)
 
@@ -12,7 +12,9 @@ From committed Performance DB v2 facts, calculate a disposable, ordered selectio
 
 The button runs from the current v2 database and does **not** create `selection_runs`, `selection_results`, tags, lifecycle changes, RETEST jobs or an XLSX import path. Those are Stage 3.
 
-The request is `symbol`, `side`, and ordered `{id, enabled, scope}` stages. IDs must be known built-ins; scope is `pair_side` or `pair_side_timeframe`. Unknown or duplicate IDs, unknown scope, inactive Pair + Side, and path traversal fail with typed 400. UI edits remain local until the explicit XLSX click.
+The request is `symbol`, `side`, and ordered `{id, enabled, scope}` stages. IDs must be known built-ins; scope is `pair_side` or `pair_side_timeframe`. Unknown or duplicate IDs, unknown scope, inactive Pair + Side, and path traversal fail with typed 400. UI edits remain local until an explicit action.
+
+The panel may request a disposable count preview for the current local setup before downloading XLSX. It returns, for every stage, `eliminated` and `remaining` after that stage; it writes neither database state nor a file. Any edit of Pair, Side, enabled flags, scopes or order invalidates the displayed counters until the user explicitly refreshes them.
 
 The universe is every ACTIVE strategy with a current result for requested `(symbol, side)`. A stage operates only on survivors of preceding enabled stages. Disabled stages never eliminate; finalists survive all enabled stages.
 

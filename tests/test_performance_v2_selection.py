@@ -16,6 +16,7 @@ from mrs3.performance_v2_selection import (
     load_selection_candidates,
     load_selection_config,
     parse_selection_request,
+    prepare_selection_window_cache,
     run_selection,
     write_selection_workbook,
 )
@@ -192,6 +193,19 @@ def test_loader_derives_proxy_holding_and_order_plateau_counts(tmp_path: Path) -
     assert row["ab_pnl_change_30d_pct"] is None
 
 
+def test_parallel_window_warmup_persists_default_selection_windows(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1)
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1)
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select count(*) from window_metrics").fetchone() == (3,)
+
+
 def test_loader_leaves_incomplete_order_and_empty_candidate_facts_blank(tmp_path: Path) -> None:
     connection = _candidate_db(tmp_path)
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
@@ -328,8 +342,12 @@ def test_workbook_keeps_all_candidates_and_only_one_ab_column(tmp_path: Path) ->
     headers = [cell.value for cell in book["All candidates"][1]]
 
     assert book.sheetnames == ["All candidates", "Finalists"]
-    assert headers.count("ab_pnl_change_30d_pct") == 1
-    assert sum(header.startswith("ab_") for header in headers if isinstance(header, str)) == 1
+    assert "Изменение PnL/30д A/B, %" in headers
+    assert "PnL/30д, %" in headers
+    assert "PnL DD5 / 30д, %" in headers
+    assert "Profit Factor" in headers
+    assert "result_id" not in headers
+    assert "total_pnl" not in headers
     assert "eliminated_by_pareto_dd5_capital" in headers
     assert book["All candidates"].max_row == 3
     assert book["Finalists"].max_row == 2
@@ -384,6 +402,31 @@ def test_stage_order_changes_survivors_and_keeps_first_elimination_trace() -> No
     assert not second.loc["b", "eliminated_by_ab_deterioration"]
     assert second.loc["a", "eliminated_by_ab_deterioration"]
     assert not second.loc["a", "eliminated_by_pareto_dd5_capital"]
+
+
+def test_stage_counts_follow_the_applied_stage_order() -> None:
+    failing_dominator = _selection_row(
+        "a", dd5_proxy=Decimal("10"), capital_proxy=Decimal("1"), ab_return_a_30d_pct=Decimal("10"), ab_return_b_30d_pct=Decimal("4"),
+        ab_win_rate_b_pct=Decimal("60"), ab_trade_rate_a_30d=Decimal("10"), ab_trade_rate_b_30d=Decimal("10"),
+    )
+    passing_dominated = _selection_row(
+        "b", strategy_id=3, dd5_proxy=Decimal("5"), capital_proxy=Decimal("2"),
+        ab_return_a_30d_pct=Decimal("10"), ab_return_b_30d_pct=Decimal("10"),
+        ab_win_rate_b_pct=Decimal("60"), ab_trade_rate_a_30d=Decimal("10"), ab_trade_rate_b_30d=Decimal("10"),
+    )
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
+        {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side"},
+        {"id": "pareto_dd5_balanced", "enabled": False, "scope": "pair_side"},
+    ]})
+
+    result = run_selection(pd.DataFrame([failing_dominator, passing_dominated]), request)
+
+    assert result.attrs["stage_counts"] == {
+        "ab_deterioration": {"enabled": True, "eliminated": 1, "remaining": 1},
+        "pareto_dd5_capital": {"enabled": True, "eliminated": 0, "remaining": 1},
+        "pareto_dd5_balanced": {"enabled": False, "eliminated": 0, "remaining": 1},
+    }
 
 
 def test_missing_pareto_objective_neither_dominates_nor_is_eliminated() -> None:
