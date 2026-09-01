@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
@@ -14,7 +14,10 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from .performance_v2_windows import METRICS_VERSION, WindowMetrics, _cached, _calculate, _load_source, _persist, get_or_calculate_window_pair
+from .performance_v2_windows import (
+    METRICS_VERSION, WindowMetrics, _METRIC_COLUMNS, _cached, _calculate,
+    _load_source, _metric_from_row, _persist, get_or_calculate_window_pair,
+)
 from .audit import write_audit_workbook
 
 StageScope = Literal["pair_side", "pair_side_timeframe"]
@@ -39,7 +42,8 @@ _CANDIDATE_COLUMNS = (
     "strategy_id", "strategy_name", "symbol", "side", "timeframe", "close_ma_len", "order_count",
     "result_id", "total_pnl", "total_pnl_pct", "max_drawdown", "max_drawdown_pct", "total_fees",
     "total_trades", "pnl_30d_pct", "profit_factor", "win_rate_pct", "risk_scale", "dd5_proxy", "holding_p95_minutes",
-    "ab_pnl_change_30d_pct", "first_shift_bp", "scaled_lot_sum", "capital_proxy",
+    "holding_median_minutes",
+    "ab_pnl_change_30d_pct", "ab_return_b_pct", "first_shift_bp", "scaled_lot_sum", "capital_proxy",
     "capital_efficiency", "total_plateau_point_count",
     "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct",
     "ab_trade_rate_a_30d", "ab_trade_rate_b_30d",
@@ -162,49 +166,47 @@ def _decimal_or_none(value: object) -> Decimal | None:
     return result if result.is_finite() else None
 
 
+def _holding_quantiles_minutes(
+    connection: duckdb.DuckDBPyConnection, request: SelectionRequest
+) -> dict[int, tuple[Decimal, Decimal]]:
+    rows = connection.execute(
+        """with actions as (
+                 select a.result_id, a.timestamp_utc, a.action_index, lower(a.action) as kind,
+                        a.post_size, lower(a.post_side) as post_side
+                   from strategy_actions a
+                   join strategy_results r on r.result_id = a.result_id
+                   join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id
+                  where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
+                    and lower(a.action) in ('opened', 'increased', 'decreased', 'closed')
+             ), numbered as (
+                 select *, sum(case when kind = 'opened' and post_size > 0 and post_side in ('long', 'short') then 1 else 0 end)
+                    over (partition by result_id order by timestamp_utc, action_index rows unbounded preceding) as position_number
+                   from actions
+             ), intervals as (
+                 select result_id, position_number,
+                        min(timestamp_utc) filter (where kind = 'opened' and post_size > 0 and post_side in ('long', 'short')) as opened_at,
+                        min(timestamp_utc) filter (where kind = 'closed' and post_size = 0) as closed_at
+                   from numbered
+                  group by result_id, position_number
+             )
+             select result_id,
+                    cast(quantile_cont(date_diff('second', opened_at, closed_at) / cast(60 as decimal(20, 6)), .95) as decimal(38, 6)),
+                    cast(quantile_cont(date_diff('second', opened_at, closed_at) / cast(60 as decimal(20, 6)), .5) as decimal(38, 6))
+               from intervals
+              where opened_at is not null and closed_at is not null and closed_at >= opened_at
+              group by result_id""",
+        [request.symbol, request.side],
+    ).fetchall()
+    return {
+        int(result_id): (Decimal(str(p95)), Decimal(str(median)))
+        for result_id, p95, median in rows if p95 is not None and median is not None
+    }
+
+
 def _holding_p95_minutes(
     connection: duckdb.DuckDBPyConnection, request: SelectionRequest
 ) -> dict[int, Decimal]:
-    active: dict[tuple[int, str, str], datetime] = {}
-    durations: dict[int, list[Decimal]] = {}
-    rows = connection.execute(
-        """select a.result_id, a.timestamp_utc, a.symbol, s.side, a.action, a.post_size, a.post_side
-             from strategy_actions a
-             join strategy_results r on r.result_id = a.result_id
-             join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id
-            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
-            order by a.result_id, a.timestamp_utc, a.action_index""",
-        [request.symbol, request.side],
-    ).fetchall()
-    for result_id, timestamp, symbol, side, kind, post_size, post_side in rows:
-        kind = str(kind).casefold()
-        if kind not in {"opened", "increased", "decreased", "closed"}:
-            continue
-        position_side = (
-            str(side).casefold()
-            if kind == "closed"
-            else str(post_side).casefold()
-        )
-        size = _decimal_or_none(post_size)
-        if position_side not in {"long", "short"} or size is None:
-            continue
-        key = (int(result_id), str(symbol), position_side)
-        if kind == "opened" and size > 0 and key not in active:
-            active[key] = timestamp
-        elif kind == "closed" and size == 0:
-            opened_at = active.pop(key, None)
-            if opened_at is not None and timestamp >= opened_at:
-                durations.setdefault(int(result_id), []).append(
-                    Decimal(str((timestamp - opened_at).total_seconds())) / Decimal(60)
-                )
-    result: dict[int, Decimal] = {}
-    for result_id, values in durations.items():
-        ordered = sorted(values)
-        rank = Decimal(len(ordered) - 1) * Decimal("0.95")
-        lower = int(rank)
-        upper = min(lower + 1, len(ordered) - 1)
-        result[result_id] = ordered[lower] + (ordered[upper] - ordered[lower]) * (rank - lower)
-    return result
+    return {result_id: values[0] for result_id, values in _holding_quantiles_minutes(connection, request).items()}
 
 
 def _return_30d(metrics: WindowMetrics) -> Decimal | None:
@@ -245,29 +247,59 @@ def _ab_metrics(
 ) -> dict[str, Decimal | None]:
     split = report_end - timedelta(days=config.ab_final_days)
     if split <= report_start:
-        return {key: None for key in ("ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")}
+        return {key: None for key in ("ab_pnl_change_30d_pct", "ab_return_b_pct", "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")}
     metrics_a, metrics_b = get_or_calculate_window_pair(
         connection, result_id, (report_start, split), (split, report_end)
     )
+    return _ab_metrics_from_windows(metrics_a, metrics_b)
+
+
+def _ab_metrics_from_windows(metrics_a: WindowMetrics, metrics_b: WindowMetrics) -> dict[str, Decimal | None]:
     return_a, return_b = _return_30d(metrics_a), _return_30d(metrics_b)
     return {
         "ab_pnl_change_30d_pct": None if return_a is None or return_b is None or return_a <= 0 else (return_b / return_a - 1) * 100,
+        "ab_return_b_pct": metrics_b.return_pct,
         "ab_return_a_30d_pct": return_a, "ab_return_b_30d_pct": return_b,
         "ab_win_rate_b_pct": metrics_b.win_rate_pct, "ab_trade_rate_a_30d": _trade_rate_30d(metrics_a),
         "ab_trade_rate_b_30d": _trade_rate_30d(metrics_b),
     }
 
 
-def _cached_selection_metrics(connection: duckdb.DuckDBPyConnection, result_id: int, report_start: datetime, report_end: datetime, config: SelectionConfig) -> tuple[WindowMetrics | None, dict[str, Decimal | None]]:
-    full = _cached(connection, result_id, report_start, report_end, METRICS_VERSION)
+def _selection_cached_metrics(connection: duckdb.DuckDBPyConnection, request: SelectionRequest) -> dict[tuple[int, datetime, datetime], WindowMetrics]:
+    rows = connection.execute(
+        "select " + ", ".join(f"wm.{column}" for column in _METRIC_COLUMNS) +
+        " from window_metrics wm"
+        " join strategy_results r on r.result_id = wm.result_id"
+        " join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id"
+        " where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ? and wm.metrics_version = ?",
+        [request.symbol, request.side, METRICS_VERSION],
+    ).fetchall()
+    metrics = (_metric_from_row(row) for row in rows)
+    return {(metric.result_id, metric.requested_start_utc, metric.requested_end_utc): metric for metric in metrics}
+
+
+def _cached_selection_metrics(
+    connection: duckdb.DuckDBPyConnection,
+    result_id: int,
+    report_start: datetime,
+    report_end: datetime,
+    config: SelectionConfig,
+    cached_metrics: Mapping[tuple[int, datetime, datetime], WindowMetrics] | None = None,
+) -> tuple[WindowMetrics | None, dict[str, Decimal | None]]:
+    cached = (
+        (lambda start, end: cached_metrics.get((result_id, start, end)))
+        if cached_metrics is not None
+        else (lambda start, end: _cached(connection, result_id, start, end, METRICS_VERSION))
+    )
+    full = cached(report_start, report_end)
     split = report_end - timedelta(days=config.ab_final_days)
     if split <= report_start:
-        return (full, {key: None for key in ("ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")})
-    a = _cached(connection, result_id, report_start, split, METRICS_VERSION)
-    b = _cached(connection, result_id, split, report_end, METRICS_VERSION)
+        return (full, {key: None for key in ("ab_pnl_change_30d_pct", "ab_return_b_pct", "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")})
+    a = cached(report_start, split)
+    b = cached(split, report_end)
     if a is None or b is None:
-        return (full, {key: None for key in ("ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")})
-    return (full, _ab_metrics(connection, result_id, report_start, report_end, config))
+        return (full, {key: None for key in ("ab_pnl_change_30d_pct", "ab_return_b_pct", "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")})
+    return (full, _ab_metrics_from_windows(a, b))
 
 
 def _selection_window_job(database: str, result_id: int, report_start: datetime, report_end: datetime, final_days: int) -> tuple[WindowMetrics, ...]:
@@ -306,6 +338,23 @@ def prepare_selection_window_cache(database: Path, request: SelectionRequest, co
             _persist(connection, metric)
 
 
+def selection_cache_status(connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig) -> dict[str, int | bool]:
+    rows = connection.execute(
+        """select r.result_id, r.report_start_utc, r.report_end_utc from strategies s
+             join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
+            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""",
+        [request.symbol, request.side],
+    ).fetchall()
+    cached_metrics = _selection_cached_metrics(connection, request)
+    missing = 0
+    for result_id, start, end in rows:
+        split = end - timedelta(days=config.ab_final_days)
+        windows = ((start, end), (start, split), (split, end)) if split > start else ((start, end),)
+        if any(cached_metrics.get((int(result_id), window_start, window_end)) is None for window_start, window_end in windows):
+            missing += 1
+    return {"total": len(rows), "missing": missing, "ready": bool(rows) and missing == 0}
+
+
 def load_selection_candidates(
     connection: duckdb.DuckDBPyConnection,
     request: SelectionRequest,
@@ -313,7 +362,8 @@ def load_selection_candidates(
     *, cache_only: bool = False,
 ) -> pd.DataFrame:
     """Load all current ACTIVE candidates for one Pair + Side without filtering them."""
-    holding_p95 = _holding_p95_minutes(connection, request)
+    holding_minutes = _holding_quantiles_minutes(connection, request)
+    cached_metrics = _selection_cached_metrics(connection, request) if cache_only else None
     rows = connection.execute(
         """select s.strategy_id, s.strategy_name, s.symbol, s.side, s.timeframe, s.close_ma_len,
                   s.order_count, r.result_id, r.report_start_utc, r.report_end_utc,
@@ -340,7 +390,9 @@ def load_selection_candidates(
         if candidate is None:
             result_id = int(result_id)
             if cache_only:
-                full_metrics, ab_metrics = _cached_selection_metrics(connection, result_id, report_start, report_end, config)
+                full_metrics, ab_metrics = _cached_selection_metrics(
+                    connection, result_id, report_start, report_end, config, cached_metrics
+                )
             else:
                 full_metrics = get_or_calculate_window_pair(connection, result_id, (report_start, report_end), (report_start, report_end))[0]
                 ab_metrics = _ab_metrics(connection, result_id, report_start, report_end, config)
@@ -358,7 +410,8 @@ def load_selection_candidates(
                 "profit_factor": None if full_metrics is None else full_metrics.profit_factor,
                 "win_rate_pct": None if full_metrics is None else full_metrics.win_rate_pct,
                 "risk_scale": risk_scale, "dd5_proxy": pnl_30d * risk_scale if pnl_30d is not None and risk_scale is not None else None,
-                "holding_p95_minutes": holding_p95.get(result_id),
+                "holding_p95_minutes": holding_minutes.get(result_id, (None, None))[0],
+                "holding_median_minutes": holding_minutes.get(result_id, (None, None))[1],
                 **ab_metrics,
                 "first_shift_bp": None, "scaled_lot_sum": None, "capital_proxy": None,
                 "capital_efficiency": None, "total_plateau_point_count": None,
@@ -537,11 +590,11 @@ def run_selection(
     return result
 
 
-def write_selection_workbook(result: pd.DataFrame, path: Path) -> Path:
+def write_selection_workbook(result: pd.DataFrame, path: Path, request: SelectionRequest) -> Path:
     """Write the one disposable selection workbook; internal A/B facts stay internal."""
     display = result.drop(columns=[
         column for column in result.columns
-        if column.startswith("ab_") and column != "ab_pnl_change_30d_pct"
+        if column.startswith("ab_") and column not in {"ab_pnl_change_30d_pct", "ab_return_b_30d_pct"}
     ] + ["result_id", "total_pnl", "max_drawdown", "total_fees", "risk_scale", "scaled_lot_sum", "daily_log_return"], errors="ignore").copy()
     if "ab_pnl_change_30d_pct" not in display:
         display["ab_pnl_change_30d_pct"] = None
@@ -554,16 +607,58 @@ def write_selection_workbook(result: pd.DataFrame, path: Path) -> Path:
         display[column] = display[column].map(
             lambda value: value.quantize(Decimal(".01")) if isinstance(value, Decimal) else value
         )
-    finalists = display.loc[display["finalist"]].copy()
+    for column in ("first_shift_bp", *(f"order_{order}_shift_bp" for order in range(1, 5))):
+        if column in display:
+            display[column] = display[column].map(
+                lambda value: (Decimal(str(value)) / Decimal("100")).quantize(
+                    Decimal(".1"), rounding=ROUND_HALF_UP
+                ) if value is not None and not pd.isna(value) else value
+            )
+    for column in (
+        "ab_pnl_change_30d_pct", "capital_efficiency", "win_rate_pct", "holding_p95_minutes",
+        "holding_median_minutes", "total_plateau_point_count",
+        *(f"order_{order}_plateau_point_count" for order in range(1, 5)),
+        *(f"order_{order}_open_ma_len" for order in range(1, 5)),
+    ):
+        if column in display:
+            display[column] = display[column].map(
+                lambda value: int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+                if value is not None and not pd.isna(value) else value
+            )
+    enabled_filter_columns = [f"eliminated_by_{stage.id}" for stage in request.stages if stage.enabled]
+    display = display.drop(columns=[
+        column for column in display if column.startswith("eliminated_by_") and column not in enabled_filter_columns
+    ], errors="ignore")
+    column_order = [
+        "strategy_id", "strategy_name", "symbol", "side", "timeframe", "close_ma_len", "order_count",
+        "total_pnl_pct", "pnl_30d_pct", "dd5_proxy", "profit_factor", "ab_pnl_change_30d_pct", "ab_return_b_30d_pct",
+        "capital_efficiency", "max_drawdown_pct", "win_rate_pct", "total_trades", "capital_proxy",
+        "holding_p95_minutes", "holding_median_minutes", "first_shift_bp", "total_plateau_point_count",
+        *(f"order_{order}_shift_bp" for order in range(1, 5)),
+        *(f"order_{order}_lot_x" for order in range(1, 5)),
+        *(f"order_{order}_plateau_point_count" for order in range(1, 5)),
+        *(f"order_{order}_open_ma_len" for order in range(1, 5)),
+        "finalist", "elimination_reason", *enabled_filter_columns,
+    ]
+    display = display.reindex(columns=column_order)
     display = display.rename(columns={
-        "strategy_id": "Strategy ID", "strategy_name": "Стратегия", "symbol": "Пара", "side": "Сторона",
-        "timeframe": "ТФ", "close_ma_len": "Close MA", "order_count": "Ордеров",
-        "total_pnl_pct": "PnL, %", "max_drawdown_pct": "DD, %", "total_trades": "Сделок",
-        "pnl_30d_pct": "PnL/30д, %", "dd5_proxy": "PnL DD5 / 30д, %", "profit_factor": "Profit Factor",
-        "win_rate_pct": "Win rate, %", "holding_p95_minutes": "Holding p95, мин",
-        "capital_proxy": "Capital proxy", "capital_efficiency": "Эффективность капитала",
-        "ab_pnl_change_30d_pct": "Изменение PnL/30д A/B, %", "first_shift_bp": "Shift 1, bp",
-        "total_plateau_point_count": "Точек плато, всего", "finalist": "Финалист", "elimination_reason": "Причина исключения",
+        "strategy_id": "ID", "strategy_name": "Стратегия", "symbol": "Пара", "side": "Side", "timeframe": "ТФ",
+        "close_ma_len": "Close", "order_count": "ORD",
+        "total_pnl_pct": "PnL", "pnl_30d_pct": "PnL/30", "dd5_proxy": "PnL DD5/30", "profit_factor": "PF",
+        "ab_pnl_change_30d_pct": "∆ PnL A/B", "ab_return_b_30d_pct": "PnL B", "capital_efficiency": "CE",
+        "max_drawdown_pct": "DD", "win_rate_pct": "W/R", "total_trades": "Trades", "capital_proxy": "Lot DD5",
+        "holding_p95_minutes": "Hold p95", "holding_median_minutes": "Hold M", "first_shift_bp": "Shift 1",
+        "total_plateau_point_count": "PointsALL", "finalist": "Final", "elimination_reason": "Причина",
+        **{f"order_{order}_open_ma_len": f"{order} MA" for order in range(1, 5)},
+        **{f"order_{order}_shift_bp": f"{order} Shift" for order in range(1, 5)},
+        **{f"order_{order}_lot_x": f"{order} lot" for order in range(1, 5)},
+        **{f"order_{order}_plateau_point_count": f"{order} Points" for order in range(1, 5)},
     })
-    finalists.columns = display.columns
-    return write_audit_workbook({"All candidates": display, "Finalists": finalists}, Path(path))
+    finalists = display.loc[display["Final"]].copy()
+    return write_audit_workbook(
+        {"All candidates": display, "Finalists": finalists}, Path(path), data_widths_only=True,
+        minimum_width=3, hidden_columns=frozenset({"Стратегия"}), numeric_decimals=True,
+        number_formats={
+            "Shift 1": "0.0", **{f"{order} Shift": "0.0" for order in range(1, 5)},
+        },
+    )

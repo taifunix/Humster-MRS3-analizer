@@ -710,6 +710,7 @@ def test_task5_readiness_grid_requires_every_shift_and_close_ma_variant() -> Non
 def test_task5_canonical_readiness_uses_operational_six_by_nineteen_contract() -> None:
     from mrs3.source_v6 import normalize_source_v6
     from mrs3.source_v6_coverage import CANONICAL_READINESS_CLOSE_LENGTHS, CANONICAL_READINESS_SHIFTS_BP, canonical_ready_intervals
+    from mrs3.duckdb_direct import CoverageInterval, canonical_coverage_from_rows
 
     report = normalize_source_v6((_FIXTURES / "source_v6_fixed_lot_overlap_a.html").read_bytes())
     variants = [
@@ -721,6 +722,168 @@ def test_task5_canonical_readiness_uses_operational_six_by_nineteen_contract() -
     assert intervals and intervals[0].scope_key == "ONUSDT|LONG|1h"
     assert (intervals[0].start, intervals[0].end) == (date(2026, 1, 1), date(2026, 1, 8))
     assert canonical_ready_intervals(variants[:-1]) == ()
+
+    rows = [{
+        "report_id": fragment.fragment_id,
+        "source_hash": fragment.source_sha256,
+        "canonical_point_key": fragment.point.canonical_key,
+        "symbol": fragment.point.symbol,
+        "side": fragment.point.side,
+        "timeframe": fragment.point.timeframe,
+        "shift_bp": fragment.point.shift_bp,
+        "open_ma_len": fragment.point.open_ma_length,
+        "close_ma_len": fragment.point.close_ma_length,
+        "report_period_start_ms": fragment.report_start_ms,
+        "report_period_end_ms": fragment.report_end_ms,
+        "start_timestamp_ms": fragment.report_start_ms,
+        "end_timestamp_ms": fragment.report_end_ms,
+    } for fragment in variants]
+    coverage = canonical_coverage_from_rows(rows)
+    assert coverage.intervals and all(isinstance(item, CoverageInterval) for item in coverage.intervals)
+    assert all(type(item.selectable) is bool for item in coverage.intervals)
+
+
+def test_task5_canonical_readiness_drops_unselectable_zero_length_duplicate(monkeypatch) -> None:
+    from mrs3.source_v6_coverage import ReadyInterval, canonical_ready_intervals
+
+    scope = SimpleNamespace(symbol="ONUSDT", side="LONG", timeframe="1h")
+    hidden_scope = SimpleNamespace(symbol="BTCUSDT", side="LONG", timeframe="1h")
+    selected = SimpleNamespace(
+        scope=scope,
+        start_utc="2026-01-01T00:00:00.000+00:00",
+        end_utc="2026-01-05T00:00:00.000+00:00",
+        selectable=True,
+    )
+    hidden_longer = SimpleNamespace(
+        scope=scope,
+        start_utc="2025-12-01T00:00:00.000+00:00",
+        end_utc="2026-01-20T00:00:00.000+00:00",
+        selectable=False,
+    )
+    hidden_only = SimpleNamespace(
+        scope=hidden_scope,
+        start_utc="2026-01-09T00:00:00.000+00:00",
+        end_utc="2026-01-09T00:00:00.000+00:00",
+        selectable=False,
+    )
+    degenerate = SimpleNamespace(
+        scope=SimpleNamespace(symbol="ETHUSDT", side="LONG", timeframe="1h"),
+        start_utc="2026-01-09T00:00:00.000+00:00",
+        end_utc="2026-01-09T00:00:00.000+00:00",
+        selectable=True,
+    )
+    calls = []
+
+    def coverage(rows):
+        calls.append(rows)
+        return SimpleNamespace(intervals=(selected, hidden_longer, hidden_only, degenerate))
+
+    # The production helper defers this import to avoid a module cycle.
+    monkeypatch.setattr(
+        "mrs3.duckdb_direct.canonical_coverage_from_rows",
+        coverage,
+    )
+
+    result = canonical_ready_intervals(())
+    assert calls
+    assert canonical_ready_intervals(()) == (
+        ReadyInterval("ONUSDT|LONG|1h", date(2026, 1, 1), date(2026, 1, 4)),
+    )
+    assert result == canonical_ready_intervals(())
+
+
+def test_task5_canonical_readiness_collapses_real_disjoint_fragment_windows() -> None:
+    from mrs3.source_v6 import normalize_source_v6
+    from mrs3.source_v6_coverage import ReadyInterval, canonical_ready_intervals
+    from mrs3.source_v6_coverage import CANONICAL_READINESS_CLOSE_LENGTHS, CANONICAL_READINESS_SHIFTS_BP
+
+    report = normalize_source_v6((_FIXTURES / "source_v6_fixed_lot_overlap_a.html").read_bytes())
+    variants = tuple(
+        replace(report, point=replace(report.point, shift_bp=shift, close_ma_length=close))
+        for shift in CANONICAL_READINESS_SHIFTS_BP
+        for close in CANONICAL_READINESS_CLOSE_LENGTHS
+    )
+    period = report.report_end_ms - report.report_start_ms
+    second_start = report.report_end_ms + 86_400_000
+    second = tuple(replace(item, report_start_ms=second_start, report_end_ms=second_start + period) for item in variants)
+
+    assert canonical_ready_intervals((*variants, *second)) == (
+        ReadyInterval("ONUSDT|LONG|1h", date(2026, 1, 1), date(2026, 1, 8)),
+    )
+
+
+def test_task5_canonical_readiness_keeps_earliest_longest_selectable_interval(monkeypatch) -> None:
+    from mrs3.source_v6_coverage import ReadyInterval, canonical_ready_intervals
+
+    scope = SimpleNamespace(symbol="ONUSDT", side="LONG", timeframe="1h")
+    late_longer = SimpleNamespace(
+        scope=scope,
+        start_utc="2026-01-05T00:00:00.000+00:00",
+        end_utc="2026-01-20T00:00:00.000+00:00",
+        selectable=True,
+    )
+    early_shorter = SimpleNamespace(
+        scope=scope,
+        start_utc="2026-01-01T00:00:00.000+00:00",
+        end_utc="2026-01-03T00:00:00.000+00:00",
+        selectable=True,
+    )
+    tie_scope = SimpleNamespace(symbol="BTCUSDT", side="LONG", timeframe="1h")
+    tie_late = SimpleNamespace(
+        scope=tie_scope,
+        start_utc="2026-02-03T00:00:00.000+00:00",
+        end_utc="2026-02-08T00:00:00.000+00:00",
+        selectable=True,
+    )
+    tie_early = SimpleNamespace(
+        scope=tie_scope,
+        start_utc="2026-02-01T00:00:00.000+00:00",
+        end_utc="2026-02-06T00:00:00.000+00:00",
+        selectable=True,
+    )
+
+    calls = []
+
+    def coverage(rows):
+        calls.append(rows)
+        return SimpleNamespace(intervals=(late_longer, early_shorter, tie_late, tie_early))
+
+    monkeypatch.setattr(
+        "mrs3.duckdb_direct.canonical_coverage_from_rows",
+        coverage,
+    )
+    expected = (
+        ReadyInterval("BTCUSDT|LONG|1h", date(2026, 2, 1), date(2026, 2, 5)),
+        ReadyInterval("ONUSDT|LONG|1h", date(2026, 1, 5), date(2026, 1, 19)),
+    )
+    assert canonical_ready_intervals(()) == expected
+    assert calls
+
+    monkeypatch.setattr(
+        "mrs3.duckdb_direct.canonical_coverage_from_rows",
+        lambda rows: SimpleNamespace(intervals=(tie_early, tie_late, early_shorter, late_longer)),
+    )
+    assert canonical_ready_intervals(()) == expected
+
+
+def test_task5_canonical_readiness_keeps_single_day_interval(monkeypatch) -> None:
+    from mrs3.source_v6_coverage import ReadyInterval, canonical_ready_intervals
+
+    scope = SimpleNamespace(symbol="SOLUSDT", side="SHORT", timeframe="1h")
+    one_day = SimpleNamespace(
+        scope=scope,
+        start_utc="2026-03-01T00:00:00.000+00:00",
+        end_utc="2026-03-02T00:00:00.000+00:00",
+        selectable=True,
+    )
+    monkeypatch.setattr(
+        "mrs3.duckdb_direct.canonical_coverage_from_rows",
+        lambda rows: SimpleNamespace(intervals=(one_day,)),
+    )
+
+    assert canonical_ready_intervals(()) == (
+        ReadyInterval("SOLUSDT|SHORT|1h", date(2026, 3, 1), date(2026, 3, 1)),
+    )
 
 
 def test_task5_selected_interval_must_be_inside_ready_bounds() -> None:

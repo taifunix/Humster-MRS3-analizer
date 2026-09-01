@@ -16,6 +16,8 @@ The request is `symbol`, `side`, and ordered `{id, enabled, scope}` stages. IDs 
 
 The panel may request a disposable count preview for the current local setup before downloading XLSX. It returns, for every stage, `eliminated` and `remaining` after that stage; it writes neither database state nor a file. Any edit of Pair, Side, enabled flags, scopes or order invalidates the displayed counters until the user explicitly refreshes them.
 
+XLSX is enabled only when every ACTIVE result in the selected Pair + Side has the default full, A and B windows in `window_metrics`. A read-only readiness check reports the missing-result count when Pair or Side changes. The explicit fact recalculation warms those windows, then refreshes readiness; checkbox, scope and order edits do not affect readiness.
+
 The universe is every ACTIVE strategy with a current result for requested `(symbol, side)`. A stage operates only on survivors of preceding enabled stages. Disabled stages never eliminate; finalists survive all enabled stages.
 
 ## Derived facts

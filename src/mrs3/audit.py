@@ -83,7 +83,11 @@ def _normalize_xlsx_archive(path: Path) -> None:
     normalized.replace(path)
 
 
-def write_audit_workbook(tables: Mapping[str, pd.DataFrame], path: Path) -> Path:
+def write_audit_workbook(
+    tables: Mapping[str, pd.DataFrame], path: Path, *, data_widths_only: bool = False,
+    minimum_width: int = 10, hidden_columns: frozenset[str] = frozenset(), decimal_comma: bool = False,
+    numeric_decimals: bool = False, number_formats: Mapping[str, str] | None = None,
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -95,9 +99,33 @@ def write_audit_workbook(tables: Mapping[str, pd.DataFrame], path: Path) -> Path
 
     for sheet_name, raw_frame in tables.items():
         worksheet = workbook.create_sheet(sheet_name)
-        frame = serializable_frame(raw_frame)
+        frame_source = raw_frame
+        if numeric_decimals:
+            frame_source = raw_frame.copy()
+            for column in frame_source.columns:
+                frame_source[column] = frame_source[column].map(
+                    lambda value: float(value) if isinstance(value, Decimal) else value
+                )
+        frame = serializable_frame(frame_source)
+        if decimal_comma:
+            for column in frame.columns:
+                frame[column] = frame[column].map(
+                    lambda value: re.sub(r"(?<=\d)\.(?=\d+$)", ",", value) if isinstance(value, str) else value
+                )
         for row in dataframe_to_rows(frame, index=False, header=True):
             worksheet.append(row)
+        if numeric_decimals:
+            for row in worksheet.iter_rows(min_row=2):
+                for cell in row:
+                    if isinstance(cell.value, float):
+                        cell.number_format = "0.00"
+        if number_formats:
+            for index, column in enumerate(frame.columns, start=1):
+                if number_format := number_formats.get(str(column)):
+                    for cell in worksheet.iter_cols(min_col=index, max_col=index, min_row=2):
+                        for value_cell in cell:
+                            if isinstance(value_cell.value, (int, float)):
+                                value_cell.number_format = number_format
         if len(frame.columns):
             for cell in worksheet[1]:
                 cell.fill = header_fill
@@ -106,12 +134,16 @@ def write_audit_workbook(tables: Mapping[str, pd.DataFrame], path: Path) -> Path
             worksheet.freeze_panes = "A2"
             worksheet.auto_filter.ref = worksheet.dimensions
             for index, column in enumerate(frame.columns, start=1):
-                values = [str(column)] + [
+                values = [
                     "" if value is None else str(value)
                     for value in frame[column].head(2000)
                 ]
-                width = min(70, max(10, max(len(value) for value in values) + 2))
-                worksheet.column_dimensions[get_column_letter(index)].width = width
+                if not data_widths_only:
+                    values.insert(0, str(column))
+                width = min(70, max(minimum_width, max((len(value) for value in values), default=0) + 2))
+                dimension = worksheet.column_dimensions[get_column_letter(index)]
+                dimension.width = width
+                dimension.hidden = str(column) in hidden_columns
     with tempfile.NamedTemporaryFile(
         prefix=f".{path.stem}.", suffix=".xlsx", dir=path.parent, delete=False
     ) as handle:

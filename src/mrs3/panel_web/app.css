@@ -219,7 +219,10 @@ tbody th { font-weight: 750; }
 .selection-stage-kind { padding: 3px 6px; border-radius: 5px; color: var(--muted); background: #eef2f7; font-size: .6rem; font-weight: 800; white-space: nowrap; }
 .selection-stage-scope { display: grid; gap: 2px; color: var(--muted); font-size: .62rem; font-weight: 700; }
 .selection-stage-scope select { min-height: 30px; padding: 4px 6px; font: inherit; font-size: .7rem; color: var(--text); }
-.selection-stage-summary { color: var(--muted); font-size: .66rem; font-weight: 700; white-space: nowrap; text-align: right; }
+.selection-stage-summary { display: grid; gap: 2px; color: var(--muted); font-size: .66rem; font-weight: 700; white-space: nowrap; text-align: right; }
+.selection-stage-summary-eliminated { color: #b42318; }
+.selection-stage-summary-zero { color: var(--muted); }
+.selection-stage-summary-remaining { color: #067647; }
 .selection-stage-controls { grid-column: 6; display: flex; gap: 4px; }
 .selection-stage-controls .button { min-width: 31px; min-height: 30px; padding: 4px 7px; }
 .selection-objectives { display: grid; gap: 10px; margin-top: 16px; }

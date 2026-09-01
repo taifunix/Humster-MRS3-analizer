@@ -64,6 +64,7 @@ class PanelPathSettings:
     tester_report_dir: Path = Path("tester/report/my_test")
     tester_strategy_dir: Path = Path("settings_strategy")
     tester_config: Path = Path("config_tester.json")
+    surface_target_path: Path = Path("data/surfaces")
 
 
 PanelPaths = PanelPathSettings
@@ -83,6 +84,7 @@ _PANEL_PATH_KEYS = {
     "tester_strategy_dir": "tester_strategy_dir",
     "tester_strategies": "tester_strategy_dir",
     "tester_config": "tester_config",
+    "surface_target_path": "surface_target_path",
 }
 
 
@@ -129,12 +131,17 @@ def load_panel_path_settings(path: Path) -> PanelPathSettings:
         if isinstance(analysis, str) and analysis.strip():
             values["analysis_root"] = Path(analysis).parent
     panel = raw.get("panel")
-    if "analysis_root" not in configured_fields and isinstance(panel, dict):
+    if isinstance(panel, dict):
         paths = panel.get("path_defaults")
         if isinstance(paths, dict):
-            analysis = paths.get("analysis_db_root") or paths.get("local_analysis_db_root")
-            if isinstance(analysis, str) and analysis.strip():
-                values["analysis_root"] = Path(analysis)
+            if "analysis_root" not in configured_fields:
+                analysis = paths.get("analysis_db_root") or paths.get("local_analysis_db_root")
+                if isinstance(analysis, str) and analysis.strip():
+                    values["analysis_root"] = Path(analysis)
+            if "surface_target_path" not in configured_fields:
+                surface_target = paths.get("surface_target_path")
+                if isinstance(surface_target, str) and surface_target.strip():
+                    values["surface_target_path"] = Path(surface_target)
     return PanelPathSettings(**values)
 
 

@@ -109,6 +109,47 @@ def test_panel_helpers_use_server_owned_fixed_roots_without_request_paths(tmp_pa
     assert controller._panel_path("strategies_root") != (tmp_path / "attacker").resolve()
 
 
+def test_panel_surface_path_comes_from_config_not_request(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    configured = tmp_path / "data" / "surfaces"
+    config.write_text(json.dumps({"panel": {"path_defaults": {"surface_target_path": str(configured)}}}), encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    calls = []
+    controller._panel_surfaces = type("Surfaces", (), {
+        "start_publish": lambda _self, token, scopes, target, filename: calls.append(target) or {"phase": "QUEUED"},
+    })()
+
+    controller.surface_publish_start({
+        "preflight_token": "token",
+        "scope_keys": ["BTCUSDT|LONG|1h"],
+        "target_path": str(tmp_path / "attacker"),
+    })
+
+    assert calls == [configured.resolve()]
+
+
+def test_panel_surface_default_is_anchored_to_project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    controller = PanelController(tmp_path, tmp_path / "missing.json")
+
+    assert controller._panel_path("surface_target_path") == (tmp_path / "data" / "surfaces").resolve()
+
+
+def test_settings_save_without_surface_path_preserves_configured_surface_path(panel_http) -> None:
+    _, config, connection = panel_http
+    configured = r"D:\SHARE\!MN\hamster\MRS-Analizer\data\surfaces"
+    document = json.loads(config.read_text(encoding="utf-8"))
+    document["panel"] = {"path_defaults": {"surface_target_path": configured}}
+    config.write_text(json.dumps(document), encoding="utf-8")
+
+    status, body = _request(connection, "POST", "/api/v2/settings/save", {"panel": {"default_root": "static"}})
+
+    assert status == 200 and body["saved"] is True
+    assert json.loads(config.read_text(encoding="utf-8"))["panel"]["path_defaults"]["surface_target_path"] == configured
+
+
 def test_analysis_path_requires_configured_database_file(tmp_path: Path) -> None:
     config = tmp_path / "config.local.json"
     config.write_text(json.dumps({"panel_paths": {"analysis_root": "data/Analysis"}}), encoding="utf-8")
@@ -185,7 +226,10 @@ def test_surface_catalog_lists_manifest_validated_surfaces_recursively_from_the_
     from mrs3.panel import PanelController
 
     config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"duckdb_import": {"source_v6_surface_dir": "data/surfaces"}}), encoding="utf-8")
+    config.write_text(json.dumps({
+        "duckdb_import": {"source_v6_surface_dir": str(tmp_path / "stale-surfaces")},
+        "panel": {"path_defaults": {"surface_target_path": str(tmp_path / "data" / "surfaces")}},
+    }), encoding="utf-8")
     good = tmp_path / "data" / "surfaces" / "CXMT.duckdb" / "CXMT.surface-v6.duckdb"
     bad = tmp_path / "data" / "surfaces" / "broken.surface-v6.duckdb"
     good.parent.mkdir(parents=True)
@@ -209,12 +253,12 @@ def test_surface_publication_path_default_is_accepted_by_settings_save(panel_htt
 
     status, body = _request(
         connection, "POST", "/api/v2/settings/save",
-        {"panel": {"path_defaults": {"surface_target_path": "D:\\MRS3\\surfaces"}}},
+        {"panel": {"path_defaults": {"surface_target_path": "D:\\SHARE\\!MN\\hamster\\MRS-Analizer\\data\\surfaces"}}},
     )
 
     assert status == 200
     assert body["saved"] is True
-    assert json.loads(config.read_text(encoding="utf-8"))["panel"]["path_defaults"]["surface_target_path"] == "D:\\MRS3\\surfaces"
+    assert json.loads(config.read_text(encoding="utf-8"))["panel"]["path_defaults"]["surface_target_path"] == "D:\\SHARE\\!MN\\hamster\\MRS-Analizer\\data\\surfaces"
 
 
 def test_bootstrap_does_not_derive_runner_paths_from_invalid_runner_config(panel_http) -> None:

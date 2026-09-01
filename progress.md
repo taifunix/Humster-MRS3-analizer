@@ -949,6 +949,13 @@ does not generate a workbook or mutate Performance DB v2.
 Evidence: focused selection/panel/static suite `130 passed`; `node --check`,
 `git diff --check`; independent Opus re-review `CODE_REVIEW_PASS`.
 
+XLSX is now fail-closed on default-window cache readiness: Pair + Side changes
+show whether recalculation is required and keep XLSX disabled until every ACTIVE
+current result has its full, A and B facts. The same check rejects direct XLSX
+requests with typed `SELECTION_CACHE_INCOMPLETE` (`409`), so the browser button
+cannot be bypassed. Evidence: focused suite `133 passed`; independent Opus
+review `CODE_REVIEW_PASS`.
+
 The preview is now executable. On `Смотреть результаты в xls`, the Panel sends
 the current Pair + Side, checkbox state, stage order and per-stage scope to the
 local v2 endpoint. It reads only ACTIVE current Performance DB v2 rows,
@@ -1025,6 +1032,14 @@ reports with zero rejected/skipped. The target contains 1,633 strategies,
 `COMMITTED`. The completed import cleared the tester report directory and
 `Output\\strategies` as requested. Focused tests: `143 passed` for the v2/panel
 slice and `53 passed` for static-panel UI after the progress-track check.
+
+Surface publication now has one server-owned output root: `panel.path_defaults.surface_target_path`.
+Catalog listing and both publish entry points ignore request-supplied target paths;
+the UI no longer exposes the stale `D:\\MRS3\\surfaces` default or a save-path button.
+The configured project path is `D:\\SHARE\\!MN\\hamster\\MRS-Analizer\\data\\surfaces`.
+Focused evidence: `216 passed`; full suite: `2050 passed, 1 failed, 2 skipped`;
+the remaining failure is the pre-existing worker-default mismatch in
+`config.performance.json` (30) versus its test expectation (16).
 
 The READY JSON endpoint now accepts up to 1 MiB because a checked READY
 selection can legitimately exceed the generic 64 KiB API limit. The live

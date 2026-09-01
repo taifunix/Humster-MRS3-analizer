@@ -282,3 +282,30 @@ def test_controller_uses_surface_adapter_and_keeps_paths_out_of_response(tmp_pat
 
     assert selected["scopes"] == ["BTCUSDT|LONG|1h"]
     assert str(tmp_path) not in json.dumps(preflight)
+
+
+def test_controller_publish_methods_ignore_request_target_path(tmp_path: Path) -> None:
+    configured = r"D:\SHARE\!MN\hamster\MRS-Analizer\data\surfaces"
+    (tmp_path / "config.local.json").write_text(
+        json.dumps({"panel": {"path_defaults": {"surface_target_path": configured}}}),
+        encoding="utf-8",
+    )
+    calls: list[Path] = []
+
+    class Service:
+        def publish(self, token, scopes, target, filename=None):
+            calls.append(Path(target))
+            return {"phase": "COMMITTED"}
+
+        def start_publish(self, token, scopes, target, filename=None):
+            calls.append(Path(target))
+            return {"phase": "QUEUED"}
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    controller._panel_surfaces = Service()
+    request = {"preflight_token": "token", "scope_keys": ["BTCUSDT|LONG|1h"], "target_path": str(tmp_path / "attacker")}
+
+    controller.surface_publish(request)
+    controller.surface_publish_start(request)
+
+    assert calls == [Path(configured), Path(configured)]

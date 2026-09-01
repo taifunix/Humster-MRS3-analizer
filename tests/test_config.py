@@ -36,6 +36,7 @@ def test_panel_path_defaults_are_fixed_and_relative(tmp_path) -> None:
     assert settings.tester_report_dir == Path("tester/report/my_test")
     assert settings.tester_strategy_dir == Path("settings_strategy")
     assert settings.tester_config == Path("config_tester.json")
+    assert settings.surface_target_path == Path("data/surfaces")
 
 
 def test_panel_path_defaults_keep_legacy_config_values(tmp_path) -> None:
@@ -55,6 +56,23 @@ def test_panel_path_defaults_keep_legacy_config_values(tmp_path) -> None:
     assert settings.tester_strategy_dir == Path("old/strategies")
     assert settings.tester_config == Path("old/config.json")
     assert settings.analysis_root == Path("old/Analysis")
+
+
+def test_panel_path_defaults_keep_legacy_surface_target_path(tmp_path) -> None:
+    path = tmp_path / "config.local.json"
+    target = r"D:\SHARE\!MN\hamster\MRS-Analizer\data\surfaces"
+    path.write_text(json.dumps({"panel": {"path_defaults": {"surface_target_path": target}}}), encoding="utf-8")
+
+    assert load_panel_path_settings(path).surface_target_path == Path(target)
+
+
+@pytest.mark.parametrize("document", [{}, {"panel": {"path_defaults": {"surface_target_path": ""}}}])
+def test_panel_surface_path_never_falls_back_to_import_settings(tmp_path, document) -> None:
+    path = tmp_path / "config.local.json"
+    document["duckdb_import"] = {"source_v6_surface_dir": "D:\\MRS3\\surfaces"}
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert load_panel_path_settings(path).surface_target_path == Path("data/surfaces")
 
 
 def test_panel_path_defaults_reject_traversal(tmp_path) -> None:

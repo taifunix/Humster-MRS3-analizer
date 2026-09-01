@@ -333,7 +333,7 @@ def test_visible_performance_card_targets_only_v2_import_job_and_status() -> Non
 def test_selection_button_posts_the_current_panel_snapshot_for_xlsx() -> None:
     panel_web = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web"
     js = (panel_web / "app.js").read_text(encoding="utf-8")
-    handler = js.split("#performance-v2-selection-xls')?.addEventListener", 1)[1].split("renderSelectionPreviewOrder", 1)[0]
+    handler = js.split("selectionXlsButton?.addEventListener", 1)[1].split("renderSelectionPreviewOrder", 1)[0]
 
     assert "/api/v2/strategies/performance-v2/selection" in handler
     assert "selectionPayload()" in handler
@@ -495,6 +495,7 @@ def test_v2_catalog_and_windows_http_are_typed_and_repeatable(tmp_path: Path) ->
 
 def test_selection_http_downloads_xlsx_without_selection_state(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
     server, thread = _http_server(controller)
     try:
         connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
@@ -520,6 +521,7 @@ def test_selection_http_downloads_xlsx_without_selection_state(tmp_path: Path) -
 
 def test_selection_preview_returns_current_stage_counts(tmp_path: Path) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
 
     preview = controller.strategies_performance_v2_selection_preview({
         "symbol": "BTCUSDT", "side": "LONG", "stages": [
@@ -532,8 +534,73 @@ def test_selection_preview_returns_current_stage_counts(tmp_path: Path) -> None:
     assert preview["stages"]["pareto_dd5_capital"] == {"enabled": False, "eliminated": 0, "remaining": 1}
 
 
+def test_selection_preview_reuses_candidates_until_recalculation(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+    controller.strategies_performance_v2_recalculate(payload)
+    import mrs3.panel as panel_module
+    original = panel_module.load_selection_candidates
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(panel_module, "load_selection_candidates", counted)
+    controller.strategies_performance_v2_selection_preview(payload)
+    controller.strategies_performance_v2_selection_preview(payload)
+    assert calls == 1
+
+    controller.strategies_performance_v2_recalculate(payload)
+    controller.strategies_performance_v2_selection_preview(payload)
+    assert calls == 2
+
+
+def test_selection_cache_status_reports_missing_default_windows(tmp_path: Path) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    payload = {"symbol": "BTCUSDT", "side": "LONG"}
+
+    assert controller.strategies_performance_v2_selection_cache_status(payload) == {
+        "total": 1, "missing": 1, "ready": False,
+    }
+    assert controller.strategies_performance_v2_recalculate(payload) == {"status": "READY"}
+    assert controller.strategies_performance_v2_selection_cache_status(payload) == {
+        "total": 1, "missing": 0, "ready": True,
+    }
+
+
+def test_selection_cache_status_requires_an_active_candidate(tmp_path: Path) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+
+    assert controller.strategies_performance_v2_selection_cache_status({"symbol": "ETHUSDT", "side": "LONG"}) == {
+        "total": 0, "missing": 0, "ready": False,
+    }
+
+
+def test_selection_recalculate_all_skips_pairs_with_ready_facts(tmp_path: Path) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+
+    first = controller.strategies_performance_v2_recalculate_all()
+    second = controller.strategies_performance_v2_recalculate_all()
+
+    assert first == {"status": "READY", "total_pairs": 1, "recalculated_pairs": 1, "ready_pairs": 0}
+    assert second == {"status": "READY", "total_pairs": 1, "recalculated_pairs": 0, "ready_pairs": 1}
+
+
+def test_selection_xlsx_rejects_incomplete_cache(tmp_path: Path) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+
+    with pytest.raises(PerformanceV2ApiError, match="recalculation") as raised:
+        controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    assert raised.value.code == "SELECTION_CACHE_INCOMPLETE"
+    assert raised.value.status == 409
+
+
 def test_selection_still_exports_when_parallel_cache_warmup_fails(tmp_path: Path, monkeypatch) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
     import mrs3.panel as panel_module
     monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *_args: (_ for _ in ()).throw(OSError("warmup unavailable")))
 

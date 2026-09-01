@@ -663,9 +663,6 @@
     local_bot_root: inputValue('local-bot-root'), local_runner_root: inputValue('local-runner-root'),
     local_reports_root: inputValue('local-reports-root'), local_output_root: inputValue('local-output-root'),
   }));
-  bindPathSave(document.querySelector('#surface-target-save'), document.querySelector('#surface-publish-card'), () => ({
-    surface_target_path: inputValue('surface-target'),
-  }));
   document.querySelector('#analysis-target-save')?.addEventListener('click', () => {
     const value = inputValue('analysis-target');
     const target = value.endsWith('.analysis-v6.duckdb') ? value.replace(/[\\/][^\\/]*$/, '') : value;
@@ -1807,6 +1804,9 @@
   const selectionPreviewStages = selectionPreviewOrder
     ? [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')]
     : [];
+  const orderedSelectionStages = () => selectionPreviewOrder
+    ? [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')]
+    : [];
   let selectionPreviewDirty = false;
   let selectionPreviewRevision = 0;
 
@@ -1822,7 +1822,7 @@
     });
   };
 
-  const markSelectionPreviewDirty = () => {
+  const markSelectionPreviewDirty = (fromIndex = 0) => {
     selectionPreviewDirty = true;
     selectionPreviewRevision += 1;
     if (selectionPreviewBadge) {
@@ -1831,24 +1831,58 @@
       selectionPreviewBadge.classList.add('state-ready');
     }
     if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Preview: изменения сохранены только на экране; расчёт не запускался.';
-    selectionPreviewStages.forEach((stage) => {
+    orderedSelectionStages().forEach((stage, index) => {
+      if (index < fromIndex) return;
       const summary = stage.querySelector('.selection-stage-summary');
       if (summary) summary.textContent = 'Нужен расчёт';
     });
+    scheduleSelectionPreview();
   };
 
-  const selectionStages = () => [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')].map((stage) => ({
+  const selectionStages = () => orderedSelectionStages().map((stage) => ({
     id: stage.dataset.selectionStage,
     enabled: !!stage.querySelector('input[type="checkbox"]')?.checked,
     scope: stage.querySelector('[data-selection-scope]')?.value,
   }));
   const selectionPayload = () => ({ symbol: performanceV2SelectionPair?.value || '', side: performanceV2SelectionSide?.value || '', stages: selectionStages() });
+  const selectionXlsButton = document.querySelector('#performance-v2-selection-xls');
+  let selectionCacheStatusRevision = 0;
+  const refreshSelectionCacheStatus = async () => {
+    const revision = ++selectionCacheStatusRevision;
+    const symbol = performanceV2SelectionPair?.value || '';
+    const side = performanceV2SelectionSide?.value || '';
+    if (!symbol || !side) { if (selectionXlsButton) selectionXlsButton.disabled = true; return; }
+    try {
+      const response = await fetch('/api/v2/strategies/performance-v2/selection-cache-status', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol, side }),
+      });
+      if (!response.ok) throw new Error('cache status failed');
+      const cache = await response.json();
+      if (revision !== selectionCacheStatusRevision || symbol !== performanceV2SelectionPair?.value || side !== performanceV2SelectionSide?.value) return;
+      if (selectionXlsButton) selectionXlsButton.disabled = !cache.ready;
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = cache.ready
+        ? 'Пересчёт не требуется.'
+        : `Требуется пересчёт: ${cache.missing} из ${cache.total} стратегий без фактов.`;
+    } catch (error) {
+      if (revision !== selectionCacheStatusRevision) return;
+      if (selectionXlsButton) selectionXlsButton.disabled = true;
+    }
+  };
   const renderSelectionCounts = (counts) => {
     selectionPreviewStages.forEach((stage) => {
       let summary = stage.querySelector('.selection-stage-summary');
       if (!summary) { summary = document.createElement('span'); summary.className = 'selection-stage-summary'; stage.querySelector('.selection-stage-controls')?.before(summary); }
       const count = counts[stage.dataset.selectionStage];
-      summary.textContent = count ? (count.enabled ? `Исключено ${count.eliminated} · осталось ${count.remaining}` : 'Не применялся') : '—';
+      if (!count || !count.enabled) { summary.textContent = count ? 'Не применялся' : '—'; return; }
+      const line = (label, value, className) => {
+        const item = document.createElement('span'); item.className = `selection-stage-summary-${className}`;
+        item.textContent = `${label} ${value}`;
+        return item;
+      };
+      summary.replaceChildren(
+        line('Исключено', count.eliminated, count.eliminated ? 'eliminated' : 'zero'),
+        line('Осталось', count.remaining, 'remaining'),
+      );
     });
   };
 
@@ -1860,45 +1894,51 @@
       ? stage.previousElementSibling
       : stage.nextElementSibling;
     if (!target?.matches('[data-selection-stage]')) return;
+    const oldIndex = orderedSelectionStages().indexOf(stage);
     selectionPreviewOrder.insertBefore(stage, button.dataset.selectionMove === 'up' ? target : target.nextElementSibling);
     renderSelectionPreviewOrder();
-    markSelectionPreviewDirty();
+    markSelectionPreviewDirty(Math.min(oldIndex, orderedSelectionStages().indexOf(stage)));
   });
 
   selectionPreviewStages.forEach((stage) => {
-    stage.querySelector('input[type="checkbox"]')?.addEventListener('change', markSelectionPreviewDirty);
+    stage.querySelector('input[type="checkbox"]')?.addEventListener('change', () => markSelectionPreviewDirty(orderedSelectionStages().indexOf(stage)));
   });
   document.querySelectorAll('[data-selection-scope]').forEach((input) => {
-    input.addEventListener('change', markSelectionPreviewDirty);
+    input.addEventListener('change', () => markSelectionPreviewDirty(orderedSelectionStages().indexOf(input.closest('[data-selection-stage]'))));
   });
   performanceV2SelectionPair?.addEventListener('change', () => {
     syncPerformanceV2SelectionScope();
     markSelectionPreviewDirty();
+    refreshSelectionCacheStatus();
   });
   performanceV2SelectionSide?.addEventListener('change', () => {
     markSelectionPreviewDirty();
+    refreshSelectionCacheStatus();
   });
-  const selectionPreviewButton = document.querySelector('#performance-v2-selection-preview');
-  selectionPreviewButton?.addEventListener('click', async () => {
+  let selectionPreviewTimer = 0;
+  const refreshSelectionPreview = async () => {
+    const payload = selectionPayload();
+    if (!payload.symbol || !payload.side) return;
     const revision = selectionPreviewRevision;
-    selectionPreviewButton.disabled = true;
     try {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Обновляем счётчики…';
       const response = await fetch('/api/v2/strategies/performance-v2/selection-preview', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(selectionPayload()),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       });
       if (!response.ok) throw new Error((await response.json()).error?.message || 'preview failed');
-      const payload = await response.json();
+      const preview = await response.json();
       if (revision !== selectionPreviewRevision) return;
-      renderSelectionCounts(payload.stages || {});
+      renderSelectionCounts(preview.stages || {});
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Счётчики обновлены.';
     } catch (error) {
       if (revision !== selectionPreviewRevision) return;
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Счётчики не обновлены: ${error.message || 'ошибка запроса'}`;
-    } finally {
-      selectionPreviewButton.disabled = false;
     }
-  });
+  };
+  const scheduleSelectionPreview = () => {
+    window.clearTimeout(selectionPreviewTimer);
+    selectionPreviewTimer = window.setTimeout(() => { void refreshSelectionPreview(); }, 250);
+  };
   document.querySelector('#performance-v2-selection-recalculate')?.addEventListener('click', async () => {
     try {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Пересчитываем факты…';
@@ -1908,11 +1948,24 @@
       });
       if (!response.ok) throw new Error((await response.json()).error?.message || 'recalculation failed');
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Факты пересчитаны; XLSX готовится быстро.';
+      refreshSelectionCacheStatus();
     } catch (error) {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Пересчёт не выполнен: ${error.message || 'ошибка запроса'}`;
     }
   });
-  document.querySelector('#performance-v2-selection-xls')?.addEventListener('click', async () => {
+  document.querySelector('#performance-v2-selection-recalculate-all')?.addEventListener('click', async () => {
+    try {
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Пересчитываем все пары…';
+      const response = await fetch('/api/v2/strategies/performance-v2/recalculate-all', { method: 'POST' });
+      if (!response.ok) throw new Error((await response.json()).error?.message || 'recalculation failed');
+      const result = await response.json();
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Готово: пересчитано пар ${result.recalculated_pairs}, уже готово ${result.ready_pairs}.`;
+      refreshSelectionCacheStatus();
+    } catch (error) {
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Пересчёт не выполнен: ${error.message || 'ошибка запроса'}`;
+    }
+  });
+  selectionXlsButton?.addEventListener('click', async () => {
     try {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Формируем XLSX…';
       const response = await fetch('/api/v2/strategies/performance-v2/selection', {
@@ -1938,7 +1991,6 @@
        local_source_db_root: document.querySelector('#settings-source-root')?.value || '',
       local_output_root: document.querySelector('#settings-output-root')?.value || '',
       listing_dates_path: document.querySelector('#settings-dates')?.value || '',
-      surface_target_path: document.querySelector('#surface-target')?.value || '',
     },
   }, operational: {
      source_db_path: document.querySelector('#settings-source-root')?.value || '',

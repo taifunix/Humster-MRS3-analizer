@@ -9,10 +9,12 @@ import duckdb
 import pandas as pd
 import pytest
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 from mrs3.performance_v2_selection import (
     PerformanceV2SelectionError,
     SelectionConfig,
+    _holding_p95_minutes,
     load_selection_candidates,
     load_selection_config,
     parse_selection_request,
@@ -190,7 +192,29 @@ def test_loader_derives_proxy_holding_and_order_plateau_counts(tmp_path: Path) -
     assert row["dd5_proxy"] is not None
     assert row["dd5_proxy"] > 0
     assert row["holding_p95_minutes"] == 1440
+    assert row["holding_median_minutes"] == 1440
     assert row["ab_pnl_change_30d_pct"] is None
+
+
+def test_holding_p95_uses_all_closed_positions(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    result_id = connection.execute("select result_id from strategy_results").fetchone()[0]
+    connection.executemany(
+        "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (result_id, 3, datetime(2026, 1, 5, tzinfo=UTC), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 0, 110, None),
+            (result_id, 4, datetime(2026, 1, 7, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 0, 0, 110, None),
+            (result_id, 5, datetime(2026, 1, 8, tzinfo=UTC), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 0, 110, None),
+            (result_id, 6, datetime(2026, 1, 12, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 0, 0, 110, None),
+        ],
+    )
+    try:
+        p95 = _holding_p95_minutes(connection, request)
+    finally:
+        connection.close()
+
+    assert p95[result_id] == Decimal("5472.0")
 
 
 def test_parallel_window_warmup_persists_default_selection_windows(tmp_path: Path) -> None:
@@ -262,6 +286,14 @@ def _selection_row(name: str, **values: object) -> dict[str, object]:
         "order_count": 1,
         "dd5_proxy": Decimal("10") if name == "winner" else Decimal("5"),
         "first_shift_bp": 200 if name == "winner" else 100,
+        "order_1_shift_bp": 30 if name == "winner" else 270,
+        "order_2_plateau_point_count": Decimal("7.6"),
+        "order_3_plateau_point_count": Decimal("8.4"),
+        "order_4_plateau_point_count": Decimal("9.5"),
+        "order_1_open_ma_len": Decimal("3.6"),
+        "order_2_open_ma_len": Decimal("4.4"),
+        "order_3_open_ma_len": Decimal("5.5"),
+        "order_4_open_ma_len": Decimal("6.1"),
         "capital_proxy": Decimal("1") if name == "winner" else Decimal("2"),
         "capital_efficiency": Decimal("10") if name == "winner" else Decimal("2.5"),
         "holding_p95_minutes": Decimal("10") if name == "winner" else Decimal("20"),
@@ -335,22 +367,66 @@ def test_workbook_keeps_all_candidates_and_only_one_ab_column(tmp_path: Path) ->
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side"},
     ]})
-    result = run_selection(pd.DataFrame([_selection_row("winner"), _selection_row("loser")]), request)
+    result = run_selection(pd.DataFrame([
+        _selection_row(
+            "winner", ab_return_b_30d_pct=Decimal("4.25"), ab_pnl_change_30d_pct=Decimal("1.6"),
+            capital_efficiency=Decimal("10.6"), win_rate_pct=Decimal("67.8"),
+            holding_p95_minutes=Decimal("10.7"), holding_median_minutes=Decimal("5.6"),
+        ),
+        _selection_row("loser", ab_return_b_30d_pct=Decimal("2.50")),
+    ]), request)
 
-    path = write_selection_workbook(result, tmp_path / "finalists.xlsx")
+    path = write_selection_workbook(result, tmp_path / "finalists.xlsx", request)
     book = load_workbook(path, data_only=True)
     headers = [cell.value for cell in book["All candidates"][1]]
 
+    assert headers[:22] == [
+        "ID", "Стратегия", "Пара", "Side", "ТФ", "Close", "ORD", "PnL", "PnL/30", "PnL DD5/30", "PF",
+        "∆ PnL A/B", "PnL B", "CE", "DD", "W/R", "Trades", "Lot DD5", "Hold p95", "Hold M", "Shift 1", "PointsALL",
+    ]
+    strategy_column = headers.index("Стратегия") + 1
+    assert book["All candidates"].column_dimensions[get_column_letter(strategy_column)].hidden
+    b_column = headers.index("PnL B") + 1
+    assert {book["All candidates"].cell(row, b_column).value for row in (2, 3)} == {2.5, 4.25}
+    assert book["All candidates"].cell(2, b_column).data_type == "n"
+    assert headers[22:38] == [
+        "1 Shift", "2 Shift", "3 Shift", "4 Shift", "1 lot", "2 lot", "3 lot", "4 lot",
+        "1 Points", "2 Points", "3 Points", "4 Points", "1 MA", "2 MA", "3 MA", "4 MA",
+    ]
+    first_order_shift = headers.index("1 Shift") + 1
+    first_order_points = headers.index("1 Points") + 1
+    assert {book["All candidates"].cell(row, first_order_shift).value for row in (2, 3)} == {0.3, 2.7}
+    assert {book["All candidates"].cell(row, first_order_points).value for row in (2, 3)} == {10, 20}
+    assert book["All candidates"].cell(2, first_order_shift).number_format == "0.0"
+    assert book["All candidates"].cell(2, headers.index("∆ PnL A/B") + 1).value in {2, None}
+    assert all(
+        isinstance(book["All candidates"].cell(2, headers.index(f"{order} {field}") + 1).value, int)
+        for order in range(1, 5) for field in ("Points", "MA")
+    )
+
     assert book.sheetnames == ["All candidates", "Finalists"]
-    assert "Изменение PnL/30д A/B, %" in headers
-    assert "PnL/30д, %" in headers
-    assert "PnL DD5 / 30д, %" in headers
-    assert "Profit Factor" in headers
+    assert headers[-1] == "eliminated_by_pareto_dd5_capital"
     assert "result_id" not in headers
     assert "total_pnl" not in headers
-    assert "eliminated_by_pareto_dd5_capital" in headers
     assert book["All candidates"].max_row == 3
     assert book["Finalists"].max_row == 2
+
+
+def test_workbook_keeps_only_enabled_filter_columns_in_request_order(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_low_trades", "enabled": False, "scope": "pair_side"},
+        {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side"},
+        {"id": "ab_deterioration", "enabled": False, "scope": "pair_side"},
+        {"id": "pareto_dd5_balanced", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row("winner"), _selection_row("loser")]), request)
+
+    path = write_selection_workbook(result, tmp_path / "finalists.xlsx", request)
+    headers = [cell.value for cell in load_workbook(path, data_only=True)["All candidates"][1]]
+
+    assert headers[-2:] == ["eliminated_by_pareto_dd5_capital", "eliminated_by_pareto_dd5_balanced"]
+    assert "eliminated_by_filter_low_trades" not in headers
+    assert "eliminated_by_ab_deterioration" not in headers
 
 
 def test_scope_timeframe_prevents_cross_timeframe_pareto_comparison() -> None:

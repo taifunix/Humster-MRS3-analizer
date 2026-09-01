@@ -166,6 +166,8 @@ def select_ready_interval(
 
 
 def canonical_ready_intervals(fragments: Sequence[SourceV6Fragment]) -> tuple[ReadyInterval, ...]:
+    # Contract: publish one stable selectable range per scope; ignore hidden,
+    # degenerate, and shorter duplicate candidates.
     """Evaluate the inherited six-CloseMA × nineteen-Shift contract."""
     from .duckdb_direct import canonical_coverage_from_rows
     rows = [{
@@ -184,10 +186,18 @@ def canonical_ready_intervals(fragments: Sequence[SourceV6Fragment]) -> tuple[Re
         "end_timestamp_ms": fragment.report_end_ms,
     } for fragment in fragments]
     coverage = canonical_coverage_from_rows(rows)
-    result = []
+    result_by_scope: dict[str, ReadyInterval] = {}
     for interval in coverage.intervals:
+        if not interval.selectable:
+            continue
         start = datetime.fromisoformat(interval.start_utc).astimezone(timezone.utc).date()
         end = datetime.fromisoformat(interval.end_utc).astimezone(timezone.utc).date() - timedelta(days=1)
+        if end < start:
+            continue
         scope = f"{interval.scope.symbol}|{interval.scope.side}|{interval.scope.timeframe}"
-        result.append(ReadyInterval(scope, start, end))
-    return tuple(sorted(result, key=lambda item: (item.point_key, item.start, item.end)))
+        candidate = ReadyInterval(scope, start, end)
+        previous = result_by_scope.get(scope)
+        # Equal spans choose the earliest start for stable readiness bounds.
+        if previous is None or (candidate.end - candidate.start, -candidate.start.toordinal()) > (previous.end - previous.start, -previous.start.toordinal()):
+            result_by_scope[scope] = candidate
+    return tuple(sorted(result_by_scope.values(), key=lambda item: (item.point_key, item.start, item.end)))

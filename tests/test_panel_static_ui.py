@@ -209,6 +209,13 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     html = _read("index.html")
     js = _read("app.js")
 
+    assert 'id="performance-v2-selection-preview"' not in html
+    assert 'id="performance-v2-selection-recalculate-all"' in html
+    assert "scheduleSelectionPreview" in js
+    assert "setTimeout" in js
+    assert "selectionPreviewButton" not in js
+    assert "/api/v2/strategies/performance-v2/recalculate-all" in js
+    assert "if (!payload.symbol || !payload.side) return;" in js
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
     assert 'id="performance-v2-selection-card"' in strategies
     assert "6. Парето и фильтры" in strategies
@@ -246,7 +253,7 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
         assert stage and 'data-selection-scope="pair_side_timeframe"' in stage.group(1)
     assert '<select id="performance-v2-selection-pair">' in strategies
     assert 'id="performance-v2-selection-side"' in strategies
-    assert 'id="performance-v2-selection-preview"' in strategies
+    assert 'id="performance-v2-selection-preview"' not in strategies
     assert 'id="performance-v2-selection-xls"' in strategies
     assert "Смотреть результаты в xls" in strategies
     assert "selectionPreviewDirty" in js
@@ -255,13 +262,19 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "syncPerformanceV2SelectionScope" in js
     assert "/api/v2/strategies/performance-v2/selection-preview" in js
     assert "selection-stage-summary" in js
+    assert "selection-stage-summary-${className}" in js
+    assert "line('Осталось', count.remaining, 'remaining')" in js
     assert "selectionPreviewRevision" in js
     assert "revision !== selectionPreviewRevision" in js
     assert "performanceV2SelectionCard?.addEventListener('toggle'" in js
     assert "selection_preview" not in js
-    click_handler = js.split("#performance-v2-selection-xls')?.addEventListener", 1)[1].split("renderSelectionPreviewOrder();", 1)[0]
-    dirty_handler = js.split("const markSelectionPreviewDirty", 1)[1].split("selectionPreviewOrder?.addEventListener", 1)[0]
+    click_handler = js.split("selectionXlsButton?.addEventListener", 1)[1].split("renderSelectionPreviewOrder();", 1)[0]
+    dirty_handler = js.split("const markSelectionPreviewDirty", 1)[1].split("const selectionStages", 1)[0]
     assert "fetch('/api/v2/strategies/performance-v2/selection'" in click_handler
+    assert "/api/v2/strategies/performance-v2/selection-cache-status" in js
+    assert "selectionXlsButton) selectionXlsButton.disabled = !cache.ready" in js
+    assert "selectionCacheStatusRevision" in js
+    assert "revision !== selectionCacheStatusRevision" in js
     assert "fetch(" not in dirty_handler
 
 
@@ -327,9 +340,11 @@ def test_surface_publish_uses_a_polled_job_and_selection_changes_require_confirm
     assert "'/api/v2/surfaces/publish/status'" in js
     assert "confirmedSurfaceScopesV2" in js
     assert "surface selection changed; confirm it before publishing" in js
-    assert 'id="surface-target-save"' in html
+    assert 'id="surface-target-save"' not in html
     assert 'name="surface_target_path"' in html
-    assert "surface_target_path" in js
+    assert 'name="surface_target_path" type="text" value=""' in html
+    assert 'id="surface-target"' in html and 'readonly' in html
+    assert 'placeholder="data/surfaces"' in html
 
 
 def test_active_surface_publish_handler_uses_confirmed_snapshot_and_committed_file_path() -> None:
