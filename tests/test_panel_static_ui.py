@@ -208,6 +208,7 @@ def test_performance_v2_handoff_exposes_ready_gated_controls() -> None:
 def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_without_recalculation() -> None:
     html = _read("index.html")
     js = _read("app.js")
+    css = _read("app.css")
 
     assert 'id="performance-v2-selection-preview"' not in html
     assert 'id="performance-v2-selection-recalculate-all"' in html
@@ -215,6 +216,8 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "setTimeout" in js
     assert "selectionPreviewButton" not in js
     assert "/api/v2/strategies/performance-v2/recalculate-all" in js
+    assert "recalculate-all', {" in js
+    assert "body: '{}'" in js
     assert "if (!payload.symbol || !payload.side) return;" in js
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
     assert 'id="performance-v2-selection-card"' in strategies
@@ -222,7 +225,14 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     expected_stage_order = [
         "filter_holding_outlier",
         "filter_low_trades",
+        "filter_min_shift",
         "ab_deterioration",
+        "filter_best_trade_dependency",
+        "filter_time_consistency",
+        "pareto_robust",
+        "pareto_shift_near_tie",
+        "pareto_window_b",
+        "pareto_window_b_dd_shift",
         "pareto_dd5_balanced",
         "pareto_plateau_points_per_order",
         "pareto_plateau_points_total",
@@ -233,22 +243,53 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
         "pareto_conditional_close_ma",
         "pareto_primary",
         "pareto_dd5_capital",
+        "pareto_close_ma_near_tie",
     ]
     assert re.findall(r'data-selection-stage="([^"]+)"', strategies) == expected_stage_order
+    assert 'data-selection-rank' in strategies
+    assert strategies.count('data-selection-rank') == 1
+    assert 'data-selection-pnl-tolerance' in strategies
+    assert "rank_robust_top_n" in js
+    assert "Final rank stage is unavailable." in js
     for stage_id in expected_stage_order:
         assert f'data-selection-stage="{stage_id}"' in strategies
-    for stage_id in ("filter_holding_outlier", "filter_low_trades", "ab_deterioration", "pareto_dd5_balanced"):
+    checked_stage_ids = {
+        "filter_holding_outlier", "ab_deterioration", "pareto_dd5_balanced",
+        "filter_best_trade_dependency", "filter_time_consistency", "pareto_robust", "pareto_shift_near_tie",
+        "pareto_close_ma_near_tie",
+    }
+    for stage_id in checked_stage_ids:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and '<input type="checkbox" checked>' in stage.group(1)
-    for stage_id in set(expected_stage_order) - {"filter_holding_outlier", "filter_low_trades", "ab_deterioration", "pareto_dd5_balanced"}:
+    for stage_id in set(expected_stage_order) - checked_stage_ids:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and '<input type="checkbox" checked>' not in stage.group(1)
+    assert "defaultSelectionStageOrder" in js
+    assert "stage.querySelector('[data-selection-scope]').value =" not in js
+    default_order = re.search(r"const defaultSelectionStageOrder = \[(.*?)\];", js, re.S)
+    assert default_order
+    assert re.findall(r"'([^']+)'", default_order.group(1)) == [
+        "filter_holding_outlier", "filter_low_trades", "filter_min_shift", "ab_deterioration",
+        "filter_best_trade_dependency", "filter_time_consistency", "pareto_dd5_balanced",
+        "pareto_robust", "pareto_shift_near_tie", "pareto_close_ma_near_tie",
+    ]
+    default_enabled = re.search(r"const defaultEnabledSelectionStages = new Set\(\[(.*?)\]\);", js, re.S)
+    assert default_enabled
+    assert "filter_low_trades" not in default_enabled.group(1)
+    assert "filter_min_shift" not in default_enabled.group(1)
+    assert "pareto_dd5_balanced" in default_enabled.group(1)
+    assert "pareto_plateau_points_per_order" not in default_enabled.group(1)
+    assert "pareto_close_ma_near_tie" in default_enabled.group(1)
     assert "near_tie_rank" not in strategies
     assert "data-selection-group" not in strategies
-    for stage_id in expected_stage_order[:4]:
+    min_shift_stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_min_shift">(.*?)</li>', strategies, re.S)
+    assert min_shift_stage and 'data-selection-min-shift' in min_shift_stage.group(1)
+    assert 'value="0.3"' in min_shift_stage.group(1)
+    pair_side_stages = {"filter_holding_outlier", "filter_low_trades", "filter_min_shift", "ab_deterioration", "pareto_dd5_balanced"}
+    for stage_id in pair_side_stages:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and 'data-selection-scope="pair_side"' in stage.group(1)
-    for stage_id in expected_stage_order[4:]:
+    for stage_id in set(expected_stage_order) - pair_side_stages:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and 'data-selection-scope="pair_side_timeframe"' in stage.group(1)
     assert '<select id="performance-v2-selection-pair">' in strategies
@@ -263,6 +304,24 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "/api/v2/strategies/performance-v2/selection-preview" in js
     assert "selection-stage-summary" in js
     assert "selection-stage-summary-${className}" in js
+    assert "grid-template-columns: 28px 24px minmax(0, 1fr) 112px 78px 175px minmax(80px, 105px) 66px" in css
+    assert "gap: 16px" in css
+    assert re.search(r"\.selection-stage \.check \{[^}]*grid-column: 2 / 4", css)
+    for selector, column in (
+        ("selection-stage-threshold", 5),
+        ("selection-stage-scope", 6),
+        ("selection-stage-summary", 7),
+        ("selection-stage-controls", 8),
+    ):
+        assert re.search(rf"\.{selector} \{{[^}}]*grid-column: {column}", css)
+    assert ".selection-stage-scope > span:first-child { display: none; }" in css
+    assert re.search(r"\.selection-stage-kind \{[^}]*justify-self: start;[^}]*text-align: left", css)
+    assert re.search(r"\.selection-stage-kind \{[^}]*width: max-content", css)
+    assert ".selection-stage:has(.selection-stage-threshold) .selection-stage-scope > :last-child { margin-top: 14px; }" in css
+    rank_stage = re.search(r'<div class="selection-stage selection-stage-fixed" data-selection-rank>(.*?)</div>', strategies, re.S)
+    assert rank_stage and 'class="selection-stage-threshold"' in rank_stage.group(1)
+    assert rank_stage and 'data-selection-top-n' in rank_stage.group(1)
+    assert ".selection-stage-fixed .selection-stage-scope > span:last-child {" in css
     assert "line('Осталось', count.remaining, 'remaining')" in js
     assert "selectionPreviewRevision" in js
     assert "revision !== selectionPreviewRevision" in js
@@ -356,6 +415,8 @@ def test_active_surface_publish_handler_uses_confirmed_snapshot_and_committed_fi
     assert "const selectionSnapshot" in active
     assert "const outputDir" in active
     assert "`${outputDir}\\\\${result.target}`" in active
+    assert "result.error || 'surface publication failed'" in active
+    assert "error instanceof Error ? error.message" in active
 
 
 def test_surface_timeframe_rows_override_generic_scope_list_label_style() -> None:
@@ -712,6 +773,14 @@ def test_performance_v2_window_analysis_uses_native_utc_controls() -> None:
     js = _read("app.js")
 
     assert 'id="performance-v2-window-strategy"' in html
+    assert 'id="performance-v2-window-pair"' in js
+    assert 'id="performance-v2-window-strategy-id"' in js
+    assert 'id="performance-v2-window-finalists" type="checkbox" disabled' in js
+    assert "performanceV2WindowCard.before(performanceV2SelectionCard)" in js
+    assert "5. Парето и фильтры" in js
+    assert "6. A/B анализ Performance" in js
+    assert "strategy.symbol === performanceV2WindowPair.value" in js
+    assert "String(strategy.strategy_id).includes(query)" in js
     for field in ("performance-v2-window-a-start", "performance-v2-window-a-end", "performance-v2-window-b-start", "performance-v2-window-b-end"):
         assert f'id="{field}" type="datetime-local" step="1"' in html
     assert "UTC" in html.split('id="performance-v2-window-card"', 1)[1].split("</details>", 1)[0]
@@ -810,6 +879,7 @@ def test_request_json_distinguishes_non_json_and_server_validation_safely() -> N
     assert "application/json" in helper
     assert "Backend returned invalid JSON." in helper
     assert "Server validation failed." in helper
+    assert "endpoint.startsWith('/api/v2/surfaces/')" in helper
     assert "Backend connection unavailable." in helper
 
 

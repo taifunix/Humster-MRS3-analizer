@@ -175,7 +175,7 @@
       let result;
       try { result = await response.json(); } catch (_) { throw new Error('Backend returned invalid JSON.'); }
       if (!response.ok) {
-        const code = typeof result?.error === 'string' && (endpoint.startsWith('/api/v2/strategies/fresh/') || /^[A-Z_]+$/.test(result.error)) ? result.error : 'Server validation failed.';
+        const code = typeof result?.error === 'string' && (endpoint.startsWith('/api/v2/strategies/fresh/') || endpoint.startsWith('/api/v2/surfaces/') || /^[A-Z_]+$/.test(result.error)) ? result.error : 'Server validation failed.';
         const payload = result?.error;
         const typedCode = payload && typeof payload === 'object' && typeof payload.code === 'string' ? payload.code : code;
         const typedMessage = payload && typeof payload === 'object' && typeof payload.message === 'string'
@@ -854,12 +854,12 @@
         await new Promise((resolve) => setTimeout(resolve, 500));
         result = await requestJson('/api/v2/surfaces/publish/status');
       }
-      if (result.phase !== 'COMMITTED') throw new Error('surface publication failed');
+      if (result.phase !== 'COMMITTED') throw new Error(result.error || 'surface publication failed');
       currentSurfacePath = document.querySelector('#surface-target')?.value || '';
       const analysisSurface = document.querySelector('#analysis-surface');
       if (analysisSurface) analysisSurface.replaceChildren(new Option(result.target, currentSurfacePath));
       surfaceStatus(`Surface committed: ${result.target}.`);
-    } catch (_) { surfaceStatus('Surface publication failed.'); }
+    } catch (error) { surfaceStatus(error instanceof Error ? error.message : 'Surface publication failed.'); }
   });
   const surfaceScopesV2 = document.querySelector('#surface-ready-card .scope-list');
   let surfaceGroupsV2 = [];
@@ -1093,7 +1093,7 @@
         await new Promise((resolve) => setTimeout(resolve, 500));
         result = await requestJson('/api/v2/surfaces/publish/status');
       }
-      if (result.phase !== 'COMMITTED') throw new Error('surface publication failed');
+      if (result.phase !== 'COMMITTED') throw new Error(result.error || 'surface publication failed');
       currentSurfacePath = `${outputDir}\\${result.target}`;
       await loadSurfaceCatalog();
       const analysisTarget = document.querySelector('#analysis-target');
@@ -1104,7 +1104,7 @@
         analysisTarget.value = `${root}\\${result.target.replace('.surface-v6.duckdb', '.analysis-v6.duckdb')}`;
       }
       const elapsed = formatDuration((Date.now() - started) / 1000); surfaceTextV2('#surface-publish-summary', `COMMITTED · ${selectedSurfaceScopes.length} scopes · ${elapsed}`); surfaceBadgeV2('surface-publish', 'ready', 'COMMITTED'); publishProgressV2('complete', `Surface committed: ${result.target}.`);
-    } catch (_) { surfaceBadgeV2('surface-publish', 'pending', 'FAILED'); publishProgressV2('idle', 'Surface publication failed.'); }
+    } catch (error) { surfaceBadgeV2('surface-publish', 'pending', 'FAILED'); publishProgressV2('idle', error instanceof Error ? error.message : 'Surface publication failed.'); }
     finally {
       if (surfacePublishTimerV2) clearInterval(surfacePublishTimerV2);
       surfacePublishTimerV2 = 0;
@@ -1537,6 +1537,22 @@
   const performanceV2WindowResult = document.querySelector('#performance-v2-window-result');
   const performanceV2WindowStrategyDetails = document.querySelector('#performance-v2-window-strategy-details');
   const performanceV2SelectionCard = document.querySelector('#performance-v2-selection-card');
+  if (performanceV2WindowCard && performanceV2SelectionCard) performanceV2WindowCard.before(performanceV2SelectionCard);
+  const performanceV2SelectionTitle = performanceV2SelectionCard?.querySelector('summary b');
+  const performanceV2WindowTitle = performanceV2WindowCard?.querySelector('summary b');
+  if (performanceV2SelectionTitle) performanceV2SelectionTitle.textContent = '5. Парето и фильтры';
+  if (performanceV2WindowTitle) performanceV2WindowTitle.textContent = '6. A/B анализ Performance';
+  const performanceV2WindowStrategyField = performanceV2WindowSelect?.closest('.field-group');
+  if (performanceV2WindowStrategyField && !document.querySelector('#performance-v2-window-pair')) {
+    const filters = document.createElement('div');
+    filters.className = 'field-grid performance-v2-window-filters';
+    filters.innerHTML = '<div class="field-group"><label for="performance-v2-window-pair">Пара</label><select id="performance-v2-window-pair"><option value="">Все пары</option></select></div><label class="check performance-v2-window-finalists" title="Станет доступен после сохранения результатов отбора"><input id="performance-v2-window-finalists" type="checkbox" disabled><span>Только финалисты</span></label><div class="field-group"><label for="performance-v2-window-strategy-id">Strategy ID</label><input id="performance-v2-window-strategy-id" type="search" inputmode="numeric" placeholder="Поиск по номеру стратегии"></div>';
+    performanceV2WindowStrategyField.before(filters);
+  }
+  const performanceV2WindowPair = document.querySelector('#performance-v2-window-pair');
+  const performanceV2WindowStrategyId = document.querySelector('#performance-v2-window-strategy-id');
+  const performanceV2WindowFinalists = document.querySelector('#performance-v2-window-finalists');
+  if (performanceV2WindowFinalists) performanceV2WindowFinalists.disabled = true;
   const performanceV2SelectionPair = document.querySelector('#performance-v2-selection-pair');
   const performanceV2SelectionSide = document.querySelector('#performance-v2-selection-side');
   let performanceV2Strategies = [];
@@ -1722,24 +1738,38 @@
     for (const side of sides) performanceV2SelectionSide.append(new Option(side, side));
     performanceV2SelectionSide.value = sides.includes(selectedSide) ? selectedSide : '';
   };
+  const syncPerformanceV2WindowCatalog = () => {
+    if (!performanceV2WindowSelect || !performanceV2WindowPair) return null;
+    const selectedPair = performanceV2WindowPair.value;
+    const selectedStrategyId = performanceV2WindowSelect.value;
+    const pairs = [...new Set(performanceV2Strategies.map((strategy) => strategy.symbol).filter(Boolean))].sort();
+    performanceV2WindowPair.replaceChildren(new Option('Все пары', ''));
+    for (const pair of pairs) performanceV2WindowPair.append(new Option(pair, pair));
+    performanceV2WindowPair.value = pairs.includes(selectedPair) ? selectedPair : '';
+    const query = performanceV2WindowStrategyId?.value.trim() || '';
+    const filteredStrategies = performanceV2Strategies
+      .filter((strategy) => !performanceV2WindowPair.value || strategy.symbol === performanceV2WindowPair.value)
+      .filter((strategy) => !query || String(strategy.strategy_id).includes(query));
+    performanceV2WindowSelect.replaceChildren(new Option('Select a strategy', ''));
+    for (const strategy of filteredStrategies) {
+      const name = strategy.strategy_name || `Strategy ${strategy.strategy_id}`;
+      const details = [strategy.symbol, strategy.side, strategy.timeframe].filter(Boolean).join(' · ');
+      performanceV2WindowSelect.append(new Option(details ? `${name} · ${details}` : name, String(strategy.strategy_id)));
+    }
+    const selected = filteredStrategies.find((strategy) => String(strategy.strategy_id) === selectedStrategyId) || filteredStrategies[0] || null;
+    performanceV2WindowSelect.value = selected ? String(selected.strategy_id) : '';
+    return selected;
+  };
   const loadPerformanceV2Catalog = async () => {
     if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = 'Loading Performance v2 strategies…';
     try {
       const result = await requestJson('/api/v2/strategies/performance-v2/catalog');
       performanceV2Strategies = Array.isArray(result.strategies) ? result.strategies : [];
       syncPerformanceV2SelectionScope();
-      if (performanceV2WindowSelect) {
-        performanceV2WindowSelect.replaceChildren(new Option('Select a strategy', ''));
-        for (const strategy of performanceV2Strategies) {
-          const name = strategy.strategy_name || `Strategy ${strategy.strategy_id}`;
-          const details = [strategy.symbol, strategy.side, strategy.timeframe].filter(Boolean).join(' · ');
-          performanceV2WindowSelect.append(new Option(details ? `${name} · ${details}` : name, String(strategy.strategy_id)));
-        }
-        performanceV2WindowSelect.value = performanceV2Strategies[0] ? String(performanceV2Strategies[0].strategy_id) : '';
-      }
-      if (performanceV2Strategies.length) {
-        performanceV2SetWindowBounds(performanceV2Strategies[0]);
-        performanceV2StrategyDetails(performanceV2Strategies[0]);
+      const selectedStrategy = syncPerformanceV2WindowCatalog();
+      if (selectedStrategy) {
+        performanceV2SetWindowBounds(selectedStrategy);
+        performanceV2StrategyDetails(selectedStrategy);
       } else {
         performanceV2StrategyDetails(null);
       }
@@ -1751,6 +1781,16 @@
     }
   };
   performanceV2WindowRefresh?.addEventListener('click', loadPerformanceV2Catalog);
+  performanceV2WindowPair?.addEventListener('change', () => {
+    const selected = syncPerformanceV2WindowCatalog();
+    performanceV2SetWindowBounds(selected);
+    performanceV2StrategyDetails(selected);
+  });
+  performanceV2WindowStrategyId?.addEventListener('input', () => {
+    const selected = syncPerformanceV2WindowCatalog();
+    performanceV2SetWindowBounds(selected);
+    performanceV2StrategyDetails(selected);
+  });
   performanceV2WindowCard?.addEventListener('toggle', () => {
     if (performanceV2WindowCard.open && !performanceV2Strategies.length) loadPerformanceV2Catalog();
   });
@@ -1801,6 +1841,27 @@
   const selectionPreviewOrder = document.querySelector('#performance-v2-selection-order');
   const selectionPreviewStatus = document.querySelector('#performance-v2-selection-status');
   const selectionPreviewBadge = document.querySelector('#performance-v2-selection-badge');
+  const selectionRankStage = document.querySelector('[data-selection-rank]');
+  const defaultSelectionStageOrder = [
+    'filter_holding_outlier', 'filter_low_trades', 'filter_min_shift', 'ab_deterioration',
+    'filter_best_trade_dependency', 'filter_time_consistency', 'pareto_dd5_balanced',
+    'pareto_robust', 'pareto_shift_near_tie', 'pareto_close_ma_near_tie',
+  ];
+  const defaultEnabledSelectionStages = new Set([
+    'filter_holding_outlier', 'ab_deterioration', 'filter_best_trade_dependency',
+    'filter_time_consistency', 'pareto_dd5_balanced', 'pareto_robust',
+    'pareto_shift_near_tie', 'pareto_close_ma_near_tie',
+  ]);
+  if (selectionPreviewOrder) {
+    const byId = Object.fromEntries([...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')]
+      .map((stage) => [stage.dataset.selectionStage, stage]));
+    [...defaultSelectionStageOrder].reverse().forEach((id) => {
+      if (byId[id]) selectionPreviewOrder.insertBefore(byId[id], selectionPreviewOrder.firstChild);
+    });
+    Object.values(byId).forEach((stage) => {
+      stage.querySelector('input[type="checkbox"]').checked = defaultEnabledSelectionStages.has(stage.dataset.selectionStage);
+    });
+  }
   const selectionPreviewStages = selectionPreviewOrder
     ? [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')]
     : [];
@@ -1839,11 +1900,20 @@
     scheduleSelectionPreview();
   };
 
-  const selectionStages = () => orderedSelectionStages().map((stage) => ({
+  const selectionStages = () => {
+    if (!selectionRankStage) throw new Error('Final rank stage is unavailable.');
+    return [...orderedSelectionStages().map((stage) => ({
     id: stage.dataset.selectionStage,
     enabled: !!stage.querySelector('input[type="checkbox"]')?.checked,
     scope: stage.querySelector('[data-selection-scope]')?.value,
-  }));
+    ...(stage.querySelector('[data-selection-min-shift]') ? { min_shift_pct: stage.querySelector('[data-selection-min-shift]').value } : {}),
+    ...(stage.querySelector('[data-selection-pnl-tolerance]') ? { pnl_tolerance_pct: stage.querySelector('[data-selection-pnl-tolerance]').value } : {}),
+  })), {
+    id: 'rank_robust_top_n',
+    enabled: !!selectionRankStage.querySelector('input[type="checkbox"]')?.checked,
+    scope: 'pair_side', top_n: Number(selectionRankStage.querySelector('[data-selection-top-n]')?.value || 50),
+  }];
+  };
   const selectionPayload = () => ({ symbol: performanceV2SelectionPair?.value || '', side: performanceV2SelectionSide?.value || '', stages: selectionStages() });
   const selectionXlsButton = document.querySelector('#performance-v2-selection-xls');
   let selectionCacheStatusRevision = 0;
@@ -1906,6 +1976,14 @@
   document.querySelectorAll('[data-selection-scope]').forEach((input) => {
     input.addEventListener('change', () => markSelectionPreviewDirty(orderedSelectionStages().indexOf(input.closest('[data-selection-stage]'))));
   });
+  document.querySelectorAll('[data-selection-min-shift]').forEach((input) => {
+    input.addEventListener('input', () => markSelectionPreviewDirty(orderedSelectionStages().indexOf(input.closest('[data-selection-stage]'))));
+  });
+  document.querySelectorAll('[data-selection-pnl-tolerance]').forEach((input) => {
+    input.addEventListener('input', () => markSelectionPreviewDirty(orderedSelectionStages().indexOf(input.closest('[data-selection-stage]'))));
+  });
+  selectionRankStage?.querySelector('input[type="checkbox"]')?.addEventListener('change', () => markSelectionPreviewDirty(orderedSelectionStages().length));
+  selectionRankStage?.querySelector('[data-selection-top-n]')?.addEventListener('input', () => markSelectionPreviewDirty(orderedSelectionStages().length));
   performanceV2SelectionPair?.addEventListener('change', () => {
     syncPerformanceV2SelectionScope();
     markSelectionPreviewDirty();
@@ -1956,7 +2034,9 @@
   document.querySelector('#performance-v2-selection-recalculate-all')?.addEventListener('click', async () => {
     try {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Пересчитываем все пары…';
-      const response = await fetch('/api/v2/strategies/performance-v2/recalculate-all', { method: 'POST' });
+      const response = await fetch('/api/v2/strategies/performance-v2/recalculate-all', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
       if (!response.ok) throw new Error((await response.json()).error?.message || 'recalculation failed');
       const result = await response.json();
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Готово: пересчитано пар ${result.recalculated_pairs}, уже готово ${result.ready_pairs}.`;

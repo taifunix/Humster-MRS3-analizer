@@ -128,6 +128,33 @@ def test_panel_surface_path_comes_from_config_not_request(tmp_path: Path) -> Non
     assert calls == [configured.resolve()]
 
 
+def test_panel_surface_publish_start_keeps_safe_validation_reason(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    controller._panel_surfaces = type("Surfaces", (), {
+        "start_publish": lambda _self, token, scopes, target, filename: (
+            (_ for _ in ()).throw(ValueError("stale coverage token"))
+        ),
+    })()
+
+    with pytest.raises(ValueError, match="stale coverage token"):
+        controller.surface_publish_start({
+            "preflight_token": "old-token",
+            "scope_keys": ["BTCUSDT|LONG|1h"],
+        })
+
+
+def test_surface_publish_start_http_returns_validation_reason(panel_http) -> None:
+    _, _, connection = panel_http
+
+    status, result = _request(connection, "POST", "/api/v2/surfaces/publish/start", {
+        "preflight_token": "old-token",
+        "scope_keys": ["BTCUSDT|LONG|1h"],
+    })
+
+    assert status == 400
+    assert result == {"error": "stale coverage token"}
+
+
 def test_panel_surface_default_is_anchored_to_project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     other = tmp_path / "other"
     other.mkdir()

@@ -234,6 +234,35 @@ def test_background_publish_exposes_real_publisher_progress_without_paths(tmp_pa
     }
 
 
+def test_background_publish_exposes_safe_failure_reason(tmp_path: Path) -> None:
+    service, source_db, _ = _service(
+        tmp_path,
+        ready=(ReadyInterval("BTCUSDT|LONG|1h", date(2026, 1, 1), date(2026, 1, 2)),),
+    )
+    target = tmp_path / "surfaces"
+
+    def publish(target, materialized, *, source_database, progress_callback, filename=None):
+        raise FileExistsError(f"source C:\\Users\\John Smith\\source.duckdb; relative data/tmp/source; bare settings.yaml; UNC \\\\server\\share\\db.duckdb; target {target / 'old.surface-v6.duckdb'}")
+
+    service._publish = publish
+    token = service.preflight(source_db)["token"]
+    service.start_publish(token, ("BTCUSDT|LONG|1h",), target)
+    for _ in range(100):
+        result = service.publish_status()
+        if not result["running"]:
+            break
+        Event().wait(0.01)
+
+    assert result["phase"] == "FAILED"
+    assert "<local-path>" in result["error"]
+    assert "John Smith" not in result["error"]
+    assert "data/tmp/source.duckdb" not in result["error"]
+    assert "data/tmp/source" not in result["error"]
+    assert "settings.yaml" not in result["error"]
+    assert "server\\share" not in result["error"]
+    assert str(tmp_path) not in json.dumps(result)
+
+
 def test_background_publish_hydrates_only_selected_scope_with_configured_workers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service, source_db, calls = _service(
         tmp_path,

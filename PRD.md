@@ -120,6 +120,7 @@ analysis runs и lineage согласно уже реализованной
 | Implemented / verified | [Multi-order plateau admission](docs/specs/2026-08-25-multi-order-plateau-admission.md) | pre-combination 2ORD--4ORD structural width and independent-event admission | canonical Phase 1, event filter and shortlist |
 | Active implementation contract | [Performance report import to DuckDB](docs/specs/2026-08-14-performance-report-import-duckdb.md) | immutable HTML-report import, canonical metrics, transaction, idempotency and cleanup | Strategy performance DuckDB, ADR-0004--0006 |
 | Active implementation contract | [DD5 calculation and finalist selection](docs/specs/2026-08-14-dd5-finalist-selection.md) | DD5 formulas, scoped filters, Pareto, finalists and XLSX contract | Performance report import to DuckDB |
+| Implemented / independently reviewed | [Performance v2 robust finalist ranking](docs/specs/2026-09-01-performance-v2-robust-finalist-ranking.md) | best-trade and temporal robustness filters, Shift-aware near-tie preference and deterministic Top-50 | Performance v2 finalist selection and XLSX |
 | Active implementation contract | [Tester Report Library and Fast Identity](docs/specs/2026-08-14-tester-report-library-and-fast-identity.md) | verified report library, fast embedded identity and deferred workflow/CLI integration | [Name-only runner contract](docs/specs/2026-08-14-tester-name-only-verification.md) |
 | Active — implementation pending | [MRS3 v0.7 Canonical Phase 1](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md) | fresh canonical `30..550` surfaces, six CloseMA readiness, exact audit/preflight replay, parallel materialization, frozen CMA/BASE and independent 1ORD | [ADR-0009](docs/decisions/0009-canonical-phase1-surface-selection-contract.md), DuckDB analysis storage, event filter |
 | Accepted | [ADR-0009](docs/decisions/0009-canonical-phase1-surface-selection-contract.md) | supersedes conflicting ADR-0007/0008 readiness semantics for fresh Phase 1 surfaces without rewriting historical ADRs | Canonical Phase 1 spec |
@@ -221,7 +222,8 @@ Explicitly deferred from this vertical slice:
 - cleanup of source paths outside the exact approved post-commit roots;
 - DD5 proxy UI and any scaled-result claim;
 - persisted selection runs/results, tags, discard, RETEST and Portfolio
-  Optimizer input;
+  Optimizer input; persisted finalist snapshots are governed by
+  [ADR-0021](docs/decisions/0021-performance-v2-persisted-selection-snapshots.md);
 - deletion of v1 runtime and storage;
 - `point_id`, arbitrary filter expressions, and portfolio simulation.
 

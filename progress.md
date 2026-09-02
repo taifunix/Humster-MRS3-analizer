@@ -960,14 +960,34 @@ The preview is now executable. On `Смотреть результаты в xls`
 the current Pair + Side, checkbox state, stage order and per-stage scope to the
 local v2 endpoint. It reads only ACTIVE current Performance DB v2 rows,
 derives DD5_PROXY calculation facts, holding p95, ordered plateau point counts
-and default A/B facts, then applies the 13 closed built-in filters/Pareto stages
+and default A/B facts, then applies the 14 closed built-in filters/Pareto stages
 strictly in submitted order. `pair_side_timeframe` splits comparisons by
 timeframe; missing facts never eliminate or dominate; unavailable A/B records
 remain finalists with `AB_NOT_EVALUATED_INSUFFICIENT_DATA`.
 
+The stage registry now also includes disabled-by-default `filter_min_shift`.
+Its compact inline field accepts a positive percentage (default `0.3`); when
+enabled it eliminates a strategy if any existing order has a smaller shift.
+Missing order-shift facts do not eliminate. The threshold participates in the
+same local order, automatic counters and XLSX stage boolean as other filters;
+it needs no fact recalculation. The Balanced Pareto label now correctly names
+its primary metric as `PnL DD5/30`, rather than `PnL30`.
+
+Disabled-by-default `pareto_window_b` compares survivors within Pair + Side +
+timeframe: it maximizes B PnL/30d and B trades/30d, and minimizes B drawdown
+and B holding p95. The latter uses completed positions closed in the final B
+window; missing B facts never dominate or eliminate.
+
+The adjacent disabled-by-default `pareto_window_b_dd_shift` maximizes B
+PnL/30d and first shift while minimizing full-period drawdown, within the same
+Pair + Side + timeframe scope.
+
+Focused evidence after this change: `142 passed` for the selection, panel and
+static-UI suites; `node --check src/mrs3/panel_web/app.js`; `git diff --check`.
+
 The endpoint returns one in-memory attachment with `All candidates` and
-`Finalists` sheets. Both retain a single exported A/B field
-`ab_pnl_change_30d_pct`; all other A/B support fields remain internal. The
+`Finalists` sheets. Both retain exported A/B change, A/30d and B/30d fields;
+all other A/B support fields remain internal. The
 workbook retains every requested Pair + Side candidate, ordered plateau facts,
 per-stage booleans, finalist flag and elimination reason. The run writes no
 `selection_*` tables, tags, lifecycle state, discard, RETEST or history; those
@@ -988,9 +1008,10 @@ the existing templates (`7 passed`).
 
 The Panel now has a preview-only `6. Парето и фильтры` card: Pair + Side,
 editable stage order, enable checkboxes and a per-stage Pair + Side or Pair +
-Side + timeframe scope. The first four stages are enabled by default; the two
-plateau-points Pareto stages occupy positions 5 and 6; Near-tie ranking and the
-former global grouping block are hidden. No preview interaction calculates or
+Side + timeframe scope. Holding p95, A/B deterioration, Balanced Pareto and
+the robust stages are enabled by default; Trades, Minimum Shift and both
+plateau-points Pareto stages are disabled. Near-tie ranking and the former
+global grouping block are hidden. No preview interaction calculates or
 changes the database.
 
 The selected strategy details for manual A/B analysis now show Close MA and
@@ -1046,3 +1067,28 @@ selection can legitimately exceed the generic 64 KiB API limit. The live
 70 KiB probe reached candidate validation, proving it no longer fails on body
 size; all other endpoints retain the 64 KiB limit. Focused evidence: `68
 passed`; independent review — `CODE_REVIEW_PASS`.
+
+### Performance v2 persisted finalist snapshots (2026-09-02)
+
+[ADR-0021](docs/decisions/0021-performance-v2-persisted-selection-snapshots.md)
+records the accepted deferred Stage 3 architecture: an explicit save creates an
+immutable Pair + Side selection snapshot, later used by the A/B `Только
+финалисты` catalogue filter. Stage 2 remains stateless; the currently visible
+checkbox stays disabled until this persistence contract is implemented.
+
+The next accepted Stage 2 extension is specified in
+`docs/specs/2026-09-01-performance-v2-robust-finalist-ranking.md`; its
+executable plan is
+`docs/superpowers/plans/2026-09-01-performance-v2-robust-finalist-ranking.md`.
+It adds best-trade dependency and four-window consistency filters, a robust
+Pareto, a 10%-tolerant preference for larger first Shift, and a fixed final
+38/17/15/10/10/10 Top-50 ranker for Robust PnL, worst DD, A/B stability, Shift
+1, minimum Points and Close MA. Existing Performance DB v2 tables are sufficient;
+selection persistence, tags and XLSX import remain deferred to Stage 3.
+
+Local implementation now adds the four robust movable stages, fixed final
+Top-N ranker, seven-window cache requirement, rank diagnostics in XLSX and
+panel controls. Focused verification passed: `155 passed` in finalist/static
+panel suites and `167 passed` in panel/surfaces suites, plus
+`node --check src/mrs3/panel_web/app.js` and staged `git diff --check`.
+Follow-up independent review returned `CODE_REVIEW_PASS` before commit.

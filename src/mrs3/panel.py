@@ -169,6 +169,7 @@ from .performance_v2_selection import (
 from .runner.config import RunnerConfig
 from .runner.inbox import capture_verified_inbox
 from .runner.workflow import BatchPlan, _load_saved_result_evidence, _load_saved_results, plan_batch, run_batch
+from .error_sanitization import has_local_path
 
 
 _DIRECT_MATERIALIZER_VERSION = CANONICAL_MATERIALIZER_VERSION
@@ -178,15 +179,13 @@ _TESTER_PROGRESS_PATTERN = re.compile(
     r"^RUN (\d+)/(\d+) time=([^ ]+ [^ ]+) \(([0-9]+(?:\.[0-9]+)?)%\)"
 )
 _DIRECT_GENERIC_ERROR = "direct build failed"
-_DIRECT_WINDOWS_PATH_PATTERN = re.compile(r"[A-Za-z]:[\\/]")
-_DIRECT_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<!\w)[\\/][^\s\"')]+")
 
 
 def _safe_direct_error(message: str | None) -> str | None:
     """Return a client-safe direct error, suppressing local path details."""
     if message is None:
         return None
-    if _DIRECT_WINDOWS_PATH_PATTERN.search(message) or _DIRECT_ABSOLUTE_PATH_PATTERN.search(message):
+    if has_local_path(message):
         return _DIRECT_GENERIC_ERROR
     return message
 
@@ -200,7 +199,7 @@ def _fresh_generation_error(error: BaseException) -> str:
     message = str(error).strip()
     if not message:
         return "generation request failed"
-    if _DIRECT_WINDOWS_PATH_PATTERN.search(message) or _DIRECT_ABSOLUTE_PATH_PATTERN.search(message):
+    if has_local_path(message):
         return "generation failed while accessing a local file"
     return message
 
@@ -2182,8 +2181,8 @@ class PanelController:
                 self._panel_path("surface_target_path"),
                 self._optional_string(payload, "filename") or None,
             )
-        except Exception:
-            raise ValueError("invalid surface request") from None
+        except Exception as error:
+            raise ValueError(_safe_direct_error(str(error)) or "invalid surface request") from None
 
     def surface_publish_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         scopes = payload.get("scope_keys")
@@ -2195,8 +2194,8 @@ class PanelController:
                 self._panel_path("surface_target_path"),
                 self._optional_string(payload, "filename") or None,
             )
-        except Exception:
-            raise ValueError("invalid surface request") from None
+        except Exception as error:
+            raise ValueError(_safe_direct_error(str(error)) or "invalid surface request") from None
 
     def surface_publish_status(self) -> dict[str, object]:
         return self._surfaces().publish_status()
@@ -5912,7 +5911,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all"}:
             self._json(404, {"error": "not found"})
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
@@ -6098,7 +6097,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             elif endpoint == "/api/v2/strategies/fresh/generate":
                 self._json(400, {"error": _fresh_generation_error(error)})
             else:
-                self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
+                self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": _safe_direct_error(str(error)) or "invalid surface request"} if endpoint.startswith("/api/v2/surfaces/") else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})))
             return
         except Exception:
             if performance_v2_windows_endpoint:

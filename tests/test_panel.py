@@ -1154,6 +1154,13 @@ def test_direct_error_preserves_non_absolute_slash_text() -> None:
     assert panel_module._safe_direct_error("report/grid mismatch") == "report/grid mismatch"
 
 
+@pytest.mark.parametrize("path", [
+    "source.duckdb", "data/tmp/source", r"\\server\share\db.duckdb", "data/tmp/source.duckdb",
+])
+def test_direct_error_redacts_local_file_path(path: str) -> None:
+    assert panel_module._safe_direct_error(f"failed reading {path}") == "direct build failed"
+
+
 @pytest.mark.parametrize("prepare_error", [
     RuntimeError("unexpected boom near " + r"C:\Users\alice\secrets\source.duckdb" + " and /home/bob/secrets/analysis.duckdb"),
     DirectMaterializationError("failed near " + r"C:\Users\alice\secrets\source.duckdb" + " and /home/bob/secrets/analysis.duckdb"),

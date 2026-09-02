@@ -8,11 +8,11 @@ import re
 import shutil
 import tempfile
 import zipfile
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import pandas as pd
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 
@@ -87,6 +87,9 @@ def write_audit_workbook(
     tables: Mapping[str, pd.DataFrame], path: Path, *, data_widths_only: bool = False,
     minimum_width: int = 10, hidden_columns: frozenset[str] = frozenset(), decimal_comma: bool = False,
     numeric_decimals: bool = False, number_formats: Mapping[str, str] | None = None,
+    bold_columns: frozenset[str] = frozenset(), column_edge_borders: Mapping[str, tuple[str, ...]] | None = None,
+    center_from_column: int | None = None, left_aligned_columns: frozenset[str] = frozenset(),
+    row_fill_colors: Mapping[str, Sequence[str | None]] | None = None,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
@@ -114,6 +117,15 @@ def write_audit_workbook(
                 )
         for row in dataframe_to_rows(frame, index=False, header=True):
             worksheet.append(row)
+        if center_from_column is not None:
+            for row in worksheet.iter_rows(min_col=center_from_column):
+                for cell in row:
+                    cell.alignment = Alignment(horizontal="center")
+        for index, column in enumerate(frame.columns, start=1):
+            if str(column) in left_aligned_columns:
+                for cell in worksheet.iter_cols(min_col=index, max_col=index, min_row=2):
+                    for value_cell in cell:
+                        value_cell.alignment = Alignment(horizontal="left")
         if numeric_decimals:
             for row in worksheet.iter_rows(min_row=2):
                 for cell in row:
@@ -126,6 +138,21 @@ def write_audit_workbook(
                         for value_cell in cell:
                             if isinstance(value_cell.value, (int, float)):
                                 value_cell.number_format = number_format
+        if bold_columns or column_edge_borders:
+            edge_side = Side(style="double", color="8FA3B8")
+            for index, column in enumerate(frame.columns, start=1):
+                cells = list(worksheet.iter_cols(min_col=index, max_col=index, min_row=1, max_row=worksheet.max_row))[0]
+                if str(column) in bold_columns:
+                    for value_cell in cells[1:]:
+                        value_cell.font = Font(bold=True)
+                for edge in (column_edge_borders or {}).get(str(column), ()):
+                    border = Border(**{edge: edge_side})
+                    for value_cell in cells:
+                        value_cell.border += border
+        for row, color in zip(worksheet.iter_rows(min_row=2), (row_fill_colors or {}).get(sheet_name, ())):
+            if color:
+                for cell in row:
+                    cell.fill = PatternFill("solid", fgColor=color)
         if len(frame.columns):
             for cell in worksheet[1]:
                 cell.fill = header_fill

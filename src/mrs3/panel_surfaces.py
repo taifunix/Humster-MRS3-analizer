@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+import re
 from threading import RLock, Thread
 import secrets
 from types import SimpleNamespace
@@ -25,9 +26,18 @@ from .source_v6_storage import (
     validate_source_v6_database,
 )
 from .source_v6_surface_fresh import publish_multiscope_surface, suggested_multiscope_surface_filename
+from .error_sanitization import redact_local_paths
 
 
 _NOT_READY = "n/r - Check gaps"
+
+
+def _safe_failure_reason(error: BaseException, output: Path) -> str:
+    message = str(error) or type(error).__name__
+    for path in {str(output), str(output.resolve())}:
+        message = message.replace(path, "<surface-target>")
+    message = redact_local_paths(message)
+    return f"{type(error).__name__}: {message}"[:500]
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,9 +330,11 @@ class LocalSurfacesService:
             )
             with self._lock:
                 job.running, job.phase, job.target, job.detail = False, "COMMITTED", Path(str(artifact)).name, None
-        except BaseException:
+        except BaseException as error:
             with self._lock:
-                job.running, job.phase, job.error, job.detail = False, "FAILED", "surface publication failed", None
+                job.running, job.phase, job.error, job.detail = (
+                    False, "FAILED", _safe_failure_reason(error, output), None
+                )
 
     def _selected_ids(self, pending: _Pending, selected: Sequence[str]) -> tuple[str, ...]:
         wanted = set(selected)

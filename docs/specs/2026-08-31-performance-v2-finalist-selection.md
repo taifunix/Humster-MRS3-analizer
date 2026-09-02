@@ -12,9 +12,9 @@ From committed Performance DB v2 facts, calculate a disposable, ordered selectio
 
 The button runs from the current v2 database and does **not** create `selection_runs`, `selection_results`, tags, lifecycle changes, RETEST jobs or an XLSX import path. Those are Stage 3.
 
-The request is `symbol`, `side`, and ordered `{id, enabled, scope}` stages. IDs must be known built-ins; scope is `pair_side` or `pair_side_timeframe`. Unknown or duplicate IDs, unknown scope, inactive Pair + Side, and path traversal fail with typed 400. UI edits remain local until an explicit action.
+The request is `symbol`, `side`, and ordered stages. A normal stage is `{id, enabled, scope}`; `filter_min_shift` additionally requires positive `min_shift_pct`. IDs must be known built-ins; scope is `pair_side` or `pair_side_timeframe`. Unknown or duplicate IDs, unknown scope, invalid minimum Shift, inactive Pair + Side, and path traversal fail with typed 400. UI edits remain local until an explicit action.
 
-The panel may request a disposable count preview for the current local setup before downloading XLSX. It returns, for every stage, `eliminated` and `remaining` after that stage; it writes neither database state nor a file. Any edit of Pair, Side, enabled flags, scopes or order invalidates the displayed counters until the user explicitly refreshes them.
+The panel requests a disposable count preview for the current local setup before downloading XLSX. It returns, for every stage, `eliminated` and `remaining` after that stage; it writes neither database state nor a file. Any edit of Pair, Side, enabled flags, scopes, threshold or order schedules a refreshed counter preview.
 
 XLSX is enabled only when every ACTIVE result in the selected Pair + Side has the default full, A and B windows in `window_metrics`. A read-only readiness check reports the missing-result count when Pair or Side changes. The explicit fact recalculation warms those windows, then refreshes readiness; checkbox, scope and order edits do not affect readiness.
 
@@ -49,7 +49,7 @@ B win_rate_pct < 58
 A trade_rate_30d > 0 and B trade_rate_30d <= A trade_rate_30d / 7
 ```
 
-The XLSX exports only `ab_pnl_change_30d_pct = (B return_pct_30d / A return_pct_30d - 1) * 100` when A is positive; otherwise blank. No other A/B columns are exported.
+The XLSX exports `ab_pnl_change_30d_pct = (B return_pct_30d / A return_pct_30d - 1) * 100` when A is positive; otherwise blank, plus the two inputs `ab_return_a_30d_pct` and `ab_return_b_30d_pct`. No other A/B columns are exported.
 
 ## Stage registry
 
@@ -58,8 +58,11 @@ Each stage uses its selected scope: `pair_side` compares all requested candidate
 | ID | Rule |
 | --- | --- |
 | `filter_holding_outlier` | Eliminate `holding_p95_minutes > Q3 + 1.5 * IQR`. |
-| `filter_low_trades` | Eliminate `total_trades < Q1 - 1.5 * IQR`. |
+| `filter_low_trades` | Eliminate `total_trades < Q1 - 1.5 * IQR`. Disabled by default. |
+| `filter_min_shift` | Eliminate when any existing order has `shift_bp < min_shift_pct * 100`. Missing shift data does not eliminate. The input uses percent, is defaulted to `0.3`, and the stage is disabled by default. |
 | `ab_deterioration` | Apply A/B rule above. |
+| `pareto_window_b` | Maximize `B return_pct_30d`, B trades/30d; minimize B max drawdown and B holding p95. B holding p95 uses completed positions closed in B. Disabled by default; default scope is `pair_side_timeframe`. |
+| `pareto_window_b_dd_shift` | Maximize `B return_pct_30d` and first shift; minimize full-period max drawdown. Disabled by default; default scope is `pair_side_timeframe`. |
 | `pareto_dd5_balanced` | Maximize `dd5_proxy`, `first_shift_bp`; minimize `capital_proxy`, holding p95, Close MA. |
 | `pareto_plateau_points_per_order` | Equal order count only. A eliminates B when `dd5_proxy_A >= dd5_proxy_B * plateau_points_pareto_pnl_multiplier` and every A plateau count is at least B's. Proxy condition is strict under multiplier; equal counts are allowed. |
 | `pareto_plateau_points_total` | Equal order count only. Same strict proxy condition and A total plateau count is at least B's. |
@@ -75,13 +78,16 @@ Ordinary Pareto eliminates iff a candidate is no worse in every objective and st
 
 ## XLSX
 
-Download one deterministic workbook with `All candidates` and `Finalists`, both from the same in-memory result. `All candidates` retains every input strategy. It includes identity/settings, current result metrics, DD5 proxy diagnostics, holding, ordered plateau counts and total, the sole A/B column above, then `eliminated_by_<stage_id>` for every submitted stage, `finalist`, and `elimination_reason`.
+Download one deterministic workbook with `All candidates` and `Finalists`, both from the same in-memory result. `All candidates` retains every input strategy. It includes identity/settings, current result metrics, DD5 proxy diagnostics, holding, ordered plateau counts and total, the three A/B columns above, then `eliminated_by_<stage_id>` for every submitted stage, `finalist`, and `elimination_reason`.
 
-Display fractions round to two decimals; IDs and counts remain integral; holding is minutes. A stage boolean is true only if that stage actually eliminated the row.
+IDs and counts remain integral; holding is minutes. The requested display columns
+`PnL`, `PnL/30`, `PnL DD5/30`, `PF`, `PnL A/30d, %`, `PnL B/30d, %` and
+`PnL without best, %` are rounded to the nearest whole number in XLSX. A stage
+boolean is true only if that stage actually eliminated the row.
 
 ## Acceptance evidence
 
-- Tests cover every stage, both scopes, stage order, deterministic ties, and missing-data non-elimination.
+- Tests cover every stage, both scopes, stage order, deterministic ties, and missing-data non-elimination, including the minimum-Shift threshold.
 - Endpoint tests prove only the requested active Pair + Side is exported and no selection/tag table is mutated.
 - XLSX tests prove all candidates, ordered plateau counts, stage booleans and exactly one A/B column.
 - API and workbook visibly label DD5 as calculation-only.
