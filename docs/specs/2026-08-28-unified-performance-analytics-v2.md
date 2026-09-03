@@ -218,16 +218,26 @@ report bounds: Window A "entire period" uses both bounds; Window B "last week"
 and "last two weeks" end at the report end and clamp their start to the report
 start. They only fill the existing UTC fields and never trigger a calculation.
 
+After calculation, the card shows a compact interval summary for both windows.
+It keeps the calendar interval used for duration normalization separate from
+the effective first/last event-backed flat boundaries. A short event span is
+not an import warning: the tester's wallet/equity series is event-based and may
+legitimately end at the last transaction before the report end. An unavailable
+window remains visually marked. This presentation uses fields already returned
+by the API and does not add a query, cache row or calculation.
+
 ### 30-day equivalent for unequal manual windows
 
-The manual A/B response adds `normalization_30d` to each returned window. It
-is calculated on the server from the `effective_start_utc` and
-`effective_end_utc` stored in that same `WindowMetrics` row; it never uses the
-requested dates or browser time. It is additive: the raw `window_metrics`
-cache, schema and all pre-existing response fields remain unchanged.
+The manual A/B response adds `normalization_30d` to each returned window. Its
+duration is the requested calendar interval intersected with the authoritative
+report interval. It must not use the first or last action/equity timestamp as a
+duration boundary: those series are event-based, so an idle tail after the last
+trade remains part of the tested period. It is additive: the raw
+`window_metrics` cache, schema and all pre-existing response fields remain
+unchanged.
 
-`observed_days` is the effective elapsed microseconds divided by 86,400,000,000
-as a `Decimal`. With a full-precision duration of at least one day, the server
+`observed_days` is the intersected calendar elapsed microseconds divided by
+86,400,000,000 as a `Decimal`. With a full-precision duration of at least one day, the server
 returns a constant-rate 30-day equivalent:
 
 ```text
@@ -251,6 +261,23 @@ factor, win rate, holding time and time in market are path- or ratio-dependent
 raw metrics. The UI must always label those rows as not duration-normalized and
 state that the 30-day values are a mathematical constant-rate equivalent of a
 source window, not a forecast, tick test or MRS3 PnL.
+
+Selection and XLSX use the same calendar duration for `PnL/30`, A/B PnL and
+`Trades/30d`. Sparse trading never compresses that denominator to the event
+span. Existing cached raw window facts remain reusable; this correction does
+not require a cache-version bump or fact recalculation.
+
+### Current-report import integrity
+
+When a current Performance v2 HTML report declares them, the parser fails closed when the declared
+`Total transactions (buy/sell)` differs from the number of parsed action rows,
+or when the final wallet sample does not round to the declared `Final balance`
+at that declared precision. The existing raw/semantic inventory comparison and
+post-write DuckDB row-count verification remain mandatory. The final event or
+equity timestamp is only required to fall inside the report interval; the
+tester's declared `EndDate` is inclusive for imported event and equity samples,
+so a timestamp exactly equal to that endpoint is valid. It is not required to
+equal the report end.
 
 Each interval requires `start < end`; A and B may be identical, overlapping,
 nested or disjoint. Equity samples use the closed effective interval and

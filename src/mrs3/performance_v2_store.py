@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import duckdb
 
 from .config import PanelPathSettings, load_panel_path_settings
 
 
-_SCHEMA_VERSION = "2"
+_SCHEMA_VERSION = "3"
 _DATABASE_NAME = "strategy_performance.duckdb"
 _MAX_WORKERS = 64
 _DEFAULT_V1_PERFORMANCE_ROOT = PanelPathSettings().performance_db_root
@@ -263,21 +264,97 @@ CREATE INDEX IF NOT EXISTS strategy_actions_result_timestamp_idx ON strategy_act
 CREATE INDEX IF NOT EXISTS strategy_equity_result_timestamp_idx ON strategy_equity(result_id, timestamp_utc);
 """
 
+_SELECTION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS selection_runs (
+    selection_run_id VARCHAR PRIMARY KEY,
+    database_instance_id VARCHAR NOT NULL,
+    symbol VARCHAR NOT NULL,
+    side VARCHAR NOT NULL CHECK (side IN ('LONG', 'SHORT')),
+    selection_contract_version VARCHAR NOT NULL,
+    request_json VARCHAR NOT NULL,
+    request_sha256 VARCHAR NOT NULL,
+    config_json VARCHAR NOT NULL,
+    config_sha256 VARCHAR NOT NULL,
+    candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+    representative_count INTEGER NOT NULL CHECK (representative_count >= 0),
+    auto_finalist_count INTEGER NOT NULL CHECK (auto_finalist_count >= 0),
+    top_n INTEGER NOT NULL CHECK (top_n > 0),
+    workbook_sha256 VARCHAR NOT NULL,
+    created_at_utc TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS selection_results (
+    selection_run_id VARCHAR NOT NULL REFERENCES selection_runs(selection_run_id),
+    strategy_id BIGINT NOT NULL,
+    result_id_at_selection BIGINT NOT NULL,
+    auto_status VARCHAR NOT NULL CHECK (auto_status IN ('FINALIST', 'RESERVE', 'ANALOG', 'FILTERED')),
+    auto_score DOUBLE,
+    auto_rank INTEGER CHECK (auto_rank IS NULL OR auto_rank > 0),
+    auto_reason VARCHAR,
+    analog_group_key VARCHAR,
+    auto_analog_of_strategy_id BIGINT,
+    prior_rejected BOOLEAN NOT NULL,
+    stage_trace_json VARCHAR NOT NULL,
+    PRIMARY KEY (selection_run_id, strategy_id)
+);
+
+CREATE TABLE IF NOT EXISTS selection_review_imports (
+    review_import_id VARCHAR PRIMARY KEY,
+    selection_run_id VARCHAR NOT NULL REFERENCES selection_runs(selection_run_id),
+    workbook_sha256 VARCHAR NOT NULL UNIQUE,
+    imported_at_utc TIMESTAMPTZ NOT NULL,
+    row_count INTEGER NOT NULL CHECK (row_count >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS selection_review_rows (
+    review_import_id VARCHAR NOT NULL REFERENCES selection_review_imports(review_import_id),
+    strategy_id BIGINT NOT NULL,
+    user_status VARCHAR NOT NULL CHECK (user_status IN ('FINALIST', 'RESERVE', 'ANALOG', 'FILTERED', 'REJECTED')),
+    user_rank INTEGER CHECK (user_rank IS NULL OR user_rank > 0),
+    user_analog_of_strategy_id BIGINT,
+    comment VARCHAR,
+    PRIMARY KEY (review_import_id, strategy_id)
+);
+
+CREATE TABLE IF NOT EXISTS strategy_tags (
+    strategy_id BIGINT NOT NULL REFERENCES strategies(strategy_id),
+    tag VARCHAR NOT NULL CHECK (tag = 'REJECTED'),
+    source_review_import_id VARCHAR NOT NULL REFERENCES selection_review_imports(review_import_id),
+    updated_at_utc TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (strategy_id, tag)
+);
+
+CREATE INDEX IF NOT EXISTS selection_runs_pair_side_created_idx
+ON selection_runs(symbol, side, created_at_utc);
+CREATE INDEX IF NOT EXISTS selection_review_imports_run_imported_idx
+ON selection_review_imports(selection_run_id, imported_at_utc);
+CREATE INDEX IF NOT EXISTS strategy_tags_tag_idx ON strategy_tags(tag);
+"""
+
+_V2_TABLE_NAMES = {
+    "schema_info",
+    "strategies",
+    "analysis_plateaus",
+    "strategy_orders",
+    "strategy_results",
+    "strategy_actions",
+    "strategy_equity",
+    "window_metrics",
+    "import_runs",
+    "import_files",
+}
+
 _EXPECTED_TABLES = frozenset(
     ("main", name)
-    for name in {
-        "schema_info",
-        "strategies",
-        "analysis_plateaus",
-        "strategy_orders",
-        "strategy_results",
-        "strategy_actions",
-        "strategy_equity",
-        "window_metrics",
-        "import_runs",
-        "import_files",
+    for name in _V2_TABLE_NAMES | {
+        "selection_runs",
+        "selection_results",
+        "selection_review_imports",
+        "selection_review_rows",
+        "strategy_tags",
     }
 )
+_V2_EXPECTED_TABLES = frozenset(("main", name) for name in _V2_TABLE_NAMES)
 _EXPECTED_SEQUENCES = frozenset(
     ("main", name)
     for name in {
@@ -287,17 +364,18 @@ _EXPECTED_SEQUENCES = frozenset(
         "performance_v2_import_file_id_seq",
     }
 )
-_EXPECTED_MARKERS = {
-    "schema_version": _SCHEMA_VERSION,
-    "database_kind": "unified_performance_v2",
-}
+_V2_EXPECTED_MARKERS = {"schema_version": "2", "database_kind": "unified_performance_v2"}
 _EXPECTED_INDEXES = frozenset(
     {
         ("main", "strategy_results_strategy_id_idx"),
         ("main", "strategy_actions_result_timestamp_idx"),
         ("main", "strategy_equity_result_timestamp_idx"),
+        ("main", "selection_runs_pair_side_created_idx"),
+        ("main", "selection_review_imports_run_imported_idx"),
+        ("main", "strategy_tags_tag_idx"),
     }
 )
+_V2_EXPECTED_INDEXES = frozenset(index for index in _EXPECTED_INDEXES if not index[1].startswith(("selection_", "strategy_tags_")))
 
 
 def _schema_version(connection: duckdb.DuckDBPyConnection) -> str | None:
@@ -352,9 +430,17 @@ def _schema_markers(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
 def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     """Fail closed unless the connection already contains the v2 schema."""
     if _schema_version(connection) != _SCHEMA_VERSION:
-        raise PerformanceV2StoreError("Performance database does not have schema version 2")
-    if _schema_markers(connection) != _EXPECTED_MARKERS:
+        raise PerformanceV2StoreError("Performance database does not have schema version 3")
+    markers = _schema_markers(connection)
+    if set(markers) != {"schema_version", "database_kind", "database_instance_id"} or markers.get(
+        "database_kind"
+    ) != "unified_performance_v2":
         raise PerformanceV2StoreError("Performance database is not unified performance v2")
+    try:
+        if str(UUID(markers["database_instance_id"])) != markers["database_instance_id"]:
+            raise ValueError
+    except (KeyError, ValueError, AttributeError):
+        raise PerformanceV2StoreError("Performance database has invalid instance identity") from None
     tables, sequences, indexes = _catalog_objects(connection)
     if (
         tables != _EXPECTED_TABLES
@@ -364,21 +450,68 @@ def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
 
 
+def _require_schema_v2_for_migration(connection: duckdb.DuckDBPyConnection) -> None:
+    if _schema_markers(connection) != _V2_EXPECTED_MARKERS:
+        raise PerformanceV2StoreError("Performance database is not unified performance v2")
+    tables, sequences, indexes = _catalog_objects(connection)
+    if tables != _V2_EXPECTED_TABLES or sequences != _EXPECTED_SEQUENCES or indexes != _V2_EXPECTED_INDEXES:
+        raise PerformanceV2StoreError("Performance database has an unexpected catalog")
+
+
+def _add_window_columns(connection: duckdb.DuckDBPyConnection) -> None:
+    connection.execute("alter table window_metrics add column if not exists holding_seconds decimal(38,12)")
+    connection.execute("alter table window_metrics add column if not exists time_in_market_pct decimal(38,12)")
+
+
+def _rollback_quietly(connection: duckdb.DuckDBPyConnection) -> None:
+    try:
+        connection.execute("rollback")
+    except Exception:
+        pass
+
+
 def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     """Initialize the additive v2 schema, rejecting all non-v2 databases."""
     version = _schema_version(connection)
-    if version is not None and version != _SCHEMA_VERSION:
+    if version is not None and version not in {"2", _SCHEMA_VERSION}:
         raise PerformanceV2StoreError("Performance database has an unsupported schema version")
     if version == _SCHEMA_VERSION:
         require_performance_v2(connection)
-        connection.execute("alter table window_metrics add column if not exists holding_seconds decimal(38,12)")
-        connection.execute("alter table window_metrics add column if not exists time_in_market_pct decimal(38,12)")
+        _add_window_columns(connection)
+        return
+    if version == "2":
+        _require_schema_v2_for_migration(connection)
+        try:
+            connection.execute("begin transaction")
+            _add_window_columns(connection)
+            connection.execute(_SELECTION_SCHEMA)
+            connection.execute(
+                "insert into schema_info values ('database_instance_id', ?)", [str(uuid4())]
+            )
+            connection.execute("update schema_info set value = ? where key = 'schema_version'", [_SCHEMA_VERSION])
+            connection.execute("commit")
+        except Exception as error:
+            _rollback_quietly(connection)
+            raise PerformanceV2StoreError("Performance database schema migration failed") from error
+        require_performance_v2(connection)
         return
     if not _catalog_is_empty(connection):
         raise PerformanceV2StoreError("Performance v2 target catalog is not empty")
-    connection.execute("create table schema_info (key varchar primary key, value varchar not null)")
-    connection.execute(_SCHEMA)
-    connection.executemany(
-        "insert into schema_info (key, value) values (?, ?)",
-        list(_EXPECTED_MARKERS.items()),
-    )
+    try:
+        connection.execute("begin transaction")
+        connection.execute("create table schema_info (key varchar primary key, value varchar not null)")
+        connection.execute(_SCHEMA)
+        connection.execute(_SELECTION_SCHEMA)
+        connection.executemany(
+            "insert into schema_info (key, value) values (?, ?)",
+            [
+                ("schema_version", _SCHEMA_VERSION),
+                ("database_kind", "unified_performance_v2"),
+                ("database_instance_id", str(uuid4())),
+            ],
+        )
+        connection.execute("commit")
+    except Exception as error:
+        _rollback_quietly(connection)
+        raise PerformanceV2StoreError("Performance database initialization failed") from error
+    require_performance_v2(connection)

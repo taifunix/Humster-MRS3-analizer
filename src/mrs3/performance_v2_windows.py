@@ -195,6 +195,18 @@ def _decimal(value: object, field: str) -> Decimal:
     return result
 
 
+def calendar_window_days(
+    metrics: WindowMetrics,
+    report_start_utc: datetime | None = None,
+    report_end_utc: datetime | None = None,
+) -> Decimal | None:
+    """Calendar denominator for rate metrics; event series may end while idle."""
+    start = max(metrics.requested_start_utc, _utc(report_start_utc)) if report_start_utc else metrics.requested_start_utc
+    end = min(metrics.requested_end_utc, _utc(report_end_utc)) if report_end_utc else metrics.requested_end_utc
+    seconds = Decimal(str((end - start).total_seconds()))
+    return seconds / Decimal(86_400) if seconds > 0 else None
+
+
 def _metric_from_row(row: tuple[Any, ...]) -> WindowMetrics:
     values = list(row)
     for index in (8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19):
@@ -467,6 +479,7 @@ __all__ = [
     "PerformanceV2WindowsError",
     "WindowMetrics",
     "WindowPairComparison",
+    "calendar_window_days",
     "compare_window_pair_geometrically",
     "get_or_calculate_window",
     "get_or_calculate_window_pair",

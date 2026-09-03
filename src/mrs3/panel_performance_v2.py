@@ -28,6 +28,7 @@ from .performance_v2_windows import (
     METRICS_VERSION,
     WindowMetrics,
     _cached,
+    calendar_window_days,
     compare_window_pair_geometrically,
     get_or_calculate_window_pair,
 )
@@ -160,10 +161,14 @@ def _fixed_decimal(value: Decimal, places: int) -> str:
     return format(quantized, "f")
 
 
-def _normalization_30d(metrics: WindowMetrics) -> dict[str, object]:
+def _normalization_30d(
+    metrics: WindowMetrics,
+    report_start_utc: datetime | None = None,
+    report_end_utc: datetime | None = None,
+) -> dict[str, object]:
     """Return the duration-normalized values without changing raw metrics."""
-    start, end = metrics.effective_start_utc, metrics.effective_end_utc
-    if not isinstance(start, datetime) or not isinstance(end, datetime):
+    observed_days = calendar_window_days(metrics, report_start_utc, report_end_utc)
+    if observed_days is None:
         return {
             "period_days": 30,
             "status": "invalid_duration",
@@ -172,29 +177,9 @@ def _normalization_30d(metrics: WindowMetrics) -> dict[str, object]:
             "return_pct": None,
             "trade_rate": None,
         }
-    try:
-        elapsed = end - start
-        elapsed_microseconds = (
-            elapsed.days * 86_400_000_000
-            + elapsed.seconds * 1_000_000
-            + elapsed.microseconds
-        )
-    except (ArithmeticError, TypeError, ValueError):
-        elapsed_microseconds = 0
-    if elapsed_microseconds <= 0:
-        return {
-            "period_days": 30,
-            "status": "invalid_duration",
-            "observed_days": None,
-            "growth_factor": None,
-            "return_pct": None,
-            "trade_rate": None,
-        }
-
     with localcontext() as context:
         context.prec = 34
         context.rounding = ROUND_HALF_UP
-        observed_days = Decimal(elapsed_microseconds) / Decimal(86_400_000_000)
         result: dict[str, object] = {
             "period_days": 30,
             "status": "ok" if observed_days >= 1 else "too_short",
@@ -302,9 +287,13 @@ def performance_v2_catalog(connection: duckdb.DuckDBPyConnection) -> dict[str, o
     return {"strategies": strategies}
 
 
-def _window_document(metrics: WindowMetrics) -> dict[str, object]:
+def _window_document(
+    metrics: WindowMetrics,
+    report_start_utc: datetime | None = None,
+    report_end_utc: datetime | None = None,
+) -> dict[str, object]:
     document = _json_value(asdict(metrics))  # type: ignore[assignment]
-    document["normalization_30d"] = _normalization_30d(metrics)
+    document["normalization_30d"] = _normalization_30d(metrics, report_start_utc, report_end_utc)
     return document  # type: ignore[return-value]
 
 
@@ -321,8 +310,8 @@ def _pair_document(
     document: dict[str, object] = {
         "strategy_id": strategy_id,
         "result_id": result_id,
-        "window_a": _window_document(pair[0]),
-        "window_b": _window_document(pair[1]),
+        "window_a": _window_document(pair[0], report_start_utc, report_end_utc),
+        "window_b": _window_document(pair[1], report_start_utc, report_end_utc),
         "comparison": _json_value(asdict(comparison)),
     }
     if report_start_utc is not None:

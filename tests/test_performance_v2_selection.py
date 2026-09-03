@@ -14,7 +14,10 @@ from openpyxl.utils import get_column_letter
 from mrs3.performance_v2_selection import (
     PerformanceV2SelectionError,
     SelectionConfig,
+    _ab_metrics_from_windows,
     _holding_p95_minutes,
+    _return_30d,
+    _trade_rate_30d,
     load_selection_candidates,
     load_selection_config,
     parse_selection_request,
@@ -24,9 +27,41 @@ from mrs3.performance_v2_selection import (
     write_selection_workbook,
 )
 from mrs3.performance_v2_store import initialize_performance_v2
+from mrs3.performance_v2_windows import WindowMetrics
 
 
 UTC = timezone.utc
+
+
+def test_selection_30d_rates_use_calendar_window_with_sparse_events() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    metrics = WindowMetrics(
+        1, start, start + timedelta(days=14), "test",
+        start, start + timedelta(days=2), "AVAILABLE", None,
+        Decimal("1.1"), Decimal("10"), None, None, Decimal("2"), Decimal("5"),
+        Decimal("0.1"), Decimal("2"), 5, Decimal("60"),
+    )
+
+    assert _return_30d(metrics).quantize(Decimal(".0001")) == Decimal("22.6588")
+    assert _trade_rate_30d(metrics).quantize(Decimal(".0001")) == Decimal("10.7143")
+
+
+def test_selection_ab_metrics_clamp_duration_to_report_bounds() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    metrics = WindowMetrics(
+        1, start, start + timedelta(days=14), "test",
+        start, start + timedelta(days=2), "AVAILABLE", None,
+        Decimal("1.1"), Decimal("10"), None, None, Decimal("2"), Decimal("5"),
+        Decimal("0.1"), Decimal("2"), 5, Decimal("60"),
+    )
+
+    values = _ab_metrics_from_windows(
+        metrics, metrics, report_start_utc=start + timedelta(days=3), report_end_utc=start + timedelta(days=10)
+    )
+
+    assert values["ab_calendar_days_a"] == Decimal("7")
+    assert values["ab_calendar_days_b"] == Decimal("7")
+    assert values["ab_trade_rate_a_30d"] == Decimal(5) * 30 / 7
 
 
 def _config(path: Path, **selection: object) -> Path:
@@ -277,7 +312,9 @@ def test_loader_derives_proxy_holding_and_order_plateau_counts(tmp_path: Path) -
         connection.close()
 
     assert row["order_1_plateau_point_count"] == 12
+    assert row["order_1_plateau_key"] == ("run", "P1")
     assert row["total_plateau_point_count"] == 12
+    assert row["total_trades"] == 1
     assert row["dd5_proxy"] is not None
     assert row["dd5_proxy"] > 0
     assert row["holding_p95_minutes"] == 1440
@@ -493,16 +530,20 @@ def test_new_robust_filters_only_eliminate_evaluable_or_dominated_candidates() -
     result = run_selection(pd.DataFrame([
         _selection_row("winner", strategy_id=1, best_trade_reliable=True, completed_profitable_trade_count=4,
                        best_trade_profit_share_pct=Decimal("20"), pnl_without_best_trade=Decimal("5"),
-                       positive_quarter_count=4, robust_pnl_30d_pct=Decimal("20"), worst_drawdown_pct=Decimal("4"),
+                       positive_quarter_count=4, positive_quarter_available_count=4,
+                       robust_pnl_30d_pct=Decimal("20"), worst_drawdown_pct=Decimal("4"),
                        worst_holding_p95_minutes=Decimal("40"), first_shift_bp=200),
         _selection_row("dependent", strategy_id=2, best_trade_reliable=True, completed_profitable_trade_count=4,
-                       best_trade_profit_share_pct=Decimal("36"), pnl_without_best_trade=Decimal("5"), positive_quarter_count=4),
+                       best_trade_profit_share_pct=Decimal("36"), pnl_without_best_trade=Decimal("5"),
+                       positive_quarter_count=4, positive_quarter_available_count=4),
         _selection_row("boundary", strategy_id=5, best_trade_reliable=True, completed_profitable_trade_count=4,
-                       best_trade_profit_share_pct=Decimal("35"), pnl_without_best_trade=Decimal("5"), positive_quarter_count=None),
+                       best_trade_profit_share_pct=Decimal("35"), pnl_without_best_trade=Decimal("5"),
+                       positive_quarter_count=1, positive_quarter_available_count=3),
         _selection_row("inconsistent", strategy_id=3, best_trade_reliable=False, completed_profitable_trade_count=1,
-                       positive_quarter_count=2),
+                       positive_quarter_count=2, positive_quarter_available_count=4),
         _selection_row("dominated", strategy_id=4, best_trade_reliable=False, completed_profitable_trade_count=1,
-                       positive_quarter_count=4, robust_pnl_30d_pct=Decimal("10"), worst_drawdown_pct=Decimal("5"),
+                       positive_quarter_count=4, positive_quarter_available_count=4,
+                       robust_pnl_30d_pct=Decimal("10"), worst_drawdown_pct=Decimal("5"),
                        worst_holding_p95_minutes=Decimal("50"), first_shift_bp=100),
     ]), request).set_index("strategy_name")
 
@@ -530,7 +571,8 @@ def test_shift_near_tie_and_final_rank_keep_top_rankable_and_unranked_rows() -> 
 
     assert result.loc["near-tie", "eliminated_by_pareto_shift_near_tie"]
     assert result.loc["shift-winner", "final_rank"] == 1
-    assert result.loc["unranked", "finalist"]
+    assert not result.loc["unranked", "finalist"]
+    assert result.loc["unranked", "auto_status"] == "RESERVE"
     assert result.loc["unranked", "elimination_reason"] == "RANK_NOT_EVALUATED_INSUFFICIENT_DATA"
 
 
@@ -598,10 +640,13 @@ def test_final_rank_uses_only_prior_stage_survivors_and_renormalizes_weights() -
     assert result.loc["filtered-top", "elimination_reason"] == "FILTER_MIN_SHIFT"
     assert result.loc["survivor", "finalist"]
     assert result.loc["survivor", "final_rank"] == 1
-    assert sum(result.loc["survivor", f"rank_weight_{name}"] for name in ("robust_pnl", "worst_drawdown", "ab_stability", "first_shift", "minimum_plateau_points", "close_ma")) == pytest.approx(1.0)
+    assert sum(result.loc["survivor", f"rank_weight_{name}"] for name in (
+        "robust_pnl", "worst_drawdown", "ab_stability", "worst_holding",
+        "first_shift", "minimum_plateau_points", "close_ma",
+    )) == pytest.approx(1.0)
 
 
-def test_final_rank_prefers_smaller_close_ma_with_weight_ten_pct() -> None:
+def test_final_rank_prefers_smaller_close_ma_with_approved_weight() -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 2},
     ]})
@@ -619,10 +664,119 @@ def test_final_rank_prefers_smaller_close_ma_with_weight_ten_pct() -> None:
     assert result.loc["large-close", "final_rank"] == 2
     assert result.loc["small-close", "rank_quality_close_ma"] == pytest.approx(1.0)
     assert result.loc["large-close", "rank_quality_close_ma"] == pytest.approx(0.0)
-    assert result.loc["small-close", "rank_weight_close_ma"] == pytest.approx(0.10)
+    assert result.loc["small-close", "rank_weight_close_ma"] == pytest.approx(0.09)
     assert [result.loc["small-close", f"rank_weight_{name}"] for name in (
         "robust_pnl", "worst_drawdown", "ab_stability", "first_shift", "minimum_plateau_points",
-    )] == pytest.approx([0.38, 0.17, 0.15, 0.10, 0.10])
+    )] == pytest.approx([0.30, 0.15, 0.15, 0.10, 0.09])
+
+
+def test_final_rank_uses_approved_weights_including_worst_holding() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 20},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _selection_row(
+            "only", strategy_id=1, robust_pnl_30d_pct=Decimal("10"), worst_drawdown_pct=Decimal("5"),
+            ab_stability_ratio=Decimal(".8"), worst_holding_p95_minutes=Decimal("60"),
+            first_shift_bp=100, minimum_plateau_point_count=20, close_ma_len=3,
+        ),
+    ]), request).iloc[0]
+
+    assert [result[f"rank_weight_{name}"] for name in (
+        "robust_pnl", "worst_drawdown", "ab_stability", "worst_holding",
+        "first_shift", "minimum_plateau_points", "close_ma",
+    )] == pytest.approx([.30, .15, .15, .12, .10, .09, .09])
+    assert result["final_score"] == pytest.approx(100)
+
+
+def test_final_rank_collapses_exact_analogs_before_top_n() -> None:
+    request = parse_selection_request({"symbol": "BABAUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1},
+    ]})
+    common = {
+        "symbol": "BABAUSDT", "side": "LONG", "timeframe": "1h", "order_count": 2,
+            "close_ma_len": 3, "worst_drawdown_pct": Decimal("5"),
+            "ab_stability_ratio": Decimal(".8"), "worst_holding_p95_minutes": Decimal("60"),
+            "first_shift_bp": 100, "minimum_plateau_point_count": 20,
+            "order_1_plateau_key": (77, 900), "order_2_plateau_key": (77, 901),
+    }
+    result = run_selection(pd.DataFrame([
+        _selection_row("best-analog", strategy_id=5, robust_pnl_30d_pct=Decimal("20"), **common),
+        _selection_row("other-analog", strategy_id=6, robust_pnl_30d_pct=Decimal("10"), **common),
+        _selection_row("other-close", strategy_id=7, close_ma_len=5, robust_pnl_30d_pct=Decimal("15"),
+                       **{key: value for key, value in common.items() if key != "close_ma_len"}),
+    ]), request).set_index("strategy_name")
+
+    assert result.loc["best-analog", "auto_status"] == "FINALIST"
+    assert result.loc["other-analog", "auto_status"] == "ANALOG"
+    assert result.loc["other-analog", "auto_analog_of_strategy_id"] == 5
+    assert result.loc["other-close", "auto_status"] == "RESERVE"
+    assert result["finalist"].sum() == 1
+
+
+def test_final_rank_collapses_adjacent_close_ma_only_with_identical_order_plateaus() -> None:
+    request = parse_selection_request({"symbol": "BABAUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 2},
+    ]})
+    common = {
+        "symbol": "BABAUSDT", "side": "LONG", "timeframe": "1h", "order_count": 1,
+        "worst_drawdown_pct": Decimal("5"), "ab_stability_ratio": Decimal(".8"),
+        "worst_holding_p95_minutes": Decimal("60"), "first_shift_bp": 100,
+        "minimum_plateau_point_count": 20, "order_1_plateau_key": (77, 900),
+    }
+    result = run_selection(pd.DataFrame([
+        _selection_row("close-5", strategy_id=5, close_ma_len=5, robust_pnl_30d_pct=Decimal("20"), **common),
+        _selection_row("close-6", strategy_id=6, close_ma_len=6, robust_pnl_30d_pct=Decimal("10"), **common),
+        _selection_row("close-7", strategy_id=7, close_ma_len=7, robust_pnl_30d_pct=Decimal("15"), **common),
+    ]), request).set_index("strategy_name")
+
+    assert result.loc["close-5", "auto_status"] == "FINALIST"
+    assert result.loc["close-6", "auto_status"] == "ANALOG"
+    assert result.loc["close-6", "auto_analog_of_strategy_id"] == 5
+    assert result.loc["close-7", "auto_status"] == "FINALIST"
+    assert result.loc["close-7", "auto_analog_of_strategy_id"] is pd.NA
+
+
+def test_prior_rejected_representative_does_not_consume_top_n_slot() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1},
+    ]})
+    common = {
+        "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "order_count": 1,
+        "worst_drawdown_pct": Decimal("5"), "ab_stability_ratio": Decimal(".8"),
+        "worst_holding_p95_minutes": Decimal("60"), "first_shift_bp": 100,
+        "minimum_plateau_point_count": 20,
+    }
+    result = run_selection(pd.DataFrame([
+        _selection_row("rejected", strategy_id=1, close_ma_len=2, robust_pnl_30d_pct=Decimal("30"),
+                       prior_rejected=True, **common),
+        _selection_row("selected", strategy_id=2, close_ma_len=3, robust_pnl_30d_pct=Decimal("20"),
+                       prior_rejected=False, **common),
+        _selection_row("reserve", strategy_id=3, close_ma_len=4, robust_pnl_30d_pct=Decimal("10"),
+                       prior_rejected=False, **common),
+    ]), request).set_index("strategy_name")
+
+    assert result.loc["rejected", "auto_status"] == "RESERVE"
+    assert result.loc["rejected", "elimination_reason"] == "PRIOR_USER_REJECTED"
+    assert result.loc["selected", "auto_status"] == "FINALIST"
+    assert result.loc["reserve", "auto_status"] == "RESERVE"
+
+
+def test_ranker_does_not_collapse_rows_with_missing_structural_key_or_dd5() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 2},
+    ]})
+    rows = pd.DataFrame([
+        {"strategy_id": 1, "strategy_name": "one", "timeframe": "1h", "close_ma_len": 3,
+         "robust_pnl_30d_pct": 20, "worst_drawdown_pct": 5},
+        {"strategy_id": 2, "strategy_name": "two", "timeframe": "1h", "close_ma_len": 3,
+         "robust_pnl_30d_pct": 10, "worst_drawdown_pct": 6},
+    ])
+
+    result = run_selection(rows, request).set_index("strategy_id")
+
+    assert result["auto_status"].to_dict() == {1: "FINALIST", 2: "FINALIST"}
+    assert result["auto_analog_of_strategy_id"].isna().all()
 
 
 def test_final_rank_breaks_boundary_ties_by_strategy_id_independent_of_input_order() -> None:
@@ -630,9 +784,10 @@ def test_final_rank_breaks_boundary_ties_by_strategy_id_independent_of_input_ord
         {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1},
     ]})
     facts = {
-        "robust_pnl_30d_pct": Decimal("10"), "worst_drawdown_pct": Decimal("5"),
-        "ab_stability_ratio": Decimal(".5"), "first_shift_bp": 100,
-        "minimum_plateau_point_count": 10, "close_ma_len": 3,
+            "robust_pnl_30d_pct": Decimal("10"), "worst_drawdown_pct": Decimal("5"),
+            "ab_stability_ratio": Decimal(".5"), "first_shift_bp": 100,
+            "minimum_plateau_point_count": 10, "close_ma_len": 3,
+            "order_1_plateau_key": (77, 900),
     }
     rows = [_selection_row("two", strategy_id=2, **facts), _selection_row("one", strategy_id=1, **facts)]
 
@@ -642,7 +797,8 @@ def test_final_rank_breaks_boundary_ties_by_strategy_id_independent_of_input_ord
     for result in (first, second):
         assert result.loc[1, "finalist"]
         assert result.loc[1, "final_rank"] == 1
-        assert result.loc[2, "elimination_reason"] == "RANK_ROBUST_TOP_N"
+        assert result.loc[2, "elimination_reason"] == "ANALOG"
+        assert result.loc[2, "auto_analog_of_strategy_id"] == 1
 
 
 def test_workbook_keeps_rank_eliminated_rows_with_rank_diagnostics(tmp_path: Path) -> None:
@@ -650,9 +806,9 @@ def test_workbook_keeps_rank_eliminated_rows_with_rank_diagnostics(tmp_path: Pat
         {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1},
     ]})
     result = run_selection(pd.DataFrame([
-        _selection_row("top", strategy_id=1, robust_pnl_30d_pct=Decimal("20"), worst_drawdown_pct=Decimal("4"),
+        _selection_row("top", strategy_id=1, close_ma_len=2, robust_pnl_30d_pct=Decimal("20"), worst_drawdown_pct=Decimal("4"),
                        worst_holding_p95_minutes=Decimal("40"), ab_stability_ratio=Decimal(".8"), minimum_plateau_point_count=20),
-        _selection_row("cut", strategy_id=2, robust_pnl_30d_pct=Decimal("10"), worst_drawdown_pct=Decimal("5"),
+        _selection_row("cut", strategy_id=2, close_ma_len=3, robust_pnl_30d_pct=Decimal("10"), worst_drawdown_pct=Decimal("5"),
                        worst_holding_p95_minutes=Decimal("50"), ab_stability_ratio=Decimal(".7"), minimum_plateau_point_count=10),
     ]), request)
     book = load_workbook(write_selection_workbook(result, tmp_path / "ranked.xlsx", request), data_only=True)
@@ -699,10 +855,11 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     ]})
     result = run_selection(pd.DataFrame([
         _selection_row(
-            "winner", ab_return_a_30d_pct=Decimal("10.75"), ab_return_b_30d_pct=Decimal("4.25"), ab_pnl_change_30d_pct=Decimal("1.6"),
+            "winner", ab_return_a_30d_pct=Decimal("10.75"), ab_return_b_30d_pct=Decimal("4.25"), ab_calendar_days_a=Decimal("31"), ab_calendar_days_b=Decimal("14"), ab_pnl_change_30d_pct=Decimal("1.6"),
             total_pnl_pct=Decimal("12.6"), pnl_30d_pct=Decimal("8.5"), dd5_proxy=Decimal("5.5"), profit_factor=Decimal("1.6"),
             capital_efficiency=Decimal("10.6"), win_rate_pct=Decimal("67.8"), pnl_without_best_trade_pct=Decimal("5.6"),
             holding_p95_minutes=Decimal("10.7"), holding_median_minutes=Decimal("5.6"),
+            positive_quarter_count=3, positive_quarter_available_count=3,
         ),
         _selection_row("loser", ab_return_b_30d_pct=Decimal("2.50")),
     ]), request)
@@ -716,9 +873,9 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     book = load_workbook(path, data_only=True)
     headers = [cell.value for cell in book["All candidates"][1]]
 
-    assert headers[:23] == [
+    assert headers[:25] == [
         "ID", "Стратегия", "Пара", "Side", "ТФ", "ORD", "Close", "PnL", "PnL/30", "PnL DD5/30",
-        "∆ PnL A/B", "PnL A/30д, %", "PnL B/30д, %", "Positive quarters", "CE", "PF", "DD", "W/R", "Trades", "Lot DD5", "Hold p95", "Hold M", "PointsALL",
+        "∆ PnL A/B", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "Positive quarters", "CE", "PF", "DD", "W/R", "Trades", "Lot DD5", "Hold p95", "Hold M", "PointsALL",
     ]
     assert "Shift 1" not in headers
     strategy_column = headers.index("Стратегия") + 1
@@ -734,6 +891,15 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     assert book["All candidates"].cell(winner_row, a_column).value == 11
     assert {book["All candidates"].cell(row, b_column).value for row in (winner_row, loser_row)} == {3, 4}
     assert book["All candidates"].cell(winner_row, b_column).data_type == "n"
+    for header in ("Дней A", "Дней B"):
+        column = headers.index(header) + 1
+        cell = book["All candidates"].cell(winner_row, column)
+        assert cell.data_type == "n"
+        assert cell.alignment.horizontal == "center"
+        assert cell.font.color.type == "rgb"
+        assert cell.font.color.rgb == "FF0000FF"
+        assert book["All candidates"].column_dimensions[get_column_letter(column)].width == 6
+    assert book["All candidates"].cell(winner_row, headers.index("Positive quarters") + 1).value == "3/3"
     pnl_without_best_column = headers.index("PnL without best, %") + 1
     assert {book["All candidates"].cell(row, pnl_without_best_column).value for row in (2, 3)} == {6, None}
     assert book["All candidates"].cell(3, pnl_without_best_column).data_type == "n"

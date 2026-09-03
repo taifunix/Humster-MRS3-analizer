@@ -1,7 +1,23 @@
 # MRS3 — current verification
 
-**Updated:** 2026-08-31
+**Updated:** 2026-09-03
 **Current branch:** `main`
+
+## Performance v2 selection review cleanup (2026-09-03)
+
+The accumulated Performance v2 selection/review work is implemented, staged, and
+ready for the scoped commit. It includes schema v3 selection snapshots, editable
+XLSX review/import, REJECTED-only durable tags, period-integrity checks, typed
+database/API failures, cache invalidation for result/config/window-fact changes,
+and resilient multi-file review import. Trades remain completed round trips from
+`strategy_actions`, not partial order openings or `strategy_results.total_trades`.
+
+Verification: the full suite reports `2118 passed, 2 skipped, 1 warning` in
+`730.19s`; the focused Performance v2/panel slice reports `248 passed in 29.96s`;
+`node --check src/mrs3/panel_web/app.js` and `git diff --cached --check` pass.
+The independent review found no High or blocking finding; its Medium/Low
+follow-ups were addressed and verified. Next step after commit/push is manual
+Excel round-trip acceptance on the real Performance v2 database.
 
 ## Current unified Performance v2 handoff (2026-08-30)
 
@@ -1092,3 +1108,99 @@ panel controls. Focused verification passed: `155 passed` in finalist/static
 panel suites and `167 passed` in panel/surfaces suites, plus
 `node --check src/mrs3/panel_web/app.js` and staged `git diff --check`.
 Follow-up independent review returned `CODE_REVIEW_PASS` before commit.
+
+### Performance v2 selection review lifecycle design (2026-09-02)
+
+The next approved Stage 3 contract is
+`docs/specs/2026-09-02-performance-v2-selection-review-import.md`; its
+implementation plan is
+`docs/superpowers/plans/2026-09-02-performance-v2-selection-review-import.md`
+and the storage decision is
+`docs/decisions/0022-performance-v2-selection-review-ledger.md`.
+
+The design revises final ranking to `30/15/15/12/10/9/9` for Robust PnL,
+Worst DD, A/B stability, Worst Hold p95, Shift 1, PointsMin and Close MA. It
+collapses surviving exact Pair + Side + TF + ORD + Close MA analog groups to
+one weighted representative before a default Top-20 ceiling. The current
+Close-MA near-tie Pareto remains available but becomes disabled by default.
+
+Every downloaded selection becomes an immutable schema-v3 snapshot in the same
+Performance DB. XLSX review keeps automatic and user status/rank separately;
+successful imports append history and maintain only the current `REJECTED` tag.
+`REJECTED` includes the previously discussed “мусор” meaning and never deletes
+data. Strategy deletion, RETEST and generic tags remain outside this contract.
+
+Implementation is complete. Performance DB v2 auto-migrates once from internal
+schema 2 to 3 in one transaction; it preserves existing facts and adds immutable
+selection runs/results, immutable XLSX review ledger and the scoped durable
+`REJECTED` tag. The current local DB migration preserved 16,272 strategies,
+16,272 results, 10,432,397 actions, 77,787,295 equity samples and 113,425
+window-metric rows; it finished in 0.743 s. Reopening schema 3 completed in
+0.089 s and does not require fact/cache recalculation. The existing tester
+import contract remains unchanged.
+
+Selection export now persists the exact calculated run and produces editable
+review columns plus a very-hidden metadata sheet. The panel imports every XLSX
+in a selected folder as an independent atomic request, validates the workbook
+against the newest saved run and current facts, appends review history and
+updates only `REJECTED` tags scoped to that run. A/B Pair filtering offers
+`Только финалисты` after a saved selection exists and uses the latest effective
+review result. The revised 30/15/15/12/10/9/9 score, exact analog groups and
+Top-20 default are active.
+
+Analog grouping additionally treats Close MA values differing by one as the
+same group only when Pair, Side, timeframe, order count and the exact
+`(analysis_run_id, plateau_id)` of every order match. It is deliberately
+non-transitive: `5/6` may group, but `5/6/7` is split into `5/6` and `7`.
+Focused regression evidence: `174 passed` across selection, selection-review
+and panel/static-UI suites, plus `node --check` and `git diff --check`.
+
+Selection `Trades` now uses the full-window completed-round-trip count from
+`WindowMetrics.trade_count`, not the tester's execution-level `TotalTrades`.
+For the diagnosed SNOWUSDT examples it reports ID 961 as 49 and ID 1110 as 51;
+their former report-level values were 183 and 166. The focused selection,
+selection-review and panel/static-UI evidence remains `174 passed`.
+
+`Positive quarters` now exports `positive/available` rather than hiding an
+incomplete early report fragment. For example, RDWUSDT ID 9428 has three
+usable quarter windows and now exports `3/3`; an unavailable first window is
+not counted as negative. The consistency filter continues to evaluate the
+numeric positive count and does not reject missing data by itself. Focused
+selection, selection-review and panel/static-UI evidence: `174 passed`.
+
+Fresh verification: `214 passed` across Performance v2 store/import/selection,
+selection-review and panel/static-UI suites; the full repository suite passed
+with `2097 passed, 2 skipped, 1 warning` in 737.79 s. The skips are Windows
+symlink permission cases and the warning is the existing Python 3.14 tar
+extraction deprecation. `node --check src/mrs3/panel_web/app.js`, Python
+byte-compilation and `git diff --check` passed. Acceptance still requires one
+operator round-trip through Microsoft Excel and an independent code review; the
+external review bridge was unavailable and a fallback reviewer exhausted its
+usage quota, so no review disposition is claimed. Next step: perform the Excel
+round-trip, obtain review, then commit the scoped change.
+
+Independent Opus plan review initially found lifecycle edge cases around scoped
+tag removal, repeated/stale workbooks, manual analog transitions, prior
+rejections and manual Top-N overrides. The contract and plan now define and test
+those cases; the final disposition is `PLAN_APPROVED`.
+
+### Performance v2 calendar-window normalization (2026-09-02)
+
+30-day metrics now normalize over the requested calendar interval intersected
+with the report range, never the shorter first/last event span. The panel
+displays both ranges. XLSX exposes the actual normalizers as blue centered
+`Дней A` and `Дней B` columns next to the respective A/B PnL/30 columns;
+their widths are based on data values. The raw cache remains valid and does not
+need recalculation. For ID 8859 the B interval is 14 calendar days while its
+event span is 2026-08-13T10:13Z through 2026-08-15T18:43Z; the corrected B
+values are 8.3511%/30d and 23.5714 trades/30d rather than an event-span
+extrapolation. Focused regression suites: `77 passed` for panel/window/HTML
+and `145 passed` for selection/import/static UI/audit export.
+The current HTML importer accepts a timestamp exactly at the tester's declared
+inclusive report end and rejects only timestamps later than that endpoint;
+optional declared transaction/final-balance checks remain skipped when an older
+current report omits those fields.
+
+The re-review of calendar normalization, import integrity and A/B XLSX
+duration columns returned `CODE_REVIEW_PASS` after bounds were threaded through
+selection as well. No cache migration or recalculation is needed.

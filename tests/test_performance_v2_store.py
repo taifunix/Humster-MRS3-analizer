@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from uuid import UUID
 
 import duckdb
 import pytest
@@ -129,19 +130,55 @@ def test_config_defaults_workers_to_sixteen(tmp_path: Path) -> None:
     assert load_performance_v2_config(_config(tmp_path / "config.performance.json")).workers == 16
 
 
-def test_versioned_performance_config_keeps_the_sixteen_worker_default() -> None:
+def test_versioned_performance_config_keeps_the_configured_thirty_worker_default() -> None:
     config_path = Path(__file__).resolve().parents[1] / "config.performance.json"
 
-    assert load_performance_v2_config(config_path).workers == 16
+    assert load_performance_v2_config(config_path).workers == 30
 
 
-def test_initialize_is_idempotent_and_requires_schema_v2() -> None:
+def test_initialize_is_idempotent_and_requires_internal_schema_v3() -> None:
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
         initialize_performance_v2(connection)
 
         require_performance_v2(connection)
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("2",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("3",)
+        instance_id = connection.execute(
+            "select value from schema_info where key = 'database_instance_id'"
+        ).fetchone()[0]
+        assert str(UUID(instance_id)) == instance_id
+        assert {
+            "selection_runs", "selection_results", "selection_review_imports",
+            "selection_review_rows", "strategy_tags",
+        }.issubset({
+            row[0] for row in connection.execute(
+                "select table_name from information_schema.tables where table_schema = 'main'"
+            ).fetchall()
+        })
+
+
+def test_initialize_migrates_schema_v2_without_changing_existing_facts() -> None:
+    with duckdb.connect(":memory:") as connection:
+        initialize_performance_v2(connection)
+        for table in (
+            "strategy_tags", "selection_review_rows", "selection_review_imports",
+            "selection_results", "selection_runs",
+        ):
+            connection.execute(f"drop table {table}")
+        connection.execute("delete from schema_info where key = 'database_instance_id'")
+        connection.execute("update schema_info set value = '2' where key = 'schema_version'")
+        strategy_id = _strategy(connection, name="before-migration")
+
+        initialize_performance_v2(connection)
+
+        require_performance_v2(connection)
+        assert connection.execute("select strategy_name from strategies where strategy_id = ?", [strategy_id]).fetchone() == (
+            "before-migration",
+        )
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("3",)
+        assert UUID(connection.execute(
+            "select value from schema_info where key = 'database_instance_id'"
+        ).fetchone()[0])
 
 
 def test_v1_schema_is_rejected_without_mutation() -> None:

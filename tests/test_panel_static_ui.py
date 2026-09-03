@@ -256,7 +256,6 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     checked_stage_ids = {
         "filter_holding_outlier", "ab_deterioration", "pareto_dd5_balanced",
         "filter_best_trade_dependency", "filter_time_consistency", "pareto_robust", "pareto_shift_near_tie",
-        "pareto_close_ma_near_tie",
     }
     for stage_id in checked_stage_ids:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
@@ -279,7 +278,8 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "filter_min_shift" not in default_enabled.group(1)
     assert "pareto_dd5_balanced" in default_enabled.group(1)
     assert "pareto_plateau_points_per_order" not in default_enabled.group(1)
-    assert "pareto_close_ma_near_tie" in default_enabled.group(1)
+    assert "pareto_close_ma_near_tie" not in default_enabled.group(1)
+    assert 'data-selection-top-n type="number" min="1" step="1" value="20"' in strategies
     assert "near_tie_rank" not in strategies
     assert "data-selection-group" not in strategies
     min_shift_stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_min_shift">(.*?)</li>', strategies, re.S)
@@ -781,6 +781,8 @@ def test_performance_v2_window_analysis_uses_native_utc_controls() -> None:
     assert "6. A/B анализ Performance" in js
     assert "strategy.symbol === performanceV2WindowPair.value" in js
     assert "String(strategy.strategy_id).includes(query)" in js
+    assert "strategy.is_latest_finalist" in js
+    assert "performanceV2SelectionPairsWithRuns" in js
     for field in ("performance-v2-window-a-start", "performance-v2-window-a-end", "performance-v2-window-b-start", "performance-v2-window-b-end"):
         assert f'id="{field}" type="datetime-local" step="1"' in html
     assert "UTC" in html.split('id="performance-v2-window-card"', 1)[1].split("</details>", 1)[0]
@@ -793,6 +795,17 @@ def test_performance_v2_window_analysis_uses_native_utc_controls() -> None:
     assert "performanceV2SetRecentWindow(14)" in js
     assert "performanceV2SetRecentWindow(7)" in js
     assert "Math.max(range[0].getTime(), range[1].getTime() - days * 86_400_000)" in js
+
+
+def test_performance_v2_review_import_uses_a_folder_picker_and_bounded_endpoint() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="performance-v2-selection-review-file"' in html
+    assert "multiple webkitdirectory hidden" in html
+    assert "Обратный импорт XLS" in html
+    assert "/api/v2/strategies/performance-v2/selection-review-import" in js
+    assert ".filter((file) => file.name.toLowerCase().endsWith('.xlsx'))" in js
 
 
 def test_performance_v2_window_analysis_renders_server_normalization_in_one_four_column_table() -> None:
@@ -813,7 +826,7 @@ def test_performance_v2_window_analysis_renders_server_normalization_in_one_four
     for metric in ("max_drawdown_pct", "fees_pct", "holding_seconds", "time_in_market_pct"):
         assert f"['{metric}'," in js
     for label in (
-        "Статус эквивалента 30 дней", "Наблюдаемая длительность (дни)",
+        "Статус эквивалента 30 дней", "Календарная длительность нормализации (дни)",
         "Доходность — эквивалент 30 дней", "Фактор роста — эквивалент 30 дней",
         "Сделок / 30д", "Время удержания (мин)", "raw; не нормализуется по длительности",
         "Запрошенное начало (UTC)", "Фактический конец (UTC)", "Причина недоступности",
@@ -824,6 +837,21 @@ def test_performance_v2_window_analysis_renders_server_normalization_in_one_four
     assert "const minutes = Number(value) / 60;" in js
     assert "batch" not in render.lower()
     assert "rank" not in render.lower()
+
+
+def test_performance_v2_window_analysis_highlights_effective_coverage_before_metrics() -> None:
+    js = _read("app.js")
+    render = js.split("const performanceV2MetricDefinitions", 1)[1].split("const loadPerformanceV2Catalog", 1)[0]
+
+    assert "performanceV2WindowCoverage" in render
+    assert "requested_start_utc" in render
+    assert "effective_start_utc" in render
+    assert "observed_days" in render
+    assert "performance-v2-coverage-warning" in render
+    assert "performanceV2UtcText(window?.requested_start_utc)" in render
+    assert "performanceV2UtcText(window?.effective_start_utc)" in render
+    assert "effectiveMs / requestedMs" not in render
+    assert "performanceV2WindowCoverage(windowA, windowB), performanceV2WindowTable(windowA, windowB)" in render
 
 
 def test_performance_v2_window_analysis_has_selected_strategy_parameters() -> None:

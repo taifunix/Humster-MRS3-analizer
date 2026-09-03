@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy
 from datetime import datetime
 from decimal import Decimal
 import json
@@ -89,7 +90,7 @@ def write_audit_workbook(
     numeric_decimals: bool = False, number_formats: Mapping[str, str] | None = None,
     bold_columns: frozenset[str] = frozenset(), column_edge_borders: Mapping[str, tuple[str, ...]] | None = None,
     center_from_column: int | None = None, left_aligned_columns: frozenset[str] = frozenset(),
-    row_fill_colors: Mapping[str, Sequence[str | None]] | None = None,
+    row_fill_colors: Mapping[str, Sequence[str | None]] | None = None, font_colors: Mapping[str, str] | None = None,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
@@ -138,13 +139,18 @@ def write_audit_workbook(
                         for value_cell in cell:
                             if isinstance(value_cell.value, (int, float)):
                                 value_cell.number_format = number_format
-        if bold_columns or column_edge_borders:
+        if bold_columns or column_edge_borders or font_colors:
             edge_side = Side(style="double", color="8FA3B8")
             for index, column in enumerate(frame.columns, start=1):
                 cells = list(worksheet.iter_cols(min_col=index, max_col=index, min_row=1, max_row=worksheet.max_row))[0]
                 if str(column) in bold_columns:
                     for value_cell in cells[1:]:
                         value_cell.font = Font(bold=True)
+                if color := (font_colors or {}).get(str(column)):
+                    for value_cell in cells[1:]:
+                        font = copy(value_cell.font)
+                        font.color = color
+                        value_cell.font = font
                 for edge in (column_edge_borders or {}).get(str(column), ()):
                     border = Border(**{edge: edge_side})
                     for value_cell in cells:

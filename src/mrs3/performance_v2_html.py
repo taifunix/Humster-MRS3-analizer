@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
 from typing import TYPE_CHECKING, Protocol
 
@@ -19,6 +19,7 @@ from .performance import (
     _raw_markup,
     _timestamp,
     parse_performance_report,
+    report_range,
 )
 
 
@@ -219,6 +220,40 @@ def _typed_series(
     return tuple((_epoch_timestamp(timestamp), value) for timestamp, value in series)
 
 
+def _validate_report_integrity(
+    metrics: Mapping[str, str],
+    actions: tuple[ParsedPerformanceV2Action, ...],
+    wallet_series: tuple[tuple[int, Decimal], ...],
+) -> None:
+    declared_transactions = metrics.get("Total transactions (buy/sell)")
+    if declared_transactions is not None:
+        if not declared_transactions.strip():
+            raise PerformanceV2HtmlError("Total transactions (buy/sell) must not be blank")
+        transactions = _decimal(declared_transactions, "Total transactions (buy/sell)")
+        if transactions != transactions.to_integral_value() or int(transactions) != len(actions):
+            raise PerformanceV2HtmlError(
+                f"declared transaction count {transactions} does not match {len(actions)} action rows"
+            )
+    declared_final_text = metrics.get("Final balance")
+    if declared_final_text is not None:
+        if not declared_final_text.strip():
+            raise PerformanceV2HtmlError("Final balance must not be blank")
+        if not wallet_series:
+            raise PerformanceV2HtmlError("Final balance requires a wallet sample")
+        declared_final = _decimal(declared_final_text, "Final balance")
+        quantum = Decimal(1).scaleb(declared_final.as_tuple().exponent)
+        final_wallet = wallet_series[-1][1].quantize(quantum, rounding=ROUND_HALF_UP)
+        if final_wallet != declared_final:
+            raise PerformanceV2HtmlError(
+                f"final wallet {final_wallet} does not match declared Final balance {declared_final}"
+            )
+    start, end = report_range(metrics)
+    timestamps = [action.timestamp_utc for action in actions]
+    timestamps.extend(_epoch_timestamp(timestamp) for timestamp, _value in wallet_series)
+    if any(timestamp < start or timestamp > end for timestamp in timestamps):
+        raise PerformanceV2HtmlError("action/equity timestamp falls outside Report range")
+
+
 def _validate_limits(limits: object) -> _PerformanceV2Limits:
     max_html_bytes = getattr(limits, "max_html_bytes", None)
     max_actions = getattr(limits, "max_actions_per_report", None)
@@ -248,6 +283,7 @@ def parse_current_performance_v2_html(
         raise PerformanceV2HtmlError("report exceeds action limit")
     symbol = _settings_identity(parsed.settings)
     actions = _typed_actions(parsed.actions, symbol)
+    _validate_report_integrity(parsed.metrics, actions, parsed.wallet_series)
     return ParsedPerformanceV2Report(
         _freeze(parsed.settings),  # type: ignore[arg-type]
         _FrozenMapping(parsed.metrics),

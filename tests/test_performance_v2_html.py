@@ -12,6 +12,7 @@ import pytest
 from mrs3.performance import parse_performance_report
 from mrs3.performance_v2_html import (
     PerformanceV2HtmlError,
+    _validate_report_integrity,
     parse_current_performance_v2_html,
 )
 from mrs3.performance_v2_store import PerformanceV2Config
@@ -40,6 +41,67 @@ def test_parser_accepts_only_the_current_typed_layout() -> None:
     assert parsed.actions[1].post_side == ""
     assert parsed.wallet_series[0][0] == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert parsed.wallet_series[-1][1] == Decimal("1009.9")
+
+
+def test_parser_rejects_action_rows_incomplete_against_declared_transaction_count() -> None:
+    source = _current().replace(
+        b"<td>Total transactions (buy/sell)</td><td>2</td>",
+        b"<td>Total transactions (buy/sell)</td><td>3</td>",
+        1,
+    )
+
+    with pytest.raises(PerformanceV2HtmlError, match="transaction count"):
+        parse_current_performance_v2_html(source, _limits())
+
+
+def test_parser_rejects_blank_declared_transaction_count() -> None:
+    source = _current().replace(
+        b"<td>Total transactions (buy/sell)</td><td>2</td>",
+        b"<td>Total transactions (buy/sell)</td><td> </td>",
+        1,
+    )
+
+    with pytest.raises(PerformanceV2HtmlError, match="Total transactions"):
+        parse_current_performance_v2_html(source, _limits())
+
+
+def test_parser_rejects_final_wallet_incomplete_against_declared_balance() -> None:
+    source = _current().replace(
+        b"<td>Final balance</td><td>1009.9</td>",
+        b"<td>Final balance</td><td>1010.9</td>",
+        1,
+    )
+
+    with pytest.raises(PerformanceV2HtmlError, match="final wallet"):
+        parse_current_performance_v2_html(source, _limits())
+
+
+def test_integrity_check_rejects_declared_final_balance_without_wallet_sample() -> None:
+    with pytest.raises(PerformanceV2HtmlError, match="wallet sample"):
+        _validate_report_integrity({"Final balance": "100"}, (), ())
+
+
+def test_parser_keeps_current_import_compatible_when_optional_integrity_metrics_are_absent() -> None:
+    source = _current().replace(
+        b"<tr><td>Total transactions (buy/sell)</td><td>2</td></tr>\n", b"", 1
+    ).replace(
+        b"<tr><td>Final balance</td><td>1009.9</td></tr>\n", b"", 1
+    )
+
+    assert len(parse_current_performance_v2_html(source, _limits()).actions) == 2
+
+
+def test_parser_accepts_event_at_tester_report_end() -> None:
+    source = _current().replace(b"2026-01-03T01:00:00+00:00", b"2026-01-09T00:00:00Z", 1)
+
+    assert len(parse_current_performance_v2_html(source, _limits()).actions) == 2
+
+
+def test_parser_rejects_event_after_tester_report_end() -> None:
+    source = _current().replace(b"2026-01-03T01:00:00+00:00", b"2026-01-09T00:00:01Z", 1)
+
+    with pytest.raises(PerformanceV2HtmlError, match="outside Report range"):
+        parse_current_performance_v2_html(source, _limits())
 
 
 @pytest.mark.parametrize(

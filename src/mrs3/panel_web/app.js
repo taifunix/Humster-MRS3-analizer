@@ -1556,6 +1556,7 @@
   const performanceV2SelectionPair = document.querySelector('#performance-v2-selection-pair');
   const performanceV2SelectionSide = document.querySelector('#performance-v2-selection-side');
   let performanceV2Strategies = [];
+  let performanceV2SelectionPairsWithRuns = new Set();
 
   // datetime-local has no timezone. The value is explicitly UTC in this card,
   // so preserve its fields and append Z without Date/browser timezone conversion.
@@ -1607,7 +1608,7 @@
     ['availability_status', 'Доступность', '', 'neutral'],
     ['unavailable_reason', 'Причина недоступности', '', 'neutral'],
     ['normalization_status', 'Статус эквивалента 30 дней', '', 'normalization_status'],
-    ['observed_days', 'Наблюдаемая длительность (дни)', '', 'normalization'],
+    ['observed_days', 'Календарная длительность нормализации (дни)', '', 'normalization'],
     ['return_pct', 'Доходность — эквивалент 30 дней', '%', 'normalization'],
     ['growth_factor', 'Фактор роста — эквивалент 30 дней', '', 'normalization'],
     ['trade_rate', 'Сделок / 30д', '', 'normalization'],
@@ -1623,6 +1624,28 @@
     ['holding_seconds', performanceV2RawLabel('Время удержания (мин)'), ' мин', 'raw_minutes'],
     ['time_in_market_pct', performanceV2RawLabel('Время в рынке'), '%', 'raw'],
   ];
+  const performanceV2UtcText = (value) => {
+    if (!value) return '—';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return `${new Intl.DateTimeFormat('ru-RU', {
+      timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit',
+    }).format(date)} UTC`;
+  };
+  const performanceV2WindowCoverage = (windowA, windowB) => {
+    const coverage = document.createElement('div');
+    coverage.className = 'performance-v2-coverage';
+    for (const [label, window] of [['Окно A', windowA], ['Окно B', windowB]]) {
+      const line = document.createElement('p');
+      if (window?.availability_status !== 'AVAILABLE') {
+        line.classList.add('performance-v2-coverage-warning');
+      }
+      line.textContent = `${label}: календарно ${performanceV2UtcText(window?.requested_start_utc)} — ${performanceV2UtcText(window?.requested_end_utc)} (${performanceV2NormalizationText(window, 'observed_days')} дн.) · события ${performanceV2UtcText(window?.effective_start_utc)} — ${performanceV2UtcText(window?.effective_end_utc)}`;
+      coverage.append(line);
+    }
+    return coverage;
+  };
   const performanceV2NormalizationStatus = (window) => {
     const status = window?.normalization_30d?.status;
     return status === 'ok' ? 'ok — готово'
@@ -1720,7 +1743,7 @@
     performanceV2WindowResult.replaceChildren(performanceV2WindowCaveat());
     const windowA = payload?.window_a;
     const windowB = payload?.window_b;
-    if (windowA || windowB) performanceV2WindowResult.append(performanceV2WindowTable(windowA, windowB));
+    if (windowA || windowB) performanceV2WindowResult.append(performanceV2WindowCoverage(windowA, windowB), performanceV2WindowTable(windowA, windowB));
   };
   if (performanceV2WindowResult) performanceV2WindowResult.append(performanceV2WindowCaveat());
   const syncPerformanceV2SelectionScope = () => {
@@ -1747,8 +1770,13 @@
     for (const pair of pairs) performanceV2WindowPair.append(new Option(pair, pair));
     performanceV2WindowPair.value = pairs.includes(selectedPair) ? selectedPair : '';
     const query = performanceV2WindowStrategyId?.value.trim() || '';
+    if (performanceV2WindowFinalists) {
+      performanceV2WindowFinalists.disabled = !performanceV2WindowPair.value || !performanceV2SelectionPairsWithRuns.has(performanceV2WindowPair.value);
+      if (performanceV2WindowFinalists.disabled) performanceV2WindowFinalists.checked = false;
+    }
     const filteredStrategies = performanceV2Strategies
       .filter((strategy) => !performanceV2WindowPair.value || strategy.symbol === performanceV2WindowPair.value)
+      .filter((strategy) => !performanceV2WindowFinalists?.checked || strategy.is_latest_finalist)
       .filter((strategy) => !query || String(strategy.strategy_id).includes(query));
     performanceV2WindowSelect.replaceChildren(new Option('Select a strategy', ''));
     for (const strategy of filteredStrategies) {
@@ -1765,6 +1793,7 @@
     try {
       const result = await requestJson('/api/v2/strategies/performance-v2/catalog');
       performanceV2Strategies = Array.isArray(result.strategies) ? result.strategies : [];
+      performanceV2SelectionPairsWithRuns = new Set(Array.isArray(result.selection_pairs_with_runs) ? result.selection_pairs_with_runs : []);
       syncPerformanceV2SelectionScope();
       const selectedStrategy = syncPerformanceV2WindowCatalog();
       if (selectedStrategy) {
@@ -1787,6 +1816,11 @@
     performanceV2StrategyDetails(selected);
   });
   performanceV2WindowStrategyId?.addEventListener('input', () => {
+    const selected = syncPerformanceV2WindowCatalog();
+    performanceV2SetWindowBounds(selected);
+    performanceV2StrategyDetails(selected);
+  });
+  performanceV2WindowFinalists?.addEventListener('change', () => {
     const selected = syncPerformanceV2WindowCatalog();
     performanceV2SetWindowBounds(selected);
     performanceV2StrategyDetails(selected);
@@ -1850,7 +1884,7 @@
   const defaultEnabledSelectionStages = new Set([
     'filter_holding_outlier', 'ab_deterioration', 'filter_best_trade_dependency',
     'filter_time_consistency', 'pareto_dd5_balanced', 'pareto_robust',
-    'pareto_shift_near_tie', 'pareto_close_ma_near_tie',
+    'pareto_shift_near_tie',
   ]);
   if (selectionPreviewOrder) {
     const byId = Object.fromEntries([...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')]
@@ -1911,11 +1945,13 @@
   })), {
     id: 'rank_robust_top_n',
     enabled: !!selectionRankStage.querySelector('input[type="checkbox"]')?.checked,
-    scope: 'pair_side', top_n: Number(selectionRankStage.querySelector('[data-selection-top-n]')?.value || 50),
+    scope: 'pair_side', top_n: Number(selectionRankStage.querySelector('[data-selection-top-n]')?.value || 20),
   }];
   };
   const selectionPayload = () => ({ symbol: performanceV2SelectionPair?.value || '', side: performanceV2SelectionSide?.value || '', stages: selectionStages() });
   const selectionXlsButton = document.querySelector('#performance-v2-selection-xls');
+  const selectionReviewFile = document.querySelector('#performance-v2-selection-review-file');
+  const selectionReviewImportButton = document.querySelector('#performance-v2-selection-review-import');
   let selectionCacheStatusRevision = 0;
   const refreshSelectionCacheStatus = async () => {
     const revision = ++selectionCacheStatusRevision;
@@ -2060,6 +2096,37 @@
     } catch (error) {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = `XLSX не сформирован: ${error.message || 'ошибка запроса'}`;
     }
+  });
+  selectionReviewImportButton?.addEventListener('click', () => selectionReviewFile?.click());
+  selectionReviewFile?.addEventListener('change', async () => {
+    const files = [...(selectionReviewFile.files || [])]
+      .filter((file) => file.name.toLowerCase().endsWith('.xlsx'))
+      .sort((a, b) => a.lastModified - b.lastModified || a.name.localeCompare(b.name));
+    if (!files.length) return;
+    const imported = [];
+    const failed = [];
+    for (const [index, file] of files.entries()) {
+      try {
+        if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Импорт XLSX ${index + 1}/${files.length}: ${file.name}`;
+        const response = await fetch('/api/v2/strategies/performance-v2/selection-review-import', {
+          method: 'POST', headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, body: file,
+        });
+        const result = await response.json().catch(() => ({}));
+        if (response.ok) imported.push(result);
+        else failed.push(`${file.name}: ${result.error?.code || result.error?.message || 'ошибка'}`);
+      } catch (error) {
+        failed.push(`${file.name}: ${error.message || 'ошибка запроса'}`);
+      }
+    }
+    try {
+      await loadPerformanceV2Catalog();
+    } catch (error) {
+      failed.push(`catalog: ${error.message || 'ошибка обновления'}`);
+    }
+    if (selectionPreviewStatus) selectionPreviewStatus.textContent = failed.length
+      ? `Импортировано ${imported.length}/${files.length}. Ошибки: ${failed.join('; ')}`
+      : `Импортировано файлов: ${imported.length}, строк: ${imported.reduce((sum, item) => sum + Number(item?.row_count || 0), 0)}.`;
+    selectionReviewFile.value = '';
   });
   renderSelectionPreviewOrder();
 

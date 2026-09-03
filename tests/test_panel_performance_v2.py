@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 from http.client import HTTPConnection
 from decimal import Decimal
@@ -42,7 +43,7 @@ def _metrics_for_normalization(
     trade_count: object = 5,
 ) -> WindowMetrics:
     return WindowMetrics(
-        1, start, start + datetime.resolution, "test", start, end, "AVAILABLE", None,
+        1, start, end or start, "test", start, end, "AVAILABLE", None,
         growth, Decimal("1.2345"), Decimal(".01"), Decimal("1.02"), Decimal("3.4"),
         Decimal("2.3"), Decimal(".4"), Decimal("1.5"), trade_count, Decimal("50"),
     )
@@ -56,7 +57,7 @@ def _metrics_for_normalization(
         (60, "1.04880885", "4.8809", "2.5000"),
     ],
 )
-def test_normalization_30d_uses_effective_duration(days, expected_growth, expected_return, expected_trade_rate) -> None:
+def test_normalization_30d_uses_calendar_duration(days, expected_growth, expected_return, expected_trade_rate) -> None:
     start = datetime(2026, 1, 1, tzinfo=UTC)
     result = _normalization_30d(_metrics_for_normalization(start, start + timedelta(days=days)))
     assert result == {
@@ -493,7 +494,7 @@ def test_v2_catalog_and_windows_http_are_typed_and_repeatable(tmp_path: Path) ->
             assert connection.execute(f"select count(*) from {table}").fetchone() == (count,)
 
 
-def test_selection_http_downloads_xlsx_without_selection_state(tmp_path: Path) -> None:
+def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
     server, thread = _http_server(controller)
@@ -511,12 +512,26 @@ def test_selection_http_downloads_xlsx_without_selection_state(tmp_path: Path) -
         assert "attachment; filename=\"performance-v2-finalists-BTCUSDT-LONG.xlsx\"" == response.getheader("Content-Disposition")
         assert body.startswith(b"PK")
         connection.close()
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST", "/api/v2/strategies/performance-v2/selection-review-import", body=body,
+            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+        )
+        response = connection.getresponse()
+        imported = json.loads(response.read())
+        assert response.status == 200
+        assert imported["row_count"] == imported["finalist_count"] == 1
+        connection.close()
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
     with duckdb.connect(str(database), read_only=True) as connection:
-        assert connection.execute("select count(*) from information_schema.tables where table_name like 'selection_%'").fetchone() == (0,)
+        assert connection.execute("select candidate_count, workbook_sha256 from selection_runs").fetchone() == (
+            1, sha256(body).hexdigest(),
+        )
+        assert connection.execute("select count(*) from selection_results").fetchone() == (1,)
+        assert connection.execute("select count(*) from selection_review_imports").fetchone() == (1,)
 
 
 def test_selection_preview_returns_current_stage_counts(tmp_path: Path) -> None:
@@ -535,7 +550,7 @@ def test_selection_preview_returns_current_stage_counts(tmp_path: Path) -> None:
 
 
 def test_selection_preview_reuses_candidates_until_recalculation(tmp_path: Path, monkeypatch) -> None:
-    controller, _, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path)
     payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
     controller.strategies_performance_v2_recalculate(payload)
     import mrs3.panel as panel_module
@@ -556,6 +571,101 @@ def test_selection_preview_reuses_candidates_until_recalculation(tmp_path: Path,
     controller.strategies_performance_v2_selection_preview(payload)
     assert calls == 2
 
+    config_path = tmp_path / "config.performance.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["unified_performance_v2"]["finalist_selection"] = {"best_trade_max_profit_share_pct": 34}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    controller.strategies_performance_v2_selection_preview(payload)
+    assert calls == 3
+
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("update window_metrics set return_pct = coalesce(return_pct, 0) + 1")
+    controller.strategies_performance_v2_selection_preview(payload)
+    assert calls == 4
+
+
+def test_performance_v2_schema_initialization_is_memoized(tmp_path: Path, monkeypatch) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    import mrs3.panel as panel_module
+    original = panel_module.initialize_performance_v2
+    calls = 0
+
+    def counted(connection):
+        nonlocal calls
+        calls += 1
+        return original(connection)
+
+    monkeypatch.setattr(panel_module, "initialize_performance_v2", counted)
+    controller.performance_v2_catalog()
+    controller.performance_v2_catalog()
+
+    assert calls == 1
+
+    database.unlink()
+    with duckdb.connect(str(database)):
+        pass
+    controller.performance_v2_catalog()
+    assert calls == 2
+
+
+def test_selection_xlsx_maps_stale_snapshot_to_api_error(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+    import mrs3.panel as panel_module
+
+    def stale(*_args, **_kwargs):
+        raise panel_module.SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=[1])
+
+    monkeypatch.setattr(panel_module, "persist_selection_snapshot", stale)
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    assert raised.value.code == "SELECTION_REVIEW_STALE_RESULTS"
+    assert raised.value.status == 409
+
+
+def test_selection_xlsx_maps_metadata_database_lock_to_api_error(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+    import mrs3.panel as panel_module
+    monkeypatch.setattr(panel_module, "new_run_metadata", lambda *_args: (_ for _ in ()).throw(duckdb.IOException("locked")))
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    assert raised.value.code == "PERFORMANCE_V2_LOCKED"
+    assert raised.value.status == 409
+
+
+def test_selection_review_import_maps_database_lock_to_api_error(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+    import mrs3.panel as panel_module
+    monkeypatch.setattr(panel_module, "import_selection_review", lambda *_args: (_ for _ in ()).throw(duckdb.IOException("locked")))
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller.strategies_performance_v2_selection_review_import(b"xlsx")
+
+    assert raised.value.code == "PERFORMANCE_V2_LOCKED"
+    assert raised.value.status == 409
+
+
+@pytest.mark.parametrize("operation", ["selection", "cache_status", "recalculate"])
+def test_performance_v2_missing_database_has_typed_not_found_error(tmp_path: Path, operation: str) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    database.unlink()
+    payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        {
+            "selection": lambda: controller.strategies_performance_v2_selection(payload),
+            "cache_status": lambda: controller.strategies_performance_v2_selection_cache_status(payload),
+            "recalculate": lambda: controller.strategies_performance_v2_recalculate(payload),
+        }[operation]()
+
+    assert raised.value.code == "PERFORMANCE_V2_NOT_FOUND"
+    assert raised.value.status == 404
+
 
 def test_selection_cache_status_reports_missing_default_windows(tmp_path: Path) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
@@ -570,6 +680,39 @@ def test_selection_cache_status_reports_missing_default_windows(tmp_path: Path) 
     }
 
 
+def test_normalization_30d_does_not_compress_idle_tail_to_event_span() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    metrics = replace(
+        _metrics_for_normalization(start, start + timedelta(days=2)),
+        requested_end_utc=start + timedelta(days=14),
+    )
+
+    assert _normalization_30d(metrics) == {
+        "period_days": 30,
+        "status": "ok",
+        "observed_days": "14.000000",
+        "growth_factor": "1.22658772",
+        "return_pct": "22.6588",
+        "trade_rate": "10.7143",
+    }
+
+
+def test_normalization_30d_clamps_to_report_calendar_interval_and_rejects_empty_overlap() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    metrics = _metrics_for_normalization(start, start + timedelta(days=14))
+
+    clamped = _normalization_30d(metrics, start + timedelta(days=3), start + timedelta(days=10))
+    empty = _normalization_30d(metrics, start + timedelta(days=20), start + timedelta(days=25))
+
+    assert clamped["observed_days"] == "7.000000"
+    assert empty == {
+        "period_days": 30,
+        "status": "invalid_duration",
+        "observed_days": None,
+        "growth_factor": None,
+        "return_pct": None,
+        "trade_rate": None,
+    }
 def test_selection_cache_status_requires_an_active_candidate(tmp_path: Path) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
 
@@ -791,7 +934,7 @@ def test_v2_stale_current_result_pointer_is_excluded_and_returns_404(tmp_path: P
     controller, database, _ = _controller_for_windows(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.execute("update strategies set current_result_id = 999 where strategy_id = 1")
-    assert controller.performance_v2_catalog() == {"strategies": []}
+    assert controller.performance_v2_catalog() == {"strategies": [], "selection_pairs_with_runs": []}
     with pytest.raises(PerformanceV2ApiError) as raised:
         controller.performance_v2_windows(
             {

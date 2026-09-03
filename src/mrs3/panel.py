@@ -154,7 +154,13 @@ from .panel_performance_v2 import (
     performance_v2_catalog,
     _parse_window_payload,
 )
-from .performance_v2_store import load_performance_v2_config, performance_v2_database_path, require_performance_v2
+from .performance_v2_store import (
+    PerformanceV2StoreError,
+    initialize_performance_v2,
+    load_performance_v2_config,
+    performance_v2_database_path,
+    require_performance_v2,
+)
 from .performance_v2_selection import (
     PerformanceV2SelectionError,
     SelectionRequest,
@@ -165,6 +171,14 @@ from .performance_v2_selection import (
     run_selection,
     selection_cache_status,
     write_selection_workbook,
+)
+from .performance_v2_selection_review import (
+    SelectionReviewError,
+    apply_prior_rejected,
+    import_selection_review,
+    latest_effective_finalists,
+    new_run_metadata,
+    persist_selection_snapshot,
 )
 from .runner.config import RunnerConfig
 from .runner.inbox import capture_verified_inbox
@@ -1202,7 +1216,9 @@ class PanelController:
         self._browse_factory = browse_factory
         self._lock = threading.RLock()
         self._selection_candidate_cache_lock = threading.RLock()
-        self._selection_candidate_cache: OrderedDict[tuple[str, str, int], object] = OrderedDict()
+        self._performance_v2_writer_lock = threading.RLock()
+        self._performance_v2_schema_ready: set[tuple[str, int, int, int, int, int]] = set()
+        self._selection_candidate_cache: OrderedDict[tuple[object, ...], object] = OrderedDict()
         self._panel_jobs = PanelJobRegistry(self.root / ".panel-jobs.json")
         self._local_testing_filled = False
         self._remote_testing_filled = False
@@ -2868,6 +2884,33 @@ class PanelController:
             v1_database_root=self._panel_path("performance_db_root"),
         )
 
+    def _ensure_performance_v2_schema(self, target: Path) -> None:
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
+        with self._performance_v2_writer_lock:
+            try:
+                stat = target.stat()
+            except OSError as error:
+                raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable") from error
+            identity = (
+                str(target.resolve()),
+                int(stat.st_dev),
+                int(stat.st_ino),
+                int(stat.st_ctime_ns),
+                int(stat.st_mtime_ns),
+                int(stat.st_size),
+            )
+            if identity in self._performance_v2_schema_ready:
+                return
+            try:
+                with duckdb.connect(str(target)) as connection:
+                    initialize_performance_v2(connection)
+            except PerformanceV2StoreError as error:
+                raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
+            except duckdb.Error as error:
+                raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
+            self._performance_v2_schema_ready.add(identity)
+
     def strategies_performance_v2_import(self, payload: Mapping[str, object]) -> dict[str, object]:
         allowed = {"tester_job_id", "mode", "replacement_strategy_ids", "window_a", "window_b"}
         if set(payload).difference(allowed):
@@ -2926,9 +2969,19 @@ class PanelController:
         if not target.is_file():
             return {"strategies": []}
         try:
+            self._ensure_performance_v2_schema(target)
             with duckdb.connect(str(target), read_only=True) as connection:
-                require_performance_v2(connection)
-                return performance_v2_catalog(connection)
+                catalog = performance_v2_catalog(connection)
+                pairs_with_runs: list[str] = []
+                for symbol in sorted({str(row["symbol"]) for row in catalog["strategies"]}):
+                    has_runs, finalists = latest_effective_finalists(connection, symbol)
+                    if has_runs:
+                        pairs_with_runs.append(symbol)
+                    for strategy in catalog["strategies"]:
+                        if strategy["symbol"] == symbol:
+                            strategy["is_latest_finalist"] = int(strategy["strategy_id"]) in finalists
+                catalog["selection_pairs_with_runs"] = pairs_with_runs
+                return catalog
         except PerformanceV2ApiError:
             raise
         except (duckdb.Error, OSError) as error:
@@ -2945,6 +2998,7 @@ class PanelController:
         target = performance_v2_database_path(config)
         if not target.is_file():
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
+        self._ensure_performance_v2_schema(target)
         return calculate_performance_v2_windows(target, strategy_id, window_a, window_b)
 
     def strategies_performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -2962,13 +3016,42 @@ class PanelController:
         target = performance_v2_database_path(performance_config)
         if not target.is_file():
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
-        cache_key = (request.symbol, request.side, target.stat().st_mtime_ns)
+        self._ensure_performance_v2_schema(target)
         try:
-            with duckdb.connect(str(target)) as connection:
+            with duckdb.connect(str(target), read_only=True) as connection:
                 connection.execute(f"set threads to {performance_config.workers}")
                 require_performance_v2(connection)
                 if not selection_cache_status(connection, request, selection_config)["ready"]:
                     raise PerformanceV2ApiError("SELECTION_CACHE_INCOMPLETE", status=409, message="Selection facts require recalculation")
+                result_token = tuple(connection.execute(
+                    """select s.strategy_id, s.current_result_id from strategies s
+                         join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
+                        where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
+                        order by s.strategy_id""",
+                    [request.symbol, request.side],
+                ).fetchall())
+                facts_token = connection.execute(
+                    """select count(*), max(wm.calculated_at_utc), bit_xor(hash(
+                                   wm.result_id, wm.requested_start_utc, wm.requested_end_utc,
+                                   wm.metrics_version, wm.availability_status, wm.unavailable_reason,
+                                   wm.growth_factor, wm.return_pct, wm.daily_log_return,
+                                   wm.daily_growth_pct, wm.max_drawdown_pct, wm.return_dd_ratio,
+                                   wm.fees_pct, wm.profit_factor, wm.trade_count, wm.win_rate_pct,
+                                   wm.holding_seconds, wm.time_in_market_pct
+                               ))
+                         from window_metrics wm
+                         join strategy_results r on r.result_id = wm.result_id
+                         join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id
+                        where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""",
+                    [request.symbol, request.side],
+                ).fetchone()
+                cache_key = (
+                    request.symbol,
+                    request.side,
+                    tuple(asdict(selection_config).items()),
+                    result_token,
+                    facts_token,
+                )
                 with self._selection_candidate_cache_lock:
                     candidates = self._selection_candidate_cache.get(cache_key)
                     if candidates is not None:
@@ -2980,16 +3063,52 @@ class PanelController:
                         self._selection_candidate_cache.move_to_end(cache_key)
                         while len(self._selection_candidate_cache) > 8:
                             self._selection_candidate_cache.popitem(last=False)
-                result = run_selection(candidates, request, selection_config)
+                result = run_selection(apply_prior_rejected(connection, candidates), request, selection_config)
             return request, result
         except duckdb.Error as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
 
     def strategies_performance_v2_selection(self, payload: Mapping[str, object]) -> tuple[str, bytes]:
+        target = performance_v2_database_path(self._performance_v2_config())
+        self._ensure_performance_v2_schema(target)
         request, result = self._performance_v2_selection_result(payload)
-        with tempfile.TemporaryDirectory() as directory:
-            workbook = write_selection_workbook(result, Path(directory) / "finalists.xlsx", request)
-            return f"performance-v2-finalists-{request.symbol}-{request.side}.xlsx", workbook.read_bytes()
+        selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                with duckdb.connect(str(target), read_only=True) as connection:
+                    metadata = new_run_metadata(connection)
+                workbook = write_selection_workbook(result, Path(directory) / "finalists.xlsx", request, metadata)
+                data = workbook.read_bytes()
+                with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+                    persist_selection_snapshot(connection, request, selection_config, result, metadata, data)
+        except SelectionReviewError as error:
+            status = 409 if error.code in {
+                "SELECTION_REVIEW_NOT_LATEST_RUN", "SELECTION_REVIEW_STALE_RESULTS", "SELECTION_REVIEW_ALREADY_IMPORTED"
+            } else 400
+            details = f": {error.details}" if error.details else ""
+            raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
+        except duckdb.Error as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
+        return f"performance-v2-finalists-{request.symbol}-{request.side}.xlsx", data
+
+    def strategies_performance_v2_selection_review_import(self, data: bytes) -> dict[str, object]:
+        target = performance_v2_database_path(self._performance_v2_config())
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
+        self._ensure_performance_v2_schema(target)
+        try:
+            with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+                return import_selection_review(connection, data)
+        except SelectionReviewError as error:
+            status = 409 if error.code in {
+                "SELECTION_REVIEW_NOT_LATEST_RUN", "SELECTION_REVIEW_STALE_RESULTS", "SELECTION_REVIEW_ALREADY_IMPORTED"
+            } else 400
+            details = f": {error.details}" if error.details else ""
+            raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
+        except PerformanceV2StoreError as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
+        except duckdb.Error as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
 
     def strategies_performance_v2_selection_preview(self, payload: Mapping[str, object]) -> dict[str, object]:
         _, result = self._performance_v2_selection_result(payload)
@@ -2999,9 +3118,15 @@ class PanelController:
         request = parse_selection_request({"symbol": payload.get("symbol"), "side": payload.get("side"), "stages": []})
         config = load_selection_config(self.default_config.with_name("config.performance.json"))
         target = performance_v2_database_path(self._performance_v2_config())
-        with duckdb.connect(str(target), read_only=True) as connection:
-            require_performance_v2(connection)
-            return selection_cache_status(connection, request, config)
+        self._ensure_performance_v2_schema(target)
+        try:
+            with duckdb.connect(str(target), read_only=True) as connection:
+                require_performance_v2(connection)
+                return selection_cache_status(connection, request, config)
+        except PerformanceV2StoreError as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
+        except duckdb.Error as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
 
     def strategies_performance_v2_recalculate(self, payload: Mapping[str, object]) -> dict[str, object]:
         try:
@@ -3009,7 +3134,9 @@ class PanelController:
             config = load_selection_config(self.default_config.with_name("config.performance.json"))
             performance_config = self._performance_v2_config()
             target = performance_v2_database_path(performance_config)
-            prepare_selection_window_cache(target, request, config, performance_config.workers)
+            self._ensure_performance_v2_schema(target)
+            with self._performance_v2_writer_lock:
+                prepare_selection_window_cache(target, request, config, performance_config.workers)
             with self._selection_candidate_cache_lock:
                 self._selection_candidate_cache.clear()
             return {"status": "READY"}
@@ -3021,6 +3148,7 @@ class PanelController:
             config = load_selection_config(self.default_config.with_name("config.performance.json"))
             performance_config = self._performance_v2_config()
             target = performance_v2_database_path(performance_config)
+            self._ensure_performance_v2_schema(target)
             with duckdb.connect(str(target), read_only=True) as connection:
                 require_performance_v2(connection)
                 pairs = connection.execute(
@@ -3034,8 +3162,9 @@ class PanelController:
                     for symbol, side in pairs
                     if not selection_cache_status(connection, SelectionRequest(str(symbol), str(side), ()), config)["ready"]
                 ]
-            for request in pending:
-                prepare_selection_window_cache(target, request, config, performance_config.workers)
+            with self._performance_v2_writer_lock:
+                for request in pending:
+                    prepare_selection_window_cache(target, request, config, performance_config.workers)
             if pending:
                 with self._selection_candidate_cache_lock:
                     self._selection_candidate_cache.clear()
@@ -5911,8 +6040,26 @@ class _PanelHandler(BaseHTTPRequestHandler):
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import"}:
             self._json(404, {"error": "not found"})
+            return
+        if endpoint == "/api/v2/strategies/performance-v2/selection-review-import":
+            if self.headers.get("Content-Type", "").partition(";")[0].strip().casefold() != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+                self._json(415, {"error": {"code": "SELECTION_REVIEW_INVALID_FILE", "message": "XLSX Content-Type required"}})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 20 * 1024 * 1024:
+                self._json(400, {"error": {"code": "SELECTION_REVIEW_INVALID_FILE", "message": "XLSX must be between 1 byte and 20 MiB"}})
+                return
+            try:
+                result = self.server.controller.strategies_performance_v2_selection_review_import(self.rfile.read(length))
+            except PerformanceV2ApiError as error:
+                self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+                return
+            self._json(200, result)
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
         if content_type.strip().casefold() != "application/json":

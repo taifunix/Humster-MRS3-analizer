@@ -76,6 +76,9 @@ input:hover, select:hover { border-color: #99adca; }
 .performance-v2-window-filters { grid-template-columns: minmax(180px, 1fr) max-content minmax(180px, 1fr); align-items: end; }
 .performance-v2-window-finalists { min-height: 39px; margin: 0; }
 .performance-v2-caveat { margin: 0 0 12px; color: var(--muted); font-size: .75rem; line-height: 1.55; }
+.performance-v2-coverage { display: grid; gap: 6px; margin: 0 0 12px; }
+.performance-v2-coverage p { margin: 0; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: #f7f9fc; font-size: .75rem; }
+.performance-v2-coverage .performance-v2-coverage-warning { border-color: #e7c89c; background: #fff8ee; color: #8a4b08; }
 .performance-v2-raw { color: var(--muted); }
 .button-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .check { display: inline-flex; align-items: center; gap: 8px; width: fit-content; color: var(--ink); font-size: .78rem; font-weight: 700; }
