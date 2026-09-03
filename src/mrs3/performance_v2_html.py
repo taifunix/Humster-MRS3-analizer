@@ -82,6 +82,16 @@ class ParsedPerformanceV2Report:
     wallet_series: tuple[tuple[datetime, Decimal], ...]
     equity_series: tuple[tuple[datetime, Decimal], ...]
     inventory: PerformanceInventory
+    reported_start_utc: datetime | None = None
+    reported_end_utc: datetime | None = None
+    listing_date_utc: datetime | None = None
+    listing_date_raw: str | None = None
+    listing_date_source: str | None = None
+    effective_start_utc: datetime | None = None
+    effective_end_utc: datetime | None = None
+    warmup_hours: int | None = None
+    excluded_trade_count: int = 0
+    exclusion_reason: str | None = None
 
 
 class _FrozenMapping(Mapping[str, object]):
@@ -224,6 +234,7 @@ def _validate_report_integrity(
     metrics: Mapping[str, str],
     actions: tuple[ParsedPerformanceV2Action, ...],
     wallet_series: tuple[tuple[int, Decimal], ...],
+    equity_series: tuple[tuple[int, Decimal], ...] = (),
 ) -> None:
     declared_transactions = metrics.get("Total transactions (buy/sell)")
     if declared_transactions is not None:
@@ -250,6 +261,7 @@ def _validate_report_integrity(
     start, end = report_range(metrics)
     timestamps = [action.timestamp_utc for action in actions]
     timestamps.extend(_epoch_timestamp(timestamp) for timestamp, _value in wallet_series)
+    timestamps.extend(_epoch_timestamp(timestamp) for timestamp, _value in equity_series)
     if any(timestamp < start or timestamp > end for timestamp in timestamps):
         raise PerformanceV2HtmlError("action/equity timestamp falls outside Report range")
 
@@ -283,7 +295,7 @@ def parse_current_performance_v2_html(
         raise PerformanceV2HtmlError("report exceeds action limit")
     symbol = _settings_identity(parsed.settings)
     actions = _typed_actions(parsed.actions, symbol)
-    _validate_report_integrity(parsed.metrics, actions, parsed.wallet_series)
+    _validate_report_integrity(parsed.metrics, actions, parsed.wallet_series, parsed.equity_series)
     return ParsedPerformanceV2Report(
         _freeze(parsed.settings),  # type: ignore[arg-type]
         _FrozenMapping(parsed.metrics),

@@ -132,6 +132,13 @@
   "panel": {
     "default_root": "static"
   },
+  "panel_workflow": {
+    "listing_dates_path": "input/dates.xlsx",
+    "strategy_templates": {
+      "LONG": "templates/strategies/retest-mrs3/base.json",
+      "SHORT": "templates/strategies/retest-mrs3/base.json"
+    }
+  },
   "panel_paths": {
     "analysis_root": "data/Analysis",
     "strategies_root": "Output/strategies",

@@ -10,7 +10,7 @@ from typing import Any
 import duckdb
 
 
-METRICS_VERSION = "performance-window-v2.1"
+METRICS_VERSION = "performance-window-v2.2"
 
 
 class PerformanceV2WindowsError(ValueError):

@@ -1,5 +1,7 @@
 # MRS3 v0.7 — минимальное ТЗ: Independent Events + безопасное сокращение кандидатов
 
+> Superseded for performance selection and post-test reporting by `docs/specs/2026-09-03-performance-v2-retest-workflow.md`; retained for historical provenance only.
+
 ## 0. Назначение
 
 Это дополнение/коррекция к MRS3 v0.6.

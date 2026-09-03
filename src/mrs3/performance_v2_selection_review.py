@@ -84,7 +84,9 @@ def new_run_metadata(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
 def apply_prior_rejected(connection: duckdb.DuckDBPyConnection, candidates: pd.DataFrame) -> pd.DataFrame:
     output = candidates.copy()
     rejected = {int(row[0]) for row in connection.execute("select strategy_id from strategy_tags where tag = 'REJECTED'").fetchall()}
+    retest = {int(row[0]) for row in connection.execute("select strategy_id from strategy_tags where tag = 'RETEST'").fetchall()}
     output["prior_rejected"] = output["strategy_id"].map(lambda value: int(value) in rejected)
+    output["prior_retest"] = output["strategy_id"].map(lambda value: int(value) in retest)
     return output
 
 
@@ -206,6 +208,18 @@ def _whole_number(value: object, code: str, *, optional: bool = True) -> int | N
     return number
 
 
+def _normalize_retest(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return False
+        if normalized == "RETEST":
+            return True
+    raise SelectionReviewError("SELECTION_REVIEW_INVALID_RETEST")
+
+
 def _parse_workbook(data: bytes) -> tuple[dict[str, str], list[dict[str, object]]]:
     _bounded_xlsx(data)
     try:
@@ -213,10 +227,10 @@ def _parse_workbook(data: bytes) -> tuple[dict[str, str], list[dict[str, object]
     except Exception:
         raise SelectionReviewError("SELECTION_REVIEW_INVALID_FILE") from None
     try:
-        if META_SHEET not in workbook.sheetnames or "All candidates" not in workbook.sheetnames:
-            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
         if any(cell.data_type == "f" for worksheet in workbook.worksheets for row in worksheet.iter_rows() for cell in row):
             raise SelectionReviewError("SELECTION_REVIEW_INVALID_FILE")
+        if META_SHEET not in workbook.sheetnames or "All candidates" not in workbook.sheetnames:
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
         meta_sheet = workbook[META_SHEET]
         metadata = {str(key): str(value) for key, value in meta_sheet.iter_rows(min_row=1, max_col=2, values_only=True) if key and value is not None}
         if metadata.get("workbook_schema_version") != WORKBOOK_SCHEMA_VERSION or metadata.get("selection_contract_version") != SELECTION_CONTRACT_VERSION:
@@ -230,8 +244,10 @@ def _parse_workbook(data: bytes) -> tuple[dict[str, str], list[dict[str, object]
             if isinstance(header, str) and header.strip()
         ]
         headers = [header for _, header in header_pairs]
-        required = {"ID", "Result ID", "Стратегия", "Auto Status", "User Status", "Auto Rank", "User Rank", "Auto Analog Of ID", "Analog Of ID", "Comment"}
-        if len(headers) != len(set(headers)) or not required.issubset(headers):
+        positions = {header: position for position, header in header_pairs}
+        required = {"ID", "Result ID", "Стратегия", "Auto Status", "User Status", "RETEST", "Auto Rank", "User Rank", "Auto Analog Of ID", "Analog Of ID", "Comment"}
+        if (len(headers) != len(set(headers)) or not required.issubset(headers)
+                or positions["RETEST"] != positions["User Status"] + 1):
             raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
         index = {header: position for position, header in header_pairs}
         rows: list[dict[str, object]] = []
@@ -275,12 +291,14 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
         "select strategy_id, strategy_name from strategies where strategy_id in (select unnest(?::bigint[]))", [list(snapshot)]
     ).fetchall()) if snapshot else {}
     submitted: dict[int, dict[str, object]] = {}
-    ranks: set[int] = set()
     for row in rows:
         strategy_id = _whole_number(row["ID"], "SELECTION_REVIEW_ROWSET_MISMATCH", optional=False)
         if strategy_id in submitted:
             raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
         submitted[strategy_id] = row
+    retest_by_id: dict[int, bool] = {}
+    ranks: set[int] = set()
+    for strategy_id, row in submitted.items():
         status = str(row["User Status"] or "").strip().upper()
         if status not in STATUSES:
             raise SelectionReviewError("SELECTION_REVIEW_INVALID_STATUS")
@@ -292,6 +310,7 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
         comment = "" if row["Comment"] is None else str(row["Comment"])
         if len(comment) > 1000:
             raise SelectionReviewError("SELECTION_REVIEW_INVALID_FILE")
+        retest_by_id[strategy_id] = _normalize_retest(row["RETEST"])
     if set(submitted) != set(snapshot):
         raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
     decisions: list[list[object]] = []
@@ -347,10 +366,30 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
         ), [[review_id, *decision] for decision in decisions])
         ids = list(snapshot)
         connection.execute("delete from strategy_tags where tag = 'REJECTED' and strategy_id in (select unnest(?::bigint[]))", [ids])
-        rejected = [[strategy_id, "REJECTED", review_id, now] for strategy_id, status, *_ in decisions if status == "REJECTED"]
+        rejected = [[strategy_id, "REJECTED", "SELECTION_REVIEW", review_id, now] for strategy_id, status, *_ in decisions if status == "REJECTED"]
         _insert_rows(connection, "strategy_tags", (
-            "strategy_id", "tag", "source_review_import_id", "updated_at_utc",
+            "strategy_id", "tag", "source", "source_ref", "updated_at_utc",
         ), rejected)
+        blank_retest_ids = [strategy_id for strategy_id in ids if not retest_by_id[strategy_id]]
+        if blank_retest_ids:
+            connection.execute(
+                "delete from strategy_tags where tag = 'RETEST' and source = 'SELECTION_REVIEW' and strategy_id in (select unnest(?::bigint[]))",
+                [blank_retest_ids],
+            )
+        asserted_retest = [
+            [strategy_id, "RETEST", "SELECTION_REVIEW", review_id, now]
+            for strategy_id in ids if retest_by_id[strategy_id]
+        ]
+        if asserted_retest:
+            connection.executemany(
+                """insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc)
+                   values (?, ?, ?, ?, ?)
+                   on conflict (strategy_id, tag) do update set
+                       source = excluded.source,
+                       source_ref = excluded.source_ref,
+                       updated_at_utc = excluded.updated_at_utc""",
+                asserted_retest,
+            )
         connection.execute("commit")
     except duckdb.ConstraintException as error:
         _rollback_quietly(connection)

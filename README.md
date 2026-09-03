@@ -49,8 +49,6 @@ Copy-Item config.local.json.example config.local.json
 .\.venv\Scripts\python.exe -m mrs3.cli tester-plan --help
 .\.venv\Scripts\python.exe -m mrs3.cli tester-run --help
 
-# Post-test DD5 comparison
-.\.venv\Scripts\python.exe -m mrs3.cli posttest --help
 ```
 
 В панели источники MRS2 разделены на CSV и DuckDB. На вкладке «Кандидаты

@@ -5,19 +5,11 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from .config import AlgorithmConfig, load_duckdb_import_settings
+from .config import AlgorithmConfig
 from .duckdb_events import build_duckdb_package
 from .models import Side
 from .panel import serve_panel
 from .pipeline import SelectionInputs, run_selection
-from .posttest import run_posttest
-from .performance_dd5 import run_performance_dd5
-from .performance_import import (
-    PerformanceImportProgress,
-    PerformanceImportRequest,
-    import_performance_batch,
-    resume_performance_cleanup,
-)
 from .runner.config import RunnerConfig
 from .runner.workflow import plan_batch, run_batch
 from .source_packs import build_csv_package
@@ -63,21 +55,6 @@ def _parser() -> argparse.ArgumentParser:
     tester_run.add_argument("--config", type=Path, required=True)
     tester_run.add_argument("--strategies", type=Path, required=True)
     tester_run.add_argument("--output-csv", type=Path, required=True)
-    posttest = subparsers.add_parser(
-        "posttest", help="normalize tester results to calculated DD5 comparison metrics"
-    )
-    posttest.add_argument("--results-csv", type=Path, required=True)
-    posttest.add_argument("--audit-xlsx", type=Path, required=True)
-    posttest.add_argument("--strategies-dir", type=Path, required=True)
-    posttest.add_argument("--config", type=Path, required=True)
-    posttest.add_argument("--output-dir", type=Path, required=True)
-    performance_dd5 = subparsers.add_parser(
-        "performance-dd5", help="import committed tester evidence and calculate DD5"
-    )
-    performance_dd5.add_argument("--database", type=Path, required=True)
-    performance_dd5.add_argument("--inbox", type=Path, required=True)
-    performance_dd5.add_argument("--config", type=Path, required=True)
-    performance_dd5.add_argument("--output-dir", type=Path, required=True)
     panel = subparsers.add_parser(
         "panel", help="run the local MRS3 control panel"
     )
@@ -162,73 +139,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 indent=2,
             )
         )
-        return 0
-    if args.command == "posttest":
-        config = AlgorithmConfig.from_json(args.config)
-        result = run_posttest(
-            args.results_csv,
-            args.audit_xlsx,
-            args.strategies_dir,
-            args.output_dir,
-            config,
-        )
-        print(
-            json.dumps(
-                {
-                    "workbook": str(result.workbook),
-                    "csv_directory": str(result.csv_directory),
-                    "manifest": str(result.manifest),
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        return 0
-    if args.command == "performance-dd5":
-        config = AlgorithmConfig.from_json(args.config)
-        settings = load_duckdb_import_settings(args.config)
-        request = PerformanceImportRequest(
-            args.inbox,
-            args.database,
-            workers=settings.workers,
-            transaction_batch_size=settings.transaction_batch_size,
-        )
-        last_progress = {"stage": "VALIDATE", "completed": 0, "total": 0, "quarantined": 0}
-
-        def emit(progress: PerformanceImportProgress) -> None:
-            payload = {
-                "stage": progress.stage,
-                "completed": progress.completed,
-                "total": progress.total,
-                "quarantined": progress.quarantined,
-                "scheduled": progress.scheduled,
-                "prepared": progress.prepared,
-                "imported": progress.imported,
-                "skipped": progress.skipped,
-                "phase_seconds": progress.phase_seconds,
-            }
-            last_progress.update(payload)
-            print(json.dumps({"performance_progress": payload}, ensure_ascii=False), flush=True)
-
-        def emit_stage(stage: str, terminal_error: str | None = None) -> None:
-            last_progress["stage"] = stage
-            payload = dict(last_progress)
-            if terminal_error is not None: payload["terminal_error"] = terminal_error
-            print(json.dumps({"performance_progress": payload}, ensure_ascii=False), flush=True)
-
-        try:
-            imported = import_performance_batch(request, emit)
-            if imported.quarantined_count:
-                raise ValueError("DD5 refused an import with quarantined reports")
-            emit_stage("CALCULATE_EXPORT")
-            result = run_performance_dd5(args.database, imported.import_id, args.output_dir, config)
-            emit_stage("CLEANUP")
-            resume_performance_cleanup(request)
-            emit_stage("COMPLETED")
-        except Exception as error:
-            emit_stage(str(last_progress["stage"]), terminal_error=type(error).__name__)
-            raise
-        print(json.dumps({"import_id": imported.import_id, "workbook": str(result.workbook), "manifest": str(result.manifest)}, ensure_ascii=False))
         return 0
     if args.command == "panel":
         serve_panel(

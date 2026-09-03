@@ -23,8 +23,8 @@ class PanelTestingError(ValueError):
 
 _SYMBOL = re.compile(r"^[A-Z0-9]{2,32}$")
 _TEMPLATES = {
-    "LONG": ("config_tester_long_standart.json", "Bybit_long.json"),
-    "SHORT": ("config_tester_short_standart.json", "Bybit_short.json"),
+    "LONG": ("config_tester_long_standart.json", "templates/strategies/source-v6-mrs2/long.json"),
+    "SHORT": ("config_tester_short_standart.json", "templates/strategies/source-v6-mrs2/short.json"),
 }
 
 
@@ -191,7 +191,7 @@ class LocalTestingService:
 
         config_name, strategy_name = _TEMPLATES[side]
         config_template = (self.repo_root / "Input" / config_name).read_text(encoding="utf-8")
-        strategy_template = (self.repo_root / "Input" / strategy_name).read_text(encoding="utf-8")
+        strategy_template = (self.repo_root / strategy_name).read_text(encoding="utf-8")
         rendered_config = render_tester_config(config_template, selected, start, end)
         filename, strategy = render_strategy(strategy_template, selected[0], side)
 

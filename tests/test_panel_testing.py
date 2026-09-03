@@ -14,6 +14,23 @@ from mrs3.panel import PanelController
 from mrs3.runner.config import RunnerConfig
 
 
+def test_canonical_strategy_templates_are_tracked_by_mode() -> None:
+    root = Path(__file__).parents[1]
+    expected = {
+        "templates/strategies/source-v6-mrs2/long.json": ("mrs2", True, False),
+        "templates/strategies/source-v6-mrs2/short.json": ("mrs2", False, True),
+        "templates/strategies/retest-mrs3/base.json": ("mrs3", True, False),
+    }
+
+    for relative, contract in expected.items():
+        document = json.loads((root / relative).read_text(encoding="utf-8"))
+        assert (
+            document["basic"]["strategy"],
+            document["basic"]["use_long"],
+            document["basic"]["use_short"],
+        ) == contract
+
+
 def test_render_tester_config_updates_dates_and_symbols_from_long_template() -> None:
     template = '''{
       "StartDate": "2026-01-01T00:00:00",

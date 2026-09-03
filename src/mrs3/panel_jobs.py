@@ -113,6 +113,8 @@ class PanelJobRegistry:
             if not isinstance(job_id, str) or not job_id.strip() or len(job_id) > 128 or job_id in self.jobs:
                 raise PanelJobError("INVALID_REQUEST")
             job = {"job_id": job_id, "kind": kind, "idempotency_key": idempotency_key, "fingerprint": fingerprint, "resource_keys": list(resource_keys), "state": "QUEUED", "phase": "QUEUED", "progress": {"current": 0, "total": 0, "unit": "items"}, "artifacts": [], "error": None, "logs": []}
+            if request.get("retest") is True:
+                job["retest"] = True
             self.jobs[job["job_id"]] = job; self._save(); return self._copy(job)
 
     def get(self, job_id: str) -> dict:
@@ -186,6 +188,33 @@ class PanelJobRegistry:
                 raise PanelJobError("NOT_FOUND")
             value = job.get("runtime", {})
             return json.loads(json.dumps(value)) if isinstance(value, dict) else {}
+
+    def reserve_runtime(self, job_id: str, key: str, value: object) -> None:
+        """Atomically reserve one controller-only runtime marker."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise PanelJobError("NOT_FOUND")
+            runtime = job.setdefault("runtime", {})
+            if not isinstance(runtime, dict):
+                runtime = job["runtime"] = {}
+            if key in runtime:
+                raise PanelJobError("RUNTIME_BUSY")
+            runtime[key] = json.loads(json.dumps(value))
+            self._save()
+
+    def clear_runtime(self, job_id: str, key: str, *, value: object = None) -> None:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise PanelJobError("NOT_FOUND")
+            runtime = job.get("runtime")
+            if not isinstance(runtime, dict) or (value is not None and runtime.get(key) != value):
+                return
+            runtime.pop(key, None)
+            if not runtime:
+                job.pop("runtime", None)
+            self._save()
 
     def recover_committed(self, job_id: str, *, runtime: dict) -> dict:
         """Commit only a restart-interrupted job whose owner revalidated its artifacts."""

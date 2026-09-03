@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
 import duckdb
 import pytest
+from openpyxl import Workbook
 import mrs3.performance_v2_import as import_module
 
 from mrs3.performance_v2_import import (
@@ -15,8 +18,12 @@ from mrs3.performance_v2_import import (
     PerformanceV2LockedError,
     import_performance_v2,
 )
+from mrs3.performance_v2_html import parse_current_performance_v2_html
+from mrs3.performance_v2_input import read_performance_v2_inbox
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
+    PerformanceV2StoreError,
+    PerformanceV2WriterLock,
     initialize_performance_v2,
     performance_v2_database_path,
 )
@@ -142,7 +149,14 @@ def _request(
 ) -> tuple[PerformanceV2ImportRequest, bytes]:
     inbox, report_root, snapshot = _inbox(tmp_path, names, orders=orders)
     config = PerformanceV2Config(tmp_path / "v2", workers=4)
-    request = PerformanceV2ImportRequest(inbox, report_root, config, mode=mode)
+    dates_path = tmp_path / "Input" / "dates.xlsx"
+    dates_path.parent.mkdir()
+    workbook = Workbook()
+    workbook.active.append(["ONUSDT", datetime(2025, 12, 25)])
+    workbook.save(dates_path)
+    request = PerformanceV2ImportRequest(
+        inbox, report_root, config, mode=mode, listing_dates_path=Path("Input/dates.xlsx")
+    )
     if initialize_db:
         _db(request)
     return request, snapshot
@@ -309,7 +323,11 @@ def test_replace_requires_mapping_and_rolls_back_on_typed_mismatch(tmp_path: Pat
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(PerformanceV2ImportError, match="typed"):
         import_performance_v2(
-            PerformanceV2ImportRequest(request.inbox, request.report_root, request.config, mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id})
+            PerformanceV2ImportRequest(
+                request.inbox, request.report_root, request.config,
+                mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id},
+                listing_dates_path=request.listing_dates_path,
+            )
         )
     with duckdb.connect(str(target), read_only=True) as connection:
         assert connection.execute("select current_result_id from strategies where strategy_id = ?", [strategy_id]).fetchone() == (old_result,)
@@ -326,7 +344,11 @@ def test_replace_switches_current_result_and_keeps_one_result(tmp_path: Path) ->
     _rewrite_report(request, changed)
 
     result = import_performance_v2(
-        PerformanceV2ImportRequest(request.inbox, request.report_root, request.config, mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id})
+        PerformanceV2ImportRequest(
+            request.inbox, request.report_root, request.config,
+            mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id},
+            listing_dates_path=request.listing_dates_path,
+        )
     )
 
     assert result.imported_count == 1
@@ -358,6 +380,7 @@ def test_replace_upgrades_pre_task5_window_schema_before_rebuilding_children(tmp
             request.config,
             mode="REPLACE",
             replacement_strategy_ids={"alpha": strategy_id},
+            listing_dates_path=request.listing_dates_path,
         )
     )
 
@@ -376,11 +399,15 @@ def test_replace_rollback_restores_old_result_after_delete_failure(tmp_path: Pat
     request, _ = _request(tmp_path)
     import_performance_v2(request)
     target = performance_v2_database_path(request.config)
-    with duckdb.connect(str(target), read_only=True) as connection:
+    with duckdb.connect(str(target)) as connection:
         strategy_id, old_result = connection.execute(
             "select strategy_id, current_result_id from strategies where strategy_name = 'alpha'"
         ).fetchone()
         old_actions = connection.execute("select count(*) from strategy_actions where result_id = ?", [old_result]).fetchone()[0]
+        connection.execute(
+            "insert into strategy_tags values (?, 'RETEST', 'RETEST_WORKFLOW', 'test', now())",
+            [strategy_id],
+        )
     _rewrite_report(request, FIXTURE.read_bytes().replace(b"1009.9", b"1019.9"))
     original_inbox = {path.relative_to(request.inbox): path.read_bytes() for path in request.inbox.rglob("*") if path.is_file()}
     import mrs3.performance_v2_import as import_module
@@ -388,11 +415,23 @@ def test_replace_rollback_restores_old_result_after_delete_failure(tmp_path: Pat
 
     with pytest.raises(PerformanceV2ImportError, match="transaction failed|injected"):
         import_performance_v2(
-            PerformanceV2ImportRequest(request.inbox, request.report_root, request.config, mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id})
+            PerformanceV2ImportRequest(
+                request.inbox,
+                request.report_root,
+                request.config,
+                mode="REPLACE",
+                replacement_strategy_ids={"alpha": strategy_id},
+                clear_retest_on_success=True,
+                listing_dates_path=request.listing_dates_path,
+            )
         )
     with duckdb.connect(str(target), read_only=True) as connection:
         assert connection.execute("select current_result_id from strategies where strategy_id = ?", [strategy_id]).fetchone() == (old_result,)
         assert connection.execute("select count(*) from strategy_actions where result_id = ?", [old_result]).fetchone() == (old_actions,)
+        assert connection.execute(
+            "select count(*) from strategy_tags where strategy_id = ? and tag = 'RETEST'", [strategy_id]
+        ).fetchone() == (1,)
+    assert list(request.config.database_root.glob("performance_v2_failures_*.csv"))
     assert {path.relative_to(request.inbox): path.read_bytes() for path in request.inbox.rglob("*") if path.is_file()} == original_inbox
 
 
@@ -409,6 +448,24 @@ def test_lock_conflict_does_not_read_inbox_or_create_staging(tmp_path: Path, mon
     finally:
         held.close()
     assert not (request.config.database_root / ".staging").exists()
+
+
+def test_writer_lock_fails_closed_before_opening_database(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+
+    with PerformanceV2WriterLock(request.config.database_root):
+        with pytest.raises(PerformanceV2LockedError):
+            import_performance_v2(request)
+
+
+def test_writer_lock_does_not_create_missing_database_root(tmp_path: Path) -> None:
+    missing_root = tmp_path / "missing-v2"
+
+    with pytest.raises(PerformanceV2StoreError, match="root does not exist"):
+        with PerformanceV2WriterLock(missing_root):
+            pass
+
+    assert not missing_root.exists()
 
 
 def test_missing_target_fails_before_connect_and_does_not_create_root(
@@ -439,6 +496,462 @@ def test_empty_target_fails_schema_gate_without_staging_or_audit(tmp_path: Path)
     assert target.exists()
     assert not (request.config.database_root / ".staging").exists()
     assert not (request.config.database_root / "import_audit.v2.json").exists()
+
+
+def test_warmup_does_not_publish_an_open_only_report(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed = replace(
+        parsed,
+        actions=(replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 7, tzinfo=timezone.utc)),),
+    )
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2026, 1, 1, tzinfo=timezone.utc)}
+    )
+
+    assert result is None
+    assert failure is not None and failure["reason"] == "NO_EFFECTIVE_TRADE"
+
+
+def test_no_warmup_drops_open_at_end_lifecycle_and_counts_it(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    open_action = replace(
+        parsed.actions[0], action_index=2, timestamp_utc=datetime(2026, 1, 4, tzinfo=timezone.utc),
+    )
+    parsed = replace(parsed, actions=parsed.actions + (open_action,))
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2025, 12, 25, tzinfo=timezone.utc)}
+    )
+
+    assert failure is None and result is not None
+    assert len(result.actions) == 2
+    assert result.metrics["Total Trades"] == "1"
+    assert result.excluded_trade_count == 1
+
+
+def test_no_warmup_open_only_report_is_not_published(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed = replace(parsed, actions=(replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 4, tzinfo=timezone.utc)),))
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2025, 12, 25, tzinfo=timezone.utc)}
+    )
+
+    assert result is None
+    assert failure is not None and failure["reason"] == "NO_EFFECTIVE_TRADE"
+    assert failure["excluded_trade_count"] == 1
+
+
+def test_warmup_excludes_crossing_trade_pnl_and_fees(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    actions = (
+        replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 2, tzinfo=timezone.utc), fee=Decimal("0.5"), balance=Decimal("999.5")),
+        replace(parsed.actions[1], timestamp_utc=datetime(2026, 1, 7, tzinfo=timezone.utc), fee=Decimal("0.5"), pnl=Decimal("10"), balance=Decimal("1009")),
+        replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 8, tzinfo=timezone.utc), fee=Decimal("1"), balance=Decimal("1008")),
+        replace(parsed.actions[1], timestamp_utc=datetime(2026, 1, 9, tzinfo=timezone.utc), fee=Decimal("1"), pnl=Decimal("4"), balance=Decimal("1011")),
+    )
+    metrics = dict(parsed.metrics)
+    metrics["Report range"] = "2026-01-01 - 2026-01-10"
+    parsed = replace(parsed, metrics=metrics, actions=actions, wallet_series=(), equity_series=())
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2026, 1, 3, tzinfo=timezone.utc)}
+    )
+
+    assert failure is None and result is not None
+    assert len(result.actions) == 2
+    assert result.wallet_series == () and result.equity_series == ()
+    assert result.inventory.wallet_sample_count == result.inventory.equity_sample_count == 0
+    assert result.metrics["Initial balance"] == "1000.0"
+    assert result.metrics["Max Drawdown"] == "N/A"
+    assert result.metrics["Total Trades"] == "1"
+    assert result.metrics["Total PnL"] == "2"
+    assert result.metrics["Total fees"] == "2"
+    assert result.reported_start_utc == datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert result.reported_end_utc == datetime(2026, 1, 10, tzinfo=timezone.utc)
+    assert result.listing_date_utc == datetime(2026, 1, 3, tzinfo=timezone.utc)
+    assert result.effective_start_utc == datetime(2026, 1, 8, tzinfo=timezone.utc)
+    assert result.effective_end_utc == result.reported_end_utc
+    assert result.warmup_hours == 120
+    assert result.excluded_trade_count == 1
+    assert result.exclusion_reason is None
+
+
+def test_warmup_drawdown_peak_starts_at_baseline_for_first_sample_below_it(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed = replace(
+        parsed,
+        actions=(
+            replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 8, tzinfo=timezone.utc), fee=Decimal("1"), balance=Decimal("999")),
+            replace(parsed.actions[1], timestamp_utc=datetime(2026, 1, 9, tzinfo=timezone.utc), pnl=Decimal("0"), fee=Decimal("0"), balance=Decimal("999")),
+        ),
+        wallet_series=((datetime(2026, 1, 8, tzinfo=timezone.utc), Decimal("999")),),
+        equity_series=(),
+    )
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2026, 1, 3, tzinfo=timezone.utc)}
+    )
+
+    assert failure is None and result is not None
+    assert result.wallet_series == ((datetime(2026, 1, 8, tzinfo=timezone.utc), Decimal("999")),)
+    assert result.inventory.wallet_sample_count == 1
+    assert result.metrics["Max Drawdown"] == "1"
+
+
+def test_warmup_pins_signed_gross_loss_for_a_losing_trade(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed = replace(
+        parsed,
+        actions=(
+            replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 8, tzinfo=timezone.utc), fee=Decimal("0"), pnl=Decimal("0"), balance=Decimal("1000")),
+            replace(parsed.actions[1], timestamp_utc=datetime(2026, 1, 9, tzinfo=timezone.utc), fee=Decimal("0"), pnl=Decimal("-2"), balance=Decimal("998")),
+        ),
+        wallet_series=(),
+        equity_series=(),
+    )
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2026, 1, 3, tzinfo=timezone.utc)}
+    )
+
+    assert failure is None and result is not None
+    # Gross loss is a positive magnitude, matching the window calculator.
+    assert result.metrics["Gross loss"] == "2"
+
+
+def test_result_values_persist_full_precision_effective_provenance(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    effective_start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+    effective_end = datetime(2026, 1, 9, 18, 30, tzinfo=timezone.utc)
+    parsed = replace(parsed, effective_start_utc=effective_start, effective_end_utc=effective_end)
+
+    values = import_module._result_values(
+        prepared.entries[0], parsed, {"TakerFee": "0.0004"}, datetime(2026, 1, 10, tzinfo=timezone.utc)
+    )
+
+    assert values[0:2] == [effective_start, effective_end]
+
+
+def test_warmup_does_not_publish_when_the_only_trade_crosses_warmup(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed = replace(
+        parsed,
+        actions=(
+            replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 2, tzinfo=timezone.utc)),
+            replace(parsed.actions[1], timestamp_utc=datetime(2026, 1, 8, tzinfo=timezone.utc)),
+        ),
+        wallet_series=(),
+        equity_series=(),
+    )
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2026, 1, 3, tzinfo=timezone.utc)}
+    )
+
+    assert result is None
+    assert failure is not None
+    assert failure["reason"] == "NO_EFFECTIVE_TRADE"
+    assert failure["excluded_trade_count"] == 1
+
+
+def test_warmup_rejects_unknown_action_without_dropping_it(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed = replace(parsed, actions=(replace(parsed.actions[0], action="mystery"), parsed.actions[1]))
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2025, 12, 25, tzinfo=timezone.utc)}
+    )
+
+    assert result is None
+    assert failure is not None and failure["reason"] == "UNKNOWN_ACTION"
+
+
+def test_import_persists_warmup_provenance(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    dates = tmp_path / "Input" / "dates.xlsx"
+    dates.parent.mkdir(exist_ok=True)
+    workbook = Workbook()
+    workbook.active.append(["ONUSDT", datetime(2025, 12, 25)])
+    workbook.save(dates)
+    request = PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config, listing_dates_path=Path("Input/dates.xlsx")
+    )
+
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        row = connection.execute(
+            """select report_start_utc, report_end_utc, reported_start_utc, reported_end_utc,
+                      listing_date_utc, listing_date_raw, listing_date_source,
+                      effective_start_utc, effective_end_utc, warmup_hours,
+                      excluded_trade_count, exclusion_reason
+                 from strategy_results"""
+        ).fetchone()
+    assert row[0].date().isoformat() == "2026-01-01"
+    assert row[1].date().isoformat() == "2026-01-09"
+    assert row[2].date().isoformat() == "2026-01-01"
+    assert row[3].date().isoformat() == "2026-01-09"
+    assert row[4].date().isoformat() == "2025-12-25"
+    assert row[5] and row[6] == "configured_listing_dates_path"
+    assert row[7].date().isoformat() == "2026-01-01"
+    assert row[8].date().isoformat() == "2026-01-09"
+    assert row[9:] == (120, 0, None)
+def test_warmup_normalizes_listing_timezone_and_keeps_inclusive_report_end(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    metrics = dict(parsed.metrics)
+    metrics["Report range"] = "2026-01-01 - 2026-01-10"
+    parsed = replace(
+        parsed,
+        metrics=metrics,
+        actions=(
+            replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 6, 10, tzinfo=timezone.utc)),
+            replace(parsed.actions[1], timestamp_utc=datetime(2026, 1, 10, tzinfo=timezone.utc)),
+        ),
+        wallet_series=(),
+        equity_series=(),
+    )
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0],
+        parsed,
+        {"ONUSDT": datetime(2026, 1, 1, 12, tzinfo=timezone(timedelta(hours=2)))},
+    )
+
+    assert failure is None and result is not None
+    assert len(result.actions) == 2
+    assert result.actions[-1].timestamp_utc == datetime(2026, 1, 10, tzinfo=timezone.utc)
+
+
+def test_warmup_drops_a_trade_closed_after_inclusive_report_end(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    metrics = dict(parsed.metrics)
+    metrics["Report range"] = "2026-01-01 - 2026-01-10"
+    parsed = replace(
+        parsed,
+        metrics=metrics,
+        actions=(
+            replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 9, 10, tzinfo=timezone.utc)),
+            replace(parsed.actions[1], timestamp_utc=datetime(2026, 1, 10, 0, 1, tzinfo=timezone.utc)),
+        ),
+        wallet_series=(),
+        equity_series=(),
+    )
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2026, 1, 4, tzinfo=timezone.utc)}
+    )
+
+    assert result is None
+    assert failure is not None and failure["reason"] == "NO_EFFECTIVE_TRADE"
+
+
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [("actions", "ACTIONS_OUT_OF_ORDER"), ("wallet_series", "WALLET_OUT_OF_ORDER"), ("equity_series", "EQUITY_OUT_OF_ORDER")],
+)
+def test_warmup_rejects_out_of_order_source_rows(tmp_path: Path, field: str, reason: str) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    values = {
+        "actions": tuple(reversed(parsed.actions)),
+        "wallet_series": tuple(reversed(parsed.wallet_series)),
+        "equity_series": tuple(reversed(parsed.equity_series)),
+    }
+    parsed = replace(parsed, **{field: values[field]})
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2025, 12, 25, tzinfo=timezone.utc)}
+    )
+
+    assert result is None
+    assert failure is not None and failure["reason"] == reason
+
+
+def test_warmup_rejects_orphan_increased_action(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed = replace(parsed, actions=(replace(parsed.actions[0], action="increased"), parsed.actions[1]))
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2025, 12, 25, tzinfo=timezone.utc)}
+    )
+
+    assert result is None
+    assert failure is not None and failure["reason"] == "INVALID_ACTION_STATE"
+
+
+def test_single_mode_without_listing_dates_fails_closed(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    request = PerformanceV2ImportRequest(request.inbox, request.report_root, request.config)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update({"run_mode": "SINGLE_MODE", "test_start": "2026-01-01", "test_end": "2026-01-09"})
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+
+    filtered, failures = import_module._prepare_listing_ranges(request, prepared, (parsed,))
+
+    assert filtered == (None,)
+    assert failures and failures[0]["reason"] == "LISTING_MISSING"
+
+
+def test_all_invalid_reports_commit_zero_without_empty_in_clause(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for index, name in enumerate(("alpha", "beta")):
+        report_path = request.report_root / f"{name}.html"
+        report_path.write_text("<html>invalid</html>", encoding="utf-8")
+        manifest["entries"][index]["source_report_sha256"] = sha256(report_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.skipped_count, result.rejected_count) == (0, 0, 2)
+    assert result.failure_count == 2
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        assert connection.execute("select count(*) from strategies").fetchone() == (0,)
+        assert connection.execute("select distinct status from import_files").fetchall() == [("REJECTED:INVALID_REPORT",)]
+    failure_csv = result.failure_report_path
+    assert failure_csv is not None
+    assert failure_csv.read_text(encoding="utf-8").splitlines()[0].split(",")[:5] == [
+        "reason", "strategy_name", "symbol", "import_id", "outcome"
+    ]
+
+
+def test_clear_retest_on_success_uses_replaced_strategy_ids_only(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target)) as connection:
+        # Seed an unrelated strategy so strategy and result IDs are visibly
+        # out of phase before the replacement transaction.
+        connection.execute(
+            """insert into strategies (
+                strategy_name, symbol, side, timeframe, close_ma_len, order_count,
+                analysis_run_id, candidate_identity, lifecycle_status, current_result_id,
+                created_at_utc, updated_at_utc
+            ) values ('seed', 'SEEDUSDT', 'LONG', '1h', 3, 1, 'seed-run', 'seed-candidate', 'ACTIVE', null, now(), now())"""
+        )
+    import_performance_v2(request)
+    with duckdb.connect(str(target)) as connection:
+        ids = dict(
+            connection.execute(
+                "select strategy_name, strategy_id from strategies where strategy_name in ('alpha', 'beta')"
+            ).fetchall()
+        )
+        connection.executemany(
+            "insert into strategy_tags values (?, 'RETEST', 'RETEST_WORKFLOW', 'test', now())",
+            [(ids["alpha"],), (ids["beta"],)],
+        )
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    replacement = PerformanceV2ImportRequest(
+        request.inbox,
+        request.report_root,
+        request.config,
+        mode="REPLACE",
+        replacement_strategy_ids=ids,
+        clear_retest_on_success=True,
+        listing_dates_path=request.listing_dates_path,
+    )
+    with duckdb.connect(str(target)) as connection:
+        import_module._publish(connection, replacement, prepared, (parsed, None), "selective-clear")
+
+    with duckdb.connect(str(target), read_only=True) as connection:
+        pairs = connection.execute("select strategy_id, current_result_id from strategies").fetchall()
+        assert all(strategy_id != result_id for strategy_id, result_id in pairs)
+        assert connection.execute(
+            "select count(*) from strategy_tags where strategy_id = ? and tag = 'RETEST'", [ids["alpha"]]
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "select count(*) from strategy_tags where strategy_id = ? and tag = 'RETEST'", [ids["beta"]]
+        ).fetchone() == (1,)
+
+
+def test_import_request_rejects_absolute_listing_dates_path(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+
+    with pytest.raises(ValueError, match="relative"):
+        PerformanceV2ImportRequest(
+            request.inbox,
+            request.report_root,
+            request.config,
+            listing_dates_path=tmp_path / "Input" / "dates.xlsx",
+        )
+
+
+def test_relative_input_listing_dates_path_is_resolved_from_inbox_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request, _ = _request(tmp_path)
+    dates_path = tmp_path / "Input" / "dates.xlsx"
+    dates_path.parent.mkdir(exist_ok=True)
+    dates_path.touch()
+    seen: list[Path] = []
+    monkeypatch.setattr(
+        import_module,
+        "load_listing_dates",
+        lambda path: (seen.append(path), {"ONUSDT": datetime(2025, 12, 1, tzinfo=timezone.utc)})[1],
+    )
+    request = PerformanceV2ImportRequest(
+        request.inbox,
+        request.report_root,
+        request.config,
+        listing_dates_path=Path("Input/dates.xlsx"),
+    )
+
+    result = import_performance_v2(request)
+
+    assert result.imported_count == 1
+    assert seen == [dates_path]
+
+
+def test_valid_strategy_is_published_when_sibling_report_is_invalid(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    invalid = request.report_root / "beta.html"
+    invalid.write_text("<html>invalid</html>", encoding="utf-8")
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    beta_entry = manifest["entries"][1]
+    beta_entry["source_report_sha256"] = sha256(invalid.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = import_performance_v2(request)
+
+    assert result.imported_count == 1
+    assert result.skipped_count == 0
+    assert result.rejected_count == 1
+    assert result.failure_report_path is not None and result.failure_report_path.is_file()
+    assert result.failure_report_xlsx_path is not None and result.failure_report_xlsx_path.is_file()
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        assert connection.execute("select strategy_name from strategies order by strategy_name").fetchall() == [("alpha",)]
 
 
 def test_invalid_schema_fails_before_staging_or_audit(tmp_path: Path) -> None:

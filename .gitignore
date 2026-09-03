@@ -21,6 +21,8 @@ output/
 results/
 audit_csv/
 strategies/
+!templates/strategies/
+!templates/strategies/**
 *.duckdb
 *.duckdb.wal
 *.duckdb.tmp

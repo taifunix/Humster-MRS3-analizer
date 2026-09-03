@@ -399,3 +399,90 @@ def test_inbox_snapshot_is_verified_when_preparation_fails(tmp_path: Path, monke
     monkeypatch.setattr(input_module, "_manifest_diagnostics", mutate)
     with pytest.raises(PerformanceV2InputError, match="changed"):
         read_performance_v2_inbox(inbox, report_root)
+
+
+def test_mixed_analysis_run_map_is_used_for_entries_and_plateaus(tmp_path: Path) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["v6_provenance"]["strategy_analysis_run_ids"] = {"BTC-demo.json": "original-run"}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    assert prepared.analysis_run_id == "a" * 64
+    assert prepared.entries[0].analysis_run_id == "original-run"
+    assert prepared.plateaus[0].analysis_run_id == "original-run"
+
+
+def test_v6_provenance_run_map_is_authoritative_over_top_level_map(tmp_path: Path) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["v6_provenance"]["strategy_analysis_run_ids"] = {"BTC-demo.json": "v6-run"}
+    manifest["strategy_analysis_run_ids"] = {"BTC-demo.json": "top-level-override"}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    assert prepared.entries[0].analysis_run_id == "v6-run"
+    assert prepared.plateaus[0].analysis_run_id == "v6-run"
+
+
+def test_top_level_run_map_is_ignored_when_v6_provenance_exists(tmp_path: Path) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["strategy_analysis_run_ids"] = {"BTC-demo.json": "top-level-override"}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    assert prepared.entries[0].analysis_run_id == "a" * 64
+    assert prepared.plateaus[0].analysis_run_id == "a" * 64
+
+
+def test_legacy_plain_manifest_accepts_top_level_run_map(tmp_path: Path) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    provenance = manifest.pop("v6_provenance")
+    manifest.update(provenance)
+    manifest["strategy_analysis_run_ids"] = {"BTC-demo.json": "legacy-run"}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    assert prepared.entries[0].analysis_run_id == "legacy-run"
+    assert prepared.plateaus[0].analysis_run_id == "legacy-run"
+
+
+@pytest.mark.parametrize("run_map", [{}, {"unknown.json": "run"}, "run", None, {"BTC-demo.json": 1}])
+def test_mixed_analysis_run_map_must_cover_entries_with_text_ids(tmp_path: Path, run_map: object) -> None:
+    inbox, report_root = _inbox(tmp_path / "invalid")
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["v6_provenance"]["strategy_analysis_run_ids"] = run_map
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2InputError, match="strategy analysis run ID map|strategy analysis run id"):
+        read_performance_v2_inbox(inbox, report_root)
+
+
+def test_run_map_miss_during_entry_read_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    alternate = inbox / "strategies" / "alternate.json"
+    alternate.write_bytes((inbox / "strategies" / "BTC-demo.json").read_bytes())
+    original_path = input_module._strategy_path
+    calls = 0
+
+    def switch_path(*args: object, **kwargs: object) -> Path:
+        nonlocal calls
+        calls += 1
+        path = original_path(*args, **kwargs)
+        return alternate if calls == 2 else path
+
+    monkeypatch.setattr(input_module, "_strategy_path", switch_path)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["v6_provenance"]["strategy_analysis_run_ids"] = {"BTC-demo.json": "original-run"}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2InputError, match="strategy analysis run ID map does not cover inbox"):
+        read_performance_v2_inbox(inbox, report_root)

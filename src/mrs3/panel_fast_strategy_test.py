@@ -923,7 +923,21 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
         return "unknown"
 
     @staticmethod
-    def _native_reports(report_dir: Path, expected: set[str]) -> dict[str, Path]:
+    def _native_reports(
+        report_dir: Path,
+        expected: set[str],
+        *,
+        expected_settings: Mapping[str, Mapping[str, object]] | None = None,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> dict[str, Path]:
+        if (
+            not isinstance(expected_settings, Mapping)
+            or set(expected_settings) != expected
+            or start is None
+            or end is None
+        ):
+            raise FastStrategyTestError("native report validation settings are unavailable")
         found: dict[str, Path] = {}
         for report in sorted(report_dir.glob("*.html"), key=lambda path: path.name):
             if report.is_symlink() or not report.is_file():
@@ -940,6 +954,9 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 or name not in expected
                 or not _has_current_performance_v2_layout(source)
             ):
+                continue
+            expected_for_name = expected_settings[name]
+            if not isinstance(settings, Mapping) or not _report_matches_run(report, settings, expected_for_name, start, end):
                 continue
             previous = found.get(name)
             if previous is None or (modified, report.name) > (previous.stat().st_mtime_ns, previous.name):
@@ -997,7 +1014,22 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             client.run_tester()
             self._wait_for_native_idle(job, client, config, batch_number, batch_total)
             self._set_phase(job, "REPORT_COLLECTION", batch_number=batch_number, batch_total=batch_total)
-            return self._native_reports(job.report_dir, set(names))
+            expected_settings: dict[str, Mapping[str, object]] = {}
+            for name in names:
+                try:
+                    value = json.loads((job.manifest.strategy_source / f"{name}.json").read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise FastStrategyTestError(f"expected strategy settings are unavailable for {name}") from error
+                if not isinstance(value, Mapping):
+                    raise FastStrategyTestError(f"expected strategy settings are invalid for {name}")
+                expected_settings[name] = value
+            return self._native_reports(
+                job.report_dir,
+                set(names),
+                expected_settings=expected_settings,
+                start=job.start_date,
+                end=job.end_date,
+            )
         finally:
             try:
                 self._stop_bot(config)

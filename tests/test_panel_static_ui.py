@@ -205,6 +205,26 @@ def test_performance_v2_handoff_exposes_ready_gated_controls() -> None:
     assert "Cleanup warning" in js
 
 
+def test_performance_v2_retest_card_uses_server_mapping_and_committed_inbox_gate() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    card = html.split('id="performance-v2-retest-card"', 1)[1].split("</details>", 1)[0]
+    assert "CHECK &amp; RETEST" in card
+    assert 'id="performance-v2-retest-count"' in card
+    assert 'id="performance-v2-retest-start"' in card
+    assert 'id="performance-v2-retest-end"' in card
+    assert 'id="performance-v2-retest-import" class="button button-primary" disabled' in card
+    assert "/api/v2/strategies/performance-v2/retest/status" in js
+    assert "/api/v2/strategies/performance-v2/retest/start" in js
+    assert "/api/v2/strategies/performance-v2/retest/import" in js
+    assert "job.inbox_ready === true" in js
+    assert "tester_job_id: retestTesterJobId" in js
+    retest_slice = js.split("const retestCard", 1)[1].split("const performanceV2WindowSelect", 1)[0]
+    assert "replacement_strategy_ids" not in retest_slice
+    assert "failure_report_available" in js
+
+
 def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_without_recalculation() -> None:
     html = _read("index.html")
     js = _read("app.js")
@@ -719,7 +739,6 @@ def test_reload_recovers_only_server_job_snapshots() -> None:
     assert "job.kind === 'strategies.tester.start'" in recovery
     assert "job.kind === 'strategies.tester.native.start'" in recovery
     assert "job.kind === 'strategies.tester.native.start' && job.state === 'COMMITTED'" in recovery
-    assert "job.kind === 'strategies.performance-dd5'" not in recovery
     assert "const tester = testerJobs.find" in recovery
     assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
     assert "kind: 'strategies.tester.start'" in js

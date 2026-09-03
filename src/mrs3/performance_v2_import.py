@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass, field, replace
+from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import csv
 import json
 from pathlib import Path
 from typing import Callable, Mapping
@@ -15,7 +16,8 @@ import duckdb
 import pandas as pd
 
 from .performance import PerformanceParseError, report_range
-from .performance_v2_html import ParsedPerformanceV2Report, parse_current_performance_v2_html
+from .performance_v2_html import PerformanceV2HtmlError, ParsedPerformanceV2Report, parse_current_performance_v2_html
+from .loader import load_listing_dates
 from .performance_v2_input import (
     PerformanceV2InputError,
     PreparedV2Entry,
@@ -30,6 +32,7 @@ from .performance_v2_store import (
     initialize_performance_v2,
     performance_v2_database_path,
     require_performance_v2,
+    PerformanceV2WriterLock,
 )
 
 
@@ -59,6 +62,10 @@ class PerformanceV2ImportRequest:
     replacement_strategy_ids: Mapping[str, int]
     expected_strategy_identities: Mapping[str, object] | None
     strategy_root: Path | None
+    clear_retest_on_success: bool
+    test_start: str | None
+    test_end: str | None
+    listing_dates_path: Path | None
 
     def __init__(
         self,
@@ -73,6 +80,10 @@ class PerformanceV2ImportRequest:
         strategy_id_mapping: Mapping[str, int] | None = None,
         expected_strategy_identities: Mapping[str, object] | None = None,
         strategy_root: Path | None = None,
+        clear_retest_on_success: bool = False,
+        test_start: str | None = None,
+        test_end: str | None = None,
+        listing_dates_path: Path | None = None,
     ) -> None:
         if inbox is None:
             inbox = inbox_path
@@ -92,6 +103,18 @@ class PerformanceV2ImportRequest:
             raise ValueError("replacement_strategy_ids must be a mapping")
         if mode not in {"ADD", "REPLACE"}:
             raise ValueError("v2 import mode must be ADD or REPLACE")
+        if type(clear_retest_on_success) is not bool:
+            raise ValueError("clear_retest_on_success must be boolean")
+        if (test_start is None) != (test_end is None):
+            raise ValueError("test_start and test_end must be supplied together")
+        if test_start is not None:
+            try:
+                parsed_start = date.fromisoformat(test_start)
+                parsed_end = date.fromisoformat(test_end)  # type: ignore[arg-type]
+            except (TypeError, ValueError) as error:
+                raise ValueError("test_start and test_end must be ISO dates") from error
+            if parsed_start.isoformat() != test_start or parsed_end.isoformat() != test_end or parsed_end < parsed_start:
+                raise ValueError("test_start and test_end must be ISO dates")
         object.__setattr__(self, "inbox", Path(inbox))
         object.__setattr__(self, "report_root", Path(report_root))
         object.__setattr__(self, "config", config)
@@ -99,6 +122,15 @@ class PerformanceV2ImportRequest:
         object.__setattr__(self, "replacement_strategy_ids", dict(mapping))
         object.__setattr__(self, "expected_strategy_identities", expected_strategy_identities)
         object.__setattr__(self, "strategy_root", None if strategy_root is None else Path(strategy_root))
+        object.__setattr__(self, "clear_retest_on_success", clear_retest_on_success)
+        object.__setattr__(self, "test_start", test_start)
+        object.__setattr__(self, "test_end", test_end)
+        if listing_dates_path is not None:
+            listing_path = Path(listing_dates_path)
+            if listing_path.is_absolute() or ".." in listing_path.parts:
+                raise ValueError("listing dates path must be relative to a trusted input root")
+            listing_dates_path = listing_path
+        object.__setattr__(self, "listing_dates_path", listing_dates_path)
 
     @property
     def inbox_path(self) -> Path:
@@ -123,6 +155,10 @@ class PerformanceV2ImportResult:
     database_path: Path | None = None
     audit_path: Path | None = None
     phases: Mapping[str, float] = field(default_factory=dict)
+    failure_report_path: Path | None = None
+    failure_report_xlsx_path: Path | None = None
+    failure_count: int = 0
+    excluded_trade_count: int = 0
 
     @property
     def committed(self) -> bool:
@@ -174,7 +210,7 @@ def _parse_reports(
     prepared: PreparedV2Input,
     config: PerformanceV2Config,
     progress: ProgressCallback | None = None,
-) -> tuple[ParsedPerformanceV2Report, ...]:
+) -> tuple[ParsedPerformanceV2Report | None, ...]:
     paths = tuple(staging / "reports" / entry.report_path.name for entry in prepared.entries)
     workers = min(config.workers, len(paths))
     if progress is not None:
@@ -182,7 +218,10 @@ def _parse_reports(
     if workers == 1:
         parsed = []
         for path in paths:
-            parsed.append(_parse_staged_report(path, config))
+            try:
+                parsed.append(_parse_staged_report(path, config))
+            except Exception:
+                parsed.append(None)
             if progress is not None:
                 progress("PARSING", len(parsed), len(paths))
         return tuple(parsed)
@@ -190,10 +229,424 @@ def _parse_reports(
         futures = {executor.submit(_parse_staged_report, path, config): index for index, path in enumerate(paths)}
         parsed: list[ParsedPerformanceV2Report | None] = [None] * len(paths)
         for completed, future in enumerate(as_completed(futures), start=1):
-            parsed[futures[future]] = future.result()
+            try:
+                parsed[futures[future]] = future.result()
+            except Exception:
+                pass
             if progress is not None:
                 progress("PARSING", completed, len(paths))
-    return tuple(item for item in parsed if item is not None)
+    return tuple(parsed)
+
+
+def _listing_datetime(value: object) -> datetime:
+    """Normalize the existing loader's UTC timestamp without accepting naive values."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("listing date has no UTC offset")
+        return value.astimezone(timezone.utc)
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time(), tzinfo=timezone.utc)
+    to_pydatetime = getattr(value, "to_pydatetime", None)
+    if callable(to_pydatetime):
+        return _listing_datetime(to_pydatetime())
+    raise ValueError("listing date is invalid")
+
+
+def _format_decimal(value: Decimal) -> str:
+    return format(value, "f")
+
+
+def _warmup_report(
+    entry: PreparedV2Entry,
+    report: ParsedPerformanceV2Report,
+    listing_dates: Mapping[str, object],
+) -> tuple[ParsedPerformanceV2Report | None, dict[str, object] | None]:
+    """Trim one report to its listing warm-up range, preserving parser types."""
+    try:
+        reported_start, reported_end = report_range(report.metrics)
+    except PerformanceParseError:
+        return None, {"strategy_name": entry.strategy_name, "reason": "INVALID_REPORT_RANGE"}
+    reported_start = reported_start.astimezone(timezone.utc)
+    reported_end = reported_end.astimezone(timezone.utc)
+    # ``report_end`` is an inclusive UTC endpoint (the existing parser accepts
+    # an event exactly at that instant).  Anything later is outside this
+    # report and must not be used to flush an otherwise open lifecycle.
+    report_end_inclusive = reported_end
+    raw_listing = listing_dates.get(entry.identity.symbol)
+    if raw_listing is None:
+        return None, {
+            "strategy_name": entry.strategy_name,
+            "symbol": entry.identity.symbol,
+            "reported_start": reported_start.isoformat(),
+            "reported_end": reported_end.isoformat(),
+            "reason": "LISTING_MISSING",
+        }
+    try:
+        listing = _listing_datetime(raw_listing)
+    except (TypeError, ValueError):
+        return None, {
+            "strategy_name": entry.strategy_name,
+            "symbol": entry.identity.symbol,
+            "reported_start": reported_start.isoformat(),
+            "reported_end": reported_end.isoformat(),
+            "listing_raw": str(raw_listing),
+            "reason": "LISTING_INVALID",
+        }
+    effective_start = max(reported_start, listing + timedelta(hours=120))
+    if effective_start >= report_end_inclusive:
+        return None, {
+            "strategy_name": entry.strategy_name,
+            "symbol": entry.identity.symbol,
+            "reported_start": reported_start.isoformat(),
+            "reported_end": reported_end.isoformat(),
+            "effective_start": effective_start.isoformat(),
+            "effective_end": reported_end.isoformat(),
+            "listing_raw": str(raw_listing),
+            "listing_normalized": listing.isoformat(),
+            "reason": "EFFECTIVE_RANGE_EMPTY",
+        }
+
+    for previous, current in zip(report.actions, report.actions[1:], strict=False):
+        if previous.timestamp_utc > current.timestamp_utc:
+            return None, {
+                "strategy_name": entry.strategy_name,
+                "symbol": entry.identity.symbol,
+                "reason": "ACTIONS_OUT_OF_ORDER",
+            }
+    for label, series in (("WALLET", report.wallet_series), ("EQUITY", report.equity_series)):
+        if any(previous[0] > current[0] for previous, current in zip(series, series[1:], strict=False)):
+            return None, {
+                "strategy_name": entry.strategy_name,
+                "symbol": entry.identity.symbol,
+                "reason": f"{label}_OUT_OF_ORDER",
+            }
+
+    # Group actions by complete position lifecycles.  A pyramided position has
+    # multiple opens and partial closes, so a single boolean is not enough.
+    retained: list[object] = []
+    current_trade: list[object] = []
+    active_trade = False
+    trade_excluded = False
+    excluded_trades = 0
+    retained_trade_count = 0
+    trade_results: list[Decimal] = []
+    for action in report.actions:
+        action_name = action.action.casefold()
+        if action.timestamp_utc > report_end_inclusive:
+            # Actions after the inclusive report end cannot complete a trade
+            # inside this report.  Leave the lifecycle open so it is dropped
+            # below instead of flushing an opening fee as a fake result.
+            break
+        if action_name not in {"opened", "increased", "decreased", "closed"}:
+            return None, {
+                "strategy_name": entry.strategy_name,
+                "symbol": entry.identity.symbol,
+                "reported_start": reported_start.isoformat(),
+                "reported_end": reported_end.isoformat(),
+                "effective_start": effective_start.isoformat(),
+                "effective_end": reported_end.isoformat(),
+                "listing_raw": str(raw_listing),
+                "listing_normalized": listing.isoformat(),
+                "action": action.action,
+                "reason": "UNKNOWN_ACTION",
+            }
+        is_open = action_name in {"opened", "increased"}
+        is_close = action_name in {"decreased", "closed"}
+        if is_open:
+            if action_name == "opened" and active_trade:
+                return None, {
+                    "strategy_name": entry.strategy_name,
+                    "symbol": entry.identity.symbol,
+                    "reported_start": reported_start.isoformat(),
+                    "reported_end": reported_end.isoformat(),
+                    "effective_start": effective_start.isoformat(),
+                    "effective_end": reported_end.isoformat(),
+                    "listing_raw": str(raw_listing),
+                    "listing_normalized": listing.isoformat(),
+                    "action": action.action,
+                    "reason": "INVALID_ACTION_STATE",
+                }
+            if action_name == "increased" and not active_trade:
+                return None, {
+                    "strategy_name": entry.strategy_name,
+                    "symbol": entry.identity.symbol,
+                    "reported_start": reported_start.isoformat(),
+                    "reported_end": reported_end.isoformat(),
+                    "effective_start": effective_start.isoformat(),
+                    "effective_end": reported_end.isoformat(),
+                    "listing_raw": str(raw_listing),
+                    "listing_normalized": listing.isoformat(),
+                    "action": action.action,
+                    "reason": "INVALID_ACTION_STATE",
+                }
+            if not active_trade:
+                active_trade = True
+                current_trade = []
+                trade_excluded = False
+            if action.timestamp_utc < effective_start:
+                trade_excluded = True
+            if not trade_excluded and action.timestamp_utc <= report_end_inclusive:
+                current_trade.append(action)
+        else:
+            if not active_trade:
+                return None, {
+                    "strategy_name": entry.strategy_name,
+                    "symbol": entry.identity.symbol,
+                    "reported_start": reported_start.isoformat(),
+                    "reported_end": reported_end.isoformat(),
+                    "effective_start": effective_start.isoformat(),
+                    "effective_end": reported_end.isoformat(),
+                    "listing_raw": str(raw_listing),
+                    "listing_normalized": listing.isoformat(),
+                    "action": action.action,
+                    "reason": "INVALID_ACTION_STATE",
+                }
+            if action.timestamp_utc < effective_start:
+                trade_excluded = True
+            if not trade_excluded:
+                current_trade.append(action)
+        # A flat post-size is the authoritative lifecycle boundary.  This
+        # handles both full ``closed`` rows and a full ``decreased`` row.
+        if active_trade and is_close and action.post_size == 0:
+            trade_pnl = sum((item.pnl - item.fee for item in current_trade), Decimal("0"))
+            if trade_excluded:
+                excluded_trades += 1
+            else:
+                retained.extend(current_trade)
+                trade_results.append(trade_pnl)
+                retained_trade_count += 1
+            current_trade = []
+            active_trade = False
+            trade_excluded = False
+    # An open position at the report boundary is not a complete round trip.
+    # Count an excluded one for diagnostics, but never publish its fee/PnL.
+    if active_trade:
+        # Every position still open at the report boundary is dropped. This
+        # applies equally to warm-up and no-trim reports, but an already
+        # counted excluded lifecycle must not be counted twice.
+        excluded_trades += 1
+    actions = tuple(retained)
+    if not actions:
+        return None, {
+            "strategy_name": entry.strategy_name,
+            "symbol": entry.identity.symbol,
+            "reported_start": reported_start.isoformat(),
+            "reported_end": reported_end.isoformat(),
+            "effective_start": effective_start.isoformat(),
+            "effective_end": reported_end.isoformat(),
+            "listing_raw": str(raw_listing),
+            "listing_normalized": listing.isoformat(),
+            "excluded_trade_count": excluded_trades,
+            "reason": "NO_EFFECTIVE_TRADE",
+        }
+    # When no warm-up is required and no partial lifecycle was dropped, tester
+    # metrics and samples are authoritative.  A dropped open-at-end lifecycle
+    # still requires the same reconciliation as a trimmed report.
+    if effective_start == reported_start and excluded_trades == 0:
+        return replace(
+            report,
+            reported_start_utc=reported_start,
+            reported_end_utc=reported_end,
+            listing_date_utc=listing,
+            listing_date_raw=str(raw_listing),
+            listing_date_source="configured_listing_dates_path",
+            effective_start_utc=effective_start,
+            effective_end_utc=reported_end,
+            warmup_hours=120,
+            excluded_trade_count=0,
+            exclusion_reason=None,
+        ), None
+
+    # Recompute the action-derived financial totals from retained lifecycles,
+    # but preserve every parsed action field.  In particular, do not invent a
+    # balance series from action deltas: wallet/equity are tester observations
+    # and must remain empty when the source did not provide them.
+    # Anchor the researched balance to the source's first pre-action balance;
+    # this removes all warm-up lifecycle deltas, including excluded fees/PnL.
+    source_first = report.actions[0]
+    baseline = source_first.balance - source_first.pnl + source_first.fee
+    fees = sum((action.fee for action in actions), Decimal("0"))
+    total_pnl = sum((action.pnl for action in actions), Decimal("0")) - fees
+    final = baseline + total_pnl
+
+    def rebuild_series(series: tuple[tuple[datetime, Decimal], ...]) -> tuple[tuple[datetime, Decimal], ...]:
+        if not series:
+            return ()
+        # Values are tester observations, not a synthetic balance projection.
+        # Only timestamps outside the retained report window are discarded.
+        return tuple(item for item in series if effective_start <= item[0] <= report_end_inclusive)
+
+    wallet = rebuild_series(report.wallet_series)
+    equity = rebuild_series(report.equity_series)
+    values = [value for _timestamp, value in equity or wallet]
+    max_drawdown: Decimal | None = None
+    if values:
+        # Seed the peak at the baseline so the first retained sample can
+        # legitimately establish drawdown below starting capital.
+        peak = baseline
+        max_drawdown = Decimal("0")
+        for value in values:
+            peak = max(peak, value)
+            max_drawdown = max(max_drawdown, peak - value)
+    gross_profit = sum((value for value in trade_results if value > 0), Decimal("0"))
+    # Gross loss is the positive magnitude of losing trade PnL, matching the
+    # Performance v2 window calculator and profit-factor convention.
+    gross_loss = -sum((value for value in trade_results if value < 0), Decimal("0"))
+    # Keep only metrics backed by the retained action/series set.  Parser
+    # values such as Sharpe/expectancy are not recomputable after warm-up and
+    # must not survive with their untrimmed values.
+    metrics = {
+        "Report range": f"{effective_start.date().isoformat()} - {reported_end.date().isoformat()}",
+        "Initial balance": _format_decimal(baseline),
+        "Final balance": _format_decimal(final),
+        "Total PnL": _format_decimal(total_pnl),
+        "Total PnL, %": _format_decimal((total_pnl / baseline * Decimal("100")) if baseline else Decimal("0")),
+        "Total Trades": str(retained_trade_count),
+        "Total transactions (buy/sell)": str(len(actions)),
+        "Total fees": _format_decimal(fees),
+        "Max Drawdown": _format_decimal(max_drawdown) if max_drawdown is not None else "N/A",
+        "Max Drawdown, %": _format_decimal((max_drawdown / baseline * Decimal("100")) if baseline and max_drawdown is not None else Decimal("0")) if max_drawdown is not None else "N/A",
+        "Win Trades": str(sum(1 for value in trade_results if value > 0)),
+        "Los Trades": str(sum(1 for value in trade_results if value < 0)),
+        "Gross profit": _format_decimal(gross_profit),
+        "Gross loss": _format_decimal(gross_loss),
+    }
+    timestamps = [action.timestamp_utc for action in actions]
+    timestamps.extend(timestamp for timestamp, _value in wallet)
+    timestamps.extend(timestamp for timestamp, _value in equity)
+    inventory = replace(
+        report.inventory,
+        trade_row_count=len(actions),
+        wallet_sample_count=len(wallet),
+        equity_sample_count=len(equity),
+        minimum_timestamp=min(timestamps),
+        maximum_timestamp=max(timestamps),
+    )
+    return replace(
+        report,
+        metrics=metrics,
+        actions=actions,
+        wallet_series=wallet,
+        equity_series=equity,
+        inventory=inventory,
+        reported_start_utc=reported_start,
+        reported_end_utc=reported_end,
+        listing_date_utc=listing,
+        listing_date_raw=str(raw_listing),
+        listing_date_source="configured_listing_dates_path",
+        effective_start_utc=effective_start,
+        effective_end_utc=reported_end,
+        warmup_hours=120,
+        excluded_trade_count=excluded_trades,
+        exclusion_reason=None,
+    ), None
+
+
+def _prepare_listing_ranges(
+    request: PerformanceV2ImportRequest,
+    prepared: PreparedV2Input,
+    parsed: tuple[ParsedPerformanceV2Report | None, ...],
+) -> tuple[tuple[ParsedPerformanceV2Report | None, ...], list[dict[str, object]]]:
+    path = request.listing_dates_path
+    if path is None:
+        path = prepared.listing_dates_path
+    if path is None:
+        # A listing date is required for every run mode. Publishing an
+        # untrimmed report would make the warm-up contract depend on mode.
+        failures = [
+            {
+                "strategy_name": entry.strategy_name,
+                "symbol": entry.identity.symbol,
+                "reason": "LISTING_MISSING",
+            }
+            for entry, report in zip(prepared.entries, parsed, strict=True)
+            if report is not None
+        ]
+        return (None,) * len(parsed), failures
+    path = Path(path)
+    if ".." in path.parts:
+        raise PerformanceV2ImportError("listing dates path contains parent traversal")
+    if path.is_absolute():
+        raise PerformanceV2ImportError("listing dates path must be relative to a trusted input root")
+    if not path.is_absolute():
+        # The inbox parent is the one declared trusted input root. Do not
+        # probe strategy/database roots: that makes resolution depend on
+        # unrelated filesystem state.
+        path = request.inbox.parent / path
+    if path.is_symlink():
+        raise PerformanceV2ImportError("listing dates path cannot use a symlink")
+    if not path.is_file():
+        raise PerformanceV2ImportError("listing dates path is not a regular file")
+    trusted_root = request.inbox.parent.resolve()
+    try:
+        path = path.resolve(strict=True)
+        path.relative_to(trusted_root)
+    except (OSError, ValueError) as error:
+        raise PerformanceV2ImportError("listing dates path is outside the trusted input root") from error
+    failures: list[dict[str, object]] = []
+    try:
+        loaded = load_listing_dates(path)
+        listing_dates: Mapping[str, object] = loaded
+    except Exception as error:
+        raise PerformanceV2ImportError("listing dates file could not be loaded") from error
+    filtered: list[ParsedPerformanceV2Report | None] = []
+    for entry, report in zip(prepared.entries, parsed, strict=True):
+        if report is None:
+            filtered.append(None)
+            continue
+        try:
+            result, failure = _warmup_report(entry, report, listing_dates)
+        except Exception as error:
+            result, failure = None, {
+                "strategy_name": entry.strategy_name,
+                "symbol": entry.identity.symbol,
+                "reason": "WARMUP_FAILED",
+                "error": str(error),
+            }
+        filtered.append(result)
+        if failure is not None:
+            failure["listing_dates_path"] = str(path)
+            failures.append(failure)
+    return tuple(filtered), failures
+
+
+def _write_failure_reports(
+    config: PerformanceV2Config,
+    rows: list[dict[str, object]],
+    *,
+    import_id: str,
+    status: str,
+) -> tuple[Path, Path | None]:
+    root = config.database_root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    csv_path = root / f"performance_v2_failures_{import_id}_{stamp}.csv"
+    xlsx_path = root / f"performance_v2_failures_{import_id}_{stamp}.xlsx"
+    rows = [dict(row, import_id=import_id, outcome=status) for row in rows]
+    # Keep this artifact schema stable for operators and downstream tooling.
+    # These are all fields emitted by parser, warm-up, validation and abort
+    # paths; missing values remain blank in a given row.
+    keys = [
+        "reason", "strategy_name", "symbol", "import_id", "outcome",
+        "reported_start", "reported_end", "effective_start", "effective_end",
+        "listing_raw", "listing_normalized", "listing_dates_path", "action",
+        "excluded_trade_count", "error",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(rows)
+    try:
+        pd.DataFrame(rows, columns=keys).to_excel(xlsx_path, index=False)
+    except Exception:
+        # Keep the CSV path usable when the optional Excel writer is not
+        # available or the second artifact cannot be written.
+        try:
+            xlsx_path.unlink()
+        except OSError:
+            pass
+        return csv_path, None
+    return csv_path, xlsx_path
 
 
 def _decimal_metric(metrics: Mapping[str, str], *names: str, default: Decimal | None = None) -> Decimal | None:
@@ -224,10 +677,28 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _validate_report(entry: PreparedV2Entry, report: ParsedPerformanceV2Report) -> None:
+def _validate_report(
+    entry: PreparedV2Entry,
+    report: ParsedPerformanceV2Report,
+    prepared: PreparedV2Input | None = None,
+    request: PerformanceV2ImportRequest | None = None,
+    *,
+    check_range: bool = True,
+) -> None:
     basic = report.settings.get("basic")
     if not isinstance(basic, Mapping) or str(basic.get("symbol", "")).strip() != entry.identity.symbol:
         raise PerformanceV2ImportError(f"report symbol does not match strategy {entry.strategy_name!r}")
+    configured_start = getattr(prepared, "test_start", None)
+    configured_end = getattr(prepared, "test_end", None)
+    if request is not None and request.test_start is not None and (request.test_start, request.test_end) != (configured_start, configured_end):
+        raise PerformanceV2ImportError("request test range does not match the prepared inbox")
+    if check_range and configured_start is not None and configured_end is not None:
+        try:
+            reported_start, reported_end = report_range(report.metrics)
+        except PerformanceParseError as error:
+            raise PerformanceV2ImportError(f"report period is invalid for strategy {entry.strategy_name!r}") from error
+        if (reported_start.date().isoformat(), reported_end.date().isoformat()) != (configured_start, configured_end):
+            raise PerformanceV2ImportError(f"report range does not match configured batch for strategy {entry.strategy_name!r}")
 
 
 def _load_existing(connection: duckdb.DuckDBPyConnection, names: tuple[str, ...]) -> tuple[dict[str, tuple[object, ...]], dict[int, list[tuple[object, ...]]], dict[int, tuple[object, ...]], dict[str, set[str]]]:
@@ -263,7 +734,10 @@ def _load_existing(connection: duckdb.DuckDBPyConnection, names: tuple[str, ...]
             for row in connection.execute(
                 f"""select result_id, strategy_id, report_start_utc, report_end_utc, exchange,
                            commission_rate, initial_balance, final_balance, total_pnl,
-                           total_pnl_pct, max_drawdown, max_drawdown_pct, total_fees, total_trades
+                           total_pnl_pct, max_drawdown, max_drawdown_pct, total_fees, total_trades,
+                           reported_start_utc, reported_end_utc, listing_date_utc, listing_date_raw,
+                           listing_date_source, effective_start_utc, effective_end_utc, warmup_hours,
+                           excluded_trade_count, exclusion_reason
                        from strategy_results where result_id in ({result_placeholders})""",
                 list(result_ids),
             ).fetchall()
@@ -311,9 +785,13 @@ def _result_matches(report: ParsedPerformanceV2Report, row: tuple[object, ...], 
         start, end = report_range(report.metrics)
     except PerformanceParseError:
         return False
+    reported_start = (report.reported_start_utc or start).astimezone(timezone.utc)
+    reported_end = (report.reported_end_utc or end).astimezone(timezone.utc)
+    effective_start = (report.effective_start_utc or reported_start).astimezone(timezone.utc)
+    effective_end = (report.effective_end_utc or reported_end).astimezone(timezone.utc)
     expected = (
-        start,
-        end,
+        effective_start,
+        effective_end,
         str(report.settings.get("exchange", {}).get("name", entry.exchange_name)) if isinstance(report.settings.get("exchange"), Mapping) else entry.exchange_name,
         Decimal(contract["TakerFee"]),
         _decimal_metric(report.metrics, "Initial balance", default=Decimal("0")),
@@ -325,7 +803,26 @@ def _result_matches(report: ParsedPerformanceV2Report, row: tuple[object, ...], 
         _decimal_metric(report.metrics, "Total fees", "Total Fees"),
         _int_metric(report.metrics, "Total Trades"),
     )
-    return all(a == b for a, b in zip(expected, row[2:], strict=True))
+    if not all(a == b for a, b in zip(expected, row[2:14], strict=True)):
+        return False
+
+    def utc(value: object) -> object:
+        return value.astimezone(timezone.utc) if isinstance(value, datetime) else value
+
+    provenance = (
+        reported_start,
+        reported_end,
+        utc(report.listing_date_utc),
+        report.listing_date_raw,
+        report.listing_date_source,
+        effective_start,
+        effective_end,
+        report.warmup_hours,
+        report.excluded_trade_count,
+        report.exclusion_reason,
+    )
+    actual_provenance = tuple(utc(value) for value in row[14:24])
+    return provenance == actual_provenance
 
 
 def _plateau_facts(connection: duckdb.DuckDBPyConnection, prepared: PreparedV2Input) -> dict[tuple[str, str], tuple[object, ...]]:
@@ -442,8 +939,10 @@ def _publish(
     connection: duckdb.DuckDBPyConnection,
     request: PerformanceV2ImportRequest,
     prepared: PreparedV2Input,
-    parsed: tuple[ParsedPerformanceV2Report, ...],
+    parsed: tuple[ParsedPerformanceV2Report | None, ...],
     import_id: str,
+    *,
+    failure_reasons: Mapping[str, str] | None = None,
 ) -> tuple[int, int, int]:
     names = tuple(entry.strategy_name for entry in prepared.entries)
     existing, existing_orders, existing_results, known_hashes = _load_existing(connection, names)
@@ -460,10 +959,15 @@ def _publish(
             if row is None or int(row[1]) != int(strategy_id):
                 raise PerformanceV2ImportError(f"replacement mapping does not match existing strategy {name!r}")
 
-    decisions: list[tuple[str, PreparedV2Entry, ParsedPerformanceV2Report, tuple[object, ...] | None]] = []
+    decisions: list[tuple[str, PreparedV2Entry, ParsedPerformanceV2Report | None, tuple[object, ...] | None]] = []
     skipped = 0
+    rejected = 0
     for entry, report in zip(prepared.entries, parsed, strict=True):
-        _validate_report(entry, report)
+        if report is None:
+            decisions.append(("REJECTED", entry, None, None))
+            rejected += 1
+            continue
+        _validate_report(entry, report, prepared, request, check_range=False)
         row = existing.get(entry.strategy_name)
         if row is None:
             if request.mode == "REPLACE":
@@ -532,6 +1036,10 @@ def _publish(
                 [fact.analysis_run_id, fact.plateau_id, fact.plateau_point_count, fact.plateau_total_trades],
             )
         for decision, entry, report, old in decisions:
+            if report is None:
+                reason = (failure_reasons or {}).get(entry.strategy_name, "INVALID_REPORT")
+                result_files.append((entry.report_path.name, report_hash(entry), entry.report_path.stat().st_size, 0, 0, f"REJECTED:{reason}"))
+                continue
             if decision == "SKIPPED":
                 result_files.append((entry.report_path.name, report_hash(entry), entry.report_path.stat().st_size, len(report.actions), len(report.equity_series), "SKIPPED"))
                 continue
@@ -566,8 +1074,11 @@ def _publish(
             result_id = int(connection.execute(
                 """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
                    commission_rate, initial_balance, final_balance, total_pnl, total_pnl_pct,
-                   max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc)
-                   values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
+                   max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc,
+                   reported_start_utc, reported_end_utc, listing_date_utc, listing_date_raw,
+                   listing_date_source, effective_start_utc, effective_end_utc, warmup_hours,
+                   excluded_trade_count, exclusion_reason)
+                   values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
                 [strategy_id, *values],
             ).fetchone()[0])
             result_ids[entry.strategy_name] = result_id
@@ -602,38 +1113,58 @@ def _publish(
         expected_action_counts = {
             result_ids[entry.strategy_name]: len(report.actions)
             for decision, entry, report, _old in decisions
-            if decision != "SKIPPED"
+            if decision in {"ADD", "REPLACE"} and report is not None
         }
+        imported_names = [
+            entry.strategy_name
+            for decision, entry, report, _old in decisions
+            if decision in {"ADD", "REPLACE"} and report is not None
+        ]
         actual_action_counts = {
             int(row[0]): int(row[1])
             for row in connection.execute(
-                "select result_id, count(*) from strategy_actions where result_id in (select current_result_id from strategies where strategy_name in (" + ",".join("?" for _ in expected_action_counts) + ")) group by result_id",
-                list(names),
+                "select result_id, count(*) from strategy_actions where result_id in (select current_result_id from strategies where strategy_name in (" + ",".join("?" for _ in imported_names) + ")) group by result_id",
+                imported_names,
             ).fetchall()
-        } if expected_action_counts else {}
+        } if imported_names else {}
         if any(actual_action_counts.get(result_id, 0) != count for result_id, count in expected_action_counts.items()):
             raise PerformanceV2ImportError("action readback count mismatch")
         expected_equity_counts = {
             result_ids[entry.strategy_name]: len(report.equity_series)
             for decision, entry, report, _old in decisions
-            if decision != "SKIPPED"
+            if decision in {"ADD", "REPLACE"} and report is not None
         }
         actual_equity_counts = {
             int(row[0]): int(row[1])
             for row in connection.execute(
-                "select result_id, count(*) from strategy_equity where result_id in (select current_result_id from strategies where strategy_name in (" + ",".join("?" for _ in expected_equity_counts) + ")) group by result_id",
-                list(names),
+                "select result_id, count(*) from strategy_equity where result_id in (select current_result_id from strategies where strategy_name in (" + ",".join("?" for _ in imported_names) + ")) group by result_id",
+                imported_names,
             ).fetchall()
-        } if expected_equity_counts else {}
+        } if imported_names else {}
         if any(actual_equity_counts.get(result_id, 0) != count for result_id, count in expected_equity_counts.items()):
             raise PerformanceV2ImportError("equity readback count mismatch")
+        # RETEST is removed only after all replacement readbacks pass.  Since
+        # this remains in the same transaction, any later failure preserves
+        # both the old result and its tag.
+        if request.clear_retest_on_success and request.mode == "REPLACE":
+            replaced_ids = [
+                int(request.replacement_strategy_ids[entry.strategy_name])
+                for decision, entry, _report, old in decisions
+                if decision in {"REPLACE", "SKIPPED"} and old is not None
+            ]
+            if replaced_ids:
+                placeholders = ",".join("?" for _ in replaced_ids)
+                connection.execute(
+                    f"delete from strategy_tags where tag = 'RETEST' and strategy_id in ({placeholders})",
+                    replaced_ids,
+                )
         connection.execute(
-            """update import_runs set imported_count = ?, skipped_count = ?, rejected_count = 0,
+            """update import_runs set imported_count = ?, skipped_count = ?, rejected_count = ?,
                status = 'COMMITTED', finished_at_utc = ? where source_inbox_sha256 = ?""",
-            [imported, skipped, _utc_now(), prepared.inbox_snapshot_sha256],
+            [imported, skipped, rejected, _utc_now(), prepared.inbox_snapshot_sha256],
         )
         connection.execute("commit")
-        return imported, skipped, 0
+        return imported, skipped, rejected
     except Exception as error:
         try:
             connection.execute("rollback")
@@ -653,9 +1184,13 @@ def _result_values(entry: PreparedV2Entry, report: ParsedPerformanceV2Report, co
     exchange_name = entry.exchange_name
     if isinstance(exchange, Mapping) and isinstance(exchange.get("name"), str) and exchange["name"].strip():
         exchange_name = exchange["name"].strip()
+    reported_start = (report.reported_start_utc or start).astimezone(timezone.utc)
+    reported_end = (report.reported_end_utc or end).astimezone(timezone.utc)
+    effective_start = (report.effective_start_utc or reported_start).astimezone(timezone.utc)
+    effective_end = (report.effective_end_utc or reported_end).astimezone(timezone.utc)
     return [
-        start,
-        end,
+        effective_start,
+        effective_end,
         exchange_name,
         Decimal(contract["TakerFee"]),
         _decimal_metric(report.metrics, "Initial balance", default=Decimal("0")),
@@ -667,6 +1202,16 @@ def _result_values(entry: PreparedV2Entry, report: ParsedPerformanceV2Report, co
         _decimal_metric(report.metrics, "Total fees", "Total Fees"),
         _int_metric(report.metrics, "Total Trades"),
         now,
+        reported_start,
+        reported_end,
+        report.listing_date_utc,
+        report.listing_date_raw,
+        report.listing_date_source,
+        effective_start,
+        effective_end,
+        report.warmup_hours,
+        report.excluded_trade_count,
+        report.exclusion_reason,
     ]
 
 
@@ -674,7 +1219,14 @@ def report_hash(entry: PreparedV2Entry) -> str:
     return entry.report_sha256
 
 
-def _write_audit(config: PerformanceV2Config, request: PerformanceV2ImportRequest, result: PerformanceV2ImportResult | None, error: Exception | None, source_hash: str | None) -> Path:
+def _write_audit(
+    config: PerformanceV2Config,
+    request: PerformanceV2ImportRequest,
+    result: PerformanceV2ImportResult | None,
+    error: Exception | None,
+    source_hash: str | None,
+    failure_report_paths: tuple[Path, Path | None] | None = None,
+) -> Path:
     path = config.database_root.resolve() / "import_audit.v2.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -686,8 +1238,13 @@ def _write_audit(config: PerformanceV2Config, request: PerformanceV2ImportReques
         "imported_count": result.imported_count if result is not None else 0,
         "skipped_count": result.skipped_count if result is not None else 0,
         "rejected_count": result.rejected_count if result is not None else 1,
+        "failure_count": result.failure_count if result is not None else 1,
+        "excluded_trade_count": result.excluded_trade_count if result is not None else 0,
         "error": str(error) if error is not None else None,
         "database_path": str(performance_v2_database_path(config)),
+        "failure_report_paths": [
+            str(path) for path in failure_report_paths if path is not None
+        ] if failure_report_paths else [],
     }
     path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
     return path
@@ -712,10 +1269,23 @@ def import_performance_v2(
     connection: duckdb.DuckDBPyConnection | None = None
     staging: Path | None = None
     lock_acquired = False
+    writer_lock: PerformanceV2WriterLock | None = None
     prepared: PreparedV2Input | None = None
     result: PerformanceV2ImportResult | None = None
     failure: Exception | None = None
+    failure_rows: list[dict[str, object]] = []
+    import_id = uuid4().hex
+    failure_report_paths: tuple[Path, Path | None] | None = None
     try:
+        writer_lock = PerformanceV2WriterLock(target.parent)
+        try:
+            writer_lock.__enter__()
+        except PerformanceV2StoreError as error:
+            if "root does not exist" in str(error).casefold():
+                raise PerformanceV2ImportError(
+                    "Performance v2 target does not exist or does not have schema version 2"
+                ) from error
+            raise PerformanceV2LockedError("Performance v2 database writer is busy") from error
         try:
             connection = duckdb.connect(str(target))
         except duckdb.Error as error:
@@ -739,13 +1309,81 @@ def import_performance_v2(
             config=config,
             strategy_root=request.strategy_root,
         )
+        if request.test_start is not None and (request.test_start, request.test_end) != (prepared.test_start, prepared.test_end):
+            raise PerformanceV2ImportError("request test range does not match the prepared inbox")
         staging = create_v2_parser_staging(config.database_root, prepared)
         parsed = _parse_reports(staging, prepared, config, progress)
+        parse_failures: list[dict[str, object]] = []
+        validation_failures: list[dict[str, object]] = []
+        validated: list[ParsedPerformanceV2Report | None] = []
+        for entry, report in zip(prepared.entries, parsed, strict=True):
+            if report is None:
+                validated.append(None)
+                parse_failures.append({
+                    "strategy_name": entry.strategy_name,
+                    "symbol": entry.identity.symbol,
+                    "reason": "INVALID_REPORT",
+                })
+                continue
+            try:
+                _validate_report(entry, report, prepared, request)
+            except PerformanceV2ImportError as error:
+                validated.append(None)
+                validation_failures.append({
+                    "strategy_name": entry.strategy_name,
+                    "symbol": entry.identity.symbol,
+                    "reason": "INVALID_REPORT",
+                    "error": str(error),
+                })
+            else:
+                validated.append(report)
+        parsed, listing_failures = _prepare_listing_ranges(request, prepared, tuple(validated))
+        failure_rows = parse_failures + listing_failures + validation_failures
         if progress is not None:
             progress("PUBLISHING", len(parsed), len(parsed))
-        import_id = uuid4().hex
-        imported, skipped, rejected = _publish(connection, request, prepared, parsed, import_id)
-        result = PerformanceV2ImportResult(import_id, "COMMITTED", imported, skipped, rejected, target)
+        failure_reasons = {
+            str(row["strategy_name"]): str(row.get("reason", "INVALID_REPORT"))
+            for row in failure_rows
+            if row.get("strategy_name")
+        }
+        imported, skipped, rejected = _publish(
+            connection,
+            request,
+            prepared,
+            parsed,
+            import_id,
+            failure_reasons=failure_reasons,
+        )
+        if failure_rows:
+            try:
+                failure_report_paths = _write_failure_reports(
+                    request.config, failure_rows, import_id=import_id, status="COMMITTED"
+                )
+            except Exception:
+                # The database transaction is already committed.  Report I/O
+                # must not turn a successful publication into a false FAILED.
+                failure_report_paths = None
+        result = PerformanceV2ImportResult(
+            import_id,
+            "COMMITTED",
+            imported,
+            skipped,
+            rejected,
+            target,
+            None,
+            {},
+            failure_report_paths[0] if failure_report_paths else None,
+            failure_report_paths[1] if failure_report_paths else None,
+            len(failure_rows),
+            sum(
+                int(row.get("excluded_trade_count", 0) or 0)
+                for row in failure_rows
+            ) + sum(
+                report.excluded_trade_count
+                for report in parsed
+                if report is not None
+            ),
+        )
     except Exception as error:
         failure = (
             error
@@ -756,6 +1394,18 @@ def import_performance_v2(
         )
         if failure is not error:
             failure.__cause__ = error
+        if failure_report_paths is None and (failure_rows or connection is not None):
+            try:
+                report_rows = failure_rows or [{
+                    "strategy_name": "",
+                    "reason": "IMPORT_ABORTED",
+                    "error": str(failure),
+                }]
+                failure_report_paths = _write_failure_reports(
+                    request.config, report_rows, import_id=import_id, status="FAILED"
+                )
+            except Exception:
+                failure_report_paths = None
     finally:
         if connection is not None:
             connection.close()
@@ -768,12 +1418,26 @@ def import_performance_v2(
                     failure.__cause__ = error
         if lock_acquired and not isinstance(failure, PerformanceV2LockedError):
             try:
-                audit_path = _write_audit(config, request, result, failure, prepared.inbox_snapshot_sha256 if prepared else None)
+                audit_path = _write_audit(
+                    config,
+                    request,
+                    result,
+                    failure,
+                    prepared.inbox_snapshot_sha256 if prepared else None,
+                    failure_report_paths,
+                )
                 if result is not None:
-                    result = PerformanceV2ImportResult(result.import_id, result.status, result.imported_count, result.skipped_count, result.rejected_count, result.database_path, audit_path, result.phases)
+                    result = replace(result, audit_path=audit_path)
             except Exception as error:
                 if failure is None:
                     failure = PerformanceV2ImportError("v2 audit write failed")
+                    failure.__cause__ = error
+        if writer_lock is not None:
+            try:
+                writer_lock.__exit__(None, None, None)
+            except Exception as error:
+                if failure is None:
+                    failure = PerformanceV2ImportError("Performance v2 writer lock release failed")
                     failure.__cause__ = error
     if failure is not None:
         raise failure

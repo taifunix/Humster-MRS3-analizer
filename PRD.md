@@ -67,6 +67,11 @@ analysis runs и lineage согласно уже реализованной
 
 | № | Результат | Входной критерий | Выходной критерий |
 | --- | --- | --- | --- |
+| Current governing contract | [Performance DB v2 CHECK & RETEST](docs/specs/2026-09-03-performance-v2-retest-workflow.md) | listing-date warm-up, raw DD, PnL/30d and Trades/30d comparison, atomic valid-sibling import and safe RETEST recovery | production Task 7 backup/migration/seed |
+
+> The older 2026-08-14 Performance import/DD5 rows below are retained as
+> historical provenance; the 2026-09-03 Performance DB v2 contract governs the
+> current runtime and selection behavior.
 | 0 | Репозиторий v0.7 | перенесён baseline | root package, tests, docs и Git готовы |
 | 1 | Проверенный v4 import | база и audit доступны | schema v4, manifest, quarantine/checklist проверены |
 | 2 | Source packages | CSV и raw payloads v4 | один declared event mode, window и audit на пакет |
@@ -110,7 +115,7 @@ analysis runs и lineage согласно уже реализованной
 | Optional / Deferred | [v0.7 CSV-DuckDB overlay](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md) | необязательное объединение CSV coarse-grid и DuckDB fine-grid | DuckDB analysis storage, event-filter spec |
 | Accepted | [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) | раздельная full-horizon/windowed verification для real packages v2 | event source packs |
 | Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
-| Planned | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | empirical cap без leakage | завершённые tick-tests |
+| Superseded / historical | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | legacy posttest calibration retained for provenance | Performance DB v2 RETEST |
 | Queued — hook «Анализатор Портфеля» | [Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) | отдельный анализ готовых MRS3-стратегий и сетов | individual results, trade timestamps, limiter/L2/margin contract |
 | Accepted | [ADR-0001](docs/decisions/0001-repository-and-documentation-model.md) | root v0.7 и модель документации | — |
 | Pending production acceptance | [Strategy performance DuckDB governing spec](docs/specs/2026-08-14-strategy-performance-duckdb.md) | transactional performance import, DB-only DD5 and safe cleanup | [ADR-0004](docs/decisions/0004-strategy-performance-evidence-store.md) |

@@ -25,11 +25,13 @@ from mrs3.runner.monitor import BatchCompletion, BatchRetryExhausted, StrategyCo
 from mrs3.runner.inbox import capture_run_snapshot_inbox
 
 
-def _native_report(name: str, suffix: str = "") -> str:
+def _native_report(name: str, suffix: str = "", *, start: str = "2026-01-01", end: str = "2026-01-02") -> str:
     return (
-        f'<pre>{{"name":"{name}","basic":{{"symbol":"BTCUSDT","time_frame":"1h"}}}}</pre>'
+        f'<pre>{{"name":"{name}","basic":{{"symbol":"BTCUSDT","time_frame":"1h"}},'
+        '"mrs3":{"ma_long":[{"id":1,"len":5,"multiplier":"0.99","lot_x":"1"}],'
+        '"ma_close_long":{"len":3}}}</pre>'
         '<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>'
-        '<tr><td>Report range</td><td>2026-01-01 - 2026-01-02</td></tr>'
+        f'<tr><td>Report range</td><td>{start} - {end}</td></tr>'
         '</tbody></table>'
         '<table><thead><tr><th>Timestamp</th><th>Symbol</th><th>Order ID</th>'
         '<th>Action</th><th>Fee</th><th>PnL</th><th>Balance</th><th>Size</th>'
@@ -198,7 +200,7 @@ def test_native_single_mode_installs_each_batch_before_one_native_run_and_create
         def run_tester(self) -> None:
             events.append("run")
             for name in self.expected:
-                (config.report_dir / f"{name}.html").write_text(_native_report(name), encoding="utf-8")
+                (config.report_dir / f"{name}.html").write_text(_native_report(name, start="2026-08-01", end="2026-08-31"), encoding="utf-8")
 
         def tester_status(self) -> str:
             value = next(self.statuses)
@@ -260,8 +262,8 @@ def test_native_single_mode_chooses_newest_complete_report_for_embedded_name(tmp
         def run_tester(self) -> None:
             old = config.report_dir / "old-name.html"
             new = config.report_dir / "new-name.html"
-            old.write_text(_native_report(names[0], " old"), encoding="utf-8")
-            new.write_text(_native_report(names[0], " new"), encoding="utf-8")
+            old.write_text(_native_report(names[0], " old", start="2026-08-01", end="2026-08-31"), encoding="utf-8")
+            new.write_text(_native_report(names[0], " new", start="2026-08-01", end="2026-08-31"), encoding="utf-8")
             os.utime(old, (1, 1))
             os.utime(new, (2, 2))
 
@@ -286,6 +288,54 @@ def test_native_single_mode_chooses_newest_complete_report_for_embedded_name(tmp
     assert status["evidence"]["verified_reports"] == {names[0]: "new-name.html"}
     assert (config.report_dir / "old-name.html").is_file()
     assert (config.report_dir / "new-name.html").is_file()
+
+
+def test_native_single_mode_rejects_wrong_report_range(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path, 1)
+    config = replace(
+        _runner_config(tmp_path),
+        poll_interval_seconds=0.001,
+        batch_timeout_seconds=2,
+        stall_timeout_seconds=2,
+        max_strategy_attempts=1,
+    )
+    runs = 0
+
+    class NativeClient:
+        def __init__(self) -> None:
+            self.statuses = iter(("Running", "Idle", "Idle"))
+
+        def run_tester(self) -> None:
+            nonlocal runs
+            runs += 1
+            (config.report_dir / f"{names[0]}.html").write_text(_native_report(names[0]), encoding="utf-8")
+
+        def tester_status(self) -> str:
+            return f'<span class="stat-value">{next(self.statuses)}</span>'
+
+        def close(self) -> None:
+            pass
+
+    service = LocalSingleModeStrategyTestService(
+        config,
+        start_bot=lambda _: None,
+        stop_bot=lambda _: None,
+        client_factory=lambda _: NativeClient(),
+        wait_for_exact_batch=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wizard launch")),
+        monitor=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wizard monitor")),
+    )
+    started = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="native-wrong-range",
+    )
+    status = _wait_terminal(service, str(started["job_id"]))
+
+    assert status["state"] == "FAILED", status
+    assert status["error"]["code"] == "SINGLE_MODE_RETRIES_EXHAUSTED"
+    assert runs == 1
 
 
 def test_native_single_mode_retries_marker_only_report_then_rejects_it(tmp_path: Path) -> None:
@@ -361,7 +411,7 @@ def test_native_single_mode_retries_malformed_series_then_rejects_it(
         def run_tester(self) -> None:
             nonlocal runs
             runs += 1
-            report = _native_report(names[0]).replace(
+            report = _native_report(names[0], start="2026-08-01", end="2026-08-31").replace(
                 f'const {series_name} = [[1767225600000,"1000"]];',
                 f"const {series_name} = malformed;",
             )
@@ -460,6 +510,8 @@ def test_v2_accepts_external_strategy_only_under_trusted_output_root(tmp_path: P
     manifest = {
         "schema_version": 1,
         "run_mode": "SINGLE_MODE",
+        "test_start": "2026-08-01",
+        "test_end": "2026-08-31",
         "expected_strategy_names": ["A"],
         "entries": [entry],
         "commission_contract": {
@@ -575,7 +627,7 @@ def test_single_mode_auto_captures_metadata_inbox_and_marks_ready(tmp_path: Path
 
         def run_tester(self) -> None:
             report = config.report_dir / f"{names[0]}.html"
-            report.write_text(_native_report(names[0]), encoding="utf-8")
+            report.write_text(_native_report(names[0], start="2026-08-01", end="2026-08-31"), encoding="utf-8")
 
         def tester_status(self) -> str:
             return f'<span class="stat-value">{next(self.statuses)}</span>'

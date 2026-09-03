@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -11,6 +12,7 @@ from mrs3.performance_import import PerformanceImportRequest, allocate_performan
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
+    _SELECTION_SCHEMA_V3,
     initialize_performance_v2,
     load_performance_v2_config,
     performance_v2_database_path,
@@ -136,13 +138,13 @@ def test_versioned_performance_config_keeps_the_configured_thirty_worker_default
     assert load_performance_v2_config(config_path).workers == 30
 
 
-def test_initialize_is_idempotent_and_requires_internal_schema_v3() -> None:
+def test_initialize_is_idempotent_and_requires_internal_schema_v4() -> None:
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
         initialize_performance_v2(connection)
 
         require_performance_v2(connection)
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("3",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("4",)
         instance_id = connection.execute(
             "select value from schema_info where key = 'database_instance_id'"
         ).fetchone()[0]
@@ -157,7 +159,94 @@ def test_initialize_is_idempotent_and_requires_internal_schema_v3() -> None:
         })
 
 
-def test_initialize_migrates_schema_v2_without_changing_existing_facts() -> None:
+def test_strategy_tags_require_nonempty_source_ref() -> None:
+    with duckdb.connect(":memory:") as connection:
+        initialize_performance_v2(connection)
+        strategy_id = _strategy(connection)
+
+        with pytest.raises(duckdb.ConstraintException):
+            connection.execute(
+                "insert into strategy_tags values (?, 'RETEST', 'SELECTION_REVIEW', ' ', now())",
+                [strategy_id],
+            )
+
+
+def test_v4_reentry_restores_legacy_window_columns_before_validation() -> None:
+    with duckdb.connect(":memory:") as connection:
+        initialize_performance_v2(connection)
+        connection.execute("alter table window_metrics drop column holding_seconds")
+        connection.execute("alter table window_metrics drop column time_in_market_pct")
+
+        initialize_performance_v2(connection)
+
+        columns = {
+            row[0]
+            for row in connection.execute(
+                "select column_name from information_schema.columns where table_name = 'window_metrics'"
+            ).fetchall()
+        }
+        assert {"holding_seconds", "time_in_market_pct"} <= columns
+
+
+def test_v4_reentry_adds_result_provenance_without_changing_existing_facts() -> None:
+    with duckdb.connect(":memory:") as connection:
+        initialize_performance_v2(connection)
+        strategy_id = _strategy(connection)
+        connection.execute(
+            """insert into strategy_results (
+                strategy_id, report_start_utc, report_end_utc, exchange,
+                commission_rate, initial_balance, final_balance, imported_at_utc
+            ) values (?, '2026-01-01', '2026-01-09', 'BYBIT', .001, 100, 101, now())""",
+            [strategy_id],
+        )
+        initialize_performance_v2(connection)
+        columns = {
+            row[0] for row in connection.execute(
+                "select column_name from information_schema.columns where table_name = 'strategy_results'"
+            ).fetchall()
+        }
+        assert {
+            "reported_start_utc", "reported_end_utc", "listing_date_utc", "listing_date_raw",
+            "listing_date_source", "effective_start_utc", "effective_end_utc", "warmup_hours",
+            "excluded_trade_count", "exclusion_reason",
+        } <= columns
+        assert connection.execute("select count(*) from strategy_results").fetchone() == (1,)
+        initialize_performance_v2(connection)
+
+
+def test_v4_marker_with_foreign_catalog_is_rejected_before_window_repair() -> None:
+    with duckdb.connect(":memory:") as connection:
+        connection.execute("create table schema_info (key varchar primary key, value varchar not null)")
+        connection.executemany(
+            "insert into schema_info values (?, ?)",
+            [("schema_version", "4"), ("database_kind", "unified_performance_v2"),
+             ("database_instance_id", "00000000-0000-0000-0000-000000000001")],
+        )
+        connection.execute("create table foreign_facts (value integer)")
+
+        with pytest.raises(PerformanceV2StoreError, match="catalog"):
+            initialize_performance_v2(connection)
+
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("4",)
+        assert connection.execute("select count(*) from information_schema.tables where table_name = 'foreign_facts'").fetchone() == (1,)
+        assert connection.execute("select count(*) from information_schema.tables where table_name = 'window_metrics'").fetchone() == (0,)
+
+
+def test_v4_invalid_instance_id_is_rejected_before_window_repair() -> None:
+    with duckdb.connect(":memory:") as connection:
+        initialize_performance_v2(connection)
+        connection.execute("update schema_info set value = 'not-a-uuid' where key = 'database_instance_id'")
+        connection.execute("alter table window_metrics drop column holding_seconds")
+        connection.execute("alter table window_metrics drop column time_in_market_pct")
+
+        with pytest.raises(PerformanceV2StoreError, match="invalid instance identity"):
+            initialize_performance_v2(connection)
+
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("4",)
+        assert connection.execute("select column_name from information_schema.columns where table_name = 'window_metrics' and column_name in ('holding_seconds', 'time_in_market_pct')").fetchall() == []
+
+
+def test_initialize_migrates_schema_v2_through_v4_without_changing_existing_facts() -> None:
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
         for table in (
@@ -166,19 +255,192 @@ def test_initialize_migrates_schema_v2_without_changing_existing_facts() -> None
         ):
             connection.execute(f"drop table {table}")
         connection.execute("delete from schema_info where key = 'database_instance_id'")
+        connection.execute("alter table window_metrics drop column holding_seconds")
+        connection.execute("alter table window_metrics drop column time_in_market_pct")
         connection.execute("update schema_info set value = '2' where key = 'schema_version'")
         strategy_id = _strategy(connection, name="before-migration")
 
         initialize_performance_v2(connection)
 
-        require_performance_v2(connection)
         assert connection.execute("select strategy_name from strategies where strategy_id = ?", [strategy_id]).fetchone() == (
             "before-migration",
         )
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("4",)
+        assert connection.execute("select count(*) from information_schema.tables where table_name = 'strategy_tags'").fetchone() == (1,)
+        assert connection.execute("select count(*) from information_schema.columns where table_name = 'window_metrics' and column_name in ('holding_seconds', 'time_in_market_pct')").fetchone() == (2,)
+
+
+def _as_v3_fixture(connection: duckdb.DuckDBPyConnection) -> None:
+    initialize_performance_v2(connection)
+    if connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("3",):
+        return
+    connection.execute("drop table strategy_tags")
+    connection.execute(
+        """
+        create table strategy_tags (
+            strategy_id bigint not null references strategies(strategy_id),
+            tag varchar not null check (tag = 'REJECTED'),
+            source_review_import_id varchar not null references selection_review_imports(review_import_id),
+            updated_at_utc timestamptz not null,
+            primary key (strategy_id, tag)
+        )
+        """
+    )
+    connection.execute("create index strategy_tags_tag_idx on strategy_tags(tag)")
+    connection.execute("update schema_info set value = '3' where key = 'schema_version'")
+
+
+def test_v3_selection_schema_builder_keeps_the_legacy_tag_columns() -> None:
+    assert "source_review_import_id" in _SELECTION_SCHEMA_V3
+    assert "source_ref" not in _SELECTION_SCHEMA_V3
+
+
+def _insert_v3_rejected(
+    connection: duckdb.DuckDBPyConnection,
+    strategy_id: int,
+    *,
+    run_id: str = "run-v3",
+    review_id: str = "review-1",
+    updated_at: datetime | None = None,
+) -> datetime:
+    updated_at = updated_at or datetime.now(UTC)
+    instance_id = connection.execute(
+        "select value from schema_info where key = 'database_instance_id'"
+    ).fetchone()[0]
+    connection.execute(
+        """
+        insert into selection_runs (
+            selection_run_id, database_instance_id, symbol, side, selection_contract_version,
+            request_json, request_sha256, config_json, config_sha256, candidate_count,
+            representative_count, auto_finalist_count, top_n, workbook_sha256, created_at_utc
+        ) values (?, ?, 'BTCUSDT', 'LONG', 'contract', '{}', 'request', '{}', 'config', 1, 1, 1, 1, ?, ?)
+        """,
+        [run_id, instance_id, f"{review_id}-workbook", updated_at],
+    )
+    connection.execute(
+        "insert into selection_review_imports values (?, ?, ?, ?, 1)",
+        [review_id, run_id, f"{review_id}-hash", updated_at],
+    )
+    connection.execute(
+        "insert into strategy_tags values (?, 'REJECTED', ?, ?)", [strategy_id, review_id, updated_at]
+    )
+    return updated_at
+
+
+def test_v3_to_v4_migration_persists_rows_and_exact_tag_index(tmp_path: Path) -> None:
+    database = tmp_path / "performance.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        _as_v3_fixture(connection)
+        connection.execute("alter table window_metrics drop column holding_seconds")
+        connection.execute("alter table window_metrics drop column time_in_market_pct")
+        first_id = _strategy(connection, name="v3-row-one")
+        second_id = _strategy(connection, name="v3-row-two")
+        first_updated = _insert_v3_rejected(
+            connection, first_id, updated_at=datetime(2026, 1, 1, tzinfo=UTC)
+        )
+        second_updated = _insert_v3_rejected(
+            connection,
+            second_id,
+            run_id="run-v3-two",
+            review_id="review-2",
+            updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        )
+
+        initialize_performance_v2(connection)
+        require_performance_v2(connection)
+
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("4",)
+        assert connection.execute(
+            "select strategy_id, tag, source, source_ref, updated_at_utc from strategy_tags order by strategy_id"
+        ).fetchall() == [
+            (first_id, "REJECTED", "SELECTION_REVIEW", "review-1", first_updated),
+            (second_id, "REJECTED", "SELECTION_REVIEW", "review-2", second_updated),
+        ]
+        assert connection.execute(
+            "select table_type from information_schema.tables where table_schema = 'main' and table_name = 'strategy_tags__v4_new'"
+        ).fetchall() == []
+        assert connection.execute(
+            "select index_name, table_name from duckdb_indexes() where schema_name = 'main' and table_name = 'strategy_tags'"
+        ).fetchall() == [("strategy_tags_tag_idx", "strategy_tags")]
+
+    with duckdb.connect(str(database)) as connection:
+        require_performance_v2(connection)
+        assert connection.execute("select count(*) from strategies where strategy_name like 'v3-row-%'").fetchone() == (2,)
+        assert connection.execute(
+            "select strategy_id, tag, source_ref, updated_at_utc from strategy_tags order by strategy_id"
+        ).fetchall() == [
+            (first_id, "REJECTED", "review-1", first_updated),
+            (second_id, "REJECTED", "review-2", second_updated),
+        ]
+
+
+class _FailAtRename:
+    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+        self._connection = connection
+
+    def execute(self, sql: str, parameters: object = None):
+        if "alter table strategy_tags__v4_new rename to strategy_tags" in sql.lower():
+            raise RuntimeError("forced migration failure")
+        if parameters is None:
+            return self._connection.execute(sql)
+        return self._connection.execute(sql, parameters)
+
+
+def test_failed_v3_to_v4_migration_rolls_back_staging_and_preserves_v3(tmp_path: Path) -> None:
+    database = tmp_path / "performance.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        _as_v3_fixture(connection)
+        strategy_id = _strategy(connection, name="rollback-row")
+        _insert_v3_rejected(connection, strategy_id)
+
+        with pytest.raises(PerformanceV2StoreError, match="migration failed"):
+            initialize_performance_v2(_FailAtRename(connection))
         assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("3",)
-        assert UUID(connection.execute(
-            "select value from schema_info where key = 'database_instance_id'"
-        ).fetchone()[0])
+        assert connection.execute("select tag, source_review_import_id from strategy_tags").fetchone() == (
+            "REJECTED", "review-1"
+        )
+        assert connection.execute(
+            "select count(*) from information_schema.tables where table_name = 'strategy_tags__v4_new'"
+        ).fetchone() == (0,)
+
+    with duckdb.connect(str(database)) as connection:
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("3",)
+        assert connection.execute("select count(*) from strategy_tags").fetchone() == (1,)
+
+
+def test_v3_migration_rejects_unexpected_catalog_without_mutation() -> None:
+    with duckdb.connect(":memory:") as connection:
+        _as_v3_fixture(connection)
+        strategy_id = _strategy(connection, name="extra-table")
+        _insert_v3_rejected(connection, strategy_id)
+        connection.execute("create table foreign_facts (value integer)")
+
+        with pytest.raises(PerformanceV2StoreError, match="catalog"):
+            initialize_performance_v2(connection)
+
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("3",)
+        assert connection.execute("select tag, source_review_import_id from strategy_tags").fetchone() == (
+            "REJECTED", "review-1"
+        )
+        assert connection.execute("select count(*) from information_schema.tables where table_name = 'foreign_facts'").fetchone() == (1,)
+        assert connection.execute("select count(*) from information_schema.tables where table_name = 'strategy_tags__v4_new'").fetchone() == (0,)
+
+
+def test_v3_migration_rejects_invalid_marker_identity_without_mutation() -> None:
+    with duckdb.connect(":memory:") as connection:
+        _as_v3_fixture(connection)
+        strategy_id = _strategy(connection, name="invalid-marker")
+        _insert_v3_rejected(connection, strategy_id)
+        connection.execute("update schema_info set value = 'not-v2' where key = 'database_kind'")
+
+        with pytest.raises(PerformanceV2StoreError, match="unified performance v2"):
+            initialize_performance_v2(connection)
+
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("3",)
+        assert connection.execute("select value from schema_info where key = 'database_kind'").fetchone() == ("not-v2",)
+        assert connection.execute("select tag, source_review_import_id from strategy_tags").fetchone() == (
+            "REJECTED", "review-1"
+        )
 
 
 def test_v1_schema_is_rejected_without_mutation() -> None:

@@ -131,8 +131,8 @@
   "panel_workflow": {
     "listing_dates_path": "input/dates.xlsx",
     "strategy_templates": {
-      "LONG": "input/MRS_3_LONG.json",
-      "SHORT": "input/MRS_3_SHORT.json"
+      "LONG": "templates/strategies/retest-mrs3/base.json",
+      "SHORT": "templates/strategies/retest-mrs3/base.json"
     }
   },
   "panel_paths": {

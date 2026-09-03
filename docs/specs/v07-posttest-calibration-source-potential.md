@@ -1,4 +1,6 @@
 # MRS3 v0.7 — ТЗ на обработку результатов большой MRS3-выборки
+
+> Superseded by the Performance DB v2 and RETEST contracts; retained for historical provenance only. The removed posttest workflow is not a current runtime path.
 ## Калибровка безопасного pre-test фильтра по Source PnL
 
 ## 0. Цель

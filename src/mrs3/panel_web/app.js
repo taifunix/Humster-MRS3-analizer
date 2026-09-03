@@ -1513,7 +1513,7 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const importJob = [...jobs].reverse().find((job) => job.kind === 'strategies.performance.v2.import');
+      const importJob = [...jobs].reverse().find((job) => job.kind === 'strategies.performance.v2.import' && job.retest !== true);
       if (importJob?.job_id) {
         importJobV2 = importJob.job_id;
         const poll = async () => {
@@ -1525,6 +1525,125 @@
       }
     } catch (_) { /* stale jobs remain visible through the server registry */ }
   };
+
+  const retestCard = document.querySelector('#performance-v2-retest-card');
+  const retestCount = document.querySelector('#performance-v2-retest-count');
+  const retestStartDate = document.querySelector('#performance-v2-retest-start');
+  const retestEndDate = document.querySelector('#performance-v2-retest-end');
+  const retestStart = document.querySelector('#performance-v2-retest-check');
+  const retestImport = document.querySelector('#performance-v2-retest-import');
+  const retestProgress = document.querySelector('#performance-v2-retest-progress');
+  const retestProgressText = document.querySelector('#performance-v2-retest-progress-text');
+  const retestStatus = document.querySelector('#performance-v2-retest-status');
+  const retestInbox = document.querySelector('#performance-v2-retest-inbox');
+  const retestFailure = document.querySelector('#performance-v2-retest-failure-report');
+  const retestBadge = document.querySelector('#performance-v2-retest-badge');
+  let retestTesterJobId = '';
+  let retestImportJobId = '';
+  let retestInboxReady = false;
+  let retestTesterTimer = 0;
+  let retestImportTimer = 0;
+  const retestTerminal = (job) => ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job?.state);
+  const renderRetestTester = (job = {}) => {
+    const p = job.progress || {};
+    const current = Number(p.current || 0);
+    const total = Number(p.total || 0);
+    const failed = Array.isArray(job.evidence?.failed_names) ? job.evidence.failed_names.length : Number(p.failed || 0);
+    retestInboxReady = job.state === 'COMMITTED' && job.inbox_ready === true;
+    if (retestProgress) retestProgress.value = total ? Math.min(100, current * 100 / total) : (retestInboxReady ? 100 : 0);
+    if (retestProgressText) retestProgressText.textContent = `${job.phase || job.state || 'RUNNING'} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}`;
+    if (retestInbox) retestInbox.textContent = job.inbox_path ? `committed inbox: ${job.inbox_path}` : '';
+    if (retestStatus) retestStatus.textContent = `CHECK & RETEST: ${job.phase || job.state || 'RUNNING'} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}${job.error ? ` · ${formatErrorReason(job.error)}` : ''}`;
+    if (retestStart) retestStart.disabled = !retestTerminal(job);
+    if (retestImport) retestImport.disabled = !retestInboxReady;
+    if (retestBadge) { retestBadge.className = `state-badge state-${retestInboxReady ? 'ready' : 'pending'}`; retestBadge.textContent = retestInboxReady ? 'INBOX_READY' : (job.phase || 'WAITING'); }
+  };
+  const pollRetestTester = async () => {
+    if (!retestTesterJobId) return true;
+    try {
+      const job = await requestJson(`/api/v2/strategies/tester/status?job_id=${encodeURIComponent(retestTesterJobId)}`);
+      renderRetestTester(job);
+      return retestTerminal(job);
+    } catch (error) {
+      if (retestStatus) retestStatus.textContent = `RETEST status unavailable: ${error?.message || 'request failed'}.`;
+      return false;
+    }
+  };
+  const startRetestPolling = () => {
+    window.clearInterval(retestTesterTimer);
+    retestTesterTimer = window.setInterval(async () => { if (await pollRetestTester()) window.clearInterval(retestTesterTimer); }, 1000);
+  };
+  const pollRetestImport = async () => {
+    if (!retestImportJobId) return true;
+    try {
+      const job = await requestJson(`/api/v2/strategies/performance-v2/import/status?job_id=${encodeURIComponent(retestImportJobId)}`);
+      const p = job.progress || {}; const current = Number(p.current || 0); const total = Number(p.total || 0); const failed = Array.isArray(job.evidence?.failed_names) ? job.evidence.failed_names.length : Number(p.failed || 0);
+      if (retestProgress) retestProgress.value = total ? Math.min(100, current * 100 / total) : (job.state === 'COMMITTED' ? 100 : 0);
+      if (retestProgressText) retestProgressText.textContent = `${job.phase || job.state || 'IMPORTING'} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}`;
+      if (retestStatus) retestStatus.textContent = `IMPORT & REPLACE: ${job.phase || job.state || 'IMPORTING'}${job.error ? ` · ${formatErrorReason(job.error)}` : ''}`;
+      const reportAvailable = job.result?.failure_report_available === true;
+      if (retestFailure && reportAvailable) { retestFailure.hidden = false; retestFailure.href = `/api/artifact?name=${encodeURIComponent(`performance-v2-failure-report:${retestImportJobId}`)}`; retestFailure.textContent = 'Open failure report'; }
+      if (job.state === 'COMMITTED') { await loadRetestStatus(); return true; }
+      if (retestTerminal(job) && retestImport) retestImport.disabled = !retestInboxReady;
+      return retestTerminal(job);
+    } catch (error) {
+      if (retestStatus) retestStatus.textContent = `RETEST import status unavailable: ${error?.message || 'request failed'}.`;
+      return false;
+    }
+  };
+  const startRetestImportPolling = () => {
+    window.clearInterval(retestImportTimer);
+    retestImportTimer = window.setInterval(async () => { if (await pollRetestImport()) window.clearInterval(retestImportTimer); }, 1000);
+  };
+  const loadRetestStatus = async () => {
+    try {
+      const result = await requestJson('/api/v2/strategies/performance-v2/retest/status');
+      const count = Number(result.count ?? result.retest_count ?? result.active_count ?? 0);
+      if (retestCount) retestCount.textContent = String(count);
+      if (retestStartDate && !retestStartDate.value && result.default_start) retestStartDate.value = result.default_start;
+      if (retestEndDate && !retestEndDate.value && result.default_end) retestEndDate.value = result.default_end;
+      if (retestBadge && !retestTesterJobId) { retestBadge.textContent = count ? 'READY' : 'EMPTY'; retestBadge.className = `state-badge state-${count ? 'ready' : 'pending'}`; }
+    } catch (error) { if (retestStatus) retestStatus.textContent = `RETEST count unavailable: ${error?.message || 'request failed'}.`; }
+  };
+  retestStart?.addEventListener('click', async () => {
+    const start = retestStartDate?.value || '';
+    const end = retestEndDate?.value || '';
+    if (!validIsoDate(start) || !validIsoDate(end) || start >= end) { if (retestStatus) retestStatus.textContent = 'Enter valid RETEST dates with start before end.'; return; }
+    retestStart.disabled = true;
+    retestImportJobId = '';
+    if (retestFailure) { retestFailure.hidden = true; retestFailure.removeAttribute('href'); }
+    try {
+      const result = await remoteRequest('/api/v2/strategies/performance-v2/retest/start', { test_start: start, test_end: end });
+      retestTesterJobId = result.job?.job_id || '';
+      if (!retestTesterJobId) throw new Error('missing RETEST job');
+      renderRetestTester(result.job); await pollRetestTester();
+      if (!retestTerminal(result.job)) startRetestPolling();
+    } catch (error) { if (retestStatus) retestStatus.textContent = `CHECK & RETEST failed: ${error?.message || 'request failed'}.`; retestStart.disabled = false; }
+  });
+  retestImport?.addEventListener('click', async () => {
+    if (!retestTesterJobId || !retestInboxReady) return;
+    retestImport.disabled = true;
+    if (retestFailure) { retestFailure.hidden = true; retestFailure.removeAttribute('href'); }
+    try {
+      const result = await remoteRequest('/api/v2/strategies/performance-v2/retest/import', { tester_job_id: retestTesterJobId });
+      retestImportJobId = result.job?.job_id || '';
+      if (!retestImportJobId) throw new Error('missing RETEST import job');
+      if (!(await pollRetestImport())) startRetestImportPolling();
+    } catch (error) { if (retestStatus) retestStatus.textContent = `IMPORT & REPLACE failed: ${error?.message || 'request failed'}.`; retestImport.disabled = !retestInboxReady; }
+  });
+  const recoverRetestJobs = async () => {
+    try {
+      const snapshot = await requestJson('/api/v2/jobs');
+      const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
+      const tester = [...jobs].reverse().find((job) => job.kind === 'strategies.tester.native.start' && job.retest === true);
+      if (tester?.job_id) { retestTesterJobId = tester.job_id; renderRetestTester(tester); if (!retestTerminal(tester)) { await pollRetestTester(); startRetestPolling(); } }
+      const importJob = [...jobs].reverse().find((job) => job.kind === 'strategies.performance.v2.import' && job.retest === true);
+      if (importJob?.job_id) { retestImportJobId = importJob.job_id; if (!(await pollRetestImport())) startRetestImportPolling(); }
+    } catch (_) { /* count/status remains independently visible */ }
+  };
+  retestCard?.addEventListener('toggle', () => { if (retestCard.open) loadRetestStatus(); });
+  loadRetestStatus();
+  recoverRetestJobs();
 
   const performanceV2WindowSelect = document.querySelector('#performance-v2-window-strategy');
   const performanceV2WindowCard = document.querySelector('#performance-v2-window-card');

@@ -53,14 +53,14 @@ _SCOPES = frozenset(("pair_side", "pair_side_timeframe"))
 _CANDIDATE_COLUMNS = (
     "strategy_id", "strategy_name", "symbol", "side", "timeframe", "close_ma_len", "order_count",
     "result_id", "total_pnl", "total_pnl_pct", "max_drawdown", "max_drawdown_pct", "total_fees",
-    "total_trades", "pnl_30d_pct", "profit_factor", "win_rate_pct", "risk_scale", "dd5_proxy", "holding_p95_minutes",
+    "total_trades", "trades_30d", "pnl_30d_pct", "profit_factor", "win_rate_pct", "risk_scale", "dd5_proxy", "holding_p95_minutes",
     "holding_median_minutes",
     "ab_pnl_change_30d_pct", "ab_return_b_pct", "first_shift_bp", "scaled_lot_sum", "capital_proxy",
     "capital_efficiency", "total_plateau_point_count",
     "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_calendar_days_a", "ab_calendar_days_b", "ab_win_rate_b_pct",
     "ab_trade_rate_a_30d", "ab_trade_rate_b_30d", "ab_drawdown_b_pct", "ab_holding_p95_minutes",
     "best_trade_profit_share_pct", "pnl_without_best_trade", "pnl_without_best_trade_pct", "completed_profitable_trade_count", "best_trade_reliable",
-    "positive_quarter_count", "positive_quarter_available_count", "robust_pnl_30d_pct", "worst_drawdown_pct", "worst_holding_p95_minutes",
+    "positive_quarter_count", "positive_quarter_available_count", "positive_quarter_status", "robust_pnl_30d_pct", "worst_drawdown_pct", "worst_holding_p95_minutes",
     "ab_stability_ratio", "minimum_plateau_point_count",
     "rank_quality_robust_pnl", "rank_quality_worst_drawdown", "rank_quality_ab_stability", "rank_quality_worst_holding",
     "rank_quality_first_shift", "rank_quality_minimum_plateau_points", "rank_quality_close_ma", "rank_weight_coverage_pct",
@@ -430,13 +430,27 @@ def _ab_metrics_from_windows(
     }
 
 
+def _consistency_windows(report_start: datetime, report_end: datetime) -> tuple[tuple[datetime, datetime], ...]:
+    span = report_end - report_start
+    if span >= timedelta(days=28):
+        count = 4
+    elif span >= timedelta(days=21):
+        count = 3
+    else:
+        return ()
+    return tuple(
+        (report_start + span * index / count, report_end if index == count - 1 else report_start + span * (index + 1) / count)
+        for index in range(count)
+    )
+
+
 def _selection_windows(report_start: datetime, report_end: datetime, config: SelectionConfig) -> tuple[tuple[datetime, datetime], ...]:
     split = report_end - timedelta(days=config.ab_final_days)
-    base = ((report_start, report_end),)
-    ab = ((report_start, split), (split, report_end)) if split > report_start else ()
-    span = report_end - report_start
-    quarters = tuple((report_start + span * index / 4, report_start + span * (index + 1) / 4) for index in range(4))
-    return base + ab + quarters
+    windows = [(report_start, report_end)]
+    if split > report_start:
+        windows.extend(((report_start, split), (split, report_end)))
+    windows.extend(_consistency_windows(report_start, report_end))
+    return tuple(dict.fromkeys(windows))
 
 
 def _empty_ab_metrics() -> dict[str, Decimal | None]:
@@ -483,22 +497,40 @@ def _cached_selection_metrics(
     return (full, _ab_metrics_from_windows(a, b, report_start, report_end))
 
 
+def _consistency_summary(
+    metrics: Sequence[WindowMetrics | None], windows: Sequence[tuple[datetime, datetime]],
+) -> tuple[int | None, int | None, str]:
+    windows = tuple(windows)
+    window_count = len(windows)
+    if not window_count or len(metrics) != window_count:
+        return None, None, "UNAVAILABLE"
+    positive = 0
+    assessed = 0
+    for metric, (window_start, window_end) in zip(metrics, windows):
+        if metric is None:
+            return None, None, "UNAVAILABLE"
+        if metric.availability_status == "NO_TRADES" or metric.unavailable_reason == "NO_TRADES":
+            continue
+        if not metric.available:
+            return None, None, "UNAVAILABLE"
+        value = _return_30d(metric, window_start, window_end)
+        if value is None:
+            return None, None, "UNAVAILABLE"
+        assessed += 1
+        positive += value > 0
+    if assessed == 0:
+        return None, 0, "UNAVAILABLE"
+    threshold = 3 if window_count == 4 else 2
+    return positive, assessed, "PASS" if positive >= threshold else "FAIL"
+
+
 def _cached_positive_quarters(
     result_id: int, report_start: datetime, report_end: datetime, config: SelectionConfig,
     cached_metrics: Mapping[tuple[int, datetime, datetime], WindowMetrics],
-) -> tuple[int, int] | None:
-    quarters = _selection_windows(report_start, report_end, config)[-4:]
-    metrics = [cached_metrics.get((result_id, start, end)) for start, end in quarters]
-    return _positive_quarter_summary(metrics)
-
-
-def _positive_quarter_summary(metrics: Sequence[WindowMetrics | None]) -> tuple[int, int] | None:
-    returns = [
-        value for metric in metrics
-        if metric is not None and metric.available
-        for value in (_return_30d(metric),) if value is not None
-    ]
-    return (sum(value > 0 for value in returns), len(returns)) if returns else None
+) -> tuple[int | None, int | None, str]:
+    windows = _consistency_windows(report_start, report_end)
+    metrics = [cached_metrics.get((result_id, start, end)) for start, end in windows]
+    return _consistency_summary(metrics, windows)
 
 
 def _selection_window_job(database: str, result_id: int, report_start: datetime, report_end: datetime, final_days: int) -> tuple[WindowMetrics, ...]:
@@ -601,9 +633,11 @@ def load_selection_candidates(
                 ab_metrics = _ab_metrics(connection, result_id, report_start, report_end, config)
                 quarter_metrics = [
                     get_or_calculate_window(connection, result_id, start, end)
-                    for start, end in _selection_windows(report_start, report_end, config)[-4:]
+                    for start, end in _consistency_windows(report_start, report_end)
                 ]
-                positive_quarters = _positive_quarter_summary(quarter_metrics)
+                positive_quarters = _consistency_summary(
+                    quarter_metrics, _consistency_windows(report_start, report_end)
+                )
             daily_log = None if full_metrics is None else full_metrics.daily_log_return
             pnl_30d = None if full_metrics is None else _return_30d(full_metrics, report_start, report_end)
             drawdown = _decimal_or_none(max_drawdown_pct)
@@ -620,7 +654,9 @@ def load_selection_candidates(
                 "order_count": int(order_count), "result_id": result_id, "total_pnl": _decimal_or_none(total_pnl),
                 "total_pnl_pct": _decimal_or_none(total_pnl_pct), "max_drawdown": _decimal_or_none(max_drawdown),
                 "max_drawdown_pct": drawdown, "total_fees": _decimal_or_none(total_fees),
-                "total_trades": None if full_metrics is None else full_metrics.trade_count, "pnl_30d_pct": pnl_30d,
+                "total_trades": None if full_metrics is None else full_metrics.trade_count,
+                "trades_30d": None if full_metrics is None else _trade_rate_30d(full_metrics, report_start, report_end),
+                "pnl_30d_pct": pnl_30d,
                 "profit_factor": None if full_metrics is None else full_metrics.profit_factor,
                 "win_rate_pct": None if full_metrics is None else full_metrics.win_rate_pct,
                 "risk_scale": risk_scale, "dd5_proxy": pnl_30d * risk_scale if pnl_30d is not None and risk_scale is not None else None,
@@ -632,8 +668,9 @@ def load_selection_candidates(
                 "best_trade_profit_share_pct": best_share, "pnl_without_best_trade": pnl_without_best,
                 "pnl_without_best_trade_pct": pnl_without_best_pct,
                 "completed_profitable_trade_count": positive_trade_count, "best_trade_reliable": best_trade_reliable,
-                "positive_quarter_count": None if positive_quarters is None else positive_quarters[0],
-                "positive_quarter_available_count": None if positive_quarters is None else positive_quarters[1],
+                "positive_quarter_count": positive_quarters[0],
+                "positive_quarter_available_count": positive_quarters[1],
+                "positive_quarter_status": positive_quarters[2],
                 "robust_pnl_30d_pct": None,
                 "worst_drawdown_pct": None, "worst_holding_p95_minutes": None,
                 "ab_stability_ratio": None, "minimum_plateau_point_count": None,
@@ -994,7 +1031,9 @@ def run_selection(
         survivors = result.loc[result["finalist"]]
         for _, group in _scope_groups(survivors, stage.scope):
             if stage.id in {"filter_holding_outlier", "filter_low_trades"}:
-                metric = "holding_p95_minutes" if stage.id == "filter_holding_outlier" else "total_trades"
+                metric = "holding_p95_minutes" if stage.id == "filter_holding_outlier" else "trades_30d"
+                if metric not in group:
+                    continue
                 values = pd.to_numeric(group[metric], errors="coerce").dropna()
                 if values.empty:
                     continue
@@ -1019,9 +1058,15 @@ def run_selection(
                 )
                 eliminated = group.index[failed.fillna(False)]
             elif stage.id == "filter_time_consistency":
-                available = pd.to_numeric(group["positive_quarter_available_count"], errors="coerce")
-                positive = pd.to_numeric(group["positive_quarter_count"], errors="coerce")
-                failed = available.eq(4) & positive.lt(3)
+                status = group.get("positive_quarter_status")
+                if status is not None:
+                    failed = status.eq("FAIL")
+                else:
+                    if not {"positive_quarter_available_count", "positive_quarter_count"}.issubset(group.columns):
+                        continue
+                    available = pd.to_numeric(group["positive_quarter_available_count"], errors="coerce")
+                    positive = pd.to_numeric(group["positive_quarter_count"], errors="coerce")
+                    failed = available.eq(4) & positive.lt(3)
                 eliminated = group.index[failed.fillna(False)]
             elif stage.id == "ab_deterioration":
                 eliminated = []
@@ -1067,7 +1112,7 @@ def write_selection_workbook(
         if column.startswith("ab_") and column not in {
             "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "ab_stability_ratio",
         }
-    ] + ["total_pnl", "max_drawdown", "total_fees", "risk_scale", "scaled_lot_sum", "daily_log_return"], errors="ignore").copy()
+    ] + ["total_pnl", "total_pnl_pct", "max_drawdown", "total_fees", "risk_scale", "scaled_lot_sum", "daily_log_return"], errors="ignore").copy()
     if "ab_pnl_change_30d_pct" not in display:
         display["ab_pnl_change_30d_pct"] = None
     reason_aliases = {"PARETO_PLATEAU_POINTS_PER_ORDER": "PARETO_PL_PTS_PER_ORDER"}
@@ -1094,9 +1139,15 @@ def write_selection_workbook(
     for column in ("pnl_30d_pct", "profit_factor", "win_rate_pct"):
         if column not in display:
             display[column] = None
+    if "positive_quarter_status" in display:
+        if "positive_quarter_count" not in display:
+            display["positive_quarter_count"] = None
+        if "positive_quarter_available_count" not in display:
+            display["positive_quarter_available_count"] = None
     if {"positive_quarter_count", "positive_quarter_available_count"}.issubset(display.columns):
         display["positive_quarter_count"] = display.apply(
             lambda row: (
+                "N/A" if row.get("positive_quarter_status") == "UNAVAILABLE" else
                 f"{int(row['positive_quarter_count'])}/{int(row['positive_quarter_available_count'])}"
                 if _present(row["positive_quarter_count"]) and _present(row["positive_quarter_available_count"])
                 else None
@@ -1117,7 +1168,7 @@ def write_selection_workbook(
                 ) if value is not None and not pd.isna(value) else value
             )
     for column in (
-        "total_pnl_pct", "pnl_30d_pct", "dd5_proxy", "profit_factor", "ab_pnl_change_30d_pct",
+        "pnl_30d_pct", "dd5_proxy", "profit_factor", "ab_pnl_change_30d_pct",
         "ab_return_a_30d_pct", "ab_return_b_30d_pct", "pnl_without_best_trade_pct",
         "capital_efficiency", "win_rate_pct", "holding_p95_minutes",
         "holding_median_minutes", "total_plateau_point_count", "minimum_plateau_point_count", "final_rank",
@@ -1135,9 +1186,16 @@ def write_selection_workbook(
     ], errors="ignore")
     for column in enabled_filter_columns:
         if column in display:
-            display[column] = display[column].map(
-                lambda value: ("BLOCK" if bool(value) else "PASS") if pd.notna(value) else value
-            )
+            if column == "eliminated_by_filter_time_consistency" and "positive_quarter_status" in display:
+                display[column] = display.apply(
+                    lambda row: "N/A" if row.get("positive_quarter_status") == "UNAVAILABLE"
+                    else ("BLOCK" if bool(row[column]) else "PASS") if pd.notna(row[column]) else row[column],
+                    axis=1,
+                )
+            else:
+                display[column] = display[column].map(
+                    lambda value: ("BLOCK" if bool(value) else "PASS") if pd.notna(value) else value
+                )
     def order_values(columns: list[str], render: Callable[[object], str]) -> pd.Series:
         values = display.reindex(columns=columns)
         return values.apply(
@@ -1163,6 +1221,9 @@ def write_selection_workbook(
         display["user_status"] = display.apply(
             lambda row: "REJECTED" if bool(row.get("prior_rejected", False)) else row.get("auto_status"), axis=1
         )
+        display["retest"] = display.apply(
+            lambda row: "RETEST" if bool(row.get("prior_retest", False)) else None, axis=1
+        )
         display["auto_rank"] = display.get("final_rank")
         display["user_rank"] = display.apply(
             lambda row: row.get("final_rank") if row.get("user_status") in {"FINALIST", "RESERVE"} else None,
@@ -1175,13 +1236,13 @@ def write_selection_workbook(
         display["comment"] = None
     review_identity_columns = ["result_id"] if review_metadata is not None else []
     review_columns = [
-        "auto_status", "user_status", "auto_rank", "user_rank", "auto_analog_of_strategy_id",
+        "auto_status", "user_status", "retest", "auto_rank", "user_rank", "auto_analog_of_strategy_id",
         "user_analog_of_strategy_id", "comment",
     ] if review_metadata is not None else []
     column_order = [
         "strategy_id", *review_identity_columns, "strategy_name", "symbol", "side", "timeframe", "order_count", "close_ma_len",
-        "total_pnl_pct", "pnl_30d_pct", "dd5_proxy", "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "positive_quarter_count",
-        "capital_efficiency", "profit_factor", "max_drawdown_pct", "win_rate_pct", "total_trades", "capital_proxy",
+        "pnl_30d_pct", "dd5_proxy", "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "positive_quarter_count",
+        "capital_efficiency", "profit_factor", "max_drawdown_pct", "win_rate_pct", "total_trades", "trades_30d", "capital_proxy",
         "holding_p95_minutes", "holding_median_minutes", "total_plateau_point_count", "minimum_plateau_point_count",
         "best_trade_profit_share_pct", "pnl_without_best_trade_pct", "completed_profitable_trade_count",
         "robust_pnl_30d_pct", "worst_drawdown_pct", "worst_holding_p95_minutes", "ab_stability_ratio",
@@ -1198,13 +1259,13 @@ def write_selection_workbook(
     display = display.rename(columns={
         "strategy_id": "ID", "result_id": "Result ID", "strategy_name": "Стратегия", "symbol": "Пара", "side": "Side", "timeframe": "ТФ",
         "close_ma_len": "Close", "order_count": "ORD",
-        "total_pnl_pct": "PnL", "pnl_30d_pct": "PnL/30", "dd5_proxy": "PnL DD5/30", "profit_factor": "PF",
+        "pnl_30d_pct": "PnL/30", "dd5_proxy": "PnL DD5/30", "profit_factor": "PF",
         "ab_pnl_change_30d_pct": "∆ PnL A/B", "ab_return_a_30d_pct": "PnL A/30д, %", "ab_calendar_days_a": "Дней A", "ab_return_b_30d_pct": "PnL B/30д, %", "ab_calendar_days_b": "Дней B", "capital_efficiency": "CE",
         "max_drawdown_pct": "DD", "win_rate_pct": "W/R", "total_trades": "Trades", "capital_proxy": "Lot DD5",
         "holding_p95_minutes": "Hold p95", "holding_median_minutes": "Hold M",
         "total_plateau_point_count": "PointsALL", "finalist": "Final", "elimination_reason": "Причина",
         "best_trade_profit_share_pct": "Best trade, %", "pnl_without_best_trade_pct": "PnL without best, %",
-        "completed_profitable_trade_count": "Positive trades", "positive_quarter_count": "Positive quarters",
+        "completed_profitable_trade_count": "Positive trades", "positive_quarter_count": "Positive windows", "trades_30d": "Trades/30",
         "robust_pnl_30d_pct": "Robust PnL/30", "worst_drawdown_pct": "Worst DD", "worst_holding_p95_minutes": "Worst Hold p95",
         "ab_stability_ratio": "A/B stability", "minimum_plateau_point_count": "PointsMin",
         "rank_quality_robust_pnl": "Rank q PnL", "rank_quality_worst_drawdown": "Rank q DD",
@@ -1219,7 +1280,7 @@ def write_selection_workbook(
         **{f"order_{order}_shift_bp": f"{order} Shift" for order in range(1, 5)},
         "lots": "Lots",
         "points": "Points",
-        "auto_status": "Auto Status", "user_status": "User Status", "auto_rank": "Auto Rank",
+        "auto_status": "Auto Status", "user_status": "User Status", "retest": "RETEST", "auto_rank": "Auto Rank",
         "user_rank": "User Rank", "auto_analog_of_strategy_id": "Auto Analog Of ID",
         "user_analog_of_strategy_id": "Analog Of ID", "comment": "Comment",
     })
@@ -1240,7 +1301,7 @@ def write_selection_workbook(
         number_formats={
             **{f"{order} Shift": "0.0" for order in range(1, 5)},
             **{header: "0" for header in (
-                "PnL", "PnL/30", "PnL DD5/30", "PF", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "PnL without best, %",
+                "PnL/30", "PnL DD5/30", "PF", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "PnL without best, %",
             )},
             "Final rank": "0",
         },
@@ -1248,8 +1309,7 @@ def write_selection_workbook(
         font_colors={"Дней A": "FF0000FF", "Дней B": "FF0000FF"},
         bold_columns=frozenset({"Close", "DD", "Hold p95", "1 Shift", "Final rank"}),
         column_edge_borders={
-            "PnL": ("left",),
-                "Positive quarters": ("right",),
+                "Positive windows": ("right",),
             "Hold p95": ("left",),
             "Hold M": ("right",),
             "1 Shift": ("left",),
@@ -1276,6 +1336,10 @@ def write_selection_workbook(
             )
             worksheet.add_data_validation(validation)
             validation.add(f'{headers["User Status"]}2:{headers["User Status"]}{max(2, worksheet.max_row)}')
+        if "RETEST" in headers:
+            validation = DataValidation(type="list", formula1='"RETEST"', allow_blank=True)
+            worksheet.add_data_validation(validation)
+            validation.add(f'{headers["RETEST"]}2:{headers["RETEST"]}{max(2, worksheet.max_row)}')
     workbook.save(workbook_path)
     _normalize_xlsx_archive(workbook_path)
     return workbook_path

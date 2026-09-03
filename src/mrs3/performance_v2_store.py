@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+from typing import BinaryIO
 from uuid import UUID, uuid4
 
 import duckdb
@@ -10,7 +12,7 @@ import duckdb
 from .config import PanelPathSettings, load_panel_path_settings
 
 
-_SCHEMA_VERSION = "3"
+_SCHEMA_VERSION = "4"
 _DATABASE_NAME = "strategy_performance.duckdb"
 _MAX_WORKERS = 64
 _DEFAULT_V1_PERFORMANCE_ROOT = PanelPathSettings().performance_db_root
@@ -18,6 +20,58 @@ _DEFAULT_V1_PERFORMANCE_ROOT = PanelPathSettings().performance_db_root
 
 class PerformanceV2StoreError(ValueError):
     """Raised when a database is not the isolated Performance v2 schema."""
+
+
+class PerformanceV2WriterLock:
+    """Small cross-process lock for the v2 database writer."""
+
+    def __init__(self, database_root: Path) -> None:
+        self.database_root = Path(database_root).resolve()
+        self.path = self.database_root / ".performance-v2.lock"
+        self._handle: BinaryIO | None = None
+
+    def __enter__(self) -> "PerformanceV2WriterLock":
+        # The import target gate owns directory creation policy. A bare lock
+        # must never make a missing database root look initialized.
+        if not self.database_root.is_dir():
+            raise PerformanceV2StoreError("Performance v2 database root does not exist")
+        handle = self.path.open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if self.path.stat().st_size == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            handle.close()
+            raise PerformanceV2StoreError("Performance v2 database writer is busy") from error
+        self._handle = handle
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            self._handle = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +233,16 @@ CREATE TABLE IF NOT EXISTS strategy_results (
     total_fees DECIMAL(38,12),
     total_trades INTEGER,
     imported_at_utc TIMESTAMPTZ NOT NULL,
+    reported_start_utc TIMESTAMPTZ,
+    reported_end_utc TIMESTAMPTZ,
+    listing_date_utc TIMESTAMPTZ,
+    listing_date_raw VARCHAR,
+    listing_date_source VARCHAR,
+    effective_start_utc TIMESTAMPTZ,
+    effective_end_utc TIMESTAMPTZ,
+    warmup_hours INTEGER,
+    excluded_trade_count INTEGER,
+    exclusion_reason VARCHAR,
     CHECK (report_end_utc >= report_start_utc)
 );
 
@@ -318,8 +382,9 @@ CREATE TABLE IF NOT EXISTS selection_review_rows (
 
 CREATE TABLE IF NOT EXISTS strategy_tags (
     strategy_id BIGINT NOT NULL REFERENCES strategies(strategy_id),
-    tag VARCHAR NOT NULL CHECK (tag = 'REJECTED'),
-    source_review_import_id VARCHAR NOT NULL REFERENCES selection_review_imports(review_import_id),
+    tag VARCHAR NOT NULL CHECK (tag IN ('REJECTED', 'RETEST')),
+    source VARCHAR NOT NULL,
+    source_ref VARCHAR NOT NULL CHECK (length(trim(source_ref)) > 0),
     updated_at_utc TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (strategy_id, tag)
 );
@@ -330,6 +395,28 @@ CREATE INDEX IF NOT EXISTS selection_review_imports_run_imported_idx
 ON selection_review_imports(selection_run_id, imported_at_utc);
 CREATE INDEX IF NOT EXISTS strategy_tags_tag_idx ON strategy_tags(tag);
 """
+
+_V4_TAG_SCHEMA = """CREATE TABLE IF NOT EXISTS strategy_tags (
+    strategy_id BIGINT NOT NULL REFERENCES strategies(strategy_id),
+    tag VARCHAR NOT NULL CHECK (tag IN ('REJECTED', 'RETEST')),
+    source VARCHAR NOT NULL,
+    source_ref VARCHAR NOT NULL CHECK (length(trim(source_ref)) > 0),
+    updated_at_utc TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (strategy_id, tag)
+);"""
+_V3_TAG_SCHEMA = """CREATE TABLE IF NOT EXISTS strategy_tags (
+    strategy_id BIGINT NOT NULL REFERENCES strategies(strategy_id),
+    tag VARCHAR NOT NULL CHECK (tag = 'REJECTED'),
+    source_review_import_id VARCHAR NOT NULL REFERENCES selection_review_imports(review_import_id),
+    updated_at_utc TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (strategy_id, tag)
+);"""
+if _SELECTION_SCHEMA.count(_V4_TAG_SCHEMA) != 1:
+    raise RuntimeError("Performance v4 selection schema tag definition changed unexpectedly")
+_SELECTION_SCHEMA_V3 = _SELECTION_SCHEMA.replace(
+    _V4_TAG_SCHEMA,
+    _V3_TAG_SCHEMA,
+)
 
 _V2_TABLE_NAMES = {
     "schema_info",
@@ -365,6 +452,7 @@ _EXPECTED_SEQUENCES = frozenset(
     }
 )
 _V2_EXPECTED_MARKERS = {"schema_version": "2", "database_kind": "unified_performance_v2"}
+_V3_EXPECTED_MARKERS = {"schema_version": "3", "database_kind": "unified_performance_v2"}
 _EXPECTED_INDEXES = frozenset(
     {
         ("main", "strategy_results_strategy_id_idx"),
@@ -427,10 +515,7 @@ def _schema_markers(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
         raise PerformanceV2StoreError("Performance database has invalid schema markers") from error
 
 
-def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
-    """Fail closed unless the connection already contains the v2 schema."""
-    if _schema_version(connection) != _SCHEMA_VERSION:
-        raise PerformanceV2StoreError("Performance database does not have schema version 3")
+def _require_v4_markers(connection: duckdb.DuckDBPyConnection) -> None:
     markers = _schema_markers(connection)
     if set(markers) != {"schema_version", "database_kind", "database_instance_id"} or markers.get(
         "database_kind"
@@ -441,6 +526,10 @@ def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
             raise ValueError
     except (KeyError, ValueError, AttributeError):
         raise PerformanceV2StoreError("Performance database has invalid instance identity") from None
+
+
+def _require_v4_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_v4_markers(connection)
     tables, sequences, indexes = _catalog_objects(connection)
     if (
         tables != _EXPECTED_TABLES
@@ -448,6 +537,13 @@ def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
         or indexes != _EXPECTED_INDEXES
     ):
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
+
+
+def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
+    """Fail closed unless the connection already contains the v2 schema."""
+    if _schema_version(connection) != _SCHEMA_VERSION:
+        raise PerformanceV2StoreError("Performance database does not have schema version 4")
+    _require_v4_catalog(connection)
 
 
 def _require_schema_v2_for_migration(connection: duckdb.DuckDBPyConnection) -> None:
@@ -458,9 +554,80 @@ def _require_schema_v2_for_migration(connection: duckdb.DuckDBPyConnection) -> N
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
 
 
+def _require_schema_v3_for_migration(connection: duckdb.DuckDBPyConnection) -> None:
+    markers = _schema_markers(connection)
+    if (
+        markers.get("schema_version") != _V3_EXPECTED_MARKERS["schema_version"]
+        or markers.get("database_kind") != _V3_EXPECTED_MARKERS["database_kind"]
+        or set(markers) != {"schema_version", "database_kind", "database_instance_id"}
+    ):
+        raise PerformanceV2StoreError("Performance database is not unified performance v2")
+    try:
+        if str(UUID(markers["database_instance_id"])) != markers["database_instance_id"]:
+            raise ValueError
+    except (KeyError, ValueError, AttributeError):
+        raise PerformanceV2StoreError("Performance database has invalid instance identity") from None
+    tables, sequences, indexes = _catalog_objects(connection)
+    if tables != _EXPECTED_TABLES or sequences != _EXPECTED_SEQUENCES or indexes != _EXPECTED_INDEXES:
+        raise PerformanceV2StoreError("Performance database has an unexpected catalog")
+
+
+def _migrate_schema_v3_to_v4(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_schema_v3_for_migration(connection)
+    try:
+        connection.execute("begin transaction")
+        _add_window_columns(connection)
+        connection.execute(
+            """
+            CREATE TABLE strategy_tags__v4_new (
+                strategy_id BIGINT NOT NULL REFERENCES strategies(strategy_id),
+                tag VARCHAR NOT NULL CHECK (tag IN ('REJECTED', 'RETEST')),
+                source VARCHAR NOT NULL,
+                source_ref VARCHAR NOT NULL CHECK (length(trim(source_ref)) > 0),
+                updated_at_utc TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (strategy_id, tag)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO strategy_tags__v4_new
+                (strategy_id, tag, source, source_ref, updated_at_utc)
+            SELECT strategy_id, tag, 'SELECTION_REVIEW', source_review_import_id, updated_at_utc
+            FROM strategy_tags
+            """
+        )
+        connection.execute("DROP TABLE strategy_tags")
+        connection.execute("ALTER TABLE strategy_tags__v4_new RENAME TO strategy_tags")
+        connection.execute("CREATE INDEX strategy_tags_tag_idx ON strategy_tags(tag)")
+        _add_result_provenance_columns(connection)
+        connection.execute("UPDATE schema_info SET value = '4' WHERE key = 'schema_version'")
+        connection.execute("commit")
+    except Exception as error:
+        _rollback_quietly(connection)
+        raise PerformanceV2StoreError("Performance database schema migration failed") from error
+
+
 def _add_window_columns(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute("alter table window_metrics add column if not exists holding_seconds decimal(38,12)")
     connection.execute("alter table window_metrics add column if not exists time_in_market_pct decimal(38,12)")
+
+
+def _add_result_provenance_columns(connection: duckdb.DuckDBPyConnection) -> None:
+    """Add warm-up provenance to v4 databases without rewriting result facts."""
+    for name, definition in (
+        ("reported_start_utc", "timestamptz"),
+        ("reported_end_utc", "timestamptz"),
+        ("listing_date_utc", "timestamptz"),
+        ("listing_date_raw", "varchar"),
+        ("listing_date_source", "varchar"),
+        ("effective_start_utc", "timestamptz"),
+        ("effective_end_utc", "timestamptz"),
+        ("warmup_hours", "integer"),
+        ("excluded_trade_count", "integer"),
+        ("exclusion_reason", "varchar"),
+    ):
+        connection.execute(f"alter table strategy_results add column if not exists {name} {definition}")
 
 
 def _rollback_quietly(connection: duckdb.DuckDBPyConnection) -> None:
@@ -471,28 +638,41 @@ def _rollback_quietly(connection: duckdb.DuckDBPyConnection) -> None:
 
 
 def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
-    """Initialize the additive v2 schema, rejecting all non-v2 databases."""
+    """Initialize or migrate the isolated Performance v2 schema to v4."""
     version = _schema_version(connection)
-    if version is not None and version not in {"2", _SCHEMA_VERSION}:
+    if version is not None and version not in {"2", "3", _SCHEMA_VERSION}:
         raise PerformanceV2StoreError("Performance database has an unsupported schema version")
-    if version == _SCHEMA_VERSION:
-        require_performance_v2(connection)
-        _add_window_columns(connection)
-        return
     if version == "2":
         _require_schema_v2_for_migration(connection)
         try:
             connection.execute("begin transaction")
             _add_window_columns(connection)
-            connection.execute(_SELECTION_SCHEMA)
+            connection.execute(_SELECTION_SCHEMA_V3)
             connection.execute(
                 "insert into schema_info values ('database_instance_id', ?)", [str(uuid4())]
             )
-            connection.execute("update schema_info set value = ? where key = 'schema_version'", [_SCHEMA_VERSION])
+            connection.execute("update schema_info set value = '3' where key = 'schema_version'")
             connection.execute("commit")
         except Exception as error:
             _rollback_quietly(connection)
             raise PerformanceV2StoreError("Performance database schema migration failed") from error
+        _migrate_schema_v3_to_v4(connection)
+        require_performance_v2(connection)
+        return
+    if version == _SCHEMA_VERSION:
+        _require_v4_catalog(connection)
+        try:
+            connection.execute("begin transaction")
+            _add_window_columns(connection)
+            _add_result_provenance_columns(connection)
+            connection.execute("commit")
+        except Exception as error:
+            _rollback_quietly(connection)
+            raise PerformanceV2StoreError("Performance database schema repair failed") from error
+        require_performance_v2(connection)
+        return
+    if version == "3":
+        _migrate_schema_v3_to_v4(connection)
         require_performance_v2(connection)
         return
     if not _catalog_is_empty(connection):

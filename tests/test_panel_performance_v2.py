@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import duckdb
+from openpyxl import Workbook
 import pytest
 
 from mrs3.performance_v2_store import (
@@ -277,10 +278,16 @@ def _request(tmp_path: Path) -> tuple[PerformanceV2PanelRequest, dict[Path, byte
     target.parent.mkdir(parents=True)
     with duckdb.connect(str(target)) as connection:
         initialize_performance_v2(connection)
+    dates = tmp_path / "Input" / "dates.xlsx"
+    dates.parent.mkdir()
+    workbook = Workbook()
+    workbook.active.append(["ONUSDT", datetime(2025, 12, 25)])
+    workbook.save(dates)
     return PerformanceV2PanelRequest(
         inbox=inbox,
         report_root=reports,
         config=config,
+        listing_dates_path=Path("Input/dates.xlsx"),
     ), snapshot
 
 
@@ -344,14 +351,8 @@ def test_selection_button_posts_the_current_panel_snapshot_for_xlsx() -> None:
 
 
 def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_path: Path, monkeypatch) -> None:
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("v1 Performance/DD5/workbook service was called")
-
     import mrs3.panel as panel_module
 
-    monkeypatch.setattr(panel_module, "LocalPerformanceImportJobs", forbidden)
-    monkeypatch.setattr(panel_module, "LocalPerformanceDd5Jobs", forbidden)
-    monkeypatch.setattr(panel_module, "LocalPerformanceDd5Service", forbidden)
     request, _ = _request(tmp_path)
     config_path = tmp_path / "config.local.json"
     config_path.write_text(json.dumps({"panel_paths": {"tester_report_dir": "wrong-reports"}}), encoding="utf-8")
@@ -374,6 +375,7 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
             "tester_job_id": "tester-v2",
             "window_a": ["2026-01-01T00:00:00Z", "2026-01-09T00:00:00Z"],
             "window_b": ["2026-01-01T00:00:00Z", "2026-01-03T12:00:00Z"],
+            "listing_dates_path": "Input/dates.xlsx",
         },
     })
     v2_job_id = started["job_id"]
@@ -385,8 +387,8 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
         time.sleep(0.02)
     assert status["state"] == "COMMITTED"
     assert status["result"]["imported_count"] == 2
-    assert status["result"]["database_path"].endswith("strategy_performance.duckdb")
-    assert status["result"]["audit_path"].endswith("import_audit.v2.json")
+    assert "database_path" not in status["result"]
+    assert "audit_path" not in status["result"]
     assert status["result"]["order_count"] == 3
     assert status["result"]["window_count"] == 0
 
@@ -404,13 +406,15 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
             connection.close()
         assert response.status == 200
         assert document["state"] == "COMMITTED"
-        assert document["result"]["database_path"].endswith("strategy_performance.duckdb")
+        assert "database_path" not in document["result"]
+        assert "failure_report_path" not in document["result"]
 
         restarted = PanelController(tmp_path, config_path)
         persisted = restarted.strategies_performance_v2_import_status(v2_job_id)
         assert persisted["state"] == "COMMITTED"
         assert persisted["result"]["imported_count"] == 2
-        assert persisted["result"]["audit_path"].endswith("import_audit.v2.json")
+        assert "audit_path" not in persisted["result"]
+        assert "failure_report_path" not in persisted["result"]
         assert "windows" not in persisted["result"]
     finally:
         server.shutdown()

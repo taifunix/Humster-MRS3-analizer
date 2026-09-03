@@ -71,7 +71,6 @@ def test_builder_contains_only_transfer_runtime(tmp_path: Path) -> None:
         "pipeline.py",
         "strategy_json.py",
         "published_surface.py",
-        "posttest.py",
         "runner",
     }
     assert not any(part in forbidden_names for path in bundle.rglob("*") for part in path.parts)

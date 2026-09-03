@@ -64,17 +64,6 @@ class _SynchronousThread:
             self.target(*self.args, **self.kwargs)
 
 
-class _PerformanceProgressProcess(_FakeProcess):
-    def __init__(self, command: list[str], **kwargs: object) -> None:
-        super().__init__(command, **kwargs)
-        self.stdout = io.StringIO(
-            "ordinary diagnostic\n"
-            '{"performance_progress":{"stage":"READBACK_VERIFIED","completed":1,"total":1,"quarantined":0,"scheduled":1,"prepared":1,"imported":1,"skipped":0,"phase_seconds":{"PARSE_PREPARE":0.1}}}\n'
-            '{"performance_progress":{"stage":"READBACK_VERIFIED","completed":1,"total":1,"quarantined":0,"scheduled":1,"prepared":1,"imported":1,"skipped":0,"phase_seconds":{"PARSE_PREPARE":0.1},"terminal_error":"ValueError"}}\n'
-        )
-        self.returncode = 1
-
-
 def _wait_finished(controller: PanelController) -> dict[str, object]:
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
@@ -83,51 +72,6 @@ def _wait_finished(controller: PanelController) -> dict[str, object]:
             return snapshot
         time.sleep(0.01)
     raise AssertionError("panel job did not finish")
-
-
-def test_panel_rejects_performance_dd5_without_inbox_manifest(tmp_path: Path) -> None:
-    inbox = tmp_path / "inbox"
-    inbox.mkdir()
-
-    with pytest.raises(ValueError, match="inbox_manifest.json is missing"):
-        PanelController(tmp_path, tmp_path / "config.json")._build_command(
-            "performance-dd5",
-            {"config": "config.json", "database": "performance.duckdb", "inbox": "inbox", "output_dir": "posttest"},
-        )
-
-
-def test_panel_rejects_performance_dd5_without_commission_contract(tmp_path: Path) -> None:
-    inbox = tmp_path / "inbox"
-    inbox.mkdir()
-    (inbox / "inbox_manifest.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "batch_id": "batch-1",
-                "expected_strategy_names": ["Demo"],
-                "tester_config_sha256": "0" * 64,
-                "entries": [{}],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="commission contract"):
-        PanelController(tmp_path, tmp_path / "config.json")._build_command(
-            "performance-dd5",
-            {"config": "config.json", "database": "performance.duckdb", "inbox": "inbox", "output_dir": "posttest"},
-        )
-
-
-def test_panel_autofills_performance_inbox_from_completed_workflow() -> None:
-    html = panel_module.PANEL_HTML
-    autofill = html.split("function autofillPerformanceInbox(workflow)", 1)[1]
-    assert "workflow.state !== 'COMPLETED'" in autofill
-    assert "workflow.inbox_path" in autofill
-    assert "document.getElementById('performance_inbox')" in autofill
-    assert "input.value = workflow.inbox_path" in autofill
-    render = html.split("function render(data)", 1)[1]
-    assert "autofillPerformanceInbox(workflow);" in render
 
 
 @pytest.mark.parametrize(
@@ -3725,23 +3669,6 @@ def test_controller_builds_shell_free_tester_command_and_captures_log(
     ]
 
 
-def test_performance_dd5_job_preserves_last_progress_snapshot_on_failure(tmp_path: Path) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_PerformanceProgressProcess)
-    controller._job = _Job("performance", "performance-dd5", (), {}, {})
-
-    controller._run_job("performance")
-
-    job = controller.snapshot()["job"]
-    assert job["status"] == "FAILED"
-    assert job["logs"] == ["ordinary diagnostic"]
-    assert job["performance_progress"] == {
-        "stage": "READBACK_VERIFIED", "completed": 1, "total": 1,
-        "quarantined": 0, "scheduled": 1, "prepared": 1, "imported": 1,
-        "skipped": 0, "phase_seconds": {"PARSE_PREPARE": 0.1},
-        "terminal_error": "ValueError",
-    }
-
-
 def test_controller_builds_source_csv_command_without_tester_config(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.json", process_factory=_FakeProcess)
 
@@ -3984,60 +3911,6 @@ def test_dashboard_reports_manifest_counts_but_never_claims_v2_selectable(
     assert str(package) not in json.dumps(dashboard)
 
 
-def test_dashboard_reports_candidate_tester_and_posttest_final_artifacts(
-    tmp_path: Path,
-) -> None:
-    selected = tmp_path / "selected"
-    selected.mkdir()
-    (selected / "run_manifest.json").write_text(
-        json.dumps(
-            {
-                "event_mode": "real_independent_events",
-                "event_eligible_point_count": 11,
-                "geometric_plateau_count": 4,
-                "ready_plateau_count": 3,
-                "ready_structure_count": 2,
-                "ready_json_count": 5,
-            }
-        ),
-        encoding="utf-8",
-    )
-    results = tmp_path / "results.csv"
-    results.write_text(
-        "strategy_name,total_pnl_pct,max_drawdown_pct\na,2.5,1.2\nb,3.0,2.0\n",
-        encoding="utf-8",
-    )
-    posttest = tmp_path / "posttest"
-    posttest.mkdir()
-    (posttest / "posttest_manifest.json").write_text(
-        json.dumps(
-            {"raw_result_count": 2, "pareto_count": 1, "scaled_strategy_count": 1, "target_dd_pct": "5", "dd5_mode": "CALCULATION_ONLY"}
-        ),
-        encoding="utf-8",
-    )
-    controller = PanelController(tmp_path, tmp_path / "config.json")
-    controller._section_jobs = {
-        "candidates": _Job("selected", "select", (), {"manifest": selected / "run_manifest.json"}, {"manifest": None}, status="SUCCEEDED"),
-        "tester": _Job("tested", "tester-run", (), {"output_csv": results}, {"output_csv": None}, status="SUCCEEDED"),
-        "posttest": _Job("dd5", "posttest", (), {"manifest": posttest / "posttest_manifest.json"}, {"manifest": None}, status="SUCCEEDED"),
-    }
-
-    dashboard = controller.snapshot()["dashboard"]
-
-    assert dashboard["candidates"]["state"] == "READY_FOR_TEST"
-    assert dashboard["candidates"]["metrics"][-1] == {"label": "JSON для теста", "value": 5}
-    assert dashboard["tester"]["state"] == "COMPLETED"
-    assert dashboard["tester"]["metrics"] == [
-        {"label": "Результаты", "value": 2},
-        {"label": "Лучший PnL, %", "value": "3"},
-        {"label": "DD лучшего, %", "value": "2"},
-        {"label": "Ошибки", "value": 0},
-    ]
-    assert dashboard["posttest"]["state"] == "CALCULATED"
-    assert dashboard["posttest"]["metrics"][-1]["value"] == "5"
-    assert dashboard["posttest"]["details"]
-
-
 def test_dashboard_keeps_last_artifact_when_a_later_job_has_none(tmp_path: Path) -> None:
     package = tmp_path / "package"
     package.mkdir()
@@ -4088,7 +3961,7 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert html.count('<button role="tab"') == 5
         assert html.count('<section role="tabpanel"') == 5
         assert "Import" in html and "surface" in html and "analysis" in html
-        assert "Test plan" in html and "DD5" in html
+        assert "Test plan" in html
         assert "Анализатор портфелей" in html
         assert "Настройки" in html
         assert "legacy_trades_proxy" in html
@@ -4106,10 +3979,6 @@ def test_http_panel_serves_ui_status_and_start_endpoint(tmp_path: Path) -> None:
         assert "prefers-contrast: more" in html
         assert "function activateTab" in html
         assert "function browse" in html
-        assert "performance_progress" in html
-        assert "function renderPerformanceProgress" in html
-        assert "performanceProgress" in html
-        assert "performanceTerminalError" in html
         assert "/api/browse" in html
         assert "CSV-файлы" in html
 

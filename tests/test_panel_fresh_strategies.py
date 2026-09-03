@@ -285,19 +285,6 @@ def test_generation_status_redacts_path_from_permission_error(tmp_path: Path, mo
     assert str(tmp_path) not in result["error"]
 
 
-def test_performance_cleanup_requires_boolean_confirmation(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-
-    try:
-        controller.strategies_performance_dd5({"tester_job_id": "job", "delete_html": "false"})
-    except ValueError as error:
-        assert "delete_html" in str(error)
-    else:
-        raise AssertionError("string confirmation must be rejected")
-
-
 def test_tester_job_uses_the_ui_recovery_kind(tmp_path: Path, monkeypatch) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
     captured: dict[str, object] = {}

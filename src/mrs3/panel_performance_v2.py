@@ -117,6 +117,10 @@ class PerformanceV2PanelRequest:
     window_a: Window | None = None
     window_b: Window | None = None
     strategy_root: Path | None = None
+    clear_retest_on_success: bool = False
+    test_start: str | None = None
+    test_end: str | None = None
+    listing_dates_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +136,7 @@ class PerformanceV2PanelResult:
     order_count: int
     plateau_count: int
     result_count: int
+    failure_report_path: Path | None = None
     windows: tuple[dict[str, object], ...] = ()
     cleanup_warning: Mapping[str, str] | None = None
 
@@ -486,6 +491,10 @@ class LocalPerformanceV2Service:
                 mode=request.mode,
                 replacement_strategy_ids=request.replacement_strategy_ids,
                 strategy_root=request.strategy_root,
+                clear_retest_on_success=request.clear_retest_on_success,
+                test_start=request.test_start,
+                test_end=request.test_end,
+                listing_dates_path=request.listing_dates_path,
             ),
             progress=import_progress,
         )
@@ -525,6 +534,7 @@ class LocalPerformanceV2Service:
             imported.audit_path,
             windows=(),
             cleanup_warning=cleanup_warning,
+            failure_report_path=imported.failure_report_path,
             **counts,
         )
 
@@ -621,6 +631,7 @@ class LocalPerformanceV2Jobs:
             "rejected_count": result.rejected_count,
             "database_path": str(result.database_path),
             "audit_path": str(result.audit_path) if result.audit_path is not None else None,
+            "failure_report_path": str(result.failure_report_path) if result.failure_report_path is not None else None,
             "strategy_count": result.strategy_count,
             "order_count": result.order_count,
             "plateau_count": result.plateau_count,

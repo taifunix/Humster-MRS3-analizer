@@ -1,5 +1,7 @@
 # Strategy Performance DuckDB v1
 
+> Superseded by the Performance DB v2 contract in `docs/specs/2026-09-03-performance-v2-retest-workflow.md`; retained for historical provenance only. References to the removed legacy posttest workbook are not current behavior.
+
 **Status:** Approved for implementation
 **Date:** 2026-08-14
 

@@ -9,6 +9,7 @@ identity before a caller starts workers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import hmac
@@ -155,6 +156,9 @@ class PreparedV2Input:
     tester_config_sha256: str
     run_mode: str
     max_html_bytes: int
+    test_start: str | None = None
+    test_end: str | None = None
+    listing_dates_path: Path | None = None
 
     @property
     def strategies(self) -> tuple[PreparedV2Entry, ...]:
@@ -597,6 +601,36 @@ def read_performance_v2_inbox(
         run_mode = manifest.get("run_mode", "FAST")
         if run_mode not in {"FAST", "RUNS", "SINGLE_MODE"}:
             raise PerformanceV2InputError("unsupported inbox run mode")
+        raw_test_start = manifest.get("test_start")
+        raw_test_end = manifest.get("test_end")
+        if (raw_test_start is None) != (raw_test_end is None):
+            raise PerformanceV2InputError("inbox test range is incomplete")
+        test_start: str | None = None
+        test_end: str | None = None
+        if raw_test_start is not None:
+            if not isinstance(raw_test_start, str) or not isinstance(raw_test_end, str):
+                raise PerformanceV2InputError("inbox test range must be ISO dates")
+            try:
+                parsed_start = date.fromisoformat(raw_test_start)
+                parsed_end = date.fromisoformat(raw_test_end)
+            except ValueError as error:
+                raise PerformanceV2InputError("inbox test range must be ISO dates") from error
+            if parsed_start.isoformat() != raw_test_start or parsed_end.isoformat() != raw_test_end or parsed_end < parsed_start:
+                raise PerformanceV2InputError("inbox test range is invalid")
+            test_start, test_end = raw_test_start, raw_test_end
+        if run_mode == "SINGLE_MODE" and test_start is None:
+            raise PerformanceV2InputError("SINGLE_MODE inbox test range is missing")
+        raw_listing_dates_path = manifest.get("listing_dates_path")
+        listing_dates_path: Path | None = None
+        if raw_listing_dates_path is not None:
+            if not isinstance(raw_listing_dates_path, str) or not raw_listing_dates_path.strip():
+                raise PerformanceV2InputError("listing dates path is invalid")
+            listing_dates_path = Path(raw_listing_dates_path)
+            # The manifest is an untrusted handoff.  Keep its path relative to
+            # the configured inbox root; the importer resolves it against its
+            # trusted roots immediately before loading the file.
+            if listing_dates_path.is_absolute() or ".." in listing_dates_path.parts:
+                raise PerformanceV2InputError("listing dates path must stay under a trusted root")
         raw_entry_mappings: list[Mapping[str, object]] = []
         seen_names: set[str] = set()
         seen_paths: set[Path] = set()
@@ -651,8 +685,25 @@ def read_performance_v2_inbox(
             raise PerformanceV2InputError("manifest names do not match expected names")
         candidate_by_name, diagnostics_by_name = _manifest_diagnostics(manifest, raw_entry_mappings, expected_set)
         provenance = manifest.get("v6_provenance")
-        provenance = provenance if isinstance(provenance, Mapping) else manifest
+        has_v6_provenance = isinstance(provenance, Mapping)
+        provenance = provenance if has_v6_provenance else manifest
         analysis_run_id = _text(provenance.get("analysis_run_id", manifest.get("analysis_run_id")), "analysis run id")
+        has_run_id_map = "strategy_analysis_run_ids" in provenance
+        raw_run_ids = provenance.get("strategy_analysis_run_ids")
+        if not has_run_id_map:
+            strategy_run_ids = {
+                Path(str(raw["strategy_path"])).name: analysis_run_id
+                for raw in raw_entry_mappings
+            }
+        else:
+            if not isinstance(raw_run_ids, Mapping):
+                raise PerformanceV2InputError("strategy analysis run ID map is malformed")
+            expected_filenames = [Path(str(raw["strategy_path"])).name for raw in raw_entry_mappings]
+            if len(set(expected_filenames)) != len(expected_filenames) or set(raw_run_ids) != set(expected_filenames):
+                raise PerformanceV2InputError("strategy analysis run ID map does not cover inbox")
+            strategy_run_ids = {}
+            for filename in expected_filenames:
+                strategy_run_ids[filename] = _text(raw_run_ids.get(filename), "strategy analysis run id")
         provenance_hashes = provenance.get("strategy_json_sha256")
         if provenance_hashes is not None and not isinstance(provenance_hashes, Mapping):
             raise PerformanceV2InputError("strategy JSON provenance hashes are malformed")
@@ -671,13 +722,16 @@ def read_performance_v2_inbox(
             identity = adapt_strategy_identity(strategy, strategy_name=name, order_plateau_diagnostics=diagnostics_by_name[name])
             if identity.order_count != int(diagnostics_by_name[name]["order_count"]):
                 raise PerformanceV2InputError("plateau diagnostic order count differs from strategy")
+            entry_analysis_run_id = strategy_run_ids.get(strategy_path.name)
+            if entry_analysis_run_id is None:
+                raise PerformanceV2InputError("strategy analysis run ID map does not cover inbox")
             if isinstance(provenance_hashes, Mapping):
                 expected_hash = provenance_hashes.get(strategy_path.name)
                 if expected_hash is not None and expected_hash != raw["strategy_version_id"]:
                     raise PerformanceV2InputError("strategy JSON provenance hash mismatch")
             for order in identity.orders:
-                key = (analysis_run_id, order.plateau_id)
-                fact = PlateauFact(analysis_run_id, order.plateau_id, order.plateau_point_count, order.plateau_total_trades)
+                key = (entry_analysis_run_id, order.plateau_id)
+                fact = PlateauFact(entry_analysis_run_id, order.plateau_id, order.plateau_point_count, order.plateau_total_trades)
                 previous = plateau_by_key.get(key)
                 if previous is not None and previous != fact:
                     raise PerformanceV2InputError("conflicting facts for shared plateau")
@@ -691,7 +745,7 @@ def read_performance_v2_inbox(
                     report_path,
                     str(raw["source_report_sha256"]),
                     identity,
-                    analysis_run_id,
+                    entry_analysis_run_id,
                     candidate_by_name[name],
                     _text(raw.get("wizard_run_id", raw.get("run_id", "unknown")), "wizard run id"),
                     exchange_name,
@@ -709,6 +763,9 @@ def read_performance_v2_inbox(
             tester_hash,
             str(run_mode),
             limit,
+            test_start,
+            test_end,
+            listing_dates_path,
         )
     except Exception as error:
         failure = error

@@ -72,7 +72,7 @@ trusted-path and importer contract.
 Performance DB import now defaults to 16 preparation processes and caps the
 request at 16; DuckDB publication remains a single transactional writer.
 Focused verification: `.venv\\Scripts\\python.exe -m pytest
-tests/test_performance_import.py tests/test_panel_performance_dd5.py -q` —
+  tests/test_performance_import.py -q` —
 `48 passed`.
 
 ## Unified Performance Analytics v2 vertical slice (2026-08-28)
@@ -92,8 +92,7 @@ tests/test_performance_v2_windows.py tests/test_panel_performance_v2.py` —
 V1 non-disturbance verification:
 `.venv\\Scripts\\python.exe -m pytest -q tests/test_performance.py
 tests/test_performance_store.py tests/test_performance_import.py
-tests/test_performance_metrics.py tests/test_performance_dd5.py
-tests/test_panel_performance_dd5.py tests/runner/test_inbox.py tests/test_panel.py
+  tests/test_performance_metrics.py tests/runner/test_inbox.py tests/test_panel.py
 tests/test_panel_static_ui.py tests/test_integration_contract.py` —
 `334 passed in 139.69s`.
 
@@ -198,8 +197,8 @@ nearest-unit intervals: absolute `Total PnL` and `Max Drawdown` use one unit,
 while their percentage fields use 0.1 percentage point. Precise series-derived
 values stored in the database are unchanged. The two previously quarantined
 PANW reports pass the updated validation in isolation. Focused verification:
-`.venv\\Scripts\\python.exe -m pytest tests/test_performance_metrics.py
-tests/test_performance_import.py tests/test_performance_dd5.py -q` -- `59
+  `.venv\\Scripts\\python.exe -m pytest tests/test_performance_metrics.py
+  tests/test_performance_import.py -q` -- `59
 passed`. A full inbox re-import remains pending because its referenced
 `Output\\strategies` JSON files are currently absent.
 
@@ -1204,3 +1203,56 @@ current report omits those fields.
 The re-review of calendar normalization, import integrity and A/B XLSX
 duration columns returned `CODE_REVIEW_PASS` after bounds were threaded through
 selection as well. No cache migration or recalculation is needed.
+
+### Performance v2 selection comparable windows (2026-09-03)
+
+Task 3a of the active RETEST workflow is independently reviewed
+(`PLAN_APPROVED`, then `CODE_REVIEW_PASS`). `filter_low_trades` now uses
+`Trades/30`; raw `total_pnl_pct` remains an audit field but is absent from the
+selection XLSX. Time consistency uses four equal calendar windows at 28 days
+or more, three at 21--28 days, and otherwise `UNAVAILABLE` without excluding
+the strategy. `NO_TRADES` is excluded from the assessed denominator; unsafe
+windows are `UNAVAILABLE`. Cache metrics version is `performance-window-v2.2`, so v2.1
+rows are not reused. Raw DD and the `PnL/30 * 5 / raw DD` proxy are unchanged.
+
+Evidence: focused selection suite `78 passed`; selection plus review suite
+`102 passed`; related suites `146 passed`; full `.venv` suite `2165 passed,
+2 skipped, 1 warning` in 725.00 s; `git diff --check` passed. The skips are
+Windows symlink-permission cases and the warning is the existing Python 3.14
+  tar-extraction deprecation. The legacy posttest/DD5 module and its dedicated
+  CLI/panel routes were removed after call-site tracing; the v2 Performance
+  workflow remains the supported path.
+
+### Performance v2 RETEST manifest and mixed-run input (2026-09-03)
+
+Task 4 of the active RETEST workflow is implemented and independently reviewed
+(`CODE_REVIEW_PASS`). `build_retest_manifest` renders only ACTIVE RETEST
+strategies with current results, rechecks typed identity and plateau facts,
+publishes the existing strategy output paths with staged hash binding, and
+records `strategy_analysis_run_ids` per JSON file. The input boundary uses the
+per-entry run for strategies, orders and plateau facts; v6 provenance is
+authoritative and legacy manifests retain the common-run fallback. Duplicate,
+malformed and incomplete identities/maps fail closed; failed publication keeps
+the prior batch recoverable.
+
+Evidence: `.venv\\Scripts\\python.exe -m pytest tests/test_performance_v2_retest.py
+tests/test_performance_v2_input.py tests/test_performance_v2_store.py -q` —
+`93 passed` in 9.60 s; related manifest/batch suites — `28 passed` in 2.62 s;
+`git diff --check` passed. No real DuckDB or generated output was modified.
+
+### Performance v2 CHECK & RETEST implementation (2026-09-03)
+
+Tasks 5-6 and the legacy-removal portion of Task 8 are implemented. The import
+contract applies listing-date plus five-day warm-up per strategy, excludes whole
+crossing lifecycles, recomputes retained evidence, keeps raw DD, publishes valid
+siblings while retaining RETEST for invalid ones, and exposes a safe CSV/XLSX
+failure report link. The panel provides separate SINGLE_MODE CHECK and
+server-built IMPORT & REPLACE actions with persisted recovery, atomic duplicate
+reservation and path-safe artifact streaming. `posttest` and the obsolete DD5
+runtime are no longer live paths.
+
+Evidence: focused RETEST/import/selection/panel suites `386 passed, 1 skipped`
+(Windows symlink capability); `node --check src/mrs3/panel_web/app.js`; clean
+`git diff --check`; external Opus review `CODE_REVIEW_PASS` after three rounds.
+Task 7 production DB backup/migration/HIGH+REVIEW seed remains intentionally
+pending; no production DB or generated artifacts were changed.

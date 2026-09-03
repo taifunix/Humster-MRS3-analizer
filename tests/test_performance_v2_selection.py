@@ -10,13 +10,17 @@ import pandas as pd
 import pytest
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+import mrs3.performance_v2_selection as selection_module
 
 from mrs3.performance_v2_selection import (
     PerformanceV2SelectionError,
     SelectionConfig,
+    _consistency_summary,
+    _consistency_windows,
     _ab_metrics_from_windows,
     _holding_p95_minutes,
     _return_30d,
+    _selection_windows,
     _trade_rate_30d,
     load_selection_candidates,
     load_selection_config,
@@ -27,10 +31,143 @@ from mrs3.performance_v2_selection import (
     write_selection_workbook,
 )
 from mrs3.performance_v2_store import initialize_performance_v2
-from mrs3.performance_v2_windows import WindowMetrics
+from mrs3.performance_v2_windows import METRICS_VERSION, WindowMetrics
 
 
 UTC = timezone.utc
+
+
+@pytest.mark.parametrize(
+    ("duration", "window_count"),
+    [
+        (timedelta(days=20, hours=23, minutes=59, seconds=59), 0),
+        (timedelta(days=21), 3),
+        (timedelta(days=27, hours=23, minutes=59, seconds=59), 3),
+        (timedelta(days=28), 4),
+        (timedelta(days=45), 4),
+    ],
+)
+def test_consistency_windows_have_exact_fractional_calendar_boundaries(duration: timedelta, window_count: int) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = start + duration
+
+    windows = _consistency_windows(start, end)
+
+    assert len(windows) == window_count
+    if windows:
+        assert windows[0][0] == start
+        assert windows[-1][1] == end
+        assert all(left[1] == right[0] for left, right in zip(windows, windows[1:]))
+
+
+def test_three_consistency_windows_are_requested_without_q4_or_positional_tail() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = start + timedelta(days=21)
+
+    windows = _selection_windows(start, end, SelectionConfig())
+
+    assert all(window in windows for window in _consistency_windows(start, end))
+    assert not any(window[0] == start + timedelta(days=15.75) for window in windows)
+    assert windows[-1][1] == end
+
+
+def _consistency_metric(start: datetime, end: datetime, growth: str = "1.1") -> WindowMetrics:
+    return WindowMetrics(
+        1, start, end, METRICS_VERSION, start, end, "AVAILABLE", None,
+        Decimal(growth), None, None, None, Decimal("2"), None,
+        None, None, 1, Decimal("100"),
+    )
+
+
+def test_time_consistency_status_counts_positive_windows_and_handles_unavailable() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    four = _consistency_windows(start, start + timedelta(days=28))
+    three = _consistency_windows(start, start + timedelta(days=21))
+
+    assert _consistency_summary([_consistency_metric(*window) for window in four[:3]] + [_consistency_metric(*four[3], "1")], four) == (3, 4, "PASS")
+    assert _consistency_summary([_consistency_metric(*window) for window in four[:2]] + [_consistency_metric(*four[2], "1"), _consistency_metric(*four[3], "1")], four) == (2, 4, "FAIL")
+    assert _consistency_summary([_consistency_metric(*window) for window in three[:2]] + [_consistency_metric(*three[2], "1")], three) == (2, 3, "PASS")
+    assert _consistency_summary([_consistency_metric(*window) for window in three[:1]] + [_consistency_metric(*three[1], "1"), _consistency_metric(*three[2], "1")], three) == (1, 3, "FAIL")
+    no_trades = WindowMetrics.unavailable(1, *four[3], "NO_TRADES")
+    collapsed = WindowMetrics.unavailable(1, *four[3], "COLLAPSED")
+    assert _consistency_summary([], ()) == (None, None, "UNAVAILABLE")
+    assert _consistency_summary([_consistency_metric(*window) for window in four[:3]] + [no_trades], four) == (3, 3, "PASS")
+    assert _consistency_summary([_consistency_metric(*window) for window in four[:2]] + [no_trades, no_trades], four) == (2, 2, "FAIL")
+    assert _consistency_summary([no_trades] * 4, four) == (None, 0, "UNAVAILABLE")
+    assert _consistency_summary([_consistency_metric(*window) for window in four[:3]] + [collapsed], four) == (None, None, "UNAVAILABLE")
+    assert _consistency_summary([_consistency_metric(*window) for window in four[:3]] + [None], four) == (None, None, "UNAVAILABLE")
+
+
+def test_consistency_summary_passes_each_subwindow_bounds_to_normalization(monkeypatch) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    windows = _consistency_windows(start, start + timedelta(days=21))
+    metrics = [_consistency_metric(*window) for window in windows]
+    calls = []
+    monkeypatch.setattr(selection_module, "_return_30d", lambda _metric, window_start, window_end: calls.append((window_start, window_end)) or Decimal("1"))
+
+    assert _consistency_summary(metrics, windows) == (3, 3, "PASS")
+    assert calls == list(windows)
+
+
+def test_low_trades_filter_uses_calendar_rate_and_excludes_missing_rates() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_low_trades", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _selection_row("a", strategy_id=1, total_trades=1, trades_30d=10),
+        _selection_row("b", strategy_id=2, total_trades=1000, trades_30d=10),
+        _selection_row("c", strategy_id=3, total_trades=2, trades_30d=10),
+        _selection_row("missing", strategy_id=4, total_trades=0, trades_30d=None),
+    ]), request).set_index("strategy_name")
+
+    assert result["eliminated_by_filter_low_trades"].sum() == 0
+    assert result.loc["missing", "finalist"]
+
+
+def test_unavailable_time_consistency_survives_and_exports_na(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_time_consistency", "enabled": True, "scope": "pair_side_timeframe"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _selection_row("unavailable", strategy_id=1, positive_quarter_count=3, positive_quarter_available_count=4, positive_quarter_status="UNAVAILABLE"),
+        _selection_row("fail", strategy_id=2, positive_quarter_count=1, positive_quarter_available_count=4, positive_quarter_status="FAIL"),
+    ]), request)
+    result = result.set_index("strategy_name")
+
+    assert result.loc["unavailable", "finalist"]
+    assert result.loc["fail", "eliminated_by_filter_time_consistency"]
+    book = load_workbook(write_selection_workbook(result.reset_index(), tmp_path / "consistency.xlsx", request), data_only=True)
+    headers = [cell.value for cell in book["All candidates"][1]]
+    assert "positive_quarter_status" not in headers
+    data_rows = {
+        book["All candidates"].cell(row, headers.index("Стратегия") + 1).value: row
+        for row in range(2, book["All candidates"].max_row + 1)
+    }
+    unavailable_row = data_rows["unavailable"]
+    assert book["All candidates"].cell(unavailable_row, headers.index("Positive windows") + 1).value == "N/A"
+    assert book["All candidates"].cell(unavailable_row, headers.index("eliminated_by_filter_time_consistency") + 1).value == "N/A"
+
+
+def test_unavailable_status_exports_na_without_count_fields(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    result = run_selection(pd.DataFrame([_selection_row("unavailable", positive_quarter_status="UNAVAILABLE")]), request)
+    result = result.drop(columns=["positive_quarter_count", "positive_quarter_available_count"], errors="ignore")
+
+    book = load_workbook(write_selection_workbook(result, tmp_path / "status-only.xlsx", request), data_only=True)
+    headers = [cell.value for cell in book["All candidates"][1]]
+    assert book["All candidates"].cell(2, headers.index("Positive windows") + 1).value == "N/A"
+
+
+def test_v21_cache_rows_are_stale_for_v22_selection_readiness(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1)
+    with duckdb.connect(str(database)) as check:
+        check.execute("update window_metrics set metrics_version = 'performance-window-v2.1'")
+        assert METRICS_VERSION == "performance-window-v2.2"
+        assert selection_cache_status(check, request, SelectionConfig()) == {"total": 1, "missing": 1, "ready": False}
 
 
 def test_selection_30d_rates_use_calendar_window_with_sparse_events() -> None:
@@ -320,6 +457,11 @@ def test_loader_derives_proxy_holding_and_order_plateau_counts(tmp_path: Path) -
     assert row["holding_p95_minutes"] == 1440
     assert row["holding_median_minutes"] == 1440
     assert row["ab_pnl_change_30d_pct"] is None
+    assert row["trades_30d"] == Decimal("1")
+    assert row["total_pnl_pct"] == Decimal("10")
+    assert row["positive_quarter_status"] == "UNAVAILABLE"
+    assert pd.isna(row["positive_quarter_count"])
+    assert pd.isna(row["positive_quarter_available_count"])
     assert row["best_trade_profit_share_pct"] == 100
     assert row["pnl_without_best_trade"] == 0
     assert row["pnl_without_best_trade_pct"] == 0
@@ -823,7 +965,7 @@ def test_workbook_keeps_rank_eliminated_rows_with_rank_diagnostics(tmp_path: Pat
 
 @pytest.mark.parametrize(("stage_id", "field", "values"), [
     ("filter_holding_outlier", "holding_p95_minutes", [10, 10, 10, 100]),
-    ("filter_low_trades", "total_trades", [100, 100, 100, 1]),
+    ("filter_low_trades", "trades_30d", [100, 100, 100, 1]),
 ])
 def test_iqr_filters_eliminate_only_outlier(stage_id: str, field: str, values: list[int]) -> None:
     rows = [_selection_row(f"row-{index}", strategy_id=index, **{field: value}) for index, value in enumerate(values)]
@@ -859,7 +1001,7 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
             total_pnl_pct=Decimal("12.6"), pnl_30d_pct=Decimal("8.5"), dd5_proxy=Decimal("5.5"), profit_factor=Decimal("1.6"),
             capital_efficiency=Decimal("10.6"), win_rate_pct=Decimal("67.8"), pnl_without_best_trade_pct=Decimal("5.6"),
             holding_p95_minutes=Decimal("10.7"), holding_median_minutes=Decimal("5.6"),
-            positive_quarter_count=3, positive_quarter_available_count=3,
+                positive_quarter_count=3, positive_quarter_available_count=3, trades_30d=Decimal("3.75"),
         ),
         _selection_row("loser", ab_return_b_30d_pct=Decimal("2.50")),
     ]), request)
@@ -873,9 +1015,16 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     book = load_workbook(path, data_only=True)
     headers = [cell.value for cell in book["All candidates"][1]]
 
+    assert "PnL" not in headers
+    assert "total_pnl_pct" not in headers
+    assert "PnL/30" in headers and "Trades/30" in headers
+    assert "positive_quarter_status" not in headers
+    strategy_column = headers.index("Стратегия") + 1
+    winner_row = next(row for row in range(2, book["All candidates"].max_row + 1) if book["All candidates"].cell(row, strategy_column).value == "winner")
+    assert book["All candidates"].cell(winner_row, headers.index("PnL/30") + 1).value == 9
     assert headers[:25] == [
-        "ID", "Стратегия", "Пара", "Side", "ТФ", "ORD", "Close", "PnL", "PnL/30", "PnL DD5/30",
-        "∆ PnL A/B", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "Positive quarters", "CE", "PF", "DD", "W/R", "Trades", "Lot DD5", "Hold p95", "Hold M", "PointsALL",
+        "ID", "Стратегия", "Пара", "Side", "ТФ", "ORD", "Close", "PnL/30", "PnL DD5/30",
+        "∆ PnL A/B", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "Positive windows", "CE", "PF", "DD", "W/R", "Trades", "Trades/30", "Lot DD5", "Hold p95", "Hold M", "PointsALL",
     ]
     assert "Shift 1" not in headers
     strategy_column = headers.index("Стратегия") + 1
@@ -899,13 +1048,16 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
         assert cell.font.color.type == "rgb"
         assert cell.font.color.rgb == "FF0000FF"
         assert book["All candidates"].column_dimensions[get_column_letter(column)].width == 6
-    assert book["All candidates"].cell(winner_row, headers.index("Positive quarters") + 1).value == "3/3"
+    assert book["All candidates"].cell(winner_row, headers.index("Positive windows") + 1).value == "3/3"
+    trades_30_column = headers.index("Trades/30") + 1
+    assert book["All candidates"].cell(winner_row, trades_30_column).value == 3.75
+    assert book["All candidates"].cell(winner_row, trades_30_column).data_type == "n"
     pnl_without_best_column = headers.index("PnL without best, %") + 1
     assert {book["All candidates"].cell(row, pnl_without_best_column).value for row in (2, 3)} == {6, None}
     assert book["All candidates"].cell(3, pnl_without_best_column).data_type == "n"
     assert book["All candidates"].cell(3, headers.index("Причина") + 1).value == "PARETO_PL_PTS_PER_ORDER"
     assert book["All candidates"].cell(3, headers.index("Причина") + 1).alignment.horizontal == "left"
-    for header in ("PnL", "PnL/30", "PnL DD5/30", "PF", "PnL A/30д, %", "PnL B/30д, %", "PnL without best, %"):
+    for header in ("PnL/30", "PnL DD5/30", "PF", "PnL A/30д, %", "PnL B/30д, %", "PnL without best, %"):
         assert book["All candidates"].cell(2, headers.index(header) + 1).number_format == "0"
     for header in (
         "Positive trades", "Robust PnL/30", "Worst DD", "Worst Hold p95", "A/B stability", "Rank q PnL", "Rank q DD",
@@ -920,8 +1072,7 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
         assert book["All candidates"].cell(2, headers.index(header) + 1).font.bold
     assert headers.index("ORD") + 1 == headers.index("Close")
     for header, edge in (
-        ("PnL", "left"),
-        ("Positive quarters", "right"),
+        ("Positive windows", "right"),
         ("Hold p95", "left"),
         ("Hold M", "right"),
         ("1 Shift", "left"),

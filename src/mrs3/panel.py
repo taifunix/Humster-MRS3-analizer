@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 import csv
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 from hashlib import sha256
@@ -16,17 +16,58 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
-from typing import Callable, Mapping, Sequence
+from typing import BinaryIO, Callable, Mapping, Sequence
 from urllib.parse import parse_qs, urlparse
 import uuid
 import webbrowser
 
 _PANEL_WEB = Path(__file__).with_name("panel_web")
 _LOGGER = logging.getLogger(__name__)
+
+
+def _open_regular_artifact(path: Path) -> tuple[BinaryIO, int]:
+    """Open one already-authorized artifact without following POSIX symlinks."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is not None:
+        fd = os.open(path, flags | nofollow)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError("artifact is not a regular file")
+            return os.fdopen(fd, "rb"), info.st_size
+        except BaseException:
+            os.close(fd)
+            raise
+
+    # Windows has no O_NOFOLLOW; bind the response to this opened handle and
+    # verify the path did not become a reparse point or another file while it
+    # was being opened.
+    expected_path = path.resolve(strict=True)
+    expected_parent = expected_path.parent.resolve(strict=True)
+    expected_info = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(expected_info.st_mode):
+        raise OSError("artifact is not a regular file")
+    handle = path.open("rb")
+    try:
+        info = os.fstat(handle.fileno())
+        resolved = path.resolve(strict=True)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or not os.path.samestat(expected_info, info)
+            or resolved != expected_path
+            or resolved.parent.resolve(strict=True) != expected_parent
+        ):
+            raise OSError("artifact is not a regular file")
+        return handle, info.st_size
+    except BaseException:
+        handle.close()
+        raise
 
 import duckdb
 
@@ -138,14 +179,6 @@ from .panel_tester_runs import LocalRunsBatchService
 from .panel_fast_strategy_test import (
     LocalSingleModeStrategyTestService,
 )
-from .panel_performance_dd5 import (
-    LocalPerformanceDd5Jobs,
-    LocalPerformanceDd5Service,
-    LocalPerformanceImportJobs,
-    PerformanceDd5CalculationRequest,
-    PerformanceDd5Request,
-    PerformanceImportPanelRequest,
-)
 from .panel_performance_v2 import (
     LocalPerformanceV2Jobs,
     PerformanceV2ApiError,
@@ -180,6 +213,7 @@ from .performance_v2_selection_review import (
     new_run_metadata,
     persist_selection_snapshot,
 )
+from .performance_v2_retest import build_retest_manifest, retest_status
 from .runner.config import RunnerConfig
 from .runner.inbox import capture_verified_inbox
 from .runner.workflow import BatchPlan, _load_saved_result_evidence, _load_saved_results, plan_batch, run_batch
@@ -550,8 +584,6 @@ PANEL_HTML = r"""<!doctype html>
         <h2>6–8. Test plan, tests, DD5</h2><p class="source-note">The generated JSON directory is pre-filled here after step 5. Source metrics remain diagnostic.</p>
         <div class="stack workflow-card"><h3>6. Manual legacy candidate generation</h3><p class="source-note">Use only for CSV/source-pack research, not after an immutable analysis run.</p><label>Источник точек<select id="select_source_mode" onchange="syncCandidateSource()"><option value="csv">Совместимый CSV-вход</option><option value="package">Проверенный source-pack</option></select></label><label id="raw_csv_source">Совместимый CSV-вход (текущий путь)<div class="path-control"><input id="input_csv" value="reports_history_bybit_long_day2.csv" type="text"><button type="button" class="secondary" onclick="browse('input_csv','csv',false)">Выбрать…</button></div></label><label id="package_source" hidden>Каталог проверенного source-pack<div class="path-control"><input id="source_package" value="source_package" type="text"><button type="button" class="secondary" onclick="browse('source_package','directory',false)">Выбрать…</button></div></label><div class="row"><label>Даты листинга<div class="path-control"><input id="dates" value="dates.xlsx" type="text"><button type="button" class="secondary" onclick="browse('dates','dates',false)">Выбрать…</button></div></label><label>Шаблон JSON<div class="path-control"><input id="template" value="ADM_3_LONG_SHORT.json" type="text"><button type="button" class="secondary" onclick="browse('template','template',false)">Выбрать…</button></div></label></div><label>Сторона<select id="side"><option>LONG</option><option>SHORT</option></select></label><button data-runnable="true" onclick="startAction('select')">Запустить селектор</button></div>
         <div class="stack workflow-card"><h3>7. Test plan and tester run</h3><label>Каталог JSON-стратегий<div class="path-control"><input id="strategies" value="output_long\strategies" type="text"><button type="button" class="secondary" onclick="browse('strategies','directory',false)">Выбрать…</button></div></label><div class="buttons"><button data-runnable="true" id="planButton" onclick="startAction('tester-plan')">Проверить план</button><button data-runnable="true" id="runButton" class="primary" onclick="startAction('tester-run')">Запустить тесты</button></div><div id="testerPlanSummary" class="muted">План ещё не проверен.</div></div>
-        <div class="stack workflow-card"><h3>8. DD5 calculated comparison</h3><p class="source-note">DD5 — расчётная нормализация для ранжирования по projected PnL/DD. Настройки стратегии и сделки берутся из проверенного CSV; повторный tick-test DD5 JSON не входит в workflow.</p><label>CSV результатов<div class="path-control"><input id="results_csv" value="results\mrs3_long_results.csv" type="text"><button type="button" class="secondary" onclick="browse('results_csv','results_csv',false)">Выбрать…</button></div></label><label>Новый каталог результата DD5<div class="path-control"><input id="posttest_output_dir" type="text" readonly><button type="button" class="secondary" onclick="browse('posttest_output_dir','directory',false)">Выбрать…</button></div></label><button data-runnable="true" onclick="startAction('posttest')">Рассчитать DD5</button></div>
-        <div class="stack workflow-card"><h3>Performance DuckDB DD5</h3><p class="source-note">CALCULATION_ONLY: import, calculate, export, then cleanup.</p><label>Performance DuckDB<div class="path-control"><input id="performance_database" value="data/databases/strategy_performance.duckdb" type="text"><button type="button" class="secondary" onclick="browse('performance_database','duckdb',false)">Select...</button></div></label><label>Completed performance inbox<div class="path-control"><input id="performance_inbox" value="data/tester_inbox" type="text"><button type="button" class="secondary" onclick="browse('performance_inbox','directory',false)">Select...</button></div></label><button data-runnable="true" onclick="startAction('performance-dd5')">Run DuckDB DD5</button></div>
       </section>
       <section role="tabpanel" id="panel-portfolio" aria-labelledby="tab-portfolio" hidden>
         <h2>Анализатор портфелей</h2><p id="portfolio-prerequisites" class="source-note"><span class="queued">Queued — Layer A only after input-contract check.</span> Нужны: формат individual results, timestamps входа/выхода, limiter contract (positions vs orders; LONG/SHORT; hedge/one-way), L2 и margin data/rules. Анализатор не превращает source-метрики или individual ranking в портфельный результат.</p>
@@ -611,7 +643,7 @@ PANEL_HTML = r"""<!doctype html>
 </main>
 <script>
 const labels = {
-  'tester-plan':'Проверка плана', 'tester-run':'Пакетное тестирование', 'select':'Создание стратегий', 'posttest':'DD5-анализ', 'performance-dd5':'Performance DuckDB DD5', 'source-csv':'CSV source-pack', 'source-duckdb':'DuckDB source-pack',
+  'tester-plan':'Проверка плана', 'tester-run':'Пакетное тестирование', 'select':'Создание стратегий', 'source-csv':'CSV source-pack', 'source-duckdb':'DuckDB source-pack',
   'PRECHECK':'Предварительная проверка', 'STOPPED':'Бот остановлен', 'CLEAN':'Отчёты очищены', 'INSTALLED':'Стратегии установлены',
   'STARTED':'Бот запущен', 'VISIBLE':'Стратегии появились', 'SUBMITTED':'Все тесты отправлены', 'MONITORING':'Идёт тестирование',
   'RECONCILED':'Результаты сверены', 'CSV_COMMITTED':'CSV сохранён', 'STOPPED_FOR_CLEANUP':'Бот остановлен для очистки',
@@ -620,11 +652,6 @@ const labels = {
 let defaultsLoaded = false;
 let workflowDefaults = {listing_dates_path:'', strategy_templates:{}};
 const value = id => document.getElementById(id).value.trim();
-function nextPosttestOutput(csvPath) {
-  const stem=(csvPath.split(/[\\/]/).pop() || 'results').replace(/\.csv$/i,'').replace(/[^a-z0-9_-]+/gi,'_');
-  const now=new Date(); const pad=n=>String(n).padStart(2,'0');
-  return `Output\\posttest_${stem}_${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-}
 function payload(action) {
   const base = {action, config:value('config')};
   if (action === 'tester-plan') return {...base, strategies:value('strategies'), output_csv:value('output_csv')};
@@ -637,8 +664,7 @@ function payload(action) {
       : {input_csv:value('input_csv')};
     return {...base, ...source, dates:value('dates'), template:value('template'), side:value('side'), output_dir:value('select_output_dir')};
   }
-  if (action === 'performance-dd5') return {...base, database:value('performance_database'), inbox:value('performance_inbox'), output_dir:value('posttest_output_dir')};
-  return {...base, results_csv:value('results_csv'), output_dir:value('posttest_output_dir')};
+  return base;
 }
 async function startAction(action) {
   if (action === 'tester-run' && window.v6TesterConfirmation) {
@@ -877,7 +903,7 @@ async function analysisShortlist(){ if(shortlistBusy) return; const payload=shor
 async function analysisStrategies(){ if(!shortlistScopes.length){ document.getElementById('analysisStrategiesStatus').textContent='No shortlist scopes available. Refresh the Pair/TF scope summary before generating READY JSON.'; return; } try { render(await duckdbRequest('/api/analysis/strategies',{run_id:value('analysis_run_id'),source_v6_surface_path:value('source_v6_surface_path'),criteria:analysisFilterCriteria(),...shortlistScopePayload(),selected_scopes:shortlistScopes.map(item=>({symbol:item.symbol,side:item.side,timeframe:item.timeframe})),template_path:value('analysis_template'),output_dir:value('analysis_strategy_output'),config_path:value('analysis_config')})); } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } }
 function renderDashboard(dashboard) {
   const target = document.getElementById('decisionDashboard'); target.replaceChildren();
-  const order = ['csv', 'duckdb', 'candidates', 'tester', 'posttest'];
+  const order = ['csv', 'duckdb', 'candidates', 'tester'];
   for (const key of order) {
     const item = dashboard?.[key]; if (!item) continue;
     const card = document.createElement('section'); card.className = 'decision-card';
@@ -891,41 +917,8 @@ function renderDashboard(dashboard) {
     target.appendChild(card);
   }
 }
-function renderPerformanceProgress(active, progress, fallbackStage) {
-  let block = document.getElementById('performanceProgress');
-  if (!active) { if (block) block.hidden = true; return; }
-  if (!block) {
-    block = document.createElement('section');
-    block.id = 'performanceProgress';
-    block.className = 'stack';
-    block.setAttribute('aria-live', 'polite');
-    block.setAttribute('aria-label', 'Performance DD5 progress');
-    block.innerHTML = '<h3>Performance DD5 progress</h3><div class="stats"><div class="stat"><b id="performanceStage">—</b><span>stage</span></div><div class="stat"><b id="performanceCompleted">0</b><span>completed</span></div><div class="stat"><b id="performanceTotal">0</b><span>total</span></div><div class="stat"><b id="performanceScheduled">0</b><span>scheduled</span></div><div class="stat"><b id="performancePrepared">0</b><span>prepared</span></div><div class="stat"><b id="performanceImported">0</b><span>imported</span></div><div class="stat"><b id="performanceSkipped">0</b><span>skipped</span></div><div class="stat"><b id="performanceQuarantined">0</b><span>quarantined</span></div></div><div id="performancePhases" class="muted"></div><div id="performanceTerminalError" class="muted" hidden></div>';
- document.getElementById('progressText').after(block);
-  }
-  block.hidden = false;
-  document.getElementById('performanceStage').textContent = progress.stage || fallbackStage;
- document.getElementById('performanceCompleted').textContent = progress.completed || 0;
- document.getElementById('performanceTotal').textContent = progress.total || 0;
-  document.getElementById('performanceScheduled').textContent = progress.scheduled || 0;
-  document.getElementById('performancePrepared').textContent = progress.prepared || 0;
-  document.getElementById('performanceImported').textContent = progress.imported || 0;
-  document.getElementById('performanceSkipped').textContent = progress.skipped || 0;
- document.getElementById('performanceQuarantined').textContent = progress.quarantined || 0;
-  const phases = progress.phase_seconds || {};
-  document.getElementById('performancePhases').textContent = Object.entries(phases).map(([key, value]) => `${key}: ${Number(value).toFixed(2)}s`).join(' | ');
- const terminalError = document.getElementById('performanceTerminalError');
-  terminalError.hidden = !progress.terminal_error;
-  terminalError.textContent = progress.terminal_error ? `terminal error: ${progress.terminal_error}` : '';
-}
-function autofillPerformanceInbox(workflow) {
-  if (!workflow || workflow.state !== 'COMPLETED' || !workflow.inbox_path) return;
-  const input = document.getElementById('performance_inbox');
-  const current = input && input.value;
-  if (input && (!current || current === 'data/tester_inbox')) input.value = workflow.inbox_path;
-}
 function render(data) {
-  if (!defaultsLoaded && data.defaults) { document.getElementById('config').value = data.defaults.config; document.getElementById('analysis_config').value = data.defaults.config; workflowDefaults=data.defaults.workflow || workflowDefaults; applyWorkflowDefaults(); const tester=data.defaults.tester || {}; if(tester.strategies){ document.getElementById('strategies').value=tester.strategies; } if(tester.output_csv){ document.getElementById('output_csv').value=tester.output_csv; document.getElementById('results_csv').value=tester.output_csv; } document.getElementById('posttest_output_dir').value=nextPosttestOutput(value('results_csv')); defaultsLoaded = true; }
+  if (!defaultsLoaded && data.defaults) { document.getElementById('config').value = data.defaults.config; document.getElementById('analysis_config').value = data.defaults.config; workflowDefaults=data.defaults.workflow || workflowDefaults; applyWorkflowDefaults(); const tester=data.defaults.tester || {}; if(tester.strategies){ document.getElementById('strategies').value=tester.strategies; } if(tester.output_csv){ document.getElementById('output_csv').value=tester.output_csv; } defaultsLoaded = true; }
   renderDashboard(data.dashboard);
   const imported = data.duckdb_import;
   if (imported) { document.getElementById('duckdbImportStatus').textContent = `${imported.running ? imported.phase : imported.final_state} · parsed=${imported.counts?.parsed || 0}/${imported.discovered || 0} · inserted=${imported.counts?.inserted || 0} · replaced=${imported.counts?.replaced || 0} · quarantined=${imported.counts?.quarantined || 0} · safe_to_delete=${imported.safe_to_delete}`; for (const [name, count] of Object.entries(imported.counts || {})) { const item=document.getElementById('import_'+name); if (item) item.textContent=count; } }
@@ -956,32 +949,28 @@ function render(data) {
   const job = data.job;
   const buttons = document.querySelectorAll('[data-runnable]'); buttons.forEach(button => button.disabled = Boolean(job && job.running));
   if (!job) return;
-  const workflow = job.workflow || {}; const progress = job.progress || {}; const performance = job.performance_progress || {};
-  autofillPerformanceInbox(workflow);
+  const workflow = job.workflow || {}; const progress = job.progress || {};
   const plan = job.plan_summary;
   if (plan) { const summary=document.getElementById('testerPlanSummary'); if(summary) summary.textContent=`${plan.mode === 'RESUME' ? 'Возобновление' : 'Новый запуск'}: всего ${plan.total}; готово ${plan.reusable}; подготовлено к тесту ${plan.prepared}.`; const runButton=document.getElementById('runButton'); if(runButton) runButton.textContent=`Запустить тесты (${plan.prepared})`; }
-  const performanceAction = job.action === 'performance-dd5';
-  renderPerformanceProgress(performanceAction, performance, job.status);
-  const phase = job.status === 'FAILED' ? 'FAILED' : (performanceAction ? (performance.stage || job.status) : (workflow.state || progress.workflow_state || job.status));
+  const phase = job.status === 'FAILED' ? 'FAILED' : (workflow.state || progress.workflow_state || job.status);
   const testerAction = job.action === 'tester-run';
   document.getElementById('operationStats').hidden = !testerAction;
   document.getElementById('activeStrategies').hidden = !testerAction;
   document.getElementById('operation').textContent = labels[job.action] || job.action;
   const state = document.getElementById('state'); state.textContent = labels[phase] || phase;
   state.className = 'state ' + (job.status === 'FAILED' || phase === 'FAILED' ? 'bad' : (job.running ? 'work' : 'good'));
-  const expected = Number(performanceAction ? (performance.total || 0) : (progress.expected_count || job.expected_count || 0));
-  const complete = Number(performanceAction ? (performance.completed || 0) : (progress.completed_count || 0)); const submitted = Number(progress.submitted_count || 0);
-  const monitoring = performanceAction || Number(progress.polls || 0) > 0;
+  const expected = Number(progress.expected_count || job.expected_count || 0);
+  const complete = Number(progress.completed_count || 0); const submitted = Number(progress.submitted_count || 0);
+  const monitoring = Number(progress.polls || 0) > 0;
   const shown = monitoring ? complete : submitted; const percent = expected ? Math.min(100, shown * 100 / expected) : (job.running ? 3 : 100);
   document.getElementById('barFill').style.width = percent + '%';
   document.getElementById('progressBar').setAttribute('aria-valuenow', String(Math.round(percent)));
   document.getElementById('progressText').textContent = expected ? (monitoring ? `${complete} завершено из ${expected} · ${percent.toFixed(1)}%` : `${submitted} отправлено из ${expected} · ${percent.toFixed(1)}%`) : (job.error || labels[phase] || phase);
-  if (performanceAction) document.getElementById('progressText').textContent = `${performance.stage || phase}${expected ? ` · ${complete}/${expected}` : ''}${performance.quarantined ? ` · quarantined=${performance.quarantined}` : ''}${performance.terminal_error ? ` · ${performance.terminal_error}` : ''}`;
   document.getElementById('submitted').textContent = submitted;
   document.getElementById('running').textContent = progress.running_count || 0;
   document.getElementById('result').textContent = progress.result_count || 0;
   document.getElementById('completed').textContent = complete;
-  document.getElementById('retries').textContent = performanceAction ? (performance.quarantined || 0) : (progress.retry_count || 0);
+  document.getElementById('retries').textContent = progress.retry_count || 0;
   const tbody = document.getElementById('activeRows'); tbody.replaceChildren();
   for (const item of (progress.active || [])) {
     const row = document.createElement('tr');
@@ -1053,7 +1042,6 @@ class _Job:
     error: str | None = None
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=500))
     plan_summary: dict[str, object] | None = None
-    performance_progress: dict[str, object] | None = None
 
     @property
     def running(self) -> bool:
@@ -1235,9 +1223,6 @@ class PanelController:
         self._runs_batch_service: LocalRunsBatchService | None = None
         self._single_mode_strategy_test_service: LocalSingleModeStrategyTestService | None = None
         self._strategy_batch_inboxes: dict[str, Path] = {}
-        self._performance_dd5_jobs: LocalPerformanceDd5Jobs | None = None
-        self._performance_import_jobs: LocalPerformanceImportJobs | None = None
-        self._performance_database_jobs: LocalPerformanceDd5Jobs | None = None
         self._performance_v2_jobs: LocalPerformanceV2Jobs | None = None
         self._reconcile_interrupted_remote_source_jobs()
         self._reconcile_interrupted_tester_jobs()
@@ -1293,8 +1278,6 @@ class PanelController:
             "select": "candidates",
             "tester-plan": "tester",
             "tester-run": "tester",
-            "posttest": "posttest",
-            "performance-dd5": "posttest",
         }[action]
 
     def _path(self, value: str | Path) -> Path:
@@ -1358,20 +1341,6 @@ class PanelController:
             return {}
         _, source, output = max(candidates, key=lambda item: item[0])
         return {"strategies": str(source), "output_csv": str(output)}
-
-    def _completed_tester_strategy_source(self, results_csv: Path) -> Path | None:
-        state_path = results_csv.with_name(f"{results_csv.stem}.state.json")
-        document = self._read_json(state_path)
-        if document.get("state") != "COMPLETED":
-            return None
-        output_csv = document.get("output_csv")
-        strategy_source = document.get("strategy_source")
-        if not isinstance(output_csv, str) or not isinstance(strategy_source, str):
-            return None
-        if self._path(output_csv) != results_csv.resolve():
-            return None
-        source = Path(strategy_source)
-        return source if source.is_dir() else None
 
     @staticmethod
     def _signature(path: Path) -> tuple[int, int] | None:
@@ -1636,39 +1605,6 @@ class PanelController:
                 "manifest": output_dir / "run_manifest.json",
                 "audit": output_dir / "audit.xlsx",
             }
-        elif action == "posttest":
-            results_csv = self._path(self._required(payload, "results_csv"))
-            audit_xlsx = self.root / "__embedded_tester_settings__.xlsx"
-            strategies = self._completed_tester_strategy_source(results_csv) or (
-                self.root / "__embedded_tester_settings__"
-            )
-            output_dir = self._path(self._required(payload, "output_dir"))
-            command.extend(
-                [
-                    "--results-csv",
-                    str(results_csv),
-                    "--audit-xlsx",
-                    str(audit_xlsx),
-                    "--strategies-dir",
-                    str(strategies),
-                    "--output-dir",
-                    str(output_dir),
-                ]
-            )
-            artifacts = {
-                "workbook": output_dir / "posttest.xlsx",
-                "manifest": output_dir / "posttest_manifest.json",
-            }
-        elif action == "performance-dd5":
-            database = self._path(self._required(payload, "database"))
-            inbox = self._path(self._required(payload, "inbox"))
-            output_dir = self._path(self._required(payload, "output_dir"))
-            if not (inbox / "inbox_manifest.json").is_file():
-                raise ValueError("inbox is incomplete: inbox_manifest.json is missing")
-            self._validate_performance_inbox(inbox)
-            command[3] = "performance-dd5"
-            command.extend(["--database", str(database), "--inbox", str(inbox), "--output-dir", str(output_dir)])
-            artifacts = {"workbook": output_dir / "posttest.xlsx", "manifest": output_dir / "posttest_manifest.json"}
         else:
             raise ValueError(f"unsupported action: {action}")
         return tuple(command), artifacts
@@ -1735,14 +1671,12 @@ class PanelController:
             raise PanelJobError("UNSUPPORTED_ROUTE")
         if kind == "strategies.tester.cancel" and isinstance(request, Mapping):
             return self.strategies_tester_cancel(self._required(request, "job_id"))
-        if kind == "strategies.performance.import" and isinstance(request, Mapping):
-            return self.strategies_performance_import(request)
         if kind == "strategies.performance.v2.import" and isinstance(request, Mapping):
             return self.strategies_performance_v2_import(request)
-        if kind == "strategies.dd5.start" and isinstance(request, Mapping):
-            return self.strategies_dd5_start(request)
-        if kind == "strategies.performance-dd5" and isinstance(request, Mapping):
-            return self.strategies_performance_dd5(request)
+        if kind == "strategies.performance.v2.retest.start" and isinstance(request, Mapping):
+            return self.strategies_performance_v2_retest_start(request)
+        if kind == "strategies.performance.v2.retest.import" and isinstance(request, Mapping):
+            return self.strategies_performance_v2_retest_import(request)
         idempotency_key = payload.get("idempotency_key")
         resource_keys = payload.get("resource_keys", [])
         if not isinstance(kind, str) or not isinstance(request, dict) or not isinstance(idempotency_key, str) or not isinstance(resource_keys, list):
@@ -1779,11 +1713,17 @@ class PanelController:
             return {}
         keys = (
             "import_id", "status", "imported_count", "skipped_count", "rejected_count",
-            "database_path", "audit_path", "strategy_count", "order_count",
+            "strategy_count", "order_count",
             "plateau_count", "result_count", "window_count",
             "cleanup_warning",
         )
-        return {key: result[key] for key in keys if key in result}
+        snapshot = {key: result[key] for key in keys if key in result}
+        if "failure_report_path" in result:
+            snapshot["failure_report_available"] = bool(result["failure_report_path"])
+            job_id = document.get("job_id")
+            if isinstance(job_id, str) and job_id:
+                snapshot["failure_report_token"] = f"performance-v2-failure-report:{job_id}"
+        return snapshot
 
     def _record_special_job(self, document: dict[str, object]) -> None:
         """Persist worker completion without exposing controller-only artifact paths."""
@@ -1799,10 +1739,22 @@ class PanelController:
             tracked = self._panel_jobs.get(job_id)
         except PanelJobError:
             return
+        if runtime:
+            # Worker callbacks must not erase controller-owned RETEST handoff
+            # metadata (dates, manifest and listing path) when adding inbox_path.
+            try:
+                saved_runtime = self._panel_jobs.runtime(job_id)
+            except PanelJobError:
+                saved_runtime = {}
+            saved_runtime.update(runtime)
+            runtime = saved_runtime
         if tracked.get("kind") == "strategies.performance.v2.import" and document.get("state") == "COMMITTED":
             result = self._performance_v2_result_snapshot(document)
             if result:
                 public["result"] = result
+            raw_report = document.get("result", {}).get("failure_report_path") if isinstance(document.get("result"), Mapping) else None
+            if isinstance(raw_report, str) and raw_report:
+                runtime["failure_report_path"] = raw_report
         if document.get("state") == "COMMITTED" and runtime:
             public["inbox_ready"] = True
         try:
@@ -2710,7 +2662,12 @@ class PanelController:
         if result.get("state") == "COMMITTED" and isinstance(result.get("inbox_path"), str):
             self._strategy_batch_inboxes[job_id] = Path(result["inbox_path"])
             result["inbox_ready"] = True
-        return {key: value for key, value in result.items() if key != "inbox_path"}
+        is_retest_native = tracked.get("kind") == "strategies.tester.native.start" and self._panel_jobs.runtime(job_id).get("retest") is True
+        if is_retest_native:
+            runtime = self._panel_jobs.runtime(job_id)
+            if runtime.get("retest") is True and isinstance(runtime.get("inbox_path"), str):
+                result["inbox_path"] = runtime["inbox_path"]
+        return result if is_retest_native else {key: value for key, value in result.items() if key != "inbox_path"}
 
     def strategies_tester_verify_inbox(self, job_id: str) -> dict[str, object]:
         config = RunnerConfig.from_json(self.default_config)
@@ -2800,11 +2757,6 @@ class PanelController:
         self._panel_jobs.cancel(job_id)
         return self._sync_tracked_panel_job(result)
 
-    def strategies_performance_dd5(self, payload: Mapping[str, object]) -> dict[str, object]:
-        """Compatibility adapter for the pre-v2 combined action."""
-        import_job = self.strategies_performance_import(payload)
-        return import_job
-
     def _tester_inbox(self, job_id: str) -> Path:
         inbox = self._strategy_batch_inboxes.get(job_id)
         if inbox is None:
@@ -2840,33 +2792,6 @@ class PanelController:
             raise ValueError("tester dates are not available")
         return start, end
 
-    def strategies_performance_import(self, payload: Mapping[str, object]) -> dict[str, object]:
-        job_id = self._required(payload, "tester_job_id")
-        delete_html = payload.get("delete_html", False)
-        if not isinstance(delete_html, bool):
-            raise ValueError("delete_html must be a boolean")
-        inbox = self._tester_inbox(job_id)
-        start, end = self._tester_dates(job_id)
-        if self._performance_import_jobs is None:
-            self._performance_import_jobs = LocalPerformanceImportJobs(on_update=self._record_special_job)
-        request = PerformanceImportPanelRequest(
-            inbox=inbox,
-            performance_db_root=self._panel_path("performance_db_root"),
-            test_start=start,
-            test_end=end,
-            delete_html=delete_html,
-        )
-        return self._start_tracked_panel_job(
-            "strategies.performance.import", {"tester_job_id": job_id, "delete_html": delete_html},
-            (f"tester:{job_id}", "performance-db"),
-            lambda tracked_id: self._performance_import_jobs.start(request, job_id=tracked_id),
-        )
-
-    def strategies_performance_import_status(self, job_id: str) -> dict[str, object]:
-        if self._performance_import_jobs is None:
-            return self._panel_jobs.get(job_id)
-        return self._tracked_job_or_interrupted(job_id, self._performance_import_jobs.status)
-
     @staticmethod
     def _performance_v2_window(payload: Mapping[str, object], name: str) -> tuple[object, object] | None:
         value = payload.get(name)
@@ -2883,6 +2808,271 @@ class PanelController:
             self.default_config.with_name("config.performance.json"),
             v1_database_root=self._panel_path("performance_db_root"),
         )
+
+    @staticmethod
+    def _retest_date(value: object, field: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be an ISO date")
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError:
+            raise ValueError(f"{field} must be an ISO date") from None
+        if parsed.isoformat() != value:
+            raise ValueError(f"{field} must be an ISO date")
+        return value
+
+    def _retest_default_dates(self, connection: duckdb.DuckDBPyConnection) -> tuple[str, str]:
+        rows = connection.execute(
+            """
+            select s.strategy_id, r.report_start_utc, r.report_end_utc
+              from strategy_tags tags
+              join strategies s on s.strategy_id = tags.strategy_id
+              join strategy_results r on r.result_id = s.current_result_id
+                                        and r.strategy_id = s.strategy_id
+             where tags.tag = 'RETEST'
+               and s.lifecycle_status = 'ACTIVE'
+               and s.current_result_id is not null
+             order by s.strategy_id
+            """
+        ).fetchall()
+        if not rows:
+            raise ValueError("no active RETEST strategies with current results")
+
+        def as_datetime(value: object) -> datetime:
+            if isinstance(value, datetime):
+                return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+            if isinstance(value, date):
+                return datetime.combine(value, datetime.min.time(), tzinfo=timezone.utc)
+            if isinstance(value, str):
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+            raise ValueError("RETEST result dates are invalid")
+
+        candidates: list[tuple[timedelta, int, datetime, datetime]] = []
+        for strategy_id, raw_start, raw_end in rows:
+            start, end = as_datetime(raw_start), as_datetime(raw_end)
+            if end <= start:
+                continue
+            candidates.append((end - start, int(strategy_id), start, end))
+        if not candidates:
+            raise ValueError("RETEST result dates are invalid")
+        _, _, start, end = max(candidates, key=lambda item: (item[0], -item[1]))
+        return start.astimezone(timezone.utc).date().isoformat(), end.astimezone(timezone.utc).date().isoformat()
+
+    def _retest_range(self, payload: Mapping[str, object], connection: duckdb.DuckDBPyConnection) -> tuple[str, str]:
+        allowed = {"test_start", "test_end", "start_date", "end_date"}
+        if set(payload).difference(allowed):
+            raise ValueError("RETEST start request contains unsupported fields")
+        pairs = [("test_start", "test_end"), ("start_date", "end_date")]
+        present = [(start, end) for start, end in pairs if start in payload or end in payload]
+        if len(present) > 1:
+            raise ValueError("RETEST dates must use one date contract")
+        if not present:
+            start, end = self._retest_default_dates(connection)
+        else:
+            start_key, end_key = present[0]
+            if start_key not in payload or end_key not in payload:
+                raise ValueError("RETEST test_start and test_end are required together")
+            start = self._retest_date(payload[start_key], start_key)
+            end = self._retest_date(payload[end_key], end_key)
+        if start >= end:
+            raise ValueError("RETEST test_start must be before test_end")
+        return start, end
+
+    def _retest_listing_context(self) -> tuple[Path, Path]:
+        configured = self._workflow_default("listing_dates_path")
+        try:
+            relative = configured.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            raise ValueError("RETEST listing dates path must be inside the project") from None
+        if not configured.is_file():
+            raise ValueError("RETEST listing dates file is unavailable")
+        return configured.resolve(), Path(*relative.parts)
+
+    def _validate_retest_listing(self, connection: duckdb.DuckDBPyConnection, path: Path, start: str) -> None:
+        try:
+            listing_dates = load_listing_dates(path)
+        except Exception as error:
+            raise ValueError("RETEST listing dates file is invalid") from error
+        symbols = [row[0] for row in connection.execute(
+            """
+            select s.symbol
+              from strategy_tags tags
+              join strategies s on s.strategy_id = tags.strategy_id
+             where tags.tag = 'RETEST'
+               and s.lifecycle_status = 'ACTIVE'
+               and s.current_result_id is not null
+             order by s.strategy_id
+            """
+        ).fetchall()]
+        for symbol in symbols:
+            listing = listing_dates.get(str(symbol))
+            if listing is None:
+                raise ValueError(f"RETEST listing date is missing for {symbol}")
+            if hasattr(listing, "to_pydatetime"):
+                listing = listing.to_pydatetime()
+            if isinstance(listing, datetime):
+                listed = listing.astimezone(timezone.utc).date() if listing.tzinfo else listing.date()
+            elif isinstance(listing, date):
+                listed = listing
+            else:
+                raise ValueError(f"RETEST listing date is invalid for {symbol}")
+
+    def strategies_performance_v2_retest_status(self) -> dict[str, object]:
+        config = self._performance_v2_config()
+        target = performance_v2_database_path(config)
+        if not target.is_file():
+            return {"count": 0, "retest_count": 0, "active_count": 0, "phase": "IDLE"}
+        try:
+            with duckdb.connect(str(target), read_only=True) as connection:
+                status = retest_status(connection)
+                defaults = self._retest_default_dates(connection) if status.active_count else None
+        except (duckdb.Error, OSError, PerformanceV2StoreError) as error:
+            if not target.exists():
+                return {"count": 0, "retest_count": 0, "active_count": 0, "phase": "IDLE"}
+            raise ValueError("Performance v2 RETEST status is unavailable") from error
+        return {
+            "count": status.active_count,
+            "retest_count": status.active_count,
+            "active_count": status.active_count,
+            "default_start": defaults[0] if defaults else None,
+            "default_end": defaults[1] if defaults else None,
+            "listing_dates_path": str(self._workflow_default("listing_dates_path")),
+            "phase": "READY" if status.active_count else "IDLE",
+        }
+
+    def strategies_performance_v2_retest_start(self, payload: Mapping[str, object]) -> dict[str, object]:
+        config = self._performance_v2_config()
+        target = performance_v2_database_path(config)
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
+        listing_path, listing_relative = self._retest_listing_context()
+        templates = self._workflow_defaults().get("strategy_templates", {})
+        with duckdb.connect(str(target), read_only=True) as connection:
+            start, end = self._retest_range(payload, connection)
+            self._validate_retest_listing(connection, listing_path, start)
+            batch = build_retest_manifest(
+                connection,
+                templates if isinstance(templates, Mapping) else {},
+                config.strategy_root.parent if config.strategy_root is not None else self.root / "Output",
+            )
+        runtime = {
+            "retest": True,
+            "mode": "SINGLE_MODE",
+            "manifest_path": str(batch.manifest_path),
+            "run_id": batch.run_id,
+            "strategies_path": str(batch.strategies_path),
+            "test_start": start,
+            "test_end": end,
+            "listing_dates_path": str(listing_relative),
+        }
+        request = {
+            "manifest_path": str(batch.manifest_path),
+            "analysis_run_id": batch.run_id,
+            "start_date": start,
+            "end_date": end,
+            "mode": "SINGLE_MODE",
+            "retest": True,
+        }
+        return self._start_tracked_panel_job(
+            "strategies.tester.native.start",
+            request,
+            ("strategies.tester", "performance-v2-retest"),
+            lambda job_id: self._single_mode_strategy_test().start(
+                batch.manifest_path,
+                analysis_run_id=batch.run_id,
+                start_date=start,
+                end_date=end,
+                job_id=job_id,
+            ),
+            runtime=runtime,
+        )
+
+    def _retest_mapping(self, tester_job_id: str) -> tuple[dict[str, int], dict[str, object]]:
+        job = self._panel_jobs.get(tester_job_id)
+        runtime = self._panel_jobs.runtime(tester_job_id)
+        if job.get("kind") != "strategies.tester.native.start" or runtime.get("retest") is not True:
+            raise ValueError("tester job is not a RETEST run")
+        if job.get("state") != "COMMITTED" or job.get("inbox_ready") is not True:
+            raise ValueError("RETEST tester inbox is not committed")
+        inbox = self._tester_inbox(tester_job_id)
+        try:
+            manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("committed RETEST inbox manifest is unavailable") from error
+        names = manifest.get("expected_strategy_names") if isinstance(manifest, Mapping) else None
+        if not isinstance(names, list) or not names or any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("committed RETEST inbox names are invalid")
+        if manifest.get("run_mode") != "SINGLE_MODE":
+            raise ValueError("RETEST inbox must be a committed SINGLE_MODE snapshot")
+        config = self._performance_v2_config()
+        target = performance_v2_database_path(config)
+        with duckdb.connect(str(target), read_only=True) as connection:
+            rows = connection.execute(
+                """
+                select s.strategy_name, s.strategy_id
+                  from strategy_tags tags
+                  join strategies s on s.strategy_id = tags.strategy_id
+                 where tags.tag = 'RETEST'
+                   and s.lifecycle_status = 'ACTIVE'
+                   and s.current_result_id is not null
+                 order by s.strategy_id
+                """
+            ).fetchall()
+        mapping = {str(name): int(strategy_id) for name, strategy_id in rows}
+        if set(mapping) != set(names):
+            raise ValueError("RETEST inbox does not match current RETEST strategies")
+        return mapping, runtime
+
+    def strategies_performance_v2_retest_import(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if set(payload) != {"tester_job_id"}:
+            raise ValueError("RETEST import accepts only tester_job_id; mapping is server-built")
+        tester_job_id = self._required(payload, "tester_job_id")
+        mapping, runtime = self._retest_mapping(tester_job_id)
+        if "retest_import_job_id" in runtime:
+            raise ValueError("RETEST import is already started")
+        start, end = runtime.get("test_start"), runtime.get("test_end")
+        listing_path = runtime.get("listing_dates_path")
+        if not isinstance(start, str) or not isinstance(end, str) or not isinstance(listing_path, str):
+            raise ValueError("RETEST run provenance is incomplete")
+        pending_import = f"pending:{uuid.uuid4().hex}"
+        try:
+            self._panel_jobs.reserve_runtime(tester_job_id, "retest_import_job_id", pending_import)
+        except PanelJobError as error:
+            if error.code == "RUNTIME_BUSY":
+                raise ValueError("RETEST import is already started") from None
+            raise
+        try:
+            import_job = self.strategies_performance_v2_import({
+                "tester_job_id": tester_job_id,
+                "mode": "REPLACE",
+                "replacement_strategy_ids": mapping,
+                "clear_retest_on_success": True,
+                "test_start": start,
+                "test_end": end,
+                "listing_dates_path": listing_path,
+                "_retest": True,
+            }, _internal=True)
+            if not isinstance(import_job, Mapping):
+                raise ValueError("RETEST import returned an invalid job")
+            inner_job_id = import_job.get("job_id")
+            if not isinstance(inner_job_id, str) or not inner_job_id.strip():
+                raise ValueError("RETEST import returned an invalid job")
+            try:
+                inner_job = self._panel_jobs.get(inner_job_id)
+            except PanelJobError:
+                raise ValueError("RETEST import job was not registered") from None
+            if inner_job.get("kind") != "strategies.performance.v2.import":
+                raise ValueError("RETEST import returned an invalid job")
+        except BaseException:
+            try:
+                self._panel_jobs.clear_runtime(tester_job_id, "retest_import_job_id", value=pending_import)
+            except PanelJobError:
+                pass
+            raise
+        runtime["retest_import_job_id"] = inner_job_id
+        self._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
+        return import_job
 
     def _ensure_performance_v2_schema(self, target: Path) -> None:
         if not target.is_file():
@@ -2911,10 +3101,17 @@ class PanelController:
                 raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
             self._performance_v2_schema_ready.add(identity)
 
-    def strategies_performance_v2_import(self, payload: Mapping[str, object]) -> dict[str, object]:
-        allowed = {"tester_job_id", "mode", "replacement_strategy_ids", "window_a", "window_b"}
+    def strategies_performance_v2_import(self, payload: Mapping[str, object], *, _internal: bool = False) -> dict[str, object]:
+        allowed = {
+            "tester_job_id", "mode", "replacement_strategy_ids", "window_a", "window_b",
+            "clear_retest_on_success", "test_start", "test_end", "listing_dates_path", "_retest",
+        }
         if set(payload).difference(allowed):
             raise ValueError("Performance v2 import request contains unsupported fields")
+        if not _internal and any(
+            key in payload for key in ("replacement_strategy_ids", "clear_retest_on_success", "_retest")
+        ):
+            raise ValueError("Performance v2 replacement controls are internal only")
         tester_job_id = self._required(payload, "tester_job_id")
         tester_job = self._panel_jobs.get(tester_job_id)
         if tester_job.get("state") != "COMMITTED" or tester_job.get("inbox_ready") is not True:
@@ -2922,6 +3119,8 @@ class PanelController:
         mode = payload.get("mode", "ADD")
         if not isinstance(mode, str) or mode not in {"ADD", "REPLACE"}:
             raise ValueError("Performance v2 import mode must be ADD or REPLACE")
+        if not _internal and mode == "REPLACE":
+            raise ValueError("Performance v2 REPLACE is internal only")
         replacement = payload.get("replacement_strategy_ids")
         if replacement is not None and (
             not isinstance(replacement, Mapping)
@@ -2938,6 +3137,24 @@ class PanelController:
         window_b = self._performance_v2_window(payload, "window_b")
         if (window_a is None) != (window_b is None):
             raise ValueError("window_a and window_b must be supplied together")
+        clear_retest = payload.get("clear_retest_on_success", False)
+        if type(clear_retest) is not bool:
+            raise ValueError("clear_retest_on_success must be a boolean")
+        test_start, test_end = payload.get("test_start"), payload.get("test_end")
+        if (test_start is None) != (test_end is None) or (
+            test_start is not None and (
+                not isinstance(test_start, str) or not isinstance(test_end, str)
+                or date.fromisoformat(test_start).isoformat() != test_start
+                or date.fromisoformat(test_end).isoformat() != test_end
+                or test_start >= test_end
+            )
+        ):
+            raise ValueError("test_start and test_end must be valid ISO dates")
+        listing_dates_path = payload.get("listing_dates_path")
+        if listing_dates_path is not None and (
+            not isinstance(listing_dates_path, str) or not listing_dates_path.strip()
+        ):
+            raise ValueError("listing_dates_path must be a relative path")
         if self._performance_v2_jobs is None:
             self._performance_v2_jobs = LocalPerformanceV2Jobs(on_update=self._record_special_job)
         performance_config = self._performance_v2_config()
@@ -2950,10 +3167,17 @@ class PanelController:
             window_a=window_a,
             window_b=window_b,
             strategy_root=performance_config.strategy_root,
+            clear_retest_on_success=clear_retest,
+            test_start=test_start if isinstance(test_start, str) else None,
+            test_end=test_end if isinstance(test_end, str) else None,
+            listing_dates_path=Path(listing_dates_path) if isinstance(listing_dates_path, str) else None,
         )
+        job_request = {"tester_job_id": tester_job_id, "mode": mode}
+        if _internal:
+            job_request["retest"] = True
         return self._start_tracked_panel_job(
             "strategies.performance.v2.import",
-            {"tester_job_id": tester_job_id, "mode": mode},
+            job_request,
             (f"tester:{tester_job_id}", "performance-v2-db"),
             lambda tracked_id: self._performance_v2_jobs.start(request, job_id=tracked_id),
         )
@@ -2961,7 +3185,10 @@ class PanelController:
     def strategies_performance_v2_import_status(self, job_id: str) -> dict[str, object]:
         if self._performance_v2_jobs is None:
             return self._panel_jobs.get(job_id)
-        return self._tracked_job_or_interrupted(job_id, self._performance_v2_jobs.status)
+        self._tracked_job_or_interrupted(job_id, self._performance_v2_jobs.status)
+        # The worker status contains local filesystem paths; the persisted
+        # panel job is the redacted public snapshot.
+        return self._panel_jobs.get(job_id)
 
     def performance_v2_catalog(self) -> dict[str, object]:
         config = self._performance_v2_config()
@@ -3174,83 +3401,6 @@ class PanelController:
             }
         except (PerformanceV2SelectionError, OSError, duckdb.Error) as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_RECALCULATE_FAILED", status=400, message=str(error)) from error
-
-    def performance_database_catalog(self) -> dict[str, object]:
-        root = self._panel_path("performance_db_root")
-        root.mkdir(parents=True, exist_ok=True)
-        entries: list[dict[str, object]] = []
-        for database in sorted(root.glob("*.performance-v6.duckdb")):
-            try:
-                with duckdb.connect(str(database), read_only=True) as connection:
-                    schema = connection.execute("select value from schema_info where key = 'schema_version'").fetchone()
-                    row = connection.execute(
-                        "select import_id from import_runs where status = 'COMMITTED' and quarantined_count = 0 order by finished_at_utc desc limit 1"
-                    ).fetchone()
-                if schema != ("1",) or not row or not isinstance(row[0], str):
-                    continue
-            except Exception:
-                continue
-            entries.append({
-                "database_name": database.name,
-                "relative_path": str(database.relative_to(self.root)).replace("/", "\\"),
-                "import_id": row[0],
-                "audit_relative_path": str((database.parent / database.stem / "import_audit.v4.json").relative_to(self.root)).replace("/", "\\"),
-                "workbook_name": f"{database.stem}.dd5.xlsx",
-            })
-        return {"databases": entries}
-
-    def _performance_database(self, name: object) -> tuple[Path, dict[str, object]]:
-        if not isinstance(name, str) or not name or Path(name).name != name or not name.endswith(".performance-v6.duckdb"):
-            raise ValueError("invalid Performance DB")
-        entry = next((item for item in self.performance_database_catalog()["databases"] if item["database_name"] == name), None)
-        if not isinstance(entry, dict):
-            raise ValueError("Performance DB is unavailable")
-        return self._panel_path("performance_db_root") / name, entry
-
-    def strategies_dd5_start(self, payload: Mapping[str, object]) -> dict[str, object]:
-        database, entry = self._performance_database(payload.get("database_name"))
-        import_id = payload.get("import_id", entry["import_id"])
-        if not isinstance(import_id, str) or import_id != entry["import_id"]:
-            raise ValueError("Performance import identity does not match")
-        if self._performance_database_jobs is None:
-            service = LocalPerformanceDd5Service()
-            self._performance_database_jobs = LocalPerformanceDd5Jobs(
-                run=lambda request, progress=None: service.calculate(request),
-                on_update=self._record_special_job,
-            )
-        request = PerformanceDd5CalculationRequest(
-            database=database,
-            import_id=import_id,
-            workbooks_root=self._panel_path("workbooks_root"),
-            performance_db_root=self._panel_path("performance_db_root"),
-            config=self._analysis_config_loader(self.default_config),
-        )
-        return self._start_tracked_panel_job(
-            "strategies.dd5.start", {"database_name": database.name, "import_id": import_id},
-            (f"performance-db:{database.name}", "workbooks"),
-            lambda tracked_id: self._performance_database_jobs.start(request, job_id=tracked_id),
-        )
-
-    def strategies_dd5_status(self, job_id: str) -> dict[str, object]:
-        if self._performance_database_jobs is None:
-            return self._panel_jobs.get(job_id)
-        return self._tracked_job_or_interrupted(job_id, self._performance_database_jobs.status)
-
-    def performance_artifact(self, database_name: object, kind: object) -> Path | None:
-        database, _ = self._performance_database(database_name)
-        if kind == "audit":
-            candidate = database.parent / database.stem / "import_audit.v4.json"
-        elif kind == "workbook":
-            candidate = self._panel_path("workbooks_root") / database.stem / f"{database.stem}.dd5.xlsx"
-        else:
-            raise ValueError("invalid performance artifact")
-        return candidate if candidate.is_file() else None
-
-    def strategies_performance_dd5_status(self, job_id: str) -> dict[str, object]:
-        if self._performance_dd5_jobs is None:
-            return self._panel_jobs.get(job_id)
-        return self._tracked_job_or_interrupted(job_id, self._performance_dd5_jobs.status)
-
 
     def _import_settings(self, payload: Mapping[str, object] | None = None) -> DuckDBImportSettings:
         if payload is None:
@@ -5249,19 +5399,6 @@ class PanelController:
                         raw_handle.write(str(raw_line))
                         raw_handle.flush()
                     if line:
-                        if job.action == "performance-dd5":
-                            try:
-                                event = json.loads(line).get("performance_progress")
-                            except (TypeError, ValueError):
-                                event = None
-                            if isinstance(event, dict):
-                                with self._lock:
-                                    job.performance_progress = {
-                                        key: event[key]
-                                        for key in ("stage", "completed", "total", "quarantined", "scheduled", "prepared", "imported", "skipped", "phase_seconds", "terminal_error")
-                                        if key in event
-                                    }
-                                continue
                         display_line = (
                             _normalise_tester_log_line(line)
                             if job.action == "tester-run"
@@ -5465,36 +5602,12 @@ class PanelController:
             details.append("Финальные метрики — результат реального tick-test.")
         return {"title": "Тестер", "available": True, "state": state, "metrics": metrics, "details": details}
 
-    def _posttest_dashboard(self, job: _Job, artifacts: Mapping[str, Path]) -> dict[str, object]:
-        manifest = self._read_json(artifacts.get("manifest"))
-        if manifest is None:
-            result = self._empty_dashboard("DD5 после теста")
-            result["state"] = job.status
-            return result
-        values = (
-            ("Реальные результаты", "raw_result_count"),
-            ("Pareto", "pareto_count"),
-            ("Целевой DD, %", "target_dd_pct"),
-        )
-        metrics = [
-            {"label": label, "value": self._integer(manifest.get(key)) if key != "target_dd_pct" else (self._number_text(manifest.get(key)) or "—")}
-            for label, key in values
-        ]
-        return {
-            "title": "DD5 после теста",
-            "available": True,
-            "state": "CALCULATED" if manifest.get("dd5_mode") == "CALCULATION_ONLY" else "COMPLETED",
-            "metrics": metrics,
-            "details": ["DD5 расчётно нормализует результаты для сравнения стратегий; повторный tick-test не входит в workflow."],
-        }
-
     def _dashboard(self, jobs: Mapping[str, _Job]) -> dict[str, object]:
         titles = {
             "csv": "CSV · MRS2",
             "duckdb": "DuckDB · MRS2",
             "candidates": "Кандидаты стратегий",
             "tester": "Тестер",
-            "posttest": "DD5 после теста",
         }
         dashboard: dict[str, object] = {key: self._empty_dashboard(title) for key, title in titles.items()}
         for section, job in jobs.items():
@@ -5505,8 +5618,6 @@ class PanelController:
                 dashboard[section] = self._candidate_dashboard(job, artifacts)
             elif section == "tester":
                 dashboard[section] = self._tester_dashboard(job, artifacts)
-            elif section == "posttest":
-                dashboard[section] = self._posttest_dashboard(job, artifacts)
         return dashboard
 
     def snapshot(self) -> dict[str, object]:
@@ -5535,7 +5646,6 @@ class PanelController:
                     "error": job.error,
                     "logs": list(job.logs),
                     "plan_summary": job.plan_summary,
-                    "performance_progress": job.performance_progress,
                     "expected_count": job.expected_count,
                     "workflow": self._read_json(state_path),
                     "progress": self._read_json(progress_path),
@@ -5693,6 +5803,8 @@ class PanelController:
         }
 
     def artifact(self, name: str) -> Path | tuple[str, bytes] | None:
+        if name.startswith("performance-v2-failure-report:"):
+            return self.performance_v2_failure_report(name.partition(":")[2])
         direct_artifact = self._direct_artifact(name)
         if direct_artifact is not None:
             return direct_artifact
@@ -5707,6 +5819,45 @@ class PanelController:
                 return None
             return {"import_manifest": (result.manifest_path.name, evidence[0]), "import_checklist": (result.checklist_path.name, evidence[1])}.get(name)
         return path
+
+    def performance_v2_failure_report(self, job_id: str) -> Path:
+        try:
+            job = self._panel_jobs.get(job_id)
+            if job.get("kind") != "strategies.performance.v2.import" or job.get("state") != "COMMITTED":
+                raise ValueError("failure report is not available")
+            runtime = self._panel_jobs.runtime(job_id)
+            result = job.get("result")
+            value = runtime.get("failure_report_path")
+            if not isinstance(value, str) or not value:
+                value = result.get("failure_report_path") if isinstance(result, dict) else None
+            if self._performance_v2_jobs is not None:
+                try:
+                    private = self._performance_v2_jobs.status(job_id)
+                except KeyError:
+                    private = {}
+                private_result = private.get("result") if isinstance(private, dict) else None
+                if isinstance(private_result, dict):
+                    private_value = private_result.get("failure_report_path")
+                    if isinstance(private_value, str) and private_value:
+                        value = private_value
+            if not isinstance(value, str) or not value:
+                raise ValueError("failure report is not available")
+            raw_path = Path(value)
+            root = performance_v2_database_path(self._performance_v2_config()).parent.resolve()
+            if not root.is_dir() or not raw_path.is_absolute():
+                raise ValueError("failure report is not available")
+            if raw_path.is_symlink() or os.path.islink(raw_path):
+                raise ValueError("failure report is not available")
+            os.lstat(raw_path)
+            parent = raw_path.parent
+            if parent.is_symlink() or os.path.islink(parent) or parent.resolve(strict=True) != root:
+                raise ValueError("failure report is not available")
+            path = raw_path.resolve(strict=True)
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("failure report is not available")
+            return path
+        except (PanelJobError, OSError, ValueError) as error:
+            raise ValueError("failure report is not available") from error
 
     def _direct_artifact(self, name: str) -> tuple[str, bytes] | None:
         with self._lock:
@@ -5852,12 +6003,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v2/strategies/analysis/catalog":
             self._json(200, self.server.controller.analysis_catalog())
             return
-        if parsed.path == "/api/v2/strategies/performance/catalog":
-            try:
-                self._json(200, self.server.controller.performance_database_catalog())
-            except ValueError:
-                self._json(400, {"error": "invalid performance db request"})
-            return
         if parsed.path == "/api/v2/strategies/performance-v2/catalog":
             try:
                 self._json(200, self.server.controller.strategies_performance_v2_catalog())
@@ -5912,19 +6057,11 @@ class _PanelHandler(BaseHTTPRequestHandler):
             except (KeyError, ValueError):
                 self._json(400, {"error": "invalid strategy batch request"})
             return
-        if parsed.path == "/api/v2/strategies/performance-dd5/status":
+        if parsed.path == "/api/v2/strategies/performance-v2/retest/status":
             try:
-                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
-                self._json(200, self.server.controller.strategies_performance_dd5_status(job_id))
-            except (KeyError, ValueError):
-                self._json(400, {"error": "invalid performance db request"})
-            return
-        if parsed.path == "/api/v2/strategies/performance/import/status":
-            try:
-                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
-                self._json(200, self.server.controller.strategies_performance_import_status(job_id))
-            except (KeyError, ValueError):
-                self._json(400, {"error": "invalid performance import request"})
+                self._json(200, self.server.controller.strategies_performance_v2_retest_status())
+            except ValueError:
+                self._json(200, {"count": 0, "retest_count": 0, "active_count": 0, "phase": "UNAVAILABLE"})
             return
         if parsed.path == "/api/v2/strategies/performance-v2/import/status":
             try:
@@ -5932,39 +6069,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(200, self.server.controller.strategies_performance_v2_import_status(job_id))
             except (KeyError, ValueError):
                 self._json(400, {"error": "invalid Performance v2 import request"})
-            return
-        if parsed.path == "/api/v2/strategies/dd5/status":
-            try:
-                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
-                self._json(200, self.server.controller.strategies_dd5_status(job_id))
-            except (KeyError, ValueError):
-                self._json(400, {"error": "invalid DD5 request"})
-            return
-        if parsed.path == "/api/v2/strategies/performance/artifact":
-            query = parse_qs(parsed.query)
-            try:
-                artifact = self.server.controller.performance_artifact(
-                    query.get("database_name", [""])[0], query.get("kind", [""])[0]
-                )
-            except ValueError:
-                artifact = None
-            if artifact is None:
-                self._json(404, {"error": "performance artifact is not available"})
-                return
-            filename, data = artifact.name, None
-            size = artifact.stat().st_size
-            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(size))
-            disposition = "inline" if query.get("kind", [""])[0] == "audit" else "attachment"
-            self.send_header("Content-Disposition", f'{disposition}; filename="{filename.replace(chr(34), "")}"')
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            with artifact.open("rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    self.wfile.write(chunk)
             return
         if parsed.path == "/api/ui/bootstrap":
             self._json(200, {"version": "panel-ui-v1", "defaults": {"runner": {"configured": False}}})
@@ -6002,33 +6106,46 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/artifact":
             name = parse_qs(parsed.query).get("name", [""])[0]
-            artifact = self.server.controller.artifact(name)
+            try:
+                artifact = self.server.controller.artifact(name)
+            except (OSError, ValueError):
+                self._json(404, {"error": "artifact is not available"})
+                return
             if artifact is None:
                 self._json(404, {"error": "artifact is not available"})
                 return
+            artifact_file: BinaryIO | None = None
             if isinstance(artifact, Path):
-                filename, data = artifact.name, None
-                size = artifact.stat().st_size
+                try:
+                    filename, data = artifact.name, None
+                    artifact_file, size = _open_regular_artifact(artifact)
+                except OSError:
+                    self._json(404, {"error": "artifact is not available"})
+                    return
             else:
                 filename, data = artifact
                 size = len(data)
             content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            safe_filename = "".join(char for char in filename if char >= " " and char != "\x7f").replace(chr(34), "") or "artifact"
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(size))
             self.send_header(
                 "Content-Disposition",
-                f'attachment; filename="{filename.replace(chr(34), "")}"',
+                f'attachment; filename="{safe_filename}"',
             )
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
-            if data is not None:
-                self.wfile.write(data)
-            else:
-                with artifact.open("rb") as handle:
-                    while chunk := handle.read(1024 * 1024):
-                        self.wfile.write(chunk)
+            try:
+                if data is not None:
+                    self.wfile.write(data)
+                elif artifact_file is not None:
+                    with artifact_file:
+                        shutil.copyfileobj(artifact_file, self.wfile, length=1024 * 1024)
+            finally:
+                if artifact_file is not None and not artifact_file.closed:
+                    artifact_file.close()
             return
         self._json(404, {"error": "not found"})
 
@@ -6037,10 +6154,14 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
+        direct_retest_endpoint = endpoint if endpoint in {
+            "/api/v2/strategies/performance-v2/retest/start",
+            "/api/v2/strategies/performance-v2/retest/import",
+        } else None
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import"}:
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"}:
             self._json(404, {"error": "not found"})
             return
         if endpoint == "/api/v2/strategies/performance-v2/selection-review-import":
@@ -6084,6 +6205,13 @@ class _PanelHandler(BaseHTTPRequestHandler):
             document = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(document, dict):
                 raise ValueError("JSON body must be an object")
+            if direct_retest_endpoint is not None:
+                document = {
+                    "kind": "strategies.performance.v2.retest.start"
+                    if direct_retest_endpoint.endswith("/start")
+                    else "strategies.performance.v2.retest.import",
+                    "request": document,
+                }
             if endpoint == "/api/v2/panel/restart":
                 result = self.server.restart_panel()
             elif endpoint == "/api/v2/strategies/tester/verify-inbox":
@@ -6148,6 +6276,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_performance_v2_recalculate(document)
             elif endpoint == "/api/v2/strategies/performance-v2/recalculate-all":
                 result = self.server.controller.strategies_performance_v2_recalculate_all()
+            elif endpoint == "/api/v2/strategies/performance-v2/retest/start":
+                result = {"job": self.server.controller.panel_job_submit(document)}
+            elif endpoint == "/api/v2/strategies/performance-v2/retest/import":
+                result = {"job": self.server.controller.panel_job_submit(document)}
             elif endpoint == "/api/v2/jobs":
                 result = {"job": self.server.controller.panel_job_submit(document)}
             elif endpoint == "/api/v2/settings/validate":
@@ -6241,6 +6373,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             if performance_v2_windows_endpoint:
                 self._json(400, {"error": {"code": "INVALID_REQUEST", "message": str(error)}})
+            elif direct_retest_endpoint is not None:
+                self._json(400, {"error": str(error)})
             elif endpoint == "/api/v2/strategies/fresh/generate":
                 self._json(400, {"error": _fresh_generation_error(error)})
             else:
@@ -6263,7 +6397,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start"} else 200, result)
+        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} else 200, result)
 
 
 def create_panel_server(
