@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,7 +9,7 @@ import psutil
 import pytest
 
 from mrs3.runner.config import RunnerConfig
-from mrs3.runner.process import ProcessSafetyError, resolve_bot_process, stop_bot
+from mrs3.runner.process import ProcessSafetyError, resolve_bot_process, start_bot, stop_bot
 
 
 class FakeProcess:
@@ -157,3 +158,97 @@ def test_stop_falls_back_to_verified_process_when_shutdown_client_fails(
     assert result.forced
     assert wanted.terminated
     assert failure in (result.shutdown_error or "")
+
+
+def test_stop_falls_back_to_configured_process_without_listener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    config.executable_path.parent.mkdir(parents=True, exist_ok=True)
+    config.executable_path.write_bytes(b"stub")
+    wanted = FakeProcess(101, config.executable_path)
+    monkeypatch.setattr("mrs3.runner.process.psutil.net_connections", lambda kind: [])
+    monkeypatch.setattr("mrs3.runner.process.psutil.process_iter", lambda attrs=None: [wanted])
+    monkeypatch.setattr("mrs3.runner.process.psutil.Process", lambda pid: wanted)
+
+    result = stop_bot(config)
+
+    assert result.pid == 101
+    assert result.forced
+    assert wanted.terminated
+
+
+def test_start_cleans_stale_configured_process_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(_config(tmp_path), poll_interval_seconds=0.001)
+    config.executable_path.parent.mkdir(parents=True, exist_ok=True)
+    config.executable_path.write_bytes(b"stub")
+    stale = FakeProcess(101, config.executable_path)
+    launched = FakeProcess(202, config.executable_path)
+    calls = 0
+
+    class Started:
+        pid = launched.pid
+        returncode = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    child = Started()
+
+    def listeners(kind: str) -> list[SimpleNamespace]:
+        nonlocal calls
+        calls += 1
+        return [_connection(launched.pid, config.port)] if child_started else []
+
+    child_started = False
+
+    def launch(*args: object, **kwargs: object) -> Started:
+        nonlocal child_started
+        child_started = True
+        return child
+
+    monkeypatch.setattr("mrs3.runner.process.psutil.net_connections", listeners)
+    monkeypatch.setattr("mrs3.runner.process.psutil.process_iter", lambda attrs=None: [stale] if stale.is_running() else [])
+    monkeypatch.setattr("mrs3.runner.process.psutil.Process", lambda pid: launched if pid == launched.pid else stale)
+    monkeypatch.setattr("mrs3.runner.process.subprocess.Popen", launch)
+
+    resolved = start_bot(config)
+
+    assert stale.terminated
+    assert resolved.pid == launched.pid
+
+
+def test_start_timeout_includes_process_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(_config(tmp_path), startup_timeout_seconds=0.01, poll_interval_seconds=0.001)
+    config.executable_path.parent.mkdir(parents=True, exist_ok=True)
+    config.executable_path.write_bytes(b"stub")
+
+    class Started:
+        pid = 202
+        returncode = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    monkeypatch.setattr("mrs3.runner.process.psutil.net_connections", lambda kind: [])
+    monkeypatch.setattr("mrs3.runner.process.psutil.process_iter", lambda attrs=None: [])
+    monkeypatch.setattr("mrs3.runner.process.subprocess.Popen", lambda *args, **kwargs: Started())
+
+    with pytest.raises(TimeoutError, match=r"started_pid=202.*listener_pids=none"):
+        start_bot(config)

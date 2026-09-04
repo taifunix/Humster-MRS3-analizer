@@ -65,6 +65,44 @@ def _listener_pids(port: int) -> tuple[int, ...]:
     return tuple(sorted(pids))
 
 
+def _configured_processes(config: RunnerConfig) -> tuple[BotProcess, ...]:
+    """Find live processes for this exact executable, even before bind."""
+    # A missing executable cannot be matched safely and is common in dry-run
+    # callers; avoid an expensive system-wide process walk in that case.
+    if not config.executable_path.is_file():
+        return ()
+    matching: list[BotProcess] = []
+    try:
+        processes = psutil.process_iter()
+    except (psutil.AccessDenied, OSError) as error:
+        raise ProcessSafetyError("cannot inspect running bot processes") from error
+    for process in processes:
+        try:
+            executable = Path(process.exe()).resolve()
+            if not _same_path(executable, config.executable_path):
+                continue
+            created = float(process.create_time())
+            if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+                continue
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except (psutil.AccessDenied, OSError):
+            # Protected/unrelated processes are not candidates; never terminate
+            # one that cannot be verified against the configured executable.
+            continue
+        matching.append(BotProcess(int(process.pid), executable, created, process))
+    return tuple(matching)
+
+
+def _startup_diagnostics(config: RunnerConfig, process: subprocess.Popen[bytes]) -> str:
+    try:
+        listeners = _listener_pids(config.port)
+        listener_text = ",".join(str(pid) for pid in listeners) or "none"
+    except ProcessSafetyError as error:
+        listener_text = f"error:{type(error).__name__}"
+    return f"started_pid={process.pid}; returncode={process.poll()!r}; listener_pids={listener_text}"
+
+
 def resolve_bot_process(config: RunnerConfig) -> BotProcess | None:
     pids = _listener_pids(config.port)
     if not pids:
@@ -131,6 +169,14 @@ def stop_bot(
     client_factory: Callable[[RunnerConfig], ShutdownClient] = _default_client_factory,
 ) -> StopResult:
     bot = resolve_bot_process(config)
+    endpoint_available = bot is not None
+    if bot is None:
+        configured = _configured_processes(config)
+        if len(configured) > 1:
+            raise ProcessSafetyError(
+                f"multiple configured bot processes are running: {', '.join(str(item.pid) for item in configured)}"
+            )
+        bot = configured[0] if configured else None
     if bot is None:
         return StopResult(was_running=False)
 
@@ -138,9 +184,10 @@ def stop_bot(
     endpoint_called = False
     client: ShutdownClient | None = None
     try:
-        client = client_factory(config)
-        client.shutdown()
-        endpoint_called = True
+        if endpoint_available:
+            client = client_factory(config)
+            client.shutdown()
+            endpoint_called = True
     except Exception as error:
         shutdown_error = f"{type(error).__name__}: {error}"
     finally:
@@ -219,13 +266,21 @@ def start_bot(config: RunnerConfig) -> BotProcess:
         raise ProcessSafetyError(
             f"configured bot is already listening on port {config.port} as PID {existing.pid}"
         )
+    configured = _configured_processes(config)
+    if len(configured) > 1:
+        raise ProcessSafetyError(
+            f"multiple configured bot processes are running: {', '.join(str(item.pid) for item in configured)}"
+        )
+    if configured:
+        stop_bot(config)
     command = [str(config.executable_path), *config.bot_args]
     process = subprocess.Popen(command, cwd=config.bot_root)
     deadline = time.monotonic() + config.startup_timeout_seconds
     try:
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise RuntimeError(f"bot exited during startup with code {process.returncode}")
+                diagnostics = _startup_diagnostics(config, process)
+                raise RuntimeError(f"bot exited during startup with code {process.returncode}; {diagnostics}")
             resolved = resolve_bot_process(config)
             if resolved is not None:
                 if resolved.pid != process.pid:
@@ -237,7 +292,8 @@ def start_bot(config: RunnerConfig) -> BotProcess:
     except Exception:
         _terminate_started_process(process, config.shutdown_timeout_seconds)
         raise
+    diagnostics = _startup_diagnostics(config, process)
     _terminate_started_process(process, config.shutdown_timeout_seconds)
     raise TimeoutError(
-        f"bot did not listen on port {config.port} within {config.startup_timeout_seconds}s"
+        f"bot did not listen on port {config.port} within {config.startup_timeout_seconds}s; {diagnostics}"
     )

@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+from threading import Event
 import time
 from types import SimpleNamespace
 
@@ -249,6 +250,75 @@ def test_native_single_mode_installs_each_batch_before_one_native_run_and_create
     assert events.count("run") == 2
     assert all("wizard" not in str(event).casefold() for event in events)
     assert (Path(status["inbox_path"]) / "inbox_manifest.json").is_file()
+
+
+def test_native_single_mode_publishes_startup_heartbeat(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path)
+    config = replace(_runner_config(tmp_path), poll_interval_seconds=0.005, batch_timeout_seconds=2, stall_timeout_seconds=2)
+    entered = Event()
+    release = Event()
+
+    def start(_: RunnerConfig) -> object:
+        entered.set()
+        release.wait(0.2)
+        return object()
+
+    class NativeClient:
+        statuses = iter(("Running", "Idle", "Idle"))
+
+        def run_tester(self) -> None:
+            (config.report_dir / f"{names[0]}.html").write_text(_native_report(names[0], start="2026-08-01", end="2026-08-31"), encoding="utf-8")
+
+        def tester_status(self) -> str:
+            return f'<span class="stat-value">{next(self.statuses)}</span>'
+
+        def close(self) -> None:
+            pass
+
+    service = LocalSingleModeStrategyTestService(
+        config,
+        start_bot=start,
+        stop_bot=lambda _: None,
+        client_factory=lambda _: NativeClient(),
+    )
+    started = service.start(manifest, analysis_run_id="a" * 64, start_date="2026-08-01", end_date="2026-08-31", job_id="native-startup-heartbeat")
+    assert entered.wait(1)
+    time.sleep(0.03)
+    heartbeat = service.status(str(started["job_id"]))
+    assert heartbeat["phase"] == "BOT_START"
+    assert heartbeat["progress"]["startup_elapsed_seconds"] > 0
+    release.set()
+    terminal = _wait_terminal(service, str(started["job_id"]))
+    assert terminal["state"] == "COMMITTED", terminal
+
+
+def test_native_single_mode_failure_publishes_failed_count(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path, 2)
+    config = replace(_runner_config(tmp_path), poll_interval_seconds=0.001)
+
+    def start(_: RunnerConfig) -> object:
+        raise TimeoutError("startup failed")
+
+    service = LocalSingleModeStrategyTestService(
+        config,
+        start_bot=start,
+        stop_bot=lambda _: None,
+        client_factory=lambda _: object(),
+    )
+    started = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="native-failed-count",
+    )
+
+    terminal = _wait_terminal(service, str(started["job_id"]))
+
+    assert terminal["state"] == "FAILED"
+    assert terminal["evidence"]["failed_names"] == list(names)
+    assert terminal["progress"]["failed"] == len(names)
+    assert terminal["progress"]["active"] == 0
 
 
 def test_native_single_mode_chooses_newest_complete_report_for_embedded_name(tmp_path: Path) -> None:

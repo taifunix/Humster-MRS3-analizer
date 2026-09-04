@@ -254,6 +254,21 @@ actions и equity для каждой строки её `RETEST` удаляет�
 стирает серверный job/status; новый DB count читается при загрузке экрана и
 после успешного импорта.
 
+## Native startup and status heartbeat
+
+The existing native runner is the sole owner of the configured `hb_c.exe`
+process and local port. Before starting a batch it may terminate only a live
+process whose resolved executable path exactly matches the configured
+`executable_path`; a process that has not bound the port yet is still cleaned
+up. A listener owned by another executable remains a hard safety error.
+
+The worker publishes its `BOT_START` snapshot before starting the process and
+refreshes it at the configured poll interval while startup is pending. The
+snapshot keeps the existing callback and panel-job journal contract and adds
+`progress.startup_elapsed_seconds` and `progress.active`. A startup timeout
+includes the started PID, child return code and observed listener PIDs, and
+the started child is cleaned up before the job becomes `FAILED`.
+
 ## Acceptance evidence
 
 - v3->v4 migration сохраняет старые REJECTED и все Performance facts;

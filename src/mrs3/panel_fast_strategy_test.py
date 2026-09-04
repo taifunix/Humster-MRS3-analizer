@@ -556,6 +556,11 @@ class LocalFastStrategyTestService:
                     job.phase = "FAILED"
                     if job.single_mode:
                         job.failed_names.update(name for name in job.expected_names if name not in job.verified_reports)
+                    job.progress.update(
+                        current=len(job.verified_reports),
+                        active=0,
+                        failed=len(job.failed_names),
+                    )
                     code = (
                         "SINGLE_MODE_RETRIES_EXHAUSTED"
                         if job.single_mode and isinstance(error, BatchRetryExhausted)
@@ -1000,6 +1005,33 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 raise TimeoutError("native SINGLE_MODE tester did not reach stable Idle/Completed")
             time.sleep(config.poll_interval_seconds)
 
+    def _start_native_bot(self, job: _Job, config: RunnerConfig, batch_number: int, batch_total: int) -> None:
+        """Keep the durable job heartbeat alive while the process binds its port."""
+        done = Event()
+        failure: list[BaseException] = []
+        started_at = time.monotonic()
+
+        def start() -> None:
+            try:
+                self._start_bot(config)
+            except BaseException as error:
+                failure.append(error)
+            finally:
+                done.set()
+
+        Thread(target=start, daemon=True, name="mrs3-panel-bot-start").start()
+        while not done.wait(min(config.poll_interval_seconds, 0.5)):
+            self._set_phase(
+                job,
+                "BOT_START",
+                batch_number=batch_number,
+                batch_total=batch_total,
+                active=1,
+                startup_elapsed_seconds=round(time.monotonic() - started_at, 3),
+            )
+        if failure:
+            raise failure[0]
+
     def _run_native_batch(self, job: _Job, names: tuple[str, ...], config: RunnerConfig, batch_number: int, batch_total: int) -> dict[str, Path]:
         client: object | None = None
         try:
@@ -1008,8 +1040,8 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             _install_names(job.manifest.strategy_source, job.strategy_dir, names)
             config.wizard_result.unlink(missing_ok=True)
             config.wizard_progress.unlink(missing_ok=True)
-            self._set_phase(job, "BOT_START", batch_number=batch_number, batch_total=batch_total)
-            self._start_bot(config)
+            self._set_phase(job, "BOT_START", batch_number=batch_number, batch_total=batch_total, active=1, startup_elapsed_seconds=0.0)
+            self._start_native_bot(job, config, batch_number, batch_total)
             client = self._client_factory(config)
             if not hasattr(client, "run_tester"):
                 raise FastStrategyTestError("native SINGLE_MODE client has no Run endpoint")

@@ -1365,8 +1365,12 @@
     if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : (job.state === 'COMMITTED' ? '100%' : '0%');
     const failed = Array.isArray(job.evidence?.failed_names) ? job.evidence.failed_names.length : 0;
     const stage = p.stage || job.phase || job.state || 'RUNNING';
+    const startup = stage === 'BOT_START' && Number.isFinite(Number(p.startup_elapsed_seconds))
+      ? ` · startup ${Number(p.startup_elapsed_seconds).toFixed(1)}s`
+      : '';
+    const native = stage === 'BOT_RUN' && p.native_status ? ` · tester ${p.native_status}` : '';
     const detail = singleMode
-      ? `${stage} · batch ${p.batch_number || 0}/${p.batch_total || 0} · reports ${checked}/${total} · retries ${p.retries || 0} · failed ${failed}`
+      ? `${stage}${startup}${native} · batch ${p.batch_number || 0}/${p.batch_total || 0} · reports ${checked}/${total} · retries ${p.retries || 0} · failed ${failed}`
       : runs
         ? `${stage} · reports ${checked}/${total}`
         : `${stage} · reports ${checked}/${total}`;
@@ -1551,9 +1555,13 @@
     const failed = Array.isArray(job.evidence?.failed_names) ? job.evidence.failed_names.length : Number(p.failed || 0);
     retestInboxReady = job.state === 'COMMITTED' && job.inbox_ready === true;
     if (retestProgress) retestProgress.value = total ? Math.min(100, current * 100 / total) : (retestInboxReady ? 100 : 0);
-    if (retestProgressText) retestProgressText.textContent = `${job.phase || job.state || 'RUNNING'} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}`;
+    const startup = job.phase === 'BOT_START' && Number.isFinite(Number(p.startup_elapsed_seconds))
+      ? ` · startup ${Number(p.startup_elapsed_seconds).toFixed(1)}s`
+      : '';
+    const native = job.phase === 'BOT_RUN' && p.native_status ? ` · tester ${p.native_status}` : '';
+    if (retestProgressText) retestProgressText.textContent = `${job.phase || job.state || 'RUNNING'}${startup}${native} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}`;
     if (retestInbox) retestInbox.textContent = job.inbox_path ? `committed inbox: ${job.inbox_path}` : '';
-    if (retestStatus) retestStatus.textContent = `CHECK & RETEST: ${job.phase || job.state || 'RUNNING'} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}${job.error ? ` · ${formatErrorReason(job.error)}` : ''}`;
+    if (retestStatus) retestStatus.textContent = `CHECK & RETEST: ${job.phase || job.state || 'RUNNING'}${startup}${native} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}${job.error ? ` · ${formatErrorReason(job.error)}` : ''}`;
     if (retestStart) retestStart.disabled = !retestTerminal(job);
     if (retestImport) retestImport.disabled = !retestInboxReady;
     if (retestBadge) { retestBadge.className = `state-badge state-${retestInboxReady ? 'ready' : 'pending'}`; retestBadge.textContent = retestInboxReady ? 'INBOX_READY' : (job.phase || 'WAITING'); }
