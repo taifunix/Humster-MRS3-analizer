@@ -1,7 +1,19 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-03
+**Updated:** 2026-09-04
 **Current branch:** `main`
+
+## RETEST report-header retry fix (2026-09-04)
+
+Native RETEST prevalidation now accepts the current tester action table by
+required column names, including the tester's extra/reordered `Side`, `Price`,
+and `Cost` columns. The main Performance v2 parser already followed this
+contract; regression coverage now exercises both paths and preserves missing,
+duplicate, typed, and legacy rejection.
+
+Evidence: `117 passed, 1 skipped` in the focused RETEST/Performance v2 slice;
+read-only replay accepted and parsed `186/186` captured reports for `149`
+expected strategies. Commit: `54ee9b8`.
 
 ## Performance v2 selection review cleanup (2026-09-03)
 
