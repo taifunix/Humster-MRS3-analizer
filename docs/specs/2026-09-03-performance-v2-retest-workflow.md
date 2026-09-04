@@ -163,7 +163,11 @@ dates are read from configured `listing_dates_path` (normally `Input/dates.xlsx`
 never from a hard-coded path.
 
 The Performance import request/inbox contract therefore carries the configured
-listing-dates path, and the published result retains both ranges.
+listing-dates path, and the published result retains both ranges. Panel-originated
+imports also carry the server-owned project root as the first trusted base for
+that relative path and retain the inbox parent as a compatibility fallback;
+direct inbox imports use the inbox parent. Absolute paths and parent traversal
+remain invalid.
 The typed action/equity rows and all canonical result metrics describe only the
 effective range; the unmodified HTML remains the immutable whole-report
 evidence. Persisted provenance contains reported/effective range, raw and

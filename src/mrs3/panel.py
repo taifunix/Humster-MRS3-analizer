@@ -3189,6 +3189,7 @@ class PanelController:
             test_start=test_start if isinstance(test_start, str) else None,
             test_end=test_end if isinstance(test_end, str) else None,
             listing_dates_path=Path(listing_dates_path) if isinstance(listing_dates_path, str) else None,
+            listing_dates_root=self.root,
         )
         job_request = {"tester_job_id": tester_job_id, "mode": mode}
         if _internal:

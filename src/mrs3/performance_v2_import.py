@@ -66,6 +66,7 @@ class PerformanceV2ImportRequest:
     test_start: str | None
     test_end: str | None
     listing_dates_path: Path | None
+    listing_dates_root: Path | None
 
     def __init__(
         self,
@@ -84,6 +85,7 @@ class PerformanceV2ImportRequest:
         test_start: str | None = None,
         test_end: str | None = None,
         listing_dates_path: Path | None = None,
+        listing_dates_root: Path | None = None,
     ) -> None:
         if inbox is None:
             inbox = inbox_path
@@ -125,6 +127,11 @@ class PerformanceV2ImportRequest:
         object.__setattr__(self, "clear_retest_on_success", clear_retest_on_success)
         object.__setattr__(self, "test_start", test_start)
         object.__setattr__(self, "test_end", test_end)
+        object.__setattr__(
+            self,
+            "listing_dates_root",
+            None if listing_dates_root is None else Path(listing_dates_root).resolve(),
+        )
         if listing_dates_path is not None:
             listing_path = Path(listing_dates_path)
             if listing_path.is_absolute() or ".." in listing_path.parts:
@@ -568,21 +575,31 @@ def _prepare_listing_ranges(
         raise PerformanceV2ImportError("listing dates path contains parent traversal")
     if path.is_absolute():
         raise PerformanceV2ImportError("listing dates path must be relative to a trusted input root")
+    trusted_roots = [(request.listing_dates_root or request.inbox.parent).resolve()]
+    inbox_root = request.inbox.parent.resolve()
+    if inbox_root not in trusted_roots:
+        trusted_roots.append(inbox_root)
+    resolved_path: Path | None = None
+    found_non_regular = False
     if not path.is_absolute():
-        # The inbox parent is the one declared trusted input root. Do not
-        # probe strategy/database roots: that makes resolution depend on
-        # unrelated filesystem state.
-        path = request.inbox.parent / path
-    if path.is_symlink():
-        raise PerformanceV2ImportError("listing dates path cannot use a symlink")
-    if not path.is_file():
-        raise PerformanceV2ImportError("listing dates path is not a regular file")
-    trusted_root = request.inbox.parent.resolve()
-    try:
-        path = path.resolve(strict=True)
-        path.relative_to(trusted_root)
-    except (OSError, ValueError) as error:
-        raise PerformanceV2ImportError("listing dates path is outside the trusted input root") from error
+        for trusted_root in trusted_roots:
+            candidate = trusted_root / path
+            if candidate.is_symlink():
+                raise PerformanceV2ImportError("listing dates path cannot use a symlink")
+            if not candidate.is_file():
+                found_non_regular = found_non_regular or candidate.exists()
+                continue
+            try:
+                resolved_candidate = candidate.resolve(strict=True)
+                resolved_candidate.relative_to(trusted_root)
+            except (OSError, ValueError) as error:
+                raise PerformanceV2ImportError("listing dates path is outside the trusted input root") from error
+            resolved_path = resolved_candidate
+            break
+    if resolved_path is None:
+        detail = "not a regular file" if found_non_regular else "not found"
+        raise PerformanceV2ImportError(f"listing dates path is {detail}")
+    path = resolved_path
     failures: list[dict[str, object]] = []
     try:
         loaded = load_listing_dates(path)

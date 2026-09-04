@@ -20,6 +20,7 @@ from mrs3.performance_v2_store import (
     performance_v2_database_path,
 )
 from mrs3.panel import PanelController, create_panel_server
+from mrs3.performance_v2_import import PerformanceV2ImportError
 from mrs3.panel_performance_v2 import (
     PerformanceV2ApiError,
     PerformanceV2PanelRequest,
@@ -314,6 +315,87 @@ def test_v2_panel_service_imports_committed_inbox_without_eager_window_calculati
     } == before
 
 
+def test_v2_panel_service_resolves_listing_dates_from_trusted_project_root(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    project_root = tmp_path / "project-root"
+    dates = project_root / "dates.xlsx"
+    dates.parent.mkdir(parents=True)
+    workbook = Workbook()
+    workbook.active.append(["ONUSDT", datetime(2025, 12, 25)])
+    workbook.save(dates)
+    request = replace(
+        request,
+        listing_dates_path=Path("dates.xlsx"),
+        listing_dates_root=project_root,
+    )
+
+    result = LocalPerformanceV2Service().run(request)
+
+    assert result.status == "COMMITTED"
+    assert result.imported_count == 2
+
+
+def test_v2_panel_service_falls_back_to_inbox_parent_for_legacy_listing_path(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    request = replace(request, listing_dates_root=tmp_path / "missing-project-root")
+
+    result = LocalPerformanceV2Service().run(request)
+
+    assert result.status == "COMMITTED"
+    assert result.imported_count == 2
+
+
+@pytest.mark.parametrize(
+    "listing_path",
+    [Path("../dates.xlsx"), Path("C:/absolute/dates.xlsx")],
+)
+def test_v2_panel_service_rejects_unsafe_listing_dates_paths(tmp_path: Path, listing_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    request = replace(request, listing_dates_path=listing_path, listing_dates_root=tmp_path)
+
+    with pytest.raises(ValueError, match="relative"):
+        LocalPerformanceV2Service().run(request)
+
+
+def test_v2_panel_service_rejects_symlinked_listing_dates_path(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    project_root = tmp_path / "project-root"
+    project_root.mkdir()
+    target = tmp_path / "external-dates.xlsx"
+    target.write_bytes(b"not a workbook")
+    link = project_root / "dates.xlsx"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    request = replace(request, listing_dates_path=Path("dates.xlsx"), listing_dates_root=project_root)
+
+    with pytest.raises(PerformanceV2ImportError, match="symlink"):
+        LocalPerformanceV2Service().run(request)
+
+
+def test_v2_panel_service_rejects_listing_dates_resolved_outside_trusted_roots(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    project_root = tmp_path / "project-root"
+    project_root.mkdir()
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    (external_dir / "dates.xlsx").write_bytes(b"not a workbook")
+    alias = project_root / "alias"
+    try:
+        alias.symlink_to(external_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable")
+    request = replace(
+        request,
+        listing_dates_path=Path("alias/dates.xlsx"),
+        listing_dates_root=project_root,
+    )
+
+    with pytest.raises(PerformanceV2ImportError, match="outside the trusted input root"):
+        LocalPerformanceV2Service().run(request)
+
+
 def test_visible_performance_card_targets_only_v2_import_job_and_status() -> None:
     panel_web = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web"
     html = (panel_web / "index.html").read_text(encoding="utf-8")
@@ -369,6 +451,16 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
     controller._panel_jobs.transition("tester-v2", "RUNNING")
     controller._panel_jobs.sync("tester-v2", {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True}, runtime={"inbox_path": str(request.inbox)})
 
+    with pytest.raises(ValueError, match="unsupported fields"):
+        controller.panel_job_submit({
+            "kind": "strategies.performance.v2.import",
+            "request": {
+                "tester_job_id": "tester-v2",
+                "listing_dates_path": "Input/dates.xlsx",
+                "listing_dates_root": "/",
+            },
+        })
+
     started = controller.panel_job_submit({
         "kind": "strategies.performance.v2.import",
         "request": {
@@ -419,6 +511,42 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_v2_panel_controller_injects_server_owned_listing_root(tmp_path: Path, monkeypatch) -> None:
+    import mrs3.panel as panel_module
+
+    request, _ = _request(tmp_path)
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text("{}", encoding="utf-8")
+    (tmp_path / "config.performance.json").write_text(
+        json.dumps({"unified_performance_v2": {"database_root": "performance-v2", "workers": 1}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(panel_module.RunnerConfig, "from_json", lambda _path: type("Runner", (), {"report_dir": request.report_root})())
+    controller = PanelController(tmp_path, config_path)
+    controller._panel_jobs.submit(
+        "strategies.tester.start", {"mode": "SINGLE_MODE"}, "tester-root", (), job_id="tester-root"
+    )
+    controller._panel_jobs.transition("tester-root", "RUNNING")
+    controller._panel_jobs.sync(
+        "tester-root",
+        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={"inbox_path": str(request.inbox)},
+    )
+    captured: dict[str, object] = {}
+
+    class StubJobs:
+        def start(self, panel_request: PerformanceV2PanelRequest, *, job_id: str | None = None) -> dict[str, object]:
+            captured["request"] = panel_request
+            return {"job_id": job_id, "state": "COMMITTED"}
+
+    controller._performance_v2_jobs = StubJobs()  # type: ignore[assignment]
+    controller.strategies_performance_v2_import(
+        {"tester_job_id": "tester-root", "listing_dates_path": "Input/dates.xlsx"}
+    )
+
+    assert captured["request"].listing_dates_root == tmp_path.resolve()  # type: ignore[union-attr]
 
 
 def test_v2_panel_controller_rejects_committed_job_without_verified_inbox(tmp_path: Path) -> None:

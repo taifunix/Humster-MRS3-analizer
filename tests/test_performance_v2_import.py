@@ -933,6 +933,29 @@ def test_relative_input_listing_dates_path_is_resolved_from_inbox_parent(
     assert seen == [dates_path]
 
 
+def test_listing_dates_path_reports_missing_file_distinctly(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    request = PerformanceV2ImportRequest(
+        request.inbox,
+        request.report_root,
+        request.config,
+        listing_dates_path=Path("missing/dates.xlsx"),
+    )
+
+    with pytest.raises(PerformanceV2ImportError, match="not found"):
+        import_performance_v2(request)
+
+
+def test_listing_dates_path_reports_non_regular_file_distinctly(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    dates_path = tmp_path / "Input" / "dates.xlsx"
+    dates_path.unlink()
+    dates_path.mkdir()
+
+    with pytest.raises(PerformanceV2ImportError, match="not a regular file"):
+        import_performance_v2(request)
+
+
 def test_valid_strategy_is_published_when_sibling_report_is_invalid(tmp_path: Path) -> None:
     request, _ = _request(tmp_path, names=("alpha", "beta"))
     invalid = request.report_root / "beta.html"

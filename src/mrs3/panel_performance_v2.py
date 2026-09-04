@@ -121,6 +121,7 @@ class PerformanceV2PanelRequest:
     test_start: str | None = None
     test_end: str | None = None
     listing_dates_path: Path | None = None
+    listing_dates_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +496,7 @@ class LocalPerformanceV2Service:
                 test_start=request.test_start,
                 test_end=request.test_end,
                 listing_dates_path=request.listing_dates_path,
+                listing_dates_root=request.listing_dates_root,
             ),
             progress=import_progress,
         )
