@@ -1,4 +1,5 @@
   const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
+  const { selectRetestTester } = window.retestRecovery;
   let shortlistGroups = [];
   let shortlistItems = [];
   const selectedScopeKeys = new Set();
@@ -1643,7 +1644,7 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const tester = [...jobs].reverse().find((job) => job.kind === 'strategies.tester.native.start' && job.retest === true);
+      const tester = selectRetestTester(jobs);
       if (tester?.job_id) { retestTesterJobId = tester.job_id; renderRetestTester(tester); if (!retestTerminal(tester)) { await pollRetestTester(); startRetestPolling(); } }
       const importJob = [...jobs].reverse().find((job) => job.kind === 'strategies.performance.v2.import' && job.retest === true);
       if (importJob?.job_id) { retestImportJobId = importJob.job_id; if (!(await pollRetestImport())) startRetestImportPolling(); }

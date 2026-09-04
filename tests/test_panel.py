@@ -132,6 +132,7 @@ def test_panel_static_routes_and_legacy_compatibility_are_bounded(tmp_path: Path
     try:
         for path, content_type in (
             ("/panel-web/app.css", "text/css"),
+            ("/panel-web/retest_recovery.js", "text/javascript"),
             ("/panel-web/app.js", "text/javascript"),
         ):
             connection.request("GET", path)

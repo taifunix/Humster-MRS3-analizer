@@ -1300,6 +1300,21 @@ The original pre-copy source hash was not persisted, so byte-for-byte fidelity
 is evidenced by the backup size/hash and independent read-only catalog/count
 probe rather than a retroactive source-hash comparison.
 
+## Performance v2 RETEST recovery and import retry fix (2026-09-04)
+
+Panel reload recovery now selects the newest committed RETEST inbox before
+active or failed jobs, so a stale FAILED tester cannot keep `IMPORT & REPLACE`
+disabled. A real failed Performance v2 import (`PERFORMANCE_V2_IMPORT_FAILED`)
+or cancelled import can be retried; committed, running, interrupted and
+unknown-error jobs remain duplicate-protected. The recovery selector is a
+browser-served, Node-tested helper, and its static route is covered.
+
+Evidence: RETEST/panel/job suites `91 passed, 1 skipped`; both JavaScript files
+pass `node --check`; `git diff --check` passes. External Opus review completed
+three rounds; final local fixes addressed its remaining recovery and static
+delivery findings, with no fourth review requested because the review budget
+was exhausted.
+
 ## Performance v2 panel listing-date root fix (2026-09-04)
 
 Panel imports now resolve the configured relative `listing_dates_path` from the

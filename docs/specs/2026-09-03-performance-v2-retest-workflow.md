@@ -289,6 +289,14 @@ actions и equity для каждой строки её `RETEST` удаляет�
 стирает серверный job/status; новый DB count читается при загрузке экрана и
 после успешного импорта.
 
+On panel recovery, choose the newest available RETEST job with
+`state=COMMITTED` and `inbox_ready=true`; a failed or incomplete job must not
+shadow a ready inbox. If the previous import for that committed inbox is
+`FAILED` or `CANCELLED`, `IMPORT & REPLACE` may be retried for the same inbox;
+the synthetic restart marker `FAILED/{code:INTERRUPTED}` remains blocked until
+the interrupted job is explicitly resolved. A previous `COMMITTED` import
+remains non-repeatable.
+
 ## Native startup and status heartbeat
 
 The existing native runner is the sole owner of the configured `hb_c.exe`

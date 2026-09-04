@@ -3048,7 +3048,25 @@ class PanelController:
         tester_job_id = self._required(payload, "tester_job_id")
         mapping, runtime = self._retest_mapping(tester_job_id)
         if "retest_import_job_id" in runtime:
-            raise ValueError("RETEST import is already started")
+            previous_import_id = runtime.get("retest_import_job_id")
+            if not isinstance(previous_import_id, str) or not previous_import_id.strip():
+                raise ValueError("RETEST import is already started")
+            try:
+                previous_import = self._panel_jobs.get(previous_import_id)
+            except PanelJobError:
+                raise ValueError("RETEST import is already started") from None
+            if not isinstance(previous_import, Mapping):
+                raise ValueError("RETEST import is already started")
+            error = previous_import.get("error")
+            error_code = error.get("code") if isinstance(error, Mapping) else None
+            retryable = previous_import.get("state") == "CANCELLED" or (
+                previous_import.get("state") == "FAILED"
+                and isinstance(error_code, str)
+                and error_code == "PERFORMANCE_V2_IMPORT_FAILED"
+            )
+            if not retryable:
+                raise ValueError("RETEST import is already started")
+            self._panel_jobs.clear_runtime(tester_job_id, "retest_import_job_id", value=previous_import_id)
         start, end = runtime.get("test_start"), runtime.get("test_end")
         listing_path = runtime.get("listing_dates_path")
         if not isinstance(start, str) or not isinstance(end, str) or not isinstance(listing_path, str):
@@ -5978,7 +5996,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._headers(200, "text/html; charset=utf-8", len(payload))
             self.wfile.write(payload)
             return
-        static_paths = {"/": "index.html", "/panel-web/app.css": "app.css", "/panel-web/app.js": "app.js"}
+        static_paths = {
+            "/": "index.html",
+            "/panel-web/app.css": "app.css",
+            "/panel-web/retest_recovery.js": "retest_recovery.js",
+            "/panel-web/app.js": "app.js",
+        }
         if parsed.path in static_paths and (parsed.path != "/" or self.server.controller.panel_default_root() == "static"):
             name = static_paths[parsed.path]
             try:
@@ -5986,7 +6009,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             except OSError:
                 self._json(404, {"error": "not found"})
                 return
-            content_type = {"index.html": "text/html", "app.css": "text/css", "app.js": "text/javascript"}[name]
+            content_type = {"index.html": "text/html", "app.css": "text/css", "retest_recovery.js": "text/javascript", "app.js": "text/javascript"}[name]
             self._headers(200, f"{content_type}; charset=utf-8", len(payload))
             self.wfile.write(payload)
             return

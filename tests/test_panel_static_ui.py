@@ -208,6 +208,7 @@ def test_performance_v2_handoff_exposes_ready_gated_controls() -> None:
 def test_performance_v2_retest_card_uses_server_mapping_and_committed_inbox_gate() -> None:
     html = _read("index.html")
     js = _read("app.js")
+    recovery = _read("retest_recovery.js")
 
     card = html.split('id="performance-v2-retest-card"', 1)[1].split("</details>", 1)[0]
     assert "CHECK &amp; RETEST" in card
@@ -218,11 +219,16 @@ def test_performance_v2_retest_card_uses_server_mapping_and_committed_inbox_gate
     assert "/api/v2/strategies/performance-v2/retest/status" in js
     assert "/api/v2/strategies/performance-v2/retest/start" in js
     assert "/api/v2/strategies/performance-v2/retest/import" in js
+    assert html.index('<script src="/panel-web/retest_recovery.js"></script>') < html.index('<script src="/panel-web/app.js"></script>')
+    assert "selectRetestTester(jobs)" in js
     assert "job.inbox_ready === true" in js
     assert "tester_job_id: retestTesterJobId" in js
     retest_slice = js.split("const retestCard", 1)[1].split("const performanceV2WindowSelect", 1)[0]
     assert "replacement_strategy_ids" not in retest_slice
     assert "failure_report_available" in js
+    assert "const retestTesters = (Array.isArray(jobs) ? jobs : [])" in recovery
+    assert ".reverse();" in recovery
+    assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
 
 
 def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_without_recalculation() -> None:

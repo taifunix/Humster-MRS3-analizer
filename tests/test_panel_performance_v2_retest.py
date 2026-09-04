@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from http.client import HTTPConnection
 import json
 from pathlib import Path
+import subprocess
 import threading
 
 import duckdb
@@ -206,6 +207,145 @@ def test_retest_import_requires_committed_inbox_and_builds_mapping_on_server(tmp
     _committed_retest_job(controller, tmp_path / "not-ready", state="RUNNING", job_id="not-ready")
     with pytest.raises(ValueError, match="not committed"):
         controller.strategies_performance_v2_retest_import({"tester_job_id": "not-ready"})
+
+
+def test_retest_import_allows_retry_after_failed_inner_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="tester-retry-failed-import")
+    failed_import_id = "failed-retest-import"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {"retest": True}, "panel:failed-retest-import",
+        ("performance-v2-db",), job_id=failed_import_id,
+    )
+    controller._panel_jobs.transition(failed_import_id, "RUNNING")
+    controller._panel_jobs.sync(
+        failed_import_id,
+        {"state": "FAILED", "phase": "FAILED", "error": {"code": "PERFORMANCE_V2_IMPORT_FAILED"}},
+    )
+    runtime = controller._panel_jobs.runtime(tester_job_id)
+    runtime["retest_import_job_id"] = failed_import_id
+    controller._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
+
+    def fake_import(_payload: dict[str, object], *, _internal: bool = False) -> dict[str, object]:
+        assert _internal is True
+        retry_id = "retry-retest-import"
+        controller._panel_jobs.submit(
+            "strategies.performance.v2.import", {"retest": True}, f"panel:{retry_id}",
+            ("performance-v2-db",), job_id=retry_id,
+        )
+        controller._panel_jobs.transition(retry_id, "RUNNING")
+        return controller._panel_jobs.get(retry_id)
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_import", fake_import)
+
+    result = controller.strategies_performance_v2_retest_import({"tester_job_id": tester_job_id})
+
+    assert result["job_id"] == "retry-retest-import"
+    assert result["job_id"] != failed_import_id
+    assert controller._panel_jobs.runtime(tester_job_id)["retest_import_job_id"] == "retry-retest-import"
+    with pytest.raises(ValueError, match="already started"):
+        controller.strategies_performance_v2_retest_import({"tester_job_id": tester_job_id})
+
+
+def test_retest_import_allows_retry_after_cancelled_inner_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="tester-retry-cancelled-import")
+    cancelled_import_id = "cancelled-retest-import"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {"retest": True}, "panel:cancelled-retest-import",
+        ("performance-v2-db",), job_id=cancelled_import_id,
+    )
+    controller._panel_jobs.transition(cancelled_import_id, "RUNNING")
+    controller._panel_jobs.transition(cancelled_import_id, "CANCELLING")
+    controller._panel_jobs.transition(cancelled_import_id, "CANCELLED")
+    runtime = controller._panel_jobs.runtime(tester_job_id)
+    runtime["retest_import_job_id"] = cancelled_import_id
+    controller._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
+
+    def fake_import(_payload: dict[str, object], *, _internal: bool = False) -> dict[str, object]:
+        assert _internal is True
+        retry_id = "retry-cancelled-retest-import"
+        controller._panel_jobs.submit(
+            "strategies.performance.v2.import", {"retest": True}, f"panel:{retry_id}",
+            ("performance-v2-db",), job_id=retry_id,
+        )
+        controller._panel_jobs.transition(retry_id, "RUNNING")
+        return controller._panel_jobs.get(retry_id)
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_import", fake_import)
+    result = controller.strategies_performance_v2_retest_import({"tester_job_id": tester_job_id})
+
+    assert result["job_id"] == "retry-cancelled-retest-import"
+    assert controller._panel_jobs.runtime(tester_job_id)["retest_import_job_id"] == "retry-cancelled-retest-import"
+    with pytest.raises(ValueError, match="already started"):
+        controller.strategies_performance_v2_retest_import({"tester_job_id": tester_job_id})
+
+
+def test_retest_import_blocks_interrupted_marker_with_extra_error_fields(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="tester-interrupted-import")
+    interrupted_import_id = "interrupted-retest-import"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {"retest": True}, "panel:interrupted-retest-import",
+        ("performance-v2-db",), job_id=interrupted_import_id,
+    )
+    controller._panel_jobs.transition(interrupted_import_id, "RUNNING")
+    controller._panel_jobs.sync(
+        interrupted_import_id,
+        {"state": "FAILED", "phase": "FAILED", "error": {"code": "INTERRUPTED", "message": "restart"}},
+    )
+    runtime = controller._panel_jobs.runtime(tester_job_id)
+    runtime["retest_import_job_id"] = interrupted_import_id
+    controller._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
+
+    with pytest.raises(ValueError, match="already started"):
+        controller.strategies_performance_v2_retest_import({"tester_job_id": tester_job_id})
+
+
+def test_retest_import_blocks_failed_marker_with_unknown_error_code(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="tester-unknown-import-error")
+    unknown_import_id = "unknown-retest-import"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {"retest": True}, "panel:unknown-retest-import",
+        ("performance-v2-db",), job_id=unknown_import_id,
+    )
+    controller._panel_jobs.transition(unknown_import_id, "RUNNING")
+    controller._panel_jobs.sync(
+        unknown_import_id,
+        {"state": "FAILED", "phase": "FAILED", "error": {"code": "UNKNOWN_FAILURE"}},
+    )
+    runtime = controller._panel_jobs.runtime(tester_job_id)
+    runtime["retest_import_job_id"] = unknown_import_id
+    controller._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
+
+    with pytest.raises(ValueError, match="already started"):
+        controller.strategies_performance_v2_retest_import({"tester_job_id": tester_job_id})
+
+
+def test_retest_recovery_selector_prioritizes_ready_and_newest_jobs() -> None:
+    utility = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web" / "retest_recovery.js"
+    tester = lambda job_id, state, inbox_ready=False: {
+        "job_id": job_id, "kind": "strategies.tester.native.start", "retest": True,
+        "state": state, "inbox_ready": inbox_ready,
+    }
+    fixtures = [
+        [tester("ready-old", "COMMITTED", True), tester("failed-new", "FAILED")],
+        [tester("ready-old", "COMMITTED", True), tester("running-new", "RUNNING")],
+        [tester("ready-old", "COMMITTED", True), tester("ready-new", "COMMITTED", True)],
+        [tester("failed-old", "FAILED"), tester("failed-new", "FAILED")],
+        [tester("failed-old", "FAILED"), tester("committed-no-ready", "COMMITTED")],
+    ]
+    script = (
+        f"const {{selectRetestTester}} = require({json.dumps(str(utility))});"
+        f"const fixtures = {json.dumps(fixtures)};"
+        "process.stdout.write(JSON.stringify(fixtures.map((jobs) => selectRetestTester(jobs)?.job_id ?? null)));"
+    )
+    result = subprocess.run(("node", "-e", script), capture_output=True, text=True, check=True)
+
+    assert json.loads(result.stdout) == [
+        "ready-old", "ready-old", "ready-new", "failed-new", "committed-no-ready",
+    ]
 
 
 def test_retest_import_reserves_before_inner_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
