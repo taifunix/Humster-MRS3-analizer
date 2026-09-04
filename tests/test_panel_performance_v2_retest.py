@@ -6,13 +6,14 @@ import json
 from pathlib import Path
 import subprocess
 import threading
+from types import SimpleNamespace
 
 import duckdb
 from openpyxl import Workbook
 import pytest
 
 import mrs3.panel as panel_module
-from mrs3.panel import PanelController, create_panel_server
+from mrs3.panel import PerformanceV2ApiError, PanelController, create_panel_server
 from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_retest import RetestBatch
 
@@ -129,6 +130,145 @@ def test_metadata_retest_inbox_resolves_relative_artifacts_from_runner_dirs(tmp_
     controller._validate_metadata_inbox(inbox)
 
 
+def test_metadata_retest_inbox_accepts_project_strategy_source(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
+    report_dir.mkdir(parents=True)
+    (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
+    project_strategy = tmp_path / "Output" / "strategies" / "alpha.json"
+    project_strategy.parent.mkdir(parents=True)
+    project_strategy.write_text("{}", encoding="utf-8")
+    inbox = tmp_path / "inbox" / "retest-project-source"
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{
+            "strategy_name": "alpha",
+            "strategy_path": "alpha.json",
+            "report_path": "alpha.html",
+        }],
+    }), encoding="utf-8")
+
+    controller._validate_metadata_inbox(inbox)
+
+
+def test_metadata_retest_inbox_resolves_relative_strategy_from_performance_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
+    report_dir.mkdir(parents=True)
+    (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
+    project_strategy = tmp_path / "Output" / "strategies" / "alpha.json"
+    project_strategy.parent.mkdir(parents=True)
+    project_strategy.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        controller, "_performance_v2_config", lambda: SimpleNamespace(strategy_root=Path("Output/strategies"))
+    )
+    monkeypatch.chdir(tmp_path.parent)
+    inbox = tmp_path / "inbox" / "retest-relative-project-source"
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+    }), encoding="utf-8")
+
+    controller._validate_metadata_inbox(inbox)
+
+
+@pytest.mark.parametrize("performance_config", [None, "{invalid"])
+def test_metadata_retest_inbox_is_safe_without_valid_performance_config(
+    tmp_path: Path, performance_config: str | None
+) -> None:
+    controller = _controller(tmp_path)
+    report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
+    strategy_dir = tmp_path / "bot" / "settings_strategy"
+    report_dir.mkdir(parents=True)
+    strategy_dir.mkdir(parents=True)
+    (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
+    (strategy_dir / "alpha.json").write_text("{}", encoding="utf-8")
+    inbox = tmp_path / "inbox" / "retest-without-performance-config"
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+    }), encoding="utf-8")
+    performance_path = tmp_path / "config.performance.json"
+    if performance_config is None:
+        performance_path.unlink()
+    else:
+        performance_path.write_text(performance_config, encoding="utf-8")
+
+    controller._validate_metadata_inbox(inbox)
+
+
+def test_metadata_retest_inbox_rejects_strategy_outside_both_configured_roots(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
+    report_dir.mkdir(parents=True)
+    (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
+    outside_strategy = tmp_path / "not-a-configured-strategy-root" / "alpha.json"
+    outside_strategy.parent.mkdir(parents=True)
+    outside_strategy.write_text("{}", encoding="utf-8")
+    inbox = tmp_path / "inbox" / "retest-outside-strategy"
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{
+            "strategy_name": "alpha",
+            "strategy_path": str(outside_strategy),
+            "report_path": "alpha.html",
+        }],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside configured directory"):
+        controller._validate_metadata_inbox(inbox)
+
+
+def test_metadata_retest_inbox_rejects_strategy_symlink_to_outside_root(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
+    strategy_dir = tmp_path / "bot" / "settings_strategy"
+    report_dir.mkdir(parents=True)
+    strategy_dir.mkdir(parents=True)
+    (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
+    outside_strategy = tmp_path / "outside-alpha.json"
+    outside_strategy.write_text("{}", encoding="utf-8")
+    try:
+        (strategy_dir / "alpha.json").symlink_to(outside_strategy)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable")
+    inbox = tmp_path / "inbox" / "retest-symlink-strategy"
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="strategy_path is missing"):
+        controller._validate_metadata_inbox(inbox)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -150,6 +290,18 @@ def test_retest_start_uses_native_single_mode_and_keeps_database_read_only(tmp_p
     controller = _controller(tmp_path)
     database = tmp_path / "performance-v2" / "strategy_performance.duckdb"
     before = database.read_bytes()
+    outside_inbox = tmp_path / "outside-inbox"
+    outside_inbox.mkdir()
+    controller._panel_jobs.submit(
+        "strategies.tester.native.start", {"retest": True}, "panel:outside-inbox",
+        ("strategies.tester",), job_id="outside-inbox",
+    )
+    controller._panel_jobs.transition("outside-inbox", "RUNNING")
+    controller._panel_jobs.sync(
+        "outside-inbox",
+        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={"retest": True, "inbox_path": str(outside_inbox)},
+    )
     batch = RetestBatch("batch-1", tmp_path / "output" / "strategies", tmp_path / "output" / "strategy_manifest.json", 1)
     seen: dict[str, object] = {}
 
@@ -164,6 +316,7 @@ def test_retest_start_uses_native_single_mode_and_keeps_database_read_only(tmp_p
     result = controller.strategies_performance_v2_retest_start({})
 
     assert result["state"] == "RUNNING"
+    assert result["job_id"] != "outside-inbox"
     assert seen["analysis_run_id"] == "batch-1"
     assert seen["start_date"] == "2026-01-01"
     assert seen["end_date"] == "2026-01-09"
@@ -171,6 +324,339 @@ def test_retest_start_uses_native_single_mode_and_keeps_database_read_only(tmp_p
     runtime = controller._panel_jobs.runtime(result["job_id"])
     assert runtime["retest"] is True and runtime["manifest_path"].endswith("strategy_manifest.json")
     assert database.read_bytes() == before
+
+
+@pytest.mark.parametrize("payload", [{"unknown": True}, {"test_start": "2026-01-01"}])
+def test_retest_start_validates_payload_before_reusing_committed_inbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]
+) -> None:
+    controller = _controller(tmp_path)
+    _committed_retest_job(controller, tmp_path, job_id="payload-guard")
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
+
+    with pytest.raises(ValueError):
+        controller.strategies_performance_v2_retest_start(payload)
+
+
+def test_retest_start_checks_database_before_reusing_committed_inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = _controller(tmp_path, seed=False)
+    _committed_retest_job(controller, tmp_path, job_id="missing-database")
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
+
+    with pytest.raises(PerformanceV2ApiError) as error:
+        controller.strategies_performance_v2_retest_start({})
+
+    assert error.value.status == 404
+
+
+def test_retest_start_reuses_oldest_valid_inbox_when_newest_is_missing_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
+    strategy_dir = tmp_path / "bot" / "settings_strategy"
+    report_dir.mkdir(parents=True)
+    strategy_dir.mkdir(parents=True)
+    (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
+    (strategy_dir / "alpha.json").write_text("{}", encoding="utf-8")
+    inbox = tmp_path / "inbox" / "persisted-retest"
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+    }), encoding="utf-8")
+    controller._panel_jobs.submit(
+        "strategies.tester.native.start", {"retest": True}, "panel:persisted-retest",
+        ("strategies.tester",), job_id="persisted-retest",
+    )
+    controller._panel_jobs.transition("persisted-retest", "RUNNING")
+    controller._panel_jobs.sync(
+        "persisted-retest",
+        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={
+            "retest": True,
+            "inbox_path": str(inbox),
+            "test_start": "2026-01-01",
+            "test_end": "2026-01-09",
+            "listing_dates_path": "input/dates.xlsx",
+        },
+    )
+    newer_inbox = tmp_path / "inbox" / "newer-invalid"
+    newer_inbox.mkdir(parents=True)
+    (newer_inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "missing.html"}],
+    }), encoding="utf-8")
+    controller._panel_jobs.submit(
+        "strategies.tester.native.start", {"retest": True}, "panel:newer-invalid",
+        ("strategies.tester",), job_id="newer-invalid",
+    )
+    controller._panel_jobs.transition("newer-invalid", "RUNNING")
+    controller._panel_jobs.sync(
+        "newer-invalid",
+        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={"retest": True, "inbox_path": str(newer_inbox)},
+    )
+
+    # The journal sorts object keys when persisting, so recovery must use the
+    # explicit creation timestamp rather than dictionary/reverse-list order.
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+
+    class FakeTester:
+        def status(self, job_id: str) -> dict[str, object]:
+            return {"job_id": job_id, "state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True}
+
+        def capture_inbox(self, *args: object, **kwargs: object) -> Path:
+            pytest.fail("a committed persisted inbox must not be recaptured")
+
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: FakeTester())
+    monkeypatch.setattr(panel_module, "build_retest_manifest", lambda *args: pytest.fail("a new RETEST must not be built"))
+    monkeypatch.setattr(controller, "_retest_range", lambda *args: pytest.fail("reusable inbox must skip date validation"))
+
+    result = controller.strategies_performance_v2_retest_start({})
+
+    assert result["job_id"] == "persisted-retest"
+    assert result["state"] == "COMMITTED"
+    assert result["phase"] == "COMMITTED"
+    assert isinstance(result["progress"], dict)
+    assert result["inbox_ready"] is True
+    assert result["inbox_path"] == str(inbox)
+    mapping, runtime = controller._retest_mapping(result["job_id"])
+    assert mapping == {"alpha": 1}
+    assert runtime["test_start"] == "2026-01-01"
+    assert runtime["listing_dates_path"] == "input/dates.xlsx"
+
+    captured: dict[str, object] = {}
+
+    def fake_import(payload: dict[str, object], *, _internal: bool = False) -> dict[str, object]:
+        assert _internal is True
+        captured.update(payload)
+        controller._panel_jobs.submit(
+            "strategies.performance.v2.import", {"retest": True}, "panel:import-after-reuse",
+            ("performance-v2-db",), job_id="import-after-reuse",
+        )
+        controller._panel_jobs.transition("import-after-reuse", "RUNNING")
+        return controller._panel_jobs.get("import-after-reuse")
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_import", fake_import)
+    imported = controller.strategies_performance_v2_retest_import({"tester_job_id": result["job_id"]})
+
+    assert imported["job_id"] == "import-after-reuse"
+    assert captured["mode"] == "REPLACE"
+    assert captured["replacement_strategy_ids"] == {"alpha": 1}
+    assert captured["clear_retest_on_success"] is True
+
+
+def test_committed_native_retest_verify_reuses_persisted_inbox_without_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="verify-persisted-retest")
+    report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
+    strategy_dir = tmp_path / "bot" / "settings_strategy"
+    report_dir.mkdir(parents=True)
+    strategy_dir.mkdir(parents=True)
+    (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
+    (strategy_dir / "alpha.json").write_text("{}", encoding="utf-8")
+    inbox = Path(controller._panel_jobs.runtime(tester_job_id)["inbox_path"])
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        controller, "_single_mode_strategy_test", lambda: pytest.fail("committed RETEST must not load current tester state")
+    )
+    monkeypatch.setattr(
+        controller, "_validate_metadata_inbox", lambda _inbox: pytest.fail("committed RETEST must not revalidate mutable source paths")
+    )
+
+    result = controller.strategies_tester_verify_inbox(tester_job_id)
+
+    assert result["job_id"] == tester_job_id
+    assert result["state"] == "COMMITTED"
+    assert result["phase"] == "COMMITTED"
+    assert result["inbox_ready"] is True
+    assert result["inbox_path"] == str(inbox.resolve())
+    assert controller._panel_jobs.runtime(tester_job_id)["retest"] is True
+
+
+def test_committed_native_retest_verify_rejects_same_size_foreign_manifest_without_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="verify-foreign-retest")
+    inbox = Path(controller._panel_jobs.runtime(tester_job_id)["inbox_path"])
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "batch_id": tester_job_id,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{"strategy_name": "foreign", "strategy_path": "foreign.json", "report_path": "foreign.html"}],
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        controller, "_single_mode_strategy_test", lambda: pytest.fail("broken committed RETEST must not recapture")
+    )
+
+    with pytest.raises(ValueError, match="manifest"):
+        controller.strategies_tester_verify_inbox(tester_job_id)
+
+
+def test_committed_native_retest_verify_survives_restart_with_stale_tester_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="verify-restart-retest")
+    inbox = Path(controller._panel_jobs.runtime(tester_job_id)["inbox_path"])
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "batch_id": tester_job_id,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+    }), encoding="utf-8")
+    report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
+    report_dir.mkdir(parents=True)
+    (report_dir / "tester_manifest.json").write_text(json.dumps({"job_id": "foreign-job", "phase": "COMMITTED"}), encoding="utf-8")
+    restored = PanelController(tmp_path, tmp_path / "config.local.json")
+    monkeypatch.setattr(
+        restored, "_single_mode_strategy_test", lambda: pytest.fail("stale tester manifest must not be loaded")
+    )
+
+    result = restored.strategies_tester_verify_inbox(tester_job_id)
+
+    assert result["job_id"] == tester_job_id
+    assert result["inbox_ready"] is True
+
+
+@pytest.mark.parametrize(
+    ("import_state", "reusable"),
+    [("COMMITTED", False), ("FAILED", True), ("CANCELLED", True)],
+)
+def test_reusable_retest_job_checks_persisted_import_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, import_state: str, reusable: bool
+) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id=f"tester-import-{import_state.lower()}")
+    import_job_id = f"import-{import_state.lower()}"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {"retest": True}, f"panel:{import_job_id}",
+        ("performance-v2-db",), job_id=import_job_id,
+    )
+    controller._panel_jobs.transition(import_job_id, "RUNNING")
+    if import_state == "COMMITTED":
+        controller._panel_jobs.sync(import_job_id, {"state": "COMMITTED", "phase": "COMMITTED"})
+    elif import_state == "FAILED":
+        controller._panel_jobs.sync(import_job_id, {"state": "FAILED", "phase": "FAILED"})
+    else:
+        controller._panel_jobs.transition(import_job_id, "CANCELLING")
+        controller._panel_jobs.transition(import_job_id, "CANCELLED")
+    runtime = controller._panel_jobs.runtime(tester_job_id)
+    runtime["retest_import_job_id"] = import_job_id
+    controller._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
+
+    result = controller._reusable_retest_job()
+
+    assert (result is not None) is reusable
+    if reusable:
+        assert result["job_id"] == tester_job_id
+
+
+def test_reusable_retest_job_rejects_inbox_root_itself(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = _controller(tmp_path)
+    inbox_root = tmp_path / "inbox"
+    inbox_root.mkdir()
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="tester-inbox-root")
+    runtime = controller._panel_jobs.runtime(tester_job_id)
+    runtime["inbox_path"] = str(inbox_root)
+    controller._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
+
+    assert controller._reusable_retest_job() is None
+
+
+def test_reusable_retest_job_uses_creation_order_after_registry_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    old_job_id = _committed_retest_job(controller, tmp_path, job_id="z-old-retest")
+    new_job_id = _committed_retest_job(controller, tmp_path, job_id="a-new-retest")
+    controller._panel_jobs.jobs[old_job_id].pop("created_at_utc", None)
+    controller._panel_jobs.jobs[new_job_id]["created_at_utc"] = "2026-01-01T00:00:01+00:00"
+    controller._panel_jobs._save()
+    restored = PanelController(tmp_path, tmp_path / "config.local.json")
+    monkeypatch.setattr(restored, "_validate_metadata_inbox", lambda _inbox: None)
+
+    result = restored._reusable_retest_job()
+
+    assert "created_at_utc" not in restored._panel_jobs.get(old_job_id)
+    assert result["job_id"] == new_job_id
+
+
+@pytest.mark.parametrize("link_kind", ["resource", "tester_job", "inbox"])
+def test_reusable_retest_job_blocks_reverse_committed_import_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str
+) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id=f"reverse-link-{link_kind}")
+    inbox = Path(controller._panel_jobs.runtime(tester_job_id)["inbox_path"])
+    runtime: dict[str, object] = {}
+    resource_keys: tuple[str, ...] = ()
+    if link_kind == "resource":
+        resource_keys = (f"tester:{tester_job_id}",)
+    elif link_kind == "tester_job":
+        runtime["tester_job_id"] = tester_job_id
+    else:
+        runtime["inbox_path"] = str(inbox)
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {"retest": True}, f"panel:reverse-{link_kind}",
+        resource_keys, job_id=f"reverse-import-{link_kind}",
+    )
+    controller._panel_jobs.transition(f"reverse-import-{link_kind}", "RUNNING")
+    controller._panel_jobs.sync(
+        f"reverse-import-{link_kind}",
+        {"state": "COMMITTED", "phase": "COMMITTED"},
+        runtime=runtime or None,
+    )
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
+
+    assert controller._reusable_retest_job() is None
+
+
+@pytest.mark.parametrize("kind", ["tester", "import"])
+@pytest.mark.parametrize("state", ["QUEUED", "RUNNING", "CANCELLING"])
+def test_reusable_retest_job_blocks_active_retest_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, state: str
+) -> None:
+    controller = _controller(tmp_path)
+    _committed_retest_job(controller, tmp_path, job_id=f"active-candidate-{kind}-{state}")
+    job_id = f"active-{kind}-{state}"
+    panel_kind = "strategies.tester.native.start" if kind == "tester" else "strategies.performance.v2.import"
+    resource_keys = ("strategies.tester",) if kind == "tester" else ("performance-v2-db",)
+    controller._panel_jobs.submit(panel_kind, {"retest": True}, f"panel:{job_id}", resource_keys, job_id=job_id)
+    if state != "QUEUED":
+        controller._panel_jobs.transition(job_id, "RUNNING")
+    if state == "CANCELLING":
+        controller._panel_jobs.transition(job_id, "CANCELLING")
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
+
+    assert controller._reusable_retest_job() is None
 
 
 def _committed_retest_job(controller: PanelController, tmp_path: Path, *, state: str = "COMMITTED", job_id: str = "retest-job") -> str:

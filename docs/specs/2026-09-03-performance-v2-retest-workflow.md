@@ -292,13 +292,16 @@ actions и equity для каждой строки её `RETEST` удаляет�
 On panel load, no previous RETEST tester or import job is activated and
 `IMPORT & REPLACE` remains disabled. A previously committed native RETEST job
 may be shown as an unactivated candidate only. The explicit `CHECK & RETEST`
-action first queries the durable job registry, chooses the newest committed
-native RETEST job, and calls `verify-inbox`; this rechecks the configured
-`tester_runner.report_dir` (normally `my_test`) and strategy directory and
-rebuilds the handoff metadata from reusable artifacts. A successful check
-activates that job and enables `IMPORT & REPLACE` without rerunning the tester.
-If there is no reusable committed job, the current `ACTIVE` RETEST rows are
-validated and the existing native `SINGLE_MODE` retest algorithm is started.
+action first queries the durable job registry. A committed native RETEST job
+with a safe persisted inbox and valid metadata manifest is reused directly,
+without recapturing reports or starting the tester; a successful check
+activates the job and enables `IMPORT & REPLACE`. A committed job whose
+manifest is missing, malformed, or names another strategy set returns a
+deterministic check error and never falls through to a new tester run. Only
+when no reusable committed job exists are the current `ACTIVE` RETEST rows
+validated and the existing native `SINGLE_MODE` retest algorithm started.
+Candidates linked to a `COMMITTED` import are never reused; candidates linked
+to a retryable `FAILED` or `CANCELLED` import remain eligible.
 If the previous import for that committed inbox is `FAILED` or `CANCELLED`,
 `IMPORT & REPLACE` may be retried for the same inbox; a previous `COMMITTED`
 import remains non-repeatable.

@@ -1433,9 +1433,21 @@ class PanelController:
     def _validate_metadata_inbox(self, inbox: Path) -> None:
         """Perform only the handoff check; v2 importer owns source validation."""
         config = RunnerConfig.from_json(self.default_config)
+        strategy_roots = [config.strategy_dir.resolve()]
+        try:
+            performance_root = self._performance_v2_config().strategy_root
+            if performance_root is not None:
+                performance_root = Path(performance_root)
+                if not performance_root.is_absolute():
+                    performance_root = self.root / performance_root
+                performance_root = performance_root.resolve()
+        except Exception:
+            performance_root = None
+        if performance_root is not None:
+            strategy_roots.append(performance_root)
         artifact_roots = {
-            "strategy_path": config.strategy_dir.resolve(),
-            "report_path": config.report_dir.resolve(),
+            "strategy_path": tuple(dict.fromkeys(strategy_roots)),
+            "report_path": (config.report_dir.resolve(),),
         }
         try:
             document = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
@@ -1469,17 +1481,27 @@ class PanelController:
             for field in ("strategy_path", "report_path"):
                 value = entry.get(field)
                 path = Path(value) if isinstance(value, str) and value else None
-                root = artifact_roots[field]
-                if path is not None and not path.is_absolute():
-                    path = root / path
-                if path is None or path.is_symlink():
+                roots = artifact_roots[field]
+                if path is None:
                     raise ValueError(f"metadata inbox is incomplete: {field} is missing")
-                candidate = path.resolve()
-                try:
-                    candidate.relative_to(root)
-                except ValueError as error:
-                    raise ValueError(f"metadata inbox is incomplete: {field} is outside configured directory") from error
-                if not candidate.is_file():
+                candidates = (
+                    ((path, roots),)
+                    if path.is_absolute()
+                    else tuple((root / path, (root,)) for root in roots)
+                )
+                outside = False
+                for candidate_path, trusted_roots in candidates:
+                    if candidate_path.is_symlink():
+                        continue
+                    candidate = candidate_path.resolve()
+                    if not any(candidate == trusted or trusted in candidate.parents for trusted in trusted_roots):
+                        outside = True
+                        continue
+                    if candidate.is_file():
+                        break
+                else:
+                    if outside:
+                        raise ValueError(f"metadata inbox is incomplete: {field} is outside configured directory")
                     raise ValueError(f"metadata inbox is incomplete: {field} is missing")
         if names != set(expected):
             raise ValueError("metadata inbox is incomplete: strategy names do not match")
@@ -2705,6 +2727,62 @@ class PanelController:
         config = RunnerConfig.from_json(self.default_config)
         inbox_root = Path(config.inbox_root).resolve()
         tracked = self._panel_jobs.get(job_id)
+        runtime = self._panel_jobs.runtime(job_id)
+        is_retest_native = (
+            tracked.get("kind") == "strategies.tester.native.start"
+            and (tracked.get("retest") is True or runtime.get("retest") is True)
+        )
+        if is_retest_native and tracked.get("state") == "COMMITTED":
+            raw_inbox = runtime.get("inbox_path")
+            try:
+                if (
+                    tracked.get("inbox_ready") is not True
+                    and runtime.get("inbox_ready") is not True
+                ):
+                    raise ValueError("committed RETEST inbox is not ready")
+                if not isinstance(raw_inbox, str) or not raw_inbox.strip():
+                    raise ValueError("committed RETEST inbox path is unavailable")
+                inbox = Path(raw_inbox).resolve()
+                if inbox == inbox_root:
+                    raise ValueError("committed RETEST inbox path is unsafe")
+                inbox.relative_to(inbox_root)
+                manifest_path = inbox / "inbox_manifest.json"
+                if not inbox.is_dir() or manifest_path.is_symlink() or not manifest_path.is_file():
+                    raise ValueError("committed RETEST inbox manifest is unavailable")
+                if manifest_path.stat().st_size > 16 * 1024 * 1024:
+                    raise ValueError("committed RETEST inbox manifest is too large")
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                entries = manifest.get("entries") if isinstance(manifest, Mapping) else None
+                expected = manifest.get("expected_strategy_names") if isinstance(manifest, Mapping) else None
+                entry_names = [
+                    entry.get("strategy_name")
+                    for entry in entries
+                    if isinstance(entry, Mapping)
+                ] if isinstance(entries, list) else []
+                if (
+                    not isinstance(manifest, Mapping)
+                    or manifest.get("schema_version") != 1
+                    or manifest.get("run_mode") != "SINGLE_MODE"
+                    or manifest.get("source_mode") != "metadata_only"
+                    or manifest.get("inbox_ready") is not True
+                    or not isinstance(expected, list)
+                    or not expected
+                    or not isinstance(entries, list)
+                    or len(entries) != len(expected)
+                    or any(not isinstance(name, str) or not name for name in expected)
+                    or len(set(expected)) != len(expected)
+                    or set(entry_names) != set(expected)
+                    or len(set(entry_names)) != len(entry_names)
+                    or ("batch_id" in manifest and manifest.get("batch_id") != job_id)
+                ):
+                    raise ValueError("committed RETEST inbox manifest is invalid")
+            except (OSError, RuntimeError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(str(error)) from None
+            self._strategy_batch_inboxes[job_id] = inbox
+            status = self._panel_jobs.get(job_id)
+            status["inbox_path"] = str(inbox)
+            status["inbox_ready"] = True
+            return status
         is_single_mode = tracked.get("kind") in {"strategies.tester.start", "strategies.tester.native.start"}
         if is_single_mode:
             service = self._single_mode_strategy_test()
@@ -2892,6 +2970,17 @@ class PanelController:
         return start.astimezone(timezone.utc).date().isoformat(), end.astimezone(timezone.utc).date().isoformat()
 
     def _retest_range(self, payload: Mapping[str, object], connection: duckdb.DuckDBPyConnection) -> tuple[str, str]:
+        explicit = self._retest_explicit_range(payload)
+        if explicit is not None:
+            return explicit
+        start, end = self._retest_default_dates(connection)
+        if start >= end:
+            raise ValueError("RETEST test_start must be before test_end")
+        return start, end
+
+    def _retest_explicit_range(self, payload: Mapping[str, object]) -> tuple[str, str] | None:
+        if not isinstance(payload, Mapping):
+            raise ValueError("RETEST start request must be an object")
         allowed = {"test_start", "test_end", "start_date", "end_date"}
         if set(payload).difference(allowed):
             raise ValueError("RETEST start request contains unsupported fields")
@@ -2900,13 +2989,12 @@ class PanelController:
         if len(present) > 1:
             raise ValueError("RETEST dates must use one date contract")
         if not present:
-            start, end = self._retest_default_dates(connection)
-        else:
-            start_key, end_key = present[0]
-            if start_key not in payload or end_key not in payload:
-                raise ValueError("RETEST test_start and test_end are required together")
-            start = self._retest_date(payload[start_key], start_key)
-            end = self._retest_date(payload[end_key], end_key)
+            return None
+        start_key, end_key = present[0]
+        if start_key not in payload or end_key not in payload:
+            raise ValueError("RETEST test_start and test_end are required together")
+        start = self._retest_date(payload[start_key], start_key)
+        end = self._retest_date(payload[end_key], end_key)
         if start >= end:
             raise ValueError("RETEST test_start must be before test_end")
         return start, end
@@ -2973,11 +3061,175 @@ class PanelController:
             "phase": "READY" if status.active_count else "IDLE",
         }
 
+    def _reusable_retest_job(self) -> dict[str, object] | None:
+        """Find the newest committed RETEST inbox still backed by tester files.
+
+        New registry records carry a persisted creation time.  Legacy records
+        without it remain eligible and use their stable job id as a deterministic
+        fallback, rather than relying on JSON dictionary order.
+        """
+        try:
+            inbox_root = Path(RunnerConfig.from_json(self.default_config).inbox_root).resolve()
+        except (OSError, TypeError, ValueError):
+            return None
+
+        def order(job: dict[str, object]) -> tuple[int, datetime, str]:
+            raw_created = job.get("created_at_utc")
+            if isinstance(raw_created, str):
+                try:
+                    created = datetime.fromisoformat(raw_created)
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    else:
+                        created = created.astimezone(timezone.utc)
+                except (TypeError, ValueError, OverflowError):
+                    created = None
+            else:
+                created = None
+            if created is None:
+                return (0, datetime.min.replace(tzinfo=timezone.utc), str(job.get("job_id", "")))
+            return (1, created, str(job.get("job_id", "")))
+
+        jobs = self._panel_jobs.list()
+        jobs_by_id = {
+            job.get("job_id"): job
+            for job in jobs
+            if isinstance(job.get("job_id"), str) and job.get("job_id")
+        }
+        runtimes: dict[str, dict[str, object]] = {}
+        for job_id in jobs_by_id:
+            try:
+                value = self._panel_jobs.runtime(job_id)
+            except PanelJobError:
+                value = {}
+            runtimes[job_id] = value
+
+        def is_retest(job: Mapping[str, object], runtime: Mapping[str, object]) -> bool:
+            return job.get("retest") is True or runtime.get("retest") is True
+
+        active_states = {"QUEUED", "RUNNING", "CANCELLING"}
+        if any(
+            job.get("state") in active_states
+            and job.get("kind") in {"strategies.tester", "strategies.tester.start", "strategies.tester.native.start"}
+            and is_retest(job, runtimes.get(str(job.get("job_id")), {}))
+            for job in jobs
+        ):
+            return None
+        if any(
+            job.get("state") in active_states
+            and job.get("kind") == "strategies.performance.v2.import"
+            and is_retest(job, runtimes.get(str(job.get("job_id")), {}))
+            for job in jobs
+        ):
+            return None
+
+        def references_tester(
+            import_job: Mapping[str, object], import_runtime: Mapping[str, object],
+            tester_job_id: str, inbox: Path,
+        ) -> bool:
+            if f"tester:{tester_job_id}" in import_job.get("resource_keys", ()):  # persisted reverse link
+                return True
+            containers = (import_job, import_runtime)
+            for container in containers:
+                for key in ("tester_job_id", "retest_tester_job_id", "source_tester_job_id"):
+                    if container.get(key) == tester_job_id:
+                        return True
+                for key in ("inbox_path", "retest_inbox_path"):
+                    raw_path = container.get(key)
+                    if not isinstance(raw_path, str) or not raw_path.strip():
+                        continue
+                    path = Path(raw_path)
+                    if not path.is_absolute():
+                        path = self.root / path
+                    try:
+                        if path.resolve() == inbox:
+                            return True
+                    except OSError:
+                        continue
+            return False
+
+        def has_committed_import(tester_job_id: str, inbox: Path) -> bool:
+            for import_job in jobs:
+                if (
+                    import_job.get("kind") != "strategies.performance.v2.import"
+                    or import_job.get("state") != "COMMITTED"
+                ):
+                    continue
+                import_id = import_job.get("job_id")
+                import_runtime = runtimes.get(str(import_id), {})
+                if references_tester(import_job, import_runtime, tester_job_id, inbox):
+                    return True
+            return False
+
+        def has_active_import(tester_job_id: str, inbox: Path) -> bool:
+            for import_job in jobs:
+                if (
+                    import_job.get("kind") != "strategies.performance.v2.import"
+                    or import_job.get("state") not in active_states
+                ):
+                    continue
+                import_id = import_job.get("job_id")
+                import_runtime = runtimes.get(str(import_id), {})
+                if is_retest(import_job, import_runtime) or references_tester(
+                    import_job, import_runtime, tester_job_id, inbox
+                ):
+                    return True
+            return False
+
+        jobs = sorted(jobs, key=order, reverse=True)
+        for job in jobs:
+            if (
+                job.get("kind") != "strategies.tester.native.start"
+                or job.get("state") != "COMMITTED"
+            ):
+                continue
+            job_id = job.get("job_id")
+            if not isinstance(job_id, str) or not job_id:
+                continue
+            try:
+                runtime = runtimes.get(job_id, {})
+                if job.get("inbox_ready") is not True and runtime.get("inbox_ready") is not True:
+                    continue
+                if job.get("retest") is not True and runtime.get("retest") is not True:
+                    continue
+                if "retest_import_job_id" in runtime:
+                    previous_import_id = runtime.get("retest_import_job_id")
+                    if not isinstance(previous_import_id, str) or not previous_import_id.strip():
+                        continue
+                    previous_import = self._panel_jobs.get(previous_import_id)
+                    if (
+                        previous_import.get("kind") != "strategies.performance.v2.import"
+                        or previous_import.get("state") not in {"FAILED", "CANCELLED"}
+                    ):
+                        continue
+                raw_inbox = runtime.get("inbox_path")
+                if not isinstance(raw_inbox, str) or not raw_inbox.strip():
+                    continue
+                inbox = Path(raw_inbox).resolve()
+                if inbox == inbox_root:
+                    continue
+                inbox.relative_to(inbox_root)
+                self._validate_metadata_inbox(inbox)
+                if has_committed_import(job_id, inbox) or has_active_import(job_id, inbox):
+                    continue
+            except (OSError, TypeError, ValueError, PanelJobError):
+                continue
+            self._strategy_batch_inboxes[job_id] = inbox
+            reusable = dict(job)
+            reusable["inbox_path"] = str(inbox)
+            reusable["inbox_ready"] = True
+            return reusable
+        return None
+
     def strategies_performance_v2_retest_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         config = self._performance_v2_config()
         target = performance_v2_database_path(config)
         if not target.is_file():
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
+        self._retest_explicit_range(payload)
+        reusable = self._reusable_retest_job()
+        if reusable is not None:
+            return reusable
         listing_path, listing_relative = self._retest_listing_context()
         templates = self._workflow_defaults().get("strategy_templates", {})
         with duckdb.connect(str(target), read_only=True) as connection:
@@ -3023,9 +3275,15 @@ class PanelController:
     def _retest_mapping(self, tester_job_id: str) -> tuple[dict[str, int], dict[str, object]]:
         job = self._panel_jobs.get(tester_job_id)
         runtime = self._panel_jobs.runtime(tester_job_id)
-        if job.get("kind") != "strategies.tester.native.start" or runtime.get("retest") is not True:
+        if (
+            job.get("kind") != "strategies.tester.native.start"
+            or (job.get("retest") is not True and runtime.get("retest") is not True)
+        ):
             raise ValueError("tester job is not a RETEST run")
-        if job.get("state") != "COMMITTED" or job.get("inbox_ready") is not True:
+        if (
+            job.get("state") != "COMMITTED"
+            or (job.get("inbox_ready") is not True and runtime.get("inbox_ready") is not True)
+        ):
             raise ValueError("RETEST tester inbox is not committed")
         inbox = self._tester_inbox(tester_job_id)
         try:

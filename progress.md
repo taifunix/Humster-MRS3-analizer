@@ -24,9 +24,11 @@ reports. After a committed import, the exact configured report directory, the
 configured tester strategy directory, and project `Output/strategies` are
 emptied; failed imports leave these sources intact.
 After a panel restart, the previous RETEST job remains a candidate only;
-`CHECK & RETEST` must be pressed again. The check reuses a still-present
-committed inbox through `verify-inbox` and starts a new native run only when
-those sources are unavailable.
+`CHECK & RETEST` must be pressed again. The check reuses a committed RETEST
+inbox with a safe, structurally valid metadata manifest without recapturing
+mutable tester state. A broken committed inbox reports a deterministic error;
+it never silently starts another native run. A new native run is started only
+when no reusable committed inbox exists.
 
 ## Performance v2 selection review cleanup (2026-09-03)
 

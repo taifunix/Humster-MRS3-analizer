@@ -1638,7 +1638,11 @@
           renderRetestTester(verified);
           if (retestInboxReady) return;
           retestTesterJobId = '';
-        } catch (_) { /* current configured report/strategy artifacts are not reusable */ }
+        } catch (error) {
+          if (retestStatus) retestStatus.textContent = `CHECK & RETEST: committed inbox is unavailable${error?.message ? ` · ${error.message}` : ''}.`;
+          retestStart.disabled = false;
+          return;
+        }
       }
       if (!validIsoDate(start) || !validIsoDate(end) || start >= end) { if (retestStatus) retestStatus.textContent = 'Enter valid RETEST dates with start before end.'; retestStart.disabled = false; return; }
       const result = await remoteRequest('/api/v2/strategies/performance-v2/retest/start', { test_start: start, test_end: end });

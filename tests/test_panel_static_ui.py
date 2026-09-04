@@ -239,6 +239,8 @@ def test_retest_check_is_the_only_path_that_activates_a_recovered_job() -> None:
     assert "selectCommittedRetestTester(jobs)" in check
     assert "/api/v2/strategies/tester/verify-inbox" in check
     assert check.index("/api/v2/jobs") < check.index("/api/v2/strategies/tester/verify-inbox") < check.index("/api/v2/strategies/performance-v2/retest/start")
+    assert "committed inbox is unavailable" in check
+    assert "retestStart.disabled = false; return;" in check
     invalid_dates = next(line for line in check.splitlines() if "Enter valid RETEST dates" in line)
     assert "retestStart.disabled = false" in invalid_dates
     assert "retestTesterJobId = tester.job_id" not in recovery
