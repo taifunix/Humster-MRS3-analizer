@@ -185,8 +185,9 @@ M  tests/test_panel_testing.py
 Шаблоны стратегий уже перенесены. Игнорируемые tester-config templates `Input/config_tester_*_standart.json` пока остаются на старом месте: пользователь просил канонизировать именно шаблоны JSON стратегий. Перенос tester-config templates — отдельное решение, не делать его автоматически в рамках RETEST.
 # Current implementation note (2026-09-03)
 
-The historical status text below predates the approved implementation. Tasks 2-6
-are implemented and covered by focused tests; Task 7 (real local DB migration,
-backup and HIGH+REVIEW seed) remains intentionally pending until explicit
-production-data execution. Legacy posttest runtime and dedicated tests are
-removed; the active path is Performance DB v2 plus CHECK & RETEST.
+The historical status text below predates the approved implementation. Tasks 2-7
+are implemented: the local Performance DB is schema v4, the HIGH+REVIEW audit
+set has 149 durable RETEST tags, and an adjacent verified backup was created.
+Legacy posttest runtime and dedicated tests are removed; the active path is
+Performance DB v2 plus CHECK & RETEST. The backup and database are ignored
+local artifacts and are not committed.

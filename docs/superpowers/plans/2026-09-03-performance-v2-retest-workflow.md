@@ -366,7 +366,9 @@ Expected: no output.
 JSON/HTML/XLSX/DB не коммитить.
 # Current execution status (2026-09-03)
 
-Tasks 2-6 are implemented in the working tree and verified by focused tests.
-Task 7 remains pending because it requires an explicit production-data backup,
-schema migration and audit seed. Task 8 legacy removal is implemented; final
-full-suite and independent code review remain the acceptance gates.
+Tasks 2-7 are implemented and verified. Task 7 used the explicit production-data
+authorization: the local DB is schema v4, HIGH+REVIEW seeded 149 unique RETEST
+IDs, the adjacent backup was hash-checked and opened read-only, and a second
+lock-protected idempotence pass produced zero net seed changes with unchanged
+facts. Task 8 legacy removal is implemented; external Opus review is the final
+acceptance gate for this operational evidence.

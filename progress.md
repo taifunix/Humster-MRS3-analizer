@@ -1254,5 +1254,36 @@ runtime are no longer live paths.
 Evidence: focused RETEST/import/selection/panel suites `386 passed, 1 skipped`
 (Windows symlink capability); `node --check src/mrs3/panel_web/app.js`; clean
 `git diff --check`; external Opus review `CODE_REVIEW_PASS` after three rounds.
-Task 7 production DB backup/migration/HIGH+REVIEW seed remains intentionally
-pending; no production DB or generated artifacts were changed.
+At that point Task 7 production DB backup/migration/HIGH+REVIEW seed remained
+pending; it was executed later under explicit authorization as recorded below.
+
+### Performance v2 Task 7 production migration and audit seed (2026-09-04)
+
+With explicit user authorization, the existing local Performance DB was checked
+under `PerformanceV2WriterLock`. The target was already schema v4, so
+`initialize_performance_v2` performed idempotent v4 validation without a forced
+rewrite. The HIGH and REVIEW sheets of
+`Output/performance-v2-period-integrity-audit-2026-09-02.xlsx` contained 49 and
+100 rows respectively: exact `Strategy ID` headers, 149 integer values, zero
+duplicates and zero IDs missing from `strategies`. `mark_retest_from_audit`
+seeded exactly 149 unique `RETEST` IDs with source
+`PERIOD_INTEGRITY_AUDIT`.
+
+Before mutation an adjacent ignored backup was created at
+`data/performance-v2/strategy_performance.duckdb.task7-backup-20260904T045944Z`;
+it is 7,603,499,008 bytes with SHA-256
+`1748395f353476018efeb77b88a7c6755a4071f2ce47d5a229917282ebb2eb9c`, and its
+read-only DuckDB catalog/schema probe passed (v4, 15 tables, 4 sequences, 6
+indexes, 16,272 strategies). The post-mutation target hash differs as expected
+because the RETEST seed changed the database; the backup is the pre-seed
+snapshot. A second lock-protected initialize/seed pass kept schema/catalog,
+exact RETEST set, REJECTED rows and all facts unchanged, with zero net new seed
+rows. The lock released cleanly and immediate reacquisition succeeded.
+
+Facts before and after the idempotence pass: strategies/results `16,272 / 16,272`,
+orders `41,280`, actions `10,432,397`, equity `77,787,295`, window metrics
+`113,426`, analysis plateaus `1,468`. The backup, DB and lock are covered by
+`.gitignore` rule `[Dd]ata/`; no generated artifact or source file was committed.
+The original pre-copy source hash was not persisted, so byte-for-byte fidelity
+is evidenced by the backup size/hash and independent read-only catalog/count
+probe rather than a retroactive source-hash comparison.

@@ -67,7 +67,7 @@ analysis runs и lineage согласно уже реализованной
 
 | № | Результат | Входной критерий | Выходной критерий |
 | --- | --- | --- | --- |
-| Current governing contract | [Performance DB v2 CHECK & RETEST](docs/specs/2026-09-03-performance-v2-retest-workflow.md) | listing-date warm-up, raw DD, PnL/30d and Trades/30d comparison, atomic valid-sibling import and safe RETEST recovery | production Task 7 backup/migration/seed |
+| Current governing contract | [Performance DB v2 CHECK & RETEST](docs/specs/2026-09-03-performance-v2-retest-workflow.md) | listing-date warm-up, raw DD, PnL/30d and Trades/30d comparison, atomic valid-sibling import and safe RETEST recovery | production Task 7 backup, schema v4 validation and 149-ID audit seed verified |
 
 > The older 2026-08-14 Performance import/DD5 rows below are retained as
 > historical provenance; the 2026-09-03 Performance DB v2 contract governs the
