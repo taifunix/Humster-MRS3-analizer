@@ -202,6 +202,7 @@ from .performance_v2_selection import (
     parse_selection_request,
     prepare_selection_window_cache,
     run_selection,
+    selection_cache_missing_strategy_ids,
     selection_cache_status,
     write_selection_workbook,
 )
@@ -3363,7 +3364,9 @@ class PanelController:
             target = performance_v2_database_path(performance_config)
             self._ensure_performance_v2_schema(target)
             with self._performance_v2_writer_lock:
-                prepare_selection_window_cache(target, request, config, performance_config.workers)
+                with duckdb.connect(str(target), read_only=True) as connection:
+                    missing_strategy_ids = selection_cache_missing_strategy_ids(connection, request, config)
+                prepare_selection_window_cache(target, request, config, performance_config.workers, missing_strategy_ids)
             with self._selection_candidate_cache_lock:
                 self._selection_candidate_cache.clear()
             return {"status": "READY"}
@@ -3384,14 +3387,15 @@ class PanelController:
                         where s.lifecycle_status = 'ACTIVE'
                         group by s.symbol, s.side order by s.symbol, s.side"""
                 ).fetchall()
-                pending = [
-                    SelectionRequest(str(symbol), str(side), ())
-                    for symbol, side in pairs
-                    if not selection_cache_status(connection, SelectionRequest(str(symbol), str(side), ()), config)["ready"]
-                ]
+                pending = []
+                for symbol, side in pairs:
+                    request = SelectionRequest(str(symbol), str(side), ())
+                    missing_strategy_ids = selection_cache_missing_strategy_ids(connection, request, config)
+                    if missing_strategy_ids:
+                        pending.append((request, missing_strategy_ids))
             with self._performance_v2_writer_lock:
-                for request in pending:
-                    prepare_selection_window_cache(target, request, config, performance_config.workers)
+                for request, missing_strategy_ids in pending:
+                    prepare_selection_window_cache(target, request, config, performance_config.workers, missing_strategy_ids)
             if pending:
                 with self._selection_candidate_cache_lock:
                     self._selection_candidate_cache.clear()

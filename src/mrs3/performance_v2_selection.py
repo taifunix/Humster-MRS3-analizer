@@ -563,14 +563,51 @@ def _selection_window_job_from_args(args: tuple[str, int, datetime, datetime, in
     return _selection_window_job(*args)
 
 
-def prepare_selection_window_cache(database: Path, request: SelectionRequest, config: SelectionConfig, workers: int) -> None:
+def _selection_cache_missing_strategy_ids(
+    connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig,
+) -> tuple[int, ...]:
+    rows = connection.execute(
+        """select s.strategy_id, r.result_id, r.report_start_utc, r.report_end_utc from strategies s
+             join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
+            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
+            order by s.strategy_id""",
+        [request.symbol, request.side],
+    ).fetchall()
+    cached_metrics = _selection_cached_metrics(connection, request)
+    missing: list[int] = []
+    for strategy_id, result_id, report_start, report_end in rows:
+        windows = _selection_windows(report_start, report_end, config)
+        if any(cached_metrics.get((int(result_id), window_start, window_end)) is None for window_start, window_end in windows):
+            missing.append(int(strategy_id))
+    return tuple(missing)
+
+
+def selection_cache_missing_strategy_ids(
+    connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig,
+) -> tuple[int, ...]:
+    """Return active strategies whose current result lacks a required cache window."""
+    return _selection_cache_missing_strategy_ids(connection, request, config)
+
+
+def prepare_selection_window_cache(
+    database: Path, request: SelectionRequest, config: SelectionConfig, workers: int,
+    strategy_ids: Sequence[int] | None = None,
+) -> None:
     """Warm default windows in independent readers, then persist them through one writer."""
+    selected_ids = None if strategy_ids is None else tuple(dict.fromkeys(int(strategy_id) for strategy_id in strategy_ids))
+    if selected_ids == ():
+        return
     with duckdb.connect(str(database), read_only=True) as connection:
+        where = "where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?"
+        parameters: list[object] = [request.symbol, request.side]
+        if selected_ids is not None:
+            where += " and s.strategy_id in (" + ",".join("?" for _ in selected_ids) + ")"
+            parameters.extend(selected_ids)
         rows = connection.execute(
             """select r.result_id, r.report_start_utc, r.report_end_utc from strategies s
                  join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
-                where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""",
-            [request.symbol, request.side],
+                """ + where,
+            parameters,
         ).fetchall()
     if not rows:
         return

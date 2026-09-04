@@ -38,6 +38,15 @@ are not changed.
 This stage does not deduplicate imports, delete database data, compare
 different periods, or alter the existing unrelated analog grouping.
 
+## Cache warming after RETEST
+
+The selection cache remains keyed by current `result_id` and window metrics
+version. A recalculate request first identifies active strategies whose current
+result lacks any required window, then passes only those strategy IDs to the
+worker. Existing cached strategies in the same pair are not recalculated. The
+all-pairs operation applies the same missing-ID selection independently per
+pair/side.
+
 ## Acceptance evidence
 
 Focused selection tests cover default-on and opt-out behavior, ordering,

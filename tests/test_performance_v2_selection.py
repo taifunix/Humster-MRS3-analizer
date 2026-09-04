@@ -27,6 +27,7 @@ from mrs3.performance_v2_selection import (
     parse_selection_request,
     prepare_selection_window_cache,
     run_selection,
+    selection_cache_missing_strategy_ids,
     selection_cache_status,
     write_selection_workbook,
 )
@@ -540,6 +541,35 @@ def test_parallel_window_warmup_persists_default_selection_windows(tmp_path: Pat
 
     with duckdb.connect(str(database), read_only=True) as check:
         assert check.execute("select count(*) from window_metrics").fetchone() == (7,)
+
+
+def test_missing_cache_strategy_ids_only_returns_current_results_without_facts(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    config = SelectionConfig()
+    connection.close()
+    prepare_selection_window_cache(database, request, config, workers=1)
+
+    with duckdb.connect(str(database)) as check:
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        strategy_id = check.execute(
+            """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+               order_count, analysis_run_id, candidate_identity, lifecycle_status,
+               created_at_utc, updated_at_utc) values ('beta', 'BTCUSDT', 'LONG', '1h',
+               3, 1, 'run', 'candidate-beta', 'ACTIVE', ?, ?) returning strategy_id""",
+            [start, start],
+        ).fetchone()[0]
+        result_id = check.execute(
+            """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
+               commission_rate, initial_balance, final_balance, total_pnl, total_pnl_pct,
+               max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc)
+               values (?, ?, ?, 'Bybit', .0004, 100, 110, 10, 10, 5, 5, 2, 2, ?) returning result_id""",
+            [strategy_id, start, datetime(2026, 1, 31, tzinfo=UTC), start],
+        ).fetchone()[0]
+        check.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
+
+        assert selection_cache_missing_strategy_ids(check, request, config) == (strategy_id,)
 
 
 def test_legacy_full_ab_only_cache_is_not_ready(tmp_path: Path) -> None:

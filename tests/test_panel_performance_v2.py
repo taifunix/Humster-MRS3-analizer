@@ -684,6 +684,17 @@ def test_selection_cache_status_reports_missing_default_windows(tmp_path: Path) 
     }
 
 
+def test_selection_recalculate_passes_only_missing_strategy_ids(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    import mrs3.panel as panel_module
+    calls = []
+    monkeypatch.setattr(panel_module, "selection_cache_missing_strategy_ids", lambda *_args: (17, 23))
+    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *args: calls.append(args))
+
+    assert controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"}) == {"status": "READY"}
+    assert calls and calls[0][-1] == (17, 23)
+
+
 def test_normalization_30d_does_not_compress_idle_tail_to_event_span() -> None:
     start = datetime(2026, 1, 1, tzinfo=UTC)
     metrics = replace(
