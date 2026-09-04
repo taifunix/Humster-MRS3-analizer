@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from decimal import Decimal
 from hashlib import sha256
 import json
 from pathlib import Path
 import time
 
+import pytest
+
 from mrs3.panel_fast_strategy_test import LocalFastStrategyTestService
 from mrs3.panel_fast_strategy_test import FastStrategyTestError
+from mrs3.panel_fast_strategy_test import _has_current_performance_v2_layout
 from mrs3.panel_fast_strategy_test import _write_fast_tester_config
+from mrs3.performance_v2_html import parse_current_performance_v2_html
+from mrs3.performance_v2_store import PerformanceV2Config
 from mrs3.runner.config import RunnerConfig
 from mrs3.runner.http import RowState
 from mrs3.runner.monitor import BatchCompletion, StrategyCompletion
+
+
+CURRENT_REPORT = Path(__file__).parent / "fixtures" / "performance" / "report_current_v2.html"
 
 
 def _canonical(value: object) -> bytes:
@@ -97,6 +106,81 @@ def _wait(service: LocalFastStrategyTestService, job_id: str) -> dict[str, objec
             return status
         time.sleep(0.01)
     raise AssertionError("Fast TEST did not finish")
+
+
+def test_native_prevalidation_accepts_extended_current_action_layout(tmp_path: Path) -> None:
+    source = CURRENT_REPORT.read_text(encoding="utf-8")
+    for old, new in (
+        (
+            "<th>Timestamp</th><th>Symbol</th><th>Order ID</th><th>Action</th><th>Fee</th><th>PnL</th><th>Balance</th><th>Size</th><th>Post Size</th><th>Post Side</th>",
+            "<th>Timestamp</th><th>Symbol</th><th>Order ID</th><th>Side</th><th>Action</th><th>Size</th><th>Price</th><th>Fee</th><th>Cost</th><th>PnL</th><th>Balance</th><th>Post Size</th><th>Post Side</th>",
+        ),
+        (
+            "<td>2026-01-01T01:00:00Z</td><td>ONUSDT</td><td>1</td><td>opened</td><td>0.05</td><td>0</td><td>999.95</td><td>1</td><td>1</td><td>long</td>",
+            "<td>2026-01-01T01:00:00Z</td><td>ONUSDT</td><td>1</td><td>buy</td><td>opened</td><td>1</td><td>1</td><td>0.05</td><td>1</td><td>0</td><td>999.95</td><td>1</td><td>long</td>",
+        ),
+        (
+            "<td>2026-01-03T01:00:00+00:00</td><td>ONUSDT</td><td>1</td><td>closed</td><td>0.05</td><td>9.9</td><td>1009.9</td><td>1</td><td>0</td><td></td>",
+            "<td>2026-01-03T01:00:00+00:00</td><td>ONUSDT</td><td>1</td><td>sell</td><td>closed</td><td>1</td><td>1</td><td>0.05</td><td>1</td><td>9.9</td><td>1009.9</td><td>0</td><td></td>",
+        ),
+    ):
+        previous = source
+        source = source.replace(old, new, 1)
+        assert source != previous
+
+    assert _has_current_performance_v2_layout(source)
+    parsed = parse_current_performance_v2_html(
+        source.encode(), PerformanceV2Config(tmp_path / "performance-v2")
+    )
+    assert parsed.actions[0].action == "opened"
+    assert parsed.actions[0].size == Decimal("1")
+    assert parsed.actions[0].fee == Decimal("0.05")
+
+
+def test_native_prevalidation_rejects_extended_layout_missing_post_side() -> None:
+    source = CURRENT_REPORT.read_text(encoding="utf-8")
+    extended = source.replace(
+        "<th>Action</th><th>Fee</th>",
+        "<th>Action</th><th>Side</th><th>Price</th><th>Cost</th><th>Fee</th>",
+        1,
+    )
+    assert extended != source
+    source = extended.replace("<th>Post Side</th>", "", 1)
+    assert source != extended
+
+    assert not _has_current_performance_v2_layout(source)
+
+
+def test_native_prevalidation_rejects_legacy_report_layout() -> None:
+    legacy_report = CURRENT_REPORT.with_name("report_import.html")
+
+    assert not _has_current_performance_v2_layout(legacy_report.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "duplicate_header",
+    ("Fee", "Side"),
+)
+def test_native_prevalidation_rejects_duplicate_action_headers(duplicate_header: str) -> None:
+    source = CURRENT_REPORT.read_text(encoding="utf-8")
+    if duplicate_header == "Fee":
+        replacements = (
+            ("<th>Fee</th>", "<th>Fee</th><th>Fee</th>"),
+            ("<td>opened</td><td>0.05</td>", "<td>opened</td><td>0.05</td><td>0.05</td>"),
+            ("<td>closed</td><td>0.05</td>", "<td>closed</td><td>0.05</td><td>0.05</td>"),
+        )
+    else:
+        replacements = (
+            ("<th>Action</th><th>Fee</th>", "<th>Action</th><th>Side</th><th>Side</th><th>Fee</th>"),
+            ("<td>opened</td><td>0.05</td>", "<td>opened</td><td>buy</td><td>buy</td><td>0.05</td>"),
+            ("<td>closed</td><td>0.05</td>", "<td>closed</td><td>sell</td><td>sell</td><td>0.05</td>"),
+        )
+    for old, new in replacements:
+        updated = source.replace(old, new, 1)
+        assert updated != source
+        source = updated
+
+    assert not _has_current_performance_v2_layout(source)
 
 
 def test_fast_test_replaces_strategy_dir_for_each_chunk_and_clears_success(tmp_path: Path) -> None:

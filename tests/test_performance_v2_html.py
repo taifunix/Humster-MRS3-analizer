@@ -120,17 +120,30 @@ def test_parser_requires_required_current_action_headers(
 
 
 def test_parser_accepts_current_action_table_with_extra_columns() -> None:
-    source = _current().replace(
-        b"<th>Post Side</th>", b"<th>Post Side</th><th>Side</th><th>Price</th><th>Cost</th>", 1
-    )
-    source = source.replace(
-        b"<td>long</td></tr>", b"<td>long</td><td>buy</td><td>1</td><td>1</td></tr>", 1
-    )
-    source = source.replace(
-        b"<td></td></tr>", b"<td></td><td>sell</td><td>1</td><td>1</td></tr>", 1
-    )
+    source = _current()
+    for old, new in (
+        (
+            b"<th>Action</th><th>Fee</th>",
+            b"<th>Action</th><th>Side</th><th>Price</th><th>Cost</th><th>Fee</th>",
+        ),
+        (
+            b"<td>opened</td><td>0.05</td>",
+            b"<td>opened</td><td>buy</td><td>1</td><td>1</td><td>0.05</td>",
+        ),
+        (
+            b"<td>closed</td><td>0.05</td>",
+            b"<td>closed</td><td>sell</td><td>1</td><td>1</td><td>0.05</td>",
+        ),
+    ):
+        previous = source
+        source = source.replace(old, new, 1)
+        assert source != previous
 
-    assert parse_current_performance_v2_html(source, _limits()).actions[0].order_id == 1
+    parsed = parse_current_performance_v2_html(source, _limits())
+    assert parsed.actions[0].order_id == 1
+    assert parsed.actions[0].action == "opened"
+    assert parsed.actions[0].fee == Decimal("0.05")
+    assert parsed.actions[1].pnl == Decimal("9.9")
 
 
 def test_parser_does_not_treat_report_order_id_as_strategy_order_slot() -> None:

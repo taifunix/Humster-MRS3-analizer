@@ -77,7 +77,12 @@ def _has_current_performance_v2_layout(source: str) -> bool:
     except (TypeError, ValueError):
         return False
 
-    action_tables = [headers for headers, _rows in tables if headers == CURRENT_ACTION_HEADERS]
+    action_tables = [
+        headers
+        for headers, _rows in tables
+        if set(CURRENT_ACTION_HEADERS).issubset(headers)
+        and len(headers) == len(set(headers))
+    ]
     metric_tables = [
         headers
         for headers, _rows in tables
