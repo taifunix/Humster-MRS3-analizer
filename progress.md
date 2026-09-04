@@ -1299,3 +1299,11 @@ orders `41,280`, actions `10,432,397`, equity `77,787,295`, window metrics
 The original pre-copy source hash was not persisted, so byte-for-byte fidelity
 is evidenced by the backup size/hash and independent read-only catalog/count
 probe rather than a retroactive source-hash comparison.
+
+## Performance v2 panel listing-date root fix (2026-09-04)
+
+Panel imports now resolve the configured relative `listing_dates_path` from the
+server project root, with a safe inbox-parent compatibility fallback. Client
+payloads cannot provide the trusted root. Focused checks pass (`7 passed,
+2 skipped` for Windows symlink capability); full suite baseline was `2238
+passed, 3 skipped`. The scoped fix is committed.
