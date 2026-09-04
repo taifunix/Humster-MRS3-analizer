@@ -1,0 +1,123 @@
+{
+  "name_comment": "my_test",
+  "use_runs": false,
+  "InitialBalance": 1000.0,
+  "StartDate": "2026-07-15T00:00:00",
+  "EndDate": "2026-08-07T00:00:00",
+  "WarmupDays": 1,
+  "MakerFee": 0.00001,
+  "TakerFee": 0.0002,
+  "SlippagePercent": 0.001,
+  "FundingRate": 0.00025,
+  "FundingIntervalHours": 8,
+  "UpdateData": true,
+  "save_tick_data": false,
+  "LimitOrderVolumeCheck": true,
+  "shuffle_miner": false,
+  "monte_carlo": 0,
+  "monte_carlo_seed": 0,
+  "use_logger": false,
+  "max_parallel_runs": 25,
+  "parameter_mining": [
+    {
+      "name": "settings[*].mrs2.ma_short.multiplier",
+      "start": 1.0,
+      "end": 19.0,
+      "step": 1.0,
+      "values": [
+        "1,003",
+        "1,004",
+        "1,005",
+        "1,006",
+        "1,007",
+        "1,009",
+        "1,011",
+        "1,014",
+        "1,017",
+        "1,02",
+        "1,023",
+        "1,027",
+        "1,031",
+        "1,035",
+        "1,039",
+        "1,043",
+        "1,047",
+        "1,051",
+        "1,055"
+      ]
+    },
+    {
+      "name": "settings[*].mrs2.ma_short.len",
+      "start": 2.0,
+      "end": 7.0,
+      "step": 1.0,
+      "values": []
+    },
+    {
+      "name": "settings[*].mrs2.ma_close_short.len",
+      "start": 2.0,
+      "end": 7.0,
+      "step": 1.0,
+      "values": []
+    },
+    {
+      "name": "settings[*].basic.time_frame",
+      "start": 1.0,
+      "end": 8.0,
+      "step": 1.0,
+      "values": [
+        "5m",
+        "30m",
+        "15m",
+        "45m",
+        "1h",
+        "2h",
+        "3h",
+        "4h"
+      ]
+    },
+    {
+      "name": "settings[*].basic.symbol",
+      "start": 1.0,
+      "end": 12.0,
+      "step": 1.0,
+      "values": [
+        "ONUSDT",
+        "XLKUSDT",
+        "APPSTOCKUSDT",
+        "RDWUSDT",
+        "NVDLUSDT",
+        "APLDUSDT",
+        "IONQUSDT",
+        "CXMTUSDT",
+        "TSLLUSDT",
+        "MINIMAXUSDT",
+        "GIGADEVICEUSDT",
+        "SAMSUNGUSDT"
+      ]
+    }
+  ],
+  "report": {
+    "enable_html_report": true,
+    "chart_ohlc_height": 550,
+    "chart_balance_height": 550,
+    "chart_position_height": 550,
+    "include_chart_ohlc": true,
+    "include_chart_balance": true,
+    "include_chart_position": true,
+    "include_strategy_settings": true,
+    "include_trades_table": true,
+    "include_summary_table": true,
+    "include_monthly_returns_heatmap": true,
+    "include_position_stats": true,
+    "enable_timing_logs": false
+  },
+  "report_optimizer": {
+    "chart_height": 550,
+    "z_parameters": [
+      "TotalPnLPercent",
+      "MaxDrawdownPercent",
+      "ProfitFactor"
+    ]
+  }
+}

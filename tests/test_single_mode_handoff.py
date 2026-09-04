@@ -243,6 +243,10 @@ def test_native_single_mode_installs_each_batch_before_one_native_run_and_create
 
     assert status["state"] == "COMMITTED", status
     assert status["inbox_ready"] is True
+    tester_config = json.loads(config.tester_config.read_text(encoding="utf-8"))
+    assert tester_config["single_mode"] is True
+    assert tester_config["max_parallel_runs"] == config.max_parallel_submissions
+    assert tester_config["MakerFee"] == 0.00001
     assert [(entry[0], entry[1]) for entry in events if isinstance(entry, tuple) and entry[0] == "start"] == [
         ("start", names[:2]),
         ("start", names[2:]),

@@ -181,11 +181,26 @@ provenance; readers must not infer that effective and reported ranges match.
 - `retest-mrs3/base.json` принадлежит RETEST-контуру MRS3 и содержит прототипы
   обеих сторон.
 
+Конфигурации тестера также являются каноническими шаблонами и находятся в
+`templates/tester/`:
+
+- `mrs2/config_tester_long.json` и `mrs2/config_tester_short.json` — профили
+  обычного MRS2-тестирования с соответствующим parameter-mining составом;
+- `mrs3/config_tester.json` — профиль обычного MRS3 Fast/SINGLE_MODE и RETEST.
+
 `Input/` остаётся каталогом пользовательских входных данных и не является
 источником шаблонов. `panel_workflow.strategy_templates` для LONG и SHORT
 указывает на канонический MRS3 base. Локальный MRS2 testing выбирает
-канонический side-specific файл напрямую. Неявные fallback на старые имена из
-`Input/` запрещены.
+канонические side-specific strategy и tester-config файлы напрямую. Неявные
+fallback на старые имена из `Input/` запрещены.
+
+Для удалённого MRS2 используются те же strategy-профили: их JSON-содержимое
+семантически совпадает с прежними `Input/Bybit_long.json` и
+`Input/Bybit_short.json`. Старые файлы `Input/config_tester_*_standart.json`
+остаются только как локальное происхождение и больше не читаются runtime.
+
+SHORT multiplier strings сохраняются в legacy-формате до отдельной проверки
+реальным тестером; диапазон индексов canonical-профиля приведён к 19 значениям.
 
 Для каждой стратегии JSON строится из текущих `strategies` и
 `strategy_orders`, используя существующий шаблон соответствующей стороны и
@@ -204,9 +219,25 @@ Close MA, число ордеров, Open MA, shift, lot и plateau diagnostics 
 ## Тестер и полнота отчёта
 
 Используется только существующий native `SINGLE_MODE`. Перед запуском его общий
-writer корректирует `config_tester.json`: выбранные `StartDate`/`EndDate`,
-`single_mode=true`, `use_runs=false` и обязательные HTML/settings/trades/
-balance-секции.
+writer загружает канонический `templates/tester/mrs3/config_tester.json` и
+создаёт runtime `config_tester.json`, изменяя только выбранные
+`StartDate`/`EndDate`, `single_mode=true`, `use_runs=false`,
+`max_parallel_runs` и обязательные HTML/settings/trades/balance-секции.
+
+`max_parallel_runs` в каждом созданном профиле равен
+`tester_runner.max_parallel_submissions` из `config.local.json`. Это единый
+источник числа воркеров тестера для обычного MRS2, обычного MRS3 и RETEST;
+`direct_materialization.workers` и `duckdb_import.workers` к тестеру не
+относятся. Текущий runtime-файл не используется как шаблон и не задаёт
+состав профиля.
+
+Обычный batch также записывает в точный путь `tester_runner.tester_config` из
+`config.local.json`; это единственное runtime-назначение для тестера, даже
+если путь находится не в корне bot.
+
+Удалённые MRS2-запуски требуют только положительного
+`tester_runner.max_parallel_submissions` для переноса числа воркеров; полный
+локальный preflight `tester_runner` для них не выполняется.
 
 Отчёт принимается только если одновременно:
 

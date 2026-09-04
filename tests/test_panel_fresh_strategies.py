@@ -4,6 +4,7 @@ from http.client import HTTPConnection
 import json
 from hashlib import sha256
 from pathlib import Path
+import shutil
 import threading
 from time import monotonic, sleep
 from types import SimpleNamespace
@@ -151,6 +152,12 @@ def test_http_generation_accepts_a_large_ready_selection_payload(tmp_path: Path)
 
 def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.local.json"; config.write_text("{}", encoding="utf-8")
+    template_root = tmp_path / "templates" / "tester" / "mrs3"
+    template_root.mkdir(parents=True)
+    shutil.copyfile(
+        Path(__file__).parents[1] / "templates" / "tester" / "mrs3" / "config_tester.json",
+        template_root / "config_tester.json",
+    )
     template = tmp_path / "Input" / "run_snapshot_2.json"; template.parent.mkdir()
     template.write_text(json.dumps({
         "settings": [{"name": "template", "basic": {"strategy": "mrs3", "symbol": "OLD", "time_frame": "5m", "use_long": True, "use_short": False}, "mrs3": {
@@ -176,7 +183,9 @@ def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -
 
     assert result["run_count"] == 6
     assert len(list((tmp_path / "bot" / "tester" / "runs").glob("*.json"))) == 6
-    assert json.loads(tester_config.read_text(encoding="utf-8"))["use_runs"] is True
+    global_config = json.loads(tester_config.read_text(encoding="utf-8"))
+    assert global_config["use_runs"] is True
+    assert global_config["max_parallel_runs"] == 7
 
 
 def test_fresh_generation_uses_config_workflow_defaults_not_browser_paths(tmp_path: Path, monkeypatch) -> None:

@@ -560,11 +560,14 @@ class RemoteTestingService:
         file_uploader: Callable[[Path, str, RemoteRunnerConfig], None] | None = None,
         *,
         config_template: str | None = None,
+        max_parallel_runs: int | None = None,
     ) -> dict[str, object]:
         """Render, upload, and atomically install one remote testing batch."""
 
         if not isinstance(request, Mapping):
             raise RemoteTestingError(_INVALID_REQUEST)
+        if max_parallel_runs is None or type(max_parallel_runs) is not int or max_parallel_runs <= 0:
+            raise RemoteTestingError("invalid remote testing template")
         if tester_template is None:
             tester_template = config_template
         if not isinstance(tester_template, str) or not isinstance(strategy_template, str):
@@ -583,7 +586,13 @@ class RemoteTestingService:
             side = str(normalized["side"])
             start = str(normalized["start"])
             end = str(normalized["end"])
-            rendered_config = render_tester_config(tester_template, symbols, start, end)
+            rendered_config = render_tester_config(
+                tester_template,
+                symbols,
+                start,
+                end,
+                max_parallel_runs=max_parallel_runs,
+            )
             strategy_filename, strategy_document = render_strategy(
                 strategy_template, symbols[0], side
             )

@@ -182,7 +182,11 @@ M  tests/test_panel_testing.py
 
 ## Не расширять текущую задачу
 
-Шаблоны стратегий уже перенесены. Игнорируемые tester-config templates `Input/config_tester_*_standart.json` пока остаются на старом месте: пользователь просил канонизировать именно шаблоны JSON стратегий. Перенос tester-config templates — отдельное решение, не делать его автоматически в рамках RETEST.
+Шаблоны стратегий уже перенесены. По отдельному принятому решению tester-config
+templates также канонизируются в `templates/tester/`: MRS2 получает отдельные
+LONG/SHORT профили, а native MRS3 TEST/RETEST — общий профиль. Runtime
+`config_tester.json` строится из выбранного шаблона перед запуском; число
+`max_parallel_runs` берётся из `tester_runner.max_parallel_submissions`.
 # Current implementation note (2026-09-03)
 
 The historical status text below predates the approved implementation. Tasks 2-7

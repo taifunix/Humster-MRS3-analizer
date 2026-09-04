@@ -104,7 +104,7 @@ def test_start_installs_root_json_writes_dates_and_stops_bot(tmp_path: Path, mon
     (strategy_dir / "old.json").write_text("{}", encoding="utf-8")
     legacy_config = bot_root / "tester" / "tester_config.json"
     legacy_config.parent.mkdir(parents=True, exist_ok=True)
-    legacy_config.write_text(json.dumps({"MakerFee": "0.1", "StartDate": "old"}), encoding="utf-8")
+    legacy_config.write_text(json.dumps({"MakerFee": "0.1", "StartDate": "old", "stale": True}), encoding="utf-8")
     config = RunnerConfig(
         bot_root=bot_root,
         executable_path=bot_root / "hb_c.exe",
@@ -141,11 +141,14 @@ def test_start_installs_root_json_writes_dates_and_stops_bot(tmp_path: Path, mon
         time.sleep(0.01)
 
     assert service.status(str(job["job_id"]))["state"] == "COMMITTED"
-    exact_config = bot_root / "config_tester.json"
+    exact_config = legacy_config
     document = json.loads(exact_config.read_text(encoding="utf-8"))
     assert document["StartDate"] == "2026-08-01"
     assert document["EndDate"] == "2026-08-31"
-    assert document["MakerFee"] == "0.1"
+    assert document["max_parallel_runs"] == config.max_parallel_submissions
+    assert document["MakerFee"] == 0.00001
+    assert document["parameter_mining"] == []
+    assert "stale" not in document
     assert calls == [(exact_config.resolve(), source.resolve(), strategy_dir.resolve())]
     assert stops == [exact_config.resolve()]
     assert not (report_dir / "old.html").exists()
@@ -184,6 +187,38 @@ def test_start_rejects_invalid_dates_before_mutating_tester_files(tmp_path: Path
 
     assert (report_dir / "old.html").read_text(encoding="utf-8") == "old"
     assert (strategy_dir / "old.json").read_text(encoding="utf-8") == "{}"
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {"StartDate": "old"}
+
+
+def test_start_rejects_missing_tester_template_before_mutating_runtime_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _manifest(tmp_path)
+    bot_root = tmp_path / "bot"
+    report_dir = bot_root / "tester" / "report" / "my_test"
+    strategy_dir = bot_root / "settings_strategy"
+    report_dir.mkdir(parents=True)
+    strategy_dir.mkdir(parents=True)
+    config_path = bot_root / "config_tester.json"
+    config_path.write_text('{"StartDate": "old"}', encoding="utf-8")
+    config = RunnerConfig(
+        bot_root=bot_root,
+        executable_path=bot_root / "hb_c.exe",
+        base_url="http://127.0.0.1:8087",
+        port=8087,
+        strategy_dir=strategy_dir,
+        report_dir=report_dir,
+        wizard_result=bot_root / "tester" / "wizard_result.json",
+        wizard_progress=bot_root / "tester" / "wizard_progress.json",
+        tester_config=config_path,
+        inbox_root=tmp_path / "inbox-root",
+    )
+    monkeypatch.setattr(strategy_batch, "validate_runtime_preflight", lambda _config: None)
+    service = LocalStrategyBatchService(config, tester_config_template=tmp_path / "missing.json")
+
+    with pytest.raises(StrategyBatchValidationError, match="tester config is invalid"):
+        service.start(manifest, start_date="2026-08-01", end_date="2026-08-31")
+
     assert json.loads(config_path.read_text(encoding="utf-8")) == {"StartDate": "old"}
 
 

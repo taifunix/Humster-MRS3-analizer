@@ -120,7 +120,9 @@ strategy validation rules. A config mismatch is not a generation error.
 
 ## 5. Tester HTML profile
 
-Before starting the first batch, update only these `config_tester.json` fields:
+Before starting the first batch, load the canonical
+`templates/tester/mrs3/config_tester.json` template and update only these
+runtime `config_tester.json` fields:
 the report switches live under the nested `report` object in the tester config.
 The legacy top-level copies may be mirrored for older tester builds, but the
 nested values are authoritative.
@@ -145,7 +147,9 @@ nested values are authoritative.
 
 `include_chart_balance=true` is mandatory because Performance DB requires the
 wallet/equity series. Strategy settings, trades and summary remain mandatory.
-Fast TEST does not overwrite tester-owned settings such as `max_parallel_runs`.
+`max_parallel_runs` is set to the configured
+`tester_runner.max_parallel_submissions`; all other template-owned settings
+remain unchanged.
 
 ## 6. Batch algorithm
 

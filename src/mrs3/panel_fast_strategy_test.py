@@ -16,6 +16,7 @@ from typing import Callable, Mapping
 from uuid import uuid4
 
 from .panel_strategy_batch import ValidatedStrategyManifest, validate_strategy_manifest
+from .panel_testing import mrs3_tester_config_template
 from .performance import PerformanceParseError, _raw_markup, _series
 from .performance_v2_html import CURRENT_ACTION_HEADERS
 from .runner.config import RunnerConfig
@@ -143,10 +144,18 @@ def _install_names(source: Path, target: Path, names: tuple[str, ...]) -> None:
         shutil.copy2(source_file, target / filename)
 
 
-def _write_fast_tester_config(config: RunnerConfig, start: str, end: str, *, single_mode: bool = False) -> None:
+def _write_fast_tester_config(
+    config: RunnerConfig,
+    start: str,
+    end: str,
+    *,
+    single_mode: bool = False,
+    template_path: Path | None = None,
+) -> None:
     path = Path(config.tester_config).resolve()
+    source = Path(template_path).resolve() if template_path is not None else mrs3_tester_config_template()
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise FastStrategyTestError("tester config is invalid") from error
     if not isinstance(document, dict):
@@ -165,12 +174,10 @@ def _write_fast_tester_config(config: RunnerConfig, start: str, end: str, *, sin
     }
     document.update({"StartDate": start, "EndDate": end, "use_runs": False, "single_mode": single_mode, **report_settings})
     report = document.get("report")
-    if report is None:
-        report = {}
-        document["report"] = report
     if not isinstance(report, dict):
         raise FastStrategyTestError("tester config report must be an object")
     report.update(report_settings)
+    document["max_parallel_runs"] = config.max_parallel_submissions
     temporary = path.with_name(path.name + ".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -274,6 +281,7 @@ class LocalFastStrategyTestService:
         monitor: Callable[..., BatchCompletion] = monitor_controlled_batch,
         on_update: Callable[[dict[str, object]], None] | None = None,
         single_mode: bool = False,
+        tester_config_template: Path | None = None,
     ) -> None:
         self.config = config
         self._start_bot = start_bot
@@ -283,6 +291,7 @@ class LocalFastStrategyTestService:
         self._monitor = monitor
         self._on_update = on_update
         self.single_mode = single_mode
+        self.tester_config_template = Path(tester_config_template) if tester_config_template is not None else mrs3_tester_config_template()
         self._lock = RLock()
         self._jobs: dict[str, _Job] = {}
 
@@ -398,7 +407,12 @@ class LocalFastStrategyTestService:
             if job.single_mode:
                 self._run_native(job)
                 return
-            _write_fast_tester_config(runtime_config, job.start_date, job.end_date)
+            _write_fast_tester_config(
+                runtime_config,
+                job.start_date,
+                job.end_date,
+                template_path=self.tester_config_template,
+            )
             if not job.preserve_reports:
                 _clear_directory(job.report_dir, expected=self.config.bot_root / "tester" / "report" / "my_test")
             job.report_dir.mkdir(parents=True, exist_ok=True)
@@ -1082,7 +1096,13 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
         if not job.preserve_reports:
             _clear_directory(job.report_dir, expected=self.config.bot_root / "tester" / "report" / "my_test")
         job.report_dir.mkdir(parents=True, exist_ok=True)
-        _write_fast_tester_config(config, job.start_date, job.end_date, single_mode=True)
+        _write_fast_tester_config(
+            config,
+            job.start_date,
+            job.end_date,
+            single_mode=True,
+            template_path=self.tester_config_template,
+        )
         batches = [
             job.run_names[index : index + config.strategy_batch_size]
             for index in range(0, len(job.run_names), config.strategy_batch_size)

@@ -108,6 +108,59 @@ def _wait(service: LocalFastStrategyTestService, job_id: str) -> dict[str, objec
     raise AssertionError("Fast TEST did not finish")
 
 
+def test_fast_writer_starts_from_template_and_preserves_unrelated_keys(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    template = tmp_path / "config-template.json"
+    template.write_text(json.dumps({
+        "StartDate": "old",
+        "EndDate": "old",
+        "use_runs": True,
+        "single_mode": False,
+        "max_parallel_runs": 99,
+        "include_chart_balance": False,
+        "report": {"include_chart_balance": False, "include_position_stats": True},
+        "unrelated": {"keep": [1, 2, 3]},
+    }), encoding="utf-8")
+
+    _write_fast_tester_config(
+        config,
+        "2026-08-01",
+        "2026-08-31",
+        single_mode=True,
+        template_path=template,
+    )
+
+    rendered = json.loads(config.tester_config.read_text(encoding="utf-8"))
+    assert rendered["unrelated"] == {"keep": [1, 2, 3]}
+    assert rendered["StartDate"] == "2026-08-01"
+    assert rendered["EndDate"] == "2026-08-31"
+    assert rendered["use_runs"] is False
+    assert rendered["single_mode"] is True
+    assert rendered["max_parallel_runs"] == config.max_parallel_submissions
+    assert rendered["include_chart_balance"] is True
+    assert rendered["report"]["include_chart_balance"] is True
+    assert rendered["report"]["include_position_stats"] is False
+    assert rendered["report"]["include_trades_table"] is True
+
+
+@pytest.mark.parametrize("template_text", ["{", "[]"])
+def test_fast_writer_fails_closed_for_invalid_template(tmp_path: Path, template_text: str) -> None:
+    config = _config(tmp_path)
+    before = config.tester_config.read_bytes()
+    template = tmp_path / "invalid-template.json"
+    template.write_text(template_text, encoding="utf-8")
+
+    with pytest.raises(FastStrategyTestError, match="tester config"):
+        _write_fast_tester_config(
+            config,
+            "2026-08-01",
+            "2026-08-31",
+            template_path=template,
+        )
+
+    assert config.tester_config.read_bytes() == before
+
+
 def test_native_prevalidation_accepts_extended_current_action_layout(tmp_path: Path) -> None:
     source = CURRENT_REPORT.read_text(encoding="utf-8")
     for old, new in (
@@ -220,6 +273,8 @@ def test_fast_test_replaces_strategy_dir_for_each_chunk_and_clears_success(tmp_p
     tester_config = json.loads(config.tester_config.read_text(encoding="utf-8"))
     assert tester_config["include_chart_balance"] is True
     assert tester_config["use_runs"] is False
+    assert tester_config["MakerFee"] == 0.00001
+    assert tester_config["parameter_mining"] == []
     assert tester_config["report"]["include_chart_balance"] is True
     assert tester_config["report"]["include_position_stats"] is False
     fast_manifest = json.loads((config.report_dir / "fast_test_manifest.json").read_text(encoding="utf-8"))

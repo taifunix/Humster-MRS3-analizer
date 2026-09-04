@@ -65,7 +65,10 @@ def _positive_float(raw: dict[str, object], key: str, default: float) -> float:
 
 
 def _positive_int(raw: dict[str, object], key: str, default: int) -> int:
-    value = int(raw.get(key, default))
+    raw_value = raw.get(key, default)
+    if isinstance(raw_value, bool):
+        raise RunnerConfigError(f"{key} must be a positive integer")
+    value = int(raw_value)
     if value <= 0:
         raise RunnerConfigError(f"{key} must be greater than zero")
     return value

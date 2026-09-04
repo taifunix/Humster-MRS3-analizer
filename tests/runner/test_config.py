@@ -83,6 +83,21 @@ def test_runner_config_resolves_paths_and_runtime_values(tmp_path: Path) -> None
     assert config.result_report_grace_seconds == pytest.approx(15)
 
 
+def test_runner_config_rejects_boolean_worker_count(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"tester_runner": {
+        "bot_root": str(tmp_path / "hb"), "executable": "hb_c.exe",
+        "base_url": "http://127.0.0.1:8087", "port": 8087,
+        "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test",
+        "wizard_result": "tester/wizard_result.json", "wizard_progress": "tester/wizard_progress.json",
+        "tester_config": "config_tester.json", "inbox_root": "data/tester_inbox",
+        "max_parallel_submissions": True,
+    }}), encoding="utf-8")
+
+    with pytest.raises(RunnerConfigError, match="max_parallel_submissions"):
+        RunnerConfig.from_json(path)
+
+
 @pytest.mark.parametrize(
     ("base_url", "port"),
     [

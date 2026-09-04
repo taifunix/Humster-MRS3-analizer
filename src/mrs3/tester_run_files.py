@@ -13,6 +13,7 @@ from typing import Mapping
 
 from .config import AlgorithmConfig
 from .lots import LotMethod, allocate_lots
+from .panel_testing import mrs3_tester_config_template
 from .strategy_json import generate_strategy
 
 
@@ -123,6 +124,7 @@ def publish_run_snapshots(
     config: AlgorithmConfig,
     *,
     analysis_run_id: str,
+    tester_config_template: Path | str | None = None,
 ) -> dict[str, object]:
     """Replace the exact tester runs directory with all selected snapshots."""
     if not structures:
@@ -134,8 +136,13 @@ def publish_run_snapshots(
     tester_config = _inside(Path(tester_config_path), root, "tester config")
     if not root.is_dir() or not tester_config.is_file():
         raise ValueError("tester runs target is unavailable")
+    config_template = (
+        Path(tester_config_template).resolve()
+        if tester_config_template is not None
+        else mrs3_tester_config_template()
+    )
     try:
-        config_document = json.loads(tester_config.read_text(encoding="utf-8"))
+        config_document = json.loads(config_template.read_text(encoding="utf-8"))
         if not isinstance(config_document, dict):
             raise ValueError
     except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -149,7 +156,13 @@ def publish_run_snapshots(
         raise ValueError("READY candidates must have unique strategy names")
     for path in existing:
         shutil.rmtree(path) if path.is_dir() else path.unlink()
-    config_document["use_runs"] = True
+    config_document.update({
+        "StartDate": _timestamp(start_date),
+        "EndDate": _timestamp(end_date),
+        "use_runs": True,
+        "single_mode": False,
+        "max_parallel_runs": max_parallel_runs,
+    })
     _write_json(tester_config, config_document)
     names: list[str] = []
     for index, (name, snapshot) in enumerate(rendered, start=1):

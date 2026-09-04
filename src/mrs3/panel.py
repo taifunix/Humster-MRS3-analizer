@@ -166,7 +166,7 @@ from .panel_remote_source_db import RemoteSourceDbExecutor, RemoteSourceDbError
 from .panel_source_db import LocalSourceDbService
 from .panel_source_jobs import LocalSourceDbJobRunner
 from .panel_surfaces import LocalSurfacesService
-from .panel_testing import LocalTestingService, PanelTestingError
+from .panel_testing import LocalTestingService, PanelTestingError, _TEMPLATES, mrs3_tester_config_template
 from .fresh_analysis_strategies import (
     filter_fresh_analysis_candidates,
     generate_fresh_analysis_strategies,
@@ -1871,18 +1871,28 @@ class PanelController:
         side = request["side"]
         if not isinstance(side, str):
             raise PanelTestingError("invalid testing request")
-        templates = {
-            "LONG": ("config_tester_long_standart.json", "Bybit_long.json"),
-            "SHORT": ("config_tester_short_standart.json", "Bybit_short.json"),
-        }
-        selected = templates.get(side.strip().upper())
+        selected = _TEMPLATES.get(side.strip().upper())
         if selected is None:
             raise PanelTestingError("invalid testing request")
         try:
+            document = json.loads(self.default_config.read_text(encoding="utf-8"))
+            tester_runner = document.get("tester_runner") if isinstance(document, Mapping) else None
+            workers = tester_runner.get("max_parallel_submissions") if isinstance(tester_runner, Mapping) else None
+            if workers is None or type(workers) is not int or workers <= 0:
+                raise PanelTestingError("invalid tester configuration")
+            fill_kwargs: dict[str, object] = {
+                "tester_template": (self.root / selected[0]).read_text(encoding="utf-8"),
+                "strategy_template": (self.root / selected[1]).read_text(encoding="utf-8"),
+                "max_parallel_runs": workers,
+            }
+        except PanelTestingError:
+            raise
+        except Exception:
+            raise PanelTestingError("invalid tester configuration") from None
+        try:
             result = self._remote_testing_service().fill(
                 request,
-                tester_template=(self.root / "Input" / selected[0]).read_text(encoding="utf-8"),
-                strategy_template=(self.root / "Input" / selected[1]).read_text(encoding="utf-8"),
+                **fill_kwargs,
             )
             self._remote_testing_filled = True
             return result
@@ -2414,6 +2424,7 @@ class PanelController:
             self.root / "Input" / "run_snapshot_2.json", runner.bot_root, runner.tester_config, structures,
             start_date, end_date, runner.max_parallel_submissions, self._analysis_config_loader(self.default_config),
             analysis_run_id=analysis_id,
+            tester_config_template=mrs3_tester_config_template(self.root),
         )
         return {"phase": "COMMITTED", "analysis_run_id": analysis_id, **result}
 
@@ -2597,7 +2608,11 @@ class PanelController:
 
     def _strategy_batch(self) -> LocalStrategyBatchService:
         if self._strategy_batch_service is None:
-            self._strategy_batch_service = LocalStrategyBatchService(RunnerConfig.from_json(self.default_config), on_update=self._record_special_job)
+            self._strategy_batch_service = LocalStrategyBatchService(
+                RunnerConfig.from_json(self.default_config),
+                on_update=self._record_special_job,
+                tester_config_template=mrs3_tester_config_template(self.root),
+            )
         return self._strategy_batch_service
 
     def _runs_batch(self) -> LocalRunsBatchService:
@@ -2608,7 +2623,9 @@ class PanelController:
     def _single_mode_strategy_test(self) -> LocalSingleModeStrategyTestService:
         if self._single_mode_strategy_test_service is None:
             self._single_mode_strategy_test_service = LocalSingleModeStrategyTestService(
-                RunnerConfig.from_json(self.default_config), on_update=self._record_special_job
+                RunnerConfig.from_json(self.default_config),
+                on_update=self._record_special_job,
+                tester_config_template=mrs3_tester_config_template(self.root),
             )
         return self._single_mode_strategy_test_service
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -49,6 +50,57 @@ def test_render_tester_config_updates_dates_and_symbols_from_long_template() -> 
     assert rendered["parameter_mining"][1]["values"] == ["CXUSDT", "BABAUSDT"]
     assert rendered["parameter_mining"][0]["name"] == "settings[*].mrs2.ma_long.len"
     assert rendered["report"] == {"enable_html_report": True}
+
+
+def test_canonical_mrs2_templates_are_strict_and_render_worker_count() -> None:
+    root = Path(__file__).parents[1]
+    for name in ("config_tester_long.json", "config_tester_short.json"):
+        path = root / "templates" / "tester" / "mrs2" / name
+        assert path.is_file()
+        template = path.read_text(encoding="utf-8")
+        original = json.loads(template)
+        assert original["parameter_mining"]
+        rendered = json.loads(
+            render_tester_config(
+                template,
+                ("CXUSDT",),
+                "2026-07-15",
+                "2026-08-06",
+                max_parallel_runs=7,
+            )
+        )
+        assert rendered["max_parallel_runs"] == 7
+        target = next(item for item in original["parameter_mining"] if item["name"] == "settings[*].basic.symbol")
+        rendered_target = next(item for item in rendered["parameter_mining"] if item["name"] == "settings[*].basic.symbol")
+        assert rendered_target["values"] == ["CXUSDT"]
+        for entry in original["parameter_mining"]:
+            if entry["name"] != target["name"]:
+                assert next(item for item in rendered["parameter_mining"] if item["name"] == entry["name"]) == entry
+
+        if name == "config_tester_short.json":
+            multiplier = next(item for item in original["parameter_mining"] if item["name"].endswith("mrs2.ma_short.multiplier"))
+            assert multiplier["start"] == 1.0 and multiplier["end"] == 19.0
+            assert multiplier["values"] == [
+                "1,003", "1,004", "1,005", "1,006", "1,007", "1,009", "1,011",
+                "1,014", "1,017", "1,02", "1,023", "1,027", "1,031", "1,035",
+                "1,039", "1,043", "1,047", "1,051", "1,055",
+            ]
+
+    mrs3 = root / "templates" / "tester" / "mrs3" / "config_tester.json"
+    document = json.loads(mrs3.read_text(encoding="utf-8"))
+    assert isinstance(document, dict)
+    assert document["parameter_mining"] == []
+    assert document["report"]["include_chart_balance"] is True
+
+
+def test_canonical_mrs2_strategy_templates_match_legacy_profiles_when_present() -> None:
+    root = Path(__file__).parents[1]
+    for legacy, canonical in (
+        (root / "Input" / "Bybit_long.json", root / "templates" / "strategies" / "source-v6-mrs2" / "long.json"),
+        (root / "Input" / "Bybit_short.json", root / "templates" / "strategies" / "source-v6-mrs2" / "short.json"),
+    ):
+        if legacy.is_file():
+            assert json.loads(legacy.read_text(encoding="utf-8")) == json.loads(canonical.read_text(encoding="utf-8"))
 
 
 def test_render_strategy_keeps_one_named_strategy_and_sets_requested_side() -> None:
@@ -138,6 +190,18 @@ def test_local_testing_prepare_stages_selected_side_without_touching_bot(tmp_pat
         if path.is_file()
     } == bot_before
     assert not config.tester_config.exists()
+
+
+def test_local_testing_prepare_uses_canonical_template_and_configured_workers(tmp_path: Path) -> None:
+    config = replace(_runner_config(tmp_path), max_parallel_submissions=7)
+    prepared = LocalTestingService(config, Path(__file__).parents[1]).prepare(
+        side="LONG", symbols=("CXUSDT",), start="2026-07-15", end="2026-08-06",
+        output_dir=config.inbox_root / "panel-testing",
+    )
+
+    rendered = json.loads(prepared.tester_config.read_text(encoding="utf-8"))
+    assert rendered["max_parallel_runs"] == 7
+    assert "parameter_mining" in rendered
 
 
 def test_local_testing_prepare_uses_isolated_directory_without_deleting_workspace_files(

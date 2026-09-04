@@ -12,6 +12,7 @@ import shutil
 from threading import Event, RLock, Thread
 from uuid import uuid4
 
+from .panel_testing import mrs3_tester_config_template
 from .runner.config import RunnerConfig
 from .runner.files import prepare_batch_files
 from .runner.process import stop_bot as _stop_bot
@@ -193,11 +194,12 @@ def _publish_reports(config: RunnerConfig, inbox: Path) -> None:
 class LocalStrategyBatchService:
     """Run a validated READY batch in a daemon thread with redacted status."""
 
-    def __init__(self, config: RunnerConfig, *, run_batch=_run_batch, stop_bot=_stop_bot, on_update=None) -> None:
+    def __init__(self, config: RunnerConfig, *, run_batch=_run_batch, stop_bot=_stop_bot, on_update=None, tester_config_template: Path | None = None) -> None:
         self.config = config
         self._run_batch = run_batch
         self._stop_bot = stop_bot
         self._on_update = on_update
+        self._tester_config_template = Path(tester_config_template) if tester_config_template is not None else mrs3_tester_config_template()
         self._lock = RLock()
         self._jobs: dict[str, _Job] = {}
 
@@ -218,20 +220,24 @@ class LocalStrategyBatchService:
             raise StrategyBatchValidationError("start_date must be on or before end_date")
         return start_date, end_date
 
-    @staticmethod
-    def _write_tester_dates(config: RunnerConfig, start_date: str, end_date: str) -> RunnerConfig:
-        target = (config.bot_root / "config_tester.json").resolve()
-        seed = target
-        if not seed.is_file() and config.tester_config.is_file():
-            seed = config.tester_config
+    def _write_tester_dates(self, config: RunnerConfig, start_date: str, end_date: str) -> RunnerConfig:
+        target = config.tester_config.resolve()
+        seed = self._tester_config_template
         try:
-            document = json.loads(seed.read_text(encoding="utf-8")) if seed.is_file() else {}
+            document = json.loads(seed.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise StrategyBatchValidationError("tester config is invalid") from error
         if not isinstance(document, dict):
             raise StrategyBatchValidationError("tester config must be an object")
-        document["StartDate"] = start_date
-        document["EndDate"] = end_date
+        document.update(
+            {
+                "StartDate": start_date,
+                "EndDate": end_date,
+                "use_runs": False,
+                "single_mode": False,
+                "max_parallel_runs": config.max_parallel_submissions,
+            }
+        )
         temporary = target.with_name(target.name + ".tmp")
         try:
             target.parent.mkdir(parents=True, exist_ok=True)

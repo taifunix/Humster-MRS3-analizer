@@ -23,9 +23,14 @@ class PanelTestingError(ValueError):
 
 _SYMBOL = re.compile(r"^[A-Z0-9]{2,32}$")
 _TEMPLATES = {
-    "LONG": ("config_tester_long_standart.json", "templates/strategies/source-v6-mrs2/long.json"),
-    "SHORT": ("config_tester_short_standart.json", "templates/strategies/source-v6-mrs2/short.json"),
+    "LONG": ("templates/tester/mrs2/config_tester_long.json", "templates/strategies/source-v6-mrs2/long.json"),
+    "SHORT": ("templates/tester/mrs2/config_tester_short.json", "templates/strategies/source-v6-mrs2/short.json"),
 }
+
+
+def mrs3_tester_config_template(repo_root: Path | None = None) -> Path:
+    root = Path(repo_root).resolve() if repo_root is not None else Path(__file__).resolve().parents[2]
+    return root / "templates/tester/mrs3/config_tester.json"
 
 
 def _without_trailing_commas(text: str) -> str:
@@ -58,8 +63,17 @@ def _without_trailing_commas(text: str) -> str:
     return "".join(output)
 
 
-def render_tester_config(template: str, symbols: tuple[str, ...], start: str, end: str) -> str:
+def render_tester_config(
+    template: str,
+    symbols: tuple[str, ...],
+    start: str,
+    end: str,
+    *,
+    max_parallel_runs: int | None = None,
+) -> str:
     if not isinstance(template, str) or not isinstance(symbols, tuple) or not symbols:
+        raise PanelTestingError("invalid tester configuration")
+    if max_parallel_runs is not None and (type(max_parallel_runs) is not int or max_parallel_runs <= 0):
         raise PanelTestingError("invalid tester configuration")
     clean_symbols = tuple(symbol.strip().upper() for symbol in symbols)
     if len(set(clean_symbols)) != len(clean_symbols) or any(not _SYMBOL.fullmatch(symbol) for symbol in clean_symbols):
@@ -79,6 +93,8 @@ def render_tester_config(template: str, symbols: tuple[str, ...], start: str, en
         raise PanelTestingError("invalid tester configuration")
     document["StartDate"] = f"{start_date.isoformat()}T00:00:00"
     document["EndDate"] = f"{end_date.isoformat()}T00:00:00"
+    if max_parallel_runs is not None:
+        document["max_parallel_runs"] = max_parallel_runs
     targets[0]["values"] = list(clean_symbols)
     return json.dumps(document, ensure_ascii=False, indent=2) + "\n"
 
@@ -190,9 +206,15 @@ class LocalTestingService:
             raise PanelTestingError("at least one symbol is required")
 
         config_name, strategy_name = _TEMPLATES[side]
-        config_template = (self.repo_root / "Input" / config_name).read_text(encoding="utf-8")
+        config_template = (self.repo_root / config_name).read_text(encoding="utf-8")
         strategy_template = (self.repo_root / strategy_name).read_text(encoding="utf-8")
-        rendered_config = render_tester_config(config_template, selected, start, end)
+        rendered_config = render_tester_config(
+            config_template,
+            selected,
+            start,
+            end,
+            max_parallel_runs=self.config.max_parallel_submissions,
+        )
         filename, strategy = render_strategy(strategy_template, selected[0], side)
 
         workspace = (self.config.inbox_root / "panel-testing").resolve()

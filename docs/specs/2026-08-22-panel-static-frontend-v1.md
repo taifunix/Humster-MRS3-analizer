@@ -38,14 +38,18 @@ Runner paths are present only after `RunnerConfig` validation. Invalid configura
 ## Testing templates
 
 The local testing flow uses the canonical repository templates
-`Input/config_tester_long_standart.json`,
-`Input/config_tester_short_standart.json`, `Input/Bybit_long.json`, and
-`Input/Bybit_short.json`. The selected direction chooses both templates.
+`templates/tester/mrs2/config_tester_long.json`,
+`templates/tester/mrs2/config_tester_short.json`,
+`templates/strategies/source-v6-mrs2/long.json`, and
+`templates/strategies/source-v6-mrs2/short.json`. The selected direction
+chooses both templates.
 
 The rendered tester configuration changes only `StartDate`, `EndDate`, and
-the one `settings[*].basic.symbol` mining value list. Its JSONC-style trailing
-commas are accepted; all other template fields remain intact. The rendered
-strategy changes its base symbol and `basic.use_long`/`basic.use_short` only.
+the one `settings[*].basic.symbol` mining value list and
+`max_parallel_runs` from `tester_runner.max_parallel_submissions`. Its
+JSONC-style trailing commas are accepted; all other template fields remain
+intact. The rendered strategy changes its base symbol and
+`basic.use_long`/`basic.use_short` only.
 Before a tester starts, the runner's existing transactional preparation puts
 exactly that one rendered strategy JSON in `settings_strategy`; it never uses
 the Input template in place and never mixes sides.

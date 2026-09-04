@@ -13,7 +13,7 @@ from mrs3.panel_remote_testing import (
     load_remote_runner_config,
     prepare_request,
 )
-from mrs3.panel import PanelController
+from mrs3.panel import PanelController, PanelTestingError
 
 
 def _config(**overrides: object) -> dict[str, object]:
@@ -161,11 +161,12 @@ def test_panel_controller_remote_fill_uses_side_templates_without_connection_lea
         def __init__(self, _document):
             pass
 
-        def fill(self, request, *, tester_template, strategy_template):
+        def fill(self, request, *, tester_template, strategy_template, max_parallel_runs):
             calls.append({
                 "request": request,
                 "tester_template": tester_template,
                 "strategy_template": strategy_template,
+                "max_parallel_runs": max_parallel_runs,
             })
             return {"state": "FILLED", "strategy_name": "safe"}
 
@@ -175,7 +176,17 @@ def test_panel_controller_remote_fill_uses_side_templates_without_connection_lea
 
     monkeypatch.setattr(panel_module, "RemoteTestingService", FakeRemoteService)
     config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"remote_runner": _config()}), encoding="utf-8")
+    config.write_text(json.dumps({
+        "remote_runner": _config(),
+        "tester_runner": {
+            "bot_root": str(tmp_path / "hb"), "executable": "hb_c.exe",
+            "base_url": "http://127.0.0.1:8087", "port": 8087,
+            "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test",
+            "wizard_result": "tester/wizard_result.json", "wizard_progress": "tester/wizard_progress.json",
+            "tester_config": "config_tester.json", "inbox_root": str(tmp_path / "inbox"),
+            "max_parallel_submissions": 7,
+        },
+    }), encoding="utf-8")
     controller = PanelController(Path(__file__).parents[1], config)
 
     result = controller.remote_testing_fill({
@@ -184,11 +195,42 @@ def test_panel_controller_remote_fill_uses_side_templates_without_connection_lea
 
     assert result == {"state": "FILLED", "strategy_name": "safe"}
     assert calls[0]["request"]["side"] == "SHORT"
+    assert calls[0]["max_parallel_runs"] == 7
     assert "mrs2.ma_short" in calls[0]["tester_template"]
     assert '"use_short"' in calls[0]["strategy_template"]
     assert "runner.example.test" not in json.dumps(result)
     assert controller.remote_testing_start() == {"state": "STARTED"}
     assert calls[-1] == {"started": True}
+
+
+def test_panel_controller_remote_fill_fails_closed_when_worker_config_is_invalid(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeRemoteService:
+        def __init__(self, _document):
+            pass
+
+        def fill(self, **_kwargs):
+            pytest.fail("remote upload must not start")
+
+    monkeypatch.setattr(panel_module, "RemoteTestingService", FakeRemoteService)
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({
+        "remote_runner": _config(),
+        "tester_runner": {
+            "bot_root": str(tmp_path / "hb"), "executable": "hb_c.exe",
+            "base_url": "http://127.0.0.1:8087", "port": 8087,
+            "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test",
+            "wizard_result": "tester/wizard_result.json", "wizard_progress": "tester/wizard_progress.json",
+            "tester_config": "config_tester.json", "inbox_root": str(tmp_path / "inbox"),
+            "max_parallel_submissions": True,
+        },
+    }), encoding="utf-8")
+
+    with pytest.raises(PanelTestingError, match="invalid tester configuration"):
+        PanelController(Path(__file__).parents[1], config).remote_testing_fill({
+            "symbols": "BTCUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06",
+        })
 
 
 def test_remote_start_is_rejected_until_this_controller_fills_the_config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -377,6 +419,7 @@ def test_fill_uploads_rendered_files_then_one_redacted_install_action() -> None:
         _fill_request(),
         tester_template=_tester_template(),
         strategy_template=_strategy_template(),
+        max_parallel_runs=7,
     )
 
     assert result == {
@@ -391,6 +434,7 @@ def test_fill_uploads_rendered_files_then_one_redacted_install_action() -> None:
     rendered_config, config_destination = uploaded_by_suffix["config_tester.json"]
     rendered_strategy, strategy_destination = uploaded_by_suffix["AAOIUSDT.json"]
     assert json.loads(rendered_config)["StartDate"] == "2026-07-15T00:00:00"
+    assert json.loads(rendered_config)["max_parallel_runs"] == 7
     assert json.loads(rendered_config)["parameter_mining"][0]["values"] == ["BTCUSDT", "ETHUSDT"]
     strategy = json.loads(rendered_strategy)
     assert strategy["basic"] == {"symbol": "BTCUSDT", "use_long": False, "use_short": True}
@@ -405,6 +449,15 @@ def test_fill_uploads_rendered_files_then_one_redacted_install_action() -> None:
     encoded = json.dumps(result)
     assert "/opt/hb1" not in encoded
     assert "correct horse battery staple" not in encoded
+
+
+def test_fill_requires_configured_worker_count() -> None:
+    service = RemoteTestingService(load_remote_runner_config(_config()))
+
+    with pytest.raises(ValueError, match="invalid remote testing template"):
+        service.fill(
+            _fill_request(), tester_template=_tester_template(), strategy_template=_strategy_template()
+        )
 
 
 def test_default_uploader_keeps_port_and_password_as_separate_argv_values(
@@ -443,7 +496,8 @@ def test_fill_rejects_unsafe_strategy_filename_without_uploading() -> None:
 
     with pytest.raises(ValueError, match="invalid remote testing template"):
         service.fill(
-            _fill_request(), tester_template=_tester_template(), strategy_template=unsafe
+            _fill_request(), tester_template=_tester_template(), strategy_template=unsafe,
+            max_parallel_runs=1,
         )
     assert uploaded == []
 
@@ -464,7 +518,10 @@ def test_fill_cleans_only_its_uploaded_files_after_upload_failure() -> None:
     )
 
     with pytest.raises(ValueError, match="remote upload failed"):
-        service.fill(_fill_request(), tester_template=_tester_template(), strategy_template=_strategy_template())
+        service.fill(
+            _fill_request(), tester_template=_tester_template(), strategy_template=_strategy_template(),
+            max_parallel_runs=1,
+        )
 
     assert len(commands) == 1
     assert commands[0][-1].startswith("rm -f -- '/opt/hb1/.mrs3-panel-upload-")
