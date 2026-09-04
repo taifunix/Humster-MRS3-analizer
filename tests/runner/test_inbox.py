@@ -227,7 +227,9 @@ def test_capture_run_snapshots_keeps_original_report_for_guarded_cleanup(tmp_pat
 
     manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
     assert manifest["run_mode"] == "RUNS" and manifest["test_start"] == "2026-08-01"
-    assert Path(manifest["entries"][0]["report_path"]).resolve() == report.resolve()
+    entry = manifest["entries"][0]
+    assert Path(entry["report_path"]).resolve() == report.resolve()
+    assert not (inbox / "reports").exists()
     PanelController._validate_performance_inbox(inbox)
 
 
@@ -248,6 +250,36 @@ def test_capture_run_snapshot_inbox_supports_fast_mode(tmp_path: Path) -> None:
 
     manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
     assert manifest["run_mode"] == "FAST"
+    entry = manifest["entries"][0]
+    assert Path(entry["report_path"]).resolve() == report.resolve()
+    assert not (inbox / "reports").exists()
+
+
+def test_single_mode_inbox_keeps_report_as_configured_filename_only(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    report = tmp_path / "my_test_runs" / "run.html"
+    report.parent.mkdir(parents=True)
+    report.write_bytes((Path(__file__).parents[1] / "fixtures" / "performance" / "report_import.html").read_bytes())
+    strategy = {"name": "MRS3 Demo", "exchange": {"name": "Bybit"}, "basic": {"symbol": "ONUSDT", "time_frame": "1h"}}
+    digest = sha256(json.dumps(strategy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    strategy_path = tmp_path / "strategy.json"
+    strategy_path.write_bytes(json.dumps(strategy, sort_keys=True, separators=(",", ":")).encode())
+    inbox = capture_run_snapshot_inbox(
+        config,
+        "single-metadata",
+        {"MRS3 Demo": strategy},
+        {"MRS3 Demo": report},
+        tester_config_bytes=config.tester_config.read_bytes(),
+        provenance={"analysis_run_id": "a" * 64, "generation_manifest_sha256": "b" * 64, "strategy_json_sha256": {"MRS3 Demo.json": digest}},
+        test_start="2026-08-01",
+        test_end="2026-08-18",
+        run_mode="SINGLE_MODE",
+        strategy_paths={"MRS3 Demo": strategy_path},
+    )
+
+    manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["entries"][0]["report_path"] == report.name
+    assert not (inbox / "reports").exists()
 
 
 def test_single_mode_replace_rejects_reparse_inbox_before_recursive_delete(

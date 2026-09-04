@@ -289,13 +289,37 @@ actions и equity для каждой строки её `RETEST` удаляет�
 стирает серверный job/status; новый DB count читается при загрузке экрана и
 после успешного импорта.
 
-On panel recovery, choose the newest available RETEST job with
-`state=COMMITTED` and `inbox_ready=true`; a failed or incomplete job must not
-shadow a ready inbox. If the previous import for that committed inbox is
-`FAILED` or `CANCELLED`, `IMPORT & REPLACE` may be retried for the same inbox;
-the synthetic restart marker `FAILED/{code:INTERRUPTED}` remains blocked until
-the interrupted job is explicitly resolved. A previous `COMMITTED` import
-remains non-repeatable.
+On panel load, no previous RETEST tester or import job is activated and
+`IMPORT & REPLACE` remains disabled. A previously committed native RETEST job
+may be shown as an unactivated candidate only. The explicit `CHECK & RETEST`
+action first queries the durable job registry, chooses the newest committed
+native RETEST job, and calls `verify-inbox`; this rechecks the configured
+`tester_runner.report_dir` (normally `my_test`) and strategy directory and
+rebuilds the handoff metadata from reusable artifacts. A successful check
+activates that job and enables `IMPORT & REPLACE` without rerunning the tester.
+If there is no reusable committed job, the current `ACTIVE` RETEST rows are
+validated and the existing native `SINGLE_MODE` retest algorithm is started.
+If the previous import for that committed inbox is `FAILED` or `CANCELLED`,
+`IMPORT & REPLACE` may be retried for the same inbox; a previous `COMMITTED`
+import remains non-repeatable.
+
+The tester remains the sole owner of the standard report directory configured
+by `tester_runner.report_dir` (normally `hb/tester/report/my_test`). A
+`SINGLE_MODE` inbox stores report filenames as metadata and does not copy or
+archive HTML files. Import resolves those filenames against the configured
+report directory, verifies the manifest hash, and empties the contents of the
+exact configured report directory, tester strategy directory, and project
+`Output/strategies` directory only after the replacement transaction commits.
+The directories themselves and their parents are retained; no reports are
+copied or archived during cleanup.
+The tester strategy directory is validated as a strict child of the configured
+`tester_runner.bot_root`; if one of the three cleanups fails after commit, the
+panel returns a non-fatal warning naming the failed root.
+New `SINGLE_MODE` values are one filename component (no absolute path,
+separators, `.` or `..`); older absolute values remain readable only when
+their resolved file is inside the configured report directory and passes the
+same regular-file, reparse-point, and SHA-256 checks. Missing or changed
+reports fail before any database mutation or cleanup.
 
 ## Native startup and status heartbeat
 

@@ -298,7 +298,7 @@ def capture_run_snapshot_inbox(
                 "strategy_name": name,
                 "strategy_version_id": strategy_id,
                 "strategy_path": str(strategy_path),
-                "report_path": str(report_path.resolve()),
+                "report_path": report_path.name if run_mode == "SINGLE_MODE" else str(report_path.resolve()),
                 "wizard_run_id": f"runs:{job_id}:{name}",
                 "exchange_name": exchange_name,
                 "source_strategy_sha256": sha256(strategy_bytes).hexdigest(),

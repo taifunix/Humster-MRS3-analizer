@@ -231,6 +231,20 @@ def test_performance_v2_retest_card_uses_server_mapping_and_committed_inbox_gate
     assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
 
 
+def test_retest_check_is_the_only_path_that_activates_a_recovered_job() -> None:
+    js = _read("app.js")
+    check = js.split("retestStart?.addEventListener", 1)[1].split("retestImport?.addEventListener", 1)[0]
+    recovery = js.split("const recoverRetestJobs = async", 1)[1].split("retestCard?.addEventListener", 1)[0]
+
+    assert "selectCommittedRetestTester(jobs)" in check
+    assert "/api/v2/strategies/tester/verify-inbox" in check
+    assert check.index("/api/v2/jobs") < check.index("/api/v2/strategies/tester/verify-inbox") < check.index("/api/v2/strategies/performance-v2/retest/start")
+    invalid_dates = next(line for line in check.splitlines() if "Enter valid RETEST dates" in line)
+    assert "retestStart.disabled = false" in invalid_dates
+    assert "retestTesterJobId = tester.job_id" not in recovery
+    assert "retestImportJobId = importJob.job_id" not in recovery
+
+
 def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_without_recalculation() -> None:
     html = _read("index.html")
     js = _read("app.js")

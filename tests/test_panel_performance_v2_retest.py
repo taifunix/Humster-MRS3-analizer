@@ -106,6 +106,29 @@ def test_retest_status_is_safe_when_database_is_missing_or_empty(tmp_path: Path)
     assert status["default_start"] is None and status["default_end"] is None
 
 
+def test_metadata_retest_inbox_resolves_relative_artifacts_from_runner_dirs(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    bot_root = tmp_path / "bot"
+    report_dir = bot_root / "tester" / "report" / "my_test"
+    strategy_dir = bot_root / "settings_strategy"
+    report_dir.mkdir(parents=True)
+    strategy_dir.mkdir(parents=True)
+    (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
+    (strategy_dir / "alpha.json").write_text("{}", encoding="utf-8")
+    inbox = tmp_path / "inbox" / "retest-relative"
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+    }), encoding="utf-8")
+
+    controller._validate_metadata_inbox(inbox)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -346,6 +369,27 @@ def test_retest_recovery_selector_prioritizes_ready_and_newest_jobs() -> None:
     assert json.loads(result.stdout) == [
         "ready-old", "ready-old", "ready-new", "failed-new", "committed-no-ready",
     ]
+
+
+def test_retest_check_selector_uses_newest_committed_native_job() -> None:
+    utility = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web" / "retest_recovery.js"
+    tester = lambda job_id, state, inbox_ready=False: {
+        "job_id": job_id, "kind": "strategies.tester.native.start", "retest": True,
+        "state": state, "inbox_ready": inbox_ready,
+    }
+    jobs = [
+        tester("ready-old", "COMMITTED", True),
+        tester("committed-new", "COMMITTED"),
+        tester("running-newest", "RUNNING"),
+    ]
+    script = (
+        f"const {{selectCommittedRetestTester}} = require({json.dumps(str(utility))});"
+        f"const jobs = {json.dumps(jobs)};"
+        "process.stdout.write(selectCommittedRetestTester(jobs)?.job_id ?? '');"
+    )
+    result = subprocess.run(("node", "-e", script), capture_output=True, text=True, check=True)
+
+    assert result.stdout == "committed-new"
 
 
 def test_retest_import_reserves_before_inner_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

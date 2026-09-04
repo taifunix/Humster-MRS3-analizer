@@ -137,6 +137,115 @@ def test_fast_and_runs_share_one_adapter_and_keep_typed_identity(tmp_path: Path)
     assert prepared_fast.plateaus[0].plateau_id == "P1"
 
 
+def _single_mode_inbox(tmp_path: Path) -> tuple[Path, Path]:
+    inbox, report_root = _inbox(tmp_path, mode="SINGLE_MODE")
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["test_start"] = "2026-08-01"
+    manifest["test_end"] = "2026-08-31"
+    manifest["entries"][0]["report_path"] = (report_root / "BTC-demo.html").name
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return inbox, report_root
+
+
+def test_single_mode_bare_report_filename_resolves_under_configured_root(tmp_path: Path) -> None:
+    inbox, report_root = _single_mode_inbox(tmp_path)
+
+    prepared = read_performance_v2_inbox(inbox, report_root)
+
+    report = report_root / "BTC-demo.html"
+    assert prepared.entries[0].report_path == report.resolve()
+    assert prepared.entries[0].report_sha256 == sha256(report.read_bytes()).hexdigest()
+
+
+def test_single_mode_changed_report_hash_is_rejected_during_staging(tmp_path: Path) -> None:
+    inbox, report_root = _single_mode_inbox(tmp_path)
+    prepared = read_performance_v2_inbox(inbox, report_root)
+    (report_root / "BTC-demo.html").write_bytes(b"changed")
+
+    with pytest.raises(PerformanceV2InputError, match="changed during staging"):
+        create_v2_parser_staging(tmp_path / "v2", prepared)
+
+
+def test_single_mode_missing_report_is_rejected(tmp_path: Path) -> None:
+    inbox, report_root = _single_mode_inbox(tmp_path)
+    (report_root / "BTC-demo.html").unlink()
+
+    with pytest.raises(PerformanceV2InputError, match="report path"):
+        read_performance_v2_inbox(inbox, report_root)
+
+
+@pytest.mark.parametrize(
+    ("report_path", "message"),
+    (
+        ("", "report path"),
+        ("   ", "report path"),
+        (".", "filename"),
+        ("..", "filename"),
+        ("nested/BTC-demo.html", "filename"),
+        ("./BTC-demo.html", "filename"),
+        ("../BTC-demo.html", "filename"),
+        ("BTC-demo.html:ads", "filename"),
+        ("C:BTC-demo.html", "filename"),
+    ),
+)
+def test_single_mode_rejects_non_filename_report_metadata(tmp_path: Path, report_path: str, message: str) -> None:
+    inbox, report_root = _single_mode_inbox(tmp_path)
+    if report_path.startswith("nested/"):
+        nested = report_root / "nested" / "BTC-demo.html"
+        nested.parent.mkdir()
+        nested.write_bytes((report_root / "BTC-demo.html").read_bytes())
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"][0]["report_path"] = report_path
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2InputError, match=message):
+        read_performance_v2_inbox(inbox, report_root)
+
+
+def test_single_mode_rejects_bare_report_symlink_outside_root(tmp_path: Path) -> None:
+    inbox, report_root = _single_mode_inbox(tmp_path)
+    outside = tmp_path / "outside.html"
+    outside.write_bytes(b"outside")
+    report = report_root / "BTC-demo.html"
+    report.unlink()
+    try:
+        report.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    with pytest.raises(PerformanceV2InputError, match="outside its trusted root|symlink"):
+        read_performance_v2_inbox(inbox, report_root)
+    assert not (tmp_path / "v2" / ".staging").exists()
+
+
+def test_single_mode_rejects_absolute_report_outside_root(tmp_path: Path) -> None:
+    inbox, report_root = _single_mode_inbox(tmp_path)
+    outside = tmp_path / "outside.html"
+    outside.write_bytes(b"outside")
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"][0]["report_path"] = str(outside.resolve())
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2InputError, match="outside its trusted root"):
+        read_performance_v2_inbox(inbox, report_root)
+
+
+def test_single_mode_accepts_legacy_absolute_report_under_root(tmp_path: Path) -> None:
+    inbox, report_root = _single_mode_inbox(tmp_path)
+    report = report_root / "BTC-demo.html"
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"][0]["report_path"] = str(report.resolve())
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    prepared = read_performance_v2_inbox(inbox, report_root)
+
+    assert prepared.entries[0].report_path == report.resolve()
+
+
 def test_missing_and_conflicting_plateau_facts_are_rejected(tmp_path: Path) -> None:
     inbox, report_root = _inbox(tmp_path, orders=1, diagnostics={})
     with pytest.raises(PerformanceV2InputError, match="plateau"):

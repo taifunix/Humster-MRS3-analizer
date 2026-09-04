@@ -1430,9 +1430,13 @@ class PanelController:
         if sorted(names) != sorted(expected_names):
             raise ValueError("inbox is incomplete: strategy names do not match")
 
-    @staticmethod
-    def _validate_metadata_inbox(inbox: Path) -> None:
+    def _validate_metadata_inbox(self, inbox: Path) -> None:
         """Perform only the handoff check; v2 importer owns source validation."""
+        config = RunnerConfig.from_json(self.default_config)
+        artifact_roots = {
+            "strategy_path": config.strategy_dir.resolve(),
+            "report_path": config.report_dir.resolve(),
+        }
         try:
             document = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
@@ -1465,7 +1469,17 @@ class PanelController:
             for field in ("strategy_path", "report_path"):
                 value = entry.get(field)
                 path = Path(value) if isinstance(value, str) and value else None
-                if path is None or path.is_symlink() or not path.is_file():
+                root = artifact_roots[field]
+                if path is not None and not path.is_absolute():
+                    path = root / path
+                if path is None or path.is_symlink():
+                    raise ValueError(f"metadata inbox is incomplete: {field} is missing")
+                candidate = path.resolve()
+                try:
+                    candidate.relative_to(root)
+                except ValueError as error:
+                    raise ValueError(f"metadata inbox is incomplete: {field} is outside configured directory") from error
+                if not candidate.is_file():
                     raise ValueError(f"metadata inbox is incomplete: {field} is missing")
         if names != set(expected):
             raise ValueError("metadata inbox is incomplete: strategy names do not match")
@@ -3194,15 +3208,18 @@ class PanelController:
         if self._performance_v2_jobs is None:
             self._performance_v2_jobs = LocalPerformanceV2Jobs(on_update=self._record_special_job)
         performance_config = self._performance_v2_config()
+        runner_config = RunnerConfig.from_json(self.default_config)
         request = PerformanceV2PanelRequest(
             inbox=self._tester_inbox(tester_job_id),
-            report_root=RunnerConfig.from_json(self.default_config).report_dir,
+            report_root=runner_config.report_dir,
             config=performance_config,
             mode=mode,
             replacement_strategy_ids=replacement,
             window_a=window_a,
             window_b=window_b,
             strategy_root=performance_config.strategy_root,
+            tester_strategy_root=getattr(runner_config, "strategy_dir", None),
+            tester_bot_root=getattr(runner_config, "bot_root", None),
             clear_retest_on_success=clear_retest,
             test_start=test_start if isinstance(test_start, str) else None,
             test_end=test_end if isinstance(test_end, str) else None,

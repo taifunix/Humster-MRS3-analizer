@@ -1,5 +1,5 @@
   const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
-  const { selectRetestTester } = window.retestRecovery;
+  const { selectCommittedRetestTester, selectRetestTester } = window.retestRecovery;
   let shortlistGroups = [];
   let shortlistItems = [];
   const selectedScopeKeys = new Set();
@@ -1617,11 +1617,30 @@
   retestStart?.addEventListener('click', async () => {
     const start = retestStartDate?.value || '';
     const end = retestEndDate?.value || '';
-    if (!validIsoDate(start) || !validIsoDate(end) || start >= end) { if (retestStatus) retestStatus.textContent = 'Enter valid RETEST dates with start before end.'; return; }
     retestStart.disabled = true;
+    if (retestImport) retestImport.disabled = true;
+    retestTesterJobId = '';
+    retestInboxReady = false;
     retestImportJobId = '';
     if (retestFailure) { retestFailure.hidden = true; retestFailure.removeAttribute('href'); }
+    if (retestStatus) retestStatus.textContent = 'CHECK & RETEST: checking configured tester inbox…';
     try {
+      const snapshot = await requestJson('/api/v2/jobs');
+      const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
+      const candidate = selectCommittedRetestTester(jobs);
+      if (candidate?.job_id) {
+        try {
+          const verified = await requestJson('/api/v2/strategies/tester/verify-inbox', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ job_id: candidate.job_id }),
+          });
+          retestTesterJobId = verified.job_id || candidate.job_id;
+          renderRetestTester(verified);
+          if (retestInboxReady) return;
+          retestTesterJobId = '';
+        } catch (_) { /* current configured report/strategy artifacts are not reusable */ }
+      }
+      if (!validIsoDate(start) || !validIsoDate(end) || start >= end) { if (retestStatus) retestStatus.textContent = 'Enter valid RETEST dates with start before end.'; retestStart.disabled = false; return; }
       const result = await remoteRequest('/api/v2/strategies/performance-v2/retest/start', { test_start: start, test_end: end });
       retestTesterJobId = result.job?.job_id || '';
       if (!retestTesterJobId) throw new Error('missing RETEST job');
@@ -1644,10 +1663,10 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const tester = selectRetestTester(jobs);
-      if (tester?.job_id) { retestTesterJobId = tester.job_id; renderRetestTester(tester); if (!retestTerminal(tester)) { await pollRetestTester(); startRetestPolling(); } }
-      const importJob = [...jobs].reverse().find((job) => job.kind === 'strategies.performance.v2.import' && job.retest === true);
-      if (importJob?.job_id) { retestImportJobId = importJob.job_id; if (!(await pollRetestImport())) startRetestImportPolling(); }
+      const candidate = selectRetestTester(jobs);
+      if (candidate?.state === 'COMMITTED' && candidate.inbox_ready === true && retestStatus) {
+        retestStatus.textContent = 'RETEST inbox found; press CHECK & RETEST to verify it.';
+      }
     } catch (_) { /* count/status remains independently visible */ }
   };
   retestCard?.addEventListener('toggle', () => { if (retestCard.open) loadRetestStatus(); });

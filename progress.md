@@ -15,6 +15,19 @@ Evidence: `117 passed, 1 skipped` in the focused RETEST/Performance v2 slice;
 read-only replay accepted and parsed `186/186` captured reports for `149`
 expected strategies. Commit: `54ee9b8`.
 
+## Performance v2 shared tester-source cleanup (2026-09-04)
+
+SINGLE_MODE inbox metadata now stores only the configured report filename;
+imports resolve it under `tester_runner.report_dir` without copying HTML. The
+import remains fail-closed for missing, changed, unsafe, or reparse-backed
+reports. After a committed import, the exact configured report directory, the
+configured tester strategy directory, and project `Output/strategies` are
+emptied; failed imports leave these sources intact.
+After a panel restart, the previous RETEST job remains a candidate only;
+`CHECK & RETEST` must be pressed again. The check reuses a still-present
+committed inbox through `verify-inbox` and starts a new native run only when
+those sources are unavailable.
+
 ## Performance v2 selection review cleanup (2026-09-03)
 
 The accumulated Performance v2 selection/review work is implemented, staged, and

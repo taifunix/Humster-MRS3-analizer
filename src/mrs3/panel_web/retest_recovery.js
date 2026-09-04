@@ -14,5 +14,8 @@
       || retestTesters.find((job) => isRecoveryTerminal(job))
       || null;
   };
-  return { isRecoveryTerminal, selectRetestTester };
+  const selectCommittedRetestTester = (jobs) => (Array.isArray(jobs) ? jobs : [])
+    .filter((job) => job?.kind === 'strategies.tester.native.start' && job?.retest === true && job?.state === 'COMMITTED')
+    .reverse()[0] || null;
+  return { isRecoveryTerminal, selectRetestTester, selectCommittedRetestTester };
 });

@@ -424,6 +424,18 @@ def _contained_path(raw: object, root: Path, label: str) -> Path:
     return resolved
 
 
+def _single_mode_report_path(raw: object, root: Path) -> Path:
+    """Resolve the SINGLE_MODE report basename or a legacy absolute path."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise PerformanceV2InputError("report path is missing")
+    path = Path(raw)
+    if path.is_absolute():
+        return _contained_path(raw, root, "report path")
+    if path.name != raw or path.anchor or "/" in raw or "\\" in raw or ":" in raw or raw in {".", ".."}:
+        raise PerformanceV2InputError("SINGLE_MODE report path must be a filename")
+    return _contained_path(raw, root, "report path")
+
+
 def _strategy_path(
     raw: object,
     inbox: Path,
@@ -647,7 +659,11 @@ def read_performance_v2_inbox(
                 trusted_strategy_root,
                 allow_external=run_mode == "SINGLE_MODE",
             )
-            report_path = _contained_path(raw.get("report_path"), report_root, "report path")
+            report_path = (
+                _single_mode_report_path(raw.get("report_path"), report_root)
+                if run_mode == "SINGLE_MODE"
+                else _contained_path(raw.get("report_path"), report_root, "report path")
+            )
             if strategy_path in seen_paths:
                 raise PerformanceV2InputError("duplicate manifest strategy path")
             seen_paths.add(strategy_path)
@@ -717,7 +733,11 @@ def read_performance_v2_inbox(
                 trusted_strategy_root,
                 allow_external=run_mode == "SINGLE_MODE",
             )
-            report_path = _contained_path(raw["report_path"], report_root, "report path")
+            report_path = (
+                _single_mode_report_path(raw["report_path"], report_root)
+                if run_mode == "SINGLE_MODE"
+                else _contained_path(raw["report_path"], report_root, "report path")
+            )
             strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
             identity = adapt_strategy_identity(strategy, strategy_name=name, order_plateau_diagnostics=diagnostics_by_name[name])
             if identity.order_count != int(diagnostics_by_name[name]["order_count"]):
