@@ -219,7 +219,7 @@ def test_parse_selection_request_accepts_all_known_stages_in_order() -> None:
         "filter_holding_outlier", "filter_low_trades", "filter_min_shift", "ab_deterioration", "pareto_window_b", "pareto_window_b_dd_shift", "pareto_dd5_balanced",
         "pareto_plateau_points_per_order", "pareto_plateau_points_total", "pareto_efficiency_shift",
         "pareto_dd5_holding", "pareto_dd5_close_ma", "pareto_dd5_first_shift",
-        "pareto_conditional_close_ma", "pareto_primary", "pareto_dd5_capital",
+        "pareto_conditional_close_ma", "pareto_primary", "pareto_dd5_capital", "filter_lot_variant_redundancy",
     ]
 
     request = parse_selection_request({
@@ -269,6 +269,7 @@ def test_parse_selection_request_accepts_new_stages_and_requires_last_fixed_rank
         ({"symbol": "BTCUSDT", "side": "LONG", "stages": [{"id": "unknown", "enabled": True, "scope": "pair_side"}]}, "UNKNOWN_STAGE"),
         ({"symbol": "BTCUSDT", "side": "LONG", "stages": [{"id": "ab_deterioration", "enabled": True, "scope": "pair_side"}, {"id": "ab_deterioration", "enabled": False, "scope": "pair_side"}]}, "DUPLICATE_STAGE"),
         ({"symbol": "BTCUSDT", "side": "LONG", "stages": [{"id": "ab_deterioration", "enabled": True, "scope": "global"}]}, "INVALID_SCOPE"),
+        ({"symbol": "BTCUSDT", "side": "LONG", "stages": [{"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side"}]}, "LOT_VARIANT_STAGE_SCOPE"),
     ],
 )
 def test_parse_selection_request_rejects_unknown_duplicate_and_invalid_scope(payload: dict[str, object], code: str) -> None:
@@ -333,6 +334,7 @@ def test_selection_config_reads_agreed_defaults(tmp_path: Path) -> None:
     assert config.best_trade_max_profit_share_pct == 35
     assert config.best_trade_min_profitable_trades == 4
     assert config.shift_near_tie_min_advantage_bp == 10
+    assert config.lot_variant_redundancy_enabled is True
 
 
 def test_selection_config_reads_explicit_overrides(tmp_path: Path) -> None:
@@ -347,6 +349,7 @@ def test_selection_config_reads_explicit_overrides(tmp_path: Path) -> None:
         best_trade_max_profit_share_pct=40,
         best_trade_min_profitable_trades=5,
         shift_near_tie_min_advantage_bp=15,
+        lot_variant_redundancy_enabled=False,
     ))
 
     assert config.ab_final_days == 21
@@ -355,6 +358,7 @@ def test_selection_config_reads_explicit_overrides(tmp_path: Path) -> None:
     assert config.best_trade_max_profit_share_pct == 40
     assert config.best_trade_min_profitable_trades == 5
     assert config.shift_near_tie_min_advantage_bp == 15
+    assert config.lot_variant_redundancy_enabled is False
 
 
 @pytest.mark.parametrize(
@@ -370,6 +374,7 @@ def test_selection_config_reads_explicit_overrides(tmp_path: Path) -> None:
         ("best_trade_max_profit_share_pct", 100),
         ("best_trade_min_profitable_trades", 0),
         ("shift_near_tie_min_advantage_bp", 0),
+        ("lot_variant_redundancy_enabled", "yes"),
     ],
 )
 def test_selection_config_rejects_invalid_values(tmp_path: Path, field: str, value: object) -> None:
@@ -631,6 +636,128 @@ def _selection_row(name: str, **values: object) -> dict[str, object]:
         "total_plateau_point_count": 20 if name == "winner" else 10,
         **values,
     }
+
+
+def _lot_variant_row(
+    name: str,
+    strategy_id: int,
+    lots: tuple[str, str] = ("1", "2"),
+    interval: tuple[datetime, datetime] = (datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 2, 1, tzinfo=UTC)),
+    **metrics: object,
+) -> dict[str, object]:
+    start, end = interval
+    return {
+        "strategy_id": strategy_id,
+        "strategy_name": name,
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "timeframe": "1h",
+        "close_ma_len": 20,
+        "order_count": 2,
+        "order_1_open_ma_len": 5,
+        "order_1_shift_bp": 100,
+        "order_1_lot_x": Decimal(lots[0]),
+        "order_2_open_ma_len": 10,
+        "order_2_shift_bp": 200,
+        "order_2_lot_x": Decimal(lots[1]),
+        "report_start_utc": start,
+        "report_end_utc": end,
+        "effective_start_utc": start,
+        "effective_end_utc": end,
+        "dd5_proxy": Decimal("10"),
+        "capital_proxy": Decimal("5"),
+        "robust_pnl_30d_pct": Decimal("8"),
+        "worst_drawdown_pct": Decimal("6"),
+        "profit_factor": Decimal("1.5"),
+        **metrics,
+    }
+
+
+def test_lot_variant_filter_is_default_on_first_and_keeps_loser_auditable() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_best_trade_dependency", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _lot_variant_row("winner", 1, lots=("1", "2"), dd5_proxy=Decimal("11")),
+        _lot_variant_row(
+            "loser", 2, lots=("3", "4"), best_trade_reliable=True,
+            completed_profitable_trade_count=4, pnl_without_best_trade=Decimal("0"),
+            best_trade_profit_share_pct=Decimal("40"),
+        ),
+    ]), request).set_index("strategy_name")
+
+    assert result.loc["winner", "finalist"]
+    assert not result.loc["loser", "finalist"]
+    assert result.loc["loser", "eliminated_by_filter_lot_variant_redundancy"]
+    assert not result.loc["loser", "eliminated_by_filter_best_trade_dependency"]
+    assert result.loc["loser", "auto_status"] == "FILTERED"
+    assert result.loc["loser", "elimination_reason"] == "LOT_VARIANT_REDUNDANT"
+    assert result.loc["winner", "lot_variant_representative_strategy_id"] == 1
+    assert result.loc["loser", "lot_variant_representative_strategy_id"] == 1
+    assert result.loc["winner", "lot_variant_group_key"] == result.loc["loser", "lot_variant_group_key"]
+
+
+def test_lot_variant_filter_can_be_disabled_and_fails_closed() -> None:
+    frame = pd.DataFrame([
+        _lot_variant_row("missing-a", 1, lots=("1", "2"), profit_factor=None),
+        _lot_variant_row("missing-b", 2, lots=("3", "4"), profit_factor=None),
+    ])
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    disabled = run_selection(frame, request, SelectionConfig(lot_variant_redundancy_enabled=False))
+    assert disabled["finalist"].all()
+    assert disabled["lot_variant_group_key"].isna().all()
+
+    failed_closed = run_selection(frame, request)
+    assert failed_closed["finalist"].all()
+    assert failed_closed["lot_variant_group_key"].isna().all()
+
+    malformed = pd.DataFrame([
+        _lot_variant_row("bad-a", 1, lots=("1", "2"), effective_start_utc="not-a-date"),
+        _lot_variant_row("bad-b", 2, lots=("3", "4")),
+    ])
+    malformed_result = run_selection(malformed, request)
+    assert malformed_result["finalist"].all()
+    assert malformed_result["lot_variant_group_key"].isna().all()
+
+
+def test_lot_variant_filter_isolated_by_interval_and_canonicalizes_order_permutation() -> None:
+    first = _lot_variant_row("first", 1, lots=("1", "2"))
+    second = _lot_variant_row("second", 2, lots=("3", "4"))
+    second["order_1_open_ma_len"], second["order_2_open_ma_len"] = second["order_2_open_ma_len"], second["order_1_open_ma_len"]
+    second["order_1_shift_bp"], second["order_2_shift_bp"] = second["order_2_shift_bp"], second["order_1_shift_bp"]
+    second["order_1_lot_x"], second["order_2_lot_x"] = second["order_2_lot_x"], second["order_1_lot_x"]
+    same_interval = run_selection(pd.DataFrame([first, second]), parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})).set_index("strategy_name")
+    assert same_interval.loc["first", "finalist"]
+    assert not same_interval.loc["second", "finalist"]
+
+    later = _lot_variant_row(
+        "later", 3, lots=("3", "4"),
+        interval=(datetime(2026, 2, 1, tzinfo=UTC), datetime(2026, 3, 1, tzinfo=UTC)),
+    )
+    separate = run_selection(pd.DataFrame([first, later]), parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []}))
+    assert separate["finalist"].all()
+
+
+@pytest.mark.parametrize(
+    ("metric", "a_value", "b_value", "expected"),
+    [
+        ("dd5_proxy", Decimal("11"), Decimal("10"), "a"),
+        ("capital_proxy", Decimal("4"), Decimal("5"), "a"),
+        ("robust_pnl_30d_pct", Decimal("9"), Decimal("8"), "a"),
+        ("worst_drawdown_pct", Decimal("5"), Decimal("6"), "a"),
+        ("profit_factor", Decimal("1.6"), Decimal("1.5"), "a"),
+        ("strategy_id", None, None, "b"),
+    ],
+)
+def test_lot_variant_filter_uses_declared_winner_order(metric: str, a_value: object, b_value: object, expected: str) -> None:
+    a_id, b_id = (2, 1) if metric == "strategy_id" else (1, 2)
+    a = _lot_variant_row("a", a_id, lots=("1", "2"), **({metric: a_value} if a_value is not None else {}))
+    b = _lot_variant_row("b", b_id, lots=("3", "4"), **({metric: b_value} if b_value is not None else {}))
+    result = run_selection(pd.DataFrame([a, b]), parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []}))
+    finalists = result.loc[result["finalist"], "strategy_name"].tolist()
+    assert finalists == [expected]
 
 
 @pytest.mark.parametrize("stage_id", [
@@ -1018,6 +1145,7 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     assert "PnL" not in headers
     assert "total_pnl_pct" not in headers
     assert "PnL/30" in headers and "Trades/30" in headers
+    assert "eliminated_by_filter_lot_variant_redundancy" in headers
     assert "positive_quarter_status" not in headers
     strategy_column = headers.index("Стратегия") + 1
     winner_row = next(row for row in range(2, book["All candidates"].max_row + 1) if book["All candidates"].cell(row, strategy_column).value == "winner")

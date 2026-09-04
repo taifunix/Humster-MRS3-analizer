@@ -1996,12 +1996,12 @@
   const selectionPreviewBadge = document.querySelector('#performance-v2-selection-badge');
   const selectionRankStage = document.querySelector('[data-selection-rank]');
   const defaultSelectionStageOrder = [
-    'filter_holding_outlier', 'filter_low_trades', 'filter_min_shift', 'ab_deterioration',
+    'filter_lot_variant_redundancy', 'filter_holding_outlier', 'filter_low_trades', 'filter_min_shift', 'ab_deterioration',
     'filter_best_trade_dependency', 'filter_time_consistency', 'pareto_dd5_balanced',
     'pareto_robust', 'pareto_shift_near_tie', 'pareto_close_ma_near_tie',
   ];
   const defaultEnabledSelectionStages = new Set([
-    'filter_holding_outlier', 'ab_deterioration', 'filter_best_trade_dependency',
+    'filter_lot_variant_redundancy', 'filter_holding_outlier', 'ab_deterioration', 'filter_best_trade_dependency',
     'filter_time_consistency', 'pareto_dd5_balanced', 'pareto_robust',
     'pareto_shift_near_tie',
   ]);
@@ -2031,8 +2031,9 @@
       const up = stage.querySelector('[data-selection-move="up"]');
       const down = stage.querySelector('[data-selection-move="down"]');
       if (position) position.textContent = String(index + 1);
-      if (up) up.disabled = index === 0;
-      if (down) down.disabled = index === stages.length - 1;
+      const fixedFirst = stage.dataset.selectionStage === 'filter_lot_variant_redundancy';
+      if (up) up.disabled = fixedFirst || index === 0;
+      if (down) down.disabled = fixedFirst || index === stages.length - 1;
     });
   };
 

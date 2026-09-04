@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from concurrent.futures import ThreadPoolExecutor
 from colorsys import hls_to_rgb
@@ -26,6 +26,7 @@ from .audit import _normalize_xlsx_archive, write_audit_workbook
 StageScope = Literal["pair_side", "pair_side_timeframe"]
 
 _STAGE_IDS = frozenset((
+    "filter_lot_variant_redundancy",
     "filter_holding_outlier",
     "filter_low_trades",
     "filter_min_shift",
@@ -55,6 +56,8 @@ _CANDIDATE_COLUMNS = (
     "result_id", "total_pnl", "total_pnl_pct", "max_drawdown", "max_drawdown_pct", "total_fees",
     "total_trades", "trades_30d", "pnl_30d_pct", "profit_factor", "win_rate_pct", "risk_scale", "dd5_proxy", "holding_p95_minutes",
     "holding_median_minutes",
+    "report_start_utc", "report_end_utc", "reported_start_utc", "reported_end_utc",
+    "effective_start_utc", "effective_end_utc",
     "ab_pnl_change_30d_pct", "ab_return_b_pct", "first_shift_bp", "scaled_lot_sum", "capital_proxy",
     "capital_efficiency", "total_plateau_point_count",
     "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_calendar_days_a", "ab_calendar_days_b", "ab_win_rate_b_pct",
@@ -62,6 +65,7 @@ _CANDIDATE_COLUMNS = (
     "best_trade_profit_share_pct", "pnl_without_best_trade", "pnl_without_best_trade_pct", "completed_profitable_trade_count", "best_trade_reliable",
     "positive_quarter_count", "positive_quarter_available_count", "positive_quarter_status", "robust_pnl_30d_pct", "worst_drawdown_pct", "worst_holding_p95_minutes",
     "ab_stability_ratio", "minimum_plateau_point_count",
+    "lot_variant_group_key", "lot_variant_representative_strategy_id",
     "rank_quality_robust_pnl", "rank_quality_worst_drawdown", "rank_quality_ab_stability", "rank_quality_worst_holding",
     "rank_quality_first_shift", "rank_quality_minimum_plateau_points", "rank_quality_close_ma", "rank_weight_coverage_pct",
     "rank_weight_robust_pnl", "rank_weight_worst_drawdown", "rank_weight_ab_stability", "rank_weight_worst_holding",
@@ -104,6 +108,7 @@ class SelectionConfig:
     best_trade_max_profit_share_pct: Decimal = Decimal("35")
     best_trade_min_profitable_trades: int = 4
     shift_near_tie_min_advantage_bp: int = 10
+    lot_variant_redundancy_enabled: bool = True
 
 
 def _error(code: str) -> PerformanceV2SelectionError:
@@ -152,6 +157,8 @@ def parse_selection_request(payload: Mapping[str, object]) -> SelectionRequest:
         top_n = _positive_int(raw["top_n"], "top_n") if stage_id == "rank_robust_top_n" else None
         if stage_id == "rank_robust_top_n" and scope != "pair_side":
             raise _error("RANK_STAGE_SCOPE")
+        if stage_id == "filter_lot_variant_redundancy" and scope != "pair_side_timeframe":
+            raise _error("LOT_VARIANT_STAGE_SCOPE")
         seen.add(stage_id)
         parsed.append(SelectionStage(stage_id, enabled, scope, min_shift_pct, pnl_tolerance_pct, top_n))
     if any(stage.id == "rank_robust_top_n" for stage in parsed) and parsed[-1].id != "rank_robust_top_n":
@@ -205,6 +212,9 @@ def load_selection_config(path: Path) -> SelectionConfig:
         raise _error("INVALID_CONFIG_ab_final_days")
     best_trade_min = selected.get("best_trade_min_profitable_trades", 4)
     shift_advantage = selected.get("shift_near_tie_min_advantage_bp", 10)
+    lot_variant_enabled = selected.get("lot_variant_redundancy_enabled", True)
+    if not isinstance(lot_variant_enabled, bool):
+        raise _error("INVALID_CONFIG_lot_variant_redundancy_enabled")
     return SelectionConfig(
         ab_final_days=final_days,
         ab_return_floor_pct=_positive_decimal(selected.get("ab_return_floor_pct", 5), "ab_return_floor_pct"),
@@ -220,6 +230,7 @@ def load_selection_config(path: Path) -> SelectionConfig:
         ),
         best_trade_min_profitable_trades=_positive_int(best_trade_min, "best_trade_min_profitable_trades"),
         shift_near_tie_min_advantage_bp=_positive_int(shift_advantage, "shift_near_tie_min_advantage_bp"),
+        lot_variant_redundancy_enabled=lot_variant_enabled,
     )
 
 
@@ -600,7 +611,9 @@ def load_selection_candidates(
     cached_metrics = _selection_cached_metrics(connection, request) if cache_only else None
     rows = connection.execute(
         """select s.strategy_id, s.strategy_name, s.symbol, s.side, s.timeframe, s.close_ma_len,
-                  s.order_count, r.result_id, r.report_start_utc, r.report_end_utc, r.initial_balance,
+                  s.order_count, r.result_id, r.report_start_utc, r.report_end_utc,
+                  r.reported_start_utc, r.reported_end_utc, r.effective_start_utc, r.effective_end_utc,
+                  r.initial_balance,
                   r.total_pnl, r.total_pnl_pct, r.max_drawdown, r.max_drawdown_pct,
                   r.total_fees, r.total_trades, o.order_id, o.analysis_run_id, o.plateau_id,
                   o.open_ma_len, o.open_multiplier, o.shift_bp, o.lot_x, p.plateau_point_count
@@ -616,7 +629,8 @@ def load_selection_candidates(
     for row in rows:
         (
             strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count,
-            result_id, report_start, report_end, initial_balance, total_pnl, total_pnl_pct, max_drawdown,
+            result_id, report_start, report_end, reported_start, reported_end, effective_start, effective_end,
+            initial_balance, total_pnl, total_pnl_pct, max_drawdown,
             max_drawdown_pct, total_fees, total_trades, order_id, analysis_run_id, plateau_id,
             open_ma_len, open_multiplier, shift_bp, lot_x, plateau_count,
         ) = row
@@ -654,6 +668,9 @@ def load_selection_candidates(
                 "order_count": int(order_count), "result_id": result_id, "total_pnl": _decimal_or_none(total_pnl),
                 "total_pnl_pct": _decimal_or_none(total_pnl_pct), "max_drawdown": _decimal_or_none(max_drawdown),
                 "max_drawdown_pct": drawdown, "total_fees": _decimal_or_none(total_fees),
+                "report_start_utc": report_start, "report_end_utc": report_end,
+                "reported_start_utc": reported_start, "reported_end_utc": reported_end,
+                "effective_start_utc": effective_start, "effective_end_utc": effective_end,
                 "total_trades": None if full_metrics is None else full_metrics.trade_count,
                 "trades_30d": None if full_metrics is None else _trade_rate_30d(full_metrics, report_start, report_end),
                 "pnl_30d_pct": pnl_30d,
@@ -674,6 +691,7 @@ def load_selection_candidates(
                 "robust_pnl_30d_pct": None,
                 "worst_drawdown_pct": None, "worst_holding_p95_minutes": None,
                 "ab_stability_ratio": None, "minimum_plateau_point_count": None,
+                "lot_variant_group_key": None, "lot_variant_representative_strategy_id": pd.NA,
             }
             candidates[int(strategy_id)] = candidate
         if order_id is not None:
@@ -946,11 +964,137 @@ def _ab_eliminates(row: pd.Series, config: SelectionConfig) -> bool | None:
     )
 
 
+_LOT_VARIANT_STAGE_ID = "filter_lot_variant_redundancy"
+_LOT_VARIANT_METRICS = ("dd5_proxy", "capital_proxy", "robust_pnl_30d_pct", "worst_drawdown_pct", "profit_factor")
+
+
+def _utc_datetime(value: object) -> datetime | None:
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return None
+    return value.astimezone(timezone.utc)
+
+
+def _comparison_interval(row: pd.Series) -> tuple[datetime, datetime] | None:
+    for start_name, end_name in (
+        ("comparison_interval_start_utc", "comparison_interval_end_utc"),
+        ("effective_start_utc", "effective_end_utc"),
+        ("reported_start_utc", "reported_end_utc"),
+        ("report_start_utc", "report_end_utc"),
+    ):
+        if start_name not in row or end_name not in row:
+            continue
+        raw_start, raw_end = row[start_name], row[end_name]
+        if not _present(raw_start) and not _present(raw_end):
+            continue
+        start, end = _utc_datetime(raw_start), _utc_datetime(raw_end)
+        if start is not None and end is not None and end >= start:
+            return start, end
+        return None
+    return None
+
+
+def _integer(value: object) -> int | None:
+    parsed = _decimal_or_none(value)
+    if parsed is None or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
+
+
+def _lot_variant_structure(row: pd.Series) -> tuple[tuple[object, ...], tuple[Decimal, ...]] | None:
+    close_ma = _integer(row.get("close_ma_len"))
+    order_count = _integer(row.get("order_count"))
+    if close_ma is None or order_count is None or order_count < 1:
+        return None
+    fields: list[tuple[int, int, Decimal]] = []
+    for order in range(1, order_count + 1):
+        open_ma = _integer(row.get(f"order_{order}_open_ma_len"))
+        shift = _integer(row.get(f"order_{order}_shift_bp"))
+        lot = _decimal_or_none(row.get(f"order_{order}_lot_x"))
+        if open_ma is None or shift is None or lot is None:
+            return None
+        fields.append((open_ma, shift, lot))
+    fields.sort(key=lambda value: (value[0], value[1], value[2]))
+    symbol, side, timeframe = (row.get(name) for name in ("symbol", "side", "timeframe"))
+    if any(value is None or pd.isna(value) for value in (symbol, side, timeframe)):
+        return None
+    pairs = tuple((open_ma, shift) for open_ma, shift, _ in fields)
+    lots = tuple(lot for _, _, lot in fields)
+    return (str(symbol), str(side), str(timeframe), close_ma, order_count, pairs), lots
+
+
+def _lot_variant_group_key(structure: tuple[object, ...]) -> str:
+    symbol, side, timeframe, close_ma, order_count, pairs = structure
+    return json.dumps(
+        [symbol, side, timeframe, close_ma, order_count, [[open_ma, shift] for open_ma, shift in pairs]],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _lot_variant_eliminated(result: pd.DataFrame, group: pd.DataFrame) -> list[object]:
+    candidates: dict[tuple[object, ...], list[tuple[object, tuple[Decimal, ...]]]] = {}
+    for index, row in group.iterrows():
+        structure = _lot_variant_structure(row)
+        interval = _comparison_interval(row)
+        if structure is None or interval is None:
+            continue
+        group_id = (*structure[0], interval[0], interval[1])
+        candidates.setdefault(group_id, []).append((index, structure[1]))
+
+    eliminated: list[object] = []
+    for group_id, members in candidates.items():
+        if len(members) < 2 or len({lots for _, lots in members}) < 2:
+            continue
+        rows = result.loc[[index for index, _ in members]]
+        if any(
+            _decimal_or_none(rows.iloc[position].get(metric)) is None
+            for position in range(len(rows))
+            for metric in _LOT_VARIANT_METRICS
+        ):
+            continue
+        strategy_ids: dict[object, int] = {}
+        for index in rows.index:
+            raw_id = rows.at[index, "strategy_id"]
+            if isinstance(raw_id, bool) or not isinstance(raw_id, (int, np.integer)) or int(raw_id) < 1:
+                break
+            strategy_ids[index] = int(raw_id)
+        else:
+            def winner_key(index: object) -> tuple[object, ...]:
+                row = rows.loc[index]
+                values = [_decimal_or_none(row[metric]) for metric in _LOT_VARIANT_METRICS]
+                assert all(value is not None for value in values)
+                dd5, capital, robust, drawdown, profit_factor = values
+                return (-dd5, capital, -robust, drawdown, -profit_factor, strategy_ids[index], row.get("_source_order", index))
+
+            winner = min(rows.index, key=winner_key)
+            structure = group_id[:-2]
+            key = _lot_variant_group_key(structure)
+            result.loc[rows.index, "lot_variant_group_key"] = key
+            result.loc[rows.index, "lot_variant_representative_strategy_id"] = strategy_ids[winner]
+            losers = [index for index in rows.index if index != winner]
+            if losers:
+                eliminated.extend(losers)
+                result.loc[losers, "auto_status"] = "FILTERED"
+                result.loc[losers, "elimination_reason"] = "LOT_VARIANT_REDUNDANT"
+    return eliminated
+
+
 def run_selection(
     candidates: pd.DataFrame, request: SelectionRequest, config: SelectionConfig = SelectionConfig()
 ) -> pd.DataFrame:
     """Apply the submitted stages in order; input candidates remain fully represented."""
-    result = candidates.copy().sort_values(["strategy_name", "strategy_id"], kind="stable").reset_index(drop=True)
+    result = candidates.copy()
+    result["_source_order"] = np.arange(len(result))
+    result = result.sort_values(["strategy_name", "strategy_id"], kind="stable").reset_index(drop=True)
     if "symbol" not in result:
         result["symbol"] = request.symbol
     if "side" not in result:
@@ -963,12 +1107,33 @@ def run_selection(
     result["auto_status"] = None
     result["analog_group_key"] = None
     result["auto_analog_of_strategy_id"] = pd.NA
+    result["lot_variant_group_key"] = None
+    result["lot_variant_representative_strategy_id"] = pd.NA
     stage_counts: dict[str, dict[str, int | bool]] = {}
-    for stage in request.stages:
+    explicit_stage_ids = {stage.id for stage in request.stages}
+    stages = list(request.stages)
+    if _LOT_VARIANT_STAGE_ID not in explicit_stage_ids and config.lot_variant_redundancy_enabled:
+        stages.insert(0, SelectionStage(_LOT_VARIANT_STAGE_ID, True, "pair_side_timeframe"))
+    elif _LOT_VARIANT_STAGE_ID in explicit_stage_ids:
+        lot_stage = next(stage for stage in stages if stage.id == _LOT_VARIANT_STAGE_ID)
+        stages = [lot_stage, *(stage for stage in stages if stage.id != _LOT_VARIANT_STAGE_ID)]
+    implicit_lot_variant_stage = _LOT_VARIANT_STAGE_ID not in explicit_stage_ids
+    for stage in stages:
         column = f"eliminated_by_{stage.id}"
         result[column] = False
-        if not stage.enabled:
-            stage_counts[stage.id] = {"enabled": False, "eliminated": 0, "remaining": int(result["finalist"].sum())}
+        if not stage.enabled or (stage.id == _LOT_VARIANT_STAGE_ID and not config.lot_variant_redundancy_enabled):
+            if stage.id != _LOT_VARIANT_STAGE_ID or not implicit_lot_variant_stage:
+                stage_counts[stage.id] = {"enabled": False, "eliminated": 0, "remaining": int(result["finalist"].sum())}
+            continue
+        if stage.id == _LOT_VARIANT_STAGE_ID:
+            survivors = result.loc[result["finalist"]]
+            for _, group in _scope_groups(survivors, stage.scope):
+                eliminated = _lot_variant_eliminated(result, group)
+                if eliminated:
+                    result.loc[eliminated, column] = True
+                    result.loc[eliminated, "finalist"] = False
+            if stage.id != _LOT_VARIANT_STAGE_ID or not implicit_lot_variant_stage:
+                stage_counts[stage.id] = {"enabled": True, "eliminated": int(result[column].sum()), "remaining": int(result["finalist"].sum())}
             continue
         if stage.id == "rank_robust_top_n":
             survivors = result.loc[result["finalist"]]
@@ -1093,9 +1258,11 @@ def run_selection(
                 result.loc[eliminated, column] = True
                 result.loc[eliminated, "finalist"] = False
                 result.loc[eliminated, "elimination_reason"] = stage.id.upper()
-        stage_counts[stage.id] = {"enabled": True, "eliminated": int(result[column].sum()), "remaining": int(result["finalist"].sum())}
+        if stage.id != _LOT_VARIANT_STAGE_ID or not implicit_lot_variant_stage:
+            stage_counts[stage.id] = {"enabled": True, "eliminated": int(result[column].sum()), "remaining": int(result["finalist"].sum())}
     result.loc[result["auto_status"].isna() & result["finalist"], "auto_status"] = "FINALIST"
     result.loc[result["auto_status"].isna() & ~result["finalist"], "auto_status"] = "FILTERED"
+    result = result.drop(columns=["_source_order"])
     result.attrs["stage_counts"] = stage_counts
     return result
 
@@ -1181,6 +1348,11 @@ def write_selection_workbook(
                 if value is not None and not pd.isna(value) else value
             )
     enabled_filter_columns = [f"eliminated_by_{stage.id}" for stage in request.stages if stage.enabled]
+    implicit_lot_column = "eliminated_by_filter_lot_variant_redundancy"
+    if implicit_lot_column in display and implicit_lot_column not in enabled_filter_columns and not any(
+        stage.id == _LOT_VARIANT_STAGE_ID for stage in request.stages
+    ):
+        enabled_filter_columns.insert(0, implicit_lot_column)
     display = display.drop(columns=[
         column for column in display if column.startswith("eliminated_by_") and column not in enabled_filter_columns
     ], errors="ignore")
@@ -1253,7 +1425,8 @@ def write_selection_workbook(
         "lots",
         "points",
         "open_ma",
-        "final_rank", "finalist", "elimination_reason", *enabled_filter_columns, *review_columns,
+        "final_rank", "finalist", "elimination_reason", "lot_variant_group_key", "lot_variant_representative_strategy_id",
+        *enabled_filter_columns, *review_columns,
     ]
     display = display.reindex(columns=column_order)
     display = display.rename(columns={
@@ -1276,6 +1449,7 @@ def write_selection_workbook(
         "rank_weight_first_shift": "Rank w Shift", "rank_weight_minimum_plateau_points": "Rank w Points",
         "rank_weight_close_ma": "Rank w Close MA",
         "final_score": "Final score (Pair+Side)", "final_rank": "Final rank",
+        "lot_variant_group_key": "Lot variant group key", "lot_variant_representative_strategy_id": "Lot variant representative ID",
         "open_ma": "MA",
         **{f"order_{order}_shift_bp": f"{order} Shift" for order in range(1, 5)},
         "lots": "Lots",

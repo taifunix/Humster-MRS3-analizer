@@ -14,7 +14,8 @@
       "plateau_points_pareto_pnl_multiplier": 2,
       "best_trade_max_profit_share_pct": 35,
       "best_trade_min_profitable_trades": 4,
-      "shift_near_tie_min_advantage_bp": 10
+      "shift_near_tie_min_advantage_bp": 10,
+      "lot_variant_redundancy_enabled": true
     }
   }
 }
