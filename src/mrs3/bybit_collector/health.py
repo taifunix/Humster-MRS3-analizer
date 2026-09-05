@@ -25,11 +25,17 @@ class HealthMonitor:
         *,
         collector_version: str = "0.7.0",
         started_at_ms: int | None = None,
+        runtime_mode: str = "production",
+        accelerated_clock: bool = False,
     ) -> None:
         self.root = Path(root)
         self.path = self.root / "status" / "health.json"
         self.collector_version = collector_version
         self.started_at_ms = int(time.time() * 1000) if started_at_ms is None else started_at_ms
+        if runtime_mode not in {"production", "smoke_test"}:
+            raise ValueError("runtime_mode must be production or smoke_test")
+        self.runtime_mode = runtime_mode
+        self.accelerated_clock = bool(accelerated_clock)
 
     def update(
         self,
@@ -74,6 +80,8 @@ class HealthMonitor:
             "started_at_utc": _utc_iso(self.started_at_ms),
             "updated_at_utc": _utc_iso(now_ms),
             "status": status,
+            "runtime_mode": self.runtime_mode,
+            "accelerated_clock": self.accelerated_clock,
             "config_revision": config_revision,
             "configured_symbols": list(configured_symbols),
             "active_symbols": list(active_symbols),

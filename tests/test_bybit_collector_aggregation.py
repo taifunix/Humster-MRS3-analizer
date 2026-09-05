@@ -405,7 +405,7 @@ def test_aggregation_schema_has_exact_order_and_python_types() -> None:
     row = row.finalize()
 
     assert tuple(row) == LIQUIDITY_1M_COLUMNS
-    assert len(LIQUIDITY_1M_COLUMNS) == 32
+    assert len(LIQUIDITY_1M_COLUMNS) == 40
     assert LIQUIDITY_1M_COLUMNS[:8] == (
         "minute_ts_ms",
         "symbol",
@@ -468,6 +468,8 @@ def test_partial_depth_is_quantiled_but_complete_ratio_requires_both_sides() -> 
 
     assert row["bid_depth_usdt_100bps_p05"] is not None
     assert row["ask_depth_usdt_100bps_median"] is not None
+    assert row["bid_depth_100bps_complete_ratio"] == pytest.approx(0.5)
+    assert row["ask_depth_100bps_complete_ratio"] == pytest.approx(0.5)
     assert row["depth_100bps_complete_ratio"] == pytest.approx(0.5)
 
 
@@ -590,5 +592,11 @@ def test_all_bands_have_the_four_depth_fields_then_complete_ratio() -> None:
             f"ask_depth_usdt_{band}bps_median",
         )
     assert keys[depth_start + len(BANDS_BPS) * 4 :] == tuple(
-        f"depth_{band}bps_complete_ratio" for band in BANDS_BPS
+        name
+        for band in BANDS_BPS
+        for name in (
+            f"bid_depth_{band}bps_complete_ratio",
+            f"ask_depth_{band}bps_complete_ratio",
+            f"depth_{band}bps_complete_ratio",
+        )
     )

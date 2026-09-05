@@ -35,7 +35,15 @@ _DEPTH_COLUMNS = tuple(
         f"ask_depth_usdt_{band}bps_median",
     )
 )
-_COMPLETE_COLUMNS = tuple(f"depth_{band}bps_complete_ratio" for band in BANDS_BPS)
+_COMPLETE_COLUMNS = tuple(
+    name
+    for band in BANDS_BPS
+    for name in (
+        f"bid_depth_{band}bps_complete_ratio",
+        f"ask_depth_{band}bps_complete_ratio",
+        f"depth_{band}bps_complete_ratio",
+    )
+)
 LIQUIDITY_1M_COLUMNS = _BASE_COLUMNS + _DEPTH_COLUMNS + _COMPLETE_COLUMNS
 
 # (name, DuckDB type, nullable) is the archive's single source of schema truth.
@@ -68,9 +76,17 @@ LIQUIDITY_1M_SCHEMA = (
     ("bid_depth_usdt_100bps_median", "DOUBLE", True),
     ("ask_depth_usdt_100bps_p05", "DOUBLE", True),
     ("ask_depth_usdt_100bps_median", "DOUBLE", True),
+    ("bid_depth_10bps_complete_ratio", "DOUBLE", True),
+    ("ask_depth_10bps_complete_ratio", "DOUBLE", True),
     ("depth_10bps_complete_ratio", "DOUBLE", True),
+    ("bid_depth_25bps_complete_ratio", "DOUBLE", True),
+    ("ask_depth_25bps_complete_ratio", "DOUBLE", True),
     ("depth_25bps_complete_ratio", "DOUBLE", True),
+    ("bid_depth_50bps_complete_ratio", "DOUBLE", True),
+    ("ask_depth_50bps_complete_ratio", "DOUBLE", True),
     ("depth_50bps_complete_ratio", "DOUBLE", True),
+    ("bid_depth_100bps_complete_ratio", "DOUBLE", True),
+    ("ask_depth_100bps_complete_ratio", "DOUBLE", True),
     ("depth_100bps_complete_ratio", "DOUBLE", True),
 )
 if tuple(name for name, _type, _nullable in LIQUIDITY_1M_SCHEMA) != LIQUIDITY_1M_COLUMNS:
@@ -362,6 +378,8 @@ class MinuteAggregator:
         self._depth: dict[int, dict[str, list[float]]] = {
             band: {"bid": [], "ask": []} for band in BANDS_BPS
         }
+        self._bid_complete: dict[int, int] = {band: 0 for band in BANDS_BPS}
+        self._ask_complete: dict[int, int] = {band: 0 for band in BANDS_BPS}
         self._complete: dict[int, int] = {band: 0 for band in BANDS_BPS}
 
     @property
@@ -391,6 +409,10 @@ class MinuteAggregator:
             ask_depth, ask_complete = _depth(asks, mid, band, "ask")
             self._depth[band]["bid"].append(bid_depth)
             self._depth[band]["ask"].append(ask_depth)
+            if bid_complete:
+                self._bid_complete[band] += 1
+            if ask_complete:
+                self._ask_complete[band] += 1
             if bid_complete and ask_complete:
                 self._complete[band] += 1
         return True
@@ -436,6 +458,12 @@ class MinuteAggregator:
             row[f"ask_depth_usdt_{band}bps_p05"] = quantile(values["ask"], 0.05)
             row[f"ask_depth_usdt_{band}bps_median"] = quantile(values["ask"], 0.5)
         for band in BANDS_BPS:
+            row[f"bid_depth_{band}bps_complete_ratio"] = (
+                self._bid_complete[band] / valid if valid else None
+            )
+            row[f"ask_depth_{band}bps_complete_ratio"] = (
+                self._ask_complete[band] / valid if valid else None
+            )
             row[f"depth_{band}bps_complete_ratio"] = (
                 self._complete[band] / valid if valid else None
             )

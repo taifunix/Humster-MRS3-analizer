@@ -78,3 +78,16 @@ def test_health_errors_after_prolonged_missing_valid_data(tmp_path: Path, monkey
         book_diagnostics={"ETHUSDT": {"book_synchronized": False}},
     )
     assert snapshot["status"] == "ERROR"
+
+
+def test_health_marks_accelerated_smoke_mode(tmp_path: Path, monkeypatch) -> None:
+    monitor = HealthMonitor(
+        tmp_path,
+        started_at_ms=0,
+        runtime_mode="smoke_test",
+        accelerated_clock=True,
+    )
+    monkeypatch.setattr("mrs3.bybit_collector.health.shutil.disk_usage", lambda _: (0, 0, 20 * 1024**3))
+    snapshot = monitor.update(1, connected=False)
+    assert snapshot["runtime_mode"] == "smoke_test"
+    assert snapshot["accelerated_clock"] is True

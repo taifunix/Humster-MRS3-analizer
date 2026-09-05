@@ -38,9 +38,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return 2
     try:
+        accelerated_clock = getattr(args, "test_export_minutes", None) is not None
         clock = _logical_clock(
             _test_clock_scale(args.test_export_minutes)
-            if getattr(args, "test_export_minutes", None) is not None
+            if accelerated_clock
             else 1.0
         )
     except ValueError as exc:
@@ -80,7 +81,13 @@ def main(argv: list[str] | None = None) -> int:
             exporter=exporter,
             reference_callback=collect_reference,
         )
-        monitor = HealthMonitor(config.storage_root, collector_version="0.7.0")
+        monitor = HealthMonitor(
+            config.storage_root,
+            collector_version="0.7.0",
+            started_at_ms=clock()[0],
+            runtime_mode="smoke_test" if accelerated_clock else "production",
+            accelerated_clock=accelerated_clock,
+        )
         stop = threading.Event()
         session = BybitWebSocketSession(config.symbols, _default_transport)
         thread = threading.Thread(

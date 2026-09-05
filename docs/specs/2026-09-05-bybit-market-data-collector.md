@@ -53,7 +53,9 @@ gap. `book_reset_count` increments once per accepted snapshot in that minute.
 
 RPI orders are absent from public orderbook. `depth_*` is visible API depth, not
 guaranteed full exchange liquidity. A complete ratio below one means the known
-1000 levels did not reach that bps boundary for part of the minute.
+1000 levels did not reach that bps boundary for part of the minute. The depth
+value remains the minimum observed depth within those available levels; it is
+not a claim that the full requested band was present.
 
 ## Sampling and liquidity_1m
 
@@ -80,8 +82,10 @@ Fixed column order: `minute_ts_ms` INT64, `symbol` UTF-8, `sample_count` INT16,
 `ws_connected_ratio` FLOAT64, `active_sample_target` INT16; nullable FLOAT64
 `mid_median`, `spread_bps_median`, `spread_bps_p95`, `spread_bps_max`; then for
 10/25/50/100 bps nullable FLOAT64 bid p05/median and ask p05/median USDT depth;
-then nullable FLOAT64 four band complete ratios. Required metadata:
-`schema_name=bybit_liquidity_1m`, `schema_version=1`, `exchange=bybit`,
+then nullable FLOAT64 bid, ask, and combined complete ratios for each band.
+The bid/ask ratios describe each side independently; the combined ratio is the
+share where both sides are complete. Required metadata:
+`schema_name=bybit_liquidity_1m`, `schema_version=2`, `exchange=bybit`,
 `category=linear`, `collector_version`, `created_at_utc`.
 
 Validator pins required metadata plus logical schema/order/types/nullability. It
@@ -156,8 +160,11 @@ exactly `run`, `validate-config`, `health`, `verify-archive`, each
 with `--config PATH`; verify is read-only. For disposable debugging only,
 `run --test-export-minutes N` scales the logical wall/monotonic clock so one
 production export cycle (one hour plus its 120-second eligibility delay) elapses
-in N real minutes. The default is unscaled; test mode keeps the production hourly
-schema/names and must not be used as production evidence. Existing advisory `OutputDirectoryLock`
+in N real minutes. Health marks this run as `runtime_mode=smoke_test` and
+`accelerated_clock=true`. Without the flag health uses `runtime_mode=production`
+and `accelerated_clock=false`; accelerated output is diagnostic and must not be
+used as production sampling evidence. The production hourly schema/names remain
+unchanged. Existing advisory `OutputDirectoryLock`
 owns a root (Windows byte lock/POSIX flock); live peer exits 3, stale filename is
 not a lock. Windows scripts create SYSTEM task `MRS_BybitMarketCollector` at boot
 with a 30-second delay, restart-on-failure, no limit/no parallel, and project `.venv`.
@@ -176,3 +183,8 @@ quarantine/late archive (retained spool + health), archive transaction machine
 Unchanged: data boundaries, minute schema, hot reload, health/CLI/Windows, RPI.
 Revision 2.1 additionally makes transport/data-health separation explicit and
 preserves initial snapshots received before the subscription ACK.
+Revision 2.2 (ADR-0027) labels accelerated smoke runs in health and clarifies
+incomplete depth semantics without changing the production schema or reference
+pipeline.
+Revision 2.3 (ADR-0028) adds side-specific depth completeness to schema version
+2 while retaining the combined completeness fields.

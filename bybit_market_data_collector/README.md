@@ -1,5 +1,19 @@
 # Bybit market-data collector
 
+## Runtime mode and depth semantics
+
+Normal runs publish `runtime_mode=production` and `accelerated_clock=false` in
+`health.json`. Runs using `--test-export-minutes` publish
+`runtime_mode=smoke_test` and `accelerated_clock=true`; their coverage is
+diagnostic and is not production acceptance evidence.
+
+For each band, `bid_depth_*bps_complete_ratio` and
+`ask_depth_*bps_complete_ratio` describe side-specific coverage;
+`depth_*bps_complete_ratio` remains their combined (both-sides) coverage. If a
+ratio is below 1, the corresponding depth value is the minimum observed
+available depth, not a claim of full exchange liquidity. New Parquet files use
+`schema_version=2`.
+
 Операционная папка для отдельного запуска сборщика. Реализация находится в
 `src/mrs3/bybit_collector`; данные не должны храниться в Git.
 

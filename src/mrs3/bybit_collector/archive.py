@@ -309,7 +309,7 @@ class HourlyExporter:
                 connection.executemany(f"INSERT INTO hourly VALUES ({placeholders})", values)
             metadata = {
                 "schema_name": "bybit_liquidity_1m",
-                "schema_version": "1",
+                "schema_version": "2",
                 "collector_version": self.collector_version,
                 "exchange": "bybit",
                 "category": "linear",
@@ -357,7 +357,7 @@ class HourlyExporter:
                 metadata.setdefault(str(key), []).append(str(value))
             required = {
                 "schema_name": "bybit_liquidity_1m",
-                "schema_version": "1",
+                "schema_version": "2",
                 "collector_version": None,
                 "exchange": "bybit",
                 "category": "linear",

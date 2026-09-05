@@ -59,7 +59,7 @@ def test_export_hour_publishes_valid_marker_authoritative_parquet(tmp_path: Path
                 ).fetchall()
             }
             assert metadata["schema_name"] == "bybit_liquidity_1m"
-            assert metadata["schema_version"] == "1"
+            assert metadata["schema_version"] == "2"
             assert metadata["collector_version"] == "test"
         finally:
             connection.close()
