@@ -81,8 +81,10 @@ def _text(item: Mapping[str, Any], *paths: str, default: str | None = None) -> s
     return value
 
 
-def _decimal(item: Mapping[str, Any], *paths: str) -> Decimal:
+def _decimal(item: Mapping[str, Any], *paths: str, empty_as_zero: bool = False) -> Decimal:
     value = _pick(item, *paths)
+    if empty_as_zero and value == "":
+        return Decimal("0")
     try:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError) as exc:
@@ -191,7 +193,7 @@ def _risk_limit(item: Any, symbol: str, captured_at_ms: int) -> dict[str, Any]:
         ),
         "initial_margin": _decimal(item, "initialMargin", "initial_margin"),
         "max_leverage": _decimal(item, "maxLeverage", "max_leverage"),
-        "mm_deduction": _decimal(item, "mmDeduction", "mm_deduction"),
+        "mm_deduction": _decimal(item, "mmDeduction", "mm_deduction", empty_as_zero=True),
         "is_lowest_risk": _boolean(item, "isLowestRisk", "is_lowest_risk"),
     }
 

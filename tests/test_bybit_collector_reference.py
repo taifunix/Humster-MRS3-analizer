@@ -44,7 +44,7 @@ def instrument(symbol: str, *, status: str = "Trading", tick_size: str = "0.1") 
     }
 
 
-def risk(symbol: str, *, risk_id: str = "1") -> dict:
+def risk(symbol: str, *, risk_id: str = "1", mm_deduction: str = "0") -> dict:
     return {
         "id": risk_id,
         "symbol": symbol,
@@ -52,7 +52,7 @@ def risk(symbol: str, *, risk_id: str = "1") -> dict:
         "maintenanceMargin": "0.005",
         "initialMargin": "0.01",
         "maxLeverage": "100",
-        "mmDeduction": "0",
+        "mmDeduction": mm_deduction,
         "isLowestRisk": 1,
     }
 
@@ -109,6 +109,18 @@ def test_rejects_malformed_rest_envelope(tmp_path: Path) -> None:
         ReferenceDataCollector(tmp_path, fetcher=fetcher).collect(
             ["BTCUSDT"], captured_at_ms=1_756_000_000_000
         )
+
+
+def test_normalizes_bybit_empty_risk_deduction_as_zero(tmp_path: Path) -> None:
+    def fetcher(feed: str, _params: dict[str, str]) -> dict:
+        return response([instrument("BTCUSDT")]) if feed == "instruments-info" else response(
+            [risk("BTCUSDT", mm_deduction="")]
+        )
+
+    result = ReferenceDataCollector(tmp_path, fetcher=fetcher).collect(
+        ["BTCUSDT"], captured_at_ms=1_756_000_000_000
+    )
+    assert result.risk_limits[0]["mm_deduction"] == Decimal("0")
 
 
 def test_saves_each_rest_response_as_gzip_json_without_sidecars(tmp_path: Path) -> None:
