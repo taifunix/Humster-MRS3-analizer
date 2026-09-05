@@ -6,12 +6,13 @@ import argparse
 from collections import deque
 import json
 import logging
+import math
 from pathlib import Path
 import sys
 import threading
 import time
 
-from .archive import HourlyExporter
+from .archive import EXPORT_CYCLE_MS, HourlyExporter
 from .config import ConfigError, ConfigManager
 from .health import HealthMonitor
 from .reference import ReferenceDataCollector
@@ -26,12 +27,23 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("run", "validate-config", "health", "verify-archive"):
         command = commands.add_parser(name)
         command.add_argument("--config", type=Path, required=True)
+        if name == "run":
+            command.add_argument("--test-export-minutes", type=float, default=None)
     args = parser.parse_args(argv)
     try:
         manager = ConfigManager(args.config)
         config = manager.active
         logging.basicConfig(level=getattr(logging, config.logging_level))
     except ConfigError as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+        return 2
+    try:
+        clock = _logical_clock(
+            _test_clock_scale(args.test_export_minutes)
+            if getattr(args, "test_export_minutes", None) is not None
+            else 1.0
+        )
+    except ValueError as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return 2
     if args.command == "validate-config":
@@ -87,9 +99,9 @@ def main(argv: list[str] | None = None) -> int:
             last_reload = 0
             runtime_errors: deque[str] = deque(maxlen=100)
             while not stop.is_set():
-                now_ms = int(time.time() * 1000)
+                now_ms, monotonic_ms = clock()
                 try:
-                    poll = runtime.poll(now_ms, time.monotonic_ns() // 1_000_000)
+                    poll = runtime.poll(now_ms, monotonic_ms)
                     runtime_errors.extend(poll.errors)
                 except Exception as exc:
                     runtime_errors.append(f"poll: {exc}")
@@ -166,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             stop.set()
             thread.join(timeout=5)
             try:
-                runtime.flush(int(time.time() * 1000))
+                runtime.flush(clock()[0])
             except Exception as exc:
                 print(json.dumps({"error": f"flush: {exc}"}, ensure_ascii=False))
     return exit_code
@@ -207,6 +219,26 @@ def _last_exported_date(spool: SQLiteSpool) -> str | None:
         if Path(marker.file_name).parent.name.startswith("date=")
     ]
     return max(dates) if dates else None
+
+
+def _test_clock_scale(real_minutes: float) -> float:
+    if isinstance(real_minutes, bool) or not math.isfinite(real_minutes) or real_minutes <= 0:
+        raise ValueError("test-export-minutes must be a positive finite number")
+    return EXPORT_CYCLE_MS / (real_minutes * 60_000)
+
+
+def _logical_clock(scale: float):
+    if scale == 1.0:
+        return lambda: (int(time.time() * 1000), time.monotonic_ns() // 1_000_000)
+    wall_start = int(time.time() * 1000)
+    monotonic_start = time.monotonic_ns() // 1_000_000
+
+    def read() -> tuple[int, int]:
+        elapsed = time.monotonic_ns() // 1_000_000 - monotonic_start
+        logical_elapsed = int(elapsed * scale)
+        return wall_start + logical_elapsed, monotonic_start + logical_elapsed
+
+    return read
 
 
 if __name__ == "__main__":

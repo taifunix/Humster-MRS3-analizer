@@ -17,14 +17,12 @@ inactive under the current PRD. Next: agree the proposals and remaining scope.
 
 ## Bybit collector current implementation status (2026-09-05)
 
-Phases 1-6 and the minimal operations/runtime surface are implemented in this
-isolated branch: strict config, RAM-only order books, scheduler/aggregation,
-SQLite WAL spool, hourly immutable Parquet, paginated reference data/raw gzip,
-  one-connection WebSocket protocol, runtime wiring, health/CLI, and Windows task
-  scripts. The focused collector suite currently contains 248 passing tests after
-  self-review. Remaining work is live integration/soak and Windows boot evidence;
-  no live credentials or generated
-market data are committed.
+Phases 1-6 and the minimal operations/runtime surface are implemented on `main`:
+strict config, RAM-only order books, scheduler/aggregation, SQLite WAL spool,
+hourly immutable Parquet, paginated reference data/raw gzip, one-connection
+WebSocket protocol, runtime wiring, health/CLI, and Windows task scripts. The
+focused collector suite contains 250 passing tests after self-review. No live
+credentials or generated market data are committed.
 
 Final implementation review disposition (2026-09-05): the restart-only storage
 root path now persists a visible health error, prints a diagnostic, and exits 3
@@ -41,6 +39,13 @@ pages and instruments/risk Parquet; a 95-second run reached `connected=true` and
 wrote minute rows; after forced stop, a 75-second restart reopened SQLite WAL,
 reached `connected=true`, continued rows, published an eligible hourly Parquet,
 and `verify-archive` returned `valid=true`. Generated smoke data is not tracked.
+
+Accelerated debug evidence (2026-09-05, isolated `.tmp` data root):
+`run --test-export-minutes 5` completed a five-real-minute public REST/WebSocket
+run. SQLite contains 144 minute rows (72 per BTCUSDT/ETHUSDT); one immutable
+hourly Parquet marker contains 62 rows (31 per symbol); health was `OK` with
+`late_rows=0`; `verify-archive` returned `valid=true`. The test flag scales only
+the process clock and is not production evidence.
 
 ## Bybit market-data collector Phase 1 started (2026-09-05)
 

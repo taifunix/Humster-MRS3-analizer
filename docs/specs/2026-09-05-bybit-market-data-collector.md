@@ -1,7 +1,6 @@
 # Bybit public market-data collector v1 — Revision 2
 
-**Status:** Approved implementation contract. Runtime is being delivered on
-`feat/bybit-market-data-collector`.
+**Status:** Approved implementation contract. Runtime is delivered on `main`.
 
 ## Boundary
 
@@ -148,7 +147,11 @@ and active symbols, last completed minute, last exported date, free disk/spool
 bytes, pending/late rows, connection state, and recent errors; late rows or
 errors set status `DEGRADED` when disk thresholds are normal. Future commands are
 exactly `run`, `validate-config`, `health`, `verify-archive`, each
-with `--config PATH`; verify is read-only. Existing advisory `OutputDirectoryLock`
+with `--config PATH`; verify is read-only. For disposable debugging only,
+`run --test-export-minutes N` scales the logical wall/monotonic clock so one
+production export cycle (one hour plus its 120-second eligibility delay) elapses
+in N real minutes. The default is unscaled; test mode keeps the production hourly
+schema/names and must not be used as production evidence. Existing advisory `OutputDirectoryLock`
 owns a root (Windows byte lock/POSIX flock); live peer exits 3, stale filename is
 not a lock. Windows scripts create SYSTEM task `MRS_BybitMarketCollector` at boot
 with a 30-second delay, restart-on-failure, no limit/no parallel, and project `.venv`.

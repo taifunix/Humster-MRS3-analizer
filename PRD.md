@@ -140,23 +140,14 @@ analysis runs и lineage согласно уже реализованной
 
 The approved [Revision 2 specification](docs/specs/2026-09-05-bybit-market-data-collector.md)
 is an active implementation contract for a public, no-key Bybit linear market-data
-collector. Phase 1 has started with strict UTF-8 TOML configuration: only
-`storage.root`, `symbols.items`, and `logging.level` are accepted; revisions are
-SHA-256 hashes of the exact file bytes; invalid reload candidates are rejected
-without changing the last accepted state; and a storage-root change is reported
-as restart-required while valid symbol/log changes are applied atomically.
-Bybit network validation and collector phases 6–9 remain pending. Phase 5
-hourly archive is implemented and verified in the collector worktree.
-
-Phase 3 (five-second UTC scheduling and `liquidity_1m` minute aggregation) is
-implemented and verified in the collector worktree. The scheduler reanchors on
-clock discontinuity without backfill; aggregation remains RAM-only and emits
-the fixed nullable schema from the specification. Phase 4 delivers only the
-SQLite spool and its `published_hours` marker index. Phase 5 adds immutable
-hourly Parquet export with DuckDB structural validation, same-directory
-no-clobber publication, marker-authoritative readers, and startup recovery;
-manifests, quarantine, archive state machines, reference data, operations,
-and integration phases remain pending.
+collector. The implementation is delivered on `main`: strict UTF-8 TOML
+configuration, five-second UTC scheduling and `liquidity_1m` aggregation, SQLite
+WAL spool, hourly immutable Parquet, paginated reference data/raw JSON.gz, one
+public linear WebSocket connection, symbol events, atomic health, CLI commands,
+and Windows task scripts. Only `storage.root`, `symbols.items`, and
+`logging.level` are accepted; revisions hash exact file bytes; invalid reload
+candidates are rejected without changing the last accepted state; and a storage
+root change is restart-only while valid symbol/log changes apply atomically.
 
 Phase 4 evidence covers the WAL/NORMAL SQLite spool, canonical minute JSON,
 first-winner duplicate/conflict handling, bounded BUSY/LOCKED retries, durable
@@ -167,15 +158,13 @@ delivered; those remain deferred.
 
 ### Bybit collector implementation status (2026-09-05)
 
-The isolated branch `feat/bybit-market-data-collector` now contains the approved
-collector runtime: strict config/hot reload, RAM-only books and five-second
-aggregation, SQLite WAL spool with marker index, hourly immutable Parquet,
-paginated reference data with raw JSON.gz and daily Parquet, one supported
-linear WebSocket connection, symbol events, atomic health, CLI commands, and
-Windows task scripts. Focused evidence is 248 passing tests plus module
-compilation and whitespace checks. A bounded public smoke and restart recovery
-run passed for BTCUSDT/ETHUSDT; long soak and Windows boot evidence remain pending;
-source metrics are not presented as MRS3 strategy results.
+Focused evidence is 250 passing tests plus module compilation and whitespace
+checks. Public REST/WebSocket smoke and restart recovery passed for
+BTCUSDT/ETHUSDT; a five-real-minute `--test-export-minutes 5` run produced 144
+SQLite minute rows and one valid hourly Parquet marker with 62 rows. Long soak
+and Windows boot evidence remain pending; source metrics are not presented as
+MRS3 strategy results. The test flag only accelerates the process clock and is
+not production evidence.
 ## Canonical Phase 1 status addendum (2026-08-17)
 
 Tasks 0–4 are complete and independently reviewed. Task 4 includes bounded

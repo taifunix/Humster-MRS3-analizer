@@ -18,6 +18,16 @@ Copy-Item bybit_market_data_collector/config.toml.example bybit_market_data_coll
 .\.venv\Scripts\python.exe -m mrs3.bybit_collector.cli validate-config --config .\bybit_market_data_collector\config.toml
 ```
 
+Для отладочного запуска, где один часовой цикл архивирования проходит за пять
+реальных минут, добавьте `--test-export-minutes 5` к команде `run`:
+
+```powershell
+.\.venv\Scripts\python.exe -m mrs3.bybit_collector.cli run --config .\bybit_market_data_collector\config.toml --test-export-minutes 5
+```
+
+Этот режим только ускоряет логические часы процесса; схема и имена часовых
+Parquet не меняются. Полученные данные являются диагностическими.
+
 Проверка состояния и архива:
 
 ```powershell

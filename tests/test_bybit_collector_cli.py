@@ -6,7 +6,10 @@ from pathlib import Path
 import subprocess
 import sys
 
-from mrs3.bybit_collector.cli import main
+import pytest
+
+from mrs3.bybit_collector.archive import EXPORT_CYCLE_MS
+from mrs3.bybit_collector.cli import _test_clock_scale, main
 
 
 def _config(tmp_path: Path) -> Path:
@@ -24,6 +27,17 @@ def test_validate_config_is_read_only(tmp_path: Path, capsys) -> None:
     config = _config(tmp_path)
     assert main(["validate-config", "--config", str(config)]) == 0
     assert "BTCUSDT" in capsys.readouterr().out
+
+
+def test_test_export_minutes_scales_one_cycle_to_requested_real_minutes() -> None:
+    assert _test_clock_scale(5.0) == pytest.approx(EXPORT_CYCLE_MS / 300_000)
+
+
+def test_test_export_minutes_requires_positive_finite_value() -> None:
+    with pytest.raises(ValueError):
+        _test_clock_scale(0.0)
+    with pytest.raises(ValueError):
+        _test_clock_scale(float("inf"))
 
 
 def test_cli_module_entrypoint_runs_validate_config(tmp_path: Path) -> None:
