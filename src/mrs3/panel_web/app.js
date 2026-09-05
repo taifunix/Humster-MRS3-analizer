@@ -1128,17 +1128,26 @@
     const option = surfaceSource.querySelector('option');
     if (option) option.textContent = 'Select a newly committed Source DB';
   }
-  const v2Cards = [...document.querySelectorAll('#strategies-dd5 > .panel-performance-v2')];
+  const v2CardOrder = ['performance-v2-window-card', 'performance-v2-retest-card', 'performance-v2-selection-card'];
+  const v2Cards = [...document.querySelectorAll('#strategies-dd5 > .panel-performance-v2')]
+    .sort((a, b) => v2CardOrder.indexOf(a.id) - v2CardOrder.indexOf(b.id));
   const strategyStack = document.querySelector('#strategies-dd5 .stack');
   v2Cards.forEach((card) => strategyStack?.append(card));
   const strategyCards = [...document.querySelectorAll('#strategies-dd5 .panel-card')].filter((card) => !card.classList.contains('panel-performance-v2'));
-  ['1. Analysis of published surface', '2. Shortlist and READY JSON', '3. Tester batch', '4. Inbox to Performance DB'].forEach((label, index) => {
+  ['1. Analysis of published surface', '2. Shortlist and READY JSON', '3. Test and Import to Performance DB'].forEach((label, index) => {
     const heading = strategyCards[index]?.querySelector('summary b');
     if (heading) heading.textContent = label;
   });
   let currentAnalysisId = '';
   let testerJobId = '';
   let testerPoller = 0;
+  let testerCommitted = false;
+  let normalInboxReady = false;
+  let normalImportAuthorized = false;
+  let authorizedTesterJobId = '';
+  let normalVerifyEpoch = 0;
+  let normalVerifyInFlight = false;
+  let normalImportInFlight = false;
   const setTesterReadyCount = (count) => {
     const badge = strategyCards[2]?.querySelector('summary .state-badge');
     if (!badge) return;
@@ -1360,7 +1369,7 @@
   const renderTester = (job) => {
     const p = job.progress || {};
     const total = Number(p.total || job.strategy_count || 0);
-    const singleMode = job.mode === 'SINGLE_MODE' || job.kind === 'strategies.tester.native.start' || (job.kind === 'strategies.tester.start' && job.request?.mode === 'SINGLE_MODE');
+    const singleMode = job.mode === 'SINGLE_MODE' || job.kind === 'strategies.tester.native.start' || job.kind === 'strategies.tester.start';
     const runs = false;
     const checked = Number(p.current || p.checked || 0);
     if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : (job.state === 'COMMITTED' ? '100%' : '0%');
@@ -1375,25 +1384,32 @@
       : runs
         ? `${stage} · reports ${checked}/${total}`
         : `${stage} · reports ${checked}/${total}`;
-    const ready = job.state === 'COMMITTED' && job.inbox_ready === true;
-    const canRebuildInbox = singleMode && job.state === 'COMMITTED';
-    inboxReadyV2 = ready;
+    const committed = singleMode && job.state === 'COMMITTED';
+    const ready = committed && job.inbox_ready === true;
+    normalInboxReady = ready;
+    if (testerIsTerminal(job) && !committed && job.job_id === testerJobId) {
+      normalImportAuthorized = false;
+      authorizedTesterJobId = '';
+    }
+    const importAllowed = normalImportAuthorized && authorizedTesterJobId === testerJobId && ready;
+    testerCommitted = committed;
     if (testerText) testerText.textContent = detail;
     if (testerStatus) {
       const error = job.error?.code ? ` ${job.error.code}: ${job.error.message || ''}` : '';
-      testerStatus.textContent = `${singleMode ? 'SINGLE_MODE' : 'Tester'}: ${detail}.${error}`;
+      const gate = committed ? (importAllowed ? 'CHECKED' : 'CHECK REQUIRED') : 'CHECK REQUIRED';
+      testerStatus.textContent = `${singleMode ? 'SINGLE_MODE' : 'Tester'}: ${detail} · ${gate}.${error}`;
     }
     if (testerStop) testerStop.disabled = !testerJobId || testerIsTerminal(job);
     setTesterControls(!testerIsTerminal(job));
-    if (inboxVerifyV2) inboxVerifyV2.disabled = !canRebuildInbox;
-    if (importStartV2) importStartV2.disabled = !ready;
-    if (importStatusV2) importStatusV2.textContent = ready
-      ? 'Performance v2: READY · metadata manifest captured.'
-      : 'Performance v2: waiting for inbox_ready=true.';
-    const badge = importStartV2?.closest('details')?.querySelector('summary .state-badge');
+    if (inboxVerifyV2) inboxVerifyV2.disabled = !committed || importAllowed;
+    if (importStartV2) importStartV2.disabled = !importAllowed;
+    if (importStatusV2 && !importJobV2) importStatusV2.textContent = ready
+      ? `Performance v2: ${importAllowed ? 'CHECKED · import enabled.' : 'CHECK REQUIRED · press Проверить to verify the committed inbox.'}`
+      : 'Performance v2: waiting for a committed tester inbox.';
+    const badge = testerCard?.querySelector('summary .state-badge');
     if (badge) {
-      badge.className = `state-badge ${ready ? 'state-ready' : 'state-pending'}`;
-      badge.textContent = ready ? 'READY' : 'WAITING';
+      badge.className = `state-badge ${importAllowed ? 'state-ready' : 'state-pending'}`;
+      badge.textContent = importAllowed ? 'CHECKED' : (committed ? 'CHECK REQUIRED' : 'WAITING');
     }
   };
   const pollTester = async () => {
@@ -1416,6 +1432,10 @@
     const endDate = testerEndDate?.value || '';
     if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Enter valid tester start and end dates.'; return; }
     if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Tester start date must not be after end date.'; return; }
+    normalImportAuthorized = false;
+    authorizedTesterJobId = '';
+    normalVerifyEpoch += 1;
+    testerCommitted = false;
     setTesterControls(true);
     try {
       const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId, start_date: startDate, end_date: endDate } });
@@ -1429,6 +1449,9 @@
   });
   if (testerStop) testerStop.addEventListener('click', async () => {
     if (!testerJobId) return;
+    normalImportAuthorized = false;
+    authorizedTesterJobId = '';
+    normalVerifyEpoch += 1;
     try {
       const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.cancel', request: { job_id: testerJobId } });
       renderTester(result.job || {});
@@ -1440,11 +1463,20 @@
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const testerJobs = [...jobs].reverse().filter((job) => job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester.native.start' || job.kind === 'strategies.tester');
-      const tester = testerJobs.find((job) => !testerIsTerminal(job) || (job.kind === 'strategies.tester.native.start' && job.state === 'COMMITTED') || (job.state === 'COMMITTED' && job.inbox_ready === true));
+      const testerJobs = jobs
+        .filter((job) => job.kind === 'strategies.tester.start' && job.retest !== true)
+        .filter((job) => Number.isFinite(Date.parse(job.created_at_utc)) && (
+          ['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)
+          || (job.state === 'COMMITTED' && job.inbox_ready === true)
+        ))
+        .sort((a, b) => Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)
+          || String(b.job_id).localeCompare(String(a.job_id)));
+      const tester = testerJobs[0];
       if (tester && typeof tester.job_id === 'string') {
         const job = tester;
         testerJobId = job.job_id;
+        normalImportAuthorized = false;
+        authorizedTesterJobId = '';
         renderTester(job);
         if (!testerIsTerminal(job)) { await pollTester(); startTesterPolling(1000); }
       }
@@ -1452,48 +1484,91 @@
   };
   const importStartV2 = document.querySelector('#performance-import-start');
   const inboxVerifyV2 = document.querySelector('#performance-inbox-verify');
-  const importStatusV2 = document.querySelector('#performance-import-status');
-  const importProgressV2 = document.querySelector('#performance-import-progress');
+  const importStatusV2 = testerStatus;
+  const importProgressV2 = testerText;
+  const importFailureV2 = document.createElement('a');
+  importFailureV2.hidden = true;
+  importFailureV2.textContent = 'Open failure report';
+  importStatusV2?.after(importFailureV2);
   let importJobV2 = '';
-  let inboxReadyV2 = false;
   if (inboxVerifyV2) inboxVerifyV2.disabled = true;
   if (importStartV2) importStartV2.disabled = true;
   const renderImportV2 = (job) => {
     const p = job.progress || {};
     const total = Number(p.total || 0);
     const current = Number(p.current || 0);
-    const track = document.querySelector('#performance-import-progress .progress-track span');
+    const track = testerTrack;
     if (track) {
       const done = job.state === 'COMMITTED';
       track.classList.toggle('is-running', !total && !done && !['FAILED', 'CANCELLED'].includes(job.state));
       track.style.width = done ? '100%' : (total ? `${Math.max(0, Math.min(100, current * 100 / total))}%` : '0%');
     }
-    if (importProgressV2) importProgressV2.textContent = `${job.phase || 'IMPORTING'} · ${current} / ${total} reports.`;
+    const failed = Array.isArray(job.evidence?.failed_names) ? job.evidence.failed_names.length : Number(p.failed || 0);
+    const detail = `${job.phase || job.state || 'IMPORTING'} · ${current} / ${total} reports · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}`;
+    if (importProgressV2) importProgressV2.textContent = detail;
     const result = job.result || {};
+    if (result.failure_report_available === true) {
+      importFailureV2.hidden = false;
+      importFailureV2.href = `/api/artifact?name=${encodeURIComponent(`performance-v2-failure-report:${importJobV2}`)}`;
+    }
     const warning = result.cleanup_warning || job.cleanup_warning;
     const warningText = warning && typeof warning === 'object'
       ? formatErrorReason({ code: warning.code, message: warning.message }, 'cleanup failed')
       : formatErrorReason(warning, '');
     const error = job.error ? ` ${formatErrorReason(job.error)}` : '';
+    const terminal = ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
+    if (terminal && job.job_id === importJobV2) {
+      normalImportInFlight = false;
+      normalImportAuthorized = false;
+      authorizedTesterJobId = '';
+      if (inboxVerifyV2) inboxVerifyV2.disabled = !testerCommitted;
+      if (importStartV2) importStartV2.disabled = true;
+    }
     if (importStatusV2) importStatusV2.textContent = job.state === 'COMMITTED'
-      ? `Performance v2: COMMITTED · imported ${result.imported_count || 0} · skipped ${result.skipped_count || 0} · rejected ${result.rejected_count || 0} · target ${result.database_path || '—'} · audit ${result.audit_path || '—'}.`
-      : `Performance v2: ${job.phase || job.state || 'RUNNING'}.${error}`;
+      ? `Performance v2: ${detail} · COMMITTED · imported ${result.imported_count || 0} · skipped ${result.skipped_count || 0} · rejected ${result.rejected_count || 0} · target ${result.database_path || '—'} · audit ${result.audit_path || '—'}.`
+      : `Performance v2: ${detail}.${error}`;
     if (warningText && importStatusV2 && job.state === 'COMMITTED') importStatusV2.textContent += ` Cleanup warning: ${warningText}.`;
   };
   inboxVerifyV2?.addEventListener('click', async () => {
-    if (!testerJobId) {
-      if (importStatusV2) importStatusV2.textContent = 'Проверка невозможна: tester job не найден.';
+    if (!testerJobId || !testerCommitted || normalVerifyInFlight) {
+      if (importStatusV2) importStatusV2.textContent = 'CHECK REQUIRED: a committed tester job is required before Проверить.';
       return;
     }
     inboxVerifyV2.disabled = true;
+    normalImportAuthorized = false;
+    authorizedTesterJobId = '';
+    const verifyJobId = testerJobId;
+    const verifyEpoch = ++normalVerifyEpoch;
+    normalVerifyInFlight = true;
     if (importStatusV2) importStatusV2.textContent = 'Проверка verified inbox…';
-    try { renderTester(await requestJson('/api/v2/strategies/tester/verify-inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: testerJobId }) })); }
-    catch (error) { if (importStatusV2) importStatusV2.textContent = `Проверка не выполнена: ${error?.message || 'unknown error'}.`; }
-    finally { inboxVerifyV2.disabled = !inboxReadyV2; }
+    try {
+      const verified = await requestJson('/api/v2/strategies/tester/verify-inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: verifyJobId }) });
+      if (verified?.state !== 'COMMITTED' || verified?.inbox_ready !== true) throw new Error('verified inbox is not ready');
+      if (verifyEpoch !== normalVerifyEpoch || verifyJobId !== testerJobId || !testerCommitted) return;
+      normalImportAuthorized = true;
+      authorizedTesterJobId = verifyJobId;
+      renderTester(verified);
+      if (importStatusV2) importStatusV2.textContent = 'CHECKED: committed inbox verified; import is enabled.';
+    } catch (error) {
+      if (importStatusV2) importStatusV2.textContent = `Проверка не выполнена: ${error?.message || 'unknown error'}.`;
+    }
+    finally {
+      normalVerifyInFlight = false;
+      const allowed = normalImportAuthorized && authorizedTesterJobId === testerJobId;
+      inboxVerifyV2.disabled = !testerCommitted || allowed;
+      if (importStartV2) importStartV2.disabled = !allowed;
+    }
   });
   importStartV2?.addEventListener('click', async () => {
-    if (!testerJobId) return;
+    if (!testerJobId || !testerCommitted || !normalInboxReady || normalImportInFlight || !normalImportAuthorized || authorizedTesterJobId !== testerJobId) {
+      if (importStatusV2) importStatusV2.textContent = 'CHECK REQUIRED: verify the committed tester inbox before import.';
+      return;
+    }
     importStartV2.disabled = true;
+    importFailureV2.hidden = true;
+    importFailureV2.removeAttribute('href');
+    normalImportInFlight = true;
+    window.clearInterval(testerPoller); testerPoller = 0;
     if (importStatusV2) importStatusV2.textContent = 'Импорт Performance v2…';
     try {
       const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.performance.v2.import', request: { tester_job_id: testerJobId } });
@@ -1509,10 +1584,11 @@
       };
       if (!(await poll())) { const timer = window.setInterval(async () => { if (await poll()) window.clearInterval(timer); }, 1000); }
     } catch (error) {
+      normalImportInFlight = false;
       const reason = formatErrorReason({ code: error?.code, message: error?.message });
       if (importStatusV2) importStatusV2.textContent = `Импорт Performance v2 не прошёл проверку: ${reason}.`;
     }
-    finally { importStartV2.disabled = !inboxReadyV2; }
+    finally { importStartV2.disabled = normalImportInFlight || !(normalImportAuthorized && authorizedTesterJobId === testerJobId && normalInboxReady); }
   });
   const recoverSplitJobs = async () => {
     try {
@@ -1574,6 +1650,7 @@
       renderRetestTester(job);
       return retestTerminal(job);
     } catch (error) {
+      normalImportInFlight = false;
       if (retestStatus) retestStatus.textContent = `RETEST status unavailable: ${error?.message || 'request failed'}.`;
       return false;
     }
@@ -1639,9 +1716,13 @@
           if (retestInboxReady) return;
           retestTesterJobId = '';
         } catch (error) {
-          if (retestStatus) retestStatus.textContent = `CHECK & RETEST: committed inbox is unavailable${error?.message ? ` · ${error.message}` : ''}.`;
-          retestStart.disabled = false;
-          return;
+          if (error?.code === 'RETEST_SOURCE_ARTIFACTS_UNAVAILABLE') {
+            if (retestStatus) retestStatus.textContent = 'CHECK & RETEST: source files are absent; starting a new RETEST.';
+          } else {
+            if (retestStatus) retestStatus.textContent = `CHECK & RETEST: committed inbox is unavailable${error?.message ? ` · ${error.message}` : ''}.`;
+            retestStart.disabled = false;
+            return;
+          }
         }
       }
       if (!validIsoDate(start) || !validIsoDate(end) || start >= end) { if (retestStatus) retestStatus.textContent = 'Enter valid RETEST dates with start before end.'; retestStart.disabled = false; return; }
@@ -1688,11 +1769,10 @@
   const performanceV2WindowResult = document.querySelector('#performance-v2-window-result');
   const performanceV2WindowStrategyDetails = document.querySelector('#performance-v2-window-strategy-details');
   const performanceV2SelectionCard = document.querySelector('#performance-v2-selection-card');
-  if (performanceV2WindowCard && performanceV2SelectionCard) performanceV2WindowCard.before(performanceV2SelectionCard);
   const performanceV2SelectionTitle = performanceV2SelectionCard?.querySelector('summary b');
   const performanceV2WindowTitle = performanceV2WindowCard?.querySelector('summary b');
-  if (performanceV2SelectionTitle) performanceV2SelectionTitle.textContent = '5. Парето и фильтры';
-  if (performanceV2WindowTitle) performanceV2WindowTitle.textContent = '6. A/B анализ Performance';
+  if (performanceV2SelectionTitle) performanceV2SelectionTitle.textContent = '6. Парето и фильтры';
+  if (performanceV2WindowTitle) performanceV2WindowTitle.textContent = '4. A/B анализ Performance';
   const performanceV2WindowStrategyField = performanceV2WindowSelect?.closest('.field-group');
   if (performanceV2WindowStrategyField && !document.querySelector('#performance-v2-window-pair')) {
     const filters = document.createElement('div');

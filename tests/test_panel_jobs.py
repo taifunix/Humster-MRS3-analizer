@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
 
 
@@ -67,3 +69,16 @@ def test_registry_syncs_worker_completion_and_keeps_runtime_private(tmp_path):
     assert saved["evidence"]["safe_to_delete"] == "YES"
     assert "runtime" not in saved
     assert PanelJobRegistry(tmp_path / "jobs.json").runtime("worker-job") == {"inbox_path": "private"}
+
+
+def test_registry_persists_creation_timestamp_for_restored_jobs(tmp_path):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    first = registry.submit("strategies.tester.native.start", {"retest": True}, "old", job_id="z-old")
+    second = registry.submit("strategies.tester.native.start", {"retest": True}, "new", job_id="a-new")
+
+    restored = PanelJobRegistry(path)
+
+    assert datetime.fromisoformat(first["created_at_utc"]) <= datetime.fromisoformat(second["created_at_utc"])
+    assert restored.get("z-old")["created_at_utc"] == first["created_at_utc"]
+    assert restored.get("a-new")["created_at_utc"] == second["created_at_utc"]

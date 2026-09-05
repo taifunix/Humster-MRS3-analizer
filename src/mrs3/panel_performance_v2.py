@@ -545,6 +545,21 @@ class LocalPerformanceV2Service:
             ),
             progress=import_progress,
         )
+        if imported.status == "FAILED":
+            return PerformanceV2PanelResult(
+                imported.import_id,
+                imported.status,
+                imported.imported_count,
+                imported.skipped_count,
+                imported.rejected_count,
+                Path(imported.database_path or performance_v2_database_path(request.config)).resolve(),
+                imported.audit_path,
+                0,
+                0,
+                0,
+                0,
+                failure_report_path=imported.failure_report_path,
+            )
         if not imported.committed or imported.database_path is None:
             raise ValueError("Performance v2 import did not commit")
         target = Path(imported.database_path).resolve()
@@ -692,12 +707,14 @@ class LocalPerformanceV2Jobs:
             "windows": list(result.windows),
             "cleanup_warning": result.cleanup_warning,
         }
+        succeeded = result.status == "COMMITTED"
+        completed = result.imported_count + result.skipped_count + result.rejected_count
         with self._lock:
             self._jobs[job_id].update(
-                state="COMMITTED",
-                phase="COMMITTED",
-                error=None,
-                progress={"current": result.result_count, "total": result.result_count, "unit": "reports"},
+                state="COMMITTED" if succeeded else "FAILED",
+                phase="COMMITTED" if succeeded else "FAILED",
+                error=None if succeeded else {"code": "PERFORMANCE_V2_IMPORT_REJECTED", "message": "all reports were rejected; open failure report"},
+                progress={"current": completed, "total": completed, "unit": "reports"},
                 result=result_document,
             )
             snapshot = dict(self._jobs[job_id])

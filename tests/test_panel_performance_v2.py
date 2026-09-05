@@ -20,7 +20,7 @@ from mrs3.performance_v2_store import (
     performance_v2_database_path,
 )
 from mrs3.panel import PanelController, create_panel_server
-from mrs3.performance_v2_import import PerformanceV2ImportError
+from mrs3.performance_v2_import import PerformanceV2ImportError, PerformanceV2ImportResult
 from mrs3.panel_performance_v2 import (
     PerformanceV2ApiError,
     PerformanceV2PanelRequest,
@@ -345,6 +345,41 @@ def test_v2_panel_service_falls_back_to_inbox_parent_for_legacy_listing_path(tmp
     assert result.imported_count == 2
 
 
+def test_v2_all_rejected_import_does_not_cleanup_tester_sources(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    reports = []
+    for index, name in enumerate(("P1", "P2")):
+        report = request.report_root / f"{name}.html"
+        report.write_text("<html>invalid</html>", encoding="utf-8")
+        manifest["entries"][index]["source_report_sha256"] = sha256(report.read_bytes()).hexdigest()
+        reports.append(report)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    request = replace(request, strategy_root=request.inbox / "strategies")
+
+    result = LocalPerformanceV2Service().run(request)
+
+    assert result.status == "FAILED"
+    assert result.imported_count == 0
+    assert result.rejected_count == 2
+    assert result.failure_report_path is not None and result.failure_report_path.is_file()
+    assert all(report.is_file() for report in reports)
+    assert (request.strategy_root / "P1.json").is_file()  # type: ignore[union-attr]
+
+
+def test_v2_failed_import_without_database_keeps_sources(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    result = LocalPerformanceV2Service(
+        import_func=lambda _request, **_kwargs: PerformanceV2ImportResult(
+            "failed", "FAILED", 0, 0, 1, None, None
+        )
+    ).run(request)
+
+    assert result.status == "FAILED"
+    assert (request.report_root / "P1.html").is_file()
+
+
 @pytest.mark.parametrize(
     "listing_path",
     [Path("../dates.xlsx"), Path("C:/absolute/dates.xlsx")],
@@ -400,7 +435,7 @@ def test_visible_performance_card_targets_only_v2_import_job_and_status() -> Non
     panel_web = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web"
     html = (panel_web / "index.html").read_text(encoding="utf-8")
     js = (panel_web / "app.js").read_text(encoding="utf-8")
-    card = html.split('class="panel-card accordion panel-performance-v2"', 1)[1].split("</details>", 1)[0]
+    card = html.split("3. Test and Import to Performance DB", 1)[1].split("</details>", 1)[0]
     handler = js.split("importStartV2?.addEventListener", 1)[1].split("const recoverSplitJobs", 1)[0]
     recovery = js.split("const recoverSplitJobs = async", 1)[1].split("const settingsStatus", 1)[0]
     v2_slice = js.split("const importStartV2", 1)[1].split("const settingsStatus", 1)[0]
@@ -437,19 +472,26 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
 
     request, _ = _request(tmp_path)
     config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps({"panel_paths": {"tester_report_dir": "wrong-reports"}}), encoding="utf-8")
+    config_path.write_text(json.dumps({
+        "panel_paths": {"tester_report_dir": "wrong-reports"},
+        "panel_workflow": {"listing_dates_path": "Input/dates.xlsx"},
+    }), encoding="utf-8")
     (tmp_path / "config.performance.json").write_text(
         json.dumps({"unified_performance_v2": {"database_root": "performance-v2", "workers": 1}}),
         encoding="utf-8",
     )
     monkeypatch.setattr(panel_module.RunnerConfig, "from_json", lambda _path: type("Runner", (), {"report_dir": request.report_root})())
     controller = PanelController(tmp_path, config_path)
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
     job = controller._panel_jobs.submit(
         "strategies.tester.start", {"mode": "SINGLE_MODE", "analysis_run_id": "a", "start_date": "2026-01-01", "end_date": "2026-01-09"},
         "tester-v2", ("strategies.tester",), job_id="tester-v2",
     )
     controller._panel_jobs.transition("tester-v2", "RUNNING")
-    controller._panel_jobs.sync("tester-v2", {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True}, runtime={"inbox_path": str(request.inbox)})
+    controller._panel_jobs.sync(
+        "tester-v2", {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={"inbox_path": str(request.inbox), "performance_v2_import_verified": True},
+    )
 
     with pytest.raises(ValueError, match="unsupported fields"):
         controller.panel_job_submit({
@@ -467,7 +509,6 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
             "tester_job_id": "tester-v2",
             "window_a": ["2026-01-01T00:00:00Z", "2026-01-09T00:00:00Z"],
             "window_b": ["2026-01-01T00:00:00Z", "2026-01-03T12:00:00Z"],
-            "listing_dates_path": "Input/dates.xlsx",
         },
     })
     v2_job_id = started["job_id"]
@@ -518,13 +559,14 @@ def test_v2_panel_controller_injects_server_owned_listing_root(tmp_path: Path, m
 
     request, _ = _request(tmp_path)
     config_path = tmp_path / "config.local.json"
-    config_path.write_text("{}", encoding="utf-8")
+    config_path.write_text(json.dumps({"panel_workflow": {"listing_dates_path": "input/dates.xlsx"}}), encoding="utf-8")
     (tmp_path / "config.performance.json").write_text(
         json.dumps({"unified_performance_v2": {"database_root": "performance-v2", "workers": 1}}),
         encoding="utf-8",
     )
     monkeypatch.setattr(panel_module.RunnerConfig, "from_json", lambda _path: type("Runner", (), {"report_dir": request.report_root})())
     controller = PanelController(tmp_path, config_path)
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
     controller._panel_jobs.submit(
         "strategies.tester.start", {"mode": "SINGLE_MODE"}, "tester-root", (), job_id="tester-root"
     )
@@ -532,7 +574,7 @@ def test_v2_panel_controller_injects_server_owned_listing_root(tmp_path: Path, m
     controller._panel_jobs.sync(
         "tester-root",
         {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
-        runtime={"inbox_path": str(request.inbox)},
+        runtime={"inbox_path": str(request.inbox), "performance_v2_import_verified": True},
     )
     captured: dict[str, object] = {}
 
@@ -542,11 +584,13 @@ def test_v2_panel_controller_injects_server_owned_listing_root(tmp_path: Path, m
             return {"job_id": job_id, "state": "COMMITTED"}
 
     controller._performance_v2_jobs = StubJobs()  # type: ignore[assignment]
-    controller.strategies_performance_v2_import(
-        {"tester_job_id": "tester-root", "listing_dates_path": "Input/dates.xlsx"}
-    )
+    controller.strategies_performance_v2_import({"tester_job_id": "tester-root"})
 
     assert captured["request"].listing_dates_root == tmp_path.resolve()  # type: ignore[union-attr]
+    assert captured["request"].listing_dates_path == Path("input/dates.xlsx")  # type: ignore[union-attr]
+    assert controller._panel_jobs.runtime("tester-root")["performance_v2_import_verified"] is False
+    with pytest.raises(ValueError, match="explicit inbox verification"):
+        controller.strategies_performance_v2_import({"tester_job_id": "tester-root"})
 
 
 def test_v2_panel_controller_rejects_committed_job_without_verified_inbox(tmp_path: Path) -> None:
@@ -559,6 +603,47 @@ def test_v2_panel_controller_rejects_committed_job_without_verified_inbox(tmp_pa
 
     with pytest.raises(ValueError, match="committed tester inbox"):
         controller.strategies_performance_v2_import({"tester_job_id": "tester"})
+
+
+def test_v2_panel_controller_requires_explicit_verify_before_import(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    controller._panel_jobs.submit(
+        "strategies.tester.start", {"mode": "SINGLE_MODE"}, "tester", (), job_id="tester"
+    )
+    controller._panel_jobs.transition("tester", "RUNNING")
+    controller._panel_jobs.sync(
+        "tester", {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={"inbox_path": str(tmp_path / "inbox" )},
+    )
+
+    with pytest.raises(ValueError, match="explicit inbox verification"):
+        controller.strategies_performance_v2_import({"tester_job_id": "tester"})
+
+
+def test_v2_failed_import_keeps_failure_report_available(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    job_id = "failed-import"
+    report = database.parent / "performance_v2_failures_failed.csv"
+    report.write_text("reason\nINVALID_REPORT\n", encoding="utf-8")
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, f"panel:{job_id}",
+        ("performance-v2-db",), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    document = {
+        "job_id": job_id,
+        "state": "FAILED",
+        "error": {"code": "PERFORMANCE_V2_IMPORT_FAILED", "message": "all reports rejected"},
+        "result": {
+            "status": "FAILED",
+            "imported_count": 0,
+            "rejected_count": 2,
+            "failure_report_path": str(report),
+        },
+    }
+    controller._record_special_job(document)
+
+    assert controller.artifact(f"performance-v2-failure-report:{job_id}") == report.resolve()
 
 
 def _controller_for_windows(tmp_path: Path) -> tuple[PanelController, Path, int]:

@@ -478,9 +478,8 @@ def test_committed_native_retest_verify_reuses_persisted_inbox_without_capture(
     monkeypatch.setattr(
         controller, "_single_mode_strategy_test", lambda: pytest.fail("committed RETEST must not load current tester state")
     )
-    monkeypatch.setattr(
-        controller, "_validate_metadata_inbox", lambda _inbox: pytest.fail("committed RETEST must not revalidate mutable source paths")
-    )
+    validated: list[Path] = []
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", validated.append)
 
     result = controller.strategies_tester_verify_inbox(tester_job_id)
 
@@ -490,6 +489,32 @@ def test_committed_native_retest_verify_reuses_persisted_inbox_without_capture(
     assert result["inbox_ready"] is True
     assert result["inbox_path"] == str(inbox.resolve())
     assert controller._panel_jobs.runtime(tester_job_id)["retest"] is True
+    assert validated == [inbox.resolve()]
+
+
+def test_committed_native_retest_verify_reports_missing_source_artifacts_for_fresh_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="verify-missing-sources")
+    inbox = Path(controller._panel_jobs.runtime(tester_job_id)["inbox_path"])
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        controller, "_single_mode_strategy_test", lambda: pytest.fail("missing source artifacts must not recapture")
+    )
+
+    with pytest.raises(PerformanceV2ApiError) as error:
+        controller.strategies_tester_verify_inbox(tester_job_id)
+
+    assert error.value.code == "RETEST_SOURCE_ARTIFACTS_UNAVAILABLE"
+    assert "source artifacts" in str(error.value)
 
 
 def test_committed_native_retest_verify_rejects_same_size_foreign_manifest_without_capture(
@@ -532,6 +557,10 @@ def test_committed_native_retest_verify_survives_restart_with_stale_tester_manif
     }), encoding="utf-8")
     report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
     report_dir.mkdir(parents=True)
+    strategy_dir = tmp_path / "bot" / "settings_strategy"
+    strategy_dir.mkdir(parents=True)
+    (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
+    (strategy_dir / "alpha.json").write_text("{}", encoding="utf-8")
     (report_dir / "tester_manifest.json").write_text(json.dumps({"job_id": "foreign-job", "phase": "COMMITTED"}), encoding="utf-8")
     restored = PanelController(tmp_path, tmp_path / "config.local.json")
     monkeypatch.setattr(

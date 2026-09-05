@@ -1785,15 +1785,24 @@ class PanelController:
                 saved_runtime = {}
             saved_runtime.update(runtime)
             runtime = saved_runtime
-        if tracked.get("kind") == "strategies.performance.v2.import" and document.get("state") == "COMMITTED":
+        if tracked.get("kind") == "strategies.performance.v2.import" and document.get("state") in {"COMMITTED", "FAILED"}:
             result = self._performance_v2_result_snapshot(document)
             if result:
                 public["result"] = result
             raw_report = document.get("result", {}).get("failure_report_path") if isinstance(document.get("result"), Mapping) else None
             if isinstance(raw_report, str) and raw_report:
                 runtime["failure_report_path"] = raw_report
-        if document.get("state") == "COMMITTED" and runtime:
-            public["inbox_ready"] = True
+            if document.get("state") == "COMMITTED" and runtime:
+                public["inbox_ready"] = True
+            request = tracked.get("request")
+            tester_job_id = request.get("tester_job_id") if isinstance(request, Mapping) else None
+            if isinstance(tester_job_id, str) and tester_job_id:
+                try:
+                    tester_runtime = self._panel_jobs.runtime(tester_job_id)
+                    tester_runtime["performance_v2_import_verified"] = False
+                    self._panel_jobs.sync(tester_job_id, {}, runtime=tester_runtime)
+                except PanelJobError:
+                    pass
         try:
             self._panel_jobs.sync(job_id, public, runtime=runtime or None)
         except PanelJobError:
@@ -2773,11 +2782,32 @@ class PanelController:
                     or len(set(expected)) != len(expected)
                     or set(entry_names) != set(expected)
                     or len(set(entry_names)) != len(entry_names)
+                    or any(
+                        not isinstance(entry, Mapping)
+                        or any(
+                            not isinstance(entry.get(field), str) or not entry[field].strip()
+                            for field in ("strategy_path", "report_path")
+                        )
+                        for entry in entries
+                    )
                     or ("batch_id" in manifest and manifest.get("batch_id") != job_id)
                 ):
                     raise ValueError("committed RETEST inbox manifest is invalid")
             except (OSError, RuntimeError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ValueError(str(error)) from None
+            try:
+                self._validate_metadata_inbox(inbox)
+            except ValueError as error:
+                if str(error) in {
+                    "metadata inbox is incomplete: strategy_path is missing",
+                    "metadata inbox is incomplete: report_path is missing",
+                }:
+                    raise PerformanceV2ApiError(
+                        "RETEST_SOURCE_ARTIFACTS_UNAVAILABLE",
+                        status=409,
+                        message="committed RETEST inbox source artifacts are unavailable",
+                    ) from error
+                raise
             self._strategy_batch_inboxes[job_id] = inbox
             status = self._panel_jobs.get(job_id)
             status["inbox_path"] = str(inbox)
@@ -2793,7 +2823,7 @@ class PanelController:
             )
             service.mark_inbox_ready(job_id, inbox)
             self._strategy_batch_inboxes[job_id] = inbox
-            runtime = {"inbox_path": str(inbox)}
+            runtime = {"inbox_path": str(inbox), "performance_v2_import_verified": True}
             state = self._panel_jobs.get(job_id)["state"]
             if state == "FAILED":
                 self._panel_jobs.recover_running(job_id)
@@ -3420,15 +3450,37 @@ class PanelController:
             key in payload for key in ("replacement_strategy_ids", "clear_retest_on_success", "_retest")
         ):
             raise ValueError("Performance v2 replacement controls are internal only")
+        if not _internal and payload.get("mode") == "REPLACE":
+            raise ValueError("Performance v2 REPLACE is internal only")
         tester_job_id = self._required(payload, "tester_job_id")
         tester_job = self._panel_jobs.get(tester_job_id)
         if tester_job.get("state") != "COMMITTED" or tester_job.get("inbox_ready") is not True:
             raise ValueError("Performance v2 import requires a committed tester inbox")
+        if not _internal and self._panel_jobs.runtime(tester_job_id).get("performance_v2_import_verified") is not True:
+            raise ValueError("Performance v2 import requires explicit inbox verification")
+        if not _internal:
+            try:
+                self._validate_metadata_inbox(self._tester_inbox(tester_job_id))
+            except ValueError as error:
+                raise PerformanceV2ApiError(
+                    "PERFORMANCE_V2_VERIFIED_INBOX_UNAVAILABLE",
+                    status=409,
+                    message="verified tester inbox is unavailable",
+                ) from error
+            with self._panel_jobs.lock:
+                current = self._panel_jobs.get(tester_job_id)
+                runtime = self._panel_jobs.runtime(tester_job_id)
+                if (
+                    current.get("state") != "COMMITTED"
+                    or current.get("inbox_ready") is not True
+                    or runtime.get("performance_v2_import_verified") is not True
+                ):
+                    raise ValueError("Performance v2 import requires explicit inbox verification")
+                runtime["performance_v2_import_verified"] = False
+                self._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
         mode = payload.get("mode", "ADD")
         if not isinstance(mode, str) or mode not in {"ADD", "REPLACE"}:
             raise ValueError("Performance v2 import mode must be ADD or REPLACE")
-        if not _internal and mode == "REPLACE":
-            raise ValueError("Performance v2 REPLACE is internal only")
         replacement = payload.get("replacement_strategy_ids")
         if replacement is not None and (
             not isinstance(replacement, Mapping)
@@ -3458,11 +3510,12 @@ class PanelController:
             )
         ):
             raise ValueError("test_start and test_end must be valid ISO dates")
-        listing_dates_path = payload.get("listing_dates_path")
-        if listing_dates_path is not None and (
-            not isinstance(listing_dates_path, str) or not listing_dates_path.strip()
-        ):
-            raise ValueError("listing_dates_path must be a relative path")
+        if payload.get("listing_dates_path") is not None:
+            raise ValueError("listing_dates_path is configured by the server")
+        try:
+            listing_dates_path = self._workflow_default("listing_dates_path").resolve().relative_to(self.root.resolve())
+        except ValueError:
+            raise ValueError("Performance v2 listing dates file is unavailable") from None
         if self._performance_v2_jobs is None:
             self._performance_v2_jobs = LocalPerformanceV2Jobs(on_update=self._record_special_job)
         performance_config = self._performance_v2_config()
@@ -3481,7 +3534,7 @@ class PanelController:
             clear_retest_on_success=clear_retest,
             test_start=test_start if isinstance(test_start, str) else None,
             test_end=test_end if isinstance(test_end, str) else None,
-            listing_dates_path=Path(listing_dates_path) if isinstance(listing_dates_path, str) else None,
+            listing_dates_path=listing_dates_path,
             listing_dates_root=self.root,
         )
         job_request = {"tester_job_id": tester_job_id, "mode": mode}
@@ -6138,7 +6191,7 @@ class PanelController:
     def performance_v2_failure_report(self, job_id: str) -> Path:
         try:
             job = self._panel_jobs.get(job_id)
-            if job.get("kind") != "strategies.performance.v2.import" or job.get("state") != "COMMITTED":
+            if job.get("kind") != "strategies.performance.v2.import" or job.get("state") not in {"COMMITTED", "FAILED"}:
                 raise ValueError("failure report is not available")
             runtime = self._panel_jobs.runtime(job_id)
             result = job.get("result")

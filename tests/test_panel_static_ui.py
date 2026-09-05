@@ -197,12 +197,37 @@ def test_performance_v2_handoff_exposes_ready_gated_controls() -> None:
     html = _read("index.html")
     js = _read("app.js")
 
+    card = html.split("3. Test and Import to Performance DB", 1)[1].split("</details>", 1)[0]
+    assert "Inbox → Performance DB" not in html
+    assert "Tester batch" not in html
     assert 'id="performance-inbox-verify"' in html
     assert 'id="performance-import-start"' in html
     assert 'id="performance-import-start" class="button button-primary" disabled' in html
-    assert "let inboxReadyV2 = false;" in js
-    assert "importStartV2.disabled = !inboxReadyV2" in js
+    rows = re.findall(r'<div class="button-row">(.*?)</div>', card, re.S)
+    actions = [row for row in rows if "shortlist-generate" in row or "performance-inbox-verify" in row]
+    assert len(actions) == 2
+    assert actions[0].index("shortlist-generate") < actions[0].index("tester-start") < actions[0].index("tester-stop")
+    assert actions[1].index("performance-inbox-verify") < actions[1].index("performance-import-start")
+    assert "let normalImportAuthorized = false;" in js
+    assert "normalImportAuthorized = true;" in js
+    assert "importStartV2.disabled = !ready" not in js
     assert "Cleanup warning" in js
+
+
+def test_normal_test_and_import_card_is_unified_and_numbered() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert html.count("performance-inbox-verify") == 1
+    assert html.count("performance-import-start") == 1
+    assert html.count("3. Test and Import to Performance DB") == 1
+    assert "4. A/B анализ Performance" in html
+    assert "5. CHECK &amp; RETEST" in html
+    card = html.split("3. Test and Import to Performance DB", 1)[1].split("</details>", 1)[0]
+    assert card.count('class="progress-block"') == 1
+    assert card.count('role="status"') == 1
+    assert "const v2CardOrder" in js
+    assert "performanceV2WindowTitle) performanceV2WindowTitle.textContent = '4. A/B" in js
 
 
 def test_performance_v2_retest_card_uses_server_mapping_and_committed_inbox_gate() -> None:
@@ -240,6 +265,7 @@ def test_retest_check_is_the_only_path_that_activates_a_recovered_job() -> None:
     assert "/api/v2/strategies/tester/verify-inbox" in check
     assert check.index("/api/v2/jobs") < check.index("/api/v2/strategies/tester/verify-inbox") < check.index("/api/v2/strategies/performance-v2/retest/start")
     assert "committed inbox is unavailable" in check
+    assert "RETEST_SOURCE_ARTIFACTS_UNAVAILABLE" in check
     assert "retestStart.disabled = false; return;" in check
     invalid_dates = next(line for line in check.splitlines() if "Enter valid RETEST dates" in line)
     assert "retestStart.disabled = false" in invalid_dates
@@ -558,6 +584,19 @@ def test_tester_card_exposes_single_mode_and_hides_fast_controls() -> None:
     assert "setTesterControls(!testerIsTerminal(job))" in js
 
 
+def test_normal_tester_jobs_default_to_single_mode_without_metadata() -> None:
+    js = _read("app.js")
+    render = js.split("const renderTester", 1)[1].split("const pollTester", 1)[0]
+
+    single_mode = re.search(r"const singleMode = ([^;]+);", render)
+    assert single_mode
+    assert "job.kind === 'strategies.tester.start'" in single_mode.group(1)
+    assert "job.request?.mode" not in single_mode.group(1)
+    assert "const committed = singleMode && job.state === 'COMMITTED';" in render
+    assert "const ready = committed && job.inbox_ready === true;" in render
+    assert "inboxVerifyV2.disabled = !committed || importAllowed;" in render
+
+
 def test_shortlist_active_selection_uses_ready_after_filters_without_http() -> None:
     html = _read("index.html")
     js = _read("app.js")
@@ -663,7 +702,7 @@ def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() 
     assert 'data-path-root="analysis_db_root"' in html
     assert "suggested_filename" in js
     assert "analysis_db_root" in js
-    assert "inboxReadyV2" in js
+    assert "normalImportAuthorized" in js
 
 
 def test_shortlist_has_one_grouped_renderer_and_shared_candidate_state() -> None:
@@ -722,8 +761,8 @@ def test_shared_request_json_and_job_recovery_keep_errors_and_busy_state_truthfu
     assert "const code = typeof result?.error === 'string'" in js
     assert "Backend connection unavailable." in js
     assert "const setTesterControls = (busy)" in js
-    assert "inboxReadyV2 = ready;" in js
-    assert "importStartV2.disabled = !inboxReadyV2;" in js
+    assert "testerCommitted = committed;" in js
+    assert "normalImportAuthorized = false;" in js
     assert "const recoverJobs = async () =>" in js
     assert "requestJson('/api/v2/jobs')" in js
     assert "recoverJobs();" in js
@@ -753,7 +792,7 @@ def test_shared_json_requests_fail_safely_and_busy_job_controls_cleanup() -> Non
     assert "finally" in js
     assert "setTesterControls(false)" in js
     assert "importStartV2.disabled = true" in js
-    assert "importStartV2.disabled = !inboxReadyV2" in js
+    assert "authorizedTesterJobId !== testerJobId" in js
 
 
 def test_reload_recovers_only_server_job_snapshots() -> None:
@@ -763,10 +802,10 @@ def test_reload_recovers_only_server_job_snapshots() -> None:
     recovery = js.split("const recoverJobs = async", 1)[1].split("const settingsStatus", 1)[0]
     assert "requestJson('/api/v2/jobs')" in recovery
     assert "job.kind === 'strategies.tester.start'" in recovery
-    assert "job.kind === 'strategies.tester.native.start'" in recovery
-    assert "job.kind === 'strategies.tester.native.start' && job.state === 'COMMITTED'" in recovery
-    assert "const tester = testerJobs.find" in recovery
-    assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
+    assert "job.kind === 'strategies.tester.start' && job.retest !== true" in recovery
+    assert "const tester = testerJobs[0];" in recovery
+    assert "normalImportAuthorized = false;" in recovery
+    assert "CHECK REQUIRED" in js
     assert "kind: 'strategies.tester.start'" in js
     assert "renderTester(job);" in recovery
     assert "renderPerformance(job)" not in recovery
@@ -774,15 +813,75 @@ def test_reload_recovers_only_server_job_snapshots() -> None:
     assert "recoverJobs();" in js
 
 
+def test_import_result_does_not_repeat_the_pre_import_gate() -> None:
+    js = _read("app.js")
+    assert "const renderImportV2" in js
+    assert "inboxVerifyV2?.addEventListener" in js
+    assert "const renderTester" in js
+    assert "const pollTester" in js
+    import_result = js.split("const renderImportV2", 1)[1].split("inboxVerifyV2?.addEventListener", 1)[0]
+
+    assert "CHECK REQUIRED before import" not in import_result
+    assert "gate" not in import_result
+    assert "CHECK REQUIRED" in js.split("const renderTester", 1)[1].split("const pollTester", 1)[0]
+
+
+def test_normal_recovery_uses_created_date_and_suitable_job_priority() -> None:
+    js = _read("app.js")
+    recovery = js.split("const recoverJobs = async", 1)[1].split("const importStartV2", 1)[0]
+
+    assert "job.kind === 'strategies.tester.start' && job.retest !== true" in recovery
+    assert "Number.isFinite(Date.parse(job.created_at_utc))" in recovery
+    assert "['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)" in recovery
+    assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
+    assert "Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)" in recovery
+    assert "String(b.job_id).localeCompare(String(a.job_id))" in recovery
+    assert "const tester = testerJobs[0];" in recovery
+    assert ".reverse()" not in recovery
+    assert "testerJobs.find((job) => !testerIsTerminal(job))" not in recovery
+    assert "job.state === 'FAILED'" not in recovery
+    assert "job.state === 'CANCELLED'" not in recovery
+
+
 def test_inbox_verify_does_not_fail_silently() -> None:
     js = _read("app.js")
-    handler = js.split("inboxVerifyV2?.addEventListener", 1)[1].split("const refreshPerformanceCatalog", 1)[0]
+    handler = js.split("inboxVerifyV2?.addEventListener", 1)[1].split("importStartV2?.addEventListener", 1)[0]
 
-    assert "if (!testerJobId) {" in handler
-    assert "tester job" in handler
+    assert "if (!testerJobId || !testerCommitted || normalVerifyInFlight) {" in handler
+    assert "committed tester job" in handler
     assert "verified inbox" in handler
+    assert "method: 'POST'" in handler
+    assert "verified?.inbox_ready !== true" in handler
+    assert "const verifyJobId = testerJobId;" in handler
+    assert "const verifyEpoch = ++normalVerifyEpoch;" in handler
+    assert "verifyEpoch !== normalVerifyEpoch || verifyJobId !== testerJobId || !testerCommitted" in handler
+    assert "strategies.tester.start" not in handler
+    assert "performance-v2/retest/start" not in handler
     assert "catch (error)" in handler
     assert "error?.message || 'unknown error'" in handler
+
+
+def test_normal_import_requires_a_fresh_check_after_terminal_import() -> None:
+    js = _read("app.js")
+    render = js.split("const renderImportV2", 1)[1].split("inboxVerifyV2?.addEventListener", 1)[0]
+    handler = js.split("importStartV2?.addEventListener", 1)[1].split("const recoverSplitJobs", 1)[0]
+
+    assert "if (terminal && job.job_id === importJobV2)" in render
+    assert "normalImportAuthorized = false;" in render
+    assert "authorizedTesterJobId = '';" in render
+    assert "importStartV2.disabled = true;" in render
+    assert "window.clearInterval(testerPoller); testerPoller = 0;" in handler
+    assert "!normalImportAuthorized || authorizedTesterJobId !== testerJobId" in handler
+    assert "performance-v2/retest" not in handler
+    assert "REPLACE" not in handler
+
+
+def test_terminal_tester_or_stale_verify_cannot_authorize_import() -> None:
+    js = _read("app.js")
+    render = js.split("const renderTester", 1)[1].split("const pollTester", 1)[0]
+
+    assert "testerIsTerminal(job) && !committed && job.job_id === testerJobId" in render
+    assert "normalVerifyEpoch += 1;" in js
 
 
 def test_performance_import_keeps_typed_backend_error_reason() -> None:
@@ -809,8 +908,9 @@ def test_performance_import_renders_the_existing_progress_bar() -> None:
     js = _read("app.js")
     render = js.split("const renderImportV2", 1)[1].split("inboxVerifyV2?.addEventListener", 1)[0]
 
-    assert "#performance-import-progress .progress-track span" in render
+    assert "const track = testerTrack;" in render
     assert "track.style.width" in render
+    assert "batch" in render and "retries" in render and "failed" in render
 
 
 def test_performance_v2_window_analysis_uses_native_utc_controls() -> None:
@@ -821,9 +921,10 @@ def test_performance_v2_window_analysis_uses_native_utc_controls() -> None:
     assert 'id="performance-v2-window-pair"' in js
     assert 'id="performance-v2-window-strategy-id"' in js
     assert 'id="performance-v2-window-finalists" type="checkbox" disabled' in js
-    assert "performanceV2WindowCard.before(performanceV2SelectionCard)" in js
-    assert "5. Парето и фильтры" in js
-    assert "6. A/B анализ Performance" in js
+    assert "const v2CardOrder" in js
+    assert "5. Парето и фильтры" not in js
+    assert "6. Парето и фильтры" in js
+    assert "4. A/B анализ Performance" in js
     assert "strategy.symbol === performanceV2WindowPair.value" in js
     assert "String(strategy.strategy_id).includes(query)" in js
     assert "strategy.is_latest_finalist" in js
