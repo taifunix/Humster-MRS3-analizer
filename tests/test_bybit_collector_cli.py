@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 from mrs3.bybit_collector.cli import main
 
@@ -21,6 +24,21 @@ def test_validate_config_is_read_only(tmp_path: Path, capsys) -> None:
     config = _config(tmp_path)
     assert main(["validate-config", "--config", str(config)]) == 0
     assert "BTCUSDT" in capsys.readouterr().out
+
+
+def test_cli_module_entrypoint_runs_validate_config(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    result = subprocess.run(
+        [sys.executable, "-m", "mrs3.bybit_collector.cli", "validate-config", "--config", str(config)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "BTCUSDT" in result.stdout
 
 
 def test_health_command_reads_existing_snapshot_without_overwriting(tmp_path: Path, capsys) -> None:

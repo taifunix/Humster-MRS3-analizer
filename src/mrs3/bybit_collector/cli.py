@@ -209,4 +209,8 @@ def _last_exported_date(spool: SQLiteSpool) -> str | None:
     return max(dates) if dates else None
 
 
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
 __all__ = ["main"]
