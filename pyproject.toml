@@ -18,9 +18,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3,<9"]
+collector = ["websocket-client>=1.8,<2"]
 
 [project.scripts]
 mrs3 = "mrs3.cli:main"
+bybit-market-collector = "mrs3.bybit_collector.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

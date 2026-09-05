@@ -1,0 +1,8 @@
+[storage]
+root = "../.tmp/bybit-market-data"
+
+[symbols]
+items = ["BTCUSDT", "ETHUSDT"]
+
+[logging]
+level = "INFO"
