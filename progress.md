@@ -9,7 +9,7 @@ Phases 1-6 and the minimal operations/runtime surface are implemented in this
 isolated branch: strict config, RAM-only order books, scheduler/aggregation,
 SQLite WAL spool, hourly immutable Parquet, paginated reference data/raw gzip,
   one-connection WebSocket protocol, runtime wiring, health/CLI, and Windows task
-  scripts. The focused collector suite currently contains 247 passing tests after
+  scripts. The focused collector suite currently contains 248 passing tests after
   self-review. Remaining work is live integration/soak and Windows boot evidence;
   no live credentials or generated
 market data are committed.
