@@ -1,16 +1,18 @@
 # Executable plan — Bybit market-data collector, Revision 2
 
-**Status:** Approved for implementation. No runtime changes now.
+**Status:** Approved executable plan; implementation in `feat/bybit-market-data-collector`.
 
 ## Documentation scope
 
-This revision edits only this plan, the paired
-[specification](../../specs/2026-09-05-bybit-market-data-collector.md), and
-[ADR-0024](../../decisions/0024-bybit-market-data-collector-archive.md). It does
-not edit code, dependencies, PRD, or progress because the worktree has unrelated
-user changes.
+The approved documentation contract is implemented incrementally in the isolated
+collector worktree. Each phase keeps its focused tests and review evidence in
+`progress.md`; unrelated user changes in the parent worktree remain untouched.
 
 ## Future delivery phases
+
+Implementation ledger (2026-09-05): phases 1-8 have their minimal runtime,
+tests, and operational scripts in the branch; phase 9 live integration/soak
+evidence remains before merge.
 
 1. **Configuration.** Narrow failing tests for the exact TOML, 30-second reload,
    restart-only root, and symbol isolation; then minimal configuration code.

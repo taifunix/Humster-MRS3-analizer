@@ -1,7 +1,98 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-04
-**Current branch:** `main`
+**Updated:** 2026-09-05
+**Current branch:** `feat/bybit-market-data-collector`
+
+## Bybit collector current implementation status (2026-09-05)
+
+Phases 1-6 and the minimal operations/runtime surface are implemented in this
+isolated branch: strict config, RAM-only order books, scheduler/aggregation,
+SQLite WAL spool, hourly immutable Parquet, paginated reference data/raw gzip,
+  one-connection WebSocket protocol, runtime wiring, health/CLI, and Windows task
+  scripts. The focused collector suite currently contains 246 passing tests after
+  self-review. Remaining work is live integration/soak and Windows boot evidence;
+  no live credentials or generated
+market data are committed.
+
+Final implementation review disposition (2026-09-05): the restart-only storage
+root path now persists a visible health error, prints a diagnostic, and exits 3
+so the Windows task restarts it. Independent review accepted the implementation;
+  self-review corrected the linear subscription topic to the supported
+  `orderbook.1000` depth and updated the focused protocol tests. Low-severity
+  follow-ups are deliberately deferred: half-open WS idle watchdog,
+snapshot ordering during multi-batch handshake, persisted reference baseline,
+reference page-count cap, and a lock around cross-thread book snapshots.
+
+## Bybit market-data collector Phase 1 started (2026-09-05)
+
+Implementation follows the approved [Bybit market-data collector Revision 2
+specification](docs/specs/2026-09-05-bybit-market-data-collector.md) and its
+[executable plan](docs/superpowers/plans/2026-09-05-bybit-market-data-collector.md).
+The new strict TOML configuration loader validates the exact three-section
+contract, resolves and checks the storage root relative to the config file, and
+hashes exact UTF-8 bytes. `ConfigManager.reload()` is all-or-nothing: invalid
+candidates preserve the accepted config; valid symbol/log changes report atomic
+added/removed/unchanged sets; and a changed root remains on the accepted active
+root while returning `restart_required`.
+
+Evidence: `.venv\\Scripts\\python.exe -m pytest
+tests/test_bybit_collector_config.py -q` — `36 passed` after the expected
+pre-implementation import failure. This is Phase 1 configuration evidence only;
+network validation and collector phases 4–9 remain pending.
+
+## Bybit market-data collector Phase 3 implemented (2026-09-05)
+
+The RAM-only minute aggregation slice now provides deterministic UTC five-second
+boundary scheduling with monotonic wait calculation, forward/backward clock and
+suspend reanchoring without backfill, and fixed-order `liquidity_1m` rows. It
+tracks active targets, attempted/valid/connected samples, reset attribution,
+nullable no-valid rows, interpolated p05/p50/p95 metrics, visible depth, and
+per-band completeness according to the approved specification.
+
+Evidence: `.venv\\Scripts\\python.exe -m pytest -q
+tests/test_bybit_collector_aggregation.py tests/test_bybit_collector_core.py
+tests/test_bybit_collector_config.py` — `115 passed`; collector modules also
+pass `py_compile` and `git diff --check`. SQLite spool is now implemented as
+Phase 4; archive, reference data, operations, and integration phases remain
+pending.
+
+## Bybit market-data collector Phase 4 implemented (2026-09-05)
+
+The SQLite spool persists only canonical `liquidity_1m` minute aggregates and
+the `published_hours` marker index under `storage.root/spool`. WAL/NORMAL
+settings, finite canonical JSON, first-winner duplicate/conflict policy,
+bounded BUSY/LOCKED retries, marker idempotency/conflict rejection, half-open
+hour reads, restart recovery, marker-only reader files, and the existing
+`OutputDirectoryLock` are covered by focused tests. WebSocket frames, books,
+and five-second samples remain RAM-only; Parquet export is deferred to Phase 5.
+
+Evidence: `.venv\\Scripts\\python.exe -m pytest -q
+tests/test_bybit_collector_storage.py tests/test_bybit_collector_aggregation.py
+tests/test_bybit_collector_core.py tests/test_bybit_collector_config.py` — `188
+passed`; collector modules pass `py_compile` and `git diff --check`. The phase
+delivers only the SQLite spool and `published_hours` marker index: no Parquet,
+manifests, quarantine, or archive state machine is delivered here.
+
+## Bybit market-data collector Phase 5 implemented (2026-09-05)
+
+Hourly export snapshots committed SQLite rows for an eligible UTC hour, writes
+DuckDB `COPY` Parquet with ZSTD metadata, fsyncs and structurally validates the
+temporary file, publishes with a same-directory no-clobber link, and commits
+`published_hours` last. Existing marked and unmarked finals are validated
+self-consistently, so late SQLite rows never rewrite or invalidate immutable
+archive files; only a fresh temporary file is compared with its SQLite
+snapshot. Verification reads only marker-listed files. Recovery removes only
+owned stale UUID scratch files, reports unlink/export errors, skips valid
+marked history, and bounds unmarked-hour reconciliation to the recent
+48-hour window; older unmarked files remain an operator-retention concern.
+
+Evidence: `.venv\\Scripts\\python.exe -m pytest -q
+tests/test_bybit_collector_archive.py tests/test_bybit_collector_storage.py
+tests/test_bybit_collector_aggregation.py tests/test_bybit_collector_core.py
+tests/test_bybit_collector_config.py` — `209 passed`;
+collector modules pass `py_compile` and
+`git diff --check` remain required before integration. Phases 6–9 remain
+pending.
 
 ## RETEST report-header retry fix (2026-09-04)
 

@@ -1,6 +1,7 @@
 # Bybit public market-data collector v1 — Revision 2
 
-**Status:** Approved for implementation. This is documentation only.
+**Status:** Approved implementation contract. Runtime is being delivered on
+`feat/bybit-market-data-collector`.
 
 ## Boundary
 
@@ -141,8 +142,12 @@ Times are INT64, text UTF-8, numbers DECIMAL(38,18), flag BOOLEAN; unknown field
 remain only raw.
 
 Every 10 minutes disk <10 GiB is WARNING, <2 GiB CRITICAL. Neither deletes data
-or disconnects WS. Atomic `status/health.json` updates every 60 seconds. Future
-commands are exactly `run`, `validate-config`, `health`, `verify-archive`, each
+or disconnects WS. Atomic `status/health.json` updates every 60 seconds. The
+snapshot includes collector/start/update timestamps, config revision, configured
+and active symbols, last completed minute, last exported date, free disk/spool
+bytes, pending/late rows, connection state, and recent errors; late rows or
+errors set status `DEGRADED` when disk thresholds are normal. Future commands are
+exactly `run`, `validate-config`, `health`, `verify-archive`, each
 with `--config PATH`; verify is read-only. Existing advisory `OutputDirectoryLock`
 owns a root (Windows byte lock/POSIX flock); live peer exits 3, stale filename is
 not a lock. Windows scripts create SYSTEM task `MRS_BybitMarketCollector` at boot
