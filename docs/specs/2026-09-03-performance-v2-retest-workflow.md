@@ -123,9 +123,8 @@ Time-consistency использует ту же календарную длит�
 четырёхоконные записи не использовались для этой логики. Новая задача не
 меняет схему БД и не удаляет старые cache rows.
 
-`src/mrs3/posttest.py` — устаревший legacy DD5 workflow и удаляется отдельной
-задачей вместе с его вызовами и тестами; v2 selection является единственным
-поддерживаемым контуром этого отбора.
+Legacy DD5 workflow `src/mrs3/posttest.py`, его вызовы и тесты удалены; v2
+selection — единственный поддерживаемый контур этого отбора.
 
 ### Listing-date warm-up and effective research window
 
@@ -161,6 +160,13 @@ and XLSX failure report with strategy identity, reported/effective ranges,
 listing provenance and reason; panel status exposes a safe link to it. Listing
 dates are read from configured `listing_dates_path` (normally `Input/dates.xlsx`),
 never from a hard-coded path.
+
+An import with at least one accepted strategy is `COMMITTED`, even when sibling
+reports are rejected; its failure report is retained. When every report is
+rejected and zero strategies are imported, the import is `FAILED` (with the
+typed public error `PERFORMANCE_V2_IMPORT_FAILED`), its database import run is
+never marked `COMMITTED`, no strategy rows are created, and the CSV/XLSX failure
+report remains available for download.
 
 The Performance import request/inbox contract therefore carries the configured
 listing-dates path, and the published result retains both ranges. Panel-originated
@@ -265,8 +271,18 @@ RETEST job; browser не является источником identity. Пер�
 проверяются RETEST-тег, current result и typed identity каждой строки.
 
 Весь пакет заменяется одной транзакцией. Ошибка одной стратегии откатывает
-пакет и сохраняет все RETEST-теги. После успешной замены старого current result,
-actions и equity для каждой строки её `RETEST` удаляется в той же транзакции.
+пакет и сохраняет все RETEST-теги. Для совместимости со схемой v4 текущая
+строка `strategy_results` обновляется на месте с сохранением её `result_id`, а
+её `strategy_actions`, `strategy_equity` и `window_metrics` удаляются и заново
+записываются только для этой стратегии. Другие строки и таблицы не
+перестраиваются. `strategies.current_result_id` остаётся тем же указателем,
+а `RETEST` удаляется в той же транзакции только после успешных readback.
+Новый отчёт обязан иметь те же pair/side/timeframe, Close MA, число ордеров,
+Open MA, shifts и lots. Его effective period считается после `listing + 5
+days`: допускается равный период либо период с более поздним концом и
+длительностью не меньше старой. Дата начала отчёта сама по себе не запрещает
+замену. Повреждённый отдельный отчёт получает `REJECTED` и не блокирует
+валидных siblings; противоречие identity в БД останавливает весь пакет.
 Новые Strategy ID не создаются. `REJECTED` и review history не меняются.
 
 ## Экран и состояния
@@ -279,6 +295,27 @@ actions и equity для каждой строки её `RETEST` удаляет�
 - общий progress bar и текущий этап;
 - completed/total, batch, active tester jobs, retries, failed names;
 - путь committed inbox и результат REPLACE.
+
+Обычный native `SINGLE_MODE` tester и обычный Performance DB import являются
+одним пользовательским контуром в карточке `3. Test and Import to Performance
+DB`. После дат и локальных range-shortcuts первый action-row содержит
+`Generate READY JSON`, `Launch SINGLE_MODE tester`, `Stop`; второй содержит
+`Проверить`, `Импортировать в Performance DB`. Отдельная карточка Inbox →
+Performance DB не используется. A/B получает номер `4`, RETEST сохраняет
+номер `5`.
+
+`Проверить` доступна только для текущего committed обычного tester job и
+выполняет только `POST /api/v2/strategies/tester/verify-inbox` с его job ID;
+она не запускает и не перезапускает tester. Успешная проверка должна вернуть
+`state=COMMITTED` и `inbox_ready=true`. Только после такой явной проверки в
+текущей загрузке страницы import разрешается для этого же job ID. Reload,
+восстановление jobs и одно лишь `inbox_ready=true` authorization не создают;
+новый tester job её сбрасывает и возвращает состояние `CHECK REQUIRED`.
+
+Обычный tester и import используют одну карточку и одну progress/status
+поверхность. Она показывает серверные phase, current/total, batch, retries,
+failed names и существующие error/commit details; timer-based progress не
+добавляется.
 
 Основные этапы: `READING_DB`, `GENERATING_JSON`, `VALIDATING_MANIFEST`,
 `UPDATING_TESTER_CONFIG`, `BOT_START`, `BOT_RUN`, `REPORT_COLLECTION`,
@@ -293,12 +330,15 @@ On panel load, no previous RETEST tester or import job is activated and
 `IMPORT & REPLACE` remains disabled. A previously committed native RETEST job
 may be shown as an unactivated candidate only. The explicit `CHECK & RETEST`
 action first queries the durable job registry. A committed native RETEST job
-with a safe persisted inbox and valid metadata manifest is reused directly,
+with a safe persisted inbox, valid metadata manifest, and current configured
+report/strategy artifacts is reused directly,
 without recapturing reports or starting the tester; a successful check
 activates the job and enables `IMPORT & REPLACE`. A committed job whose
 manifest is missing, malformed, or names another strategy set returns a
-deterministic check error and never falls through to a new tester run. Only
-when no reusable committed job exists are the current `ACTIVE` RETEST rows
+deterministic check error and never falls through to a new tester run. When the
+manifest is valid but its current report or strategy artifacts were removed,
+the candidate is not reusable and the check starts a new native run. Only when
+no reusable committed job exists are the current `ACTIVE` RETEST rows
 validated and the existing native `SINGLE_MODE` retest algorithm started.
 Candidates linked to a `COMMITTED` import are never reused; candidates linked
 to a retryable `FAILED` or `CANCELLED` import remain eligible.

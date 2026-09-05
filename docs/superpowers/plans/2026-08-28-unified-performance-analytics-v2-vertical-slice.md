@@ -38,7 +38,7 @@ RETEST, filters/Pareto, XLSX and Portfolio input remain explicitly deferred.
 ## Global Constraints
 
 - Use `ponytail:ponytail` at full level: no new dependency, no speculative abstraction, no second inbox or mode-specific manifest.
-- Do not modify `performance_store.py`, `performance_import.py`, `performance.py`, `performance_metrics.py`, or `performance_dd5.py`; `runner/inbox.py` is modified only for the metadata-only native handoff.
+- Do not modify the legacy v1 performance storage/import components; `runner/inbox.py` is modified only for the metadata-only native handoff.
 - Do not migrate or dual-read schema v1. Existing v1 code is a historical, untouched compatibility path.
 - Source inboxes are read-only during import. After a successful v2 DB commit, only the exact tester report and `Output/strategies` directories may be cleared; inbox metadata and v2 audit remain provenance.
 - The only v2 database is `<v2-owned-root>/strategy_performance.duckdb`; it has one writer.
@@ -54,7 +54,7 @@ RETEST, filters/Pareto, XLSX and Portfolio input remain explicitly deferred.
 **Files:**
 
 - Create: `docs/superpowers/plans/2026-08-28-unified-performance-analytics-v2-vertical-slice.md` (fill the evidence table below before Task 1)
-- Read only: `src/mrs3/performance_import.py`, `src/mrs3/panel_performance_dd5.py`, `config.performance.json`, `config.local.json.example`
+- Read only: `src/mrs3/performance_import.py`, `config.performance.json`, `config.local.json.example`
 
 **Stop condition:** Do not implement any v2 code while this gate is not `PASS`.
 
@@ -160,7 +160,7 @@ RETEST, filters/Pareto, XLSX and Portfolio input remain explicitly deferred.
 - [ ] **Step 6: Run storage and v1 non-disturbance checks.**
 
   ```powershell
-  .venv\Scripts\python.exe -m pytest -q tests/test_performance_v2_store.py tests/test_performance_import.py tests/test_panel_performance_dd5.py
+  .venv\Scripts\python.exe -m pytest -q tests/test_performance_v2_store.py tests/test_performance_import.py
   ```
 
 - [ ] **Step 7: Commit.**
@@ -344,7 +344,7 @@ RETEST, filters/Pareto, XLSX and Portfolio input remain explicitly deferred.
 - [ ] **Step 4: Verify and commit.**
 
   ```powershell
-  .venv\Scripts\python.exe -m pytest -q tests/test_panel_performance_v2.py tests/test_panel.py tests/test_panel_static_ui.py tests/test_integration_contract.py tests/test_panel_performance_dd5.py
+  .venv\Scripts\python.exe -m pytest -q tests/test_panel_performance_v2.py tests/test_panel.py tests/test_panel_static_ui.py tests/test_integration_contract.py
   node --check src/mrs3/panel_web/app.js
   git add src/mrs3/panel_performance_v2.py tests/test_panel_performance_v2.py src/mrs3/panel.py src/mrs3/panel_web/app.js src/mrs3/panel_web/index.html
   git commit -m "feat: expose unified performance v2 vertical slice"
@@ -366,7 +366,7 @@ RETEST, filters/Pareto, XLSX and Portfolio input remain explicitly deferred.
 - [ ] **Step 2: Prove v1 non-disturbance and panel syntax.**
 
   ```powershell
-  .venv\Scripts\python.exe -m pytest -q tests/test_performance.py tests/test_performance_store.py tests/test_performance_import.py tests/test_performance_metrics.py tests/test_performance_dd5.py tests/test_panel_performance_dd5.py tests/runner/test_inbox.py tests/test_panel.py tests/test_panel_static_ui.py tests/test_integration_contract.py
+  .venv\Scripts\python.exe -m pytest -q tests/test_performance.py tests/test_performance_store.py tests/test_performance_import.py tests/test_performance_metrics.py tests/runner/test_inbox.py tests/test_panel.py tests/test_panel_static_ui.py tests/test_integration_contract.py
   node --check src/mrs3/panel_web/app.js
   git diff --check
   ```

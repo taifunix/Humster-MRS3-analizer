@@ -1,7 +1,35 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-04
+**Updated:** 2026-09-05
 **Current branch:** `main`
+
+## Performance v2 import hardening and unified panel (2026-09-05)
+
+The normal tester and Performance DB import are one card. Import requires an
+explicit inbox check for the current `SINGLE_MODE` job. The server consumes that
+authorization atomically before dispatch, revalidates the metadata inbox, and
+uses only the configured listing-dates path. A terminal import requires a new
+check. All-rejected imports are `FAILED`, retain sources and expose the failure
+report; successful imports no longer display a post-import check warning.
+
+Evidence: importer/selection/windows/input `232 passed, 1 skipped`; panel
+`187 passed, 4 skipped`; `node --check`; `git diff --check`; independent Opus
+reviews returned `CODE_REVIEW_PASS` for both importer and panel scopes.
+
+## Performance v2 SHORT import and terminal status (2026-09-05)
+
+The normal `SINGLE_MODE` import resolves the project-configured listing dates
+when the browser does not send a path. A failed all-rejected import is `FAILED`,
+retains its failure report and tester sources, and never reports a false commit.
+The terminal `COMMITTED` message no longer appends `CHECK REQUIRED`: that gate
+exists only before import.
+
+Production evidence: the normal SHORT batch committed 321 of 321 reports with
+zero rejected entries. Database readback found 321 current strategy/results
+across eight symbols; all have listing-aware effective periods and warm-up
+provenance. Focused importer regressions: `20 passed`; focused panel failure
+and RETEST recovery regressions: `5 passed`; static panel checks: `68 passed`.
+The terminal-status change received external `CODE_REVIEW_PASS`.
 
 ## RETEST report-header retry fix (2026-09-04)
 
@@ -25,10 +53,14 @@ configured tester strategy directory, and project `Output/strategies` are
 emptied; failed imports leave these sources intact.
 After a panel restart, the previous RETEST job remains a candidate only;
 `CHECK & RETEST` must be pressed again. The check reuses a committed RETEST
-inbox with a safe, structurally valid metadata manifest without recapturing
-mutable tester state. A broken committed inbox reports a deterministic error;
-it never silently starts another native run. A new native run is started only
-when no reusable committed inbox exists.
+inbox with a safe, structurally valid metadata manifest and current configured
+report/strategy artifacts, without recapturing mutable tester state. A broken
+committed inbox reports a deterministic error; it never silently starts another
+native run. If the manifest is valid but its report or strategy files were
+removed, the inbox is not reusable and CHECK starts a new native run.
+RETEST replacement now updates the existing result row in place and replaces
+only that result's action, equity, and window child rows in one transaction;
+the obsolete full-table child rebuild is gone.
 
 ## Performance v2 selection review cleanup (2026-09-03)
 
@@ -1337,3 +1369,62 @@ server project root, with a safe inbox-parent compatibility fallback. Client
 payloads cannot provide the trusted root. Focused checks pass (`7 passed,
 2 skipped` for Windows symlink capability); full suite baseline was `2238
 passed, 3 skipped`. The scoped fix is committed.
+
+## Performance v2 typed-config dedup contract (2026-09-04)
+
+The active import contract now treats executable settings, not strategy names
+or analysis lineage, as the deduplication identity. The key includes Close MA,
+Open MA, shift and quantized `lot_x`; this preserves intentional EQUAL/INCOME
+variants. Effective coverage uses the configured listing date plus the existing
+five-day warm-up, symmetrically for new and legacy-null result provenance.
+Only a proper interval superset may replace a canonical result; equal, narrow
+or shifted intervals are skipped. The one-time production audit is dry-run by
+default and soft-discard is allowed only behind an explicit apply operation.
+
+Read-only baseline and post-implementation audit are recorded in the ignored
+artifact
+`data/performance-v2/typed-config-dedup-audit-20260904T064327Z.json`:
+7,904 apparent groups when `lot_x` is omitted (intentional EQUAL/INCOME
+pairs), zero exact full-key groups, zero unresolved effective intervals;
+16,272 strategies/results and 41,280 orders remain active, with 149 RETEST
+tags. All 16,272 active typed keys are computable with zero order-count
+mismatches. The importer and RETEST regression suites pass (92 tests), and the
+broader Performance v2 regression set passes (216 tests, 1 Windows symlink
+capability skip); no
+database mutation or duplicate cleanup was warranted.
+
+## Performance v2 lot-variant redundancy filter (2026-09-04)
+
+The selection pipeline now has a default-on `filter_lot_variant_redundancy`
+stage. It runs first, is fixed to `pair_side_timeframe`, and groups only
+identical executable settings with the same known effective comparison
+interval; order lots are intentionally excluded from the canonical key. The
+representative is chosen by `dd5_proxy` descending, `capital_proxy` ascending,
+`robust_pnl_30d_pct` descending, `worst_drawdown_pct` ascending,
+`profit_factor` descending, then `strategy_id` ascending. Missing or malformed
+intervals/metrics fail closed. Losers remain in All candidates as
+`FILTERED / LOT_VARIANT_REDUNDANT` with representative and group-key audit
+fields, and never reach later filters, Pareto or Top-N. Import and database
+rows are unchanged.
+
+The panel exposes the checked-by-default fixed-first stage and the persisted
+`lot_variant_redundancy_enabled` setting. The active specification is
+`docs/specs/2026-09-04-performance-v2-lot-variant-filter.md`.
+
+Evidence: `.venv\\Scripts\\python.exe -m pytest tests/test_performance_v2_selection.py
+tests/test_panel_static_ui.py tests/test_panel_performance_v2.py -q` —
+`200 passed`; broader Performance v2/panel set — `411 passed`; `node --check
+src/mrs3/panel_web/app.js`; `git diff --check`. External reviewer was
+unavailable by user instruction; root self-review covered the scoped diff and
+the fail-closed/default-order invariants.
+
+## Performance v2 targeted cache warming after RETEST (2026-09-04)
+
+Cache recalculation now resolves missing current `result_id` windows first and
+passes only those strategy IDs to the workers. Existing cached strategies in
+the same pair are no longer recalculated; the all-pairs action applies the same
+missing-ID selection per pair/side. The panel keeps the existing pair-level
+button, but its backend work is now incremental.
+
+Evidence: focused selection/panel/retest/review tests — `201 passed`; `node --check
+src/mrs3/panel_web/app.js`; `git diff --check`.

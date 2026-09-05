@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python standard library (`pathlib`, `subprocess`, `threading`), existing panel job registry, static HTML/CSS/JavaScript, pytest.
 
-**Spec:** `docs/specs/2026-08-24-panel-dd5-frontend-tuning.md`
+**Spec:** `docs/specs/2026-08-22-panel-static-frontend-v1.md`
 
 ## Global Constraints
 
@@ -81,7 +81,7 @@ git commit -m "feat: run tester snapshots from panel"
 **Files:**
 - Modify: `src/mrs3/panel_web/index.html`
 - Modify: `src/mrs3/panel_web/app.js`
-- Modify: `docs/specs/2026-08-24-panel-dd5-frontend-tuning.md`
+- Modify: `docs/specs/2026-08-22-panel-static-frontend-v1.md`
 - Test: `tests/test_panel_static_ui.py`
 
 **Interfaces:**
@@ -122,7 +122,7 @@ Expected: PASS and no JavaScript syntax error.
 Update the Tester batch contract with RUNS fixed report root, HTML-count progress, and shared lock; then:
 
 ```bash
-git add src/mrs3/panel_web/index.html src/mrs3/panel_web/app.js docs/specs/2026-08-24-panel-dd5-frontend-tuning.md tests/test_panel_static_ui.py
+git add src/mrs3/panel_web/index.html src/mrs3/panel_web/app.js docs/specs/2026-08-22-panel-static-frontend-v1.md tests/test_panel_static_ui.py
 git commit -m "feat: add tester runs controls"
 ```
 

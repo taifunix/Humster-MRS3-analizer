@@ -42,13 +42,13 @@
 
 ### Task 3: Structures-only shortlist, generation, and post-test — completed
 
-**Files:** `src/mrs3/fresh_analysis_strategies.py`, `src/mrs3/posttest.py`; tests `test_fresh_analysis_strategies.py`, `test_fresh_analysis_shortlist_groups.py`, `test_posttest.py`.
+**Files:** `src/mrs3/fresh_analysis_strategies.py`; post-test comparison was a historical downstream artifact. Tests: `test_fresh_analysis_strategies.py`, `test_fresh_analysis_shortlist_groups.py`.
 
 - [ ] Baseline then write red tests for BASE IDs/counts sourced only from `structures`, a BASE-only scope, no duplicate IDs, and no double-counting `base_one_order` evidence.
 - [ ] Implement removal of the separate base table/count pass. Derive all `1ORD..4ORD`, READY counts, and `candidate_ids` from `structures`.
 - [ ] Red then implement fresh provenance/variants with exactly the three diagnostics. Verify BASE produces one EQUAL strategy; a 2ORD regression produces both EQUAL and INCOME; events are absent from provenance.
 - [ ] Red then implement `_PLATEAU_DIAGNOSTIC_COLUMNS` in metadata extraction, variants whitelist, embedded settings fallback, and final comparison ordering. Verify scalars/lists remain unmodified.
-- [ ] Green: `.venv\Scripts\python.exe -m pytest -q tests/test_fresh_analysis_strategies.py tests/test_fresh_analysis_shortlist_groups.py tests/test_posttest.py --basetemp=.pytest-tmp-base1-t3-green`
+- [ ] Green: `.venv\Scripts\python.exe -m pytest -q tests/test_fresh_analysis_strategies.py tests/test_fresh_analysis_shortlist_groups.py --basetemp=.pytest-tmp-base1-t3-green`
 
 ### Task 4: Real evidence, review, docs, and commit — completed
 

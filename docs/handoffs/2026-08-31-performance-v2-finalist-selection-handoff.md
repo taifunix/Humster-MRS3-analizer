@@ -20,12 +20,11 @@ trace каждого кандидата → таблица панели и од�
 - В `index.html` уже есть статическая карточка «Pareto и фильтры»: она
   показывает предполагаемые stage/group controls, но `app.js` намеренно не
   вызывает endpoint selection. Это preview, а не реализация.
-- В v1 готова полезная алгоритмическая база:
-  `src/mrs3/posttest.py` и `tests/test_posttest.py` реализуют DD5 proxy,
-  holding evidence, global/scoped Pareto, детерминированный sequential
-  selection, причины исключения и XLSX. Это источник проверенных правил, но
-  не runtime для v2: v1 schema, pandas-таблицы и v1 DD5 runs нельзя
-  подключать к v2 или читать из него.
+- В v1 была полезная алгоритмическая база для DD5 proxy, holding evidence,
+  global/scoped Pareto, детерминированного sequential selection, причин
+  исключения и XLSX. Она остаётся только историческим источником проверенных
+  правил; v1 schema, pandas-таблицы и DD5 runs нельзя подключать к v2 или
+  читать из него.
 
 ## Источники истины и приоритет
 

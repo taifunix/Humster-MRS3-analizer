@@ -3,7 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-08-25
 **Depends on:** [event filter and shortlist](v07-event-filter-and-shortlist.md),
-[panel DD5 frontend tuning](2026-08-24-panel-dd5-frontend-tuning.md),
+[static panel frontend contract](2026-08-22-panel-static-frontend-v1.md),
 [BASE 1ORD selection](2026-08-24-base-1ord-selection.md)
 
 ## Goal
