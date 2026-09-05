@@ -201,11 +201,15 @@ def _typed_actions(
         balance = _decimal(row["Balance"], "Balance")
         size = _decimal(row["Size"], "Size")
         post_size = _decimal(row["Post Size"], "Post Size")
-        if post_size < 0:
-            raise PerformanceV2HtmlError("Post Size must not be negative")
         post_side = row["Post Side"].strip().casefold()
         if post_size != 0 and not post_side:
             raise PerformanceV2HtmlError("Post Side is required for non-zero Post Size")
+        if (post_size == 0 and post_side) or (post_size != 0 and (
+            post_side not in {"long", "short"}
+            or (post_size > 0 and post_side != "long")
+            or (post_size < 0 and post_side != "short")
+        )):
+            raise PerformanceV2HtmlError("Post Size sign is inconsistent with Post Side")
         result.append(
             ParsedPerformanceV2Action(
                 action_index,

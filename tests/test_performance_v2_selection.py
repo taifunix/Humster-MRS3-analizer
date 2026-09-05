@@ -475,6 +475,40 @@ def test_loader_derives_proxy_holding_and_order_plateau_counts(tmp_path: Path) -
     assert row["best_trade_reliable"]
 
 
+def test_signed_short_actions_feed_holding_and_best_trade_metrics(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    result_id = connection.execute("select result_id from strategy_results").fetchone()[0]
+    connection.execute("update strategies set side = 'SHORT'")
+    connection.execute(
+        "update strategy_actions set size = -1, post_size = -1, post_side = 'short' "
+        "where result_id = ? and action = 'opened'",
+        [result_id],
+    )
+    connection.execute(
+        "update strategy_actions set post_size = 0, post_side = '' where result_id = ? and action = 'closed'",
+        [result_id],
+    )
+    connection.executemany(
+        "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (result_id, 3, datetime(2026, 1, 25, tzinfo=UTC), "BTCUSDT", 1, "opened", -1, -1, "short", 0, 0, 110, None),
+            (result_id, 4, datetime(2026, 1, 26, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 5, 0, 115, None),
+        ],
+    )
+    try:
+        row = load_selection_candidates(
+            connection, parse_selection_request({"symbol": "BTCUSDT", "side": "SHORT", "stages": []})
+        ).iloc[0]
+    finally:
+        connection.close()
+
+    assert row["holding_p95_minutes"] == Decimal("1440")
+    assert row["ab_holding_p95_minutes"] == Decimal("1440")
+    assert row["best_trade_reliable"]
+    assert row["completed_profitable_trade_count"] == 2
+    assert row["pnl_without_best_trade"] == 5
+
+
 def test_best_trade_facts_with_no_profitable_trip_are_not_evaluable(tmp_path: Path) -> None:
     connection = _candidate_db(tmp_path)
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})

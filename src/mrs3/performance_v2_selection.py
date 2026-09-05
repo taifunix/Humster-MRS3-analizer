@@ -257,12 +257,12 @@ def _holding_quantiles_minutes(
                   where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
                     and lower(a.action) in ('opened', 'increased', 'decreased', 'closed')
              ), numbered as (
-                 select *, sum(case when kind = 'opened' and post_size > 0 and post_side in ('long', 'short') then 1 else 0 end)
+                 select *, sum(case when kind = 'opened' and post_size <> 0 and post_side in ('long', 'short') then 1 else 0 end)
                     over (partition by result_id order by timestamp_utc, action_index rows unbounded preceding) as position_number
                    from actions
              ), intervals as (
                  select result_id, position_number,
-                        min(timestamp_utc) filter (where kind = 'opened' and post_size > 0 and post_side in ('long', 'short')) as opened_at,
+                        min(timestamp_utc) filter (where kind = 'opened' and post_size <> 0 and post_side in ('long', 'short')) as opened_at,
                         min(timestamp_utc) filter (where kind = 'closed' and post_size = 0) as closed_at
                    from numbered
                   group by result_id, position_number
@@ -300,12 +300,12 @@ def _window_b_holding_p95_minutes(
                   where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
                     and lower(a.action) in ('opened', 'increased', 'decreased', 'closed')
              ), numbered as (
-                 select *, sum(case when kind = 'opened' and post_size > 0 and post_side in ('long', 'short') then 1 else 0 end)
+                 select *, sum(case when kind = 'opened' and post_size <> 0 and post_side in ('long', 'short') then 1 else 0 end)
                     over (partition by result_id order by timestamp_utc, action_index rows unbounded preceding) as position_number
                    from actions
              ), intervals as (
                  select result_id, position_number, min(b_start) as b_start, min(report_end_utc) as report_end_utc,
-                        min(timestamp_utc) filter (where kind = 'opened' and post_size > 0 and post_side in ('long', 'short')) as opened_at,
+                        min(timestamp_utc) filter (where kind = 'opened' and post_size <> 0 and post_side in ('long', 'short')) as opened_at,
                         min(timestamp_utc) filter (where kind = 'closed' and post_size = 0) as closed_at
                    from numbered group by result_id, position_number
              )
@@ -325,7 +325,7 @@ def _best_trade_facts(
         """with actions as (
                  select a.result_id, a.timestamp_utc, a.action_index, lower(a.action) as kind,
                         a.post_size, lower(a.post_side) as post_side, a.pnl, lower(s.side) as expected_side,
-                        case when a.post_size > 0 and lower(a.post_side) in ('long', 'short')
+                        case when a.post_size <> 0 and lower(a.post_side) in ('long', 'short')
                                   and lower(a.post_side) <> lower(s.side) then 1 else 0 end as side_flip
                    from strategy_actions a
                    join strategy_results r on r.result_id = a.result_id
@@ -333,7 +333,7 @@ def _best_trade_facts(
                   where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
                     and lower(a.action) in ('opened', 'increased', 'decreased', 'closed')
              ), numbered as (
-                 select *, sum(case when kind = 'opened' and post_size > 0 and post_side = expected_side then 1 else 0 end)
+                 select *, sum(case when kind = 'opened' and post_size <> 0 and post_side = expected_side then 1 else 0 end)
                     over (partition by result_id order by timestamp_utc, action_index rows unbounded preceding) as position_number
                    from actions
              ), trips as (

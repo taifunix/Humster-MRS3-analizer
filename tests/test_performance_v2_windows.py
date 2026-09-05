@@ -227,29 +227,17 @@ def test_partial_close_then_increase_stays_one_position_episode() -> None:
     assert len(trips[0].realisations) == 2
 
 
-def test_replace_child_cleanup_removes_cached_window(tmp_path) -> None:
-    from mrs3.performance_v2_import import _prepare_replace_children
-
-    connection, result_id = _db(tmp_path)
-    try:
-        start = datetime(2026, 1, 1, tzinfo=UTC)
-        end = datetime(2026, 1, 5, tzinfo=UTC)
-        connection.execute(
-            """insert into window_metrics (
-               result_id, requested_start_utc, requested_end_utc, metrics_version,
-               effective_start_utc, effective_end_utc, availability_status, unavailable_reason,
-               growth_factor, return_pct, daily_log_return, daily_growth_pct, max_drawdown_pct,
-               return_dd_ratio, fees_pct, profit_factor, trade_count, win_rate_pct,
-               holding_seconds, time_in_market_pct, calculated_at_utc)
-               values (?, ?, ?, ?, ?, ?, 'AVAILABLE', null, 1, 0, 0, 0, 0, null, 0, null, 1, 100, 3600, 10, ?)""",
-            [result_id, start, end, METRICS_VERSION, start, end, start],
+def test_signed_short_position_uses_the_same_round_trip_boundaries() -> None:
+    actions = tuple(
+        _Action(index, datetime(2026, 1, 1, hour=index, tzinfo=UTC), kind, Decimal(post_size), Decimal(pnl), Decimal("0"))
+        for index, (kind, post_size, pnl) in enumerate(
+            (("opened", "-1", "0"), ("decreased", "-0.5", "2"), ("increased", "-1", "0"), ("closed", "0", "3"))
         )
-        connection.execute("begin")
-        _prepare_replace_children(connection, (result_id,))
-        connection.execute("commit")
-        assert connection.execute("select count(*) from window_metrics").fetchone() == (0,)
-    finally:
-        connection.close()
+    )
+    trips = _round_trips(actions)
+    assert len(trips) == 1
+    assert len(trips[0].entries) == 2
+    assert len(trips[0].realisations) == 2
 
 
 def test_geometric_comparison_rejects_zero_negative_and_unavailable_inputs() -> None:

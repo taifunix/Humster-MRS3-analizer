@@ -38,9 +38,23 @@ def test_parser_accepts_only_the_current_typed_layout() -> None:
     assert parsed.actions[0].order_id == 1
     assert parsed.actions[0].fee == Decimal("0.05")
     assert parsed.actions[0].post_size == Decimal("1")
+    assert parsed.actions[1].post_size == Decimal("0")
     assert parsed.actions[1].post_side == ""
     assert parsed.wallet_series[0][0] == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert parsed.wallet_series[-1][1] == Decimal("1009.9")
+
+
+def test_parser_accepts_signed_short_post_size() -> None:
+    source = _current().replace(
+        b"<td>999.95</td><td>1</td><td>1</td><td>long</td>",
+        b"<td>999.95</td><td>1</td><td>-1</td><td>  SHORT  </td>",
+        1,
+    )
+
+    parsed = parse_current_performance_v2_html(source, _limits())
+
+    assert parsed.actions[0].post_size == Decimal("-1")
+    assert parsed.actions[0].post_side == "short"
 
 
 def test_parser_rejects_action_rows_incomplete_against_declared_transaction_count() -> None:
@@ -165,7 +179,11 @@ def test_parser_rejects_legacy_layout_even_when_v1_accepts_it() -> None:
     [
         (b"<td>1</td><td>opened</td>", b"<td>one</td><td>opened</td>", "integer"),
         (b"<td>0.05</td><td>0</td>", b"<td>NaN</td><td>0</td>", "finite"),
-        (b"<td>999.95</td><td>1</td><td>1</td><td>long</td>", b"<td>999.95</td><td>1</td><td>-1</td><td>long</td>", "Post Size.*negative"),
+        (b"<td>999.95</td><td>1</td><td>1</td><td>long</td>", b"<td>999.95</td><td>1</td><td>-1</td><td>long</td>", "Post Size.*inconsistent"),
+        (b"<td>999.95</td><td>1</td><td>1</td><td>long</td>", b"<td>999.95</td><td>1</td><td>1</td><td>short</td>", "Post Size.*inconsistent"),
+        (b"<td>999.95</td><td>1</td><td>1</td><td>long</td>", b"<td>999.95</td><td>1</td><td>1</td><td>hedge</td>", "Post Size.*inconsistent"),
+        (b"<td>999.95</td><td>1</td><td>1</td><td>long</td>", b"<td>999.95</td><td>1</td><td>-1</td><td></td>", "Post Side"),
+        (b"<td>0</td><td></td>", b"<td>0</td><td>long</td>", "Post Size.*inconsistent"),
         (b"<td>1</td><td>long</td>", b"<td>1</td><td></td>", "Post Side"),
         (b"<td>ONUSDT</td><td>1</td>", b"<td>BTCUSDT</td><td>1</td>", "symbol"),
     ],
