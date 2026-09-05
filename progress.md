@@ -9,7 +9,7 @@ Phases 1-6 and the minimal operations/runtime surface are implemented in this
 isolated branch: strict config, RAM-only order books, scheduler/aggregation,
 SQLite WAL spool, hourly immutable Parquet, paginated reference data/raw gzip,
   one-connection WebSocket protocol, runtime wiring, health/CLI, and Windows task
-  scripts. The focused collector suite currently contains 246 passing tests after
+  scripts. The focused collector suite currently contains 247 passing tests after
   self-review. Remaining work is live integration/soak and Windows boot evidence;
   no live credentials or generated
 market data are committed.
@@ -22,6 +22,13 @@ so the Windows task restarts it. Independent review accepted the implementation;
   follow-ups are deliberately deferred: half-open WS idle watchdog,
 snapshot ordering during multi-batch handshake, persisted reference baseline,
 reference page-count cap, and a lock around cross-thread book snapshots.
+
+Live smoke evidence (2026-09-05, isolated `.tmp` data root): public REST returned
+HTTP 200 for BTCUSDT/ETHUSDT; normalized reference output contained 4 raw gzip
+pages and instruments/risk Parquet; a 95-second run reached `connected=true` and
+wrote minute rows; after forced stop, a 75-second restart reopened SQLite WAL,
+reached `connected=true`, continued rows, published an eligible hourly Parquet,
+and `verify-archive` returned `valid=true`. Generated smoke data is not tracked.
 
 ## Bybit market-data collector Phase 1 started (2026-09-05)
 

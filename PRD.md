@@ -172,8 +172,9 @@ collector runtime: strict config/hot reload, RAM-only books and five-second
 aggregation, SQLite WAL spool with marker index, hourly immutable Parquet,
 paginated reference data with raw JSON.gz and daily Parquet, one supported
 linear WebSocket connection, symbol events, atomic health, CLI commands, and
-Windows task scripts. Focused evidence is 246 passing tests plus module
-compilation and whitespace checks. Live soak/boot evidence remains pending;
+Windows task scripts. Focused evidence is 247 passing tests plus module
+compilation and whitespace checks. A bounded public smoke and restart recovery
+run passed for BTCUSDT/ETHUSDT; long soak and Windows boot evidence remain pending;
 source metrics are not presented as MRS3 strategy results.
 ## Canonical Phase 1 status addendum (2026-08-17)
 
