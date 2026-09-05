@@ -74,6 +74,11 @@ class BybitWebSocketSession:
         transport = None
         try:
             transport = self.transport_factory()
+            if on_connect is not None:
+                # Bybit may deliver the initial snapshot before its subscribe
+                # acknowledgement. Mark the transport live first so the
+                # runtime does not invalidate that snapshot after applying it.
+                on_connect()
             with self._lock:
                 messages = self._messages
                 self._reconnect_requested = False
@@ -96,8 +101,6 @@ class BybitWebSocketSession:
                         break
                     if isinstance(ack, Mapping) and str(ack.get("topic", "")).startswith("orderbook."):
                         on_message(decode_orderbook_frame(ack))
-            if on_connect is not None:
-                on_connect()
             self._session_established = True
             last_ping = time.monotonic()
             while not _stopped(stop):

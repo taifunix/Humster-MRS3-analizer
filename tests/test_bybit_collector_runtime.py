@@ -60,6 +60,24 @@ def test_runtime_invalidates_all_books_on_connection_loss(tmp_path: Path) -> Non
     assert runtime.handle_ws_message(_snapshot(update_id=2))
 
 
+def test_runtime_tracks_book_and_valid_sample_diagnostics(tmp_path: Path) -> None:
+    runtime = CollectorRuntime(_config(tmp_path))
+    runtime.set_connected(True)
+    assert runtime.handle_ws_message(_snapshot(), event_ts_ms=123)
+    runtime.poll(0, 0)
+    runtime.poll(5_000, 5_000)
+
+    assert runtime.health_diagnostics(5_000) == {
+        "BTCUSDT": {
+            "book_synchronized": True,
+            "last_book_update_ms": 123,
+            "last_valid_sample_ms": 5_000,
+            "valid_sample_count_recent": 1,
+            "coverage_recent": 1.0,
+        }
+    }
+
+
 def test_runtime_ignores_malformed_ws_frames(tmp_path: Path) -> None:
     runtime = CollectorRuntime(_config(tmp_path))
 

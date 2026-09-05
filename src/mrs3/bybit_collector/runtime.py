@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from collections import deque
 import threading
+import time
 from typing import Any
 
 from .aggregation import FiveSecondScheduler, MarketSample, MinuteAggregator
@@ -62,6 +63,15 @@ class CollectorRuntime:
         self._reference_lock = threading.Lock()
         self._reference_errors: deque[str] = deque(maxlen=20)
         self._books_lock = threading.RLock()
+        self._last_book_update_ms: dict[str, int | None] = {
+            symbol: None for symbol in config.symbols
+        }
+        self._last_valid_sample_ms: dict[str, int | None] = {
+            symbol: None for symbol in config.symbols
+        }
+        self._recent_samples: dict[str, deque[tuple[int, bool]]] = {
+            symbol: deque() for symbol in config.symbols
+        }
 
     @property
     def connected(self) -> bool:
@@ -72,7 +82,9 @@ class CollectorRuntime:
     def last_completed_minute_ms(self) -> int | None:
         return max(self._finalized_minutes.values(), default=None)
 
-    def handle_ws_message(self, message: str | bytes | dict[str, Any]) -> bool:
+    def handle_ws_message(
+        self, message: str | bytes | dict[str, Any], *, event_ts_ms: int | None = None
+    ) -> bool:
         if isinstance(message, dict):
             frame = message
             if not isinstance(frame.get("topic"), str) or not str(frame["topic"]).startswith("orderbook."):
@@ -94,7 +106,13 @@ class CollectorRuntime:
             book = self.books.get(symbol)
         if book is None:
             return False
-        return book.apply_message(frame)
+        accepted = book.apply_message(frame)
+        if accepted:
+            with self._books_lock:
+                self._last_book_update_ms[symbol] = (
+                    int(time.time() * 1000) if event_ts_ms is None else event_ts_ms
+                )
+        return accepted
 
     def set_connected(self, connected: bool) -> None:
         connected = bool(connected)
@@ -129,12 +147,18 @@ class CollectorRuntime:
             with self._books_lock:
                 self.books.pop(symbol, None)
                 self._last_reset_counts.pop(symbol, None)
+                self._last_book_update_ms.pop(symbol, None)
+                self._last_valid_sample_ms.pop(symbol, None)
+                self._recent_samples.pop(symbol, None)
             if self.spool is not None:
                 self.spool.record_symbol_event(event_ts_ms, symbol, "removed", "config", config.config_revision)
         for symbol in sorted(current - previous):
             with self._books_lock:
                 self.books[symbol] = OrderBook(symbol)
                 self._last_reset_counts[symbol] = 0
+                self._last_book_update_ms[symbol] = None
+                self._last_valid_sample_ms[symbol] = None
+                self._recent_samples[symbol] = deque()
             if self.spool is not None:
                 self.spool.record_symbol_event(event_ts_ms, symbol, "added", "config", config.config_revision)
             with self._reference_lock:
@@ -181,16 +205,21 @@ class CollectorRuntime:
                 self._last_reset_counts[symbol] = reset_total
                 state = book.state()
                 try:
-                    aggregator.add_sample(
-                        MarketSample(
-                            local_timestamp_ms=boundary,
-                            bids=state.bids,
-                            asks=state.asks,
-                            book_valid=state.valid,
-                            ws_connected=self.connected,
-                            reset_count=reset_delta,
-                        )
+                    sample = MarketSample(
+                        local_timestamp_ms=boundary,
+                        bids=state.bids,
+                        asks=state.asks,
+                        book_valid=state.valid,
+                        ws_connected=self.connected,
+                        reset_count=reset_delta,
                     )
+                    valid_sample = aggregator.add_sample(sample)
+                    recent = self._recent_samples[symbol]
+                    recent.append((boundary, valid_sample))
+                    if valid_sample:
+                        self._last_valid_sample_ms[symbol] = boundary
+                    while recent and recent[0][0] < boundary - 5 * MINUTE_MS:
+                        recent.popleft()
                 except ValueError as exc:
                     errors.append(f"{symbol}@{boundary}: {exc}")
         if self.exporter is not None and (
@@ -229,6 +258,26 @@ class CollectorRuntime:
                 self._reference_errors.clear()
         duplicates = self._duplicate_rows - duplicates_before
         return RuntimePollResult(result, rows_written, duplicates, tuple(errors))
+
+    def health_diagnostics(self, now_ms: int) -> dict[str, dict[str, Any]]:
+        """Return current book and recent-sample state for the health snapshot."""
+
+        with self._books_lock:
+            symbols = tuple(self.books)
+            diagnostics: dict[str, dict[str, Any]] = {}
+            for symbol in symbols:
+                recent = self._recent_samples[symbol]
+                while recent and recent[0][0] < now_ms - 5 * MINUTE_MS:
+                    recent.popleft()
+                valid_count = sum(1 for _timestamp, valid in recent if valid)
+                diagnostics[symbol] = {
+                    "book_synchronized": self.books[symbol].valid,
+                    "last_book_update_ms": self._last_book_update_ms[symbol],
+                    "last_valid_sample_ms": self._last_valid_sample_ms[symbol],
+                    "valid_sample_count_recent": valid_count,
+                    "coverage_recent": valid_count / len(recent) if recent else 0.0,
+                }
+            return diagnostics
 
     def _reference_worker(self, symbols: tuple[str, ...], now_ms: int, day: str) -> None:
         try:

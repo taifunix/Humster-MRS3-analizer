@@ -368,7 +368,7 @@ class MinuteAggregator:
     def missed_boundary_count(self) -> int:
         return self._missed_boundary_count
 
-    def add_sample(self, sample: MarketSample) -> None:
+    def add_sample(self, sample: MarketSample) -> bool:
         if not isinstance(sample, MarketSample):
             raise ValueError("sample must be a MarketSample")
         reset_count = _nonnegative_count(sample.reset_count, "reset_count")
@@ -379,7 +379,7 @@ class MinuteAggregator:
         self._book_reset_count += reset_count
         book = _valid_book(sample)
         if book is None:
-            return
+            return False
         bids, asks, best_bid, best_ask = book
         self._valid_sample_count += 1
         mid = (best_bid + best_ask) / 2.0
@@ -393,6 +393,7 @@ class MinuteAggregator:
             self._depth[band]["ask"].append(ask_depth)
             if bid_complete and ask_complete:
                 self._complete[band] += 1
+        return True
 
     def record_boundary(self, sample: MarketSample | None) -> None:
         if sample is None:

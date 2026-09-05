@@ -43,3 +43,38 @@ def test_health_exposes_operator_fields_and_degrades_on_data_errors(tmp_path: Pa
     assert snapshot["last_completed_minute_ms"] == 0
     assert snapshot["last_exported_date"] == "2026-09-05"
     assert snapshot["free_disk_bytes"] == 20 * 1024**3
+
+
+def test_health_degrades_when_connected_without_synchronized_data(tmp_path: Path, monkeypatch) -> None:
+    monitor = HealthMonitor(tmp_path, started_at_ms=0)
+    monkeypatch.setattr("mrs3.bybit_collector.health.shutil.disk_usage", lambda _: (0, 0, 20 * 1024**3))
+    snapshot = monitor.update(
+        60_000,
+        connected=True,
+        active_symbols=("BTCUSDT",),
+        book_diagnostics={
+            "BTCUSDT": {
+                "book_synchronized": False,
+                "last_book_update_ms": None,
+                "last_valid_sample_ms": None,
+                "valid_sample_count_recent": 0,
+                "coverage_recent": 0.0,
+            }
+        },
+    )
+    assert snapshot["status"] == "DEGRADED"
+    assert snapshot["data_health"]["BTCUSDT"]["book_synchronized"] is False
+    assert snapshot["data_health"]["BTCUSDT"]["last_valid_sample_utc"] is None
+    assert snapshot["data_errors"] == ["BTCUSDT: no synchronized valid samples"]
+
+
+def test_health_errors_after_prolonged_missing_valid_data(tmp_path: Path, monkeypatch) -> None:
+    monitor = HealthMonitor(tmp_path, started_at_ms=0)
+    monkeypatch.setattr("mrs3.bybit_collector.health.shutil.disk_usage", lambda _: (0, 0, 20 * 1024**3))
+    snapshot = monitor.update(
+        5 * 60_000,
+        connected=True,
+        active_symbols=("ETHUSDT",),
+        book_diagnostics={"ETHUSDT": {"book_synchronized": False}},
+    )
+    assert snapshot["status"] == "ERROR"

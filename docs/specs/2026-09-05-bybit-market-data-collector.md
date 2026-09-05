@@ -37,6 +37,12 @@ reconnect loop operate for all symbols. No max-ten grouping, rebalance, or secon
 connection is v1 behavior. Multi-connection split is deferred until measured
 lag, dropped-frame, or reconnect evidence requires a new decision.
 
+The transport is reported connected immediately after the socket is created,
+before subscription acknowledgements are consumed, because Bybit may deliver an
+initial snapshot before the ACK. The runtime therefore applies that snapshot
+without invalidating it after the handshake; a reconnect still invalidates the
+book and requires a fresh snapshot.
+
 Snapshot replaces the RAM book; delta inserts/updates; quantity zero deletes.
 After accepted snapshot the book stays synchronised until explicit invalidation.
 Silence alone is not stale. Invalidation is disconnect/reconnect, ping failure,
@@ -156,9 +162,17 @@ owns a root (Windows byte lock/POSIX flock); live peer exits 3, stale filename i
 not a lock. Windows scripts create SYSTEM task `MRS_BybitMarketCollector` at boot
 with a 30-second delay, restart-on-failure, no limit/no parallel, and project `.venv`.
 
+Transport `connected=true` is not data health. After a 60-second startup grace,
+an active symbol without a synchronized book or valid sample makes health
+`DEGRADED`; after five minutes without a valid sample it makes health `ERROR`.
+Health exposes per-symbol `book_synchronized`, `last_book_update_utc`,
+`last_valid_sample_utc`, `valid_sample_count_recent`, and `coverage_recent`.
+
 ## Revision 2 changelog
 
 Removed: manifests/hashes/reconstruction (reader index + structural validator),
 quarantine/late archive (retained spool + health), archive transaction machine
 (one tmp/validate/no-clobber/marker flow), max-ten WS groups (one connection).
 Unchanged: data boundaries, minute schema, hot reload, health/CLI/Windows, RPI.
+Revision 2.1 additionally makes transport/data-health separation explicit and
+preserves initial snapshots received before the subscription ACK.

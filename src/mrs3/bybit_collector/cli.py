@@ -85,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         session = BybitWebSocketSession(config.symbols, _default_transport)
         thread = threading.Thread(
             target=session.run_forever,
-            args=(runtime.handle_ws_message,),
+            args=(lambda message: runtime.handle_ws_message(message, event_ts_ms=clock()[0]),),
             kwargs={
                 "stop": stop.is_set,
                 "on_connect": lambda: runtime.set_connected(True),
@@ -127,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
                                         active_symbols=tuple(runtime.books),
                                         last_completed_minute_ms=runtime.last_completed_minute_ms,
                                         last_exported_date=_last_exported_date(spool),
+                                        book_diagnostics=runtime.health_diagnostics(now_ms),
                                     )
                                 except Exception as exc:
                                     print(json.dumps({"error": f"health: {exc}"}), file=sys.stderr)
@@ -161,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
                             active_symbols=tuple(runtime.books),
                             last_completed_minute_ms=runtime.last_completed_minute_ms,
                             last_exported_date=_last_exported_date(spool),
+                            book_diagnostics=runtime.health_diagnostics(now_ms),
                         )
                         runtime_errors.clear()
                     except Exception as exc:

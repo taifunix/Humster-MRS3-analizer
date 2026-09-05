@@ -132,6 +132,49 @@ def test_session_handles_ping_pong_and_interleaved_data_before_subscribe_ack() -
     assert json.loads(transport.sent[1]) == {"op": "pong"}
 
 
+def test_session_reports_connected_before_handshake_data_is_delivered() -> None:
+    events: list[str] = []
+    stopped = False
+
+    class Transport:
+        def __init__(self) -> None:
+            self.frames = iter(
+                [
+                    json.dumps(
+                        {
+                            "topic": "orderbook.1000.BTCUSDT",
+                            "type": "snapshot",
+                            "data": {"s": "BTCUSDT", "u": 1, "b": [["100", "2"]], "a": [["101", "3"]]},
+                        }
+                    ),
+                    json.dumps({"op": "subscribe", "success": True}),
+                ]
+            )
+
+        def send(self, _payload: str) -> None:
+            pass
+
+        def recv(self, timeout: float = 1) -> str | None:
+            return next(self.frames)
+
+        def close(self) -> None:
+            pass
+
+    def on_message(_message: object) -> None:
+        nonlocal stopped
+        stopped = True
+        events.append("message")
+
+    BybitWebSocketSession(["BTCUSDT"], lambda: Transport()).run_once(
+        on_message,
+        stop=lambda: stopped,
+        on_connect=lambda: events.append("connect"),
+        on_disconnect=lambda: events.append("disconnect"),
+    )
+
+    assert events == ["connect", "message", "disconnect"]
+
+
 def test_session_reconnects_and_calls_lifecycle_callbacks() -> None:
     calls: list[str] = []
     attempts = 0
