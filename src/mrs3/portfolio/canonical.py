@@ -68,6 +68,14 @@ PORTFOLIO_REASON_V1 = frozenset(
         "LOCK_MANUAL_CLEAR",
     }
 )
+PORTFOLIO_REASON_V2 = PORTFOLIO_REASON_V1 | frozenset(
+    {
+        "INDIVIDUAL_DD_UNAVAILABLE",
+        "INDIVIDUAL_DD_LIMIT",
+        # Reserved for M5 applied-leverage readback; M4 has no verification gate.
+        "LEVERAGE_UNVERIFIED",
+    }
+)
 
 _ENUMS = {
     "portfolio_disposition_v1": PORTFOLIO_DISPOSITION_V1,
@@ -75,6 +83,7 @@ _ENUMS = {
     "portfolio_evidence_class_v1": PORTFOLIO_EVIDENCE_CLASS_V1,
     "portfolio_capability_result_v1": PORTFOLIO_CAPABILITY_RESULT_V1,
     "portfolio_reason_v1": PORTFOLIO_REASON_V1,
+    "portfolio_reason_v2": PORTFOLIO_REASON_V2,
 }
 
 _DECIMAL_ROUNDING_MODES = frozenset(

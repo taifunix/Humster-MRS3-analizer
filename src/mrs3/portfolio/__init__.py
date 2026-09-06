@@ -72,6 +72,23 @@ from .margin import (
     validate_applied_leverage,
     validate_quantity,
 )
+from .search import (
+    DirectionalSize,
+    ExcludedVariant,
+    IdentityResult,
+    PortfolioCandidate,
+    PairSlot,
+    REASON_ENUM_VERSION,
+    SchedulingKey,
+    SearchResult,
+    Variant,
+    build_pair_slots,
+    canonical_candidate_identity,
+    classify_identity,
+    enumerate_compositions,
+    search_portfolios,
+)
+from .render import RenderResult, render_portfolio, reverse_typed_compare
 
 __all__ = [
     "ALGORITHM_VERSIONS",
@@ -140,4 +157,21 @@ __all__ = [
     "symbol_conflicts",
     "validate_applied_leverage",
     "validate_quantity",
+    "DirectionalSize",
+    "ExcludedVariant",
+    "IdentityResult",
+    "PortfolioCandidate",
+    "PairSlot",
+    "REASON_ENUM_VERSION",
+    "SchedulingKey",
+    "SearchResult",
+    "Variant",
+    "build_pair_slots",
+    "enumerate_compositions",
+    "canonical_candidate_identity",
+    "classify_identity",
+    "search_portfolios",
+    "RenderResult",
+    "render_portfolio",
+    "reverse_typed_compare",
 ]

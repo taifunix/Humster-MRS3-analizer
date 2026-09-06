@@ -13,6 +13,8 @@ from mrs3.portfolio.disposition import (
     campaign_ready_allowed,
     dependent_evaluation_allowed,
     rules_for,
+    primary_reason,
+    status_for_reasons,
 )
 
 
@@ -185,3 +187,11 @@ def test_no_validation_pass_is_added_to_specific_invalid_trading_run_reason():
     assert tuple(item.value for item in applicable_reasons(rules)) == (
         "SEMANTIC_RESULT_DIVERGENCE", "NO_VALIDATION_PASS",
     )
+
+
+def test_reason_status_mapping_preserves_specific_failures_and_open_policy_precedence():
+    assert status_for_reasons(("VALIDATION_FAILED", "NO_VALIDATION_PASS")) == "FAIL"
+    assert status_for_reasons(("MARGIN_BOUND_UNAVAILABLE", "NO_VALIDATION_PASS")) == "UNKNOWN"
+    assert status_for_reasons(("VALIDATION_FAILED", "OPEN_POLICY")) == "OPEN_POLICY"
+    assert primary_reason(("VALIDATION_FAILED", "NO_VALIDATION_PASS")) == "VALIDATION_FAILED"
+    assert primary_reason(("VALIDATION_FAILED", "OPEN_POLICY")) == "OPEN_POLICY"

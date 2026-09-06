@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Iterable, Mapping
 
-from .canonical import TypedValue, enum_value
+from .canonical import PORTFOLIO_REASON_V1, PORTFOLIO_REASON_V2, TypedValue, enum_value
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,8 +38,55 @@ _DISPOSITION = "portfolio_disposition_v1"
 _GATE = "portfolio_gate_result_v1"
 _EVIDENCE = "portfolio_evidence_class_v1"
 _REASON = "portfolio_reason_v1"
+_REASON_V2 = "portfolio_reason_v2"
+
+REASON_ENUM_VERSION_V1 = _REASON
+REASON_ENUM_VERSION_V2 = _REASON_V2
+PORTFOLIO_REASON_CODES_V1 = PORTFOLIO_REASON_V1
+PORTFOLIO_REASON_CODES_V2 = PORTFOLIO_REASON_V2
+
+
+def reason_value(code: str, *, version: str = _REASON) -> TypedValue:
+    """Return a stable reason enum without changing the immutable v1 values."""
+
+    if version == _REASON:
+        if code not in PORTFOLIO_REASON_CODES_V1:
+            raise ValueError(f"unknown portfolio_reason_v1 code: {code}")
+        return enum_value(version, code)
+    if version == _REASON_V2 and code in PORTFOLIO_REASON_CODES_V2:
+        return enum_value(version, code)
+    raise ValueError(f"unknown portfolio reason code: {code}")
 
 OPEN_POLICY_CONDITIONS_V1 = ("mandatory_policy_open",)
+
+_UNKNOWN_REASONS = frozenset(
+    {"INDIVIDUAL_DD_UNAVAILABLE", "MARGIN_BOUND_UNAVAILABLE", "LIQUIDITY_MISSING", "NO_VALIDATION_PASS"}
+)
+
+
+def status_for_reasons(reasons: Iterable[str]) -> str:
+    """Return the deterministic gate status for all applicable reasons."""
+
+    values = tuple(reasons)
+    if "OPEN_POLICY" in values:
+        return "OPEN_POLICY"
+    if any(reason in (_UNKNOWN_REASONS - {"NO_VALIDATION_PASS"}) for reason in values):
+        return "UNKNOWN"
+    if "NO_VALIDATION_PASS" in values:
+        return "UNKNOWN" if len(values) == 1 else "FAIL"
+    return "FAIL"
+
+
+def primary_reason(reasons: Iterable[str]) -> str | None:
+    """Choose one stable representative without discarding other reasons."""
+
+    values = tuple(reasons)
+    if "OPEN_POLICY" in values:
+        return "OPEN_POLICY"
+    for reason in values:
+        if reason != "NO_VALIDATION_PASS":
+            return reason
+    return values[0] if values else None
 
 
 PORTFOLIO_DISPOSITION_RULES_V1: Mapping[str, DispositionRule] = MappingProxyType(
