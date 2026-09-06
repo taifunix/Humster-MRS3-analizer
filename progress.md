@@ -88,6 +88,21 @@ hourly Parquet marker contains 62 rows (31 per symbol); health was `OK` with
 `late_rows=0`; `verify-archive` returned `valid=true`. The test flag scales only
 the process clock and is not production evidence.
 
+Post-smoke hardening (2026-09-05) marks health explicitly as
+`runtime_mode=production|smoke_test` plus `accelerated_clock`. A two-minute
+real-clock sanity run for BTCUSDT/ETHUSDT produced one complete minute per
+symbol with `sample_count=12`, `valid_sample_count=12`, and `coverage_ratio=1.0`;
+partial edge minutes were expected at start/stop. Health ended as `OK`, both
+books were synchronized, `data_errors=[]`, and `verify-archive` returned
+`valid=true`. The full collector suite now passes `255` tests. The isolated
+production sanity data remains under `.tmp/bybit-production-sanity-20260905`.
+
+Depth completeness follow-up (2026-09-05): ADR-0028 extends
+`liquidity_1m` to schema version 2. Existing combined completeness ratios remain;
+each band now also stores independent bid and ask completeness ratios, so a
+one-sided orderbook limitation is visible to downstream consumers. The
+reference pipeline, retention, and five-second sampling cadence are unchanged.
+
 ## Bybit market-data collector Phase 1 started (2026-09-05)
 
 Implementation follows the approved [Bybit market-data collector Revision 2

@@ -191,13 +191,20 @@ delivered; those remain deferred.
 
 ### Bybit collector implementation status (2026-09-05)
 
-Focused evidence is 250 passing tests plus module compilation and whitespace
+Focused evidence is 255 passing tests plus module compilation and whitespace
 checks. Public REST/WebSocket smoke and restart recovery passed for
 BTCUSDT/ETHUSDT; a five-real-minute `--test-export-minutes 5` run produced 144
 SQLite minute rows and one valid hourly Parquet marker with 62 rows. Long soak
 and Windows boot evidence remain pending; source metrics are not presented as
 MRS3 strategy results. The test flag only accelerates the process clock and is
-not production evidence.
+not production evidence. The bugfix smoke then produced synchronized books for
+both symbols, `coverage_recent=1.0`, `valid_sample_count_recent=24`, health `OK`,
+and a valid `part-18.parquet` archive. A separate two-minute real-clock sanity
+run produced one complete minute per symbol with `sample_count=12`,
+`valid_sample_count=12`, `coverage_ratio=1.0`, and health markers
+`runtime_mode=production`, `accelerated_clock=false`.
+The liquidity schema now publishes side-specific bid/ask completeness ratios in
+schema version 2 while retaining the combined fields.
 ## Canonical Phase 1 status addendum (2026-08-17)
 
 Tasks 0–4 are complete and independently reviewed. Task 4 includes bounded
