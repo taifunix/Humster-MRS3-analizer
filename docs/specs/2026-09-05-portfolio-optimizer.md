@@ -18,10 +18,14 @@ runs остаются запрещены до M5 и отдельного раз�
 **Реализация:** M0 read-only inventory accepted after independent Opus
 `CODE_REVIEW_PASS`; fixture-only M1 implementation accepted after independent
 Opus `CODE_REVIEW_PASS`; fixture-only M2 liquidity/reference implementation accepted
-after independent Opus `CODE_REVIEW_PASS`. Runtime M3–M8 не начат. Запуск tester/bot не разрешён. Evidence:
+after independent Opus `CODE_REVIEW_PASS`. M3–M4 fixture-only implementations are
+accepted after independent Opus `CODE_REVIEW_PASS`; M5 выполняется только на
+fixtures/fakes, M6–M8 не начаты. Запуск tester/bot не разрешён. Evidence:
 [M0 capability inventory](../superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md),
 [M1 implementation evidence](../superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md),
-[M2 implementation evidence](../superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md).
+[M2 implementation evidence](../superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md),
+[M3 evidence](../superpowers/plans/2026-09-06-portfolio-optimizer-m3-evidence.md),
+[M4 evidence](../superpowers/plans/2026-09-06-portfolio-optimizer-m4-evidence.md).
 
 **Численные политики:** стартовые DD/free-margin/MM limits для исследования
 зафиксированы как `portfolio_optimizer_research_risk_v1` в §10.1. Минимальный PnL, liquidity/freshness и точный
@@ -1251,7 +1255,7 @@ ADR-0031 при любом конфликте о допуске, ликвидн�
 `PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED`; сокращённая форма не используется. Этап
 2 закрыт до принятых M5/M6 и отдельного явного разрешения. U0/U1 не меняют
 порядок M-задач: уже принятый M2 не зависел от UI,
-а M3 остаётся следующим серверным этапом. Готовность UI не закрывает
+а после независимой приёмки M3–M4 следующим серверным этапом остаётся M5. Готовность UI не закрывает
 PnL/liquidity/freshness/ranking policies и не разрешает tester, рекомендации,
 торговый допуск или live use.
 

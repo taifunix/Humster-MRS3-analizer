@@ -37,9 +37,12 @@ D7 UI-контракт не делает M3 зависимым от Panel и н�
 U1 требует отдельного назначения, а Stage 2 — M5/M6 и явного разрешения.
 При конфликте основная optimizer spec и ADR-0030 выше UI spec/ADR-0031 для
 `FINALIST`, liquidity, leverage, sizing и DD; D7 сохраняет эти правила D6.
-Для M3 implementation-сессии дополнительно читать M2 evidence
-`docs/superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md`; M0 handoff
-и M1 evidence остаются историческими evidence, не текущей инструкцией.
+Для M5 implementation-сессии дополнительно читать M3/M4 evidence
+`docs/superpowers/plans/2026-09-06-portfolio-optimizer-m3-evidence.md` и
+`docs/superpowers/plans/2026-09-06-portfolio-optimizer-m4-evidence.md`; M0–M2
+остаются историческими evidence, не текущей инструкцией. M3 и M4 accepted after
+independent `CODE_REVIEW_PASS`; M5 выполняется только на fixtures/fakes до
+отдельного разрешения real tester и принятого M6.
 
 Если пользователь пишет **«работаем над Анализатором Портфеля»** (или `Portfolio Analyzer`), это означает: после шагов 1–3 минимального контекста обязательно прочитать `docs/specs/2026-08-09-portfolio-analyzer-v04.md`, затем `docs/decisions/0001-repository-and-documentation-model.md`, затем только разделы 9–10 `docs/archive/sources/MRS3_v07_MASTER_HANDOFF_LEGACY_DUCKDB_2026-08-10.md`.
 

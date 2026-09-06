@@ -22,6 +22,12 @@ Fixture-only M2 exact-FINALIST admission, liquidity history/ceilings, typed exch
 reference, injected ticker snapshots and coarse capacity screen are accepted after
 independent Opus `CODE_REVIEW_PASS` in four rounds; evidence is in
 [the M2 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md).
+Fixture-only M3 margin/limiter and M4 proposal search/renderer are accepted after
+independent Opus `CODE_REVIEW_PASS`; evidence is in
+[the M3 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m3-evidence.md)
+and [the M4 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m4-evidence.md).
+Focused verification is `118 passed` for M3 and `66 passed` for M4. The combined
+M1–M4/collector/performance verification is `545 passed, 1 warning`.
 D5 records
 `portfolio_optimizer_research_risk_v1`
 research/calibration defaults: AGGRESSIVE DD/free-margin/MM 20%/20%/50%,
@@ -58,8 +64,8 @@ disabled Stage 2 boundary. The documentation update touches only the UI spec,
 ADR-0031, main spec/plan, PRD, progress and AGENTS; tests and runtime checks are
 not applicable. U1 code is not implemented or authorized, config schema v2 is
 not accepted, and Stage 2 remains blocked until M5/M6 plus explicit user
-authorization. M2 remains independent and accepted; M3 fixture-only
-margin/limiter TDD is still the next safe implementation step. No Panel API,
+authorization. M2 remains independent and accepted; M3–M4 are accepted and M5
+is the next server stage. No Panel API,
 UI, tester, bot, real database or generated workbook was run for U0.
 
 M0 read-only contract inventory is accepted after final independent Opus
@@ -78,8 +84,8 @@ transaction or stop without source writes. Current joint portfolio mode/report,
 dual-TF, limiter/priority, sizing, opposite-order, target-wide ownership,
 collateral reserve and shared-liquidity details remain capability blockers.
 No tester/bot, API, real DB/archive, runtime config or target write was used.
-Next safe step is M3 fixture-only margin/limiter TDD; real tester work remains blocked by M5
-ownership and separate user authorization.
+Next safe step is fixture/fake-only M5 ownership implementation. Real tester/bot
+execution requires accepted M5 and M6 plus separate explicit user authorization.
 
 ## Bybit collector current implementation status (2026-09-05)
 

@@ -305,37 +305,37 @@ symbol; changed composition; unbounded sizing envelope; tier boundary.
 
 **Spec:** §6.2, §7. **Зависимости:** M0–M2.
 
-- [ ] Реализовать pure state evaluator с position/order IM и MM компонентами.
-- [ ] Хранить denominator, fee/order-loss/haircut availability и модель guard.
-- [ ] Различать observed, calculated, conservative bound и unknown values.
-- [ ] После выбранного scalar определить notional/exposure и applicable tier,
+- [x] Реализовать pure state evaluator с position/order IM и MM компонентами.
+- [x] Хранить denominator, fee/order-loss/haircut availability и модель guard.
+- [x] Различать observed, calculated, conservative bound и unknown values.
+- [x] После выбранного scalar определить notional/exposure и applicable tier,
   взять maximum valid symbol-level leverage, округлить вниз по `leverage_step` и
   одинаково применить в renderer/test/guards/export. Historical individual
   leverage — provenance, не gate; unknown/non-convergent tier и конфликт одного
   symbol блокируют variant. Missing/mismatched applied leverage joint run делает
   весь TradingRun `NEEDS_RETEST`.
-- [ ] Quantity округлять вниз по `qtyStep`, никогда не вверх ради minimum;
+- [x] Quantity округлять вниз по `qtyStep`, никогда не вверх ради minimum;
   после rounding повторить minQty/minNotional/maxQty/geometry/liquidity/margin guards.
-- [ ] Ноль или нарушение minimum/immutable geometry отклоняет candidate с reason,
+- [x] Ноль или нарушение minimum/immutable geometry отклоняет candidate с reason,
   а не молча удаляет отдельный order.
-- [ ] Проверять dynamic base и B/max_balance recalculation.
-- [ ] Для backtest использовать exact MakerFee/TakerFee из tester manifest;
+- [x] Проверять dynamic base и B/max_balance recalculation.
+- [x] Для backtest использовать exact MakerFee/TakerFee из tester manifest;
   current deployment rates принимать только с provenance. UNKNOWN fee не равна нулю.
-- [ ] L=0 допускает все разрешённые pairs; L>0 считает non-flat symbol slots.
-- [ ] Priority=0 не занимает L и не отменяется limiter, но всегда входит в margin/liquidity.
-- [ ] Моделировать openings до L, pending cancel при L и восстановление после flat.
-- [ ] Оценивать L+1 и более, partial market closes и остающиеся orders до подтверждений.
-- [ ] Не считать исполненную часть одновременно position и full pending order.
-- [ ] Подтвердить произвольные partial states/order sequencing и same-symbol reserve.
-- [ ] Ограничить exact enumeration versioned config; при превышении считать
+- [x] L=0 допускает все разрешённые pairs; L>0 считает non-flat symbol slots.
+- [x] Priority=0 не занимает L и не отменяется limiter, но всегда входит в margin/liquidity.
+- [x] Моделировать openings до L, pending cancel при L и восстановление после flat.
+- [x] Оценивать L+1 и более, partial market closes и остающиеся orders до подтверждений.
+- [x] Не считать исполненную часть одновременно position и full pending order.
+- [x] Подтвердить произвольные partial states/order sequencing и same-symbol reserve.
+- [x] Ограничить exact enumeration versioned config; при превышении считать
   conservative all-executable bound для всех positions/orders, включая exempt,
   с worst applicable tier/price assumptions. Top-L shortcut запрещён.
-- [ ] Resource failure допустим только если нельзя посчитать даже этот bound.
-- [ ] Применять stable reasons spec §5.6; passing fallback хранит
+- [x] Resource failure допустим только если нельзя посчитать даже этот bound.
+- [x] Применять stable reasons spec §5.6; passing fallback хранит
   `CONSERVATIVE_BOUND/ENUMERATION_FALLBACK_USED`, candidate rejection не
   подменяет disposition всей Campaign.
-- [ ] Сохранить worst-case witness и не называть несинхронные maxima observed peak.
-- [ ] Диагностировать достаточность user deposit; minimum-deposit estimate
+- [x] Сохранить worst-case witness и не называть несинхронные maxima observed peak.
+- [x] Диагностировать достаточность user deposit; minimum-deposit estimate
   привязать к фиксированным абсолютным размерам, не к изменяемому percentage lot.
 
 **Acceptance tests:** L0/L1/ограниченный L; all-exempt/mixed/no-exempt;
@@ -353,29 +353,29 @@ Tester не используется как liquidation oracle. Неизвест
 
 **Spec:** §8.1–8.2. **Зависимости:** M1–M3.
 
-- [ ] Строить LONG-only, SHORT-only и BOTH PairSlot только из frozen exact
+- [x] Строить LONG-only, SHORT-only и BOTH PairSlot только из frozen exact
   `FINALIST` strategies; RESERVE/manual/missing status не имеют fallback.
-- [ ] Проверить dual-TF capability и совместимость общих runtime fields.
-- [ ] Сохранить dedicated close и явно выбранную opposite-order policy.
-- [ ] Масштабировать directional scalar, не изменяя internal lot_x/geometry.
-- [ ] Ограничивать scalar минимумом per-direction liquidity ceiling, margin/
+- [x] Проверить dual-TF capability и совместимость общих runtime fields.
+- [x] Сохранить dedicated close и явно выбранную opposite-order policy.
+- [x] Масштабировать directional scalar, не изменяя internal lot_x/geometry.
+- [x] Ограничивать scalar минимумом per-direction liquidity ceiling, margin/
   exchange limits и `dd_scalar_pct_max`; для последнего использовать current
   portfolio equity, а не start deposit, `max_balance` или MarginBalance. Missing
   D100/equity/currency/expiry даёт UNKNOWN; missing profile cap — OPEN_POLICY.
-- [ ] Генерировать один JSON на symbol, выполнять обратное typed comparison.
-- [ ] Не вводить фиксированный продуктовый лимит числа пар.
-- [ ] Предлагать composition, sizing, limiter и priority включая разрешённый 0.
-- [ ] Заморозить finite sizing grid в экспортируемых percentage units, version,
+- [x] Генерировать один JSON на symbol, выполнять обратное typed comparison.
+- [x] Не вводить фиксированный продуктовый лимит числа пар.
+- [x] Предлагать composition, sizing, limiter и priority включая разрешённый 0.
+- [x] Заморозить finite sizing grid в экспортируемых percentage units, version,
   порядок и ties; проверить каждую точку без early stop или monotonicity assumption.
-- [ ] Maximum выбирать только среди фактически прошедших точек.
-- [ ] Выполнять structural → liquidity → margin → individual-DD gates до отправки tester.
-- [ ] Фиксировать deterministic order, seed, hash и причины исключения.
-- [ ] Development ranking сделать полным порядком: versioned ordered metrics
+- [x] Maximum выбирать только среди фактически прошедших точек.
+- [x] Выполнять structural → liquidity → margin → individual-DD gates до отправки tester.
+- [x] Фиксировать deterministic order, seed, hash и причины исключения.
+- [x] Development ranking сделать полным порядком: versioned ordered metrics
   из OPEN POLICY и canonical candidate identity как последний tie-break;
   сохранить это правило в decision Campaign и включить в её canonical identity.
-- [ ] Каждая новая decision Campaign заново фиксирует ranking version; не
+- [x] Каждая новая decision Campaign заново фиксирует ranking version; не
   наследовать её молча от execution Campaign или прежней Evaluation.
-- [ ] Предварительно упорядочивать только прошедшие конечные варианты по
+- [x] Предварительно упорядочивать только прошедшие конечные варианты по
   `estimated_individual_net_pnl_at_selected_scalar / worst_calculated_initial_margin_requirement`:
   denominator positive/known, negative numerator допустим, canonical identity
   разрешает tie. Это только порядок расходования test budget, не portfolio PnL,
@@ -744,13 +744,13 @@ replacement/trial/rollback, без автоматического deployment п�
 - [ ] Обновить spec/ADR/PRD/progress по изменившимся контрактам и evidence.
 - [ ] Создать scoped conventional commit после review, не раньше.
 
-M0–M2 are accepted with independent `CODE_REVIEW_PASS` by Claude Opus 5 high.
-Runtime M3–M8 remain unstarted.
+M0–M4 are accepted with independent `CODE_REVIEW_PASS` by Claude Opus 5 high.
+M5 fixture/fake implementation is in progress; M6–M8 remain unstarted.
 
 ## U0/U1 — отдельная сквозная дорожка Panel
 
 Эта дорожка не меняет и не перенумеровывает M-задачи. M2 был реализован без UI;
-M3 остаётся следующим серверным этапом.
+после независимой приёмки M3–M4 следующим серверным этапом остаётся M5.
 
 ### U0 — архитектура и контракт
 
@@ -783,10 +783,11 @@ U1 не разрешает менять алгоритмы оптимизато�
 
 ## 15. Ближайший следующий этап
 
-M0–M2 are accepted after independent `CODE_REVIEW_PASS`; M3 is the next safe
-step. Q01–Q12 remain isolated or
-fail-closed where unknown. Real tester experiments additionally require accepted
-M5 target-wide ownership and separate user authorization.
+M0–M4 are accepted after independent `CODE_REVIEW_PASS`; M5 is the next server
+stage. Evidence: [M3 ledger](2026-09-06-portfolio-optimizer-m3-evidence.md),
+[M4 ledger](2026-09-06-portfolio-optimizer-m4-evidence.md). Q01–Q12 remain isolated or
+fail-closed where unknown. Real tester/bot execution additionally requires
+accepted M5 and M6 plus separate explicit user authorization.
 Не задавать пользователю вопросы повторно, если поведение уже закреплено в
 §2/§7 спецификации: выяснять physical mapping и evidence.
 
