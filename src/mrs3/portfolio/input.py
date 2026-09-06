@@ -195,6 +195,12 @@ def _records_for_ids(connection: duckdb.DuckDBPyConnection, table: str, column: 
     )
 
 
+def _source_integer(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PortfolioInputError(f"invalid source {field}", code="INVALID_SOURCE_VALUE")
+    return value
+
+
 def _request(value: SelectionRequest | Mapping[str, object]) -> SelectionRequest:
     if isinstance(value, SelectionRequest):
         return value
@@ -549,6 +555,97 @@ def _selection_provenance(
     }
 
 
+def _current_review_facts(
+    connection: duckdb.DuckDBPyConnection,
+    requests: Sequence[SelectionRequest],
+) -> tuple[
+    dict[tuple[str, str, int, int], dict[str, str | int]],
+    set[tuple[str, str, int, int]],
+    tuple[dict[str, str], ...],
+]:
+    """Return only statuses from the latest imported review for each pair/side."""
+    facts: dict[tuple[str, str, int, int], dict[str, str | int]] = {}
+    selected: set[tuple[str, str, int, int]] = set()
+    lineage: list[dict[str, str]] = []
+
+    def latest_unique(query: str, parameters: Sequence[object], field: str) -> str:
+        rows = connection.execute(query, list(parameters)).fetchall()
+        if not rows or rows[0][1] is None or (len(rows) > 1 and rows[1][1] == rows[0][1]):
+            raise PortfolioInputError(
+                f"current selection {field} is ambiguous",
+                code=SOURCE_SNAPSHOT_UNAVAILABLE,
+            )
+        value = rows[0][0]
+        if not isinstance(value, str) or not value.strip():
+            raise PortfolioInputError(
+                f"invalid source {field}",
+                code="INVALID_SOURCE_VALUE",
+            )
+        return value
+
+    pairs = tuple(dict.fromkeys((request.symbol, request.side) for request in requests))
+    for symbol, side in pairs:
+        run_id = latest_unique(
+            """select selection_run_id, created_at_utc from selection_runs
+               where symbol = ? and side = ?
+               order by created_at_utc desc""",
+            [symbol, side],
+            "run",
+        )
+        review_id = latest_unique(
+            """select review_import_id, imported_at_utc from selection_review_imports
+               where selection_run_id = ?
+               order by imported_at_utc desc""",
+            [run_id],
+            "review",
+        )
+        selected_results: dict[int, int] = {}
+        for strategy_id, result_id in connection.execute(
+            "select strategy_id, result_id_at_selection from selection_results where selection_run_id = ?",
+            [run_id],
+        ).fetchall():
+            strategy_key = _source_integer(strategy_id, "strategy_id")
+            result_key = _source_integer(result_id, "result_id")
+            if strategy_key in selected_results:
+                raise PortfolioInputError(
+                    "duplicate current selection result identity",
+                    code=SOURCE_SNAPSHOT_UNAVAILABLE,
+                )
+            selected_results[strategy_key] = result_key
+            selected.add((symbol, side, strategy_key, result_key))
+        rows = connection.execute(
+            "select strategy_id, user_status from selection_review_rows where review_import_id = ?",
+            [review_id],
+        ).fetchall()
+        review_statuses: dict[int, object] = {}
+        for strategy_id, user_status in rows:
+            strategy_key = _source_integer(strategy_id, "strategy_id")
+            if strategy_key in review_statuses:
+                raise PortfolioInputError(
+                    "duplicate current review row identity",
+                    code=SOURCE_SNAPSHOT_UNAVAILABLE,
+                )
+            review_statuses[strategy_key] = user_status
+        facts.update(
+            {
+                (symbol, side, strategy_id, selected_results[strategy_id]): {
+                    "user_status": user_status,
+                    "selection_run_id": run_id,
+                    "review_import_id": review_id,
+                }
+                for strategy_id, user_status in review_statuses.items()
+                if strategy_id in selected_results and isinstance(user_status, str)
+            }
+        )
+        lineage.append({
+            "symbol": symbol,
+            "side": side,
+            "selection_run_id": run_id,
+            "review_import_id": review_id,
+        })
+    return facts, selected, tuple(lineage)
+
+
 def _provenance_identity(name: str, row: Mapping[str, Any]) -> str:
     if name == "selection_runs":
         return str(row["selection_run_id"])
@@ -560,6 +657,8 @@ def _provenance_identity(name: str, row: Mapping[str, Any]) -> str:
         return f"{row['review_import_id']}:{row['strategy_id']}"
     if name == "strategy_tags":
         return f"{row['strategy_id']}:{row['tag']}"
+    if name == "admission_lineage":
+        return f"{row['symbol']}:{row['side']}"
     raise PortfolioInputError(f"unknown provenance relation: {name}", code="INVALID_PROVENANCE")
 
 
@@ -618,7 +717,7 @@ def read_performance_snapshot(
     if not parsed:
         raise PortfolioInputError("at least one selection request is required", code="INVALID_REQUEST")
     path = Path(database).resolve()
-    candidates_by_identity: dict[tuple[int, int], dict[str, Any]] = {}
+    candidates_by_identity: dict[tuple[str, str, int, int], dict[str, Any]] = {}
     strategy_ids: set[int] = set()
     result_ids: set[int] = set()
     source_rows: dict[int, _SourceSeries] = {}
@@ -639,11 +738,59 @@ def read_performance_snapshot(
                 for row in frame.to_dict(orient="records"):
                     candidate = dict(row)
                     try:
-                        identity_key = (int(candidate["strategy_id"]), int(candidate["result_id"]))
+                        symbol = candidate["symbol"]
+                        side = candidate["side"]
+                        if not isinstance(symbol, str) or not isinstance(side, str):
+                            raise ValueError("invalid candidate pair identity")
+                        identity_key = (
+                            symbol,
+                            side,
+                            _source_integer(candidate["strategy_id"], "strategy_id"),
+                            _source_integer(candidate["result_id"], "result_id"),
+                        )
                     except (KeyError, TypeError, ValueError) as error:
                         raise PortfolioInputError("invalid source candidate identity", code="INVALID_SOURCE_VALUE") from error
                     candidates_by_identity.setdefault(identity_key, candidate)
-            candidates = list(candidates_by_identity.values())
+            review_facts, selected, admission_lineage = _current_review_facts(connection, parsed)
+            candidates = []
+            for candidate in candidates_by_identity.values():
+                symbol = candidate["symbol"]
+                side = candidate["side"]
+                strategy_id = _source_integer(candidate["strategy_id"], "strategy_id")
+                result_id = _source_integer(candidate["result_id"], "result_id")
+                candidate_key = (symbol, side, strategy_id, result_id)
+                strategy_key = (symbol, side, strategy_id)
+                fact = review_facts.get(candidate_key)
+                if fact is None:
+                    prior_facts = [
+                        value for key, value in review_facts.items() if key[:3] == strategy_key
+                    ]
+                    if any(value["user_status"] == "FINALIST" for value in prior_facts):
+                        raise PortfolioInputError(
+                            "current finalist result is stale",
+                            code=SOURCE_SNAPSHOT_UNAVAILABLE,
+                        )
+                    if any(key[:3] == strategy_key for key in selected):
+                        if prior_facts:
+                            continue
+                        raise PortfolioInputError(
+                            "current selection status is unavailable",
+                            code=SOURCE_SNAPSHOT_UNAVAILABLE,
+                        )
+                    continue
+                if fact["user_status"] != "FINALIST":
+                    continue
+                try:
+                    start = _utc(candidate["report_start_utc"])
+                    end = _utc(candidate["report_end_utc"])
+                    if end <= start:
+                        raise ValueError("invalid report period")
+                except (KeyError, TypeError, ValueError) as error:
+                    raise PortfolioInputError(
+                        "current finalist period is unavailable",
+                        code=SOURCE_SNAPSHOT_UNAVAILABLE,
+                    ) from error
+                candidates.append(candidate)
             strategy_ids.update(int(row["strategy_id"]) for row in candidates)
             result_ids.update(int(row["result_id"]) for row in candidates)
             strategy_rows = _records_for_ids(connection, "strategies", "strategy_id", tuple(strategy_ids))
@@ -659,6 +806,7 @@ def read_performance_snapshot(
             action_rows = _records_for_ids(connection, "strategy_actions", "result_id", tuple(result_ids))
             equity_rows = _records_for_ids(connection, "strategy_equity", "result_id", tuple(result_ids))
             provenance = _selection_provenance(connection, parsed, tuple(strategy_ids))
+            provenance["admission_lineage"] = admission_lineage
             for result in result_rows:
                 result_id = int(result["result_id"])
                 source_rows[result_id] = _SourceSeries(

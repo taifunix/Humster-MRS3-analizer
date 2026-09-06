@@ -35,8 +35,58 @@ IDENTITY = {
 }
 
 
+def _add_review(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    run_id: str,
+    review_id: str,
+    symbol: str,
+    side: str,
+    strategy_id: int,
+    result_id: int,
+    user_status: str,
+    selection_time: datetime,
+) -> None:
+    instance_id = connection.execute(
+        "select value from schema_info where key = 'database_instance_id'"
+    ).fetchone()[0]
+    connection.execute(
+        """insert into selection_runs values
+           (?, ?, ?, ?, 'test-selection-v1', '{}', ?, '{}', ?, 1, 1, 1, 1, ?, ?)""",
+        [run_id, instance_id, symbol, side, f"request-hash-{run_id}", f"config-hash-{run_id}", f"workbook-hash-{run_id}", selection_time],
+    )
+    connection.execute(
+        """insert into selection_results values
+           (?, ?, ?, 'FINALIST', 1, 1, 'selected', '{}', null, false, '{}')""",
+        [run_id, strategy_id, result_id],
+    )
+    connection.execute(
+        "insert into selection_review_imports values (?, ?, ?, ?, 1)",
+        [review_id, run_id, f"review-hash-{review_id}", selection_time],
+    )
+    connection.execute(
+        "insert into selection_review_rows values (?, ?, ?, 1, null, 'selected')",
+        [review_id, strategy_id, user_status],
+    )
+
+
 def _database(tmp_path: Path) -> Path:
     connection = _candidate_db(tmp_path)
+    strategy_id, result_id = connection.execute(
+        "select strategy_id, current_result_id from strategies"
+    ).fetchone()
+    selection_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    _add_review(
+        connection,
+        run_id="run-default",
+        review_id="review-default",
+        symbol="BTCUSDT",
+        side="LONG",
+        strategy_id=strategy_id,
+        result_id=result_id,
+        user_status="FINALIST",
+        selection_time=selection_time,
+    )
     connection.close()
     return tmp_path / "strategy_performance.duckdb"
 
@@ -122,6 +172,235 @@ def test_overlapping_candidate_rows_are_deduplicated_by_strategy_and_result(tmp_
     snapshot = _snapshot(database, [REQUEST, REQUEST])
 
     assert len(snapshot.candidates) == 1
+
+
+def test_snapshot_admits_only_exact_current_finalists(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("update selection_review_rows set user_status = 'RESERVE'")
+
+    snapshot = _snapshot(database, [REQUEST])
+
+    assert snapshot.candidates == ()
+
+
+def test_snapshot_keeps_source_candidate_schema_separate_from_review_admission(tmp_path: Path) -> None:
+    snapshot = _snapshot(_database(tmp_path), [REQUEST])
+
+    assert snapshot.candidates
+    assert "user_status" not in snapshot.candidates[0]
+    assert "selection_run_id" not in snapshot.candidates[0]
+    assert "review_import_id" not in snapshot.candidates[0]
+
+
+def test_snapshot_preserves_admission_lineage_and_digest_tracks_lineage(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    snapshot = _snapshot(database, [REQUEST])
+
+    lineage = [dict(row) for row in snapshot.provenance["admission_lineage"]]
+    assert lineage == [{
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "selection_run_id": "run-default",
+        "review_import_id": "review-default",
+    }]
+
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies").fetchone()[0]
+        connection.execute(
+            "insert into selection_review_imports values ('review-new', 'run-default', 'review-hash-new', ?, 1)",
+            [datetime(2026, 1, 2, tzinfo=timezone.utc)],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-new', ?, 'FINALIST', 1, null, 'selected')",
+            [strategy_id],
+        )
+
+    changed = _snapshot(database, [REQUEST])
+
+    assert changed.digest != snapshot.digest
+    assert dict(changed.provenance["admission_lineage"][0])["review_import_id"] == "review-new"
+
+
+def _replace_with_unconstrained_copy(connection: duckdb.DuckDBPyConnection, table: str) -> None:
+    copy = f"{table}_copy"
+    connection.execute(f"create table {copy} as select * from {table}")
+    connection.execute(f"drop table {table}")
+    connection.execute(f"alter table {copy} rename to {table}")
+
+
+def test_snapshot_fails_closed_on_duplicate_selection_result_identity(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        _replace_with_unconstrained_copy(connection, "selection_results")
+        strategy_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies"
+        ).fetchone()
+        connection.execute(
+            "insert into selection_results values ('run-default', ?, ?, 'FINALIST', 9, 1, 'conflict', '{}', null, false, '{}')",
+            [strategy_id, result_id + 1],
+        )
+
+    with pytest.raises(PortfolioInputError) as error:
+        _snapshot(database, [REQUEST])
+
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+
+def test_snapshot_fails_closed_on_duplicate_review_row_identity(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        _replace_with_unconstrained_copy(connection, "selection_review_rows")
+        strategy_id = connection.execute("select strategy_id from strategies").fetchone()[0]
+        connection.execute(
+            "insert into selection_review_rows values ('review-default', ?, 'RESERVE', 1, null, 'conflict')",
+            [strategy_id],
+        )
+
+    with pytest.raises(PortfolioInputError) as error:
+        _snapshot(database, [REQUEST])
+
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+
+def test_snapshot_scopes_review_status_by_pair_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = _database(tmp_path)
+    eth_request = parse_selection_request({"symbol": "ETHUSDT", "side": "SHORT", "stages": []})
+    with duckdb.connect(str(database)) as connection:
+        strategy_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies"
+        ).fetchone()
+        selection_time = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        _add_review(
+            connection,
+            run_id="run-eth",
+            review_id="review-eth",
+            symbol="ETHUSDT",
+            side="SHORT",
+            strategy_id=strategy_id,
+            result_id=result_id,
+            user_status="RESERVE",
+            selection_time=selection_time,
+        )
+
+    original = portfolio_input.load_selection_candidates
+    source_frame = None
+
+    def pair_scoped_loader(connection, request, *args, **kwargs):
+        nonlocal source_frame
+        if request.symbol == "BTCUSDT":
+            source_frame = original(connection, request, *args, **kwargs)
+            return source_frame
+        clone = source_frame.copy()
+        clone["symbol"] = "ETHUSDT"
+        clone["side"] = "SHORT"
+        return clone
+
+    monkeypatch.setattr(portfolio_input, "load_selection_candidates", pair_scoped_loader)
+    snapshot = _snapshot(database, [REQUEST, eth_request])
+
+    assert [candidate["symbol"] for candidate in snapshot.candidates] == ["BTCUSDT"]
+
+
+def test_snapshot_excludes_stale_non_finalist_alongside_valid_finalist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = _database(tmp_path)
+    eth_request = parse_selection_request({"symbol": "ETHUSDT", "side": "SHORT", "stages": []})
+    with duckdb.connect(str(database)) as connection:
+        strategy_id, _ = connection.execute(
+            "select strategy_id, current_result_id from strategies"
+        ).fetchone()
+        selection_time = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        _add_review(
+            connection,
+            run_id="run-eth-stale",
+            review_id="review-eth-stale",
+            symbol="ETHUSDT",
+            side="SHORT",
+            strategy_id=strategy_id,
+            result_id=999,
+            user_status="RESERVE",
+            selection_time=selection_time,
+        )
+
+    original = portfolio_input.load_selection_candidates
+    source_frame = None
+
+    def stale_pair_loader(connection, request, *args, **kwargs):
+        nonlocal source_frame
+        if request.symbol == "BTCUSDT":
+            source_frame = original(connection, request, *args, **kwargs)
+            return source_frame
+        clone = source_frame.copy()
+        clone["symbol"] = "ETHUSDT"
+        clone["side"] = "SHORT"
+        return clone
+
+    monkeypatch.setattr(portfolio_input, "load_selection_candidates", stale_pair_loader)
+    snapshot = _snapshot(database, [REQUEST, eth_request])
+
+    assert [candidate["symbol"] for candidate in snapshot.candidates] == ["BTCUSDT"]
+
+
+def test_snapshot_fails_closed_when_current_review_is_missing(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("delete from selection_review_rows")
+
+    with pytest.raises(PortfolioInputError) as error:
+        _snapshot(database, [REQUEST])
+
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+
+def test_snapshot_fails_closed_when_finalist_period_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = _database(tmp_path)
+
+    original = portfolio_input.load_selection_candidates
+
+    def missing_period(connection, request, *args, **kwargs):
+        frame = original(connection, request, *args, **kwargs)
+        frame["report_start_utc"] = None
+        return frame
+
+    monkeypatch.setattr(portfolio_input, "load_selection_candidates", missing_period)
+
+    with pytest.raises(PortfolioInputError) as error:
+        _snapshot(database, [REQUEST])
+
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+
+def test_snapshot_fails_closed_when_current_run_timestamps_tie(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        instance_id = connection.execute(
+            "select value from schema_info where key = 'database_instance_id'"
+        ).fetchone()[0]
+        connection.execute(
+            """insert into selection_runs values
+               ('run-tie', ?, 'BTCUSDT', 'LONG', 'test-selection-v1', '{}',
+                'request-hash-2', '{}', 'config-hash-2', 1, 1, 1, 1, 'workbook-hash-2', ?)""",
+            [instance_id, datetime(2026, 1, 1, tzinfo=timezone.utc)],
+        )
+
+    with pytest.raises(PortfolioInputError) as error:
+        _snapshot(database, [REQUEST])
+
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+
+def test_snapshot_fails_closed_when_current_review_timestamps_tie(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "insert into selection_review_imports values ('review-tie', 'run-default', 'review-hash-tie', ?, 1)",
+            [datetime(2026, 1, 1, tzinfo=timezone.utc)],
+        )
+
+    with pytest.raises(PortfolioInputError) as error:
+        _snapshot(database, [REQUEST])
+
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
 
 
 def test_identical_requests_collapse_but_conflicting_stages_fail_closed(tmp_path: Path) -> None:
@@ -310,6 +589,14 @@ def test_series_keep_source_ordinals_per_result_identity(tmp_path: Path) -> None
         connection.executemany(
             "insert into strategy_equity values (?, ?, ?, ?, ?)",
             [(result_id, 0, start, 100, 100), (result_id, 1, datetime(2026, 1, 2, tzinfo=timezone.utc), 100, 100), (result_id, 2, datetime(2026, 1, 3, tzinfo=timezone.utc), 110, 110)],
+        )
+        connection.execute(
+            "insert into selection_results values ('run-default', ?, ?, 'FINALIST', 2, 2, 'selected', '{}', null, false, '{}')",
+            [strategy_id, result_id],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-default', ?, 'FINALIST', 2, null, 'selected')",
+            [strategy_id],
         )
     snapshot = _snapshot(database, [REQUEST])
 
