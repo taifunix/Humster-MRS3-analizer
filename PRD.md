@@ -98,11 +98,15 @@ analysis runs и lineage согласно уже реализованной
 
 ## Hook: Анализатор Портфеля
 
-Новый Portfolio Optimizer — **Draft D5 / M0–M1 accepted, M2 next**. Канонические
+Новый Portfolio Optimizer — **Draft D7 / M0–M2 accepted, M3 next**. Канонические
 [спецификация по фазам](docs/specs/2026-09-05-portfolio-optimizer.md),
 [план внедрения](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md) и
-[ADR-0025 (Proposed)](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md)
-фиксируют дизайн; они пока не активируют реализацию и не доказывают portfolio results.
+[ADR-0025 (Proposed)](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md),
+[ADR-0030 (Accepted)](docs/decisions/0030-portfolio-optimizer-m2-admission-and-sizing-contract.md),
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md) и
+[ADR-0031 (Accepted)](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md)
+фиксируют дизайн и границы принятой fixture-only реализации M0–M2; они не
+доказывают portfolio results и не разрешают runtime/tester/live use.
 [Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md)
 сохраняется как предшествующий queued-контракт до принятия замены.
 
@@ -115,21 +119,33 @@ immutable MRS3-кандидатов, liquidity/margin guards, общий tick-te
 
 M0 read-only inventory accepted after independent `CODE_REVIEW_PASS`. Fixture-only
 M1 config/storage/snapshot implementation is accepted after independent Opus
-`CODE_REVIEW_PASS`; runtime M2-M8 remains unstarted. Q01-Q12 unknowns are isolated or
+`CODE_REVIEW_PASS`. Fixture-only M2 liquidity/reference implementation is accepted
+after independent Opus `CODE_REVIEW_PASS`; runtime M3-M8 remains unstarted. Q01-Q12 unknowns are isolated or
 fail-closed where unresolved.
 The versioned matrix is in
 [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md).
 M1 evidence is recorded in
 [the implementation ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md).
+M2 evidence is recorded in
+[the M2 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md).
 Стартовые
 research-only DD/free-margin/MM limits
 описаны в D5 и [ADR-0029](docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md)
-как `portfolio_optimizer_research_risk_v1`; PnL, liquidity/freshness policies и
-точное ranking согласуются позже, без них нет финальных рекомендаций. Текущая
+как `portfolio_optimizer_research_risk_v1`. D6 закрепляет exact `FINALIST`
+universe, seven-day liquidity distribution, maximum current symbol-level leverage
+и per-strategy DD ceiling from current portfolio equity; его numerical profile cap,
+PnL, liquidity/freshness policies и точное ranking согласуются позже, без них нет
+финальных рекомендаций. Текущая
 документационная работа не разрешает запуск tester/bot и не изменяет Performance runtime.
 Прохождение research thresholds не разрешает implementation, tester run,
 `RECOMMENDATION_READY`, trading admission или live use; все remaining gates
 (PnL floor, liquidity/freshness limits, profile ranking) остаются open blockers.
+
+Минимальный интерфейс Panel выделен в отдельную сквозную дорожку: U0
+документации принят, U1 реализации запланирован и не начат. Этап 1 только
+создаёт неизменяемый Campaign, показывает прогресс и успешный XLSX; тестер не
+запускается. Передача тестеру остаётся закрыта до M5/M6 и отдельного разрешения.
+Текущий M3 не зависит от UI. README не меняется до появления работающего экрана.
 
 ## Реестр активной документации
 
@@ -145,9 +161,12 @@ research-only DD/free-margin/MM limits
 | Accepted | [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) | раздельная full-horizon/windowed verification для real packages v2 | event source packs |
 | Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
 | Superseded / historical | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | legacy posttest calibration retained for provenance | Performance DB v2 RETEST |
-| Draft D5 / M0–M1 accepted | [Portfolio Optimizer phased spec](docs/specs/2026-09-05-portfolio-optimizer.md), [plan](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md), [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md), [M1 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md) | joint tick-tests, separate Cross portfolios, immutable evidence, phased recommendations | Performance v2, collector ADR-0024, tester capabilities, open PnL/liquidity/freshness/ranking and runtime gates |
+| Draft D7 / M0–M2 accepted | [Portfolio Optimizer phased spec](docs/specs/2026-09-05-portfolio-optimizer.md), [plan](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md), [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md), [M1 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md), [M2 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md) | joint tick-tests, separate Cross portfolios, immutable evidence, phased recommendations | Performance v2, collector ADR-0024, tester capabilities, open PnL/liquidity/freshness/ranking and runtime gates |
+| Specified / U0 accepted; U1 planned | [Portfolio Optimizer Panel UI](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [ADR-0031](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md) | local launch form, persisted Stage 1 job, settings CAS, summary and XLSX | backend optimizer capabilities; Stage 2 also requires M5/M6 and explicit authorization |
 | Proposed | [ADR-0025](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md) | optimizer data boundaries, replay and MVP/post-MVP scope | ADR-0001/0020/0024; approval deferred |
 | Accepted | [ADR-0029](docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md) | research-only DD/free-margin/MM profile defaults | Portfolio Optimizer D5; not runtime/trading permission |
+| Accepted | [ADR-0030](docs/decisions/0030-portfolio-optimizer-m2-admission-and-sizing-contract.md) | FINALIST admission, liquidity/lot ceiling, leverage and individual-DD sizing semantics | Portfolio Optimizer D6; not runtime/trading permission |
+| Accepted | [ADR-0031](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md) | local Panel UI, immutable Campaign, persisted job, config CAS and success-only XLSX | Portfolio Optimizer D7; U1 and tester runtime not authorized |
 | Accepted | [ADR-0026](docs/decisions/0026-bybit-orderbook-data-health.md) | preserve snapshots received before ACK; separate transport connectivity from data health | Bybit collector specification |
 | Accepted | [ADR-0027](docs/decisions/0027-bybit-runtime-mode-markers.md) | explicit production versus accelerated smoke health markers | Bybit collector specification |
 | Accepted | [ADR-0028](docs/decisions/0028-bybit-side-depth-completeness.md) | preserve combined depth completeness and add bid/ask ratios in schema v2 | Bybit collector specification |

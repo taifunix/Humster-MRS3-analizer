@@ -2,19 +2,26 @@
 
 **Дата:** 2026-09-05
 
-**Статус:** Draft D5 — независимый Opus plan/spec review D4 и D5:
+**Статус:** Draft D7 — независимый Opus plan/spec review D4–D7:
 `PLAN_APPROVED`. D5 фиксирует стартовую
-`portfolio_optimizer_research_risk_v1`.
+`portfolio_optimizer_research_risk_v1`; D6 уточняет admission/sizing contract;
+D7 добавляет отдельный контракт минимального интерфейса Panel.
 
-**D5 review:** `PLAN_APPROVED`.
+**D5 review:** `PLAN_APPROVED`. **D6 review:** `PLAN_APPROVED`.
+**D6 contract:** [ADR-0030](../decisions/0030-portfolio-optimizer-m2-admission-and-sizing-contract.md).
+**D7 UI contract:** [спецификация Panel](2026-09-06-portfolio-optimizer-panel-ui.md),
+[ADR-0031](../decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md).
+**D7 UI docs review:** `CODE_REVIEW_PASS` — Claude Opus 5 high, two rounds.
 Пользователь авторизовал M0 read-only inventory в новой сессии; real tester/bot
 runs остаются запрещены до M5 и отдельного разрешения.
 
 **Реализация:** M0 read-only inventory accepted after independent Opus
 `CODE_REVIEW_PASS`; fixture-only M1 implementation accepted after independent
-Opus `CODE_REVIEW_PASS`. Runtime M2–M8 не начат. Запуск tester/bot не разрешён. Evidence:
+Opus `CODE_REVIEW_PASS`; fixture-only M2 liquidity/reference implementation accepted
+after independent Opus `CODE_REVIEW_PASS`. Runtime M3–M8 не начат. Запуск tester/bot не разрешён. Evidence:
 [M0 capability inventory](../superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md),
-[M1 implementation evidence](../superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md).
+[M1 implementation evidence](../superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md),
+[M2 implementation evidence](../superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md).
 
 **Численные политики:** стартовые DD/free-margin/MM limits для исследования
 зафиксированы как `portfolio_optimizer_research_risk_v1` в §10.1. Минимальный PnL, liquidity/freshness и точный
@@ -53,6 +60,8 @@ Balanced/Conservative ranking требуют последующего согла
   [ADR-0022](../decisions/0022-performance-v2-selection-review-ledger.md).
 - [Bybit collector Revision 2](2026-09-05-bybit-market-data-collector.md) и
   [ADR-0024](../decisions/0024-bybit-market-data-collector-archive.md).
+- [Минимальный интерфейс Panel](2026-09-06-portfolio-optimizer-panel-ui.md) и
+  [ADR-0031](../decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md).
 - Исторический handoff: только
   [разделы 9–10](../archive/sources/MRS3_v07_MASTER_HANDOFF_LEGACY_DUCKDB_2026-08-10.md#9-что-появится-только-после-реальных-mrs3-tick-тестов).
 
@@ -138,9 +147,10 @@ live monitor/alerts, оптимизация времени торговли, а�
 
 Adapter проверяет текущую схему и читает typed strategy/orders, current result,
 report/effective/research windows, metrics, tags и актуальный selection review.
-Правило допуска FINALIST/RESERVE/ручного набора фиксируется campaign policy;
-`DISCARDED`, `REJECTED` и неразрешённый `RETEST` не получают финальный допуск.
-Нет данных о текущем статусе/периоде — причина отказа, не молчаливый fallback.
+Единственный MVP-universe — строки замороженного source snapshot с точным
+`User Status = FINALIST`. `RESERVE`, ручной набор, отсутствующий или иной status
+исключаются без fallback. Нет данных о текущем статусе/периоде — причина отказа,
+а не молчаливый fallback.
 
 В коде уже есть `selection_runs`/`selection_results`, но это не доказательство
 полного immutable snapshot использованных фактов. `strategy_results` может
@@ -206,12 +216,12 @@ tester capabilities, collector schema и данных instrument tiers. Отсу
 | --- | --- |
 | Identity | schema version, policy version, algorithm versions |
 | Inputs/storage | Performance DB, Portfolio DB, collector root, approved templates |
-| Scenarios | явно заданный депозит каждого портфеля, currency/collateral assumptions, max_balance, sizing mode и верхняя граница sizing balance для проверяемого горизонта |
-| Search | universe selection, composition proposals, sizing/limiter/priority candidates, seed, rounds, total test budget |
+| Scenarios | явно заданный депозит каждого портфеля, currency/collateral assumptions, `current_portfolio_equity` с timestamp/source/currency и maximum age, `max_balance`, sizing mode и верхняя граница sizing balance для проверяемого горизонта |
+| Search | exact `FINALIST` universe, composition proposals, sizing/limiter/priority candidates, finite sizing grid, maximum pre-test variant count, seed, rounds, total test budget |
 | Research | development/validation windows, warm-up и boundary rules, evidence minimums |
 | Liquidity | lookback, band, quantile, permitted share, freshness, valid-minute/coverage/completeness minima, global screen |
 | Margin model | venue/account mode, fees, tier и denominator semantics, overflow envelope, missing-data policy |
-| Profiles | отдельные DD/free-margin/MM bounds, PnL minimum, exact ranking ID/parameters и top_n |
+| Profiles | отдельные DD/free-margin/MM bounds, `each_strategy_max_dd_pct`, PnL minimum, exact ranking ID/parameters и top_n |
 | Runner | локальный либо уже предоставленный удалённый tester target, paths, timeouts/retries и ownership |
 
 Все денежные единицы, проценты/fractions и временные единицы задаются явно.
@@ -378,7 +388,9 @@ binary и ticks дополнительно сравнивается канони
 | fee unknown без approved bound | Evaluation | `INSUFFICIENT_EVIDENCE` | `FEE_RATE_UNKNOWN` |
 | нет finite sizing upper bound | candidate Evaluation | `INSUFFICIENT_EVIDENCE` | `SIZING_ENVELOPE_UNBOUNDED` |
 | equity denominator/path/coverage недостаточны | TradingRun и dependent Evaluation | `INSUFFICIENT_EVIDENCE` | `EQUITY_DENOMINATOR_INVALID` / `EQUITY_PATH_MISSING` / `EQUITY_COVERAGE_INSUFFICIENT` |
-| фактический leverage не равен manifest | TradingRun | `NEEDS_RETEST` | `LEVERAGE_MISMATCH` |
+| baseline individual DD/current equity/profile cap недоступны или invalid | PortfolioCandidate | `INSUFFICIENT_EVIDENCE` / `RESEARCH_ONLY` | `INDIVIDUAL_DD_UNAVAILABLE` / `OPEN_POLICY` |
+| оценённый DD одной стратегии выше `each_strategy_max_dd_pct` | PortfolioCandidate | `FAIL` | `INDIVIDUAL_DD_LIMIT` |
+| фактический leverage не равен manifest либо не прочитан | TradingRun | `NEEDS_RETEST` | `LEVERAGE_MISMATCH` / `LEVERAGE_UNVERIFIED` |
 | round-down ниже minimum/нарушил geometry | PortfolioCandidate | `FAIL` | `POST_ROUNDING_MINIMUM` / `POST_ROUNDING_GEOMETRY` |
 | enumeration limit превышен, approved bound посчитан | guard evidence | не автоматический отказ; `CONSERVATIVE_BOUND` | `ENUMERATION_FALLBACK_USED` |
 | margin bound нарушен/недоступен | candidate / Evaluation | `FAIL` / `INSUFFICIENT_EVIDENCE` | `MARGIN_BOUND_FAILED` / `MARGIN_BOUND_UNAVAILABLE` |
@@ -413,11 +425,17 @@ TradingRun и блокируют зависящие Evaluations; decision Campai
   `ENUMERATION_FALLBACK_USED`, `MARGIN_BOUND_FAILED`,
   `MARGIN_BOUND_UNAVAILABLE`, `VALIDATION_FAILED`, `NO_VALIDATION_PASS`,
   `SEMANTIC_RESULT_DIVERGENCE`, `EXECUTABLE_PAYLOAD_CHANGED`,
-  `PORTFOLIO_SET_CHANGED`, `OPEN_POLICY`, `LOCK_OWNER_UNVERIFIABLE`,
-  `LOCK_MANUAL_CLEAR`.
+   `PORTFOLIO_SET_CHANGED`, `OPEN_POLICY`, `LOCK_OWNER_UNVERIFIABLE`,
+   `LOCK_MANUAL_CLEAR`.
 
-Golden canonical vector фиксирует exact строки всех enum. Добавление или
-переименование значения требует новой enum/canonical schema version; disposition
+Каждая запись причины несёт явное поле `reason_enum_version`. `portfolio_reason_v1`
+никогда не переопределяется и остаётся читаемым всеми последующими readers.
+`portfolio_reason_v2` содержит все коды v1 с тем же значением и добавляет
+`INDIVIDUAL_DD_UNAVAILABLE`, `INDIVIDUAL_DD_LIMIT`, `LEVERAGE_UNVERIFIED`.
+До отдельной авторизованной M4-реализации writer продолжает выпускать только v1;
+M2/M4 readers обязаны принимать v1. Golden canonical vector фиксирует exact строки
+каждой версии enum. Добавление или переименование значения требует новой
+enum/canonical schema version; disposition
 gate, evidence class и capability result нельзя сохранять в поле reason code.
 
 ## 6. Phase 1 — liquidity и sizing
@@ -425,9 +443,14 @@ gate, evidence class и capability result нельзя сохранять в п�
 ### 6.1. Рыночный ceiling
 
 Для symbol/side policy фиксирует lookback, band, history quantile, долю depth,
-freshness и минимальное качество. Из minute p05 depth вычисляется выбранный
-history quantile; quantiles следуют интерполяции collector. Пропуски, неполная
-depth, stale data и отсутствие достаточной истории не заменяются нулями.
+freshness и минимальное качество. Базовый horizon — последние семь полностью
+завершённых UTC-суток; изменение horizon требует versioned policy. Ceiling
+строится по опубликованному распределению minute p05 depth всего horizon, а не
+по мгновенному стакану или последней минуте: выбранный history quantile следует
+интерполяции collector. Поэтому обычное падение ликвидности фондов на выходных и
+вне основной сессии участвует в расчёте, а не зависит от времени запуска.
+Пропуски, неполная depth, stale data и отсутствие достаточной истории не
+заменяются нулями.
 `band` выбирается только из опубликованных collector bands 10/25/50/100 bps;
 другое значение — ошибка config, а не интерполяция стакана.
 
@@ -438,6 +461,14 @@ single_order_cap = depth_reference * policy.allowed_depth_share
 
 LONG/bid и SHORT/ask в этой proxy-политике описывают сторону размещения входной
 лимитной заявки; это не модель очереди и не доказательство её fill probability.
+В opening geometry входят все position-opening уровни выбранной стратегии и
+направления (включая grid/averaging/DCA), но не closing, reduce-only, TP/SL и
+прочие закрывающие заявки. Для каждого Strategy ID и направления M2 сохраняет
+`liquidity_scalar_pct_max`, использованные facts/window/content digest, источник и
+timestamp liquidity snapshot, а также policy-defined срок его годности. Изменение
+filters/tier/geometry или stale/missing snapshot инвалидирует ceiling: M4 считает
+его `UNKNOWN`, а не last-known-good; отсутствие сохранённого ceiling не означает
+отсутствие лимита.
 Риск закрытия LONG относится к bid, закрытия SHORT — к ask; весь закрываемый
 размер и аварийные market closes нельзя считать исполненными только потому,
 что каждый отдельный opening order прошёл ceiling. В MVP это отдельная
@@ -454,15 +485,17 @@ conservative position/exit diagnostic с явной availability, empirical cali
 
 ### 6.2. Масштабирование и `max_balance`
 
-После подтверждения bot/tester sizing contract, для balance-percentage mode:
+После подтверждения bot/tester sizing contract, для balance-percentage mode
+`scalar_pct` измеряется в процентах исторического размера (100 = размер
+индивидуального теста):
 
 ```text
 B = actual sizing balance at the bot-defined recalculation event
 B_cap = B if max_balance is disabled else min(B, max_balance)
-s = balance_percentage / 100
+s = scalar_pct / 100
 opening_order_notional[i] = B_cap * s * lot_x[i]
 full_side_notional = B_cap * s * sum(lot_x)
-s_liquidity_max = min_i(single_order_cap / (B_cap * lot_x[i]))
+liquidity_scalar_pct_max = 100 * min_i(single_order_cap / (B_cap * lot_x[i]))
 ```
 
 `lot_x` не нормализуются до суммы 1. Начальный `scenario_balance` — старт теста,
@@ -480,6 +513,41 @@ quantity и precision. Quantity округляется вниз до `qtyStep`; 
 ради minimum запрещено. Нулевой/меньший minimum или нарушающий immutable
 геометрию уровень делает вариант FAIL с причиной, а не удаляется молча.
 После округления заново проверяются сумма размера, capacity, tiers и margin.
+
+### 6.2.1. Ceiling просадки одной стратегии
+
+Отдельно от actual joint DD профиля применяется planning estimate одной
+стратегии. Пусть `D100` — maximum drawdown amount из individual PerformanceDB
+result при ровно `scalar_pct=100`, в account settlement currency этого result;
+`E` — положительный `current_portfolio_equity` из одного planning snapshot в той
+же currency; `c` — profile `each_strategy_max_dd_pct` в процентных пунктах.
+Никакой implicit FX conversion не допускается:
+
+```text
+estimated_individual_dd_amount = D100 * scalar_pct / 100
+estimated_individual_dd_pct = estimated_individual_dd_amount / E * 100
+dd_scalar_pct_max = c * E / D100
+```
+
+`D100` отсутствует, не положителен или имеет другую currency; `E` отсутствует,
+не положителен, stale либо имеет другую currency — `UNKNOWN` и candidate не
+проходит. Отсутствующий численный `c` — `OPEN_POLICY`, не бесконечный ceiling.
+Это линейная planning-модель fixed-lot, non-compounding historical result без
+заявления о path-dependent margin/liquidation effects; она не является actual
+joint DD и не заменяет joint test. Ограничение применяется независимо к каждой
+стратегии, не суммируется между ними и ограничивает только новый или увеличенный
+order, не принудительное закрытие уже открытой позиции.
+
+`E`, `D100`, `c`, `dd_scalar_pct_max`, их currency/provenance и timestamp
+сохраняются в Campaign/TradingRun evidence. `E` снимается один раз на planning
+run и имеет policy-defined maximum age; при каждом новом/увеличенном order его
+нужно переоценить по свежему `E`. `max_balance` ограничивает только sizing base
+`B_cap` и никогда не заменяет знаменатель `E`.
+
+Для варианта берётся minimum всех применимых ceiling, включая
+`liquidity_scalar_pct_max`, `dd_scalar_pct_max`, margin и exchange limits, затем
+quantity округляется вниз. Если после округления любой opening order ниже биржевого
+minimum, candidate отклоняется с stable reason; увеличивать его до minimum нельзя.
 Для растущей базы/изменения mark стоимость не считается навсегда равной
 стартовому notional: envelope и post-test diagnostics учитывают sizing path.
 
@@ -529,16 +597,25 @@ OPEN POLICY без default. Timeout, rate limit или request failure дают
 quantity/price filters и полный набор tiers: value bounds, max leverage,
 initial/maintenance rates, mm deduction. Проверяются pagination, единицы,
 freshness и применимость symbol. Значение leverage из одиночного source test
-не принимается за актуальный предел биржи.
+сохраняется только как provenance и никогда не является gate допуска или отказа.
 
-Для каждого состояния определяется exposure и применимый tier, затем берётся
-минимум их `max_leverage` и округляется вниз до `leverageStep` в допустимом
-интервале. Полученное единое значение используется в renderer, tester, guards
-и export. Mismatch фактической tester-настройки делает evidence неполным.
-Тир включает combined position и active-order exposure, не только открытую
-позицию. Direction/one-way semantics проверяются fixtures. Выбранный максимум
-снижает IM reservation и не доказывает безопасность при другом фактическом
-плече; leverage не является свободной осью поиска.
+Для уже выбранного scalar сначала определяется notional варианта и его
+position+active-order exposure, затем применимый tier; leverage не меняет этот
+notional и не является свободной осью поиска. Берётся maximum valid leverage
+этого tier, округлённый вниз до `leverageStep`. Если exposure пересекает границу
+tier, tier/maximum пересчитываются по новому exposure; неизвестный tier, конфликт
+границ или невозможность получить устойчивый результат дают `UNKNOWN`, не выбор
+удобного значения. Тир включает combined position и active-order exposure, не
+только открытую позицию.
+
+Для одного symbol в one-way portfolio существует одно planned leverage. Несколько
+стратегий одного symbol не могут требовать разные значения: такой variant blocked
+до единого symbol-level значения, а не разрешается молча выбором max/min. Полученное
+planned leverage используется в renderer, joint tester, guards и export; оно влияет
+на IM reservation, но не на размер лота. Direction/one-way semantics проверяются
+fixtures. Если actual applied leverage нельзя прочитать обратно хотя бы для одного
+symbol joint run, либо он не равен manifest, весь TradingRun получает
+`NEEDS_RETEST` и исключается из ranking, scheduling и recommendation surfaces.
 
 Обновление reference перед тестом и финальным экспортом обязательно по policy.
 Современный tier не выдаётся за историческое состояние биржи в прошлом тесте.
@@ -659,18 +736,31 @@ margin evaluation остаётся отдельной обязанностью �
 
 ### 8.1. Поиск
 
-Оси: composition, directional choice, scalars, limiter, priorities включая
-явно разрешённое исключение 0, opposite-order policy и выбранные cap-сценарии.
-Новые shifts/MA не создаются. Индивидуальные metrics задают порядок proposals,
-не фактический ranking портфелей.
+Оси: composition только из exact `FINALIST` snapshot, directional choice, scalars,
+limiter, priorities включая явно разрешённое исключение 0, opposite-order policy
+и выбранные cap-сценарии. Новые shifts/MA не создаются. Индивидуальные metrics
+задают только порядок proposals, не фактический ranking портфелей.
 
 Бюджет ограничивает число proposals/проверок/test attempts и refinement rounds.
-Детерминированно выполняются structural → liquidity → margin gates до tester.
-Sizing grid в единицах экспортируемого percentage-поля, её границы, порядок и
-tie-break фиксируются config/Campaign. Проверяются все точки конечной grid без
-раннего останова; Seed — максимальный прошедший uniform scalar либо явный
-override. Локальное уточнение меняет одну сторону/общий scalar, L или
-priority в ограниченном наборе; любой новый вариант снова проходит gates.
+До tester детерминированно выполняются structural → liquidity ceiling → margin
+→ individual-DD gates. M4 рассматривает только конечные варианты из config:
+sizing grid в единицах экспортируемого percentage-поля, её границы, порядок,
+hard `max_pretest_variant_count` и tie-break фиксируются в Campaign; превышение
+лимита не расширяет перебор автоматически. Выбранный scalar не превышает minimum
+всех ceiling и после round-down снова проходит все gates. Проверяются все точки
+этой конечной grid без раннего останова; Seed — максимальный прошедший uniform
+scalar либо явный override. Локальное уточнение меняет одну сторону/общий scalar,
+L или priority в ограниченном наборе; любой новый вариант снова проходит gates.
+
+Прошедшие варианты получают только scheduling key:
+`estimated_individual_net_pnl_at_selected_scalar / worst_calculated_initial_margin_requirement`.
+Numerator — линейная planning estimate individual historical net PnL при выбранном
+scalar; denominator — положительная известная worst initial-margin requirement
+из уже рассчитанного envelope. Нулевой/unknown denominator исключает variant;
+negative numerator остаётся допустимым числом и сортируется по обычному числовому
+порядку. Равенство key разрешается canonical candidate identity. Key, его inputs и
+enum/version сохраняются для воспроизведения порядка, но никогда не выдаются или
+отображаются как portfolio PnL, portfolio ranking либо recommendation.
 Монотонность DD/PnL по размеру не предполагается, бинарный поиск по DD запрещён.
 Все tried/excluded варианты и исчерпание бюджета отражаются в Campaign.
 
@@ -858,6 +948,11 @@ default profile, а также per-run override. Любое отклонение
 exact ranking, validation, capabilities и отдельные разрешения. Числа,
 минимальный PnL, точное Balanced/Conservative ранжирование, near-tie и duration
 limits, кроме трёх строк таблицы, остаются OPEN-POLICY.
+
+`each_strategy_max_dd_pct` — четвёртое, отдельное profile поле для pre-tester
+ограничения размера одной стратегии по §6.2.1. Его численные значения ещё
+OPEN-POLICY; оно не заменяет `max_actual_equity_dd_pct` и не меняет принятую
+таблицу `portfolio_optimizer_research_risk_v1`.
 
 Ограничения и ranking хранятся в profile config; универсальной DD-first
 сортировки для всех типов нет. No feasible candidate — явный результат,
@@ -1104,7 +1199,7 @@ semantics, воспроизводимые сценарии, joint retests пос
 | Q04 | обработка opposite opening fill в one-way, cancel_opposite, partial orders | active-order reserve и faithful renderer |
 | Q05 | balance/equity sizing basis, moment, resting resize, risk_* mapping, disabled cap encoding | sizing model и динамические guards |
 | Q06 | portfolio mode/config и фактические report fields/series, fees/funding/close attribution | portfolio adapter, metrics и safe deletion |
-| Q07 | PnL/liquidity/freshness policies и exact Balanced/Conservative ranking; DD/free/MM имеют только research defaults §10.1.1 | READY, не fixture development |
+| Q07 | PnL/liquidity/freshness policies, `each_strategy_max_dd_pct` и exact Balanced/Conservative ranking; DD/free/MM имеют только research defaults §10.1.1 | READY, не fixture development |
 | Q08 | research windows, state/warm-up boundary, minimum evidence и upstream OOS provenance | независимая validation и финальный статус |
 | Q09 | достаточность selection snapshot, tick/binary identity и безопасное чтение concurrent Performance DB | воспроизводимость campaign/run |
 | Q10 | target local/предоставленный remote, ownership и restore contract | разрешённые реальные runs |
@@ -1137,7 +1232,30 @@ risk-limit snapshots, Bybit formula engine или новой fee/funding под�
 Закрытие вопросов отражается изменением этой спецификации и evidence ledger,
 а не неявным предположением в коде. Новые поля/capabilities должны иметь fixture.
 
-## 19. Приёмка документации и дальнейшая работа
+## 19. D7 — Panel и развитие config
+
+Интерфейс, Campaign jobs, Settings CAS и XLSX регулируются отдельной
+[спецификацией Panel](2026-09-06-portfolio-optimizer-panel-ui.md) и
+[ADR-0031](../decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md).
+Эта основная спецификация и ADR-0030 имеют приоритет над UI-спецификацией и
+ADR-0031 при любом конфликте о допуске, ликвидности, leverage, sizing и
+индивидуальном DD; D7 сохраняет соответствующий смысл D6 без изменений.
+
+Текущая строгая схема config v1 остаётся нормативной. Необязательный
+`max_balance_usdt` в запуске Campaign не является config-полем. Nullable или
+отсутствующий `scenarios[].max_balance` и UI defaults требуют отдельной принятой
+схемы v2, миграции и поддержки parser.
+
+Этап 1 фиксирует входы и config digest в неизменяемом Campaign и не запускает
+совместный тестер. Канонический отказ этапа 2 —
+`PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED`; сокращённая форма не используется. Этап
+2 закрыт до принятых M5/M6 и отдельного явного разрешения. U0/U1 не меняют
+порядок M-задач: уже принятый M2 не зависел от UI,
+а M3 остаётся следующим серверным этапом. Готовность UI не закрывает
+PnL/liquidity/freshness/ranking policies и не разрешает tester, рекомендации,
+торговый допуск или live use.
+
+## 20. Приёмка документации и дальнейшая работа
 
 Полнота консолидации: MVP implementation design, advanced liquidity/margin,
 Live Monitor, sessions, phases 4–7, collector integration, developer wishes,
@@ -1154,6 +1272,18 @@ spec→plan, отсутствие зависимости от прежней р�
 `PLAN_APPROVED` для архитектурной документации и D5 policy amendment. Это не
 `CODE_REVIEW_PASS`, не implementation authorization и не production safety
 evidence; обязательные policy/capability gates остаются открыты.
+
+Для D6 дополнительно проверяются: docs-only diff без runtime/tester/live files;
+ссылки на ADR-0030 из spec/plan/PRD/progress/AGENTS; exact `FINALIST` universe;
+наличие `each_strategy_max_dd_pct` как OPEN-POLICY без нового числа; сохранение
+открытыми PnL/liquidity/freshness/ranking blockers. Упомянутые в плане M2/M3/M4
+tests — будущие описания acceptance tests, не test code этой редакции.
+
+Для D7 дополнительно проверяются: единый API-контракт Panel; точный отбор по
+`User Status=FINALIST` и усечение только по `User Rank`; неизменяемость Campaign;
+CAS и строгая схема настроек; сохранение заданий с restart→`INTERRUPTED`;
+успешная публикация XLSX только при `SUCCEEDED`; отсутствие путей и секретов вне
+Settings GET/PUT; постоянный gate этапа 2 до M5/M6 и отдельного разрешения.
 
 Справочные первичные источники для будущего venue adapter:
 [Bybit UTA formulas](https://www.bybit.com/en/help-center/article/?id=000001912),

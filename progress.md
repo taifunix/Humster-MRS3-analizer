@@ -13,19 +13,26 @@ The canonical package has no required dependency on the old working dossier;
 that directory has not been deleted. Current collector Revision 2/ADR-0024
 is reused instead of reviving its older design.
 
-State: Draft D5 / plan-spec review approved; M0 accepted after final
+State: Draft D7 amendment `PLAN_APPROVED`; M0 accepted after final
 independent `CODE_REVIEW_PASS` by Claude Opus 5 high in three rounds. Fixture-only
 M1 config, canonical identity, source snapshot, Portfolio DB, and dispositions
 are accepted after independent Opus `CODE_REVIEW_PASS` in five rounds; evidence is in
 [the M1 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md).
+Fixture-only M2 exact-FINALIST admission, liquidity history/ceilings, typed exchange
+reference, injected ticker snapshots and coarse capacity screen are accepted after
+independent Opus `CODE_REVIEW_PASS` in four rounds; evidence is in
+[the M2 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md).
 D5 records
 `portfolio_optimizer_research_risk_v1`
 research/calibration defaults: AGGRESSIVE DD/free-margin/MM 20%/20%/50%,
 BALANCED 10%/40%/35%, CONSERVATIVE 5%/60%/20%. They are not automatic trading
 admission; independent Opus D5 review returned `PLAN_APPROVED`. PnL, liquidity/freshness policies and
-exact ranking remain open. Capability questions Q01-Q12 gate their dependent
+exact ranking remain open. D6/ [ADR-0030](docs/decisions/0030-portfolio-optimizer-m2-admission-and-sizing-contract.md)
+fix exact `FINALIST` admission, seven-day liquidity distribution, current maximum
+symbol-level leverage and individual-DD sizing from current portfolio equity;
+the numerical individual-DD cap remains open. Capability questions Q01-Q12 gate their dependent
 tasks. No tester/bot was launched and no real config, DB, archive, API, or
-runtime target was used by M1. Пользователь авторизовал
+runtime target was used by M1–M2. Пользователь авторизовал
 M0 read-only inventory в новой чистой сессии по
 [M0 handoff](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-handoff.md):
 сначала capability/evidence matrix, затем принятие M0 и M1. Real tester
@@ -40,6 +47,20 @@ new files passed. Implementation phase gates, open policy labels and synthetic
 limiter/cycle/cap/replay examples were checked locally for consistency. M0
 review is now `CODE_REVIEW_PASS`; this remains documentation evidence, not
 implementation authorization or runtime evidence.
+
+Panel UI U0 documentation is accepted after independent Opus
+`PLAN_APPROVED` and final `CODE_REVIEW_PASS` in two rounds:
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md)
+and [ADR-0031](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md)
+fix the local launch form, exact `FINALIST`/`User Rank` truncation, immutable
+Campaign, persisted seven-stage job, settings CAS, success-only XLSX and the
+disabled Stage 2 boundary. The documentation update touches only the UI spec,
+ADR-0031, main spec/plan, PRD, progress and AGENTS; tests and runtime checks are
+not applicable. U1 code is not implemented or authorized, config schema v2 is
+not accepted, and Stage 2 remains blocked until M5/M6 plus explicit user
+authorization. M2 remains independent and accepted; M3 fixture-only
+margin/limiter TDD is still the next safe implementation step. No Panel API,
+UI, tester, bot, real database or generated workbook was run for U0.
 
 M0 read-only contract inventory is accepted after final independent Opus
 `CODE_REVIEW_PASS` in three rounds. The versioned evidence is
@@ -57,7 +78,7 @@ transaction or stop without source writes. Current joint portfolio mode/report,
 dual-TF, limiter/priority, sizing, opposite-order, target-wide ownership,
 collateral reserve and shared-liquidity details remain capability blockers.
 No tester/bot, API, real DB/archive, runtime config or target write was used.
-Next safe step is M2 fixture-only TDD against accepted collector contracts; real tester work remains blocked by M5
+Next safe step is M3 fixture-only margin/limiter TDD; real tester work remains blocked by M5
 ownership and separate user authorization.
 
 ## Bybit collector current implementation status (2026-09-05)

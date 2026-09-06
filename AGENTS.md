@@ -19,17 +19,27 @@
 Если пользователь пишет **«Оптимизатор портфеля»** или `Portfolio Optimizer`,
 после шагов 1–3 читать `docs/specs/2026-09-05-portfolio-optimizer.md`, затем
 `docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md` и
-`docs/superpowers/plans/2026-09-05-portfolio-optimizer.md`. Этот пакет пока
-Draft/Proposed: Opus plan/spec review D4/D5 вернул `PLAN_APPROVED`; D5 фиксирует
-research-only `portfolio_optimizer_research_risk_v1` DD/free-margin/MM defaults.
-PnL,
-liquidity/freshness и ranking policies не закрыты; пакет не разрешает runtime
-или запуск tester. Исходная рабочая подборка не требуется для продолжения.
+`docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md`,
+`docs/decisions/0030-portfolio-optimizer-m2-admission-and-sizing-contract.md` и
+`docs/superpowers/plans/2026-09-05-portfolio-optimizer.md`. M0–M2 accepted;
+D6 `PLAN_APPROVED` уточняет strict `FINALIST` universe, seven-day liquidity distribution,
+maximum current symbol-level leverage и individual-DD ceiling from current
+portfolio equity. PnL, `each_strategy_max_dd_pct`, liquidity/freshness и ranking
+policies не закрыты; пакет не разрешает runtime или запуск tester. Исходная
+рабочая подборка не требуется для продолжения.
 Прохождение research thresholds не разрешает implementation, tester run,
 `RECOMMENDATION_READY`, trading admission или live use; все remaining gates
 (PnL floor, liquidity/freshness limits, profile ranking) остаются open blockers.
-Для новой M0 implementation-сессии дополнительно читать
-`docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-handoff.md`.
+Для работы над Panel/UI, настройками, Campaign jobs, XLSX или передачей тестеру
+дополнительно читать `docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md` и
+`docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md`.
+D7 UI-контракт не делает M3 зависимым от Panel и не разрешает tester/runtime;
+U1 требует отдельного назначения, а Stage 2 — M5/M6 и явного разрешения.
+При конфликте основная optimizer spec и ADR-0030 выше UI spec/ADR-0031 для
+`FINALIST`, liquidity, leverage, sizing и DD; D7 сохраняет эти правила D6.
+Для M3 implementation-сессии дополнительно читать M2 evidence
+`docs/superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md`; M0 handoff
+и M1 evidence остаются историческими evidence, не текущей инструкцией.
 
 Если пользователь пишет **«работаем над Анализатором Портфеля»** (или `Portfolio Analyzer`), это означает: после шагов 1–3 минимального контекста обязательно прочитать `docs/specs/2026-08-09-portfolio-analyzer-v04.md`, затем `docs/decisions/0001-repository-and-documentation-model.md`, затем только разделы 9–10 `docs/archive/sources/MRS3_v07_MASTER_HANDOFF_LEGACY_DUCKDB_2026-08-10.md`.
 
