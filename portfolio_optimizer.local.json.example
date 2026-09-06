@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "policy_version": "portfolio_optimizer_research_risk_v1",
+  "algorithm_versions": {
+    "sizing": "portfolio_optimizer_sizing_v1",
+    "ranking": "portfolio_optimizer_ranking_v1"
+  },
+  "inputs": {
+    "performance_db": "./operator-supplied/performance.duckdb",
+    "portfolio_db": "./operator-supplied/portfolio.duckdb",
+    "collector_root": "./operator-supplied/collector",
+    "approved_templates": [
+      "./operator-supplied/templates/strategy.json"
+    ]
+  },
+  "scenarios": {
+    "AGGRESSIVE": {
+      "account": "operator-supplied-aggressive",
+      "deposit": {"amount": 10000, "currency": "USDT"},
+      "collateral": {"amount": 10000, "currency": "USDT"},
+      "max_balance": {"amount": 10000, "currency": "USDT"},
+      "sizing": {
+        "upper_bound": {"amount": 10000, "currency": "USDT"},
+        "grid": [
+          {"amount": 1000, "currency": "USDT"},
+          {"amount": 5000, "currency": "USDT"},
+          {"amount": 10000, "currency": "USDT"}
+        ]
+      }
+    },
+    "BALANCED": {
+      "account": "operator-supplied-balanced",
+      "deposit": {"amount": 10000, "currency": "USDT"},
+      "collateral": {"amount": 10000, "currency": "USDT"},
+      "max_balance": {"amount": 10000, "currency": "USDT"},
+      "sizing": {
+        "upper_bound": {"amount": 10000, "currency": "USDT"},
+        "grid": [
+          {"amount": 1000, "currency": "USDT"},
+          {"amount": 5000, "currency": "USDT"},
+          {"amount": 10000, "currency": "USDT"}
+        ]
+      }
+    },
+    "CONSERVATIVE": {
+      "account": "operator-supplied-conservative",
+      "deposit": {"amount": 10000, "currency": "USDT"},
+      "collateral": {"amount": 10000, "currency": "USDT"},
+      "max_balance": {"amount": 10000, "currency": "USDT"},
+      "sizing": {
+        "upper_bound": {"amount": 10000, "currency": "USDT"},
+        "grid": [
+          {"amount": 1000, "currency": "USDT"},
+          {"amount": 5000, "currency": "USDT"},
+          {"amount": 10000, "currency": "USDT"}
+        ]
+      }
+    }
+  },
+  "search": {
+    "universe": {"policy_id": "operator_supplied_universe_v1", "parameters": {"operator_supplied": true}},
+    "composition": {"policy_id": "operator_supplied_composition_v1", "parameters": {"operator_supplied": true}},
+    "sizing": {"policy_id": "operator_supplied_sizing_v1", "parameters": {"operator_supplied": true}},
+    "limiter": {"policy_id": "operator_supplied_limiter_v1", "parameters": {"operator_supplied": true}},
+    "priority": {"policy_id": "operator_supplied_priority_v1", "parameters": {"operator_supplied": true}},
+    "seed": 1,
+    "rounds": 1,
+    "total_test_budget": 1
+  },
+  "research": {
+    "development_window": {"value": 1, "unit": "days"},
+    "validation_window": {"value": 1, "unit": "days"},
+    "warmup": {"value": 0, "unit": "days"},
+    "boundary": "operator-supplied",
+    "evidence_minimum": {"value": 1, "unit": "count"}
+  },
+  "liquidity": {
+    "policy_id": "operator_supplied_liquidity_v1",
+    "parameters": {"operator_supplied": true}
+  },
+  "margin": {
+    "policy_id": "operator_supplied_margin_v1",
+    "parameters": {"operator_supplied": true}
+  },
+  "profiles": {
+    "AGGRESSIVE": {
+      "pnl": {"policy_id": "operator_supplied_pnl_v1", "parameters": {"operator_supplied": true}},
+      "liquidity": {"policy_id": "operator_supplied_liquidity_v1", "parameters": {"operator_supplied": true}},
+      "ranking": {"id": "operator_supplied_ranking_v1", "parameters": {"operator_supplied": true}, "top_n": 1}
+    },
+    "BALANCED": {
+      "pnl": {"policy_id": "operator_supplied_pnl_v1", "parameters": {"operator_supplied": true}},
+      "liquidity": {"policy_id": "operator_supplied_liquidity_v1", "parameters": {"operator_supplied": true}},
+      "ranking": {"id": "operator_supplied_ranking_v1", "parameters": {"operator_supplied": true}, "top_n": 1}
+    },
+    "CONSERVATIVE": {
+      "pnl": {"policy_id": "operator_supplied_pnl_v1", "parameters": {"operator_supplied": true}},
+      "liquidity": {"policy_id": "operator_supplied_liquidity_v1", "parameters": {"operator_supplied": true}},
+      "ranking": {"id": "operator_supplied_ranking_v1", "parameters": {"operator_supplied": true}, "top_n": 1}
+    }
+  },
+  "runner": {
+    "target": "local",
+    "root": "./operator-supplied/tester",
+    "timeout": {"value": 1, "unit": "seconds"},
+    "retries": 0
+  }
+}

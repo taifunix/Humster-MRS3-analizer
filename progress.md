@@ -14,14 +14,18 @@ that directory has not been deleted. Current collector Revision 2/ADR-0024
 is reused instead of reviving its older design.
 
 State: Draft D5 / plan-spec review approved; M0 accepted after final
-independent `CODE_REVIEW_PASS` by Claude Opus 5 high in three rounds. D5 records
+independent `CODE_REVIEW_PASS` by Claude Opus 5 high in three rounds. Fixture-only
+M1 config, canonical identity, source snapshot, Portfolio DB, and dispositions
+are accepted after independent Opus `CODE_REVIEW_PASS` in five rounds; evidence is in
+[the M1 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md).
+D5 records
 `portfolio_optimizer_research_risk_v1`
 research/calibration defaults: AGGRESSIVE DD/free-margin/MM 20%/20%/50%,
 BALANCED 10%/40%/35%, CONSERVATIVE 5%/60%/20%. They are not automatic trading
 admission; independent Opus D5 review returned `PLAN_APPROVED`. PnL, liquidity/freshness policies and
 exact ranking remain open. Capability questions Q01-Q12 gate their dependent
-tasks. No tester/bot was launched, no runtime config or implementation was
-created and no commit was made for this consolidation. Пользователь авторизовал
+tasks. No tester/bot was launched and no real config, DB, archive, API, or
+runtime target was used by M1. Пользователь авторизовал
 M0 read-only inventory в новой чистой сессии по
 [M0 handoff](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-handoff.md):
 сначала capability/evidence matrix, затем принятие M0 и M1. Real tester
@@ -53,7 +57,7 @@ transaction or stop without source writes. Current joint portfolio mode/report,
 dual-TF, limiter/priority, sizing, opposite-order, target-wide ownership,
 collateral reserve and shared-liquidity details remain capability blockers.
 No tester/bot, API, real DB/archive, runtime config or target write was used.
-Next safe step is M1 fixture-only TDD; real tester work remains blocked by M5
+Next safe step is M2 fixture-only TDD against accepted collector contracts; real tester work remains blocked by M5
 ownership and separate user authorization.
 
 ## Bybit collector current implementation status (2026-09-05)

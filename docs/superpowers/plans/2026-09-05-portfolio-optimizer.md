@@ -4,17 +4,18 @@
 
 **Версия:** D5.
 
-**Статус:** `PLAN_APPROVED`; M0 accepted after independent `CODE_REVIEW_PASS`
-by Claude Opus 5 high in three rounds. Runtime M1–M8 remain unstarted.
+**Статус:** `PLAN_APPROVED`; M0 and fixture-only M1 accepted after independent
+`CODE_REVIEW_PASS` by Claude Opus 5 high. Runtime M2–M8 remain unstarted.
 
 **D5 review:** `PLAN_APPROVED`.
 **M0 review:** `CODE_REVIEW_PASS` — Claude Opus 5 high, three rounds.
+**M1 review:** `CODE_REVIEW_PASS` — Claude Opus 5 high, five rounds.
 
 **Спецификация:** [Portfolio Optimizer](../../specs/2026-09-05-portfolio-optimizer.md).
 
 **Решение:** [ADR-0025, Proposed](../../decisions/0025-portfolio-optimizer-evidence-and-phases.md).
 
-**Research risk policy:** [ADR-0029, Proposed](../../decisions/0029-portfolio-optimizer-research-risk-profile-v1.md).
+**Research risk policy:** [ADR-0029, Accepted](../../decisions/0029-portfolio-optimizer-research-risk-profile-v1.md).
 
 ## 1. Назначение плана и текущая граница
 
@@ -32,9 +33,9 @@ capabilities и DoD находятся в спецификации. Это не 
 - [ ] Согласовать PnL/liquidity/freshness policies и exact Balanced/Conservative ranking до финальных рекомендаций.
 - [ ] Получать отдельное разрешение перед реальными tester/bot runs.
 
-Сейчас завершена только документационная консолидация и её plan/spec review.
-Storage/parser/чистые расчёты на fixtures могут разрабатываться после разрешения
-реализации. `portfolio_optimizer_research_risk_v1` не даёт READY без остальных policy/capability gates.
+Завершены документационная консолидация, M0 inventory и fixture-only M1
+config/storage/snapshot contracts. `portfolio_optimizer_research_risk_v1` не
+даёт READY без остальных policy/capability gates.
 Прохождение research thresholds не разрешает implementation, tester run,
 `RECOMMENDATION_READY`, trading admission или live use; все remaining gates
 (PnL floor, liquidity/freshness limits, profile ranking) остаются open blockers.
@@ -179,51 +180,51 @@ PortfolioSet READY, но не single-account fixture research. Перед READY 
 
 **Spec:** §5. **Зависимости:** M0.
 
-- [ ] Создать versioned `portfolio_optimizer.local.json` loader и безопасный `.example`.
-- [ ] Добавить рабочий local config в gitignore; не публиковать secrets/реальные paths.
-- [ ] Валидировать schema/policy versions, units, required profile fields/ranking IDs.
-- [ ] Внести ровно `portfolio_optimizer_research_risk_v1` из spec §10.1.1; не добавлять defaults для PnL, liquidity/freshness или ranking.
-- [ ] Хранить user deposit, cap и конечный sizing-balance envelope отдельно по
+- [x] Создать versioned `portfolio_optimizer.local.json` loader и безопасный `.example`.
+- [x] Добавить рабочий local config в gitignore; не публиковать secrets/реальные paths.
+- [x] Валидировать schema/policy versions, units, required profile fields/ranking IDs.
+- [x] Внести ровно `portfolio_optimizer_research_risk_v1` из spec §10.1.1; не добавлять defaults для PnL, liquidity/freshness или ranking.
+- [x] Хранить user deposit, cap и конечный sizing-balance envelope отдельно по
   каждому scenario/account; заморозить finite sizing grid и её порядок.
-- [ ] Создать transactional Portfolio DuckDB с required series в child tables.
-- [ ] До первой записи реализовать DB-scoped cross-process lease по canonical
+- [x] Создать transactional Portfolio DuckDB с required series в child tables.
+- [x] До первой записи реализовать DB-scoped cross-process lease по canonical
   Portfolio DB path; все writers M1–M8 используют её для короткой publication.
-- [ ] Owner lease хранит PID/start/host/boot identity; foreign/unknown host/boot
+- [x] Owner lease хранит PID/start/host/boot identity; foreign/unknown host/boot
   блокирует запись, reclaim — только same-host/same-boot proven-dead owner.
-- [ ] Для `LOCK_OWNER_UNVERIFIABLE` прекратить write без retry/bypass/partial
+- [x] Для `LOCK_OWNER_UNVERIFIABLE` прекратить write без retry/bypass/partial
   publication. Manual clear разрешать только после atomic durable operator
   attestation sidecar с lock kind/path/target, stale owner, operator, UTC и reason;
   никакой автоматический процесс не создаёт attestation и не делает clear.
-- [ ] Не держать DB transaction при ожидании tester-target lock.
-- [ ] Добавить transactional UNIQUE Campaign content identity: concurrent duplicate
+- [x] Не держать DB transaction при ожидании tester-target lock.
+- [x] Добавить transactional UNIQUE Campaign content identity: concurrent duplicate
   возвращает exact row либо после uniqueness conflict перечитывает её; mismatch
   fail-closed и никогда не создаёт вторую identity.
-- [ ] Разделить Campaign, TradingRun, Evaluation и PortfolioSet composition identity.
-- [ ] TradingRun хранит immutable `execution_campaign_id`; Evaluation хранит его
+- [x] Разделить Campaign, TradingRun, Evaluation и PortfolioSet composition identity.
+- [x] TradingRun хранит immutable `execution_campaign_id`; Evaluation хранит его
   вместе с отдельным `decision_campaign_id` текущих decision/reference facts.
-- [ ] Снять одной read-only transaction согласованный snapshot всех typed
+- [x] Снять одной read-only transaction согласованный snapshot всех typed
   candidate/fact/window inputs; не останавливать и не ставить на паузу чужой writer.
-- [ ] Вызывать source selection/window API только с `cache_only=True`; cache miss
+- [x] Вызывать source selection/window API только с `cache_only=True`; cache miss
   вычислять из snapshot и записывать только в Portfolio DB.
-- [ ] Сохранить canonical content digest полного snapshot, source schema/version,
+- [x] Сохранить canonical content digest полного snapshot, source schema/version,
   read time, geometry, periods, metrics/features, exclusions и review provenance.
-- [ ] Реализовать единый `canonical_digest_v1` по spec §5.4 и использовать его
+- [x] Реализовать единый `canonical_digest_v1` по spec §5.4 и использовать его
   для Campaign/ticker/semantic/PortfolioSet digests.
-- [ ] Добавить literal golden vectors Campaign, semantic result и PortfolioSet;
+- [x] Добавить literal golden vectors Campaign, semantic result и PortfolioSet;
   проверить ordering, type/unit, decimals, missing/null/UNKNOWN и source ordinal.
-- [ ] Зафиксировать отдельные versioned disposition, gate-result, evidence-class,
+- [x] Зафиксировать отдельные versioned disposition, gate-result, evidence-class,
   capability-result и reason-code enums spec §5.6; golden vector проверяет exact
   строки, rename требует version bump.
-- [ ] Зафиксировать upstream selection window, config/algorithm hashes и seed.
-- [ ] Старый decision replay выполнять из frozen facts; изменение source создаёт
+- [x] Зафиксировать upstream selection window, config/algorithm hashes и seed.
+- [x] Старый decision replay выполнять из frozen facts; изменение source создаёт
   новую Campaign, но не инвалидирует старую.
-- [ ] Различать decision replay и tick replay с доступностью binary/ticks.
-- [ ] Обеспечить single writer Portfolio DB и fail-closed source read при
+- [x] Различать decision replay и tick replay с доступностью binary/ticks.
+- [x] Обеспечить single writer Portfolio DB и fail-closed source read при
   невозможности consistent snapshot.
-- [ ] Хранить typed dispositions `RESEARCH_ONLY`, `RECOMMENDATION_READY`,
+- [x] Хранить typed dispositions `RESEARCH_ONLY`, `RECOMMENDATION_READY`,
   `NEEDS_RETEST`, `NEEDS_RESCREEN`, `INSUFFICIENT_EVIDENCE` и конкретные reasons,
   не создавая отдельный workflow engine.
-- [ ] Реализовать exact condition/scope/disposition/reason mapping из spec §5.6;
+- [x] Реализовать exact condition/scope/disposition/reason mapping из spec §5.6;
   candidate-local FAIL не завершает Campaign, passing conservative bound сам по
   себе не блокирует READY.
 
@@ -704,17 +705,15 @@ replacement/trial/rollback, без автоматического deployment п�
 - [ ] Обновить spec/ADR/PRD/progress по изменившимся контрактам и evidence.
 - [ ] Создать scoped conventional commit после review, не раньше.
 
-Нынешний перенос документации не запускает эти implementation checks и не
-создаёт runtime config; M0 accepted with independent `CODE_REVIEW_PASS` by
-Claude Opus 5 high in three rounds. Runtime M1–M8 and acceptance beyond M0
-remain unstarted.
+M0 and fixture-only M1 are accepted with independent `CODE_REVIEW_PASS` by
+Claude Opus 5 high. Runtime M2–M8 remain unstarted.
 
 ## 15. Ближайший следующий этап
 
-M0 read-only inventory is accepted after independent `CODE_REVIEW_PASS`; M1
-is the next safe step and begins only after this acceptance. Q01–Q12 remain
-isolated or fail-closed where unknown. Real tester experiments additionally
-require accepted M5 target-wide ownership and separate user authorization.
+M0 read-only inventory and fixture-only M1 are accepted after independent
+`CODE_REVIEW_PASS`; M2 is the next safe step. Q01–Q12 remain isolated or
+fail-closed where unknown. Real tester experiments additionally require accepted
+M5 target-wide ownership and separate user authorization.
 Не задавать пользователю вопросы повторно, если поведение уже закреплено в
 §2/§7 спецификации: выяснять physical mapping и evidence.
 

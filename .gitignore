@@ -12,6 +12,7 @@ htmlcov/
 # Local runtime configuration and artifacts
 config.local.json
 config.local.json.bak
+portfolio_optimizer.local.json
 .panel-jobs.json
 data/
 output/

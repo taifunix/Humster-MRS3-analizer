@@ -11,8 +11,10 @@
 runs остаются запрещены до M5 и отдельного разрешения.
 
 **Реализация:** M0 read-only inventory accepted after independent Opus
-`CODE_REVIEW_PASS`; runtime M1–M8 не начат. Запуск tester/bot не разрешён.
-Evidence: [M0 capability inventory](../superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md).
+`CODE_REVIEW_PASS`; fixture-only M1 implementation accepted after independent
+Opus `CODE_REVIEW_PASS`. Runtime M2–M8 не начат. Запуск tester/bot не разрешён. Evidence:
+[M0 capability inventory](../superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md),
+[M1 implementation evidence](../superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md).
 
 **Численные политики:** стартовые DD/free-margin/MM limits для исследования
 зафиксированы как `portfolio_optimizer_research_risk_v1` в §10.1. Минимальный PnL, liquidity/freshness и точный

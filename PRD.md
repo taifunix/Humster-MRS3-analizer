@@ -98,7 +98,7 @@ analysis runs и lineage согласно уже реализованной
 
 ## Hook: Анализатор Портфеля
 
-Новый Portfolio Optimizer — **Draft D5 / M0 accepted, M1 next, plan/spec review approved**. Канонические
+Новый Portfolio Optimizer — **Draft D5 / M0–M1 accepted, M2 next**. Канонические
 [спецификация по фазам](docs/specs/2026-09-05-portfolio-optimizer.md),
 [план внедрения](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md) и
 [ADR-0025 (Proposed)](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md)
@@ -113,12 +113,14 @@ immutable MRS3-кандидатов, liquidity/margin guards, общий tick-te
 повторяющихся symbols и базовая validation входят в MVP. Распределение общего
 капитала, live monitor, sessions, advanced risk и rotation — последующие фазы.
 
-Перед M1 нужны принятые M0 evidence и подтверждённые adapters/inputs. M0
-read-only inventory accepted after independent `CODE_REVIEW_PASS`; M1 is the
-next safe step. Runtime M1-M8 remains unstarted; Q01-Q12 unknowns are isolated
-or fail-closed where unresolved.
+M0 read-only inventory accepted after independent `CODE_REVIEW_PASS`. Fixture-only
+M1 config/storage/snapshot implementation is accepted after independent Opus
+`CODE_REVIEW_PASS`; runtime M2-M8 remains unstarted. Q01-Q12 unknowns are isolated or
+fail-closed where unresolved.
 The versioned matrix is in
 [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md).
+M1 evidence is recorded in
+[the implementation ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md).
 Стартовые
 research-only DD/free-margin/MM limits
 описаны в D5 и [ADR-0029](docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md)
@@ -143,7 +145,7 @@ research-only DD/free-margin/MM limits
 | Accepted | [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) | раздельная full-horizon/windowed verification для real packages v2 | event source packs |
 | Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
 | Superseded / historical | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | legacy posttest calibration retained for provenance | Performance DB v2 RETEST |
-| Draft D5 / M0 accepted | [Portfolio Optimizer phased spec](docs/specs/2026-09-05-portfolio-optimizer.md), [plan](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md), [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md) | joint tick-tests, separate Cross portfolios, immutable evidence, phased recommendations | Performance v2, collector ADR-0024, tester capabilities, open PnL/liquidity/freshness/ranking and runtime gates |
+| Draft D5 / M0–M1 accepted | [Portfolio Optimizer phased spec](docs/specs/2026-09-05-portfolio-optimizer.md), [plan](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md), [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md), [M1 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md) | joint tick-tests, separate Cross portfolios, immutable evidence, phased recommendations | Performance v2, collector ADR-0024, tester capabilities, open PnL/liquidity/freshness/ranking and runtime gates |
 | Proposed | [ADR-0025](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md) | optimizer data boundaries, replay and MVP/post-MVP scope | ADR-0001/0020/0024; approval deferred |
 | Accepted | [ADR-0029](docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md) | research-only DD/free-margin/MM profile defaults | Portfolio Optimizer D5; not runtime/trading permission |
 | Accepted | [ADR-0026](docs/decisions/0026-bybit-orderbook-data-health.md) | preserve snapshots received before ACK; separate transport connectivity from data health | Bybit collector specification |
