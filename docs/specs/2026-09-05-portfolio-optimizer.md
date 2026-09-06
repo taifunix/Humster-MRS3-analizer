@@ -1,0 +1,1164 @@
+# Portfolio Optimizer — спецификация по фазам
+
+**Дата:** 2026-09-05
+
+**Статус:** Draft D5 — независимый Opus plan/spec review D4 и D5:
+`PLAN_APPROVED`. D5 фиксирует стартовую
+`portfolio_optimizer_research_risk_v1`.
+
+**D5 review:** `PLAN_APPROVED`.
+Пользователь авторизовал M0 read-only inventory в новой сессии; real tester/bot
+runs остаются запрещены до M5 и отдельного разрешения.
+
+**Реализация:** M0 read-only inventory accepted after independent Opus
+`CODE_REVIEW_PASS`; runtime M1–M8 не начат. Запуск tester/bot не разрешён.
+Evidence: [M0 capability inventory](../superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md).
+
+**Численные политики:** стартовые DD/free-margin/MM limits для исследования
+зафиксированы как `portfolio_optimizer_research_risk_v1` в §10.1. Минимальный PnL, liquidity/freshness и точный
+Balanced/Conservative ranking требуют последующего согласования.
+
+## 1. Назначение и управление документом
+
+Из заранее протестированных MRS3-стратегий система формирует несколько
+независимых портфелей, подбирает состав, размеры, limiter и приоритеты,
+проверяет совместную торговлю существующим tick-tester и выдаёт рекомендации.
+Сумма одиночных PnL никогда не считается результатом портфеля.
+
+Этот файл содержит требования, контракты и DoD по фазам. Порядок реализации
+находится в [плане](../superpowers/plans/2026-09-05-portfolio-optimizer.md),
+архитектурная граница — в [ADR-0025](../decisions/0025-portfolio-optimizer-evidence-and-phases.md).
+Оперативное состояние хранится только в [progress](../../progress.md),
+продуктовый scope — в [PRD](../../PRD.md).
+
+Это самодостаточный новый пакет дизайна, а не приложение к прежней подборке
+заметок. Для его применения не требуется сохранять исходную рабочую папку.
+Он ещё не supersede-ит утверждённые runtime-контракты: принятие новой
+спецификации/ADR и независимый review остаются отдельным gate. Старый
+[Portfolio Analyzer v0.4](2026-08-09-portfolio-analyzer-v04.md) сохраняет
+происхождение прежнего дизайна; его собственная replay-симуляция и фиксированное
+число пар не переносятся в новый оптимизатор.
+
+### Явные зависимости
+
+- [Модель документации, ADR-0001](../decisions/0001-repository-and-documentation-model.md).
+- [Unified Performance v2](2026-08-28-unified-performance-analytics-v2.md),
+  [ADR-0020](../decisions/0020-unified-performance-analytics-v2.md),
+  [CHECK & RETEST](2026-09-03-performance-v2-retest-workflow.md),
+  [typed-config identity](2026-09-04-performance-v2-config-dedup.md).
+- [Selection review](2026-09-02-performance-v2-selection-review-import.md),
+  [ADR-0021](../decisions/0021-performance-v2-persisted-selection-snapshots.md),
+  [ADR-0022](../decisions/0022-performance-v2-selection-review-ledger.md).
+- [Bybit collector Revision 2](2026-09-05-bybit-market-data-collector.md) и
+  [ADR-0024](../decisions/0024-bybit-market-data-collector-archive.md).
+- Исторический handoff: только
+  [разделы 9–10](../archive/sources/MRS3_v07_MASTER_HANDOFF_LEGACY_DUCKDB_2026-08-10.md#9-что-появится-только-после-реальных-mrs3-tick-тестов).
+
+## 2. Согласованная предметная модель
+
+### 2.1. Рынок и счета
+
+- Начальный рынок — Bybit linear контракты на американские акции;
+  сырьевые контракты допускаются после проверки конкретного инструмента.
+  Это биржевой дериватив, не ликвидность базовой акции на другой площадке.
+- На каждый портфель — отдельный Unified Cross account или несвязанный
+  subaccount, свой баланс, свой limiter. Балансы и маржа счетов не суммируются.
+- Пользователь задаёт депозит каждого сценария. Рекомендация распределения
+  общего капитала между типами портфеля отложена до Phase 7.
+- Фиксированного продуктового ограничения «6–8» или «не более 10 пар» нет.
+  Реальная граница — допустимый universe, биржевые ограничения и бюджет поиска.
+- Одна пара может входить в несколько портфелей. Разные глубины shift
+  выбираются только из уже протестированных кандидатов. Отличие shifts
+  само по себе не доказывает независимость риска или исполнения.
+
+### 2.2. Стратегия
+
+Стратегия mean-reversion, без стратегических стопов. Dedicated closing order
+закрывает позицию. Принудительное закрытие лишней позиции по limiter — отдельная
+штатная механика, не добавление стопа оптимизатором.
+
+LONG и SHORT выбираются независимо при достаточном индивидуальном evidence.
+Целевой контракт — не более одной направленной позиции по symbol на счёте.
+При открытой позиции opposite opening orders могут оставаться или сниматься
+согласно явной настройке бота. Оставленная встречная заявка не объявляется
+closing order; эффект её исполнения должен быть подтверждён adapter fixtures.
+
+Оптимизатор не меняет MA, sources, shifts, число/геометрию ордеров, внутренние
+`lot_x`, CloseMA и правила выхода. Разрешено масштабировать все opening orders
+одного directional candidate единым scalar, сохраняя внутренние пропорции.
+Режим BOTH требует совместного retest даже после успешных раздельных тестов.
+
+### 2.3. Термины
+
+| Сущность | Содержание |
+| --- | --- |
+| DirectionalCandidate | Strategy ID, канонические настройки, symbol/side/TF, индивидуальные факты и их период |
+| PairSlot | один symbol и необязательные LONG/SHORT candidates; хотя бы одна сторона обязательна |
+| PortfolioCandidate | PairSlots, скаляры, limiter, priority, opposite-order policy, депозит/max_balance и исполняемые настройки |
+| Campaign | замороженный universe, input/config snapshots, periods, budget, список experiments |
+| TradingRun | конкретный совместный tick-test с точными входами, immutable `execution_campaign_id` и результатами |
+| Evaluation | расчёт gates/ranking фиксированной политикой над сохранённым TradingRun |
+| PortfolioSet | одновременно рассматриваемые независимые портфели и совместная проверка их liquidity load |
+| Тип портфеля / профиль риска | AGGRESSIVE, BALANCED, CONSERVATIVE; не биржевой margin mode |
+
+## 3. Фазы и границы MVP
+
+| Фаза | Результат | Граница |
+| --- | --- | --- |
+| 0 | готовность внешних данных и adapters | переиспользовать collector и Performance v2 |
+| 1 — MVP | offline optimizer, portfolio tests, три типа рекомендаций | несколько счетов, пользовательские депозиты, грубая общая liquidity-проверка |
+| 2A | empirical capacity и уточнённая margin/order модель | дополнительные факты об исполнении |
+| 2B | read-only Live Account Monitor | наблюдение и alerts, без торговых команд |
+| 3 | time/session analysis | только evidence-backed entry policies и joint retest |
+| 4 | dependency и robustness | совместные неблагоприятные состояния и устойчивость выбора |
+| 5 | degradation analytics | сравнение live и test, рекомендации |
+| 6 | controlled rotation | проверяемая замена стратегий, без автоматической торговли по умолчанию |
+| 7 | advanced validation, multi-account allocation и profit policies | распределение капитала — будущая идея, не MVP |
+
+В MVP входят liquidity ceilings, актуальные leverage/risk tiers, limiter-aware
+IM/MM precheck, оптимизация priorities, portfolio report import, replay,
+минимальная защита от подгонки, экспорт точных конфигураций.
+
+Не входят: собственный matching engine, точная копия Bybit liquidation engine,
+live monitor/alerts, оптимизация времени торговли, автоматические переводы,
+автоторговля/ротация, генерация новых shifts, точная empirical fill capacity,
+полный order-lifecycle recorder и отдельная funding/fee аналитическая система.
+Комиссии и funding в фактическом PnL при этом не исключаются.
+
+## 4. Phase 0 — источники и готовность
+
+### 4.1. PerformanceDB и `portfolio_optimizer_input`
+
+Единственный источник индивидуальных кандидатов — текущая Performance v2 DB
+через read-only adapter `portfolio_optimizer_input`. Это имя выходного
+контракта, не утверждение о существующем готовом API. Source DB/raw HTML не
+становятся альтернативными входами оптимизатора.
+
+Adapter проверяет текущую схему и читает typed strategy/orders, current result,
+report/effective/research windows, metrics, tags и актуальный selection review.
+Правило допуска FINALIST/RESERVE/ручного набора фиксируется campaign policy;
+`DISCARDED`, `REJECTED` и неразрешённый `RETEST` не получают финальный допуск.
+Нет данных о текущем статусе/периоде — причина отказа, не молчаливый fallback.
+
+В коде уже есть `selection_runs`/`selection_results`, но это не доказательство
+полного immutable snapshot использованных фактов. `strategy_results` может
+обновляться на месте с прежним Result ID при расширении истории.
+Достаточность existing snapshots проверяется, недостающие входы сохраняются
+в Campaign (§5.2), без полной копии Performance DB.
+
+Нельзя вызывать cache-writing selection/windows функции через read-only adapter.
+Всё source-чтение выполняется одной согласованной read-only транзакцией;
+существующий selection path вызывается только с `cache_only=True`. Cache miss
+рассчитывается из уже прочитанных typed facts и сохраняется только в Portfolio
+DB. Оптимизатор не останавливает и не ставит на паузу чужой writer: если
+согласованный snapshot открыть нельзя, операция завершается fail-closed и может
+быть повторена оператором. Копирование открытого файла не заменяет snapshot.
+
+### 4.2. Collector — существующая независимая подсистема
+
+Его действующая спецификация и ADR-0024 определяют формат; заново реализовывать
+сборщик из прежнего проекта нельзя. Он не знает стратегий, балансов и позиций,
+не использует private API и не выдаёт capacity-рекомендаций.
+
+Контракт чтения оптимизатора:
+
+- `liquidity_1m`, видимые bid/ask depth 10/25/50/100 bps, minute p05/median,
+  spread, coverage, active targets и complete ratios;
+- текущая `schema_version=2`, nullable FLOAT64 и combined/side-specific
+  bid/ask completeness ratios по утверждённой схеме;
+- `published_hours` SQLite index определяет опубликованные liquidity-файлы:
+  сырой glob не является источником истины, незарегистрированный final не читается;
+- instruments/risk-limit snapshots и symbol events читаются по проверенному
+  текущему reference-контракту; архив и spool не изменяются потребителем;
+- недоступный/неполный файл, неподдерживаемая схема, низкое качество, пропуски
+  наблюдения и смена состава symbols отражаются явно.
+
+Collector не публикует per-file cryptographic manifests и не обязан это делать.
+Digest фактов/файлов, использованных кампанией, при необходимости вычисляет
+сам read-only consumer для своей воспроизводимости. Marker удостоверяет
+структурную публикацию, не достаточность рыночной ликвидности.
+
+Для чтения индекса использовать проверенный read-only путь, например текущий
+`SQLiteSpool.open_read_only(...).published_hours()`. Обычный `SQLiteSpool(...)`
+берёт writer lock и создаёт/настраивает schema, поэтому не подходит consumer.
+Открытый reader закрывается после чтения; отсутствие spool не запускает collector.
+
+### 4.3. Gate фазы 0
+
+Есть зафиксированное сопоставление реальных полей DB/report/config, поддержанных
+tester capabilities, collector schema и данных instrument tiers. Отсутствующая
+возможность блокирует только зависящий путь; mocks не подтверждают реальную
+совместимость. Live/soak status collector берётся из progress, не из этой спеки.
+
+## 5. Phase 1 — MVP: конфигурация, данные и воспроизводимость
+
+### 5.1. Отдельный config
+
+Рабочий файл: `portfolio_optimizer.local.json`. Будущий отслеживаемый образец:
+`portfolio_optimizer.local.json.example`, без реальных путей и secrets.
+Это не конфиг collector и не неявное расширение `config.local.json` панели.
+
+Обязательные группы:
+
+| Группа | Содержание |
+| --- | --- |
+| Identity | schema version, policy version, algorithm versions |
+| Inputs/storage | Performance DB, Portfolio DB, collector root, approved templates |
+| Scenarios | явно заданный депозит каждого портфеля, currency/collateral assumptions, max_balance, sizing mode и верхняя граница sizing balance для проверяемого горизонта |
+| Search | universe selection, composition proposals, sizing/limiter/priority candidates, seed, rounds, total test budget |
+| Research | development/validation windows, warm-up и boundary rules, evidence minimums |
+| Liquidity | lookback, band, quantile, permitted share, freshness, valid-minute/coverage/completeness minima, global screen |
+| Margin model | venue/account mode, fees, tier и denominator semantics, overflow envelope, missing-data policy |
+| Profiles | отдельные DD/free-margin/MM bounds, PnL minimum, exact ranking ID/parameters и top_n |
+| Runner | локальный либо уже предоставленный удалённый tester target, paths, timeouts/retries и ownership |
+
+Все денежные единицы, проценты/fractions и временные единицы задаются явно.
+Неверное значение или неизвестный ranking ID — ошибка. Versioned стартовые
+DD/free-margin/MM defaults `portfolio_optimizer_research_risk_v1` определены
+в §10.1; никаких иных risk/PnL/ranking чисел не подразумевается.
+Общие margin-поля определяют модель, профильные — лимиты: конфликтующие
+численные значения в двух местах запрещены.
+
+Config и overrides разрешаются один раз при старте Campaign. Новая редакция
+файла не меняет уже идущую кампанию. Неутверждённые thresholds/ranking допускают
+разработку parser/storage на fixtures, но не `RECOMMENDATION_READY`.
+
+Поля config делятся на три класса. Исполняемые входят в TradingRun identity;
+risk/ranking/reference policy — в Evaluation identity; timeout/retry и другие
+чисто операционные параметры могут меняться между attempts, но не исполняемый
+payload. Класс каждого поля фиксирует schema, неизвестное поле не принимается.
+Campaign, TradingRun, Evaluation и export имеют типизированные disposition/reason;
+минимальный набор использует `RESEARCH_ONLY`, `RECOMMENDATION_READY`,
+`NEEDS_RETEST`, `NEEDS_RESCREEN` и причины `OPEN_POLICY`,
+`INSUFFICIENT_EVIDENCE`/`UNKNOWN`. Это не отдельный workflow-engine.
+
+### 5.2. Что замораживается
+
+Согласованное read-only чтение сохраняет минимальный набор, достаточный для
+повтора решения, а не всю исходную DB:
+
+- все рассмотренные Strategy IDs, точные канонические настройки и их hashes;
+- идентичность source DB/result, report/effective/selection periods;
+- использованные метрики/признаки, их версии, причины допуска/исключения и
+  selection/review provenance, включая данные upstream-периода отбора;
+- разрешённые настройки кампании и random seed, если алгоритм использует RNG;
+- использованные exchange/liquidity facts, качество, периоды и content digests;
+- для каждого run — strategy JSON, tester/account runtime settings без secrets,
+  binary version/hash и доступная идентичность tick dataset;
+- normalized results, required series, parser/metric versions, report digest.
+
+Если поиск использует derived dependency features, сохраняются эти входы,
+а не только ссылка на mutable таблицу. При замене/расширении Performance-истории
+старое решение остаётся объяснимым, новая кампания читает новое состояние.
+
+Для каждого набора source-строк, окон, метрик и derived facts сохраняются
+канонический content digest, время согласованного чтения и версия source schema.
+Result ID без digest не является identity. Decision replay читает сохранённые
+факты и не сверяется с изменившейся Performance DB; несовпадение нового чтения
+создаёт новую Campaign и не инвалидирует replay старой.
+
+### 5.3. Три идентичности вместо смешивания кэшей
+
+1. Campaign/input identity фиксирует universe, periods, facts и policy.
+2. Trading-run identity фиксирует точный исполняемый portfolio package,
+   период, депозит/cap, fees, limiter/priority, opposite policy, версии
+   binary/templates и tick data, а также immutable `execution_campaign_id`.
+   Любое влияющее на торговлю изменение — новый run.
+3. Evaluation identity фиксирует Run ID, ranking/margin/liquidity policy,
+   `execution_campaign_id` из TradingRun и отдельный `decision_campaign_id`
+   snapshot, факты которого использованы для текущего решения. Decision replay
+   читает decision Campaign, executable verification — execution Campaign.
+   Повторная оценка старого run допустима, но не переписывает старую оценку.
+
+Хеш только timestamp обновления reference не должен создавать фиктивное
+изменение торгового run. Изменившееся фактическое leverage/quantity — должно.
+При неизвестной идентичности binary/ticks нельзя заявлять exact rerun cache hit.
+
+К TradingRun относятся все фактически переданные tester параметры: quantities,
+leverage, geometry, deposit/cap и sizing, limiter/priority/opposite policy,
+tester fees, период/ticks, binary и templates. Текущие status/filters, max
+leverage, tiers/MMR и liquidity facts относятся к Evaluation, пока не меняют
+payload. Если обновление делает payload недопустимым, READY блокируется; если
+для исправления меняется payload, создаётся новый TradingRun и нужен retest.
+Например, fresh turnover создаёт новый decision Campaign и Evaluation, но
+сохраняет TradingRun и его execution Campaign, если executable payload остался
+валидным и неизменным.
+
+**Decision replay** воспроизводит выбор из сохранённых входов/results без
+текущей Performance DB и HTML. **Tick-test replay** дополнительно требует
+доступности тех же ticks и executable; один hash не восстанавливает удалённые
+файлы. Ограничения replay показываются отдельно, все ticks в DB не копируются.
+
+### 5.4. Канонический digest
+
+Все content, ticker/reference, semantic-result и PortfolioSet digests используют
+один versioned `canonical_digest_v1`: SHA-256 от compact UTF-8 JSON с
+детерминированной сортировкой ключей. Envelope включает schema ID/version,
+версию digest contract и явные type/unit tags. Timestamps нормализуются в UTC
+RFC 3339 с `Z` и schema-declared precision. Decimal quantities, prices и equity
+кодируются по объявленным для поля scale/rounding rules без промежуточного
+binary-float rendering и без молчаливого отбрасывания лишней точности.
+
+Missing field, explicit `null` и `UNKNOWN` имеют разные представления; UNKNOWN
+включает stable reason. Presentation-only fields исключаются только versioned
+списком схемы. Candidates/facts/members сортируются по canonical typed identity,
+actions и series — по `(timestamp_utc, source_ordinal)`, loads — по
+`(symbol, direction, member_identity)`. `source_ordinal` сохраняет экономически
+значимый порядок при одинаковом времени. Изменение canonical schema создаёт
+новую identity, не меняя воспроизводимость старой версии.
+
+Golden fixtures фиксируют literal expected digest как минимум для Campaign
+snapshot, semantic result/actions/series и PortfolioSet; перестановка ключей
+не меняет digest, а изменение type/unit/UNKNOWN reason/decimal/source ordinal
+меняет. Expected bytes нельзя получать в тесте второй копией той же реализации.
+
+### 5.5. Portfolio DuckDB
+
+Это отдельное хранилище портфельных экспериментов, не конкурирующая Performance
+DB. В MVP численные portfolio series хранятся в child-таблицах DuckDB;
+вынос в Parquet — отдельное изменение по измеренному объёму, не второй
+одновременно поддерживаемый способ хранения.
+
+Минимальные логические наборы (физическое объединение таблиц допустимо):
+
+| Набор | Обязательные факты |
+| --- | --- |
+| campaigns / candidate snapshots | config, universe, input facts, provenance, status |
+| portfolio candidates / members | состав, directions, scalars, limiter, priorities, scenario |
+| reference used / prechecks | exchange/liq facts, качество, envelope, diagnostics, решения gates |
+| generated strategies / test runs | точные JSON/settings, hashes, execution identity, attempts/status |
+| transactions / position cycles | все actions, stable order, реконструированные циклы и availability |
+| portfolio / symbol metrics / series | фактические joint results, numeric paths и версии |
+| evaluations / profile rankings | policy, причины отказа, diagnostics, ordering |
+| portfolio sets / deployments | выбранные независимые accounts, shared-liquidity assessment, manifest |
+
+До первой записи M1 все writers M1–M8 используют DB-scoped cross-process lease,
+ключом которой служит canonical resolved Portfolio DB path. Owner содержит PID,
+process-start identity, host/machine identity и boot/container-instance identity.
+Foreign/unknown host или boot считается live/unverifiable и блокирует запись;
+reclaim разрешён только на том же host/boot для доказанно мёртвого PID с
+проверенной start identity. Optimizer не останавливает и не завершает процессы.
+Read-only подготовка не держит lease; publication выполняется короткой transaction.
+
+Непроверяемый owner даёт `LOCK_OWNER_UNVERIFIABLE`: write прекращается без
+retry loop, bypass и partial publication. Для retired host/container разрешён
+только явный manual clear оператором. До очистки versioned append-only ownership
+audit sidecar рядом с lock сохраняет lock kind/path/target, полный stale owner
+PID/start/host/boot, operator identity, UTC time и причину. Запись attestation
+выполняется атомарно вне защищаемой DB до удаления lock; автоматический процесс
+не может создать attestation или применить clear. Clear не завершает process.
+
+Campaign canonical content identity имеет transactional UNIQUE constraint.
+Concurrent duplicate возвращает ту же exact row либо после deterministic
+uniqueness conflict перечитывает её; mismatch/collision завершается fail-closed,
+а не создаёт вторую Campaign. Уникальность run/attempt/action keys и idempotent
+import также проверяются транзакцией.
+Raw report digest хранится как provenance. Для одинакового executable manifest,
+binary и ticks дополнительно сравнивается канонический semantic digest
+нормализованных results/actions/series: расхождение получает
+`NONDETERMINISTIC_RESULT`, не схлопывается в cache hit и блокирует READY до
+явного disposition. Отличающийся только raw HTML digest этого не доказывает.
+Один DB writer; независимая подготовка может быть параллельной, стандартный
+бюджет тяжёлой обработки — 16 workers с явным ограничением ресурсов.
+Число workers импорта не задаёт число одновременно запущенных tester instances.
+
+### 5.6. Нормативные dispositions и причины
+
+Отдельная state machine не создаётся. Каждый condition применяется к указанному
+объекту; candidate-local `FAIL` не делает всю Campaign неуспешной, если поиск
+может продолжаться. Все применимые reasons сохраняются.
+
+| Condition | Scope | Результат | Stable reason |
+| --- | --- | --- | --- |
+| owner unverifiable / operator manual clear | requested protected action / ownership audit | stop без write / durable audit event | `LOCK_OWNER_UNVERIFIABLE` / `LOCK_MANUAL_CLEAR` |
+| turnover отсутствует/stale либо public request failed | Evaluation / PortfolioSet | `INSUFFICIENT_EVIDENCE` | `TURNOVER_MISSING` / `TURNOVER_STALE` / `TURNOVER_REQUEST_FAILED` |
+| liquidity отсутствует/stale/ниже quality policy | candidate Evaluation | `INSUFFICIENT_EVIDENCE` | `LIQUIDITY_MISSING` / `LIQUIDITY_STALE` / `LIQUIDITY_QUALITY_INSUFFICIENT` |
+| fee unknown без approved bound | Evaluation | `INSUFFICIENT_EVIDENCE` | `FEE_RATE_UNKNOWN` |
+| нет finite sizing upper bound | candidate Evaluation | `INSUFFICIENT_EVIDENCE` | `SIZING_ENVELOPE_UNBOUNDED` |
+| equity denominator/path/coverage недостаточны | TradingRun и dependent Evaluation | `INSUFFICIENT_EVIDENCE` | `EQUITY_DENOMINATOR_INVALID` / `EQUITY_PATH_MISSING` / `EQUITY_COVERAGE_INSUFFICIENT` |
+| фактический leverage не равен manifest | TradingRun | `NEEDS_RETEST` | `LEVERAGE_MISMATCH` |
+| round-down ниже minimum/нарушил geometry | PortfolioCandidate | `FAIL` | `POST_ROUNDING_MINIMUM` / `POST_ROUNDING_GEOMETRY` |
+| enumeration limit превышен, approved bound посчитан | guard evidence | не автоматический отказ; `CONSERVATIVE_BOUND` | `ENUMERATION_FALLBACK_USED` |
+| margin bound нарушен/недоступен | candidate / Evaluation | `FAIL` / `INSUFFICIENT_EVIDENCE` | `MARGIN_BOUND_FAILED` / `MARGIN_BOUND_UNAVAILABLE` |
+| frozen finalist не прошёл validation | finalist Evaluation | `FAIL` | `VALIDATION_FAILED` |
+| semantic divergence при exact execution identity | TradingRun | `NONDETERMINISTIC_RESULT` | `SEMANTIC_RESULT_DIVERGENCE` |
+| executable payload изменился | Evaluation / export | `NEEDS_RETEST` | `EXECUTABLE_PAYLOAD_CHANGED` |
+| PortfolioSet member/load изменился | PortfolioSet Evaluation / export | `NEEDS_RESCREEN` | `PORTFOLIO_SET_CHANGED` |
+| обязательная PnL/liquidity/freshness/ranking policy открыта | Evaluation / export | `RESEARCH_ONLY` | `OPEN_POLICY` |
+| ни один frozen finalist не прошёл validation | profile/decision Campaign | `INSUFFICIENT_EVIDENCE` | `NO_VALIDATION_PASS` |
+
+`RECOMMENDATION_READY` допустим только без blocking rows. Если отсутствие
+validation pass совпало с invalid TradingRun, сохраняются обе причины, а более
+конкретный TradingRun disposition не заменяется `NO_VALIDATION_PASS`.
+`NEEDS_RETEST` и `NONDETERMINISTIC_RESULT` относятся к execution evidence этого
+TradingRun и блокируют зависящие Evaluations; decision Campaign facts они не изменяют.
+
+Нормативные enum версии 1 разделены по смыслу:
+
+- `portfolio_disposition_v1`: `RESEARCH_ONLY`, `RECOMMENDATION_READY`, `NEEDS_RETEST`,
+  `NEEDS_RESCREEN`, `INSUFFICIENT_EVIDENCE`, `NONDETERMINISTIC_RESULT`;
+- `portfolio_gate_result_v1`: `PASS`, `FAIL`, `UNKNOWN`;
+- `portfolio_evidence_class_v1`: `OBSERVED`, `CALCULATED`, `CONSERVATIVE_BOUND`,
+  `COARSE_ESTIMATE`, `UNKNOWN`;
+- `portfolio_capability_result_v1`: `CONFIRMED_CAPABILITY`, `APPROVED_CONSERVATIVE_BOUND`,
+  `BLOCKING_UNKNOWN`;
+- `portfolio_reason_v1`: `TURNOVER_MISSING`, `TURNOVER_STALE`, `TURNOVER_REQUEST_FAILED`,
+  `LIQUIDITY_MISSING`, `LIQUIDITY_STALE`, `LIQUIDITY_QUALITY_INSUFFICIENT`,
+  `FEE_RATE_UNKNOWN`, `SIZING_ENVELOPE_UNBOUNDED`,
+  `EQUITY_DENOMINATOR_INVALID`, `EQUITY_PATH_MISSING`,
+  `EQUITY_COVERAGE_INSUFFICIENT`, `LEVERAGE_MISMATCH`,
+  `POST_ROUNDING_MINIMUM`, `POST_ROUNDING_GEOMETRY`,
+  `ENUMERATION_FALLBACK_USED`, `MARGIN_BOUND_FAILED`,
+  `MARGIN_BOUND_UNAVAILABLE`, `VALIDATION_FAILED`, `NO_VALIDATION_PASS`,
+  `SEMANTIC_RESULT_DIVERGENCE`, `EXECUTABLE_PAYLOAD_CHANGED`,
+  `PORTFOLIO_SET_CHANGED`, `OPEN_POLICY`, `LOCK_OWNER_UNVERIFIABLE`,
+  `LOCK_MANUAL_CLEAR`.
+
+Golden canonical vector фиксирует exact строки всех enum. Добавление или
+переименование значения требует новой enum/canonical schema version; disposition
+gate, evidence class и capability result нельзя сохранять в поле reason code.
+
+## 6. Phase 1 — liquidity и sizing
+
+### 6.1. Рыночный ceiling
+
+Для symbol/side policy фиксирует lookback, band, history quantile, долю depth,
+freshness и минимальное качество. Из minute p05 depth вычисляется выбранный
+history quantile; quantiles следуют интерполяции collector. Пропуски, неполная
+depth, stale data и отсутствие достаточной истории не заменяются нулями.
+`band` выбирается только из опубликованных collector bands 10/25/50/100 bps;
+другое значение — ошибка config, а не интерполяция стакана.
+
+```text
+depth_reference = quantile(eligible minute depth_p05, policy.quantile)
+single_order_cap = depth_reference * policy.allowed_depth_share
+```
+
+LONG/bid и SHORT/ask в этой proxy-политике описывают сторону размещения входной
+лимитной заявки; это не модель очереди и не доказательство её fill probability.
+Риск закрытия LONG относится к bid, закрытия SHORT — к ask; весь закрываемый
+размер и аварийные market closes нельзя считать исполненными только потому,
+что каждый отдельный opening order прошёл ceiling. В MVP это отдельная
+conservative position/exit diagnostic с явной availability, empirical calibration
+отложена до Phase 2A. Неизвестный обязательный liquidity guard не получает
+финальный PASS. Отсутствие точной empirical capacity само по себе не добавляет
+в MVP Phase 2A: применяются явно утверждённые coarse/proxy ограничения с
+указанием их уровня доказательности, а не утверждение о точной исполнимости.
+
+Недостаток истории не препятствует исследованию доступных фактов, но приводит
+к `LIQUIDITY_QUALITY_INSUFFICIENT` для зависящей финальной рекомендации. Сегодняшняя
+ликвидность поверх старого tick-test — текущая feasibility-оценка, не измерение
+ликвидности того исторического периода. Оба периода фиксируются отдельно.
+
+### 6.2. Масштабирование и `max_balance`
+
+После подтверждения bot/tester sizing contract, для balance-percentage mode:
+
+```text
+B = actual sizing balance at the bot-defined recalculation event
+B_cap = B if max_balance is disabled else min(B, max_balance)
+s = balance_percentage / 100
+opening_order_notional[i] = B_cap * s * lot_x[i]
+full_side_notional = B_cap * s * sum(lot_x)
+s_liquidity_max = min_i(single_order_cap / (B_cap * lot_x[i]))
+```
+
+`lot_x` не нормализуются до суммы 1. Начальный `scenario_balance` — старт теста,
+не постоянная база будущих заявок при динамическом sizing. Момент перерасчёта,
+wallet/equity basis и изменение resting quantities подтверждаются в Phase 0.
+Режим `risk_*` не объявляется эквивалентным без доказанного mapping.
+
+Liquidity/capacity gate использует верхнюю базу объявленного sizing envelope:
+при включённом cap — `min(B_envelope_max, max_balance)`, без cap — явный
+конечный `B_envelope_max` и порог обязательной переоценки. Текущий balance
+пригоден только для диагностики; без конечной границы READY невозможен.
+
+Размер ограничивается exchange `qtyStep`, minQty/minNotional, maxLimit/maxMarket
+quantity и precision. Quantity округляется вниз до `qtyStep`; округление вверх
+ради minimum запрещено. Нулевой/меньший minimum или нарушающий immutable
+геометрию уровень делает вариант FAIL с причиной, а не удаляется молча.
+После округления заново проверяются сумма размера, capacity, tiers и margin.
+Для растущей базы/изменения mark стоимость не считается навсегда равной
+стартовому notional: envelope и post-test diagnostics учитывают sizing path.
+
+Cap ограничивает базу лота, а не реальный Cross balance. Прибыль, оставленная
+на счёте, учитывается в equity; её будущая защитная роль не гарантируется.
+Изъятие/каскад и оптимизация распределения капитала — Phase 7.
+
+### 6.3. Общая ёмкость нескольких портфелей
+
+MVP выдаёт грубый допуск совместного использования symbol: `PASS`, `FAIL` или
+`UNKNOWN`, с пометкой `COARSE_ESTIMATE`. Уже выбранные accounts и рассматриваемый
+новый учитываются совместно, независимо от размера их маржинальных балансов.
+
+Входы: суммарный потенциальный opening/position notional по symbol/direction,
+размер отдельных заявок и `turnover24h` именно этого Bybit linear-контракта;
+доступная depth даёт дополнительное ограничение. Turnover получает Phase 0/M2
+read-only adapter из публичного Bybit `/v5/market/tickers` по exact
+category/symbol и сохраняет server/capture time, единицы, freshness и content
+digest в Portfolio DB. Этот network snapshot выполняется вне Performance DB
+transaction; Decision Campaign отдельно сохраняет source snapshot time и ticker
+server/capture times. Допустимые source↔ticker skew и staleness — именованные
+OPEN POLICY без default. Timeout, rate limit или request failure дают
+`TURNOVER_REQUEST_FAILED`/UNKNOWN, не ноль и не unlimited capacity.
+
+Это единственный outbound endpoint Phase 1; он public/read-only, private API
+запрещён. Текущая документационная работа и fixture development его не вызывают;
+фактический request требует разрешения implementation. Это snapshot текущей feasibility, а не второй постоянно
+работающий collector. Missing/stale значение даёт `UNKNOWN` и блокирует
+зависящий READY. Месячные/средние/медианные оценки требуют накопленной истории
+и не выводятся из одного snapshot. Порог и агрегация утверждаются в policy.
+
+Отношение размера заявки к суточному turnover — грубый static screen, не
+прогноз дневного оборота стратегии и не доказанная возможность выхода.
+Нетто LONG минус SHORT между счетами не освобождает market capacity. Если
+используется оценка оборота стратегии, отдельно учитываются частота и обе
+стороны исполнения. Missing/stale turnover не означает достаточную ликвидность.
+
+Нельзя каждому счёту выдать весь один и тот же capacity budget. Изменение
+состава PortfolioSet пересчитывает shared screen перед выдачей deployment;
+эта проверка не распределяет депозиты и не перемещает средства.
+
+## 7. Phase 1 — margin и limiter
+
+### 7.1. Биржевые facts и leverage
+
+Из instruments/risk-limit используются status, settlement/contract type,
+quantity/price filters и полный набор tiers: value bounds, max leverage,
+initial/maintenance rates, mm deduction. Проверяются pagination, единицы,
+freshness и применимость symbol. Значение leverage из одиночного source test
+не принимается за актуальный предел биржи.
+
+Для каждого состояния определяется exposure и применимый tier, затем берётся
+минимум их `max_leverage` и округляется вниз до `leverageStep` в допустимом
+интервале. Полученное единое значение используется в renderer, tester, guards
+и export. Mismatch фактической tester-настройки делает evidence неполным.
+Тир включает combined position и active-order exposure, не только открытую
+позицию. Direction/one-way semantics проверяются fixtures. Выбранный максимум
+снижает IM reservation и не доказывает безопасность при другом фактическом
+плече; leverage не является свободной осью поиска.
+
+Обновление reference перед тестом и финальным экспортом обязательно по policy.
+Современный tier не выдаётся за историческое состояние биржи в прошлом тесте.
+
+### 7.2. Расчётная модель, не биржевой liquidation engine
+
+Минимально различаются initial margin (позиции и оставшиеся opening orders)
+и maintenance requirement. Для линейного контракта исходные формулы:
+
+```text
+Position IM = position value / leverage + estimated close fee
+Order IM = order value / leverage + estimated open fee + estimated close fee
+Position MM = position value * tier MMR - applicable MM deduction + close fee
+```
+
+Ставки fees всегда имеют versioned source. Historical TradingRun использует
+ровно MakerFee/TakerFee своего tester contract. Deployment evaluation может
+использовать вручную заданные актуальные account rates с provenance либо
+будущий read-only private snapshot; private API не является требованием MVP.
+Численного default нет: неизвестная ставка не равна нулю, а assumed upper
+bound допустим только как явно утверждённая policy.
+
+Order MM, deduction, netting и однонаправленные/встречные резервы проверяются
+venue adapter; нельзя повторно вычитать position deduction из каждой заявки.
+Исполненная часть заявки не учитывается одновременно как позиция и pending.
+Close/reduce-only orders классифицируются отдельно; произвольная встречная
+opening order не получает освобождение маржи как reduce-only.
+
+Account IM/MM ratio требует корректного знаменателя: Margin Balance с
+применимыми Haircut/Order Loss поправками. Equity DD, IM load, MM load и gross
+notional/equity — разные показатели. Низкая historical DD не доказывает
+достаточность маржи; `Position avg/max %` отчёта не переименовывается в IM.
+
+Для каждого guard сохраняются numerator/denominator, источники, времена,
+model version и класс `OBSERVED` / `CALCULATED` / `CONSERVATIVE_BOUND` / `UNKNOWN`.
+Equity proxy не называется фактическим Bybit Available Balance или расстоянием
+до ликвидации. Нет данных для обязательного gate — он не пройден. Проверенный
+conservative bound допускается только явной утверждённой моделью, не подстановкой
+неизвестных поправок нулём. Чистый USDT collateral, отсутствие borrow и
+применимость one-way netting проверяются, не предполагаются для любого UTA.
+
+До READY Q11/M3 фиксирует закрытую классификацию. Всегда блокируют неизвестные
+или неверные equity denominator/path, instrument/tier/quantity/price identity,
+sizing/limiter semantics, требуемое качество liquidity и collateral/borrow
+state, когда оно влияет на знаменатель. Approved bound может покрывать сумму
+всех ещё исполнимых orders/positions, multi-overflow, sizing envelope и
+зафиксированные fee/price-shock assumptions только с формулой, значением и
+provenance. Haircut принимается нулевым только для подтверждённого eligible
+collateral без borrow; иначе это `UNKNOWN`. Phase 2A уточняет эти bounds, но не
+является обязательным условием READY, если MVP-классификация полностью закрыта.
+
+Funding не отдельный margin reservation, но его уплата влияет на wallet/equity.
+Fees/funding фактического теста учитываются без двойного вычитания.
+Отсутствие ликвидации в отчёте не является доказательством точной Bybit-модели.
+
+### 7.3. Состояния limiter и priority=0
+
+- `L=0`: limiter выключен; все разрешённые пары могут входить.
+- `L>0`: учитываются уникальные PairSlots с ненулевой позицией; partial fill
+  занимает slot, partial close его не освобождает, flat освобождает.
+- `position_priority=0`: пара исключена из счётчика и ограничений limiter,
+  но не из общей маржи/ликвидности. Её заявки не снимаются только из-за L.
+- Приоритеты 1..N определяют выбор лишних позиций для market close.
+  Направление сравнения и ties — capability contract, пока не доказанный default.
+
+Пусть Z — exempt pairs, C — counted pairs, k — число открытых из C.
+При k<L активны openings ещё не открытых C; при k=L бот инициирует их отмену.
+Openings Z и разрешённые незаполненные уровни уже открытых позиций остаются
+согласно стратегии. В нормальном состоянии число позиций может достигать
+`|Z| + min(L, |C|)`; при L=0 — числа всех допускаемых пар.
+Это operational/report diagnostic; margin precheck всегда использует race
+envelope ниже, а не normal-state maximum.
+
+При отмене заявки или закрытии позиции маржа освобождается только после
+подтверждённого состояния. Race envelope включает L+1 И БОЛЕЕ counted positions,
+pending cancels, partial fills/closes, fees и потери принудительного выхода.
+До подтверждения более узкой гарантии проверяется верхняя комбинация всех
+ещё способных исполниться разрешённых заявок, включая exempt pairs.
+При отсутствии цены/исполнения для shock используется явный conservative
+сценарий с provenance или UNKNOWN, а не гарантированное мгновенное закрытие.
+
+До реализации policy задаёт предел полного перебора достижимых состояний.
+За ним именованный conservative fallback суммирует requirements всех ещё
+исполнимых positions/orders, включая exempt, под худшими применимыми tier/price
+assumptions. Resource failure допустим, только если нельзя вычислить и этот
+bound. Запрет считать только L самых тяжёлых позиций не отменяется из-за
+ограничения времени алгоритма.
+Произвольные partial fills и допустимый порядок исполнения учитываются;
+последовательность «первый ордер, второй...» требует capability evidence.
+
+### 7.4. Precheck и post-test
+
+Precheck проверяет совместную IM/MM нагрузку по состояниям, quantity/capacity,
+профильные ограничения и явный запас. Отдельные component IM limits не заменяют
+проверку суммы. Post-test использует actual joint equity, exposure, concurrency
+и реконструируемые позиции; margin guards считаются по протестированным settings.
+Каждая equity/DD метрика хранит sampling resolution, coverage, boundary и
+censoring. Недостаточная по profile policy полнота не превращается в точный DD
+и блокирует зависимый gate.
+
+Нельзя выдавать сумму несовпадающих по времени максимумов за наблюдённый пик.
+Консервативная комбинация worst requirement и min equity может использоваться
+как upper/lower bound с явной маркировкой. Equity<=0, invalid tiers или
+невыполненное обязательное ограничение — FAIL независимо от PnL.
+
+Явно зарегистрированная ликвидация в основном/validation прогоне — FAIL.
+Нет liquidation-поля — не значит, что число ликвидаций достоверно равно нулю;
+margin evaluation остаётся отдельной обязанностью оптимизатора.
+
+В отчёте показывается достаточность заданного депозита. Если рассчитывается
+минимально необходимый депозит, он относится к конкретному фиксированному
+пакету абсолютных размеров и объявленным guards/model assumptions. Нельзя
+менять депозит при percentage sizing, автоматически менять лоты и выдавать
+это за минимальный капитал для прежних лотов. Недоступная нижняя граница
+маркируется UNKNOWN. Это диагностика одного счёта, не распределение общего капитала.
+
+## 8. Phase 1 — поиск, renderer и безопасный тестер
+
+### 8.1. Поиск
+
+Оси: composition, directional choice, scalars, limiter, priorities включая
+явно разрешённое исключение 0, opposite-order policy и выбранные cap-сценарии.
+Новые shifts/MA не создаются. Индивидуальные metrics задают порядок proposals,
+не фактический ranking портфелей.
+
+Бюджет ограничивает число proposals/проверок/test attempts и refinement rounds.
+Детерминированно выполняются structural → liquidity → margin gates до tester.
+Sizing grid в единицах экспортируемого percentage-поля, её границы, порядок и
+tie-break фиксируются config/Campaign. Проверяются все точки конечной grid без
+раннего останова; Seed — максимальный прошедший uniform scalar либо явный
+override. Локальное уточнение меняет одну сторону/общий scalar, L или
+priority в ограниченном наборе; любой новый вариант снова проходит gates.
+Монотонность DD/PnL по размеру не предполагается, бинарный поиск по DD запрещён.
+Все tried/excluded варианты и исчерпание бюджета отражаются в Campaign.
+
+### 8.2. Renderer
+
+На каждый symbol создаётся один JSON. LONG/SHORT geometry и sizing берутся
+строго из своих candidates, leverage общий. Разные TF сторон разрешены
+только при подтверждённой поддержке конкретной версией bot/tester. Имена
+physical fields изолированы в adapter, не выдумываются из пожеланий.
+
+Общие runtime fields проверяются на совместимость. Неподдержанный mixed-TF или
+конфликт closing/settings не решается копированием одной стороны поверх другой.
+После рендера выполняется обратное typed-сравнение; запрещены неподтверждённые
+изменения immutable settings и молчаливое отключение выбранной стороны.
+Capability для mixed-TF, opposite opening и dedicated close привязана к
+binary/adapter fixture manifest. `UNKNOWN` трактуется как unsupported: ось
+исключается из поиска с причиной, удобный default не подставляется.
+
+### 8.3. Runner
+
+Portfolio mode существующего тестера проверяется отдельно от индивидуального
+`SINGLE_MODE`. Сначала capability/report fixtures, затем только с явным
+разрешением пользователя ограниченный реальный прогон. Нельзя использовать
+непроверенный `--help` или запуск executable для исследования формата.
+
+Текущие panel registry и output-CSV lock не дают target-wide cross-process
+гарантию. До любого реального optimizer run общий runner получает один
+cross-process lock по resolved tester target, и тот же primitive обязаны брать
+panel, RETEST, CLI и optimizer до изменения конфигов/стратегий/reports/process.
+Lock хранит PID, process-start, host/machine и boot/container-instance identity.
+Foreign/unknown host или boot, живой или неидентифицируемый owner — preflight
+stop. Reclaim разрешён только на том же host/boot для доказанно мёртвого PID с
+проверенной start identity. Для непроверяемого owner применяется тот же
+`LOCK_OWNER_UNVERIFIABLE` и manual ownership-attestation contract §5.5;
+автоматического bypass/clear нет. Чужой процесс не завершается. Tester-target lock
+не заменяет Portfolio DB lease; DB transaction не держится во время ожидания
+tester lock. Отдельный уже
+предоставленный remote tester допускается; развёртывание машины не требуется MVP.
+Один instance не обслуживает два меняющих его конфиги задания одновременно.
+
+Run manifest перечисляет exact ожидаемые strategy/config/report artifacts,
+включая каждый разрешённый HTML report, и связывает их с run_id/attempt_id,
+expected members и digest. Удаляемым считается только сматченный report внутри
+зарегистрированного run-owned каталога; несовпавший файл остаётся с warning.
+Пути берутся из проверенного config, не из произвольной строки HTML.
+Временно изменяемые strategy/tester/account settings сохраняются и восстанавливаются
+после успеха, ошибки и отмены. Secrets в campaign/deployment/log не попадают.
+Предпочтителен изолированный тестовый аккаунт/config, не live trading config.
+
+Запрещены безусловные очистки общих каталогов до запуска. Чужие файлы или
+неподтверждённое владение — остановка preflight, не разрешение их удалить.
+Не останавливать чужой bot/process/listener. Remote adapter обеспечивает те же
+ownership/restore/path/hash свойства и не ослабляет их ради транспорта.
+
+Runner проверяет ожидаемый набор reports, завершённость и свежесть, имена и
+настройки всех members, exact periods, limiter/account settings по manifest
+и доступному embedded evidence. Неподтверждённая семантика не объявляется
+проверенной из-за отсутствия поля в HTML. Timeout/retry/cancel сохраняют
+attempt identity; неполный run не ранжируется как успешный.
+
+## 9. Phase 1 — импорт и результат
+
+### 9.1. Report data contract
+
+Portfolio parser принимает фактическую схему report и сохраняет:
+
+- balance/equity boundaries, net PnL, DD, fees/funding, volume;
+- portfolio и symbol summary: gross profit/loss, PF, recovery, если доступны;
+- все execution rows: timestamp, stable source index, symbol, order ID,
+  side/action, size, price/cost, fee/PnL/balance, post_size/post_side — по наличию;
+- wallet/equity, margin-balance и notional series с точными timestamps,
+  availability и разрешением наблюдения.
+
+Не вся колонка обязана существовать в любом report. Phase 0 фиксирует mapping
+и обязательный набор для каждой производной метрики; missing price/funding/
+notional не синтезируется. Объявленное число actions сверяется с parsed count.
+`Trades` сохраняет исходную execution-семантику, не называется числом positions.
+Source summaries и proxy метрики не подменяют actual joint results.
+
+### 9.2. Position cycles и временные границы
+
+Cycle начинается при переходе flat→nonzero и заканчивается nonzero→flat.
+Внутри увеличения и сокращения могут чередоваться. Поддерживаются partial
+fills, стабильный порядок одинаковых timestamps, carry-in/open-at-end и
+отдельная диагностика unexpected reversal. Незакрытый cycle не удаляется и
+не получает выдуманную дату выхода. Dedicated/forced close классифицируется
+только при наличии доказуемых полей, иначе UNKNOWN.
+
+Сохраняются opened/closed, duration/censoring, realised PnL/fees, максимальная
+наблюдённая позиция, число исполнений. Funding без attribution к symbol/cycle
+остаётся account-level. Requested/filled ratio не выводится из filled Size,
+если requested quantity нельзя однозначно восстановить.
+
+Основной portfolio result равен `final_equity - initial_equity`; поэтому
+unrealised PnL открытой на границе позиции не исчезает. Realised PnL хранится
+отдельно, `OPEN_AT_END` остаётся diagnostic и сам по себе не блокирует READY
+при полной boundary/equity evidence и пройденных guards. Наблюдаемый DD
+считается по той же полной equity path, не сумме closed PnL. Потерянные
+ticks между samples не объявляются измеренным минимумом. Unrealised PnL на
+границах, fees, funding и warm-up входят по явному metric contract с reconciliation;
+они не вычитаются повторно и не переносятся из будущего окна.
+
+### 9.3. Transactional import и cleanup
+
+Parse → identity/schema/count/range/financial consistency → одна DB transaction
+→ readback normalized facts → COMMITTED. Финальная торговая история доступна
+целиком либо не опубликована; failed sibling не превращает частичный
+портфель в полный результат. Повтор report digest не создаёт duplicate actions.
+
+Удаление собственного raw HTML разрешается только после committed/readback,
+проверенного manifest и отдельно принятого portfolio-specific safe-delete
+контракта. Он обязан доказать ownership по run/attempt/report digest, полноту
+всех replay-required normalized facts и зафиксированные parser/metric versions.
+Контракт portfolio report/schema должен быть утверждён, а не заимствовать
+`schema_version=4` как доказательство полноты другого формата. До этого gate
+автоматическое удаление выключено. Ошибка parse/import сохраняет evidence;
+ошибка cleanup после commit — warning, не откат подтверждённого результата.
+
+Успешный результат хранится без обязательного постоянного HTML после safe-delete.
+Отчётные настройки, нормализованные факты и provenance достаточны для decision
+replay; raw HTML, binary, ticks не коммитятся в репозиторий.
+Новая версия parser не переписывает старые normalized evidence без доступного
+raw report; до принятия этих правил удаление остаётся выключенным.
+
+## 10. Phase 1 — типы портфеля, validation и deployment
+
+### 10.1. Цели типов
+
+| Тип | Цель после одновременного прохождения всех ограничений |
+| --- | --- |
+| AGGRESSIVE | максимизация net profit в допустимой нагрузке и с минимальным заданным запасом |
+| BALANCED | согласованный компромисс PnL, DD и margin risk |
+| CONSERVATIVE | минимизация риска при минимально приемлемом net profit |
+
+### 10.1.1. Стартовая `portfolio_optimizer_research_risk_v1` для исследования
+
+Следующие значения являются defaults именно для исследования и калибровки. Они
+не дают автоматического допуска к торговле, не ослабляют другие gates и могут
+быть изменены только новой versioned policy/Campaign. Их формулировка вынесена
+в [ADR-0029](../decisions/0029-portfolio-optimizer-research-risk-profile-v1.md):
+
+| Ограничение | AGGRESSIVE | BALANCED | CONSERVATIVE |
+| --- | ---: | ---: | ---: |
+| `max_actual_equity_dd_pct` | 20% | 10% | 5% |
+| `min_calculated_free_margin_reserve_pct` | 20% | 40% | 60% |
+| `max_calculated_account_mm_load_pct` | 50% | 35% | 20% |
+
+`actual_equity_dd_pct` — maximum peak-to-trough DD из полной actual joint
+equity series TradingRun: положительный процент падения от running peak. Он
+считается по всей доступной series без сокращения окна, resampling, synthetic,
+extrapolated или per-symbol aggregated substitute. Missing, truncated или
+non-joint series даёт `UNKNOWN`, не PASS. Для каждого рассчитанного
+margin-envelope state с корректным `MarginBalance` (с применимыми Haircut/Order
+Loss) используются:
+
+```text
+calculated_free_margin_reserve_pct =
+    (MarginBalance - calculated_total_IM) / MarginBalance * 100
+calculated_account_mm_load_pct =
+    calculated_total_MM / MarginBalance * 100
+```
+
+Margin guards берут minimum reserve и maximum MM load по полному проверяемому
+race envelope, включая conservative bound. Каждый state использует один
+согласованный snapshot: timestamp, account currency, `MarginBalance`,
+`calculated_total_IM` и `calculated_total_MM` из одного источника. Это не
+подмена envelope наблюдённой actual equity series. `MarginBalance` обязан быть
+положительным числом той же currency; null, stale или currency mismatch дают
+`UNKNOWN`. Reserve может быть отрицательным и ниже profile minimum означает
+`FAIL`.
+
+Каждый guard возвращает `PASS`, `FAIL` или `UNKNOWN`. Любой missing, invalid,
+stale или unverified input (equity series, IM, MM, MarginBalance, timestamp,
+currency) даёт `UNKNOWN`, который никогда не повышается до PASS. Profile PASS
+возможен только когда все три guard PASS в одном Evaluation; иначе итог FAIL
+или UNKNOWN. Thresholds fixed per named profile: запрещены automatic relaxation,
+interpolation/blending, derived intermediate profiles, fallback к другому или
+default profile, а также per-run override. Любое отклонение — policy violation,
+не passing result. Изменение threshold, formula, verdict rule или profile set
+требует новый policy ID и ADR; `portfolio_optimizer_research_risk_v1`
+неизменяем, а каждый результат хранит применённый policy ID.
+
+Эти три лимита сами по себе не создают
+`RECOMMENDATION_READY`: до него остаются обязательными PnL, liquidity/freshness,
+exact ranking, validation, capabilities и отдельные разрешения. Числа,
+минимальный PnL, точное Balanced/Conservative ранжирование, near-tie и duration
+limits, кроме трёх строк таблицы, остаются OPEN-POLICY.
+
+Ограничения и ranking хранятся в profile config; универсальной DD-first
+сортировки для всех типов нет. No feasible candidate — явный результат,
+а не автоматическое ослабление риска. Исторический PnL/30d не прогноз доходности.
+Открытый ranking относится только к profile selection/recommendation ordering и
+не изменяет, не переупорядочивает и не перераспределяет фиксированные thresholds.
+Прохождение research thresholds не разрешает implementation, tester run,
+`RECOMMENDATION_READY`, trading admission или live use; все remaining gates
+(PnL floor, liquidity/freshness limits, profile ranking) остаются open blockers.
+
+### 10.2. Базовая защита от подгонки — уже MVP
+
+До поиска фиксируются development и untouched validation periods, upstream
+период отбора стратегий, список гипотез, ranking и budget. Development ranking
+задаёт полный порядок: versioned ordered metrics из OPEN POLICY и canonical
+candidate identity как последний tie-break. Metric list/version/tie-break
+хранятся именно в decision Campaign, входят в её canonical content identity и
+используются decision replay. Новая decision Campaign заново фиксирует свою
+ranking version; молчаливое наследование другой версии запрещено.
+На validation
+не подбираются состав, shifts, scalar, L, priority, thresholds и cap.
+
+Если индивидуальные кандидаты уже выбирались с использованием validation,
+он называется повторной проверкой на использованной истории, не независимым OOS.
+Для настоящего OOS нужен позднейший untouched период либо повтор полного
+upstream selection только на development. Короткая история/мало cycles —
+INSUFFICIENT_EVIDENCE; точные минимумы согласуются отдельно.
+
+Warm-up и state на границе задаются заранее. Carry-in нельзя убрать, сохранив
+его прибыль: фиксируются initial wallet/equity/positions и правила attribution.
+Baseline cold-start и continuation не смешиваются в одном сравнении.
+Точный протокол и минимальные окна — gate M0, не скрытая реализация.
+
+На validation проверяется заранее замороженный winner/набор финалистов по
+заранее заданному PASS/FAIL acceptance rule. Порядок и tie-break финалистов
+заморожены на development; если прошли несколько, выбирается первый в этом
+порядке, без сортировки по validation metrics. Выбор нового победителя по увиденным
+validation returns — новая оптимизация, а не независимая проверка. После
+изменения политики требуется новый untouched evidence; провал не маскируется.
+Если не прошёл ни один frozen finalist, profile decision и decision Campaign получают
+`INSUFFICIENT_EVIDENCE/NO_VALIDATION_PASS`; отдельный invalid TradingRun status
+сохраняется вместе с этой причиной и не заменяется ею.
+Все experiments, включая неудачные и повторные, сохраняются в Portfolio DB.
+Расширенные walk-forward/multiple-testing методы — Phase 7.
+
+### 10.3. Выходы и статусы
+
+Пользователь получает manifest/JSON по symbol и сопроводительный отчёт:
+тип портфеля, депозит/cap, selected IDs и TF, scalars и rounded quantities,
+leverage, limiter/priorities/opposite policy, net PnL/DD/recovery, margin/liq
+guards, validation status, периоды и причины выбора/отказа, model limitations.
+
+Исследовательский результат может быть `RESEARCH_ONLY`. Финальный
+`RECOMMENDATION_READY` требует утверждённых policies, complete committed joint
+test, требуемого validation evidence, пройденных risk/liquidity gates и
+совместной liquidity-проверки всего PortfolioSet. UNKNOWN не равен PASS.
+Composition/load digest PortfolioSet входит в manifest/evaluation. Любое
+изменение состава сохраняет underlying account TradingRuns, но переводит ранее
+готовые общие рекомендации в `NEEDS_RESCREEN` до нового shared screen.
+
+Перед export обновляются exchange reference и liquidity freshness. Generated
+package должен совпадать с протестированным по исполняемым настройкам.
+Изменение leverage, quantity после rounding, geometry, policy бота или других
+влияющих на торговлю полей требует нового test/validation, а не замены JSON
+в старом winner. Обновление не влияющего на исполнение reference допускает
+новую оценку gates с сохранением provenance. Stale обязательные данные
+блокируют READY, но могут сопровождать явно неготовый исследовательский export.
+
+Никакой автоматической установки в live bot, открытия/закрытия позиций или
+переводов средств. Отсутствие исторической ликвидации не гарантирует будущую
+безопасность; «консервативный» — относительное имя внутри стратегии без стопов.
+
+### 10.4. DoD Phase 1
+
+- Immutable campaign snapshot воспроизводит решение после изменения source DB.
+- Есть несколько portfolio compositions, sizes, priorities и L, включая
+  disabled, ограниченный режим и exempt pairs, а не только один happy-path.
+- Проверены mixed directions/TF capability gates, rounding/tiers/capacity,
+  динамическая sizing база ниже/выше cap и account isolation.
+- Проверены normal и multi-overflow states, partial fill/close и pending cancel;
+  UNKNOWN и ресурсный отказ не принимаются за margin PASS.
+- Реальный разрешённый portfolio test и report fixture подтверждают целевой
+  режим; single-member контроль согласуется с сопоставимым одиночным тестом.
+- Atomic import/replay/failed-run recovery и safe cleanup подтверждены отдельно.
+- У каждого типа есть явные policies и фактический validation disposition;
+  отсутствие подходящего портфеля корректно отображается.
+- Повторяющаяся пара проверяется совместно на нескольких независимых счетах.
+- Exact deployment reproducible; изменившийся исполняемый payload не выдаётся
+  со старым successful run ID без нового evidence.
+- Пропорциональные tests, independent review и acceptance ledger выполнены
+  перед признанием реализации завершённой; сейчас эти пункты не выполнены.
+
+## 11. Phase 2A — advanced liquidity и margin research
+
+**Вход:** работающий Phase 1 хотя бы в статусе `RESEARCH_ONLY` и новые факты
+исполнения. Phase 1 READY не является prerequisite. **Не prerequisite MVP:**
+точный queue/fill simulator, live order lifecycle и полная UTA replica.
+
+Scope: requested/filled, time-to-first/full-fill, partial count/remaining при
+cancel/replace, lot-degradation curves; capacity по symbol/side/TF, затем
+сессиям. Полный placement/replace/cancel/reduce-only lifecycle позволяет
+уточнить Active Order IM вместо conservative envelope.
+
+Уточняется работа с Mark/Order Loss, collateral haircuts, borrow, close fees
+и при отдельном расширении scope hedge-mode. Неизвестные необходимые поправки
+MVP всё равно обязано маркировать, откладывание точности не разрешает их игнорировать.
+Добавляются correlated price/equity shocks, снижение liquidity/leverage и
+одновременный deepest fill. Multi-overflow уже проверяется в MVP.
+
+**Выход/DoD:** сравнение прежнего proxy и измеренного исполнения, versioned
+calibration с диапазоном применимости; missing requested не даёт fill ratio;
+изменение capacity/size снова проходит общий test. Новая модель улучшает
+проверяемый результат, а не задним числом исправляет прошлый backtest.
+
+## 12. Phase 2B — read-only Live Account Monitor
+
+**Вход:** явный deployment manifest и отдельно разрешённый доступ к нужному
+account. Состояние берётся с private REST wallet/positions/orders, затем
+wallet/position/order/execution WS с REST reconcile при reconnect и периодически.
+Тестер не источник истины о live позициях.
+
+Dashboard: wallet/equity/margin/available balances, realised/unrealised PnL,
+Total IM/MM и account rates, gross exposure, открытые counted/exempt позиции,
+limiter, connection/reconciliation freshness. По symbol: selected IDs,
+side/size/entry/mark/leverage, orders/fills, fees/funding и reference state.
+Графики account и symbol paths, event markers, фактические результаты против
+test baseline; liquidity-based предложение изменения размера — только рекомендация.
+
+Watchdog: при counted>L — LIMITER_OVERFLOW; восстановление в заданный grace
+period — LIMITER_RECOVERED; оставшееся превышение — LIMITER_BREACH и alert.
+При L=0 нет нарушения по количеству; exempt не считаются в L, но видны в марже.
+Хранятся начала/концы, involved symbols/priorities, expected/actual closes и
+availability. Grace/alert thresholds — отдельные versioned settings.
+
+Margin/connection/config drift alerts включают unexpected symbol, изменённые
+leverage/order size/settings, stale references и несогласованное состояние.
+Отсутствие позиции само по себе не доказывает отсутствие стратегии в боте.
+Missing/stale API snapshot не считается здоровым пустым счётом.
+
+Storage live-подсистемы выбирается отдельным уточнением до реализации;
+Performance DB не используется. Read-only permissions, secrets вне DB/log,
+notification transport без trading credentials. Никаких emergency close API.
+
+**DoD:** fixtures REST/WS/reconcile не дублируют executions/PnL, проверены
+disconnect/stale/overflow/exemption и false alarms; никакие сценарии Monitor
+не выполняют торговых команд. Любая future emergency action требует нового scope.
+
+## 13. Phase 3 — time/session analysis
+
+**Вход:** versioned position cycles, liquidity history и market calendar.
+US equity underlying размечается в `America/New_York`, с DST, weekends,
+holidays и shortened sessions. Базовые окна: 04:00–09:30 premarket,
+09:30–16:00 regular, 16:00–20:00 postmarket и вне extended session;
+реальный календарь переопределяет обычный день. Для commodities требуется свой
+календарь, не автоматическое применение US-stock расписания.
+
+Диагностика по режиму: independent entries/cycles, net PnL, DD, worst cycles,
+duration median/p90/p95/max, deepest fill, position size, зависания и
+spread/depth на входе. Доступность/количество samples и consistency нескольких
+периодов обязательны; min evidence фиксируется до исследования.
+
+Отдельные configurable boundary windows вокруг открытия/закрытия сессий;
+произвольный поиск лучшей минуты суток не допускается. Policies ALWAYS_ON,
+NO_WEEKEND_ENTRIES и другие evidence-backed варианты запрещают только новые
+входы, не бросают сопровождение открытой позиции. Поведение добора уровней
+в уже открытой позиции уточняется явно в entry-policy contract.
+
+**DoD:** DST/holiday/short-session fixtures, INSUFFICIENT_EVIDENCE при малой
+выборке, сравнение с ALWAYS_ON в совместном test и untouched validation.
+Индивидуальное улучшение не признаётся улучшением портфеля без joint retest.
+
+## 14. Phase 4 — dependency и robustness
+
+**Вход:** сопоставимые независимые и portfolio series/cycles. Scope: overlap
+позиций/entries/deepest fills, simultaneous losing periods, long-hold overlaps,
+downside dependence и общие asset/sector/direction факторы. Одна корреляция
+итогового PnL не является достаточным критерием диверсификации.
+
+Тесты соседних sizes/deposit/L, замены одной стратегии, priority/composition
+и позднее time policy выполняются в ограниченном заранее заданном наборе.
+Предпочтение устойчивой области подтверждается сравнением, не названием метода.
+
+**DoD:** matrix/group diagnostics с missing-data flags и периодами, воспроизводимые
+perturbation experiments, проверка чувствительности winners вне search period;
+никаких новых shifts вне pretested universe.
+
+## 15. Phase 5 — degradation analytics
+
+**Вход:** reconciled live evidence Phase 2B и frozen test baseline. Сравниваются
+frequency, PnL/cycle, holding, deepest fill/partial fills, actual sizes, DD,
+liquidity, limiter events и IM/MM trajectories в сопоставимых окнах.
+
+Versioned recommendation states: NORMAL, WATCH, REDUCE_RISK, NO_NEW_ENTRIES,
+RETEST_REQUIRED. Thresholds, minimum samples, missing-data и переходы
+утверждаются отдельно; UNKNOWN не переводится автоматически в NORMAL.
+
+**DoD:** воспроизводимые переходы на fixtures улучшения/ухудшения/пропусков,
+объяснение причин, защита от дребезга состояний; рекомендации не меняют bot config.
+
+## 16. Phase 6 — controlled rotation
+
+Новые finalists сравниваются с текущим manifest. Replacement проходит общий
+test/validation и refreshed capacity/margin gates. Ограниченный trial sizing,
+наблюдение перед увеличением и REDUCE_RISK/NO_NEW_ENTRIES для деградирующих
+компонентов описываются как рекомендации, исполняемые пользователем.
+
+**DoD:** immutable old/new manifests, причины замены, совместный retest,
+возможность восстановить прежние настройки без переписывания результатов;
+это не обещание экономически откатить уже исполненные сделки. Автоматическое
+развёртывание/торговля требует отдельного решения.
+
+## 17. Phase 7 — advanced validation и управление несколькими портфелями
+
+Базовый development/validation gate уже входит в MVP. Здесь — walk-forward,
+учёт числа trials/selection bias и специальные методы переоптимизации при
+достаточной истории. Дополняются tail loss, conditional DD, contributions и
+оценка числа независимых источников риска.
+
+Multi-account development: уточнённая global capacity вместо грубого MVP
+screen, общие exposure diagnostics, hidden risk duplication, размещение новых
+стратегий по счетам и сравнение keep/replace.
+
+**Отложенная идея:** рекомендовать распределение заданного общего капитала
+между AGGRESSIVE/BALANCED/CONSERVATIVE с учётом risk/capacity. В MVP депозиты
+задаёт пользователь. Это не перевод средств и не объединение Cross collateral.
+
+Profit policy research: accumulation с cap, изъятие суммы выше порога,
+cascade из более агрессивного в менее рисковый портфель. Раздельно считаются
+equity каждого счёта, защищённая/выведенная прибыль, transfer cash flows и
+общий капитал без двойного счёта. Изъятие уменьшает margin buffer и требует
+повторного расчёта; момент изъятия при открытых позициях — отдельный контракт.
+
+**DoD:** отдельная принятая спецификация численных policies и cash-flow
+semantics, воспроизводимые сценарии, joint retests после изменения deposit/size,
+нулевое двойное включение transfers в прибыль и отсутствие trading permissions.
+
+## 18. Открытые вопросы и capability ledger
+
+| ID | Что ещё определить | Блокирует |
+| --- | --- | --- |
+| Q01 | физические dual-TF fields и список общих LONG/SHORT runtime fields | mixed-TF renderer и соответствующий test |
+| Q02 | set-leverage через bot, допустимые tiers/steps и mismatch handling | final leverage/deployment |
+| Q03 | exact limiter storage, частота реакции, priority order/ties, versioned overflow bound | limiter adapter и точность margin envelope |
+| Q04 | обработка opposite opening fill в one-way, cancel_opposite, partial orders | active-order reserve и faithful renderer |
+| Q05 | balance/equity sizing basis, moment, resting resize, risk_* mapping, disabled cap encoding | sizing model и динамические guards |
+| Q06 | portfolio mode/config и фактические report fields/series, fees/funding/close attribution | portfolio adapter, metrics и safe deletion |
+| Q07 | PnL/liquidity/freshness policies и exact Balanced/Conservative ranking; DD/free/MM имеют только research defaults §10.1.1 | READY, не fixture development |
+| Q08 | research windows, state/warm-up boundary, minimum evidence и upstream OOS provenance | независимая validation и финальный статус |
+| Q09 | достаточность selection snapshot, tick/binary identity и безопасное чтение concurrent Performance DB | воспроизводимость campaign/run |
+| Q10 | target local/предоставленный remote, ownership и restore contract | разрешённые реальные runs |
+| Q11 | минимально доступный collateral/order-loss/mark reserve contract и bound при missing facts | доказуемость margin guards |
+| Q12 | coarse global liquidity aggregation/threshold и position/exit diagnostic | shared-liquidity gate PortfolioSet |
+
+Capability ledger различает три исхода: `BLOCKING_UNKNOWN`,
+`APPROVED_CONSERVATIVE_BOUND` и `CONFIRMED_CAPABILITY`. К началу M2 допустимы
+не все закрытия Q01–Q12: достаточно закрыть M0/M1 и иметь working result Phase 1
+в `RESEARCH_ONLY`. До `RECOMMENDATION_READY` обязаны быть закрыты Q07–Q12 и
+все используемые ветви Q01–Q06. Неизвестные denominator/equity path,
+instrument/tier/qty/price identity, sizing/limiter semantics, обязательное
+качество liquidity evidence и применимые collateral/borrow facts всегда
+остаются `BLOCKING_UNKNOWN`. Conservative bound допустим только с сохранёнными
+формулой, числом, provenance и перечнем покрытых состояний.
+
+Q03 не переоткрывает согласованные L=0, count-by-pair, exempt priority=0,
+снятие других openings при L и возврат после flat. Q04 не переоткрывает
+целевое отсутствие одновременных LONG+SHORT positions. Требуются точные
+adapter evidence, а не повторное голосование о пользовательском поведении.
+
+Пожелания разработчику tester: self-contained limiter/priority/version metadata
+в HTML; limiter events с count before/after, symbol, priorities, выбранным
+forced-close, временем и результатом исполнения. Отдельное requested quantity
+поле не обязательно, если оно однозначно восстанавливается из подтверждённого
+sizing contract. Без этого нельзя заявлять точный fill ratio.
+
+Не требуется переделывать tester ради собственного liquidity collector,
+risk-limit snapshots, Bybit formula engine или новой fee/funding подсистемы.
+Закрытие вопросов отражается изменением этой спецификации и evidence ledger,
+а не неявным предположением в коде. Новые поля/capabilities должны иметь fixture.
+
+## 19. Приёмка документации и дальнейшая работа
+
+Полнота консолидации: MVP implementation design, advanced liquidity/margin,
+Live Monitor, sessions, phases 4–7, collector integration, developer wishes,
+исходная концепция и уточнения config/replay распределены по разделам выше.
+Исходное ТЗ collector заменено уже действующими spec/ADR, а не дублировано.
+Численные предложения, кроме явно принятой стартовой
+`portfolio_optimizer_research_risk_v1`,
+неподтверждённая точность и запрещённые cleanup defaults не становятся
+требованиями при переносе.
+
+Документационная проверка включает существование ссылок, фазовую трассировку
+spec→plan, отсутствие зависимости от прежней рабочей папки и отсутствие
+ложных отметок PASS/Implemented. Независимый Opus review редакции D4 вернул
+`PLAN_APPROVED` для архитектурной документации и D5 policy amendment. Это не
+`CODE_REVIEW_PASS`, не implementation authorization и не production safety
+evidence; обязательные policy/capability gates остаются открыты.
+
+Справочные первичные источники для будущего venue adapter:
+[Bybit UTA formulas](https://www.bybit.com/en/help-center/article/?id=000001912),
+[liquidation process](https://www.bybit.com/en/help-center/article/UTA-Trading-Rules-Liquidation-Process),
+[instruments](https://bybit-exchange.github.io/docs/v5/market/instrument),
+[risk limits](https://bybit-exchange.github.io/docs/v5/market/risk-limit),
+[tickers/24h turnover](https://bybit-exchange.github.io/docs/v5/market/tickers),
+[account fee rate](https://bybit-exchange.github.io/docs/v5/account/fee-rate).
+При реализации проверяется актуальная версия и фиксируется reference date;
+эти ссылки не заменяют сохранённые campaign facts и не задают наши risk limits.

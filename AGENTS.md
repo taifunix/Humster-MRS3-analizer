@@ -16,6 +16,21 @@
 
 ## Hooks по имени модуля
 
+Если пользователь пишет **«Оптимизатор портфеля»** или `Portfolio Optimizer`,
+после шагов 1–3 читать `docs/specs/2026-09-05-portfolio-optimizer.md`, затем
+`docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md` и
+`docs/superpowers/plans/2026-09-05-portfolio-optimizer.md`. Этот пакет пока
+Draft/Proposed: Opus plan/spec review D4/D5 вернул `PLAN_APPROVED`; D5 фиксирует
+research-only `portfolio_optimizer_research_risk_v1` DD/free-margin/MM defaults.
+PnL,
+liquidity/freshness и ranking policies не закрыты; пакет не разрешает runtime
+или запуск tester. Исходная рабочая подборка не требуется для продолжения.
+Прохождение research thresholds не разрешает implementation, tester run,
+`RECOMMENDATION_READY`, trading admission или live use; все remaining gates
+(PnL floor, liquidity/freshness limits, profile ranking) остаются open blockers.
+Для новой M0 implementation-сессии дополнительно читать
+`docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-handoff.md`.
+
 Если пользователь пишет **«работаем над Анализатором Портфеля»** (или `Portfolio Analyzer`), это означает: после шагов 1–3 минимального контекста обязательно прочитать `docs/specs/2026-08-09-portfolio-analyzer-v04.md`, затем `docs/decisions/0001-repository-and-documentation-model.md`, затем только разделы 9–10 `docs/archive/sources/MRS3_v07_MASTER_HANDOFF_LEGACY_DUCKDB_2026-08-10.md`.
 
 

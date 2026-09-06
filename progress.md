@@ -1,19 +1,60 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-05
+**Updated:** 2026-09-06
 **Current branch:** `main`
 
-## Portfolio Optimizer design clarification (2026-09-05)
+## Portfolio Optimizer canonical phased design (2026-09-05)
 
-Documentation-only discussion update in
-`docs/superpowers/plans/Portfolio-Optimizer/08_OPTIMIZER_SETTINGS_AND_REPRODUCIBILITY_RU.md`:
-separate optimizer settings file, explicit risk-type terminology, proposed
-initial thresholds/ranking and a minimal campaign reproducibility contract.
-Thresholds and ranking remain unapproved, uncalibrated proposals; snapshot
-implementation and validation protocol remain open. General capital allocation
-recommendations are explicitly post-MVP in the Phase 7 roadmap. No tester/bot
-was launched, no runtime config was created, and portfolio runtime remains
-inactive under the current PRD. Next: agree the proposals and remaining scope.
+Documentation-only consolidation now lives in
+[the phased specification](docs/specs/2026-09-05-portfolio-optimizer.md),
+[the implementation plan](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md)
+and [ADR-0025, Proposed](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md).
+The canonical package has no required dependency on the old working dossier;
+that directory has not been deleted. Current collector Revision 2/ADR-0024
+is reused instead of reviving its older design.
+
+State: Draft D5 / plan-spec review approved; M0 accepted after final
+independent `CODE_REVIEW_PASS` by Claude Opus 5 high in three rounds. D5 records
+`portfolio_optimizer_research_risk_v1`
+research/calibration defaults: AGGRESSIVE DD/free-margin/MM 20%/20%/50%,
+BALANCED 10%/40%/35%, CONSERVATIVE 5%/60%/20%. They are not automatic trading
+admission; independent Opus D5 review returned `PLAN_APPROVED`. PnL, liquidity/freshness policies and
+exact ranking remain open. Capability questions Q01-Q12 gate their dependent
+tasks. No tester/bot was launched, no runtime config or implementation was
+created and no commit was made for this consolidation. Пользователь авторизовал
+M0 read-only inventory в новой чистой сессии по
+[M0 handoff](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-handoff.md):
+сначала capability/evidence matrix, затем принятие M0 и M1. Real tester
+permissions остаются отдельным M5 gate. Прохождение research thresholds не разрешает implementation,
+tester run, `RECOMMENDATION_READY`, trading admission или live use; все remaining
+gates (PnL floor, liquidity/freshness limits, profile ranking) остаются open
+blockers. Documentation link/consistency verification
+passed: 146 local Markdown file targets resolve; the new spec/plan/ADR have
+balanced code fences, no conflict markers, no required old-dossier paths and
+no migration map. Tracked `git diff --check` and whitespace checks of all three
+new files passed. Implementation phase gates, open policy labels and synthetic
+limiter/cycle/cap/replay examples were checked locally for consistency. M0
+review is now `CODE_REVIEW_PASS`; this remains documentation evidence, not
+implementation authorization or runtime evidence.
+
+M0 read-only contract inventory is accepted after final independent Opus
+`CODE_REVIEW_PASS` in three rounds. The versioned evidence is
+[portfolio_optimizer_m0_capabilities_v1](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md).
+It traces Performance v4 current-result replacement, cache-writing selection
+paths, the collector schema-v2 marker/read-only boundary, runner target
+mutators/locks, planned M1-M8 writers, and Q01-Q12 owners with named fail-closed
+outcomes. Root fresh verification: Performance `300 passed, 1 skipped, 1
+warning`; collector `55 passed`; runner `129 passed, 1 skipped`; Markdown links
+`151 targets, 0 errors`; `git diff --check` passed.
+The isolated DuckDB 1.5.5 probe accepted a read-only transaction and rejected
+writes, while a differently configured concurrent connection was rejected;
+therefore the future M1 adapter must either obtain one consistent read-only
+transaction or stop without source writes. Current joint portfolio mode/report,
+dual-TF, limiter/priority, sizing, opposite-order, target-wide ownership,
+collateral reserve and shared-liquidity details remain capability blockers.
+No tester/bot, API, real DB/archive, runtime config or target write was used.
+Next safe step is M1 fixture-only TDD; real tester work remains blocked by M5
+ownership and separate user authorization.
 
 ## Bybit collector current implementation status (2026-09-05)
 

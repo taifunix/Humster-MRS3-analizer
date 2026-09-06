@@ -18,7 +18,8 @@
 | Source verification | [Event source packs](specs/2026-08-10-v07-event-source-packs.md) | при CSV/DuckDB package, materializer или selector изменениях |
 | Необязательная фича — Deferred | [CSV-DuckDB overlay](specs/2026-08-11-v07-optional-csv-duckdb-overlay.md) | только если отдельно решено объединять CSV coarse-grid и DuckDB fine-grid |
 | Superseded / historical | [Source-potential calibration](specs/v07-posttest-calibration-source-potential.md) | legacy posttest calibration retained for provenance |
-| Анализатор Портфеля — Queued | [Portfolio Analyzer v0.4](specs/2026-08-09-portfolio-analyzer-v04.md) | отдельной команде после проверки входных данных |
+| Portfolio Optimizer — Draft D5 / M0 accepted | [Phased specification](specs/2026-09-05-portfolio-optimizer.md), [implementation plan](superpowers/plans/2026-09-05-portfolio-optimizer.md), [M0 evidence](superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md), [ADR-0025 Proposed](decisions/0025-portfolio-optimizer-evidence-and-phases.md) | M0 accepted after CODE_REVIEW_PASS; M1 next, policies/capabilities and runtime gates remain open |
+| Portfolio Analyzer v0.4 — predecessor | [v0.4](specs/2026-08-09-portfolio-analyzer-v04.md) | происхождение прежнего queued-контракта до принятия замены |
 | Решения | [ADR-0001](decisions/0001-repository-and-documentation-model.md), [ADR-0002](decisions/0002-source-summary-and-window-metrics-verification.md), [ADR-0003](decisions/0003-source-integrity-action-metrics.md), [ADR-0009](decisions/0009-canonical-phase1-surface-selection-contract.md) | при вопросах структуры/workflow, source verification и Canonical Phase 1 governance |
 
 ## Правила обновления
@@ -31,4 +32,7 @@
 
 ## Архив
 
-[archive/](archive/README.md) хранит v0.6 baseline, handoff и source-материалы. Он не определяет текущие требования; queued Portfolio Analyzer находится в `docs/specs/`.
+[archive/](archive/README.md) хранит v0.6 baseline, handoff и source-материалы.
+Он не определяет текущие требования; новый draft Portfolio Optimizer находится
+в `docs/specs/`, план — в `docs/superpowers/plans/`. Его Draft-статус не означает
+принятую замену existing runtime.
