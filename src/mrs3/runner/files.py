@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
+from typing import Callable, TypeVar
 
 from .config import (
     RunnerConfig,
@@ -34,6 +35,140 @@ class BatchInspection:
     expected_names: tuple[str, ...]
     filenames: tuple[str, ...]
     file_hashes: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TesterSettingsSnapshot:
+    tester_config: bytes | None
+    strategies: tuple[tuple[str, bytes], ...]
+
+
+FileFingerprint = tuple[int, int, str]
+_StableValue = TypeVar("_StableValue")
+
+
+def file_fingerprint(path: Path) -> FileFingerprint | None:
+    """Read one exact regular file identity for stale shared-log checks."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        payload = path.read_bytes()
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size, hashlib.sha256(payload).hexdigest()
+
+
+def file_changed_since(path: Path, baseline: FileFingerprint | None) -> bool:
+    current = file_fingerprint(path)
+    return current is not None and current != baseline
+
+
+def read_stable_file(
+    path: Path,
+    parser: Callable[[Path], _StableValue],
+    *,
+    baseline: FileFingerprint | None = None,
+) -> _StableValue | None:
+    """Parse one immutable observation of a shared file.
+
+    The parser receives a private copy of the bytes that were checked before
+    and after reading the source.  This avoids parsing a later, separately
+    read version after a stale-result or freshness check.
+    """
+    try:
+        before = path.stat()
+        payload = path.read_bytes()
+        after = path.stat()
+        verify_payload = path.read_bytes()
+        verified = path.stat()
+    except (OSError, ValueError):
+        return None
+    fingerprint = (after.st_mtime_ns, after.st_size, hashlib.sha256(payload).hexdigest())
+    verified_fingerprint = (
+        verified.st_mtime_ns,
+        verified.st_size,
+        hashlib.sha256(verify_payload).hexdigest(),
+    )
+    if (
+        before.st_mtime_ns != after.st_mtime_ns
+        or before.st_size != after.st_size
+        or fingerprint != verified_fingerprint
+        or (baseline is not None and fingerprint == baseline)
+    ):
+        return None
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, suffix=path.suffix, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+        return parser(temporary)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def capture_tester_settings(config: RunnerConfig) -> TesterSettingsSnapshot:
+    """Capture the two shared tester inputs while target ownership is held."""
+    strategy_dir = _inside_bot(config.strategy_dir, config, "strategy_dir")
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    protected = [
+        path for path in strategy_dir.iterdir()
+        if path.suffix.casefold() == ".json" and (path.is_symlink() or not path.is_file())
+    ]
+    if protected:
+        raise BatchPreparationError("tester settings contain a protected JSON entry")
+    strategies = tuple((path.name, path.read_bytes()) for path in _root_json_files(strategy_dir))
+    tester_config = _inside_bot(config.tester_config, config, "tester_config")
+    if tester_config.exists() and (tester_config.is_symlink() or not tester_config.is_file()):
+        raise BatchPreparationError("tester config is not a regular file")
+    return TesterSettingsSnapshot(
+        tester_config.read_bytes() if tester_config.exists() else None,
+        strategies,
+    )
+
+
+def _replace_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def restore_tester_settings(config: RunnerConfig, snapshot: TesterSettingsSnapshot) -> None:
+    """Restore captured config and root strategy JSON under the same owner."""
+    strategy_dir = _inside_bot(config.strategy_dir, config, "strategy_dir")
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    if any(path.suffix.casefold() == ".json" and (path.is_symlink() or not path.is_file()) for path in strategy_dir.iterdir()):
+        raise BatchPreparationError("tester settings restore found a protected JSON entry")
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for name, payload in snapshot.strategies:
+            with tempfile.NamedTemporaryFile(dir=strategy_dir, delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(payload)
+                handle.flush()
+            staged.append((temporary, strategy_dir / name))
+        for path in _root_json_files(strategy_dir):
+            path.unlink()
+        for temporary, destination in staged:
+            temporary.replace(destination)
+        tester_config = _inside_bot(config.tester_config, config, "tester_config")
+        if snapshot.tester_config is None:
+            tester_config.unlink(missing_ok=True)
+        else:
+            _replace_bytes(tester_config, snapshot.tester_config)
+    finally:
+        for temporary, _ in staged:
+            temporary.unlink(missing_ok=True)
 
 
 def _inside_bot(path: Path, config: RunnerConfig, label: str) -> Path:
@@ -143,15 +278,6 @@ def inspect_strategy_batch(source_strategies: Path) -> BatchInspection:
     )
 
 
-def _remove_raw_artifacts(report_dir: Path, result: Path, progress: Path) -> None:
-    if report_dir.exists():
-        if not report_dir.is_dir():
-            raise BatchPreparationError(f"report_dir is not a directory: {report_dir}")
-        shutil.rmtree(report_dir)
-    result.unlink(missing_ok=True)
-    progress.unlink(missing_ok=True)
-
-
 def _restore_root_json(
     strategy_dir: Path, backup: Path, installed: tuple[Path, ...]
 ) -> None:
@@ -168,9 +294,11 @@ def prepare_batch_files(
     *,
     expected_file_hashes: tuple[tuple[str, str], ...] | None = None,
     selected_names: tuple[str, ...] | None = None,
-    preserve_raw_artifacts: bool = False,
+    preserve_raw_artifacts: bool = True,
 ) -> BatchFiles:
-    strategy_dir, report_dir, result, progress = validate_runner_paths(config)
+    strategy_dir, _, _, _ = validate_runner_paths(config)
+    if preserve_raw_artifacts is not True:
+        raise BatchPreparationError("shared tester artifacts cannot be cleared during batch preparation")
     if _source_is_inside_strategy_dir(source_strategies, strategy_dir):
         raise BatchPreparationError(
             f"strategy source cannot be inside strategy_dir: {source_strategies.resolve()}"
@@ -220,8 +348,6 @@ def prepare_batch_files(
                 "staged strategy collides with protected root entry: "
                 + ", ".join(protected_collisions)
             )
-        if not preserve_raw_artifacts:
-            _remove_raw_artifacts(report_dir, result, progress)
         backup.mkdir()
         backup_created = True
         for existing in _root_json_files(strategy_dir):
@@ -260,8 +386,3 @@ def prepare_batch_files(
         filenames=filenames,
         file_hashes=staged_hashes,
     )
-
-
-def cleanup_completed_batch(config: RunnerConfig) -> None:
-    _, report_dir, result, progress = validate_runner_paths(config)
-    _remove_raw_artifacts(report_dir, result, progress)

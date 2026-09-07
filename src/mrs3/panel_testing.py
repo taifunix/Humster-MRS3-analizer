@@ -11,8 +11,9 @@ import shutil
 import tempfile
 from typing import Callable
 
+from .locking import TesterTargetLock
 from .runner.config import RunnerConfig
-from .runner.files import prepare_batch_files
+from .runner.files import TesterSettingsSnapshot, capture_tester_settings, prepare_batch_files, restore_tester_settings
 from .runner.process import start_bot, stop_bot
 from .runner.workflow import validate_runtime_preflight
 
@@ -160,6 +161,8 @@ class LocalTestingService:
         self._install_batch = install_batch
         self._start_bot = start_bot
         self._stop_bot = stop_bot
+        self._target_owner: TesterTargetLock | None = None
+        self._target_snapshot: TesterSettingsSnapshot | None = None
 
     def status(self) -> dict[str, object]:
         try:
@@ -259,37 +262,70 @@ class LocalTestingService:
     ) -> dict[str, object]:
         """Install the requested single strategy and rendered tester config."""
         prepared = self.prepare(side=side, symbols=symbols, start=start, end=end)
+        owner: TesterTargetLock | None = None
+        target_quiesced = True
         try:
-            previous = self.config.tester_config.read_bytes() if self.config.tester_config.exists() else None
+            if self._target_owner is not None:
+                raise PanelTestingError("tester target is already owned")
+            owner = TesterTargetLock(self.config.bot_root).acquire()
+            try:
+                self._stop_bot(self.config)
+            except BaseException:
+                target_quiesced = False
+                raise
+            self._target_snapshot = capture_tester_settings(self.config)
             _atomic_write(
                 self.config.tester_config,
                 prepared.tester_config.read_text(encoding="utf-8"),
             )
-            try:
-                self._install_batch(
-                    self.config,
-                    prepared.strategy_source,
-                    selected_names=(prepared.strategy_name,),
-                    preserve_raw_artifacts=True,
-                )
-            except BaseException:
-                if previous is None:
-                    self.config.tester_config.unlink(missing_ok=True)
-                else:
-                    self.config.tester_config.write_bytes(previous)
-                raise
+            self._install_batch(
+                self.config,
+                prepared.strategy_source,
+                selected_names=(prepared.strategy_name,),
+                preserve_raw_artifacts=True,
+            )
+            self._target_owner = owner
             return prepared.as_dict()
+        except BaseException:
+            if owner is not None:
+                self._target_owner = owner
+                if target_quiesced:
+                    if self._target_snapshot is not None:
+                        restore_tester_settings(self.config, self._target_snapshot)
+                        self._target_snapshot = None
+                    owner.release()
+                    self._target_owner = None
+            raise
         finally:
             shutil.rmtree(prepared.tester_config.parent, ignore_errors=True)
 
     def start(self) -> dict[str, str]:
         validate_runtime_preflight(self.config)
-        self._start_bot(self.config)
+        owner = self._target_owner or TesterTargetLock(self.config.bot_root).acquire()
+        try:
+            self._start_bot(self.config)
+        except BaseException:
+            self._target_owner = owner
+            raise
+        self._target_owner = owner
         return {"state": "STARTED"}
 
     def stop(self) -> dict[str, str]:
         validate_runtime_preflight(self.config)
-        self._stop_bot(self.config)
+        owner = self._target_owner
+        temporary = owner is None
+        if temporary:
+            owner = TesterTargetLock(self.config.bot_root).acquire()
+        try:
+            self._stop_bot(self.config)
+        except BaseException:
+            self._target_owner = owner
+            raise
+        if self._target_snapshot is not None:
+            restore_tester_settings(self.config, self._target_snapshot)
+            self._target_snapshot = None
+        owner.release()
+        self._target_owner = None
         return {"state": "STOPPED"}
 
 

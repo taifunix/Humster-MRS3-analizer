@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from pathlib import Path
 import re
-import shutil
 from threading import RLock, Thread
 from typing import Callable, Mapping
 from uuid import uuid4
@@ -88,10 +87,6 @@ def _canonical_utc(value: datetime) -> str:
 def _is_duckdb_lock_error(error: duckdb.IOException) -> bool:
     message = str(error).casefold()
     return "could not set lock on file" in message or "conflicting lock is held" in message
-
-
-def _is_reparse(path: Path) -> bool:
-    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
 
 
 def _safe_cleanup_message(error: BaseException) -> str:
@@ -420,85 +415,6 @@ def calculate_performance_v2_windows(
             connection.close()
 
 
-def _cleanup_exact_directory(path: Path, *tail: str) -> None:
-    """Remove only the contents of one known tester/output directory."""
-    raw = Path(path).absolute()
-    current = Path(raw.anchor)
-    for part in raw.parts[1:]:
-        current /= part
-        if current.exists() and _is_reparse(current):
-            raise ValueError("cleanup target contains a symlink or reparse point")
-    resolved = raw.resolve()
-    if tail and tuple(resolved.parts[-len(tail):]) != tail:
-        raise ValueError("cleanup target is outside the configured exact path")
-    if not resolved.exists():
-        return
-    if not resolved.is_dir() or resolved.is_symlink():
-        raise ValueError("cleanup target is not a real directory")
-    for child in resolved.iterdir():
-        if child.is_symlink() or not child.is_dir():
-            child.unlink()
-        elif _is_reparse(child):
-            raise ValueError("cleanup child is a symlink or reparse point")
-        else:
-            shutil.rmtree(child)
-
-
-def _reject_reparse_components(path: Path) -> None:
-    raw = Path(path).absolute()
-    for current in (*reversed(raw.parents), raw):
-        if _is_reparse(current):
-            raise ValueError("cleanup target contains a symlink or reparse point")
-
-
-def _cleanup_performance_sources(
-    report_root: Path,
-    strategy_root: Path | None = None,
-    tester_strategy_root: Path | None = None,
-    tester_bot_root: Path | None = None,
-) -> None:
-    failures: list[str] = []
-
-    def record_failure(label: str, error: BaseException) -> None:
-        failures.append(f"{label}: {error}")
-
-    try:
-        _cleanup_exact_directory(report_root, "tester", "report", "my_test")
-    except Exception as error:
-        record_failure("report_root", error)
-
-    if strategy_root is not None:
-        try:
-            _cleanup_exact_directory(strategy_root, "Output", "strategies")
-            stale_manifest = strategy_root.resolve().parent / "strategy_manifest.json"
-            if stale_manifest.is_symlink():
-                raise ValueError("cleanup manifest is a symlink")
-            if stale_manifest.exists():
-                if not stale_manifest.is_file():
-                    raise ValueError("cleanup manifest is not a regular file")
-                stale_manifest.unlink()
-        except Exception as error:
-            record_failure("strategy_root", error)
-
-    if tester_strategy_root is not None:
-        try:
-            bot_root = Path(tester_bot_root) if tester_bot_root is not None else Path(report_root).resolve().parents[2]
-            _reject_reparse_components(bot_root)
-            _reject_reparse_components(tester_strategy_root)
-            try:
-                relative = Path(tester_strategy_root).resolve().relative_to(bot_root.resolve())
-            except (OSError, RuntimeError, ValueError) as error:
-                raise ValueError("tester strategy cleanup target is outside the bot root") from error
-            if not relative.parts:
-                raise ValueError("tester strategy cleanup target cannot be the bot root")
-            _cleanup_exact_directory(tester_strategy_root)
-        except Exception as error:
-            record_failure("tester strategy root [tester_strategy_root]", error)
-
-    if failures:
-        raise ValueError("cleanup failed for " + ", ".join(failures))
-
-
 class LocalPerformanceV2Service:
     """Import one committed inbox, then cache the requested A/B windows."""
 
@@ -577,20 +493,6 @@ class LocalPerformanceV2Service:
                     "completed": counts["result_count"],
                     "total": counts["result_count"],
                 })
-        cleanup_warning: Mapping[str, str] | None = None
-        if request.strategy_root is not None or request.tester_strategy_root is not None:
-            try:
-                _cleanup_performance_sources(
-                    request.report_root,
-                    request.strategy_root,
-                    request.tester_strategy_root,
-                    request.tester_bot_root,
-                )
-            except Exception as error:
-                cleanup_warning = {
-                    "code": "CLEANUP_FAILED",
-                    "message": _safe_cleanup_message(error),
-                }
         return PerformanceV2PanelResult(
             imported.import_id,
             imported.status,
@@ -600,7 +502,7 @@ class LocalPerformanceV2Service:
             target,
             imported.audit_path,
             windows=(),
-            cleanup_warning=cleanup_warning,
+            cleanup_warning=None,
             failure_report_path=imported.failure_report_path,
             **counts,
         )

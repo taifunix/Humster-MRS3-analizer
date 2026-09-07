@@ -16,7 +16,9 @@ import secrets
 import subprocess
 import tempfile
 from typing import Any, Callable
+from urllib.parse import quote, urlunsplit
 
+from .locking import canonical_tester_target
 from .panel_testing import render_strategy, render_tester_config
 
 
@@ -48,6 +50,29 @@ class RemoteTestingError(ValueError):
     """A stable, client-safe remote operation error."""
 
 
+class RemoteOwnershipAdapter:
+    """Capability required before a remote target may be mutated.
+
+    Implementations must attest the exact target and owner they acquired and
+    must return a false value or raise when release is not confirmed.
+    """
+
+    def acquire(self, canonical_target: str) -> object:
+        raise NotImplementedError
+
+    def attest(self, lease: object, canonical_target: str) -> bool:
+        raise NotImplementedError
+
+    def release(self, lease: object) -> bool | None:
+        raise NotImplementedError
+
+    def snapshot_settings(self, lease: object, canonical_target: str) -> object:
+        raise NotImplementedError
+
+    def restore_settings(self, lease: object, canonical_target: str, snapshot: object) -> bool | None:
+        raise NotImplementedError
+
+
 def _config_error() -> RemoteRunnerConfigError:
     return RemoteRunnerConfigError(_INVALID)
 
@@ -71,7 +96,25 @@ def _remote_path(value: object) -> str:
         raise _config_error()
     if any(part in {".", ".."} for part in value.split("/")):
         raise _config_error()
-    return value
+    # Keep the POSIX script boundary explicit while giving equivalent roots
+    # one identity (including repeated separators and a trailing slash).
+    return "/" + "/".join(part for part in value.split("/") if part)
+
+
+def _remote_host(value: object) -> str:
+    value = _clean_text(value, required=True)
+    bracketed = value.startswith("[") or value.endswith("]")
+    if value.startswith("[") or value.endswith("]"):
+        if not (value.startswith("[") and value.endswith("]")):
+            raise _config_error()
+        value = value[1:-1]
+    if not value:
+        raise _config_error()
+    if ":" in value:
+        return value.casefold()
+    if bracketed:
+        raise _config_error()
+    return value.casefold().rstrip(".")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -94,7 +137,7 @@ class RemoteRunnerConfig:
     def from_mapping(cls, raw: Mapping[str, Any]) -> "RemoteRunnerConfig":
         if not isinstance(raw, Mapping) or not _ALLOWED_CONFIG.issuperset(raw):
             raise _config_error()
-        host = _clean_text(raw.get("host"), required=True)
+        host = _remote_host(raw.get("host"))
         user = _clean_text(raw.get("user"), required=True)
         port = raw.get("port")
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
@@ -494,6 +537,7 @@ class RemoteTestingService:
         config: RemoteRunnerConfig | Mapping[str, Any],
         command_runner: Callable[[tuple[str, ...]], str] | None = None,
         file_uploader: Callable[[Path, str, RemoteRunnerConfig], None] | None = None,
+        ownership_adapter: RemoteOwnershipAdapter | None = None,
     ) -> None:
         self.config = config if isinstance(config, RemoteRunnerConfig) else load_remote_runner_config(config)
         if command_runner is not None and not callable(command_runner):
@@ -502,6 +546,91 @@ class RemoteTestingService:
             raise RemoteTestingError("remote uploader unavailable")
         self._command_runner = command_runner or _default_command_runner
         self._file_uploader = file_uploader or _default_file_uploader
+        self._ownership_adapter = ownership_adapter
+        self._ownership_lease: object | None = None
+        self._settings_snapshot: object | None = None
+
+    @property
+    def target_identity(self) -> str:
+        # The remote scripts are POSIX-only; _remote_path enforces that
+        # boundary. Quote the validated path before embedding it in the URL so
+        # spaces, '#', and '?' remain part of the target identity.
+        path = quote(_remote_path(self.config.bot_root), safe="/!$&'()*+,;=:@-._~")
+        host = self.config.host.casefold()
+        if ":" in host:
+            host = host.removeprefix("[").removesuffix("]")
+            host = f"[{host}]"
+        else:
+            host = host.rstrip(".")
+            host = quote(host, safe=".-_~")
+        authority = f"{quote(self.config.user, safe='')}@{host}:{self.config.port}"
+        return canonical_tester_target(
+            urlunsplit(("remote", authority, path, "", ""))
+        )
+
+    def _acquire_ownership(self) -> object:
+        if self._ownership_lease is not None:
+            raise RemoteTestingError("remote target is already owned")
+        adapter = self._ownership_adapter
+        if adapter is None or not all(
+            callable(getattr(adapter, name, None))
+            for name in ("acquire", "attest", "release", "snapshot_settings", "restore_settings")
+        ):
+            raise RemoteTestingError("remote ownership capability unavailable")
+        lease: object | None = None
+        try:
+            lease = adapter.acquire(self.target_identity)
+            if lease is None:
+                raise RemoteTestingError("remote ownership attestation failed")
+            self._ownership_lease = lease
+            if adapter.attest(lease, self.target_identity) is not True:
+                self._release_ownership(lease)
+                raise RemoteTestingError("remote ownership attestation failed")
+        except RemoteTestingError:
+            raise
+        except Exception:
+            if lease is not None and self._ownership_lease is lease:
+                try:
+                    self._release_ownership(lease)
+                except RemoteTestingError:
+                    pass
+            raise RemoteTestingError("remote ownership unavailable") from None
+        return lease
+
+    def _snapshot_settings(self, lease: object) -> object:
+        try:
+            snapshot = self._ownership_adapter.snapshot_settings(lease, self.target_identity)
+        except Exception:
+            raise RemoteTestingError("remote settings snapshot failed") from None
+        if snapshot is None:
+            raise RemoteTestingError("remote settings snapshot failed")
+        self._settings_snapshot = snapshot
+        return snapshot
+
+    def _restore_settings(self, lease: object) -> None:
+        snapshot = self._settings_snapshot
+        if snapshot is None:
+            return
+        try:
+            restored = self._ownership_adapter.restore_settings(lease, self.target_identity, snapshot)
+        except Exception:
+            raise RemoteTestingError("remote settings restore failed") from None
+        if restored is False:
+            raise RemoteTestingError("remote settings restore failed")
+        self._settings_snapshot = None
+
+    def _release_ownership(self, lease: object) -> None:
+        adapter = self._ownership_adapter
+        if adapter is None:
+            raise RemoteTestingError("remote ownership capability unavailable")
+        try:
+            result = adapter.release(lease)
+        except Exception:
+            raise RemoteTestingError("remote ownership release failed") from None
+        if result is False:
+            raise RemoteTestingError("remote ownership release failed")
+        if self._ownership_lease is lease:
+            self._ownership_lease = None
 
     def status(self) -> dict[str, object]:
         return _status(self.config)
@@ -547,10 +676,19 @@ class RemoteTestingService:
         raise RemoteTestingError("remote command failed")
 
     def start(self) -> dict[str, object]:
+        lease = self._ownership_lease or self._acquire_ownership()
         return self._lifecycle("start")
 
     def stop(self) -> dict[str, object]:
-        return self._lifecycle("stop")
+        lease = self._ownership_lease
+        if lease is None:
+            lease = self._acquire_ownership()
+        result = self._lifecycle("stop")
+        if result.get("state") not in {"STOPPED", "NOT_RUNNING"}:
+            return result
+        self._restore_settings(lease)
+        self._release_ownership(lease)
+        return result
 
     def fill(
         self,
@@ -608,7 +746,15 @@ class RemoteTestingService:
         token = secrets.token_hex(8)
         remote_config = _remote_child(self.config, f".mrs3-panel-upload-{token}.config")
         remote_strategy = _remote_child(self.config, f".mrs3-panel-upload-{token}.strategy")
+        lease = self._acquire_ownership()
+        operation_started = False
         try:
+            self._snapshot_settings(lease)
+            operation_started = True
+            stopped = self._lifecycle("stop")
+            if stopped.get("state") not in {"STOPPED", "NOT_RUNNING"}:
+                raise RemoteTestingError("remote tester stop was not confirmed")
+            operation_started = False
             with tempfile.TemporaryDirectory(prefix="mrs3-remote-fill-") as temporary:
                 root = Path(temporary)
                 local_config = root / "config_tester.json"
@@ -621,12 +767,21 @@ class RemoteTestingService:
                 except Exception:
                     self._cleanup_uploads(remote_config, remote_strategy)
                     raise RemoteTestingError("remote upload failed") from None
+                operation_started = True
                 output = self._run(_fill_script(self.config, token, strategy_filename)).strip()
         except RemoteTestingError:
+            if not operation_started:
+                self._restore_settings(lease)
+                self._release_ownership(lease)
             raise
         except Exception:
+            if not operation_started:
+                self._restore_settings(lease)
+                self._release_ownership(lease)
             raise RemoteTestingError("remote fill failed") from None
         if output != "FILLED":
+            self._restore_settings(lease)
+            self._release_ownership(lease)
             raise RemoteTestingError("remote fill failed")
         return {
             "state": "FILLED",

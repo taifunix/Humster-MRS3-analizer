@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date
 from hashlib import sha256
 import json
+import inspect
 import os
 from pathlib import Path
 import shutil
@@ -14,10 +15,11 @@ from uuid import uuid4
 
 from .panel_testing import mrs3_tester_config_template
 from .runner.config import RunnerConfig
-from .runner.files import prepare_batch_files
+from .runner.files import TesterSettingsSnapshot, capture_tester_settings, prepare_batch_files, restore_tester_settings
 from .runner.process import stop_bot as _stop_bot
 from .runner.workflow import run_batch as _run_batch
 from .runner.workflow import validate_runtime_preflight
+from .locking import TesterTargetLock
 
 
 class StrategyBatchValidationError(ValueError):
@@ -38,6 +40,7 @@ class _Job:
     manifest: ValidatedStrategyManifest
     output_csv: Path
     runner_config: object
+    dates: tuple[str, str] | None = None
     cancel: Event = field(default_factory=Event)
     state: str = "RUNNING"
     phase: str = "RUNNING"
@@ -261,6 +264,13 @@ class LocalStrategyBatchService:
         if analysis_run_id is not None and validated.analysis_run_id != analysis_run_id:
             raise StrategyBatchValidationError("strategy batch does not match analysis run")
         dates = self._dates(start_date, end_date)
+        if dates is not None:
+            try:
+                seed_document = json.loads(self._tester_config_template.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise StrategyBatchValidationError("tester config is invalid") from error
+            if not isinstance(seed_document, dict):
+                raise StrategyBatchValidationError("tester config is invalid")
         job_id = job_id or str(uuid4())
         with self._lock:
             if any(item.state not in {"COMMITTED", "CANCELLED", "FAILED"} for item in self._jobs.values()):
@@ -272,8 +282,7 @@ class LocalStrategyBatchService:
                 if not isinstance(self.config, RunnerConfig):
                     raise StrategyBatchValidationError("tester config is unavailable")
                 validate_runtime_preflight(self.config)
-                runtime_config = self._write_tester_dates(self.config, *dates)
-                prepare_batch_files(runtime_config, validated.strategy_source)
+                runtime_config = self.config
             else:
                 validate_runtime_preflight(self.config)
             inbox_root = Path(getattr(self.config, "inbox_root", Path.cwd() / ".mrs3-panel-inbox"))
@@ -283,6 +292,7 @@ class LocalStrategyBatchService:
                 validated,
                 output,
                 runtime_config,
+                dates,
                 progress={
                     "sent": 0,
                     "running": 0,
@@ -322,12 +332,37 @@ class LocalStrategyBatchService:
 
     def _run(self, job: _Job) -> None:
         terminal: str
+        owner: TesterTargetLock | None = None
+        runtime_config = job.runner_config
+        target_snapshot: TesterSettingsSnapshot | None = None
         try:
+            bot_root = getattr(runtime_config, "bot_root", None)
+            if not isinstance(runtime_config, RunnerConfig) or not isinstance(bot_root, Path):
+                raise StrategyBatchValidationError(
+                    "tester target ownership and settings snapshot are unavailable"
+                )
+            owner = TesterTargetLock(bot_root).acquire()
+            # Capture before stopping or installing anything: without a
+            # recoverable snapshot this run must fail closed before mutation.
+            target_snapshot = capture_tester_settings(runtime_config)
+            self._stop_bot(runtime_config)
+            if job.dates is not None:
+                runtime_config = self._write_tester_dates(runtime_config, *job.dates)
+                prepare_batch_files(
+                    runtime_config,
+                    job.manifest.strategy_source,
+                    preserve_raw_artifacts=True,
+                )
+            try:
+                accepts_owner = "target_owner" in inspect.signature(self._run_batch).parameters
+            except (TypeError, ValueError):
+                accepts_owner = False
             result = self._run_batch(
-                job.runner_config,
+                runtime_config,
                 job.manifest.strategy_source,
                 job.output_csv,
                 provenance=job.manifest.provenance,
+                **({"target_owner": owner} if owner is not None and accepts_owner else {}),
             )
             inbox = getattr(result, "inbox_path", None)
             with self._lock:
@@ -336,7 +371,7 @@ class LocalStrategyBatchService:
                 terminal = "CANCELLED"
             elif inbox is not None:
                 inbox = Path(inbox).resolve()
-                _publish_reports(job.runner_config, inbox)
+                _publish_reports(runtime_config, inbox)
                 with self._lock:
                     job.inbox_path = inbox
             with self._lock:
@@ -350,10 +385,25 @@ class LocalStrategyBatchService:
                 cancelled = job.cancel.is_set()
             terminal = "CANCELLED" if cancelled else "FAILED"
         finally:
-            try:
-                self._stop_bot(job.runner_config)
-            except BaseException:
-                pass
+            cleanup_failed = False
+            if owner is not None and target_snapshot is not None:
+                try:
+                    self._stop_bot(runtime_config)
+                except BaseException:
+                    cleanup_failed = True
+                if not cleanup_failed:
+                    try:
+                        if target_snapshot is not None:
+                            restore_tester_settings(job.runner_config, target_snapshot)
+                    except BaseException:
+                        cleanup_failed = True
+                if not cleanup_failed:
+                    try:
+                        owner.release()
+                    except BaseException:
+                        cleanup_failed = True
+            if cleanup_failed:
+                terminal = "FAILED"
             self._finish(job, terminal)
 
     def _finish(self, job: _Job, state: str) -> None:

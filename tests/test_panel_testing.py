@@ -11,6 +11,7 @@ from mrs3.panel_testing import (
     render_strategy,
     render_tester_config,
 )
+from mrs3.locking import TesterTargetBusyError, TesterTargetLock
 from mrs3.panel import PanelController
 from mrs3.runner.config import RunnerConfig
 
@@ -253,6 +254,7 @@ def test_local_testing_fill_installs_exactly_one_strategy_and_config_without_cle
         config,
         Path(__file__).parents[1],
         install_batch=install,
+        stop_bot=lambda _config: None,
     )
 
     filled = service.fill(
@@ -263,6 +265,10 @@ def test_local_testing_fill_installs_exactly_one_strategy_and_config_without_cle
     assert existing_report.read_text(encoding="utf-8") == "keep"
     assert json.loads(config.tester_config.read_text(encoding="utf-8"))["StartDate"] == "2026-07-15T00:00:00"
     assert filled["strategy_name"] == "AAOIUSDT"
+    with pytest.raises(TesterTargetBusyError):
+        TesterTargetLock(config.bot_root).acquire()
+    service.stop()
+    assert not config.tester_config.exists()
 
 
 def test_local_testing_fill_replaces_all_root_strategy_json_with_exactly_one_rendered_file(
@@ -293,6 +299,53 @@ def test_local_testing_start_and_stop_delegate_only_after_preflight(tmp_path: Pa
     assert service.start() == {"state": "STARTED"}
     assert service.stop() == {"state": "STOPPED"}
     assert calls == ["start", "stop"]
+
+
+def test_local_testing_keeps_owner_when_process_state_is_unconfirmed(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        start_bot=lambda _config: (_ for _ in ()).throw(RuntimeError("start failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        service.start()
+
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+
+
+def test_local_testing_does_not_restore_while_stop_is_unconfirmed(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        stop_bot=lambda _config: None,
+    )
+    service.fill(side="LONG", symbols=("CXUSDT",), start="2026-07-15", end="2026-08-06")
+    service._stop_bot = lambda _config: (_ for _ in ()).throw(RuntimeError("stop failed"))
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        service.stop()
+
+    assert config.tester_config.is_file()
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+
+
+def test_local_fill_does_not_mutate_when_initial_stop_is_unconfirmed(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        stop_bot=lambda _config: (_ for _ in ()).throw(RuntimeError("stop failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        service.fill(side="LONG", symbols=("CXUSDT",), start="2026-07-15", end="2026-08-06")
+
+    assert not config.tester_config.exists()
+    assert not tuple(config.strategy_dir.glob("*.json"))
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
 
 
 def test_panel_controller_exposes_local_testing_preflight_without_paths(tmp_path: Path) -> None:

@@ -11,12 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import mrs3.panel_performance_v2 as performance_v2
 from mrs3.performance_v2_input import PerformanceV2InputError, read_performance_v2_inbox
 from mrs3.performance_v2_store import PerformanceV2Config, load_performance_v2_config
 from mrs3.panel_fast_strategy_test import LocalSingleModeStrategyTestService
 from mrs3.panel_fast_strategy_test import _write_fast_tester_config
-from mrs3.panel_performance_v2 import _cleanup_performance_sources
 from mrs3.panel_performance_v2 import _safe_cleanup_message
 from mrs3.panel_performance_v2 import LocalPerformanceV2Service
 from mrs3.panel_performance_v2 import PerformanceV2PanelRequest
@@ -209,9 +207,30 @@ def test_single_mode_config_flag_is_scoped_to_native_helper(tmp_path: Path) -> N
     assert json.loads(config.tester_config.read_text(encoding="utf-8"))["single_mode"] is False
 
 
+def test_native_single_mode_rejects_unchanged_preexisting_report(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path, 1)
+    config = _runner_config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    report = config.report_dir / f"{names[0]}.html"
+    report.write_text(_native_report(names[0], start="2026-08-01", end="2026-08-31"), encoding="utf-8")
+    stat = report.stat()
+    expected = json.loads((manifest.parent / "strategies" / f"{names[0]}.json").read_text(encoding="utf-8"))
+
+    found = LocalSingleModeStrategyTestService._native_reports(
+        config.report_dir, {names[0]}, expected_settings={names[0]: expected},
+        start="2026-08-01", end="2026-08-31",
+        baseline={report.name: (stat.st_mtime_ns, stat.st_size, sha256(report.read_bytes()).hexdigest())},
+    )
+
+    assert found == {}
+
+
 def test_native_single_mode_installs_each_batch_before_one_native_run_and_creates_inbox(tmp_path: Path) -> None:
     manifest, names = _generation(tmp_path, 3)
     config = replace(_runner_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=2, stall_timeout_seconds=2)
+    old_report = config.report_dir / "unowned.html"
+    old_report.parent.mkdir(parents=True)
+    old_report.write_text("keep", encoding="utf-8")
     events: list[object] = []
 
     class NativeClient:
@@ -265,9 +284,13 @@ def test_native_single_mode_installs_each_batch_before_one_native_run_and_create
     assert status["state"] == "COMMITTED", status
     assert status["inbox_ready"] is True
     tester_config = json.loads(config.tester_config.read_text(encoding="utf-8"))
-    assert tester_config["single_mode"] is True
-    assert tester_config["max_parallel_runs"] == config.max_parallel_submissions
-    assert tester_config["MakerFee"] == 0.00001
+    assert tester_config == {
+        "MakerFee": "0.00001",
+        "TakerFee": "0.00005",
+        "SlippagePercent": "0",
+        "FundingRate": "0",
+        "FundingIntervalHours": "8",
+    }
     assert [(entry[0], entry[1]) for entry in events if isinstance(entry, tuple) and entry[0] == "start"] == [
         ("start", names[:2]),
         ("start", names[2:]),
@@ -275,6 +298,7 @@ def test_native_single_mode_installs_each_batch_before_one_native_run_and_create
     assert events.count("run") == 2
     assert all("wizard" not in str(event).casefold() for event in events)
     assert (Path(status["inbox_path"]) / "inbox_manifest.json").is_file()
+    assert old_report.read_text(encoding="utf-8") == "keep"
 
 
 def test_native_single_mode_publishes_startup_heartbeat(tmp_path: Path) -> None:
@@ -796,27 +820,8 @@ def test_single_mode_exhausted_report_retries_is_failed_not_partial_commit(tmp_p
     assert status["inbox_ready"] is False
 
 
-def test_performance_cleanup_removes_only_exact_sources_and_stale_manifest(tmp_path: Path) -> None:
-    report_root = tmp_path / "bot" / "tester" / "report" / "my_test"
-    strategy_root = tmp_path / "Output" / "strategies"
-    report_root.mkdir(parents=True)
-    strategy_root.mkdir(parents=True)
-    (report_root / "A.html").write_text("report", encoding="utf-8")
-    (strategy_root / "A.json").write_text("strategy", encoding="utf-8")
-    stale = strategy_root.parent / "strategy_manifest.json"
-    stale.write_text("manifest", encoding="utf-8")
-    unrelated = tmp_path / "Output" / "keep.txt"
-    unrelated.write_text("keep", encoding="utf-8")
 
-    _cleanup_performance_sources(report_root, strategy_root)
-
-    assert list(report_root.iterdir()) == []
-    assert list(strategy_root.iterdir()) == []
-    assert not stale.exists()
-    assert unrelated.read_text(encoding="utf-8") == "keep"
-
-
-def test_successful_v2_import_empties_exact_report_directory(tmp_path: Path) -> None:
+def test_successful_v2_import_retains_shared_tester_sources(tmp_path: Path) -> None:
     from tests.test_panel_performance_v2 import _request
 
     request, _ = _request(tmp_path)
@@ -846,61 +851,12 @@ def test_successful_v2_import_empties_exact_report_directory(tmp_path: Path) -> 
     result = LocalPerformanceV2Service().run(request)
 
     assert result.status == "COMMITTED"
-    assert list(exact_report_root.iterdir()) == []
-    assert list(tester_strategy_root.iterdir()) == []
+    assert sorted(path.name for path in exact_report_root.iterdir()) == ["P1.html", "P2.html"]
+    assert (tester_strategy_root / "S1.json").read_text(encoding="utf-8") == "strategy"
 
 
-def test_cleanup_uses_explicit_bot_root_for_nonstandard_report_location(tmp_path: Path) -> None:
-    report_root = tmp_path / "outside-hb" / "tester" / "report" / "my_test"
-    bot_root = tmp_path / "configured-bot"
-    tester_strategy_root = bot_root / "settings_strategy"
-    report_root.mkdir(parents=True)
-    tester_strategy_root.mkdir(parents=True)
-    (report_root / "A.html").write_text("report", encoding="utf-8")
-    (tester_strategy_root / "A.json").write_text("strategy", encoding="utf-8")
-
-    _cleanup_performance_sources(
-        report_root,
-        tester_strategy_root=tester_strategy_root,
-        tester_bot_root=bot_root,
-    )
-
-    assert list(report_root.iterdir()) == []
-    assert list(tester_strategy_root.iterdir()) == []
 
 
-def test_cleanup_rejects_tester_strategy_outside_explicit_bot_root(tmp_path: Path) -> None:
-    report_root = tmp_path / "outside-hb" / "tester" / "report" / "my_test"
-    bot_root = tmp_path / "configured-bot"
-    outside = tmp_path / "outside" / "settings_strategy"
-    report_root.mkdir(parents=True)
-    outside.mkdir(parents=True)
-
-    with pytest.raises(ValueError, match="tester strategy"):
-        _cleanup_performance_sources(
-            report_root,
-            tester_strategy_root=outside,
-            tester_bot_root=bot_root,
-        )
-
-
-def test_performance_cleanup_rejects_non_exact_report_root(tmp_path: Path) -> None:
-    report_root = tmp_path / "reports"
-    strategy_root = tmp_path / "Output" / "strategies"
-    report_root.mkdir(parents=True)
-    strategy_root.mkdir(parents=True)
-    with pytest.raises(ValueError, match="exact path"):
-        _cleanup_performance_sources(report_root, strategy_root)
-
-
-def test_performance_cleanup_rejects_tester_strategy_outside_bot_root(tmp_path: Path) -> None:
-    report_root = tmp_path / "bot" / "tester" / "report" / "my_test"
-    report_root.mkdir(parents=True)
-    outside = tmp_path / "outside" / "settings_strategy"
-    outside.mkdir(parents=True)
-
-    with pytest.raises(ValueError, match="tester strategy"):
-        _cleanup_performance_sources(report_root, None, outside)
 
 
 def test_v2_config_owns_output_strategy_root_server_side(tmp_path: Path) -> None:
@@ -911,67 +867,6 @@ def test_v2_config_owns_output_strategy_root_server_side(tmp_path: Path) -> None
     config = load_performance_v2_config(config_path)
     assert config.strategy_root == (tmp_path / "Output" / "strategies").resolve()
 
-
-def test_cleanup_failure_preserves_committed_v2_result_and_hides_local_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from tests.test_panel_performance_v2 import _request
-
-    request, _ = _request(tmp_path)
-    request = replace(request, strategy_root=tmp_path / "Output" / "strategies")
-
-    def fail_cleanup(*_args: object) -> None:
-        raise RuntimeError(f"cannot remove {tmp_path}\\Output\\strategies")
-
-    monkeypatch.setattr("mrs3.panel_performance_v2._cleanup_performance_sources", fail_cleanup)
-    result = LocalPerformanceV2Service().run(request)
-
-    assert result.status == "COMMITTED"
-    assert result.cleanup_warning == {
-        "code": "CLEANUP_FAILED",
-        "message": "cannot remove <path>",
-    }
-
-
-def test_cleanup_warning_names_failed_root_after_committed_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from tests.test_panel_performance_v2 import _request
-
-    request, _ = _request(tmp_path)
-    exact_report_root = tmp_path / "outside-hb" / "tester" / "report" / "my_test"
-    exact_report_root.mkdir(parents=True)
-    manifest_path = request.inbox / "inbox_manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    for entry in manifest["entries"]:
-        source = Path(entry["report_path"])
-        target = exact_report_root / source.name
-        source.replace(target)
-        entry["report_path"] = str(target)
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    strategy_root = tmp_path / "Output" / "strategies"
-    strategy_root.mkdir(parents=True)
-    tester_bot_root = tmp_path / "configured-bot"
-    tester_strategy_root = tester_bot_root / "settings_strategy"
-    tester_strategy_root.mkdir(parents=True)
-    request = replace(
-        request,
-        report_root=exact_report_root,
-        strategy_root=strategy_root,
-        tester_strategy_root=tester_strategy_root,
-        tester_bot_root=tester_bot_root,
-    )
-
-    original = performance_v2._cleanup_exact_directory
-
-    def fail_tester_root(path: Path, *tail: str) -> None:
-        if path == tester_strategy_root:
-            raise RuntimeError("tester cleanup unavailable")
-        original(path, *tail)
-
-    monkeypatch.setattr(performance_v2, "_cleanup_exact_directory", fail_tester_root)
-    result = LocalPerformanceV2Service().run(request)
-
-    assert result.status == "COMMITTED"
-    assert result.cleanup_warning is not None
-    assert result.cleanup_warning["code"] == "CLEANUP_FAILED"
-    assert "tester_strategy_root" in result.cleanup_warning["message"]
 
 
 def test_import_failure_leaves_performance_sources_intact(tmp_path: Path) -> None:
@@ -1000,17 +895,3 @@ def test_cleanup_warning_hides_windows_paths_with_spaces() -> None:
     assert _safe_cleanup_message(
         RuntimeError(r"cannot remove C:\Users\Alice Example\Output\strategies")
     ) == "cannot remove <path>"
-
-
-def test_cleanup_refuses_reparse_child_before_recursive_delete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    report_root = tmp_path / "bot" / "tester" / "report" / "my_test"
-    child = report_root / "junction-like-child"
-    child.mkdir(parents=True)
-    (child / "keep.txt").write_text("keep", encoding="utf-8")
-    real_is_reparse = performance_v2._is_reparse
-    monkeypatch.setattr(performance_v2, "_is_reparse", lambda path: path == child or real_is_reparse(path))
-
-    with pytest.raises(ValueError, match="symlink or reparse"):
-        performance_v2._cleanup_exact_directory(report_root, "tester", "report", "my_test")
-
-    assert (child / "keep.txt").is_file()

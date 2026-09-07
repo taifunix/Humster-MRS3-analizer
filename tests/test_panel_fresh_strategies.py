@@ -14,7 +14,7 @@ import pytest
 from mrs3.config import AlgorithmConfig
 from mrs3.panel import PanelController, create_panel_server
 from mrs3.panel_jobs import PanelJobError
-from mrs3.panel_tester_runs import LocalRunsBatchService
+from mrs3.panel_tester_runs import LocalRunsBatchService, _RunsJob
 
 
 def test_panel_keeps_runs_backend_but_hides_legacy_run_controls() -> None:
@@ -432,7 +432,7 @@ def test_runs_tester_rejects_an_empty_runs_directory(tmp_path: Path, monkeypatch
         raise AssertionError("empty runs directory must be rejected")
 
 
-def test_runs_tester_clears_only_its_report_directory_and_counts_html(tmp_path: Path) -> None:
+def test_runs_tester_retains_old_reports_and_counts_only_fresh_html(tmp_path: Path) -> None:
     root = tmp_path / "bot"
     runs = root / "tester" / "runs"; runs.mkdir(parents=True)
     entries = []
@@ -467,7 +467,19 @@ def test_runs_tester_clears_only_its_report_directory_and_counts_html(tmp_path: 
     assert result["state"] == "COMMITTED"
     assert result["inbox_path"] == str(inbox)
     assert result["progress"] == {"current": 2, "total": 2, "unit": "reports"}
-    assert not (report / "old.html").exists()
+    assert (report / "old.html").read_text(encoding="utf-8") == "old"
+
+
+def test_runs_terminal_state_is_hidden_until_target_is_finalized(tmp_path: Path) -> None:
+    service = LocalRunsBatchService(SimpleNamespace())
+    job = _RunsJob(
+        "job", tmp_path, 0, tmp_path / "reports", {}, {}, "2026-08-01",
+        "2026-08-31", b"{}", state="COMMITTED", phase="COMMITTED",
+    )
+
+    assert service._document(job)["state"] == "RUNNING"
+    job.target_finalized = True
+    assert service._document(job)["state"] == "COMMITTED"
 
 
 def test_runs_and_regular_tester_share_the_panel_job_resource(tmp_path: Path) -> None:

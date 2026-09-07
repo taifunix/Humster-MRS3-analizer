@@ -13,6 +13,7 @@ from mrs3.panel_fast_strategy_test import LocalFastStrategyTestService
 from mrs3.panel_fast_strategy_test import FastStrategyTestError
 from mrs3.panel_fast_strategy_test import _has_current_performance_v2_layout
 from mrs3.panel_fast_strategy_test import _write_fast_tester_config
+from mrs3.locking import TesterTargetLock
 from mrs3.performance_v2_html import parse_current_performance_v2_html
 from mrs3.performance_v2_store import PerformanceV2Config
 from mrs3.runner.config import RunnerConfig
@@ -271,15 +272,59 @@ def test_fast_test_replaces_strategy_dir_for_each_chunk_and_clears_success(tmp_p
     assert observed == [names[:2], names[2:4], names[4:]]
     assert not list(config.strategy_dir.glob("*.json")), status
     tester_config = json.loads(config.tester_config.read_text(encoding="utf-8"))
-    assert tester_config["include_chart_balance"] is True
-    assert tester_config["use_runs"] is False
+    assert tester_config["include_chart_balance"] is False
     assert tester_config["MakerFee"] == 0.00001
-    assert tester_config["parameter_mining"] == []
-    assert tester_config["report"]["include_chart_balance"] is True
-    assert tester_config["report"]["include_position_stats"] is False
+    assert "use_runs" not in tester_config
+    assert "parameter_mining" not in tester_config
+    assert tester_config["report"]["include_chart_balance"] is False
+    assert tester_config["report"]["include_position_stats"] is True
     fast_manifest = json.loads((config.report_dir / "fast_test_manifest.json").read_text(encoding="utf-8"))
     assert fast_manifest["expected_names"] == list(names)
     assert fast_manifest["candidate_diagnostics"]["S0"]["orders"][0]["plateau_point_count"] == 3
+
+
+def test_fast_test_retains_owner_when_tester_stop_is_unconfirmed(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    service = LocalFastStrategyTestService(
+        config,
+        start_bot=lambda _: object(),
+        stop_bot=lambda _: (_ for _ in ()).throw(RuntimeError("stop failed")),
+        client_factory=lambda _: object(),
+        wait_for_exact_batch=lambda *_args, **_kwargs: (),
+    )
+
+    job = service.start(
+        manifest, analysis_run_id="a" * 64, start_date="2026-08-01",
+        end_date="2026-08-31", job_id="fast-stop-failed",
+    )
+
+    assert _wait(service, str(job["job_id"]))["state"] == "FAILED"
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+
+
+def test_fast_test_releases_owner_after_clean_ordinary_failure(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+
+    class OrdinaryFailure(LocalFastStrategyTestService):
+        def _run_owned(self, job: object) -> None:
+            raise RuntimeError("ordinary tester failure")
+
+    service = OrdinaryFailure(config)
+    job = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="fast-clean-failure",
+    )
+    status = _wait(service, str(job["job_id"]))
+
+    assert status["state"] == "FAILED"
+    assert "ordinary tester failure" in json.dumps(status)
+    with TesterTargetLock(config.bot_root):
+        pass
 
 
 def test_fast_test_captures_only_verified_reports_for_performance_import(tmp_path: Path) -> None:
@@ -410,7 +455,7 @@ def test_fast_test_continues_after_failure_and_leaves_only_failed_json(tmp_path:
     assert status["phase"] == "PARTIAL", status
     assert status["progress"]["current"] == 3
     assert status["evidence"]["failed_names"] == ["S1"]
-    assert [path.name for path in config.strategy_dir.glob("*.json")] == ["S1.json"]
+    assert not list(config.strategy_dir.glob("*.json"))
 
 
 def test_fast_retry_accepts_matching_manual_report_without_starting_bot(tmp_path: Path) -> None:

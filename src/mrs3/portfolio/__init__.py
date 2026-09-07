@@ -89,6 +89,25 @@ from .search import (
     search_portfolios,
 )
 from .render import RenderResult, render_portfolio, reverse_typed_compare
+from .runner import (
+    Artifact,
+    ArtifactMismatchError,
+    DuplicateRunError,
+    M6CommitReadbackProof,
+    OperationUnconfirmedError,
+    PortfolioCancelled,
+    PortfolioModeUnsupported,
+    PortfolioRunResult,
+    PortfolioRunner,
+    PortfolioRunnerError,
+    PortfolioTesterRunner,
+    PortfolioTimedOut,
+    PortfolioTransport,
+    RunManifest,
+    RunWorkspace,
+    SnapshotError,
+    TransportContractError,
+)
 
 __all__ = [
     "ALGORITHM_VERSIONS",
@@ -174,4 +193,21 @@ __all__ = [
     "RenderResult",
     "render_portfolio",
     "reverse_typed_compare",
+    "Artifact",
+    "ArtifactMismatchError",
+    "DuplicateRunError",
+    "M6CommitReadbackProof",
+    "OperationUnconfirmedError",
+    "PortfolioCancelled",
+    "PortfolioModeUnsupported",
+    "PortfolioRunResult",
+    "PortfolioRunner",
+    "PortfolioRunnerError",
+    "PortfolioTesterRunner",
+    "PortfolioTimedOut",
+    "PortfolioTransport",
+    "RunManifest",
+    "RunWorkspace",
+    "SnapshotError",
+    "TransportContractError",
 ]

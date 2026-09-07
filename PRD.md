@@ -98,14 +98,14 @@ analysis runs и lineage согласно уже реализованной
 
 ## Hook: Анализатор Портфеля
 
-Новый Portfolio Optimizer — **Draft D7 / M0–M4 accepted**. Канонические
+Новый Portfolio Optimizer — **Draft D7 / M0–M5 accepted**. Канонические
 [спецификация по фазам](docs/specs/2026-09-05-portfolio-optimizer.md),
 [план внедрения](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md) и
 [ADR-0025 (Proposed)](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md),
 [ADR-0030 (Accepted)](docs/decisions/0030-portfolio-optimizer-m2-admission-and-sizing-contract.md),
 [UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md) и
 [ADR-0031 (Accepted)](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md)
-фиксируют дизайн и границы принятой fixture-only реализации M0–M4; они не
+фиксируют дизайн и границы принятой fixture-only реализации M0–M5; они не
 доказывают portfolio results и не разрешают runtime/tester/live use.
 [Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md)
 сохраняется как предшествующий queued-контракт до принятия замены.
@@ -121,8 +121,8 @@ M0 read-only inventory accepted after independent `CODE_REVIEW_PASS`. Fixture-on
 M1 config/storage/snapshot implementation is accepted after independent Opus
 `CODE_REVIEW_PASS`. Fixture-only M2 liquidity/reference implementation is accepted
 after independent Opus `CODE_REVIEW_PASS`. Fixture-only M3–M4 are accepted after
-independent Opus `CODE_REVIEW_PASS`; M5 implementation is in progress on
-fixtures/fakes and M6-M8 remain unstarted. Q01-Q12 unknowns are isolated or
+independent Opus `CODE_REVIEW_PASS`; fixture/fake-only M5 is accepted after
+independent Opus `CODE_REVIEW_PASS` and M6-M8 remain unstarted. Q01-Q12 unknowns are isolated or
 fail-closed where unresolved.
 The versioned matrix is in
 [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md).
@@ -167,7 +167,7 @@ M5 не зависит от UI. README не меняется до появлен
 | Accepted | [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) | раздельная full-horizon/windowed verification для real packages v2 | event source packs |
 | Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
 | Superseded / historical | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | legacy posttest calibration retained for provenance | Performance DB v2 RETEST |
-| Draft D7 / M0–M4 accepted | [Portfolio Optimizer phased spec](docs/specs/2026-09-05-portfolio-optimizer.md), [plan](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md), [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md), [M1 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md), [M2 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md), [M3 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m3-evidence.md), [M4 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m4-evidence.md) | joint tick-tests, separate Cross portfolios, immutable evidence, phased recommendations | Performance v2, collector ADR-0024, M5 tester capabilities, open PnL/liquidity/freshness/ranking and runtime gates |
+| Draft D7 / M0–M5 accepted | [Portfolio Optimizer phased spec](docs/specs/2026-09-05-portfolio-optimizer.md), [plan](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md), [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md), [M1 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md), [M2 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md), [M3 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m3-evidence.md), [M4 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m4-evidence.md), [M5 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m5-evidence.md) | joint tick-tests, separate Cross portfolios, immutable evidence, phased recommendations | Performance v2, collector ADR-0024, M6 metrics, open PnL/liquidity/freshness/ranking and runtime gates |
 | Specified / U0 accepted; U1 planned | [Portfolio Optimizer Panel UI](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [ADR-0031](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md) | local launch form, persisted Stage 1 job, settings CAS, summary and XLSX | backend optimizer capabilities; Stage 2 also requires M5/M6 and explicit authorization |
 | Proposed | [ADR-0025](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md) | optimizer data boundaries, replay and MVP/post-MVP scope | ADR-0001/0020/0024; approval deferred |
 | Accepted | [ADR-0029](docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md) | research-only DD/free-margin/MM profile defaults | Portfolio Optimizer D5; not runtime/trading permission |

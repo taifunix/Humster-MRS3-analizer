@@ -1,6 +1,6 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-06
+**Updated:** 2026-09-07
 **Current branch:** `main`
 
 ## Portfolio Optimizer canonical phased design (2026-09-05)
@@ -28,6 +28,16 @@ independent Opus `CODE_REVIEW_PASS`; evidence is in
 and [the M4 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m4-evidence.md).
 Focused verification is `118 passed` for M3 and `66 passed` for M4. The combined
 M1–M4/collector/performance verification is `545 passed, 1 warning`.
+Fixture-only M5 target ownership and portfolio runner implementation is
+accepted after independent Opus `CODE_REVIEW_PASS` in three rounds. Its
+evidence is in
+[the M5 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m5-evidence.md):
+focused ownership verification is `239 passed, 1 skipped`; the R12-R14 subset
+is `131 passed, 1 skipped`; and the final complete project suite is `2938
+passed, 7 skipped, 8 warnings`. Opus round 1 R1-R10 and round 2 R11-R14 are
+fixed or explicitly adjudicated; round 3 accepted the exact final tree. M6/U1
+have not started, and no real tester, bot, remote target
+or database was used.
 D5 records
 `portfolio_optimizer_research_risk_v1`
 research/calibration defaults: AGGRESSIVE DD/free-margin/MM 20%/20%/50%,

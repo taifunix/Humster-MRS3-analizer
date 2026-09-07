@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import date
+from hashlib import sha256
 import html
 import json
 import os
@@ -20,13 +21,14 @@ from .panel_testing import mrs3_tester_config_template
 from .performance import PerformanceParseError, _raw_markup, _series
 from .performance_v2_html import CURRENT_ACTION_HEADERS
 from .runner.config import RunnerConfig
-from .runner.files import validate_runner_paths
+from .runner.files import capture_tester_settings, restore_tester_settings, validate_runner_paths
 from .runner.http import TesterHttpClient
 from .runner.inbox import InboxCaptureError, capture_run_snapshot_inbox
 from .runner.monitor import BatchCompletion, BatchRetryExhausted, monitor_controlled_batch
 from .runner.process import start_bot as _start_bot, stop_bot as _stop_bot
 from .runner.results import extract_html_strategy_settings
 from .runner.workflow import _wait_for_exact_batch
+from .locking import TesterTargetLock
 
 
 class FastStrategyTestError(ValueError):
@@ -35,6 +37,10 @@ class FastStrategyTestError(ValueError):
 
 class _FastCancelled(RuntimeError):
     pass
+
+
+class _FastCleanupUnconfirmed(RuntimeError):
+    """The target cannot be safely released after a failed run."""
 
 
 @dataclass(slots=True)
@@ -62,6 +68,8 @@ class _Job:
     preserve_reports: bool = False
     inbox_path: Path | None = None
     single_mode: bool = False
+    target_finalized: bool = False
+    report_baseline: dict[str, tuple[int, int, str]] = field(default_factory=dict)
 
 
 def _client(config: RunnerConfig) -> TesterHttpClient:
@@ -328,12 +336,17 @@ class LocalFastStrategyTestService:
 
     def _snapshot(self, job: _Job) -> dict[str, object]:
         with self._lock:
+            state = (
+                "RUNNING"
+                if not job.target_finalized and job.thread is not None and job.thread.is_alive()
+                else job.state
+            )
             return {
                 "job_id": job.job_id,
-                "state": job.state,
+                "state": state,
                 "phase": job.phase,
                 "mode": "SINGLE_MODE" if job.single_mode else "FAST",
-                "inbox_ready": job.inbox_path is not None and job.state == "COMMITTED",
+                "inbox_ready": job.inbox_path is not None and state == "COMMITTED",
                 "progress": dict(job.progress),
                 "evidence": {
                     "failed_names": sorted(job.failed_names),
@@ -400,10 +413,55 @@ class LocalFastStrategyTestService:
         _install_names(job.manifest.strategy_source, job.strategy_dir, names)
 
     def _run(self, job: _Job) -> None:
+        """Hold the shared tester-target lease through every retry and cleanup."""
+        owner: TesterTargetLock | None = None
+
+        def failed(error: BaseException, code: str) -> None:
+            with self._lock:
+                job.target_finalized = True
+                job.state = job.phase = "FAILED"
+                job.error = {"code": code, "message": _safe_error_message(error)}
+            self._emit(job)
+
+        try:
+            owner = TesterTargetLock(Path(self.config.bot_root)).acquire()
+            self._run_owned(job)
+        except _FastCleanupUnconfirmed as error:
+            failed(error, "RESTORE_OR_RELEASE_FAILED")
+            return
+        except BaseException as error:
+            if owner is None:
+                failed(error, "FAST_TEST_FAILED")
+                return
+            try:
+                owner.release()
+            except BaseException as release_error:
+                failed(release_error, "RESTORE_OR_RELEASE_FAILED")
+            else:
+                failed(error, "FAST_TEST_FAILED")
+            return
+        try:
+            owner.release()
+        except BaseException as error:
+            failed(error, "RESTORE_OR_RELEASE_FAILED")
+        else:
+            job.target_finalized = True
+            self._emit(job)
+
+    def _run_owned(self, job: _Job) -> None:
         client: object | None = None
         runtime_config = job.runtime_config or self.config
         snapshot_dir: Path | None = None
+        target_snapshot = None
+        stop_confirmed = True
         try:
+            self._stop_bot(runtime_config)
+            target_snapshot = capture_tester_settings(runtime_config)
+            job.report_baseline = {
+                path.name: (path.stat().st_mtime_ns, path.stat().st_size, sha256(path.read_bytes()).hexdigest())
+                for path in job.report_dir.glob("*.html")
+                if path.is_file() and not path.is_symlink()
+            }
             if job.single_mode:
                 self._run_native(job)
                 return
@@ -413,11 +471,11 @@ class LocalFastStrategyTestService:
                 job.end_date,
                 template_path=self.tester_config_template,
             )
-            if not job.preserve_reports:
-                _clear_directory(job.report_dir, expected=self.config.bot_root / "tester" / "report" / "my_test")
             job.report_dir.mkdir(parents=True, exist_ok=True)
             snapshot_dir = job.report_dir / f".fast-snapshots-{job.job_id}"
-            _clear_directory(snapshot_dir, expected=snapshot_dir)
+            if snapshot_dir.exists():
+                raise FastStrategyTestError("Fast TEST snapshot workspace already exists")
+            snapshot_dir.mkdir()
             self._write_manifest(job)
             batches = [
                 job.run_names[index : index + runtime_config.strategy_batch_size]
@@ -432,8 +490,6 @@ class LocalFastStrategyTestService:
                 self._stop_bot(runtime_config)
                 _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
                 _install_names(job.manifest.strategy_source, job.strategy_dir, names)
-                runtime_config.wizard_result.unlink(missing_ok=True)
-                runtime_config.wizard_progress.unlink(missing_ok=True)
                 self._set_progress(job, batch_current=batch_number, active=0)
                 if job.single_mode:
                     self._set_phase(job, "BOT_START", batch_number=batch_number, batch_total=len(batches))
@@ -471,7 +527,7 @@ class LocalFastStrategyTestService:
                         initial_attempt_counts={name: job.attempt_counts.get(name, 0) for name in group_names},
                         attempts_callback=lambda counts: job.attempt_counts.update(counts),
                         snapshot_report_dir=snapshot_dir,
-                        remove_source_reports=True,
+                        remove_source_reports=False,
                         allow_partial=not job.single_mode,
                     )
                     for name, result in completion.strategies.items():
@@ -547,7 +603,7 @@ class LocalFastStrategyTestService:
             try:
                 self._stop_bot(runtime_config)
             except BaseException:
-                pass
+                stop_confirmed = False
             if job.cancel.is_set():
                 incomplete = tuple(name for name in job.expected_names if name not in job.verified_reports)
                 try:
@@ -589,13 +645,20 @@ class LocalFastStrategyTestService:
                     pass
                 self._emit(job)
         finally:
-            if snapshot_dir is not None and snapshot_dir.exists() and not snapshot_dir.is_symlink():
-                shutil.rmtree(snapshot_dir)
             if client is not None and hasattr(client, "close"):
                 try:
                     client.close()
                 except BaseException:
                     pass
+            if not stop_confirmed:
+                raise _FastCleanupUnconfirmed("tester stop was not confirmed")
+            if target_snapshot is not None:
+                try:
+                    restore_tester_settings(runtime_config, target_snapshot)
+                except BaseException as error:
+                    raise _FastCleanupUnconfirmed(
+                        "tester settings restore was not confirmed"
+                    ) from error
 
     def _run_native(self, job: _Job) -> None:
         raise FastStrategyTestError("native SINGLE_MODE runner is unavailable")
@@ -817,6 +880,8 @@ class LocalFastStrategyTestService:
                 raise FastStrategyTestError("Fast TEST job not found") from None
             if source_job.state not in {"COMMITTED", "CANCELLED", "FAILED"} or source_job.phase not in {"PARTIAL", "FAILED", "CANCELLED"}:
                 raise FastStrategyTestError("Fast TEST job has no recoverable failures")
+            if source_job.thread is not None and source_job.thread.is_alive():
+                source_job.thread.join(timeout=1.0)
             identifier = _safe_name(job_id or str(uuid4()))
             if identifier in self._jobs:
                 raise FastStrategyTestError("Fast TEST job id is already used")
@@ -841,15 +906,6 @@ class LocalFastStrategyTestService:
                         failed.remove(name)
                         accepted = report
                         break
-                if accepted is not None:
-                    for report in reports:
-                        if report != accepted and extract_html_strategy_settings(report) is not None:
-                            try:
-                                duplicate = extract_html_strategy_settings(report)
-                                if isinstance(duplicate, dict) and duplicate.get("name") == name and _report_matches_run(report, duplicate, expected_settings, source_job.start_date, source_job.end_date):
-                                    report.unlink()
-                            except OSError:
-                                pass
             job = _Job(
                 identifier,
                 source_job.manifest_path,
@@ -880,9 +936,9 @@ class LocalFastStrategyTestService:
             self._jobs[identifier] = job
             if not failed:
                 job.phase = "COMMITTED"
-                _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
                 self._write_manifest(job)
                 job.state = "COMMITTED"
+                job.target_finalized = True
                 return self._snapshot(job)
             job.thread = Thread(
                 target=self._run,
@@ -903,7 +959,15 @@ class LocalFastStrategyTestService:
 
     def has_active_job(self) -> bool:
         with self._lock:
-            return any(job.state not in {"COMMITTED", "CANCELLED", "FAILED"} for job in self._jobs.values())
+            return any(
+                job.state not in {"COMMITTED", "CANCELLED", "FAILED"}
+                or (
+                    not job.target_finalized
+                    and job.thread is not None
+                    and job.thread.is_alive()
+                )
+                for job in self._jobs.values()
+            )
 
     def cancel(self, job_id: str) -> dict[str, object]:
         with self._lock:
@@ -954,6 +1018,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
         expected_settings: Mapping[str, Mapping[str, object]] | None = None,
         start: str | None = None,
         end: str | None = None,
+        baseline: Mapping[str, tuple[int, int, str]] | None = None,
     ) -> dict[str, Path]:
         if (
             not isinstance(expected_settings, Mapping)
@@ -968,8 +1033,13 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 continue
             try:
                 source = report.read_text(encoding="utf-8")
-                modified = report.stat().st_mtime_ns
+                stat = report.stat()
+                modified = stat.st_mtime_ns
             except (OSError, UnicodeDecodeError):
+                continue
+            if baseline is not None and baseline.get(report.name) == (
+                modified, stat.st_size, sha256(report.read_bytes()).hexdigest()
+            ):
                 continue
             settings = extract_html_strategy_settings(report)
             name = settings.get("name") if isinstance(settings, Mapping) else None
@@ -1052,8 +1122,6 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             self._stop_bot(config)
             _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
             _install_names(job.manifest.strategy_source, job.strategy_dir, names)
-            config.wizard_result.unlink(missing_ok=True)
-            config.wizard_progress.unlink(missing_ok=True)
             self._set_phase(job, "BOT_START", batch_number=batch_number, batch_total=batch_total, active=1, startup_elapsed_seconds=0.0)
             self._start_native_bot(job, config, batch_number, batch_total)
             client = self._client_factory(config)
@@ -1080,6 +1148,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 expected_settings=expected_settings,
                 start=job.start_date,
                 end=job.end_date,
+                baseline=job.report_baseline,
             )
         finally:
             try:
@@ -1093,8 +1162,6 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
 
     def _run_native(self, job: _Job) -> None:
         config = job.runtime_config or self.config
-        if not job.preserve_reports:
-            _clear_directory(job.report_dir, expected=self.config.bot_root / "tester" / "report" / "my_test")
         job.report_dir.mkdir(parents=True, exist_ok=True)
         _write_fast_tester_config(
             config,

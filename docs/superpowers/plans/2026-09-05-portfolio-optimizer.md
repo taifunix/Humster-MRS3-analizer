@@ -400,28 +400,28 @@ canonical tie-break.
 
 **Spec:** §8.3. **Зависимости:** M0, M1, M4.
 
-- [ ] Переиспользовать/расширить один existing runner ownership primitive;
+- [x] Переиспользовать/расширить один existing runner ownership primitive;
   независимый optimizer lock не создавать.
-- [ ] Ввести target-wide cross-process owner для resolved local/remote tester
+- [x] Ввести target-wide cross-process owner для resolved local/remote tester
   identity с PID, process-start, host/machine и boot/container identity и
   применить его в panel, RETEST,
   CLI/common runner и optimizer до любого реального запуска.
-- [ ] Foreign/unknown host/boot, live либо unverifiable owner всегда блокирует
+- [x] Foreign/unknown host/boot, live либо unverifiable owner всегда блокирует
   запуск; reclaim — только same-host/same-boot proven-dead PID/start owner.
   Чужой process никогда не завершать.
-- [ ] Для unverifiable tester owner использовать тот же manual attestation
+- [x] Для unverifiable tester owner использовать тот же manual attestation
   contract; без audit нет clear, retry loop или bypass.
-- [ ] Соблюдать M0 lock order и не ожидать tester lock внутри DB transaction.
-- [ ] Добавить portfolio-mode adapter, не дублировать весь runner и не подменять SINGLE_MODE.
-- [ ] Поддержать локальный либо уже предоставленный пользователем remote target.
-- [ ] Exact configured paths и instance identity задаются config; credentials — вне artifacts/log/DB.
-- [ ] Создать run-owned workspace и manifest exact input/output artifacts.
-- [ ] Snapshot/restore изменяемых strategy/tester/account settings без утечки secrets.
-- [ ] Не очищать общие папки и не удалять unowned reports.
-- [ ] Проверять binary/settings/tick identity и ожидаемый complete report set.
-- [ ] Реализовать timeout/cancel/retry/resume с отдельной attempt identity.
-- [ ] Сохранять failed/interrupted artifacts; cleanup только после M6 commit/readback gate.
-- [ ] Проверить crash recovery восстановления settings, не только обычный `finally`.
+- [x] Соблюдать M0 lock order и не ожидать tester lock внутри DB transaction.
+- [x] Добавить portfolio-mode adapter, не дублировать весь runner и не подменять SINGLE_MODE.
+- [x] Поддержать локальный либо уже предоставленный пользователем remote target.
+- [x] Exact configured paths и instance identity задаются config; credentials — вне artifacts/log/DB.
+- [x] Создать run-owned workspace и manifest exact input/output artifacts.
+- [x] Snapshot/restore изменяемых strategy/tester/account settings без утечки secrets.
+- [x] Не очищать общие папки и не удалять unowned reports.
+- [x] Проверять binary/settings/tick identity и ожидаемый complete report set.
+- [x] Реализовать timeout/cancel/retry/resume с отдельной attempt identity.
+- [x] Сохранять failed/interrupted artifacts; cleanup только после M6 commit/readback gate.
+- [x] Проверить crash recovery восстановления settings, не только обычный `finally`.
 
 **Acceptance tests:** два panel processes; panel/RETEST и CLI/optimizer races;
 PID reuse/start identity; live/unknown/proven-dead owner; fake process/HTTP/remote transport;
@@ -744,8 +744,8 @@ replacement/trial/rollback, без автоматического deployment п�
 - [ ] Обновить spec/ADR/PRD/progress по изменившимся контрактам и evidence.
 - [ ] Создать scoped conventional commit после review, не раньше.
 
-M0–M4 are accepted with independent `CODE_REVIEW_PASS` by Claude Opus 5 high.
-M5 fixture/fake implementation is in progress; M6–M8 remain unstarted.
+M0–M5 are accepted with independent `CODE_REVIEW_PASS` by Claude Opus 5 high.
+M6–M8 remain unstarted.
 
 ## U0/U1 — отдельная сквозная дорожка Panel
 
@@ -783,9 +783,10 @@ U1 не разрешает менять алгоритмы оптимизато�
 
 ## 15. Ближайший следующий этап
 
-M0–M4 are accepted after independent `CODE_REVIEW_PASS`; M5 is the next server
+M0–M5 are accepted after independent `CODE_REVIEW_PASS`; M6 is the next server
 stage. Evidence: [M3 ledger](2026-09-06-portfolio-optimizer-m3-evidence.md),
-[M4 ledger](2026-09-06-portfolio-optimizer-m4-evidence.md). Q01–Q12 remain isolated or
+[M4 ledger](2026-09-06-portfolio-optimizer-m4-evidence.md),
+[M5 ledger](2026-09-06-portfolio-optimizer-m5-evidence.md). Q01–Q12 remain isolated or
 fail-closed where unknown. Real tester/bot execution additionally requires
 accepted M5 and M6 plus separate explicit user authorization.
 Не задавать пользователю вопросы повторно, если поведение уже закреплено в

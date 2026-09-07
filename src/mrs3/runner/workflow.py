@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import tempfile
 import time
 from typing import Callable, Mapping, Protocol
@@ -20,13 +19,18 @@ from .files import (
     BatchPreparationError,
     _root_json_files,
     _source_is_inside_strategy_dir,
-    cleanup_completed_batch,
+    capture_tester_settings,
+    file_changed_since,
+    file_fingerprint,
     inspect_strategy_batch,
     prepare_batch_files,
+    read_stable_file,
+    restore_tester_settings,
     validate_runner_paths,
 )
 from .http import RowState, StrategyRow, TesterHttpClient
 from .inbox import capture_verified_inbox
+from ..locking import TesterTargetLock, canonical_tester_target
 from .monitor import BatchCompletion, BatchHtmlCollision, BatchTimeout, monitor_controlled_batch
 from .process import start_bot, stop_bot
 from .results import (
@@ -45,6 +49,9 @@ class WorkflowClient(Protocol):
     def launch_strategy(self, name: str) -> object: ...
 
     def close(self) -> None: ...
+
+
+_NO_BASELINE = object()
 
 
 def _client(config: RunnerConfig) -> WorkflowClient:
@@ -152,15 +159,27 @@ def _validated_results_for_names(
     config: RunnerConfig,
     expected_names: tuple[str, ...],
     report_paths: Mapping[str, Path] | None = None,
+    wizard_result_baseline: object = _NO_BASELINE,
 ) -> tuple[WizardResult, ...]:
     """Return only single-strategy results backed by matching valid HTML."""
     try:
-        results = load_wizard_results(
+        results = read_stable_file(
             config.wizard_result,
-            fallback_report_names={
-                name: path.name for name, path in (report_paths or {}).items()
-            },
+            lambda path: load_wizard_results(
+                path,
+                fallback_report_names={
+                    name: report_path.name
+                    for name, report_path in (report_paths or {}).items()
+                },
+            ),
+            baseline=(
+                None
+                if wizard_result_baseline is _NO_BASELINE
+                else wizard_result_baseline
+            ),
         )
+        if results is None:
+            return ()
     except Exception:
         return ()
     by_name = {
@@ -187,6 +206,9 @@ def _validated_results_for_names(
     return tuple(validated)
 
 
+_VALIDATED_RESULTS_IMPL = _validated_results_for_names
+
+
 def _merge_wizard_results(
     saved: tuple[WizardResult, ...], current: tuple[WizardResult, ...]
 ) -> tuple[WizardResult, ...]:
@@ -203,6 +225,7 @@ def _wait_for_stable_reconciliation(
     saved: tuple[WizardResult, ...],
     config: RunnerConfig,
     report_paths: dict[str, Path] | None = None,
+    wizard_result_baseline: object = _NO_BASELINE,
 ) -> object:
     """The tester updates wizard JSON after RESULT; require stable matching views."""
     deadline = time.monotonic() + config.stall_timeout_seconds
@@ -214,14 +237,26 @@ def _wait_for_stable_reconciliation(
             fallback_report_names = {
                 name: path.name for name, path in (report_paths or {}).items()
             }
+            current = (
+                read_stable_file(
+                    config.wizard_result,
+                    lambda path: load_wizard_results(
+                        path,
+                        fallback_report_names=fallback_report_names,
+                    ),
+                    baseline=(
+                        None
+                        if wizard_result_baseline is _NO_BASELINE
+                        else wizard_result_baseline
+                    ),
+                )
+                or ()
+            )
             frame = reconcile_results(
                 plan.expected_names,
                 _merge_wizard_results(
                     saved,
-                    load_wizard_results(
-                        config.wizard_result,
-                        fallback_report_names=fallback_report_names,
-                    ),
+                    current,
                 ),
                 config.report_dir,
                 config.metric_tolerance,
@@ -244,6 +279,7 @@ def _wait_for_verified_batch_results(
     expected_names: tuple[str, ...],
     config: RunnerConfig,
     report_paths: dict[str, Path] | None = None,
+    wizard_result_baseline: object = _NO_BASELINE,
 ) -> tuple[WizardResult, ...]:
     """Keep each completed chunk before the tester accepts the next one."""
     deadline = time.monotonic() + config.stall_timeout_seconds
@@ -256,12 +292,23 @@ def _wait_for_verified_batch_results(
             fallback_report_names = {
                 name: path.name for name, path in (report_paths or {}).items()
             }
+            current = read_stable_file(
+                config.wizard_result,
+                lambda path: load_wizard_results(
+                    path,
+                    fallback_report_names=fallback_report_names,
+                ),
+                baseline=(
+                    None
+                    if wizard_result_baseline is _NO_BASELINE
+                    else wizard_result_baseline
+                ),
+            )
+            if current is None:
+                raise ResultParseError("tester wizard result is stale")
             current = tuple(
                 result
-                for result in load_wizard_results(
-                    config.wizard_result,
-                    fallback_report_names=fallback_report_names,
-                )
+                for result in current
                 if len(result.strategy_names) == 1 and result.strategy_names[0] in expected
             )
             if {result.strategy_names[0] for result in current} != expected:
@@ -777,19 +824,38 @@ def run_batch(
     *,
     dependencies: WorkflowDependencies | None = None,
     provenance: Mapping[str, object] | None = None,
+    target_owner: TesterTargetLock | None = None,
 ) -> BatchRunResult:
     dependencies = dependencies or WorkflowDependencies()
     output = output_csv.resolve()
     _output_is_safe(output, config)
     run_lock = _acquire_run_lock(output)
+    target_lock: TesterTargetLock | None = None
+    target_snapshot = None
+    owns_target_lock = target_owner is None
     try:
         plan = plan_batch(config, strategy_source, output, hydrate_resume=False)
+        if target_owner is None:
+            # Planning is read-only. Claim the shared target immediately before
+            # the first operation that can install settings or start the tester.
+            target_lock = TesterTargetLock(config.bot_root).acquire()
+        else:
+            if target_owner.owner is None or target_owner.target_identity != canonical_tester_target(config.bot_root):
+                raise RuntimeError("provided tester target owner is not valid for this target")
+            target_lock = target_owner
     except BaseException:
         _release_run_lock(run_lock)
+        if owns_target_lock and target_lock is not None:
+            target_lock.release()
         raise
     run_names = plan.resume_remaining_names
     state_file = _state_path(output)
     progress_file = _progress_path(output)
+    # Both tester logs are shared and survive prior runs.  Capture their exact
+    # identity before this run can mutate the target; readers accept only a
+    # changed wizard result as completion evidence.
+    wizard_result_baseline = file_fingerprint(config.wizard_result)
+    wizard_progress_baseline = file_fingerprint(config.wizard_progress)
     events: list[str] = []
 
     def advance(state: str, *, inbox_path: Path | None = None) -> None:
@@ -803,6 +869,9 @@ def run_batch(
                 **snapshot,
                 "workflow_state": events[-1] if events else "PRECHECK",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
+                "wizard_progress_fresh": file_changed_since(
+                    config.wizard_progress, wizard_progress_baseline
+                ),
             },
         )
 
@@ -816,6 +885,7 @@ def run_batch(
 
     completion: BatchCompletion | None = None
     bot_started = False
+    target_quiesced = True
     bot_restart_count = 0
     strategy_attempt_counts = _load_resume_attempt_counts(output, plan)
     cumulative_retry_reasons: dict[str, int] = {}
@@ -848,7 +918,12 @@ def run_batch(
                 "attempt_counts": strategy_attempt_counts,
             }
         )
-        dependencies.stop(config)
+        try:
+            dependencies.stop(config)
+        except BaseException:
+            target_quiesced = False
+            raise
+        target_snapshot = capture_tester_settings(config)
         plan = plan_batch(config, strategy_source, output, hydrate_resume=True)
         run_names = plan.resume_remaining_names
         saved_resume_results = plan.resume_results
@@ -879,7 +954,11 @@ def run_batch(
         )
         if not run_names:
             frame = _wait_for_stable_reconciliation(
-                plan, saved_resume_results, config, verified_report_paths
+                plan,
+                saved_resume_results,
+                config,
+                verified_report_paths,
+                wizard_result_baseline,
             )
             advance("RECONCILED")
             write_results_csv_atomic(frame, output)
@@ -903,6 +982,7 @@ def run_batch(
                 inbox_path=inbox_path,
             )
         batch_number = 0
+        batch_wizard_result_baseline = wizard_result_baseline
         while run_names:
             batch_number += 1
             batch_names = run_names[: config.strategy_batch_size]
@@ -911,7 +991,7 @@ def run_batch(
                 plan.strategy_source,
                 expected_file_hashes=plan.file_hashes,
                 selected_names=batch_names,
-                preserve_raw_artifacts=bool(saved_resume_results),
+                preserve_raw_artifacts=True,
             )
             if prepared.expected_names != batch_names:
                 raise RuntimeError("installed strategy chunk does not match the planned chunk")
@@ -921,8 +1001,8 @@ def run_batch(
                 client: WorkflowClient | None = None
                 attempt_retry_reasons: dict[str, int] = {}
                 try:
-                    dependencies.start(config)
                     bot_started = True
+                    dependencies.start(config)
                     advance("STARTED" if bot_restart_count == 0 else f"BOT_RESTART_{bot_restart_count}")
                     client = dependencies.client_factory(config)
                     completed_before_attempt = len(saved_resume_results)
@@ -972,6 +1052,7 @@ def run_batch(
                     advance("VISIBLE")
                     advance("SUBMITTED")
                     advance("MONITORING")
+                    batch_wizard_result_baseline = file_fingerprint(config.wizard_result)
                     monitor_kwargs: dict[str, object] = {
                         "progress_callback": report_attempt_progress,
                         "snapshot_report_dir": report_snapshot_dir,
@@ -1010,9 +1091,13 @@ def run_batch(
                     saved_resume_results = _merge_wizard_results(
                         saved_resume_results,
                         _wait_for_verified_batch_results(
-                            batch_names, config, verified_report_paths
+                            batch_names,
+                            config,
+                            verified_report_paths,
+                            batch_wizard_result_baseline,
                         ),
                     )
+                    wizard_result_baseline = file_fingerprint(config.wizard_result)
                     _write_saved_results(output, saved_resume_results, verified_report_paths)
                     cumulative_retry_reasons = merged_counts(
                         cumulative_retry_reasons, attempt_retry_reasons
@@ -1032,6 +1117,10 @@ def run_batch(
                         dependencies.stop(config)
                     except Exception:
                         events.append("BOT_RESTART_STOP_FAILED")
+                        try:
+                            dependencies.stop(config)
+                        except Exception as stop_error:
+                            raise RuntimeError("tester stop after failure was not confirmed") from stop_error
                     bot_started = False
                     cumulative_retry_reasons = merged_counts(
                         cumulative_retry_reasons, attempt_retry_reasons
@@ -1052,9 +1141,19 @@ def run_batch(
                     verified_report_paths.update(
                         _load_snapshot_report_paths(output, batch_names)
                     )
-                    validated = _validated_results_for_names(
-                        config, batch_names, verified_report_paths
-                    )
+                    if _validated_results_for_names is _VALIDATED_RESULTS_IMPL:
+                        validated = _validated_results_for_names(
+                            config,
+                            batch_names,
+                            verified_report_paths,
+                            wizard_result_baseline=batch_wizard_result_baseline,
+                        )
+                    else:
+                        # Tests and injected recovery adapters may validate an
+                        # already-captured result independently of the shared log.
+                        validated = _validated_results_for_names(
+                            config, batch_names, verified_report_paths
+                        )
                     if forced_retry_names:
                         validated = tuple(
                             result
@@ -1167,10 +1266,7 @@ def run_batch(
             provenance=provenance,
         )
         advance("INBOX_CAPTURED")
-        if not config.preserve_raw_artifacts:
-            cleanup_completed_batch(config)
-            shutil.rmtree(report_snapshot_dir, ignore_errors=True)
-            advance("RAW_ARTIFACTS_REMOVED")
+        advance("RAW_ARTIFACTS_RETAINED")
         advance("COMPLETED", inbox_path=inbox_path)
         if completion is None:
             raise RuntimeError("batch completion was not recorded")
@@ -1187,8 +1283,10 @@ def run_batch(
         if bot_started:
             try:
                 dependencies.stop(config)
+                bot_started = False
                 events.append("STOPPED_AFTER_FAILURE")
             except Exception:
+                target_quiesced = False
                 events.append("STOP_AFTER_FAILURE_FAILED")
         try:
             _write_state(
@@ -1204,3 +1302,8 @@ def run_batch(
         raise
     finally:
         _release_run_lock(run_lock)
+        if target_quiesced:
+            if target_lock is not None and target_snapshot is not None:
+                restore_tester_settings(config, target_snapshot)
+            if owns_target_lock and target_lock is not None:
+                target_lock.release()

@@ -161,6 +161,7 @@ from .panel_settings import (
     validate_settings as validate_panel_settings,
 )
 from .panel_jobs import PanelJobError, PanelJobRegistry
+from .locking import TesterTargetLock
 from .panel_remote_testing import RemoteTestingService, remote_testing_status
 from .panel_remote_source_db import RemoteSourceDbExecutor, RemoteSourceDbError
 from .panel_source_db import LocalSourceDbService
@@ -648,7 +649,7 @@ const labels = {
   'PRECHECK':'Предварительная проверка', 'STOPPED':'Бот остановлен', 'CLEAN':'Отчёты очищены', 'INSTALLED':'Стратегии установлены',
   'STARTED':'Бот запущен', 'VISIBLE':'Стратегии появились', 'SUBMITTED':'Все тесты отправлены', 'MONITORING':'Идёт тестирование',
   'RECONCILED':'Результаты сверены', 'CSV_COMMITTED':'CSV сохранён', 'STOPPED_FOR_CLEANUP':'Бот остановлен для очистки',
-  'RAW_ARTIFACTS_REMOVED':'Временные отчёты удалены', 'COMPLETED':'Завершено', 'FAILED':'Ошибка'
+  'RAW_ARTIFACTS_REMOVED':'Временные отчёты удалены', 'RAW_ARTIFACTS_RETAINED':'Артефакты сохранены', 'COMPLETED':'Завершено', 'FAILED':'Ошибка'
 };
 let defaultsLoaded = false;
 let workflowDefaults = {listing_dates_path:'', strategy_templates:{}};
@@ -1198,6 +1199,7 @@ class PanelController:
         source_v6_adapter_func: Callable[..., object] = load_source_v6_pipeline_input,
         source_v6_analysis_func: Callable[..., object] = run_source_v6_analysis,
         source_v6_listing_dates_loader: Callable[[Path], Mapping[str, object]] = load_listing_dates,
+        remote_ownership_adapter: object | None = None,
     ) -> None:
         self.root = root.resolve()
         self.default_config = self._path(default_config)
@@ -1211,6 +1213,9 @@ class PanelController:
         self._panel_jobs = PanelJobRegistry(self.root / ".panel-jobs.json")
         self._local_testing_filled = False
         self._remote_testing_filled = False
+        self._local_testing_service_instance: LocalTestingService | None = None
+        self._remote_testing_service_instance: RemoteTestingService | None = None
+        self._remote_ownership_adapter = remote_ownership_adapter
         self._panel_source_service: LocalSourceDbService | None = None
         self._panel_source_jobs: LocalSourceDbJobRunner | None = None
         self._remote_source_executor: RemoteSourceDbExecutor | None = None
@@ -1785,6 +1790,13 @@ class PanelController:
                 saved_runtime = {}
             saved_runtime.update(runtime)
             runtime = saved_runtime
+        if (
+            tracked.get("kind") in {"strategies.tester.runs", "strategies.tester.start", "strategies.tester.native.start"}
+            and document.get("state") == "COMMITTED"
+            and isinstance(inbox, str)
+            and inbox
+        ):
+            public["inbox_ready"] = True
         if tracked.get("kind") == "strategies.performance.v2.import" and document.get("state") in {"COMMITTED", "FAILED"}:
             result = self._performance_v2_result_snapshot(document)
             if result:
@@ -1842,11 +1854,14 @@ class PanelController:
         return LocalTestingService(config, self.root).status()
 
     def _local_testing_service(self) -> LocalTestingService:
+        if self._local_testing_service_instance is not None:
+            return self._local_testing_service_instance
         try:
             config = RunnerConfig.from_json(self.default_config)
         except Exception:
             raise PanelTestingError("invalid testing request") from None
-        return LocalTestingService(config, Path(__file__).resolve().parents[2])
+        self._local_testing_service_instance = LocalTestingService(config, Path(__file__).resolve().parents[2])
+        return self._local_testing_service_instance
 
     @staticmethod
     def _local_testing_request(payload: Mapping[str, object]) -> dict[str, object]:
@@ -1886,9 +1901,14 @@ class PanelController:
             raise PanelTestingError("invalid testing request") from None
 
     def _remote_testing_service(self) -> RemoteTestingService:
+        if self._remote_testing_service_instance is not None:
+            return self._remote_testing_service_instance
         try:
             document = json.loads(self.default_config.read_text(encoding="utf-8"))
-            return RemoteTestingService(document)
+            kwargs = ({"ownership_adapter": self._remote_ownership_adapter}
+                      if self._remote_ownership_adapter is not None else {})
+            self._remote_testing_service_instance = RemoteTestingService(document, **kwargs)
+            return self._remote_testing_service_instance
         except Exception:
             raise PanelTestingError("invalid testing request") from None
 
@@ -2465,12 +2485,13 @@ class PanelController:
         if not structures:
             raise ValueError("no READY candidates match the selected scopes")
         runner = RunnerConfig.from_json(self.default_config)
-        result = publish_run_snapshots(
-            self.root / "Input" / "run_snapshot_2.json", runner.bot_root, runner.tester_config, structures,
-            start_date, end_date, runner.max_parallel_submissions, self._analysis_config_loader(self.default_config),
-            analysis_run_id=analysis_id,
-            tester_config_template=mrs3_tester_config_template(self.root),
-        )
+        with TesterTargetLock(runner.bot_root):
+            result = publish_run_snapshots(
+                self.root / "Input" / "run_snapshot_2.json", runner.bot_root, runner.tester_config, structures,
+                start_date, end_date, runner.max_parallel_submissions, self._analysis_config_loader(self.default_config),
+                analysis_run_id=analysis_id,
+                tester_config_template=mrs3_tester_config_template(self.root),
+            )
         return {"phase": "COMMITTED", "analysis_run_id": analysis_id, **result}
 
     def _run_fresh_strategy_generation(self, job: dict[str, object], payload: Mapping[str, object]) -> None:

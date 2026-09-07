@@ -9,7 +9,7 @@ from mrs3.config import AlgorithmConfig
 from mrs3.tester_run_files import publish_run_snapshots
 
 
-def test_publish_run_snapshots_replaces_runs_and_configures_tester(tmp_path: Path) -> None:
+def test_publish_run_snapshots_configures_empty_runs_directory(tmp_path: Path) -> None:
     template = tmp_path / "run_snapshot.json"
     template.write_text(json.dumps({
         "settings": [{"name": "template", "basic": {"strategy": "mrs3", "symbol": "OLD", "time_frame": "5m", "use_long": True, "use_short": False}, "mrs3": {
@@ -18,13 +18,12 @@ def test_publish_run_snapshots_replaces_runs_and_configures_tester(tmp_path: Pat
         }}], "tester_config": {"MakerFee": 0.00001, "StartDate": "old", "EndDate": "old", "max_parallel_runs": 1},
     }), encoding="utf-8")
     bot_root = tmp_path / "bot"; runs = bot_root / "tester" / "runs"; runs.mkdir(parents=True)
-    (runs / "old.json").write_text("old", encoding="utf-8")
     tester_config = bot_root / "tester" / "config_tester.json"; tester_config.write_text('{"use_runs": false}', encoding="utf-8")
     structure = {"candidate_id": "CANDIDATE", "structure_id": "STR", "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "order_count": 1, "common_close_ma": 7, "orders": ({"point_id": "P", "plateau_id": "PLAT", "open_ma": 5, "shift_bp": 100, "close_support": 1.0, "source_pnl_pct": 10},)}
 
     result = publish_run_snapshots(template, bot_root, tester_config, [structure], "2026-08-01", "2026-08-18", 7, AlgorithmConfig.defaults(), analysis_run_id="a" * 64)
 
-    files = list(runs.glob("*.json")); assert result["run_count"] == len(files) == 1; assert not (runs / "old.json").exists()
+    files = list(runs.glob("*.json")); assert result["run_count"] == len(files) == 1
     snapshot = json.loads(files[0].read_text(encoding="utf-8")); settings = snapshot["settings"][0]
     assert settings["basic"]["symbol"] == "BTCUSDT" and settings["basic"]["time_frame"] == "1h"
     assert settings["mrs3"]["ma_long"][0] == {"id": 1, "len": 5, "multiplier": 0.99, "lot_x": 1.0}
@@ -40,6 +39,36 @@ def test_publish_run_snapshots_replaces_runs_and_configures_tester(tmp_path: Pat
     assert snapshot["tester_config"]["use_runs"] is True
     manifest = json.loads((bot_root / "tester" / "runs_manifest.json").read_text(encoding="utf-8"))
     assert manifest["analysis_run_id"] == "a" * 64 and manifest["entries"][0]["strategy_name"] == settings["name"]
+
+    manifest_path = bot_root / "tester" / "runs_manifest.json"
+    manifest["generation_manifest_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    original = files[0].read_bytes()
+    with pytest.raises(ValueError, match="unowned"):
+        publish_run_snapshots(
+            template, bot_root, tester_config, [structure], "2026-08-01", "2026-08-18", 7,
+            AlgorithmConfig.defaults(), analysis_run_id="b" * 64,
+        )
+    assert files[0].read_bytes() == original
+
+
+def test_publish_run_snapshots_rejects_unowned_existing_file(tmp_path: Path) -> None:
+    template = tmp_path / "run_snapshot.json"
+    template.write_text(json.dumps({"settings": [{}], "tester_config": {}}), encoding="utf-8")
+    bot_root = tmp_path / "bot"
+    runs = bot_root / "tester" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "foreign.json").write_text("{}", encoding="utf-8")
+    tester_config = bot_root / "tester" / "config_tester.json"
+    tester_config.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unowned"):
+        publish_run_snapshots(
+            template, bot_root, tester_config, [{}], "2026-08-01", "2026-08-18", 1,
+            AlgorithmConfig.defaults(), analysis_run_id="a" * 64,
+        )
+
+    assert (runs / "foreign.json").is_file()
 
 
 def test_publish_run_snapshots_reads_run_snapshot_template_with_bom_and_trailing_comma(tmp_path: Path) -> None:

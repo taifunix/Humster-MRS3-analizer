@@ -12,7 +12,7 @@ import pytest
 
 import mrs3.runner.workflow as runner_workflow
 from mrs3.runner.config import RunnerConfig
-from mrs3.runner.files import BatchPreparationError
+from mrs3.runner.files import BatchPreparationError, file_fingerprint
 from mrs3.runner.http import RowState, StrategyRow
 from mrs3.runner.monitor import BatchCompletion, BatchHtmlCollision, StrategyCompletion
 from mrs3.runner.results import ResultMismatchError, WizardResult
@@ -240,6 +240,26 @@ def test_merge_wizard_results_keeps_saved_entries_when_tester_rewrites_log() -> 
     assert {result.strategy_names[0] for result in merged} == {"A", "B"}
 
 
+def test_stale_wizard_result_is_not_used_as_new_completion_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    config.wizard_result.write_text(
+        json.dumps([{"runId": "old", "strategies": ["A"], "stats": {}, "chartUrl": "/tester-report/my_test/A.html"}]),
+        encoding="utf-8",
+    )
+    baseline = file_fingerprint(config.wizard_result)
+    monkeypatch.setattr(
+        runner_workflow,
+        "load_wizard_results",
+        lambda *_args, **_kwargs: pytest.fail("stale wizard result was read"),
+    )
+
+    assert runner_workflow._validated_results_for_names(
+        config, ("A",), wizard_result_baseline=baseline
+    ) == ()
+
+
 def test_reconciliation_waits_for_transient_tester_log_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -396,7 +416,7 @@ def test_missing_executable_fails_before_stop_or_file_mutation(tmp_path: Path) -
     assert existing.read_text(encoding="utf-8") == "keep"
 
 
-def test_successful_batch_commits_csv_before_raw_cleanup(tmp_path: Path) -> None:
+def test_successful_batch_retains_shared_raw_artifacts(tmp_path: Path) -> None:
     config = _config(tmp_path)
     source = tmp_path / "generated"
     _strategy(source, "A")
@@ -417,21 +437,65 @@ def test_successful_batch_commits_csv_before_raw_cleanup(tmp_path: Path) -> None
     result = run_batch(config, source, output, dependencies=dependencies)
 
     assert result.events.index("CSV_COMMITTED") < result.events.index(
-        "RAW_ARTIFACTS_REMOVED"
+        "RAW_ARTIFACTS_RETAINED"
     )
     assert output.exists()
     assert pd.read_csv(output).loc[0, "strategy_name"] == "A"
-    assert not config.report_dir.exists()
-    assert not config.wizard_result.exists()
+    assert (config.report_dir / "A.html").is_file()
+    assert config.wizard_result.is_file()
     assert client.closed
     assert stop_observations == [False, False, True]
     assert result.events.index("CSV_COMMITTED") < result.events.index(
         "STOPPED_FOR_CLEANUP"
-    ) < result.events.index("RAW_ARTIFACTS_REMOVED")
+    ) < result.events.index("RAW_ARTIFACTS_RETAINED")
     progress = json.loads(result.progress_file.read_text(encoding="utf-8"))
     assert progress["expected_count"] == 1
     assert progress["completed_count"] == 1
     assert progress["result_count"] == 1
+
+
+def test_restore_failure_retains_tester_target_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config(tmp_path)
+    source = tmp_path / "generated"
+    _strategy(source, "A")
+    client = BatchClient(config)
+    monkeypatch.setattr(
+        runner_workflow,
+        "restore_tester_settings",
+        lambda *_args: (_ for _ in ()).throw(OSError("restore failed")),
+    )
+
+    with pytest.raises(OSError, match="restore failed"):
+        run_batch(
+            config,
+            source,
+            tmp_path / "out" / "results.csv",
+            dependencies=WorkflowDependencies(
+                stop=lambda _config: object(),
+                start=lambda _config: object(),
+                client_factory=lambda _config: client,
+            ),
+        )
+
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+
+
+def test_unconfirmed_initial_stop_retains_tester_target_owner(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    source = tmp_path / "generated"
+    _strategy(source, "A")
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        run_batch(
+            config,
+            source,
+            tmp_path / "out" / "results.csv",
+            dependencies=WorkflowDependencies(
+                stop=lambda _config: (_ for _ in ()).throw(RuntimeError("stop failed")),
+            ),
+        )
+
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
 
 
 def test_batch_keeps_shared_timeframe_in_parallel_window(
@@ -764,6 +828,7 @@ def test_verified_batch_converts_one_name_mismatch_to_single_strategy_collision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
+    config.wizard_result.write_text("[]", encoding="utf-8")
     result = WizardResult("run", "", ("A",), {}, "/tester-report/my_test/A.html", "A.html", "", "")
     monkeypatch.setattr(
         runner_workflow, "load_wizard_results", lambda _path, **_kwargs: (result,)

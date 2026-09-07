@@ -6,12 +6,12 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 import json
 from pathlib import Path
-import shutil
 import subprocess
 from threading import Event, RLock, Thread
 from typing import Callable
 
 from .runner.inbox import capture_run_snapshot_inbox, extract_html_strategy_name
+from .locking import TesterTargetLock
 
 
 _TERMINAL = frozenset({"COMMITTED", "CANCELLED", "FAILED"})
@@ -34,6 +34,9 @@ class _RunsJob:
     phase: str = "RUNNING"
     error: dict[str, str] | None = None
     inbox_path: Path | None = None
+    target_owner: TesterTargetLock | None = None
+    baseline_reports: dict[str, tuple[int, int, str]] = field(default_factory=dict)
+    target_finalized: bool = False
 
 
 def _launch(root: Path) -> subprocess.Popen[bytes]:
@@ -119,11 +122,24 @@ class LocalRunsBatchService:
         return strategies, {"analysis_run_id": analysis_id, "generation_manifest_sha256": generation_hash, "strategy_json_sha256": hashes}, start, end
 
     @staticmethod
-    def _reports(job: _RunsJob) -> dict[str, Path]:
-        reports: dict[str, Path] = {}
+    def _signature(path: Path) -> tuple[int, int, str]:
+        stat = path.stat()
+        return stat.st_mtime_ns, stat.st_size, sha256(path.read_bytes()).hexdigest()
+
+    @staticmethod
+    def _current_reports(job: _RunsJob) -> tuple[Path, ...]:
+        reports: list[Path] = []
         for path in job.report_dir.glob("*.html"):
             if path.is_symlink():
                 raise ValueError("tester RUNS report contains a symbolic link")
+            if job.baseline_reports.get(path.name) != LocalRunsBatchService._signature(path):
+                reports.append(path)
+        return tuple(reports)
+
+    @staticmethod
+    def _reports(job: _RunsJob) -> dict[str, Path]:
+        reports: dict[str, Path] = {}
+        for path in LocalRunsBatchService._current_reports(job):
             name = extract_html_strategy_name(path)
             if name in reports:
                 raise ValueError("tester RUNS report names are duplicated")
@@ -136,11 +152,13 @@ class LocalRunsBatchService:
     def _completed(job: _RunsJob) -> int:
         if not job.report_dir.is_dir():
             return 0
-        return min(job.total, sum(1 for path in job.report_dir.glob("*.html") if path.is_file() and not path.is_symlink()))
+        return min(job.total, len(LocalRunsBatchService._current_reports(job)))
 
     def _document(self, job: _RunsJob) -> dict[str, object]:
+        state = "RUNNING" if job.state in _TERMINAL and not job.target_finalized else job.state
+        phase = "RUNNING" if job.phase in _TERMINAL and not job.target_finalized else job.phase
         document = {
-            "job_id": job.job_id, "state": job.state, "phase": job.phase,
+            "job_id": job.job_id, "state": state, "phase": phase,
             "progress": {"current": self._completed(job), "total": job.total, "unit": "reports"},
             "strategy_count": job.total, "error": job.error, "mode": "RUNS",
         }
@@ -160,23 +178,46 @@ class LocalRunsBatchService:
         snapshots = self._snapshots(runs)
         if not snapshots:
             raise ValueError("RUNS_EMPTY")
-        report_dir = self._target(root, "tester", "report", "my_test_runs")
-        if report_dir.exists():
-            shutil.rmtree(report_dir)
-        report_dir.mkdir(parents=True, exist_ok=True)
-        strategies, provenance, test_start, test_end = self._load_manifest(root, snapshots)
+        owner = TesterTargetLock(root).acquire()
         try:
+            report_dir = self._target(root, "tester", "report", "my_test_runs")
+            report_dir.mkdir(parents=True, exist_ok=True)
+            baseline_reports = {
+                path.name: self._signature(path)
+                for path in report_dir.glob("*.html")
+                if path.is_file() and not path.is_symlink()
+            }
+            strategies, provenance, test_start, test_end = self._load_manifest(root, snapshots)
             tester_config_bytes = Path(getattr(self.config, "tester_config")).read_bytes()
         except OSError as error:
+            owner.release()
             raise ValueError("tester config is unavailable") from error
-        with self._lock:
-            job = _RunsJob(job_id, root, len(snapshots), report_dir, strategies, provenance, test_start, test_end, tester_config_bytes)
-            self._jobs[job_id] = job
-        self._notify(job)
-        Thread(target=self._run, args=(job,), daemon=True).start()
+        except BaseException:
+            owner.release()
+            raise
+        try:
+            with self._lock:
+                job = _RunsJob(
+                    job_id, root, len(snapshots), report_dir, strategies, provenance,
+                    test_start, test_end, tester_config_bytes,
+                    target_owner=owner, baseline_reports=baseline_reports,
+                )
+                self._jobs[job_id] = job
+        except BaseException:
+            owner.release()
+            raise
+        try:
+            self._notify(job)
+            Thread(target=self._run, args=(job,), daemon=True).start()
+        except BaseException:
+            with self._lock:
+                self._jobs.pop(job_id, None)
+            owner.release()
+            raise
         return self._document(job)
 
     def _run(self, job: _RunsJob) -> None:
+        release_owner = True
         try:
             job.process = self._launcher(job.root)
             while not job.cancel.wait(1):
@@ -196,6 +237,25 @@ class LocalRunsBatchService:
                 job.error = {"code": "RUNS_INCOMPLETE"}
         except Exception:
             job.state, job.phase, job.error = "FAILED", "FAILED", {"code": "RUNS_FAILED"}
+        finally:
+            if job.target_owner is not None:
+                process = job.process
+                if process is not None:
+                    try:
+                        if process.poll() is None and callable(getattr(process, "wait", None)):
+                            process.wait(timeout=1)
+                        release_owner = process.poll() is not None
+                    except Exception:
+                        release_owner = False
+                if release_owner:
+                    try:
+                        job.target_owner.release()
+                        job.target_owner = None
+                    except Exception:
+                        release_owner = False
+                if not release_owner:
+                    job.state, job.phase, job.error = "FAILED", "FAILED", {"code": "OPERATION_UNCONFIRMED"}
+                job.target_finalized = True
         self._notify(job)
 
     def status(self, job_id: str) -> dict[str, object]:

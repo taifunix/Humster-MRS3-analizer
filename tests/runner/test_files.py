@@ -12,10 +12,68 @@ import mrs3.runner.files as runner_files
 from mrs3.runner.config import RunnerConfig, UnsafePathError
 from mrs3.runner.files import (
     BatchPreparationError,
-    cleanup_completed_batch,
+    capture_tester_settings,
+    file_changed_since,
+    file_fingerprint,
     inspect_strategy_batch,
     prepare_batch_files,
+    read_stable_file,
+    restore_tester_settings,
 )
+
+
+def test_shared_log_fingerprint_rejects_retained_bytes_and_accepts_new_bytes(
+    tmp_path: Path,
+) -> None:
+    result = tmp_path / "wizard_result.json"
+    progress = tmp_path / "wizard_progress.json"
+    result.write_text("old", encoding="utf-8")
+    progress.write_text("old", encoding="utf-8")
+    result_baseline = file_fingerprint(result)
+    progress_baseline = file_fingerprint(progress)
+    assert not file_changed_since(result, result_baseline)
+    assert not file_changed_since(progress, progress_baseline)
+    result.write_text("new", encoding="utf-8")
+    progress.write_text("new", encoding="utf-8")
+    assert file_changed_since(result, result_baseline)
+    assert file_changed_since(progress, progress_baseline)
+
+
+def test_stable_read_rejects_mutation_between_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = tmp_path / "wizard_result.json"
+    result.write_bytes(b"old")
+    original_read_bytes = Path.read_bytes
+    calls = 0
+
+    def mutate_after_first_read(path: Path) -> bytes:
+        nonlocal calls
+        payload = original_read_bytes(path)
+        if path == result:
+            calls += 1
+            if calls == 1:
+                result.write_bytes(b"new")
+        return payload
+
+    monkeypatch.setattr(Path, "read_bytes", mutate_after_first_read)
+    assert read_stable_file(result, lambda path: path.read_bytes()) is None
+
+
+def test_tester_settings_snapshot_restores_config_and_root_strategies(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.strategy_dir.mkdir(parents=True)
+    config.tester_config.parent.mkdir(parents=True)
+    (config.strategy_dir / "old.json").write_bytes(b'{"name":"old"}')
+    config.tester_config.write_bytes(b'{"StartDate":"old"}')
+    snapshot = capture_tester_settings(config)
+    (config.strategy_dir / "old.json").unlink()
+    (config.strategy_dir / "new.json").write_bytes(b'{"name":"new"}')
+    config.tester_config.write_bytes(b'{"StartDate":"new"}')
+    restore_tester_settings(config, snapshot)
+    assert [path.name for path in config.strategy_dir.glob("*.json")] == ["old.json"]
+    assert (config.strategy_dir / "old.json").read_bytes() == b'{"name":"old"}'
+    assert config.tester_config.read_bytes() == b'{"StartDate":"old"}'
 
 
 def _config(tmp_path: Path) -> RunnerConfig:
@@ -41,7 +99,7 @@ def _strategy(path: Path, name: str) -> Path:
     return path
 
 
-def test_preparation_removes_reports_and_logs_then_installs_exact_batch(
+def test_preparation_retains_reports_and_logs_then_installs_exact_batch(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -56,9 +114,9 @@ def test_preparation_removes_reports_and_logs_then_installs_exact_batch(
 
     batch = prepare_batch_files(config, source)
 
-    assert not config.report_dir.exists()
-    assert not config.wizard_result.exists()
-    assert not config.wizard_progress.exists()
+    assert (config.report_dir / "old.html").read_text(encoding="utf-8") == "old"
+    assert config.wizard_result.read_text(encoding="utf-8") == "{}"
+    assert config.wizard_progress.read_text(encoding="utf-8") == "{}"
     assert sorted(path.name for path in config.strategy_dir.glob("*.json")) == [
         "A.json",
         "B.json",
@@ -212,21 +270,14 @@ def test_preparation_rejects_source_inside_strategy_directory(tmp_path: Path) ->
         prepare_batch_files(config, source)
 
 
-def test_failed_pre_run_cleanup_keeps_root_json_unchanged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_batch_preparation_rejects_shared_cleanup_and_keeps_root_json(tmp_path: Path) -> None:
     config = _config(tmp_path)
     original = _strategy(config.strategy_dir / "OLD.json", "OLD")
     source = tmp_path / "generated"
     _strategy(source / "NEW.json", "NEW")
 
-    def fail_cleanup(*_args: object) -> None:
-        raise OSError("cleanup failed")
-
-    monkeypatch.setattr(runner_files, "_remove_raw_artifacts", fail_cleanup)
-
-    with pytest.raises(BatchPreparationError, match="could not install"):
-        prepare_batch_files(config, source)
+    with pytest.raises(BatchPreparationError, match="cannot be cleared"):
+        prepare_batch_files(config, source, preserve_raw_artifacts=False)
 
     assert original.is_file()
     assert not (config.strategy_dir / "NEW.json").exists()
@@ -305,20 +356,3 @@ def test_preparation_rejects_collision_with_root_json_symlink(tmp_path: Path) ->
 
     assert root_link.is_symlink()
     assert protected_target.read_text(encoding="utf-8") == "protected"
-
-
-def test_success_cleanup_removes_only_report_tree_and_two_logs(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    config.report_dir.mkdir(parents=True)
-    (config.report_dir / "result.html").write_text("result", encoding="utf-8")
-    config.wizard_result.write_text("{}", encoding="utf-8")
-    config.wizard_progress.write_text("{}", encoding="utf-8")
-    keep = config.bot_root / "tester" / "keep.txt"
-    keep.write_text("keep", encoding="utf-8")
-
-    cleanup_completed_batch(config)
-
-    assert not config.report_dir.exists()
-    assert not config.wizard_result.exists()
-    assert not config.wizard_progress.exists()
-    assert keep.exists()

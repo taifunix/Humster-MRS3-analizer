@@ -8,7 +8,6 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
-import shutil
 from typing import Mapping
 
 from .config import AlgorithmConfig
@@ -113,6 +112,38 @@ def _digest(value: object) -> str:
     return sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def _owned_previous_runs(root: Path, runs: Path, existing: list[Path]) -> tuple[Path, ...]:
+    if not existing:
+        return ()
+    manifest_path = root / "tester" / "runs_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entries = manifest["entries"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError("tester runs directory contains unowned files") from error
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1 or not isinstance(entries, list):
+        raise ValueError("tester runs directory contains unowned files")
+    unsigned = dict(manifest)
+    generation_hash = unsigned.pop("generation_manifest_sha256", None)
+    if generation_hash != _digest(unsigned):
+        raise ValueError("tester runs directory contains unowned files")
+    by_name = {path.name: path for path in existing if path.is_file() and not path.is_symlink()}
+    expected = {
+        entry.get("filename"): entry.get("snapshot_sha256")
+        for entry in entries
+        if isinstance(entry, dict)
+    }
+    if set(by_name) != set(expected) or any(
+        not isinstance(name, str)
+        or Path(name).name != name
+        or not isinstance(digest, str)
+        or sha256(by_name[name].read_bytes()).hexdigest() != digest
+        for name, digest in expected.items()
+    ):
+        raise ValueError("tester runs directory contains unowned files")
+    return tuple(by_name[name] for name in sorted(by_name))
+
+
 def publish_run_snapshots(
     template_path: Path | str,
     bot_root: Path | str,
@@ -151,11 +182,12 @@ def publish_run_snapshots(
     existing = list(runs.iterdir())
     if any(path.is_symlink() for path in existing):
         raise ValueError("tester runs directory contains a symbolic link")
+    owned_previous = _owned_previous_runs(root, runs, existing)
     rendered = [render_run_snapshot(template_path, row, start_date, end_date, max_parallel_runs, config) for row in structures]
     if len({name for name, _ in rendered}) != len(rendered):
         raise ValueError("READY candidates must have unique strategy names")
-    for path in existing:
-        shutil.rmtree(path) if path.is_dir() else path.unlink()
+    for path in owned_previous:
+        path.unlink()
     config_document.update({
         "StartDate": _timestamp(start_date),
         "EndDate": _timestamp(end_date),

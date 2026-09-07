@@ -33,6 +33,32 @@ def _config(**overrides: object) -> dict[str, object]:
     return value
 
 
+class _FakeOwnership:
+    restored = False
+
+    def acquire(self, target: str) -> dict[str, str]:
+        return {"target": target}
+
+    def attest(self, lease: object, target: str) -> bool:
+        return lease == {"target": target}
+
+    def release(self, _lease: object) -> bool:
+        return True
+
+    def snapshot_settings(self, lease: object, target: str) -> dict[str, object]:
+        return {"lease": lease, "target": target}
+
+    def restore_settings(self, lease: object, target: str, snapshot: object) -> bool:
+        self.restored = snapshot == {"lease": lease, "target": target}
+        return self.restored
+
+
+def _owned_service(**kwargs: object) -> RemoteTestingService:
+    return RemoteTestingService(
+        load_remote_runner_config(_config()), ownership_adapter=_FakeOwnership(), **kwargs
+    )
+
+
 def test_remote_config_validates_and_never_repr_secrets() -> None:
     config = RemoteRunnerConfig.from_mapping(_config())
 
@@ -41,6 +67,57 @@ def test_remote_config_validates_and_never_repr_secrets() -> None:
     assert config.auth_method == "password"
     assert "correct horse battery staple" not in repr(config)
     assert "correct horse battery staple" not in str(config)
+
+
+def test_remote_target_identity_quotes_special_posix_root() -> None:
+    config = load_remote_runner_config(
+        _config(
+            bot_root="/opt/hb #1/?",
+            debian_runner_root="/opt/hb #1/debian",
+            reports_root="/opt/hb #1/reports",
+            source_db_root="/opt/hb #1/db",
+            reports_archive_root="/opt/hb #1/archive",
+        )
+    )
+    identity = RemoteTestingService(config).target_identity
+    assert identity.endswith("/opt/hb%20%231/%3F")
+    assert " " not in identity and "#" not in identity and "?" not in identity
+    assert identity != RemoteTestingService(
+        load_remote_runner_config(
+            _config(
+                bot_root="/opt/hb #2/?",
+                debian_runner_root="/opt/hb #2/debian",
+                reports_root="/opt/hb #2/reports",
+                source_db_root="/opt/hb #2/db",
+                reports_archive_root="/opt/hb #2/archive",
+            )
+        )
+    ).target_identity
+
+
+def test_remote_target_identity_normalizes_host_and_root_forms() -> None:
+    canonical = load_remote_runner_config(_config())
+    equivalent = load_remote_runner_config(
+        _config(
+            host="RUNNER.EXAMPLE.TEST.",
+            bot_root="//opt//hb1/",
+            debian_runner_root="//opt//hb1//debian-duckdb-importer/",
+            reports_root="//opt//hb1//tester/report/",
+            source_db_root="//opt//hb1//debian-duckdb-importer/data/db/",
+            reports_archive_root="//opt//hb1//debian-duckdb-importer/data/html/",
+        )
+    )
+
+    assert equivalent.host == "runner.example.test"
+    assert equivalent.bot_root == "/opt/hb1"
+    assert RemoteTestingService(equivalent).target_identity == RemoteTestingService(canonical).target_identity
+
+
+def test_remote_target_identity_normalizes_bracketed_ipv6() -> None:
+    unbracketed = load_remote_runner_config(_config(host="2001:DB8::1"))
+    bracketed = load_remote_runner_config(_config(host="[2001:db8::1]"))
+
+    assert RemoteTestingService(unbracketed).target_identity == RemoteTestingService(bracketed).target_identity
 
 
 @pytest.mark.parametrize(
@@ -52,6 +129,7 @@ def test_remote_config_validates_and_never_repr_secrets() -> None:
         {"port": 65536},
         {"bot_root": "relative"},
         {"reports_root": "/opt/hb1/../escape"},
+        {"bot_root": "/opt/./hb1"},
         {"source_db_root": "/opt/hb1\n/db"},
     ],
 )
@@ -256,7 +334,7 @@ def test_check_paths_uses_one_injected_plink_argv_and_returns_only_labels() -> N
         calls.append(argv)
         return "1\n1\n0\n1\n1\n1048576\n"
 
-    service = RemoteTestingService(load_remote_runner_config(_config()), command_runner=runner)
+    service = _owned_service(command_runner=runner)
     result = service.check_paths()
 
     assert len(calls) == 1
@@ -286,7 +364,7 @@ def test_check_paths_reports_free_space_on_reports_filesystem() -> None:
     def runner(_argv: tuple[str, ...]) -> str:
         return "1\n1\n1\n1\n1\n1048576\n"
 
-    service = RemoteTestingService(load_remote_runner_config(_config()), command_runner=runner)
+    service = _owned_service(command_runner=runner)
 
     assert service.check_paths()["disk_free_bytes"] == 1048576 * 1024
 
@@ -295,7 +373,7 @@ def test_check_paths_keeps_path_result_when_disk_probe_is_unavailable() -> None:
     def runner(_argv: tuple[str, ...]) -> str:
         return "1\n1\n1\n1\n1\n"
 
-    service = RemoteTestingService(load_remote_runner_config(_config()), command_runner=runner)
+    service = _owned_service(command_runner=runner)
 
     assert service.check_paths()["disk_free_bytes"] == 0
 
@@ -323,7 +401,7 @@ def test_start_uses_verified_binary_and_fixed_log_without_http_assumptions(
         calls.append(argv)
         return output
 
-    service = RemoteTestingService(load_remote_runner_config(_config()), command_runner=runner)
+    service = _owned_service(command_runner=runner)
     result = service.start()
 
     assert result == {"state": expected}
@@ -336,6 +414,52 @@ def test_start_uses_verified_binary_and_fixed_log_without_http_assumptions(
     assert "8087" not in command
 
 
+def test_remote_mutation_fails_before_io_without_ownership_adapter() -> None:
+    calls: list[tuple[str, ...]] = []
+    service = RemoteTestingService(
+        load_remote_runner_config(_config()), command_runner=lambda argv: calls.append(argv) or "STARTED\n"
+    )
+    with pytest.raises(ValueError, match="remote ownership capability unavailable"):
+        service.start()
+    assert calls == []
+
+
+def test_remote_attestation_and_release_fail_closed() -> None:
+    class BadAttestation(_FakeOwnership):
+        released = False
+
+        def attest(self, lease: object, target: str) -> bool:
+            return False
+
+        def release(self, _lease: object) -> bool:
+            self.released = True
+            return True
+
+    calls: list[tuple[str, ...]] = []
+    ownership = BadAttestation()
+    service = RemoteTestingService(
+        load_remote_runner_config(_config()),
+        command_runner=lambda argv: calls.append(argv) or "STARTED\n",
+        ownership_adapter=ownership,
+    )
+    with pytest.raises(ValueError, match="attestation failed"):
+        service.start()
+    assert calls == []
+    assert ownership.released is True
+
+    class BadRelease(_FakeOwnership):
+        def release(self, _lease: object) -> bool:
+            return False
+
+    service = RemoteTestingService(
+        load_remote_runner_config(_config()), command_runner=lambda _argv: "STOPPED\n",
+        ownership_adapter=BadRelease(),
+    )
+    with pytest.raises(ValueError, match="release failed"):
+        service.stop()
+    assert service._ownership_lease is not None
+
+
 def test_stop_fails_closed_when_executable_verification_is_unavailable() -> None:
     calls: list[tuple[str, ...]] = []
 
@@ -343,7 +467,7 @@ def test_stop_fails_closed_when_executable_verification_is_unavailable() -> None
         calls.append(argv)
         return "VERIFY_FAILED\n"
 
-    service = RemoteTestingService(load_remote_runner_config(_config()), command_runner=runner)
+    service = _owned_service(command_runner=runner)
 
     assert service.stop() == {"state": "FAILED"}
     command = calls[0][-1]
@@ -359,7 +483,7 @@ def test_stop_signals_only_verified_binary_processes() -> None:
         calls.append(argv)
         return "STOPPED\n"
 
-    service = RemoteTestingService(load_remote_runner_config(_config()), command_runner=runner)
+    service = _owned_service(command_runner=runner)
 
     assert service.stop() == {"state": "STOPPED"}
     command = calls[0][-1]
@@ -410,11 +534,9 @@ def test_fill_uploads_rendered_files_then_one_redacted_install_action() -> None:
 
     def runner(argv: tuple[str, ...]) -> str:
         commands.append(argv)
-        return "FILLED\n"
+        return "FILLED\n" if "stage_created=0" in argv[-1] else "STOPPED\n"
 
-    service = RemoteTestingService(
-        load_remote_runner_config(_config()), command_runner=runner, file_uploader=uploader
-    )
+    service = _owned_service(command_runner=runner, file_uploader=uploader)
     result = service.fill(
         _fill_request(),
         tester_template=_tester_template(),
@@ -440,7 +562,7 @@ def test_fill_uploads_rendered_files_then_one_redacted_install_action() -> None:
     assert strategy["basic"] == {"symbol": "BTCUSDT", "use_long": False, "use_short": True}
     assert config_destination.startswith("/opt/hb1/")
     assert strategy_destination.startswith("/opt/hb1/")
-    command = commands[0][-1]
+    command = commands[-1][-1]
     assert "mkdir" in command and "backup" in command
     assert "config_tester.json" in command
     assert "settings_strategy" in command
@@ -449,6 +571,83 @@ def test_fill_uploads_rendered_files_then_one_redacted_install_action() -> None:
     encoded = json.dumps(result)
     assert "/opt/hb1" not in encoded
     assert "correct horse battery staple" not in encoded
+
+
+def test_remote_fill_holds_owner_until_stop_restores_settings() -> None:
+    ownership = _FakeOwnership()
+
+    def runner(argv: tuple[str, ...]) -> str:
+        script = argv[-1]
+        if "printf 'FILLED" in script:
+            return "FILLED\n"
+        if "nohup" in script:
+            return "STARTED\n"
+        return "STOPPED\n"
+
+    service = RemoteTestingService(
+        load_remote_runner_config(_config()), command_runner=runner,
+        file_uploader=lambda *_args: None, ownership_adapter=ownership,
+    )
+    service.fill(
+        _fill_request(), tester_template=_tester_template(), strategy_template=_strategy_template(),
+        max_parallel_runs=1,
+    )
+    assert service._ownership_lease is not None
+    assert ownership.restored is False
+    assert service.start() == {"state": "STARTED"}
+    assert service.stop() == {"state": "STOPPED"}
+    assert ownership.restored is True
+    assert service._ownership_lease is None
+
+
+def test_remote_failed_start_keeps_owner_and_snapshot() -> None:
+    ownership = _FakeOwnership()
+    service = RemoteTestingService(
+        load_remote_runner_config(_config()), command_runner=lambda _argv: "VERIFY_FAILED\n",
+        file_uploader=lambda *_args: None, ownership_adapter=ownership,
+    )
+    service._ownership_lease = ownership.acquire(service.target_identity)
+    service._settings_snapshot = ownership.snapshot_settings(service._ownership_lease, service.target_identity)
+
+    assert service.start() == {"state": "FAILED"}
+    assert service._ownership_lease is not None
+    assert ownership.restored is False
+
+
+def test_remote_failed_stop_keeps_owner_and_snapshot() -> None:
+    ownership = _FakeOwnership()
+    service = RemoteTestingService(
+        load_remote_runner_config(_config()), command_runner=lambda _argv: "STOP_FAILED\n",
+        file_uploader=lambda *_args: None, ownership_adapter=ownership,
+    )
+    service._ownership_lease = ownership.acquire(service.target_identity)
+    service._settings_snapshot = ownership.snapshot_settings(service._ownership_lease, service.target_identity)
+
+    assert service.stop() == {"state": "FAILED"}
+    assert service._ownership_lease is not None
+    assert ownership.restored is False
+
+
+def test_remote_fill_disconnect_keeps_owner_and_snapshot() -> None:
+    ownership = _FakeOwnership()
+    service = RemoteTestingService(
+        load_remote_runner_config(_config()),
+        command_runner=lambda argv: (
+            (_ for _ in ()).throw(RuntimeError("disconnect"))
+            if "stage_created=0" in argv[-1] else "STOPPED\n"
+        ),
+        file_uploader=lambda *_args: None,
+        ownership_adapter=ownership,
+    )
+
+    with pytest.raises(ValueError, match="remote command failed"):
+        service.fill(
+            _fill_request(), tester_template=_tester_template(),
+            strategy_template=_strategy_template(), max_parallel_runs=1,
+        )
+
+    assert service._ownership_lease is not None
+    assert ownership.restored is False
 
 
 def test_fill_requires_configured_worker_count() -> None:
@@ -511,11 +710,9 @@ def test_fill_cleans_only_its_uploaded_files_after_upload_failure() -> None:
 
     def runner(argv: tuple[str, ...]) -> str:
         commands.append(argv)
-        return ""
+        return "STOPPED\n"
 
-    service = RemoteTestingService(
-        load_remote_runner_config(_config()), command_runner=runner, file_uploader=uploader
-    )
+    service = _owned_service(command_runner=runner, file_uploader=uploader)
 
     with pytest.raises(ValueError, match="remote upload failed"):
         service.fill(
@@ -523,8 +720,9 @@ def test_fill_cleans_only_its_uploaded_files_after_upload_failure() -> None:
             max_parallel_runs=1,
         )
 
-    assert len(commands) == 1
-    assert commands[0][-1].startswith("rm -f -- '/opt/hb1/.mrs3-panel-upload-")
+    cleanup = [argv[-1] for argv in commands if argv[-1].startswith("rm -f -- ")]
+    assert len(cleanup) == 1
+    assert cleanup[0].startswith("rm -f -- '/opt/hb1/.mrs3-panel-upload-")
 
 
 def test_read_progress_parses_last_bounded_marker_without_returning_log_text() -> None:
