@@ -7,7 +7,7 @@ is retained until an M6 commit/readback proof authorizes deletion.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import inspect
@@ -182,6 +182,27 @@ class M6CommitReadbackProof:
     committed: bool = True
     readback_verified: bool = True
     contract: str = CLEANUP_PROOF_CONTRACT
+    # M6 fills these fields from a transactional readback.  The default keeps
+    # the M5 proof constructor source-compatible for reports with no decoder.
+    # None is the legacy M5 proof shape.  M6 proofs always set this boolean
+    # and therefore must satisfy the additional replay-fact checks below.
+    normalized_facts_complete: bool | None = None
+    parser_version: str | None = None
+    metrics_version: str | None = None
+    semantic_digests: Mapping[str, str] = field(default_factory=dict)
+    replay_fact_counts: Mapping[str, int] = field(default_factory=dict)
+
+    @property
+    def normalized_fact_completeness(self) -> bool:
+        return self.normalized_facts_complete is True
+
+    @property
+    def raw_report_digests(self) -> Mapping[str, str]:
+        return self.report_digests
+
+    @property
+    def committed_readback(self) -> bool:
+        return self.committed and self.readback_verified
 
 
 class RunWorkspace:
@@ -243,16 +264,34 @@ class RunWorkspace:
     def cleanup(self, proof: object, manifest: RunManifest) -> bool:
         if not isinstance(proof, M6CommitReadbackProof) or proof.contract != CLEANUP_PROOF_CONTRACT:
             return False
-        if not proof.committed or not proof.readback_verified or proof.run_id != manifest.run_id or proof.attempt_id != manifest.attempt_id:
+        if proof.committed is not True or proof.readback_verified is not True or proof.normalized_facts_complete is not True or proof.run_id != manifest.run_id or proof.attempt_id != manifest.attempt_id:
             return False
         actual = {
             artifact.path.removeprefix("report_").removesuffix(".html"): artifact.sha256
             for artifact in manifest.artifacts
             if artifact.role == "report"
         }
-        if dict(proof.report_digests) != actual:
+        if not isinstance(proof.report_digests, Mapping) or dict(proof.report_digests) != actual:
             return False
-        shutil.rmtree(self.root)
+        members = set(actual)
+        if not isinstance(proof.semantic_digests, Mapping) or set(proof.semantic_digests) != members:
+            return False
+        if not isinstance(proof.parser_version, str) or not proof.parser_version.strip() or not isinstance(proof.metrics_version, str) or not proof.metrics_version.strip():
+            return False
+        expected_counts = {"reports", "actions", "series", "cycles"}
+        if not isinstance(proof.replay_fact_counts, Mapping) or set(proof.replay_fact_counts) != expected_counts:
+            return False
+        if any(type(value) is not int or value < 0 for value in proof.replay_fact_counts.values()):
+            return False
+        if any(type(value) is not str or not re.fullmatch(r"[0-9a-f]{64}", value) for value in proof.semantic_digests.values()):
+            return False
+        if proof.replay_fact_counts["reports"] != len(members):
+            return False
+        try:
+            shutil.rmtree(self.root)
+        except OSError:
+            # Commit/readback already happened; cleanup is an advisory warning.
+            return False
         return True
 
     @classmethod
@@ -293,6 +332,7 @@ class PortfolioRunResult:
     manifest_path: Path
     reports: tuple[Path, ...]
     cleanup_performed: bool = False
+    commit_readback_proof: M6CommitReadbackProof | None = None
 
 
 def _call(method: Callable[..., Any], kwargs: Mapping[str, object], *, required: Sequence[str] = ()) -> Any:
@@ -597,7 +637,7 @@ class PortfolioTesterRunner:
             raise OperationUnconfirmedError("operation cancellation was not confirmed")
         self._quiesce(run_id=run_id, attempt_id=attempt_id)
 
-    def run(self, *, members: Sequence[str], strategies: Mapping[str, Path] | Sequence[Path], expected_reports: Sequence[str], binary_identity: object | None = None, settings_identity: object | None = None, tick_identity: object | None = None, tester_settings: Mapping[str, object] | None = None, run_id: str | None = None, attempt_id: str | None = None, timeout_seconds: float | None = None, cancel_check: Callable[[], bool] | None = None, cleanup_gate: object = False) -> PortfolioRunResult:
+    def run(self, *, members: Sequence[str], strategies: Mapping[str, Path] | Sequence[Path], expected_reports: Sequence[str], binary_identity: object | None = None, settings_identity: object | None = None, tick_identity: object | None = None, tester_settings: Mapping[str, object] | None = None, run_id: str | None = None, attempt_id: str | None = None, timeout_seconds: float | None = None, cancel_check: Callable[[], bool] | None = None, cleanup_gate: object = False, report_decoder: object | None = None, portfolio_store: object | None = None, planned_leverage: Mapping[str, object] | None = None) -> PortfolioRunResult:
         members = tuple(str(member) for member in members)
         expected = tuple(str(report) for report in expected_reports)
         if not members or len(set(members)) != len(members):
@@ -692,14 +732,43 @@ class PortfolioTesterRunner:
                     tester_settings_sha256=settings_artifact.sha256,
                     strategy_sha256=strategy_digests, test_start=test_start, test_end=test_end,
                 )
+                if len(report_paths) != len(expected) or tuple(path.name.removeprefix("report_").removesuffix(".html") for path in report_paths) != expected:
+                    raise ArtifactMismatchError("report/member cardinality or binding mismatch")
+                m6_proof: M6CommitReadbackProof | None = None
+                m6_attempted = report_decoder is not None or portfolio_store is not None
+                normalized = []
+                if m6_attempted:
+                    from .metrics import calculate_metrics
+                    from .reports import normalize_report
+                    if report_decoder is not None and portfolio_store is None:
+                        from .store import PortfolioStoreError
+                        raise PortfolioStoreError("portfolio report decoding requires publication store")
+                    for member, path in zip(expected, report_paths):
+                        decoder = report_decoder.get(member) if isinstance(report_decoder, Mapping) else report_decoder
+                        normalized_report = normalize_report(
+                            path.read_bytes(), decoder=decoder, source_report_name=path.name,
+                            source_report_sha256=_sha256(path), run_id=run_id, attempt_id=attempt_id, member=member,
+                        )
+                        calculate_metrics(normalized_report, planned_leverage=planned_leverage)
+                        normalized.append(normalized_report)
                 manifest = self._transition(workspace, manifest, "REPORTS_VALIDATED")
                 try:
                     restore_evidence = self._restore(snapshot, run_id=run_id, attempt_id=attempt_id)
                     workspace.write_file("restore_evidence.json", _json_bytes(restore_evidence), "restore_evidence")
+                    manifest = self._transition(workspace, manifest, "RESTORED")
                 except BaseException as error:
                     release_lock = False
                     manifest = self._transition(workspace, manifest, "RESTORE_FAILED")
                     raise SnapshotError("settings restore failed; run evidence retained") from error
+                if m6_attempted:
+                    publish = getattr(portfolio_store, "publish_portfolio_run", None) or getattr(portfolio_store, "publish_run", None)
+                    if not callable(publish):
+                        from .store import PortfolioStoreError
+                        raise PortfolioStoreError("portfolio store publication is unavailable")
+                    publish_kwargs = {"attempt_id": attempt_id, "executable_identity": {"binary": binary_identity if binary_identity is not None else capabilities.get("binary_identity"), "settings": settings_identity if settings_identity is not None else capabilities.get("settings_identity"), "ticks": tick_identity if tick_identity is not None else capabilities.get("tick_identity")}}
+                    if planned_leverage is not None:
+                        publish_kwargs["planned_leverage"] = planned_leverage
+                    m6_proof = publish(run_id, tuple(normalized), **publish_kwargs)
                 # The restore evidence and this pre-release state are durable before
                 # the target lease is touched.  Releasing the lease is the last
                 # target mutation; the terminal transition is safe to retry after a
@@ -708,19 +777,22 @@ class PortfolioTesterRunner:
                 lock.release()
                 release_lock = False
                 manifest = self._transition(workspace, manifest, "COMPLETED")
-                cleanup = workspace.cleanup(cleanup_gate, manifest)
-                return PortfolioRunResult(run_id, attempt_id, "COMPLETED", workspace.root, workspace.manifest_path, tuple() if cleanup else tuple(report_paths), cleanup)
+                # Once M6 was requested, a legacy M5 proof cannot authorize
+                # deletion if publication/readback did not produce a proof.
+                cleanup = workspace.cleanup(m6_proof if m6_attempted else cleanup_gate, manifest)
+                retained_reports = tuple(path for path in report_paths if path.is_file() and not path.is_symlink())
+                return PortfolioRunResult(run_id, attempt_id, "COMPLETED", workspace.root, workspace.manifest_path, tuple() if cleanup else retained_reports, cleanup, m6_proof)
             except BaseException as error:
                 primary = error
                 if isinstance(error, OperationUnconfirmedError):
                     release_lock = False
                     if manifest is not None:
                         manifest = self._transition(workspace, manifest, "OPERATION_UNCONFIRMED")
-                elif manifest is not None and manifest.status not in {"COMPLETED", "RESTORE_FAILED", "READY_TO_RELEASE"}:
+                elif manifest is not None and manifest.status not in {"COMPLETED", "RESTORE_FAILED", "READY_TO_RELEASE", "RESTORED"}:
                     manifest = self._transition(workspace, manifest, "FAILED")
                 raise
             finally:
-                if release_lock and snapshot is not None and (manifest is None or manifest.status not in {"COMPLETED", "RESTORE_FAILED", "READY_TO_RELEASE"}):
+                if release_lock and snapshot is not None and (manifest is None or manifest.status not in {"COMPLETED", "RESTORE_FAILED", "READY_TO_RELEASE", "RESTORED"}):
                     try:
                         evidence = self._restore(snapshot, run_id=run_id, attempt_id=attempt_id)
                         workspace.write_file("restore_evidence.json", _json_bytes(evidence), "restore_evidence")

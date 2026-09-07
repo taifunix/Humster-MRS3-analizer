@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import mrs3.portfolio.runner as runner_module
 from pathlib import Path
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from mrs3.portfolio.runner import (
     SnapshotError,
     TransportContractError,
 )
+from mrs3.portfolio.store import PortfolioStore, PortfolioStoreError
 
 
 def _tester_settings() -> dict[str, object]:
@@ -158,8 +160,29 @@ def test_workspace_manifest_hash_and_cleanup_gate(tmp_path: Path) -> None:
     assert loaded.cleanup(True, manifest) is False
     assert workspace.root.exists()
     proof = M6CommitReadbackProof("run-1", "attempt-1", {})
-    assert loaded.cleanup(proof, manifest) is True
-    assert not workspace.root.exists()
+    assert loaded.cleanup(proof, manifest) is False
+    assert workspace.root.exists()
+
+
+def test_m6_cleanup_requires_semantic_versions_and_replay_counts(tmp_path: Path) -> None:
+    workspace = RunWorkspace.create(tmp_path / "runs", "m6-proof", "attempt")
+    artifact = workspace.write_file("report_A.html", b"report", "report")
+    manifest = RunManifest(
+        "m6-proof", "attempt", "target", ("A",), ("A",), "b", "s", "t", (artifact,)
+    )
+    workspace.write_manifest(manifest)
+    digest = artifact.sha256
+    incomplete = M6CommitReadbackProof(
+        "m6-proof", "attempt", {"A": digest}, normalized_facts_complete=True,
+    )
+    assert workspace.cleanup(incomplete, manifest) is False
+    complete = M6CommitReadbackProof(
+        "m6-proof", "attempt", {"A": digest}, normalized_facts_complete=True,
+        parser_version="parser-v1", metrics_version="metrics-v1",
+        semantic_digests={"A": "a" * 64},
+        replay_fact_counts={"reports": 1, "actions": 0, "series": 0, "cycles": 0},
+    )
+    assert workspace.cleanup(complete, manifest) is True
 
 
 def test_duplicate_committed_attempts_fail_closed(tmp_path: Path) -> None:
@@ -756,7 +779,7 @@ def test_restore_failure_retains_manifest_and_cleanup_requires_typed_proof(tmp_p
     result = PortfolioTesterRunner(clean_target, tmp_path / "runs2", good).run(
         members=("A",), strategies={"A": source}, expected_reports=("A",), tester_settings=_tester_settings(), run_id="cleanup", attempt_id="attempt", cleanup_gate=proof
     )
-    assert result.cleanup_performed
+    assert not result.cleanup_performed and result.reports
 
 
 def test_recovery_restores_incomplete_attempt_and_records_terminal_state(tmp_path: Path) -> None:
@@ -826,3 +849,249 @@ def test_recovery_restore_failure_retains_target_owner(tmp_path: Path) -> None:
 
     assert TesterTargetLock(target).path.exists()
     assert json.loads(workspace.manifest_path.read_text(encoding="utf-8"))["status"] == "RECOVERY_FAILED"
+
+
+def test_m6_runner_decodes_publishes_reads_back_and_then_cleans(tmp_path: Path) -> None:
+    target = tmp_path / "tester"
+    target.mkdir()
+    source = tmp_path / "A.json"
+    source.write_text("{}", encoding="utf-8")
+    decoded = {
+        "schema": "portfolio_report_v1", "version": 1,
+        "identity": {"run_id": "m6", "attempt_id": "attempt", "member": "A"},
+        "action_count": 2,
+        "period": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:02Z"},
+        "actions": [
+            {"timestamp": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT", "action": "OPEN", "side": "LONG", "size": "1"},
+            {"timestamp": "2026-01-01T00:00:01Z", "symbol": "BTCUSDT", "action": "CLOSE", "side": "LONG", "size": "1", "pnl": "1"},
+        ],
+        "series": {"equity": [["2026-01-01T00:00:00Z", "100"], ["2026-01-01T00:00:02Z", "101"]]},
+    }
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    result = PortfolioTesterRunner(target, tmp_path / "runs", _FakeTransport()).run(
+        members=("A",), strategies={"A": source}, expected_reports=("A",),
+        tester_settings=_tester_settings(), run_id="m6", attempt_id="attempt",
+        report_decoder=lambda _: decoded, portfolio_store=store,
+    )
+    assert result.cleanup_performed and result.commit_readback_proof is not None
+    assert store.read_portfolio_run("m6", "attempt")["action_count"] == 2
+
+
+def test_m6_unknown_q06_report_without_decoder_retains_raw_evidence(tmp_path: Path) -> None:
+    target = tmp_path / "tester"
+    target.mkdir()
+    source = tmp_path / "A.json"
+    source.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="decoder"):
+        PortfolioTesterRunner(target, tmp_path / "runs", _FakeTransport()).run(
+            members=("A",), strategies={"A": source}, expected_reports=("A",),
+            tester_settings=_tester_settings(), run_id="q06", attempt_id="attempt",
+            portfolio_store=PortfolioStore(tmp_path / "portfolio.duckdb"),
+        )
+    assert list((tmp_path / "runs" / "q06" / "attempt").glob("report_*.html"))
+
+
+def test_m6_decoder_without_store_cannot_fall_back_to_legacy_cleanup(tmp_path: Path) -> None:
+    target = tmp_path / "tester"
+    target.mkdir()
+    source = tmp_path / "A.json"
+    source.write_text("{}", encoding="utf-8")
+    decoded = {
+        "schema": "portfolio_report_v1", "version": 1,
+        "identity": {"run_id": "decoder-only", "attempt_id": "attempt", "member": "A"},
+        "action_count": 0,
+        "period": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:02Z"},
+        "actions": [],
+        "series": {
+            "equity": [["2026-01-01T00:00:00Z", "100"], ["2026-01-01T00:00:02Z", "101"]],
+            "notional": [["2026-01-01T00:00:00Z", "200"], ["2026-01-01T00:00:02Z", "200"]],
+            "margin_balance": [["2026-01-01T00:00:00Z", "100"], ["2026-01-01T00:00:02Z", "100"]],
+        },
+    }
+    legacy_proof = M6CommitReadbackProof(
+        "decoder-only", "attempt", {"A": __import__("hashlib").sha256(b"report").hexdigest()}
+    )
+    with pytest.raises(PortfolioStoreError, match="requires publication store"):
+        PortfolioTesterRunner(target, tmp_path / "runs", _FakeTransport()).run(
+            members=("A",), strategies={"A": source}, expected_reports=("A",),
+            tester_settings=_tester_settings(), run_id="decoder-only", attempt_id="attempt",
+            report_decoder=lambda _: decoded, cleanup_gate=legacy_proof,
+        )
+    assert list((tmp_path / "runs" / "decoder-only" / "attempt").glob("report_*.html"))
+
+
+def test_m6_incomplete_metrics_proof_retains_report_files(tmp_path: Path) -> None:
+    target = tmp_path / "tester"
+    target.mkdir()
+    source = tmp_path / "A.json"
+    source.write_text("{}", encoding="utf-8")
+    decoded = {
+        "schema": "portfolio_report_v1", "version": 1,
+        "identity": {"run_id": "incomplete", "attempt_id": "attempt", "member": "A"},
+        "action_count": 0,
+        "period": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:02Z"},
+        "actions": [], "series": {},
+    }
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    result = PortfolioTesterRunner(target, tmp_path / "runs", _FakeTransport()).run(
+        members=("A",), strategies={"A": source}, expected_reports=("A",),
+        tester_settings=_tester_settings(), run_id="incomplete", attempt_id="attempt",
+        report_decoder=lambda _: decoded, portfolio_store=store,
+    )
+    assert not result.cleanup_performed and result.reports
+    assert result.commit_readback_proof is not None and not result.commit_readback_proof.normalized_facts_complete
+    assert store.read_portfolio_run("incomplete", "attempt")["status"] == "INCOMPLETE"
+
+
+def test_m6_margin_bound_failure_retains_raw_report_evidence(tmp_path: Path) -> None:
+    target = tmp_path / "tester"
+    target.mkdir()
+    source = tmp_path / "A.json"
+    source.write_text("{}", encoding="utf-8")
+    decoded = {
+        "schema": "portfolio_report_v1", "version": 1,
+        "identity": {"run_id": "margin-fail", "attempt_id": "attempt", "member": "A"},
+        "action_count": 0,
+        "period": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:02Z"},
+        "actions": [],
+        "portfolio": {"realized_pnl": "0", "fees": "0"},
+        "series": {
+            "equity": [["2026-01-01T00:00:00Z", "100"], ["2026-01-01T00:00:02Z", "101"]],
+            "notional": [["2026-01-01T00:00:00Z", "200"], ["2026-01-01T00:00:02Z", "200"]],
+            "margin_balance": [["2026-01-01T00:00:00Z", "100"], ["2026-01-01T00:00:02Z", "100"]],
+        },
+    }
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    result = PortfolioTesterRunner(target, tmp_path / "runs", _FakeTransport()).run(
+        members=("A",), strategies={"A": source}, expected_reports=("A",),
+        tester_settings=_tester_settings(), run_id="margin-fail", attempt_id="attempt",
+        report_decoder=lambda _: decoded, portfolio_store=store,
+    )
+    assert not result.cleanup_performed and result.reports
+    assert result.commit_readback_proof is not None
+    assert not result.commit_readback_proof.committed
+    assert store.read_portfolio_run("margin-fail", "attempt")["status"] == "INCOMPLETE"
+
+
+def test_m6_missing_store_publication_method_uses_store_error_and_retains_files(tmp_path: Path) -> None:
+    target = tmp_path / "tester"
+    target.mkdir()
+    source = tmp_path / "A.json"
+    source.write_text("{}", encoding="utf-8")
+    decoded = {
+        "schema": "portfolio_report_v1", "version": 1,
+        "identity": {"run_id": "store-error", "attempt_id": "attempt", "member": "A"},
+        "action_count": 0,
+        "period": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:02Z"},
+        "actions": [], "series": {},
+    }
+    with pytest.raises(PortfolioStoreError, match="publication"):
+        PortfolioTesterRunner(target, tmp_path / "runs", _FakeTransport()).run(
+            members=("A",), strategies={"A": source}, expected_reports=("A",),
+            tester_settings=_tester_settings(), run_id="store-error", attempt_id="attempt",
+            report_decoder=lambda _: decoded, portfolio_store=object(),
+        )
+    assert list((tmp_path / "runs" / "store-error" / "attempt").glob("report_*.html"))
+
+
+def test_m6_publish_failure_retains_raw_report_evidence(tmp_path: Path) -> None:
+    target = tmp_path / "tester"
+    target.mkdir()
+    source = tmp_path / "A.json"
+    source.write_text("{}", encoding="utf-8")
+    decoded = {
+        "schema": "portfolio_report_v1", "version": 1,
+        "identity": {"run_id": "publish-error", "attempt_id": "attempt", "member": "A"},
+        "action_count": 0,
+        "period": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:02Z"},
+        "actions": [], "series": {},
+    }
+
+    class FailingStore:
+        def publish_portfolio_run(self, *_args, **_kwargs):
+            raise PortfolioStoreError("forced publication failure")
+
+    with pytest.raises(PortfolioStoreError, match="forced publication"):
+        PortfolioTesterRunner(target, tmp_path / "runs", _FakeTransport()).run(
+            members=("A",), strategies={"A": source}, expected_reports=("A",),
+            tester_settings=_tester_settings(), run_id="publish-error", attempt_id="attempt",
+            report_decoder=lambda _: decoded, portfolio_store=FailingStore(),
+        )
+    assert list((tmp_path / "runs" / "publish-error" / "attempt").glob("report_*.html"))
+
+
+def test_m6_runner_durable_readback_failure_retains_raw_report_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "tester"
+    target.mkdir()
+    source = tmp_path / "A.json"
+    source.write_text("{}", encoding="utf-8")
+    decoded = {
+        "schema": "portfolio_report_v1", "version": 1,
+        "identity": {"run_id": "readback-error", "attempt_id": "attempt", "member": "A"},
+        "action_count": 0,
+        "period": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:02Z"},
+        "actions": [], "series": {},
+    }
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+
+    def fail_readback(*_args, **_kwargs):
+        raise PortfolioStoreError("forced durable readback failure")
+
+    monkeypatch.setattr(store, "read_portfolio_run", fail_readback)
+    with pytest.raises(PortfolioStoreError, match="forced durable"):
+        PortfolioTesterRunner(target, tmp_path / "runs", _FakeTransport()).run(
+            members=("A",), strategies={"A": source}, expected_reports=("A",),
+            tester_settings=_tester_settings(), run_id="readback-error", attempt_id="attempt",
+            report_decoder=lambda _: decoded, portfolio_store=store,
+        )
+    assert list((tmp_path / "runs" / "readback-error" / "attempt").glob("report_*.html"))
+
+
+def test_m6_restore_failure_does_not_publish_commit(tmp_path: Path) -> None:
+    class RestoreFails(_FakeTransport):
+        def restore_settings(self, snapshot: object, run_id: str, attempt_id: str) -> dict[str, object]:
+            raise RuntimeError("restore failed")
+
+    target = tmp_path / "tester"
+    target.mkdir()
+    source = tmp_path / "A.json"
+    source.write_text("{}", encoding="utf-8")
+    decoded = {
+        "schema": "portfolio_report_v1", "version": 1,
+        "identity": {"run_id": "restore-publish", "attempt_id": "attempt", "member": "A"},
+        "action_count": 2,
+        "period": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:02Z"},
+        "actions": [
+            {"timestamp": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT", "action": "OPEN", "side": "LONG", "size": "1"},
+            {"timestamp": "2026-01-01T00:00:01Z", "symbol": "BTCUSDT", "action": "CLOSE", "side": "LONG", "size": "1", "pnl": "1"},
+        ],
+        "series": {"equity": [["2026-01-01T00:00:00Z", "100"], ["2026-01-01T00:00:02Z", "101"]]},
+    }
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    with pytest.raises(SnapshotError):
+        PortfolioTesterRunner(target, tmp_path / "runs", RestoreFails()).run(
+            members=("A",), strategies={"A": source}, expected_reports=("A",),
+            tester_settings=_tester_settings(), run_id="restore-publish", attempt_id="attempt",
+            report_decoder=lambda _: decoded, portfolio_store=store,
+        )
+    assert store.read_portfolio_run("restore-publish", "attempt") is None
+    assert list((tmp_path / "runs" / "restore-publish" / "attempt").glob("report_*.html"))
+
+
+def test_cleanup_surfaces_partial_deletion_and_keeps_only_remaining_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = RunWorkspace.create(tmp_path / "runs", "partial", "attempt")
+    first = workspace.write_file("report_A.html", b"A", "report")
+    second = workspace.write_file("report_B.html", b"B", "report")
+    manifest = RunManifest("partial", "attempt", "target", ("A", "B"), ("A", "B"), "b", "s", "t", workspace.artifacts)
+    proof = M6CommitReadbackProof(
+        "partial", "attempt", {"A": first.sha256, "B": second.sha256}, normalized_facts_complete=True,
+        parser_version="p", metrics_version="m", semantic_digests={"A": "a" * 64, "B": "b" * 64},
+        replay_fact_counts={"reports": 2, "actions": 0, "series": 0, "cycles": 0},
+    )
+    def partially_remove(path: Path) -> None:
+        (path / "report_A.html").unlink()
+        raise OSError("partial delete")
+    monkeypatch.setattr(runner_module.shutil, "rmtree", partially_remove)
+    assert workspace.cleanup(proof, manifest) is False
+    assert not (workspace.root / "report_A.html").exists()
+    assert (workspace.root / "report_B.html").exists()

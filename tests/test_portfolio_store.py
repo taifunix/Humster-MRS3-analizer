@@ -23,6 +23,30 @@ from mrs3.portfolio.store import (
     PortfolioStoreError,
     manual_clear_lock,
 )
+from mrs3.portfolio.reports import ReportNormalizationError, normalize_report
+
+
+def _m6_report(member: str, *, run_id: str = "run", attempt_id: str = "attempt", size: str = "1", bad: bool = False, actual_leverage: dict[str, str] | None = None, margin_fail: bool = False, missing_close_pnl: bool = False, portfolio: dict[str, str] | None = None):
+    action = {"timestamp": "2026-01-01T00:00:00Z", "symbol": member, "action": "OPEN", "side": "LONG", "size": size}
+    document = {
+        "schema": "portfolio_report_v1", "version": 1,
+        "identity": {"run_id": run_id, "attempt_id": attempt_id, "member": member},
+        "action_count": 2, "actions": [action, {**action, "timestamp": "2026-01-01T00:00:01Z", "action": "CLOSE", "size": "1"}],
+        "period": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:02Z"},
+        "series": {"equity": [["2026-01-01T00:00:00Z", "100"], ["2026-01-01T00:00:02Z", "101"]]},
+    }
+    if actual_leverage is not None:
+        document["actual_leverage"] = actual_leverage
+    if margin_fail:
+        document["series"]["notional"] = [["2026-01-01T00:00:00Z", "200"], ["2026-01-01T00:00:02Z", "200"]]
+        document["series"]["margin_balance"] = [["2026-01-01T00:00:00Z", "100"], ["2026-01-01T00:00:02Z", "100"]]
+    if missing_close_pnl:
+        document["actions"][1].pop("pnl", None)
+    if portfolio is not None:
+        document["portfolio"] = portfolio
+    if bad:
+        document["action_count"] = 3
+    return normalize_report(document)
 
 
 def test_schema_has_logical_entities_and_numeric_child_series(tmp_path: Path) -> None:
@@ -739,3 +763,151 @@ def test_cross_process_busy_reclaim_and_manual_clear_are_safe(tmp_path: Path) ->
     finally:
         release.write_text("release", encoding="utf-8")
         clear.wait(timeout=10)
+
+
+def test_m6_portfolio_publication_is_idempotent_and_readback_proved(tmp_path: Path) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    report = _m6_report("A")
+    first = store.publish_portfolio_run("run", (report,), executable_identity={"binary": "b"})
+    second = store.publish_portfolio_run("run", (report,), executable_identity={"binary": "b"})
+    assert first == second
+    assert first.normalized_facts_complete
+    facts = store.read_portfolio_run("run", "attempt")
+    assert facts and facts["report_count"] == facts["action_count"] // 2 == 1
+    with duckdb.connect(str(store.path), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM portfolio_report_actions").fetchone() == (2,)
+
+
+def test_m6_corrupt_member_fails_before_any_portfolio_write(tmp_path: Path) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    _m6_report("A")
+    with pytest.raises(ReportNormalizationError):
+        _m6_report("B", bad=True)
+    assert store.read_portfolio_run("run") is None
+
+
+def test_m6_same_executable_semantic_mismatch_is_nondeterministic(tmp_path: Path) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    first = _m6_report("A", attempt_id="first", size="1")
+    second = _m6_report("A", attempt_id="second", size="2")
+    store.publish_portfolio_run("run", (first,), executable_identity={"binary": "b"})
+    proof = store.publish_portfolio_run("run", (second,), executable_identity={"binary": "b"})
+    assert not proof.committed
+    assert store.read_portfolio_run("run", "second")["status"] == "NONDETERMINISTIC_RESULT"
+
+
+def test_m6_unavailable_or_changed_executable_identity_is_unverified(tmp_path: Path) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    first = _m6_report("A", attempt_id="first")
+    second = _m6_report("A", attempt_id="second", size="2")
+    store.publish_portfolio_run("run", (first,), executable_identity={})
+    unknown = store.publish_portfolio_run("run", (second,), executable_identity={})
+    assert not unknown.committed
+    assert store.read_portfolio_run("run", "second")["status"] == "UNKNOWN"
+
+    other = _m6_report("A", attempt_id="other", size="3")
+    store.publish_portfolio_run("run", (other,), executable_identity={"binary": "other"})
+    assert store.compare_portfolio_runs("run", "first", "other") == "UNKNOWN"
+
+
+def test_m6_leverage_mismatch_is_persisted_and_blocks_cleanup_proof(tmp_path: Path) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    proof = store.publish_portfolio_run(
+        "run", (_m6_report("A", actual_leverage={"A": "5"}),),
+        executable_identity={"binary": "b"}, planned_leverage={"A": "3"},
+    )
+    assert proof.committed is False and proof.normalized_facts_complete is False
+    facts = store.read_portfolio_run("run", "attempt")
+    assert facts["status"] == "NEEDS_RETEST"
+    assert facts["metrics"]["A"]["leverage"]["reason"] == "LEVERAGE_MISMATCH"
+
+
+def test_m6_relational_decimal_facts_keep_eighteen_fractional_digits(tmp_path: Path) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    report = _m6_report("A", size="1.123456789012345678")
+    store.publish_portfolio_run("run", (report,), executable_identity={"binary": "b"})
+    with duckdb.connect(str(store.path), read_only=True) as db:
+        assert db.execute("SELECT numeric_size FROM portfolio_report_actions WHERE source_ordinal = 0").fetchone() == ("1.123456789012345678",)
+
+
+def test_m6_corrupt_metrics_payload_fails_durable_readback(tmp_path: Path) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    store.publish_portfolio_run("run", (_m6_report("A"),), executable_identity={"binary": "b"})
+    with duckdb.connect(str(store.path)) as db:
+        db.execute("UPDATE portfolio_runs SET payload = ? WHERE run_id = ?", ['{"metrics":{}}', "run"])
+    with pytest.raises(PortfolioStoreError):
+        store.read_portfolio_run("run", "attempt")
+
+
+def test_m6_post_commit_readback_failure_cannot_return_cleanup_proof(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+
+    def fail_readback(*_args, **_kwargs):
+        raise PortfolioStoreError("forced durable readback failure")
+
+    monkeypatch.setattr(store, "read_portfolio_run", fail_readback)
+    with pytest.raises(PortfolioStoreError, match="forced durable"):
+        store.publish_portfolio_run("run", (_m6_report("A"),), executable_identity={"binary": "b"})
+    with duckdb.connect(str(store.path), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM portfolio_runs").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("identity", [object(), 1.25])
+def test_m6_identity_rejects_unsupported_or_float_values(tmp_path: Path, identity: object) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    with pytest.raises(PortfolioStoreError):
+        store.publish_portfolio_run("run", (_m6_report("A"),), executable_identity={"binary": identity})
+
+
+def test_m6_margin_failure_is_persisted_incomplete_and_cannot_prove_cleanup(tmp_path: Path) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    proof = store.publish_portfolio_run("run", (_m6_report("A", margin_fail=True),), executable_identity={"binary": "b"})
+    assert proof.committed is False and proof.normalized_facts_complete is False
+    facts = store.read_portfolio_run("run", "attempt")
+    assert facts["status"] == "INCOMPLETE"
+    assert facts["metrics"]["A"]["margin_guard"]["status"] == "FAIL"
+    assert facts["metrics"]["A"]["margin_guard"]["reason"] == "MARGIN_BOUND_FAILED"
+
+
+def test_m6_unverified_financial_reconciliation_is_persisted_incomplete(tmp_path: Path) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    report = _m6_report(
+        "A", missing_close_pnl=True,
+        portfolio={"realized_pnl": "0", "fees": "0"},
+    )
+    proof = store.publish_portfolio_run("run", (report,), executable_identity={"binary": "b"})
+    assert proof.committed is False and proof.normalized_facts_complete is False
+    facts = store.read_portfolio_run("run", "attempt")
+    assert facts["status"] == "INCOMPLETE"
+    assert "FINANCIAL_RECONCILIATION_UNVERIFIED" in facts["metrics"]["A"]["blocking_diagnostics"]
+
+
+def test_m6_compare_rejects_missing_database_and_identical_attempt(tmp_path: Path) -> None:
+    missing = PortfolioStore(tmp_path / "missing.duckdb")
+    with pytest.raises(PortfolioStoreError, match="evidence is missing"):
+        missing.compare_portfolio_runs("run", "one", "two")
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    store.initialize()
+    with pytest.raises(PortfolioStoreError, match="distinct attempts"):
+        store.compare_portfolio_runs("run", "one", "one")
+
+
+def test_m6_mid_publish_failure_rolls_back_every_child_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    store.initialize()
+    store.replace_current_result("old", {"value": "preserve"})
+    first, second = _m6_report("A"), _m6_report("B")
+    original = store_module._report_payload
+
+    def fail_on_member(value):
+        if getattr(value, "member", None) == "B":
+            raise ValueError("corrupt sibling")
+        return original(value)
+
+    monkeypatch.setattr(store_module, "_report_payload", fail_on_member)
+    with pytest.raises(PortfolioStoreError):
+        store.publish_portfolio_run("run", (first, second), executable_identity={"binary": "b"})
+    with duckdb.connect(str(store.path), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM current_results WHERE result_id = 'old'").fetchone() == (1,)
+        for table in ("portfolio_runs", "portfolio_reports", "portfolio_report_actions", "portfolio_report_series", "portfolio_position_cycles"):
+            assert db.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)

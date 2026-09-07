@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import hashlib
 import json
 import math
 import os
@@ -461,6 +462,78 @@ CREATE TABLE IF NOT EXISTS current_results (
     payload VARCHAR NOT NULL,
     replaced_at_utc VARCHAR NOT NULL
 );
+CREATE TABLE IF NOT EXISTS portfolio_runs (
+    run_id VARCHAR NOT NULL,
+    attempt_id VARCHAR NOT NULL,
+    executable_identity VARCHAR NOT NULL,
+    status VARCHAR NOT NULL,
+    parser_version VARCHAR NOT NULL,
+    metrics_version VARCHAR NOT NULL,
+    semantic_digest VARCHAR NOT NULL,
+    report_count BIGINT NOT NULL,
+    action_count BIGINT NOT NULL,
+    series_count BIGINT NOT NULL,
+    cycle_count BIGINT NOT NULL,
+    payload VARCHAR NOT NULL,
+    created_at_utc VARCHAR NOT NULL,
+    PRIMARY KEY (run_id, attempt_id)
+);
+CREATE TABLE IF NOT EXISTS portfolio_reports (
+    run_id VARCHAR NOT NULL,
+    attempt_id VARCHAR NOT NULL,
+    member VARCHAR NOT NULL,
+    source_report_name VARCHAR NOT NULL,
+    raw_digest VARCHAR NOT NULL,
+    semantic_digest VARCHAR NOT NULL,
+    parser_version VARCHAR NOT NULL,
+    metrics_version VARCHAR NOT NULL,
+    action_count BIGINT NOT NULL,
+    series_count BIGINT NOT NULL,
+    cycle_count BIGINT NOT NULL,
+    payload VARCHAR NOT NULL,
+    PRIMARY KEY (run_id, attempt_id, member),
+    FOREIGN KEY (run_id, attempt_id) REFERENCES portfolio_runs(run_id, attempt_id)
+);
+CREATE TABLE IF NOT EXISTS portfolio_report_actions (
+    run_id VARCHAR NOT NULL,
+    attempt_id VARCHAR NOT NULL,
+    member VARCHAR NOT NULL,
+    source_ordinal BIGINT NOT NULL,
+    timestamp_utc VARCHAR NOT NULL,
+    symbol VARCHAR,
+    action VARCHAR NOT NULL,
+    numeric_size VARCHAR,
+    numeric_price VARCHAR,
+    numeric_fee VARCHAR,
+    numeric_pnl VARCHAR,
+    payload VARCHAR NOT NULL,
+    PRIMARY KEY (run_id, attempt_id, member, source_ordinal),
+    FOREIGN KEY (run_id, attempt_id, member) REFERENCES portfolio_reports(run_id, attempt_id, member)
+);
+CREATE TABLE IF NOT EXISTS portfolio_report_series (
+    run_id VARCHAR NOT NULL,
+    attempt_id VARCHAR NOT NULL,
+    member VARCHAR NOT NULL,
+    series_name VARCHAR NOT NULL,
+    source_ordinal BIGINT NOT NULL,
+    timestamp_utc VARCHAR NOT NULL,
+    numeric_value VARCHAR,
+    availability VARCHAR NOT NULL,
+    reason VARCHAR,
+    payload VARCHAR NOT NULL,
+    PRIMARY KEY (run_id, attempt_id, member, series_name, source_ordinal),
+    FOREIGN KEY (run_id, attempt_id, member) REFERENCES portfolio_reports(run_id, attempt_id, member)
+);
+CREATE TABLE IF NOT EXISTS portfolio_position_cycles (
+    run_id VARCHAR NOT NULL,
+    attempt_id VARCHAR NOT NULL,
+    member VARCHAR NOT NULL,
+    cycle_id BIGINT NOT NULL,
+    symbol VARCHAR NOT NULL,
+    payload VARCHAR NOT NULL,
+    PRIMARY KEY (run_id, attempt_id, member, cycle_id),
+    FOREIGN KEY (run_id, attempt_id, member) REFERENCES portfolio_reports(run_id, attempt_id, member)
+);
 """
 
 
@@ -501,6 +574,37 @@ def _payload(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     except (TypeError, ValueError) as error:
         raise PortfolioStoreError("content is not serializable") from error
+
+
+def _report_json_value(value: Any) -> Any:
+    """Encode normalized facts without converting Decimal through float."""
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, Mapping):
+        return {str(key): _report_json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_report_json_value(item) for item in value]
+    if hasattr(value, "as_dict") and callable(value.as_dict):
+        return _report_json_value(value.as_dict())
+    if hasattr(value, "__dataclass_fields__"):
+        from dataclasses import asdict
+        return _report_json_value(asdict(value))
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, float):
+        raise PortfolioStoreError("floating point values are not canonical portfolio facts")
+    raise PortfolioStoreError(f"unsupported portfolio fact value: {type(value).__name__}")
+
+
+def _report_payload(value: Any) -> str:
+    return json.dumps(_report_json_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _report_decimal_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    number = value if isinstance(value, Decimal) else _numeric_decimal(value)
+    return format(number, "f")
 
 
 def _numeric_decimal(value: Any) -> Decimal:
@@ -802,6 +906,306 @@ class PortfolioStore:
         return self._publish(publish)
 
     upsert_current_result = replace_current_result
+
+    def publish_portfolio_run(
+        self,
+        run_id: str,
+        reports: Iterable[Any] | Mapping[str, Any],
+        *,
+        attempt_id: str | None = None,
+        executable_identity: Any = None,
+        planned_leverage: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Atomically publish normalized member reports and return readback proof."""
+        from .reports import NormalizedReport
+        from .metrics import calculate_metrics
+
+        if isinstance(reports, Mapping):
+            values = tuple(reports.values())
+        else:
+            values = tuple(reports)
+        if not values or any(not isinstance(report, NormalizedReport) for report in values):
+            raise PortfolioStoreError("portfolio publication requires normalized reports")
+        inferred_attempt = str(attempt_id or values[0].attempt_id)
+        if not run_id or not inferred_attempt:
+            raise PortfolioStoreError("portfolio run identity is required")
+        if any(report.run_id != run_id or report.attempt_id != inferred_attempt for report in values):
+            raise PortfolioStoreError("portfolio report identity mismatch")
+        if len({report.member for report in values}) != len(values):
+            raise PortfolioStoreError("portfolio report members are duplicated")
+        if any(len(report.source_report_sha256) != 64 or len(report.semantic_digest) != 64 for report in values):
+            raise PortfolioStoreError("portfolio report digest is malformed")
+        values = tuple(sorted(values, key=lambda report: report.member))
+        metric_values = {
+            report.member: calculate_metrics(report, planned_leverage=planned_leverage)
+            for report in values
+        }
+        executable = _report_payload(executable_identity if executable_identity is not None else {})
+        combined_digest = hashlib.sha256(
+            "|".join(f"{report.member}:{report.semantic_digest}" for report in values).encode("utf-8")
+        ).hexdigest()
+        report_payload = _report_payload({"run_id": run_id, "attempt_id": inferred_attempt, "members": [report.member for report in values], "metrics": metric_values})
+        executable_known = (
+            isinstance(executable_identity, Mapping)
+            and bool(executable_identity)
+            and all(value is not None for value in executable_identity.values())
+        )
+
+        def publish(db: duckdb.DuckDBPyConnection) -> Any:
+            existing = db.execute(
+                "SELECT executable_identity, parser_version, metrics_version, semantic_digest, report_count, action_count, series_count, cycle_count FROM portfolio_runs WHERE run_id = ? AND attempt_id = ?",
+                [run_id, inferred_attempt],
+            ).fetchone()
+            if existing is not None:
+                expected_counts = (
+                    len(values), sum(report.action_count for report in values),
+                    sum(len(points) for report in values for points in report.series.values()),
+                    sum(len(report.cycles) for report in values),
+                )
+                if existing[:4] != (executable, values[0].parser_version, values[0].metrics_version, combined_digest) or tuple(existing[4:]) != expected_counts:
+                    raise PortfolioStoreError("portfolio run identity mismatch")
+                return self._portfolio_readback(db, run_id, inferred_attempt)
+            if any(report.parser_version != values[0].parser_version or report.metrics_version != values[0].metrics_version for report in values):
+                raise PortfolioStoreError("portfolio parser/metrics version mismatch")
+            action_count = sum(report.action_count for report in values)
+            series_count = sum(len(points) for report in values for points in report.series.values())
+            cycle_count = sum(len(report.cycles) for report in values)
+            blocking_codes = {"EQUITY_PATH_MISSING", "EQUITY_COVERAGE_INSUFFICIENT", "EQUITY_DENOMINATOR_INVALID", "FINANCIAL_RECONCILIATION_FAILED", "FINANCIAL_RECONCILIATION_UNVERIFIED", "MARGIN_BOUND_FAILED"}
+            prior_rows = db.execute(
+                "SELECT executable_identity, semantic_digest FROM portfolio_runs WHERE run_id = ? AND attempt_id <> ?",
+                [run_id, inferred_attempt],
+            ).fetchall()
+            identity_changed = False
+            prior_different = False
+            for prior_identity_json, prior_digest in prior_rows:
+                try:
+                    prior_identity = json.loads(str(prior_identity_json))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    identity_changed = True
+                    continue
+                if (
+                    not isinstance(prior_identity, Mapping)
+                    or not prior_identity
+                    or any(value is None for value in prior_identity.values())
+                    or prior_identity != executable_identity
+                ):
+                    identity_changed = True
+                elif str(prior_digest) != combined_digest:
+                    prior_different = True
+            status = "UNKNOWN" if not executable_known or identity_changed else ("NONDETERMINISTIC_RESULT" if prior_different else "COMMITTED")
+            if status == "COMMITTED":
+                if any(metric.status == "NEEDS_RETEST" for metric in metric_values.values()):
+                    status = "NEEDS_RETEST"
+                elif any(metric.status != "COMPLETE" for metric in metric_values.values()) or any(blocking_codes & set(report.diagnostics) for report in values):
+                    status = "INCOMPLETE"
+            db.execute(
+                "INSERT INTO portfolio_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [run_id, inferred_attempt, executable, status, values[0].parser_version, values[0].metrics_version, combined_digest, len(values), action_count, series_count, cycle_count, report_payload, _utc_now()],
+            )
+            for report in values:
+                payload = _report_payload(report)
+                db.execute(
+                    "INSERT INTO portfolio_reports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [run_id, inferred_attempt, report.member, report.source_report_name, report.source_report_sha256, report.semantic_digest, report.parser_version, report.metrics_version, report.action_count, sum(len(points) for points in report.series.values()), len(report.cycles), payload],
+                )
+                for action in report.actions:
+                    db.execute(
+                        "INSERT INTO portfolio_report_actions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [run_id, inferred_attempt, report.member, action.source_ordinal, action.timestamp_utc, action.symbol, action.action, _report_decimal_text(action.size), _report_decimal_text(action.price), _report_decimal_text(action.fee), _report_decimal_text(action.pnl), _report_payload(action)],
+                    )
+                for name, points in report.series.items():
+                    for point in points:
+                        db.execute(
+                            "INSERT INTO portfolio_report_series VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [run_id, inferred_attempt, report.member, name, point.source_ordinal, point.timestamp_utc, _report_decimal_text(point.value), point.availability, point.reason, _report_payload(point)],
+                        )
+                for cycle in report.cycles:
+                    db.execute(
+                        "INSERT INTO portfolio_position_cycles VALUES (?, ?, ?, ?, ?, ?)",
+                        [run_id, inferred_attempt, report.member, cycle.cycle_id, cycle.symbol, _report_payload(cycle)],
+                    )
+            return self._portfolio_readback(db, run_id, inferred_attempt)
+
+        # `_publish` validates inside its transaction; this second read uses a
+        # fresh connection after COMMIT so the cleanup proof reflects durable
+        # evidence rather than an uncommitted view.
+        self._publish(publish)
+        readback = self.read_portfolio_run(run_id, inferred_attempt)
+        if readback is None:
+            raise PortfolioStoreError("portfolio durable readback is missing")
+        from .runner import M6CommitReadbackProof
+        report_rows = readback["reports"]
+        complete = (
+            readback["status"] == "COMMITTED"
+            and readback["report_count"] == len(values)
+            and readback["action_count"] == sum(report.action_count for report in values)
+            and readback["series_count"] == sum(len(points) for report in values for points in report.series.values())
+            and readback["cycle_count"] == sum(len(report.cycles) for report in values)
+        )
+        return M6CommitReadbackProof(
+            run_id, inferred_attempt,
+            {str(row[0]): str(row[1]) for row in report_rows},
+            committed=readback["status"] == "COMMITTED",
+            readback_verified=True,
+            normalized_facts_complete=complete,
+            parser_version=readback["parser_version"],
+            metrics_version=readback["metrics_version"],
+            semantic_digests={str(row[0]): str(row[2]) for row in report_rows},
+            replay_fact_counts={"reports": readback["report_count"], "actions": readback["action_count"], "series": readback["series_count"], "cycles": readback["cycle_count"]},
+        )
+
+    publish_run = publish_portfolio_run
+    import_portfolio_reports = publish_portfolio_run
+    publish_portfolio = publish_portfolio_run
+
+    def _portfolio_readback(self, db: duckdb.DuckDBPyConnection, run_id: str, attempt_id: str) -> dict[str, Any]:
+        row = db.execute(
+            "SELECT status, parser_version, metrics_version, semantic_digest, report_count, action_count, series_count, cycle_count, payload, executable_identity FROM portfolio_runs WHERE run_id = ? AND attempt_id = ?",
+            [run_id, attempt_id],
+        ).fetchone()
+        if row is None:
+            raise PortfolioStoreError("portfolio run readback is missing")
+        report_details = db.execute(
+            "SELECT member, raw_digest, semantic_digest, parser_version, metrics_version, action_count, series_count, cycle_count, payload FROM portfolio_reports WHERE run_id = ? AND attempt_id = ? ORDER BY member",
+            [run_id, attempt_id],
+        ).fetchall()
+        reports = [tuple(row[:3]) for row in report_details]
+        expected = (int(row[4]), int(row[5]), int(row[6]), int(row[7]))
+        actual = (
+            len(reports),
+            int(db.execute("SELECT count(*) FROM portfolio_report_actions WHERE run_id = ? AND attempt_id = ?", [run_id, attempt_id]).fetchone()[0]),
+            int(db.execute("SELECT count(*) FROM portfolio_report_series WHERE run_id = ? AND attempt_id = ?", [run_id, attempt_id]).fetchone()[0]),
+            int(db.execute("SELECT count(*) FROM portfolio_position_cycles WHERE run_id = ? AND attempt_id = ?", [run_id, attempt_id]).fetchone()[0]),
+        )
+        if expected != actual:
+            raise PortfolioStoreError("portfolio readback count mismatch")
+        if reports and hashlib.sha256("|".join(f"{item[0]}:{item[2]}" for item in reports).encode("utf-8")).hexdigest() != str(row[3]):
+            raise PortfolioStoreError("portfolio semantic digest readback mismatch")
+        report_facts: dict[str, Any] = {}
+        for detail in report_details:
+            member, raw_digest, semantic_digest, parser_version, metrics_version, action_count, series_count, cycle_count, encoded_report = detail
+            if str(parser_version) != str(row[1]) or str(metrics_version) != str(row[2]):
+                raise PortfolioStoreError("portfolio report version readback mismatch")
+            try:
+                fact = json.loads(str(encoded_report))
+            except (TypeError, ValueError) as error:
+                raise PortfolioStoreError("portfolio normalized report fact is malformed") from error
+            if not isinstance(fact, dict):
+                raise PortfolioStoreError("portfolio normalized report fact is malformed")
+            if fact.get("member") != str(member) or fact.get("semantic_digest") != str(semantic_digest) or fact.get("raw_digest") != str(raw_digest):
+                raise PortfolioStoreError("portfolio report identity readback mismatch")
+            report_facts[str(member)] = fact
+            child_counts = (
+                int(db.execute("SELECT count(*) FROM portfolio_report_actions WHERE run_id = ? AND attempt_id = ? AND member = ?", [run_id, attempt_id, member]).fetchone()[0]),
+                int(db.execute("SELECT count(*) FROM portfolio_report_series WHERE run_id = ? AND attempt_id = ? AND member = ?", [run_id, attempt_id, member]).fetchone()[0]),
+                int(db.execute("SELECT count(*) FROM portfolio_position_cycles WHERE run_id = ? AND attempt_id = ? AND member = ?", [run_id, attempt_id, member]).fetchone()[0]),
+            )
+            if child_counts != (int(action_count), int(series_count), int(cycle_count)):
+                raise PortfolioStoreError("portfolio report fact count mismatch")
+        for table in ("portfolio_report_actions", "portfolio_report_series", "portfolio_position_cycles"):
+            malformed = db.execute(
+                f"SELECT payload FROM {table} WHERE run_id = ? AND attempt_id = ?",
+                [run_id, attempt_id],
+            ).fetchall()
+            for item in malformed:
+                try:
+                    if not isinstance(json.loads(str(item[0])), dict):
+                        raise ValueError
+                except (TypeError, ValueError) as error:
+                    raise PortfolioStoreError("portfolio normalized child fact is malformed") from error
+        try:
+            payload = json.loads(str(row[8]))
+        except (TypeError, ValueError) as error:
+            raise PortfolioStoreError("portfolio readback payload is malformed") from error
+        if not isinstance(payload, dict):
+            raise PortfolioStoreError("portfolio readback payload is malformed")
+        try:
+            executable_identity = json.loads(str(row[9]))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise PortfolioStoreError("portfolio executable identity is malformed") from error
+        if not isinstance(executable_identity, Mapping):
+            raise PortfolioStoreError("portfolio executable identity is malformed")
+        metrics = payload.get("metrics")
+        if not isinstance(metrics, Mapping) or set(str(key) for key in metrics) != set(report_facts):
+            raise PortfolioStoreError("portfolio metrics readback is incomplete")
+        for member, entry in metrics.items():
+            if not isinstance(entry, Mapping) or entry.get("metrics_version") != str(row[2]):
+                raise PortfolioStoreError("portfolio metric version readback mismatch")
+            leverage = entry.get("leverage")
+            if not isinstance(leverage, Mapping) or leverage.get("status") not in {"PASS", "UNKNOWN", "NEEDS_RETEST"}:
+                raise PortfolioStoreError("portfolio leverage metric readback is malformed")
+            if "reason" not in leverage:
+                raise PortfolioStoreError("portfolio leverage metric reason is missing")
+            if leverage.get("status") == "PASS" and leverage.get("reason") is not None:
+                raise PortfolioStoreError("portfolio leverage metric reason is inconsistent")
+            if leverage.get("status") == "UNKNOWN" and leverage.get("reason") != "LEVERAGE_UNVERIFIED":
+                raise PortfolioStoreError("portfolio leverage metric reason is inconsistent")
+            if leverage.get("status") == "NEEDS_RETEST" and leverage.get("reason") not in {"LEVERAGE_MISMATCH", "LEVERAGE_UNVERIFIED"}:
+                raise PortfolioStoreError("portfolio leverage metric reason is inconsistent")
+            margin = entry.get("margin_guard")
+            if not isinstance(margin, Mapping) or margin.get("status") not in {"PASS", "FAIL", "UNKNOWN"}:
+                raise PortfolioStoreError("portfolio margin metric readback is malformed")
+            if "reason" not in margin:
+                raise PortfolioStoreError("portfolio margin metric reason is missing")
+            if margin.get("status") == "PASS" and margin.get("reason") is not None:
+                raise PortfolioStoreError("portfolio margin metric reason is inconsistent")
+            if margin.get("status") == "FAIL" and margin.get("reason") != "MARGIN_BOUND_FAILED":
+                raise PortfolioStoreError("portfolio margin metric reason is inconsistent")
+            if margin.get("status") == "UNKNOWN" and margin.get("reason") != "MARGIN_BOUND_UNAVAILABLE":
+                raise PortfolioStoreError("portfolio margin metric reason is inconsistent")
+            if entry.get("status") not in {"COMPLETE", "INCOMPLETE", "NEEDS_RETEST"}:
+                raise PortfolioStoreError("portfolio metric status readback is malformed")
+            if margin.get("status") == "FAIL" and entry.get("status") == "COMPLETE":
+                raise PortfolioStoreError("portfolio margin failure was published as complete")
+        return {"status": str(row[0]), "parser_version": str(row[1]), "metrics_version": str(row[2]), "semantic_digest": str(row[3]), "report_count": expected[0], "action_count": expected[1], "series_count": expected[2], "cycle_count": expected[3], "reports": reports, "report_facts": report_facts, "facts": report_facts, "metrics": metrics, "payload": payload, "executable_identity": executable_identity}
+
+    def read_portfolio_run(self, run_id: str, attempt_id: str | None = None) -> dict[str, Any] | None:
+        if not self.path.exists():
+            return None
+        try:
+            with duckdb.connect(str(self.path), read_only=True) as db:
+                if attempt_id is None:
+                    row = db.execute("SELECT attempt_id FROM portfolio_runs WHERE run_id = ? ORDER BY created_at_utc DESC LIMIT 1", [run_id]).fetchone()
+                    if row is None:
+                        return None
+                    attempt_id = str(row[0])
+                return self._portfolio_readback(db, run_id, attempt_id)
+        except duckdb.Error as error:
+            raise PortfolioStoreError("portfolio readback failed") from error
+
+    get_portfolio_run = read_portfolio_run
+    read_portfolio = read_portfolio_run
+
+    def compare_portfolio_runs(self, run_id: str, first_attempt_id: str, second_attempt_id: str) -> str:
+        """Compare two committed attempts without replacing either evidence row."""
+        if first_attempt_id == second_attempt_id:
+            raise PortfolioStoreError("portfolio comparison requires distinct attempts")
+        if not self.path.exists():
+            raise PortfolioStoreError("portfolio comparison evidence is missing")
+        try:
+            with duckdb.connect(str(self.path), read_only=True) as db:
+                rows = db.execute(
+                    "SELECT executable_identity, semantic_digest FROM portfolio_runs WHERE run_id = ? AND attempt_id IN (?, ?)",
+                    [run_id, first_attempt_id, second_attempt_id],
+                ).fetchall()
+        except duckdb.Error as error:
+            raise PortfolioStoreError("portfolio comparison readback failed") from error
+        if len(rows) != 2:
+            raise PortfolioStoreError("portfolio comparison evidence is missing")
+        try:
+            identities = tuple(json.loads(str(row[0])) for row in rows)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise PortfolioStoreError("portfolio comparison identity is malformed") from error
+        if (
+            any(not isinstance(identity, Mapping) or not identity or any(value is None for value in identity.values()) for identity in identities)
+            or identities[0] != identities[1]
+        ):
+            return "UNKNOWN"
+        if rows[0][1] != rows[1][1]:
+            return "NONDETERMINISTIC_RESULT"
+        return "DETERMINISTIC"
+
+    classify_semantic_identity = compare_portfolio_runs
 
     def get_campaign(self, campaign_id: str) -> dict[str, Any] | None:
         with duckdb.connect(str(self.path), read_only=True) as db:

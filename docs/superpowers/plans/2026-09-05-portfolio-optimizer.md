@@ -442,29 +442,29 @@ state факты после принятия M5 выводятся заново,
 
 **Spec:** §9. **Зависимости:** M0–M1, M5 для интеграции.
 
-- [ ] Парсить portfolio/symbol summaries, все actions и доступные required series.
-- [ ] Сохранить typed values, source order, availability и report provenance.
-- [ ] Не переименовывать execution Trades в position count.
-- [ ] Восстановить flat/nonflat cycles с чередующимися increases/decreases.
-- [ ] Поддержать partial fills/closes, одинаковые timestamps, carry-in и open-at-end.
-- [ ] Фиксировать unknown reversal/forced-close attribution, не выдумывать события.
-- [ ] Основной результат считать как `final_equity - initial_equity`, realised PnL
+- [x] Парсить portfolio/symbol summaries, все actions и доступные required series.
+- [x] Сохранить typed values, source order, availability и report provenance.
+- [x] Не переименовывать execution Trades в position count.
+- [x] Восстановить flat/nonflat cycles с чередующимися increases/decreases.
+- [x] Поддержать partial fills/closes, одинаковые timestamps, carry-in и open-at-end.
+- [x] Фиксировать unknown reversal/forced-close attribution, не выдумывать события.
+- [x] Основной результат считать как `final_equity - initial_equity`, realised PnL
   хранить отдельно; `OPEN_AT_END` оставлять diagnostic.
-- [ ] Actual DD считать по той же полной equity series; хранить sampling resolution,
+- [x] Actual DD считать по той же полной equity series; хранить sampling resolution,
   coverage, start/end boundaries, gaps и censoring. Требуемая неполнота блокирует READY.
-- [ ] Сверить counts/range/identity, fees/funding/PnL и equity boundaries.
-- [ ] Вычислить actual concurrency и отдельно calculated margin guards.
-- [ ] Сохранить raw report digest и canonical semantic digest normalized
+- [x] Сверить counts/range/identity, fees/funding/PnL и equity boundaries.
+- [x] Вычислить actual concurrency и отдельно calculated margin guards.
+- [x] Сохранить raw report digest и canonical semantic digest normalized
   result/actions/series. Только semantic mismatch при одинаковых executable
   manifest/binary/ticks означает `NONDETERMINISTIC_RESULT`.
-- [ ] Опубликовать полный portfolio run одной транзакцией и выполнить readback.
-- [ ] Сохранить фактически применённый leverage при наличии report field и
+- [x] Опубликовать полный portfolio run одной транзакцией и выполнить readback.
+- [x] Сохранить фактически применённый leverage при наличии report field и
   сверить с planned value; mismatch → `NEEDS_RETEST/LEVERAGE_MISMATCH`.
-- [ ] Оставить safe-delete выключенным до отдельного portfolio-specific контракта,
+- [x] Оставить safe-delete выключенным до отдельного portfolio-specific контракта,
   доказывающего commit/readback всех replay facts и parser/metric versions.
-- [ ] Не переписывать старое evidence новым parser/metrics без raw report.
-- [ ] При parse/import failure оставить evidence; cleanup failure после commit — warning.
-- [ ] Сохранить hashes/parser/metrics versions для replay без HTML.
+- [x] Не переписывать старое evidence новым parser/metrics без raw report.
+- [x] При parse/import failure оставить evidence; cleanup failure после commit — warning.
+- [x] Сохранить hashes/parser/metrics versions для replay без HTML.
 
 **Acceptance tests:** sanitized portfolio fixture; malformed schema/count/identity;
 duplicate report; rollback на одном повреждённом member; reconciliation;
