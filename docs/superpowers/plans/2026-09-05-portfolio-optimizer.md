@@ -480,27 +480,27 @@ censored cycle; interleaved reductions/additions; undefined metrics. Imported re
 
 **Spec:** §8.1, §10.1–10.2. **Зависимости:** M1–M6 и agreed policy для READY.
 
-- [ ] Заморозить development/validation windows и upstream selection provenance до поиска.
-- [ ] Фиксировать warm-up/state boundary и минимальное evidence.
-- [ ] Не называть повтор на upstream-used периоде независимым OOS.
-- [ ] Реализовать propose → precheck → test → import → refine в общем budget.
-- [ ] Проверить каждую точку finite sizing grid; не использовать early stop или
+- [x] Заморозить development/validation windows и upstream selection provenance до поиска.
+- [x] Фиксировать warm-up/state boundary и минимальное evidence.
+- [x] Не называть повтор на upstream-used периоде независимым OOS.
+- [x] Реализовать propose → precheck → test → import → refine в общем budget.
+- [x] Проверить каждую точку finite sizing grid; не использовать early stop или
   предположение монотонности.
-- [ ] Сохранять failed/rejected/tried/not-tested-budget candidates и attempts.
-- [ ] Вынести `portfolio_optimizer_research_risk_v1` DD/free/MM limits в profile config и проверять их совместно; не auto-relax.
-- [ ] AGGRESSIVE: max profit только после всех gates.
-- [ ] BALANCED/CONSERVATIVE: реализовать exact ranking только после его отдельного согласования.
-- [ ] Не добавлять PnL, liquidity/freshness или ranking formulas как defaults.
-- [ ] Preliminary исследования маркировать; missing mandatory policy блокирует READY.
-- [ ] Заморозить development ranking и finalist order до validation.
-- [ ] На validation выполнять только PASS/FAIL; если прошли несколько finalists,
+- [x] Сохранять failed/rejected/tried/not-tested-budget candidates и attempts.
+- [x] Вынести `portfolio_optimizer_research_risk_v1` DD/free/MM limits в profile config и проверять их совместно; не auto-relax.
+- [x] AGGRESSIVE: max profit только после всех gates.
+- [x] BALANCED/CONSERVATIVE: реализовать exact ranking только после его отдельного согласования.
+- [x] Не добавлять PnL, liquidity/freshness или ranking formulas как defaults.
+- [x] Preliminary исследования маркировать; missing mandatory policy блокирует READY.
+- [x] Заморозить development ranking и finalist order до validation.
+- [x] На validation выполнять только PASS/FAIL; если прошли несколько finalists,
   выбрать первый в frozen development order, не сортировать по validation return.
-- [ ] Не ретюнить по validation и не скрывать провал новым ranking.
-- [ ] Если zero finalists прошли, дать profile decision
+- [x] Не ретюнить по validation и не скрывать провал новым ranking.
+- [x] Если zero finalists прошли, дать profile decision
   и decision Campaign `INSUFFICIENT_EVIDENCE/NO_VALIDATION_PASS`, сохранив
   отдельные invalid TradingRun reasons.
-- [ ] Совместно проверить global liquidity всего PortfolioSet.
-- [ ] Депозиты пользовательские; никаких allocation/transfer алгоритмов в MVP.
+- [x] Совместно проверить global liquidity всего PortfolioSet.
+- [x] Депозиты пользовательские; никаких allocation/transfer алгоритмов в MVP.
 
 **Acceptance tests:** deterministic resume и бюджет; no auto-relaxation;
 holdout leakage; upstream-used validation label; missing policy; failed risk
