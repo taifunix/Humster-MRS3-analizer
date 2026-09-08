@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "cases": {
+    "filled": [
+      {"event_id": "filled-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "10"},
+      {"event_id": "filled-ack", "event_type": "ACKNOWLEDGED", "source_sequence": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "requested_qty": "10", "remaining_qty": "10"},
+      {"event_id": "filled-partial", "event_type": "PARTIAL_FILL", "source_sequence": 2, "timestamp_utc": "2026-01-01T00:00:02Z", "requested_qty": "10", "fill_qty": "4", "remaining_qty": "6"},
+      {"event_id": "filled-full", "event_type": "FULL_FILL", "source_sequence": 3, "timestamp_utc": "2026-01-01T00:00:03Z", "requested_qty": "10", "fill_qty": "10", "remaining_qty": "0"}
+    ],
+    "cancel_replace_reduce": [
+      {"event_id": "cycle-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "10"},
+      {"event_id": "cycle-partial", "event_type": "PARTIAL_FILL", "source_sequence": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "requested_qty": "10", "fill_qty": "4", "remaining_qty": "6"},
+      {"event_id": "cycle-replace-request", "event_type": "REPLACE_REQUESTED", "source_sequence": 2, "timestamp_utc": "2026-01-01T00:00:02Z", "requested_qty": "10", "remaining_qty": "6"},
+      {"event_id": "cycle-replace-confirm", "event_type": "REPLACE_CONFIRMED", "order_revision": 1, "revision_link": "0", "source_sequence": 3, "timestamp_utc": "2026-01-01T00:00:03Z", "requested_qty": "8", "remaining_qty": "8"},
+      {"event_id": "cycle-ack", "event_type": "ACKNOWLEDGED", "order_revision": 1, "source_sequence": 4, "timestamp_utc": "2026-01-01T00:00:04Z", "requested_qty": "8", "remaining_qty": "8"},
+      {"event_id": "cycle-partial-revision", "event_type": "PARTIAL_FILL", "order_revision": 1, "source_sequence": 5, "timestamp_utc": "2026-01-01T00:00:05Z", "requested_qty": "8", "fill_qty": "4", "remaining_qty": "4"},
+      {"event_id": "cycle-reduce", "event_type": "REDUCE_ONLY_FILL", "order_revision": 1, "source_sequence": 6, "timestamp_utc": "2026-01-01T00:00:06Z", "requested_qty": "8", "fill_qty": "6", "remaining_qty": "2", "reduce_only": true},
+      {"event_id": "cycle-cancel-request", "event_type": "CANCEL_REQUESTED", "order_revision": 1, "source_sequence": 7, "timestamp_utc": "2026-01-01T00:00:07Z", "requested_qty": "8", "remaining_qty": "2"},
+      {"event_id": "cycle-cancel-confirm", "event_type": "CANCEL_CONFIRMED", "order_revision": 1, "source_sequence": 8, "timestamp_utc": "2026-01-01T00:00:08Z", "requested_qty": "8", "remaining_qty": "2"}
+    ],
+    "rejected": [
+      {"event_id": "reject-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "10"},
+      {"event_id": "reject-rejected", "event_type": "REJECTED", "source_sequence": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "requested_qty": "10"}
+    ],
+    "missing_facts": [
+      {"event_id": "missing-placed", "event_type": "PLACED", "source_sequence": 0},
+      {"event_id": "missing-partial", "event_type": "PARTIAL_FILL", "source_sequence": 1, "fill_qty": "2"}
+    ],
+    "missing_cancel_confirmation": [
+      {"event_id": "unknown-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "10"},
+      {"event_id": "unknown-partial", "event_type": "PARTIAL_FILL", "source_sequence": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "requested_qty": "10", "fill_qty": "4", "remaining_qty": "6"},
+      {"event_id": "unknown-cancel-request", "event_type": "CANCEL_REQUESTED", "source_sequence": 2, "timestamp_utc": "2026-01-01T00:00:02Z", "requested_qty": "10", "remaining_qty": "6"},
+      {"event_id": "unknown-cancel-confirm", "event_type": "CANCEL_CONFIRMED", "source_sequence": 3, "requested_qty": "10", "remaining_qty": "5"}
+    ],
+    "duplicate": [
+      {"event_id": "duplicate-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "10"},
+      {"event_id": "duplicate-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "10"}
+    ],
+    "conflict": [
+      {"event_id": "conflict-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "10"},
+      {"event_id": "conflict-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "9"}
+    ],
+    "fill_mismatch": [
+      {"event_id": "mismatch-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "10"},
+      {"event_id": "mismatch-partial", "event_type": "PARTIAL_FILL", "source_sequence": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "requested_qty": "10", "fill_qty": "4", "cumulative_filled_qty": "5", "remaining_qty": "5"}
+    ],
+    "fill_decrease": [
+      {"event_id": "decrease-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "10"},
+      {"event_id": "decrease-first", "event_type": "PARTIAL_FILL", "source_sequence": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "requested_qty": "10", "fill_qty": "4", "remaining_qty": "6"},
+      {"event_id": "decrease-second", "event_type": "PARTIAL_FILL", "source_sequence": 2, "timestamp_utc": "2026-01-01T00:00:02Z", "requested_qty": "10", "fill_qty": "3", "remaining_qty": "7"}
+    ],
+    "fill_overfill": [
+      {"event_id": "overfill-placed", "event_type": "PLACED", "source_sequence": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "requested_qty": "10", "remaining_qty": "10"},
+      {"event_id": "overfill-full", "event_type": "FULL_FILL", "source_sequence": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "requested_qty": "10", "fill_qty": "11", "remaining_qty": "0"}
+    ]
+  }
+}

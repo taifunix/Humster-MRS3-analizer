@@ -199,6 +199,19 @@ def test_evaluation_keeps_execution_and_decision_campaigns_separate(tmp_path: Pa
     assert row["decision_campaign_id"] == decision
 
 
+def test_evaluation_replay_is_idempotent_and_conflicting_correction_does_not_rewrite_history(tmp_path: Path) -> None:
+    store = PortfolioStore(tmp_path / "portfolio.duckdb")
+    execution = store.create_campaign("execution", "ed", "execution")
+    decision = store.create_campaign("decision", "dd", "decision")
+    store.create_trading_run("run", execution, "run-payload")
+    assert store.create_evaluation("evaluation", "run", decision, {"value": "v1"}) == "evaluation"
+    assert store.create_evaluation("evaluation", "run", decision, {"value": "v1"}) == "evaluation"
+    before = store.get_evaluation("evaluation")
+    with pytest.raises(PortfolioStoreError, match="identity mismatch"):
+        store.create_evaluation("evaluation", "run", decision, {"value": "v2"})
+    assert store.get_evaluation("evaluation") == before
+
+
 def test_portfolio_set_supports_empty_members_order_and_idempotent_recreation(
     tmp_path: Path,
 ) -> None:

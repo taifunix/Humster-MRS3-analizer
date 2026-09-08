@@ -68,6 +68,27 @@ def test_margin_keeps_position_and_order_components_and_combined_exposure_tier()
     assert result.components[0].evidence.denominator == Decimal("600")
 
 
+def test_decimal_margin_facts_replay_to_identical_canonical_outputs():
+    kwargs = dict(
+        positions=[Position("BTCUSDT", "LONG", "1", "100")],
+        tiers=TIERS,
+        leverage={"BTCUSDT": Decimal("10")},
+        leverage_steps={"BTCUSDT": Decimal("1")},
+        fees=FEES,
+        margin_balance=Decimal("1000"),
+        collateral_haircut=Decimal("0.10"),
+        order_loss=Decimal("0.20"),
+    )
+    decimal_result = margin(**kwargs)
+    string_result = margin(**{**kwargs, "leverage_steps": {"BTCUSDT": "1"}, "margin_balance": "1000", "collateral_haircut": "0.10", "order_loss": "0.20"})
+    assert decimal_result.status == string_result.status == PASS
+    assert decimal_result.total_im == string_result.total_im
+    assert decimal_result.total_mm == string_result.total_mm
+    assert decimal_result.order_loss_evidence.value == Decimal("0.20")
+    assert decimal_result.collateral_haircut_evidence.value == Decimal("0.10")
+    assert decimal_result.fee_evidence.value == string_result.fee_evidence.value
+
+
 def test_missing_fee_or_nonpositive_denominator_is_unknown_and_never_zero():
     no_fee = margin([Position("BTCUSDT", "LONG", "1", "100")], tiers=TIERS, leverage={"BTCUSDT": Decimal("50")}, leverage_steps={"BTCUSDT": "1"}, margin_balance=Decimal("1000"), collateral_haircut="0", order_loss="0")
     assert no_fee.status == UNKNOWN and no_fee.reason == "FEE_RATE_UNKNOWN"

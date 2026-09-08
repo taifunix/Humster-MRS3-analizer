@@ -1654,3 +1654,18 @@ button, but its backend work is now incremental.
 
 Evidence: focused selection/panel/retest/review tests — `201 passed`; `node --check
 src/mrs3/panel_web/app.js`; `git diff --check`.
+
+## Portfolio Optimizer Phase 2A accepted; Phase 2B started (2026-09-08)
+
+Phase 2A fixture execution research passed independent Opus review and is
+accepted at the `RESEARCH_ONLY` fixture boundary. Focused verification is
+`67 passed`; the required execution/liquidity/margin/store set is `280 passed`.
+The full suite produced `3327 passed, 7 skipped` and one pre-existing local HTTP
+timeout whose exact isolated rerun passed. Evidence is recorded in
+`docs/superpowers/plans/2026-09-08-portfolio-optimizer-phase2a-evidence.md`.
+
+Revision 6 of the Phase 2B fixture/fake read-only monitor contract is
+`PLAN_APPROVED`. The next implementation step is its isolated LiveStore slice,
+followed by reconcile, monitor/order projection, exact charts and the separate
+Panel slice. Real REST/WS, credentials, tester execution, notifications,
+trading, admission and deployment remain blocked pending separate authorization.

@@ -556,22 +556,25 @@ mandatory evidence. Реальный E2E не считается выполне�
 Relevant broader: `tests/test_performance_v2_*.py`, panel Performance tests,
 `tests/runner`, затронутые collector tests; конкретный набор фиксируется по diff.
 
-## 6. Phase 2A — advanced liquidity/margin
+## 6. Phase 2A — advanced liquidity/margin, принята на fixtures
 
 **Spec:** §11. **Entry:** работающий Phase 1 хотя бы в статусе `RESEARCH_ONLY`
 и новые execution facts. Phase 2A не является prerequisite для MVP READY;
 отдельное уточнение схемы и плана требуется до изменения поведения.
 
-- [ ] Requested/filled, time-to-first/full-fill, partial counts и remaining quantity.
-- [ ] Размерные degradation curves по symbol/side/TF, затем time regimes.
-- [ ] Placement/replace/cancel/reduce-only lifecycle и более точный active-order reserve.
-- [ ] Уточнённые Order Loss/haircuts/borrow/close fees только при наличии данных.
-- [ ] Correlated shocks, liquidity/leverage deterioration и simultaneous deepest fills.
-- [ ] Сравнение proxy и empirical bounds с confidence/применимостью и версиями.
+- [x] Requested/filled, time-to-first/full-fill, partial counts и remaining quantity.
+- [x] Размерные degradation curves по symbol/side/TF, затем time regimes.
+- [x] Placement/replace/cancel/reduce-only lifecycle и более точный active-order reserve.
+- [x] Уточнённые Order Loss/haircuts/borrow/close fees только при наличии данных.
+- [x] Correlated shocks, liquidity/leverage deterioration и simultaneous deepest fills.
+- [x] Сравнение proxy и empirical bounds с confidence/применимостью и версиями.
 
 **DoD:** missing requested не даёт fill ratio; calibration не меняет старые
 evaluations; новую sizing-рекомендацию подтверждает joint retest. Multi-overflow
 и грубая общая liquidity-проверка не откладываются сюда из MVP.
+
+Fixture boundary принята после Opus `CODE_REVIEW_PASS`; evidence:
+[Phase 2A ledger](2026-09-08-portfolio-optimizer-phase2a-evidence.md).
 
 ## 7. Phase 2B — read-only Live Account Monitor
 

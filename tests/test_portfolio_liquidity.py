@@ -394,6 +394,18 @@ def test_exit_mapping_is_opposite_and_empirical_capacity_stays_open() -> None:
     assert capacity.status == "UNKNOWN" and capacity.reason == "OPEN_POLICY" and capacity.content_digest
 
 
+def test_empirical_capacity_decimal_proxy_replay_keeps_canonical_digest() -> None:
+    decimal_facts = {
+        "proxy_capacity": Decimal("100.25"),
+        "borrow": Decimal("2.5"),
+        "active_order_reserve": Decimal("10"),
+    }
+    before = empirical_capacity(decimal_facts)
+    after = empirical_capacity(dict(decimal_facts))
+    assert before.status == after.status == "UNKNOWN"
+    assert before.content_digest == after.content_digest
+
+
 def test_omitted_now_is_never_treated_as_fresh() -> None:
     rows = _dense_rows({"symbol": "BTCUSDT", "bid_depth_usdt_10bps_p05": "1000", "bid_depth_10bps_complete_ratio": "1", "coverage_ratio": "1"})
     kwargs = dict(
