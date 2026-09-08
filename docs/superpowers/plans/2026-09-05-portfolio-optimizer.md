@@ -591,6 +591,13 @@ account credentials; storage/reconcile контракт уточняется п�
 - [ ] Не иметь market-close/trading permission и не менять bot config.
 - [ ] Сохранять исторические данные ПНЛ и других исторических показателей по каждой стратегии локально для ускорения при новом старте а так-же сохранения данных превышающих период доступный для хранения на бирже.
 
+Implementation slices:
+
+- [x] Отдельный fixture-only LiveStore и immutable secret-free manifest;
+  [evidence](2026-09-08-portfolio-optimizer-phase2b-store-evidence.md).
+- [ ] Reconcile, monitor/read models, order projection и exact charts.
+- [ ] Отдельная Panel visualization после принятого server evidence.
+
 **DoD:** REST/WS duplicate/reconnect/stale fixtures, L0 и priority0 без false
 alarms, фактические forced closes отличимы от неизвестных; отсутствие позиции
 не выдаётся за отсутствующую стратегию. Monitor не исполняет аварийных команд.

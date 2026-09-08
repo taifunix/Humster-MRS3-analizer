@@ -1669,3 +1669,10 @@ Revision 6 of the Phase 2B fixture/fake read-only monitor contract is
 followed by reconcile, monitor/order projection, exact charts and the separate
 Panel slice. Real REST/WS, credentials, tester execution, notifications,
 trading, admission and deployment remain blocked pending separate authorization.
+
+The isolated 2B-1 LiveStore slice is accepted after Opus `CODE_REVIEW_PASS`.
+It provides a separate WAL/FK/append-only SQLite history, immutable secret-free
+fixture manifests, canonical Decimal evidence, foreign/baseline DB rejection
+and correction provenance. Root verification: `32 passed` for the store and
+`70 passed` with the provisional monitor/chart regression set. The next step is
+2B-2 complete REST/WS reconcile on fixtures.

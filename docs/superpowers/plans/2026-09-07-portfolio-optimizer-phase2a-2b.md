@@ -311,3 +311,16 @@ The Phase 2B implementation diff may touch only
 `tests/test_panel_portfolio.py`, and `tests/test_panel_static_ui.py` must have
 zero diff and remain byte-identical in this slice. No route registration may be
 added to any existing served application.
+
+## 4. Phase 2B implementation status
+
+- [x] **2B-1 LiveStore/manifest:** accepted after Opus `CODE_REVIEW_PASS`;
+  [evidence](2026-09-08-portfolio-optimizer-phase2b-store-evidence.md).
+- [ ] **2B-2 reconcile:** complete paginated REST, buffered contiguous WS and
+  atomic checkpoint recovery.
+- [ ] **2B-3 monitor/read models:** attribution, cashflow-adjusted metrics,
+  margin timeline and watchdog.
+- [ ] **2B-4 order projection:** explicit ENTRY role and 20-second freshness.
+- [ ] **2B-5 exact charts:** deterministic bounded overview and pure handler.
+- [ ] **2B-9 Panel visualization:** separate implementation and review after
+  accepted server evidence.
