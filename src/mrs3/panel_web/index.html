@@ -19,7 +19,7 @@
         <a href="#source-db" data-screen-link="source-db"><span>02</span>Source DB</a>
         <a href="#surfaces" data-screen-link="surfaces" aria-label="Surfaces / Поверхности"><span>03</span>Поверхности</a>
         <a href="#strategies-dd5" data-screen-link="strategies-dd5" aria-label="Strategies and DD5 / Стратегии и DD5"><span>04</span>Стратегии и DD5</a>
-        <button class="nav-disabled" type="button" disabled aria-disabled="true" tabindex="-1"><span>05</span>Portfolio <em>скоро</em></button>
+        <a href="#portfolio" data-screen-link="portfolio" aria-label="Portfolio Optimizer"><span>05</span>Portfolio Optimizer</a>
       </nav>
       <p class="sidebar-label sidebar-label-settings">Система</p>
       <nav class="workflow-nav" aria-label="Системные разделы">
@@ -157,6 +157,48 @@
         </div>
       </section>
 
+      <section id="portfolio" class="screen" aria-labelledby="portfolio-title" hidden>
+        <div class="screen-heading"><div><p class="eyebrow">MRS3 / STAGE 1</p><h1 id="portfolio-title">Portfolio Optimizer</h1><p class="screen-intro">Create a reproducible Stage 1 campaign from the server's current FINALIST snapshot. The server owns selection, ranking, sizing, and job state.</p></div><span id="portfolio-badge" class="state-badge state-pending">WAITING</span></div>
+        <div class="runner-grid portfolio-grid">
+          <article class="panel-card runner-card" id="portfolio-readiness">
+            <div class="card-heading"><div><span class="card-index">READINESS</span><h2>Input readiness</h2></div><span id="portfolio-readiness-state" class="state-badge state-pending">WAITING</span></div>
+            <div class="card-body">
+              <dl class="portfolio-metrics"><div><dt>Schema</dt><dd id="portfolio-schema-version">—</dd></div><div><dt>Policy</dt><dd id="portfolio-policy-version">—</dd></div><div><dt>Config digest</dt><dd id="portfolio-config-digest">—</dd></div></dl>
+              <p id="portfolio-stage1-state" class="card-status" role="status" aria-live="polite">Readiness is loaded from the server.</p>
+              <ul id="portfolio-blockers" class="portfolio-list"><li>Waiting for readiness.</li></ul>
+              <p id="portfolio-stage2-status" class="card-status" role="status" aria-live="polite">Stage 2 is disabled until separately authorized.</p>
+            </div>
+          </article>
+          <article class="panel-card runner-card" id="portfolio-launch-card">
+            <div class="card-heading"><div><span class="card-index">CAMPAIGN</span><h2>Stage 1 calculation</h2></div><span id="portfolio-lock-badge" class="state-badge state-ready">EDITABLE</span></div>
+            <form id="portfolio-launch-form" class="card-body" onsubmit="return false">
+              <fieldset id="portfolio-pairs-fieldset"><legend>Pairs and directions</legend><p class="helper">Set common maxima, then select pairs from the current server snapshot. Each selected pair receives a copy that can be edited independently. A value of 0 disables that direction.</p><div class="field-grid"><div class="field-group"><label for="portfolio-default-long">Maximum LONG</label><input id="portfolio-default-long" type="number" min="0" step="1" value="0"></div><div class="field-group"><label for="portfolio-default-short">Maximum SHORT</label><input id="portfolio-default-short" type="number" min="0" step="1" value="0"></div></div><div id="portfolio-pairs" class="portfolio-pairs" role="group" aria-label="Portfolio pairs">Waiting for FINALIST pairs.</div></fieldset>
+              <fieldset><legend>Profiles</legend><div id="portfolio-profiles" class="portfolio-profiles">
+                <div class="portfolio-profile"><label class="check"><input id="portfolio-profile-aggressive" type="checkbox" checked><span>AGGRESSIVE</span></label><div class="field-grid"><div class="field-group"><label for="portfolio-equity-aggressive">Equity USDT</label><input id="portfolio-equity-aggressive" type="number" min="0.000000000001" step="any" value="1000"></div><div class="field-group"><label for="portfolio-max-balance-aggressive">Max balance override USDT (optional)</label><input id="portfolio-max-balance-aggressive" type="number" min="0.000000000001" step="any"></div><div class="field-group"><label for="portfolio-candidates-aggressive">Max candidates</label><input id="portfolio-candidates-aggressive" type="number" min="1" step="1" value="10"></div></div></div>
+                <div class="portfolio-profile"><label class="check"><input id="portfolio-profile-balanced" type="checkbox" checked><span>BALANCED</span></label><div class="field-grid"><div class="field-group"><label for="portfolio-equity-balanced">Equity USDT</label><input id="portfolio-equity-balanced" type="number" min="0.000000000001" step="any" value="1000"></div><div class="field-group"><label for="portfolio-max-balance-balanced">Max balance override USDT (optional)</label><input id="portfolio-max-balance-balanced" type="number" min="0.000000000001" step="any"></div><div class="field-group"><label for="portfolio-candidates-balanced">Max candidates</label><input id="portfolio-candidates-balanced" type="number" min="1" step="1" value="10"></div></div></div>
+                <div class="portfolio-profile"><label class="check"><input id="portfolio-profile-conservative" type="checkbox" checked><span>CONSERVATIVE</span></label><div class="field-grid"><div class="field-group"><label for="portfolio-equity-conservative">Equity USDT</label><input id="portfolio-equity-conservative" type="number" min="0.000000000001" step="any" value="1000"></div><div class="field-group"><label for="portfolio-max-balance-conservative">Max balance override USDT (optional)</label><input id="portfolio-max-balance-conservative" type="number" min="0.000000000001" step="any"></div><div class="field-group"><label for="portfolio-candidates-conservative">Max candidates</label><input id="portfolio-candidates-conservative" type="number" min="1" step="1" value="10"></div></div></div>
+              </div></fieldset>
+              <div class="button-row"><button id="portfolio-run" type="button" class="button button-primary" disabled>Calculate variants</button><button id="portfolio-new-calculation" type="button" class="button button-secondary" disabled>New calculation</button></div>
+              <p id="portfolio-form-status" class="card-status" role="status" aria-live="polite">Choose at least one pair and profile.</p>
+            </form>
+          </article>
+        </div>
+        <div class="stack portfolio-stack">
+          <article id="portfolio-job-card" class="panel-card runner-card">
+            <div class="card-heading"><div><span class="card-index">SERVER JOB</span><h2>Calculation progress</h2></div><span id="portfolio-job-state" class="state-badge state-pending">NO JOB</span></div>
+            <div class="card-body"><div class="progress-block"><div class="progress-track"><span id="portfolio-progress-bar" style="width:0%"></span></div><p id="portfolio-progress-text">No calculation is active.</p></div><p id="portfolio-job-status" class="card-status" role="status" aria-live="polite">The active job is restored from the server.</p><div id="portfolio-journal" class="portfolio-journal" aria-live="polite"></div><div class="button-row"><button id="portfolio-cancel" type="button" class="button button-secondary" disabled>Cancel calculation</button></div></div>
+          </article>
+          <article id="portfolio-result-card" class="panel-card runner-card">
+            <div class="card-heading"><div><span class="card-index">RESULT</span><h2>Stage 1 summary</h2></div><span id="portfolio-result-state" class="state-badge state-pending">WAITING</span></div>
+            <div class="card-body"><div id="portfolio-summary" class="portfolio-summary" role="status" aria-live="polite">Results appear only after SUCCEEDED.</div><div id="portfolio-exclusions" class="portfolio-exclusions"></div><a id="portfolio-xlsx" hidden class="button button-primary" download>Download Stage 1 XLSX</a></div>
+          </article>
+          <article id="portfolio-stage2-card" class="panel-card runner-card">
+            <div class="card-heading"><div><span class="card-index">STAGE 2</span><h2>Tester handoff</h2></div><span class="state-badge state-pending">DISABLED</span></div>
+            <div class="card-body"><p id="portfolio-stage2-reason" class="card-status" role="status" aria-live="polite">PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED</p><button id="portfolio-stage2-submit" type="button" class="button button-secondary" disabled aria-disabled="true" tabindex="-1" aria-describedby="portfolio-stage2-reason">Submit to tester</button></div>
+          </article>
+        </div>
+      </section>
+
       <section id="settings" class="screen" aria-labelledby="settings-title" hidden>
         <div class="screen-heading"><div><p class="eyebrow">SYSTEM · SAFE DEFAULTS</p><h1 id="settings-title">Настройки</h1><p class="screen-intro">Постоянные пути и профили. Подключение и секреты остаются в локальном config и не отображаются в панели.</p></div><span class="state-badge state-ready">LOCAL ONLY</span></div>
         <form aria-label="Настройки панели" class="stack" onsubmit="return false">
@@ -164,6 +206,10 @@
           <details class="panel-card accordion"><summary><span><b>Local runner</b><small>рабочий default</small></span><span class="state-badge state-ready">SAFE</span></summary><div class="card-body details-content"><div class="field-group"><label for="settings-local-runner">Локальный runner</label><input id="settings-local-runner" type="text" value="D:\\HamsterBot\\runner"></div><div class="button-row"><button type="button" class="button button-secondary" data-pending="Проверка локального runner ожидает backend">Проверить runner</button><button type="button" class="button button-secondary" data-pending="Сохранение локального runner ожидает backend">Сохранить local runner</button></div></div></details>
           <details class="panel-card accordion"><summary><span><b>Данные и output</b><small>корневые каталоги</small></span><span class="state-badge state-ready">SAFE</span></summary><div class="card-body details-content"><div class="field-group"><label for="settings-source-root">Source DB root</label><input id="settings-source-root" type="text" value="D:\\MRS3\\output\\source-v6"></div><div class="field-group"><label for="settings-output-root">Output root</label><input id="settings-output-root" type="text" value="D:\\MRS3\\output"></div><div class="button-row"><button type="button" class="button button-secondary" data-pending="Проверка output paths ожидает backend">Проверить пути</button><button type="button" class="button button-secondary" data-pending="Сохранение output paths ожидает backend">Сохранить output paths</button></div></div></details>
           <details class="panel-card accordion"><summary><span><b>Профиль анализа</b><small>canonical inputs</small></span><span class="state-badge state-ready">SAFE</span></summary><div class="card-body details-content"><div class="field-group"><label for="settings-dates">Listing dates path</label><input id="settings-dates" type="text" value="D:\\MRS3\\config\\dates.xlsx"></div><div class="field-group"><label for="settings-algorithm">Algorithm version</label><input id="settings-algorithm" type="text" value="0.7-canonical-phase1"></div><div class="field-grid"><div class="field-group"><label for="settings-workers">Import workers</label><input id="settings-workers" type="number" min="1" value="30"></div><div class="field-group"><label for="settings-batch">Transaction batch size</label><input id="settings-batch" type="number" min="1" value="5000"></div></div><div class="button-row"><button type="button" class="button button-primary" data-pending="Проверка профиля ожидает backend">Проверить профиль</button><button type="button" class="button button-secondary" data-pending="Сохранение профиля ожидает backend">Сохранить профиль</button></div></div></details>
+          <details id="portfolio-settings" class="panel-card accordion">
+            <summary><span><b>Portfolio Optimizer</b><small>accepted v1 document</small></span><span id="portfolio-settings-state" class="state-badge state-pending">WAITING</span></summary>
+            <div class="card-body details-content"><p class="helper">Only fields accepted by the current v1 parser are editable. Unsupported, missing, and invalid documents remain read-only.</p><div class="field-group"><label for="portfolio-settings-document">Portfolio Optimizer settings document</label><textarea id="portfolio-settings-document" rows="18" spellcheck="false" disabled aria-describedby="portfolio-settings-meta"></textarea></div><p id="portfolio-settings-meta" class="card-status" role="status" aria-live="polite">Load settings from the server.</p><div class="button-row"><button id="portfolio-settings-reload" type="button" class="button button-secondary">Reload</button><button id="portfolio-settings-save" type="button" class="button button-primary" disabled>Save</button></div></div>
+          </details>
           <p id="settings-status" class="global-status" aria-live="polite">Settings are local and validated before saving.</p>
         </form>
       </section>

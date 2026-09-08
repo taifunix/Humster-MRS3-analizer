@@ -84,6 +84,11 @@ def _normalize_xlsx_archive(path: Path) -> None:
     normalized.replace(path)
 
 
+def normalize_xlsx_workbook(path: Path) -> None:
+    """Normalize an already-saved workbook using the audit export rules."""
+    _normalize_xlsx_archive(path)
+
+
 def write_audit_workbook(
     tables: Mapping[str, pd.DataFrame], path: Path, *, data_widths_only: bool = False,
     minimum_width: int = 10, hidden_columns: frozenset[str] = frozenset(), decimal_comma: bool = False,

@@ -142,6 +142,21 @@ class PanelJobRegistry:
         state = self.get(job_id)["state"]
         return self.transition(job_id, "CANCELLED" if state == "QUEUED" else "CANCELLING", phase="CANCELLED" if state == "QUEUED" else "CANCELLING")
 
+    def discard_queued(self, job_id: str) -> None:
+        """Remove a job only when submission failed before its worker started."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return
+            if job["state"] != "QUEUED":
+                raise PanelJobError("DISCARD_NOT_ALLOWED")
+            removed = self.jobs.pop(job_id)
+            try:
+                self._save()
+            except BaseException:
+                self.jobs[job_id] = removed
+                raise
+
     def sync(self, job_id: str, status: dict, *, runtime: dict | None = None) -> dict:
         """Persist a redacted worker snapshot; runtime is controller-only recovery data."""
         with self.lock:

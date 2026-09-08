@@ -764,21 +764,23 @@ M8 fixture export/replay is accepted; its separately authorized real joint test 
 - [x] Получить финальный `CODE_REVIEW_PASS` документационного diff.
 - [x] Не изменять код, config, тесты, runtime или tester.
 
-### U1 — реализация Panel, не начата
+### U1 — реализация Panel, реализована локально; финальный review ожидается
 
-U1 планируется ближе к M8 и начинается только после отдельного назначения и
-принятого backend API scope. До кода исполнитель должен:
+U1 начата после отдельного назначения пользователя и достижения зависимостей M8.
+Текущий implementation status:
 
-1. переиспользовать существующие SPA Panel и серверный реестр заданий;
-2. добавить API-адаптер, не копирующий selection/ranking/sizing из
+- [x] Переиспользовать существующие SPA Panel и серверный реестр заданий.
+- [x] Добавить API-адаптер, не копирующий selection/ranking/sizing из
    `src/mrs3/portfolio` и не пишущий в PerformanceDB;
-3. показывать только поля config, принятые текущим parser; nullable config
+- [x] Показывать только поля config, принятые текущим parser; nullable config
    `max_balance` и UI defaults ждать отдельной схемы v2;
-4. реализовать Campaign freeze, одно активное задание, журнал, восстановление
+- [x] Реализовать Campaign freeze, одно активное задание, журнал, восстановление
    страницы, restart→`INTERRUPTED`, безопасную отмену и success-only XLSX;
-5. покрыть API, CAS, rank isolation, прогресс, redaction и lifecycle тестами;
-6. держать передачу тестеру выключенной до принятых M5/M6 и отдельного явного
+- [x] Покрыть API, CAS, rank isolation, прогресс, redaction и lifecycle тестами.
+- [x] Держать передачу тестеру выключенной до принятых M5/M6 и отдельного явного
    разрешения пользователя.
+- [x] Получить финальный независимый `CODE_REVIEW_PASS` через Opus на полном U1 diff.
+- [ ] Создать отдельный scoped conventional commit после review.
 
 U1 не разрешает менять алгоритмы оптимизатора ради удобства интерфейса. Поля и
 кнопки появляются только после принятия соответствующей backend capability.

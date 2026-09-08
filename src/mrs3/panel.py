@@ -161,6 +161,7 @@ from .panel_settings import (
     validate_settings as validate_panel_settings,
 )
 from .panel_jobs import PanelJobError, PanelJobRegistry
+from .panel_portfolio import PortfolioPanelError, PortfolioPanelService
 from .locking import TesterTargetLock
 from .panel_remote_testing import RemoteTestingService, remote_testing_status
 from .panel_remote_source_db import RemoteSourceDbExecutor, RemoteSourceDbError
@@ -1211,6 +1212,12 @@ class PanelController:
         self._performance_v2_schema_ready: set[tuple[str, int, int, int, int, int]] = set()
         self._selection_candidate_cache: OrderedDict[tuple[object, ...], object] = OrderedDict()
         self._panel_jobs = PanelJobRegistry(self.root / ".panel-jobs.json")
+        self._portfolio_service = PortfolioPanelService(
+            self.root,
+            self.root / "portfolio_optimizer.local.json",
+            registry=self._panel_jobs,
+            lock=self._lock,
+        )
         self._local_testing_filled = False
         self._remote_testing_filled = False
         self._local_testing_service_instance: LocalTestingService | None = None
@@ -1690,6 +1697,36 @@ class PanelController:
 
     def panel_jobs(self) -> list[dict]:
         return self._panel_jobs.list()
+
+    def portfolio_readiness(self) -> dict[str, object]:
+        return self._portfolio_service.readiness()
+
+    def portfolio_settings_get(self) -> dict[str, object]:
+        return self._portfolio_service.settings_get()
+
+    def portfolio_settings_put(self, payload: Mapping[str, object]) -> dict[str, object]:
+        return self._portfolio_service.settings_put(payload)
+
+    def portfolio_submit_campaign(self, payload: Mapping[str, object]) -> dict[str, object]:
+        return self._portfolio_service.submit_campaign(payload)
+
+    def portfolio_active_job(self) -> dict[str, object] | None:
+        return self._portfolio_service.active_job()
+
+    def portfolio_job(self, job_id: str) -> dict[str, object]:
+        return self._portfolio_service.job(job_id)
+
+    def portfolio_cancel(self, job_id: str) -> dict[str, object]:
+        return self._portfolio_service.cancel(job_id)
+
+    def portfolio_results(self, campaign_id: str) -> dict[str, object]:
+        return self._portfolio_service.results(campaign_id)
+
+    def portfolio_workbook(self, campaign_id: str) -> bytes:
+        return self._portfolio_service.workbook(campaign_id)
+
+    def portfolio_tester_submission(self, campaign_id: str, payload: Mapping[str, object]) -> dict[str, object]:
+        return self._portfolio_service.submit_tester_submission(campaign_id, payload)
 
     def has_active_panel_jobs(self) -> bool:
         if any(job["state"] not in {"COMMITTED", "CANCELLED", "FAILED"} for job in self.panel_jobs()):
@@ -6318,6 +6355,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
         self._headers(status, "application/json; charset=utf-8", len(payload))
         self.wfile.write(payload)
 
+    def _portfolio_error(self, error: PortfolioPanelError) -> None:
+        self._json(error.status, {"error": {"code": error.code, "message": str(error), "field_errors": error.field_errors}})
+
     def _has_local_host(self) -> bool:
         host = self.headers.get("Host", "").casefold()
         port = self.server.server_port
@@ -6364,6 +6404,54 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/v2/bootstrap":
             self._json(200, self.server.controller.panel_bootstrap())
+            return
+        if parsed.path == "/api/v2/portfolio/readiness":
+            try:
+                self._json(200, self.server.controller.portfolio_readiness())
+            except PortfolioPanelError as error:
+                self._portfolio_error(error)
+            return
+        if parsed.path == "/api/v2/portfolio/settings":
+            try:
+                self._json(200, self.server.controller.portfolio_settings_get())
+            except PortfolioPanelError as error:
+                self._portfolio_error(error)
+            return
+        if parsed.path == "/api/v2/portfolio/jobs/active":
+            try:
+                self._json(200, {"job": self.server.controller.portfolio_active_job()})
+            except PortfolioPanelError as error:
+                self._portfolio_error(error)
+            return
+        portfolio_job_match = re.fullmatch(r"/api/v2/portfolio/jobs/([^/]+)", parsed.path)
+        if portfolio_job_match:
+            try:
+                self._json(200, {"job": self.server.controller.portfolio_job(portfolio_job_match.group(1))})
+            except PortfolioPanelError as error:
+                self._portfolio_error(error)
+            return
+        portfolio_result_match = re.fullmatch(r"/api/v2/portfolio/campaigns/([^/]+)/results", parsed.path)
+        if portfolio_result_match:
+            try:
+                self._json(200, self.server.controller.portfolio_results(portfolio_result_match.group(1)))
+            except PortfolioPanelError as error:
+                self._portfolio_error(error)
+            return
+        portfolio_workbook_match = re.fullmatch(r"/api/v2/portfolio/campaigns/([^/]+)/stage1\.xlsx", parsed.path)
+        if portfolio_workbook_match:
+            try:
+                data = self.server.controller.portfolio_workbook(portfolio_workbook_match.group(1))
+            except PortfolioPanelError as error:
+                self._portfolio_error(error)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", 'attachment; filename="stage1.xlsx"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
             return
         if parsed.path == "/api/v2/settings/reload":
             try:
@@ -6543,6 +6631,36 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         self._json(404, {"error": "not found"})
 
+    def do_PUT(self) -> None:
+        if not self._has_local_host():
+            self._json(403, {"error": "local Host header required"})
+            return
+        if urlparse(self.path).path != "/api/v2/portfolio/settings":
+            self._json(404, {"error": "not found"})
+            return
+        if self.headers.get("Content-Type", "").partition(";")[0].strip().casefold() != "application/json":
+            self._portfolio_error(PortfolioPanelError("CONFIG_INVALID", "Content-Type must be application/json", status=415))
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 65536:
+            self._portfolio_error(PortfolioPanelError("CONFIG_INVALID", "invalid JSON body length", status=400))
+            return
+        try:
+            document = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(document, dict):
+                raise ValueError("JSON body must be an object")
+            result = self.server.controller.portfolio_settings_put(document)
+        except PortfolioPanelError as error:
+            self._portfolio_error(error)
+            return
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            self._portfolio_error(PortfolioPanelError("CONFIG_INVALID", "portfolio settings are invalid", status=422))
+            return
+        self._json(200, result)
+
     def do_POST(self) -> None:
         if not self._has_local_host():
             self._json(403, {"error": "local Host header required"})
@@ -6555,8 +6673,14 @@ class _PanelHandler(BaseHTTPRequestHandler):
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"}:
+        portfolio_route = endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
+        portfolio_cancel_route = bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint))
+        portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
+        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
             self._json(404, {"error": "not found"})
+            return
+        if portfolio_submission_route:
+            self._portfolio_error(PortfolioPanelError("PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED", "stage 2 is not authorized", status=409))
             return
         if endpoint == "/api/v2/strategies/performance-v2/selection-review-import":
             if self.headers.get("Content-Type", "").partition(";")[0].strip().casefold() != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
@@ -6578,6 +6702,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         content_type = self.headers.get("Content-Type", "").partition(";")[0]
         if content_type.strip().casefold() != "application/json":
+            if portfolio_route:
+                code = "PORTFOLIO_JOB_CANCEL_INVALID" if portfolio_cancel_route else "PORTFOLIO_CAMPAIGN_INVALID"
+                self._portfolio_error(PortfolioPanelError(code, "portfolio request is invalid", status=415))
+                return
             self._json(400 if performance_v2_windows_endpoint else 415, {"error": {"code": "INVALID_REQUEST", "message": "Content-Type must be application/json"}} if performance_v2_windows_endpoint else ({"error": "Content-Type must be application/json"} if fresh_generation else (
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "Content-Type must be application/json"}
             )))
@@ -6591,6 +6719,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
             )))
             return
         if length <= 0 or length > max_body_length:
+            if portfolio_route:
+                code = "PORTFOLIO_JOB_CANCEL_INVALID" if portfolio_cancel_route else "PORTFOLIO_CAMPAIGN_INVALID"
+                self._portfolio_error(PortfolioPanelError(code, "portfolio request is invalid", status=400))
+                return
             self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid JSON body length"}} if performance_v2_windows_endpoint else ({"error": f"JSON body must be between 1 and {max_body_length} bytes"} if fresh_generation else (
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "JSON body must be between 1 and 65536 bytes"}
             )))
@@ -6599,6 +6731,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             document = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(document, dict):
                 raise ValueError("JSON body must be an object")
+            portfolio_campaign_match = endpoint == "/api/v2/portfolio/campaigns"
+            portfolio_cancel_match = re.fullmatch(r"/api/v2/portfolio/jobs/([^/]+)/cancel", endpoint)
+            portfolio_submission_match = re.fullmatch(r"/api/v2/portfolio/campaigns/([^/]+)/tester-submissions", endpoint)
             if direct_retest_endpoint is not None:
                 document = {
                     "kind": "strategies.performance.v2.retest.start"
@@ -6606,7 +6741,13 @@ class _PanelHandler(BaseHTTPRequestHandler):
                     else "strategies.performance.v2.retest.import",
                     "request": document,
                 }
-            if endpoint == "/api/v2/panel/restart":
+            if portfolio_campaign_match:
+                result = self.server.controller.portfolio_submit_campaign(document)
+            elif portfolio_cancel_match:
+                result = self.server.controller.portfolio_cancel(portfolio_cancel_match.group(1))
+            elif portfolio_submission_match:
+                result = self.server.controller.portfolio_tester_submission(portfolio_submission_match.group(1), document)
+            elif endpoint == "/api/v2/panel/restart":
                 result = self.server.restart_panel()
             elif endpoint == "/api/v2/strategies/tester/verify-inbox":
                 result = self.server.controller.strategies_tester_verify_inbox(self.server.controller._required(document, "job_id"))
@@ -6755,6 +6896,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             else:
                 action = str(document.get("action", ""))
                 result = self.server.controller.start(action, document)
+        except PortfolioPanelError as error:
+            self._portfolio_error(error)
+            return
         except PanelJobError as error:
             self._json(409 if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED", "IDEMPOTENCY_CONFLICT", "RESTART_BLOCKED"} else 400, {"error": error.code})
             return
@@ -6765,7 +6909,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(409, {"error": _fresh_generation_error(error)} if endpoint == "/api/v2/strategies/fresh/generate" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
             return
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-            if performance_v2_windows_endpoint:
+            if portfolio_route:
+                code = "PORTFOLIO_JOB_CANCEL_INVALID" if portfolio_cancel_route else "PORTFOLIO_CAMPAIGN_INVALID"
+                self._portfolio_error(PortfolioPanelError(code, "portfolio request is invalid", status=422))
+            elif performance_v2_windows_endpoint:
                 self._json(400, {"error": {"code": "INVALID_REQUEST", "message": str(error)}})
             elif direct_retest_endpoint is not None:
                 self._json(400, {"error": str(error)})
@@ -6791,7 +6938,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        self._json(202 if endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} else 200, result)
+        accepted = portfolio_cancel_route or endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/portfolio/campaigns"}
+        self._json(202 if accepted else 200, result)
 
 
 def create_panel_server(

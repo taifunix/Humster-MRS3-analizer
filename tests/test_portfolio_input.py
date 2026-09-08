@@ -16,8 +16,11 @@ from mrs3.portfolio import input as portfolio_input
 from mrs3.portfolio.input import (
     SOURCE_SNAPSHOT_UNAVAILABLE,
     DecisionCampaign,
+    apply_finalist_cutoff,
     PortfolioInputError,
     fresh_decision_campaign,
+    read_and_select_finalists,
+    read_current_finalists,
     read_performance_snapshot,
 )
 from mrs3.portfolio.store import PortfolioStore
@@ -740,4 +743,153 @@ def test_concurrent_writer_is_consistent_or_fails_closed(tmp_path: Path) -> None
 def test_unavailable_source_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(PortfolioInputError) as error:
         _snapshot(tmp_path / "missing.duckdb", [REQUEST])
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+
+def _finalist_row(strategy_id: int, symbol: str = "BTCUSDT", side: str = "LONG", rank: int | None = None, *, auto_rank: int | None = 1) -> dict[str, object]:
+    return {
+        "strategy_id": strategy_id,
+        "result_id": strategy_id + 100,
+        "symbol": symbol,
+        "side": side,
+        "user_status": "FINALIST",
+        "user_rank": rank,
+        "auto_rank": auto_rank,
+    }
+
+
+def test_finalist_cutoff_applies_pair_direction_rules_independently() -> None:
+    rows = [
+        _finalist_row(1), _finalist_row(2),
+        _finalist_row(4, side="SHORT"),
+    ]
+
+    result = apply_finalist_cutoff(
+        rows,
+        selected_pairs={("BTCUSDT", "LONG"), ("BTCUSDT", "SHORT")},
+        maximums={("BTCUSDT", "LONG"): 2, ("BTCUSDT", "SHORT"): 0},
+    )
+
+    assert [row["selection_status"] for row in result[:2]] == ["SELECTED", "SELECTED"]
+    assert all(row["selection_reason"] == "WITHIN_MAXIMUM" for row in result[:2])
+    assert result[2]["selection_status"] == "EXCLUDED"
+    assert result[2]["selection_reason"] == "DIRECTION_DISABLED"
+
+
+def test_finalist_cutoff_uses_user_rank_only_and_marks_cutoff_rows() -> None:
+    rows = [_finalist_row(1, rank=3, auto_rank=1), _finalist_row(2, rank=1, auto_rank=999), _finalist_row(3, rank=2, auto_rank=2)]
+
+    result = apply_finalist_cutoff(
+        rows,
+        selected_pairs={("BTCUSDT", "LONG")},
+        maximums={("BTCUSDT", "LONG"): 2},
+    )
+
+    assert [row["selection_status"] for row in result] == ["EXCLUDED", "SELECTED", "SELECTED"]
+    assert result[0]["selection_reason"] == "USER_RANK_CUTOFF"
+    assert result[1]["user_rank"] == 1
+
+
+def test_finalist_cutoff_accepts_missing_rank_when_count_is_within_maximum() -> None:
+    result = apply_finalist_cutoff(
+        [_finalist_row(1), _finalist_row(2, rank=2)],
+        selected_pairs={("BTCUSDT", "LONG")},
+        maximums={("BTCUSDT", "LONG"): 2},
+    )
+
+    assert all(row["selection_status"] == "SELECTED" for row in result)
+
+
+@pytest.mark.parametrize(
+    ("rows", "reason"),
+    [
+        ([_finalist_row(1), _finalist_row(2, rank=1)], "USER_RANK_MISSING"),
+        ([_finalist_row(1, rank=1), _finalist_row(2, rank=1)], "USER_RANK_DUPLICATE"),
+    ],
+)
+def test_finalist_cutoff_blocks_only_invalid_pair_direction(rows: list[dict[str, object]], reason: str) -> None:
+    rows.append(_finalist_row(3, side="SHORT", rank=1))
+
+    result = apply_finalist_cutoff(
+        rows,
+        selected_pairs={("BTCUSDT", "LONG"), ("BTCUSDT", "SHORT")},
+        maximums={("BTCUSDT", "LONG"): 1, ("BTCUSDT", "SHORT"): 1},
+    )
+
+    assert [row["selection_reason"] for row in result[:2]] == [reason, reason]
+    assert result[2]["selection_status"] == "SELECTED"
+
+
+def test_finalist_cutoff_marks_unselected_pair_and_preserves_input_order() -> None:
+    rows = [_finalist_row(2), _finalist_row(1)]
+
+    result = apply_finalist_cutoff(
+        rows,
+        selected_pairs=set(),
+        maximums={("BTCUSDT", "LONG"): 1},
+    )
+
+    assert [row["strategy_id"] for row in result] == [2, 1]
+    assert all(row["selection_reason"] == "PAIR_UNSELECTED" for row in result)
+
+
+def test_read_current_finalists_returns_exact_review_facts_without_writes(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    before = database.read_bytes()
+
+    rows = read_current_finalists(database, [("BTCUSDT", "LONG")])
+
+    assert rows == ({
+        "strategy_id": rows[0]["strategy_id"],
+        "result_id": rows[0]["result_id"],
+        "strategy_name": "alpha",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "user_status": "FINALIST",
+        "user_rank": 1,
+    },)
+    assert database.read_bytes() == before
+
+
+def test_read_and_select_finalists_uses_current_user_rank(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    result = read_and_select_finalists(
+        database,
+        selected_pairs={("BTCUSDT", "LONG")},
+        maximums={("BTCUSDT", "LONG"): 1},
+    )
+
+    assert result[0]["user_status"] == "FINALIST"
+    assert result[0]["user_rank"] == 1
+    assert result[0]["effective_maximum"] == 1
+    assert result[0]["selection_status"] == "SELECTED"
+
+
+def test_read_and_select_finalists_reads_selected_direction_without_explicit_maximum(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+
+    result = read_and_select_finalists(
+        database,
+        selected_pairs={("BTCUSDT", "LONG")},
+        maximums={},
+    )
+
+    assert len(result) == 1
+    assert result[0]["selection_status"] == "EXCLUDED"
+    assert result[0]["selection_reason"] == "DIRECTION_DISABLED"
+
+
+def test_read_current_finalists_uses_exact_current_status_and_fails_closed_on_stale_result(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("update selection_review_rows set user_status = 'RESERVE'")
+    assert read_current_finalists(database, [("BTCUSDT", "LONG")]) == ()
+
+    stale_path = tmp_path / "stale"
+    stale_path.mkdir()
+    database = _database(stale_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("update strategies set current_result_id = current_result_id + 1")
+    with pytest.raises(PortfolioInputError) as error:
+        read_current_finalists(database, [("BTCUSDT", "LONG")])
     assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE

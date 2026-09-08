@@ -241,7 +241,10 @@
   }
 
   function routeFromHash() {
-    showScreen(window.location.hash.slice(1) || 'testing');
+    const id = window.location.hash.slice(1) || 'testing';
+    showScreen(id);
+    if (id === 'portfolio') loadPortfolioScreen();
+    if (id === 'settings') loadPortfolioSettings();
   }
 
   links.forEach((link) => link.addEventListener('click', () => showScreen(link.dataset.screenLink, true)));
@@ -2402,6 +2405,281 @@
       } catch (_) { if (settingsStatus) settingsStatus.textContent = 'Settings operation failed.'; }
     });
   });
+  function portfolioErrorMessage(error) {
+    return error?.code ? `${error.code}: ${error.message || ''}`.trim() : (error?.message || 'request failed');
+  }
+
+  function portfolioValues(value) {
+    if (Array.isArray(value)) return value;
+    if (value && typeof value === 'object') return Object.values(value);
+    return [];
+  }
+
+  function portfolioPairRows(readiness) {
+    const source = readiness?.available_pairs || readiness?.pairs || readiness?.stage1?.available_pairs || readiness?.stage1?.pairs || [];
+    const finalistCounts = readiness?.current_finalists || readiness?.stage1?.current_finalists || {};
+    const grouped = new Map();
+    const items = Array.isArray(source) ? source : Object.entries(source || {}).map(([pair, item]) => ({ ...(item && typeof item === 'object' ? item : {}), pair: item?.pair || pair }));
+    for (const item of items) {
+      if (typeof item !== 'string' || !item.includes('|')) continue;
+      const [pair, side] = item.split('|'); const row = grouped.get(pair) || { pair, finalistLong: 0, finalistShort: 0, long: 0, short: 0, selected: false };
+      row[`finalist${side[0]}${side.slice(1).toLowerCase()}`] = Number(finalistCounts[item] || 0); grouped.set(pair, row);
+    }
+    const normalItems = grouped.size ? [...grouped.values()] : items;
+    return normalItems.map((item) => {
+      const row = typeof item === 'string' ? { pair: item } : (item || {});
+      const counts = row.finalist_counts || row.counts || {};
+      const long = Number(row.current_finalist_long ?? row.finalist_long ?? row.finalistLong ?? counts.LONG ?? counts.long ?? 0);
+      const short = Number(row.current_finalist_short ?? row.finalist_short ?? row.finalistShort ?? counts.SHORT ?? counts.short ?? 0);
+      return { pair: String(row.pair || row.symbol || row.name || ''), finalistLong: Number.isFinite(long) ? Math.max(0, long) : 0, finalistShort: Number.isFinite(short) ? Math.max(0, short) : 0, long: Number(row.max_finalist_long ?? 0), short: Number(row.max_finalist_short ?? 0), selected: row.selected === true };
+    }).filter((row) => row.pair);
+  }
+
+  function loadPortfolioScreen() {
+    if (!loadPortfolioScreen.state) {
+      const state = { pairRows: [], readiness: null, configDigest: null, activeJobId: '', job: null, poller: 0, initialized: true, locked: false, renderedJobId: '', renderedPercent: 0, settingsChanged: false, refreshPromise: null };
+      const portfolioJobEndpoint = '/api/v2/portfolio/jobs/';
+      const query = (selector) => document.querySelector(selector);
+      const runButton = query('#portfolio-run');
+      const newButton = query('#portfolio-new-calculation');
+      const cancelButton = query('#portfolio-cancel');
+      const formStatus = query('#portfolio-form-status');
+      const setBadge = (selector, value, kind = 'pending') => {
+        const node = query(selector);
+        if (node) { node.className = `state-badge state-${kind}`; node.textContent = value; }
+      };
+      const text = (selector, value) => { const node = query(selector); if (node) node.textContent = value == null || value === '' ? '—' : String(value); };
+      const terminal = (job) => ['SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(String(job?.status || job?.state || '').toUpperCase());
+      const statusOf = (job) => String(job?.status || job?.state || 'WAITING').toUpperCase();
+      const portfolioDecimal = (value) => {
+        const raw = String(value ?? '').trim(); const match = /^(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(raw);
+        if (!match || (!match[1] && !match[2])) return false;
+        const exponent = Number(match[3] || 0); if (!Number.isSafeInteger(exponent)) return false;
+        let digits = `${match[1]}${match[2] || ''}`.replace(/^0+/, ''); let scale = (match[2] || '').length - exponent;
+        while (digits.endsWith('0') && scale > 0) { digits = digits.slice(0, -1); scale -= 1; }
+        return digits !== '' && Math.max(scale, 0) <= 12 && Math.max(digits.length - scale, 0) <= 26;
+      };
+      const portfolioSafeInteger = (value, minimum = 0) => { const raw = String(value ?? '').trim(); const number = Number(raw); return raw !== '' && Number.isSafeInteger(number) && number >= minimum; };
+      const copyPortfolioMaximum = (selector) => { const value = query(selector)?.value; return portfolioSafeInteger(value, 0) ? Number(value) : 0; };
+      const portfolioBudget = (readiness) => {
+        const candidates = [readiness?.search?.total_test_budget, readiness?.stage1?.search?.total_test_budget, readiness?.total_test_budget, readiness?.search_total_test_budget, readiness?.stage1?.total_test_budget];
+        for (const value of candidates) if (portfolioSafeInteger(value, 1)) return Number(value);
+        return null;
+      };
+      const freezeStatus = (status) => `${status}${state.settingsChanged ? ' · SETTINGS_CHANGED_SINCE_FREEZE' : ''}`;
+      const updateFreezeStatus = (job) => {
+        const changed = job?.settings_changed_since_freeze === true || (state.configDigest && job?.config_digest && state.configDigest !== job.config_digest);
+        if (changed) state.settingsChanged = true;
+      };
+      const portfolioLaunchForm = () => {
+        const rows = state.pairRows.map((row) => ({ ...row }));
+        const byPair = new Map(rows.map((row) => [row.pair, row]));
+        const pairInputs = query('#portfolio-pairs')?.querySelectorAll('input[data-portfolio-side]') || [];
+        let pairFieldsValid = rows.length > 0;
+        for (const input of pairInputs) {
+          const row = byPair.get(input.dataset.portfolioPair); const side = String(input.dataset.portfolioSide || '').toLowerCase();
+          if (!row || !['long', 'short'].includes(side)) continue;
+          const value = Number(input.value); row[side] = value;
+          if (!portfolioSafeInteger(input.value, 0)) pairFieldsValid = false;
+        }
+        const selectedPairs = rows.filter((row) => row.selected);
+        const activePair = selectedPairs.some((row) => row.long > 0 || row.short > 0);
+        const selectedProfiles = ['aggressive', 'balanced', 'conservative'].filter((profile) => query(`#portfolio-profile-${profile}`)?.checked);
+        const budget = portfolioBudget(state.readiness);
+        const profiles = selectedProfiles.map((profile) => {
+          const equity = query(`#portfolio-equity-${profile}`)?.value || '';
+          const maxBalance = query(`#portfolio-max-balance-${profile}`)?.value || '';
+          const candidates = query(`#portfolio-candidates-${profile}`)?.value || '';
+          return { profile, equity, maxBalance, candidates };
+        });
+        const profileBudgetTotal = profiles.reduce((total, profile) => total + (portfolioSafeInteger(profile.candidates, 1) ? Number(profile.candidates) : 0), 0);
+        const profilesValid = profiles.length > 0 && budget !== null && profileBudgetTotal <= budget && profiles.every((profile) => portfolioDecimal(profile.equity) && (!String(profile.maxBalance).trim() || portfolioDecimal(profile.maxBalance)) && portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= budget);
+        return { rows, selectedPairs, activePair, selectedProfiles, profiles, budget, profileBudgetTotal, valid: state.readiness?.stage1?.enabled === true && pairFieldsValid && activePair && profilesValid };
+      };
+      const blockerItems = (readiness) => [
+        ...portfolioValues(readiness?.stage1?.blockers || readiness?.blockers),
+        ...portfolioValues(readiness?.stage2?.blockers).map((value) => `Stage 2: ${value}`),
+      ].map((value) => typeof value === 'string' ? value : (value?.code ? `${value.code}: ${value.message || ''}` : JSON.stringify(value))).filter(Boolean);
+      const renderReadiness = (readiness) => {
+        state.readiness = readiness || {};
+        state.configDigest = readiness?.config_digest ?? readiness?.settings?.digest ?? null;
+        state.pairRows = portfolioPairRows(readiness);
+        text('#portfolio-schema-version', readiness?.schema_version ?? readiness?.settings?.schema_version);
+        text('#portfolio-policy-version', readiness?.policy_version ?? readiness?.settings?.policy_version);
+        text('#portfolio-config-digest', state.configDigest);
+        const stage1 = readiness?.stage1 || {};
+        const stage2 = readiness?.stage2 || {};
+        const stage1Ready = stage1.enabled === true;
+        setBadge('#portfolio-readiness-state', stage1Ready ? 'READY' : 'BLOCKED', stage1Ready ? 'ready' : 'pending');
+        setBadge('#portfolio-badge', stage1Ready ? 'READY' : 'BLOCKED', stage1Ready ? 'ready' : 'pending');
+        text('#portfolio-stage1-state', stage1Ready ? 'Stage 1 is available.' : 'Stage 1 is blocked by server readiness.');
+        const blockers = query('#portfolio-blockers');
+        if (blockers) { blockers.replaceChildren(); for (const reason of blockerItems(readiness)) { const item = document.createElement('li'); item.textContent = reason; blockers.append(item); } if (!blockers.children.length) { const item = document.createElement('li'); item.textContent = 'No readiness blockers reported.'; blockers.append(item); } }
+        const stage2Reasons = portfolioValues(stage2.blockers);
+        text('#portfolio-stage2-status', stage2.enabled === true ? 'Stage 2 capability is reported by the server.' : `Stage 2 disabled: ${stage2Reasons[0] || 'PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED'}`);
+        renderPairs();
+        if (state.job) { updateFreezeStatus(state.job); text('#portfolio-job-status', freezeStatus(statusOf(state.job))); }
+        updateControls();
+      };
+      const renderPairs = () => {
+        const container = query('#portfolio-pairs');
+        if (!container) return;
+        container.replaceChildren();
+        if (!state.pairRows.length) { container.textContent = 'No current FINALIST pairs reported by the server.'; return; }
+        for (const row of state.pairRows) {
+          const card = document.createElement('div'); card.className = 'portfolio-pair';
+          const label = document.createElement('label'); label.className = 'check';
+          const selected = document.createElement('input'); selected.type = 'checkbox'; selected.checked = row.selected; selected.dataset.portfolioPair = row.pair; selected.setAttribute('aria-label', `Select ${row.pair}`);
+          selected.addEventListener('change', () => { row.selected = selected.checked; if (row.selected) { row.long = copyPortfolioMaximum('#portfolio-default-long'); row.short = copyPortfolioMaximum('#portfolio-default-short'); renderPairs(); } updateControls(); });
+          const name = document.createElement('span'); name.textContent = row.pair;
+          const count = document.createElement('small'); count.className = 'portfolio-pair-count'; count.textContent = `FINALIST: LONG ${row.finalistLong} · SHORT ${row.finalistShort}`;
+          label.append(selected, name, count); card.append(label);
+          const grid = document.createElement('div'); grid.className = 'portfolio-pair-grid';
+          for (const [side, countValue] of [['LONG', row.long], ['SHORT', row.short]]) {
+            const field = document.createElement('label'); field.className = 'field-group'; field.textContent = `Maximum ${side}`;
+            const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.step = '1'; input.value = String(countValue); input.dataset.portfolioPair = row.pair; input.dataset.portfolioSide = side; input.setAttribute('aria-label', `${row.pair} maximum ${side}`);
+            input.addEventListener('input', () => { row[side.toLowerCase()] = Number(input.value); updateControls(); }); field.append(input); grid.append(field);
+          }
+          card.append(grid); container.append(card);
+        }
+      };
+      const setLocked = (locked) => {
+        state.locked = locked;
+        const form = query('#portfolio-launch-form');
+        form?.querySelectorAll('input').forEach((input) => { input.disabled = locked; });
+        const fieldsets = form?.querySelectorAll('fieldset'); fieldsets?.forEach((fieldset) => { fieldset.disabled = locked; });
+        runButton.disabled = locked || !(state.readiness?.stage1?.enabled === true);
+        setBadge('#portfolio-lock-badge', locked ? 'FROZEN' : 'EDITABLE', locked ? 'pending' : 'ready');
+        updateControls();
+      };
+      const updateControls = () => {
+        const launch = portfolioLaunchForm();
+        if (formStatus && !state.locked) formStatus.textContent = launch.valid ? 'Ready to freeze this Campaign.' : 'Complete valid pair, direction, profile, and budget fields.';
+        if (runButton) runButton.disabled = state.locked || !launch.valid;
+        const jobTerminal = terminal(state.job);
+        if (newButton) newButton.disabled = !state.locked || !jobTerminal;
+        if (cancelButton) cancelButton.disabled = !state.activeJobId || jobTerminal || ['CANCEL_REQUESTED', 'CANCELLING'].includes(statusOf(state.job));
+      };
+      const renderJournal = (job) => {
+        const journal = query('#portfolio-journal'); if (!journal) return; journal.replaceChildren();
+        const entries = portfolioValues(job?.journal || job?.diagnostics);
+        for (const entry of entries) { const line = document.createElement('p'); const severity = String(entry?.severity || entry?.level || 'INFO').toLowerCase(); line.className = `is-${severity}`; line.textContent = `${entry?.timestamp_utc || entry?.created_at || ''} ${entry?.stage || ''} ${entry?.code || ''} ${entry?.text || entry?.message || entry || ''}`.trim(); journal.append(line); }
+      };
+      const renderResults = async (job) => {
+        const summary = query('#portfolio-summary'); const exclusions = query('#portfolio-exclusions'); const portfolioXlsx = query('#portfolio-xlsx');
+        if (portfolioXlsx) { portfolioXlsx.hidden = true; portfolioXlsx.removeAttribute('href'); }
+        const succeeded = (job && job.status === 'SUCCEEDED') || statusOf(job) === 'SUCCEEDED';
+        if (!job?.campaign_id || !succeeded) { if (summary) summary.textContent = 'Results appear only after SUCCEEDED.'; if (exclusions) exclusions.replaceChildren(); return; }
+        try {
+          const result = await requestJson(`/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/results`);
+          const values = result.summary || result;
+          if (summary) { summary.replaceChildren(); for (const [key, value] of Object.entries(values || {})) { const row = document.createElement('div'); const label = document.createElement('strong'); label.textContent = key; row.append(label, document.createTextNode(`: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`)); summary.append(row); } }
+          if (exclusions) { exclusions.replaceChildren(); for (const item of portfolioValues(result.exclusions || result.blockers)) { const row = document.createElement('div'); row.className = 'portfolio-exclusion'; row.textContent = typeof item === 'string' ? item : `${item.code || item.stage || 'Excluded'}: ${item.message || item.reason || ''}`; exclusions.append(row); } }
+          if (portfolioXlsx && result.workbook_available === true) { portfolioXlsx.href = `/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/stage1.xlsx`; portfolioXlsx.hidden = false; }
+        } catch (error) { if (summary) summary.textContent = `Results unavailable: ${portfolioErrorMessage(error)}`; }
+      };
+      const renderJob = (job) => {
+        state.job = job || null;
+        const statusName = statusOf(job); const stage = job?.stage || {}; const overallPercent = Number(job?.overall_percent); const stagePercent = Number(stage.percent); const overallKnown = Number.isFinite(overallPercent); const stageKnown = Number.isFinite(stagePercent) && stage.total !== undefined && Number.isFinite(Number(stage.total)); const stageIndeterminate = !!job && !stageKnown;
+        if (state.renderedJobId !== job?.job_id) { state.renderedJobId = job?.job_id || ''; state.renderedPercent = 0; state.settingsChanged = false; }
+        updateFreezeStatus(job);
+        text('#portfolio-job-status', job ? freezeStatus(`${statusName}${job.campaign_id ? ` · Campaign ${job.campaign_id}` : ''}`) : 'No calculation is active.');
+        text('#portfolio-progress-text', job ? `${stage.name || stage.index || statusName}${stageIndeterminate ? ' · indeterminate · elapsed time available' : ` · ${Math.max(0, Math.min(100, Math.round(stagePercent)))}%`}` : 'No calculation is active.');
+        const bar = query('#portfolio-progress-bar'); if (bar) { bar.classList.toggle('is-running', stageIndeterminate && !terminal(job)); if (overallKnown) { state.renderedPercent = Math.max(state.renderedPercent, Math.max(0, Math.min(100, overallPercent))); bar.style.width = `${Math.round(state.renderedPercent)}%`; } else if (stageKnown) { state.renderedPercent = Math.max(state.renderedPercent, Math.max(0, Math.min(100, stagePercent))); bar.style.width = `${Math.round(state.renderedPercent)}%`; } else if (!job || terminal(job)) bar.style.width = statusName === 'SUCCEEDED' ? '100%' : '0%'; }
+        setBadge('#portfolio-job-state', job ? statusName : 'NO JOB', statusName === 'SUCCEEDED' ? 'ready' : (job && !terminal(job) ? 'running' : 'pending'));
+        setBadge('#portfolio-result-state', statusName === 'SUCCEEDED' ? 'SUCCEEDED' : (job ? statusName : 'WAITING'), statusName === 'SUCCEEDED' ? 'ready' : 'pending');
+        renderJournal(job); updateControls();
+        if (statusName === 'SUCCEEDED') renderResults(job); else { const xlsx = query('#portfolio-xlsx'); if (xlsx) { xlsx.hidden = true; xlsx.removeAttribute('href'); } }
+      };
+      const pollPortfolioJob = async () => {
+        if (!state.activeJobId) return;
+        try {
+          const payload = await requestJson(`${portfolioJobEndpoint}${encodeURIComponent(state.activeJobId)}`);
+          const job = payload.job || payload; if (job?.job_id) state.activeJobId = job.job_id; renderJob(job);
+          if (terminal(job)) { window.clearInterval(state.poller); state.poller = 0; updateControls(); }
+        } catch (_) { /* requestJson exposes the safe error while polling remains server-only. */ }
+      };
+      const startPortfolioPolling = () => { window.clearInterval(state.poller); state.poller = window.setInterval(pollPortfolioJob, 1000); pollPortfolioJob(); };
+      const recoverPortfolioJob = async (keepLocked = false) => {
+        const active = await requestJson('/api/v2/portfolio/jobs/active'); const candidate = active.job;
+        if (!candidate?.job_id) { state.activeJobId = ''; renderJob(null); if (!keepLocked) setLocked(false); window.clearInterval(state.poller); state.poller = 0; return; }
+        state.activeJobId = candidate.job_id; setLocked(true); await pollPortfolioJob(); if (!terminal(state.job)) startPortfolioPolling();
+      };
+      const refreshPortfolio = async () => {
+        if (state.refreshPromise) return state.refreshPromise;
+        state.refreshPromise = Promise.allSettled([requestJson('/api/v2/portfolio/readiness'), recoverPortfolioJob()]).then(([readiness]) => { if (readiness.status === 'fulfilled') renderReadiness(readiness.value); }).finally(() => { state.refreshPromise = null; });
+        return state.refreshPromise;
+      };
+      runButton?.addEventListener('click', async () => {
+        const launch = portfolioLaunchForm();
+        if (!launch.valid) { if (formStatus) formStatus.textContent = 'Fix the server readiness and form blockers before calculating.'; updateControls(); return; }
+        const selectedPairs = launch.selectedPairs.map((row) => ({ pair: row.pair, max_finalist_long: row.long, max_finalist_short: row.short }));
+        const profiles = launch.profiles.map((profile) => {
+          const item = { profile_id: profile.profile.toUpperCase(), equity_usdt: profile.equity, max_candidates: Number(profile.candidates) };
+          if (String(profile.maxBalance).trim()) item.max_balance_usdt = profile.maxBalance;
+          return item;
+        });
+        setLocked(true); if (formStatus) formStatus.textContent = 'Campaign frozen; creating server job…';
+        try {
+          const result = await requestJson('/api/v2/portfolio/campaigns', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairs: selectedPairs, profiles, expected_config_digest: state.configDigest }) });
+          state.activeJobId = result.job_id || result.job?.job_id || ''; renderJob(result.job || { job_id: state.activeJobId, campaign_id: result.campaign_id, status: result.status || 'QUEUED', config_digest: result.config_digest }); if (state.activeJobId) startPortfolioPolling();
+          if (formStatus) formStatus.textContent = 'Campaign frozen and queued on the server.';
+        } catch (error) {
+          const activeConflict = ['PORTFOLIO_JOB_ACTIVE_DUPLICATE', 'PORTFOLIO_JOB_BUSY'].includes(error?.code);
+          if (activeConflict) {
+            setLocked(true);
+            try { await recoverPortfolioJob(true); } catch (_) { /* retain the frozen form until the server job can be recovered. */ }
+            if (formStatus) formStatus.textContent = `${error.code}: an active calculation already exists.`;
+            return;
+          }
+          setLocked(false);
+          if (formStatus) formStatus.textContent = portfolioErrorMessage(error);
+        }
+      });
+      cancelButton?.addEventListener('click', async () => {
+        if (!state.activeJobId || ['CANCEL_REQUESTED', 'CANCELLING'].includes(statusOf(state.job))) return;
+        cancelButton.disabled = true;
+        try { const result = await requestJson(`${portfolioJobEndpoint}${encodeURIComponent(state.activeJobId)}/cancel`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); renderJob(result.job || { ...state.job, status: result.status || 'CANCEL_REQUESTED' }); }
+        catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); await pollPortfolioJob(); }
+      });
+      newButton?.addEventListener('click', async () => { if (!terminal(state.job)) return; state.activeJobId = ''; state.job = null; state.settingsChanged = false; renderJob(null); setLocked(false); try { renderReadiness(await requestJson('/api/v2/portfolio/readiness')); if (formStatus) formStatus.textContent = 'New Campaign ready.'; } catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); } });
+      ['aggressive', 'balanced', 'conservative'].forEach((profile) => query(`#portfolio-profile-${profile}`)?.addEventListener('change', updateControls));
+      ['#portfolio-default-long', '#portfolio-default-short'].forEach((selector) => query(selector)?.addEventListener('input', updateControls));
+      query('#portfolio-profiles')?.querySelectorAll('input').forEach((input) => { input.addEventListener('input', updateControls); input.addEventListener('change', updateControls); });
+      loadPortfolioScreen.state = state;
+      state.refresh = refreshPortfolio;
+    }
+    loadPortfolioScreen.state.refresh();
+  }
+
+  function loadPortfolioSettings(force = false) {
+    if (!loadPortfolioSettings.state) {
+      const state = { digest: null, document: null, readOnly: true, dirty: false, loading: null };
+      const query = (selector) => document.querySelector(selector);
+      const editor = query('#portfolio-settings-document'); const save = query('#portfolio-settings-save'); const reload = query('#portfolio-settings-reload'); const meta = query('#portfolio-settings-meta');
+      const setBadge = (value, kind) => { const node = query('#portfolio-settings-state'); if (node) { node.className = `state-badge state-${kind}`; node.textContent = value; } };
+      const show = (result) => {
+        const stateName = result?.state || 'INVALID'; const readOnlyStates = ['MISSING', 'INVALID', 'UNSUPPORTED_SCHEMA']; state.digest = stateName === 'READY' ? (result?.digest ?? null) : null; state.document = stateName === 'READY' ? (result?.document ?? null) : null; state.readOnly = readOnlyStates.includes(stateName) || stateName !== 'READY' || !state.document; state.dirty = false;
+        if (editor) { editor.value = state.document ? JSON.stringify(state.document, null, 2) : ''; editor.disabled = state.readOnly; }
+        if (save) save.disabled = state.readOnly;
+        setBadge(stateName, stateName === 'READY' ? 'ready' : 'pending');
+        if (meta) meta.textContent = state.readOnly ? `${stateName}: settings are read-only.` : `READY · digest ${state.digest || '—'}`;
+      };
+      const load = async () => { state.loading = requestJson('/api/v2/portfolio/settings').then(show).catch((error) => { state.document = null; state.digest = null; state.dirty = false; state.readOnly = true; if (editor) { editor.value = ''; editor.disabled = true; } if (save) save.disabled = true; if (meta) meta.textContent = portfolioErrorMessage(error); }).finally(() => { state.loading = null; }); return state.loading; };
+      editor?.addEventListener('input', () => { state.dirty = true; if (meta) meta.textContent = 'Unsaved changes.'; });
+      reload?.addEventListener('click', async () => { if (state.dirty && !window.confirm('Discard unsaved Portfolio Optimizer settings changes?')) return; await load(); });
+      save?.addEventListener('click', async () => {
+        if (state.readOnly || !editor) return;
+        try { JSON.parse(editor.value); } catch (_) { if (meta) meta.textContent = 'Settings document must be valid JSON.'; return; }
+        save.disabled = true;
+        try { const result = await requestJson('/api/v2/portfolio/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_digest: state.digest, document: JSON.parse(editor.value) }) }); show(result); }
+        catch (error) { if (meta) meta.textContent = portfolioErrorMessage(error); save.disabled = false; }
+      });
+      loadPortfolioSettings.state = state; state.load = load;
+    }
+    if (force || !loadPortfolioSettings.state.document) loadPortfolioSettings.state.load();
+  }
+
   loadSafeDefaults();
   loadRemoteStatus();
   recoverJobs();

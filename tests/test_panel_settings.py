@@ -696,7 +696,7 @@ def test_v2_local_testing_fill_rejects_unconfigured_runner(panel_http) -> None:
     assert body == {"error": "invalid settings"}
 
 
-def test_static_settings_markup_is_semantic_and_non_operational() -> None:
+def test_static_settings_markup_remains_semantic_with_portfolio_screen() -> None:
     from mrs3 import panel as panel_module
 
     html = (Path(panel_module.__file__).parent / "panel_web" / "index.html").read_text(encoding="utf-8")
@@ -705,4 +705,4 @@ def test_static_settings_markup_is_semantic_and_non_operational() -> None:
     assert 'for="settings-default-root"' in html
     assert 'id="settings-default-root"' in html
     assert 'aria-live="polite"' in html
-    assert 'id="portfolio"' not in html
+    assert '<section id="portfolio"' in html

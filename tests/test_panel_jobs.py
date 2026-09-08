@@ -1,5 +1,7 @@
 from datetime import datetime
 
+import pytest
+
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
 
 
@@ -20,6 +22,19 @@ def test_registry_cancel_transition_and_bounded_logs(tmp_path):
     for index in range(205): registry.append_log(job["job_id"], str(index))
     assert len(registry.get(job["job_id"])["logs"]) == 200
     assert registry.cancel(job["job_id"])["state"] == "CANCELLING"
+
+
+def test_registry_discards_only_queued_job(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json")
+    queued = registry.submit("kind", {}, "queued")
+    registry.discard_queued(queued["job_id"])
+    with pytest.raises(PanelJobError, match="NOT_FOUND"):
+        registry.get(queued["job_id"])
+
+    running = registry.submit("kind", {}, "running")
+    registry.transition(running["job_id"], "RUNNING")
+    with pytest.raises(PanelJobError, match="DISCARD_NOT_ALLOWED"):
+        registry.discard_queued(running["job_id"])
 
 
 def test_registry_rejects_invalid_request_and_illegal_transition(tmp_path):

@@ -53,6 +53,12 @@ SOURCE_SNAPSHOT_UNAVAILABLE = "SOURCE_SNAPSHOT_UNAVAILABLE"
 TICK_REPLAY_AVAILABLE = "AVAILABLE"
 TICK_REPLAY_UNAVAILABLE = "UNAVAILABLE"
 
+PAIR_UNSELECTED = "PAIR_UNSELECTED"
+DIRECTION_DISABLED = "DIRECTION_DISABLED"
+USER_RANK_MISSING = "USER_RANK_MISSING"
+USER_RANK_DUPLICATE = "USER_RANK_DUPLICATE"
+USER_RANK_CUTOFF = "USER_RANK_CUTOFF"
+
 
 class PortfolioInputError(RuntimeError):
     """A fail-closed source snapshot error with a stable code."""
@@ -558,19 +564,28 @@ def _selection_provenance(
 def _current_review_facts(
     connection: duckdb.DuckDBPyConnection,
     requests: Sequence[SelectionRequest],
+    *,
+    allow_missing_pair: bool = False,
 ) -> tuple[
-    dict[tuple[str, str, int, int], dict[str, str | int]],
+    dict[tuple[str, str, int, int], dict[str, Any]],
     set[tuple[str, str, int, int]],
     tuple[dict[str, str], ...],
 ]:
-    """Return only statuses from the latest imported review for each pair/side."""
-    facts: dict[tuple[str, str, int, int], dict[str, str | int]] = {}
+    """Return status and User Rank from the latest imported review per pair/side."""
+    facts: dict[tuple[str, str, int, int], dict[str, Any]] = {}
     selected: set[tuple[str, str, int, int]] = set()
     lineage: list[dict[str, str]] = []
 
     def latest_unique(query: str, parameters: Sequence[object], field: str) -> str:
         rows = connection.execute(query, list(parameters)).fetchall()
-        if not rows or rows[0][1] is None or (len(rows) > 1 and rows[1][1] == rows[0][1]):
+        if not rows:
+            if field == "run" and allow_missing_pair:
+                return ""
+            raise PortfolioInputError(
+                f"current selection {field} is ambiguous",
+                code=SOURCE_SNAPSHOT_UNAVAILABLE,
+            )
+        if rows[0][1] is None or (len(rows) > 1 and rows[1][1] == rows[0][1]):
             raise PortfolioInputError(
                 f"current selection {field} is ambiguous",
                 code=SOURCE_SNAPSHOT_UNAVAILABLE,
@@ -592,6 +607,8 @@ def _current_review_facts(
             [symbol, side],
             "run",
         )
+        if not run_id:
+            continue
         review_id = latest_unique(
             """select review_import_id, imported_at_utc from selection_review_imports
                where selection_run_id = ?
@@ -614,26 +631,27 @@ def _current_review_facts(
             selected_results[strategy_key] = result_key
             selected.add((symbol, side, strategy_key, result_key))
         rows = connection.execute(
-            "select strategy_id, user_status from selection_review_rows where review_import_id = ?",
+            "select strategy_id, user_status, user_rank from selection_review_rows where review_import_id = ?",
             [review_id],
         ).fetchall()
         review_statuses: dict[int, object] = {}
-        for strategy_id, user_status in rows:
+        for strategy_id, user_status, user_rank in rows:
             strategy_key = _source_integer(strategy_id, "strategy_id")
             if strategy_key in review_statuses:
                 raise PortfolioInputError(
                     "duplicate current review row identity",
                     code=SOURCE_SNAPSHOT_UNAVAILABLE,
                 )
-            review_statuses[strategy_key] = user_status
+            review_statuses[strategy_key] = (user_status, user_rank)
         facts.update(
             {
                 (symbol, side, strategy_id, selected_results[strategy_id]): {
                     "user_status": user_status,
+                    "user_rank": user_rank,
                     "selection_run_id": run_id,
                     "review_import_id": review_id,
                 }
-                for strategy_id, user_status in review_statuses.items()
+                for strategy_id, (user_status, user_rank) in review_statuses.items()
                 if strategy_id in selected_results and isinstance(user_status, str)
             }
         )
@@ -968,6 +986,179 @@ def read_performance_snapshot(
         digest,
         canonical_json,
         read_at,
+    )
+
+
+def _pair(value: object) -> tuple[str, str]:
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        raise PortfolioInputError("pair must contain symbol and side", code="INVALID_REQUEST")
+    symbol, side = value
+    if not isinstance(symbol, str) or not symbol.strip() or not isinstance(side, str):
+        raise PortfolioInputError("pair must contain symbol and side", code="INVALID_REQUEST")
+    side = side.strip().upper()
+    if side not in {"LONG", "SHORT"}:
+        raise PortfolioInputError("pair side is invalid", code="INVALID_REQUEST")
+    return symbol.strip(), side
+
+
+def _maximum(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PortfolioInputError("effective maximum must be a non-negative integer", code="INVALID_REQUEST")
+    return value
+
+
+def _user_rank(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise PortfolioInputError("invalid current User Rank", code="INVALID_SOURCE_VALUE")
+    return value
+
+
+def apply_finalist_cutoff(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    selected_pairs: Sequence[tuple[str, str]] | set[tuple[str, str]],
+    maximums: Mapping[tuple[str, str], int],
+) -> tuple[dict[str, Any], ...]:
+    """Annotate current FINALIST rows with the pair/side cutoff decision."""
+    limits = {_pair(pair): _maximum(value) for pair, value in maximums.items()}
+    selected = {_pair(pair) for pair in selected_pairs}
+    rows: list[dict[str, Any]] = []
+    groups: dict[tuple[str, str], list[int]] = {}
+    for candidate in candidates:
+        if candidate.get("user_status") != "FINALIST":
+            continue
+        row = dict(candidate)
+        pair = _pair((row.get("symbol"), row.get("side")))
+        row["symbol"], row["side"] = pair
+        row["user_rank"] = _user_rank(row.get("user_rank"))
+        row["effective_maximum"] = limits.get(pair, 0)
+        rows.append(row)
+        groups.setdefault(pair, []).append(len(rows) - 1)
+
+    for pair, indexes in groups.items():
+        limit = limits.get(pair, 0)
+        if pair not in selected:
+            status, reason = "EXCLUDED", PAIR_UNSELECTED
+        elif limit == 0:
+            status, reason = "EXCLUDED", DIRECTION_DISABLED
+        elif len(indexes) <= limit:
+            status, reason = "SELECTED", "WITHIN_MAXIMUM"
+            for index in indexes:
+                rows[index]["selection_status"] = status
+                rows[index]["selection_reason"] = reason
+            continue
+        else:
+            ranks = [rows[index]["user_rank"] for index in indexes]
+            if any(rank is None for rank in ranks):
+                status, reason = "EXCLUDED", USER_RANK_MISSING
+                for index in indexes:
+                    rows[index]["selection_status"] = status
+                    rows[index]["selection_reason"] = reason
+                continue
+            if len(set(ranks)) != len(ranks):
+                status, reason = "EXCLUDED", USER_RANK_DUPLICATE
+                for index in indexes:
+                    rows[index]["selection_status"] = status
+                    rows[index]["selection_reason"] = reason
+                continue
+            winners = {index for _, index in sorted(zip(ranks, indexes))[:limit]}
+            for index in indexes:
+                rows[index]["selection_status"] = "SELECTED" if index in winners else "EXCLUDED"
+                rows[index]["selection_reason"] = "USER_RANK_SELECTED" if index in winners else USER_RANK_CUTOFF
+            continue
+        for index in indexes:
+            rows[index]["selection_status"] = status
+            rows[index]["selection_reason"] = reason
+    return tuple(rows)
+
+
+def read_current_finalists(
+    database: str | Path,
+    pairs: Sequence[tuple[str, str]],
+) -> tuple[dict[str, Any], ...]:
+    """Read current exact User Status=FINALIST facts without source writes."""
+    pair_values = tuple(dict.fromkeys(_pair(pair) for pair in pairs))
+    if not pair_values:
+        return ()
+    requests = tuple(
+        parse_selection_request({"symbol": symbol, "side": side, "stages": []})
+        for symbol, side in pair_values
+    )
+    path = Path(database).resolve()
+    try:
+        with duckdb.connect(str(path), read_only=True) as connection:
+            connection.execute("begin transaction")
+            require_performance_v2(connection)
+            facts, selected, _ = _current_review_facts(connection, requests, allow_missing_pair=True)
+            scoped_selected = {key for key in selected if key[:2] in pair_values}
+            missing_review = sorted(key for key in scoped_selected if key not in facts)
+            if missing_review:
+                raise PortfolioInputError(
+                    "current selection review is incomplete",
+                    code=SOURCE_SNAPSHOT_UNAVAILABLE,
+                )
+            finalist_keys = [
+                key for key, fact in facts.items()
+                if key[:2] in pair_values and fact.get("user_status") == "FINALIST"
+            ]
+            strategy_ids = tuple(dict.fromkeys(key[2] for key in finalist_keys))
+            result_ids = tuple(dict.fromkeys(key[3] for key in finalist_keys))
+            strategy_rows = _records_for_ids(connection, "strategies", "strategy_id", strategy_ids)
+            by_strategy = {int(row["strategy_id"]): row for row in strategy_rows}
+            result_rows = _records_for_ids(connection, "strategy_results", "result_id", result_ids)
+            by_result = {int(row["result_id"]): row for row in result_rows}
+            result: list[dict[str, Any]] = []
+            pair_order = {pair: index for index, pair in enumerate(pair_values)}
+            for key in finalist_keys:
+                symbol, side, strategy_id, result_id = key
+                source = by_strategy.get(strategy_id)
+                if source is None or source.get("current_result_id") != result_id:
+                    raise PortfolioInputError(
+                        "current finalist result is stale",
+                        code=SOURCE_SNAPSHOT_UNAVAILABLE,
+                    )
+                source_result = by_result.get(result_id)
+                if source_result is None or source_result.get("strategy_id") != strategy_id:
+                    raise PortfolioInputError(
+                        "current finalist result is unavailable",
+                        code=SOURCE_SNAPSHOT_UNAVAILABLE,
+                    )
+                if source.get("lifecycle_status") != "ACTIVE" or (source.get("symbol"), source.get("side")) != (symbol, side):
+                    raise PortfolioInputError(
+                        "current finalist source identity is unavailable",
+                        code=SOURCE_SNAPSHOT_UNAVAILABLE,
+                    )
+                result.append({
+                    "strategy_id": strategy_id,
+                    "result_id": result_id,
+                    "strategy_name": source["strategy_name"],
+                    "symbol": symbol,
+                    "side": side,
+                    "user_status": "FINALIST",
+                    "user_rank": _user_rank(facts[key].get("user_rank")),
+                })
+            connection.execute("commit")
+    except PortfolioInputError:
+        raise
+    except Exception as error:
+        raise PortfolioInputError(SOURCE_SNAPSHOT_UNAVAILABLE) from error
+    return tuple(sorted(result, key=lambda row: (pair_order[(row["symbol"], row["side"])], row["strategy_id"], row["result_id"])))
+
+
+def read_and_select_finalists(
+    database: str | Path,
+    *,
+    selected_pairs: Sequence[tuple[str, str]] | set[tuple[str, str]],
+    maximums: Mapping[tuple[str, str], int],
+) -> tuple[dict[str, Any], ...]:
+    """Read current FINALIST facts and apply the package-owned cutoff."""
+    pairs = tuple(dict.fromkeys((*maximums, *selected_pairs)))
+    return apply_finalist_cutoff(
+        read_current_finalists(database, pairs),
+        selected_pairs=selected_pairs,
+        maximums=maximums,
     )
 
 

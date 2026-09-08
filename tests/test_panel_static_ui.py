@@ -1067,3 +1067,157 @@ def test_status_and_dynamic_controls_have_accessible_announcements() -> None:
     assert 'caption class="sr-only"' in html
     assert 'aria-expanded' in js
     assert 'aria-label' in js
+
+
+def test_portfolio_screen_exposes_server_backed_launch_form() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'href="#portfolio"' in html
+    assert 'data-screen-link="portfolio"' in html
+    assert '<section id="portfolio"' in html
+    for control in (
+        'id="portfolio-readiness"', 'id="portfolio-pairs"',
+        'id="portfolio-default-long"', 'id="portfolio-default-short"',
+        'id="portfolio-profile-aggressive"', 'id="portfolio-profile-balanced"',
+        'id="portfolio-profile-conservative"', 'id="portfolio-equity-aggressive"',
+        'id="portfolio-max-balance-aggressive"', 'id="portfolio-candidates-aggressive"',
+        'id="portfolio-run"', 'id="portfolio-new-calculation"',
+    ):
+        assert control in html
+    assert "loadPortfolioScreen" in js
+    assert "'/api/v2/portfolio/readiness'" in js
+    assert "'/api/v2/portfolio/jobs/active'" in js
+    assert "'/api/v2/portfolio/campaigns'" in js
+
+
+def test_portfolio_pair_selection_copies_global_maxima_without_auto_selection() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert 'id="portfolio-default-long"' in html
+    assert 'id="portfolio-default-short"' in html
+    assert "selected: row.selected === true" in js
+    assert "copyPortfolioMaximum" in portfolio
+    assert "label.append(selected, name, count)" in portfolio
+    assert "#portfolio-default-long" in portfolio
+    assert "#portfolio-default-short" in portfolio
+
+
+def test_portfolio_recovery_and_polling_use_server_job_endpoints_only() -> None:
+    js = _read("app.js")
+
+    assert "'/api/v2/portfolio/jobs/'" in js
+    assert "state.poller" in js
+    assert "setInterval(pollPortfolioJob" in js
+    assert "GET /api/v2/portfolio/jobs/active" not in js
+    assert "localStorage" not in js
+    assert "sessionStorage" not in js
+    assert "PORTFOLIO_JOB_ACTIVE_DUPLICATE" in js
+    assert "PORTFOLIO_JOB_BUSY" in js
+    assert "newButton?.addEventListener('click', async" in js
+    assert "await requestJson('/api/v2/portfolio/readiness')" in js
+
+
+def test_portfolio_stage2_is_explicitly_disabled_without_tester_dispatch() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="portfolio-stage2-submit"' in html
+    assert re.search(r'id="portfolio-stage2-submit"[^>]*disabled[^>]*aria-describedby="portfolio-stage2-reason"', html)
+    assert 'id="portfolio-stage2-reason"' in html
+    assert "PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED" in html
+    assert "tester-submissions" not in js
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+    assert "strategies.tester" not in portfolio
+
+
+def test_portfolio_xlsx_is_rendered_only_after_succeeded_results() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="portfolio-xlsx"' in html
+    assert 'id="portfolio-xlsx" hidden' in html
+    assert "/api/v2/portfolio/campaigns/" in js
+    assert "stage1.xlsx" in js
+    assert "job.status === 'SUCCEEDED'" in js
+    assert "portfolioXlsx.hidden = false" in js
+
+
+def test_portfolio_settings_uses_full_document_compare_and_swap() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="portfolio-settings"' in html
+    assert 'id="portfolio-settings-document"' in html
+    assert 'id="portfolio-settings-save"' in html
+    assert 'id="portfolio-settings-reload"' in html
+    assert "'/api/v2/portfolio/settings'" in js
+    assert "expected_digest" in js
+    assert "JSON.parse" in js
+    assert "document: JSON.parse" in js
+    assert "window.confirm" in js
+    assert "UNSUPPORTED_SCHEMA" in js
+    assert "MISSING" in js
+    assert "INVALID" in js
+
+
+def test_portfolio_form_has_no_speculative_nullable_config_fields() -> None:
+    html = _read("index.html")
+
+    portfolio = html.split('id="portfolio"', 1)[1].split('id="settings"', 1)[0]
+    assert 'name="max_balance_usdt"' not in portfolio
+    assert 'name="default_max_balance"' not in portfolio
+    assert 'schema_version="2"' not in portfolio
+
+
+def test_portfolio_launch_validates_decimal_integer_and_budget_fields() -> None:
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert "portfolioDecimal" in portfolio
+    assert "digits.length - scale" in portfolio
+    assert "Math.max(scale, 0) <= 12" in portfolio
+    assert "Number.isFinite" in portfolio
+    assert "Number.isSafeInteger" in portfolio
+    assert "total_test_budget" in portfolio
+    assert "readiness?.search?.total_test_budget" in portfolio
+    assert "profileBudgetTotal" in portfolio
+    assert "profileBudgetTotal <= budget" in portfolio
+    assert "addEventListener('input', updateControls)" in portfolio
+
+
+def test_portfolio_duplicate_or_busy_recovers_and_keeps_campaign_frozen() -> None:
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert "await recoverPortfolioJob(true)" in portfolio
+    assert "setLocked(true)" in portfolio
+    assert "PORTFOLIO_JOB_ACTIVE_DUPLICATE" in portfolio
+    assert "PORTFOLIO_JOB_BUSY" in portfolio
+
+
+def test_portfolio_overall_progress_does_not_claim_unknown_stage_is_known() -> None:
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert "stageIndeterminate" in portfolio
+    assert "indeterminate" in portfolio
+    assert "overallPercent" in portfolio
+
+
+def test_portfolio_settings_changed_since_freeze_is_latched_in_job_status() -> None:
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert "settingsChanged" in portfolio
+    assert "settings_changed_since_freeze" in portfolio
+    assert "SETTINGS_CHANGED_SINCE_FREEZE" in portfolio
+
+
+def test_portfolio_journal_renders_server_text_entries() -> None:
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert "entry?.text || entry?.message" in portfolio

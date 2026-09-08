@@ -1,5 +1,15 @@
 """Portfolio optimizer contracts."""
 
+from .input import (
+    DIRECTION_DISABLED,
+    PAIR_UNSELECTED,
+    USER_RANK_CUTOFF,
+    USER_RANK_DUPLICATE,
+    USER_RANK_MISSING,
+    apply_finalist_cutoff,
+    read_and_select_finalists,
+    read_current_finalists,
+)
 from .config import (
     ALGORITHM_VERSIONS,
     POLICY_VERSION,
@@ -187,6 +197,14 @@ from .export import (
 )
 
 __all__ = [
+    "PAIR_UNSELECTED",
+    "DIRECTION_DISABLED",
+    "USER_RANK_MISSING",
+    "USER_RANK_DUPLICATE",
+    "USER_RANK_CUTOFF",
+    "apply_finalist_cutoff",
+    "read_current_finalists",
+    "read_and_select_finalists",
     "ALGORITHM_VERSIONS",
     "POLICY_VERSION",
     "PROFILE_NAMES",
