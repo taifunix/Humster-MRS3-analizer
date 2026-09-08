@@ -5,8 +5,8 @@
 **Версия:** D7.
 
 **Статус:** `PLAN_APPROVED`; M0–M8 fixture scope and U1 are accepted after
-independent `CODE_REVIEW_PASS`. This change commits M8 fixture scope; the real M8
-joint test remains separately gated and U1 awaits its own scoped commit.
+independent `CODE_REVIEW_PASS`. M8 is committed as `272f895`, U1 as `7ddbb94`;
+the real M8 joint test remains separately gated.
 
 **D5 review:** `PLAN_APPROVED`.
 **D6 review:** `PLAN_APPROVED` — Claude Opus 5 high.
@@ -764,7 +764,7 @@ M8 fixture export/replay is accepted; its separately authorized real joint test 
 - [x] Получить финальный `CODE_REVIEW_PASS` документационного diff.
 - [x] Не изменять код, config, тесты, runtime или tester.
 
-### U1 — реализация Panel, реализована локально; финальный review ожидается
+### U1 — реализация Panel, принята и закоммичена
 
 U1 начата после отдельного назначения пользователя и достижения зависимостей M8.
 Текущий implementation status:
@@ -780,7 +780,7 @@ U1 начата после отдельного назначения польз�
 - [x] Держать передачу тестеру выключенной до принятых M5/M6 и отдельного явного
    разрешения пользователя.
 - [x] Получить финальный независимый `CODE_REVIEW_PASS` через Opus на полном U1 diff.
-- [ ] Создать отдельный scoped conventional commit после review.
+- [x] Создать отдельный scoped conventional commit после review: `7ddbb94`.
 
 U1 не разрешает менять алгоритмы оптимизатора ради удобства интерфейса. Поля и
 кнопки появляются только после принятия соответствующей backend capability.
@@ -789,7 +789,7 @@ U1 не разрешает менять алгоритмы оптимизато�
 
 M0–M8 fixture scope is accepted after independent `CODE_REVIEW_PASS`; the real
 M8 joint test still requires separate authorization.
-U1 is accepted after final Opus review and awaits its scoped commit. Evidence:
+U1 is accepted after final Opus review and committed as `7ddbb94`. Evidence:
 [M3 ledger](2026-09-06-portfolio-optimizer-m3-evidence.md),
 [M4 ledger](2026-09-06-portfolio-optimizer-m4-evidence.md),
 [M5 ledger](2026-09-06-portfolio-optimizer-m5-evidence.md),

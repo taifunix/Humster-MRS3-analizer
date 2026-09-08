@@ -49,4 +49,4 @@ Verification performed only with fixtures/fakes and the repository `.venv`:
 No real tester, bot, remote target, production database, credentials or live
 trading action was used. Claude Opus 5 high reviewed the complete U1 diff,
 verified all eight corrections and the final typed-GET residual, and returned
-`CODE_REVIEW_PASS`. The scoped commit remains pending.
+`CODE_REVIEW_PASS`. The scoped U1 commit is `7ddbb94`.
