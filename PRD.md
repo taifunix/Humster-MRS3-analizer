@@ -98,7 +98,7 @@ analysis runs и lineage согласно уже реализованной
 
 ## Hook: Анализатор Портфеля
 
-Новый Portfolio Optimizer — **Draft D7 / M0–M5 accepted**. Канонические
+Новый Portfolio Optimizer — **Draft D7 / M0–M8 fixture scope accepted**. Канонические
 [спецификация по фазам](docs/specs/2026-09-05-portfolio-optimizer.md),
 [план внедрения](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md) и
 [ADR-0025 (Proposed)](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md),
@@ -122,7 +122,11 @@ M1 config/storage/snapshot implementation is accepted after independent Opus
 `CODE_REVIEW_PASS`. Fixture-only M2 liquidity/reference implementation is accepted
 after independent Opus `CODE_REVIEW_PASS`. Fixture-only M3–M4 are accepted after
 independent Opus `CODE_REVIEW_PASS`; fixture/fake-only M5 is accepted after
-independent Opus `CODE_REVIEW_PASS` and M6-M8 remain unstarted. Q01-Q12 unknowns are isolated or
+independent Opus `CODE_REVIEW_PASS`. Fixture/fake-only M6 is accepted after a
+fresh full Opus `CODE_REVIEW_PASS`. M7 is accepted after a fresh full Opus
+`CODE_REVIEW_PASS`; M8 fixture export and replay are accepted after final Opus
+`CODE_REVIEW_PASS`, while real E2E remains pending separate authorization.
+Q01-Q12 unknowns are isolated or
 fail-closed where unresolved.
 The versioned matrix is in
 [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md).
@@ -134,6 +138,16 @@ M3 evidence is recorded in
 [the M3 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m3-evidence.md).
 M4 evidence is recorded in
 [the M4 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m4-evidence.md).
+M5 evidence is recorded in
+[the M5 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m5-evidence.md).
+Accepted M6 evidence is recorded in
+[the M6 ledger](docs/superpowers/plans/2026-09-07-portfolio-optimizer-m6-evidence.md).
+Accepted M7 evidence is recorded in
+[the M7 ledger](docs/superpowers/plans/2026-09-07-portfolio-optimizer-m7-evidence.md).
+M8 fixture evidence is recorded in
+[the M8 ledger](docs/superpowers/plans/2026-09-07-portfolio-optimizer-m8-evidence.md).
+U1 Panel implementation is accepted after final Opus `CODE_REVIEW_PASS` and
+awaits a separate commit with its evidence ledger.
 Стартовые
 research-only DD/free-margin/MM limits
 описаны в D5 и [ADR-0029](docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md)

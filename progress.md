@@ -1,6 +1,6 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-07
+**Updated:** 2026-09-08
 **Current branch:** `main`
 
 ## Portfolio Optimizer canonical phased design (2026-09-05)
@@ -35,9 +35,23 @@ evidence is in
 focused ownership verification is `239 passed, 1 skipped`; the R12-R14 subset
 is `131 passed, 1 skipped`; and the final complete project suite is `2938
 passed, 7 skipped, 8 warnings`. Opus round 1 R1-R10 and round 2 R11-R14 are
-fixed or explicitly adjudicated; round 3 accepted the exact final tree. M6/U1
-have not started, and no real tester, bot, remote target
-or database was used.
+fixed or explicitly adjudicated; round 3 accepted the exact final tree.
+Fixture/fake-only M6 is accepted after a fresh full Opus review and final
+`CODE_REVIEW_PASS`. The accepted-tree focused suite passes `147` tests. Evidence
+and the complete prior/fresh review disposition are in
+[the M6 ledger](docs/superpowers/plans/2026-09-07-portfolio-optimizer-m6-evidence.md).
+Fixture/fake-only M7 is accepted after a fresh full Opus review and final
+`CODE_REVIEW_PASS`. The accepted-tree focused suite passes `147` tests. Evidence
+and the complete review disposition are in
+[the M7 ledger](docs/superpowers/plans/2026-09-07-portfolio-optimizer-m7-evidence.md).
+M8 deterministic fixture export and Portfolio-DB replay are accepted after a
+fresh final Opus `CODE_REVIEW_PASS`; focused verification is `95 passed`. Evidence is in
+[the M8 ledger](docs/superpowers/plans/2026-09-07-portfolio-optimizer-m8-evidence.md).
+The real joint-test plan item remains pending separate authorization. U1 Panel,
+API, Campaign lifecycle, package-owned finalist rank/cutoff, deterministic XLSX
+and disabled Stage 2 are accepted after final Opus `CODE_REVIEW_PASS`; their
+separate scoped commit and evidence ledger remain pending.
+No real tester, bot, remote target or production database was used.
 D5 records
 `portfolio_optimizer_research_risk_v1`
 research/calibration defaults: AGGRESSIVE DD/free-margin/MM 20%/20%/50%,

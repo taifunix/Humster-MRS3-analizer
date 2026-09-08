@@ -4,8 +4,9 @@
 
 **Версия:** D7.
 
-**Статус:** `PLAN_APPROVED`; M0–M2 accepted after independent
-`CODE_REVIEW_PASS` by Claude Opus 5 high. Runtime M3–M8 remain unstarted.
+**Статус:** `PLAN_APPROVED`; M0–M8 fixture scope and U1 are accepted after
+independent `CODE_REVIEW_PASS`. This change commits M8 fixture scope; the real M8
+joint test remains separately gated and U1 awaits its own scoped commit.
 
 **D5 review:** `PLAN_APPROVED`.
 **D6 review:** `PLAN_APPROVED` — Claude Opus 5 high.
@@ -524,26 +525,27 @@ gate с высоким PnL; no feasible candidate; new policy/new evaluation;
 
 **Spec:** §10.3–10.4. **Зависимости:** M0–M7.
 
-- [ ] Refresh exchange reference, проверить freshness/quality и shared liquidity.
-- [ ] Разделять TradingRun inputs и Evaluation facts: fresh reference может создать
+- [x] Refresh exchange reference, проверить freshness/quality и shared liquidity.
+- [x] Разделять TradingRun inputs и Evaluation facts: fresh reference может создать
   новую Evaluation на прежнем run; material payload/settings change требует retest.
-- [ ] Evaluation хранит `execution_campaign_id` TradingRun и новый
+- [x] Evaluation хранит `execution_campaign_id` TradingRun и новый
   `decision_campaign_id`; replay/verification используют соответствующую ссылку.
-- [ ] Сопоставить export payload с exact tested/validated settings.
-- [ ] При changed leverage/rounded quantity/material config создать NEEDS_RETEST.
-- [ ] Сохранить один strategy JSON на symbol, portfolio/PortfolioSet manifests и human report.
-- [ ] Сохранить PortfolioSet composition digest; изменение member/load переводит
+- [x] Сопоставить export payload с exact tested/validated settings.
+- [x] При changed leverage/rounded quantity/material config создать NEEDS_RETEST.
+- [x] Сохранить один strategy JSON на symbol, portfolio/PortfolioSet manifests и human report.
+- [x] Сохранить PortfolioSet composition digest; изменение member/load переводит
   shared evaluation в `NEEDS_RESCREEN`, не инвалидируя single-account TradingRun.
-- [ ] Включить account/scenario deposit, cap, L/priority/opposite mode, periods,
+- [x] Включить account/scenario deposit, cap, L/priority/opposite mode, periods,
   candidate IDs, initial/final equity, primary result, realised PnL, DD coverage,
   metrics, gates, confidence limitations и причины выбора.
-- [ ] Не включать secrets, не публиковать live commands и не запускать trading bot.
-- [ ] Проверить decision replay из Portfolio DB без Performance DB/raw HTML.
-- [ ] Явно показать недоступность exact tick replay при отсутствии binary/ticks.
+- [x] Не включать secrets, не публиковать live commands и не запускать trading bot.
+- [x] Проверить decision replay из Portfolio DB без Performance DB/raw HTML.
+- [x] Явно показать недоступность exact tick replay при отсутствии binary/ticks.
 - [ ] После отдельного разрешения выполнить минимальный настоящий joint test и import.
-- [ ] Проверить single-member equivalence на сопоставимых условиях.
-- [ ] Проверить несколько compositions, scalars, priorities/L и repeated-symbol accounts.
-- [ ] Зафиксировать реальные risk/validation dispositions, а не заполнить их из mocks.
+- [x] Проверить single-member equivalence на сопоставимых условиях.
+- [x] Проверить несколько compositions, scalars, priorities/L и repeated-symbol accounts.
+- [x] Зафиксировать fixture risk/validation dispositions из durable recorded facts,
+  не заполняя их напрямую из mock return values.
 
 **Acceptance:** fixture E2E содержит liquidity/margin reject, успешный committed
 run, cancellation/recovery и export; READY невозможен при missing/stale
@@ -744,8 +746,8 @@ replacement/trial/rollback, без автоматического deployment п�
 - [ ] Обновить spec/ADR/PRD/progress по изменившимся контрактам и evidence.
 - [ ] Создать scoped conventional commit после review, не раньше.
 
-M0–M5 are accepted with independent `CODE_REVIEW_PASS` by Claude Opus 5 high.
-M6–M8 remain unstarted.
+M0–M7 are accepted with independent `CODE_REVIEW_PASS` by Claude Opus 5 high.
+M8 fixture export/replay is accepted; its separately authorized real joint test remains pending.
 
 ## U0/U1 — отдельная сквозная дорожка Panel
 
@@ -783,10 +785,15 @@ U1 не разрешает менять алгоритмы оптимизато�
 
 ## 15. Ближайший следующий этап
 
-M0–M5 are accepted after independent `CODE_REVIEW_PASS`; M6 is the next server
-stage. Evidence: [M3 ledger](2026-09-06-portfolio-optimizer-m3-evidence.md),
+M0–M8 fixture scope is accepted after independent `CODE_REVIEW_PASS`; the real
+M8 joint test still requires separate authorization.
+U1 is accepted after final Opus review and awaits its scoped commit. Evidence:
+[M3 ledger](2026-09-06-portfolio-optimizer-m3-evidence.md),
 [M4 ledger](2026-09-06-portfolio-optimizer-m4-evidence.md),
-[M5 ledger](2026-09-06-portfolio-optimizer-m5-evidence.md). Q01–Q12 remain isolated or
+[M5 ledger](2026-09-06-portfolio-optimizer-m5-evidence.md),
+[M6 ledger](2026-09-07-portfolio-optimizer-m6-evidence.md),
+[M7 ledger](2026-09-07-portfolio-optimizer-m7-evidence.md),
+[M8 ledger](2026-09-07-portfolio-optimizer-m8-evidence.md). Q01–Q12 remain isolated or
 fail-closed where unknown. Real tester/bot execution additionally requires
 accepted M5 and M6 plus separate explicit user authorization.
 Не задавать пользователю вопросы повторно, если поведение уже закреплено в
