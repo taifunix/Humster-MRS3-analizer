@@ -8,7 +8,7 @@ from decimal import Decimal
 from hashlib import sha256
 from io import BytesIO
 import json
-from typing import Mapping
+from typing import Mapping, Sequence
 from uuid import uuid4
 import zipfile
 
@@ -123,18 +123,76 @@ def persist_selection_snapshot(
     metadata: Mapping[str, str],
     workbook_bytes: bytes,
 ) -> str:
-    required = {"strategy_id", "result_id", "auto_status"}
-    if not required.issubset(result.columns):
+    """Persist one immutable selection snapshot.
+
+    The original single-run API remains intentionally small.  It delegates to
+    :func:`persist_selection_snapshots` so callers which publish a combined
+    workbook can validate and commit every pair in one transaction.
+    """
+    return persist_selection_snapshots(
+        connection,
+        ({"request": request, "config": config, "result": result, "metadata": metadata},),
+        workbook_bytes=workbook_bytes,
+    )[0]
+
+
+def persist_selection_snapshots(
+    connection: duckdb.DuckDBPyConnection,
+    snapshots: Sequence[Mapping[str, object]],
+    *,
+    workbook_bytes: bytes | None = None,
+    workbook_sha256: str | None = None,
+) -> tuple[str, ...]:
+    """Atomically persist several immutable selection snapshots.
+
+    ``selection_review_imports.workbook_sha256`` is unique in the existing
+    schema, while ``selection_runs.workbook_sha256`` is not.  Every group run
+    therefore records the same actual combined workbook hash and its review
+    import receives the existing deterministic per-run key.  All stale checks
+    happen before the transaction and all inserts happen in one transaction,
+    so a failed pair cannot leave a partial ledger.
+    """
+    if not snapshots:
         raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
-    run_id = metadata["selection_run_id"]
-    request_json, request_hash, config_json, config_hash = canonical_contract(request, config)
-    expected = {int(row.strategy_id): int(row.result_id) for row in result.itertuples()}
-    rank_stage = next((stage for stage in request.stages if stage.id == "rank_robust_top_n"), None)
-    top_n = rank_stage.top_n if rank_stage and rank_stage.top_n else 20
-    representative_count = int(result["auto_status"].isin(["FINALIST", "RESERVE"]).sum())
-    workbook_hash = sha256(workbook_bytes).hexdigest()
-    connection.execute("begin transaction")
+    if workbook_sha256 is None:
+        if workbook_bytes is None:
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_FILE")
+        workbook_sha256 = sha256(workbook_bytes).hexdigest()
+    if not isinstance(workbook_sha256, str) or len(workbook_sha256) != 64:
+        raise SelectionReviewError("SELECTION_REVIEW_INVALID_FILE")
     try:
+        int(workbook_sha256, 16)
+    except ValueError:
+        raise SelectionReviewError("SELECTION_REVIEW_INVALID_FILE") from None
+
+    prepared: list[dict[str, object]] = []
+    seen_run_ids: set[str] = set()
+    for item in snapshots:
+        if not isinstance(item, Mapping):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        request = item.get("request")
+        config = item.get("config")
+        result = item.get("result")
+        metadata = item.get("metadata")
+        if not isinstance(request, SelectionRequest) or not isinstance(config, SelectionConfig) or not isinstance(result, pd.DataFrame) or not isinstance(metadata, Mapping):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        required = {"strategy_id", "result_id", "auto_status"}
+        if not required.issubset(result.columns):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        run_id = str(metadata.get("selection_run_id") or "")
+        if not run_id or run_id in seen_run_ids:
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        seen_run_ids.add(run_id)
+        request_json, request_hash, config_json, config_hash = canonical_contract(request, config)
+        request_extra = item.get("request_json_extra")
+        if request_extra is not None:
+            if not isinstance(request_extra, Mapping):
+                raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+            parsed_request = json.loads(request_json)
+            parsed_request.update(_json_value(request_extra))
+            request_json = canonical_json(parsed_request)
+            request_hash = sha256(request_json.encode()).hexdigest()
+        expected = {int(row.strategy_id): int(row.result_id) for row in result.itertuples()}
         current = dict(connection.execute(
             "select strategy_id, current_result_id from strategies where strategy_id in (select unnest(?::bigint[]))",
             [list(expected)],
@@ -142,32 +200,52 @@ def persist_selection_snapshot(
         stale = sorted(strategy_id for strategy_id, result_id in expected.items() if current.get(strategy_id) != result_id)
         if stale:
             raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
-        connection.execute(
-            """insert into selection_runs (
-                selection_run_id, database_instance_id, symbol, side, selection_contract_version,
-                request_json, request_sha256, config_json, config_sha256, candidate_count,
-                representative_count, auto_finalist_count, top_n, workbook_sha256, created_at_utc
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [run_id, metadata["database_instance_id"], request.symbol, request.side,
-             metadata["selection_contract_version"], request_json, request_hash, config_json, config_hash,
-             len(result), representative_count, int((result["auto_status"] == "FINALIST").sum()), top_n,
-             workbook_hash, datetime.now(timezone.utc)],
-        )
-        stage_columns = [f"eliminated_by_{stage.id}" for stage in request.stages if stage.enabled]
-        rows = []
-        for row in result.to_dict(orient="records"):
-            trace = canonical_json({column.removeprefix("eliminated_by_"): bool(row.get(column)) for column in stage_columns})
-            rows.append([
-                run_id, int(row["strategy_id"]), int(row["result_id"]), str(row["auto_status"]),
-                _cell(row.get("final_score")), _cell(row.get("final_rank")), _cell(row.get("elimination_reason")),
-                _cell(row.get("analog_group_key")), _cell(row.get("auto_analog_of_strategy_id")),
-                bool(row.get("prior_rejected", False)), trace,
-            ])
-        _insert_rows(connection, "selection_results", (
-            "selection_run_id", "strategy_id", "result_id_at_selection", "auto_status", "auto_score",
-            "auto_rank", "auto_reason", "analog_group_key", "auto_analog_of_strategy_id", "prior_rejected",
-            "stage_trace_json",
-        ), rows)
+        rank_stage = next((stage for stage in request.stages if stage.id == "rank_robust_top_n"), None)
+        top_n = rank_stage.top_n if rank_stage and rank_stage.top_n else 20
+        representative_count = int(result["auto_status"].isin(["FINALIST", "RESERVE"]).sum())
+        run_hash = workbook_sha256
+        prepared.append({
+            "request": request, "config": config, "result": result, "metadata": metadata,
+            "request_json_extra": request_extra,
+            "run_id": run_id, "request_json": request_json, "request_hash": request_hash,
+            "config_json": config_json, "config_hash": config_hash, "expected": expected,
+            "top_n": top_n, "representative_count": representative_count, "run_hash": run_hash,
+        })
+
+    now = datetime.now(timezone.utc)
+    connection.execute("begin transaction")
+    try:
+        for item in prepared:
+            request = item["request"]
+            config = item["config"]
+            result = item["result"]
+            metadata = item["metadata"]
+            connection.execute(
+                """insert into selection_runs (
+                    selection_run_id, database_instance_id, symbol, side, selection_contract_version,
+                    request_json, request_sha256, config_json, config_sha256, candidate_count,
+                    representative_count, auto_finalist_count, top_n, workbook_sha256, created_at_utc
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [item["run_id"], metadata["database_instance_id"], request.symbol, request.side,
+                 metadata["selection_contract_version"], item["request_json"], item["request_hash"],
+                 item["config_json"], item["config_hash"], len(result), item["representative_count"],
+                 int((result["auto_status"] == "FINALIST").sum()), item["top_n"], item["run_hash"], now],
+            )
+            stage_columns = [f"eliminated_by_{stage.id}" for stage in request.stages if stage.enabled]
+            rows: list[list[object]] = []
+            for row in result.to_dict(orient="records"):
+                trace = canonical_json({column.removeprefix("eliminated_by_"): bool(row.get(column)) for column in stage_columns})
+                rows.append([
+                    item["run_id"], int(row["strategy_id"]), int(row["result_id"]), str(row["auto_status"]),
+                    _cell(row.get("final_score")), _cell(row.get("final_rank")), _cell(row.get("elimination_reason")),
+                    _cell(row.get("analog_group_key")), _cell(row.get("auto_analog_of_strategy_id")),
+                    bool(row.get("prior_rejected", False)), trace,
+                ])
+            _insert_rows(connection, "selection_results", (
+                "selection_run_id", "strategy_id", "result_id_at_selection", "auto_status", "auto_score",
+                "auto_rank", "auto_reason", "analog_group_key", "auto_analog_of_strategy_id", "prior_rejected",
+                "stage_trace_json",
+            ), rows)
         connection.execute("commit")
     except duckdb.ConstraintException as error:
         _rollback_quietly(connection)
@@ -177,7 +255,7 @@ def persist_selection_snapshot(
     except Exception:
         _rollback_quietly(connection)
         raise
-    return run_id
+    return tuple(str(item["run_id"]) for item in prepared)
 
 
 def _bounded_xlsx(data: bytes) -> None:

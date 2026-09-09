@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -11,7 +13,8 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 POLICY_VERSION = "portfolio_optimizer_research_risk_v1"
 ALGORITHM_VERSIONS = MappingProxyType(
     {
@@ -20,7 +23,47 @@ ALGORITHM_VERSIONS = MappingProxyType(
     }
 )
 PROFILE_NAMES = ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
-RANKING_IDS = frozenset({"operator_supplied_ranking_v1"})
+SIZING_MODE = "liquidity_cap_single"
+RANKING_IDS = frozenset({"portfolio_preliminary_ranking_v1"})
+INDIVIDUAL_DD_DEFAULTS = MappingProxyType(
+    {
+        "AGGRESSIVE": Decimal("30"),
+        "BALANCED": Decimal("20"),
+        "CONSERVATIVE": Decimal("15"),
+    }
+)
+RANKING_METRICS = MappingProxyType(
+    {
+        "AGGRESSIVE": (
+            {"field": "net_pnl", "direction": "DESC"},
+            {"field": "recovery_factor", "direction": "DESC"},
+            {"field": "max_dd_pct", "direction": "ASC"},
+        ),
+        "BALANCED": (
+            {"field": "recovery_factor", "direction": "DESC"},
+            {"field": "net_pnl", "direction": "DESC"},
+            {"field": "max_dd_pct", "direction": "ASC"},
+        ),
+        "CONSERVATIVE": (
+            {"field": "recovery_factor", "direction": "DESC"},
+            {"field": "max_dd_pct", "direction": "ASC"},
+            {"field": "net_pnl", "direction": "DESC"},
+        ),
+    }
+)
+RANKING_ID = "portfolio_preliminary_ranking_v1"
+LIQUIDITY_DEFAULTS = MappingProxyType(
+    {
+        "close_volume_participation_pct": 30,
+        "round_down_usdt": 50,
+        "minimum_coverage_pct": 90,
+        "maximum_age_hours": 2,
+        "weekend_start_utc": "SATURDAY 00:00",
+        "weekend_end_utc": "MONDAY 00:00",
+        "archive_publication_lag_hours": 6,
+        "backfill_write_enabled": False,
+    }
+)
 RESEARCH_RISK_POLICY = MappingProxyType(
     {
         "AGGRESSIVE": MappingProxyType(
@@ -71,7 +114,6 @@ class Scenario:
     collateral: Money
     max_balance: Money
     sizing_upper_bound: Money
-    sizing_grid: tuple[Money, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +122,8 @@ class Profile:
     max_actual_equity_dd_pct: Decimal
     min_calculated_free_margin_reserve_pct: Decimal
     max_calculated_account_mm_load_pct: Decimal
+    individual_max_dd_pct: Decimal
+    individual_net_pnl_min_exclusive: Decimal
     pnl: Mapping[str, Any]
     liquidity: Mapping[str, Any]
     ranking_id: str
@@ -128,6 +172,15 @@ def _string(value: Any, path: str) -> str:
     if not isinstance(value, str) or not value:
         raise PortfolioConfigError(f"{path} must be a non-empty string")
     return value
+
+
+def _weekday_time(value: Any, path: str) -> tuple[str, int]:
+    text = _string(value, path)
+    match = re.fullmatch(r"(MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY) ([01][0-9]|2[0-3]):([0-5][0-9])", text)
+    if match is None:
+        raise PortfolioConfigError(f"{path} must be WEEKDAY HH:MM in UTC")
+    weekday = ("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY").index(match.group(1))
+    return text, weekday * 1440 + int(match.group(2)) * 60 + int(match.group(3))
 
 
 def _finite_number(value: Any, path: str, *, positive: bool = False) -> float:
@@ -200,22 +253,26 @@ def _parse_scenario(value: Any, name: str) -> Scenario:
     deposit = _money(raw["deposit"], f"scenarios.{name}.deposit")
     collateral = _money(raw["collateral"], f"scenarios.{name}.collateral")
     max_balance = _money(raw["max_balance"], f"scenarios.{name}.max_balance")
-    sizing = _object(raw["sizing"], f"scenarios.{name}.sizing", ("upper_bound", "grid"))
+    sizing = _object(raw["sizing"], f"scenarios.{name}.sizing", ("upper_bound",))
     upper_bound = _money(sizing["upper_bound"], f"scenarios.{name}.sizing.upper_bound")
-    grid_raw = sizing["grid"]
-    if not isinstance(grid_raw, list) or not grid_raw:
-        raise PortfolioConfigError(f"scenarios.{name}.sizing.grid must be finite and nonempty")
-    grid = tuple(_money(item, f"scenarios.{name}.sizing.grid[{index}]") for index, item in enumerate(grid_raw))
-    if any(item.currency != upper_bound.currency for item in grid):
-        raise PortfolioConfigError(f"scenarios.{name}.sizing.grid currency must match upper_bound")
-    if any(item.amount > upper_bound.amount for item in grid):
-        raise PortfolioConfigError(f"scenarios.{name}.sizing.grid must fit upper_bound")
-    if any(left.amount >= right.amount for left, right in zip(grid, grid[1:])):
-        raise PortfolioConfigError(f"scenarios.{name}.sizing.grid must be strictly ordered")
     currencies = {deposit.currency, collateral.currency, max_balance.currency, upper_bound.currency}
     if len(currencies) != 1:
         raise PortfolioConfigError(f"scenarios.{name} money currencies must match")
-    return Scenario(account, deposit, collateral, max_balance, upper_bound, grid)
+    return Scenario(account, deposit, collateral, max_balance, upper_bound)
+
+
+def _ranking_metrics(value: Any, path: str, profile: str) -> tuple[Mapping[str, str], ...]:
+    if not isinstance(value, list) or value != list(RANKING_METRICS[profile]):
+        raise PortfolioConfigError(f"{path}.metrics must be the concrete {profile} preliminary ranking")
+    metrics: list[Mapping[str, str]] = []
+    for index, item in enumerate(value):
+        raw = _object(item, f"{path}.metrics[{index}]", ("field", "direction"))
+        field = _string(raw["field"], f"{path}.metrics[{index}].field")
+        direction = _string(raw["direction"], f"{path}.metrics[{index}].direction")
+        if direction not in {"ASC", "DESC"}:
+            raise PortfolioConfigError(f"{path}.metrics[{index}].direction is invalid")
+        metrics.append(MappingProxyType({"field": field, "direction": direction}))
+    return tuple(metrics)
 
 
 def _parse_profiles(value: Any) -> Mapping[str, Profile]:
@@ -223,7 +280,11 @@ def _parse_profiles(value: Any) -> Mapping[str, Profile]:
         raise PortfolioConfigError("profiles must contain exactly AGGRESSIVE, BALANCED, CONSERVATIVE")
     profiles: dict[str, Profile] = {}
     for name in PROFILE_NAMES:
-        raw = _object(value[name], f"profiles.{name}", ("pnl", "liquidity", "ranking"))
+        raw = _object(
+            value[name],
+            f"profiles.{name}",
+            ("pnl", "liquidity", "ranking", "individual_max_dd_pct", "individual_net_pnl_min_exclusive"),
+        )
         pnl = _descriptor(raw["pnl"], f"profiles.{name}.pnl")
         liquidity = _descriptor(raw["liquidity"], f"profiles.{name}.liquidity")
         ranking = _object(raw["ranking"], f"profiles.{name}.ranking", ("id", "parameters", "top_n"))
@@ -233,18 +294,22 @@ def _parse_profiles(value: Any) -> Mapping[str, Profile]:
         parameters = ranking["parameters"]
         if not isinstance(parameters, dict) or not parameters:
             raise PortfolioConfigError(f"profiles.{name}.ranking.parameters must be explicit")
+        _ranking_metrics(parameters.get("metrics"), f"profiles.{name}.ranking.parameters", name)
         top_n = _integer(ranking["top_n"], f"profiles.{name}.ranking.top_n", positive=True)
         risk = RESEARCH_RISK_POLICY[name]
         dd = risk["max_actual_equity_dd_pct"]
         reserve = risk["min_calculated_free_margin_reserve_pct"]
         mm = risk["max_calculated_account_mm_load_pct"]
-        profiles[name] = Profile(name, dd, reserve, mm, pnl, liquidity, ranking_id, _freeze(parameters), top_n)
+        individual_dd = _finite_decimal(raw["individual_max_dd_pct"], f"profiles.{name}.individual_max_dd_pct", positive=True)
+        individual_pnl = _finite_decimal(raw["individual_net_pnl_min_exclusive"], f"profiles.{name}.individual_net_pnl_min_exclusive")
+        profiles[name] = Profile(name, dd, reserve, mm, individual_dd, individual_pnl, pnl, liquidity, ranking_id, _freeze(parameters), top_n)
     return MappingProxyType(profiles)
 
 
 def _parse_inputs(value: Any) -> Mapping[str, Any]:
-    raw = _object(value, "inputs", ("performance_db", "portfolio_db", "collector_root", "approved_templates"))
+    raw = _object(value, "inputs", ("performance_db", "portfolio_db", "collector_root", "approved_templates", "bybit_minute_data_root"))
     result = {key: _string(raw[key], f"inputs.{key}") for key in ("performance_db", "portfolio_db", "collector_root")}
+    result["bybit_minute_data_root"] = _string(raw["bybit_minute_data_root"], "inputs.bybit_minute_data_root")
     templates = raw["approved_templates"]
     if not isinstance(templates, list) or not templates:
         raise PortfolioConfigError("inputs.approved_templates must be nonempty")
@@ -252,10 +317,50 @@ def _parse_inputs(value: Any) -> Mapping[str, Any]:
     return MappingProxyType(result)
 
 
+def _parse_liquidity(value: Any) -> Mapping[str, Any]:
+    raw = _object(
+        value,
+        "liquidity",
+        (
+            "policy_id", "parameters", "round_down_usdt", "minimum_coverage_pct", "maximum_age_hours",
+            "weekend_start_utc", "weekend_end_utc", "archive_publication_lag_hours", "backfill_write_enabled",
+        ),
+    )
+    descriptor = _descriptor({"policy_id": raw["policy_id"], "parameters": raw["parameters"]}, "liquidity")
+    parameters = dict(descriptor["parameters"])
+    participation = _integer(parameters.get("close_volume_participation_pct"), "liquidity.parameters.close_volume_participation_pct")
+    if not 1 <= participation <= 200:
+        raise PortfolioConfigError("liquidity.parameters.close_volume_participation_pct must be between 1 and 200")
+    result: dict[str, Any] = dict(descriptor)
+    result["parameters"] = MappingProxyType(parameters)
+    result["round_down_usdt"] = _finite_decimal(raw["round_down_usdt"], "liquidity.round_down_usdt", positive=True)
+    coverage = _integer(raw["minimum_coverage_pct"], "liquidity.minimum_coverage_pct")
+    if not 1 <= coverage <= 100:
+        raise PortfolioConfigError("liquidity.minimum_coverage_pct must be between 1 and 100")
+    result["minimum_coverage_pct"] = coverage
+    result["maximum_age_hours"] = _integer(raw["maximum_age_hours"], "liquidity.maximum_age_hours", positive=True)
+    result["weekend_start_utc"], start_minutes = _weekday_time(raw["weekend_start_utc"], "liquidity.weekend_start_utc")
+    result["weekend_end_utc"], end_minutes = _weekday_time(raw["weekend_end_utc"], "liquidity.weekend_end_utc")
+    if (end_minutes - start_minutes) % (7 * 1440) == 0:
+        raise PortfolioConfigError("liquidity weekend interval must be non-empty")
+    lag = _integer(raw["archive_publication_lag_hours"], "liquidity.archive_publication_lag_hours", nonnegative=True)
+    if lag > 48:
+        raise PortfolioConfigError("liquidity.archive_publication_lag_hours must be between 0 and 48")
+    result["archive_publication_lag_hours"] = lag
+    if not isinstance(raw["backfill_write_enabled"], bool):
+        raise PortfolioConfigError("liquidity.backfill_write_enabled must be a boolean")
+    result["backfill_write_enabled"] = raw["backfill_write_enabled"]
+    return MappingProxyType(result)
+
+
 def _parse_groups(raw: dict[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
-    search_raw = _object(raw["search"], "search", ("universe", "composition", "sizing", "limiter", "priority", "seed", "rounds", "total_test_budget"))
+    search_raw = _object(raw["search"], "search", ("universe", "composition", "sizing", "limiter", "priority", "seed", "rounds", "total_test_budget", "sizing_mode", "max_enumerated_combinations"))
     search = {key: _descriptor(search_raw[key], f"search.{key}") for key in ("universe", "composition", "sizing", "limiter", "priority")}
     search.update({key: _integer(search_raw[key], f"search.{key}", positive=True if key != "seed" else False, nonnegative=key == "seed") for key in ("seed", "rounds", "total_test_budget")})
+    if search_raw["sizing_mode"] != SIZING_MODE:
+        raise PortfolioConfigError("search.sizing_mode is unsupported")
+    search["sizing_mode"] = SIZING_MODE
+    search["max_enumerated_combinations"] = _integer(search_raw["max_enumerated_combinations"], "search.max_enumerated_combinations", positive=True)
 
     research_raw = _object(raw["research"], "research", ("development_window", "validation_window", "warmup", "boundary", "evidence_minimum"))
     research = {
@@ -266,7 +371,7 @@ def _parse_groups(raw: dict[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, 
         "evidence_minimum": _unit_number(research_raw["evidence_minimum"], "research.evidence_minimum", frozenset({"count"}), positive=True),
     }
 
-    liquidity = _descriptor(raw["liquidity"], "liquidity")
+    liquidity = _parse_liquidity(raw["liquidity"])
     margin = _descriptor(raw["margin"], "margin")
 
     runner_raw = _object(raw["runner"], "runner", ("target", "root", "timeout", "retries"))
@@ -286,6 +391,53 @@ def _reject_json_constant(value: str) -> None:
     raise PortfolioConfigError(f"JSON number {value} is not finite")
 
 
+def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Return a deterministic v2 copy; v1 monetary sizing grids are discarded."""
+    if not isinstance(document, Mapping):
+        raise PortfolioConfigError("config must be an object")
+    if document.get("schema_version") == SCHEMA_VERSION:
+        return deepcopy(dict(document)), False
+    if document.get("schema_version") != LEGACY_SCHEMA_VERSION:
+        return deepcopy(dict(document)), False
+    migrated = deepcopy(dict(document))
+    migrated["schema_version"] = SCHEMA_VERSION
+    runner = migrated.get("runner") if isinstance(migrated.get("runner"), dict) else {}
+    inputs = migrated.get("inputs") if isinstance(migrated.get("inputs"), dict) else {}
+    inputs.setdefault("bybit_minute_data_root", f"{runner.get('root', '.')}/tester/data/bybit")
+    migrated["inputs"] = inputs
+    search = migrated.get("search") if isinstance(migrated.get("search"), dict) else {}
+    search.setdefault("sizing_mode", SIZING_MODE)
+    search.setdefault("max_enumerated_combinations", 100000)
+    migrated["search"] = search
+    liquidity = migrated.get("liquidity") if isinstance(migrated.get("liquidity"), dict) else {}
+    parameters = liquidity.get("parameters") if isinstance(liquidity.get("parameters"), dict) else {}
+    parameters.setdefault("close_volume_participation_pct", LIQUIDITY_DEFAULTS["close_volume_participation_pct"])
+    liquidity["parameters"] = parameters
+    for key, default in LIQUIDITY_DEFAULTS.items():
+        if key != "close_volume_participation_pct":
+            liquidity.setdefault(key, default)
+    migrated["liquidity"] = liquidity
+    scenarios = migrated.get("scenarios") if isinstance(migrated.get("scenarios"), dict) else {}
+    for scenario in scenarios.values():
+        if isinstance(scenario, dict) and isinstance(scenario.get("sizing"), dict):
+            scenario["sizing"].pop("grid", None)
+    profiles = migrated.get("profiles") if isinstance(migrated.get("profiles"), dict) else {}
+    for name in PROFILE_NAMES:
+        profile = profiles.get(name)
+        if not isinstance(profile, dict):
+            continue
+        profile.setdefault("individual_max_dd_pct", str(INDIVIDUAL_DD_DEFAULTS[name]))
+        profile.setdefault("individual_net_pnl_min_exclusive", "0")
+        ranking = profile.get("ranking") if isinstance(profile.get("ranking"), dict) else {}
+        parameters = ranking.get("parameters") if isinstance(ranking.get("parameters"), dict) else {}
+        parameters["metrics"] = [dict(item) for item in RANKING_METRICS[name]]
+        ranking["parameters"] = parameters
+        ranking["id"] = RANKING_ID
+        profile["ranking"] = ranking
+    migrated["profiles"] = profiles
+    return migrated, True
+
+
 def load_portfolio_config(path: str | Path = "portfolio_optimizer.local.json") -> PortfolioConfig:
     """Load and validate a complete portfolio optimizer config once."""
     config_path = Path(path)
@@ -297,6 +449,7 @@ def load_portfolio_config(path: str | Path = "portfolio_optimizer.local.json") -
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PortfolioConfigError(f"cannot read config {config_path}: {exc}") from exc
+    raw, _ = migrate_portfolio_config_document(raw)
     top = _object(raw, "config", ("schema_version", "policy_version", "algorithm_versions", "inputs", "scenarios", "search", "research", "liquidity", "margin", "profiles", "runner"))
     if top["schema_version"] != SCHEMA_VERSION or isinstance(top["schema_version"], bool):
         raise PortfolioConfigError("schema_version is unsupported")

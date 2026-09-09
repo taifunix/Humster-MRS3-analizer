@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 import duckdb
@@ -21,6 +22,8 @@ from mrs3.performance_v2_store import (
 )
 from mrs3.panel import PanelController, create_panel_server
 from mrs3.performance_v2_import import PerformanceV2ImportError, PerformanceV2ImportResult
+from mrs3.performance_v2_finalist_retest import FinalistRetestError
+from mrs3.performance_v2_selection import PerformanceV2SelectionError
 from mrs3.panel_performance_v2 import (
     PerformanceV2ApiError,
     PerformanceV2PanelRequest,
@@ -380,6 +383,23 @@ def test_v2_failed_import_without_database_keeps_sources(tmp_path: Path) -> None
     assert (request.report_root / "P1.html").is_file()
 
 
+def test_v2_panel_service_passes_frozen_result_ids_directly(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    request = replace(
+        request, mode="REPLACE", replacement_strategy_ids={"P1": 1},
+        expected_current_result_ids={"P1": 11},
+    )
+    captured = {}
+
+    def import_result(import_request, **_kwargs):
+        captured["expected"] = import_request.expected_current_result_ids
+        return PerformanceV2ImportResult("failed", "FAILED", 0, 0, 1, None, None)
+
+    LocalPerformanceV2Service(import_func=import_result).run(request)
+
+    assert captured["expected"] == {"P1": 11}
+
+
 @pytest.mark.parametrize(
     "listing_path",
     [Path("../dates.xlsx"), Path("C:/absolute/dates.xlsx")],
@@ -709,6 +729,138 @@ def test_v2_catalog_and_windows_http_are_typed_and_repeatable(tmp_path: Path) ->
         assert connection.execute("select count(*) from window_metrics").fetchone() == (2,)
         for table, count in facts.items():
             assert connection.execute(f"select count(*) from {table}").fetchone() == (count,)
+
+
+def test_finalist_retest_preview_http_uses_server_owned_scope(tmp_path: Path, monkeypatch) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    seen: list[bool] = []
+
+    def preview(include_reserve: bool = False) -> dict[str, object]:
+        seen.append(include_reserve)
+        return {"scope": "FINALIST_RESERVE", "test_start": "2025-01-01", "test_end": "2026-09-07", "cohort_count": 7, "excluded_count": 1}
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_finalist_retest_preview", preview)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        status, document = _http_json(connection, "GET", "/api/v2/strategies/performance-v2/finalist-retest/preview?include_reserve=true")
+        connection.close()
+        assert status == 200 and document["cohort_count"] == 7
+        assert seen == [True]
+
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        status, document = _http_json(connection, "GET", "/api/v2/strategies/performance-v2/finalist-retest/preview?include_reserve=1")
+        connection.close()
+        assert status == 400 and document["error"]["code"] == "INVALID_REQUEST"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_finalist_retest_start_rejects_client_member_ids_before_io(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+
+    with pytest.raises(FinalistRetestError, match="unsupported fields"):
+        controller.strategies_performance_v2_finalist_retest_start({"strategy_ids": [1]})
+
+
+def test_finalist_retest_start_http_preserves_typed_validation_error(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        status, document = _http_json(
+            connection, "POST", "/api/v2/strategies/performance-v2/finalist-retest/start",
+            {"strategy_ids": [1]},
+        )
+        connection.close()
+        assert status == 400
+        assert document["error"]["code"] == "INVALID_REQUEST"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_retest_cohort_selection_requires_matching_server_job_kind(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+
+    class Jobs:
+        def get(self, _job_id):
+            return {"state": "COMMITTED", "kind": "strategies.tester.native.start"}
+
+        def runtime(self, _job_id):
+            return {"bulk_retest": True, "successful_replacements": [{"strategy_id": 1, "new_result_id": 2}]}
+
+    controller._panel_jobs = Jobs()  # type: ignore[assignment]
+    with pytest.raises(PerformanceV2SelectionError, match="RETEST_COHORT_JOB_NOT_COMMITTED"):
+        controller._selection_request({
+            "symbol": "BTCUSDT", "side": "LONG", "stages": [], "bulk_retest_job_id": "wrong-kind",
+        })
+
+
+def test_finalist_retest_default_end_is_two_complete_utc_days_back(monkeypatch) -> None:
+    import mrs3.panel as panel_module
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls, _timezone):
+            return datetime(2026, 9, 9, 12, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(panel_module, "datetime", FixedDateTime)
+    monkeypatch.setattr(panel_module, "freeze_finalist_cohort", lambda *_args, **_kwargs: SimpleNamespace(
+        members=({"listing_date_utc": datetime(2020, 1, 1, tzinfo=timezone.utc)},)
+    ))
+
+    assert PanelController._bulk_retest_range({}, {}, object(), False) == ("2020-01-01", "2026-09-07")
+
+
+def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, monkeypatch) -> None:
+    import mrs3.panel as panel_module
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    database = tmp_path / "performance.duckdb"
+    database.touch()
+    listing = tmp_path / "dates.xlsx"
+    listing.touch()
+    template = tmp_path / "base.json"
+    template.write_text("{}", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    cohort = SimpleNamespace(scope="FINALIST", cohort_sha256="new-cohort", members=({"strategy_id": 1},), exclusions=())
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+
+    class Jobs:
+        def __init__(self, old_cohort: str): self.old_cohort = old_cohort
+        def list(self): return [{"kind": "strategies.performance.v2.finalist-retest", "job_id": "old", "state": "COMMITTED"}]
+        def runtime(self, _job_id):
+            return {"scope": "FINALIST", "test_start": "2025-01-01", "test_end": "2026-09-07",
+                    "cohort_sha256": self.old_cohort, "config_sha256": panel_module.finalist_retest_config_digest({"LONG": str(template)}),
+                    "outcomes_finalized": True, "successful_replacements": [{"strategy_id": 1}]}
+
+    monkeypatch.setattr(controller, "_retest_listing_context", lambda: (listing, Path("dates.xlsx")))
+    monkeypatch.setattr(controller, "_performance_v2_config", lambda: SimpleNamespace(strategy_root=tmp_path / "Output" / "strategies"))
+    monkeypatch.setattr(controller, "_workflow_defaults", lambda: {"strategy_templates": {"LONG": str(template)}})
+    monkeypatch.setattr(controller, "_bulk_retest_range", lambda *_args: ("2025-01-01", "2026-09-07"))
+    monkeypatch.setattr(controller, "_bulk_retest_status_document", lambda job_id: {"job_id": job_id, "replayed": True})
+    monkeypatch.setattr(controller, "_start_tracked_panel_job", lambda *_args, **_kwargs: {"job_id": "new"})
+    monkeypatch.setattr(panel_module, "performance_v2_database_path", lambda _config: database)
+    monkeypatch.setattr(panel_module, "load_listing_dates", lambda _path: {})
+    monkeypatch.setattr(panel_module.duckdb, "connect", lambda *_args, **_kwargs: Connection())
+    monkeypatch.setattr(panel_module, "freeze_finalist_cohort", lambda *_args, **_kwargs: cohort)
+    monkeypatch.setattr(panel_module, "build_finalist_retest_manifest", lambda *_args, **_kwargs: SimpleNamespace(
+        cohort=cohort, config_sha256=panel_module.finalist_retest_config_digest({"LONG": str(template)}),
+        manifest_path=manifest, run_id="new-run",
+    ))
+
+    controller._panel_jobs = Jobs("old-cohort")  # type: ignore[assignment]
+    assert controller.strategies_performance_v2_finalist_retest_start({})["job_id"] == "new"
+    controller._panel_jobs = Jobs("new-cohort")  # type: ignore[assignment]
+    assert controller.strategies_performance_v2_finalist_retest_start({}) == {"job_id": "old", "replayed": True}
 
 
 def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_path: Path) -> None:

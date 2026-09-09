@@ -221,7 +221,7 @@ tester capabilities, collector schema и данных instrument tiers. Отсу
 | Identity | schema version, policy version, algorithm versions |
 | Inputs/storage | Performance DB, Portfolio DB, collector root, approved templates |
 | Scenarios | явно заданный депозит каждого портфеля, currency/collateral assumptions, `current_portfolio_equity` с timestamp/source/currency и maximum age, `max_balance`, sizing mode и верхняя граница sizing balance для проверяемого горизонта |
-| Search | exact `FINALIST` universe, composition proposals, sizing/limiter/priority candidates, finite sizing grid, maximum pre-test variant count, seed, rounds, total test budget |
+| Search | exact `FINALIST` universe, exhaustive composition candidates bounded by `max_enumerated_combinations`, sizing/limiter/priority candidates, finite sizing grid, seed, rounds, total test budget, and a post-joint-test selection limit |
 | Research | development/validation windows, warm-up и boundary rules, evidence minimums |
 | Liquidity | lookback, band, quantile, permitted share, freshness, valid-minute/coverage/completeness minima, global screen |
 | Margin model | venue/account mode, fees, tier и denominator semantics, overflow envelope, missing-data policy |
@@ -749,8 +749,9 @@ limiter, priorities включая явно разрешённое исключ�
 До tester детерминированно выполняются structural → liquidity ceiling → margin
 → individual-DD gates. M4 рассматривает только конечные варианты из config:
 sizing grid в единицах экспортируемого percentage-поля, её границы, порядок,
-hard `max_pretest_variant_count` и tie-break фиксируются в Campaign; превышение
-лимита не расширяет перебор автоматически. Выбранный scalar не превышает minimum
+composition enumeration is exhaustive up to the Campaign's hard
+`max_enumerated_combinations` safety bound; exceeding that bound fails closed.
+The selected scalar does not exceed the minimum
 всех ceiling и после round-down снова проходит все gates. Проверяются все точки
 этой конечной grid без раннего останова; Seed — максимальный прошедший uniform
 scalar либо явный override. Локальное уточнение меняет одну сторону/общий scalar,
@@ -1296,5 +1297,102 @@ Settings GET/PUT; постоянный gate этапа 2 до M5/M6 и отде�
 [risk limits](https://bybit-exchange.github.io/docs/v5/market/risk-limit),
 [tickers/24h turnover](https://bybit-exchange.github.io/docs/v5/market/tickers),
 [account fee rate](https://bybit-exchange.github.io/docs/v5/account/fee-rate).
+
+## D8 amendment: adapter/core contract and config schema v2
+
+This amendment is normative for the changed rules below and is linked to
+ADR-0033. ADR-0030 remains historical and unchanged for every rule that this
+amendment does not explicitly replace. The implementation boundary remains
+fixture/research-only; it does not authorize a tester run, recommendation,
+trading admission, or live use.
+
+### Config v2
+
+`schema_version` is `2`. v2 is strict: unknown keys at the document,
+scenario, search, liquidity, profile, ranking, input, or runner object levels
+are rejected. A v1 document is accepted only through deterministic in-memory
+migration. Migration changes the version to 2, removes the legacy monetary
+`scenarios.<name>.sizing.grid`, inserts the required fields below, and
+preserves every other accepted value. The v1 source bytes remain available for
+CAS; Panel Save writes the migrated v2 document.
+
+The active sizing mode is the fixed `search.sizing_mode =
+liquidity_cap_single`. `search.max_enumerated_combinations` defaults to
+`100000`. Each scenario keeps one deposit, collateral, max balance, and sizing
+upper bound. There is no active monetary sizing grid.
+
+Each profile has configurable `individual_max_dd_pct` with v1 migration
+defaults of 30, 20, and 15 for AGGRESSIVE, BALANCED, and CONSERVATIVE, plus
+`individual_net_pnl_min_exclusive` defaulting to 0. The preliminary ranking
+metric order is fixed per profile:
+
+| Profile | Ordered metrics |
+| --- | --- |
+| AGGRESSIVE | `net_pnl DESC`, `recovery_factor DESC`, `max_dd_pct ASC` |
+| BALANCED | `recovery_factor DESC`, `net_pnl DESC`, `max_dd_pct ASC` |
+| CONSERVATIVE | `recovery_factor DESC`, `max_dd_pct ASC`, `net_pnl DESC` |
+
+The global liquidity settings are `liquidity.parameters.close_volume_participation_pct`
+(integer 1..200, default 30), `round_down_usdt` (default 50),
+`maximum_age_hours` (default 2) for the market reference snapshot,
+`weekend_start_utc` (default `SATURDAY 00:00`),
+`weekend_end_utc` (default `MONDAY 00:00`), each configurable as a valid
+weekday and `HH:MM` UTC pair with a non-empty weekly interval, and
+`archive_publication_lag_hours` (integer
+0..48, default 6), and `backfill_write_enabled = false`. The accepted local
+input `inputs.bybit_minute_data_root` defaults from the configured tester root
+to its `data/bybit` directory. With the default `backfill_write_enabled =
+false`, missing archive data is reported without writes. If explicitly enabled,
+an adapter may atomically publish a downloaded complete daily CSV; tests use an
+injected fetcher and temporary output root.
+
+### Liquidity and individual gates
+
+Liquidity is calculated over the full accumulated directional position: every
+opening, averaging, and DCA increase contributes to the maximum absolute
+directional position before it returns flat. The largest closing Limit
+quantity is also recorded and must fit the same published capacity evidence;
+closing orders cannot bypass the gate. The MVP emits one member per profile,
+with its size equal to the calculated rounded-down full-position cap. It emits
+no 50/75/100 variants and no partial-close recommendation. Multi-size
+calibration remains deferred Phase 8.
+
+The individual gate reads the report's direct `max_dd_pct` value and requires
+`max_dd_pct <= profiles.<PROFILE>.individual_max_dd_pct`. It is independent of
+the portfolio-level research policy: actual joint DD remains 20/10/5,
+free-margin reserve remains 20/40/60, and MM load remains 50/35/20. A report
+also passes the profile PnL gate only when
+`net_pnl > individual_net_pnl_min_exclusive`; source PnL is never presented as
+portfolio PnL.
+
+### Candidate and reference determinism
+
+The future multi-pair `PortfolioCandidate` identity is the sorted tuple of
+canonical pair/direction member identities, followed by the fixed profile and
+scenario identities. Pair order is never an incidental input order. One
+Campaign freezes exactly one validated market-reference snapshot and digest;
+all candidate, leverage, quantity, and capacity calculations in that Campaign
+use that snapshot. A changed snapshot creates a new decision Campaign.
+
+The selected pair list is the candidate universe. For each selected symbol,
+search includes an explicit empty choice, so every candidate contains any
+non-empty subset of the selected symbols, from one pair through all selected
+pairs; a symbol may also contribute its admissible mixed LONG/SHORT option.
+Symbols with no usable finalist direction options are skipped. The search
+returns `INSUFFICIENT_DIRECTIONAL_UNIVERSE` only when no usable option remains
+across the entire selected universe. With `k_s` non-empty options for symbol
+`s`, the full universe count is exactly
+`product(1 + k_s) - 1`. In the active contract every candidate is returned
+when this full count is within `max_enumerated_combinations`;
+`max_candidates` is retained on the Campaign profile for future selection
+after joint tests and never truncates the pre-test composition universe.
+Enumeration sorts symbols and options, places the empty choice first for each
+symbol, uses product order, and omits the all-empty composition.
+
+The Panel is a thin facade. It owns HTTP validation, Settings CAS, immutable
+Campaign capture, job lifecycle, progress, and artifact delivery. The
+`src/mrs3/portfolio` package owns migration, candidate identity, sizing,
+liquidity, gates, ranking, and all calculations. Panel does not duplicate those
+algorithms or write PerformanceDB.
 При реализации проверяется актуальная версия и фиксируется reference date;
 эти ссылки не заменяют сохранённые campaign facts и не задают наши risk limits.

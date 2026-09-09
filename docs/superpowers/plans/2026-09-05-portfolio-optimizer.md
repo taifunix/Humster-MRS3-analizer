@@ -27,6 +27,34 @@ the real M8 joint test remains separately gated.
 **Panel UI contract:** [UI spec](../../specs/2026-09-06-portfolio-optimizer-panel-ui.md),
 [ADR-0031, Accepted](../../decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md).
 
+## Immediate adapter/core completion block (D8)
+
+The D8 contract amendment is accepted as implementation input and is recorded
+in [ADR-0033](../../decisions/0033-portfolio-optimizer-v2-adapter-and-liquidity-cap-contract.md).
+The accepted liquidity-capacity research is the implementation input for this
+block. It does not authorize tester, runtime, recommendation, trading, or live
+use.
+
+- [x] Freeze strict config schema v2 and deterministic v1 in-memory migration;
+  remove the active monetary sizing grid, preserve other accepted values, and
+  keep Panel CAS over the full document.
+- [x] Freeze one-size MVP semantics: one member/profile at the rounded full
+  accumulated directional liquidity cap, with no partial-close recommendation
+  or 50/75/100 size variants.
+- [x] Freeze direct report `max_dd_pct` individual gate, profile PnL floors,
+  and the three concrete preliminary ranking orders.
+- [x] Freeze one market-reference snapshot per Campaign and deterministic
+  future multi-pair `PortfolioCandidate` identity; keep Panel as a thin facade.
+- [x] Implement the one-size adapter, connect it to Panel Calculate, expose
+  7d/5d capacity and spread diagnostics, and pass root self-review plus full
+  regression verification (`3625 passed, 7 skipped`).
+- [ ] Obtain independent review of the adapter/core implementation and then
+  update this block with the reviewer disposition.
+
+The existing Phase 8 remains deferred and unchanged: multi-size liquidity
+calibration requires real joint execution evidence and does not belong to the
+one-size MVP.
+
 ## 1. Назначение плана и текущая граница
 
 План определяет порядок работ и проверок; требования, формулы, открытые
@@ -678,7 +706,24 @@ replacement/trial/rollback, без автоматического deployment п�
 воспроизводимые scenarios и explicit withdrawal-at-open-position contract.
 Ни один из этих пунктов не добавляется как обязательный capital allocator MVP.
 
-## 13. Общая failure/recovery матрица
+## 13. Phase 8 — multi-size liquidity calibration, отложена
+
+**Entry:** работающий реальный joint portfolio path с одним рассчитанным
+ликвидностью размером на стратегию и импортируемыми execution actions.
+
+- [ ] Добавить несколько размеров ниже индивидуального full-position cap.
+- [ ] На одинаковых composition/settings сравнивать длительность закрытия и
+  proven volume-bound partial closes по strategy-TF buckets.
+- [ ] Не считать ожидание до первого close fill проблемой ликвидности.
+- [ ] Рекомендовать только меньший размер, уже прошедший отдельный joint test.
+- [ ] Если все проверенные размеры stressed, рекомендовать уменьшить
+  `close_volume_participation_pct` и выполнить новый тест.
+
+**DoD:** размерная сетка, partial-close diagnostic и рекомендация воспроизводимы
+из сохранённых run facts. Текущий MVP использует ровно один размер — рассчитанный
+индивидуальный full-position cap — и не заявляет автоматическую калибровку.
+
+## 14. Общая failure/recovery матрица
 
 | Граница | Инъекция/пример | Ожидаемое поведение |
 | --- | --- | --- |
@@ -747,7 +792,7 @@ replacement/trial/rollback, без автоматического deployment п�
     одну Campaign identity; перестановка object keys digest не меняет, смена
     type/unit/UNKNOWN reason меняет.
 
-## 14. Проверки, review и коммиты в будущей реализации
+## 15. Проверки, review и коммиты в будущей реализации
 
 - [ ] Сверить каждый scoped diff со spec, не включать unrelated work.
 - [ ] Узкий failing test → implementation → focused suite → relevant broader suite.
@@ -796,7 +841,7 @@ U1 начата после отдельного назначения польз�
 U1 не разрешает менять алгоритмы оптимизатора ради удобства интерфейса. Поля и
 кнопки появляются только после принятия соответствующей backend capability.
 
-## 15. Ближайший следующий этап
+## 16. Ближайший следующий этап
 
 M0–M8 fixture scope is accepted after independent `CODE_REVIEW_PASS`; the real
 M8 joint test still requires separate authorization.
@@ -812,7 +857,7 @@ accepted M5 and M6 plus separate explicit user authorization.
 Не задавать пользователю вопросы повторно, если поведение уже закреплено в
 §2/§7 спецификации: выяснять physical mapping и evidence.
 
-## 16. Критерий независимости нового пакета
+## 17. Критерий независимости нового пакета
 
 Canonical spec/plan/ADR и навигация не ссылаются на рабочую подборку как на
 обязательный источник. Утверждённый collector имеет собственный canonical

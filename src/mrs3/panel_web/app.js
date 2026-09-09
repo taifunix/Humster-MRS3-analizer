@@ -16,11 +16,31 @@ const portfolioSettingsHelpers = (() => {
     const value = Number(text); if (!Number.isSafeInteger(value)) throw new Error('money');
     return value;
   };
-  const settingsIntegerValue = (raw) => {
+  const settingsIntegerValue = (raw, allowZero = false) => {
     const text = String(raw ?? '').trim();
-    if (!/^[1-9][0-9]*$/.test(text)) throw new Error('integer');
+    if (!(allowZero ? /^(?:0|[1-9][0-9]*)$/ : /^[1-9][0-9]*$/).test(text)) throw new Error('integer');
     const value = Number(text); if (!Number.isSafeInteger(value)) throw new Error('integer');
     return value;
+  };
+  const settingsDecimalParts = (value) => {
+    const text = typeof value === 'number' ? String(value) : value;
+    if (typeof text !== 'string' || !/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(text)) return null;
+    const pieces = text.replace('-', '').split('.'); const digits = `${pieces[0]}${pieces[1] || ''}`; const scaled = BigInt(digits || '0');
+    return { text, negative: text.startsWith('-'), scale: (pieces[1] || '').length, scaled };
+  };
+  const settingsDecimalValue = (raw, original, positive = false) => {
+    const text = String(raw ?? '').trim(); const parts = settingsDecimalParts(text);
+    if (!parts || (positive && (parts.negative || parts.scaled === 0n))) throw new Error('decimal');
+    if (text === String(original)) return original;
+    if (typeof original === 'string' || text.includes('.') || parts.negative) return text;
+    const value = Number(text); if (!Number.isSafeInteger(value)) throw new Error('decimal');
+    return value;
+  };
+  const settingsWeekdayMinutes = (raw) => {
+    if (typeof raw !== 'string') return null;
+    const match = /^(MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY) ([0-9]{2}):([0-9]{2})$/.exec(raw);
+    if (!match || Number(match[2]) > 23 || Number(match[3]) > 59) return null;
+    return ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'].indexOf(match[1]) * 1440 + Number(match[2]) * 60 + Number(match[3]);
   };
   const settingsCompareMoney = (left, right) => {
     const a = settingsMoneyParts(left); const b = settingsMoneyParts(right); if (!a || !b) return NaN;
@@ -30,43 +50,58 @@ const portfolioSettingsHelpers = (() => {
   };
   const validMoney = (money) => !!money && typeof money === 'object' && !Array.isArray(money) && Object.keys(money).sort().join(',') === 'amount,currency' && typeof money.currency === 'string' && !!money.currency.trim() && !!settingsMoneyParts(money.amount);
   const validSettingsDocument = (doc) => {
-    if (!doc || typeof doc !== 'object' || Array.isArray(doc) || !Number.isSafeInteger(doc.search?.total_test_budget) || doc.search.total_test_budget <= 0) return false;
+    const liquidity = doc?.liquidity; const parameters = liquidity?.parameters;
+    const start = settingsWeekdayMinutes(liquidity?.weekend_start_utc); const end = settingsWeekdayMinutes(liquidity?.weekend_end_utc);
+    const rounding = settingsDecimalParts(liquidity?.round_down_usdt);
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc) || doc.schema_version !== 2 || !Number.isSafeInteger(doc.search?.total_test_budget) || doc.search.total_test_budget <= 0 || doc.search.sizing_mode !== 'liquidity_cap_single' || !Number.isSafeInteger(doc.search.max_enumerated_combinations) || doc.search.max_enumerated_combinations <= 0 || !Number.isSafeInteger(parameters?.close_volume_participation_pct) || parameters.close_volume_participation_pct < 1 || parameters.close_volume_participation_pct > 200 || !rounding || rounding.negative || rounding.scaled === 0n || !Number.isSafeInteger(liquidity.minimum_coverage_pct) || liquidity.minimum_coverage_pct < 1 || liquidity.minimum_coverage_pct > 100 || !Number.isSafeInteger(liquidity.maximum_age_hours) || liquidity.maximum_age_hours <= 0 || start === null || end === null || start === end || !Number.isSafeInteger(liquidity.archive_publication_lag_hours) || liquidity.archive_publication_lag_hours < 0 || liquidity.archive_publication_lag_hours > 48 || typeof liquidity.backfill_write_enabled !== 'boolean') return false;
     for (const profile of profiles) {
-      const scenario = doc.scenarios?.[profile]; const ranking = doc.profiles?.[profile]?.ranking;
-      if (!scenario || !validMoney(scenario.deposit) || !validMoney(scenario.collateral) || !validMoney(scenario.max_balance) || !validMoney(scenario.sizing?.upper_bound) || !Array.isArray(scenario.sizing?.grid) || !scenario.sizing.grid.length || !Number.isSafeInteger(ranking?.top_n) || ranking.top_n <= 0) return false;
-      let previous = null;
-      for (const item of scenario.sizing.grid) { if (!validMoney(item) || item.currency !== scenario.sizing.upper_bound.currency || (previous && settingsCompareMoney(previous.amount, item.amount) >= 0) || settingsCompareMoney(item.amount, scenario.sizing.upper_bound.amount) > 0) return false; previous = item; }
+      const scenario = doc.scenarios?.[profile]; const profileDocument = doc.profiles?.[profile]; const ranking = profileDocument?.ranking;
+      if (!scenario || !validMoney(scenario.deposit) || !validMoney(scenario.collateral) || !validMoney(scenario.max_balance) || !validMoney(scenario.sizing?.upper_bound) || scenario.sizing.grid !== undefined || !settingsDecimalParts(profileDocument?.individual_max_dd_pct) || settingsDecimalParts(profileDocument.individual_max_dd_pct).negative || settingsDecimalParts(profileDocument.individual_max_dd_pct).scaled === 0n || !settingsDecimalParts(profileDocument.individual_net_pnl_min_exclusive) || !Number.isSafeInteger(ranking?.top_n) || ranking.top_n <= 0) return false;
       if ([scenario.deposit, scenario.collateral, scenario.max_balance].some((money) => money.currency !== scenario.sizing.upper_bound.currency)) return false;
     }
     return true;
   };
-  const settingsGridLines = (raw) => {
-    const text = String(raw ?? '').trim(); if (!text) throw new Error('grid');
-    const lines = text.split(/\r?\n/).map((line) => line.trim()); if (lines.some((line) => !line)) throw new Error('grid');
-    return lines;
-  };
   const settingsPatch = (document, values) => {
     if (!validSettingsDocument(document)) throw new Error('invalid-document');
     const payload = clone(document);
-    try { payload.search.total_test_budget = settingsIntegerValue(values.total_test_budget); } catch (error) { error.field = 'total-test-budget'; throw error; }
+    try { payload.liquidity.parameters.close_volume_participation_pct = settingsIntegerValue(values.close_volume_participation_pct); if (payload.liquidity.parameters.close_volume_participation_pct > 200) throw new Error('integer'); } catch (error) { error.field = 'close-volume-participation-pct'; throw error; }
+    try { payload.liquidity.round_down_usdt = settingsDecimalValue(values.round_down_usdt, document.liquidity.round_down_usdt, true); } catch (error) { error.field = 'round-down-usdt'; throw error; }
+    try { payload.liquidity.minimum_coverage_pct = settingsIntegerValue(values.minimum_coverage_pct); if (payload.liquidity.minimum_coverage_pct > 100) throw new Error('integer'); } catch (error) { error.field = 'minimum-coverage-pct'; throw error; }
+    try { payload.liquidity.maximum_age_hours = settingsIntegerValue(values.maximum_age_hours); } catch (error) { error.field = 'maximum-age-hours'; throw error; }
+    try { payload.liquidity.archive_publication_lag_hours = settingsIntegerValue(values.archive_publication_lag_hours, true); if (payload.liquidity.archive_publication_lag_hours > 48) throw new Error('integer'); } catch (error) { error.field = 'archive-publication-lag-hours'; throw error; }
+    try { const start = settingsWeekdayMinutes(String(values.weekend_start_utc ?? '').trim()); if (start === null) throw new Error('time'); payload.liquidity.weekend_start_utc = String(values.weekend_start_utc).trim(); } catch (error) { error.field = 'weekend-start-utc'; throw error; }
+    try { const end = settingsWeekdayMinutes(String(values.weekend_end_utc ?? '').trim()); if (end === null || end === settingsWeekdayMinutes(payload.liquidity.weekend_start_utc)) throw new Error('time'); payload.liquidity.weekend_end_utc = String(values.weekend_end_utc).trim(); } catch (error) { error.field = 'weekend-end-utc'; throw error; }
+    if (typeof values.backfill_write_enabled !== 'boolean') { const error = new Error('boolean'); error.field = 'backfill-write-enabled'; throw error; }
+    payload.liquidity.backfill_write_enabled = values.backfill_write_enabled;
     for (const profile of profiles) {
       const source = document.scenarios[profile]; const scenario = payload.scenarios[profile]; const value = values.profiles[profile];
       for (const name of ['deposit', 'collateral', 'max_balance']) {
         try { scenario[name].amount = settingsMoneyValue(value[name], source[name].amount); } catch (error) { error.field = `${profile.toLowerCase()}-${name.replace('_', '-')}`; throw error; }
       }
       try { scenario.sizing.upper_bound.amount = settingsMoneyValue(value.upper_bound, source.sizing.upper_bound.amount); } catch (error) { error.field = `${profile.toLowerCase()}-upper-bound`; throw error; }
-      const currency = source.sizing.upper_bound.currency;
-      try {
-        scenario.sizing.grid = settingsGridLines(value.grid).map((line, index) => ({ amount: settingsMoneyValue(line, source.sizing.grid[index]?.amount), currency }));
-        let previous = null; for (const item of scenario.sizing.grid) { if (previous && settingsCompareMoney(previous.amount, item.amount) >= 0) throw new Error('grid'); if (settingsCompareMoney(item.amount, scenario.sizing.upper_bound.amount) > 0) throw new Error('grid'); previous = item; }
-      } catch (error) { error.field = `${profile.toLowerCase()}-grid`; throw error; }
+      try { payload.profiles[profile].individual_max_dd_pct = settingsDecimalValue(value.individual_max_dd_pct, document.profiles[profile].individual_max_dd_pct, true); } catch (error) { error.field = `${profile.toLowerCase()}-individual-max-dd-pct`; throw error; }
+      try { payload.profiles[profile].individual_net_pnl_min_exclusive = settingsDecimalValue(value.individual_net_pnl_min_exclusive, document.profiles[profile].individual_net_pnl_min_exclusive); } catch (error) { error.field = `${profile.toLowerCase()}-individual-net-pnl-min-exclusive`; throw error; }
       try { payload.profiles[profile].ranking.top_n = settingsIntegerValue(value.top_n); } catch (error) { error.field = `${profile.toLowerCase()}-top-n`; throw error; }
     }
     return payload;
   };
-  return { profiles, clone, settingsMoneyParts, settingsMoneyValue, settingsIntegerValue, settingsCompareMoney, validSettingsDocument, settingsGridLines, settingsPatch };
+  return { profiles, clone, settingsMoneyParts, settingsMoneyValue, settingsIntegerValue, settingsDecimalParts, settingsDecimalValue, settingsWeekdayMinutes, settingsCompareMoney, validSettingsDocument, settingsPatch };
 })();
 if (typeof globalThis !== 'undefined') globalThis.portfolioSettingsHelpers = portfolioSettingsHelpers;
+
+const portfolioReasonHelpers = (() => {
+  const labels = Object.freeze({
+    INSUFFICIENT_DIRECTIONAL_UNIVERSE: 'после фильтров не осталось ни одного допустимого состава',
+    SIZE_BELOW_MINIMUM_QTY: 'после округления количество ниже минимального размера ордера Bybit',
+    SIZE_ROUNDED_TO_ZERO: 'расчётный размер позиции меньше шага округления; уменьшите шаг или исключите пару из universe',
+  });
+  const humanize = (value) => String(value ?? '').replace(/(^|[;\s])([A-Z][A-Z0-9_]*):([A-Z][A-Z0-9_]*)/g, (match, separator, prefix, code) => {
+    const label = labels[code];
+    return label ? `${separator}${prefix}: ${label}` : match;
+  });
+  return { humanize };
+})();
+if (typeof globalThis !== 'undefined') globalThis.portfolioReasonHelpers = portfolioReasonHelpers;
 
 const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const { selectCommittedRetestTester, selectRetestTester } = window.retestRecovery;
@@ -1831,6 +1866,93 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   loadRetestStatus();
   recoverRetestJobs();
 
+  // Global finalist retest uses a server-frozen cohort. The browser sends
+  // only scope and dates; Strategy/Result IDs are returned by the server.
+  const finalistRetestStart = document.querySelector('#performance-v2-finalist-retest-start-button');
+  const finalistRetestCard = document.querySelector('#performance-v2-finalist-retest-card');
+  const finalistRetestImport = document.querySelector('#performance-v2-finalist-retest-import-button');
+  const finalistRetestReserve = document.querySelector('#performance-v2-finalist-retest-reserve');
+  const finalistRetestStartDate = document.querySelector('#performance-v2-finalist-retest-start');
+  const finalistRetestEndDate = document.querySelector('#performance-v2-finalist-retest-end');
+  const finalistRetestStatus = document.querySelector('#performance-v2-finalist-retest-status');
+  const finalistRetestCount = document.querySelector('#performance-v2-finalist-retest-count');
+  const finalistRetestSuccesses = document.querySelector('#performance-v2-finalist-retest-successes');
+  const finalistRetestFailures = document.querySelector('#performance-v2-finalist-retest-failures');
+  const finalistRetestExport = document.querySelector('#performance-v2-finalist-retest-export');
+  const finalistRetestControlFile = document.querySelector('#performance-v2-finalist-retest-control-file');
+  const finalistRetestControlImport = document.querySelector('#performance-v2-finalist-retest-control-import');
+  let finalistRetestJobId = '';
+  let finalistRetestTimer = 0;
+  const loadFinalistRetestPreview = async () => {
+    try {
+      const preview = await requestJson(`/api/v2/strategies/performance-v2/finalist-retest/preview?include_reserve=${Boolean(finalistRetestReserve?.checked)}`);
+      if (finalistRetestStartDate && !finalistRetestStartDate.value) finalistRetestStartDate.value = preview.test_start || '';
+      if (finalistRetestEndDate && !finalistRetestEndDate.value) finalistRetestEndDate.value = preview.test_end || '';
+      if (finalistRetestCount) finalistRetestCount.textContent = String(preview.cohort_count ?? 0);
+      if (finalistRetestFailures) finalistRetestFailures.textContent = String(preview.excluded_count ?? 0);
+    } catch (error) {
+      if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist preview unavailable: ${error?.message || 'request failed'}.`;
+    }
+  };
+  const pollFinalistRetest = async () => {
+    if (!finalistRetestJobId) return;
+    try {
+      const job = await requestJson(`/api/v2/strategies/performance-v2/finalist-retest/status?job_id=${encodeURIComponent(finalistRetestJobId)}`);
+      const terminal = ['FAILED', 'CANCELLED'].includes(job.state) || job.outcomes_finalized === true;
+      if (finalistRetestCount) finalistRetestCount.textContent = String(job.cohort_count ?? 0);
+      if (finalistRetestSuccesses) finalistRetestSuccesses.textContent = String(job.success_count ?? 0);
+      if (finalistRetestFailures) finalistRetestFailures.textContent = String(job.failure_count ?? 0);
+      if (finalistRetestStatus) finalistRetestStatus.textContent = job.error?.code
+        ? `Global finalist retest: ${job.error.code}`
+        : `Global finalist retest: ${job.phase || job.state || 'RUNNING'}`;
+      if (finalistRetestImport) finalistRetestImport.disabled = !(job.state === 'COMMITTED' && job.inbox_ready === true);
+      if (finalistRetestExport) { finalistRetestExport.hidden = !(job.success_count > 0); finalistRetestExport.href = `/api/v2/strategies/performance-v2/finalist-retest/export?job_id=${encodeURIComponent(finalistRetestJobId)}`; }
+      if (terminal) { window.clearInterval(finalistRetestTimer); if (finalistRetestStart) finalistRetestStart.disabled = false; }
+    } catch (error) { if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist retest unavailable: ${error?.message || 'request failed'}.`; }
+  };
+  finalistRetestStart?.addEventListener('click', async () => {
+    finalistRetestStart.disabled = true;
+    try {
+      const payload = { include_reserve: Boolean(finalistRetestReserve?.checked) };
+      if (finalistRetestStartDate?.value) payload.test_start = finalistRetestStartDate.value;
+      if (finalistRetestEndDate?.value) payload.test_end = finalistRetestEndDate.value;
+      const result = await remoteRequest('/api/v2/strategies/performance-v2/finalist-retest/start', payload);
+      finalistRetestJobId = result.job_id || result.job?.job_id || '';
+      if (!finalistRetestJobId) throw new Error('missing global finalist retest job');
+      if (finalistRetestStatus) finalistRetestStatus.textContent = 'Global finalist retest started.';
+      finalistRetestTimer = window.setInterval(pollFinalistRetest, 1000); pollFinalistRetest();
+    } catch (error) { if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist retest failed: ${error?.message || 'request failed'}.`; finalistRetestStart.disabled = false; }
+  });
+  finalistRetestCard?.addEventListener('toggle', () => { if (finalistRetestCard.open) loadFinalistRetestPreview(); });
+  finalistRetestReserve?.addEventListener('change', loadFinalistRetestPreview);
+  finalistRetestImport?.addEventListener('click', async () => {
+    if (!finalistRetestJobId) return;
+    finalistRetestImport.disabled = true;
+    try {
+      await remoteRequest('/api/v2/strategies/performance-v2/finalist-retest/import', { tester_job_id: finalistRetestJobId });
+      if (finalistRetestStatus) finalistRetestStatus.textContent = 'Global finalist IMPORT & REPLACE started.';
+      window.clearInterval(finalistRetestTimer);
+      finalistRetestTimer = window.setInterval(pollFinalistRetest, 1000);
+      pollFinalistRetest();
+    }
+    catch (error) { if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist import failed: ${error?.message || 'request failed'}.`; finalistRetestImport.disabled = false; }
+  });
+  finalistRetestControlImport?.addEventListener('click', () => finalistRetestControlFile?.click());
+  finalistRetestControlFile?.addEventListener('change', async () => {
+    const file = finalistRetestControlFile.files?.[0];
+    if (!file) return;
+    try {
+      const response = await fetch('/api/v2/strategies/performance-v2/finalist-retest/control-import', {
+        method: 'POST', headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, body: file,
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error?.code || result.error?.message || 'control import failed');
+      if (finalistRetestStatus) finalistRetestStatus.textContent = `Control workbook imported: ${result.group_count || 0} groups.`;
+    } catch (error) {
+      if (finalistRetestStatus) finalistRetestStatus.textContent = `Control workbook import failed: ${error?.message || 'request failed'}.`;
+    } finally { finalistRetestControlFile.value = ''; }
+  });
+
   const performanceV2WindowSelect = document.querySelector('#performance-v2-window-strategy');
   const performanceV2WindowCard = document.querySelector('#performance-v2-window-card');
   const performanceV2WindowAEntire = document.querySelector('#performance-v2-window-a-entire');
@@ -2476,7 +2598,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     });
   });
   function portfolioErrorMessage(error) {
-    return error?.code ? `${error.code}: ${error.message || ''}`.trim() : (error?.message || 'request failed');
+    return error?.code ? `${error.code}: ${portfolioReasonHelpers.humanize(error.message || '')}`.trim() : portfolioReasonHelpers.humanize(error?.message || 'request failed');
   }
 
   function portfolioValues(value) {
@@ -2531,11 +2653,6 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       };
       const portfolioSafeInteger = (value, minimum = 0) => { const raw = String(value ?? '').trim(); const number = Number(raw); return raw !== '' && Number.isSafeInteger(number) && number >= minimum; };
       const copyPortfolioMaximum = (selector) => { const value = query(selector)?.value; return portfolioSafeInteger(value, 0) ? Number(value) : 0; };
-      const portfolioBudget = (readiness) => {
-        const candidates = [readiness?.search?.total_test_budget, readiness?.stage1?.search?.total_test_budget, readiness?.total_test_budget, readiness?.search_total_test_budget, readiness?.stage1?.total_test_budget];
-        for (const value of candidates) if (portfolioSafeInteger(value, 1)) return Number(value);
-        return null;
-      };
       const freezeStatus = (status) => `${status}${state.settingsChanged ? ' · SETTINGS_CHANGED_SINCE_FREEZE' : ''}`;
       const updateFreezeStatus = (job) => {
         const changed = job?.settings_changed_since_freeze === true || (state.configDigest && job?.config_digest && state.configDigest !== job.config_digest);
@@ -2555,21 +2672,19 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         const selectedPairs = rows.filter((row) => row.selected);
         const activePair = selectedPairs.some((row) => row.long > 0 || row.short > 0);
         const selectedProfiles = ['aggressive', 'balanced', 'conservative'].filter((profile) => query(`#portfolio-profile-${profile}`)?.checked);
-        const budget = portfolioBudget(state.readiness);
         const profiles = selectedProfiles.map((profile) => {
           const equity = query(`#portfolio-equity-${profile}`)?.value || '';
           const maxBalance = query(`#portfolio-max-balance-${profile}`)?.value || '';
           const candidates = query(`#portfolio-candidates-${profile}`)?.value || '';
           return { profile, equity, maxBalance, candidates };
         });
-        const profileBudgetTotal = profiles.reduce((total, profile) => total + (portfolioSafeInteger(profile.candidates, 1) ? Number(profile.candidates) : 0), 0);
-        const profilesValid = profiles.length > 0 && budget !== null && profileBudgetTotal <= budget && profiles.every((profile) => portfolioDecimal(profile.equity) && (!String(profile.maxBalance).trim() || portfolioDecimal(profile.maxBalance)) && portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= budget);
-        return { rows, selectedPairs, activePair, selectedProfiles, profiles, budget, profileBudgetTotal, valid: state.readiness?.stage1?.enabled === true && pairFieldsValid && activePair && profilesValid };
+        const profilesValid = profiles.length > 0 && profiles.every((profile) => portfolioDecimal(profile.equity) && (!String(profile.maxBalance).trim() || portfolioDecimal(profile.maxBalance)) && portfolioSafeInteger(profile.candidates, 1));
+        return { rows, selectedPairs, activePair, selectedProfiles, profiles, valid: state.readiness?.stage1?.enabled === true && pairFieldsValid && activePair && profilesValid };
       };
       const blockerItems = (readiness) => [
         ...portfolioValues(readiness?.stage1?.blockers || readiness?.blockers),
         ...portfolioValues(readiness?.stage2?.blockers).map((value) => `Stage 2: ${value}`),
-      ].map((value) => typeof value === 'string' ? value : (value?.code ? `${value.code}: ${value.message || ''}` : JSON.stringify(value))).filter(Boolean);
+      ].map((value) => portfolioReasonHelpers.humanize(typeof value === 'string' ? value : (value?.code ? `${value.code}: ${value.message || ''}` : JSON.stringify(value)))).filter(Boolean);
       const renderReadiness = (readiness) => {
         state.readiness = readiness || {};
         state.configDigest = readiness?.config_digest ?? readiness?.settings?.digest ?? null;
@@ -2632,8 +2747,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       };
       const renderJournal = (job) => {
         const journal = query('#portfolio-journal'); if (!journal) return; journal.replaceChildren();
-        const entries = portfolioValues(job?.journal || job?.diagnostics);
-        for (const entry of entries) { const line = document.createElement('p'); const severity = String(entry?.severity || entry?.level || 'INFO').toLowerCase(); line.className = `is-${severity}`; line.textContent = `${entry?.timestamp_utc || entry?.created_at || ''} ${entry?.stage || ''} ${entry?.code || ''} ${entry?.text || entry?.message || entry || ''}`.trim(); journal.append(line); }
+        const entries = portfolioValues(Array.isArray(job?.journal) && job.journal.length ? job.journal : job?.diagnostics);
+        for (const entry of entries) { const line = document.createElement('p'); const severity = String(entry?.severity || entry?.level || 'INFO').toLowerCase(); const message = portfolioReasonHelpers.humanize(entry?.text || entry?.message || entry || ''); line.className = `is-${severity}`; line.textContent = `${entry?.timestamp_utc || entry?.created_at || ''} ${entry?.stage || ''} ${entry?.code || ''} ${message}`.trim(); journal.append(line); }
       };
       const renderResults = async (job) => {
         const summary = query('#portfolio-summary'); const exclusions = query('#portfolio-exclusions'); const portfolioXlsx = query('#portfolio-xlsx');
@@ -2644,7 +2759,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
           const result = await requestJson(`/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/results`);
           const values = result.summary || result;
           if (summary) { summary.replaceChildren(); for (const [key, value] of Object.entries(values || {})) { const row = document.createElement('div'); const label = document.createElement('strong'); label.textContent = key; row.append(label, document.createTextNode(`: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`)); summary.append(row); } }
-          if (exclusions) { exclusions.replaceChildren(); for (const item of portfolioValues(result.exclusions || result.blockers)) { const row = document.createElement('div'); row.className = 'portfolio-exclusion'; row.textContent = typeof item === 'string' ? item : `${item.code || item.stage || 'Excluded'}: ${item.message || item.reason || ''}`; exclusions.append(row); } }
+           if (exclusions) { exclusions.replaceChildren(); for (const item of portfolioValues(result.exclusions || result.blockers)) { const row = document.createElement('div'); row.className = 'portfolio-exclusion'; row.textContent = portfolioReasonHelpers.humanize(typeof item === 'string' ? item : `${item.code || item.stage || 'Excluded'}: ${item.message || item.reason || ''}`); exclusions.append(row); } }
           if (portfolioXlsx && result.workbook_available === true) { portfolioXlsx.href = `/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/stage1.xlsx`; portfolioXlsx.hidden = false; }
         } catch (error) { if (summary) summary.textContent = `Results unavailable: ${portfolioErrorMessage(error)}`; }
       };
@@ -2736,11 +2851,18 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const displayMoney = (money) => String(money?.amount ?? '');
       const input = (profile, name) => query(`#portfolio-settings-${profile.toLowerCase()}-${name}`);
       const renderDocument = () => {
-        const doc = state.document; if (!doc) { controls().forEach((control) => { control.value = ''; }); return; }
-        const budget = query('#portfolio-settings-total-test-budget'); if (budget) budget.value = String(doc.search.total_test_budget);
-        for (const profile of profiles) {
-          const key = profile.toLowerCase(); const scenario = doc.scenarios[profile]; const ranking = doc.profiles[profile].ranking;
-          input(profile, 'deposit').value = displayMoney(scenario.deposit); input(profile, 'collateral').value = displayMoney(scenario.collateral); input(profile, 'max-balance').value = displayMoney(scenario.max_balance); input(profile, 'upper-bound').value = displayMoney(scenario.sizing.upper_bound); input(profile, 'grid').value = scenario.sizing.grid.map((item) => displayMoney(item)).join('\n'); input(profile, 'top-n').value = String(ranking.top_n);
+         const doc = state.document; if (!doc) { controls().forEach((control) => { if (control.type === 'checkbox') control.checked = false; else control.value = ''; }); return; }
+         const participation = query('#portfolio-settings-close-volume-participation-pct'); if (participation) participation.value = String(doc.liquidity.parameters.close_volume_participation_pct);
+         const rounding = query('#portfolio-settings-round-down-usdt'); if (rounding) rounding.value = String(doc.liquidity.round_down_usdt);
+         const coverage = query('#portfolio-settings-minimum-coverage-pct'); if (coverage) coverage.value = String(doc.liquidity.minimum_coverage_pct);
+         const age = query('#portfolio-settings-maximum-age-hours'); if (age) age.value = String(doc.liquidity.maximum_age_hours);
+         const lag = query('#portfolio-settings-archive-publication-lag-hours'); if (lag) lag.value = String(doc.liquidity.archive_publication_lag_hours);
+         const weekendStart = query('#portfolio-settings-weekend-start-utc'); if (weekendStart) weekendStart.value = doc.liquidity.weekend_start_utc;
+         const weekendEnd = query('#portfolio-settings-weekend-end-utc'); if (weekendEnd) weekendEnd.value = doc.liquidity.weekend_end_utc;
+         const backfill = query('#portfolio-settings-backfill-write-enabled'); if (backfill) backfill.checked = !!doc.liquidity.backfill_write_enabled;
+         for (const profile of profiles) {
+           const key = profile.toLowerCase(); const scenario = doc.scenarios[profile]; const ranking = doc.profiles[profile].ranking;
+           input(profile, 'deposit').value = displayMoney(scenario.deposit); input(profile, 'collateral').value = displayMoney(scenario.collateral); input(profile, 'max-balance').value = displayMoney(scenario.max_balance); input(profile, 'upper-bound').value = displayMoney(scenario.sizing.upper_bound); input(profile, 'individual-max-dd-pct').value = String(doc.profiles[profile].individual_max_dd_pct); input(profile, 'individual-net-pnl-min-exclusive').value = String(doc.profiles[profile].individual_net_pnl_min_exclusive); input(profile, 'top-n').value = String(ranking.top_n);
           const currency = query(`#portfolio-settings-${key}-currency`); if (currency) currency.textContent = scenario.deposit.currency;
         }
       };
@@ -2757,14 +2879,15 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         return state.loading;
       };
       const collect = () => {
-        const values = { total_test_budget: query('#portfolio-settings-total-test-budget')?.value, profiles: {} };
+         const values = { close_volume_participation_pct: query('#portfolio-settings-close-volume-participation-pct')?.value, round_down_usdt: query('#portfolio-settings-round-down-usdt')?.value, minimum_coverage_pct: query('#portfolio-settings-minimum-coverage-pct')?.value, maximum_age_hours: query('#portfolio-settings-maximum-age-hours')?.value, archive_publication_lag_hours: query('#portfolio-settings-archive-publication-lag-hours')?.value, weekend_start_utc: query('#portfolio-settings-weekend-start-utc')?.value, weekend_end_utc: query('#portfolio-settings-weekend-end-utc')?.value, backfill_write_enabled: !!query('#portfolio-settings-backfill-write-enabled')?.checked, profiles: {} };
         for (const profile of profiles) {
           values.profiles[profile] = {
             deposit: input(profile, 'deposit')?.value,
             collateral: input(profile, 'collateral')?.value,
             max_balance: input(profile, 'max-balance')?.value,
             upper_bound: input(profile, 'upper-bound')?.value,
-            grid: input(profile, 'grid')?.value,
+             individual_max_dd_pct: input(profile, 'individual-max-dd-pct')?.value,
+             individual_net_pnl_min_exclusive: input(profile, 'individual-net-pnl-min-exclusive')?.value,
             top_n: input(profile, 'top-n')?.value,
           };
         }

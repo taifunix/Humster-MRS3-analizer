@@ -108,10 +108,12 @@ GET/PUT локальной Panel.
 | --- | --- |
 | `equity_usdt` | число, совместимое с `DECIMAL(38,12)`, строго больше нуля |
 | `max_balance_usdt` | пусто означает отсутствие переопределения; иначе `DECIMAL(38,12)` строго больше нуля; связи с equity нет |
-| `max_candidates` | целое строго больше нуля и не больше текущего `search.total_test_budget` |
+| `max_candidates` | целое строго больше нуля; сохраняемый лимит будущего выбора результатов после joint tests, который не ограничивает полный pre-test composition universe |
 
 Если не выбран ни один профиль, кнопка расчёта заблокирована. Эти значения —
-поля конкретного Campaign, а не новые ключи файла настроек.
+поля конкретного Campaign, а не новые ключи файла настроек. `search.total_test_budget`
+остаётся скрытым legacy/downstream техническим полем конфигурации и не является
+полем формы или gate для создания Campaign Этапа 1; общего бюджета между профилями нет.
 
 ## 5. Campaign и задание этапа 1
 
@@ -257,7 +259,8 @@ M5/M6 и явного разрешения тестера.
   элементы `sizing.grid` с теми же полями;
 - дескрипторы `search.universe`, `search.composition`, `search.sizing`,
   `search.limiter`, `search.priority` с `policy_id`/`parameters`, а также
-  `search.seed`, `search.rounds`, `search.total_test_budget`;
+  `search.seed`, `search.rounds`, `search.total_test_budget` (legacy/downstream,
+  скрытое техническое поле, не gate Этапа 1);
 - `research.development_window`, `research.validation_window`, `research.warmup`,
   `research.evidence_minimum` с `value`/`unit`, плюс `research.boundary`;
 - дескрипторы `liquidity` и `margin` с `policy_id`/`parameters`;
@@ -343,9 +346,12 @@ UI не определяет новый смысл этих причин.
 
 ## 11. Этап 2 — передача тестеру
 
-Отдельное подтверждение обязательно. Для каждого выбранного профиля берутся
-первые N вариантов из зафиксированного серверного порядка, где N — сохранённый
-`max_candidates`. XLSX не загружается обратно и не является входом.
+Отдельное подтверждение обязательно. Сначала для каждого выбранного профиля
+строится полный зафиксированный pre-test composition universe; его объём
+ограничивается только `search.max_enumerated_combinations`. После joint tests
+будущий выбор первых N результатов из серверного порядка может использовать
+сохранённый `max_candidates`. XLSX не загружается обратно и не является
+входом.
 
 Кнопка и маршрут остаются отключёнными с точной причиной до завершения M5/M6 и
 отдельного явного разрешения на запуск тестера. Исследовательские пороги сами по
@@ -390,10 +396,12 @@ U0 не разрешает реализацию U1, запуск тестера 
 The Settings screen uses the same `portfolio_optimizer.local.json` document as
 the only source of truth and keeps `GET/PUT /api/v2/portfolio/settings` with
 `expected_digest` compare-and-swap. The raw JSON editor is replaced by a human
-form. The form exposes only `search.total_test_budget` and, for each of the
-three profiles `AGGRESSIVE`, `BALANCED`, and `CONSERVATIVE`, the amounts in
+form. The form exposes, for each of the three profiles `AGGRESSIVE`, `BALANCED`,
+and `CONSERVATIVE`, the amounts in
 `scenarios.<PROFILE>.deposit`, `collateral`, `max_balance`,
 `sizing.upper_bound`, every `sizing.grid` entry, and `profiles.<PROFILE>.ranking.top_n`.
+The legacy/downstream `search.total_test_budget` remains hidden and is not a
+Stage-1 form field or creation gate.
 Currencies are shown read-only; paths, IDs, versions, policy descriptors,
 research and runner settings remain hidden technical fields in the cloned
 document.
@@ -406,7 +414,7 @@ edited values remain strings so their lexemes stay exact. Floating point JSON, c
 and negative values are invalid. Grid entries are one nonblank value per line
 after trimming surrounding blank lines, numerically positive, strictly
 increasing, and no greater than the edited upper bound. New grid entries use
-the READY document's canonical currency. Budget and
+the READY document's canonical currency. The
 `top_n` inputs accept only positive JSON integers matching
 `^[1-9][0-9]*$`. Every inbound exposed value is validated before enabling the
 form; any invalid value makes the whole form read-only and shows:
@@ -423,3 +431,36 @@ version and keeps the message `Настройки изменены в друго
 form controls and Save; Reload remains available. This form does not change
 the separate runtime variant-generation blocker or the paused
 export-only-finalists path.
+
+## D8 amendment: v2 settings and thin facade
+
+The optimizer Settings contract now uses strict `schema_version = 2`. The
+server accepts a v1 document only through the deterministic in-memory
+migration defined by the main optimizer specification and ADR-0033. GET may
+display the migrated v2 document while retaining the source byte digest for
+CAS. A successful Save always writes v2; it removes every legacy monetary
+`scenarios.<PROFILE>.sizing.grid` and preserves all other accepted document
+fields. v2 unknown keys are rejected before write. A stale
+`expected_digest` still returns `409 CONFIG_CHANGED`, and the server never
+merges a stale partial document.
+
+The form exposes the single-size controls: scenario deposit, collateral,
+max_balance, and sizing upper bound; profile
+`individual_max_dd_pct`, `individual_net_pnl_min_exclusive`, and `ranking.top_n`;
+and the editable global controls `close_volume_participation_pct` (1..200),
+`round_down_usdt`, `minimum_coverage_pct`, market-reference
+`maximum_age_hours`, archive lag 0..48, the weekend window, and
+`backfill_write_enabled` (default false). The combination limit remains a
+hidden technical field. It does not
+render a sizing grid or partial-close size variants. Fixed descriptors,
+algorithm versions, paths, and policy identifiers remain technical fields in
+the cloned document. The Bybit minute root is accepted as a server-side local
+input and is never supplied by an untrusted browser field. The
+legacy/downstream `search.total_test_budget` remains in the configuration
+schema but is hidden from Settings and does not gate Stage-1 Campaign creation.
+
+Panel remains a thin facade. It owns HTTP validation, CAS, immutable Campaign
+capture, job lifecycle/progress, and artifact delivery. `src/mrs3/portfolio`
+owns migration, candidate identity, the one frozen market-reference snapshot,
+sizing, liquidity, gates, and ranking. No Panel code duplicates those
+algorithms or writes PerformanceDB.

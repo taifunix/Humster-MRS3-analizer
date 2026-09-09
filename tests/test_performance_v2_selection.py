@@ -30,9 +30,20 @@ from mrs3.performance_v2_selection import (
     selection_cache_missing_strategy_ids,
     selection_cache_status,
     write_selection_workbook,
+    retest_cohort_request,
 )
 from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_windows import METRICS_VERSION, WindowMetrics
+
+
+def test_retest_cohort_request_is_explicit_and_rejects_empty_members():
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    scoped = retest_cohort_request(request, "bulk-1", {9: 19, 2: 12})
+    assert scoped.ranking_scope == "RETEST_COHORT"
+    assert scoped.bulk_retest_job_id == "bulk-1"
+    assert scoped.cohort_members == ((2, 12), (9, 19))
+    with pytest.raises(PerformanceV2SelectionError, match="RETEST_COHORT_NO_SUCCESSFUL_MEMBERS"):
+        retest_cohort_request(request, "bulk-1", {})
 
 
 UTC = timezone.utc

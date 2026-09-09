@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, localcontext
 import math
 from pathlib import Path
 from types import MappingProxyType
@@ -1015,6 +1015,97 @@ def _user_rank(value: object) -> int | None:
     return value
 
 
+def _source_decimal(value: object, field: str, *, minimum: Decimal | None = None, exclusive_minimum: bool = False) -> Decimal:
+    if value is None:
+        raise PortfolioInputError(
+            f"current finalist {field} is unavailable",
+            code=SOURCE_SNAPSHOT_UNAVAILABLE,
+        )
+    if isinstance(value, bool):
+        raise PortfolioInputError(f"invalid source {field}", code="INVALID_SOURCE_VALUE")
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise PortfolioInputError(f"invalid source {field}", code="INVALID_SOURCE_VALUE") from error
+    if not result.is_finite():
+        raise PortfolioInputError(f"invalid source {field}", code="INVALID_SOURCE_VALUE")
+    if minimum is not None and (result <= minimum if exclusive_minimum else result < minimum):
+        raise PortfolioInputError(f"invalid source {field}", code="INVALID_SOURCE_VALUE")
+    return result
+
+
+def _source_timestamp(value: object, field: str, *, required: bool = True) -> str | None:
+    if value is None:
+        if required:
+            raise PortfolioInputError(
+                f"current finalist {field} is unavailable",
+                code=SOURCE_SNAPSHOT_UNAVAILABLE,
+            )
+        return None
+    try:
+        return _utc(value).isoformat().replace("+00:00", "Z")
+    except (TypeError, ValueError) as error:
+        raise PortfolioInputError(f"invalid source {field}", code="INVALID_SOURCE_VALUE") from error
+
+
+def _source_text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PortfolioInputError(f"invalid source {field}", code="INVALID_SOURCE_VALUE")
+    return value
+
+
+def _finalist_provenance(
+    facts: Mapping[tuple[str, str, int, int], Mapping[str, Any]],
+    strategy: Mapping[str, Any],
+    result: Mapping[str, Any],
+    key: tuple[str, str, int, int],
+    runs: Mapping[str, Mapping[str, Any]],
+    reviews: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    fact = facts[key]
+    run_id = _source_text(fact.get("selection_run_id"), "selection_run_id")
+    review_id = _source_text(fact.get("review_import_id"), "review_import_id")
+    run = runs.get(run_id)
+    review = reviews.get(review_id)
+    if run is None or review is None:
+        raise PortfolioInputError(
+            "current finalist provenance is unavailable",
+            code=SOURCE_SNAPSHOT_UNAVAILABLE,
+        )
+    return {
+        "selection_run_id": run_id,
+        "review_import_id": review_id,
+        "database_instance_id": _source_text(run.get("database_instance_id"), "database_instance_id"),
+        "selection_contract_version": _source_text(run.get("selection_contract_version"), "selection_contract_version"),
+        "request_sha256": _source_text(run.get("request_sha256"), "request_sha256"),
+        "config_sha256": _source_text(run.get("config_sha256"), "config_sha256"),
+        "run_workbook_sha256": _source_text(run.get("workbook_sha256"), "workbook_sha256"),
+        "run_created_at_utc": _source_timestamp(run.get("created_at_utc"), "selection_run.created_at_utc"),
+        "review_workbook_sha256": _source_text(review.get("workbook_sha256"), "workbook_sha256"),
+        "review_imported_at_utc": _source_timestamp(review.get("imported_at_utc"), "review_imported_at_utc"),
+        "analysis_run_id": _source_text(strategy.get("analysis_run_id"), "analysis_run_id"),
+        "candidate_identity": _source_text(strategy.get("candidate_identity"), "candidate_identity"),
+        "strategy_created_at_utc": _source_timestamp(strategy.get("created_at_utc"), "strategy.created_at_utc"),
+        "strategy_updated_at_utc": _source_timestamp(strategy.get("updated_at_utc"), "strategy.updated_at_utc"),
+        "result_imported_at_utc": _source_timestamp(result.get("imported_at_utc"), "imported_at_utc"),
+    }
+
+
+def _finalist_order(row: Mapping[str, Any]) -> dict[str, Any]:
+    order_id = _source_integer(row.get("order_id"), "order_id")
+    open_ma_len = _source_integer(row.get("open_ma_len"), "open_ma_len")
+    shift_bp = _source_integer(row.get("shift_bp"), "shift_bp")
+    if order_id <= 0 or open_ma_len <= 0 or shift_bp < 0:
+        raise PortfolioInputError("invalid source strategy order", code="INVALID_SOURCE_VALUE")
+    return {
+        "order_id": order_id,
+        "open_ma_len": open_ma_len,
+        "open_multiplier": _source_decimal(row.get("open_multiplier"), "open_multiplier", minimum=Decimal("0"), exclusive_minimum=True),
+        "shift_bp": shift_bp,
+        "lot_x": _source_decimal(row.get("lot_x"), "lot_x", minimum=Decimal("0"), exclusive_minimum=True),
+    }
+
+
 def apply_finalist_cutoff(
     candidates: Sequence[Mapping[str, Any]],
     *,
@@ -1109,6 +1200,23 @@ def read_current_finalists(
             by_strategy = {int(row["strategy_id"]): row for row in strategy_rows}
             result_rows = _records_for_ids(connection, "strategy_results", "result_id", result_ids)
             by_result = {int(row["result_id"]): row for row in result_rows}
+            order_rows = _records_for_ids(connection, "strategy_orders", "strategy_id", strategy_ids)
+            orders_by_strategy: dict[int, list[dict[str, Any]]] = {}
+            for order in order_rows:
+                strategy_id = _source_integer(order.get("strategy_id"), "strategy_id")
+                orders_by_strategy.setdefault(strategy_id, []).append(order)
+            run_ids = tuple(dict.fromkeys(
+                _source_text(facts[key].get("selection_run_id"), "selection_run_id")
+                for key in finalist_keys
+            ))
+            review_ids = tuple(dict.fromkeys(
+                _source_text(facts[key].get("review_import_id"), "review_import_id")
+                for key in finalist_keys
+            ))
+            run_rows = _records_for_ids(connection, "selection_runs", "selection_run_id", run_ids)
+            review_rows = _records_for_ids(connection, "selection_review_imports", "review_import_id", review_ids)
+            runs = {str(row["selection_run_id"]): row for row in run_rows}
+            reviews = {str(row["review_import_id"]): row for row in review_rows}
             result: list[dict[str, Any]] = []
             pair_order = {pair: index for index, pair in enumerate(pair_values)}
             for key in finalist_keys:
@@ -1130,14 +1238,74 @@ def read_current_finalists(
                         "current finalist source identity is unavailable",
                         code=SOURCE_SNAPSHOT_UNAVAILABLE,
                     )
+                orders = orders_by_strategy.get(strategy_id, [])
+                expected_order_count = _source_integer(source.get("order_count"), "order_count")
+                if expected_order_count <= 0 or len(orders) != expected_order_count:
+                    raise PortfolioInputError(
+                        "current finalist strategy geometry is unavailable",
+                        code=SOURCE_SNAPSHOT_UNAVAILABLE,
+                    )
+                ordered_orders = tuple(
+                    _finalist_order(order)
+                    for order in sorted(orders, key=lambda item: _source_integer(item.get("order_id"), "order_id"))
+                )
+                source_result = dict(source_result)
+                provenance = _finalist_provenance(facts, source, source_result, key, runs, reviews)
+                total_pnl = _source_decimal(source_result.get("total_pnl"), "total_pnl")
+                total_fees = _source_decimal(source_result.get("total_fees"), "total_fees", minimum=Decimal("0"))
+                max_drawdown = _source_decimal(source_result.get("max_drawdown"), "max_drawdown", minimum=Decimal("0"))
+                max_drawdown_pct = _source_decimal(source_result.get("max_drawdown_pct"), "max_drawdown_pct", minimum=Decimal("0"))
+                report_start = _source_timestamp(source_result.get("report_start_utc"), "report_start_utc")
+                report_end = _source_timestamp(source_result.get("report_end_utc"), "report_end_utc")
+                if report_end <= report_start:
+                    raise PortfolioInputError(
+                        "current finalist report period is invalid",
+                        code="INVALID_SOURCE_VALUE",
+                    )
+                recovery_factor: Decimal | dict[str, str]
+                if max_drawdown > 0:
+                    with localcontext() as context:
+                        context.prec = max(
+                            32,
+                            len(total_pnl.as_tuple().digits) + len(max_drawdown.as_tuple().digits) + 8,
+                        )
+                        recovery_factor = total_pnl / max_drawdown
+                    if not recovery_factor.is_finite():
+                        raise PortfolioInputError(
+                            "invalid source recovery_factor",
+                            code="INVALID_SOURCE_VALUE",
+                        )
+                else:
+                    recovery_factor = {
+                        "status": "UNKNOWN",
+                        "reason": "MAX_DRAWDOWN_NOT_POSITIVE",
+                    }
                 result.append({
                     "strategy_id": strategy_id,
                     "result_id": result_id,
-                    "strategy_name": source["strategy_name"],
+                    "strategy_name": _source_text(source.get("strategy_name"), "strategy_name"),
                     "symbol": symbol,
                     "side": side,
                     "user_status": "FINALIST",
                     "user_rank": _user_rank(facts[key].get("user_rank")),
+                    "timeframe": _source_text(source.get("timeframe"), "timeframe"),
+                    "report_start_utc": report_start,
+                    "report_end_utc": report_end,
+                    "effective_start_utc": _source_timestamp(source_result.get("effective_start_utc"), "effective_start_utc", required=False),
+                    "effective_end_utc": _source_timestamp(source_result.get("effective_end_utc"), "effective_end_utc", required=False),
+                    "imported_at_utc": _source_timestamp(source_result.get("imported_at_utc"), "imported_at_utc"),
+                    "reported_start_utc": _source_timestamp(source_result.get("reported_start_utc"), "reported_start_utc", required=False),
+                    "reported_end_utc": _source_timestamp(source_result.get("reported_end_utc"), "reported_end_utc", required=False),
+                    "total_pnl": total_pnl,
+                    "total_pnl_basis": "PERSISTED_NET_PNL",
+                    "total_fees": total_fees,
+                    "max_drawdown": max_drawdown,
+                    "max_drawdown_pct": max_drawdown_pct,
+                    "recovery_factor": recovery_factor,
+                    "strategy_orders": ordered_orders,
+                    "selection_run_id": provenance["selection_run_id"],
+                    "review_import_id": provenance["review_import_id"],
+                    "source_provenance": provenance,
                 })
             connection.execute("commit")
     except PortfolioInputError:

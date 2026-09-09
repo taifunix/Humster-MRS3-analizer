@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
+import json
 from pathlib import Path
 
 import duckdb
@@ -12,6 +14,7 @@ from mrs3.performance_v2_selection import (
     parse_selection_request,
     prepare_selection_window_cache,
 )
+from mrs3.panel_portfolio import _plain
 from mrs3.portfolio import input as portfolio_input
 from mrs3.portfolio.input import (
     SOURCE_SNAPSHOT_UNAVAILABLE,
@@ -78,6 +81,12 @@ def _database(tmp_path: Path) -> Path:
     strategy_id, result_id = connection.execute(
         "select strategy_id, current_result_id from strategies"
     ).fetchone()
+    connection.execute(
+        """update strategy_results set reported_start_utc = report_start_utc,
+           reported_end_utc = report_end_utc, effective_start_utc = report_start_utc,
+           effective_end_utc = report_end_utc where result_id = ?""",
+        [result_id],
+    )
     selection_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
     _add_review(
         connection,
@@ -584,6 +593,12 @@ def test_series_keep_source_ordinals_per_result_identity(tmp_path: Path) -> None
             "insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange, commission_rate, initial_balance, final_balance, total_pnl, total_pnl_pct, max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc) values (?, ?, ?, 'Bybit', .0004, 100, 110, 10, 10, 5, 5, 2, 2, ?) returning result_id",
             [strategy_id, start, datetime(2026, 1, 31, tzinfo=timezone.utc), start],
         ).fetchone()[0]
+        connection.execute(
+            """update strategy_results set reported_start_utc = report_start_utc,
+               reported_end_utc = report_end_utc, effective_start_utc = report_start_utc,
+               effective_end_utc = report_end_utc where result_id = ?""",
+            [result_id],
+        )
         connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
         connection.executemany(
             "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -839,16 +854,125 @@ def test_read_current_finalists_returns_exact_review_facts_without_writes(tmp_pa
 
     rows = read_current_finalists(database, [("BTCUSDT", "LONG")])
 
-    assert rows == ({
-        "strategy_id": rows[0]["strategy_id"],
-        "result_id": rows[0]["result_id"],
+    assert rows[0] | {
         "strategy_name": "alpha",
         "symbol": "BTCUSDT",
         "side": "LONG",
         "user_status": "FINALIST",
         "user_rank": 1,
-    },)
+    } == rows[0]
     assert database.read_bytes() == before
+
+
+def test_read_current_finalists_returns_physical_facts_and_panel_safe_values(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        result_id = connection.execute("select current_result_id from strategies").fetchone()[0]
+        connection.execute(
+            """update strategy_results set reported_start_utc = report_start_utc,
+               reported_end_utc = report_end_utc, effective_start_utc = report_start_utc,
+               effective_end_utc = report_end_utc where result_id = ?""",
+            [result_id],
+        )
+    before = database.read_bytes()
+
+    row = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+
+    assert row["timeframe"] == "1h"
+    assert row["report_start_utc"] == "2026-01-01T00:00:00Z"
+    assert row["reported_end_utc"] == "2026-01-31T00:00:00Z"
+    assert row["effective_start_utc"] == "2026-01-01T00:00:00Z"
+    assert row["imported_at_utc"] == "2026-01-01T00:00:00Z"
+    assert row["total_pnl"] == Decimal("10")
+    assert row["total_fees"] == Decimal("2")
+    assert row["max_drawdown"] == Decimal("5")
+    assert row["max_drawdown_pct"] == Decimal("5")
+    assert row["recovery_factor"] == Decimal("2")
+    assert row["strategy_orders"] == ({
+        "order_id": 1,
+        "open_ma_len": 7,
+        "open_multiplier": Decimal("0.995000000000"),
+        "shift_bp": 125,
+        "lot_x": Decimal("1.000000000000"),
+    },)
+    assert row["source_provenance"]["selection_run_id"] == "run-default"
+    json.dumps(_plain(dict(row)), ensure_ascii=False, allow_nan=False)
+    assert database.read_bytes() == before
+
+
+def test_read_current_finalists_accepts_legacy_null_optional_ranges(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "update strategy_results set reported_start_utc = null, reported_end_utc = null, effective_start_utc = null, effective_end_utc = null"
+        )
+
+    row = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+
+    assert row["report_start_utc"] == "2026-01-01T00:00:00Z"
+    assert row["reported_start_utc"] is None
+    assert row["effective_start_utc"] is None
+
+
+def test_read_current_finalists_marks_nonpositive_drawdown_recovery_unknown(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        result_id = connection.execute("select current_result_id from strategies").fetchone()[0]
+        connection.execute("update strategy_results set max_drawdown = 0 where result_id = ?", [result_id])
+
+    row = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+
+    assert row["recovery_factor"] == {
+        "status": "UNKNOWN",
+        "reason": "MAX_DRAWDOWN_NOT_POSITIVE",
+    }
+
+
+@pytest.mark.parametrize("field", ["total_pnl", "total_fees", "max_drawdown", "max_drawdown_pct"])
+def test_read_current_finalists_fails_closed_on_missing_physical_metric(tmp_path: Path, field: str) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        result_id = connection.execute("select current_result_id from strategies").fetchone()[0]
+        connection.execute(f"update strategy_results set {field} = null where result_id = ?", [result_id])
+
+    with pytest.raises(PortfolioInputError) as error:
+        read_current_finalists(database, [("BTCUSDT", "LONG")])
+
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+    assert field in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("total_fees", "-1"), ("max_drawdown", "-1"), ("max_drawdown_pct", "-1")],
+)
+def test_read_current_finalists_fails_closed_on_invalid_physical_metric(tmp_path: Path, field: str, value: str) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        result_id = connection.execute("select current_result_id from strategies").fetchone()[0]
+        connection.execute(f"update strategy_results set {field} = ? where result_id = ?", [value, result_id])
+
+    with pytest.raises(PortfolioInputError) as error:
+        read_current_finalists(database, [("BTCUSDT", "LONG")])
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+    assert field in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("open_multiplier", "0"), ("shift_bp", "-1")],
+)
+def test_read_current_finalists_fails_closed_on_invalid_strategy_geometry(tmp_path: Path, field: str, value: str) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies").fetchone()[0]
+        connection.execute(f"update strategy_orders set {field} = ? where strategy_id = ?", [value, strategy_id])
+
+    with pytest.raises(PortfolioInputError) as error:
+        read_current_finalists(database, [("BTCUSDT", "LONG")])
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
 
 
 def test_read_and_select_finalists_uses_current_user_rank(tmp_path: Path) -> None:

@@ -1,7 +1,32 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-09
+**Updated:** 2026-09-10
 **Current branch:** `main`
+
+## Performance v2 global finalist retest control (2026-09-10)
+
+The Panel now freezes the current effective `FINALIST` set, optionally adds
+`RESERVE`, generates one native `SINGLE_MODE` retest batch, and imports each
+successful report through the existing `REPLACE` path without changing user
+statuses or ranks. Post-retest selection runs in server-owned
+`RETEST_COHORT` scope: cache population, filters, percentiles, analogs and ranks
+see only the exact successfully imported Strategy/Result IDs. Failed and
+excluded members remain auditable and do not reuse their old metrics in the
+new ranking.
+
+The completed run exports one atomic control XLSX for all Pair + Direction
+groups. User status, local rank, RETEST and comment are editable; automatic
+fields, rowsets, cohort/config provenance and failure-only groups are checked
+before one transaction. Reimporting identical edited bytes is idempotent. The
+new read-only preview fills the oldest cohort listing as start and UTC today
+minus two days as end. Exact successful jobs replay only when scope, dates,
+cohort and template/config digest all match.
+
+Root focused verification:
+`.venv\Scripts\python.exe -m pytest tests/test_performance_v2_finalist_retest.py tests/test_performance_v2_retest.py tests/test_performance_v2_import.py tests/test_performance_v2_selection.py tests/test_performance_v2_selection_review.py tests/test_panel_performance_v2.py tests/test_panel_performance_v2_retest.py tests/test_panel_static_ui.py tests/test_portfolio_input.py -q`
+— `574 passed, 4 skipped`. The complete project suite passes `3650 passed,
+7 skipped`; `node --check`, `py_compile`, and `git diff --check` pass. No real
+tester or remote target was launched.
 
 ## Portfolio Optimizer human settings form (2026-09-09)
 
@@ -1712,3 +1737,44 @@ project suite. Evidence is recorded in
 The next Phase 2B step is the separate 2B-9 Panel visualization. Real exchange
 REST/WS, credentials, notifications, tester execution, trading, bot/config
 mutation, admission and deployment remain blocked pending separate approval.
+
+## Portfolio Optimizer one-size adapter implemented, pending final review (2026-09-09)
+
+The D8 one-size adapter now connects the existing Panel calculation job to the
+package-owned strict FINALIST reader, profile gates/ranking, multi-pair
+combinatorics, tester minute-volume capacity, current public Bybit
+instrument/risk/mark snapshot, collector spread diagnostics and full-position
+sizing. Config v1 migrates in memory to strict v2 and resolves minute files from
+`<bot_root>/tester/data/bybit`; existing UTF-8-BOM tester CSV files are accepted.
+The workbook exposes both 7-calendar-day sizing and 5-weekday analytical
+capacity, spread state, warnings and lineage digests. Tester execution remains
+outside this adapter.
+
+Focused verification passes 334 tests; the full project suite passes `3625
+passed, 7 skipped` with eight pre-existing pandas/archive warnings. JavaScript
+syntax, Python compileall and `git diff --check` also pass. A live read-only smoke on the current
+six selected LONG pairs reached the intended liquidity gate: `GEUSDT` has only
+three available days and about 11.32 USDT mean clock-minute turnover, so 30%
+participation rounds down to a zero 50-USDT cap and the complete six-pair
+candidate is rejected with `GEUSDT:SIZE_BELOW_MINIMUM_QTY`. Removing that pair
+produced one five-pair BALANCED candidate with current Bybit facts; collector
+spread history is visibly `PRELIMINARY` (67 available hours). The next step is
+independent review before commit when the configured reviewer route is
+authorized.
+
+Post-implementation self-review now excludes collector minutes below the
+configured coverage threshold and rejects coverage ratios above one. The human
+Settings form exposes participation, rounding, coverage, market-reference age,
+archive lag, weekend boundaries and explicit backfill. The hidden legacy
+`search.total_test_budget` no longer blocks Stage-1 Campaign creation.
+Selected pairs now define the search universe: every non-empty subset from one
+through all usable pairs is enumerated, bounded only by
+`search.max_enumerated_combinations`. A profile's `max_candidates` is retained
+for post-joint-test winner selection and does not truncate the pre-test universe.
+An exact replay of Campaign `campaign-a26ee8eec74249e6ad0d0f7cb6a2e424`
+passes with all 255 non-empty subsets of its eight usable pairs; four zero-cap
+pairs are reported as exclusions instead of failing the Campaign. Post-review
+focused Panel/adapter checks pass `197 tests`; the complete `test_portfolio_*`
+set passes `927 tests`. Python compileall, JavaScript syntax and
+`git diff --check` pass. Independent final code review is still pending before
+commit.

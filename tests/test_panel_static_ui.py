@@ -956,6 +956,19 @@ def test_performance_v2_review_import_uses_a_folder_picker_and_bounded_endpoint(
     assert ".filter((file) => file.name.toLowerCase().endsWith('.xlsx'))" in js
 
 
+def test_finalist_retest_ui_loads_server_defaults_without_member_ids() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    block = js.split("const finalistRetestStart", 1)[1].split("const performanceV2WindowSelect", 1)[0]
+
+    assert 'id="performance-v2-finalist-retest-reserve"' in html
+    assert "/api/v2/strategies/performance-v2/finalist-retest/preview?include_reserve=" in block
+    assert "preview.test_start" in block and "preview.test_end" in block
+    assert "strategy_ids" not in block and "result_ids" not in block
+    assert "job.outcomes_finalized === true" in block
+    assert "finalistRetestTimer = window.setInterval(pollFinalistRetest, 1000)" in block
+
+
 def test_performance_v2_window_analysis_renders_server_normalization_in_one_four_column_table() -> None:
     js = _read("app.js")
     render = js.split("const performanceV2MetricDefinitions", 1)[1].split("const loadPerformanceV2Catalog", 1)[0]
@@ -1172,19 +1185,22 @@ def test_portfolio_settings_uses_human_form_for_all_profiles_and_keeps_technical
 
     assert 'id="portfolio-settings-document"' not in html
     assert 'id="portfolio-settings-form"' in html
-    assert 'id="portfolio-settings-total-test-budget"' in html
+    assert 'id="portfolio-settings-total-test-budget"' not in html
     assert 'id="portfolio-settings-profile-aggressive"' in html
     assert 'id="portfolio-settings-profile-balanced"' in html
     assert 'id="portfolio-settings-profile-conservative"' in html
     for profile in ("aggressive", "balanced", "conservative"):
-        for field in ("deposit", "collateral", "max-balance", "upper-bound", "grid", "top-n"):
+        for field in ("deposit", "collateral", "max-balance", "upper-bound", "individual-max-dd-pct", "individual-net-pnl-min-exclusive", "top-n"):
             assert f'id="portfolio-settings-{profile}-{field}"' in html
-    assert "Общий бюджет проверок" in html
-    assert "Максимум кандидатов Campaign" in html
-    assert "Валюта только для чтения" in html
-    assert "Серверные настройки содержат недопустимые значения. Сохранение отключено." in js
+        assert f'id="portfolio-settings-{profile}-grid"' not in html
+    for field in ("close-volume-participation-pct", "round-down-usdt", "minimum-coverage-pct", "maximum-age-hours", "archive-publication-lag-hours", "weekend-start-utc", "weekend-end-utc", "backfill-write-enabled"):
+        assert f'id="portfolio-settings-{field}"' in html
+    assert "Доля минутного объёма для позиции" in html
+    assert "Шаг округления размера" in html
+    assert "Минимальное покрытие данных стакана" in html
     assert "^[1-9][0-9]*$" in js
-    assert "settingsCompareMoney(previous.amount, item.amount) >= 0" in js
+    assert "settingsDecimalValue" in js
+    assert "settingsWeekdayMinutes" in js
     assert "JSON.parse(JSON.stringify" in js
     assert "CONFIG_CHANGED" in js
     assert "Настройки изменены в другой сессии. Загружена серверная версия." in js
@@ -1199,10 +1215,10 @@ def test_portfolio_settings_patches_only_exposed_leaves_and_preserves_money_lexe
 
     assert "settingsMoneyValue" in js
     assert "settingsIntegerValue" in js
-    assert "settingsCompareMoney" in js
+    assert "settingsDecimalValue" in js
     assert "scenario[name].amount" in js
     assert "scenario.sizing.upper_bound.amount" in js
-    assert "scenario.sizing.grid" in js
+    assert "scenario.sizing.grid !== undefined" in js
     assert "payload.profiles[profile].ranking.top_n" in js
     assert "state.document = clone(result.document)" in js
     assert "document: payload" in js
@@ -1210,31 +1226,49 @@ def test_portfolio_settings_patches_only_exposed_leaves_and_preserves_money_lexe
     assert "state.conflictMessage = '';\n        clearInvalid();\n        let payload" in js
 
 
-def test_portfolio_settings_helpers_validate_lexemes_grid_and_hidden_fields() -> None:
+def test_portfolio_settings_helpers_validate_v2_lexemes_and_hidden_fields() -> None:
     document = {
-        "search": {"total_test_budget": 9},
+        "schema_version": 2,
         "scenarios": {
             profile: {
                 "deposit": {"amount": 10, "currency": "USDT"},
                 "collateral": {"amount": 20, "currency": "USDT"},
                 "max_balance": {"amount": 30, "currency": "USDT"},
-                "sizing": {"upper_bound": {"amount": 30, "currency": "USDT"}, "grid": [{"amount": 1, "currency": "USDT"}, {"amount": 2, "currency": "USDT"}]},
+                "sizing": {"upper_bound": {"amount": 30, "currency": "USDT"}},
             }
             for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
         },
-        "profiles": {profile: {"ranking": {"top_n": 2}} for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")},
+        "profiles": {profile: {"individual_max_dd_pct": 20, "individual_net_pnl_min_exclusive": 0, "ranking": {"top_n": 2}} for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")},
+        "liquidity": {
+            "parameters": {"close_volume_participation_pct": 30},
+            "round_down_usdt": 50,
+            "minimum_coverage_pct": 90,
+            "maximum_age_hours": 2,
+            "weekend_start_utc": "SATURDAY 00:00",
+            "weekend_end_utc": "MONDAY 00:00",
+            "archive_publication_lag_hours": 6,
+            "backfill_write_enabled": False,
+        },
+        "search": {"total_test_budget": 9, "sizing_mode": "liquidity_cap_single", "max_enumerated_combinations": 100000},
         "runner": {"root": "hidden", "token": {"keep": True}},
     }
     values = {
-        "total_test_budget": "9",
         "profiles": {
-            profile: {"deposit": "10", "collateral": "20", "max_balance": "30", "upper_bound": "30", "grid": "1\n2", "top_n": "2"}
+            profile: {"deposit": "10", "collateral": "20", "max_balance": "30", "upper_bound": "30", "individual_max_dd_pct": "20", "individual_net_pnl_min_exclusive": "0", "top_n": "2"}
             for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
         },
+        "close_volume_participation_pct": "30",
+        "round_down_usdt": "50",
+        "minimum_coverage_pct": "90",
+        "maximum_age_hours": "2",
+        "archive_publication_lag_hours": "6",
+        "weekend_start_utc": "SATURDAY 00:00",
+        "weekend_end_utc": "MONDAY 00:00",
+        "backfill_write_enabled": False,
     }
     changed = json.loads(json.dumps(values))
-    changed["total_test_budget"] = "10"
-    changed["profiles"]["AGGRESSIVE"].update({"max_balance": "31.25", "upper_bound": "40", "grid": "1\n2.50\n40.0", "top_n": "3"})
+    changed["round_down_usdt"] = "25"
+    changed["profiles"]["AGGRESSIVE"].update({"max_balance": "31.25", "upper_bound": "40", "individual_max_dd_pct": "25.5", "individual_net_pnl_min_exclusive": "-0.5", "top_n": "3"})
     script = _read("app.js").split("const ORDER_BUCKETS", 1)[0] + f"""
 const h = globalThis.portfolioSettingsHelpers;
 const document = {json.dumps(document)};
@@ -1243,9 +1277,9 @@ const changed = {json.dumps(changed)};
 const unchanged = h.settingsPatch(document, values);
 const edited = h.settingsPatch(document, changed);
 const scaleNumber = h.clone(document); scaleNumber.scenarios.AGGRESSIVE.sizing.upper_bound.amount = 100;
-const scaleNumberValues = h.clone(values); scaleNumberValues.profiles.AGGRESSIVE.upper_bound = '100'; scaleNumberValues.profiles.AGGRESSIVE.grid = '99.99\\n100';
+const scaleNumberValues = h.clone(values); scaleNumberValues.profiles.AGGRESSIVE.upper_bound = '100.0';
 const scaleString = h.clone(document); scaleString.scenarios.AGGRESSIVE.sizing.upper_bound.amount = '100.00';
-const scaleStringValues = h.clone(values); scaleStringValues.profiles.AGGRESSIVE.upper_bound = '100.00'; scaleStringValues.profiles.AGGRESSIVE.grid = '99\\n100';
+const scaleStringValues = h.clone(values); scaleStringValues.profiles.AGGRESSIVE.upper_bound = '100.00';
 const floatDocument = h.clone(document); floatDocument.scenarios.AGGRESSIVE.deposit.amount = 1.5;
 const mixedCurrency = h.clone(document); mixedCurrency.scenarios.AGGRESSIVE.collateral.currency = 'EUR';
 const mustThrow = (callback) => {{ try {{ callback(); return false; }} catch (_) {{ return true; }} }};
@@ -1256,22 +1290,24 @@ const checks = {{
   stringDecimal: typeof edited.scenarios.AGGRESSIVE.max_balance.amount === 'string',
   stringIntegerEdit: typeof h.settingsMoneyValue('11', '10.00') === 'string',
   stringScalePreserved: h.settingsMoneyValue('10.00', '10.00') === '10.00',
-  changedGridString: typeof edited.scenarios.AGGRESSIVE.sizing.grid[1].amount === 'string',
-  changedGridAddedString: typeof edited.scenarios.AGGRESSIVE.sizing.grid[2].amount === 'string',
-  leadingTrailingGrid: h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, grid: '\\n1\\n2\\n'}}}}}}).scenarios.AGGRESSIVE.sizing.grid.length === 2,
+  changedDdString: typeof edited.profiles.AGGRESSIVE.individual_max_dd_pct === 'string',
+  changedPnlString: typeof edited.profiles.AGGRESSIVE.individual_net_pnl_min_exclusive === 'string',
+  gridAbsent: edited.scenarios.AGGRESSIVE.sizing.grid === undefined,
   integerLexemes: ['1.0', '1e3', '0', '-1', ',', ''].every((value) => mustThrow(() => h.settingsIntegerValue(value))),
   moneyLexemes: invalidMoney.every((value) => mustThrow(() => h.settingsMoneyValue(value, 1))),
   unsafeIntegerRejected: mustThrow(() => h.settingsMoneyValue('9007199254740993', 1)),
-  mixedScaleNumberAccepted: h.settingsPatch(scaleNumber, scaleNumberValues).scenarios.AGGRESSIVE.sizing.grid[0].amount === '99.99',
-  mixedScaleNumberBoundRejected: mustThrow(() => h.settingsPatch(scaleNumber, {{...scaleNumberValues, profiles: {{...scaleNumberValues.profiles, AGGRESSIVE: {{...scaleNumberValues.profiles.AGGRESSIVE, grid: '99.99\\n100.01'}}}}}})),
-  mixedScaleStringAccepted: h.settingsPatch(scaleString, scaleStringValues).scenarios.AGGRESSIVE.sizing.grid[0].amount === 99,
-  mixedScaleStringBoundRejected: mustThrow(() => h.settingsPatch(scaleString, {{...scaleStringValues, profiles: {{...scaleStringValues.profiles, AGGRESSIVE: {{...scaleStringValues.profiles.AGGRESSIVE, grid: '99\\n101'}}}}}})),
+  mixedScaleNumberAccepted: h.settingsPatch(scaleNumber, scaleNumberValues).scenarios.AGGRESSIVE.sizing.upper_bound.amount === '100.0',
+  mixedScaleStringAccepted: h.settingsPatch(scaleString, scaleStringValues).scenarios.AGGRESSIVE.sizing.upper_bound.amount === '100.00',
   floatInboundRejected: h.validSettingsDocument(floatDocument) === false && mustThrow(() => h.settingsPatch(floatDocument, values)),
   mixedCurrencyRejected: h.validSettingsDocument(mixedCurrency) === false && mustThrow(() => h.settingsPatch(mixedCurrency, values)),
-  duplicateRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, grid: '1\\n1'}}}}}})),
-  descendingRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, grid: '2\\n1'}}}}}})),
-  boundRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, grid: '1\\n31'}}}}}})),
-  internalBlankRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, grid: '1\\n\\n2'}}}}}})),
+  invalidDdRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, individual_max_dd_pct: '-1'}}}}}})),
+  invalidPnlRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, individual_net_pnl_min_exclusive: '1e3'}}}}}})),
+  invalidParticipationRejected: mustThrow(() => h.settingsPatch(document, {{...values, close_volume_participation_pct: '201'}})),
+  invalidRoundingRejected: mustThrow(() => h.settingsPatch(document, {{...values, round_down_usdt: '0'}})),
+  invalidCoverageRejected: mustThrow(() => h.settingsPatch(document, {{...values, minimum_coverage_pct: '101'}})),
+  invalidAgeRejected: mustThrow(() => h.settingsPatch(document, {{...values, maximum_age_hours: '0'}})),
+  zeroLagAccepted: h.settingsPatch(document, {{...values, archive_publication_lag_hours: '0'}}).liquidity.archive_publication_lag_hours === 0,
+  equalWeekendRejected: mustThrow(() => h.settingsPatch(document, {{...values, weekend_end_utc: 'SATURDAY 00:00'}})),
 }};
 if (Object.values(checks).some((value) => !value)) process.exit(1);
 """
@@ -1288,7 +1324,7 @@ def test_portfolio_form_has_no_speculative_nullable_config_fields() -> None:
     assert 'schema_version="2"' not in portfolio
 
 
-def test_portfolio_launch_validates_decimal_integer_and_budget_fields() -> None:
+def test_portfolio_launch_validates_decimal_and_profile_candidate_fields() -> None:
     js = _read("app.js")
     portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
 
@@ -1297,10 +1333,11 @@ def test_portfolio_launch_validates_decimal_integer_and_budget_fields() -> None:
     assert "Math.max(scale, 0) <= 12" in portfolio
     assert "Number.isFinite" in portfolio
     assert "Number.isSafeInteger" in portfolio
-    assert "total_test_budget" in portfolio
-    assert "readiness?.search?.total_test_budget" in portfolio
-    assert "profileBudgetTotal" in portfolio
-    assert "profileBudgetTotal <= budget" in portfolio
+    assert "portfolioSafeInteger(profile.candidates, 1)" in portfolio
+    assert "total_test_budget" not in portfolio
+    assert "readiness?.search?.total_test_budget" not in portfolio
+    assert "profileBudgetTotal" not in portfolio
+    assert "Number(profile.candidates) <= budget" not in portfolio
     assert "addEventListener('input', updateControls)" in portfolio
 
 
@@ -1337,3 +1374,20 @@ def test_portfolio_journal_renders_server_text_entries() -> None:
     portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
 
     assert "entry?.text || entry?.message" in portfolio
+
+
+def test_portfolio_reason_codes_are_localized_without_losing_prefixes() -> None:
+    js = _read("app.js")
+    assert "INSUFFICIENT_DIRECTIONAL_UNIVERSE" in js
+    assert "SIZE_BELOW_MINIMUM_QTY" in js
+    assert "SIZE_ROUNDED_TO_ZERO" in js
+    script = js.split("const ORDER_BUCKETS", 1)[0] + """
+const humanize = globalThis.portfolioReasonHelpers.humanize;
+const actual = humanize('AGGRESSIVE:INSUFFICIENT_DIRECTIONAL_UNIVERSE; GEUSDT:SIZE_BELOW_MINIMUM_QTY; XLKUSDT:SIZE_ROUNDED_TO_ZERO; UNKNOWN:OTHER');
+if (!actual.includes('AGGRESSIVE: после фильтров не осталось ни одного допустимого состава')) process.exit(1);
+if (!actual.includes('GEUSDT: после округления количество ниже минимального размера ордера Bybit')) process.exit(1);
+if (!actual.includes('XLKUSDT: расчётный размер позиции меньше шага округления; уменьшите шаг или исключите пару из universe')) process.exit(1);
+if (!actual.includes('UNKNOWN:OTHER')) process.exit(1);
+"""
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr or completed.stdout

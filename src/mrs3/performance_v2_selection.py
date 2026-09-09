@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from concurrent.futures import ThreadPoolExecutor
@@ -95,6 +95,9 @@ class SelectionRequest:
     symbol: str
     side: Literal["LONG", "SHORT"]
     stages: tuple[SelectionStage, ...]
+    ranking_scope: Literal["ORDINARY", "RETEST_COHORT"] = "ORDINARY"
+    bulk_retest_job_id: str | None = None
+    cohort_members: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +167,53 @@ def parse_selection_request(payload: Mapping[str, object]) -> SelectionRequest:
     if any(stage.id == "rank_robust_top_n" for stage in parsed) and parsed[-1].id != "rank_robust_top_n":
         raise _error("RANK_STAGE_MUST_BE_LAST")
     return SelectionRequest(symbol.strip(), side, tuple(parsed))
+
+
+def retest_cohort_request(
+    request: SelectionRequest,
+    job_id: str,
+    members: Mapping[int, int] | Sequence[tuple[int, int]],
+) -> SelectionRequest:
+    """Create a server-owned cohort request; browsers never supply the IDs."""
+    if not isinstance(request, SelectionRequest) or not isinstance(job_id, str) or not job_id.strip():
+        raise PerformanceV2SelectionError("RETEST_COHORT_INVALID")
+    pairs = tuple(sorted((int(strategy_id), int(result_id)) for strategy_id, result_id in (
+        members.items() if isinstance(members, Mapping) else members
+    )))
+    if not pairs or any(strategy_id <= 0 or result_id <= 0 for strategy_id, result_id in pairs):
+        raise PerformanceV2SelectionError("RETEST_COHORT_NO_SUCCESSFUL_MEMBERS")
+    if len({strategy_id for strategy_id, _ in pairs}) != len(pairs):
+        raise PerformanceV2SelectionError("RETEST_COHORT_INVALID")
+    return replace(request, ranking_scope="RETEST_COHORT", bulk_retest_job_id=job_id.strip(), cohort_members=pairs)
+
+
+def _cohort_clause(request: SelectionRequest, alias: str = "s") -> tuple[str, list[object]]:
+    if request.ranking_scope == "ORDINARY":
+        return "", []
+    if request.ranking_scope != "RETEST_COHORT" or not request.bulk_retest_job_id or not request.cohort_members:
+        raise PerformanceV2SelectionError("RETEST_COHORT_NO_SUCCESSFUL_MEMBERS")
+    ids = tuple(strategy_id for strategy_id, _ in request.cohort_members)
+    return f" and {alias}.strategy_id in ({','.join('?' for _ in ids)})", list(ids)
+
+
+def _verify_retest_cohort(connection: duckdb.DuckDBPyConnection, request: SelectionRequest) -> None:
+    if request.ranking_scope != "RETEST_COHORT":
+        return
+    clause, parameters = _cohort_clause(request)
+    rows = connection.execute(
+        "select s.strategy_id, s.current_result_id from strategies s where s.lifecycle_status = 'ACTIVE'" + clause,
+        parameters,
+    ).fetchall()
+    current = {int(strategy_id): None if result_id is None else int(result_id) for strategy_id, result_id in rows}
+    expected = dict(request.cohort_members)
+    stale = sorted(strategy_id for strategy_id, result_id in expected.items() if current.get(strategy_id) != result_id)
+    if len(current) != len(expected) or stale:
+        raise PerformanceV2SelectionError("RETEST_COHORT_STALE_RESULTS")
+
+
+def _verify_retest_cohort_for_database(database: Path, request: SelectionRequest) -> None:
+    with duckdb.connect(str(database), read_only=True) as connection:
+        _verify_retest_cohort(connection, request)
 
 
 def _positive_decimal(value: object, name: str) -> Decimal:
@@ -247,6 +297,7 @@ def _decimal_or_none(value: object) -> Decimal | None:
 def _holding_quantiles_minutes(
     connection: duckdb.DuckDBPyConnection, request: SelectionRequest
 ) -> dict[int, tuple[Decimal, Decimal]]:
+    cohort_sql, cohort_params = _cohort_clause(request)
     rows = connection.execute(
         """with actions as (
                  select a.result_id, a.timestamp_utc, a.action_index, lower(a.action) as kind,
@@ -255,6 +306,7 @@ def _holding_quantiles_minutes(
                    join strategy_results r on r.result_id = a.result_id
                    join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id
                   where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
+                    """ + cohort_sql + """
                     and lower(a.action) in ('opened', 'increased', 'decreased', 'closed')
              ), numbered as (
                  select *, sum(case when kind = 'opened' and post_size <> 0 and post_side in ('long', 'short') then 1 else 0 end)
@@ -273,7 +325,7 @@ def _holding_quantiles_minutes(
                from intervals
               where opened_at is not null and closed_at is not null and closed_at >= opened_at
               group by result_id""",
-        [request.symbol, request.side],
+        [request.symbol, request.side, *cohort_params],
     ).fetchall()
     return {
         int(result_id): (Decimal(str(p95)), Decimal(str(median)))
@@ -290,6 +342,7 @@ def _holding_p95_minutes(
 def _window_b_holding_p95_minutes(
     connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig
 ) -> dict[int, Decimal]:
+    cohort_sql, cohort_params = _cohort_clause(request)
     rows = connection.execute(
         """with actions as (
                  select a.result_id, a.timestamp_utc, a.action_index, lower(a.action) as kind, a.post_size, lower(a.post_side) as post_side,
@@ -298,6 +351,7 @@ def _window_b_holding_p95_minutes(
                    join strategy_results r on r.result_id = a.result_id
                    join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id
                   where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
+                    """ + cohort_sql + """
                     and lower(a.action) in ('opened', 'increased', 'decreased', 'closed')
              ), numbered as (
                  select *, sum(case when kind = 'opened' and post_size <> 0 and post_side in ('long', 'short') then 1 else 0 end)
@@ -313,7 +367,7 @@ def _window_b_holding_p95_minutes(
                from intervals
               where opened_at is not null and closed_at between b_start and report_end_utc and closed_at >= opened_at
               group by result_id""",
-        [config.ab_final_days, request.symbol, request.side],
+        [config.ab_final_days, request.symbol, request.side, *cohort_params],
     ).fetchall()
     return {int(result_id): Decimal(str(p95)) for result_id, p95 in rows if p95 is not None}
 
@@ -321,6 +375,7 @@ def _window_b_holding_p95_minutes(
 def _best_trade_facts(
     connection: duckdb.DuckDBPyConnection, request: SelectionRequest
 ) -> dict[int, tuple[Decimal | None, Decimal | None, int | None, bool]]:
+    cohort_sql, cohort_params = _cohort_clause(request)
     rows = connection.execute(
         """with actions as (
                  select a.result_id, a.timestamp_utc, a.action_index, lower(a.action) as kind,
@@ -331,6 +386,7 @@ def _best_trade_facts(
                    join strategy_results r on r.result_id = a.result_id
                    join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id
                   where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
+                    """ + cohort_sql + """
                     and lower(a.action) in ('opened', 'increased', 'decreased', 'closed')
              ), numbered as (
                  select *, sum(case when kind = 'opened' and post_size <> 0 and post_side = expected_side then 1 else 0 end)
@@ -360,7 +416,7 @@ def _best_trade_facts(
              select reliable.result_id, summary.best_trade_pnl, summary.completed_pnl,
                     summary.gross_positive_pnl, summary.positive_count, reliable.reliable
                from reliable left join summary using (result_id)""",
-        [request.symbol, request.side],
+        [request.symbol, request.side, *cohort_params],
     ).fetchall()
     facts: dict[int, tuple[Decimal | None, Decimal | None, int | None, bool]] = {}
     for result_id, best, total, gross, count, reliable in rows:
@@ -472,13 +528,14 @@ def _empty_ab_metrics() -> dict[str, Decimal | None]:
 
 
 def _selection_cached_metrics(connection: duckdb.DuckDBPyConnection, request: SelectionRequest) -> dict[tuple[int, datetime, datetime], WindowMetrics]:
+    cohort_sql, cohort_params = _cohort_clause(request)
     rows = connection.execute(
         "select " + ", ".join(f"wm.{column}" for column in _METRIC_COLUMNS) +
         " from window_metrics wm"
         " join strategy_results r on r.result_id = wm.result_id"
         " join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id"
-        " where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ? and wm.metrics_version = ?",
-        [request.symbol, request.side, METRICS_VERSION],
+        " where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ? and wm.metrics_version = ?" + cohort_sql,
+        [request.symbol, request.side, METRICS_VERSION, *cohort_params],
     ).fetchall()
     metrics = (_metric_from_row(row) for row in rows)
     return {(metric.result_id, metric.requested_start_utc, metric.requested_end_utc): metric for metric in metrics}
@@ -566,12 +623,14 @@ def _selection_window_job_from_args(args: tuple[str, int, datetime, datetime, in
 def _selection_cache_missing_strategy_ids(
     connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig,
 ) -> tuple[int, ...]:
+    _verify_retest_cohort(connection, request)
+    cohort_sql, cohort_params = _cohort_clause(request)
     rows = connection.execute(
         """select s.strategy_id, r.result_id, r.report_start_utc, r.report_end_utc from strategies s
              join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
-            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
+            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + cohort_sql + """
             order by s.strategy_id""",
-        [request.symbol, request.side],
+        [request.symbol, request.side, *cohort_params],
     ).fetchall()
     cached_metrics = _selection_cached_metrics(connection, request)
     missing: list[int] = []
@@ -595,6 +654,9 @@ def prepare_selection_window_cache(
 ) -> None:
     """Warm default windows in independent readers, then persist them through one writer."""
     selected_ids = None if strategy_ids is None else tuple(dict.fromkeys(int(strategy_id) for strategy_id in strategy_ids))
+    if selected_ids is None and request.ranking_scope == "RETEST_COHORT":
+        _verify_retest_cohort_for_database(database, request)
+        selected_ids = tuple(strategy_id for strategy_id, _ in request.cohort_members)
     if selected_ids == ():
         return
     with duckdb.connect(str(database), read_only=True) as connection:
@@ -620,11 +682,13 @@ def prepare_selection_window_cache(
 
 
 def selection_cache_status(connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig) -> dict[str, int | bool]:
+    _verify_retest_cohort(connection, request)
+    cohort_sql, cohort_params = _cohort_clause(request)
     rows = connection.execute(
         """select r.result_id, r.report_start_utc, r.report_end_utc from strategies s
              join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
-            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""",
-        [request.symbol, request.side],
+            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + cohort_sql,
+        [request.symbol, request.side, *cohort_params],
     ).fetchall()
     cached_metrics = _selection_cached_metrics(connection, request)
     missing = 0
@@ -642,6 +706,8 @@ def load_selection_candidates(
     *, cache_only: bool = False,
 ) -> pd.DataFrame:
     """Load all current ACTIVE candidates for one Pair + Side without filtering them."""
+    _verify_retest_cohort(connection, request)
+    cohort_sql, cohort_params = _cohort_clause(request)
     holding_minutes = _holding_quantiles_minutes(connection, request)
     b_holding_minutes = _window_b_holding_p95_minutes(connection, request, config)
     best_trade_facts = _best_trade_facts(connection, request)
@@ -658,9 +724,9 @@ def load_selection_candidates(
              join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
              left join strategy_orders o on o.strategy_id = s.strategy_id
              left join analysis_plateaus p on p.analysis_run_id = o.analysis_run_id and p.plateau_id = o.plateau_id
-            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
+            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + cohort_sql + """
             order by s.strategy_name, s.strategy_id, o.order_id""",
-        [request.symbol, request.side],
+        [request.symbol, request.side, *cohort_params],
     ).fetchall()
     candidates: dict[int, dict[str, object]] = {}
     for row in rows:

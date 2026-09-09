@@ -18,7 +18,7 @@ import duckdb
 from mrs3.panel import PanelController, create_panel_server
 from mrs3.panel_portfolio import PortfolioPanelError, PortfolioPanelService, STAGES, _redact_text, _safe_cell
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
-from mrs3.portfolio.config import PortfolioConfigError
+from mrs3.portfolio.config import PortfolioConfigError, migrate_portfolio_config_document
 
 
 def _config() -> dict:
@@ -28,7 +28,7 @@ def _config() -> dict:
         "liquidity": {"policy_id": "operator_supplied_liquidity_v1", "parameters": {"operator_supplied": True}},
         "ranking": {"id": "operator_supplied_ranking_v1", "parameters": {"operator_supplied": True}, "top_n": 1},
     }
-    return {
+    return migrate_portfolio_config_document({
         "schema_version": 1,
         "policy_version": "portfolio_optimizer_research_risk_v1",
         "algorithm_versions": {"sizing": "portfolio_optimizer_sizing_v1", "ranking": "portfolio_optimizer_ranking_v1"},
@@ -39,7 +39,7 @@ def _config() -> dict:
         "liquidity": {"policy_id": "liquidity", "parameters": {"x": 1}}, "margin": {"policy_id": "margin", "parameters": {"x": 1}},
         "profiles": {name: profile() for name in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")},
         "runner": {"target": "local", "root": "tester", "timeout": {"value": 1, "unit": "seconds"}, "retries": 0},
-    }
+    })[0]
 
 
 def _write_config(path: Path) -> str:
@@ -65,6 +65,23 @@ def test_settings_get_put_uses_exact_byte_digest_and_cas(tmp_path: Path) -> None
     with pytest.raises(Exception) as error:
         service.settings_put({"expected_digest": digest, "document": changed})
     assert getattr(error.value, "code", None) == "CONFIG_CHANGED"
+
+
+def test_settings_save_migrates_legacy_v1_document_to_v2(tmp_path: Path) -> None:
+    source = Path(__file__).parents[1] / "portfolio_optimizer.local.json.example"
+    path = tmp_path / "portfolio_optimizer.local.json"
+    path.write_bytes(source.read_bytes())
+    service = PortfolioPanelService(tmp_path, path)
+
+    loaded = service.settings_get()
+    assert loaded["state"] == "READY"
+    assert loaded["schema_version"] == 2
+    saved = service.settings_put({"expected_digest": loaded["digest"], "document": loaded["document"]})
+
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 2
+    assert document["schema_version"] == 2
+    assert all("grid" not in scenario["sizing"] for scenario in document["scenarios"].values())
 
 
 def test_settings_put_restores_previous_bytes_when_readback_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -113,7 +130,7 @@ def test_settings_put_does_not_relock_plain_lock(tmp_path: Path) -> None:
 def test_unsupported_settings_are_read_only(tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     document = _config()
-    document["schema_version"] = 2
+    document["schema_version"] = 3
     path.write_text(json.dumps(document), encoding="utf-8")
     service = PortfolioPanelService(tmp_path, path)
     assert service.settings_get()["state"] == "UNSUPPORTED_SCHEMA"
@@ -130,9 +147,9 @@ def test_readiness_reports_exact_config_digest(tmp_path: Path) -> None:
     readiness = service.readiness()
 
     assert readiness["config_digest"] == digest
-    assert readiness["schema_version"] == 1
+    assert readiness["schema_version"] == 2
     assert readiness["policy_version"] == "portfolio_optimizer_research_risk_v1"
-    assert readiness["search"]["total_test_budget"] == 1
+    assert "search" not in readiness
 
 
 def test_readiness_resets_pairs_and_counts_when_finalist_read_fails(tmp_path: Path) -> None:
@@ -225,32 +242,23 @@ def test_campaign_profile_rejects_unknown_fields_exactly(tmp_path: Path) -> None
     assert service.registry.list() == []
 
 
-def test_campaign_profile_budget_is_bounded_by_sum_of_profiles(tmp_path: Path) -> None:
+def test_campaign_profile_budgets_are_independent_of_configured_total(tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     digest = _write_config(path)
     service = PortfolioPanelService(tmp_path, path)
     payload = {
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
         "profiles": [
-            {"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1},
-            {"profile_id": "AGGRESSIVE", "equity_usdt": "10000", "max_candidates": 1},
+            {"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 2},
+            {"profile_id": "AGGRESSIVE", "equity_usdt": "10000", "max_candidates": 3},
         ],
         "expected_config_digest": digest,
     }
 
-    with pytest.raises(PortfolioPanelError) as error:
-        service.submit_campaign(payload)
+    config, _raw, _document = service._config()
+    launch = service._normalise_campaign(payload, config, digest)
 
-    assert error.value.code == "PORTFOLIO_CAMPAIGN_INVALID"
-    assert error.value.status == 422
-    assert error.value.field_errors == [
-        {
-            "field": "profiles[1].max_candidates",
-            "code": "TOTAL_TEST_BUDGET_EXCEEDED",
-            "message": "profile candidate budgets exceed configured total_test_budget",
-        }
-    ]
-    assert service.registry.list() == []
+    assert [profile["max_candidates"] for profile in launch["profiles"]] == [2, 3]
 
 
 def test_multi_profile_budget_and_summary_stay_consistent(tmp_path: Path) -> None:
@@ -488,6 +496,24 @@ def test_zero_variants_fail_without_results_or_download(tmp_path: Path) -> None:
     assert any(entry["code"] == "PORTFOLIO_JOB_VARIANTS_NOT_READY" for entry in job["journal"])
 
 
+def test_zero_adapter_variants_report_actionable_gate_details(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    finalists = [{"strategy_id": 7, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG", "user_status": "FINALIST", "user_rank": 1}]
+    generated = {
+        "variants": (),
+        "blockers": ("BALANCED:INSUFFICIENT_DIRECTIONAL_UNIVERSE",),
+        "excluded": ({"symbol": "BTCUSDT", "selection_reason": "SIZE_BELOW_MINIMUM_QTY"},),
+    }
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists, variant_generator=lambda *_: generated)
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
+        time.sleep(0.01)
+
+    assert "BTCUSDT:SIZE_BELOW_MINIMUM_QTY" in service.job(result["job_id"])["diagnostics"][0]["message"]
+
+
 def test_job_messages_redact_paths_and_secret_terms(tmp_path: Path) -> None:
     registry = PanelJobRegistry(tmp_path / ".panel-jobs.json")
     saved = registry.submit("portfolio.stage1", {}, "campaign", ("portfolio_optimizer",))
@@ -583,8 +609,8 @@ def test_summary_groups_exclusions_and_profile_counts() -> None:
     )
 
     assert summary["variants_by_profile"] == {"BALANCED": 2}
-    assert summary["prepared_by_profile"] == {"BALANCED": 1}
-    assert summary["prepared"] == 1
+    assert summary["prepared_by_profile"] == {"BALANCED": 2}
+    assert summary["prepared"] == 2
     assert summary["finalist_exclusions_by_reason"] == {"USER_RANK_CUTOFF": 1}
     assert summary["optimizer_exclusions_by_reason"] == {"OPEN_POLICY": 1}
 
@@ -626,6 +652,39 @@ def test_workbook_preserves_decimal_cells_as_exact_text(tmp_path: Path) -> None:
         workbook.close()
 
 
+def test_workbook_exposes_adapter_capacity_spread_and_warning_diagnostics(tmp_path: Path) -> None:
+    service = PortfolioPanelService(tmp_path)
+    campaign = {"campaign_id": "campaign-fixed", "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z"}
+    member = {
+        "strategy_id": 1, "result_id": 2, "symbol": "BTCUSDT", "side": "LONG",
+        "position_size_usdt": Decimal("600"), "maximum_closing_quantity": Decimal("6"),
+        "planned_leverage": Decimal("50"), "max_drawdown_pct": Decimal("10"),
+        "capacity_status": "PRELIMINARY",
+        "calendar_7d": SimpleNamespace(available_days=3, mean_minute_turnover=Decimal("2000"), rounded_cap_usdt=Decimal("600")),
+        "weekday_5d": SimpleNamespace(available_days=2, mean_minute_turnover=Decimal("1800"), rounded_cap_usdt=Decimal("500")),
+        "spread_status": "CLEAR", "spread_mean_bps": Decimal("8.5"),
+        "sizing_digest": "sizing", "capacity_digest": "capacity", "reference_digest": "reference",
+    }
+    workbook_path = tmp_path / "adapter.xlsx"
+    service._write_workbook(
+        workbook_path, campaign, (), (),
+        ({"candidate_id": "candidate", "profile": "BALANCED", "members": (member,)},), (),
+        warnings=("LIQUIDITY_CAPACITY_PRELIMINARY",),
+    )
+
+    workbook = load_workbook(workbook_path, data_only=False)
+    try:
+        headers = {cell.value: index for index, cell in enumerate(workbook["Members"][1])}
+        row = workbook["Members"][2]
+        assert row[headers["7d Position Cap USDT"]].value == "600"
+        assert row[headers["5d Analytic Cap USDT"]].value == "500"
+        assert row[headers["Spread Status"]].value == "CLEAR"
+        summary = {row[0].value: row[1].value for row in workbook["Summary"].iter_rows(min_row=2)}
+        assert "LIQUIDITY_CAPACITY_PRELIMINARY" in summary["optimizer_warnings"]
+    finally:
+        workbook.close()
+
+
 def test_workbook_does_not_invent_gate_or_counts(tmp_path: Path) -> None:
     service = PortfolioPanelService(tmp_path)
     campaign = {"campaign_id": "campaign-fixed", "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z"}
@@ -641,7 +700,7 @@ def test_workbook_does_not_invent_gate_or_counts(tmp_path: Path) -> None:
         workbook.close()
 
 
-def test_variant_cap_keeps_returned_order_and_records_exclusion(tmp_path: Path) -> None:
+def test_variant_validation_keeps_full_pretest_universe_without_max_candidates(tmp_path: Path) -> None:
     campaign = {
         "campaign_id": "campaign-fixed",
         "input_digest": "i",
@@ -652,18 +711,20 @@ def test_variant_cap_keeps_returned_order_and_records_exclusion(tmp_path: Path) 
     }
     variants = ({"candidate_id": "first", "profile": "BALANCED"}, {"candidate_id": "second", "profile": "BALANCED"})
     kept, excluded, blockers = PortfolioPanelService._cap_variants(variants, campaign["launch"]["profiles"])
-    assert tuple(item["candidate_id"] for item in kept) == ("first",)
-    assert excluded[0]["candidate_id"] == "second"
-    assert blockers == ("BALANCED:MAX_CANDIDATES",)
+    assert tuple(item["candidate_id"] for item in kept) == ("first", "second")
+    assert excluded == ()
+    assert blockers == ()
     summary = PortfolioPanelService._summary(campaign, (), (), kept, (), optimizer_excluded=excluded, blockers=blockers)
-    assert summary["variants_created"] == 1
-    assert summary["optimizer_excluded"] == 1
+    assert summary["variants_created"] == 2
+    assert summary["optimizer_excluded"] == 0
+    assert summary["prepared_by_profile"] == {"BALANCED": 2}
+    assert summary["prepared"] == 2
     workbook_path = tmp_path / "capped.xlsx"
     PortfolioPanelService(tmp_path)._write_workbook(workbook_path, campaign, (), (), kept, (), optimizer_excluded=excluded, blockers=blockers)
     workbook = load_workbook(workbook_path, data_only=False)
     try:
-        assert workbook["Portfolios"].max_row == 2
-        assert workbook["Excluded"][2][8].value == "MAX_CANDIDATES"
+        assert workbook["Portfolios"].max_row == 3
+        assert workbook["Excluded"].max_row == 1
     finally:
         workbook.close()
 
@@ -724,33 +785,33 @@ def test_verify_workbook_rejects_hyperlinks_without_publishing(tmp_path: Path) -
         service.workbook(result["campaign_id"])
 
 
-def test_package_search_policy_status_is_a_structured_blocker(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("mrs3.portfolio.search.search_portfolios", lambda *_args, **_kwargs: SimpleNamespace(status="OPEN_POLICY", reason="OPEN_POLICY", detail="RANKING_POLICY_REQUIRED"))
+def test_package_adapter_status_is_a_structured_blocker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("mrs3.portfolio.adapter.run_portfolio_adapter", lambda *_args, **_kwargs: SimpleNamespace(variants=(), blockers=("BALANCED:POSITION_SIZING_FAILED",), excluded=(), warnings=()))
 
-    result = PortfolioPanelService._package_variant_generator(({"strategy_id": 1},), {}, ({"profile_id": "BALANCED"},))
+    result = PortfolioPanelService(tmp_path)._package_variant_generator(({"strategy_id": 1},), {}, ({"profile_id": "BALANCED"},))
 
-    assert result["blockers"] == ["BALANCED:OPEN_POLICY:RANKING_POLICY_REQUIRED"]
+    assert result["blockers"] == ["BALANCED:POSITION_SIZING_FAILED"]
 
 
-def test_package_search_real_contract_returns_policy_blocker() -> None:
-    result = PortfolioPanelService._package_variant_generator(
+def test_package_adapter_real_contract_rejects_invalid_campaign(tmp_path: Path) -> None:
+    result = PortfolioPanelService(tmp_path)._package_variant_generator(
         ({"strategy_id": 1, "result_id": 2, "symbol": "BTCUSDT", "side": "LONG"},),
         {},
         ({"profile_id": "BALANCED", "max_candidates": 1},),
     )
     assert result["variants"] == ()
-    assert result["blockers"] == ["BALANCED:OPEN_POLICY:RANKING_POLICY_REQUIRED"]
+    assert result["blockers"] == ["CAMPAIGN_CONFIG_INVALID"]
 
 
-def test_package_search_tags_passing_variants_with_profile_before_capping(monkeypatch: pytest.MonkeyPatch) -> None:
-    passing = (SimpleNamespace(candidate_id="first"), SimpleNamespace(candidate_id="second"))
+def test_package_adapter_passes_variants_to_profile_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    passing = ({"candidate_id": "first", "profile": "BALANCED"}, {"candidate_id": "second", "profile": "BALANCED"})
     monkeypatch.setattr(
-        "mrs3.portfolio.search.search_portfolios",
-        lambda *_args, **_kwargs: SimpleNamespace(status="PASS", passing=passing, excluded=()),
+        "mrs3.portfolio.adapter.run_portfolio_adapter",
+        lambda *_args, **_kwargs: SimpleNamespace(variants=passing, blockers=(), excluded=(), warnings=()),
     )
     profile = {"profile_id": "BALANCED", "max_candidates": 1}
-    result = PortfolioPanelService._package_variant_generator(({"strategy_id": 1},), {}, (profile,))
-    assert result["variants"][0].profile == "BALANCED"
+    result = PortfolioPanelService(tmp_path)._package_variant_generator(({"strategy_id": 1},), {}, (profile,))
+    assert result["variants"][0]["profile"] == "BALANCED"
     kept, excluded, blockers = PortfolioPanelService._cap_variants(result["variants"], (profile,))
     summary = PortfolioPanelService._summary(
         {"campaign_id": "campaign", "launch": {"profiles": [profile]}},
@@ -761,19 +822,19 @@ def test_package_search_tags_passing_variants_with_profile_before_capping(monkey
         optimizer_excluded=excluded,
         blockers=blockers,
     )
-    assert len(kept) == 1
-    assert summary["variants_created"] == 1
-    assert summary["prepared_by_profile"] == {"BALANCED": 1}
+    assert len(kept) == 2
+    assert summary["variants_created"] == 2
+    assert summary["prepared_by_profile"] == {"BALANCED": 2}
 
 
 def test_package_search_exception_is_typed_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     def broken(*_args, **_kwargs):
         raise RuntimeError("search crashed")
 
-    monkeypatch.setattr("mrs3.portfolio.search.search_portfolios", broken)
+    monkeypatch.setattr("mrs3.portfolio.adapter.run_portfolio_adapter", broken)
 
     with pytest.raises(PortfolioPanelError) as error:
-        PortfolioPanelService._package_variant_generator(({"strategy_id": 1},), {}, ({"profile_id": "BALANCED"},))
+        PortfolioPanelService(Path.cwd())._package_variant_generator(({"strategy_id": 1},), {}, ({"profile_id": "BALANCED"},))
 
     assert error.value.code == "PORTFOLIO_JOB_FAILED"
 

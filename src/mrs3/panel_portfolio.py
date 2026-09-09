@@ -19,7 +19,6 @@ from pathlib import Path
 import re
 import tempfile
 import threading
-from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -28,7 +27,13 @@ import pandas as pd
 
 from .audit import normalize_xlsx_workbook, write_audit_workbook
 from .panel_jobs import PanelJobError, PanelJobRegistry
-from .portfolio.config import POLICY_VERSION, SCHEMA_VERSION, PortfolioConfigError, load_portfolio_config
+from .portfolio.config import (
+    POLICY_VERSION,
+    SCHEMA_VERSION,
+    PortfolioConfigError,
+    load_portfolio_config,
+    migrate_portfolio_config_document,
+)
 from .portfolio.input import apply_finalist_cutoff, read_current_finalists
 
 
@@ -65,6 +70,9 @@ MEMBER_HEADERS = (
     "Campaign ID", "Candidate ID", "Profile", "Member Ordinal", "Strategy ID", "Result ID", "Pair",
     "Direction", "User Rank", "Scalar %", "Quantity", "Leverage", "Notional USDT", "Estimated Individual DD USDT",
     "Estimated Individual DD %", "Liquidity Scalar Ceiling %", "Calculated Initial Margin USDT", "Gate Result", "Reasons",
+    "Capacity Status", "7d Available Days", "7d Mean Minute Turnover USDT", "7d Position Cap USDT",
+    "5d Available Days", "5d Mean Minute Turnover USDT", "5d Analytic Cap USDT", "Spread Status",
+    "Mean p95 Spread bps", "Sizing Digest", "Capacity Digest", "Reference Digest",
 )
 EXCLUDED_HEADERS = (
     "Campaign ID", "Scope", "Object ID", "Pair", "Direction", "Profile", "Stage", "Gate Result",
@@ -236,6 +244,10 @@ class PortfolioPanelService:
             return "INVALID", None, raw
         if not isinstance(document, dict):
             return "INVALID", None, raw
+        try:
+            document, _ = migrate_portfolio_config_document(document)
+        except PortfolioConfigError:
+            return "INVALID", document, raw
         schema = document.get("schema_version")
         policy = document.get("policy_version")
         if schema != SCHEMA_VERSION or policy != POLICY_VERSION:
@@ -313,7 +325,10 @@ class PortfolioPanelService:
         current_digest = _digest(raw) if raw is not None and current is not None else None
         if expected != current_digest:
             raise PortfolioPanelError("CONFIG_CHANGED", "portfolio settings changed", status=409)
-        document = dict(payload["document"])
+        try:
+            document, _ = migrate_portfolio_config_document(payload["document"])
+        except PortfolioConfigError as error:
+            raise PortfolioPanelError("CONFIG_INVALID", "portfolio settings are invalid", status=422) from error
         encoded = self._encode_document(document)
         temporary: Path | None = None
         try:
@@ -416,13 +431,6 @@ class PortfolioPanelService:
             "schema_version": document.get("schema_version") if document else None,
             "policy_version": document.get("policy_version") if document else None,
             "config_digest": config_digest,
-            "search": {
-                "total_test_budget": (
-                    document.get("search", {}).get("total_test_budget")
-                    if isinstance(document, Mapping) and isinstance(document.get("search"), Mapping)
-                    else None
-                ),
-            },
             "available_pairs": pairs,
             "current_finalists": finalists,
         }
@@ -441,69 +449,20 @@ class PortfolioPanelService:
             raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "portfolio finalists are unavailable", status=422) from error
         return finalists
 
-    @staticmethod
-    def _package_variant_generator(selected: Sequence[Mapping[str, Any]], campaign: Mapping[str, Any], profiles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-        """Run the package search boundary without inventing missing evidence."""
-        from .portfolio.search import search_portfolios
+    def _package_variant_generator(self, selected: Sequence[Mapping[str, Any]], campaign: Mapping[str, Any], _profiles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Run the package-owned current-facts adapter for one frozen Campaign."""
+        from .portfolio.adapter import run_portfolio_adapter
 
-        variants: list[Any] = []
-        blockers: list[str] = []
-        excluded: list[dict[str, Any]] = []
-        for profile in profiles:
-            profile_id = str(profile.get("profile_id", "<unknown-profile>"))
-            try:
-                options: dict[str, Any] = {"profile": profile}
-                max_candidates = profile.get("max_candidates")
-                if isinstance(max_candidates, int) and not isinstance(max_candidates, bool):
-                    options["max_pretest_variant_count"] = max_candidates
-                result = search_portfolios(selected, **options)
-                raw_status = getattr(result, "status", None)
-                status = str(raw_status) if isinstance(raw_status, str) else ""
-                reason = str(getattr(result, "reason", status))
-                detail = getattr(result, "detail", None)
-                if status == "PASS":
-                    variants.extend(
-                        PortfolioPanelService._profile_variant(variant, profile_id)
-                        for variant in (getattr(result, "passing", ()) or ())
-                    )
-                    for rejected in getattr(result, "excluded", ()) or ():
-                        rejected_reason = str(_get(rejected, "reason", "UNKNOWN"))
-                        rejected_detail = str(_get(rejected, "detail", ""))
-                        excluded.append(
-                            {
-                                "profile": profile_id,
-                                "stage": "GENERATE_VARIANTS",
-                                "selection_reason": rejected_reason,
-                                "message": f"{profile_id}:{rejected_reason}:{rejected_detail}".rstrip(":"),
-                                "symbol": _get(rejected, "symbol"),
-                            }
-                        )
-                        if rejected_detail == "MAX_PRETEST_VARIANT_COUNT":
-                            blockers.append(f"{profile_id}:MAX_CANDIDATES")
-                elif status in {"FAIL", "UNKNOWN", "OPEN_POLICY"}:
-                    message = f"{profile_id}:{reason}"
-                    if detail:
-                        message += f":{_redact_text(detail)}"
-                    blockers.append(message)
-                    excluded.append({"profile": profile_id, "selection_reason": reason, "message": message})
-                else:
-                    raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "portfolio search returned an invalid status", status=500)
-            except PortfolioPanelError:
-                raise
-            except Exception as error:
-                raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "portfolio search failed", status=500) from error
-        return {"variants": tuple(variants), "blockers": blockers, "excluded": tuple(excluded)}
-
-    @staticmethod
-    def _profile_variant(variant: Any, profile_id: str) -> Any:
-        if _get(variant, "profile") is not None:
-            return variant
-        if isinstance(variant, Mapping):
-            return {**variant, "profile": profile_id}
-        attributes = getattr(variant, "__dict__", None)
-        if isinstance(attributes, dict):
-            return SimpleNamespace(**{key: value for key, value in attributes.items() if key != "profile"}, profile=profile_id)
-        return {"variant": variant, "profile": profile_id}
+        try:
+            result = run_portfolio_adapter(selected, campaign, workspace_root=self.root)
+        except Exception as error:
+            raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "portfolio adapter failed", status=500) from error
+        return {
+            "variants": result.variants,
+            "blockers": list(result.blockers),
+            "excluded": result.excluded,
+            "warnings": result.warnings,
+        }
 
     @staticmethod
     def _normalise_campaign(payload: Mapping[str, Any], config: Any, config_digest: str) -> dict[str, Any]:
@@ -531,8 +490,6 @@ class PortfolioPanelService:
         profiles: list[dict[str, Any]] = []
         seen_profiles: set[str] = set()
         configured = getattr(config, "profiles", {})
-        total_budget = int(config.search["total_test_budget"])
-        candidate_total = 0
         for index, value in enumerate(raw_profiles):
             if not isinstance(value, Mapping):
                 raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign fields are invalid", status=422)
@@ -549,21 +506,7 @@ class PortfolioPanelService:
             if "max_balance_usdt" in value and max_balance is None:
                 raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign fields are invalid", status=422)
             max_candidates = _integer(value.get("max_candidates"), f"profiles[{index}].max_candidates")
-            candidate_total += max_candidates
             profiles.append({"profile_id": profile_id, "equity_usdt": _decimal(value.get("equity_usdt"), f"profiles[{index}].equity_usdt"), "max_balance_usdt": _decimal(max_balance, f"profiles[{index}].max_balance_usdt") if max_balance is not None else None, "max_candidates": max_candidates})
-            if max_candidates > total_budget or candidate_total > total_budget:
-                raise PortfolioPanelError(
-                    "PORTFOLIO_CAMPAIGN_INVALID",
-                    "profile candidate budgets exceed configured total_test_budget",
-                    status=422,
-                    field_errors=[
-                        {
-                            "field": f"profiles[{index}].max_candidates",
-                            "code": "TOTAL_TEST_BUDGET_EXCEEDED",
-                            "message": "profile candidate budgets exceed configured total_test_budget",
-                        }
-                    ],
-                )
         launch = {"pairs": pairs, "profiles": profiles}
         launch["selected_pairs"] = [[pair["pair"], side] for pair in pairs for side in ("LONG", "SHORT")]
         launch["maximums"] = {f"{pair['pair']}|LONG": pair["max_finalist_long"] for pair in pairs} | {f"{pair['pair']}|SHORT": pair["max_finalist_short"] for pair in pairs}
@@ -731,7 +674,13 @@ class PortfolioPanelService:
                 raise PortfolioPanelError("PORTFOLIO_JOB_BUSY", "portfolio optimizer is busy", status=409)
             finalists = self._snapshot_finalists(document, launch)
             campaign_id = f"campaign-{uuid4().hex}"
-            campaign = {"campaign_id": campaign_id, "created_at_utc": _now(), "input_digest": input_digest, "config_digest": config_digest, "config_bytes": base64.b64encode(raw).decode("ascii"), "config_document": _plain(document), "launch": _plain(launch), "finalists": finalists, "versions": {"schema_version": SCHEMA_VERSION, "policy_version": POLICY_VERSION, "algorithm_versions": _plain(document.get("algorithm_versions", {}))}}
+            frozen_raw = raw
+            try:
+                if json.loads(raw.decode("utf-8")).get("schema_version") != SCHEMA_VERSION:
+                    frozen_raw = self._encode_document(document)
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                raise PortfolioPanelError("CONFIG_INVALID", "portfolio settings are invalid", status=422) from None
+            campaign = {"campaign_id": campaign_id, "created_at_utc": _now(), "input_digest": input_digest, "config_digest": config_digest, "frozen_config_digest": _digest(frozen_raw), "config_bytes": base64.b64encode(frozen_raw).decode("ascii"), "config_document": _plain(document), "launch": _plain(launch), "finalists": finalists, "versions": {"schema_version": SCHEMA_VERSION, "policy_version": POLICY_VERSION, "algorithm_versions": _plain(document.get("algorithm_versions", {}))}}
             saved = None
             submission_key = f"portfolio:{campaign_id}"
 
@@ -918,7 +867,8 @@ class PortfolioPanelService:
             launch = campaign["launch"]
             try:
                 frozen_raw = base64.b64decode(campaign["config_bytes"], validate=True)
-                if _digest(frozen_raw) != campaign["config_digest"] or json.loads(frozen_raw.decode("utf-8")) != campaign["config_document"]:
+                frozen_digest = campaign.get("frozen_config_digest", campaign["config_digest"])
+                if _digest(frozen_raw) != frozen_digest or json.loads(frozen_raw.decode("utf-8")) != campaign["config_document"]:
                     raise ValueError("frozen config digest mismatch")
             except (ValueError, TypeError, UnicodeDecodeError):
                 raise PortfolioPanelError("CONFIG_INVALID", "frozen portfolio settings are invalid", status=422) from None
@@ -929,6 +879,7 @@ class PortfolioPanelService:
             excluded: tuple[dict[str, Any], ...] = ()
             optimizer_excluded: tuple[dict[str, Any], ...] = ()
             optimizer_blockers: list[str] = []
+            optimizer_warnings: list[str] = []
             for index, stage in enumerate(STAGES):
                 if self._cancelled(job_id):
                     self._cancel_finish(job_id, published, previous)
@@ -969,6 +920,7 @@ class PortfolioPanelService:
                         optimizer_blockers = [str(item) for item in generated.get("blockers", ()) if isinstance(item, str)]
                         generated_excluded = generated.get("excluded", ())
                         optimizer_excluded = tuple(dict(item) for item in generated_excluded if isinstance(item, Mapping))
+                        optimizer_warnings = [str(item) for item in generated.get("warnings", ()) if isinstance(item, str)]
                     else:
                         variants = tuple(generated or ())
                     if not variants and not optimizer_blockers:
@@ -977,9 +929,16 @@ class PortfolioPanelService:
                     optimizer_excluded = tuple((*optimizer_excluded, *capped))
                     optimizer_blockers.extend(cap_blockers)
                     if not variants:
+                        details = [*optimizer_blockers]
+                        details.extend(
+                            f"{item.get('symbol')}:{item.get('selection_reason')}"
+                            for item in optimizer_excluded
+                            if item.get("symbol") and item.get("selection_reason") not in {"DIRECTION_TOP_N", "MAX_CANDIDATES"}
+                        )
+                        message = "; ".join(dict.fromkeys(details)) or "portfolio variant generation produced no variants"
                         raise PortfolioPanelError(
                             "PORTFOLIO_JOB_VARIANTS_NOT_READY",
-                            "portfolio variant generation produced no variants",
+                            message,
                             status=422,
                         )
                 elif stage == "VALIDATE_VARIANTS":
@@ -1007,9 +966,9 @@ class PortfolioPanelService:
                         built = _invoke(self.workbook_builder, workbook, campaign, finalists, selected, variants, excluded)
                         workbook = Path(built) if built is not None else workbook
                     else:
-                        self._write_workbook(workbook, campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=optimizer_blockers)
+                        self._write_workbook(workbook, campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=optimizer_blockers, warnings=optimizer_warnings)
                     self._staging_path(workbook, campaign["campaign_id"])
-                    summary = self._summary(campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=optimizer_blockers)
+                    summary = self._summary(campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=optimizer_blockers, warnings=optimizer_warnings)
                     runtime_values = {"staged_workbook_path": str(workbook), "final_workbook_path": str(final_workbook), "summary": summary, "counters": {"finalists_read": len(finalists), "candidates_selected": len(selected), "variants_created": len(variants)}}
                     self._sync_runtime(job_id, **runtime_values)
                 elif stage == "PUBLISH_RESULTS":
@@ -1090,8 +1049,9 @@ class PortfolioPanelService:
             self._threads.pop(job_id, None)
 
     @staticmethod
-    def _summary(campaign: Mapping[str, Any], finalists: Sequence[Mapping[str, Any]], selected: Sequence[Mapping[str, Any]], variants: Sequence[Any], excluded: Sequence[Mapping[str, Any]], *, optimizer_excluded: Sequence[Mapping[str, Any]] = (), blockers: Sequence[str] = ()) -> dict[str, Any]:
+    def _summary(campaign: Mapping[str, Any], finalists: Sequence[Mapping[str, Any]], selected: Sequence[Mapping[str, Any]], variants: Sequence[Any], excluded: Sequence[Mapping[str, Any]], *, optimizer_excluded: Sequence[Mapping[str, Any]] = (), blockers: Sequence[str] = (), warnings: Sequence[str] = ()) -> dict[str, Any]:
         blockers = list(dict.fromkeys(str(item) for item in blockers if item))
+        warnings = list(dict.fromkeys(str(item) for item in warnings if item))
         finalist_reasons: dict[str, int] = {}
         for item in excluded:
             reason = str(item.get("selection_reason") or "UNKNOWN")
@@ -1105,10 +1065,7 @@ class PortfolioPanelService:
             profile = str(_get(item, "profile", "UNASSIGNED") or "UNASSIGNED")
             variants_by_profile[profile] = variants_by_profile.get(profile, 0) + 1
         prepared_by_profile = {
-            str(profile["profile_id"]): min(
-                variants_by_profile.get(str(profile["profile_id"]), 0),
-                int(profile["max_candidates"]),
-            )
+            str(profile["profile_id"]): variants_by_profile.get(str(profile["profile_id"]), 0)
             for profile in campaign.get("launch", {}).get("profiles", ())
             if isinstance(profile, Mapping)
         }
@@ -1125,6 +1082,8 @@ class PortfolioPanelService:
             "optimizer_exclusions_by_reason": dict(sorted(optimizer_reasons.items())),
             "blockers": blockers,
             "optimizer_blockers": blockers,
+            "warnings": warnings,
+            "optimizer_warnings": warnings,
             "campaign_id": campaign["campaign_id"],
         }
 
@@ -1135,15 +1094,13 @@ class PortfolioPanelService:
             for profile in profiles
             if isinstance(profile, Mapping) and isinstance(profile.get("profile_id"), str) and isinstance(profile.get("max_candidates"), int)
         }
-        counts: dict[str, int] = {}
         kept: list[Any] = []
         excluded: list[dict[str, Any]] = []
         blockers: list[str] = []
         for variant in variants:
             profile = _get(variant, "profile")
             profile_id = str(profile) if profile is not None else ""
-            limit = limits.get(profile_id)
-            if limit is None:
+            if profile_id not in limits:
                 blockers.append("UNKNOWN_PROFILE")
                 excluded.append(
                     {
@@ -1155,23 +1112,10 @@ class PortfolioPanelService:
                     }
                 )
                 continue
-            if counts.get(profile_id, 0) < limit:
-                kept.append(variant)
-                counts[profile_id] = counts.get(profile_id, 0) + 1
-                continue
-            blockers.append(f"{profile_id}:MAX_CANDIDATES")
-            excluded.append(
-                {
-                    "profile": profile_id,
-                    "stage": "GENERATE_VARIANTS",
-                    "selection_reason": "MAX_CANDIDATES",
-                    "message": f"{profile_id}:MAX_CANDIDATES",
-                    "candidate_id": next((_get(variant, key) for key in ("candidate_id", "strategy_id", "id") if _get(variant, key) is not None), ""),
-                }
-            )
+            kept.append(variant)
         return tuple(kept), tuple(excluded), tuple(dict.fromkeys(blockers))
 
-    def _write_workbook(self, path: Path, campaign: Mapping[str, Any], finalists: Sequence[Mapping[str, Any]], selected: Sequence[Mapping[str, Any]], variants: Sequence[Any], excluded: Sequence[Mapping[str, Any]], *, optimizer_excluded: Sequence[Mapping[str, Any]] = (), blockers: Sequence[str] = ()) -> Path:
+    def _write_workbook(self, path: Path, campaign: Mapping[str, Any], finalists: Sequence[Mapping[str, Any]], selected: Sequence[Mapping[str, Any]], variants: Sequence[Any], excluded: Sequence[Mapping[str, Any]], *, optimizer_excluded: Sequence[Mapping[str, Any]] = (), blockers: Sequence[str] = (), warnings: Sequence[str] = ()) -> Path:
         def val(item: Any, *keys: str, default: Any = None) -> Any:
             for key in keys:
                 found = _get(item, key, None)
@@ -1190,7 +1134,8 @@ class PortfolioPanelService:
             candidate_id = val(variant, "candidate_id", "strategy_id", "id", default=f"candidate-{index + 1}")
             profile = val(variant, "profile", default="")
             directions = val(variant, "directions")
-            member_count = len(directions) if isinstance(directions, Mapping) else val(variant, "member_count")
+            members = val(variant, "members")
+            member_count = len(directions) if isinstance(directions, Mapping) else (len(members) if isinstance(members, Sequence) else val(variant, "member_count"))
             pair_count = val(variant, "pair_count")
             if pair_count is None:
                 symbols = {
@@ -1198,6 +1143,7 @@ class PortfolioPanelService:
                     for symbol in (
                         [val(details, "symbol", "pair") for details in directions.values()]
                         if isinstance(directions, Mapping)
+                        else [val(details, "symbol", "pair") for details in members] if isinstance(members, Sequence)
                         else []
                     )
                     if symbol is not None
@@ -1210,14 +1156,19 @@ class PortfolioPanelService:
             portfolio_rows.append([campaign["campaign_id"], candidate_id, profile, index + 1, val(variant, "scheduling_key_id", default=val(val(variant, "scheduling_key", default={}), "identity")), val(variant, "scheduling_score", "score"), member_count, pair_count, val(variant, "limiter"), val(variant, "maximum_individual_dd_pct"), val(variant, "minimum_free_margin_reserve_pct"), val(variant, "maximum_account_mm_load_pct"), val(variant, "gate", "gate_result", default="UNKNOWN"), val(variant, "blocking_reasons", "reasons", default=""), "", None, ""])
             if isinstance(directions, Mapping) and directions:
                 for ordinal, (direction, details) in enumerate(directions.items(), 1):
-                    member_rows.append([campaign["campaign_id"], candidate_id, profile, ordinal, val(details, "strategy_id", "strategyId"), val(details, "result_id", "resultId"), val(details, "symbol", "pair", default=val(variant, "symbol")), direction, val(details, "user_rank"), val(details, "scalar", "scalar_pct"), val(details, "quantity", "rounded_quantity"), val(details, "leverage"), val(details, "notional_usdt"), val(details, "estimated_individual_dd_usdt"), val(details, "estimated_individual_dd_pct"), val(details, "liquidity_scalar_ceiling_pct"), val(details, "calculated_initial_margin_usdt"), val(details, "gate", "gate_result", default="UNKNOWN"), val(details, "reasons", default="")])
+                    member_rows.append([campaign["campaign_id"], candidate_id, profile, ordinal, val(details, "strategy_id", "strategyId"), val(details, "result_id", "resultId"), val(details, "symbol", "pair", default=val(variant, "symbol")), direction, val(details, "user_rank"), val(details, "scalar", "scalar_pct"), val(details, "quantity", "rounded_quantity"), val(details, "leverage"), val(details, "notional_usdt"), val(details, "estimated_individual_dd_usdt"), val(details, "estimated_individual_dd_pct"), val(details, "liquidity_scalar_ceiling_pct"), val(details, "calculated_initial_margin_usdt"), val(details, "gate", "gate_result", default="UNKNOWN"), val(details, "reasons", default=""), *([None] * 12)])
+            elif isinstance(members, Sequence):
+                for ordinal, details in enumerate(members, 1):
+                    calendar = val(details, "calendar_7d", default={})
+                    weekday = val(details, "weekday_5d", default={})
+                    member_rows.append([campaign["campaign_id"], candidate_id, profile, ordinal, val(details, "strategy_id", "strategyId"), val(details, "result_id", "resultId"), val(details, "symbol", "pair"), val(details, "side", "direction"), val(details, "user_rank"), None, val(details, "maximum_closing_quantity"), val(details, "planned_leverage"), val(details, "position_size_usdt"), None, val(details, "max_drawdown_pct"), None, None, "PASS", val(details, "spread_diagnostics", default=""), val(details, "capacity_status"), val(calendar, "available_days"), val(calendar, "mean_minute_turnover"), val(calendar, "rounded_cap_usdt"), val(weekday, "available_days"), val(weekday, "mean_minute_turnover"), val(weekday, "rounded_cap_usdt"), val(details, "spread_status"), val(details, "spread_mean_bps"), val(details, "sizing_digest"), val(details, "capacity_digest"), val(details, "reference_digest")])
         excluded_rows = []
         for is_optimizer, rows in ((False, excluded), (True, optimizer_excluded)):
             excluded_rows.extend(
                 [campaign["campaign_id"], "PORTFOLIO" if is_optimizer else "FINALIST", val(row, "strategy_id", "result_id", default=""), val(row, "symbol", "pair"), val(row, "side", "direction"), val(row, "profile"), val(row, "stage", default="GENERATE_VARIANTS" if is_optimizer else "SELECT_CANDIDATES"), "BLOCKED" if is_optimizer else "EXCLUDED", val(row, "selection_reason"), _redact_text(val(row, "message", default=val(row, "selection_reason", default="")))]
                 for row in rows
             )
-        summary = self._summary(campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=blockers)
+        summary = self._summary(campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=blockers, warnings=warnings)
         metadata = {"schema_version": "portfolio_panel_stage1_v1", "campaign_id": campaign["campaign_id"], "created_at_utc": campaign.get("created_at_utc", "2000-01-01T00:00:00Z"), "input_digest": campaign["input_digest"], "config_digest": campaign["config_digest"], "policy_version": campaign["versions"]["policy_version"], "algorithm_versions": _json(campaign["versions"])}
         def frame(rows: Sequence[Sequence[Any]], headers: Sequence[str]) -> pd.DataFrame:
             return pd.DataFrame([[ _safe_cell(value, key=header) for value, header in zip(row, headers)] for row in rows], columns=headers)

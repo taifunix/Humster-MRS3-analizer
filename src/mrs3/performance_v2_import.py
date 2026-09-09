@@ -98,6 +98,7 @@ class PerformanceV2ImportRequest:
     test_end: str | None
     listing_dates_path: Path | None
     listing_dates_root: Path | None
+    expected_current_result_ids: Mapping[str, int] | None
 
     def __init__(
         self,
@@ -117,6 +118,7 @@ class PerformanceV2ImportRequest:
         test_end: str | None = None,
         listing_dates_path: Path | None = None,
         listing_dates_root: Path | None = None,
+        expected_current_result_ids: Mapping[str, int] | None = None,
     ) -> None:
         if inbox is None:
             inbox = inbox_path
@@ -140,6 +142,7 @@ class PerformanceV2ImportRequest:
             replacement_strategy_ids is not None
             or strategy_id_mapping is not None
             or expected_strategy_identities is not None
+            or expected_current_result_ids is not None
         ):
             raise ValueError("replacement identity controls require REPLACE mode")
         if type(clear_retest_on_success) is not bool:
@@ -175,6 +178,18 @@ class PerformanceV2ImportRequest:
                 raise ValueError("listing dates path must be relative to a trusted input root")
             listing_dates_path = listing_path
         object.__setattr__(self, "listing_dates_path", listing_dates_path)
+        if expected_current_result_ids is not None and (
+            not isinstance(expected_current_result_ids, Mapping)
+            or any(
+                not isinstance(name, str) or not name.strip()
+                or isinstance(result_id, bool) or not isinstance(result_id, int) or result_id <= 0
+                for name, result_id in expected_current_result_ids.items()
+            )
+        ):
+            raise ValueError("expected_current_result_ids must be a mapping")
+        if expected_current_result_ids is not None and mode == "REPLACE" and set(expected_current_result_ids) != set(mapping):
+            raise ValueError("expected_current_result_ids must cover replacement_strategy_ids")
+        object.__setattr__(self, "expected_current_result_ids", None if expected_current_result_ids is None else dict(expected_current_result_ids))
 
     @property
     def inbox_path(self) -> Path:
@@ -203,6 +218,8 @@ class PerformanceV2ImportResult:
     failure_report_xlsx_path: Path | None = None
     failure_count: int = 0
     excluded_trade_count: int = 0
+    successful_replacements: tuple[Mapping[str, int], ...] = ()
+    failures: tuple[Mapping[str, object], ...] = ()
 
     @property
     def committed(self) -> bool:
@@ -1531,6 +1548,27 @@ def import_performance_v2(
                 validated.append(report)
         parsed, listing_failures = _prepare_listing_ranges(request, prepared, tuple(validated))
         failure_rows = parse_failures + listing_failures + validation_failures
+        # Bulk finalist retests freeze the old current Result ID.  A member
+        # that diverged while the tester was running is rejected independently
+        # so its sibling replacements can still commit.
+        if request.mode == "REPLACE" and request.expected_current_result_ids:
+            parsed_list = list(parsed)
+            current_rows = connection.execute(
+                "select strategy_name, current_result_id from strategies where strategy_name in (select unnest(?::varchar[]))",
+                [list(request.expected_current_result_ids)],
+            ).fetchall()
+            current_by_name = {str(name): None if result_id is None else int(result_id) for name, result_id in current_rows}
+            for index, (entry, report) in enumerate(zip(prepared.entries, parsed_list, strict=True)):
+                expected = request.expected_current_result_ids.get(entry.strategy_name)
+                if report is None or expected is None:
+                    continue
+                if current_by_name.get(entry.strategy_name) != expected:
+                    parsed_list[index] = None
+                    failure_rows.append({
+                        "strategy_name": entry.strategy_name, "symbol": entry.identity.symbol,
+                        "reason": "STALE_RESULT",
+                    })
+            parsed = tuple(parsed_list)
         if progress is not None:
             progress("PUBLISHING", len(parsed), len(parsed))
         failure_reasons = {
@@ -1556,6 +1594,24 @@ def import_performance_v2(
                 # The database transaction is already committed.  Report I/O
                 # must not turn a successful publication into a false FAILED.
                 failure_report_paths = None
+        successful_replacements: list[Mapping[str, int]] = []
+        if request.mode == "REPLACE" and imported:
+            failed_names = {str(row.get("strategy_name")) for row in failure_rows if row.get("strategy_name")}
+            for entry, report in zip(prepared.entries, parsed, strict=True):
+                if report is None or entry.strategy_name in failed_names:
+                    continue
+                strategy_id = request.replacement_strategy_ids.get(entry.strategy_name)
+                if strategy_id is None:
+                    continue
+                current_result = connection.execute(
+                    "select current_result_id from strategies where strategy_id = ?", [strategy_id]
+                ).fetchone()
+                if current_result is not None and current_result[0] is not None:
+                    successful_replacements.append({
+                        "strategy_id": int(strategy_id),
+                        "old_result_id": int(request.expected_current_result_ids.get(entry.strategy_name, current_result[0])) if request.expected_current_result_ids else int(current_result[0]),
+                        "new_result_id": int(current_result[0]),
+                    })
         result = PerformanceV2ImportResult(
             import_id,
             status,
@@ -1576,6 +1632,8 @@ def import_performance_v2(
                 for report in parsed
                 if report is not None
             ),
+            tuple(successful_replacements),
+            tuple(dict(row) for row in failure_rows),
         )
     except Exception as error:
         failure = (

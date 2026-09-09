@@ -70,6 +70,7 @@ def _open_regular_artifact(path: Path) -> tuple[BinaryIO, int]:
         raise
 
 import duckdb
+import pandas as pd
 
 from .analysis_exports import export_analysis_run
 from .analysis_strategies import (
@@ -207,6 +208,7 @@ from .performance_v2_selection import (
     selection_cache_missing_strategy_ids,
     selection_cache_status,
     write_selection_workbook,
+    retest_cohort_request,
 )
 from .performance_v2_selection_review import (
     SelectionReviewError,
@@ -215,8 +217,19 @@ from .performance_v2_selection_review import (
     latest_effective_finalists,
     new_run_metadata,
     persist_selection_snapshot,
+    persist_selection_snapshots,
 )
 from .performance_v2_retest import build_retest_manifest, retest_status
+from .performance_v2_finalist_retest import (
+    FinalistRetestError,
+    build_finalist_retest_manifest,
+    canonical_digest,
+    freeze_finalist_cohort,
+    validate_combined_control_workbook,
+    combined_control_workbook_bytes,
+    import_combined_control_workbook,
+    finalist_retest_config_digest,
+)
 from .runner.config import RunnerConfig
 from .runner.inbox import capture_verified_inbox
 from .runner.workflow import BatchPlan, _load_saved_result_evidence, _load_saved_results, plan_batch, run_batch
@@ -1756,6 +1769,10 @@ class PanelController:
             return self.strategies_performance_v2_retest_start(request)
         if kind == "strategies.performance.v2.retest.import" and isinstance(request, Mapping):
             return self.strategies_performance_v2_retest_import(request)
+        if kind == "strategies.performance.v2.finalist-retest.start" and isinstance(request, Mapping):
+            return self.strategies_performance_v2_finalist_retest_start(request)
+        if kind == "strategies.performance.v2.finalist-retest.import" and isinstance(request, Mapping):
+            return self.strategies_performance_v2_finalist_retest_import(request)
         idempotency_key = payload.get("idempotency_key")
         resource_keys = payload.get("resource_keys", [])
         if not isinstance(kind, str) or not isinstance(request, dict) or not isinstance(idempotency_key, str) or not isinstance(resource_keys, list):
@@ -1828,7 +1845,7 @@ class PanelController:
             saved_runtime.update(runtime)
             runtime = saved_runtime
         if (
-            tracked.get("kind") in {"strategies.tester.runs", "strategies.tester.start", "strategies.tester.native.start"}
+            tracked.get("kind") in {"strategies.tester.runs", "strategies.tester.start", "strategies.tester.native.start", "strategies.performance.v2.finalist-retest"}
             and document.get("state") == "COMMITTED"
             and isinstance(inbox, str)
             and inbox
@@ -1839,6 +1856,11 @@ class PanelController:
             if result:
                 public["result"] = result
             raw_report = document.get("result", {}).get("failure_report_path") if isinstance(document.get("result"), Mapping) else None
+            raw_result = document.get("result")
+            if isinstance(raw_result, Mapping):
+                for key in ("successful_replacements", "failures"):
+                    if isinstance(raw_result.get(key), list):
+                        runtime[key] = raw_result[key]
             if isinstance(raw_report, str) and raw_report:
                 runtime["failure_report_path"] = raw_report
             if document.get("state") == "COMMITTED" and runtime:
@@ -3501,11 +3523,12 @@ class PanelController:
         allowed = {
             "tester_job_id", "mode", "replacement_strategy_ids", "window_a", "window_b",
             "clear_retest_on_success", "test_start", "test_end", "listing_dates_path", "_retest",
+            "_expected_current_result_ids",
         }
         if set(payload).difference(allowed):
             raise ValueError("Performance v2 import request contains unsupported fields")
         if not _internal and any(
-            key in payload for key in ("replacement_strategy_ids", "clear_retest_on_success", "_retest")
+            key in payload for key in ("replacement_strategy_ids", "clear_retest_on_success", "_retest", "_expected_current_result_ids")
         ):
             raise ValueError("Performance v2 replacement controls are internal only")
         if not _internal and payload.get("mode") == "REPLACE":
@@ -3551,6 +3574,14 @@ class PanelController:
             )
         ):
             raise ValueError("replacement_strategy_ids must be a mapping")
+        expected_current = payload.get("_expected_current_result_ids")
+        if expected_current is not None and (
+            not _internal or not isinstance(expected_current, Mapping)
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in expected_current.values())
+        ):
+            raise ValueError("expected current Result IDs are internal only")
+        if isinstance(expected_current, Mapping) and set(expected_current) != set(replacement or {}):
+            raise ValueError("expected current Result IDs must cover the replacement cohort")
         window_a = self._performance_v2_window(payload, "window_a")
         window_b = self._performance_v2_window(payload, "window_b")
         if (window_a is None) != (window_b is None):
@@ -3594,6 +3625,7 @@ class PanelController:
             test_end=test_end if isinstance(test_end, str) else None,
             listing_dates_path=listing_dates_path,
             listing_dates_root=self.root,
+            expected_current_result_ids=expected_current,
         )
         job_request = {"tester_job_id": tester_job_id, "mode": mode}
         if _internal:
@@ -3654,11 +3686,560 @@ class PanelController:
     def strategies_performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
         return self.performance_v2_windows(payload)
 
+    def _selection_request(self, payload: Mapping[str, object]) -> SelectionRequest:
+        """Parse an ordinary request or resolve a server-owned bulk cohort."""
+        if not isinstance(payload, Mapping):
+            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="request must be an object")
+        raw_job = payload.get("bulk_retest_job_id")
+        if raw_job is None:
+            return parse_selection_request(payload)
+        if not isinstance(raw_job, str) or not raw_job.strip():
+            raise PerformanceV2SelectionError("RETEST_COHORT_INVALID")
+        if set(payload) != {"symbol", "side", "stages", "bulk_retest_job_id"}:
+            # This route accepts exactly one server-owned handle.  In
+            # particular, cohort/strategy/result overrides must never reach
+            # the selection layer, even if they are hidden in a browser body.
+            raise PerformanceV2SelectionError("RETEST_COHORT_CLIENT_OVERRIDE")
+        base_payload = dict(payload)
+        base_payload.pop("bulk_retest_job_id", None)
+        request = parse_selection_request(base_payload)
+        try:
+            job = self._panel_jobs.get(raw_job.strip())
+            runtime = self._panel_jobs.runtime(raw_job.strip())
+        except PanelJobError as error:
+            raise PerformanceV2SelectionError("RETEST_COHORT_JOB_NOT_FOUND") from error
+        if (
+            job.get("state") != "COMMITTED"
+            or job.get("kind") != "strategies.performance.v2.finalist-retest"
+            or runtime.get("bulk_retest") is not True
+        ):
+            raise PerformanceV2SelectionError("RETEST_COHORT_JOB_NOT_COMMITTED")
+        raw_successes = runtime.get("successful_replacements")
+        if not isinstance(raw_successes, list):
+            result = job.get("result")
+            raw_successes = result.get("successful_replacements") if isinstance(result, Mapping) else None
+        pairs: dict[int, int] = {}
+        if isinstance(raw_successes, list):
+            for item in raw_successes:
+                if not isinstance(item, Mapping):
+                    continue
+                strategy_id = item.get("strategy_id")
+                result_id = item.get("new_result_id", item.get("result_id"))
+                if isinstance(strategy_id, int) and not isinstance(strategy_id, bool) and isinstance(result_id, int) and not isinstance(result_id, bool):
+                    pairs[strategy_id] = result_id
+        return retest_cohort_request(request, raw_job.strip(), pairs)
+
+    @staticmethod
+    def _bulk_retest_range(payload: Mapping[str, object], listing_dates: Mapping[str, object], connection: duckdb.DuckDBPyConnection, include_reserve: bool) -> tuple[str, str]:
+        allowed = {"include_reserve", "test_start", "test_end", "start_date", "end_date"}
+        if set(payload).difference(allowed):
+            raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
+        if type(include_reserve) is not bool:
+            raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
+        start_keys = [key for key in ("test_start", "start_date") if key in payload]
+        end_keys = [key for key in ("test_end", "end_date") if key in payload]
+        if len(start_keys) > 1 or len(end_keys) > 1 or bool(start_keys) != bool(end_keys):
+            raise FinalistRetestError("INVALID_TEST_RANGE", "bulk retest dates must be supplied together")
+        if start_keys:
+            start = PanelController._retest_date(payload[start_keys[0]], "test_start")
+            end = PanelController._retest_date(payload[end_keys[0]], "test_end")
+        else:
+            end = (datetime.now(timezone.utc).date() - timedelta(days=2)).isoformat()
+            provisional = freeze_finalist_cohort(
+                connection, test_start="1970-01-01", test_end=end,
+                include_reserve=include_reserve, listing_dates=listing_dates,
+            )
+            if not provisional.members:
+                raise FinalistRetestError("COHORT_EMPTY", "bulk retest cohort has no runnable members")
+            starts = [str(member["listing_date_utc"])[:10] for member in provisional.members]
+            start = min(starts)
+        if start >= end:
+            raise FinalistRetestError("INVALID_TEST_RANGE", "test_start must be before test_end")
+        return start, end
+
+    def strategies_performance_v2_finalist_retest_start(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if not isinstance(payload, Mapping):
+            raise FinalistRetestError("INVALID_REQUEST", "bulk retest request must be an object")
+        if set(payload).difference({"include_reserve", "test_start", "test_end", "start_date", "end_date"}):
+            raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
+        include_reserve = payload.get("include_reserve", False)
+        listing_path, listing_relative = self._retest_listing_context()
+        try:
+            listing_dates = load_listing_dates(listing_path)
+        except Exception as error:
+            raise FinalistRetestError("LISTING_DATE_INVALID", "listing dates are invalid") from error
+        config = self._performance_v2_config()
+        target = performance_v2_database_path(config)
+        if not target.is_file():
+            raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
+        templates = self._workflow_defaults().get("strategy_templates", {})
+        with duckdb.connect(str(target), read_only=True) as connection:
+            start, end = self._bulk_retest_range(payload, listing_dates, connection, include_reserve)
+            current_cohort = freeze_finalist_cohort(
+                connection, test_start=start, test_end=end,
+                include_reserve=include_reserve, listing_dates=listing_dates,
+            )
+        if not current_cohort.members:
+            raise FinalistRetestError("COHORT_EMPTY", "bulk retest cohort has no runnable members")
+        current_config_sha256 = finalist_retest_config_digest(
+            templates if isinstance(templates, Mapping) else {}
+        )
+        for existing in self._panel_jobs.list():
+            if existing.get("kind") != "strategies.performance.v2.finalist-retest":
+                continue
+            try:
+                old_runtime = self._panel_jobs.runtime(str(existing.get("job_id")))
+            except PanelJobError:
+                continue
+            same_request = (
+                old_runtime.get("scope") == current_cohort.scope
+                and old_runtime.get("test_start") == start
+                and old_runtime.get("test_end") == end
+                and old_runtime.get("cohort_sha256") == current_cohort.cohort_sha256
+                and old_runtime.get("config_sha256") == current_config_sha256
+            )
+            if not same_request:
+                continue
+            if existing.get("state") in {"QUEUED", "RUNNING", "CANCELLING"}:
+                raise PanelJobError("RESOURCE_BUSY")
+            if existing.get("state") == "COMMITTED" and old_runtime.get("outcomes_finalized") is True and old_runtime.get("successful_replacements"):
+                return self._bulk_retest_status_document(str(existing["job_id"]))
+            # Terminal all-failure jobs intentionally fall through and create
+            # a new frozen run for a fresh retry.
+        run_id = f"finalist-retest-{uuid.uuid4().hex}"
+        with duckdb.connect(str(target), read_only=True) as connection:
+            batch = build_finalist_retest_manifest(
+                connection, templates if isinstance(templates, Mapping) else {},
+                config.strategy_root.parent if config.strategy_root is not None else self.root / "Output",
+                test_start=start, test_end=end, include_reserve=include_reserve,
+                listing_dates=listing_dates, job_id=run_id,
+            )
+        runtime = {
+            "bulk_retest": True, "scope": batch.cohort.scope, "cohort_sha256": batch.cohort.cohort_sha256,
+            "config_sha256": batch.config_sha256, "manifest_sha256": sha256(batch.manifest_path.read_bytes()).hexdigest(),
+            "test_start": start, "test_end": end, "listing_dates_path": str(listing_relative),
+            "manifest_path": str(batch.manifest_path), "cohort_members": [dict(member) for member in batch.cohort.members],
+            "exclusions": [item.as_dict() for item in batch.cohort.exclusions],
+            "successful_replacements": [], "failures": [item.as_dict() for item in batch.cohort.exclusions],
+        }
+        request = {"scope": batch.cohort.scope, "test_start": start, "test_end": end, "retest": True}
+        return self._start_tracked_panel_job(
+            "strategies.performance.v2.finalist-retest", request,
+            ("strategies.tester", "performance-v2-finalist-retest"),
+            lambda job_id: self._single_mode_strategy_test().start(
+                batch.manifest_path, analysis_run_id=batch.run_id, start_date=start, end_date=end, job_id=job_id,
+            ), runtime=runtime,
+        )
+
+    def strategies_performance_v2_finalist_retest_preview(self, include_reserve: bool = False) -> dict[str, object]:
+        if type(include_reserve) is not bool:
+            raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
+        listing_path, _ = self._retest_listing_context()
+        try:
+            listing_dates = load_listing_dates(listing_path)
+        except Exception as error:
+            raise FinalistRetestError("LISTING_DATE_INVALID", "listing dates are invalid") from error
+        target = performance_v2_database_path(self._performance_v2_config())
+        if not target.is_file():
+            raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
+        with duckdb.connect(str(target), read_only=True) as connection:
+            start, end = self._bulk_retest_range({}, listing_dates, connection, include_reserve)
+            cohort = freeze_finalist_cohort(
+                connection, test_start=start, test_end=end,
+                include_reserve=include_reserve, listing_dates=listing_dates,
+            )
+        return {
+            "scope": cohort.scope,
+            "test_start": start,
+            "test_end": end,
+            "cohort_count": cohort.member_count,
+            "excluded_count": cohort.excluded_count,
+        }
+
+    # Short aliases keep the HTTP/controller surface discoverable for clients
+    # that call the feature "bulk retest".
+    strategies_performance_v2_bulk_retest_start = strategies_performance_v2_finalist_retest_start
+
+    def _bulk_retest_status_document(self, job_id: str) -> dict[str, object]:
+        tracked = self._panel_jobs.get(job_id)
+        runtime = self._panel_jobs.runtime(job_id)
+        if tracked.get("kind") != "strategies.performance.v2.finalist-retest" or runtime.get("bulk_retest") is not True:
+            raise ValueError("job is not a bulk finalist RETEST")
+        try:
+            status = self._single_mode_strategy_test().status(job_id)
+            self._record_special_job(status)
+            self._sync_tracked_panel_job(status)
+            tracked = self._panel_jobs.get(job_id)
+            runtime = self._panel_jobs.runtime(job_id)
+        except (KeyError, ValueError):
+            pass
+        self._refresh_bulk_retest_outcomes(job_id)
+        tracked = self._panel_jobs.get(job_id)
+        runtime = self._panel_jobs.runtime(job_id)
+        bulk_error = None
+        if runtime.get("outcomes_finalized") is True and not runtime.get("successful_replacements"):
+            bulk_error = {"code": "RETEST_COHORT_NO_SUCCESSFUL_MEMBERS", "message": "no finalist cohort member imported successfully"}
+            runtime["error_code"] = bulk_error["code"]
+        return {
+            **tracked,
+            "scope": runtime.get("scope"), "cohort_sha256": runtime.get("cohort_sha256"),
+            "cohort_count": len(runtime.get("cohort_members", [])) if isinstance(runtime.get("cohort_members"), list) else 0,
+            "success_count": len(runtime.get("successful_replacements", [])) if isinstance(runtime.get("successful_replacements"), list) else 0,
+            "failure_count": len(runtime.get("failures", [])) if isinstance(runtime.get("failures"), list) else 0,
+            "test_start": runtime.get("test_start"), "test_end": runtime.get("test_end"),
+            "bulk_retest": True,
+            "outcomes_finalized": runtime.get("outcomes_finalized") is True,
+            "successful_replacements": runtime.get("successful_replacements", []),
+            "failures": runtime.get("failures", []),
+            "error": bulk_error or tracked.get("error"),
+        }
+
+    def _refresh_bulk_retest_outcomes(self, job_id: str) -> None:
+        """Persist redacted per-member outcomes after the native import worker ends."""
+        try:
+            runtime = self._panel_jobs.runtime(job_id)
+        except PanelJobError:
+            return
+        child_id = runtime.get("bulk_import_job_id")
+        if not isinstance(child_id, str) or not child_id or child_id.startswith("pending:"):
+            return
+        if runtime.get("outcomes_finalized") is True:
+            return
+        try:
+            child = self._panel_jobs.get(child_id)
+            child_runtime = self._panel_jobs.runtime(child_id)
+        except PanelJobError:
+            return
+        if child.get("state") not in {"COMMITTED", "FAILED", "CANCELLED"}:
+            return
+        members = [member for member in runtime.get("cohort_members", []) if isinstance(member, Mapping)]
+        failures = [dict(item) for item in runtime.get("exclusions", []) if isinstance(item, Mapping)]
+        imported_successes = child_runtime.get("successful_replacements")
+        imported_failures = child_runtime.get("failures")
+        if isinstance(imported_successes, list) and isinstance(imported_failures, list):
+            runtime["successful_replacements"] = [dict(item) for item in imported_successes if isinstance(item, Mapping)]
+            runtime["failures"] = failures + [dict(item) for item in imported_failures if isinstance(item, Mapping)]
+            runtime["outcomes_finalized"] = True
+            try:
+                self._panel_jobs.sync(job_id, {"state": self._panel_jobs.get(job_id).get("state", "COMMITTED")}, runtime=runtime)
+            except PanelJobError:
+                pass
+            return
+        failed_names: set[str] = set()
+        report_path = child_runtime.get("failure_report_path")
+        if isinstance(report_path, str) and report_path:
+            try:
+                with Path(report_path).open(encoding="utf-8", newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        name = row.get("strategy_name", "")
+                        if name:
+                            failed_names.add(name)
+                            failures.append({
+                                "strategy_id": next((int(member["strategy_id"]) for member in members if member.get("strategy_name") == name), None),
+                                "strategy_name": name, "reason": row.get("reason") or "IMPORT_FAILED",
+                            })
+            except (OSError, UnicodeDecodeError, csv.Error, TypeError, ValueError):
+                pass
+        successful: list[dict[str, int]] = []
+        expected_by_name = {str(member["strategy_name"]): member for member in members}
+        config = self._performance_v2_config()
+        target = performance_v2_database_path(config)
+        current: dict[int, int | None] = {}
+        if child.get("state") == "COMMITTED" and target.is_file():
+            try:
+                with duckdb.connect(str(target), read_only=True) as connection:
+                    current = {int(strategy_id): (None if result_id is None else int(result_id)) for strategy_id, result_id in connection.execute("select strategy_id, current_result_id from strategies").fetchall()}
+            except duckdb.Error:
+                return
+        for name, member in expected_by_name.items():
+            strategy_id, old_result = int(member["strategy_id"]), int(member["result_id"])
+            if name in failed_names:
+                continue
+            if child.get("state") == "COMMITTED" and current.get(strategy_id) == old_result:
+                successful.append({"strategy_id": strategy_id, "old_result_id": old_result, "new_result_id": old_result})
+            elif child.get("state") == "COMMITTED":
+                failures.append({"strategy_id": strategy_id, "strategy_name": name, "reason": "STALE_RESULT"})
+            else:
+                failures.append({"strategy_id": strategy_id, "strategy_name": name, "reason": "IMPORT_FAILED"})
+        runtime["successful_replacements"] = successful
+        runtime["failures"] = failures
+        runtime["outcomes_finalized"] = True
+        try:
+            self._panel_jobs.sync(job_id, {"state": self._panel_jobs.get(job_id).get("state", "COMMITTED")}, runtime=runtime)
+        except PanelJobError:
+            pass
+
+    def strategies_performance_v2_finalist_retest_status(self, job_id: str) -> dict[str, object]:
+        return self._bulk_retest_status_document(self._required({"job_id": job_id}, "job_id"))
+
+    strategies_performance_v2_bulk_retest_status = strategies_performance_v2_finalist_retest_status
+
+    def strategies_performance_v2_finalist_retest_import(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if not isinstance(payload, Mapping) or set(payload) != {"tester_job_id"}:
+            raise ValueError("bulk RETEST import accepts only tester_job_id")
+        tester_job_id = self._required(payload, "tester_job_id")
+        tracked = self._panel_jobs.get(tester_job_id)
+        runtime = self._panel_jobs.runtime(tester_job_id)
+        if tracked.get("kind") != "strategies.performance.v2.finalist-retest" or runtime.get("bulk_retest") is not True:
+            raise ValueError("tester job is not a bulk finalist RETEST")
+        if tracked.get("state") != "COMMITTED" or tracked.get("inbox_ready") is not True:
+            raise ValueError("bulk RETEST tester inbox is not committed")
+        previous = runtime.get("bulk_import_job_id")
+        if isinstance(previous, str) and previous and not previous.startswith("pending:"):
+            try:
+                previous_job = self._panel_jobs.get(previous)
+            except PanelJobError:
+                previous_job = None
+            if isinstance(previous_job, Mapping) and previous_job.get("state") not in {"FAILED", "CANCELLED"}:
+                return previous_job
+        names = {str(member["strategy_name"]): int(member["strategy_id"]) for member in runtime.get("cohort_members", []) if isinstance(member, Mapping)}
+        expected_results = {str(member["strategy_name"]): int(member["result_id"]) for member in runtime.get("cohort_members", []) if isinstance(member, Mapping)}
+        start, end = runtime.get("test_start"), runtime.get("test_end")
+        if not isinstance(start, str) or not isinstance(end, str) or not names:
+            raise ValueError("bulk RETEST provenance is incomplete")
+        pending = f"pending:{uuid.uuid4().hex}"
+        try:
+            self._panel_jobs.reserve_runtime(tester_job_id, "bulk_import_job_id", pending)
+            result = self.strategies_performance_v2_import({
+                "tester_job_id": tester_job_id, "mode": "REPLACE", "replacement_strategy_ids": names,
+                "clear_retest_on_success": False, "test_start": start, "test_end": end, "_retest": True,
+                "_expected_current_result_ids": expected_results,
+            }, _internal=True)
+            child_id = result.get("job_id") if isinstance(result, Mapping) else None
+            if not isinstance(child_id, str) or not child_id:
+                raise ValueError("bulk RETEST import returned an invalid job")
+            runtime = self._panel_jobs.runtime(tester_job_id)
+            runtime["bulk_import_job_id"] = child_id
+            self._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
+            return result
+        except BaseException:
+            try:
+                self._panel_jobs.clear_runtime(tester_job_id, "bulk_import_job_id", value=pending)
+            except PanelJobError:
+                pass
+            raise
+
+    strategies_performance_v2_bulk_retest_import = strategies_performance_v2_finalist_retest_import
+
+    def strategies_performance_v2_finalist_retest_export(self, payload: Mapping[str, object]) -> tuple[str, bytes]:
+        if not isinstance(payload, Mapping) or set(payload) != {"job_id"}:
+            raise ValueError("bulk RETEST export accepts only job_id")
+        job_id = self._required(payload, "job_id")
+        document = self._bulk_retest_status_document(job_id)
+        if document.get("state") != "COMMITTED":
+            raise ValueError("bulk RETEST is not committed")
+        if isinstance(document.get("error"), Mapping) and document["error"].get("code") == "RETEST_COHORT_NO_SUCCESSFUL_MEMBERS":
+            raise FinalistRetestError("RETEST_COHORT_NO_SUCCESSFUL_MEMBERS")
+        runtime = self._panel_jobs.runtime(job_id)
+        successes = runtime.get("successful_replacements")
+        if not isinstance(successes, list) or not successes:
+            raise ValueError("bulk RETEST has no successful members")
+        members = {int(member["strategy_id"]): member for member in runtime.get("cohort_members", []) if isinstance(member, Mapping)}
+        audit_members: dict[int, Mapping[str, object]] = dict(members)
+        for exclusion in runtime.get("exclusions", []):
+            if not isinstance(exclusion, Mapping):
+                continue
+            raw_id, symbol, side = exclusion.get("strategy_id"), exclusion.get("symbol"), exclusion.get("side")
+            if isinstance(raw_id, int) and not isinstance(raw_id, bool) and isinstance(symbol, str) and isinstance(side, str) and side in {"LONG", "SHORT"}:
+                audit_members.setdefault(raw_id, {
+                    "strategy_id": raw_id, "strategy_name": exclusion.get("strategy_name"),
+                    "symbol": symbol, "side": side, "excluded": True,
+                })
+        success_members = {
+            int(item["strategy_id"]): item for item in successes
+            if isinstance(item, Mapping) and int(item.get("strategy_id", 0)) in members
+        }
+        if not success_members:
+            raise FinalistRetestError("RETEST_COHORT_NO_SUCCESSFUL_MEMBERS")
+        selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
+        performance_config = self._performance_v2_config()
+        target = performance_v2_database_path(performance_config)
+        if not target.is_file():
+            raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND")
+
+        # Every Pair+Side is ranked independently.  The only IDs passed to the
+        # selection/cache helpers come from the server-owned successful outcome
+        # list above; browser payloads never participate in this path.
+        by_group: dict[tuple[str, str], dict[int, Mapping[str, object]]] = {}
+        all_group_members: dict[tuple[str, str], dict[int, Mapping[str, object]]] = {}
+        for strategy_id, member in audit_members.items():
+            all_group_members.setdefault((str(member["symbol"]), str(member["side"])), {})[strategy_id] = member
+        for strategy_id, outcome in success_members.items():
+            member = members[strategy_id]
+            by_group.setdefault((str(member["symbol"]), str(member["side"])), {})[strategy_id] = member
+        run_specs: list[dict[str, object]] = []
+        try:
+            with self._performance_v2_writer_lock:
+                for (symbol, side), group_members in sorted(by_group.items()):
+                    base = SelectionRequest(symbol, side, ())
+                    # Reuse the last server-recorded stage order for this pair;
+                    # the browser still supplies no ranking controls for a
+                    # cohort export.  A legacy run may have no decodable stage
+                    # payload, in which case the pipeline's ordinary empty
+                    # stage behavior remains the safe fallback.
+                    with duckdb.connect(str(target), read_only=True) as connection:
+                        latest_request = connection.execute(
+                            "select request_json from selection_runs where symbol = ? and side = ? order by created_at_utc desc, selection_run_id desc limit 1",
+                            [symbol, side],
+                        ).fetchone()
+                    if latest_request:
+                        try:
+                            decoded = json.loads(str(latest_request[0]))
+                            if isinstance(decoded, Mapping) and isinstance(decoded.get("stages"), list):
+                                base = parse_selection_request({"symbol": symbol, "side": side, "stages": decoded["stages"]})
+                        except (TypeError, ValueError, PerformanceV2SelectionError):
+                            pass
+                    cohort_request = retest_cohort_request(
+                        base, job_id,
+                        {strategy_id: int(success_members[strategy_id].get("new_result_id", member["result_id"])) for strategy_id, member in group_members.items()},
+                    )
+                    with duckdb.connect(str(target), read_only=True) as connection:
+                        require_performance_v2(connection)
+                        cache = selection_cache_status(connection, cohort_request, selection_config)
+                    if not cache.get("ready"):
+                        with duckdb.connect(str(target), read_only=True) as connection:
+                            missing = selection_cache_missing_strategy_ids(connection, cohort_request, selection_config)
+                        prepare_selection_window_cache(target, cohort_request, selection_config, performance_config.workers, missing)
+                    with duckdb.connect(str(target), read_only=True) as connection:
+                        if not selection_cache_status(connection, cohort_request, selection_config).get("ready"):
+                            raise FinalistRetestError("SELECTION_CACHE_INCOMPLETE")
+                        result = run_selection(
+                            apply_prior_rejected(connection, load_selection_candidates(connection, cohort_request, selection_config, cache_only=True)),
+                            cohort_request,
+                            selection_config,
+                        )
+                    run_id = str(uuid.uuid4())
+                    rows: list[dict[str, object]] = []
+                    for raw in result.to_dict(orient="records"):
+                        strategy_id = int(raw["strategy_id"])
+                        member = group_members.get(strategy_id)
+                        if member is None:
+                            continue
+                        rows.append({
+                            "symbol": symbol, "side": side, "strategy_id": strategy_id,
+                            "result_id": int(raw["result_id"]), "user_status": member.get("effective_status"),
+                            "user_rank": None, "retest": None, "comment": None,
+                            "auto_status": raw.get("auto_status"), "auto_rank": raw.get("final_rank"),
+                            "auto_analog_of_strategy_id": raw.get("auto_analog_of_strategy_id"),
+                            "auto_reason": raw.get("elimination_reason"), "score": raw.get("final_score"),
+                            "effective_start": member.get("effective_start"), "effective_end": member.get("effective_end"),
+                        })
+                    run_specs.append({
+                        "symbol": symbol, "side": side, "rows": rows, "result": result, "request": cohort_request,
+                        "run_id": run_id,
+                        "request_json_extra": {
+                            "bulk_retest_job_id": job_id, "ranking_scope": "RETEST_COHORT",
+                            "cohort_sha256": runtime.get("cohort_sha256"), "manifest_sha256": runtime.get("manifest_sha256"),
+                            "config_sha256": runtime.get("config_sha256"),
+                            "selection_config_sha256": canonical_digest(asdict(selection_config)),
+                        },
+                    })
+        except PerformanceV2SelectionError as error:
+            raise FinalistRetestError(str(error)) from error
+
+        candidates = [row for spec in run_specs for row in spec["rows"]]
+        groups: list[dict[str, object]] = []
+        all_failures: list[dict[str, object]] = []
+        failures_by_group: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for failure in runtime.get("failures", []):
+            if not isinstance(failure, Mapping):
+                continue
+            raw_strategy_id = failure.get("strategy_id")
+            member = audit_members.get(int(raw_strategy_id)) if isinstance(raw_strategy_id, int) and not isinstance(raw_strategy_id, bool) else None
+            if member is None:
+                name = failure.get("strategy_name")
+                member = next((candidate for candidate in audit_members.values() if candidate.get("strategy_name") == name), None)
+            if member is None:
+                continue
+            group_key = (str(member["symbol"]), str(member["side"]))
+            item = {"symbol": group_key[0], "side": group_key[1], **dict(failure)}
+            failures_by_group.setdefault(group_key, []).append(item)
+            all_failures.append(item)
+        for (symbol, side), group_members in sorted(all_group_members.items()):
+            key = f"{symbol}|{side}"
+            group_rows = [row for row in candidates if row["symbol"] == symbol and row["side"] == side]
+            status_counts: dict[str, int] = {}
+            for row in group_rows:
+                status = str(row.get("auto_status") or "")
+                status_counts[status] = status_counts.get(status, 0) + 1
+            groups.append({
+                "symbol": symbol, "side": side, "frozen_count": len(group_members),
+                "success_count": len(group_rows), "failure_count": len(failures_by_group.get((symbol, side), [])),
+                "auto_status_count": len(status_counts),
+            })
+        group_run_ids = {f"{spec['symbol']}|{spec['side']}": spec["run_id"] for spec in run_specs}
+        workbook_names = {
+            "Pair": "symbol", "Direction": "side", "Strategy ID": "strategy_id", "Result ID": "result_id",
+            "Auto Status": "auto_status", "Auto Rank": "auto_rank", "Auto Analog Of ID": "auto_analog_of_strategy_id",
+            "Auto Reason": "auto_reason", "Effective Start": "effective_start", "Effective End": "effective_end", "Score": "score",
+        }
+        exact_rowsets = {
+            key: [
+                {name: row.get(source) for name, source in workbook_names.items()}
+                for row in sorted(spec["rows"], key=lambda item: int(item["strategy_id"]))
+            ]
+            for key, spec in ((f"{spec['symbol']}|{spec['side']}", spec) for spec in run_specs)
+        }
+        immutable = [row for key in sorted(exact_rowsets) for row in exact_rowsets[key]]
+        group_digest_rows = [{
+            "Pair": row["symbol"], "Direction": row["side"], "Frozen Count": row["frozen_count"],
+            "Success Count": row["success_count"], "Failure Count": row["failure_count"], "Auto Status Count": row["auto_status_count"],
+        } for row in groups]
+        failure_digest_rows = [{
+            "Pair": row.get("symbol"), "Direction": row.get("side"), "Strategy ID": row.get("strategy_id"),
+            "Strategy": row.get("strategy_name"), "Result ID": row.get("result_id"), "Reason": row.get("reason"),
+        } for row in all_failures]
+        metadata: dict[str, object] = {
+            "database_instance_id": None, "ranking_scope": "RETEST_COHORT", "bulk_retest_job_id": job_id,
+            "scope": runtime.get("scope"), "cohort_sha256": runtime.get("cohort_sha256"),
+            "manifest_sha256": runtime.get("manifest_sha256"), "config_sha256": runtime.get("config_sha256"),
+            "selection_config_sha256": canonical_digest(asdict(selection_config)),
+            "test_start": runtime.get("test_start"), "test_end": runtime.get("test_end"),
+            "group_run_ids_json": group_run_ids,
+            "exact_rowsets_json": exact_rowsets,
+            "exact_rowsets_sha256": canonical_digest(exact_rowsets),
+            "immutable_content_sha256": canonical_digest(immutable),
+            "groups_sha256": canonical_digest(group_digest_rows), "failures_sha256": canonical_digest(failure_digest_rows),
+        }
+        with duckdb.connect(str(target), read_only=True) as connection:
+            metadata["database_instance_id"] = connection.execute("select value from schema_info where key='database_instance_id'").fetchone()[0]
+        data = combined_control_workbook_bytes(candidates, groups, all_failures, metadata)
+        snapshots = []
+        for spec in run_specs:
+            snapshot_metadata = {
+                "selection_run_id": spec["run_id"], "database_instance_id": metadata["database_instance_id"],
+                "selection_contract_version": "performance-v2-selection-review-v1",
+            }
+            snapshots.append({"request": spec["request"], "config": selection_config, "result": spec["result"], "metadata": snapshot_metadata, "request_json_extra": spec["request_json_extra"]})
+        try:
+            with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+                persist_selection_snapshots(connection, snapshots, workbook_bytes=data)
+        except SelectionReviewError as error:
+            raise FinalistRetestError(error.code, details=error.details) from error
+        return f"performance-v2-finalist-retest-{job_id}.xlsx", data
+
+    strategies_performance_v2_bulk_retest_export = strategies_performance_v2_finalist_retest_export
+
+    def strategies_performance_v2_finalist_retest_control_import(self, data: bytes) -> dict[str, object]:
+        if not isinstance(data, bytes):
+            raise FinalistRetestError("CONTROL_INVALID_FILE")
+        target = performance_v2_database_path(self._performance_v2_config())
+        self._ensure_performance_v2_schema(target)
+        try:
+            with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+                return import_combined_control_workbook(connection, data)
+        except FinalistRetestError:
+            raise
+        except duckdb.Error as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
+
+    strategies_performance_v2_bulk_retest_control_import = strategies_performance_v2_finalist_retest_control_import
+
     def _performance_v2_selection_result(self, payload: Mapping[str, object]):
         if not isinstance(payload, Mapping):
             raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="request must be an object")
         try:
-            request = parse_selection_request(payload)
+            request = self._selection_request(payload)
             selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
         except PerformanceV2SelectionError as error:
             raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=str(error)) from error
@@ -3680,6 +4261,9 @@ class PanelController:
                         order by s.strategy_id""",
                     [request.symbol, request.side],
                 ).fetchall())
+                if request.ranking_scope == "RETEST_COHORT":
+                    cohort_ids = {strategy_id for strategy_id, _ in request.cohort_members}
+                    result_token = tuple(row for row in result_token if int(row[0]) in cohort_ids)
                 facts_token = connection.execute(
                     """select count(*), max(wm.calculated_at_utc), bit_xor(hash(
                                    wm.result_id, wm.requested_start_utc, wm.requested_end_utc,
@@ -3692,12 +4276,16 @@ class PanelController:
                          from window_metrics wm
                          join strategy_results r on r.result_id = wm.result_id
                          join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id
-                        where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""",
-                    [request.symbol, request.side],
+                        where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?"""
+                        + (" and s.strategy_id in (" + ",".join("?" for _ in request.cohort_members) + ")" if request.ranking_scope == "RETEST_COHORT" else ""),
+                    [request.symbol, request.side, *(strategy_id for strategy_id, _ in request.cohort_members)] if request.ranking_scope == "RETEST_COHORT" else [request.symbol, request.side],
                 ).fetchone()
                 cache_key = (
                     request.symbol,
                     request.side,
+                    request.ranking_scope,
+                    request.bulk_retest_job_id,
+                    request.cohort_members,
                     tuple(asdict(selection_config).items()),
                     result_token,
                     facts_token,
@@ -3765,7 +4353,12 @@ class PanelController:
         return {"stages": result.attrs["stage_counts"]}
 
     def strategies_performance_v2_selection_cache_status(self, payload: Mapping[str, object]) -> dict[str, object]:
-        request = parse_selection_request({"symbol": payload.get("symbol"), "side": payload.get("side"), "stages": []})
+        if not isinstance(payload, Mapping) or set(payload).difference({"symbol", "side", "stages", "bulk_retest_job_id"}):
+            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="unsupported selection cache fields")
+        selection_payload = {"symbol": payload.get("symbol"), "side": payload.get("side"), "stages": payload.get("stages", [])}
+        if "bulk_retest_job_id" in payload:
+            selection_payload["bulk_retest_job_id"] = payload.get("bulk_retest_job_id")
+        request = self._selection_request(selection_payload)
         config = load_selection_config(self.default_config.with_name("config.performance.json"))
         target = performance_v2_database_path(self._performance_v2_config())
         self._ensure_performance_v2_schema(target)
@@ -3780,7 +4373,12 @@ class PanelController:
 
     def strategies_performance_v2_recalculate(self, payload: Mapping[str, object]) -> dict[str, object]:
         try:
-            request = parse_selection_request({"symbol": payload.get("symbol"), "side": payload.get("side"), "stages": []})
+            if not isinstance(payload, Mapping) or set(payload).difference({"symbol", "side", "stages", "bulk_retest_job_id"}):
+                raise PerformanceV2SelectionError("RETEST_COHORT_CLIENT_OVERRIDE")
+            selection_payload = {"symbol": payload.get("symbol"), "side": payload.get("side"), "stages": payload.get("stages", [])}
+            if "bulk_retest_job_id" in payload:
+                selection_payload["bulk_retest_job_id"] = payload.get("bulk_retest_job_id")
+            request = self._selection_request(selection_payload)
             config = load_selection_config(self.default_config.with_name("config.performance.json"))
             performance_config = self._performance_v2_config()
             target = performance_v2_database_path(performance_config)
@@ -6545,6 +7143,39 @@ class _PanelHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json(200, {"count": 0, "retest_count": 0, "active_count": 0, "phase": "UNAVAILABLE"})
             return
+        if parsed.path == "/api/v2/strategies/performance-v2/finalist-retest/status":
+            try:
+                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
+                self._json(200, self.server.controller.strategies_performance_v2_finalist_retest_status(job_id))
+            except (KeyError, ValueError):
+                self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid bulk RETEST request"}})
+            return
+        if parsed.path == "/api/v2/strategies/performance-v2/finalist-retest/preview":
+            raw = parse_qs(parsed.query).get("include_reserve", ["false"])[0].casefold()
+            if raw not in {"true", "false"}:
+                self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "include_reserve must be true or false"}})
+                return
+            try:
+                self._json(200, self.server.controller.strategies_performance_v2_finalist_retest_preview(raw == "true"))
+            except FinalistRetestError as error:
+                self._json(409, {"error": {"code": error.code, "message": str(error)}})
+            return
+        if parsed.path == "/api/v2/strategies/performance-v2/finalist-retest/export":
+            try:
+                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
+                filename, data = self.server.controller.strategies_performance_v2_finalist_retest_export({"job_id": job_id})
+            except (KeyError, ValueError, FinalistRetestError):
+                self._json(409, {"error": {"code": "CONTROL_EXPORT_UNAVAILABLE", "message": "bulk control workbook is unavailable"}})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if parsed.path == "/api/v2/strategies/performance-v2/import/status":
             try:
                 job_id = parse_qs(parsed.query).get("job_id", [""])[0]
@@ -6670,13 +7301,29 @@ class _PanelHandler(BaseHTTPRequestHandler):
             "/api/v2/strategies/performance-v2/retest/start",
             "/api/v2/strategies/performance-v2/retest/import",
         } else None
+        bulk_retest_endpoint = endpoint if endpoint in {
+            "/api/v2/strategies/performance-v2/finalist-retest/start",
+            "/api/v2/strategies/performance-v2/finalist-retest/import",
+        } else None
+        if bulk_retest_endpoint is not None:
+            endpoint = "/api/v2/strategies/performance-v2/retest/start" if bulk_retest_endpoint.endswith("/start") else "/api/v2/strategies/performance-v2/retest/import"
+        bulk_control_import_endpoint = urlparse(self.path).path == "/api/v2/strategies/performance-v2/finalist-retest/control-import"
+        if bulk_control_import_endpoint:
+            endpoint = "/api/v2/strategies/performance-v2/selection-review-import"
+        legacy_endpoint = endpoint if endpoint in {
+            "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel",
+            "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library",
+            "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel",
+        } else None
+        if legacy_endpoint is not None:
+            endpoint = "/api/v2/jobs"
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
         portfolio_route = endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         portfolio_cancel_route = bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint))
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
-        if endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/source-v6/merge/preflight", "/api/source-v6/merge/start", "/api/source-v6/merge/cancel", "/api/source-v6/library", "/api/source-v6/gaps", "/api/source-v6/export", "/api/source-v6/analysis/library", "/api/source-v6/analysis/start", "/api/source-v6/analysis/status", "/api/source-v6/analysis/cancel", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
+        if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
             self._json(404, {"error": "not found"})
             return
         if portfolio_submission_route:
@@ -6694,9 +7341,15 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": {"code": "SELECTION_REVIEW_INVALID_FILE", "message": "XLSX must be between 1 byte and 20 MiB"}})
                 return
             try:
-                result = self.server.controller.strategies_performance_v2_selection_review_import(self.rfile.read(length))
+                if bulk_control_import_endpoint:
+                    result = self.server.controller.strategies_performance_v2_finalist_retest_control_import(self.rfile.read(length))
+                else:
+                    result = self.server.controller.strategies_performance_v2_selection_review_import(self.rfile.read(length))
             except PerformanceV2ApiError as error:
                 self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+                return
+            except FinalistRetestError as error:
+                self._json(409, {"error": {"code": error.code, "message": str(error)}})
                 return
             self._json(200, result)
             return
@@ -6734,6 +7387,16 @@ class _PanelHandler(BaseHTTPRequestHandler):
             portfolio_campaign_match = endpoint == "/api/v2/portfolio/campaigns"
             portfolio_cancel_match = re.fullmatch(r"/api/v2/portfolio/jobs/([^/]+)/cancel", endpoint)
             portfolio_submission_match = re.fullmatch(r"/api/v2/portfolio/campaigns/([^/]+)/tester-submissions", endpoint)
+            if legacy_endpoint is not None:
+                endpoint = legacy_endpoint
+            if bulk_retest_endpoint is not None:
+                endpoint = bulk_retest_endpoint
+                if endpoint.endswith("/start"):
+                    result = self.server.controller.strategies_performance_v2_finalist_retest_start(document)
+                else:
+                    result = self.server.controller.strategies_performance_v2_finalist_retest_import(document)
+                self._json(200, result if isinstance(result, Mapping) else {"result": result})
+                return
             if direct_retest_endpoint is not None:
                 document = {
                     "kind": "strategies.performance.v2.retest.start"
@@ -6902,6 +7565,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except PanelJobError as error:
             self._json(409 if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED", "IDEMPOTENCY_CONFLICT", "RESTART_BLOCKED"} else 400, {"error": error.code})
             return
+        except FinalistRetestError as error:
+            status = 400 if error.code in {"INVALID_REQUEST", "INVALID_TEST_RANGE"} else 409
+            self._json(status, {"error": {"code": error.code, "message": str(error)}})
+            return
         except PerformanceV2ApiError as error:
             self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
             return
@@ -6938,7 +7605,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        accepted = portfolio_cancel_route or endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/portfolio/campaigns"}
+        accepted = portfolio_cancel_route or endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
         self._json(202 if accepted else 200, result)
 
 

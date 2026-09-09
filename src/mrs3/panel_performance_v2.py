@@ -119,6 +119,7 @@ class PerformanceV2PanelRequest:
     listing_dates_root: Path | None = None
     tester_strategy_root: Path | None = None
     tester_bot_root: Path | None = None
+    expected_current_result_ids: Mapping[str, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +138,8 @@ class PerformanceV2PanelResult:
     failure_report_path: Path | None = None
     windows: tuple[dict[str, object], ...] = ()
     cleanup_warning: Mapping[str, str] | None = None
+    successful_replacements: tuple[Mapping[str, int], ...] = ()
+    failures: tuple[Mapping[str, object], ...] = ()
 
     @property
     def window_count(self) -> int:
@@ -458,6 +461,7 @@ class LocalPerformanceV2Service:
                 test_end=request.test_end,
                 listing_dates_path=request.listing_dates_path,
                 listing_dates_root=request.listing_dates_root,
+                expected_current_result_ids=request.expected_current_result_ids,
             ),
             progress=import_progress,
         )
@@ -475,6 +479,8 @@ class LocalPerformanceV2Service:
                 0,
                 0,
                 failure_report_path=imported.failure_report_path,
+                successful_replacements=imported.successful_replacements,
+                failures=imported.failures,
             )
         if not imported.committed or imported.database_path is None:
             raise ValueError("Performance v2 import did not commit")
@@ -504,6 +510,8 @@ class LocalPerformanceV2Service:
             windows=(),
             cleanup_warning=None,
             failure_report_path=imported.failure_report_path,
+            successful_replacements=imported.successful_replacements,
+            failures=imported.failures,
             **counts,
         )
 
@@ -608,6 +616,8 @@ class LocalPerformanceV2Jobs:
             "window_count": result.window_count,
             "windows": list(result.windows),
             "cleanup_warning": result.cleanup_warning,
+            "successful_replacements": list(result.successful_replacements),
+            "failures": list(result.failures),
         }
         succeeded = result.status == "COMMITTED"
         completed = result.imported_count + result.skipped_count + result.rejected_count
