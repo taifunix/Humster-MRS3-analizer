@@ -1,4 +1,74 @@
-  const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
+const portfolioSettingsHelpers = (() => {
+  const profiles = ['AGGRESSIVE', 'BALANCED', 'CONSERVATIVE'];
+  const clone = (value) => JSON.parse(JSON.stringify(value));
+  const settingsMoneyParts = (value) => {
+    if (typeof value === 'number' && (!Number.isSafeInteger(value) || value <= 0)) return null;
+    const text = typeof value === 'number' ? String(value) : value;
+    if (typeof text !== 'string' || !/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(text)) return null;
+    const pieces = text.split('.'); const digits = `${pieces[0]}${pieces[1] || ''}`; const scaled = BigInt(digits || '0');
+    return scaled > 0n ? { text, scale: (pieces[1] || '').length, scaled } : null;
+  };
+  const settingsMoneyValue = (raw, original) => {
+    const text = String(raw ?? '').trim();
+    if (!settingsMoneyParts(text)) throw new Error('money');
+    if (text === String(original)) return original;
+    if (typeof original === 'string' || text.includes('.')) return text;
+    const value = Number(text); if (!Number.isSafeInteger(value)) throw new Error('money');
+    return value;
+  };
+  const settingsIntegerValue = (raw) => {
+    const text = String(raw ?? '').trim();
+    if (!/^[1-9][0-9]*$/.test(text)) throw new Error('integer');
+    const value = Number(text); if (!Number.isSafeInteger(value)) throw new Error('integer');
+    return value;
+  };
+  const settingsCompareMoney = (left, right) => {
+    const a = settingsMoneyParts(left); const b = settingsMoneyParts(right); if (!a || !b) return NaN;
+    if (a.scale === b.scale) return a.scaled < b.scaled ? -1 : a.scaled > b.scaled ? 1 : 0;
+    const scale = Math.max(a.scale, b.scale); const av = a.scaled * 10n ** BigInt(scale - a.scale); const bv = b.scaled * 10n ** BigInt(scale - b.scale);
+    return av < bv ? -1 : av > bv ? 1 : 0;
+  };
+  const validMoney = (money) => !!money && typeof money === 'object' && !Array.isArray(money) && Object.keys(money).sort().join(',') === 'amount,currency' && typeof money.currency === 'string' && !!money.currency.trim() && !!settingsMoneyParts(money.amount);
+  const validSettingsDocument = (doc) => {
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc) || !Number.isSafeInteger(doc.search?.total_test_budget) || doc.search.total_test_budget <= 0) return false;
+    for (const profile of profiles) {
+      const scenario = doc.scenarios?.[profile]; const ranking = doc.profiles?.[profile]?.ranking;
+      if (!scenario || !validMoney(scenario.deposit) || !validMoney(scenario.collateral) || !validMoney(scenario.max_balance) || !validMoney(scenario.sizing?.upper_bound) || !Array.isArray(scenario.sizing?.grid) || !scenario.sizing.grid.length || !Number.isSafeInteger(ranking?.top_n) || ranking.top_n <= 0) return false;
+      let previous = null;
+      for (const item of scenario.sizing.grid) { if (!validMoney(item) || item.currency !== scenario.sizing.upper_bound.currency || (previous && settingsCompareMoney(previous.amount, item.amount) >= 0) || settingsCompareMoney(item.amount, scenario.sizing.upper_bound.amount) > 0) return false; previous = item; }
+      if ([scenario.deposit, scenario.collateral, scenario.max_balance].some((money) => money.currency !== scenario.sizing.upper_bound.currency)) return false;
+    }
+    return true;
+  };
+  const settingsGridLines = (raw) => {
+    const text = String(raw ?? '').trim(); if (!text) throw new Error('grid');
+    const lines = text.split(/\r?\n/).map((line) => line.trim()); if (lines.some((line) => !line)) throw new Error('grid');
+    return lines;
+  };
+  const settingsPatch = (document, values) => {
+    if (!validSettingsDocument(document)) throw new Error('invalid-document');
+    const payload = clone(document);
+    try { payload.search.total_test_budget = settingsIntegerValue(values.total_test_budget); } catch (error) { error.field = 'total-test-budget'; throw error; }
+    for (const profile of profiles) {
+      const source = document.scenarios[profile]; const scenario = payload.scenarios[profile]; const value = values.profiles[profile];
+      for (const name of ['deposit', 'collateral', 'max_balance']) {
+        try { scenario[name].amount = settingsMoneyValue(value[name], source[name].amount); } catch (error) { error.field = `${profile.toLowerCase()}-${name.replace('_', '-')}`; throw error; }
+      }
+      try { scenario.sizing.upper_bound.amount = settingsMoneyValue(value.upper_bound, source.sizing.upper_bound.amount); } catch (error) { error.field = `${profile.toLowerCase()}-upper-bound`; throw error; }
+      const currency = source.sizing.upper_bound.currency;
+      try {
+        scenario.sizing.grid = settingsGridLines(value.grid).map((line, index) => ({ amount: settingsMoneyValue(line, source.sizing.grid[index]?.amount), currency }));
+        let previous = null; for (const item of scenario.sizing.grid) { if (previous && settingsCompareMoney(previous.amount, item.amount) >= 0) throw new Error('grid'); if (settingsCompareMoney(item.amount, scenario.sizing.upper_bound.amount) > 0) throw new Error('grid'); previous = item; }
+      } catch (error) { error.field = `${profile.toLowerCase()}-grid`; throw error; }
+      try { payload.profiles[profile].ranking.top_n = settingsIntegerValue(value.top_n); } catch (error) { error.field = `${profile.toLowerCase()}-top-n`; throw error; }
+    }
+    return payload;
+  };
+  return { profiles, clone, settingsMoneyParts, settingsMoneyValue, settingsIntegerValue, settingsCompareMoney, validSettingsDocument, settingsGridLines, settingsPatch };
+})();
+if (typeof globalThis !== 'undefined') globalThis.portfolioSettingsHelpers = portfolioSettingsHelpers;
+
+const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const { selectCommittedRetestTester, selectRetestTester } = window.retestRecovery;
   let shortlistGroups = [];
   let shortlistItems = [];
@@ -2654,26 +2724,77 @@
 
   function loadPortfolioSettings(force = false) {
     if (!loadPortfolioSettings.state) {
-      const state = { digest: null, document: null, readOnly: true, dirty: false, loading: null };
+      const { profiles, clone, settingsPatch, validSettingsDocument } = portfolioSettingsHelpers;
+      const state = { digest: null, document: null, readOnly: true, dirty: false, loading: null, conflictMessage: '' };
+      const readOnlyStates = ['MISSING', 'INVALID', 'UNSUPPORTED_SCHEMA'];
       const query = (selector) => document.querySelector(selector);
-      const editor = query('#portfolio-settings-document'); const save = query('#portfolio-settings-save'); const reload = query('#portfolio-settings-reload'); const meta = query('#portfolio-settings-meta');
+      const form = query('#portfolio-settings-form'); const save = query('#portfolio-settings-save'); const reload = query('#portfolio-settings-reload'); const meta = query('#portfolio-settings-meta');
+      const controls = () => form ? [...form.querySelectorAll('input, textarea')] : [];
+      const linkDescriptions = () => controls().forEach((control) => { const description = control.closest('.field-group')?.querySelector('small'); if (description) { description.id = `${control.id}-description`; control.setAttribute('aria-describedby', description.id); } });
+      linkDescriptions();
       const setBadge = (value, kind) => { const node = query('#portfolio-settings-state'); if (node) { node.className = `state-badge state-${kind}`; node.textContent = value; } };
-      const show = (result) => {
-        const stateName = result?.state || 'INVALID'; const readOnlyStates = ['MISSING', 'INVALID', 'UNSUPPORTED_SCHEMA']; state.digest = stateName === 'READY' ? (result?.digest ?? null) : null; state.document = stateName === 'READY' ? (result?.document ?? null) : null; state.readOnly = readOnlyStates.includes(stateName) || stateName !== 'READY' || !state.document; state.dirty = false;
-        if (editor) { editor.value = state.document ? JSON.stringify(state.document, null, 2) : ''; editor.disabled = state.readOnly; }
-        if (save) save.disabled = state.readOnly;
-        setBadge(stateName, stateName === 'READY' ? 'ready' : 'pending');
-        if (meta) meta.textContent = state.readOnly ? `${stateName}: settings are read-only.` : `READY · digest ${state.digest || '—'}`;
+      const displayMoney = (money) => String(money?.amount ?? '');
+      const input = (profile, name) => query(`#portfolio-settings-${profile.toLowerCase()}-${name}`);
+      const renderDocument = () => {
+        const doc = state.document; if (!doc) { controls().forEach((control) => { control.value = ''; }); return; }
+        const budget = query('#portfolio-settings-total-test-budget'); if (budget) budget.value = String(doc.search.total_test_budget);
+        for (const profile of profiles) {
+          const key = profile.toLowerCase(); const scenario = doc.scenarios[profile]; const ranking = doc.profiles[profile].ranking;
+          input(profile, 'deposit').value = displayMoney(scenario.deposit); input(profile, 'collateral').value = displayMoney(scenario.collateral); input(profile, 'max-balance').value = displayMoney(scenario.max_balance); input(profile, 'upper-bound').value = displayMoney(scenario.sizing.upper_bound); input(profile, 'grid').value = scenario.sizing.grid.map((item) => displayMoney(item)).join('\n'); input(profile, 'top-n').value = String(ranking.top_n);
+          const currency = query(`#portfolio-settings-${key}-currency`); if (currency) currency.textContent = scenario.deposit.currency;
+        }
       };
-      const load = async () => { state.loading = requestJson('/api/v2/portfolio/settings').then(show).catch((error) => { state.document = null; state.digest = null; state.dirty = false; state.readOnly = true; if (editor) { editor.value = ''; editor.disabled = true; } if (save) save.disabled = true; if (meta) meta.textContent = portfolioErrorMessage(error); }).finally(() => { state.loading = null; }); return state.loading; };
-      editor?.addEventListener('input', () => { state.dirty = true; if (meta) meta.textContent = 'Unsaved changes.'; });
-      reload?.addEventListener('click', async () => { if (state.dirty && !window.confirm('Discard unsaved Portfolio Optimizer settings changes?')) return; await load(); });
+      const setDisabled = (disabled) => { controls().forEach((control) => { control.disabled = disabled; }); if (save) save.disabled = disabled; };
+      const show = (result) => {
+        const stateName = result?.state || 'INVALID'; state.digest = stateName === 'READY' ? (result?.digest ?? null) : null; state.document = null; if (stateName === 'READY' && result?.document) state.document = clone(result.document); state.dirty = false; state.readOnly = readOnlyStates.includes(stateName) || stateName !== 'READY' || !state.document || !validSettingsDocument(state.document);
+        renderDocument(); clearInvalid(); setDisabled(state.readOnly); setBadge(stateName, stateName === 'READY' && !state.readOnly ? 'ready' : 'pending');
+        if (meta) meta.textContent = state.readOnly ? (stateName === 'READY' ? 'Серверные настройки содержат недопустимые значения. Сохранение отключено.' : `${stateName}: настройки доступны только для чтения.`) : (state.conflictMessage || `READY · digest ${state.digest || '—'}`);
+      };
+      const load = async (preserveConflict = false) => {
+        if (state.loading) return state.loading;
+        if (!preserveConflict) state.conflictMessage = '';
+        state.loading = requestJson('/api/v2/portfolio/settings').then((result) => { show(result); return true; }).catch((error) => { state.document = null; state.digest = null; state.dirty = false; state.readOnly = true; state.conflictMessage = ''; renderDocument(); clearInvalid(); setDisabled(true); if (meta) meta.textContent = portfolioErrorMessage(error); return false; }).finally(() => { state.loading = null; });
+        return state.loading;
+      };
+      const collect = () => {
+        const values = { total_test_budget: query('#portfolio-settings-total-test-budget')?.value, profiles: {} };
+        for (const profile of profiles) {
+          values.profiles[profile] = {
+            deposit: input(profile, 'deposit')?.value,
+            collateral: input(profile, 'collateral')?.value,
+            max_balance: input(profile, 'max-balance')?.value,
+            upper_bound: input(profile, 'upper-bound')?.value,
+            grid: input(profile, 'grid')?.value,
+            top_n: input(profile, 'top-n')?.value,
+          };
+        }
+        return settingsPatch(state.document, values);
+      };
+      const clearInvalid = () => controls().forEach((control) => { control.removeAttribute('aria-invalid'); control.setCustomValidity(''); });
+      const markDirty = () => { clearInvalid(); state.dirty = true; if (meta) meta.textContent = state.conflictMessage || 'Есть несохранённые изменения.'; };
+      controls().forEach((control) => { control.addEventListener('input', markDirty); control.addEventListener('change', markDirty); });
+      reload?.addEventListener('click', async () => { if (state.dirty && !window.confirm('Отбросить несохранённые изменения настроек Portfolio Optimizer?')) return; await load(); });
       save?.addEventListener('click', async () => {
-        if (state.readOnly || !editor) return;
-        try { JSON.parse(editor.value); } catch (_) { if (meta) meta.textContent = 'Settings document must be valid JSON.'; return; }
+        if (state.readOnly || !state.document) return;
+        state.conflictMessage = '';
+        clearInvalid();
+        let payload; try { payload = collect(); } catch (error) {
+          const field = error?.field ? query(`#portfolio-settings-${error.field}`) : null;
+          if (field) { field.setAttribute('aria-invalid', 'true'); field.setCustomValidity('Введите корректное значение.'); }
+          const label = field?.closest('.field-group')?.querySelector('label')?.textContent || 'Поле настроек';
+          if (meta) meta.textContent = `${label}: введите положительное значение; для сетки используйте строгий порядок.`;
+          return;
+        }
         save.disabled = true;
-        try { const result = await requestJson('/api/v2/portfolio/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_digest: state.digest, document: JSON.parse(editor.value) }) }); show(result); }
-        catch (error) { if (meta) meta.textContent = portfolioErrorMessage(error); save.disabled = false; }
+        try { const result = await requestJson('/api/v2/portfolio/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_digest: state.digest, document: payload }) }); show(result); }
+        catch (error) {
+          if (error?.code === 'CONFIG_CHANGED') {
+            state.conflictMessage = 'Настройки изменены в другой сессии. Загружена серверная версия.';
+            const refreshed = await load(true);
+            if (meta) meta.textContent = refreshed ? state.conflictMessage : 'Не удалось загрузить актуальные настройки после конфликта. Сохранение отключено.';
+          }
+          else { if (meta) meta.textContent = portfolioErrorMessage(error); save.disabled = state.readOnly; }
+        }
       });
       loadPortfolioSettings.state = state; state.load = load;
     }

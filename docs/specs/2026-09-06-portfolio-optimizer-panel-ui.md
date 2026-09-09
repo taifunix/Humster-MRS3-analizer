@@ -384,3 +384,42 @@ U0 не разрешает реализацию U1, запуск тестера 
 политики основной спецификации — минимальный PnL, окончательные пределы
 ликвидности/свежести, `each_strategy_max_dd_pct` и точное ранжирование профилей —
 остаются блокерами соответствующих будущих функций.
+
+## 14. Settings form contract (U0 implementation)
+
+The Settings screen uses the same `portfolio_optimizer.local.json` document as
+the only source of truth and keeps `GET/PUT /api/v2/portfolio/settings` with
+`expected_digest` compare-and-swap. The raw JSON editor is replaced by a human
+form. The form exposes only `search.total_test_budget` and, for each of the
+three profiles `AGGRESSIVE`, `BALANCED`, and `CONSERVATIVE`, the amounts in
+`scenarios.<PROFILE>.deposit`, `collateral`, `max_balance`,
+`sizing.upper_bound`, every `sizing.grid` entry, and `profiles.<PROFILE>.ranking.top_n`.
+Currencies are shown read-only; paths, IDs, versions, policy descriptors,
+research and runner settings remain hidden technical fields in the cloned
+document.
+
+Money inputs accept only positive JSON integers or dot-decimal strings. An
+unchanged value preserves its exact JSON type and string scale. A changed
+digits-only value from a numeric amount is emitted as a JSON integer; a changed
+dot-decimal value is a string. When the original amount is a JSON string,
+edited values remain strings so their lexemes stay exact. Floating point JSON, comma decimals, zero
+and negative values are invalid. Grid entries are one nonblank value per line
+after trimming surrounding blank lines, numerically positive, strictly
+increasing, and no greater than the edited upper bound. New grid entries use
+the READY document's canonical currency. Budget and
+`top_n` inputs accept only positive JSON integers matching
+`^[1-9][0-9]*$`. Every inbound exposed value is validated before enabling the
+form; any invalid value makes the whole form read-only and shows:
+`Серверные настройки содержат недопустимые значения. Сохранение отключено.`
+This same message applies to inbound JSON float amounts; the form does not
+attempt to round or reinterpret binary floating point values.
+
+Save deep-clones the fetched document and patches only exposed leaves. An
+unchanged submit remains deep-equal. A successful PUT stores and renders the
+returned authoritative document and digest. On `409 CONFIG_CHANGED`, the form
+performs exactly one GET, discards local edits, renders the refreshed server
+version and keeps the message `Настройки изменены в другой сессии. Загружена
+серверная версия.` until the next manual save. Non-`READY` states disable all
+form controls and Save; Reload remains available. This form does not change
+the separate runtime variant-generation blocker or the paused
+export-only-finalists path.

@@ -1,7 +1,28 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-08
+**Updated:** 2026-09-09
 **Current branch:** `main`
+
+## Portfolio Optimizer human settings form (2026-09-09)
+
+The Settings tab now edits the existing strict-v1
+`portfolio_optimizer.local.json` through a compact form for the global test
+budget and the three AGGRESSIVE/BALANCED/CONSERVATIVE scenario profiles. The
+full-document GET/PUT compare-and-swap contract is unchanged; hidden paths,
+policy descriptors, versions and runner settings survive every save. Money,
+integer and sizing-grid input is validated without binary-float conversion,
+currencies are read-only, and stale-digest conflicts reload the authoritative
+server document without retrying the write.
+
+Verification: `.venv\\Scripts\\python.exe -m pytest
+tests/test_panel_static_ui.py tests/test_panel_portfolio.py -q` — `170 passed`;
+the executable static-UI suite includes Node checks of the settings projection
+and decimal/grid rules. `node --check src/mrs3/panel_web/app.js` and
+`git diff --check` pass. Independent Claude Opus 5 review returned
+`CODE_REVIEW_PASS` after the reported decimal-scale, currency, validation-state
+and conflict-reload findings were resolved. This UI change does not resolve the
+separate real Campaign variant-generation blocker: the Panel still lacks the
+enriched finalist runtime facts and accepted ranking/search policy inputs.
 
 ## Portfolio Optimizer canonical phased design (2026-09-05)
 

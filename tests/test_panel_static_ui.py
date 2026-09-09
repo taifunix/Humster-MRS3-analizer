@@ -1,5 +1,7 @@
+import json
 from pathlib import Path
 import re
+import subprocess
 
 
 PANEL_WEB = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web"
@@ -1150,17 +1152,131 @@ def test_portfolio_settings_uses_full_document_compare_and_swap() -> None:
     js = _read("app.js")
 
     assert 'id="portfolio-settings"' in html
-    assert 'id="portfolio-settings-document"' in html
+    assert 'id="portfolio-settings-form"' in html
+    assert 'id="portfolio-settings-document"' not in html
     assert 'id="portfolio-settings-save"' in html
     assert 'id="portfolio-settings-reload"' in html
     assert "'/api/v2/portfolio/settings'" in js
     assert "expected_digest" in js
     assert "JSON.parse" in js
-    assert "document: JSON.parse" in js
+    assert "document: payload" in js
     assert "window.confirm" in js
     assert "UNSUPPORTED_SCHEMA" in js
     assert "MISSING" in js
     assert "INVALID" in js
+
+
+def test_portfolio_settings_uses_human_form_for_all_profiles_and_keeps_technical_document_hidden() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="portfolio-settings-document"' not in html
+    assert 'id="portfolio-settings-form"' in html
+    assert 'id="portfolio-settings-total-test-budget"' in html
+    assert 'id="portfolio-settings-profile-aggressive"' in html
+    assert 'id="portfolio-settings-profile-balanced"' in html
+    assert 'id="portfolio-settings-profile-conservative"' in html
+    for profile in ("aggressive", "balanced", "conservative"):
+        for field in ("deposit", "collateral", "max-balance", "upper-bound", "grid", "top-n"):
+            assert f'id="portfolio-settings-{profile}-{field}"' in html
+    assert "Общий бюджет проверок" in html
+    assert "Максимум кандидатов Campaign" in html
+    assert "Валюта только для чтения" in html
+    assert "Серверные настройки содержат недопустимые значения. Сохранение отключено." in js
+    assert "^[1-9][0-9]*$" in js
+    assert "settingsCompareMoney(previous.amount, item.amount) >= 0" in js
+    assert "JSON.parse(JSON.stringify" in js
+    assert "CONFIG_CHANGED" in js
+    assert "Настройки изменены в другой сессии. Загружена серверная версия." in js
+    assert "const refreshed = await load(true)" in js
+    assert "Не удалось загрузить актуальные настройки после конфликта. Сохранение отключено." in js
+    assert "aria-invalid" in js
+    assert "linkDescriptions" in js
+
+
+def test_portfolio_settings_patches_only_exposed_leaves_and_preserves_money_lexemes() -> None:
+    js = _read("app.js")
+
+    assert "settingsMoneyValue" in js
+    assert "settingsIntegerValue" in js
+    assert "settingsCompareMoney" in js
+    assert "scenario[name].amount" in js
+    assert "scenario.sizing.upper_bound.amount" in js
+    assert "scenario.sizing.grid" in js
+    assert "payload.profiles[profile].ranking.top_n" in js
+    assert "state.document = clone(result.document)" in js
+    assert "document: payload" in js
+    assert "const result = await requestJson('/api/v2/portfolio/settings'" in js
+    assert "state.conflictMessage = '';\n        clearInvalid();\n        let payload" in js
+
+
+def test_portfolio_settings_helpers_validate_lexemes_grid_and_hidden_fields() -> None:
+    document = {
+        "search": {"total_test_budget": 9},
+        "scenarios": {
+            profile: {
+                "deposit": {"amount": 10, "currency": "USDT"},
+                "collateral": {"amount": 20, "currency": "USDT"},
+                "max_balance": {"amount": 30, "currency": "USDT"},
+                "sizing": {"upper_bound": {"amount": 30, "currency": "USDT"}, "grid": [{"amount": 1, "currency": "USDT"}, {"amount": 2, "currency": "USDT"}]},
+            }
+            for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
+        },
+        "profiles": {profile: {"ranking": {"top_n": 2}} for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")},
+        "runner": {"root": "hidden", "token": {"keep": True}},
+    }
+    values = {
+        "total_test_budget": "9",
+        "profiles": {
+            profile: {"deposit": "10", "collateral": "20", "max_balance": "30", "upper_bound": "30", "grid": "1\n2", "top_n": "2"}
+            for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
+        },
+    }
+    changed = json.loads(json.dumps(values))
+    changed["total_test_budget"] = "10"
+    changed["profiles"]["AGGRESSIVE"].update({"max_balance": "31.25", "upper_bound": "40", "grid": "1\n2.50\n40.0", "top_n": "3"})
+    script = _read("app.js").split("const ORDER_BUCKETS", 1)[0] + f"""
+const h = globalThis.portfolioSettingsHelpers;
+const document = {json.dumps(document)};
+const values = {json.dumps(values)};
+const changed = {json.dumps(changed)};
+const unchanged = h.settingsPatch(document, values);
+const edited = h.settingsPatch(document, changed);
+const scaleNumber = h.clone(document); scaleNumber.scenarios.AGGRESSIVE.sizing.upper_bound.amount = 100;
+const scaleNumberValues = h.clone(values); scaleNumberValues.profiles.AGGRESSIVE.upper_bound = '100'; scaleNumberValues.profiles.AGGRESSIVE.grid = '99.99\\n100';
+const scaleString = h.clone(document); scaleString.scenarios.AGGRESSIVE.sizing.upper_bound.amount = '100.00';
+const scaleStringValues = h.clone(values); scaleStringValues.profiles.AGGRESSIVE.upper_bound = '100.00'; scaleStringValues.profiles.AGGRESSIVE.grid = '99\\n100';
+const floatDocument = h.clone(document); floatDocument.scenarios.AGGRESSIVE.deposit.amount = 1.5;
+const mixedCurrency = h.clone(document); mixedCurrency.scenarios.AGGRESSIVE.collateral.currency = 'EUR';
+const mustThrow = (callback) => {{ try {{ callback(); return false; }} catch (_) {{ return true; }} }};
+const invalidMoney = ['0', '-1', '1e3', '1,5', ''];
+const checks = {{
+  unchanged: JSON.stringify(unchanged) === JSON.stringify(document),
+  hiddenPreserved: edited.runner.root === 'hidden' && edited.runner.token.keep === true,
+  stringDecimal: typeof edited.scenarios.AGGRESSIVE.max_balance.amount === 'string',
+  stringIntegerEdit: typeof h.settingsMoneyValue('11', '10.00') === 'string',
+  stringScalePreserved: h.settingsMoneyValue('10.00', '10.00') === '10.00',
+  changedGridString: typeof edited.scenarios.AGGRESSIVE.sizing.grid[1].amount === 'string',
+  changedGridAddedString: typeof edited.scenarios.AGGRESSIVE.sizing.grid[2].amount === 'string',
+  leadingTrailingGrid: h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, grid: '\\n1\\n2\\n'}}}}}}).scenarios.AGGRESSIVE.sizing.grid.length === 2,
+  integerLexemes: ['1.0', '1e3', '0', '-1', ',', ''].every((value) => mustThrow(() => h.settingsIntegerValue(value))),
+  moneyLexemes: invalidMoney.every((value) => mustThrow(() => h.settingsMoneyValue(value, 1))),
+  unsafeIntegerRejected: mustThrow(() => h.settingsMoneyValue('9007199254740993', 1)),
+  mixedScaleNumberAccepted: h.settingsPatch(scaleNumber, scaleNumberValues).scenarios.AGGRESSIVE.sizing.grid[0].amount === '99.99',
+  mixedScaleNumberBoundRejected: mustThrow(() => h.settingsPatch(scaleNumber, {{...scaleNumberValues, profiles: {{...scaleNumberValues.profiles, AGGRESSIVE: {{...scaleNumberValues.profiles.AGGRESSIVE, grid: '99.99\\n100.01'}}}}}})),
+  mixedScaleStringAccepted: h.settingsPatch(scaleString, scaleStringValues).scenarios.AGGRESSIVE.sizing.grid[0].amount === 99,
+  mixedScaleStringBoundRejected: mustThrow(() => h.settingsPatch(scaleString, {{...scaleStringValues, profiles: {{...scaleStringValues.profiles, AGGRESSIVE: {{...scaleStringValues.profiles.AGGRESSIVE, grid: '99\\n101'}}}}}})),
+  floatInboundRejected: h.validSettingsDocument(floatDocument) === false && mustThrow(() => h.settingsPatch(floatDocument, values)),
+  mixedCurrencyRejected: h.validSettingsDocument(mixedCurrency) === false && mustThrow(() => h.settingsPatch(mixedCurrency, values)),
+  duplicateRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, grid: '1\\n1'}}}}}})),
+  descendingRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, grid: '2\\n1'}}}}}})),
+  boundRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, grid: '1\\n31'}}}}}})),
+  internalBlankRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, grid: '1\\n\\n2'}}}}}})),
+}};
+if (Object.values(checks).some((value) => !value)) process.exit(1);
+"""
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def test_portfolio_form_has_no_speculative_nullable_config_fields() -> None:
