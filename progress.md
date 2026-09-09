@@ -1676,3 +1676,18 @@ fixture manifests, canonical Decimal evidence, foreign/baseline DB rejection
 and correction provenance. Root verification: `32 passed` for the store and
 `70 passed` with the provisional monitor/chart regression set. The next step is
 2B-2 complete REST/WS reconcile on fixtures.
+
+## Portfolio Optimizer Phase 2B server accepted (2026-09-09)
+
+The fixture/fake-only Phase 2B server core is accepted after the fifth and
+final Opus review returned `CODE_REVIEW_PASS`. It includes LiveStore, complete
+REST/WS reconciliation, cashflow-adjusted account and symbol metrics, current
+margin-load timelines, entry-order projection with the 20-second freshness
+contract, and deterministic bounded exact chart series. Root verification is
+`228 passed` for the four live suites and `3510 passed, 7 skipped` for the full
+project suite. Evidence is recorded in
+`docs/superpowers/plans/2026-09-09-portfolio-optimizer-phase2b-server-evidence.md`.
+
+The next Phase 2B step is the separate 2B-9 Panel visualization. Real exchange
+REST/WS, credentials, notifications, tester execution, trading, bot/config
+mutation, admission and deployment remain blocked pending separate approval.

@@ -34,6 +34,14 @@ class WriteOutcome(str, Enum):
     INCONSISTENT = "INCONSISTENT"
 
 
+class LiveStoreConflict(LiveStoreError):
+    """A bundle conflict that was rolled back by the caller's opt-in policy."""
+
+    def __init__(self, outcomes: tuple[WriteOutcome, ...] | list[WriteOutcome]) -> None:
+        self.outcomes = tuple(outcomes)
+        super().__init__("live reconcile bundle conflict; transaction rolled back")
+
+
 StoreOutcome = WriteOutcome
 
 
@@ -1041,17 +1049,46 @@ class LiveStore:
         events: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]] = (),
         reconciliation: Mapping[str, Any] | None = None,
         checkpoints: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]] = (),
+        rollback_on_conflict: bool = False,
     ) -> tuple[WriteOutcome, ...]:
-        """Persist one REST/WS application atomically, including checkpoint."""
+        """Persist one REST/WS application atomically, including cashflows/checkpoints."""
 
+        if not isinstance(rollback_on_conflict, bool):
+            raise TypeError("rollback_on_conflict must be a boolean")
         events = tuple(events or ())
         checkpoints = tuple(checkpoints or ())
         deployment_id = rest_snapshot.get("deployment_id")
+        snapshot_account_id = rest_snapshot.get("account_id")
         snapshot_id = rest_snapshot.get("snapshot_id")
         observed_at = rest_snapshot.get("observed_at")
         if not all(isinstance(item, str) and item for item in (deployment_id, snapshot_id, observed_at)):
             raise ValueError("REST snapshot identity is incomplete")
         _reject_secrets(rest_snapshot, "rest_snapshot")
+        raw_cashflows = rest_snapshot.get("cashflows", ())
+        if not isinstance(raw_cashflows, (list, tuple)):
+            raise ValueError("REST cashflows must be a sequence")
+        cashflow_rows: list[tuple[tuple[str, str, str], dict[str, Any]]] = []
+        for cashflow in raw_cashflows:
+            if not isinstance(cashflow, Mapping):
+                raise ValueError("REST cashflow entries must be mappings")
+            cashflow_id = cashflow.get("cashflow_id", cashflow.get("id"))
+            cashflow_account = cashflow.get("account_id", rest_snapshot.get("account_id"))
+            if isinstance(cashflow_id, bool) or not isinstance(cashflow_id, (str, int)) or not str(cashflow_id).strip():
+                raise ValueError("REST cashflow identity is incomplete")
+            if not isinstance(cashflow_account, str) or not cashflow_account.strip():
+                raise ValueError("REST cashflow account identity is incomplete")
+            if isinstance(snapshot_account_id, str) and snapshot_account_id.strip() and cashflow_account != snapshot_account_id:
+                raise ValueError("REST cashflow account does not match snapshot")
+            row = {
+                **dict(cashflow),
+                "deployment_id": deployment_id,
+                "account_id": cashflow_account,
+                "cashflow_id": str(cashflow_id),
+                "source_kind": cashflow.get("source_kind") or "REST",
+                "observed_at": cashflow.get("observed_at") or observed_at,
+            }
+            canonical_json(row)
+            cashflow_rows.append(((deployment_id, cashflow_account, str(cashflow_id)), row))
         for name in ("positions", "orders", "executions"):
             items = rest_snapshot.get(name, ())
             if not isinstance(items, (list, tuple)):
@@ -1090,7 +1127,7 @@ class LiveStore:
         results: list[WriteOutcome] = []
         bundle_inconsistent = False
         with self.transaction() as connection:
-            account = {key: value for key, value in rest_snapshot.items() if key not in {"positions", "orders", "executions"}}
+            account = {key: value for key, value in rest_snapshot.items() if key not in {"positions", "orders", "executions", "cashflows"}}
             outcome = self._append("account_snapshots", (deployment_id, snapshot_id), ("deployment_id", "snapshot_id"), account, connection=connection)
             results.append(outcome)
             bundle_inconsistent |= outcome in {WriteOutcome.CONFLICT, WriteOutcome.INCONSISTENT}
@@ -1112,7 +1149,7 @@ class LiveStore:
                     raise ValueError("REST execution account identity is incomplete")
                 outcome = self._append("execution_events", (deployment_id, account_id, execution_id), ("deployment_id", "account_id", "execution_id"), row, connection=connection)
                 results.append(WriteOutcome.INCONSISTENT if outcome is WriteOutcome.CONFLICT else outcome)
-                bundle_inconsistent |= outcome is WriteOutcome.CONFLICT
+                bundle_inconsistent |= outcome in {WriteOutcome.CONFLICT, WriteOutcome.INCONSISTENT}
             for event in events:
                 row = {**event, "deployment_id": deployment_id}
                 channel = str(row.get("channel", row.get("kind", "")))
@@ -1127,7 +1164,17 @@ class LiveStore:
                         raise ValueError("WS execution identity is incomplete")
                     outcome = self._append("execution_events", (deployment_id, account_id, execution_id), ("deployment_id", "account_id", "execution_id"), row, connection=connection)
                     results.append(WriteOutcome.INCONSISTENT if outcome is WriteOutcome.CONFLICT else outcome)
-                    bundle_inconsistent |= outcome is WriteOutcome.CONFLICT
+                    bundle_inconsistent |= outcome in {WriteOutcome.CONFLICT, WriteOutcome.INCONSISTENT}
+            for identity, cashflow in cashflow_rows:
+                outcome = self._append(
+                    "cashflow_events",
+                    identity,
+                    ("deployment_id", "account_id", "cashflow_id"),
+                    cashflow,
+                    connection=connection,
+                )
+                results.append(outcome)
+                bundle_inconsistent |= outcome in {WriteOutcome.CONFLICT, WriteOutcome.INCONSISTENT}
             reconciliation_status = reconciliation.get("status") if isinstance(reconciliation, Mapping) else None
             if not bundle_inconsistent and reconciliation is not None and reconciliation_status == "HEALTHY":
                 for checkpoint in checkpoints:
@@ -1140,7 +1187,11 @@ class LiveStore:
                 if bundle_inconsistent:
                     row["status"] = "INCONSISTENT"
                     row["reasons"] = tuple(dict.fromkeys((*row.get("reasons", ()), "CONFLICTING_LIVE_FACT")))
-                results.append(self._append("reconciliations", (deployment_id, str(row.get("reconcile_id", row.get("id", "")))), ("deployment_id", "reconcile_id"), row, connection=connection))
+                outcome = self._append("reconciliations", (deployment_id, str(row.get("reconcile_id", row.get("id", "")))), ("deployment_id", "reconcile_id"), row, connection=connection)
+                results.append(outcome)
+                bundle_inconsistent |= outcome in {WriteOutcome.CONFLICT, WriteOutcome.INCONSISTENT}
+            if rollback_on_conflict and bundle_inconsistent:
+                raise LiveStoreConflict(results)
         return tuple(results)
 
     append_snapshot_and_checkpoint = append_reconcile_bundle
@@ -1202,6 +1253,7 @@ class LiveStore:
 __all__ = [
     "DeploymentManifest",
     "LiveStore",
+    "LiveStoreConflict",
     "LiveStoreError",
     "StoreOutcome",
     "StoredFact",

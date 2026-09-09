@@ -11,6 +11,7 @@ from hashlib import sha256
 from mrs3.portfolio.live_store import (
     DeploymentManifest,
     LiveStore,
+    LiveStoreConflict,
     LiveStoreError,
     WriteOutcome,
     canonical_bytes,
@@ -192,6 +193,65 @@ def test_bundle_writes_snapshots_events_and_checkpoint(tmp_path: Path) -> None:
     assert WriteOutcome.INSERTED in outcomes
     assert store.latest_checkpoint("dep-1", "wallet")["sequence"] == 1
     assert len(store.rows("position_snapshots")) == 1
+    store.close()
+
+
+def test_bundle_persists_cashflows_and_excludes_them_from_account_snapshot(tmp_path: Path) -> None:
+    store = LiveStore(tmp_path / "live.sqlite3")
+    store.append_manifest(manifest())
+    rest = {"deployment_id": "dep-1", "snapshot_id": "snap-1", "account_id": "acct-1", "observed_at": "2026-09-07T00:00:00Z", "wallet": {"equity": "100"}, "positions": [], "orders": [], "executions": [], "cashflows": [{"cashflow_id": "cf-1", "amount": "10"}]}
+    outcomes = store.append_reconcile_bundle(rest, reconciliation={"reconcile_id": "rec-1", "status": "HEALTHY"}, checkpoints=({"channel": "wallet", "sequence": 1},))
+    assert WriteOutcome.INSERTED in outcomes
+    assert len(store.rows("cashflow_events")) == 1
+    assert "cashflows" not in store.rows("account_snapshots")[0]
+    store.close()
+
+
+@pytest.mark.parametrize("cashflows", [None, {"cashflow_id": "cf-1"}, [{"amount": "10"}], [{"cashflow_id": "cf-1", "amount": 1.5}]])
+def test_bundle_validates_cashflows_before_opening_transaction(tmp_path: Path, cashflows: object) -> None:
+    store = LiveStore(tmp_path / "live.sqlite3")
+    store.append_manifest(manifest())
+    rest = {"deployment_id": "dep-1", "snapshot_id": "snap-1", "account_id": "acct-1", "observed_at": "2026-09-07T00:00:00Z", "wallet": {}, "positions": [], "orders": [], "executions": [], "cashflows": cashflows}
+    with pytest.raises((TypeError, ValueError)):
+        store.append_reconcile_bundle(rest)
+    assert not store.rows("account_snapshots")
+    assert not store.rows("cashflow_events")
+    store.close()
+
+
+def test_rollback_on_conflict_is_opt_in_and_carries_outcomes(tmp_path: Path) -> None:
+    store = LiveStore(tmp_path / "live.sqlite3")
+    store.append_manifest(manifest())
+    rest = {"deployment_id": "dep-1", "snapshot_id": "snap-1", "account_id": "acct-1", "observed_at": "2026-09-07T00:00:00Z", "wallet": {"equity": "100"}, "positions": [], "orders": [], "executions": []}
+    store.append_reconcile_bundle(rest, reconciliation={"reconcile_id": "rec-1", "status": "HEALTHY"}, checkpoints=({"channel": "wallet", "sequence": 1},))
+    before = {table: len(store.rows(table)) for table in ("account_snapshots", "reconciliations", "stream_checkpoints")}
+    with pytest.raises(LiveStoreConflict) as error:
+        store.append_reconcile_bundle({**rest, "wallet": {"equity": "101"}}, reconciliation={"reconcile_id": "rec-2", "status": "HEALTHY"}, checkpoints=({"channel": "wallet", "sequence": 2},), rollback_on_conflict=True)
+    assert WriteOutcome.CONFLICT in error.value.outcomes
+    assert {table: len(store.rows(table)) for table in before} == before
+    store.close()
+
+
+@pytest.mark.parametrize("value", [None, 1, "yes"])
+def test_rollback_on_conflict_requires_a_boolean(tmp_path: Path, value: object) -> None:
+    store = LiveStore(tmp_path / "live.sqlite3")
+    store.append_manifest(manifest())
+    rest = {"deployment_id": "dep-1", "snapshot_id": "snap-1", "account_id": "acct-1", "observed_at": "2026-09-07T00:00:00Z", "wallet": {}, "positions": [], "orders": [], "executions": []}
+    with pytest.raises(TypeError, match="rollback_on_conflict"):
+        store.append_reconcile_bundle(rest, rollback_on_conflict=value)  # type: ignore[arg-type]
+    store.close()
+
+
+def test_rollback_on_reconciliation_conflict_includes_reconciliation_outcome(tmp_path: Path) -> None:
+    store = LiveStore(tmp_path / "live.sqlite3")
+    store.append_manifest(manifest())
+    rest = {"deployment_id": "dep-1", "snapshot_id": "snap-1", "account_id": "acct-1", "observed_at": "2026-09-07T00:00:00Z", "wallet": {}, "positions": [], "orders": [], "executions": []}
+    store.append_reconcile_bundle(rest, reconciliation={"reconcile_id": "rec-1", "status": "HEALTHY"})
+    before = len(store.rows("reconciliations"))
+    with pytest.raises(LiveStoreConflict) as error:
+        store.append_reconcile_bundle(rest, reconciliation={"reconcile_id": "rec-1", "status": "UNKNOWN"}, rollback_on_conflict=True)
+    assert WriteOutcome.CONFLICT in error.value.outcomes
+    assert len(store.rows("reconciliations")) == before
     store.close()
 
 

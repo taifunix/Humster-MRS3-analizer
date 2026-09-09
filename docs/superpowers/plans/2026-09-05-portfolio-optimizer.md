@@ -595,7 +595,8 @@ Implementation slices:
 
 - [x] Отдельный fixture-only LiveStore и immutable secret-free manifest;
   [evidence](2026-09-08-portfolio-optimizer-phase2b-store-evidence.md).
-- [ ] Reconcile, monitor/read models, order projection и exact charts.
+- [x] Reconcile, monitor/read models, order projection и exact charts;
+  [fixture-boundary evidence](2026-09-09-portfolio-optimizer-phase2b-server-evidence.md).
 - [ ] Отдельная Panel visualization после принятого server evidence.
 
 **DoD:** REST/WS duplicate/reconnect/stale fixtures, L0 и priority0 без false

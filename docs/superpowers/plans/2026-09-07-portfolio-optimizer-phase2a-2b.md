@@ -13,8 +13,9 @@
 
 M8 remains committed as `272f895` after its review and U1 remains committed as
 `7ddbb94` after its review. Phase 2A is accepted at the fixture boundary after
-Opus `CODE_REVIEW_PASS`; Phase 2B and Panel worktree changes remain provisional
-until their own verification and review.
+Opus `CODE_REVIEW_PASS`; the Phase 2B server core is accepted at the fixture
+boundary after its own final Opus `CODE_REVIEW_PASS`. Panel work remains
+provisional until its separate verification and review.
 
 This plan authorizes fixture/fake, read-only implementation work only. It does
 not authorize real REST/WS, credentials, secrets, notifications, tester runs,
@@ -316,11 +317,12 @@ added to any existing served application.
 
 - [x] **2B-1 LiveStore/manifest:** accepted after Opus `CODE_REVIEW_PASS`;
   [evidence](2026-09-08-portfolio-optimizer-phase2b-store-evidence.md).
-- [ ] **2B-2 reconcile:** complete paginated REST, buffered contiguous WS and
+- [x] **2B-2 reconcile:** complete paginated REST, buffered contiguous WS and
   atomic checkpoint recovery.
-- [ ] **2B-3 monitor/read models:** attribution, cashflow-adjusted metrics,
+- [x] **2B-3 monitor/read models:** attribution, cashflow-adjusted metrics,
   margin timeline and watchdog.
-- [ ] **2B-4 order projection:** explicit ENTRY role and 20-second freshness.
-- [ ] **2B-5 exact charts:** deterministic bounded overview and pure handler.
+- [x] **2B-4 order projection:** explicit ENTRY role and 20-second freshness.
+- [x] **2B-5 exact charts:** deterministic bounded overview and pure handler;
+  [evidence](2026-09-09-portfolio-optimizer-phase2b-server-evidence.md).
 - [ ] **2B-9 Panel visualization:** separate implementation and review after
   accepted server evidence.
