@@ -9,13 +9,15 @@ import threading
 from types import SimpleNamespace
 
 import duckdb
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from io import BytesIO
 import pytest
 
 import mrs3.panel as panel_module
 from mrs3.panel import PerformanceV2ApiError, PanelController, create_panel_server
 from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_retest import RetestBatch
+from mrs3.performance_v2_finalist_retest import FinalistRetestError
 
 
 def _controller(tmp_path: Path, *, seed: bool = True) -> PanelController:
@@ -78,6 +80,83 @@ def _controller(tmp_path: Path, *, seed: bool = True) -> PanelController:
                 "insert into strategy_tags values (?, 'RETEST', 'TEST', 'fixture', now())", [strategy_id]
             )
     return PanelController(tmp_path, config_path)
+
+
+def test_current_control_export_is_read_only_until_review_and_preserves_outside_scope(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    database = tmp_path / "performance-v2" / "strategy_performance.duckdb"
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with duckdb.connect(str(database)) as connection:
+        beta_id = connection.execute(
+            """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len, order_count,
+               analysis_run_id, candidate_identity, lifecycle_status, created_at_utc, updated_at_utc)
+               values ('beta', 'BTCUSDT', 'LONG', '1h', 20, 1, 'run', 'beta', 'ACTIVE', ?, ?)
+               returning strategy_id""", [now, now],
+        ).fetchone()[0]
+        beta_result_id = connection.execute(
+            """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
+               commission_rate, initial_balance, final_balance, imported_at_utc)
+               values (?, '2026-01-01', '2026-01-09', 'Bybit', .0004, 100, 101, ?)
+               returning result_id""", [beta_id, now],
+        ).fetchone()[0]
+        alpha_result_id = connection.execute("select current_result_id from strategies where strategy_name = 'alpha'").fetchone()[0]
+        connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [beta_result_id, beta_id])
+        instance = connection.execute("select value from schema_info where key = 'database_instance_id'").fetchone()[0]
+        connection.execute(
+            """insert into selection_runs (selection_run_id, database_instance_id, symbol, side, selection_contract_version,
+               request_json, request_sha256, config_json, config_sha256, candidate_count, representative_count,
+               auto_finalist_count, top_n, workbook_sha256, created_at_utc)
+               values ('ordinary', ?, 'BTCUSDT', 'LONG', 'v1', '{}', ?, '{}', ?, 2, 2, 1, 20, ?, ?)""",
+            [instance, "r" * 64, "s" * 64, "w" * 64, now],
+        )
+        connection.executemany(
+            """insert into selection_results (selection_run_id, strategy_id, result_id_at_selection, auto_status,
+               auto_score, auto_rank, prior_rejected, stage_trace_json) values ('ordinary', ?, ?, ?, ?, ?, false, '{}')""",
+            [(1, alpha_result_id, "FINALIST", 90, 1), (beta_id, beta_result_id, "RESERVE", 80, 1)],
+        )
+
+    def effective() -> dict[int, tuple[object, object, object]]:
+        with duckdb.connect(str(database), read_only=True) as connection:
+            from mrs3.performance_v2_selection_review import effective_selection_decisions
+            return {
+                int(strategy_id): decision
+                for strategy_id, decision in effective_selection_decisions(connection).items()
+            }
+
+    before = effective()
+    reserve_filename, reserve_issued = controller.strategies_performance_v2_finalist_retest_export({"include_reserve": True})
+    assert reserve_filename == "performance-v2-current-finalists-with-reserve.xlsx"
+    reserve_sheet = load_workbook(BytesIO(reserve_issued))["Candidates"]
+    assert reserve_sheet.max_row == 3
+    filename, issued = controller.strategies_performance_v2_finalist_retest_export({"include_reserve": False})
+    assert filename == "performance-v2-current-finalists.xlsx"
+    assert effective() == before
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("select count(*) from selection_runs").fetchone() == (3,)
+
+    workbook = load_workbook(BytesIO(issued))
+    sheet = workbook["Candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    assert sheet.max_row == 2 and sheet.cell(2, headers["Strategy ID"]).value == 1
+    sheet.cell(2, headers["User Status"]).value = "REJECTED"
+    sheet.cell(2, headers["User Rank"]).value = None
+    sheet.cell(2, headers["RETEST"]).value = "RETEST"
+    edited_io = BytesIO()
+    workbook.save(edited_io)
+    imported = controller.strategies_performance_v2_finalist_retest_control_import(edited_io.getvalue())
+    assert imported["group_count"] == imported["row_count"] == 1
+    after = effective()
+    assert after[1][0:2] == ("REJECTED", None)
+    assert after[beta_id] == before[beta_id]
+    replay = controller.strategies_performance_v2_finalist_retest_control_import(edited_io.getvalue())
+    assert replay["review_import_ids"] == imported["review_import_ids"]
+    with duckdb.connect(str(database)) as connection:
+        current_run_id = connection.execute(
+            "select selection_run_id from selection_runs where request_json like '%CURRENT_EFFECTIVE%' order by created_at_utc desc limit 1"
+        ).fetchone()[0]
+        connection.execute("update selection_runs set request_json = '{}' where selection_run_id = ?", [current_run_id])
+    with pytest.raises(FinalistRetestError, match="CONTROL_SCOPE_MISMATCH"):
+        controller.strategies_performance_v2_finalist_retest_control_import(edited_io.getvalue())
 
 
 def test_retest_status_is_db_authoritative_and_defaults_from_current_result(tmp_path: Path) -> None:

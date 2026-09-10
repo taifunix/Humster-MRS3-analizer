@@ -258,6 +258,17 @@ def test_performance_v2_retest_card_uses_server_mapping_and_committed_inbox_gate
     assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
 
 
+def test_finalist_retest_card_exposes_current_control_export_before_retest() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    card = html.split('id="performance-v2-finalist-retest-card"', 1)[1].split("</details>", 1)[0]
+
+    assert 'id="performance-v2-finalist-retest-export" class="button button-secondary"' in card
+    assert 'id="performance-v2-finalist-retest-export" class="button button-secondary" hidden' not in card
+    assert "/api/v2/strategies/performance-v2/finalist-retest/export?include_reserve=" in js
+    assert "finalistRetestHasSuccessfulExport" in js
+
+
 def test_retest_check_is_the_only_path_that_activates_a_recovered_job() -> None:
     js = _read("app.js")
     check = js.split("retestStart?.addEventListener", 1)[1].split("retestImport?.addEventListener", 1)[0]

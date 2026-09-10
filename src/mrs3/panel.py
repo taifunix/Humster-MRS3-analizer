@@ -228,7 +228,9 @@ from .performance_v2_finalist_retest import (
     validate_combined_control_workbook,
     combined_control_workbook_bytes,
     import_combined_control_workbook,
+    current_effective_finalist_members,
     finalist_retest_config_digest,
+    _json_value,
 )
 from .runner.config import RunnerConfig
 from .runner.inbox import capture_verified_inbox
@@ -4021,7 +4023,127 @@ class PanelController:
 
     strategies_performance_v2_bulk_retest_import = strategies_performance_v2_finalist_retest_import
 
+    def _export_current_effective_finalist_control(self, include_reserve: bool) -> tuple[str, bytes]:
+        if type(include_reserve) is not bool:
+            raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
+        selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
+        performance_config = self._performance_v2_config()
+        target = performance_v2_database_path(performance_config)
+        if not target.is_file():
+            raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND")
+        with duckdb.connect(str(target), read_only=True) as connection:
+            current_members = current_effective_finalist_members(connection, include_reserve=include_reserve)
+            if not current_members:
+                raise FinalistRetestError("COHORT_EMPTY", "there are no current effective finalists")
+            instance = connection.execute("select value from schema_info where key='database_instance_id'").fetchone()[0]
+            grouped: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+            for member in current_members:
+                grouped.setdefault((str(member["symbol"]), str(member["side"])), []).append(member)
+            specs: list[dict[str, object]] = []
+            for (symbol, side), group_members in sorted(grouped.items()):
+                origin_runs = {str(member["selection_run_id"]) for member in group_members}
+                snapshots: dict[tuple[str, int], tuple[object, ...]] = {}
+                reviewed: dict[tuple[str, int], tuple[object, object, object]] = {}
+                for origin_run_id in origin_runs:
+                    snapshots.update({
+                        (origin_run_id, int(row[0])): row
+                        for row in connection.execute(
+                            """select strategy_id, result_id_at_selection, auto_status, auto_score,
+                                      auto_rank, auto_reason, auto_analog_of_strategy_id
+                                 from selection_results where selection_run_id = ?""", [origin_run_id]
+                        ).fetchall()
+                    })
+                    review = connection.execute(
+                        """select review_import_id from selection_review_imports
+                           where selection_run_id = ? order by imported_at_utc desc, review_import_id desc limit 1""", [origin_run_id]
+                    ).fetchone()
+                    if review:
+                        reviewed.update({
+                            (origin_run_id, int(row[0])): (row[1], row[2], row[3])
+                            for row in connection.execute(
+                                "select strategy_id, user_status, user_rank, comment from selection_review_rows where review_import_id = ?", [review[0]]
+                            ).fetchall()
+                        })
+                records: list[dict[str, object]] = []
+                workbook_rows: list[dict[str, object]] = []
+                for member in group_members:
+                    strategy_id = int(member["strategy_id"])
+                    origin_key = (str(member["selection_run_id"]), strategy_id)
+                    snap = snapshots.get(origin_key)
+                    reviewed_row = reviewed.get(origin_key)
+                    auto_status = snap[2] if snap else member["effective_status"]
+                    auto_score = snap[3] if snap else None
+                    auto_rank = snap[4] if snap else None
+                    auto_reason = snap[5] if snap else None
+                    auto_analog = snap[6] if snap else None
+                    user_status = reviewed_row[0] if reviewed_row else member["effective_status"]
+                    user_rank = reviewed_row[1] if reviewed_row else member.get("effective_rank")
+                    comment = reviewed_row[2] if reviewed_row else None
+                    records.append({
+                        "strategy_id": strategy_id, "result_id": int(member["result_id"]), "auto_status": str(auto_status),
+                        "final_score": auto_score, "final_rank": auto_rank, "elimination_reason": auto_reason,
+                        "auto_analog_of_strategy_id": auto_analog, "prior_rejected": False,
+                    })
+                    workbook_row = {
+                        "symbol": symbol, "side": side, "strategy_id": strategy_id, "result_id": int(member["result_id"]),
+                        "user_status": user_status, "user_rank": user_rank, "retest": None, "comment": comment,
+                        "auto_status": auto_status, "auto_rank": auto_rank, "auto_analog_of_strategy_id": auto_analog,
+                        "auto_reason": auto_reason, "effective_start": _json_value(member.get("effective_start")),
+                        "effective_end": _json_value(member.get("effective_end")),
+                        "score": None if auto_score is None else str(auto_score),
+                    }
+                    workbook_rows.append(workbook_row)
+                specs.append({
+                    "symbol": symbol, "side": side, "rows": workbook_rows, "result": pd.DataFrame(records),
+                    "request": SelectionRequest(symbol, side, ()), "run_id": str(uuid.uuid4()),
+                })
+        candidates = [row for spec in specs for row in spec["rows"]]
+        groups = [{
+            "symbol": spec["symbol"], "side": spec["side"], "frozen_count": len(spec["rows"]),
+            "success_count": len(spec["rows"]), "failure_count": 0,
+            "auto_status_count": len({str(row.get("auto_status") or "") for row in spec["rows"]}),
+        } for spec in specs]
+        group_run_ids = {f"{spec['symbol']}|{spec['side']}": spec["run_id"] for spec in specs}
+        workbook_names = {
+            "Pair": "symbol", "Direction": "side", "Strategy ID": "strategy_id", "Result ID": "result_id",
+            "Auto Status": "auto_status", "Auto Rank": "auto_rank", "Auto Analog Of ID": "auto_analog_of_strategy_id",
+            "Auto Reason": "auto_reason", "Effective Start": "effective_start", "Effective End": "effective_end", "Score": "score",
+        }
+        exact_rowsets = {
+            f"{spec['symbol']}|{spec['side']}": [
+                {name: row.get(source) for name, source in workbook_names.items()}
+                for row in sorted(spec["rows"], key=lambda item: int(item["strategy_id"]))
+            ] for spec in specs
+        }
+        immutable = [row for key in sorted(exact_rowsets) for row in exact_rowsets[key]]
+        group_digest_rows = [{
+            "Pair": row["symbol"], "Direction": row["side"], "Frozen Count": row["frozen_count"],
+            "Success Count": row["success_count"], "Failure Count": row["failure_count"], "Auto Status Count": row["auto_status_count"],
+        } for row in groups]
+        metadata: dict[str, object] = {
+            "database_instance_id": instance, "control_mode": "CURRENT_EFFECTIVE", "ranking_scope": "CURRENT_EFFECTIVE",
+            "scope": "FINALIST_RESERVE" if include_reserve else "FINALIST",
+            "group_run_ids_json": group_run_ids, "exact_rowsets_json": exact_rowsets,
+            "exact_rowsets_sha256": canonical_digest(exact_rowsets), "immutable_content_sha256": canonical_digest(immutable),
+            "groups_sha256": canonical_digest(group_digest_rows), "failures_sha256": canonical_digest([]),
+            "selection_config_sha256": canonical_digest(asdict(selection_config)),
+        }
+        data = combined_control_workbook_bytes(candidates, groups, (), metadata)
+        snapshots = [{
+            "request": spec["request"], "config": selection_config, "result": spec["result"],
+            "metadata": {"selection_run_id": spec["run_id"], "database_instance_id": instance, "selection_contract_version": "performance-v2-selection-review-v1"},
+            "request_json_extra": {"control_mode": "CURRENT_EFFECTIVE", "ranking_scope": "CURRENT_EFFECTIVE"},
+        } for spec in specs]
+        try:
+            with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+                persist_selection_snapshots(connection, snapshots, workbook_bytes=data)
+        except SelectionReviewError as error:
+            raise FinalistRetestError(error.code, details=error.details) from error
+        return f"performance-v2-current-finalists{'-with-reserve' if include_reserve else ''}.xlsx", data
+
     def strategies_performance_v2_finalist_retest_export(self, payload: Mapping[str, object]) -> tuple[str, bytes]:
+        if isinstance(payload, Mapping) and set(payload) == {"include_reserve"}:
+            return self._export_current_effective_finalist_control(payload["include_reserve"])
         if not isinstance(payload, Mapping) or set(payload) != {"job_id"}:
             raise ValueError("bulk RETEST export accepts only job_id")
         job_id = self._required(payload, "job_id")
@@ -7162,8 +7284,18 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/v2/strategies/performance-v2/finalist-retest/export":
             try:
-                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
-                filename, data = self.server.controller.strategies_performance_v2_finalist_retest_export({"job_id": job_id})
+                query = parse_qs(parsed.query)
+                if "job_id" in query:
+                    if set(query) != {"job_id"}:
+                        raise ValueError("unsupported export fields")
+                    filename, data = self.server.controller.strategies_performance_v2_finalist_retest_export({"job_id": query["job_id"][0]})
+                else:
+                    if set(query) - {"include_reserve"}:
+                        raise ValueError("unsupported export fields")
+                    raw = query.get("include_reserve", ["false"])[0].casefold()
+                    if raw not in {"true", "false"}:
+                        raise ValueError("include_reserve must be true or false")
+                    filename, data = self.server.controller.strategies_performance_v2_finalist_retest_export({"include_reserve": raw == "true"})
             except (KeyError, ValueError, FinalistRetestError):
                 self._json(409, {"error": {"code": "CONTROL_EXPORT_UNAVAILABLE", "message": "bulk control workbook is unavailable"}})
                 return

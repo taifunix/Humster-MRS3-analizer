@@ -758,6 +758,36 @@ def test_finalist_retest_preview_http_uses_server_owned_scope(tmp_path: Path, mo
         thread.join(timeout=2)
 
 
+def test_current_finalist_control_export_http_accepts_reserve_scope_without_job(tmp_path: Path, monkeypatch) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    seen: list[dict[str, object]] = []
+
+    def export(payload: dict[str, object]) -> tuple[str, bytes]:
+        seen.append(payload)
+        return "current.xlsx", b"PK-current"
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_finalist_retest_export", export)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection.request("GET", "/api/v2/strategies/performance-v2/finalist-retest/export?include_reserve=true")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read() == b"PK-current"
+        assert seen == [{"include_reserve": True}]
+        connection.close()
+
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection.request("GET", "/api/v2/strategies/performance-v2/finalist-retest/export?strategy_ids=1")
+        response = connection.getresponse()
+        assert response.status == 409
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_finalist_retest_start_rejects_client_member_ids_before_io(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
 

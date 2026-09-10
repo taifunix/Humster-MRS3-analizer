@@ -21,12 +21,21 @@ before one transaction. Reimporting identical edited bytes is idempotent. The
 new read-only preview fills the oldest cohort listing as start and UTC today
 minus two days as end. Exact successful jobs replay only when scope, dates,
 cohort and template/config digest all match.
+The bulk card also exposes an immediate current-effective control export; its
+server-owned dormant snapshot leaves effective statuses/ranks unchanged until
+an explicit edited workbook import, which overlays only submitted rows.
+The download is visible before any retest and follows the same `Включая
+RESERVE` switch used by the bulk cohort preview.
 
 Root focused verification:
 `.venv\Scripts\python.exe -m pytest tests/test_performance_v2_finalist_retest.py tests/test_performance_v2_retest.py tests/test_performance_v2_import.py tests/test_performance_v2_selection.py tests/test_performance_v2_selection_review.py tests/test_panel_performance_v2.py tests/test_panel_performance_v2_retest.py tests/test_panel_static_ui.py tests/test_portfolio_input.py -q`
 — `574 passed, 4 skipped`. The complete project suite passes `3650 passed,
 7 skipped`; `node --check`, `py_compile`, and `git diff --check` pass. No real
 tester or remote target was launched.
+
+Immediate-export regression verification: `242 passed, 4 skipped` across the
+finalist-retest, selection-review, Performance v2 Panel and static UI slice;
+Python and JavaScript syntax checks pass.
 
 ## Portfolio Optimizer human settings form (2026-09-09)
 

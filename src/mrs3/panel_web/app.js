@@ -1882,7 +1882,15 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const finalistRetestControlFile = document.querySelector('#performance-v2-finalist-retest-control-file');
   const finalistRetestControlImport = document.querySelector('#performance-v2-finalist-retest-control-import');
   let finalistRetestJobId = '';
+  let finalistRetestHasSuccessfulExport = false;
   let finalistRetestTimer = 0;
+  const updateFinalistRetestExport = () => {
+    if (!finalistRetestExport) return;
+    finalistRetestExport.hidden = false;
+    finalistRetestExport.href = finalistRetestHasSuccessfulExport && finalistRetestJobId
+      ? `/api/v2/strategies/performance-v2/finalist-retest/export?job_id=${encodeURIComponent(finalistRetestJobId)}`
+      : `/api/v2/strategies/performance-v2/finalist-retest/export?include_reserve=${Boolean(finalistRetestReserve?.checked)}`;
+  };
   const loadFinalistRetestPreview = async () => {
     try {
       const preview = await requestJson(`/api/v2/strategies/performance-v2/finalist-retest/preview?include_reserve=${Boolean(finalistRetestReserve?.checked)}`);
@@ -1906,7 +1914,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         ? `Global finalist retest: ${job.error.code}`
         : `Global finalist retest: ${job.phase || job.state || 'RUNNING'}`;
       if (finalistRetestImport) finalistRetestImport.disabled = !(job.state === 'COMMITTED' && job.inbox_ready === true);
-      if (finalistRetestExport) { finalistRetestExport.hidden = !(job.success_count > 0); finalistRetestExport.href = `/api/v2/strategies/performance-v2/finalist-retest/export?job_id=${encodeURIComponent(finalistRetestJobId)}`; }
+      if (job.success_count > 0) finalistRetestHasSuccessfulExport = true;
+      updateFinalistRetestExport();
       if (terminal) { window.clearInterval(finalistRetestTimer); if (finalistRetestStart) finalistRetestStart.disabled = false; }
     } catch (error) { if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist retest unavailable: ${error?.message || 'request failed'}.`; }
   };
@@ -1914,6 +1923,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     finalistRetestStart.disabled = true;
     try {
       const payload = { include_reserve: Boolean(finalistRetestReserve?.checked) };
+      finalistRetestHasSuccessfulExport = false;
+      updateFinalistRetestExport();
       if (finalistRetestStartDate?.value) payload.test_start = finalistRetestStartDate.value;
       if (finalistRetestEndDate?.value) payload.test_end = finalistRetestEndDate.value;
       const result = await remoteRequest('/api/v2/strategies/performance-v2/finalist-retest/start', payload);
@@ -1924,7 +1935,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     } catch (error) { if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist retest failed: ${error?.message || 'request failed'}.`; finalistRetestStart.disabled = false; }
   });
   finalistRetestCard?.addEventListener('toggle', () => { if (finalistRetestCard.open) loadFinalistRetestPreview(); });
-  finalistRetestReserve?.addEventListener('change', loadFinalistRetestPreview);
+  finalistRetestReserve?.addEventListener('change', () => { loadFinalistRetestPreview(); updateFinalistRetestExport(); });
+  updateFinalistRetestExport();
   finalistRetestImport?.addEventListener('click', async () => {
     if (!finalistRetestJobId) return;
     finalistRetestImport.disabled = true;

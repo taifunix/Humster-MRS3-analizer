@@ -21,6 +21,7 @@ from openpyxl import Workbook, load_workbook
 from .config import AlgorithmConfig
 from .lots import LotMethod
 from .performance_v2_store import PerformanceV2StoreError, require_performance_v2
+from .performance_v2_selection_review import effective_selection_decisions
 from .strategy_json import generate_strategy
 
 
@@ -689,7 +690,11 @@ def import_combined_control_workbook(
     if "group_run_ids_json" not in metadata:
         return _legacy_import_combined_control_workbook(connection, data)
     require_performance_v2(connection)
-    if metadata.get("ranking_scope") != "RETEST_COHORT":
+    control_mode = str(metadata.get("control_mode") or "RETEST_COHORT")
+    if control_mode == "CURRENT_EFFECTIVE":
+        if metadata.get("ranking_scope") != "CURRENT_EFFECTIVE":
+            raise FinalistRetestError("CONTROL_SCOPE_MISMATCH")
+    elif metadata.get("ranking_scope") != "RETEST_COHORT":
         raise FinalistRetestError("CONTROL_SCOPE_MISMATCH")
     expected_instance = metadata.get("database_instance_id")
     instance = connection.execute("select value from schema_info where key = 'database_instance_id'").fetchone()
@@ -785,30 +790,38 @@ def import_combined_control_workbook(
             request_json = json.loads(str(run[4]))
         except (TypeError, ValueError) as error:
             raise FinalistRetestError("CONTROL_METADATA_INVALID") from error
-        if not isinstance(request_json, Mapping) or request_json.get("ranking_scope") != "RETEST_COHORT":
-            raise FinalistRetestError("CONTROL_SCOPE_MISMATCH")
-        if str(request_json.get("bulk_retest_job_id") or "") != expected_job:
-            raise FinalistRetestError("CONTROL_COHORT_MISMATCH")
-        if str(request_json.get("cohort_sha256") or "") != expected_cohort or str(request_json.get("manifest_sha256") or "") != expected_manifest or str(request_json.get("config_sha256") or "") != expected_config:
-            raise FinalistRetestError("CONTROL_COHORT_MISMATCH")
-        if expected_selection_config is not None and str(request_json.get("selection_config_sha256") or "") != str(expected_selection_config):
-            raise FinalistRetestError("CONTROL_COHORT_MISMATCH")
+        if not isinstance(request_json, Mapping):
+            raise FinalistRetestError("CONTROL_METADATA_INVALID")
+        if control_mode == "CURRENT_EFFECTIVE":
+            if request_json.get("control_mode") != "CURRENT_EFFECTIVE" or request_json.get("ranking_scope") != "CURRENT_EFFECTIVE":
+                raise FinalistRetestError("CONTROL_SCOPE_MISMATCH")
+        else:
+            if request_json.get("ranking_scope") != "RETEST_COHORT":
+                raise FinalistRetestError("CONTROL_SCOPE_MISMATCH")
+            if str(request_json.get("bulk_retest_job_id") or "") != expected_job:
+                raise FinalistRetestError("CONTROL_COHORT_MISMATCH")
+            if str(request_json.get("cohort_sha256") or "") != expected_cohort or str(request_json.get("manifest_sha256") or "") != expected_manifest or str(request_json.get("config_sha256") or "") != expected_config:
+                raise FinalistRetestError("CONTROL_COHORT_MISMATCH")
+            if expected_selection_config is not None and str(request_json.get("selection_config_sha256") or "") != str(expected_selection_config):
+                raise FinalistRetestError("CONTROL_COHORT_MISMATCH")
         snapshot = connection.execute(
             """select strategy_id, result_id_at_selection, auto_status, auto_score,
                       auto_rank, auto_reason, auto_analog_of_strategy_id
                  from selection_results where selection_run_id = ? order by strategy_id""", [run_id]
         ).fetchall()
-        raw_members = request_json.get("cohort_members")
-        if not isinstance(raw_members, list):
-            raise FinalistRetestError("CONTROL_COHORT_MISMATCH")
-        try:
-            request_members = tuple(sorted((int(pair[0]), int(pair[1])) for pair in raw_members if isinstance(pair, (list, tuple)) and len(pair) == 2))
-        except (TypeError, ValueError, IndexError):
-            raise FinalistRetestError("CONTROL_COHORT_MISMATCH") from None
-        if request_members != tuple(sorted((int(item[0]), int(item[1])) for item in snapshot)):
-            raise FinalistRetestError("CONTROL_COHORT_MISMATCH")
+        if control_mode != "CURRENT_EFFECTIVE":
+            raw_members = request_json.get("cohort_members")
+            if not isinstance(raw_members, list):
+                raise FinalistRetestError("CONTROL_COHORT_MISMATCH")
+            try:
+                request_members = tuple(sorted((int(pair[0]), int(pair[1])) for pair in raw_members if isinstance(pair, (list, tuple)) and len(pair) == 2))
+            except (TypeError, ValueError, IndexError):
+                raise FinalistRetestError("CONTROL_COHORT_MISMATCH") from None
+            if request_members != tuple(sorted((int(item[0]), int(item[1])) for item in snapshot)):
+                raise FinalistRetestError("CONTROL_COHORT_MISMATCH")
         submitted = {int(row["Strategy ID"]): row for row in group}
-        if set(submitted) != {int(item[0]) for item in snapshot}:
+        snapshot_ids = {int(item[0]) for item in snapshot}
+        if set(submitted) != snapshot_ids:
             raise FinalistRetestError("CONTROL_ROWSET_MISMATCH")
         ids = sorted(submitted)
         current = dict(connection.execute(
@@ -1084,55 +1097,6 @@ def _listing_map(value: Mapping[str, object] | Path | None) -> Mapping[str, obje
     raise FinalistRetestError("LISTING_DATE_INVALID", "listing dates are invalid")
 
 
-def _latest_selection_runs(connection: duckdb.DuckDBPyConnection) -> dict[tuple[str, str], str]:
-    rows = connection.execute(
-        """
-        select symbol, side, selection_run_id
-          from (
-            select symbol, side, selection_run_id,
-                   row_number() over (
-                     partition by symbol, side order by created_at_utc desc, selection_run_id desc
-                   ) as rn
-              from selection_runs
-          )
-         where rn = 1
-        """
-    ).fetchall()
-    return {(str(symbol), str(side)): str(run_id) for symbol, side, run_id in rows}
-
-
-def _effective_selection_decisions(connection: duckdb.DuckDBPyConnection) -> dict[int, tuple[str, int | None, str | None]]:
-    runs = _latest_selection_runs(connection)
-    if not runs:
-        return {}
-    output: dict[int, tuple[str, int | None, str | None]] = {}
-    for run_id in runs.values():
-        reviewed = connection.execute(
-            """
-            select review_import_id from selection_review_imports
-             where selection_run_id = ? order by imported_at_utc desc, review_import_id desc limit 1
-            """,
-            [run_id],
-        ).fetchone()
-        review_id = str(reviewed[0]) if reviewed else None
-        rows = connection.execute(
-            """
-            select r.strategy_id, r.auto_status, r.auto_rank, r.prior_rejected,
-                   v.user_status, v.user_rank
-              from selection_results r
-              left join selection_review_rows v
-                on v.strategy_id = r.strategy_id and v.review_import_id = ?
-             where r.selection_run_id = ?
-            """,
-            [review_id, run_id],
-        ).fetchall()
-        for strategy_id, auto_status, auto_rank, prior_rejected, user_status, user_rank in rows:
-            status = str(user_status or ("REJECTED" if prior_rejected else auto_status))
-            rank = user_rank if user_rank is not None else auto_rank
-            output[int(strategy_id)] = (status, None if rank is None else int(rank), run_id)
-    return output
-
-
 def _source_orders(connection: duckdb.DuckDBPyConnection, strategy_id: int, order_count: object) -> list[dict[str, object]] | None:
     if isinstance(order_count, bool) or not isinstance(order_count, int) or not 1 <= order_count <= 4:
         return None
@@ -1188,7 +1152,7 @@ def freeze_finalist_cohort(
         raise FinalistRetestError("INVALID_TEST_RANGE", "test_start must be before test_end")
     scope = "FINALIST_RESERVE" if include_reserve else "FINALIST"
     allowed = {"FINALIST", "RESERVE"} if include_reserve else {"FINALIST"}
-    decisions = _effective_selection_decisions(connection)
+    decisions = effective_selection_decisions(connection)
     listings = _listing_map(listing_dates)
     rows = connection.execute(
         """
@@ -1241,12 +1205,54 @@ def freeze_finalist_cohort(
     )
 
 
+def current_effective_finalist_members(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    include_reserve: bool = False,
+) -> tuple[Mapping[str, object], ...]:
+    """Return the current effective finalist population for control export.
+
+    This read-only view deliberately does not require a retest range or listing
+    dates: those are inputs to a new retest freeze, while this export represents
+    the already effective selection decision.
+    """
+    require_performance_v2(connection)
+    if type(include_reserve) is not bool:
+        raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
+    decisions = effective_selection_decisions(connection)
+    allowed = {"FINALIST", "RESERVE"} if include_reserve else {"FINALIST"}
+    rows = connection.execute(
+        """select s.strategy_id, s.strategy_name, s.symbol, s.side, s.current_result_id,
+                  r.effective_start_utc, r.effective_end_utc,
+                  r.report_start_utc, r.report_end_utc
+             from strategies s
+             join strategy_results r on r.result_id = s.current_result_id
+                                    and r.strategy_id = s.strategy_id
+            where s.lifecycle_status = 'ACTIVE' and s.current_result_id is not null
+            order by s.symbol, s.side, s.strategy_id"""
+    ).fetchall()
+    output: list[Mapping[str, object]] = []
+    for strategy_id, name, symbol, side, result_id, effective_start, effective_end, report_start, report_end in rows:
+        decision = decisions.get(int(strategy_id))
+        if decision is None or decision[0] not in allowed:
+            continue
+        output.append({
+            "strategy_id": int(strategy_id), "strategy_name": str(name), "symbol": str(symbol),
+            "side": str(side), "result_id": int(result_id), "effective_status": decision[0],
+            "effective_rank": decision[1], "selection_run_id": decision[2],
+            "effective_start": effective_start, "effective_end": effective_end,
+            "report_start_utc": report_start, "report_end_utc": report_end,
+        })
+    return tuple(output)
+
+
 __all__ = [
     "canonical_json", "canonical_digest", "cohort_digest", "review_key",
     "canonical_provenance_json", "canonical_provenance_digest", "deterministic_review_key",
     "LISTING_WARMUP_HOURS", "MAX_COHORT_MEMBERS", "FinalistRetestError", "RetestExclusion",
     "FinalistRetestCohort", "FinalistRetestBatch", "FinalistRetestImportResult",
     "freeze_finalist_cohort", "build_finalist_retest_manifest", "apply_finalist_retest_outcomes",
+    "current_effective_finalist_members",
     "finalist_retest_config_digest",
     "execute_finalist_retest_import", "import_finalist_retest", "CONTROL_WORKBOOK_SHEETS",
     "write_combined_control_workbook", "combined_control_workbook_bytes",

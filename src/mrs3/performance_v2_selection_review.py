@@ -480,25 +480,73 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
     return {"review_import_id": review_id, "selection_run_id": run_id, "row_count": len(decisions), "finalist_count": sum(row[1] == "FINALIST" for row in decisions)}
 
 
-def latest_effective_finalists(connection: duckdb.DuckDBPyConnection, symbol: str) -> tuple[bool, set[int]]:
+def effective_selection_decisions(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    symbol: str | None = None,
+) -> dict[int, tuple[str, int | None, str | None]]:
+    """Resolve ordinary selection snapshots and reviewed scoped overlays.
+
+    A regular selection run is a complete replacement for its Pair+Side.  A
+    server scoped run (RETEST_COHORT or CURRENT_EFFECTIVE) is dormant until a
+    review is imported, then only its reviewed rows overlay the prior decision.
+    This lets an exported control workbook be persisted before review without
+    changing the effective universe, while a later review changes only the
+    rows the user explicitly submitted.
+    """
+    clauses = "where symbol = ?" if symbol is not None else ""
+    params = [symbol] if symbol is not None else []
     runs = connection.execute(
-        """select selection_run_id from (
-               select selection_run_id, row_number() over (partition by side order by created_at_utc desc, selection_run_id desc) as rn
-               from selection_runs where symbol = ?
-           ) where rn = 1""", [symbol]
+        f"""select selection_run_id, symbol, side, request_json
+               from selection_runs {clauses}
+              order by created_at_utc asc, selection_run_id asc""", params
     ).fetchall()
-    finalists: set[int] = set()
-    for (run_id,) in runs:
+    states: dict[tuple[str, str], dict[int, tuple[str, int | None, str | None]]] = {}
+    for run_id, run_symbol, run_side, raw_request in runs:
+        group = (str(run_symbol), str(run_side))
+        try:
+            request = json.loads(str(raw_request))
+        except (TypeError, ValueError):
+            request = {}
+        overlay = isinstance(request, Mapping) and request.get("ranking_scope") in {"RETEST_COHORT", "CURRENT_EFFECTIVE"}
         review = connection.execute(
-            "select review_import_id from selection_review_imports where selection_run_id = ? order by imported_at_utc desc, review_import_id desc limit 1", [run_id]
+            """select review_import_id from selection_review_imports
+                where selection_run_id = ?
+                order by imported_at_utc desc, review_import_id desc limit 1""", [run_id]
         ).fetchone()
-        if review:
-            finalists.update(int(row[0]) for row in connection.execute(
-                "select strategy_id from selection_review_rows where review_import_id = ? and user_status = 'FINALIST'", [review[0]]
-            ).fetchall())
-        else:
-            finalists.update(int(row[0]) for row in connection.execute(
-                """select strategy_id from selection_results
-                   where selection_run_id = ? and auto_status = 'FINALIST' and not prior_rejected""", [run_id]
-            ).fetchall())
-    return bool(runs), finalists
+        if overlay and not review:
+            continue
+        if not overlay:
+            states[group] = {}
+        state = states.setdefault(group, {})
+        review_rows = {
+            int(row[0]): (str(row[1]), row[2])
+            for row in connection.execute(
+                "select strategy_id, user_status, user_rank from selection_review_rows where review_import_id = ?",
+                [review[0] if review else None],
+            ).fetchall()
+        }
+        result_rows = connection.execute(
+            """select strategy_id, auto_status, auto_rank, prior_rejected
+                 from selection_results where selection_run_id = ?""", [run_id]
+        ).fetchall()
+        for strategy_id, auto_status, auto_rank, prior_rejected in result_rows:
+            strategy_id = int(strategy_id)
+            if overlay and strategy_id not in review_rows:
+                continue
+            if strategy_id in review_rows:
+                status, rank = review_rows[strategy_id]
+                state[strategy_id] = (status, None if rank is None else int(rank), str(run_id))
+            else:
+                state[strategy_id] = (
+                    "REJECTED" if prior_rejected else str(auto_status),
+                    None if auto_rank is None else int(auto_rank),
+                    str(run_id),
+                )
+    return {strategy_id: decision for state in states.values() for strategy_id, decision in state.items()}
+
+
+def latest_effective_finalists(connection: duckdb.DuckDBPyConnection, symbol: str) -> tuple[bool, set[int]]:
+    has_runs = connection.execute("select 1 from selection_runs where symbol = ? limit 1", [symbol]).fetchone() is not None
+    decisions = effective_selection_decisions(connection, symbol=symbol)
+    return has_runs, {strategy_id for strategy_id, decision in decisions.items() if decision[0] == "FINALIST"}
