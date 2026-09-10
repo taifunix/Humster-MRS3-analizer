@@ -737,6 +737,12 @@ def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() 
     assert "normalImportAuthorized" in js
 
 
+def test_settings_keeps_listing_dates_in_the_workflow_payload_only() -> None:
+    js = _read("app.js")
+
+    assert js.count("listing_dates_path: document.querySelector('#settings-dates')?.value || ''") == 1
+
+
 def test_shortlist_has_one_grouped_renderer_and_shared_candidate_state() -> None:
     js = _read("app.js")
 

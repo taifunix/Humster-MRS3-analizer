@@ -24,7 +24,11 @@ Copy-Item config.local.json.example config.local.json
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-В `config.local.json` задайте локальный `tester_runner.bot_root`. Файл игнорируется Git и не должен публиковаться.
+В `config.local.json` задайте локальный `tester_runner.bot_root`. Для fresh
+Source v6 analysis также добавьте ваш private listing-date workbook в
+`input/dates.xlsx` (или укажите другой путь в
+`panel_workflow.listing_dates_path`). Файл игнорируется Git и не должен
+публиковаться. Без этого входа панель не начнёт анализ и явно сообщит причину.
 
 ## Основные команды
 

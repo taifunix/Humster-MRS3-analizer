@@ -19,6 +19,8 @@ output/
 [Dd]ata/
 [Ii]nput/
 [Oo]utput/
+!input/
+!input/README.md
 results/
 audit_csv/
 strategies/

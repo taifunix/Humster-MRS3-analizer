@@ -127,6 +127,32 @@ def test_http_generation_reports_missing_content_type(tmp_path: Path) -> None:
     assert body == {"error": "Content-Type must be application/json"}
 
 
+def test_http_fresh_analysis_reports_missing_listing_dates_actionably(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"panel_workflow": {"listing_dates_path": "Input/dates.xlsx"}}), encoding="utf-8")
+    surface = tmp_path / "surface.surface-v6.duckdb"
+    surface.write_bytes(b"surface")
+    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", lambda *_args, **_kwargs: {"surface_id": "surface"})
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        payload = json.dumps({"surface_path": str(surface)}).encode("utf-8")
+        connection.request("POST", "/api/v2/strategies/fresh/analyze", payload, {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 400
+    assert body == {"error": "Listing dates XLSX is missing. Add it and save Settings > Analysis profile."}
+
+
 def test_http_generation_accepts_a_large_ready_selection_payload(tmp_path: Path) -> None:
     config = tmp_path / "config.local.json"
     config.write_text("{}", encoding="utf-8")

@@ -245,6 +245,23 @@ _TESTER_PROGRESS_PATTERN = re.compile(
     r"^RUN (\d+)/(\d+) time=([^ ]+ [^ ]+) \(([0-9]+(?:\.[0-9]+)?)%\)"
 )
 _DIRECT_GENERIC_ERROR = "direct build failed"
+_FRESH_ANALYSIS_LISTING_DATES_ERROR = (
+    "Listing dates XLSX is missing. Add it and save Settings > Analysis profile."
+)
+
+
+def _fresh_analysis_error(message: str | None) -> str:
+    """Map fresh-analysis failures to stable, non-sensitive operator guidance."""
+    value = (message or "").casefold()
+    if "listing" in value and ("date" in value or "snapshot" in value):
+        return _FRESH_ANALYSIS_LISTING_DATES_ERROR
+    if "panel workflow default" in value:
+        return _FRESH_ANALYSIS_LISTING_DATES_ERROR
+    if "fresh source v6 surface" in value or ("surface" in value and "required" in value):
+        return "Select a valid published Source v6 surface before starting analysis."
+    if "analysis config" in value:
+        return "Fresh analysis configuration is unavailable. Check the local config file."
+    return "Fresh analysis setup failed. Check the selected surface and Analysis profile."
 
 
 def _safe_direct_error(message: str | None) -> str | None:
@@ -2452,15 +2469,18 @@ class PanelController:
     def strategies_fresh_analyze(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Run the only supported fresh multi-scope analysis contour."""
         surface = self._path(self._required(payload, "surface_path"))
+        listing_dates = self._workflow_default("listing_dates_path")
+        if not listing_dates.is_file():
+            raise ValueError(_FRESH_ANALYSIS_LISTING_DATES_ERROR)
         result = self.source_v6_start_fresh_analysis({
             "surface_path": str(surface),
-            "listing_dates_path": str(self._workflow_default("listing_dates_path")),
+            "listing_dates_path": str(listing_dates),
             "config_path": str(self.default_config),
             "algorithm_version": self._workflow_algorithm_version(payload.get("algorithm_version")),
             "target_path": self._optional_string(payload, "target_path"),
         })
         if result.get("phase") != "COMMITTED":
-            return {"phase": str(result.get("phase", "FAILED")), "error": "Analysis failed. Check panel logs."}
+            return {"phase": str(result.get("phase", "FAILED")), "error": _fresh_analysis_error(str(result.get("error") or ""))}
         artifact = Path(str(result.get("analysis_path", "")))
         try:
             connection = duckdb.connect(str(artifact), read_only=True)
@@ -4870,7 +4890,9 @@ class PanelController:
         try:
             target_value = self._optional_string(payload, "target_path")
             target = self._path(target_value) if target_value else None
-            artifact = run_multiscope_analysis(surface, target.parent if target else self.root / "Output" / "analysis-v6-compact", self._analysis_config_loader(config_path), listing_dates=self._source_v6_listing_dates_loader(dates_path), algorithm_version=str(payload.get("algorithm_version") or "0.7-canonical-phase1"), workers=max(1, self._import_settings().workers), cancel_check=lambda: bool(job["cancel_requested"]), filename=target.name if target else None)
+            explicit_target = target if target and target.name.endswith(".analysis-v6.duckdb") else None
+            directory = explicit_target.parent if explicit_target else (target or self.root / "Output" / "analysis-v6-compact")
+            artifact = run_multiscope_analysis(surface, directory, self._analysis_config_loader(config_path), listing_dates=self._source_v6_listing_dates_loader(dates_path), algorithm_version=str(payload.get("algorithm_version") or "0.7-canonical-phase1"), workers=max(1, self._import_settings().workers), cancel_check=lambda: bool(job["cancel_requested"]), filename=explicit_target.name if explicit_target else None)
             with self._source_v6_lock:
                 job.update({"phase": "COMMITTED", "current": 1, "progress": 1.0, "analysis_path": str(artifact), "analysis_id": artifact.stem})
         except BaseException as error:
@@ -7717,6 +7739,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(error)})
             elif endpoint == "/api/v2/strategies/fresh/generate":
                 self._json(400, {"error": _fresh_generation_error(error)})
+            elif endpoint == "/api/v2/strategies/fresh/analyze":
+                self._json(400, {"error": _fresh_analysis_error(str(error))})
             else:
                 self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": _safe_direct_error(str(error)) or "invalid surface request"} if endpoint.startswith("/api/v2/surfaces/") else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})))
             return

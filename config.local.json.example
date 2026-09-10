@@ -134,6 +134,7 @@
   },
   "panel_workflow": {
     "listing_dates_path": "input/dates.xlsx",
+    "algorithm_version": "0.7-canonical-phase1",
     "strategy_templates": {
       "LONG": "templates/strategies/retest-mrs3/base.json",
       "SHORT": "templates/strategies/retest-mrs3/base.json"

@@ -2589,7 +2589,6 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       local_runner_root: document.querySelector('#settings-local-runner')?.value || '',
        local_source_db_root: document.querySelector('#settings-source-root')?.value || '',
       local_output_root: document.querySelector('#settings-output-root')?.value || '',
-      listing_dates_path: document.querySelector('#settings-dates')?.value || '',
     },
   }, operational: {
      source_db_path: document.querySelector('#settings-source-root')?.value || '',

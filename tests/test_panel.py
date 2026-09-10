@@ -2090,6 +2090,30 @@ def test_fresh_source_v6_analysis_uses_the_editable_analysis_target(tmp_path: Pa
     assert captured == {"directory": target.parent, "filename": target.name}
 
 
+def test_fresh_source_v6_analysis_treats_a_target_directory_as_a_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mrs3.panel import PanelController
+
+    dates, analysis = tmp_path / "dates.xlsx", tmp_path / "config.local.json"
+    dates.write_text("dates", encoding="utf-8")
+    analysis.write_text("{}", encoding="utf-8")
+    target_directory = tmp_path / "analysis"; target_directory.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", lambda *_args, **_kwargs: {"surface_id": "surface"})
+    monkeypatch.setattr(
+        "mrs3.panel.run_multiscope_analysis",
+        lambda _surface, directory, _config, **kwargs: captured.update({"directory": directory, "filename": kwargs["filename"]}) or directory / "result.analysis-v6.duckdb",
+    )
+    controller = PanelController(tmp_path, analysis, analysis_config_loader=lambda _path: object(), source_v6_listing_dates_loader=lambda _path: {})
+
+    result = controller.source_v6_start_fresh_analysis({
+        "surface_path": "surface.surface-v6.duckdb", "listing_dates_path": str(dates), "config_path": str(analysis),
+        "target_path": str(target_directory),
+    })
+
+    assert result["phase"] == "COMMITTED"
+    assert captured == {"directory": target_directory, "filename": None}
+
+
 def test_fresh_source_v6_analysis_reports_requested_cancellation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from mrs3.panel import PanelController
 
@@ -2117,12 +2141,13 @@ def test_surface_catalog_treats_invalid_import_settings_as_empty(tmp_path: Path,
 def test_fresh_analysis_keeps_the_terminal_error_for_the_static_panel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from mrs3.panel import PanelController
 
+    dates = tmp_path / "dates.xlsx"; dates.write_text("dates", encoding="utf-8")
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     monkeypatch.setattr(controller, "source_v6_start_fresh_analysis", lambda _payload: {"phase": "FAILED", "error": "analysis input is invalid"})
-    monkeypatch.setattr(controller, "_workflow_default", lambda _name: tmp_path)
+    monkeypatch.setattr(controller, "_workflow_default", lambda _name: dates)
 
     assert controller.strategies_fresh_analyze({"surface_path": "surface.surface-v6.duckdb"}) == {
-        "phase": "FAILED", "error": "Analysis failed. Check panel logs."
+        "phase": "FAILED", "error": "Fresh analysis setup failed. Check the selected surface and Analysis profile."
     }
 
 

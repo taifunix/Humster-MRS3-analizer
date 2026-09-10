@@ -1651,6 +1651,19 @@ payloads cannot provide the trusted root. Focused checks pass (`7 passed,
 2 skipped` for Windows symlink capability); full suite baseline was `2238
 passed, 3 skipped`. The scoped fix is committed.
 
+## Panel fresh-analysis configuration clarity (2026-09-10)
+
+Fresh Source v6 analysis now reports a missing configured listing-date workbook
+with a safe actionable message instead of the generic `invalid settings`.
+`panel_workflow.listing_dates_path` is the only runtime source for that input;
+the settings save payload no longer mirrors it into UI-only path defaults.
+The examples use `input/dates.xlsx`, with a tracked `input/README.md` and no
+tracked workbook. A target directory is accepted as a directory, preventing a
+panel default such as `data/Analysis` from being treated as an invalid filename.
+Focused tests pass (`5 passed`); live Panel API verification committed analysis
+`e01da6ce43ed4d1e7e0be1da550147d4cdae2ed2cca4b46fae629970e3780c7c` from the
+published local Source v6 surface.
+
 ## Performance v2 typed-config dedup contract (2026-09-04)
 
 The active import contract now treats executable settings, not strategy names
