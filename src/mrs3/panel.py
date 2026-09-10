@@ -4,7 +4,7 @@ from collections import OrderedDict, deque
 import csv
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import hashlib
 from hashlib import sha256
 import inspect
@@ -161,6 +161,7 @@ from .panel_settings import (
     save_settings as save_panel_settings,
     validate_settings as validate_panel_settings,
 )
+from .analysis_profile import load_analysis_profile, save_analysis_profile
 from .panel_jobs import PanelJobError, PanelJobRegistry
 from .panel_portfolio import PortfolioPanelError, PortfolioPanelService
 from .locking import TesterTargetLock
@@ -262,6 +263,18 @@ def _fresh_analysis_error(message: str | None) -> str:
     if "analysis config" in value:
         return "Fresh analysis configuration is unavailable. Check the local config file."
     return "Fresh analysis setup failed. Check the selected surface and Analysis profile."
+
+
+def _analysis_profile_error(error: ValueError | InvalidOperation) -> str:
+    """Expose a concise, actionable validation error for the analysis profile."""
+    value = str(error).casefold()
+    if "unknown analysis profile field" in value or "profile fields mismatch" in value:
+        return "Профиль анализа содержит недопустимые поля."
+    if "min_plateau_points" in value:
+        return "Минимум точек READY должен быть целым числом не меньше 2."
+    if "workers" in value:
+        return "Количество параллельных процессов должно быть положительным целым числом."
+    return "Профиль анализа содержит недопустимые значения."
 
 
 def _safe_direct_error(message: str | None) -> str | None:
@@ -1726,6 +1739,17 @@ class PanelController:
     def panel_settings_save(self, payload: Mapping[str, object]) -> dict[str, object]:
         with self._lock:
             return save_panel_settings(self.default_config, self.root, payload)
+
+    def analysis_profile_get(self) -> dict[str, object]:
+        with self._lock:
+            return {"profile": load_analysis_profile(self.default_config)}
+
+    def analysis_profile_save(self, payload: Mapping[str, object]) -> dict[str, object]:
+        profile = payload.get("profile")
+        if not isinstance(profile, Mapping):
+            raise ValueError("analysis profile fields mismatch")
+        with self._lock:
+            return {"profile": save_analysis_profile(self.default_config, profile)}
 
     def panel_jobs(self) -> list[dict]:
         return self._panel_jobs.list()
@@ -7203,6 +7227,14 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 return
             self._json(200, result)
             return
+        if parsed.path == "/api/v2/settings/analysis-profile":
+            try:
+                result = self.server.controller.analysis_profile_get()
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, InvalidOperation, ValueError):
+                self._json(400, {"error": "Профиль анализа недоступен."})
+                return
+            self._json(200, result)
+            return
         if parsed.path == "/api/v2/jobs":
             self._json(200, {"jobs": self.server.controller.panel_jobs()})
             return
@@ -7477,7 +7509,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_route = endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         portfolio_cancel_route = bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint))
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
-        if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
+        if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
             self._json(404, {"error": "not found"})
             return
         if portfolio_submission_route:
@@ -7638,6 +7670,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.panel_settings_validate(document)
             elif endpoint == "/api/v2/settings/save":
                 result = self.server.controller.panel_settings_save(document)
+            elif endpoint == "/api/v2/settings/analysis-profile":
+                result = self.server.controller.analysis_profile_save(document)
             elif endpoint == "/api/browse":
                 kind = document.get("kind")
                 multiple = document.get("multiple", False)
@@ -7729,7 +7763,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except RuntimeError as error:
             self._json(409, {"error": _fresh_generation_error(error)} if endpoint == "/api/v2/strategies/fresh/generate" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
             return
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        except (UnicodeDecodeError, json.JSONDecodeError, InvalidOperation, ValueError) as error:
             if portfolio_route:
                 code = "PORTFOLIO_JOB_CANCEL_INVALID" if portfolio_cancel_route else "PORTFOLIO_CAMPAIGN_INVALID"
                 self._portfolio_error(PortfolioPanelError(code, "portfolio request is invalid", status=422))
@@ -7741,6 +7775,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": _fresh_generation_error(error)})
             elif endpoint == "/api/v2/strategies/fresh/analyze":
                 self._json(400, {"error": _fresh_analysis_error(str(error))})
+            elif endpoint == "/api/v2/settings/analysis-profile":
+                self._json(400, {"error": _analysis_profile_error(error)})
             else:
                 self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": _safe_direct_error(str(error)) or "invalid surface request"} if endpoint.startswith("/api/v2/surfaces/") else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})))
             return

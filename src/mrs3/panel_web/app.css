@@ -265,6 +265,12 @@ textarea { width: 100%; padding: 10px; border: 1px solid #cbd7e4; border-radius:
 .portfolio-exclusions { margin-top: 10px; }
 .portfolio-exclusion { padding: 8px; border-radius: 6px; background: #fff8ee; }
 .portfolio-exclusion strong { color: #8a4b08; }
+.analysis-profile-section { margin-top: 16px; padding-top: 15px; border-top: 1px solid var(--line); }
+.analysis-profile-section h3 { margin: 0 0 11px; color: var(--ink); font-size: .86rem; }
+.analysis-profile-pair { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; }
+.analysis-profile-pair > label { grid-column: 1 / -1; }
+.analysis-profile-pair-value { display: grid; gap: 4px; }
+.analysis-profile-pair:has(.analysis-profile-pair-value:only-of-type) { grid-template-columns: 1fr; }
 @media (max-width: 560px) { .portfolio-pair-grid { grid-template-columns: 1fr; } }
 
 @media (max-width: 760px) {

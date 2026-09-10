@@ -19,6 +19,9 @@
   "absolute_floor_boundary_bp": 200,
   "absolute_floor_at_or_below": 10,
   "absolute_floor_above": 5,
+  "event_filter": {
+    "min_point_events": 3
+  },
   "economic_min_pnl_pct": 0,
   "economic_min_win_rate_pct": 70,
   "economic_max_dd_pct": 11,
@@ -131,6 +134,10 @@
   },
   "panel": {
     "default_root": "static"
+  },
+  "duckdb_import": {
+    "workers": 16,
+    "transaction_batch_size": 250
   },
   "panel_workflow": {
     "listing_dates_path": "input/dates.xlsx",

@@ -30,6 +30,11 @@ Source v6 analysis также добавьте ваш private listing-date workb
 `panel_workflow.listing_dates_path`). Файл игнорируется Git и не должен
 публиковаться. Без этого входа панель не начнёт анализ и явно сообщит причину.
 
+The Settings tab's **Analysis profile** edits only parameters used by future
+fresh Source v6 analysis. Reload is read-only; Save atomically validates and
+writes `config.local.json`. The shared worker count changes processing speed
+for import, publication and analysis, but does not change calculated results.
+
 ## Основные команды
 
 ```powershell

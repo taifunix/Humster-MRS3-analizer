@@ -1664,6 +1664,25 @@ Focused tests pass (`5 passed`); live Panel API verification committed analysis
 `e01da6ce43ed4d1e7e0be1da550147d4cdae2ed2cca4b46fae629970e3780c7c` from the
 published local Source v6 surface.
 
+## Panel analysis profile (2026-09-10)
+
+Settings now provides one local-only **Analysis profile** card for the values
+that affect future fresh Source v6 analysis: point eligibility, economics,
+surface geometry, plateau/Close MA, READY admission and order construction.
+It deliberately excludes listing dates, algorithm version, batch size and
+materialization-only controls. Reload is read-only; Save validates the merged
+full configuration and atomically writes only `config.local.json`. The shared
+worker count remains visible with its cross-workflow speed impact stated.
+
+Focused verification: `.venv\\Scripts\\python.exe -m pytest
+tests/test_analysis_profile.py tests/test_panel_analysis_profile.py
+tests/test_panel_static_ui.py::test_analysis_profile_is_one_flat_card_with_explicit_controls -q`
+passes (`8 passed`); `compileall` and `git diff --check` pass. The full static
+UI suite reaches `94 passed`; its two remaining failures require an unavailable
+local `node` executable and exercise unrelated Portfolio helpers. Independent
+review completed with `CODE_REVIEW_PASS` after fixes for UI/API key alignment
+and invalid numeric form values.
+
 ## Performance v2 typed-config dedup contract (2026-09-04)
 
 The active import contract now treats executable settings, not strategy names

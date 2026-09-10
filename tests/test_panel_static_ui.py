@@ -120,6 +120,35 @@ def test_settings_semantic_ids_and_static_js_use_v2_testing_endpoints() -> None:
     assert "requestJson('/api/v2/settings/reload')" in js
 
 
+def test_analysis_profile_is_one_flat_card_with_explicit_controls() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    profile = html.split('id="analysis-profile-card"', 1)[1].split('</details>', 1)[0]
+    assert profile.count("<details") == 0
+    assert "Вход и версия" not in profile
+    assert "Импорт workers/batch" not in profile
+    for label in (
+        "Экономические фильтры",
+        "Сетка и уточнение",
+        "Плато и Close MA",
+        "READY-кандидаты",
+        "Конструкция ордеров",
+        "Количество параллельных процессов",
+    ):
+        assert label in profile
+    assert 'id="analysis-profile-reload"' in profile
+    assert 'id="analysis-profile-save"' in profile
+    assert "'/api/v2/settings/analysis-profile'" in js
+    assert "function analysisProfilePayload()" in js
+    assert "Целочисленные поля профиля должны быть заполнены целыми числами." in js
+    assert "if (!/^-?\\d+$/.test(raw))" in js
+    assert "lower_max_exclusive_bp: Number(pair.lower_max_exclusive_bp)" in js
+    assert "'envelope_min'" in js
+    assert "'base_slots'" in js
+    assert "shift должны быть целыми числами" in js
+
+
 def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
     html = _read("index.html")
     js = _read("app.js")
@@ -737,10 +766,12 @@ def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() 
     assert "normalImportAuthorized" in js
 
 
-def test_settings_keeps_listing_dates_in_the_workflow_payload_only() -> None:
+def test_settings_does_not_edit_listing_dates_outside_workflow_config() -> None:
+    html = _read("index.html")
     js = _read("app.js")
 
-    assert js.count("listing_dates_path: document.querySelector('#settings-dates')?.value || ''") == 1
+    assert 'id="settings-dates"' not in html
+    assert "listing_dates_path: document.querySelector('#settings-dates')?.value || ''" not in js
 
 
 def test_shortlist_has_one_grouped_renderer_and_shared_candidate_state() -> None:
