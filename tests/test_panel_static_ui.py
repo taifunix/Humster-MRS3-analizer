@@ -142,6 +142,18 @@ def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
     assert "remoteHtml?.addEventListener('change', () => updateRemoteTarget(true))" in js
 
 
+def test_local_source_target_derives_a_new_file_from_the_saved_directory() -> None:
+    """A saved Source DB directory must never be posted to v6 preflight as target."""
+    js = _read("app.js")
+
+    assert "function sourceTargetDirectory(value)" in js
+    assert js.index("function sourceTargetDirectory(value)") < js.index("async function loadSafeDefaults()")
+    assert "value.toLowerCase().endsWith('.duckdb')" in js
+    assert "localTarget.value = sourceTargetPath(paths.local_source_db_root, localHtml?.value || '');" in js
+    assert "remoteLocalTarget.value = sourceTargetPath(paths.local_source_db_root, remoteHtml?.value || '');" in js
+    assert "local_source_db_root: sourceTargetDirectory(inputValue('source-local-target'))" in js
+
+
 def test_merge_card_offers_catalog_choices_and_visible_progress() -> None:
     html = _read("index.html")
     js = _read("app.js")

@@ -364,6 +364,19 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   window.addEventListener('hashchange', routeFromHash);
   routeFromHash();
 
+  function sourceName(value) {
+    const reportName = value.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'source';
+    return `${reportName}.source-v6.duckdb`;
+  }
+
+  function sourceTargetPath(directory, reports) {
+    return `${directory.replace(/[\\/]+$/, '')}\\${sourceName(reports)}`;
+  }
+
+  function sourceTargetDirectory(value) {
+    return value.toLowerCase().endsWith('.duckdb') ? value.replace(/[\\/][^\\/]*$/, '') : value;
+  }
+
   async function loadSafeDefaults() {
     try {
       const bootstrap = await requestJson('/api/v2/bootstrap');
@@ -384,14 +397,11 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         const input = document.querySelector(`#${id}`);
         if (input && operational[key] !== undefined) input.value = operational[key];
       }
-      const reportName = (value) => value.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'source';
-      const sourceName = (value) => `${reportName(value)}.source-v6.duckdb`;
       const localHtml = document.querySelector('#source-local-html');
       const localTarget = document.querySelector('#source-local-target');
       if (localHtml && paths.local_reports_root) localHtml.value = paths.local_reports_root;
       if (localTarget && paths.local_source_db_root) {
-        const root = paths.local_source_db_root.replace(/[\\/][^\\/]*$/, '');
-        localTarget.value = `${root}\\${sourceName(localHtml?.value || '')}`;
+        localTarget.value = sourceTargetPath(paths.local_source_db_root, localHtml?.value || '');
       }
       const surfaceSource = document.querySelector('#surface-source');
       if (surfaceSource && localTarget) {
@@ -409,12 +419,11 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const updateRemoteTarget = (force = false) => {
         if (remoteTarget && paths.remote_source_db_root && (force || !remoteTarget.value)) remoteTarget.value = `${paths.remote_source_db_root.replace(/\/$/, '')}/${sourceName(remoteHtml?.value || '')}`;
         if (remoteLocalTarget && paths.local_source_db_root && (force || !remoteLocalTarget.value)) {
-          const root = paths.local_source_db_root.replace(/[\\/][^\\/]*$/, '');
-          remoteLocalTarget.value = `${root}\\${sourceName(remoteHtml?.value || '')}`;
+          remoteLocalTarget.value = sourceTargetPath(paths.local_source_db_root, remoteHtml?.value || '');
         }
       };
       for (const [id, key] of [
-        ['source-local-html', 'local_reports_root'], ['source-local-target', 'local_source_db_root'],
+        ['source-local-html', 'local_reports_root'],
         ['source-remote-html', 'remote_import_html_root'], ['source-remote-staging', 'remote_import_staging_path'],
         ['source-remote-target', 'remote_import_target_path'], ['merge-source-a', 'local_merge_source_a'],
         ['merge-source-b', 'local_merge_source_b'], ['merge-target', 'local_merge_target'],
@@ -778,7 +787,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     savePathDefaults(document.querySelector('#strategies-dd5 .panel-card'), { analysis_db_root: target });
   });
   bindPathSave(localImportCard?.querySelectorAll('.button-row button')[1], localImportCard, () => ({
-    local_reports_root: inputValue('source-local-html'), local_source_db_root: inputValue('source-local-target'),
+    local_reports_root: inputValue('source-local-html'), local_source_db_root: sourceTargetDirectory(inputValue('source-local-target')),
   }));
   bindPathSave(remoteSourceCard?.querySelectorAll('.button-row button')[1], remoteSourceCard, () => ({
     remote_import_html_root: inputValue('source-remote-html'), remote_import_staging_path: inputValue('source-remote-staging'),
