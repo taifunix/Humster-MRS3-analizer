@@ -271,8 +271,10 @@ not require a cache-version bump or fact recalculation.
 
 When a current Performance v2 HTML report declares them, the parser fails closed when the declared
 `Total transactions (buy/sell)` differs from the number of parsed action rows,
-or when the final wallet sample does not round to the declared `Final balance`
-at that declared precision. The existing raw/semantic inventory comparison and
+or when the newest available balance does not round to the declared
+`Final balance` at that declared precision. The newest balance is the last
+wallet sample unless a parsed action has a later timestamp, in which case its
+post-action `Balance` is authoritative. The existing raw/semantic inventory comparison and
 post-write DuckDB row-count verification remain mandatory. The final event or
 equity timestamp is only required to fall inside the report interval; the
 tester's declared `EndDate` is inclusive for imported event and equity samples,

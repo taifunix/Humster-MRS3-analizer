@@ -38,6 +38,7 @@ strategies/
 !tests/fixtures/**/*.html
 *.log
 *.tmp
+.*.retest-publication.lock
 
 # Agent workspaces
 .superpowers/

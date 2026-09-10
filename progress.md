@@ -1900,3 +1900,12 @@ verification also restores persisted counters instead of replacing them with
 an empty `0/0` progress object. The live inbox contains 5186 entries and, after
 a cold panel restart plus repeated inbox verification, the registry remains
 `COMMITTED`, `5186/5186`, `inbox_ready=true`, `failed=0`.
+
+The subsequent Performance v2 import committed 5001 rows and rejected 185
+FWDI reports because their wallet chart ended two minutes before the final
+close action. Current-report integrity now validates the later action balance
+when it is newer than the final wallet sample while retaining fail-closed
+validation for real balance mismatches. Import
+`82f311f5b7014b0eaade73016ab9f6ea` then replaced exactly those 185 current
+FWDI results: `185 imported`, `0 skipped`, `0 rejected`, with 185 verified
+replacement dispositions.

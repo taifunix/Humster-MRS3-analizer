@@ -258,6 +258,8 @@ def _validate_report_integrity(
         declared_final = _decimal(declared_final_text, "Final balance")
         quantum = Decimal(1).scaleb(declared_final.as_tuple().exponent)
         final_wallet = wallet_series[-1][1].quantize(quantum, rounding=ROUND_HALF_UP)
+        if actions and actions[-1].timestamp_utc > _epoch_timestamp(wallet_series[-1][0]):
+            final_wallet = actions[-1].balance.quantize(quantum, rounding=ROUND_HALF_UP)
         if final_wallet != declared_final:
             raise PerformanceV2HtmlError(
                 f"final wallet {final_wallet} does not match declared Final balance {declared_final}"

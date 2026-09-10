@@ -90,6 +90,30 @@ def test_parser_rejects_final_wallet_incomplete_against_declared_balance() -> No
         parse_current_performance_v2_html(source, _limits())
 
 
+def test_parser_uses_later_action_balance_when_wallet_chart_ends_early() -> None:
+    source = _current().replace(
+        b'[1767402000000,"1009.9"]', b'[1767401880000,"1010.4"]'
+    )
+
+    parsed = parse_current_performance_v2_html(source, _limits())
+
+    assert parsed.wallet_series[-1][1] == Decimal("1010.4")
+    assert parsed.actions[-1].balance == Decimal("1009.9")
+
+
+def test_parser_rejects_wrong_later_action_balance_when_wallet_chart_ends_early() -> None:
+    source = _current().replace(
+        b'[1767402000000,"1009.9"]', b'[1767401880000,"1010.4"]'
+    ).replace(
+        b"<td>1009.9</td><td>1</td><td>0</td><td></td></tr>",
+        b"<td>1008.9</td><td>1</td><td>0</td><td></td></tr>",
+        1,
+    )
+
+    with pytest.raises(PerformanceV2HtmlError, match="final wallet"):
+        parse_current_performance_v2_html(source, _limits())
+
+
 def test_integrity_check_rejects_declared_final_balance_without_wallet_sample() -> None:
     with pytest.raises(PerformanceV2HtmlError, match="wallet sample"):
         _validate_report_integrity({"Final balance": "100"}, (), ())
