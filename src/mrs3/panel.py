@@ -1982,7 +1982,13 @@ class PanelController:
 
     def local_testing_fill(self, payload: Mapping[str, object]) -> dict[str, object]:
         try:
-            result = self._local_testing_service().fill(**self._local_testing_request(payload))
+            delete_old_reports = payload.get("delete_old_reports", False)
+            if not isinstance(delete_old_reports, bool):
+                raise PanelTestingError("invalid testing request")
+            result = self._local_testing_service().fill(
+                **self._local_testing_request(payload),
+                delete_old_reports=delete_old_reports,
+            )
             self._local_testing_filled = True
             return result
         except Exception:

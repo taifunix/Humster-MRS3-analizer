@@ -3,6 +3,23 @@
 **Updated:** 2026-09-10
 **Current branch:** `main`
 
+## Local tester preparation from Panel (2026-09-10)
+
+The local runner action is now labelled `Prepare files` and placed between
+runner/disk preflight and Start. It preserves the existing config and
+single-strategy rendering, and accepts a default-off `Delete old reports before
+start` option. When selected, the service first validates and stages the
+request, acquires the tester lock, confirms the bot has stopped, then empties
+only the validated `tester/report/my_test` contents. It rejects links and
+unsupported report entries and retains the report directory itself. The Panel
+reports whether old reports were cleared. Start is unchanged; no tester HTTP or
+wizard endpoint is invoked.
+
+Focused verification passes: `111 passed, 2 deselected` across the local
+runner and static UI slice. Python `compileall` and `git diff --check` pass.
+The two deselected static tests require unavailable `node`; they are unrelated
+to this slice.
+
 ## Portfolio Optimizer PRETEST_PROXY Stage 1 (2026-09-10)
 
 Implementation slice is present in the read-only finalist input, common UTC

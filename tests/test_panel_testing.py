@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -265,10 +266,40 @@ def test_local_testing_fill_installs_exactly_one_strategy_and_config_without_cle
     assert existing_report.read_text(encoding="utf-8") == "keep"
     assert json.loads(config.tester_config.read_text(encoding="utf-8"))["StartDate"] == "2026-07-15T00:00:00"
     assert filled["strategy_name"] == "AAOIUSDT"
+    assert filled["reports_cleared"] is False
     with pytest.raises(TesterTargetBusyError):
         TesterTargetLock(config.bot_root).acquire()
     service.stop()
     assert not config.tester_config.exists()
+
+
+def test_local_testing_fill_optionally_clears_report_contents_after_stopping_tester(
+    tmp_path: Path,
+) -> None:
+    config = _runner_config(tmp_path)
+    old_file = config.report_dir / "old.html"
+    old_file.write_text("old", encoding="utf-8")
+    old_directory = config.report_dir / "old-run"
+    old_directory.mkdir()
+    (old_directory / "details.json").write_text("old", encoding="utf-8")
+    calls: list[str] = []
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        stop_bot=lambda _config: calls.append("stop"),
+    )
+
+    service.fill(
+        side="LONG",
+        symbols=("CXUSDT",),
+        start="2026-07-15",
+        end="2026-08-06",
+        delete_old_reports=True,
+    )
+
+    assert calls == ["stop"]
+    assert config.report_dir.is_dir()
+    assert tuple(config.report_dir.iterdir()) == ()
 
 
 def test_local_testing_fill_replaces_all_root_strategy_json_with_exactly_one_rendered_file(
@@ -334,6 +365,8 @@ def test_local_testing_does_not_restore_while_stop_is_unconfirmed(tmp_path: Path
 
 def test_local_fill_does_not_mutate_when_initial_stop_is_unconfirmed(tmp_path: Path) -> None:
     config = _runner_config(tmp_path)
+    existing_report = config.report_dir / "keep.html"
+    existing_report.write_text("keep", encoding="utf-8")
     service = LocalTestingService(
         config,
         Path(__file__).parents[1],
@@ -345,6 +378,7 @@ def test_local_fill_does_not_mutate_when_initial_stop_is_unconfirmed(tmp_path: P
 
     assert not config.tester_config.exists()
     assert not tuple(config.strategy_dir.glob("*.json"))
+    assert existing_report.read_text(encoding="utf-8") == "keep"
     assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
 
 
@@ -387,3 +421,72 @@ def test_panel_controller_fills_one_local_strategy_and_tester_config(tmp_path: P
     assert str(config.bot_root) not in json.dumps(prepared)
     assert config.tester_config.is_file()
     assert tuple(config.strategy_dir.glob("*.json"))
+
+
+def test_panel_controller_rejects_non_boolean_report_cleanup_request(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    document = {"tester_runner": {
+        "bot_root": str(config.bot_root), "executable": "hb_c.exe", "base_url": config.base_url, "port": config.port,
+        "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test", "wizard_result": "tester/wizard_result.json",
+        "wizard_progress": "tester/wizard_progress.json", "tester_config": "tester/tester_config.json", "inbox_root": str(config.inbox_root),
+    }}
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(Exception, match="invalid testing request"):
+        PanelController(tmp_path, config_path).local_testing_fill({
+            "symbols": "CXUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06",
+            "delete_old_reports": "yes",
+        })
+
+
+def test_runner_config_rejects_report_directory_link_before_report_cleanup(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    alias = config.report_dir.parent / "report-alias"
+    try:
+        alias.symlink_to(config.report_dir, target_is_directory=True)
+    except OSError:
+        created = subprocess.run(
+            ("cmd", "/c", "mklink", "/J", str(alias), str(config.report_dir)),
+            capture_output=True,
+            check=False,
+        )
+        if created.returncode != 0:
+            pytest.skip("symbolic links and junctions are unavailable in this test environment")
+    document = {"tester_runner": {
+        "bot_root": str(config.bot_root), "executable": "hb_c.exe", "base_url": config.base_url, "port": config.port,
+        "strategy_dir": "settings_strategy", "report_dir": "tester/report/report-alias", "wizard_result": "tester/wizard_result.json",
+        "wizard_progress": "tester/wizard_progress.json", "tester_config": "tester/tester_config.json", "inbox_root": str(config.inbox_root),
+    }}
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(Exception, match="report_dir must not contain links"):
+        RunnerConfig.from_json(config_path)
+
+
+def test_local_testing_rejects_direct_linked_report_directory_before_cleanup(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    old_report = config.report_dir / "keep.html"
+    old_report.write_text("keep", encoding="utf-8")
+    alias = config.report_dir.parent / "report-alias"
+    created = subprocess.run(
+        ("cmd", "/c", "mklink", "/J", str(alias), str(config.report_dir)),
+        capture_output=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        pytest.skip("junctions are unavailable in this test environment")
+    service = LocalTestingService(
+        replace(config, report_dir=alias),
+        Path(__file__).parents[1],
+        stop_bot=lambda _config: None,
+    )
+
+    with pytest.raises(Exception, match="report_dir must not contain links"):
+        service.fill(
+            side="LONG", symbols=("CXUSDT",), start="2026-07-15", end="2026-08-06",
+            delete_old_reports=True,
+        )
+
+    assert old_report.read_text(encoding="utf-8") == "keep"

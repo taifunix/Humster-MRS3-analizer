@@ -13,7 +13,13 @@ from typing import Callable
 
 from .locking import TesterTargetLock
 from .runner.config import RunnerConfig
-from .runner.files import TesterSettingsSnapshot, capture_tester_settings, prepare_batch_files, restore_tester_settings
+from .runner.files import (
+    TesterSettingsSnapshot,
+    capture_tester_settings,
+    prepare_batch_files,
+    restore_tester_settings,
+    validate_runner_paths,
+)
 from .runner.process import start_bot, stop_bot
 from .runner.workflow import validate_runtime_preflight
 
@@ -259,8 +265,11 @@ class LocalTestingService:
         symbols: tuple[str, ...] | list[str],
         start: str,
         end: str,
+        delete_old_reports: bool = False,
     ) -> dict[str, object]:
         """Install the requested single strategy and rendered tester config."""
+        if not isinstance(delete_old_reports, bool):
+            raise PanelTestingError("delete_old_reports must be a boolean")
         prepared = self.prepare(side=side, symbols=symbols, start=start, end=end)
         owner: TesterTargetLock | None = None
         target_quiesced = True
@@ -274,6 +283,8 @@ class LocalTestingService:
                 target_quiesced = False
                 raise
             self._target_snapshot = capture_tester_settings(self.config)
+            if delete_old_reports:
+                _clear_report_contents(self.config)
             _atomic_write(
                 self.config.tester_config,
                 prepared.tester_config.read_text(encoding="utf-8"),
@@ -285,7 +296,9 @@ class LocalTestingService:
                 preserve_raw_artifacts=True,
             )
             self._target_owner = owner
-            return prepared.as_dict()
+            result = prepared.as_dict()
+            result["reports_cleared"] = delete_old_reports
+            return result
         except BaseException:
             if owner is not None:
                 self._target_owner = owner
@@ -342,3 +355,25 @@ def _atomic_write(path: Path, text: str) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _clear_report_contents(config: RunnerConfig) -> None:
+    """Empty only the validated report directory without following links."""
+    _, report_dir, _, _ = validate_runner_paths(config)
+    if not report_dir.is_dir() or report_dir.is_symlink():
+        raise PanelTestingError("tester report directory is not a regular directory")
+    entries = tuple(report_dir.iterdir())
+    unsafe = [
+        entry
+        for entry in entries
+        if entry.is_symlink()
+        or getattr(entry, "is_junction", lambda: False)()
+        or not (entry.is_file() or entry.is_dir())
+    ]
+    if unsafe:
+        raise PanelTestingError("tester report directory contains an unsupported entry")
+    for entry in entries:
+        if entry.is_dir():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()

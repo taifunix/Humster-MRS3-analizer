@@ -59,6 +59,7 @@ def test_static_shell_does_not_claim_unverified_artifacts() -> None:
 
 def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() -> None:
     html = _read("index.html")
+    js = _read("app.js")
 
     assert 'id="runner-local"' in html
     assert 'id="runner-remote"' in html
@@ -75,6 +76,12 @@ def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() ->
     assert 'name="user"' not in html
     assert "ssh" not in html.lower()
     assert 'id="remote-paths"' not in html
+    local = html.split('id="runner-local"', 1)[1].split('id="runner-remote"', 1)[0]
+    assert 'id="local-delete-old-reports"' in local
+    assert 'type="checkbox"' in local
+    assert 'id="local-fill"' in local
+    assert local.index('id="local-check"') < local.index('id="local-fill"') < local.index('id="local-start"')
+    assert "delete_old_reports: document.querySelector('#local-delete-old-reports')?.checked === true" in js
 
 
 def test_source_surfaces_and_strategies_screens_have_approved_workflow_cards() -> None:

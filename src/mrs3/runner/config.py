@@ -37,7 +37,23 @@ def _resolve_outside(path: Path, root: Path, label: str) -> Path:
     raise UnsafePathError(f"{label} must be outside bot_root: {resolved}")
 
 
+def _path_contains_link(path: Path, root: Path) -> bool:
+    """Detect a raw link or junction below bot_root before resolving it."""
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink() or getattr(current, "is_junction", lambda: False)():
+            return True
+    return False
+
+
 def validate_report_directory(path: Path, bot_root: Path) -> Path:
+    if _path_contains_link(path, bot_root):
+        raise UnsafePathError("report_dir must not contain links")
     resolved = _resolve_inside(path, bot_root, "report_dir")
     suffix = tuple(part.casefold() for part in resolved.parts[-3:])
     if suffix != ("tester", "report", "my_test"):
@@ -136,6 +152,8 @@ class RunnerConfig:
             candidate = Path(str(raw[key]))
             if not candidate.is_absolute():
                 candidate = bot_root / candidate
+            if key == "report_dir" and _path_contains_link(candidate, bot_root):
+                raise UnsafePathError("report_dir must not contain links")
             return _resolve_inside(candidate, bot_root, key)
 
         executable_path = bot_path("executable")

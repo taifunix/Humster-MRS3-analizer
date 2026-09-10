@@ -619,12 +619,16 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         body: JSON.stringify({
           symbols: value('#local-pair'), side: value('#local-side'),
           start: value('#local-start-date'), end: value('#local-end-date'),
+          delete_old_reports: document.querySelector('#local-delete-old-reports')?.checked === true,
         }),
       });
       const target = document.querySelector('#runner-local .card-status');
-      if (target) target.textContent = `config_tester.json заполнен: ${result.strategy_name}, ${result.symbols.join(', ')}.`;
+      if (target) target.textContent = result.reports_cleared
+        ? `Файлы подготовлены, старые отчеты удалены: ${result.strategy_name}, ${result.symbols.join(', ')}.`
+        : `Файлы подготовлены: ${result.strategy_name}, ${result.symbols.join(', ')}.`;
     } catch (_) {
-      if (status) status.textContent = 'Не удалось заполнить config_tester.json.';
+      const target = document.querySelector('#runner-local .card-status');
+      if (target) target.textContent = 'Не удалось подготовить файлы. Проверьте runner и настройки тестера.';
     }
   });
 
