@@ -678,6 +678,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         }
         const label = merge ? 'MERGE' : job.phase;
         sourceStatus(card, total ? `${label}: ${current} / ${total} (${percent}%)` : `${label}: подготовка...`);
+        if (job.state === 'FAILED') {
+          const failure = job.error?.message || 'Source DB operation failed.';
+          sourceStatus(card, `FAILED: ${failure}`);
+        }
         if (job.state === 'COMMITTED') {
           if (progressTrack) {
             progressTrack.classList.remove('is-running');

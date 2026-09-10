@@ -73,6 +73,7 @@ class LocalSourceDbService:
         *,
         cancellation_requested: Callable[[], bool] | None = None,
         fault_injector: Callable[[str], object] | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> object:
         pending = self._current(self._import, token, "import")
         preflight = pending.preflight
@@ -81,6 +82,8 @@ class LocalSourceDbService:
             kwargs["cancellation_requested"] = cancellation_requested
         if fault_injector is not None:
             kwargs["fault_injector"] = fault_injector
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
         return import_source_v6(
             preflight.root_path,
             preflight.database_path,

@@ -91,6 +91,27 @@ def test_import_preflight_is_redacted_and_execute_requires_latest_token(
     }]
 
 
+def test_import_execute_forwards_job_progress_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _import_preflight(tmp_path)
+    monkeypatch.setattr(source_db, "preflight_source_v6", lambda root, target: preflight)
+    calls: list[dict[str, object]] = []
+
+    def fake_import(root: Path, target: Path, **kwargs: object) -> object:
+        calls.append(kwargs)
+        return SimpleNamespace(status="COMMITTED", target_path=target)
+
+    monkeypatch.setattr(source_db, "import_source_v6", fake_import)
+    service = LocalSourceDbService()
+    service.preflight_import(tmp_path / "reports", tmp_path / "out" / "source.duckdb")
+    callback = lambda current, total: None
+
+    service.execute_import("import-token", progress_callback=callback)
+
+    assert calls[0]["progress_callback"] is callback
+
+
 def test_merge_preflight_is_redacted_and_execute_keeps_inputs_immutable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

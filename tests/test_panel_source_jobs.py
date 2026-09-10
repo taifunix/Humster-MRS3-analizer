@@ -149,7 +149,7 @@ def test_merge_progress_is_published_without_exposing_paths() -> None:
     assert "D:/private" not in json.dumps(committed)
 
 
-def test_merge_failure_redacts_input_paths() -> None:
+def test_merge_failure_redacts_input_paths_and_reports_safe_reason() -> None:
     service = FakeService()
     service.release["merge"].set()
     service.failure = RuntimeError("unresolved quarantine: D:/private/base.source-v6.duckdb")
@@ -158,11 +158,11 @@ def test_merge_failure_redacts_input_paths() -> None:
     started = runner.start_merge("merge-token", "target-a")
     failed = _wait_for(runner, started["job_id"], "FAILED")
 
-    assert failed["error"] == {"code": "FAILED"}
+    assert failed["error"] == {"code": "FAILED", "message": "local file access failed during merge"}
     assert "D:/private" not in json.dumps(failed)
 
 
-def test_failure_is_generic_and_does_not_leak_exception_details() -> None:
+def test_failure_redacts_exception_details_and_reports_safe_reason() -> None:
     service = FakeService()
     service.release["import"].set()
     service.failure = RuntimeError("secret D:/private/source.duckdb and traceback")
@@ -171,7 +171,7 @@ def test_failure_is_generic_and_does_not_leak_exception_details() -> None:
     started = runner.start_import("import-token", "target-a")
     failed = _wait_for(runner, started["job_id"], "FAILED")
 
-    assert failed["error"] == {"code": "FAILED"}
+    assert failed["error"] == {"code": "FAILED", "message": "local file access failed during import"}
     assert "secret" not in json.dumps(failed)
     assert "source.duckdb" not in json.dumps(failed)
 

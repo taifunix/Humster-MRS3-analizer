@@ -154,6 +154,13 @@ def test_local_source_target_derives_a_new_file_from_the_saved_directory() -> No
     assert "local_source_db_root: sourceTargetDirectory(inputValue('source-local-target'))" in js
 
 
+def test_source_job_failure_shows_its_safe_backend_message() -> None:
+    js = _read("app.js")
+
+    assert "job.error?.message || 'Source DB operation failed.'" in js
+    assert "sourceStatus(card, `FAILED: ${failure}`);" in js
+
+
 def test_merge_card_offers_catalog_choices_and_visible_progress() -> None:
     html = _read("index.html")
     js = _read("app.js")

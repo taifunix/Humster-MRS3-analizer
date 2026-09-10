@@ -8,6 +8,8 @@ from threading import Event, RLock, Thread
 from typing import Any
 from uuid import uuid4
 
+from .error_sanitization import has_local_path
+
 
 _TERMINAL = frozenset({"COMMITTED", "CANCELLED", "FAILED"})
 _COUNT_FIELDS = (
@@ -111,7 +113,7 @@ class LocalSourceDbJobRunner:
             result = executor(job.token, **kwargs)
         except BaseException as error:
             cancelled = job.cancel_event.is_set() or self._cancelled_error(error)
-            self._finish(job, "CANCELLED" if cancelled else "FAILED")
+            self._finish(job, "CANCELLED" if cancelled else "FAILED", error=error)
             return
 
         if job.cancel_event.is_set() or self._cancelled_result(result):
@@ -127,6 +129,7 @@ class LocalSourceDbJobRunner:
         state: str,
         counts: dict[str, int] | None = None,
         evidence: dict[str, object] | None = None,
+        error: BaseException | None = None,
     ) -> None:
         with self._lock:
             if job.state in _TERMINAL:
@@ -134,7 +137,7 @@ class LocalSourceDbJobRunner:
             job.state = state
             job.phase = state
             if state == "FAILED":
-                job.error = {"code": "FAILED"}
+                job.error = self._safe_failure(error, job.operation)
             elif state == "CANCELLED":
                 job.error = None
             elif counts:
@@ -231,6 +234,17 @@ class LocalSourceDbJobRunner:
             return "cancel" in str(error).casefold()
         except BaseException:
             return False
+
+    @staticmethod
+    def _safe_failure(error: BaseException | None, operation: str) -> dict[str, str]:
+        action = "merge" if operation == "local-merge" else "import"
+        if error is not None:
+            try:
+                if has_local_path(str(error)):
+                    return {"code": "FAILED", "message": f"local file access failed during {action}"}
+            except BaseException:
+                pass
+        return {"code": "FAILED", "message": f"Source DB {action} failed"}
 
     @classmethod
     def _safe_counts(cls, result: object) -> dict[str, int]:
