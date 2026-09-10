@@ -32,9 +32,10 @@ analysis of an existing surface and remain config-file-only.
 
 ## UI
 
-The `Settings > Analysis profile` card contains collapsible Russian-labeled
-groups in the order above. Repeatable values use editable rows with explicit
-units (percent, bp, events/month, processes). The card has only:
+The `Settings > Analysis profile` card is one main collapsible card with no
+nested accordions. Its form uses Russian-labeled sections and visual separators
+in the order above. Repeatable values use editable rows with explicit units
+(percent, bp, events/month, processes). The card has only:
 
 - **Reload**: discard unsaved browser edits and fetch the server's current
   profile; it never writes configuration.
