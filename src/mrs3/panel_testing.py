@@ -9,7 +9,8 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Callable
+import time
+from typing import Callable, Protocol
 
 from .locking import TesterTargetLock
 from .runner.config import RunnerConfig
@@ -21,11 +22,18 @@ from .runner.files import (
     validate_runner_paths,
 )
 from .runner.process import start_bot, stop_bot
+from .runner.http import TesterHttpClient
 from .runner.workflow import validate_runtime_preflight
 
 
 class PanelTestingError(ValueError):
     pass
+
+
+class TesterRunClient(Protocol):
+    def run_tester(self) -> None: ...
+    def tester_status(self) -> str: ...
+    def close(self) -> None: ...
 
 
 _SYMBOL = re.compile(r"^[A-Z0-9]{2,32}$")
@@ -161,12 +169,18 @@ class LocalTestingService:
         install_batch: Callable[..., object] = prepare_batch_files,
         start_bot: Callable[[RunnerConfig], object] = start_bot,
         stop_bot: Callable[[RunnerConfig], object] = stop_bot,
+        client_factory: Callable[[RunnerConfig], TesterRunClient] = lambda config: TesterHttpClient(
+            config.base_url, timeout=config.request_timeout_seconds
+        ),
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
         self.repo_root = repo_root.resolve()
         self._install_batch = install_batch
         self._start_bot = start_bot
         self._stop_bot = stop_bot
+        self._client_factory = client_factory
+        self._sleep = sleep
         self._target_owner: TesterTargetLock | None = None
         self._target_snapshot: TesterSettingsSnapshot | None = None
 
@@ -315,13 +329,31 @@ class LocalTestingService:
     def start(self) -> dict[str, str]:
         validate_runtime_preflight(self.config)
         owner = self._target_owner or TesterTargetLock(self.config.bot_root).acquire()
+        bot_started = False
+        client: TesterRunClient | None = None
         try:
             self._start_bot(self.config)
+            bot_started = True
+            self._sleep(self.config.request_timeout_seconds)
+            client = self._client_factory(self.config)
+            client.run_tester()
+            tester_status = _safe_tester_status(client.tester_status())
         except BaseException:
+            if bot_started:
+                try:
+                    self._stop_bot(self.config)
+                except BaseException:
+                    pass
             self._target_owner = owner
             raise
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
         self._target_owner = owner
-        return {"state": "STARTED"}
+        return {"state": "STARTED", "tester_status": tester_status}
 
     def stop(self) -> dict[str, str]:
         validate_runtime_preflight(self.config)
@@ -377,3 +409,11 @@ def _clear_report_contents(config: RunnerConfig) -> None:
             shutil.rmtree(entry)
         else:
             entry.unlink()
+
+
+def _safe_tester_status(value: str) -> str:
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", value)).strip().casefold()
+    for status in ("idle", "running", "starting", "stopping"):
+        if re.search(rf"\b{status}\b", text):
+            return status.upper()
+    return "UNKNOWN"

@@ -320,16 +320,140 @@ def test_local_testing_fill_replaces_all_root_strategy_json_with_exactly_one_ren
 def test_local_testing_start_and_stop_delegate_only_after_preflight(tmp_path: Path) -> None:
     config = _runner_config(tmp_path)
     calls: list[str] = []
+
+    class TesterClient:
+        def run_tester(self) -> None:
+            return None
+
+        def tester_status(self) -> str:
+            return "Running"
+
+        def close(self) -> None:
+            return None
+
     service = LocalTestingService(
         config,
         Path(__file__).parents[1],
         start_bot=lambda _config: calls.append("start") or object(),
         stop_bot=lambda _config: calls.append("stop") or object(),
+        client_factory=lambda _config: TesterClient(),
+        sleep=lambda _seconds: None,
     )
 
-    assert service.start() == {"state": "STARTED"}
+    assert service.start() == {"state": "STARTED", "tester_status": "RUNNING"}
     assert service.stop() == {"state": "STOPPED"}
     assert calls == ["start", "stop"]
+
+
+def test_local_testing_start_waits_then_uses_files_tab_run_endpoint(tmp_path: Path) -> None:
+    config = replace(_runner_config(tmp_path), request_timeout_seconds=10)
+    calls: list[object] = []
+
+    class TesterClient:
+        def run_tester(self) -> None:
+            calls.append("files-run")
+
+        def tester_status(self) -> str:
+            calls.append("status")
+            return "<span>Running</span>"
+
+        def close(self) -> None:
+            calls.append("close")
+
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        start_bot=lambda _config: calls.append("bot-start") or object(),
+        client_factory=lambda _config: TesterClient(),
+        sleep=lambda seconds: calls.append(("sleep", seconds)),
+    )
+
+    assert service.start() == {"state": "STARTED", "tester_status": "RUNNING"}
+    assert calls == ["bot-start", ("sleep", 10), "files-run", "status", "close"]
+
+
+def test_local_testing_start_stops_bot_when_files_tab_run_request_fails(tmp_path: Path) -> None:
+    config = replace(_runner_config(tmp_path), request_timeout_seconds=10)
+    calls: list[object] = []
+
+    class TesterClient:
+        def run_tester(self) -> None:
+            calls.append("files-run")
+            raise RuntimeError("run request failed")
+
+        def close(self) -> None:
+            calls.append("close")
+
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        start_bot=lambda _config: calls.append("bot-start") or object(),
+        stop_bot=lambda _config: calls.append("bot-stop") or object(),
+        client_factory=lambda _config: TesterClient(),
+        sleep=lambda seconds: calls.append(("sleep", seconds)),
+    )
+
+    with pytest.raises(RuntimeError, match="run request failed"):
+        service.start()
+
+    assert calls == ["bot-start", ("sleep", 10), "files-run", "bot-stop", "close"]
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+
+
+def test_local_testing_start_redacts_unknown_tester_status(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    class TesterClient:
+        def run_tester(self) -> None:
+            return None
+
+        def tester_status(self) -> str:
+            return "<span>D:\\private\\tester-token</span>"
+
+        def close(self) -> None:
+            calls.append("close")
+
+    service = LocalTestingService(
+        _runner_config(tmp_path),
+        Path(__file__).parents[1],
+        start_bot=lambda _config: object(),
+        client_factory=lambda _config: TesterClient(),
+        sleep=lambda _seconds: None,
+    )
+
+    result = service.start()
+
+    assert result == {"state": "STARTED", "tester_status": "UNKNOWN"}
+    assert "private" not in str(result)
+    assert calls == ["close"]
+
+
+def test_local_testing_start_ignores_client_close_error_after_files_tab_run(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    class TesterClient:
+        def run_tester(self) -> None:
+            return None
+
+        def tester_status(self) -> str:
+            return "Running"
+
+        def close(self) -> None:
+            calls.append("close")
+            raise RuntimeError("close failed")
+
+    config = _runner_config(tmp_path)
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        start_bot=lambda _config: object(),
+        client_factory=lambda _config: TesterClient(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert service.start() == {"state": "STARTED", "tester_status": "RUNNING"}
+    assert calls == ["close"]
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
 
 
 def test_local_testing_keeps_owner_when_process_state_is_unconfirmed(tmp_path: Path) -> None:

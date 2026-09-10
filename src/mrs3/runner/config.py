@@ -103,7 +103,7 @@ class RunnerConfig:
     tester_config: Path
     inbox_root: Path
     bot_args: tuple[str, ...] = ()
-    request_timeout_seconds: float = 15.0
+    request_timeout_seconds: float = 10.0
     startup_timeout_seconds: float = 60.0
     shutdown_timeout_seconds: float = 30.0
     poll_interval_seconds: float = 1.0
@@ -202,7 +202,7 @@ class RunnerConfig:
             wizard_result=wizard_result,
             wizard_progress=wizard_progress,
             bot_args=tuple(str(value) for value in raw.get("bot_args", ())),
-            request_timeout_seconds=_positive_float(raw, "request_timeout_seconds", 15.0),
+            request_timeout_seconds=_positive_float(raw, "request_timeout_seconds", 10.0),
             startup_timeout_seconds=_positive_float(raw, "startup_timeout_seconds", 60.0),
             shutdown_timeout_seconds=_positive_float(raw, "shutdown_timeout_seconds", 30.0),
             poll_interval_seconds=_positive_float(raw, "poll_interval_seconds", 1.0),

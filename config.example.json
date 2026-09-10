@@ -113,7 +113,7 @@
     "tester_config": "tester/tester_config.json",
     "inbox_root": "data/tester_inbox",
     "bot_args": [],
-    "request_timeout_seconds": 15,
+    "request_timeout_seconds": 10,
     "startup_timeout_seconds": 60,
     "shutdown_timeout_seconds": 30,
     "poll_interval_seconds": 1,

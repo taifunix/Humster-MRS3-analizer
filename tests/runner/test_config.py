@@ -80,6 +80,7 @@ def test_runner_config_resolves_paths_and_runtime_values(tmp_path: Path) -> None
     assert config.max_strategy_attempts == 4
     assert config.max_bot_restarts == 30
     assert config.submission_delay_seconds == pytest.approx(0.2)
+    assert config.request_timeout_seconds == pytest.approx(10)
     assert config.result_report_grace_seconds == pytest.approx(15)
 
 

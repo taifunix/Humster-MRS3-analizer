@@ -635,18 +635,20 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const localCheck = document.querySelector('#local-check');
   if (localCheck) localCheck.addEventListener('click', loadSafeDefaults);
   for (const [id, action, message] of [
-    ['#local-start', 'start', 'Локальный bot запущен.'],
+    ['#local-start', 'start', 'Локальный tester получил команду запуска.'],
     ['#local-stop', 'stop', 'Локальный bot остановлен.'],
   ]) {
     const button = document.querySelector(id);
     if (!button) continue;
     button.addEventListener('click', async () => {
       try {
-        await requestJson(`/api/v2/testing/local/${action}`, {
+        const result = await requestJson(`/api/v2/testing/local/${action}`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
         });
         const target = document.querySelector('#runner-local .card-status');
-        if (target) target.textContent = message;
+        if (target) target.textContent = action === 'start' && result.tester_status
+          ? `${message} Статус tester: ${result.tester_status}.`
+          : message;
       } catch (_) {
         if (status) status.textContent = `Не удалось выполнить: ${action}.`;
       }

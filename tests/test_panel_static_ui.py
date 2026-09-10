@@ -79,9 +79,12 @@ def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() ->
     local = html.split('id="runner-local"', 1)[1].split('id="runner-remote"', 1)[0]
     assert 'id="local-delete-old-reports"' in local
     assert 'type="checkbox"' in local
+    assert 'class="check"' in local
+    assert '<span>Удалить старые отчеты перед стартом</span>' in local
     assert 'id="local-fill"' in local
     assert local.index('id="local-check"') < local.index('id="local-fill"') < local.index('id="local-start"')
     assert "delete_old_reports: document.querySelector('#local-delete-old-reports')?.checked === true" in js
+    assert "result.tester_status" in js
 
 
 def test_source_surfaces_and_strategies_screens_have_approved_workflow_cards() -> None:

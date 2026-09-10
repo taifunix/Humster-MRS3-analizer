@@ -12,10 +12,13 @@ start` option. When selected, the service first validates and stages the
 request, acquires the tester lock, confirms the bot has stopped, then empties
 only the validated `tester/report/my_test` contents. It rejects links and
 unsupported report entries and retains the report directory itself. The Panel
-reports whether old reports were cleared. Start is unchanged; no tester HTTP or
-wizard endpoint is invoked.
+reports whether old reports were cleared. Start launches the local bot, waits
+the configurable 10-second default `request_timeout_seconds`, then calls
+the Files-tab `POST /htmx/tester/run` endpoint and displays its status. The
+per-strategy Table wizard remains excluded. If the Files request fails, the
+just-started bot is stopped while preparation ownership is retained for retry.
 
-Focused verification passes: `111 passed, 2 deselected` across the local
+Focused verification passes: `129 passed, 2 deselected` across the local
 runner and static UI slice. Python `compileall` and `git diff --check` pass.
 The two deselected static tests require unavailable `node`; they are unrelated
 to this slice.

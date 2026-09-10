@@ -13,6 +13,7 @@ def test_config_examples_union_runner_tuning_and_performance_capture_paths() -> 
         "max_strategy_attempts",
         "max_bot_restarts",
         "submission_delay_seconds",
+        "request_timeout_seconds",
         "result_report_grace_seconds",
         "tester_config",
         "inbox_root",
