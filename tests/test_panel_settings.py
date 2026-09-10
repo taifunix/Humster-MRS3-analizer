@@ -8,7 +8,7 @@ import threading
 
 import pytest
 
-from mrs3.panel import PanelController, create_panel_server
+from mrs3.panel import PanelController, PanelTestingError, create_panel_server
 
 
 def _runner_config() -> dict[str, object]:
@@ -694,6 +694,24 @@ def test_v2_local_testing_fill_rejects_unconfigured_runner(panel_http) -> None:
 
     assert status == 400
     assert body == {"error": "invalid settings"}
+
+
+def test_v2_local_testing_fill_reports_already_prepared_files(panel_http, monkeypatch) -> None:
+    _, _, connection = panel_http
+
+    def already_prepared(self, payload):
+        del self, payload
+        raise PanelTestingError("TESTER_FILES_PREPARED")
+
+    monkeypatch.setattr(PanelController, "local_testing_fill", already_prepared)
+
+    status, body = _request(
+        connection, "POST", "/api/v2/testing/local/fill",
+        {"symbols": "CXUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06"},
+    )
+
+    assert status == 409
+    assert body == {"error": "TESTER_FILES_PREPARED"}
 
 
 def test_static_settings_markup_remains_semantic_with_portfolio_screen() -> None:

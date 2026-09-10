@@ -121,6 +121,8 @@ def test_settings_semantic_ids_and_static_js_use_v2_testing_endpoints() -> None:
     assert "requestJson('/api/v2/testing/local/status')" in js
     assert "requestJson('/api/v2/testing/remote/status')" in js
     assert "requestJson('/api/v2/testing/local/fill'" in js
+    assert "error.code === 'TESTER_FILES_PREPARED'" in js
+    assert "Файлы уже подготовлены. Если что-то изменилось, сначала нажмите Стоп." in js
     assert '`/api/v2/testing/local/${action}`' in js
     assert "/api/ui/" not in js
     assert "duckdb-direct" not in js

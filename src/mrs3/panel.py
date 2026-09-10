@@ -164,7 +164,7 @@ from .panel_settings import (
 from .analysis_profile import load_analysis_profile, save_analysis_profile
 from .panel_jobs import PanelJobError, PanelJobRegistry
 from .panel_portfolio import PortfolioPanelError, PortfolioPanelService
-from .locking import TesterTargetLock
+from .locking import TesterTargetBusyError, TesterTargetLock
 from .panel_remote_testing import RemoteTestingService, remote_testing_status
 from .panel_remote_source_db import RemoteSourceDbExecutor, RemoteSourceDbError
 from .panel_source_db import LocalSourceDbService
@@ -1991,6 +1991,12 @@ class PanelController:
             )
             self._local_testing_filled = True
             return result
+        except PanelTestingError as error:
+            if "tester target is already owned" in str(error):
+                raise PanelTestingError("TESTER_FILES_PREPARED") from None
+            raise PanelTestingError("invalid testing request") from None
+        except TesterTargetBusyError:
+            raise PanelTestingError("TESTER_FILES_PREPARED") from None
         except Exception:
             raise PanelTestingError("invalid testing request") from None
 
@@ -7796,6 +7802,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except FinalistRetestError as error:
             status = 400 if error.code in {"INVALID_REQUEST", "INVALID_TEST_RANGE"} else 409
             self._json(status, {"error": {"code": error.code, "message": str(error)}})
+            return
+        except PanelTestingError as error:
+            if endpoint == "/api/v2/testing/local/fill" and str(error) == "TESTER_FILES_PREPARED":
+                self._json(409, {"error": "TESTER_FILES_PREPARED"})
+            else:
+                self._json(400, {"error": "invalid settings"})
             return
         except PerformanceV2ApiError as error:
             self._json(error.status, {"error": {"code": error.code, "message": str(error)}})

@@ -59,6 +59,11 @@ rendered `config_tester.json`; it preserves existing reports. Start and stop
 are separate explicit actions. The browser receives only the selected side,
 symbols and strategy name, never local absolute paths.
 
+If the local tester target is already owned by a live preparation, the fill
+endpoint returns `409 TESTER_FILES_PREPARED`. The panel says that files are
+already prepared and directs the operator to use **Stop** before changing the
+request; it never exposes a PID, lock record, or local path.
+
 The remote profile lives only in ignored `config.local.json` under
 `remote_runner`. It contains connection material plus canonical remote roots;
 the Source DB card may display and submit the operator-selected remote HTML

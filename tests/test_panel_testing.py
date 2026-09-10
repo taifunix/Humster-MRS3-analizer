@@ -13,7 +13,7 @@ from mrs3.panel_testing import (
     render_tester_config,
 )
 from mrs3.locking import TesterTargetBusyError, TesterTargetLock
-from mrs3.panel import PanelController
+from mrs3.panel import PanelController, PanelTestingError
 from mrs3.runner.config import RunnerConfig
 
 
@@ -545,6 +545,43 @@ def test_panel_controller_fills_one_local_strategy_and_tester_config(tmp_path: P
     assert str(config.bot_root) not in json.dumps(prepared)
     assert config.tester_config.is_file()
     assert tuple(config.strategy_dir.glob("*.json"))
+
+
+def test_panel_controller_reports_when_local_tester_files_are_already_prepared(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    document = {"tester_runner": {
+        "bot_root": str(config.bot_root), "executable": "hb_c.exe", "base_url": config.base_url, "port": config.port,
+        "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test", "wizard_result": "tester/wizard_result.json",
+        "wizard_progress": "tester/wizard_progress.json", "tester_config": "tester/tester_config.json", "inbox_root": str(config.inbox_root),
+    }}
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+    controller = PanelController(tmp_path, config_path)
+    request = {"symbols": "CXUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06"}
+
+    controller.local_testing_fill(request)
+
+    with pytest.raises(PanelTestingError, match="TESTER_FILES_PREPARED"):
+        controller.local_testing_fill(request)
+
+
+def test_panel_controller_reports_when_another_local_tester_owner_holds_the_lock(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    document = {"tester_runner": {
+        "bot_root": str(config.bot_root), "executable": "hb_c.exe", "base_url": config.base_url, "port": config.port,
+        "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test", "wizard_result": "tester/wizard_result.json",
+        "wizard_progress": "tester/wizard_progress.json", "tester_config": "tester/tester_config.json", "inbox_root": str(config.inbox_root),
+    }}
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+    external_owner = TesterTargetLock(config.bot_root).acquire()
+    request = {"symbols": "CXUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06"}
+
+    try:
+        with pytest.raises(PanelTestingError, match="TESTER_FILES_PREPARED"):
+            PanelController(tmp_path, config_path).local_testing_fill(request)
+    finally:
+        external_owner.release()
 
 
 def test_panel_controller_rejects_non_boolean_report_cleanup_request(tmp_path: Path) -> None:

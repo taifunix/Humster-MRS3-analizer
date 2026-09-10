@@ -626,9 +626,11 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       if (target) target.textContent = result.reports_cleared
         ? `Файлы подготовлены, старые отчеты удалены: ${result.strategy_name}, ${result.symbols.join(', ')}.`
         : `Файлы подготовлены: ${result.strategy_name}, ${result.symbols.join(', ')}.`;
-    } catch (_) {
+    } catch (error) {
       const target = document.querySelector('#runner-local .card-status');
-      if (target) target.textContent = 'Не удалось подготовить файлы. Проверьте runner и настройки тестера.';
+      if (target) target.textContent = error.code === 'TESTER_FILES_PREPARED'
+        ? 'Файлы уже подготовлены. Если что-то изменилось, сначала нажмите Стоп.'
+        : 'Не удалось подготовить файлы. Проверьте runner и настройки тестера.';
     }
   });
 

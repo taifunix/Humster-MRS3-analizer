@@ -1,6 +1,6 @@
 {
   "name": "AAOIUSDT",
-  "is_runing": true,
+  "is_runing": false,
   "description": "",
   "tg_notification": {
     "id_chat": 0,

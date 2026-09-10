@@ -23,6 +23,11 @@ runner and static UI slice. Python `compileall` and `git diff --check` pass.
 The two deselected static tests require unavailable `node`; they are unrelated
 to this slice.
 
+When files are already prepared, including ownership retained by another live
+Panel instance, local fill returns the safe `TESTER_FILES_PREPARED` code. The
+browser tells the operator to press Stop before changing the request; lock
+records, PIDs, and local paths remain undisclosed.
+
 ## Portfolio Optimizer PRETEST_PROXY Stage 1 (2026-09-10)
 
 Implementation slice is present in the read-only finalist input, common UTC
