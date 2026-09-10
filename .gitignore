@@ -17,9 +17,8 @@ portfolio_optimizer.local.json
 data/
 output/
 [Dd]ata/
-[Ii]nput/
+[Ii]nput/*
 [Oo]utput/
-!input/
 !input/README.md
 results/
 audit_csv/

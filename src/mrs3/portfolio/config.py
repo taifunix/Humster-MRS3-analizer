@@ -18,6 +18,12 @@ LEGACY_SCHEMA_VERSION = 1
 POLICY_VERSION = "portfolio_optimizer_research_risk_v1"
 ALGORITHM_VERSIONS = MappingProxyType(
     {
+        "sizing": "portfolio_optimizer_sizing_v2",
+        "ranking": "portfolio_optimizer_ranking_v2",
+    }
+)
+LEGACY_ALGORITHM_VERSIONS = MappingProxyType(
+    {
         "sizing": "portfolio_optimizer_sizing_v1",
         "ranking": "portfolio_optimizer_ranking_v1",
     }
@@ -52,6 +58,14 @@ RANKING_METRICS = MappingProxyType(
     }
 )
 RANKING_ID = "portfolio_preliminary_ranking_v1"
+COMPOSITION_PARAMETER_DEFAULTS = MappingProxyType(
+    {
+        "minimum_common_days": 14,
+        "minimum_daily_coverage_pct": 90,
+        "maximum_forward_fill_gap_days": 3,
+    }
+)
+_LEGACY_COMPOSITION_PARAMETERS = "legacy_parameters"
 LIQUIDITY_DEFAULTS = MappingProxyType(
     {
         "close_volume_participation_pct": 30,
@@ -154,6 +168,14 @@ def _freeze(value: Any) -> Any:
     return value
 
 
+def _plain_copy(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _plain_copy(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_copy(item) for item in value]
+    return value
+
+
 def _object(value: Any, path: str, required: tuple[str, ...], optional: tuple[str, ...] = ()) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise PortfolioConfigError(f"{path} must be an object")
@@ -245,6 +267,31 @@ def _descriptor(value: Any, path: str, allowed_ids: frozenset[str] | None = None
     if set(parameters) & {"override", "per_run_override", "interpolation", "blend"}:
         raise PortfolioConfigError(f"{path}.parameters contains a forbidden override")
     return _freeze({"policy_id": policy_id, "parameters": parameters})
+
+
+def resolve_composition_parameters(value: Any, path: str = "search.composition") -> Mapping[str, Any]:
+    """Resolve the optional common-period parameters without writing the source document."""
+    descriptor = _descriptor(value, path)
+    parameters = dict(descriptor["parameters"])
+    legacy = parameters.pop(_LEGACY_COMPOSITION_PARAMETERS, None)
+    if legacy is not None and not isinstance(legacy, Mapping):
+        raise PortfolioConfigError(f"{path}.parameters.legacy_parameters must be an object")
+    unknown = sorted(set(parameters) - set(COMPOSITION_PARAMETER_DEFAULTS) - {"operator_supplied"})
+    if unknown:
+        raise PortfolioConfigError(f"{path}.parameters has unknown field(s): {', '.join(unknown)}")
+    for key, default in COMPOSITION_PARAMETER_DEFAULTS.items():
+        parameters.setdefault(key, default)
+    days = _integer(parameters["minimum_common_days"], f"{path}.parameters.minimum_common_days", positive=True)
+    coverage = _integer(parameters["minimum_daily_coverage_pct"], f"{path}.parameters.minimum_daily_coverage_pct")
+    gap = _integer(parameters["maximum_forward_fill_gap_days"], f"{path}.parameters.maximum_forward_fill_gap_days", nonnegative=True)
+    if not 1 <= coverage <= 100:
+        raise PortfolioConfigError(f"{path}.parameters.minimum_daily_coverage_pct must be between 1 and 100")
+    if gap < 0:
+        raise PortfolioConfigError(f"{path}.parameters.maximum_forward_fill_gap_days must be non-negative")
+    parameters.update({"minimum_common_days": days, "minimum_daily_coverage_pct": coverage, "maximum_forward_fill_gap_days": gap})
+    if legacy is not None:
+        parameters[_LEGACY_COMPOSITION_PARAMETERS] = _plain_copy(legacy)
+    return _freeze({"policy_id": descriptor["policy_id"], "parameters": parameters})
 
 
 def _parse_scenario(value: Any, name: str) -> Scenario:
@@ -355,7 +402,8 @@ def _parse_liquidity(value: Any) -> Mapping[str, Any]:
 
 def _parse_groups(raw: dict[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
     search_raw = _object(raw["search"], "search", ("universe", "composition", "sizing", "limiter", "priority", "seed", "rounds", "total_test_budget", "sizing_mode", "max_enumerated_combinations"))
-    search = {key: _descriptor(search_raw[key], f"search.{key}") for key in ("universe", "composition", "sizing", "limiter", "priority")}
+    search = {key: _descriptor(search_raw[key], f"search.{key}") for key in ("universe", "sizing", "limiter", "priority")}
+    search["composition"] = resolve_composition_parameters(search_raw["composition"])
     search.update({key: _integer(search_raw[key], f"search.{key}", positive=True if key != "seed" else False, nonnegative=key == "seed") for key in ("seed", "rounds", "total_test_budget")})
     if search_raw["sizing_mode"] != SIZING_MODE:
         raise PortfolioConfigError("search.sizing_mode is unsupported")
@@ -396,11 +444,28 @@ def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict
     if not isinstance(document, Mapping):
         raise PortfolioConfigError("config must be an object")
     if document.get("schema_version") == SCHEMA_VERSION:
-        return deepcopy(dict(document)), False
+        active = deepcopy(dict(document))
+        # Existing schema-v2 files may carry the pre-bump versions. Resolve
+        # them in the active document so Settings and frozen Campaigns expose
+        # the algorithms that actually execute. The source bytes and digest
+        # remain unchanged until an explicit save.
+        if active.get("algorithm_versions") == dict(LEGACY_ALGORITHM_VERSIONS):
+            active["algorithm_versions"] = dict(ALGORITHM_VERSIONS)
+        search = active.get("search") if isinstance(active.get("search"), dict) else {}
+        composition = search.get("composition") if isinstance(search.get("composition"), dict) else None
+        if composition is not None:
+            parameters = composition.get("parameters") if isinstance(composition.get("parameters"), dict) else {}
+            for key, default in COMPOSITION_PARAMETER_DEFAULTS.items():
+                parameters.setdefault(key, default)
+            composition["parameters"] = parameters
+            search["composition"] = composition
+            active["search"] = search
+        return active, False
     if document.get("schema_version") != LEGACY_SCHEMA_VERSION:
         return deepcopy(dict(document)), False
     migrated = deepcopy(dict(document))
     migrated["schema_version"] = SCHEMA_VERSION
+    migrated["algorithm_versions"] = dict(ALGORITHM_VERSIONS)
     runner = migrated.get("runner") if isinstance(migrated.get("runner"), dict) else {}
     inputs = migrated.get("inputs") if isinstance(migrated.get("inputs"), dict) else {}
     inputs.setdefault("bybit_minute_data_root", f"{runner.get('root', '.')}/tester/data/bybit")
@@ -408,6 +473,25 @@ def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict
     search = migrated.get("search") if isinstance(migrated.get("search"), dict) else {}
     search.setdefault("sizing_mode", SIZING_MODE)
     search.setdefault("max_enumerated_combinations", 100000)
+    composition = search.get("composition") if isinstance(search.get("composition"), dict) else None
+    if composition is not None:
+        parameters = composition.get("parameters") if isinstance(composition.get("parameters"), dict) else {}
+        # v1 descriptors accepted opaque operator parameters. Preserve them in
+        # an explicit compatibility namespace; v2 fields remain strict.
+        unknown = {
+            key: value for key, value in parameters.items()
+            if key not in COMPOSITION_PARAMETER_DEFAULTS and key != "operator_supplied"
+        }
+        parameters = {
+            key: value for key, value in parameters.items()
+            if key in COMPOSITION_PARAMETER_DEFAULTS or key == "operator_supplied"
+        }
+        if unknown:
+            parameters[_LEGACY_COMPOSITION_PARAMETERS] = unknown
+        for key, default in COMPOSITION_PARAMETER_DEFAULTS.items():
+            parameters.setdefault(key, default)
+        composition["parameters"] = parameters
+        search["composition"] = composition
     migrated["search"] = search
     liquidity = migrated.get("liquidity") if isinstance(migrated.get("liquidity"), dict) else {}
     parameters = liquidity.get("parameters") if isinstance(liquidity.get("parameters"), dict) else {}
@@ -456,7 +540,12 @@ def load_portfolio_config(path: str | Path = "portfolio_optimizer.local.json") -
     if top["policy_version"] != POLICY_VERSION:
         raise PortfolioConfigError("policy_version is unsupported")
     algorithm_versions = _object(top["algorithm_versions"], "algorithm_versions", tuple(ALGORITHM_VERSIONS))
-    if algorithm_versions != dict(ALGORITHM_VERSIONS):
+    if algorithm_versions == dict(LEGACY_ALGORITHM_VERSIONS):
+        # Existing schema-v2 files predate the version bump.  Normalize only
+        # this in-memory copy; source bytes remain unchanged until an explicit
+        # Settings save.
+        algorithm_versions = dict(ALGORITHM_VERSIONS)
+    elif algorithm_versions != dict(ALGORITHM_VERSIONS):
         raise PortfolioConfigError("algorithm_versions are unsupported")
     scenarios_raw = top["scenarios"]
     if not isinstance(scenarios_raw, dict) or not scenarios_raw:

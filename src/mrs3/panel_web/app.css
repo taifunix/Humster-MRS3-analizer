@@ -69,6 +69,10 @@ h2 { font-size: 1.05rem; }
 .card-body { display: grid; gap: 14px; padding: 19px 21px 21px; }
 .field-group { display: grid; gap: 6px; min-width: 0; }
 .field-group label { color: var(--ink); font-size: .75rem; font-weight: 750; }
+/* Stage 1 PRETEST_PROXY ignores these compatibility fields; keep them in the
+   document for frozen config round trips while removing them from the editor. */
+.portfolio-settings-profile .field-group:has(input[id$="-individual-max-dd-pct"]),
+.portfolio-settings-profile .field-group:has(input[id$="-top-n"]) { display: none; }
 input, select { width: 100%; min-height: 39px; padding: 8px 10px; border: 1px solid #cbd7e4; border-radius: 7px; color: var(--ink); background: #fbfcfe; }
 input:hover, select:hover { border-color: #99adca; }
 .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }

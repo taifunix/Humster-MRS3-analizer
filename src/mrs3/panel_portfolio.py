@@ -34,6 +34,7 @@ from .portfolio.config import (
     load_portfolio_config,
     migrate_portfolio_config_document,
 )
+from .config import load_duckdb_import_settings
 from .portfolio.input import apply_finalist_cutoff, read_current_finalists
 
 
@@ -65,6 +66,10 @@ PORTFOLIO_HEADERS = (
     "Scheduling Score (Individual/Margin; Not Portfolio PnL)", "Member Count", "Pair Count", "Limiter",
     "Maximum Individual DD %", "Minimum Free Margin Reserve %", "Maximum Account MM Load %", "Gate Result",
     "Blocking Reasons", "User Decision", "User Test Priority", "User Comment",
+    "Search Mode", "Evaluations", "Pretest PnL USDT", "Pretest DD USDT", "Pretest DD %",
+    "Pretest Recovery", "Pretest Reserve USDT", "Pretest Reserve %", "Sizing k",
+    "Tested Size USDT", "Actual Size USDT", "Capacity Basis", "Pretest Period", "Refinement",
+    "Sizing k1", "Corrective Reduction Applied", "Daily PRETEST Rank", "Final PRETEST Rank",
 )
 MEMBER_HEADERS = (
     "Campaign ID", "Candidate ID", "Profile", "Member Ordinal", "Strategy ID", "Result ID", "Pair",
@@ -79,6 +84,10 @@ EXCLUDED_HEADERS = (
     "Portfolio Reason", "Message",
 )
 METADATA_HEADERS = ("Key", "Value")
+PROFILE_STATUS_HEADERS = (
+    "Campaign ID", "Profile", "Status", "Max Candidates", "Evaluations", "Evaluation Budget",
+    "Pretest Period", "Coverage %", "Blockers", "Metric Basis", "Joint Metrics",
+)
 
 
 class PortfolioPanelError(ValueError):
@@ -184,6 +193,20 @@ def _safe_cell(value: Any, *, key: str = "") -> Any:
             return "'" + text
         return text
     return _redact_text(value)
+
+
+def _portfolio_search_workers(root: Path) -> int:
+    """Read the existing importer width; it is scheduling-only campaign input."""
+    path = root / "config.local.json"
+    if not path.is_file():
+        return 16
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    section = raw.get("duckdb_import") if isinstance(raw, Mapping) else None
+    if section is None:
+        return 16
+    if isinstance(section, Mapping) and "workers" not in section:
+        return 16
+    return load_duckdb_import_settings(path).workers
 
 
 class PortfolioPanelService:
@@ -409,7 +432,9 @@ class PortfolioPanelService:
                     with duckdb.connect(str(database), read_only=True) as connection:
                         pair_rows = connection.execute("select distinct symbol, side from selection_runs order by symbol, side").fetchall()
                     pair_keys = tuple((str(symbol), str(side).upper()) for symbol, side in pair_rows if str(side).upper() in {"LONG", "SHORT"})
-                    rows = _invoke(self.finalists_reader, database, pair_keys)
+                    # Readiness only needs current finalist metadata.  Keep
+                    # large action/equity series out of this hot path.
+                    rows = _invoke(self.finalists_reader, database, pair_keys, False)
                     for row in rows:
                         pair = f"{row.get('symbol')}|{row.get('side')}"
                         finalists[pair] = finalists.get(pair, 0) + 1
@@ -440,8 +465,18 @@ class PortfolioPanelService:
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
         pairs = tuple((pair["pair"], side) for pair in launch["pairs"] for side in ("LONG", "SHORT"))
         try:
-            loaded = _invoke(self.finalists_reader, database, pairs)
-            finalists = tuple(_plain(dict(row)) for row in (loaded or ()) if isinstance(row, Mapping))
+            # Campaign snapshots need the bulk series for PRETEST_PROXY.
+            loaded = _invoke(self.finalists_reader, database, pairs, True)
+            finalists_list = []
+            for row in (loaded or ()):
+                if not isinstance(row, Mapping):
+                    continue
+                item = _plain(dict(row))
+                for field in ("actions", "action_series", "minute_actions"):
+                    item.pop(field, None)
+                item.pop("equity_series", None)
+                finalists_list.append(item)
+            finalists = tuple(finalists_list)
             json.dumps(finalists, ensure_ascii=False, sort_keys=True, allow_nan=False)
         except PortfolioPanelError:
             raise
@@ -454,7 +489,7 @@ class PortfolioPanelService:
         from .portfolio.adapter import run_portfolio_adapter
 
         try:
-            result = run_portfolio_adapter(selected, campaign, workspace_root=self.root)
+            result = run_portfolio_adapter(selected, campaign, workspace_root=self.root, workers=_portfolio_search_workers(self.root))
         except Exception as error:
             raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "portfolio adapter failed", status=500) from error
         return {
@@ -462,6 +497,7 @@ class PortfolioPanelService:
             "blockers": list(result.blockers),
             "excluded": result.excluded,
             "warnings": result.warnings,
+            "status": getattr(result, "status", "PASS"),
         }
 
     @staticmethod
@@ -680,7 +716,7 @@ class PortfolioPanelService:
                     frozen_raw = self._encode_document(document)
             except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
                 raise PortfolioPanelError("CONFIG_INVALID", "portfolio settings are invalid", status=422) from None
-            campaign = {"campaign_id": campaign_id, "created_at_utc": _now(), "input_digest": input_digest, "config_digest": config_digest, "frozen_config_digest": _digest(frozen_raw), "config_bytes": base64.b64encode(frozen_raw).decode("ascii"), "config_document": _plain(document), "launch": _plain(launch), "finalists": finalists, "versions": {"schema_version": SCHEMA_VERSION, "policy_version": POLICY_VERSION, "algorithm_versions": _plain(document.get("algorithm_versions", {}))}}
+            campaign = {"campaign_id": campaign_id, "created_at_utc": _now(), "input_digest": input_digest, "config_digest": config_digest, "frozen_config_digest": _digest(frozen_raw), "config_bytes": base64.b64encode(frozen_raw).decode("ascii"), "config_document": _plain(document), "launch": _plain(launch), "finalists": finalists, "stage1_mode": "PRETEST_PROXY", "versions": {"schema_version": SCHEMA_VERSION, "policy_version": POLICY_VERSION, "algorithm_versions": _plain(document.get("algorithm_versions", {}))}}
             saved = None
             submission_key = f"portfolio:{campaign_id}"
 
@@ -833,7 +869,8 @@ class PortfolioPanelService:
 
         workbook = load_workbook(path, data_only=False)
         try:
-            if workbook.sheetnames != ["Summary", "Finalists", "Portfolios", "Members", "Excluded", "Metadata"]:
+            expected = ["Summary", "Finalists", "Portfolios", "Members", "Excluded", "Metadata"]
+            if workbook.sheetnames not in (expected, [*expected[:-1], "Metadata", "Profile Status"]):
                 raise ValueError("workbook sheets are invalid")
             if getattr(workbook, "_external_links", ()):
                 raise ValueError("workbook external links are not allowed")
@@ -880,6 +917,7 @@ class PortfolioPanelService:
             optimizer_excluded: tuple[dict[str, Any], ...] = ()
             optimizer_blockers: list[str] = []
             optimizer_warnings: list[str] = []
+            optimizer_status = "PASS"
             for index, stage in enumerate(STAGES):
                 if self._cancelled(job_id):
                     self._cancel_finish(job_id, published, previous)
@@ -921,6 +959,7 @@ class PortfolioPanelService:
                         generated_excluded = generated.get("excluded", ())
                         optimizer_excluded = tuple(dict(item) for item in generated_excluded if isinstance(item, Mapping))
                         optimizer_warnings = [str(item) for item in generated.get("warnings", ()) if isinstance(item, str)]
+                        optimizer_status = str(generated.get("status", "PASS"))
                     else:
                         variants = tuple(generated or ())
                     if not variants and not optimizer_blockers:
@@ -966,9 +1005,9 @@ class PortfolioPanelService:
                         built = _invoke(self.workbook_builder, workbook, campaign, finalists, selected, variants, excluded)
                         workbook = Path(built) if built is not None else workbook
                     else:
-                        self._write_workbook(workbook, campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=optimizer_blockers, warnings=optimizer_warnings)
+                        self._write_workbook(workbook, campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=optimizer_blockers, warnings=optimizer_warnings, optimizer_status=optimizer_status)
                     self._staging_path(workbook, campaign["campaign_id"])
-                    summary = self._summary(campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=optimizer_blockers, warnings=optimizer_warnings)
+                    summary = self._summary(campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=optimizer_blockers, warnings=optimizer_warnings, optimizer_status=optimizer_status)
                     runtime_values = {"staged_workbook_path": str(workbook), "final_workbook_path": str(final_workbook), "summary": summary, "counters": {"finalists_read": len(finalists), "candidates_selected": len(selected), "variants_created": len(variants)}}
                     self._sync_runtime(job_id, **runtime_values)
                 elif stage == "PUBLISH_RESULTS":
@@ -1049,7 +1088,7 @@ class PortfolioPanelService:
             self._threads.pop(job_id, None)
 
     @staticmethod
-    def _summary(campaign: Mapping[str, Any], finalists: Sequence[Mapping[str, Any]], selected: Sequence[Mapping[str, Any]], variants: Sequence[Any], excluded: Sequence[Mapping[str, Any]], *, optimizer_excluded: Sequence[Mapping[str, Any]] = (), blockers: Sequence[str] = (), warnings: Sequence[str] = ()) -> dict[str, Any]:
+    def _summary(campaign: Mapping[str, Any], finalists: Sequence[Mapping[str, Any]], selected: Sequence[Mapping[str, Any]], variants: Sequence[Any], excluded: Sequence[Mapping[str, Any]], *, optimizer_excluded: Sequence[Mapping[str, Any]] = (), blockers: Sequence[str] = (), warnings: Sequence[str] = (), optimizer_status: str | None = None) -> dict[str, Any]:
         blockers = list(dict.fromkeys(str(item) for item in blockers if item))
         warnings = list(dict.fromkeys(str(item) for item in warnings if item))
         finalist_reasons: dict[str, int] = {}
@@ -1069,7 +1108,9 @@ class PortfolioPanelService:
             for profile in campaign.get("launch", {}).get("profiles", ())
             if isinstance(profile, Mapping)
         }
+        status = optimizer_status or ("PASS" if variants and not blockers else ("PARTIAL" if variants else "FAIL"))
         return {
+            "optimizer_status": status,
             "finalists_read": len(finalists),
             "candidates_selected": len(selected),
             "variants_created": len(variants),
@@ -1115,7 +1156,7 @@ class PortfolioPanelService:
             kept.append(variant)
         return tuple(kept), tuple(excluded), tuple(dict.fromkeys(blockers))
 
-    def _write_workbook(self, path: Path, campaign: Mapping[str, Any], finalists: Sequence[Mapping[str, Any]], selected: Sequence[Mapping[str, Any]], variants: Sequence[Any], excluded: Sequence[Mapping[str, Any]], *, optimizer_excluded: Sequence[Mapping[str, Any]] = (), blockers: Sequence[str] = (), warnings: Sequence[str] = ()) -> Path:
+    def _write_workbook(self, path: Path, campaign: Mapping[str, Any], finalists: Sequence[Mapping[str, Any]], selected: Sequence[Mapping[str, Any]], variants: Sequence[Any], excluded: Sequence[Mapping[str, Any]], *, optimizer_excluded: Sequence[Mapping[str, Any]] = (), blockers: Sequence[str] = (), warnings: Sequence[str] = (), optimizer_status: str | None = None) -> Path:
         def val(item: Any, *keys: str, default: Any = None) -> Any:
             for key in keys:
                 found = _get(item, key, None)
@@ -1153,7 +1194,9 @@ class PortfolioPanelService:
                     if symbol is not None:
                         symbols.add(str(symbol))
                 pair_count = len(symbols) if symbols else None
-            portfolio_rows.append([campaign["campaign_id"], candidate_id, profile, index + 1, val(variant, "scheduling_key_id", default=val(val(variant, "scheduling_key", default={}), "identity")), val(variant, "scheduling_score", "score"), member_count, pair_count, val(variant, "limiter"), val(variant, "maximum_individual_dd_pct"), val(variant, "minimum_free_margin_reserve_pct"), val(variant, "maximum_account_mm_load_pct"), val(variant, "gate", "gate_result", default="UNKNOWN"), val(variant, "blocking_reasons", "reasons", default=""), "", None, ""])
+            metrics = val(variant, "metrics", default={})
+            period = val(variant, "pretest_period", default={})
+            portfolio_rows.append([campaign["campaign_id"], candidate_id, profile, val(variant, "final_pretest_rank", default=index + 1), val(variant, "scheduling_key_id", default=val(val(variant, "scheduling_key", default={}), "identity")), val(variant, "scheduling_score", "score"), member_count, pair_count, val(variant, "limiter"), val(variant, "maximum_individual_dd_pct"), val(variant, "minimum_free_margin_reserve_pct"), val(variant, "maximum_account_mm_load_pct"), val(variant, "gate", "gate_result", default="UNKNOWN"), val(variant, "blocking_reasons", "reasons", default=""), "", None, "", val(variant, "search_mode", default=val(metrics, "metric_basis")), val(variant, "evaluations", default="UNKNOWN"), val(metrics, "proxy_pnl_usdt", default=val(metrics, "proxy_end_pnl_usdt")), val(metrics, "proxy_max_drawdown_usdt"), val(metrics, "proxy_max_drawdown_pct"), val(metrics, "proxy_recovery_factor"), val(metrics, "proxy_reserve_usdt"), val(metrics, "proxy_reserve_pct"), val(metrics, "k"), val(metrics, "tested_size_usdt"), val(metrics, "actual_size_usdt"), val(metrics, "tested_size_basis", default=val(metrics, "sizing_basis")), f"{val(period, 'start_utc')}..{val(period, 'end_utc')}" if val(period, 'start_utc') and val(period, 'end_utc') else "UNKNOWN", val(variant, "refinement", default=val(metrics, "refinement", default="DAILY")), val(metrics, "k1"), val(metrics, "corrective_reduction_applied", default=False), val(variant, "daily_pretest_rank"), val(variant, "final_pretest_rank")])
             if isinstance(directions, Mapping) and directions:
                 for ordinal, (direction, details) in enumerate(directions.items(), 1):
                     member_rows.append([campaign["campaign_id"], candidate_id, profile, ordinal, val(details, "strategy_id", "strategyId"), val(details, "result_id", "resultId"), val(details, "symbol", "pair", default=val(variant, "symbol")), direction, val(details, "user_rank"), val(details, "scalar", "scalar_pct"), val(details, "quantity", "rounded_quantity"), val(details, "leverage"), val(details, "notional_usdt"), val(details, "estimated_individual_dd_usdt"), val(details, "estimated_individual_dd_pct"), val(details, "liquidity_scalar_ceiling_pct"), val(details, "calculated_initial_margin_usdt"), val(details, "gate", "gate_result", default="UNKNOWN"), val(details, "reasons", default=""), *([None] * 12)])
@@ -1161,14 +1204,39 @@ class PortfolioPanelService:
                 for ordinal, details in enumerate(members, 1):
                     calendar = val(details, "calendar_7d", default={})
                     weekday = val(details, "weekday_5d", default={})
-                    member_rows.append([campaign["campaign_id"], candidate_id, profile, ordinal, val(details, "strategy_id", "strategyId"), val(details, "result_id", "resultId"), val(details, "symbol", "pair"), val(details, "side", "direction"), val(details, "user_rank"), None, val(details, "maximum_closing_quantity"), val(details, "planned_leverage"), val(details, "position_size_usdt"), None, val(details, "max_drawdown_pct"), None, None, "PASS", val(details, "spread_diagnostics", default=""), val(details, "capacity_status"), val(calendar, "available_days"), val(calendar, "mean_minute_turnover"), val(calendar, "rounded_cap_usdt"), val(weekday, "available_days"), val(weekday, "mean_minute_turnover"), val(weekday, "rounded_cap_usdt"), val(details, "spread_status"), val(details, "spread_mean_bps"), val(details, "sizing_digest"), val(details, "capacity_digest"), val(details, "reference_digest")])
+                    member_rows.append([campaign["campaign_id"], candidate_id, profile, ordinal, val(details, "strategy_id", "strategyId"), val(details, "result_id", "resultId"), val(details, "symbol", "pair"), val(details, "side", "direction"), val(details, "user_rank"), None, val(details, "quantity", "maximum_closing_quantity"), val(details, "planned_leverage"), val(details, "actual_size_usdt", "position_size_usdt"), None, val(details, "max_drawdown_pct"), None, None, "PASS", val(details, "spread_diagnostics", default=""), val(details, "capacity_status"), val(calendar, "available_days"), val(calendar, "mean_minute_turnover"), val(calendar, "rounded_cap_usdt"), val(weekday, "available_days"), val(weekday, "mean_minute_turnover"), val(weekday, "rounded_cap_usdt"), val(details, "spread_status"), val(details, "spread_mean_bps"), val(details, "sizing_digest"), val(details, "capacity_digest"), val(details, "reference_digest")])
+        profile_status_rows = []
+        pretest_mode = any(val(item, "search_mode") == "PRETEST_PROXY" or (isinstance(val(item, "metrics"), Mapping) and val(item, "metrics").get("metric_basis") == "PRETEST_PROXY") for item in variants)
+        if pretest_mode:
+            configured_budget = val(campaign.get("config_document", {}).get("search", {}), "max_enumerated_combinations", default="UNKNOWN")
+            for profile in campaign.get("launch", {}).get("profiles", ()):
+                if not isinstance(profile, Mapping):
+                    continue
+                profile_id = str(profile.get("profile_id", ""))
+                profile_variants = tuple(item for item in variants if str(val(item, "profile", default="")) == profile_id)
+                profile_blockers = tuple(str(item) for item in blockers if str(item).startswith(f"{profile_id}:"))
+                status = "PASS" if profile_variants and not profile_blockers else "FAILED"
+                first_metrics = val(profile_variants[0], "metrics", default={}) if profile_variants else {}
+                first_period = val(profile_variants[0], "pretest_period", default={}) if profile_variants else {}
+                coverage = "UNKNOWN"
+                if isinstance(first_period, Mapping):
+                    coverage_map = first_period.get("coverage_pct")
+                    if isinstance(coverage_map, Mapping):
+                        coverage = ", ".join(f"{key}={value}" for key, value in sorted(coverage_map.items(), key=lambda item: str(item[0])))
+                profile_status_rows.append([
+                    campaign["campaign_id"], profile_id, status, profile.get("max_candidates", "UNKNOWN"),
+                    val(profile_variants[0], "evaluations", default=0) if profile_variants else 0,
+                    configured_budget,
+                    f"{first_period.get('start_utc')}..{first_period.get('end_utc')}" if isinstance(first_period, Mapping) and first_period.get("start_utc") and first_period.get("end_utc") else "UNKNOWN",
+                    coverage, "; ".join(profile_blockers) or "", val(first_metrics, "metric_basis", default="PRETEST_PROXY"), val(first_metrics, "joint_metrics", default="NOT_TESTED"),
+                ])
         excluded_rows = []
         for is_optimizer, rows in ((False, excluded), (True, optimizer_excluded)):
             excluded_rows.extend(
                 [campaign["campaign_id"], "PORTFOLIO" if is_optimizer else "FINALIST", val(row, "strategy_id", "result_id", default=""), val(row, "symbol", "pair"), val(row, "side", "direction"), val(row, "profile"), val(row, "stage", default="GENERATE_VARIANTS" if is_optimizer else "SELECT_CANDIDATES"), "BLOCKED" if is_optimizer else "EXCLUDED", val(row, "selection_reason"), _redact_text(val(row, "message", default=val(row, "selection_reason", default="")))]
                 for row in rows
             )
-        summary = self._summary(campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=blockers, warnings=warnings)
+        summary = self._summary(campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=blockers, warnings=warnings, optimizer_status=optimizer_status)
         metadata = {"schema_version": "portfolio_panel_stage1_v1", "campaign_id": campaign["campaign_id"], "created_at_utc": campaign.get("created_at_utc", "2000-01-01T00:00:00Z"), "input_digest": campaign["input_digest"], "config_digest": campaign["config_digest"], "policy_version": campaign["versions"]["policy_version"], "algorithm_versions": _json(campaign["versions"])}
         def frame(rows: Sequence[Sequence[Any]], headers: Sequence[str]) -> pd.DataFrame:
             return pd.DataFrame([[ _safe_cell(value, key=header) for value, header in zip(row, headers)] for row in rows], columns=headers)
@@ -1181,6 +1249,8 @@ class PortfolioPanelService:
             "Excluded": frame(excluded_rows, EXCLUDED_HEADERS),
             "Metadata": frame([[key, value] for key, value in metadata.items()], METADATA_HEADERS),
         }
+        if pretest_mode:
+            tables["Profile Status"] = frame(profile_status_rows, PROFILE_STATUS_HEADERS)
         write_audit_workbook(tables, path)
         from openpyxl import load_workbook
         workbook = load_workbook(path)

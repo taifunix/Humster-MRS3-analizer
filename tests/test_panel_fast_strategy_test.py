@@ -6,10 +6,13 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import time
+from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
-from mrs3.panel_fast_strategy_test import LocalFastStrategyTestService
+import mrs3.panel_fast_strategy_test as fast_strategy_module
+from mrs3.panel_fast_strategy_test import LocalFastStrategyTestService, LocalSingleModeStrategyTestService
 from mrs3.panel_fast_strategy_test import FastStrategyTestError
 from mrs3.panel_fast_strategy_test import _has_current_performance_v2_layout
 from mrs3.panel_fast_strategy_test import _write_fast_tester_config
@@ -209,6 +212,87 @@ def test_native_prevalidation_rejects_legacy_report_layout() -> None:
     legacy_report = CURRENT_REPORT.with_name("report_import.html")
 
     assert not _has_current_performance_v2_layout(legacy_report.read_text(encoding="utf-8"))
+
+
+def test_native_idle_waits_for_current_batch_result_files(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=0.2, report_stability_polls=2)
+    service = LocalSingleModeStrategyTestService(config)
+    job = SimpleNamespace(cancel=Event(), phase="BOT_RUN", progress={}, verified_reports={})
+    config.report_dir.mkdir(parents=True)
+    (config.report_dir / "S0.html").write_text("placeholder", encoding="utf-8")
+    config.wizard_result.parent.mkdir(parents=True, exist_ok=True)
+    config.wizard_result.write_text(json.dumps([
+        {"runId": "", "strategies": ["OLD"], "stats": {}, "chartUrl": "/tester-report/my_test/OLD.html"},
+        {"runId": "", "strategies": ["S0"], "stats": {}, "chartUrl": "/tester-report/my_test/S0.html"},
+    ]), encoding="utf-8")
+    polls = 0
+    updates: list[dict[str, object]] = []
+    service._emit = lambda current_job: updates.append(dict(current_job.progress))
+
+    class Client:
+        def tester_status(self) -> str:
+            nonlocal polls
+            polls += 1
+            if polls == 3:
+                (config.report_dir / "S1.html").write_text("placeholder", encoding="utf-8")
+                config.wizard_result.write_text(json.dumps([
+                    {"runId": "", "strategies": ["S0"], "stats": {}, "chartUrl": "/tester-report/my_test/S0.html"},
+                    {"runId": "", "strategies": ["S1"], "stats": {}, "chartUrl": "/tester-report/my_test/S1.html"},
+                ]), encoding="utf-8")
+            elif polls == 4:
+                config.wizard_result.write_text(json.dumps([
+                    {"runId": "", "strategies": ["S1"], "stats": {}, "chartUrl": "/tester-report/my_test/S1.html"},
+                ]), encoding="utf-8")
+            return "idle"
+
+    service._wait_for_native_idle(job, Client(), config, 1, 1, ("S0", "S1"))
+
+    assert polls >= 3
+    assert any(update.get("current") == 1 and update.get("active") == 1 for update in updates)
+    assert updates[-1]["current"] == 2
+    assert updates[-1]["active"] == 0
+    assert [update["current"] for update in updates] == sorted(update["current"] for update in updates)
+
+
+def test_native_idle_continues_after_transient_status_failure(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=0.2, stall_timeout_seconds=0.1, report_stability_polls=2)
+    service = LocalSingleModeStrategyTestService(config)
+    job = SimpleNamespace(cancel=Event(), phase="BOT_RUN", progress={}, verified_reports={})
+    config.report_dir.mkdir(parents=True)
+    (config.report_dir / "S0.html").write_text("placeholder", encoding="utf-8")
+    config.wizard_result.parent.mkdir(parents=True, exist_ok=True)
+    config.wizard_result.write_text(json.dumps([
+        {"runId": "", "strategies": ["S0"], "stats": {}, "chartUrl": "/tester-report/my_test/S0.html"},
+    ]), encoding="utf-8")
+    updates: list[dict[str, object]] = []
+    service._emit = lambda current_job: updates.append(dict(current_job.progress))
+    polls = 0
+
+    class Client:
+        def tester_status(self) -> str:
+            nonlocal polls
+            polls += 1
+            if polls == 1:
+                raise RuntimeError("temporary status failure")
+            return "running"
+
+    service._wait_for_native_idle(job, Client(), config, 1, 1, ("S0",))
+
+    assert updates[0]["native_status"] == "unavailable"
+    assert updates[-1]["active"] == 0
+
+
+def test_native_idle_stall_timeout_is_independent_of_batch_timeout(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=0.2, stall_timeout_seconds=0.01)
+    service = LocalSingleModeStrategyTestService(config)
+    job = SimpleNamespace(cancel=Event(), phase="BOT_RUN", progress={}, verified_reports={})
+
+    class Client:
+        def tester_status(self) -> str:
+            return "running"
+
+    with pytest.raises(TimeoutError, match="stalled"):
+        service._wait_for_native_idle(job, Client(), config, 1, 1, ("S0",))
 
 
 @pytest.mark.parametrize(
@@ -496,6 +580,108 @@ def test_fast_retry_accepts_matching_manual_report_without_starting_bot(tmp_path
     assert not list(config.strategy_dir.glob("*.json"))
 
 
+def test_single_mode_retry_with_all_reports_creates_and_publishes_inbox(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path, 2)
+    config = _config(tmp_path)
+    updates: list[dict[str, object]] = []
+
+    def monitor(_: object, expected: tuple[str, ...], *_args, **_kwargs) -> BatchCompletion:
+        successful = tuple(name for name in expected if name != "S1")
+        for name in successful:
+            (config.report_dir / f"{name}.html").write_text(
+                f'<pre>{{"name":"{name}","basic":{{}}}}</pre>', encoding="utf-8"
+            )
+        return BatchCompletion(
+            strategies={name: StrategyCompletion(name, RowState.RESULT, (), f"run-{name}", config.report_dir / f"{name}.html" if name in successful else None, name in successful, 1) for name in expected},
+            polls=1,
+            elapsed_seconds=0,
+            failed_names=("S1",),
+        )
+
+    service = LocalFastStrategyTestService(
+        config,
+        start_bot=lambda _: None,
+        stop_bot=lambda _: None,
+        client_factory=lambda _: object(),
+        wait_for_exact_batch=lambda *_args, **_kwargs: (),
+        monitor=monitor,
+        on_update=updates.append,
+    )
+    initial = service.start(manifest, analysis_run_id="a" * 64, start_date="2026-08-01", end_date="2026-08-31", job_id="single-source")
+    assert _wait(service, str(initial["job_id"]))["phase"] == "PARTIAL"
+    service.single_mode = True
+    service._jobs["single-source"].single_mode = True
+    (config.report_dir / "S1.html").write_text(
+        '<p>Test period: 2026-08-01 - 2026-08-31</p><pre>{"name":"S1","basic":{"symbol":"BTCUSDT","time_frame":"1h"}}</pre>',
+        encoding="utf-8",
+    )
+    updates.clear()
+
+    status = service.retry("single-source", job_id="single-retry")
+
+    assert status["state"] == "COMMITTED"
+    assert status["inbox_ready"] is True
+    assert Path(str(status["inbox_path"]), "inbox_manifest.json").is_file()
+    assert updates[-1]["progress"]["current"] == 2
+    assert updates[-1]["inbox_ready"] is True
+
+    reloaded = LocalSingleModeStrategyTestService(config)
+    inbox = reloaded.capture_inbox("single-retry")
+    reloaded.mark_inbox_ready("single-retry", inbox)
+    restored = reloaded.status("single-retry")
+    assert restored["progress"]["current"] == 2
+    assert restored["progress"]["total"] == 2
+
+
+def test_fast_retry_indexes_only_unverified_reports_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest, names = _generation(tmp_path, 3)
+    config = _config(tmp_path)
+    starts: list[int] = []
+
+    def monitor(_: object, expected: tuple[str, ...], *_args, **_kwargs) -> BatchCompletion:
+        successful = tuple(name for name in expected if name == "S0")
+        for name in successful:
+            (config.report_dir / f"{name}.html").write_text(
+                f'<pre>{{"name":"{name}","basic":{{}}}}</pre>', encoding="utf-8"
+            )
+        return BatchCompletion(
+            strategies={name: StrategyCompletion(name, RowState.RESULT, (), f"run-{name}", config.report_dir / f"{name}.html" if name in successful else None, name in successful, 1) for name in expected},
+            polls=1,
+            elapsed_seconds=0,
+            failed_names=tuple(name for name in expected if name != "S0"),
+        )
+
+    service = LocalFastStrategyTestService(
+        config,
+        start_bot=lambda _: starts.append(1),
+        stop_bot=lambda _: None,
+        client_factory=lambda _: object(),
+        wait_for_exact_batch=lambda *_args, **_kwargs: (),
+        monitor=monitor,
+    )
+    initial = service.start(manifest, analysis_run_id="a" * 64, start_date="2026-08-01", end_date="2026-08-31", job_id="fast-index-source")
+    assert _wait(service, str(initial["job_id"]))["phase"] == "PARTIAL"
+    (config.report_dir / "S1.html").write_text(
+        '<p>Test period: 2026-08-01 - 2026-08-31</p><pre>{"name":"S1","basic":{"symbol":"BTCUSDT","time_frame":"1h"}}</pre>',
+        encoding="utf-8",
+    )
+    calls = 0
+    original_extract = fast_strategy_module.extract_html_strategy_settings
+
+    def count_extract(path: Path) -> dict[str, object] | None:
+        nonlocal calls
+        calls += 1
+        return original_extract(path)
+
+    monkeypatch.setattr(fast_strategy_module, "extract_html_strategy_settings", count_extract)
+    recovered = service.retry(str(initial["job_id"]), job_id="fast-index-retry")
+    status = _wait(service, str(recovered["job_id"]))
+
+    assert status["phase"] == "PARTIAL"
+    assert status["evidence"]["verified_reports"] == {"S0": "S0.html", "S1": "S1.html"}
+    assert calls == 1
+
+
 def test_fast_retry_recovers_partial_manifest_after_service_restart(tmp_path: Path) -> None:
     manifest, _ = _generation(tmp_path, 2)
     config = _config(tmp_path)
@@ -527,6 +713,32 @@ def test_fast_retry_recovers_partial_manifest_after_service_restart(tmp_path: Pa
     second = LocalFastStrategyTestService(config, start_bot=lambda _: None, stop_bot=lambda _: None, client_factory=lambda _: object(), wait_for_exact_batch=lambda *_args, **_kwargs: (), monitor=recovered_monitor)
     retry = second.retry("fast-restart-source", job_id="fast-restart-retry")
     assert _wait(second, str(retry["job_id"]))["phase"] == "COMMITTED"
+
+
+def test_single_mode_retry_recovers_interrupted_running_manifest(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    config.strategy_dir.mkdir(parents=True)
+    (config.report_dir / "tester_manifest.json").write_text(json.dumps({
+        "job_id": "interrupted-native",
+        "mode": "SINGLE_MODE",
+        "phase": "RUNNING",
+        "generation_manifest_path": str(manifest),
+        "expected_names": ["S0"],
+        "start_date": "2026-08-01",
+        "end_date": "2026-08-31",
+        "attempt_counts": {"S0": 1},
+        "verified_reports": {},
+        "failed_names": ["S0"],
+    }), encoding="utf-8")
+
+    service = LocalSingleModeStrategyTestService(config)
+    loaded = service._load_persisted_job("interrupted-native")
+
+    assert loaded is not None
+    assert loaded.state == "FAILED"
+    assert loaded.phase == "FAILED"
 
 
 def test_fast_terminal_manifest_is_written_before_terminal_state(tmp_path: Path) -> None:

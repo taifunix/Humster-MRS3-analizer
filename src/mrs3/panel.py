@@ -941,9 +941,7 @@ function renderShortlist(){
     body.appendChild(row);
   }
 }
-async function analysisShortlist(){ if(shortlistBusy) return; const selectedSymbol=value('shortlist_symbol'), selectedTf=value('shortlist_timeframe'); setShortlistBusy(true); try { const result=await duckdbRequest('/api/analysis/shortlist',{run_id:value('analysis_run_id'),criteria:analysisFilterCriteria(),symbol:selectedSymbol,timeframe:selectedTf}); shortlistScopes=result.scopes||[]; shortlistMeta={input_count:result.input_count??0,ready_count:result.ready_count??0,deferred_count:result.deferred_count??0,comparable_count:result.comparable_count??0,comparison_group_count:result.comparison_group_count??0}; const symbol=document.getElementById('shortlist_symbol'), tf=document.getElementById('shortlist_timeframe'); symbol.replaceChildren(new Option('All','')); tf.replaceChildren(new Option('All','')); for(const item of (result.facets?.symbols||[])) symbol.add(new Option(item,item)); for(const item of (result.facets?.timeframes||[])) tf.add(new Option(item,item)); symbol.value=selectedSymbol; tf.value=selectedTf; renderShortlist(); document.getElementById('analysisStrategiesStatus').textContent=`${shortlistMeta.ready_count} READY · ${shortlistMeta.deferred_count} DEFERRED · ${shortlistMeta.comparable_count} COMPARABLE · ${shortlistMeta.comparison_group_count} comparison groups`; } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } finally { setShortlistBusy(false); } }
 async function analysisFilterExport(){ if(shortlistBusy) return; setShortlistBusy(true); try { const result=await duckdbRequest('/api/analysis/filter-export',{run_id:value('analysis_run_id'),criteria:analysisFilterCriteria(),output_path:value('analysis_filter_output')}); document.getElementById('analysisStrategiesStatus').textContent=`Filter audit: ${result.output}`; } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } finally { setShortlistBusy(false); } }
-async function analysisStrategies(){ try { render(await duckdbRequest('/api/analysis/strategies',{run_id:value('analysis_run_id'),criteria:analysisFilterCriteria(),symbol:value('shortlist_symbol'),timeframe:value('shortlist_timeframe'),template_path:value('analysis_template'),output_dir:value('analysis_strategy_output'),config_path:value('analysis_config')})); } catch(error){ document.getElementById('analysisStrategiesStatus').textContent=error.message; } }
 function selectedScope(name){ return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(item=>item.value); }
 function shortlistScopePayload(){ return {symbol_mode:value('shortlist_symbol_mode'),symbols:selectedScope('shortlist_symbol'),timeframe_mode:value('shortlist_timeframe_mode'),timeframes:selectedScope('shortlist_timeframe')}; }
 function renderScopeOptions(targetId,name,items,selected){ const target=document.getElementById(targetId); target.replaceChildren(); for(const item of items){ const label=document.createElement('label'), box=document.createElement('input'); box.type='checkbox'; box.name=name; box.value=item; box.checked=selected.includes(item); box.dataset.shortlistControl='true'; box.onchange=analysisShortlist; label.append(box,document.createTextNode(` ${item}`)); target.appendChild(label); } }
@@ -1800,6 +1798,8 @@ class PanelController:
         request = payload.get("request")
         if kind == "strategies.tester.start" and isinstance(request, Mapping):
             return self.strategies_tester_start(request)
+        if kind == "strategies.tester.retry" and isinstance(request, Mapping):
+            return self.strategies_tester_retry(request)
         if kind == "strategies.tester.runs" and isinstance(request, Mapping):
             return self.strategies_tester_runs_start(request)
         if isinstance(kind, str) and kind.startswith("strategies.tester.") and ".fast." in kind:
@@ -1888,7 +1888,7 @@ class PanelController:
             saved_runtime.update(runtime)
             runtime = saved_runtime
         if (
-            tracked.get("kind") in {"strategies.tester.runs", "strategies.tester.start", "strategies.tester.native.start", "strategies.performance.v2.finalist-retest"}
+            tracked.get("kind") in {"strategies.tester.runs", "strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry", "strategies.performance.v2.finalist-retest"}
             and document.get("state") == "COMMITTED"
             and isinstance(inbox, str)
             and inbox
@@ -2379,7 +2379,7 @@ class PanelController:
         except Exception:
             return
         for job in self._panel_jobs.list():
-            if job.get("kind") not in {"strategies.tester", "strategies.tester.start", "strategies.tester.native.start", "strategies.tester.runs"}:
+            if job.get("kind") not in {"strategies.tester", "strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry", "strategies.tester.runs"}:
                 continue
             job_id = job.get("job_id")
             if not isinstance(job_id, str):
@@ -2389,7 +2389,7 @@ class PanelController:
                     runtime = self._panel_jobs.runtime(job_id)
                     inbox = Path(runtime["inbox_path"]).resolve()
                     inbox.relative_to(inbox_root)
-                    is_single_mode = job.get("kind") in {"strategies.tester.start", "strategies.tester.native.start"}
+                    is_single_mode = job.get("kind") in {"strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry"}
                     if is_single_mode:
                         self._validate_metadata_inbox(inbox)
                     else:
@@ -2405,6 +2405,24 @@ class PanelController:
             if job.get("state") != "FAILED":
                 continue
             state_path = inbox_root / f"{job_id}.state.json"
+            if (
+                job.get("kind") in {"strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry"}
+                and job.get("error") == {"code": "INTERRUPTED"}
+                and not state_path.exists()
+            ):
+                inbox = (inbox_root / job_id).resolve()
+                try:
+                    inbox.relative_to(inbox_root)
+                    self._validate_metadata_inbox(inbox)
+                    self._panel_jobs.recover_committed(job_id, runtime={"inbox_path": str(inbox)})
+                    self._panel_jobs.sync(
+                        job_id,
+                        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+                        runtime={"inbox_path": str(inbox)},
+                    )
+                    continue
+                except (OSError, TypeError, ValueError, PanelJobError):
+                    pass
             try:
                 state = json.loads(state_path.read_text(encoding="utf-8"))
                 inbox = Path(state["inbox_path"]).resolve()
@@ -2438,7 +2456,7 @@ class PanelController:
         except Exception:
             return
         for job in self._panel_jobs.list():
-            if job.get("kind") not in {"strategies.tester", "strategies.tester.start", "strategies.tester.native.start"} or job.get("error") != {"code": "INTERRUPTED"}:
+            if job.get("kind") not in {"strategies.tester", "strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry"} or job.get("error") != {"code": "INTERRUPTED"}:
                 continue
             job_id = job.get("job_id")
             if not isinstance(job_id, str):
@@ -2826,6 +2844,22 @@ class PanelController:
             ),
         )
 
+    def strategies_tester_retry(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if set(payload) != {"job_id"}:
+            raise ValueError("tester retry request contains unsupported fields")
+        source_job_id = self._required(payload, "job_id")
+        source = self._panel_jobs.get(source_job_id)
+        if source.get("kind") not in {"strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry"}:
+            raise PanelJobError("UNSUPPORTED_ROUTE")
+        if source.get("state") not in {"FAILED", "CANCELLED"}:
+            raise PanelJobError("TESTER_JOB_NOT_RECOVERABLE")
+        return self._start_tracked_panel_job(
+            "strategies.tester.retry",
+            {"source_job_id": source_job_id},
+            ("strategies.tester",),
+            lambda job_id: self._single_mode_strategy_test().retry(source_job_id, job_id=job_id),
+        )
+
     def strategies_tester_runs_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         if payload:
             raise ValueError("tester RUNS request contains unsupported fields")
@@ -2841,7 +2875,7 @@ class PanelController:
 
     def strategies_tester_status(self, job_id: str) -> dict[str, object]:
         tracked = self._panel_jobs.get(job_id)
-        if tracked.get("kind") in {"strategies.tester.start", "strategies.tester.native.start"}:
+        if tracked.get("kind") in {"strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry"}:
             status = self._single_mode_strategy_test().status
         elif tracked.get("kind") == "strategies.tester.runs":
             status = self._runs_batch().status
@@ -2939,12 +2973,12 @@ class PanelController:
             status["inbox_path"] = str(inbox)
             status["inbox_ready"] = True
             return status
-        is_single_mode = tracked.get("kind") in {"strategies.tester.start", "strategies.tester.native.start"}
+        is_single_mode = tracked.get("kind") in {"strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry"}
         if is_single_mode:
             service = self._single_mode_strategy_test()
             inbox = (
                 service.capture_inbox(job_id, force_single_mode=True)
-                if tracked.get("kind") == "strategies.tester.native.start"
+                if tracked.get("kind") in {"strategies.tester.native.start", "strategies.tester.retry"}
                 else service.capture_inbox(job_id)
             )
             service.mark_inbox_ready(job_id, inbox)
@@ -3011,7 +3045,7 @@ class PanelController:
     def strategies_tester_cancel(self, job_id: str) -> dict[str, object]:
         try:
             tracked = self._panel_jobs.get(job_id)
-            if tracked.get("kind") == "strategies.tester.start":
+            if tracked.get("kind") in {"strategies.tester.start", "strategies.tester.retry"}:
                 cancel = self._single_mode_strategy_test().cancel
             elif tracked.get("kind") == "strategies.tester.runs":
                 cancel = self._runs_batch().cancel

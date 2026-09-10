@@ -1168,8 +1168,14 @@ def apply_finalist_cutoff(
 def read_current_finalists(
     database: str | Path,
     pairs: Sequence[tuple[str, str]],
+    include_series: bool = True,
 ) -> tuple[dict[str, Any], ...]:
-    """Read current exact User Status=FINALIST facts without source writes."""
+    """Read current exact User Status=FINALIST facts without source writes.
+
+    ``include_series`` is kept opt-in for callers that build an execution
+    snapshot.  Metadata-only consumers such as Panel readiness can avoid
+    touching the potentially very large action/equity tables.
+    """
     pair_values = tuple(dict.fromkeys(_pair(pair) for pair in pairs))
     if not pair_values:
         return ()
@@ -1201,6 +1207,37 @@ def read_current_finalists(
             result_rows = _records_for_ids(connection, "strategy_results", "result_id", result_ids)
             by_result = {int(row["result_id"]): row for row in result_rows}
             order_rows = _records_for_ids(connection, "strategy_orders", "strategy_id", strategy_ids)
+            actions_by_result: dict[int, tuple[Mapping[str, Any], ...]] = {}
+            equities_by_result: dict[int, tuple[Mapping[str, Any], ...]] = {}
+            if include_series:
+                # Bulk reads keep the optimizer on the read-only snapshot path
+                # and avoid one query per finalist when constructing proxy
+                # paths.  Freeze only the fields consumed by the optimizer;
+                # full DB rows can contain large or irrelevant payloads.
+                action_rows = _records_for_ids(connection, "strategy_actions", "result_id", result_ids)
+                equity_rows = _records_for_ids(connection, "strategy_equity", "result_id", result_ids)
+
+                def _public_series_row(row: Mapping[str, Any], fields: tuple[str, ...]) -> Mapping[str, Any]:
+                    value = {field: row[field] for field in fields if field in row}
+                    if value.get("timestamp_utc") is not None:
+                        value["timestamp_utc"] = _utc(value["timestamp_utc"]).isoformat().replace("+00:00", "Z")
+                    return value
+
+                for result_id in result_ids:
+                    actions_by_result[int(result_id)] = tuple(
+                        _frozen(_public_series_row(row, ("result_id", "action_index", "timestamp_utc")))
+                        for row in sorted(
+                            (item for item in action_rows if int(item.get("result_id")) == int(result_id)),
+                            key=lambda item: (item.get("timestamp_utc"), item.get("action_index")),
+                        )
+                    )
+                    equities_by_result[int(result_id)] = tuple(
+                        _frozen(_public_series_row(row, ("result_id", "sample_index", "timestamp_utc", "equity")))
+                        for row in sorted(
+                            (item for item in equity_rows if int(item.get("result_id")) == int(result_id)),
+                            key=lambda item: (item.get("timestamp_utc"), item.get("sample_index")),
+                        )
+                    )
             orders_by_strategy: dict[int, list[dict[str, Any]]] = {}
             for order in order_rows:
                 strategy_id = _source_integer(order.get("strategy_id"), "strategy_id")
@@ -1255,6 +1292,7 @@ def read_current_finalists(
                 total_fees = _source_decimal(source_result.get("total_fees"), "total_fees", minimum=Decimal("0"))
                 max_drawdown = _source_decimal(source_result.get("max_drawdown"), "max_drawdown", minimum=Decimal("0"))
                 max_drawdown_pct = _source_decimal(source_result.get("max_drawdown_pct"), "max_drawdown_pct", minimum=Decimal("0"))
+                initial_balance = _source_decimal(source_result.get("initial_balance"), "initial_balance", minimum=Decimal("0.00000001"))
                 report_start = _source_timestamp(source_result.get("report_start_utc"), "report_start_utc")
                 report_end = _source_timestamp(source_result.get("report_end_utc"), "report_end_utc")
                 if report_end <= report_start:
@@ -1280,7 +1318,7 @@ def read_current_finalists(
                         "status": "UNKNOWN",
                         "reason": "MAX_DRAWDOWN_NOT_POSITIVE",
                     }
-                result.append({
+                result_row = {
                     "strategy_id": strategy_id,
                     "result_id": result_id,
                     "strategy_name": _source_text(source.get("strategy_name"), "strategy_name"),
@@ -1298,6 +1336,9 @@ def read_current_finalists(
                     "reported_end_utc": _source_timestamp(source_result.get("reported_end_utc"), "reported_end_utc", required=False),
                     "total_pnl": total_pnl,
                     "total_pnl_basis": "PERSISTED_NET_PNL",
+                    "initial_balance": initial_balance,
+                    "result_initial_balance": initial_balance,
+                    "source_initial_balance": initial_balance,
                     "total_fees": total_fees,
                     "max_drawdown": max_drawdown,
                     "max_drawdown_pct": max_drawdown_pct,
@@ -1306,7 +1347,15 @@ def read_current_finalists(
                     "selection_run_id": provenance["selection_run_id"],
                     "review_import_id": provenance["review_import_id"],
                     "source_provenance": provenance,
-                })
+                }
+                if include_series:
+                    result_row.update({
+                        "actions": actions_by_result.get(result_id, ()),
+                        "equity": equities_by_result.get(result_id, ()),
+                        "action_series": actions_by_result.get(result_id, ()),
+                        "equity_series": equities_by_result.get(result_id, ()),
+                    })
+                result.append(result_row)
             connection.execute("commit")
     except PortfolioInputError:
         raise
@@ -1360,6 +1409,440 @@ def fresh_decision_campaign(execution_campaign_id: str, reference_facts: Mapping
 
 
 new_decision_campaign = fresh_decision_campaign
+
+
+@dataclass(frozen=True, slots=True)
+class CommonPretestPeriodResult:
+    status: str
+    start_utc: datetime | None = None
+    end_utc: datetime | None = None
+    daily_paths: Mapping[str, tuple[Mapping[str, Any], ...]] = MappingProxyType({})
+    coverage_pct: Mapping[str, Decimal] = MappingProxyType({})
+    exclusions: tuple[Mapping[str, Any], ...] = ()
+    evidence: Mapping[str, Any] = MappingProxyType({})
+    reason: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.status == "PASS"
+
+    @property
+    def start(self) -> datetime | None:
+        return self.start_utc
+
+    @property
+    def end(self) -> datetime | None:
+        return self.end_utc
+
+
+def _day_floor(value: datetime) -> datetime:
+    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+
+
+def _day_ceil(value: datetime) -> datetime:
+    floor = _day_floor(value)
+    return floor if value == floor else floor + timedelta(days=1)
+
+
+def _period_row_key(row: Mapping[str, Any]) -> str:
+    return (
+        f"{str(row.get('symbol', '')).upper()}:{str(row.get('side', '')).upper()}"
+        f":{row.get('strategy_id', '')}:{row.get('result_id', '')}"
+    )
+
+
+def _period_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    def identifier(value: Any) -> tuple[int, Any]:
+        if isinstance(value, bool):
+            return 1, str(value)
+        if isinstance(value, int):
+            return 0, value
+        return 1, str(value)
+
+    return (
+        str(row.get("symbol", "")).upper(),
+        str(row.get("side", "")).upper(),
+        identifier(row.get("strategy_id", "")),
+        identifier(row.get("result_id", "")),
+    )
+
+
+def _period_interval(row: Mapping[str, Any]) -> tuple[datetime, datetime] | None:
+    effective_start = row.get("effective_start_utc")
+    effective_end = row.get("effective_end_utc")
+    # An effective interval is usable only as a complete, valid pair.  A
+    # malformed or partial immutable range falls back to the persisted report
+    # range; never mix endpoints from the two ranges.
+    if effective_start is not None and effective_end is not None:
+        try:
+            start_value, end_value = _utc(effective_start), _utc(effective_end)
+        except (PortfolioInputError, TypeError, ValueError):
+            start_value = end_value = None
+        if start_value is not None and end_value is not None and end_value > start_value:
+            return start_value, end_value
+    try:
+        start_value, end_value = _utc(row.get("report_start_utc")), _utc(row.get("report_end_utc"))
+    except (PortfolioInputError, TypeError, ValueError):
+        return None
+    return (start_value, end_value) if end_value > start_value else None
+
+
+def _daily_path_for_row(
+    row: Mapping[str, Any], start: datetime, end: datetime, max_gap_days: int
+) -> tuple[tuple[Mapping[str, Any], ...], Decimal, str | None, Mapping[str, Any]]:
+    """Build a sparse CURRENT_RESULT step path and diagnostic evidence.
+
+    ``max_gap_days`` remains in the signature for compatibility.  Current
+    result observations are sparse evidence, so coverage and gap are reported
+    but do not gate retention.
+    """
+    raw = row.get("equity", row.get("equity_series", row.get("equity_path", ())))
+    samples: list[tuple[datetime, Decimal]] = []
+    for item in raw if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)) else ():
+        if isinstance(item, Mapping):
+            timestamp, value = item.get("timestamp_utc", item.get("timestamp")), item.get("equity", item.get("value"))
+        elif isinstance(item, Sequence) and len(item) == 2:
+            timestamp, value = item
+        else:
+            continue
+        try:
+            samples.append((_utc(timestamp), _to_decimal(value)))
+        except (PortfolioInputError, TypeError, ValueError):
+            return (), Decimal(0), "INVALID_EQUITY_SAMPLE", MappingProxyType({})
+    samples.sort(key=lambda item: item[0])
+    if any(left[0] >= right[0] for left, right in zip(samples, samples[1:])):
+        return (), Decimal(0), "INVALID_EQUITY_SAMPLE", MappingProxyType({
+            "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+        })
+    actions = row.get("actions", row.get("action_series", ()))
+    action_points: list[datetime] = []
+    for action in actions if isinstance(actions, Sequence) and not isinstance(actions, (str, bytes)) else ():
+        timestamp = action.get("timestamp_utc", action.get("timestamp")) if isinstance(action, Mapping) else None
+        try:
+            action_points.append(_utc(timestamp))
+        except (PortfolioInputError, TypeError, ValueError):
+            return (), Decimal(0), "INVALID_ACTION_SAMPLE", MappingProxyType({})
+    calendar_days = (end - start).days
+    days = tuple(start + timedelta(days=index) for index in range(calendar_days + 1))
+    if calendar_days <= 0:
+        return (), Decimal(0), "COMMON_PERIOD_TOO_SHORT", MappingProxyType({"calendar_days": 0})
+
+    # Last real sample per UTC day; samples outside the interval remain
+    # eligible only for the explicit start seed.
+    in_window = [(timestamp, value) for timestamp, value in samples if start <= timestamp < end]
+    real_days = {_day_floor(timestamp) for timestamp, _value in in_window}
+    prior = next(((timestamp, value) for timestamp, value in reversed(samples) if timestamp <= start), None)
+    actions_in_window = [timestamp for timestamp in action_points if start <= timestamp < end]
+    actions_at_or_before_start = any(timestamp <= start for timestamp in action_points)
+    initial = row.get("initial_balance", row.get("source_initial_balance"))
+    seed_source = "NONE"
+    seeded = False
+    seed_value: Decimal | None = None
+    # A future observation on the common-start day is not a start seed.  Keep
+    # it in the observed-day diagnostics, but reserve the first endpoint for a
+    # real sample at the boundary or an explicit seed.
+    if prior is not None:
+        seed_source = "EQUITY_OBSERVATION"
+        seeded = prior[0] != start
+    elif actions_at_or_before_start:
+        return (), Decimal(0), "INVALID_START_SEED", MappingProxyType({
+            "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+            "calendar_days": calendar_days, "in_window_observation_count": len(in_window),
+            "in_window_action_count": len(actions_in_window), "seed_source": "NONE", "seeded": False,
+        })
+    elif initial is not None:
+        try:
+            seed_value = _to_decimal(initial)
+        except (PortfolioInputError, TypeError, ValueError):
+            return (), Decimal(0), "INVALID_INITIAL_BALANCE", MappingProxyType({})
+        if seed_value <= 0:
+            return (), Decimal(0), "INVALID_INITIAL_BALANCE", MappingProxyType({
+                "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+                "calendar_days": calendar_days,
+                "in_window_observation_count": len(in_window),
+                "in_window_action_count": len(actions_in_window),
+                "seed_source": "NONE",
+                "seeded": False,
+            })
+        seed_source = "INITIAL_BALANCE"
+        seeded = True
+    elif not in_window and not actions_in_window:
+        return (), Decimal(0), "DAILY_PATH_REQUIRES_SEED", MappingProxyType({
+            "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+            "calendar_days": calendar_days, "in_window_observation_count": 0,
+            "in_window_action_count": 0, "seed_source": "NONE", "seeded": False,
+        })
+    elif not in_window and actions_in_window:
+        return (), Decimal(0), "OBSERVATION_LOSS_SUSPECTED", MappingProxyType({
+            "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+            "calendar_days": calendar_days, "in_window_observation_count": 0,
+            "in_window_action_count": len(actions_in_window), "seed_source": seed_source, "seeded": seeded,
+        })
+    elif not prior and initial is None:
+        return (), Decimal(0), "DAILY_PATH_REQUIRES_SEED", MappingProxyType({
+            "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+            "calendar_days": calendar_days, "in_window_observation_count": len(in_window),
+            "in_window_action_count": len(actions_in_window), "seed_source": "NONE", "seeded": False,
+        })
+
+    if not in_window and actions_in_window:
+        return (), Decimal(0), "OBSERVATION_LOSS_SUSPECTED", MappingProxyType({
+            "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+            "calendar_days": calendar_days, "in_window_observation_count": 0,
+            "in_window_action_count": len(actions_in_window), "seed_source": seed_source, "seeded": seeded,
+        })
+
+    # An observation exactly at the period edge is real; a prior observation
+    # is a seed and is excluded from observed-day coverage only when it is
+    # outside the selected window.
+    if prior is not None and prior[0] == start:
+        seed_source = "EQUITY_OBSERVATION"
+        seeded = False
+    observed_timestamps = [timestamp for timestamp, _value in in_window]
+    boundaries = [start, *observed_timestamps, end]
+    maximum_gap = max((right - left for left, right in zip(boundaries, boundaries[1:])), default=timedelta(0))
+    observed_ratio = (Decimal(len(real_days)) * Decimal(100) / Decimal(calendar_days)).quantize(Decimal("0.00000001"))
+    maximum_gap_days = (Decimal(maximum_gap.total_seconds()) / Decimal(86400)).quantize(Decimal("0.00000001"))
+    reason = "ZERO_ACTIVITY_IN_WINDOW" if not in_window and not actions_in_window else None
+    evidence = MappingProxyType({
+        "sparse_observation_tag": "SPARSE_OBSERVATION_FORWARD_FILL",
+        "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+        "pretest_source_mode": "CURRENT_RESULT",
+        "calendar_days": calendar_days,
+        "in_window_observation_count": len(in_window),
+        "in_window_action_count": len(actions_in_window),
+        "observed_day_count": len(real_days),
+        "observed_day_ratio": observed_ratio,
+        "observed_sample_day_count": len(real_days),
+        "observed_sample_day_ratio": observed_ratio,
+        "observed_distinct_date_ratio": observed_ratio,
+        "max_observation_gap_days": maximum_gap_days,
+        "maximum_observation_gap_days": maximum_gap_days,
+        "max_observation_gap_including_boundaries_days": maximum_gap_days,
+        "max_real_observation_gap_days": maximum_gap_days,
+        "max_real_observation_gap_including_boundaries_days": maximum_gap_days,
+        "max_real_observation_gap_days_including_boundaries": maximum_gap_days,
+        "seed_source": seed_source,
+        "start_seed_source": "PRIOR_OBSERVATION" if prior is not None else "INITIAL_BALANCE",
+        "initial_balance_seed_used": prior is None,
+        "seeded": seeded,
+        "dd_bias": "DOWNWARD_BIASED_BETWEEN_OBSERVATIONS",
+        "linear_scaling_assumption": "UNVERIFIED",
+        **({"reason": reason} if reason else {}),
+    })
+    result: list[Mapping[str, Any]] = []
+    last_value: Decimal | None = prior[1] if prior is not None else seed_value
+    latest_sample: tuple[datetime, Decimal] | None = prior
+    sample_index = 0
+    for day in days:
+        # Resolve each endpoint from observations at or before that endpoint.
+        # A noon observation can therefore affect the following UTC endpoint,
+        # never the midnight at which it was first observed.
+        while sample_index < len(in_window) and in_window[sample_index][0] <= day:
+            latest_sample = in_window[sample_index]
+            sample_index += 1
+        if latest_sample is not None and latest_sample[0] <= day:
+            is_real = latest_sample[0] == day
+            last_value = latest_sample[1]
+            result.append({"timestamp_utc": day, "equity": last_value, "real": is_real, "filled": not is_real and not (day == start and seeded), "seed": day == start and seeded and not is_real})
+        elif last_value is not None:
+            result.append({"timestamp_utc": day, "equity": last_value, "real": False, "filled": day != start or not seeded, "seed": day == start and seeded})
+        else:
+            return tuple(result), observed_ratio, "DAILY_PATH_REQUIRES_SEED", evidence
+    return tuple(result), observed_ratio, reason, evidence
+
+
+def _evaluate_period(rows: Sequence[Mapping[str, Any]], minimum_days: int, minimum_coverage: int, max_gap_days: int) -> CommonPretestPeriodResult:
+    ordered = tuple(sorted((row for row in rows if isinstance(row, Mapping)), key=_period_sort_key))
+    intervals_by_key = {_period_row_key(row): _period_interval(row) for row in ordered}
+    if not ordered:
+        return CommonPretestPeriodResult("UNAVAILABLE", reason="COMMON_PRETEST_PERIOD_UNAVAILABLE")
+    valid_intervals = [item for item in intervals_by_key.values() if item is not None]
+    invalid_keys = tuple(key for key, item in intervals_by_key.items() if item is None)
+    if not valid_intervals:
+        violations = tuple({"key": key, "reason": "INVALID_REPORT_INTERVAL"} for key in invalid_keys)
+        return CommonPretestPeriodResult(
+            "UNAVAILABLE",
+            exclusions=violations,
+            evidence=MappingProxyType({
+                "period_basis": "CURRENT_RESULT_SPARSE_OBSERVATION",
+                "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+                "violations": violations,
+                "retained_identities": (),
+                "excluded_identities": (),
+            }),
+            reason="COMMON_PRETEST_PERIOD_UNAVAILABLE",
+        )
+    start_edge = max(item[0] for item in valid_intervals)
+    end_edge = min(item[1] for item in valid_intervals)
+    start = _day_ceil(start_edge)
+    end = _day_floor(end_edge)
+    calendar_days = max(0, (end - start).days)
+    start_binders = tuple(_period_row_key(row) for row in ordered if intervals_by_key[_period_row_key(row)] is not None and intervals_by_key[_period_row_key(row)][0] == start_edge)
+    end_binders = tuple(_period_row_key(row) for row in ordered if intervals_by_key[_period_row_key(row)] is not None and intervals_by_key[_period_row_key(row)][1] == end_edge)
+    paths: dict[str, tuple[Mapping[str, Any], ...]] = {}
+    coverage: dict[str, Decimal] = {}
+    row_evidence: dict[str, Mapping[str, Any]] = {}
+    failures: list[Mapping[str, Any]] = [{"key": key, "reason": "INVALID_REPORT_INTERVAL"} for key in invalid_keys]
+    for row in ordered:
+        key = _period_row_key(row)
+        if intervals_by_key[key] is None or end <= start:
+            continue
+        path, ratio, reason, evidence = _daily_path_for_row(row, start, end, max_gap_days)
+        paths[key] = path
+        coverage[key] = ratio
+        row_evidence[key] = evidence
+        if reason and reason != "ZERO_ACTIVITY_IN_WINDOW":
+            failures.append({"key": key, "reason": reason})
+    violations = [*failures]
+    if calendar_days < minimum_days:
+        violations.append({"reason": "COMMON_PERIOD_TOO_SHORT"})
+    evidence = MappingProxyType({
+        "period_basis": "CURRENT_RESULT_SPARSE_OBSERVATION",
+        "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+        "common_start_utc": start,
+        "common_end_utc": end,
+        "calendar_days": calendar_days,
+        "minimum_common_days": minimum_days,
+        "minimum_daily_coverage_pct": minimum_coverage,
+        "maximum_forward_fill_gap_days": max_gap_days,
+        "coverage_gate": "NON_BINDING_DIAGNOSTIC",
+        "forward_fill_gap_gate": "NON_BINDING_DIAGNOSTIC",
+        "start_binders": start_binders,
+        "end_binders": end_binders,
+        "violations": tuple(violations),
+        "rows": MappingProxyType(row_evidence),
+        "in_window_observation_counts": MappingProxyType({key: item.get("in_window_observation_count", 0) for key, item in row_evidence.items()}),
+        "in_window_action_counts": MappingProxyType({key: item.get("in_window_action_count", 0) for key, item in row_evidence.items()}),
+        "observed_day_ratios": MappingProxyType({key: item.get("observed_day_ratio", Decimal(0)) for key, item in row_evidence.items()}),
+        "observed_distinct_date_ratios": MappingProxyType({key: item.get("observed_distinct_date_ratio", Decimal(0)) for key, item in row_evidence.items()}),
+        "max_observation_gaps_days": MappingProxyType({key: item.get("max_observation_gap_days", Decimal(0)) for key, item in row_evidence.items()}),
+        "max_real_observation_gaps_days": MappingProxyType({key: item.get("max_real_observation_gap_days", Decimal(0)) for key, item in row_evidence.items()}),
+        "max_real_observation_gaps_including_boundaries_days": MappingProxyType({key: item.get("max_real_observation_gap_including_boundaries_days", Decimal(0)) for key, item in row_evidence.items()}),
+        "seed_sources": MappingProxyType({key: item.get("seed_source", "NONE") for key, item in row_evidence.items()}),
+        "seed_flags": MappingProxyType({key: bool(item.get("seeded", False)) for key, item in row_evidence.items()}),
+        "dd_biases": MappingProxyType({key: item.get("dd_bias") for key, item in row_evidence.items()}),
+        "retained_identities": tuple(_period_row_key(row) for row in ordered),
+        "excluded_identities": (),
+    })
+    status = "PASS" if not violations else "UNAVAILABLE"
+    return CommonPretestPeriodResult(status, start, end, MappingProxyType(paths), MappingProxyType(coverage), tuple(failures), evidence, None if status == "PASS" else "COMMON_PRETEST_PERIOD_UNAVAILABLE")
+
+
+def resolve_common_pretest_period(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    minimum_common_days: int = 14,
+    minimum_daily_coverage_pct: int = 90,
+    maximum_forward_fill_gap_days: int = 3,
+) -> CommonPretestPeriodResult:
+    """Find a deterministic sparse CURRENT_RESULT common UTC daily period."""
+    if not isinstance(minimum_common_days, int) or minimum_common_days <= 0:
+        raise ValueError("minimum_common_days must be positive")
+    if not isinstance(minimum_daily_coverage_pct, int) or not 1 <= minimum_daily_coverage_pct <= 100:
+        raise ValueError("minimum_daily_coverage_pct must be between 1 and 100")
+    if not isinstance(maximum_forward_fill_gap_days, int) or maximum_forward_fill_gap_days < 0:
+        raise ValueError("maximum_forward_fill_gap_days must be non-negative")
+    active = tuple(dict(row) for row in rows if isinstance(row, Mapping))
+    removed: list[Mapping[str, Any]] = []
+
+    def score(result: CommonPretestPeriodResult) -> tuple[int, int, int, int, int]:
+        evidence = result.evidence
+        days = int(evidence.get("calendar_days", (result.end_utc - result.start_utc).days if result.start_utc and result.end_utc else 0))
+        violations = len(tuple(evidence.get("violations", ())))
+        return (
+            1 if result.available else 0,
+            -violations,
+            days,
+            -len(tuple(evidence.get("start_binders", ()))),
+            -len(tuple(evidence.get("end_binders", ()))),
+        )
+
+    def finish(
+        result: CommonPretestPeriodResult,
+        excluded: Sequence[Mapping[str, Any]],
+        retained: Sequence[Mapping[str, Any]] | None = None,
+        ledger: Sequence[Mapping[str, Any]] | None = None,
+    ) -> CommonPretestPeriodResult:
+        evidence = dict(result.evidence)
+        excluded_ids = tuple(item.get("key") for item in excluded if item.get("key"))
+        evidence["excluded_identities"] = excluded_ids
+        removal_ledger = tuple(excluded) if ledger is None else tuple(ledger)
+        evidence["binding_removals"] = removal_ledger
+        evidence["binding_removal_ledger"] = removal_ledger
+        retained_ids = tuple(_period_row_key(row) for row in retained) if retained is not None else tuple(evidence.get("retained_identities", ()))
+        evidence["retained_identities"] = retained_ids
+        evidence["final_retained_size"] = len(retained_ids)
+        return CommonPretestPeriodResult(result.status, result.start_utc, result.end_utc, result.daily_paths, result.coverage_pct, tuple(excluded), MappingProxyType(evidence), result.reason)
+
+    last_result: CommonPretestPeriodResult | None = None
+    while active:
+        result = _evaluate_period(active, minimum_common_days, minimum_daily_coverage_pct, maximum_forward_fill_gap_days)
+        last_result = result
+        if result.available:
+            return finish(result, removed, active, removed)
+        evidence = result.evidence
+        violated = {str(item.get("key")) for item in evidence.get("violations", ()) if item.get("key")}
+        offenders = {_period_row_key(row): row for row in active if _period_row_key(row) in violated}
+        if int(evidence.get("calendar_days", 0)) < minimum_common_days:
+            binders = set(evidence.get("start_binders", ())) | set(evidence.get("end_binders", ()))
+            offenders.update({_period_row_key(row): row for row in active if _period_row_key(row) in binders})
+        if not offenders:
+            return finish(result, (*removed, *result.exclusions), active, removed)
+        current_score = score(result)
+        trials: list[tuple[tuple[int, int, int, int, int], Mapping[str, Any], CommonPretestPeriodResult]] = []
+        for row in offenders.values():
+            candidate = tuple(item for item in active if item is not row)
+            trial = _evaluate_period(candidate, minimum_common_days, minimum_daily_coverage_pct, maximum_forward_fill_gap_days)
+            trials.append((score(trial), row, trial))
+        improving = [item for item in trials if item[0] > current_score]
+        if not improving:
+            return finish(result, (*removed, *result.exclusions), active, removed)
+        best_score = max(item[0] for item in improving)
+        best_candidates = [item for item in improving if item[0] == best_score]
+        _best_score, best_row, best_trial = sorted(best_candidates, key=lambda item: _period_sort_key(item[1]))[0]
+        removed_reason = "PERIOD_BINDING_REMOVAL"
+        key = _period_row_key(best_row)
+        failed_reason = next((str(item.get("reason")) for item in result.exclusions if item.get("key") == key), None)
+        if failed_reason:
+            removed_reason = failed_reason
+        else:
+            intervals_by_key = {_period_row_key(row): _period_interval(row) for row in active}
+            interval = intervals_by_key.get(key)
+            if interval is not None:
+                starts = [item[0] for item in intervals_by_key.values() if item is not None]
+                ends = [item[1] for item in intervals_by_key.values() if item is not None]
+                if interval[0] == max(starts):
+                    removed_reason = "LATEST_START_OFFENDER"
+                elif interval[1] == min(ends):
+                    removed_reason = "EARLIEST_END_OFFENDER"
+        removed.append({
+            "key": key, "reason": removed_reason,
+            "before": {"start_utc": result.start_utc, "end_utc": result.end_utc, "calendar_days": evidence.get("calendar_days"), "violations": tuple(evidence.get("violations", ()))},
+            "after": {"start_utc": best_trial.start_utc, "end_utc": best_trial.end_utc, "calendar_days": best_trial.evidence.get("calendar_days"), "violations": tuple(best_trial.evidence.get("violations", ()))},
+            "score_before": current_score, "score_after": best_score, "chosen": True,
+        })
+        active = tuple(item for item in active if item is not best_row)
+    if last_result is not None:
+        return finish(last_result, removed, active, removed)
+    return CommonPretestPeriodResult(
+        "UNAVAILABLE",
+        exclusions=tuple(removed),
+        evidence=MappingProxyType({
+            "period_basis": "CURRENT_RESULT_SPARSE_OBSERVATION",
+            "path_policy": "SPARSE_OBSERVATION_FORWARD_FILL",
+            "retained_identities": (),
+            "excluded_identities": tuple(item.get("key") for item in removed if item.get("key")),
+            "binding_removals": tuple(removed),
+            "binding_removal_ledger": tuple(removed),
+            "final_retained_size": 0,
+        }),
+        reason="COMMON_PRETEST_PERIOD_UNAVAILABLE",
+    )
+
+
+build_common_pretest_period = resolve_common_pretest_period
+common_pretest_period = resolve_common_pretest_period
 read_snapshot = read_performance_snapshot
 read_portfolio_input = read_performance_snapshot
 snapshot_performance_input = read_performance_snapshot

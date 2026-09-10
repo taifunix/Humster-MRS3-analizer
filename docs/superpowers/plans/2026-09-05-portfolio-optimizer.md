@@ -857,6 +857,31 @@ accepted M5 and M6 plus separate explicit user authorization.
 Не задавать пользователю вопросы повторно, если поведение уже закреплено в
 §2/§7 спецификации: выяснять physical mapping и evidence.
 
+## Stage 1 PRETEST_PROXY implementation slice (2026-09-10)
+
+- [x] Extend the read-only finalist bulk snapshot with source initial balance,
+  actions, and equity series.
+- [x] Resolve a common UTC daily period with minimum 14 days, 90 percent real
+  coverage, bounded forward fill, and deterministic binding exclusions.
+- [x] Scale source equity into PRETEST_PROXY metrics and preserve explicit
+  `UNKNOWN`/`NOT_TESTED` labels.
+- [x] Share each symbol's full capacity among selected members and apply one
+  uniform DD/margin scale after exchange rounding.
+- [x] Charge mandatory singleton and two-symbol composition evaluations and
+  return bounded profile-ranked `max_candidates` output.
+- [x] Treat current-result equity as sparse observations, require a valid start
+  seed, include the terminal boundary, and keep density/gap as diagnostics.
+- [x] Verify deterministic bounded process search using the machine-wide
+  `duckdb_import.workers` setting and complete a current-data resource smoke.
+
+This slice does not start the tester, write PerformanceDB, or make a trading
+recommendation. Minute refinement, workbook profile-status rendering, and the
+Panel/static UI are included in this implementation. Current-data read-only
+verification passed for 31 finalists across 12 pairs: 3,220 unique evaluations
+produced three BALANCED variants in 252.241 seconds with no blocker. The process
+pool used the machine-wide width of 25, started at most 17 workers for the
+available batches, and had an observed aggregate working-set peak near 2.2 GB.
+
 ## 17. Критерий независимости нового пакета
 
 Canonical spec/plan/ADR и навигация не ссылаются на рабочую подборку как на

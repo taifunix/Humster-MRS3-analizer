@@ -103,6 +103,17 @@ def test_v1_migration_is_deterministic_and_drops_legacy_grid():
     assert all(profile["ranking"]["id"] == "portfolio_preliminary_ranking_v1" for profile in first["profiles"].values())
 
 
+def test_v1_migration_preserves_opaque_composition_parameters_under_compatibility_namespace(tmp_path):
+    original = _v1_config()
+    original["search"]["composition"]["parameters"]["operator_knob"] = {"value": 7}
+
+    migrated, changed = migrate_portfolio_config_document(original)
+
+    assert changed
+    assert migrated["search"]["composition"]["parameters"]["legacy_parameters"] == {"operator_knob": {"value": 7}}
+    assert load_portfolio_config(_write(tmp_path, migrated)).search["composition"]["parameters"]["legacy_parameters"] == {"operator_knob": {"value": 7}}
+
+
 def test_v1_load_returns_v2_model_with_defaults(tmp_path):
     config = load_portfolio_config(_write(tmp_path, _v1_config()))
 
@@ -200,6 +211,41 @@ def test_v2_values_are_preserved_and_money_stays_decimal(tmp_path):
     assert loaded.scenarios["AGGRESSIVE"].deposit.amount == Decimal("10000.125")
     with pytest.raises(TypeError):
         loaded.algorithm_versions["new"] = "v1"
+
+
+def test_existing_v2_v1_algorithm_versions_resolve_in_memory_without_rewrite(tmp_path):
+    value = _v2_config()
+    value["algorithm_versions"] = {
+        "sizing": "portfolio_optimizer_sizing_v1",
+        "ranking": "portfolio_optimizer_ranking_v1",
+    }
+    path = _write(tmp_path, value)
+    before = path.read_bytes()
+
+    loaded = load_portfolio_config(path)
+
+    assert dict(loaded.algorithm_versions) == {
+        "sizing": "portfolio_optimizer_sizing_v2",
+        "ranking": "portfolio_optimizer_ranking_v2",
+    }
+    assert path.read_bytes() == before
+
+
+def test_v2_migration_resolves_legacy_algorithm_versions_in_document_without_rewrite():
+    value = _v2_config()
+    value["algorithm_versions"] = {
+        "sizing": "portfolio_optimizer_sizing_v1",
+        "ranking": "portfolio_optimizer_ranking_v1",
+    }
+
+    resolved, changed = migrate_portfolio_config_document(value)
+
+    assert not changed
+    assert resolved["algorithm_versions"] == {
+        "sizing": "portfolio_optimizer_sizing_v2",
+        "ranking": "portfolio_optimizer_ranking_v2",
+    }
+    assert value["algorithm_versions"]["sizing"].endswith("_v1")
 
 
 def test_nonfinite_and_binary_float_money_fail(tmp_path):

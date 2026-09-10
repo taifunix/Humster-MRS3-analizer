@@ -3,6 +3,38 @@
 **Updated:** 2026-09-10
 **Current branch:** `main`
 
+## Portfolio Optimizer PRETEST_PROXY Stage 1 (2026-09-10)
+
+Implementation slice is present in the read-only finalist input, common UTC
+period resolver, PRETEST_PROXY metrics, shared-cap composition sizing, and
+bounded candidate search. Focused portfolio tests and Python compilation pass;
+tester execution and PerformanceDB writes remain disabled. Minute refinement,
+profile-status workbook output, and Panel/static UI integration are included
+and covered by focused fixture tests; root self-review and current-data
+verification remain pending.
+
+The current implementation also accepts sparse current-result equity
+observations with a valid prior/initial seed, carries them through the terminal
+UTC boundary, and records density/gap as diagnostics. Search acceleration is in
+place: the built-in evaluator uses bounded processes from the existing
+machine-wide `duckdb_import.workers` setting, commits results deterministically,
+and keeps full equity/action payloads only for source rows and final winners.
+
+Root verification on the current read-only PerformanceDB selected 31 finalists
+over 12 pairs. With `duckdb_import.workers=25` and the configured 100,000 search
+budget, the bounded search charged 3,220 unique compositions and returned three
+BALANCED variants after minute refinement in 252.241 seconds. No PerformanceDB
+write or tester run occurred. At most 17 worker processes were needed for the
+available batches; observed aggregate Search working set peaked near 2.2 GB,
+instead of the earlier serial run's roughly 18.5 GB retained payload.
+
+Focused verification: `325 passed` for Portfolio input/config/proxy/sizing/
+search/minute/adapter/Panel/static UI; the final process/mappingproxy,
+SingleMode-evidence and Panel subset passed `136 passed`. Full repository suite
+completed with `3708 passed, 7 skipped` and one Windows HTTP timeout; the exact
+failed typed-envelope route then passed three independent reruns. Python
+`compileall`, JavaScript syntax, and `git diff --check` pass.
+
 ## Performance v2 global finalist retest control (2026-09-10)
 
 The Panel now freezes the current effective `FINALIST` set, optionally adds
@@ -1819,3 +1851,27 @@ focused Panel/adapter checks pass `197 tests`; the complete `test_portfolio_*`
 set passes `927 tests`. Python compileall, JavaScript syntax and
 `git diff --check` pass. Independent final code review is still pending before
 commit.
+
+## Native SINGLE_MODE premature-completion recovery (2026-09-10)
+
+Live job `d8fbe51edaad41af948bc61e3f56cb85` exposed that tester HTTP status can
+become `Completed` while detached workers are still writing a 1000-strategy
+batch. The panel stopped the dispatcher after 140 reports in batch 4 and the
+job failed cleanup with 3000 verified results. Native completion now requires
+current-batch result-file evidence, publishes within-batch progress, and a
+tracked retry reuses valid reports with a single report-index pass. Recovery
+job `707489374995453c9e71d2e825e783fb` accepted 3140 existing reports, then
+produced about 808 more HTML files before the tester result journal was
+rewritten and the cleanup error masked the run. The native wait now accumulates
+file evidence monotonically, tolerates transient status loss, and stops only on
+the evidence-stall or total timeout. Failed retry jobs are retryable so the next
+run can recover all valid HTML before submitting only the remaining strategies.
+Live recovery eventually produced all 5186 reports. Retry job
+`24fe865fbd9d42cbb660f3327e998599` exposed a second terminal-path defect: when
+the recovery scan found no remaining names, it returned `COMMITTED` without
+creating the durable metadata inbox or publishing its counters. The immediate
+commit path now creates the inbox and emits the final snapshot; reload-time
+verification also restores persisted counters instead of replacing them with
+an empty `0/0` progress object. The live inbox contains 5186 entries and, after
+a cold panel restart plus repeated inbox verification, the registry remains
+`COMMITTED`, `5186/5186`, `inbox_ready=true`, `failed=0`.

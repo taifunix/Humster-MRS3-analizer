@@ -1,14 +1,15 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "policy_version": "portfolio_optimizer_research_risk_v1",
   "algorithm_versions": {
-    "sizing": "portfolio_optimizer_sizing_v1",
-    "ranking": "portfolio_optimizer_ranking_v1"
+    "sizing": "portfolio_optimizer_sizing_v2",
+    "ranking": "portfolio_optimizer_ranking_v2"
   },
   "inputs": {
     "performance_db": "./operator-supplied/performance.duckdb",
     "portfolio_db": "./operator-supplied/portfolio.duckdb",
     "collector_root": "./operator-supplied/collector",
+    "bybit_minute_data_root": "./operator-supplied/tester/data/bybit",
     "approved_templates": [
       "./operator-supplied/templates/strategy.json"
     ]
@@ -20,12 +21,7 @@
       "collateral": {"amount": 10000, "currency": "USDT"},
       "max_balance": {"amount": 10000, "currency": "USDT"},
       "sizing": {
-        "upper_bound": {"amount": 10000, "currency": "USDT"},
-        "grid": [
-          {"amount": 1000, "currency": "USDT"},
-          {"amount": 5000, "currency": "USDT"},
-          {"amount": 10000, "currency": "USDT"}
-        ]
+        "upper_bound": {"amount": 10000, "currency": "USDT"}
       }
     },
     "BALANCED": {
@@ -34,12 +30,7 @@
       "collateral": {"amount": 10000, "currency": "USDT"},
       "max_balance": {"amount": 10000, "currency": "USDT"},
       "sizing": {
-        "upper_bound": {"amount": 10000, "currency": "USDT"},
-        "grid": [
-          {"amount": 1000, "currency": "USDT"},
-          {"amount": 5000, "currency": "USDT"},
-          {"amount": 10000, "currency": "USDT"}
-        ]
+        "upper_bound": {"amount": 10000, "currency": "USDT"}
       }
     },
     "CONSERVATIVE": {
@@ -48,24 +39,21 @@
       "collateral": {"amount": 10000, "currency": "USDT"},
       "max_balance": {"amount": 10000, "currency": "USDT"},
       "sizing": {
-        "upper_bound": {"amount": 10000, "currency": "USDT"},
-        "grid": [
-          {"amount": 1000, "currency": "USDT"},
-          {"amount": 5000, "currency": "USDT"},
-          {"amount": 10000, "currency": "USDT"}
-        ]
+        "upper_bound": {"amount": 10000, "currency": "USDT"}
       }
     }
   },
   "search": {
     "universe": {"policy_id": "operator_supplied_universe_v1", "parameters": {"operator_supplied": true}},
-    "composition": {"policy_id": "operator_supplied_composition_v1", "parameters": {"operator_supplied": true}},
+    "composition": {"policy_id": "operator_supplied_composition_v1", "parameters": {"operator_supplied": true, "minimum_common_days": 14, "minimum_daily_coverage_pct": 90, "maximum_forward_fill_gap_days": 3}},
     "sizing": {"policy_id": "operator_supplied_sizing_v1", "parameters": {"operator_supplied": true}},
     "limiter": {"policy_id": "operator_supplied_limiter_v1", "parameters": {"operator_supplied": true}},
     "priority": {"policy_id": "operator_supplied_priority_v1", "parameters": {"operator_supplied": true}},
     "seed": 1,
     "rounds": 1,
-    "total_test_budget": 1
+    "total_test_budget": 1,
+    "sizing_mode": "liquidity_cap_single",
+    "max_enumerated_combinations": 100000
   },
   "research": {
     "development_window": {"value": 1, "unit": "days"},
@@ -76,7 +64,14 @@
   },
   "liquidity": {
     "policy_id": "operator_supplied_liquidity_v1",
-    "parameters": {"operator_supplied": true}
+    "parameters": {"operator_supplied": true, "close_volume_participation_pct": 30},
+    "round_down_usdt": 50,
+    "minimum_coverage_pct": 90,
+    "maximum_age_hours": 2,
+    "weekend_start_utc": "SATURDAY 00:00",
+    "weekend_end_utc": "MONDAY 00:00",
+    "archive_publication_lag_hours": 6,
+    "backfill_write_enabled": false
   },
   "margin": {
     "policy_id": "operator_supplied_margin_v1",
@@ -86,17 +81,20 @@
     "AGGRESSIVE": {
       "pnl": {"policy_id": "operator_supplied_pnl_v1", "parameters": {"operator_supplied": true}},
       "liquidity": {"policy_id": "operator_supplied_liquidity_v1", "parameters": {"operator_supplied": true}},
-      "ranking": {"id": "operator_supplied_ranking_v1", "parameters": {"operator_supplied": true}, "top_n": 1}
+      "individual_max_dd_pct": "30", "individual_net_pnl_min_exclusive": "0",
+      "ranking": {"id": "portfolio_preliminary_ranking_v1", "parameters": {"metrics": [{"field": "net_pnl", "direction": "DESC"}, {"field": "recovery_factor", "direction": "DESC"}, {"field": "max_dd_pct", "direction": "ASC"}]}, "top_n": 1}
     },
     "BALANCED": {
       "pnl": {"policy_id": "operator_supplied_pnl_v1", "parameters": {"operator_supplied": true}},
       "liquidity": {"policy_id": "operator_supplied_liquidity_v1", "parameters": {"operator_supplied": true}},
-      "ranking": {"id": "operator_supplied_ranking_v1", "parameters": {"operator_supplied": true}, "top_n": 1}
+      "individual_max_dd_pct": "20", "individual_net_pnl_min_exclusive": "0",
+      "ranking": {"id": "portfolio_preliminary_ranking_v1", "parameters": {"metrics": [{"field": "recovery_factor", "direction": "DESC"}, {"field": "net_pnl", "direction": "DESC"}, {"field": "max_dd_pct", "direction": "ASC"}]}, "top_n": 1}
     },
     "CONSERVATIVE": {
       "pnl": {"policy_id": "operator_supplied_pnl_v1", "parameters": {"operator_supplied": true}},
       "liquidity": {"policy_id": "operator_supplied_liquidity_v1", "parameters": {"operator_supplied": true}},
-      "ranking": {"id": "operator_supplied_ranking_v1", "parameters": {"operator_supplied": true}, "top_n": 1}
+      "individual_max_dd_pct": "15", "individual_net_pnl_min_exclusive": "0",
+      "ranking": {"id": "portfolio_preliminary_ranking_v1", "parameters": {"metrics": [{"field": "recovery_factor", "direction": "DESC"}, {"field": "max_dd_pct", "direction": "ASC"}, {"field": "net_pnl", "direction": "DESC"}]}, "top_n": 1}
     }
   },
   "runner": {

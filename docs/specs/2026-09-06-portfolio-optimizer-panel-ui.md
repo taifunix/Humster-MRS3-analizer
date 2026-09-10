@@ -434,6 +434,10 @@ export-only-finalists path.
 
 ## D8 amendment: v2 settings and thin facade
 
+The Stage 1 amendment below is normative for current PRETEST_PROXY Campaigns;
+the settings details in this D8 section are retained as the compatibility
+history for the earlier one-size adapter path.
+
 The optimizer Settings contract now uses strict `schema_version = 2`. The
 server accepts a v1 document only through the deterministic in-memory
 migration defined by the main optimizer specification and ADR-0033. GET may
@@ -444,23 +448,35 @@ fields. v2 unknown keys are rejected before write. A stale
 `expected_digest` still returns `409 CONFIG_CHANGED`, and the server never
 merges a stale partial document.
 
-The form exposes the single-size controls: scenario deposit, collateral,
-max_balance, and sizing upper bound; profile
-`individual_max_dd_pct`, `individual_net_pnl_min_exclusive`, and `ranking.top_n`;
-and the editable global controls `close_volume_participation_pct` (1..200),
-`round_down_usdt`, `minimum_coverage_pct`, market-reference
-`maximum_age_hours`, archive lag 0..48, the weekend window, and
-`backfill_write_enabled` (default false). The combination limit remains a
-hidden technical field. It does not
-render a sizing grid or partial-close size variants. Fixed descriptors,
-algorithm versions, paths, and policy identifiers remain technical fields in
-the cloned document. The Bybit minute root is accepted as a server-side local
-input and is never supplied by an untrusted browser field. The
-legacy/downstream `search.total_test_budget` remains in the configuration
-schema but is hidden from Settings and does not gate Stage-1 Campaign creation.
+For the current Stage 1 form, the single-size controls are scenario deposit,
+collateral, max_balance, and sizing upper bound; the editable profile control
+is `individual_net_pnl_min_exclusive`. `individual_max_dd_pct` and
+`ranking.top_n` remain readable compatibility fields and are hidden from the
+editor. The editable global controls are
+`close_volume_participation_pct` (1..200), `round_down_usdt`,
+`minimum_coverage_pct`, market-reference `maximum_age_hours`, archive lag
+0..48, the weekend window, and `backfill_write_enabled` (default false).
+`search.max_enumerated_combinations` is shown as the **Pretest evaluation
+budget**. The form does not render a sizing grid or partial-close size
+variants. Fixed descriptors, algorithm versions, paths, and policy identifiers
+remain technical fields in the cloned document. The Bybit minute root is
+accepted as a server-side local input and is never supplied by an untrusted
+browser field. The legacy/downstream `search.total_test_budget` remains in the
+configuration schema but is hidden from Settings and does not gate Stage 1
+Campaign creation.
 
 Panel remains a thin facade. It owns HTTP validation, CAS, immutable Campaign
 capture, job lifecycle/progress, and artifact delivery. `src/mrs3/portfolio`
 owns migration, candidate identity, the one frozen market-reference snapshot,
 sizing, liquidity, gates, and ranking. No Panel code duplicates those
 algorithms or writes PerformanceDB.
+
+## Stage 1 PRETEST_PROXY amendment
+
+The Settings form labels `max_candidates` as **Candidates for joint tick test**
+and presents `search.max_enumerated_combinations` as the **Pretest evaluation
+budget**. Individual DD and ranking `top_n` remain readable compatibility
+fields and are not editable Stage 1 gates. Stage 1 output is preliminary
+PRETEST_PROXY evidence, with joint metrics and recommendation fields shown as
+`UNKNOWN` or `NOT_TESTED`; a PARTIAL profile result remains visible in the
+workbook and Panel summary.

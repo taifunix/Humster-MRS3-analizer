@@ -84,6 +84,33 @@ def test_settings_save_migrates_legacy_v1_document_to_v2(tmp_path: Path) -> None
     assert all("grid" not in scenario["sizing"] for scenario in document["scenarios"].values())
 
 
+def test_v2_legacy_algorithm_versions_are_resolved_for_panel_and_save(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    document = _config()
+    document["algorithm_versions"] = {
+        "sizing": "portfolio_optimizer_sizing_v1",
+        "ranking": "portfolio_optimizer_ranking_v1",
+    }
+    source = json.dumps(document, ensure_ascii=False, indent=2).encode()
+    path.write_bytes(source)
+    digest = hashlib.sha256(source).hexdigest()
+    service = PortfolioPanelService(tmp_path, path)
+
+    settings = service.settings_get()
+    assert settings["document"]["algorithm_versions"] == {
+        "sizing": "portfolio_optimizer_sizing_v2",
+        "ranking": "portfolio_optimizer_ranking_v2",
+    }
+    assert settings["digest"] == digest
+    _, config_raw, campaign_document = service._config()
+    assert config_raw == source
+    assert campaign_document["algorithm_versions"] == settings["document"]["algorithm_versions"]
+
+    saved = service.settings_put({"expected_digest": digest, "document": settings["document"]})
+    assert saved["document"]["algorithm_versions"] == settings["document"]["algorithm_versions"]
+    assert json.loads(path.read_text(encoding="utf-8"))["algorithm_versions"] == settings["document"]["algorithm_versions"]
+
+
 def test_settings_put_restores_previous_bytes_when_readback_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     digest = _write_config(path)
@@ -166,6 +193,26 @@ def test_readiness_resets_pairs_and_counts_when_finalist_read_fails(tmp_path: Pa
     assert readiness["available_pairs"] == []
     assert readiness["current_finalists"] == {}
     assert readiness["stage1"]["blockers"] == ["FINALISTS_UNAVAILABLE", "NO_FINALISTS"]
+
+
+def test_readiness_requests_metadata_only_finalists(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    with duckdb.connect(str(tmp_path / "performance.duckdb")) as connection:
+        connection.execute("create table selection_runs(symbol varchar, side varchar)")
+        connection.execute("insert into selection_runs values ('BTCUSDT', 'LONG')")
+    calls: list[tuple[object, ...]] = []
+
+    def reader(*args):
+        calls.append(args)
+        return ({"symbol": "BTCUSDT", "side": "LONG"},)
+
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=reader)
+    readiness = service.readiness()
+
+    assert readiness["available_pairs"] == ["BTCUSDT|LONG"]
+    assert len(calls) == 1
+    assert calls[0][-1] is False
 
 
 def test_active_campaign_conflict_is_reported_before_source_snapshot(tmp_path: Path) -> None:
@@ -685,6 +732,55 @@ def test_workbook_exposes_adapter_capacity_spread_and_warning_diagnostics(tmp_pa
         workbook.close()
 
 
+def test_workbook_uses_final_pretest_metrics_rank_and_composition_member_size(tmp_path: Path) -> None:
+    service = PortfolioPanelService(tmp_path)
+    campaign = {
+        "campaign_id": "campaign-fixed", "input_digest": "i", "config_digest": "c",
+        "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z",
+        "launch": {"profiles": [{"profile_id": "BALANCED", "max_candidates": 2}]},
+        "config_document": {"search": {"max_enumerated_combinations": 100}},
+    }
+    member = {
+        "strategy_id": 1, "result_id": 2, "symbol": "BTCUSDT", "side": "LONG",
+        "quantity": Decimal("4"), "maximum_closing_quantity": Decimal("99"),
+        "actual_size_usdt": Decimal("123"), "position_size_usdt": Decimal("999"),
+    }
+    variant = {
+        "candidate_id": "candidate", "profile": "BALANCED", "search_mode": "PRETEST_PROXY",
+        "daily_pretest_rank": 1, "final_pretest_rank": 2, "refinement": "MINUTE",
+        "members": (member,), "evaluations": 3,
+        "pretest_period": {"start_utc": "2026-01-01", "end_utc": "2026-01-15", "coverage_pct": {}},
+        "metrics": {
+            "metric_basis": "PRETEST_PROXY", "proxy_pnl_usdt": Decimal("77"),
+            "proxy_max_drawdown_pct": Decimal("2"), "proxy_recovery_factor": Decimal("3"),
+            "proxy_reserve_usdt": Decimal("100"), "k": Decimal("0.5"), "k1": Decimal("0.6"),
+            "tested_size_usdt": Decimal("100"), "actual_size_usdt": Decimal("123"),
+            "tested_size_basis": "SOURCE_INITIAL_BALANCE_X_OPENING_LOT", "joint_metrics": "NOT_TESTED",
+        },
+    }
+    path = tmp_path / "final-pretest.xlsx"
+    service._write_workbook(path, campaign, (), (), (variant,), ())
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        portfolio_headers = {cell.value: index for index, cell in enumerate(workbook["Portfolios"][1])}
+        portfolio = workbook["Portfolios"][2]
+        assert portfolio[portfolio_headers["Pretest PnL USDT"]].value == "77"
+        assert portfolio[portfolio_headers["Actual Size USDT"]].value == "123"
+        assert portfolio[portfolio_headers["Refinement"]].value == "MINUTE"
+        assert portfolio[portfolio_headers["Final PRETEST Rank"]].value == 2
+        member_headers = {cell.value: index for index, cell in enumerate(workbook["Members"][1])}
+        members = workbook["Members"][2]
+        assert members[member_headers["Quantity"]].value == "4"
+        assert members[member_headers["Notional USDT"]].value == "123"
+        status_headers = {cell.value: index for index, cell in enumerate(workbook["Profile Status"][1])}
+        status = workbook["Profile Status"][2]
+        assert status[status_headers["Metric Basis"]].value == "PRETEST_PROXY"
+        assert status[status_headers["Joint Metrics"]].value == "NOT_TESTED"
+    finally:
+        workbook.close()
+
+
 def test_workbook_does_not_invent_gate_or_counts(tmp_path: Path) -> None:
     service = PortfolioPanelService(tmp_path)
     campaign = {"campaign_id": "campaign-fixed", "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z"}
@@ -791,6 +887,27 @@ def test_package_adapter_status_is_a_structured_blocker(monkeypatch: pytest.Monk
     result = PortfolioPanelService(tmp_path)._package_variant_generator(({"strategy_id": 1},), {}, ({"profile_id": "BALANCED"},))
 
     assert result["blockers"] == ["BALANCED:POSITION_SIZING_FAILED"]
+
+
+def test_package_adapter_uses_duckdb_import_workers_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / "config.local.json").write_text(json.dumps({
+        "duckdb_import": {"workers": 3},
+        "direct_materialization": {"workers": 99},
+    }), encoding="utf-8")
+    observed = {}
+
+    def fake_adapter(*_args, **kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(variants=(), blockers=(), excluded=(), warnings=())
+
+    monkeypatch.setattr("mrs3.portfolio.adapter.run_portfolio_adapter", fake_adapter)
+    PortfolioPanelService(tmp_path)._package_variant_generator((), {}, ())
+
+    assert observed["workers"] == 3
+    (tmp_path / "config.local.json").write_text(json.dumps({"direct_materialization": {"workers": 99}}), encoding="utf-8")
+    observed.clear()
+    PortfolioPanelService(tmp_path)._package_variant_generator((), {}, ())
+    assert observed["workers"] == 16
 
 
 def test_package_adapter_real_contract_rejects_invalid_campaign(tmp_path: Path) -> None:

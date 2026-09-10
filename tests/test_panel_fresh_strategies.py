@@ -32,6 +32,8 @@ def test_panel_keeps_runs_backend_but_hides_legacy_run_controls() -> None:
     assert "strategies.tester.runs" not in web_source
     assert 'id="tester-start"' in panel_html
     assert "SINGLE_MODE" in panel_html
+    assert panel_source.count("async function analysisShortlist()") == 1
+    assert panel_source.count("async function analysisStrategies()") == 1
 
 
 def test_generation_validation_does_not_poison_the_next_request(tmp_path: Path) -> None:
@@ -353,6 +355,32 @@ def test_committed_tester_inbox_readiness_survives_panel_reload(tmp_path: Path) 
     assert controller._panel_jobs.get(job["job_id"])["inbox_ready"] is True
 
 
+@pytest.mark.parametrize(("source_kind", "source_phase"), (("strategies.tester.native.start", "FAILED"), ("strategies.tester.retry", "BOT_RUN")))
+def test_failed_native_tester_can_start_a_tracked_retry(tmp_path: Path, source_kind: str, source_phase: str) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    source = controller._panel_jobs.submit(
+        source_kind, {}, "native-source", ("strategies.tester",)
+    )
+    controller._panel_jobs.transition(source["job_id"], "RUNNING")
+    controller._panel_jobs.transition(source["job_id"], "FAILED", phase=source_phase)
+    calls: list[tuple[str, str]] = []
+
+    class Service:
+        def retry(self, source_job_id: str, *, job_id: str) -> dict[str, object]:
+            calls.append((source_job_id, job_id))
+            return {"job_id": job_id, "state": "RUNNING", "phase": "RUNNING", "progress": {}}
+
+    controller._single_mode_strategy_test_service = Service()
+    result = controller.panel_job_submit({
+        "kind": "strategies.tester.retry",
+        "request": {"job_id": source["job_id"]},
+    })
+
+    assert result["job_id"] != source["job_id"]
+    assert calls == [(source["job_id"], result["job_id"])]
+    assert controller._panel_jobs.get(result["job_id"])["state"] == "RUNNING"
+
+
 @pytest.mark.parametrize("kind", ("strategies.tester.start", "strategies.tester.native.start"))
 def test_existing_committed_tester_inbox_is_marked_ready_on_panel_reload(tmp_path: Path, monkeypatch, kind: str) -> None:
     config = tmp_path / "config.local.json"
@@ -370,6 +398,30 @@ def test_existing_committed_tester_inbox_is_marked_ready_on_panel_reload(tmp_pat
     controller._reconcile_interrupted_tester_jobs()
 
     assert controller._panel_jobs.get(job["job_id"])["inbox_ready"] is True
+
+
+def test_interrupted_single_mode_commit_is_recovered_from_durable_inbox(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    inbox_root = tmp_path / "inbox"
+    inbox = inbox_root / "single-job"
+    inbox.mkdir(parents=True)
+    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=inbox_root))
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    job = controller._panel_jobs.submit(
+        "strategies.tester.retry", {}, "single", ("strategies.tester",), job_id="single-job"
+    )
+    controller._panel_jobs.transition(job["job_id"], "RUNNING")
+    controller._panel_jobs.transition(job["job_id"], "FAILED", phase="COMMITTED")
+    controller._panel_jobs.jobs[job["job_id"]]["error"] = {"code": "INTERRUPTED"}
+
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda path: None if path == inbox else pytest.fail(str(path)))
+
+    controller._reconcile_interrupted_tester_jobs()
+
+    recovered = controller._panel_jobs.get(job["job_id"])
+    assert recovered["state"] == "COMMITTED"
+    assert recovered["inbox_ready"] is True
 
 
 def test_single_mode_verify_routes_through_existing_performance_inbox_button(tmp_path: Path, monkeypatch) -> None:
@@ -526,7 +578,14 @@ def test_completed_tester_batch_is_recovered_after_panel_restart(tmp_path: Path,
     config = tmp_path / "config.local.json"
     config.write_text("{}", encoding="utf-8")
     inbox_root = tmp_path / "inbox"
-    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=inbox_root))
+    monkeypatch.setattr(
+        "mrs3.panel.RunnerConfig.from_json",
+        lambda _path: SimpleNamespace(
+            inbox_root=inbox_root,
+            strategy_dir=tmp_path / "strategies",
+            report_dir=tmp_path / "reports",
+        ),
+    )
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
     job = controller._panel_jobs.submit("strategies.tester.start", {"analysis_run_id": "a" * 64}, "tester", job_id="batch-1")
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
@@ -548,7 +607,14 @@ def test_verified_tester_batch_finishes_inbox_capture_after_restart(tmp_path: Pa
     config = tmp_path / "config.local.json"
     config.write_text("{}", encoding="utf-8")
     inbox_root = tmp_path / "inbox"
-    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=inbox_root))
+    monkeypatch.setattr(
+        "mrs3.panel.RunnerConfig.from_json",
+        lambda _path: SimpleNamespace(
+            inbox_root=inbox_root,
+            strategy_dir=tmp_path / "strategies",
+            report_dir=tmp_path / "reports",
+        ),
+    )
     monkeypatch.setattr("mrs3.panel.plan_batch", lambda *_args, **_kwargs: SimpleNamespace(resume_remaining_names=()))
     inbox = inbox_root / "batch-1"
     monkeypatch.setattr("mrs3.panel.run_batch", lambda *_args, **_kwargs: SimpleNamespace(inbox_path=inbox))

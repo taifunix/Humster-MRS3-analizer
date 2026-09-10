@@ -25,6 +25,7 @@ from mrs3.portfolio.input import (
     read_and_select_finalists,
     read_current_finalists,
     read_performance_snapshot,
+    resolve_common_pretest_period,
 )
 from mrs3.portfolio.store import PortfolioStore
 from tests.test_performance_v2_selection import _candidate_db
@@ -864,6 +865,29 @@ def test_read_current_finalists_returns_exact_review_facts_without_writes(tmp_pa
     assert database.read_bytes() == before
 
 
+def test_read_current_finalists_can_skip_large_series_for_metadata_consumers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _database(tmp_path)
+    calls: list[str] = []
+    original = portfolio_input._records_for_ids
+
+    def checked(connection, table, column, ids):
+        calls.append(table)
+        return original(connection, table, column, ids)
+
+    monkeypatch.setattr(portfolio_input, "_records_for_ids", checked)
+    row = read_current_finalists(database, [("BTCUSDT", "LONG")], False)[0]
+
+    assert "strategy_actions" not in calls
+    assert "strategy_equity" not in calls
+    assert "actions" not in row
+    assert "equity" not in row
+    assert "action_series" not in row
+    assert "equity_series" not in row
+
+
 def test_read_current_finalists_returns_physical_facts_and_panel_safe_values(tmp_path: Path) -> None:
     database = _database(tmp_path)
     with duckdb.connect(str(database)) as connection:
@@ -1017,3 +1041,263 @@ def test_read_current_finalists_uses_exact_current_status_and_fails_closed_on_st
     with pytest.raises(PortfolioInputError) as error:
         read_current_finalists(database, [("BTCUSDT", "LONG")])
     assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+
+def test_common_period_seeds_from_latest_prior_real_sample_and_forward_fills_initial_balance() -> None:
+    start = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 14, tzinfo=timezone.utc)
+    prior = {"timestamp_utc": "2026-01-09T12:00:00Z", "equity": Decimal("120")}
+    row = {"symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1, "report_start_utc": "2026-01-10T00:00:00Z", "report_end_utc": "2026-01-14T00:00:00Z", "initial_balance": Decimal("100"), "equity": (prior, {"timestamp_utc": "2026-01-11T12:00:00Z", "equity": Decimal("130")})}
+
+    result = resolve_common_pretest_period((row,), minimum_common_days=1, minimum_daily_coverage_pct=1, maximum_forward_fill_gap_days=3)
+
+    assert result.available
+    path = result.daily_paths["A:LONG:1:1"]
+    assert path[0]["equity"] == Decimal("120")
+    assert path[0]["seed"] is True
+    assert path[1]["equity"] == Decimal("120")
+    assert path[2]["equity"] == Decimal("130")
+
+    initial = dict(row, equity=({"timestamp_utc": "2026-01-11T12:00:00Z", "equity": Decimal("130")},))
+    seeded = resolve_common_pretest_period((initial,), minimum_common_days=1, minimum_daily_coverage_pct=1, maximum_forward_fill_gap_days=3)
+    assert seeded.available
+    assert seeded.daily_paths["A:LONG:1:1"][0]["equity"] == Decimal("100")
+    assert seeded.daily_paths["A:LONG:1:1"][0]["seed"] is True
+
+
+def test_current_result_prior_sample_older_than_diagnostic_gap_still_passes() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-10T00:00:00Z",
+        "report_end_utc": "2026-01-24T00:00:00Z",
+        "equity": (
+            {"timestamp_utc": "2026-01-05T00:00:00Z", "equity": Decimal("120")},
+            {"timestamp_utc": "2026-01-20T00:00:00Z", "equity": Decimal("130")},
+        ),
+    }
+
+    result = resolve_common_pretest_period(
+        (row,), minimum_common_days=14, minimum_daily_coverage_pct=1,
+        maximum_forward_fill_gap_days=3,
+    )
+
+    assert result.available
+    assert result.evidence["coverage_gate"] == "NON_BINDING_DIAGNOSTIC"
+    assert result.evidence["rows"]["A:LONG:1:1"]["max_observation_gap_days"] == Decimal("10.00000000")
+
+
+def test_common_period_rejects_leading_days_without_prior_or_initial_seed() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-10T00:00:00Z",
+        "report_end_utc": "2026-01-24T00:00:00Z",
+        "equity": ({"timestamp_utc": "2026-01-11T00:00:00Z", "equity": Decimal("130")},),
+    }
+
+    result = resolve_common_pretest_period(
+        (row,), minimum_common_days=14, minimum_daily_coverage_pct=90,
+        maximum_forward_fill_gap_days=3,
+    )
+
+    assert not result.available
+    assert any(item["reason"] == "DAILY_PATH_REQUIRES_SEED" for item in result.exclusions)
+
+
+def test_current_result_accepts_sparse_observations_and_persists_diagnostics() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": start + __import__("datetime").timedelta(days=28),
+        "initial_balance": Decimal("100"),
+        "equity": tuple(
+            {"timestamp_utc": start + __import__("datetime").timedelta(days=index), "equity": Decimal("100") + index}
+            for index in range(0, 28, 2)
+        ),
+        "actions": (),
+    }
+
+    result = resolve_common_pretest_period(
+        (row,), minimum_common_days=14, minimum_daily_coverage_pct=100,
+        maximum_forward_fill_gap_days=0,
+    )
+
+    assert result.available
+    evidence = result.evidence["rows"]["A:LONG:1:1"]
+    assert evidence["sparse_observation_tag"] == "SPARSE_OBSERVATION_FORWARD_FILL"
+    assert evidence["path_policy"] == "SPARSE_OBSERVATION_FORWARD_FILL"
+    assert evidence["calendar_days"] == 28
+    assert evidence["in_window_observation_count"] == 14
+    assert evidence["in_window_action_count"] == 0
+    assert evidence["observed_day_count"] == 14
+    assert evidence["observed_day_ratio"] == Decimal("50.00000000")
+    assert evidence["observed_sample_day_count"] == 14
+    assert evidence["observed_sample_day_ratio"] == Decimal("50.00000000")
+    assert evidence["max_observation_gap_days"] == Decimal("2")
+    assert evidence["maximum_observation_gap_days"] == Decimal("2")
+    assert evidence["seed_source"] == "EQUITY_OBSERVATION"
+    assert evidence["start_seed_source"] == "PRIOR_OBSERVATION"
+    assert evidence["initial_balance_seed_used"] is False
+    assert evidence["seeded"] is False
+    assert evidence["dd_bias"] == "DOWNWARD_BIASED_BETWEEN_OBSERVATIONS"
+    assert evidence["pretest_source_mode"] == "CURRENT_RESULT"
+    assert result.coverage_pct["A:LONG:1:1"] == Decimal("50.00000000")
+
+
+def test_current_result_does_not_use_a_future_same_day_observation_as_start_seed() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": start + __import__("datetime").timedelta(days=14),
+        "initial_balance": Decimal("100"),
+        "equity": (
+            {"timestamp_utc": start + __import__("datetime").timedelta(hours=12), "equity": Decimal("120")},
+        ),
+    }
+
+    result = resolve_common_pretest_period((row,), minimum_common_days=14)
+
+    assert result.available
+    path = result.daily_paths["A:LONG:1:1"]
+    assert path[0]["equity"] == Decimal("100")
+    assert path[0]["seed"] is True
+    assert path[1]["equity"] == Decimal("120")
+
+
+def test_current_result_daily_path_includes_terminal_interval_endpoint() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + __import__("datetime").timedelta(days=14)
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": end,
+        "initial_balance": Decimal("100"),
+        "equity": (
+            {"timestamp_utc": end - __import__("datetime").timedelta(hours=1), "equity": Decimal("125")},
+        ),
+    }
+
+    result = resolve_common_pretest_period((row,), minimum_common_days=14)
+
+    assert result.available
+    path = result.daily_paths["A:LONG:1:1"]
+    assert len(path) == 15
+    assert path[-1]["timestamp_utc"] == end
+    assert path[-1]["equity"] == Decimal("125")
+
+
+def test_current_result_without_any_start_seed_is_rejected_even_when_window_is_empty() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": start + __import__("datetime").timedelta(days=14),
+        "equity": (), "actions": (),
+    }
+
+    result = resolve_common_pretest_period((row,), minimum_common_days=14)
+
+    assert not result.available
+    assert any(item["reason"] == "DAILY_PATH_REQUIRES_SEED" for item in result.exclusions)
+
+
+def test_current_result_zero_initial_balance_is_not_a_valid_start_seed() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": start + __import__("datetime").timedelta(days=14),
+        "initial_balance": Decimal("0"), "equity": (), "actions": (),
+    }
+
+    result = resolve_common_pretest_period((row,), minimum_common_days=14)
+
+    assert not result.available
+    assert any(item["reason"] == "INVALID_INITIAL_BALANCE" for item in result.exclusions)
+
+
+def test_current_result_coverage_and_gap_settings_are_diagnostics_only() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": start + __import__("datetime").timedelta(days=28),
+        "initial_balance": Decimal("100"),
+        "equity": tuple(
+            {"timestamp_utc": start + __import__("datetime").timedelta(days=index), "equity": Decimal("100") + index}
+            for index in range(0, 28, 4)
+        ),
+    }
+
+    permissive = resolve_common_pretest_period((row,), minimum_common_days=14, minimum_daily_coverage_pct=1, maximum_forward_fill_gap_days=0)
+    strict = resolve_common_pretest_period((row,), minimum_common_days=14, minimum_daily_coverage_pct=100, maximum_forward_fill_gap_days=99)
+
+    assert permissive.status == strict.status == "PASS"
+    assert (permissive.start_utc, permissive.end_utc) == (strict.start_utc, strict.end_utc)
+    assert permissive.daily_paths == strict.daily_paths
+    assert permissive.evidence["coverage_gate"] == strict.evidence["coverage_gate"] == "NON_BINDING_DIAGNOSTIC"
+    assert permissive.evidence["forward_fill_gap_gate"] == strict.evidence["forward_fill_gap_gate"] == "NON_BINDING_DIAGNOSTIC"
+
+
+def test_current_result_zero_activity_and_observation_loss_are_distinct() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    common = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": start + __import__("datetime").timedelta(days=14),
+        "initial_balance": Decimal("100"),
+    }
+    zero = resolve_common_pretest_period((common,), minimum_common_days=14)
+    assert zero.available
+    assert zero.evidence["rows"]["A:LONG:1:1"]["reason"] == "ZERO_ACTIVITY_IN_WINDOW"
+    assert all(point["equity"] == Decimal("100") for point in zero.daily_paths["A:LONG:1:1"])
+
+    loss = resolve_common_pretest_period((dict(common, actions=({"timestamp_utc": start},)),), minimum_common_days=14)
+    assert not loss.available
+    assert any(item["reason"] == "INVALID_START_SEED" for item in loss.exclusions)
+
+    observed_before = dict(common, equity=({"timestamp_utc": start - __import__("datetime").timedelta(days=1), "equity": Decimal("100")},), actions=({"timestamp_utc": start + __import__("datetime").timedelta(days=1)},))
+    loss_with_seed = resolve_common_pretest_period((observed_before,), minimum_common_days=14)
+    assert not loss_with_seed.available
+    assert any(item["reason"] == "OBSERVATION_LOSS_SUSPECTED" for item in loss_with_seed.exclusions)
+
+
+def test_current_result_prior_action_without_prior_equity_is_invalid_seed() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": start + __import__("datetime").timedelta(days=14),
+        "initial_balance": Decimal("100"),
+        "actions": ({"timestamp_utc": start},),
+        "equity": ({"timestamp_utc": start + __import__("datetime").timedelta(days=1), "equity": Decimal("101")},),
+    }
+    result = resolve_common_pretest_period((row,), minimum_common_days=14)
+    assert not result.available
+    assert any(item["reason"] == "INVALID_START_SEED" for item in result.exclusions)
+
+
+def test_current_result_tied_latest_start_offenders_are_peeled_deterministically() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    def row(strategy_id: int, report_start: datetime, report_end: datetime) -> dict:
+        return {
+            "symbol": chr(64 + strategy_id), "side": "LONG", "strategy_id": strategy_id, "result_id": strategy_id,
+            "report_start_utc": report_start, "report_end_utc": report_end,
+            "initial_balance": Decimal("100"),
+            "equity": ({"timestamp_utc": report_start, "equity": Decimal("100")},),
+        }
+    result = resolve_common_pretest_period(
+        (row(2, start + __import__("datetime").timedelta(days=16), start + __import__("datetime").timedelta(days=28)),
+             row(1, start + __import__("datetime").timedelta(days=16), start + __import__("datetime").timedelta(days=28)),
+         row(3, start, start + __import__("datetime").timedelta(days=28))),
+        minimum_common_days=14,
+    )
+    assert result.available
+    assert [item["key"] for item in result.exclusions] == ["A:LONG:1:1", "B:LONG:2:2"]
+    assert result.evidence["excluded_identities"] == ("A:LONG:1:1", "B:LONG:2:2")
+
+
+def test_current_result_common_period_shorter_than_minimum_fails_closed() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": start + __import__("datetime").timedelta(days=13),
+        "initial_balance": Decimal("100"),
+        "equity": ({"timestamp_utc": start, "equity": Decimal("100")},),
+    }
+    result = resolve_common_pretest_period((row,), minimum_common_days=14)
+    assert not result.available
+    assert result.reason == "COMMON_PRETEST_PERIOD_UNAVAILABLE"

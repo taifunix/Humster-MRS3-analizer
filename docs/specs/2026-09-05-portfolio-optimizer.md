@@ -1302,9 +1302,12 @@ Settings GET/PUT; постоянный gate этапа 2 до M5/M6 и отде�
 
 This amendment is normative for the changed rules below and is linked to
 ADR-0033. ADR-0030 remains historical and unchanged for every rule that this
-amendment does not explicitly replace. The implementation boundary remains
-fixture/research-only; it does not authorize a tester run, recommendation,
-trading admission, or live use.
+amendment does not explicitly replace. The legacy adapter behavior described
+below applies only when an explicitly legacy path is selected; current Panel
+Campaigns use the Stage 1 PRETEST_PROXY amendment at the end of this
+specification. The implementation boundary remains fixture/research-only; it
+does not authorize a tester run, recommendation, trading admission, or live
+use.
 
 ### Config v2
 
@@ -1394,5 +1397,51 @@ Campaign capture, job lifecycle, progress, and artifact delivery. The
 `src/mrs3/portfolio` package owns migration, candidate identity, sizing,
 liquidity, gates, ranking, and all calculations. Panel does not duplicate those
 algorithms or write PerformanceDB.
+
+## Stage 1 PRETEST_PROXY contract (2026-09-10)
+
+Stage 1 searches bounded PRETEST_PROXY compositions using current
+PerformanceDB equity paths. It reads exact current `FINALIST` rows, their
+initial balances, actions, and equity series through one read-only bulk
+snapshot. Effective report intervals intersect into one UTC whole-day period;
+the period requires at least 14 days. Current-result equity is a sparse
+observation series: the last observation at or before each boundary is carried
+forward, including the terminal boundary. A prior observation or a positive
+source initial balance must seed the first boundary; future observations never
+seed earlier boundaries. Observation density and maximum gap are preserved as
+diagnostics and do not reject an otherwise usable current result. Period
+exclusions and zero-activity windows are persisted as evidence.
+
+For a source member, tested size is
+`source_initial_balance_usdt * sum(original opening lot_x)`. Its scaled daily
+increment is `(equity - source_initial_balance) * actual_size / tested_size`.
+Portfolio equity is campaign equity plus the sum of member increments. This
+linear scale is labelled `PRETEST_PROXY` and
+`LINEAR_SCALING_ASSUMPTION_UNVERIFIED`; balance-percentage and risk are
+`UNKNOWN`, and joint metrics are `NOT_TESTED`.
+
+Individual DD and ranking `top_n` values are compatibility fields and do not
+filter Stage 1 candidates. Each symbol has one shared full-position capacity.
+Members receive equal initial shares, exchange-rounded quantities, and
+deterministic canonical residual steps. Uniform `k` is chosen from portfolio
+DD and margin reserve constraints and is recomputed after rounding; one ratio
+correction is allowed.
+
+The mandatory search budget is `sum(k_s) + sum(k_s*k_t)`, where
+`k_s = n_long + n_short + n_long*n_short`. It covers every singleton and
+two-symbol composition; higher cardinalities use the remaining bounded
+budget. `max_candidates` returns only the top N preliminary candidates for a
+future joint tick test. Stage 1 never recommends a strategy and never invokes
+the tester.
+
+The built-in PRETEST_PROXY evaluator may execute in a bounded process pool.
+Its width comes only from the machine-wide `config.local.json`
+`duckdb_import.workers` value (16 when the Panel has no such setting); it is a
+scheduling input and is absent from Campaign identity and the Portfolio UI.
+Arbitrary injected evaluators remain serial. Workers return results to one
+ordered parent commit path, so worker completion order cannot change candidate
+identity, budget accounting, ranking, or output. Search retains compact member
+and metric facts; source equity/actions are stored once and restored only for
+the final shortlist before minute refinement and artifact output.
 При реализации проверяется актуальная версия и фиксируется reference date;
 эти ссылки не заменяют сохранённые campaign facts и не задают наши risk limits.

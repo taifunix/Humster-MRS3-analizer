@@ -868,10 +868,11 @@ def test_reload_recovers_only_server_job_snapshots() -> None:
     js = _read("app.js")
 
     assert "const recoverJobs = async" in js
+    render = js.split("const renderTester = (job) =>", 1)[1].split("const pollTester", 1)[0]
+    assert "job.kind === 'strategies.tester.retry'" in render
     recovery = js.split("const recoverJobs = async", 1)[1].split("const settingsStatus", 1)[0]
     assert "requestJson('/api/v2/jobs')" in recovery
-    assert "job.kind === 'strategies.tester.start'" in recovery
-    assert "job.kind === 'strategies.tester.start' && job.retest !== true" in recovery
+    assert "['strategies.tester.start', 'strategies.tester.retry'].includes(job.kind)" in recovery
     assert "const tester = testerJobs[0];" in recovery
     assert "normalImportAuthorized = false;" in recovery
     assert "CHECK REQUIRED" in js
@@ -899,7 +900,7 @@ def test_normal_recovery_uses_created_date_and_suitable_job_priority() -> None:
     js = _read("app.js")
     recovery = js.split("const recoverJobs = async", 1)[1].split("const importStartV2", 1)[0]
 
-    assert "job.kind === 'strategies.tester.start' && job.retest !== true" in recovery
+    assert "['strategies.tester.start', 'strategies.tester.retry'].includes(job.kind) && job.retest !== true" in recovery
     assert "Number.isFinite(Date.parse(job.created_at_utc))" in recovery
     assert "['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)" in recovery
     assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
@@ -910,6 +911,19 @@ def test_normal_recovery_uses_created_date_and_suitable_job_priority() -> None:
     assert "testerJobs.find((job) => !testerIsTerminal(job))" not in recovery
     assert "job.state === 'FAILED'" not in recovery
     assert "job.state === 'CANCELLED'" not in recovery
+
+
+def test_import_recovery_ignores_stale_failed_jobs_and_uses_newest_suitable_snapshot() -> None:
+    js = _read("app.js")
+    recovery = js.split("const recoverSplitJobs", 1)[1].split("const retestCard", 1)[0]
+
+    assert "job.kind === 'strategies.performance.v2.import' && job.retest !== true" in recovery
+    assert "Number.isFinite(Date.parse(job.created_at_utc))" in recovery
+    assert "job.state !== 'CANCELLED'" in recovery
+    assert "job.state === 'FAILED'" not in recovery
+    assert "Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)" in recovery
+    assert "String(b.job_id).localeCompare(String(a.job_id))" in recovery
+    assert ".reverse()" not in recovery
 
 
 def test_inbox_verify_does_not_fail_silently() -> None:

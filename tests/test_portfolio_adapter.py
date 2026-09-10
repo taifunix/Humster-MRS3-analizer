@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 
 from mrs3.portfolio.adapter import build_portfolio_candidates, run_portfolio_adapter
 from mrs3.portfolio.liquidity import ReferenceReader
@@ -163,3 +164,115 @@ def test_runtime_adapter_uses_partial_local_minutes_and_injected_current_market(
     assert result.status == "PASS"
     assert result.variants[0]["members"][0]["position_size_usdt"] == Decimal("600")
     assert "LIQUIDITY_CAPACITY_PRELIMINARY" in result.warnings
+
+
+def test_new_pretest_campaign_fails_closed_when_equity_paths_are_unavailable():
+    request = campaign()
+    request["stage1_mode"] = "PRETEST_PROXY"
+    result = build_portfolio_candidates(
+        (finalist(2, "BTCUSDT", pnl="20", dd="99", recovery="2"),), request,
+        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
+        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
+        spread_history_statuses={}, now_ms=1_000,
+    )
+
+    assert result.status == "FAIL"
+    assert result.blockers == ("BALANCED:COMMON_PRETEST_PERIOD_UNAVAILABLE",)
+
+
+def test_pretest_process_search_rehydrates_final_equity_payload():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    path = tuple(
+        {"timestamp_utc": start + __import__("datetime").timedelta(days=index), "equity": Decimal("100")}
+        for index in range(14)
+    )
+    row = {
+        **finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),
+        "initial_balance": Decimal("100"), "equity": path,
+        "report_start_utc": start, "report_end_utc": start + __import__("datetime").timedelta(days=14),
+    }
+    request = campaign()
+    request["stage1_mode"] = "PRETEST_PROXY"
+    result = build_portfolio_candidates(
+        (row,), request,
+        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
+        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
+        spread_history_statuses={}, now_ms=1_000, workers=2,
+    )
+
+    assert result.status == "PASS"
+    final_path = result.variants[0]["members"][0]["equity"]
+    assert tuple((item["timestamp_utc"], item["equity"]) for item in final_path[:14]) == tuple((item["timestamp_utc"], item["equity"]) for item in path)
+    assert "equity_path" in result.variants[0]["metrics"]
+
+
+def test_pretest_campaign_accepts_zero_activity_with_a_valid_initial_seed():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = {
+        **finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),
+        "initial_balance": Decimal("100"),
+        "equity": (),
+        "actions": (),
+        "report_start_utc": start,
+        "report_end_utc": start + __import__("datetime").timedelta(days=14),
+    }
+    request = campaign()
+    request["stage1_mode"] = "PRETEST_PROXY"
+
+    result = build_portfolio_candidates(
+        (row,), request,
+        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
+        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
+        spread_history_statuses={}, now_ms=1_000,
+    )
+
+    assert result.status == "PASS"
+    assert result.variants[0]["pretest_period"]["evidence"]["path_policy"] == "SPARSE_OBSERVATION_FORWARD_FILL"
+    assert result.variants[0]["pretest_period"]["evidence"]["rows"]["BTCUSDT:LONG:2:20"]["reason"] == "ZERO_ACTIVITY_IN_WINDOW"
+
+
+def test_adapter_uses_minute_metrics_as_final_variant_metrics(monkeypatch):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    daily_path = tuple(
+        {"timestamp_utc": start + __import__("datetime").timedelta(days=index), "equity": Decimal("100")}
+        for index in range(14)
+    )
+    row = {
+        **finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),
+        "initial_balance": Decimal("100"),
+        "equity": daily_path,
+        "equity_series": daily_path,
+        "report_start_utc": start,
+        "report_end_utc": start + __import__("datetime").timedelta(days=14),
+    }
+    request = campaign()
+    period = SimpleNamespace(
+        status="PASS", available=True, start_utc=start,
+        end_utc=start + __import__("datetime").timedelta(days=14),
+        coverage_pct={}, evidence={}, exclusions=(),
+        daily_paths={"BTCUSDT:LONG:2:20": daily_path},
+    )
+    monkeypatch.setattr("mrs3.portfolio.adapter.resolve_common_pretest_period", lambda *_args, **_kwargs: period)
+
+    def refine(shortlist, *_args, **_kwargs):
+        item = dict(shortlist[0])
+        item["minute_metrics"] = {
+            "status": "PASS", "proxy_pnl_usdt": Decimal("777"),
+            "proxy_recovery_factor": Decimal("9"),
+            "proxy_max_drawdown_pct": Decimal("1"),
+            "proxy_reserve_usdt": Decimal("100"),
+        }
+        item["members"] = tuple({**dict(member), "actual_size_usdt": Decimal("12")} for member in item["members"])
+        return SimpleNamespace(status="PASS", candidates=(item,))
+
+    monkeypatch.setattr("mrs3.portfolio.adapter.refine_pretest_shortlist", refine)
+    result = build_portfolio_candidates(
+        (row,), request,
+        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
+        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
+        spread_history_statuses={}, now_ms=1_000,
+    )
+
+    assert result.status == "PASS"
+    assert result.variants[0]["metrics"]["proxy_pnl_usdt"] == Decimal("777")
+    assert result.variants[0]["members"][0]["actual_size_usdt"] == Decimal("12")

@@ -366,6 +366,29 @@ reports fail before any database mutation or cleanup.
 
 ## Native startup and status heartbeat
 
+Native `SINGLE_MODE` completion requires result evidence for every strategy in
+the active batch. An `Idle` or `Completed` HTTP status alone is insufficient:
+the tester dispatcher may report it while detached `hb_c.exe` workers are still
+writing reports. While waiting, panel progress advances from current-batch
+`wizard_result.json` entries whose referenced HTML files exist; an empty
+`runId` is valid for this progress evidence. Evidence is accumulated
+monotonically because the tester may rewrite or shrink its result journal.
+Transient loss of the tester status endpoint does not discard file evidence;
+the batch fails only after its configured evidence-stall or total timeout.
+Final acceptance still uses the strict strategy-settings, report-period and
+Performance-v2 HTML validation.
+
+A failed or cancelled native job is recoverable through the tracked
+`strategies.tester.retry` request. Recovery validates existing HTML once,
+preserves accepted reports, and submits only missing strategy names under a new
+job ID. A failed retry is itself retryable and repeats the same report recovery.
+After a panel restart, an interrupted native `RUNNING` manifest is recovered as
+a failed retry source; accepted reports are revalidated before reuse.
+If retry recovery finds every expected report, it creates the durable metadata
+inbox and publishes the complete `COMMITTED` snapshot before returning. A later
+inbox verification reloads the persisted counts and attempt totals, so it cannot
+replace visible progress with an empty `0/0` snapshot.
+
 The existing native runner is the sole owner of the configured `hb_c.exe`
 process and local port. Before starting a batch it may terminate only a live
 process whose resolved executable path exactly matches the configured

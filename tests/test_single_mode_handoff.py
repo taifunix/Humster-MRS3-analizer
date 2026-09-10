@@ -44,6 +44,26 @@ def _native_report(name: str, suffix: str = "", *, start: str = "2026-01-01", en
     )
 
 
+def _write_native_result_evidence(config: RunnerConfig, names: tuple[str, ...], report_names: dict[str, str] | None = None) -> None:
+    """Mirror the native tester's canonical result journal for fixture reports."""
+    path = config.wizard_result
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        entries = []
+    if not isinstance(entries, list):
+        entries = []
+    report_names = report_names or {}
+    entries.extend({
+        "runId": "",
+        "strategies": [name],
+        "stats": {},
+        "chartUrl": f"/tester-report/{config.report_dir.name}/{report_names.get(name, f'{name}.html')}",
+    } for name in names)
+    path.write_text(json.dumps(entries), encoding="utf-8")
+
+
 def _wait_terminal(service: LocalSingleModeStrategyTestService, job_id: str) -> dict[str, object]:
     for _ in range(500):
         status = service.status(job_id)
@@ -242,6 +262,7 @@ def test_native_single_mode_installs_each_batch_before_one_native_run_and_create
             events.append("run")
             for name in self.expected:
                 (config.report_dir / f"{name}.html").write_text(_native_report(name, start="2026-08-01", end="2026-08-31"), encoding="utf-8")
+            _write_native_result_evidence(config, self.expected)
 
         def tester_status(self) -> str:
             value = next(self.statuses)
@@ -317,6 +338,7 @@ def test_native_single_mode_publishes_startup_heartbeat(tmp_path: Path) -> None:
 
         def run_tester(self) -> None:
             (config.report_dir / f"{names[0]}.html").write_text(_native_report(names[0], start="2026-08-01", end="2026-08-31"), encoding="utf-8")
+            _write_native_result_evidence(config, names)
 
         def tester_status(self) -> str:
             return f'<span class="stat-value">{next(self.statuses)}</span>'
@@ -385,6 +407,7 @@ def test_native_single_mode_chooses_newest_complete_report_for_embedded_name(tmp
             new.write_text(_native_report(names[0], " new", start="2026-08-01", end="2026-08-31"), encoding="utf-8")
             os.utime(old, (1, 1))
             os.utime(new, (2, 2))
+            _write_native_result_evidence(config, names, {names[0]: "new-name.html"})
 
         def tester_status(self) -> str:
             return f'<span class="stat-value">{next(self.statuses)}</span>'
@@ -428,6 +451,7 @@ def test_native_single_mode_rejects_wrong_report_range(tmp_path: Path) -> None:
             nonlocal runs
             runs += 1
             (config.report_dir / f"{names[0]}.html").write_text(_native_report(names[0]), encoding="utf-8")
+            _write_native_result_evidence(config, names)
 
         def tester_status(self) -> str:
             return f'<span class="stat-value">{next(self.statuses)}</span>'
@@ -480,6 +504,7 @@ def test_native_single_mode_retries_marker_only_report_then_rejects_it(tmp_path:
                 f'<pre>{{"name":"{names[0]}","basic":{{"symbol":"BTCUSDT","time_frame":"1h"}}}}</pre>',
                 encoding="utf-8",
             )
+            _write_native_result_evidence(config, names)
 
         def tester_status(self) -> str:
             return f'<span class="stat-value">{next(self.statuses)}</span>'
@@ -535,6 +560,7 @@ def test_native_single_mode_retries_malformed_series_then_rejects_it(
                 f"const {series_name} = malformed;",
             )
             (config.report_dir / f"{names[0]}.html").write_text(report, encoding="utf-8")
+            _write_native_result_evidence(config, names)
 
         def tester_status(self) -> str:
             return f'<span class="stat-value">{next(self.statuses)}</span>'
@@ -576,6 +602,10 @@ def test_native_single_mode_retries_only_missing_reports_then_fails_terminally(t
 
         def run_tester(self) -> None:
             runs.append(tuple(sorted(path.stem for path in config.strategy_dir.glob("*.json"))))
+            for name in self.expected:
+                report = config.report_dir / f"{name}.html"
+                report.write_text(_native_report(name, start="2026-08-01", end="2026-08-31") if name == names[0] else '<p>marker only</p>', encoding="utf-8")
+            _write_native_result_evidence(config, self.expected)
 
         def tester_status(self) -> str:
             return f'<span class="stat-value">{next(self.statuses)}</span>'
@@ -597,9 +627,9 @@ def test_native_single_mode_retries_only_missing_reports_then_fails_terminally(t
     assert status["state"] == "FAILED", status
     assert status["phase"] == "FAILED", status
     assert status["inbox_ready"] is False
-    assert status["evidence"]["failed_names"] == list(names)
+    assert status["evidence"]["failed_names"] == [names[1]]
     assert status["error"]["code"] == "SINGLE_MODE_RETRIES_EXHAUSTED"
-    assert runs == [names, names]
+    assert runs == [names, (names[1],)]
 
 
 def test_v2_accepts_external_strategy_only_under_trusted_output_root(tmp_path: Path) -> None:
@@ -747,6 +777,7 @@ def test_single_mode_auto_captures_metadata_inbox_and_marks_ready(tmp_path: Path
         def run_tester(self) -> None:
             report = config.report_dir / f"{names[0]}.html"
             report.write_text(_native_report(names[0], start="2026-08-01", end="2026-08-31"), encoding="utf-8")
+            _write_native_result_evidence(config, names)
 
         def tester_status(self) -> str:
             return f'<span class="stat-value">{next(self.statuses)}</span>'

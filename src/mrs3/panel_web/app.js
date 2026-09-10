@@ -64,6 +64,7 @@ const portfolioSettingsHelpers = (() => {
   const settingsPatch = (document, values) => {
     if (!validSettingsDocument(document)) throw new Error('invalid-document');
     const payload = clone(document);
+    try { payload.search.max_enumerated_combinations = settingsIntegerValue(values.max_enumerated_combinations ?? document.search.max_enumerated_combinations); } catch (error) { error.field = 'max-enumerated-combinations'; throw error; }
     try { payload.liquidity.parameters.close_volume_participation_pct = settingsIntegerValue(values.close_volume_participation_pct); if (payload.liquidity.parameters.close_volume_participation_pct > 200) throw new Error('integer'); } catch (error) { error.field = 'close-volume-participation-pct'; throw error; }
     try { payload.liquidity.round_down_usdt = settingsDecimalValue(values.round_down_usdt, document.liquidity.round_down_usdt, true); } catch (error) { error.field = 'round-down-usdt'; throw error; }
     try { payload.liquidity.minimum_coverage_pct = settingsIntegerValue(values.minimum_coverage_pct); if (payload.liquidity.minimum_coverage_pct > 100) throw new Error('integer'); } catch (error) { error.field = 'minimum-coverage-pct'; throw error; }
@@ -1576,7 +1577,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const renderTester = (job) => {
     const p = job.progress || {};
     const total = Number(p.total || job.strategy_count || 0);
-    const singleMode = job.mode === 'SINGLE_MODE' || job.kind === 'strategies.tester.native.start' || job.kind === 'strategies.tester.start';
+    const singleMode = job.mode === 'SINGLE_MODE' || job.kind === 'strategies.tester.native.start' || job.kind === 'strategies.tester.start' || job.kind === 'strategies.tester.retry';
     const runs = false;
     const checked = Number(p.current || p.checked || 0);
     if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : (job.state === 'COMMITTED' ? '100%' : '0%');
@@ -1671,7 +1672,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
       const testerJobs = jobs
-        .filter((job) => job.kind === 'strategies.tester.start' && job.retest !== true)
+        .filter((job) => ['strategies.tester.start', 'strategies.tester.retry'].includes(job.kind) && job.retest !== true)
         .filter((job) => Number.isFinite(Date.parse(job.created_at_utc)) && (
           ['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)
           || (job.state === 'COMMITTED' && job.inbox_ready === true)
@@ -1801,7 +1802,21 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-      const importJob = [...jobs].reverse().find((job) => job.kind === 'strategies.performance.v2.import' && job.retest !== true);
+      const tester = jobs
+        .filter((job) => ['strategies.tester.start', 'strategies.tester.retry'].includes(job.kind) && job.retest !== true)
+        .filter((job) => Number.isFinite(Date.parse(job.created_at_utc)) && (
+          ['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)
+          || (job.state === 'COMMITTED' && job.inbox_ready === true)
+        ))
+        .sort((a, b) => Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)
+          || String(b.job_id).localeCompare(String(a.job_id)))[0];
+      const testerCreatedAt = Date.parse(tester?.created_at_utc);
+      const importJob = jobs
+        .filter((job) => job.kind === 'strategies.performance.v2.import' && job.retest !== true)
+        .filter((job) => Number.isFinite(Date.parse(job.created_at_utc)) && job.state !== 'CANCELLED')
+        .filter((job) => !Number.isFinite(testerCreatedAt) || Date.parse(job.created_at_utc) >= testerCreatedAt)
+        .sort((a, b) => Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)
+          || String(b.job_id).localeCompare(String(a.job_id)))[0];
       if (importJob?.job_id) {
         importJobV2 = importJob.job_id;
         const poll = async () => {
@@ -2871,14 +2886,17 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         const entries = portfolioValues(Array.isArray(job?.journal) && job.journal.length ? job.journal : job?.diagnostics);
         for (const entry of entries) { const line = document.createElement('p'); const severity = String(entry?.severity || entry?.level || 'INFO').toLowerCase(); const message = portfolioReasonHelpers.humanize(entry?.text || entry?.message || entry || ''); line.className = `is-${severity}`; line.textContent = `${entry?.timestamp_utc || entry?.created_at || ''} ${entry?.stage || ''} ${entry?.code || ''} ${message}`.trim(); journal.append(line); }
       };
-      const renderResults = async (job) => {
+       const renderResults = async (job) => {
         const summary = query('#portfolio-summary'); const exclusions = query('#portfolio-exclusions'); const portfolioXlsx = query('#portfolio-xlsx');
         if (portfolioXlsx) { portfolioXlsx.hidden = true; portfolioXlsx.removeAttribute('href'); }
         const succeeded = (job && job.status === 'SUCCEEDED') || statusOf(job) === 'SUCCEEDED';
         if (!job?.campaign_id || !succeeded) { if (summary) summary.textContent = 'Results appear only after SUCCEEDED.'; if (exclusions) exclusions.replaceChildren(); return; }
         try {
           const result = await requestJson(`/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/results`);
-          const values = result.summary || result;
+           const values = result.summary || result;
+           const optimizerStatus = String(values?.optimizer_status || '').toUpperCase();
+           if (optimizerStatus === 'PARTIAL') setBadge('#portfolio-result-state', 'PARTIAL', 'pending');
+           else if (optimizerStatus === 'FAIL') setBadge('#portfolio-result-state', 'FAILED', 'pending');
           if (summary) { summary.replaceChildren(); for (const [key, value] of Object.entries(values || {})) { const row = document.createElement('div'); const label = document.createElement('strong'); label.textContent = key; row.append(label, document.createTextNode(`: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`)); summary.append(row); } }
            if (exclusions) { exclusions.replaceChildren(); for (const item of portfolioValues(result.exclusions || result.blockers)) { const row = document.createElement('div'); row.className = 'portfolio-exclusion'; row.textContent = portfolioReasonHelpers.humanize(typeof item === 'string' ? item : `${item.code || item.stage || 'Excluded'}: ${item.message || item.reason || ''}`); exclusions.append(row); } }
           if (portfolioXlsx && result.workbook_available === true) { portfolioXlsx.href = `/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/stage1.xlsx`; portfolioXlsx.hidden = false; }
@@ -2973,6 +2991,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const input = (profile, name) => query(`#portfolio-settings-${profile.toLowerCase()}-${name}`);
       const renderDocument = () => {
          const doc = state.document; if (!doc) { controls().forEach((control) => { if (control.type === 'checkbox') control.checked = false; else control.value = ''; }); return; }
+         const budget = query('#portfolio-settings-max-enumerated-combinations'); if (budget) budget.value = String(doc.search.max_enumerated_combinations);
          const participation = query('#portfolio-settings-close-volume-participation-pct'); if (participation) participation.value = String(doc.liquidity.parameters.close_volume_participation_pct);
          const rounding = query('#portfolio-settings-round-down-usdt'); if (rounding) rounding.value = String(doc.liquidity.round_down_usdt);
          const coverage = query('#portfolio-settings-minimum-coverage-pct'); if (coverage) coverage.value = String(doc.liquidity.minimum_coverage_pct);
@@ -3000,7 +3019,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         return state.loading;
       };
       const collect = () => {
-         const values = { close_volume_participation_pct: query('#portfolio-settings-close-volume-participation-pct')?.value, round_down_usdt: query('#portfolio-settings-round-down-usdt')?.value, minimum_coverage_pct: query('#portfolio-settings-minimum-coverage-pct')?.value, maximum_age_hours: query('#portfolio-settings-maximum-age-hours')?.value, archive_publication_lag_hours: query('#portfolio-settings-archive-publication-lag-hours')?.value, weekend_start_utc: query('#portfolio-settings-weekend-start-utc')?.value, weekend_end_utc: query('#portfolio-settings-weekend-end-utc')?.value, backfill_write_enabled: !!query('#portfolio-settings-backfill-write-enabled')?.checked, profiles: {} };
+        const values = { max_enumerated_combinations: query('#portfolio-settings-max-enumerated-combinations')?.value, close_volume_participation_pct: query('#portfolio-settings-close-volume-participation-pct')?.value, round_down_usdt: query('#portfolio-settings-round-down-usdt')?.value, minimum_coverage_pct: query('#portfolio-settings-minimum-coverage-pct')?.value, maximum_age_hours: query('#portfolio-settings-maximum-age-hours')?.value, archive_publication_lag_hours: query('#portfolio-settings-archive-publication-lag-hours')?.value, weekend_start_utc: query('#portfolio-settings-weekend-start-utc')?.value, weekend_end_utc: query('#portfolio-settings-weekend-end-utc')?.value, backfill_write_enabled: !!query('#portfolio-settings-backfill-write-enabled')?.checked, profiles: {} };
         for (const profile of profiles) {
           values.profiles[profile] = {
             deposit: input(profile, 'deposit')?.value,
@@ -3040,7 +3059,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
           else { if (meta) meta.textContent = portfolioErrorMessage(error); save.disabled = state.readOnly; }
         }
       });
-      loadPortfolioSettings.state = state; state.load = load;
+       loadPortfolioSettings.state = state; state.load = load;
     }
     if (force || !loadPortfolioSettings.state.document) loadPortfolioSettings.state.load();
   }
