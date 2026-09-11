@@ -117,6 +117,45 @@ def test_manual_clear_probes_same_host_owner_even_when_boot_drifted(tmp_path: Pa
         lock.path.unlink(missing_ok=True)
 
 
+def test_reboot_reclaim_opt_in_still_rejects_live_owner(tmp_path: Path) -> None:
+    target = tmp_path / "tester"
+    target.mkdir()
+    lock = TesterTargetLock(target).acquire()
+    try:
+        owner = json.loads(lock.path.read_text(encoding="utf-8"))
+        owner["boot_identity"] = "previous-boot"
+        owner["container_identity"] = "previous-native-runtime"
+        lock.path.write_text(json.dumps(owner), encoding="utf-8")
+
+        with pytest.raises(TesterTargetBusyError):
+            TesterTargetLock(target, reclaim_dead_after_reboot=True).acquire()
+    finally:
+        lock.owner = None
+        lock.path.unlink(missing_ok=True)
+
+
+def test_reboot_reclaim_opt_in_rejects_foreign_machine(tmp_path: Path) -> None:
+    target = tmp_path / "tester"
+    target.mkdir()
+    lock = TesterTargetLock(target).acquire()
+    try:
+        owner = json.loads(lock.path.read_text(encoding="utf-8"))
+        owner.update({
+            "pid": 999999,
+            "process_start_identity": "1.0",
+            "machine_identity": "another-machine",
+            "boot_identity": "previous-boot",
+            "container_identity": "previous-native-runtime",
+        })
+        lock.path.write_text(json.dumps(owner), encoding="utf-8")
+
+        with pytest.raises(TesterTargetOwnerUnverifiableError):
+            TesterTargetLock(target, reclaim_dead_after_reboot=True).acquire()
+    finally:
+        lock.owner = None
+        lock.path.unlink(missing_ok=True)
+
+
 def test_linux_container_identity_ignores_session_scoped_self_cgroup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

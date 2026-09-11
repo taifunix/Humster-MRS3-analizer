@@ -414,6 +414,7 @@ class TesterTargetLock:
         pid_namespace: str | None = None,
         lock_kind: str = "tester_target_lease",
         process_probe: object | None = None,
+        reclaim_dead_after_reboot: bool = False,
     ) -> None:
         self.target_identity = canonical_tester_target(target)
         self.path = tester_target_lock_path(target, lock_path=lock_path)
@@ -424,6 +425,7 @@ class TesterTargetLock:
         self.pid_namespace = pid_namespace or _pid_namespace_identity(self.machine)
         self.lock_kind = lock_kind
         self._process_probe = process_probe
+        self._reclaim_dead_after_reboot = reclaim_dead_after_reboot
         self.owner: OwnerEvidence | None = None
 
     def _probe(self, pid: int) -> _ProcessProbe:
@@ -472,17 +474,30 @@ class TesterTargetLock:
             raise TesterTargetOwnerUnverifiableError(
                 "LOCK_OWNER_UNVERIFIABLE: target or lock kind mismatch"
             )
-        if (
-            not _known_identity(owner.host_identity)
-            or not _known_identity(owner.machine_identity)
-            or not _known_identity(owner.boot_identity)
-            or not _known_identity(owner.container_identity)
-            or not _known_identity(owner.pid_namespace_identity)
-            or owner.host_identity != self.host
-            or owner.machine_identity != self.machine
-            or owner.boot_identity != self.boot
-            or owner.container_identity != self.container
-            or owner.pid_namespace_identity != self.pid_namespace
+        identities_known = (
+            _known_identity(owner.host_identity)
+            and _known_identity(owner.machine_identity)
+            and _known_identity(owner.boot_identity)
+            and _known_identity(owner.container_identity)
+            and _known_identity(owner.pid_namespace_identity)
+        )
+        same_machine_scope = (
+            owner.host_identity == self.host
+            and owner.machine_identity == self.machine
+            and owner.pid_namespace_identity == self.pid_namespace
+        )
+        same_runtime = (
+            owner.boot_identity == self.boot
+            and owner.container_identity == self.container
+        )
+        previous_boot = owner.boot_identity != self.boot
+        if not (
+            identities_known
+            and same_machine_scope
+            and (
+                same_runtime
+                or (self._reclaim_dead_after_reboot and previous_boot)
+            )
         ):
             raise TesterTargetOwnerUnverifiableError(
                 "LOCK_OWNER_UNVERIFIABLE: foreign or unknown identity"

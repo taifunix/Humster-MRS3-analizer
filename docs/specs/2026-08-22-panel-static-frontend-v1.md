@@ -64,6 +64,11 @@ endpoint returns `409 TESTER_FILES_PREPARED`. The panel says that files are
 already prepared and directs the operator to use **Stop** before changing the
 request; it never exposes a PID, lock record, or local path.
 
+At the beginning of a new local preparation, a valid same-machine lock from a
+previous boot is atomically replaced only after its PID/process-start owner is
+proven dead. Live, foreign, malformed, or otherwise unverifiable locks remain
+blocking under ADR-0035.
+
 The remote profile lives only in ignored `config.local.json` under
 `remote_runner`. It contains connection material plus canonical remote roots;
 the Source DB card may display and submit the operator-selected remote HTML

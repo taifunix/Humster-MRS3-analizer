@@ -28,6 +28,11 @@ Panel instance, local fill returns the safe `TESTER_FILES_PREPARED` code. The
 browser tells the operator to press Stop before changing the request; lock
 records, PIDs, and local paths remain undisclosed.
 
+Local Panel preparation now automatically replaces a valid same-machine lock
+left by a dead owner on a previous boot. The opt-in is confined to
+`LocalTestingService.fill()`; the shared tester lock remains fail-closed by
+default for live, foreign, malformed and unknown owners (ADR-0035).
+
 ## Portfolio Optimizer PRETEST_PROXY Stage 1 (2026-09-10)
 
 Implementation slice is present in the read-only finalist input, common UTC

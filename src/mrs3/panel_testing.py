@@ -290,7 +290,10 @@ class LocalTestingService:
         try:
             if self._target_owner is not None:
                 raise PanelTestingError("tester target is already owned")
-            owner = TesterTargetLock(self.config.bot_root).acquire()
+            owner = TesterTargetLock(
+                self.config.bot_root,
+                reclaim_dead_after_reboot=True,
+            ).acquire()
             try:
                 self._stop_bot(self.config)
             except BaseException:

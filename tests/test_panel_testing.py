@@ -273,6 +273,36 @@ def test_local_testing_fill_installs_exactly_one_strategy_and_config_without_cle
     assert not config.tester_config.exists()
 
 
+def test_local_testing_fill_reclaims_dead_same_machine_lock_from_previous_boot(
+    tmp_path: Path,
+) -> None:
+    config = _runner_config(tmp_path)
+    stale = TesterTargetLock(config.bot_root).acquire()
+    owner = json.loads(stale.path.read_text(encoding="utf-8"))
+    owner.update({
+        "pid": 999999,
+        "process_start_identity": "1.0",
+        "boot_identity": "previous-boot",
+        "container_identity": "previous-native-runtime",
+    })
+    stale.path.write_text(json.dumps(owner), encoding="utf-8")
+    stale.owner = None
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        stop_bot=lambda _config: None,
+    )
+
+    filled = service.fill(
+        side="LONG", symbols=("CXUSDT",), start="2026-07-15", end="2026-08-06"
+    )
+
+    assert filled["strategy_name"] == "AAOIUSDT"
+    current = json.loads(stale.path.read_text(encoding="utf-8"))
+    assert current["acquisition_token"] != owner["acquisition_token"]
+    service.stop()
+
+
 def test_local_testing_fill_optionally_clears_report_contents_after_stopping_tester(
     tmp_path: Path,
 ) -> None:
