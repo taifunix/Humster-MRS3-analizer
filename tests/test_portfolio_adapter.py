@@ -1,6 +1,7 @@
 from decimal import Decimal
+from collections.abc import Mapping, Sequence
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from mrs3.portfolio.adapter import build_portfolio_candidates, run_portfolio_adapter
@@ -180,7 +181,7 @@ def test_new_pretest_campaign_fails_closed_when_equity_paths_are_unavailable():
     assert result.blockers == ("BALANCED:COMMON_PRETEST_PERIOD_UNAVAILABLE",)
 
 
-def test_pretest_process_search_rehydrates_final_equity_payload():
+def test_pretest_process_search_rehydrates_final_sizing_without_bulk_payload():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     path = tuple(
         {"timestamp_utc": start + __import__("datetime").timedelta(days=index), "equity": Decimal("100")}
@@ -201,9 +202,57 @@ def test_pretest_process_search_rehydrates_final_equity_payload():
     )
 
     assert result.status == "PASS"
-    final_path = result.variants[0]["members"][0]["equity"]
-    assert tuple((item["timestamp_utc"], item["equity"]) for item in final_path[:14]) == tuple((item["timestamp_utc"], item["equity"]) for item in path)
-    assert "equity_path" in result.variants[0]["metrics"]
+    assert result.variants[0]["members"][0]["position_size_usdt"] > 0
+    assert "equity" not in result.variants[0]["members"][0]
+    assert "equity_path" not in result.variants[0]["metrics"]
+
+
+def test_adapter_result_compacts_calculation_only_bulk_payloads():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    path = tuple(
+        {"timestamp_utc": start + timedelta(days=index), "equity": Decimal("100")}
+        for index in range(14)
+    )
+    row = {
+        **finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),
+        "initial_balance": Decimal("100"),
+        "equity": path,
+        "minute_equity": path,
+        "actions": ({"timestamp_utc": start},),
+        "source_provenance": {"source": "fixture"},
+        "report_start_utc": start,
+        "report_end_utc": start + timedelta(days=14),
+    }
+    request = campaign()
+    request["stage1_mode"] = "PRETEST_PROXY"
+    result = build_portfolio_candidates(
+        (row,), request,
+        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
+        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
+        spread_history_statuses={}, now_ms=1_000, workers=1,
+    )
+
+    assert result.status == "PASS"
+    variant = result.variants[0]
+    bulk_fields = {
+        "equity", "equity_series", "equity_path", "minute_equity",
+        "actions", "action_series", "strategy_actions", "minute_actions",
+    }
+
+    def assert_compact(value):
+        if isinstance(value, Mapping):
+            assert not bulk_fields.intersection(value)
+            for item in value.values():
+                assert_compact(item)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            for item in value:
+                assert_compact(item)
+
+    assert_compact(variant["members"])
+    assert_compact(variant["metrics"])
+    assert variant["members"][0]["source_provenance"] == {"source": "fixture"}
+    assert variant["metrics"]["proxy_pnl_usdt"] == Decimal("0.00000000")
+    assert variant["members"][0]["actual_size_usdt"] > 0
 
 
 def test_pretest_campaign_accepts_zero_activity_with_a_valid_initial_seed():

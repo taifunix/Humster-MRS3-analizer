@@ -29,6 +29,7 @@ _SEARCH_PAYLOAD_FIELDS = frozenset({
     "equity", "equity_series", "equity_path", "minute_equity", "actions",
     "action_series", "strategy_actions", "minute_actions", "source_provenance",
 })
+_PUBLIC_BULK_FIELDS = _SEARCH_PAYLOAD_FIELDS - {"source_provenance"}
 
 
 def _freeze(value: Any) -> Any:
@@ -46,6 +47,21 @@ def _plain(value: Any) -> Any:
         return tuple(_plain(item) for item in value)
     if isinstance(value, list):
         return [_plain(item) for item in value]
+    return value
+
+
+def _compact_public_payload(value: Any) -> Any:
+    """Drop calculation-only series after final shortlist processing."""
+    if isinstance(value, Mapping):
+        return {
+            key: _compact_public_payload(item)
+            for key, item in value.items()
+            if key not in _PUBLIC_BULK_FIELDS
+        }
+    if isinstance(value, tuple):
+        return tuple(_compact_public_payload(item) for item in value)
+    if isinstance(value, list):
+        return [_compact_public_payload(item) for item in value]
     return value
 
 
@@ -420,7 +436,8 @@ def build_portfolio_candidates(
         variants.extend(profile_variants)
     excluded.sort(key=lambda item: (str(item["profile"]), str(item["symbol"]), str(item["side"]), str(item["strategy_id"]), str(item["result_id"]), str(item["selection_reason"])))
     outcome = "PASS" if variants and not blockers else ("PARTIAL" if variants else "FAIL")
-    return AdapterResult(outcome, tuple(variants), tuple(excluded), tuple(blockers), tuple(warnings))
+    compact_variants = tuple(_compact_public_payload(item) for item in variants)
+    return AdapterResult(outcome, compact_variants, tuple(excluded), tuple(blockers), tuple(warnings))
 
 
 def _path(root: Path, value: Any) -> Path:
