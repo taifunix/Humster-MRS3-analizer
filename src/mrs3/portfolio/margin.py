@@ -471,6 +471,65 @@ class DepositResult:
         return self.status
 
 
+@dataclass(frozen=True, slots=True)
+class MarginCoefficient:
+    """Frozen per-USDT initial and maintenance margin coefficients."""
+
+    strategy_id: Any
+    a: Decimal
+    b: Decimal
+    evidence_class: str = CALCULATED
+    witness: Mapping[str, Any] = field(default_factory=dict)
+    max_notional: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "a", _decimal(self.a, "initial_margin_rate", nonnegative=True))
+        object.__setattr__(self, "b", _decimal(self.b, "maintenance_margin_rate", nonnegative=True))
+        if self.evidence_class not in {OBSERVED, CALCULATED, CONSERVATIVE_BOUND}:
+            raise ValueError("margin coefficient evidence must be known")
+        object.__setattr__(self, "witness", _freeze(self.witness))
+        if self.max_notional is not None:
+            object.__setattr__(self, "max_notional", _decimal(self.max_notional, "max_notional", nonnegative=True))
+
+@dataclass(frozen=True, slots=True)
+class MarginCoefficientResult:
+    status: str
+    coefficients: tuple[MarginCoefficient, ...]
+    evidence_class: str
+    reason: str | None = None
+    evaluated_states: int = 0
+    witness: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "witness", _freeze(self.witness))
+
+    @property
+    def by_strategy(self) -> Mapping[Any, MarginCoefficient]:
+        return MappingProxyType({item.strategy_id: item for item in self.coefficients})
+
+
+@dataclass(frozen=True, slots=True)
+class WeightedMarginResult:
+    status: str
+    reason: str | None
+    I_all: Decimal | None
+    M_all: Decimal | None
+    I_held: Decimal | None
+    loss_extra: Decimal | None
+    B_margin: Decimal | None
+    B_required: Decimal | None
+    L: int | None
+    ell: int | None
+    release_status: str
+    release_marker: str
+    closed_strategy_ids: tuple[Any, ...] = ()
+    checks: Mapping[str, bool] = field(default_factory=dict)
+    witness: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "checks", _freeze(self.checks))
+        object.__setattr__(self, "witness", _freeze(self.witness))
+
 def _pair_slot(item: Any) -> str:
     if isinstance(item, str):
         return item
@@ -1427,6 +1486,404 @@ def evaluate_margin_envelope(
         reasons=tuple(dict.fromkeys((*bound.reasons, "ENUMERATION_FALLBACK_USED"))),
     )
     return EnvelopeResult(PASS, bounded, CONSERVATIVE_BOUND, "ENUMERATION_FALLBACK_USED", 0, bounded.witness)
+
+
+def _margin_result_values(result: Any) -> tuple[Decimal | None, Decimal | None]:
+    if isinstance(result, MarginResult):
+        return result.total_im, result.total_mm
+    if isinstance(result, Mapping):
+        return result.get("total_im", result.get("initial_margin")), result.get("total_mm", result.get("maintenance_margin"))
+    return getattr(result, "total_im", getattr(result, "initial_margin", None)), getattr(result, "total_mm", getattr(result, "maintenance_margin", None))
+
+
+def _coefficient_pair(value: Any, strategy_id: Any) -> tuple[Decimal, Decimal]:
+    if isinstance(value, MarginCoefficient):
+        return value.a, value.b
+    if isinstance(value, Mapping):
+        initial = value.get("a")
+        maintenance = value.get("b")
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and len(value) == 2:
+        initial, maintenance = value
+    else:
+        initial = maintenance = None
+    if initial is None or maintenance is None:
+        raise ValueError(f"MARGIN_COEFFICIENT_UNKNOWN_{strategy_id}")
+    return _decimal(initial, "initial_margin_rate", nonnegative=True), _decimal(maintenance, "maintenance_margin_rate", nonnegative=True)
+
+
+def _coefficient_is_known(value: Any) -> bool:
+    if isinstance(value, MarginCoefficient):
+        try:
+            _decimal(value.max_notional, "max_notional", nonnegative=True)
+        except (TypeError, ValueError):
+            return False
+        return value.evidence_class in {OBSERVED, CALCULATED, CONSERVATIVE_BOUND}
+    if isinstance(value, Mapping):
+        evidence = value.get("evidence_class", value.get("evidence", UNKNOWN))
+        if isinstance(evidence, Evidence):
+            evidence = evidence.evidence_class
+        if isinstance(evidence, Mapping):
+            evidence = evidence.get("evidence_class", UNKNOWN)
+        if evidence not in {OBSERVED, CALCULATED, CONSERVATIVE_BOUND} or "max_notional" not in value:
+            return False
+        try:
+            _decimal(value["max_notional"], "max_notional", nonnegative=True)
+        except (TypeError, ValueError):
+            return False
+        return True
+    return False
+
+
+def _state_key(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return repr(tuple(sorted((str(key), _state_key(item)) for key, item in value.items())))
+    if isinstance(value, (tuple, list)):
+        return repr(tuple(_state_key(item) for item in value))
+    return repr(value)
+
+
+def _stable_id_key(value: Any) -> tuple[int, Any]:
+    """Sort numeric strategy ids numerically, with deterministic mixed-id fallback."""
+    if isinstance(value, (int, Decimal)) and not isinstance(value, bool):
+        return (0, Decimal(value))
+    return (1, str(value))
+
+
+def _coefficient_evidence(value: Any) -> tuple[str, Mapping[str, Any]]:
+    if isinstance(value, MarginCoefficient):
+        return value.evidence_class, value.witness
+    if isinstance(value, Mapping):
+        evidence = value.get("evidence_class", value.get("evidence", UNKNOWN))
+        witness = value.get("witness", {})
+        if isinstance(evidence, Evidence):
+            return evidence.evidence_class, witness if isinstance(witness, Mapping) else {}
+        if isinstance(evidence, Mapping):
+            witness = evidence.get("witness", witness)
+            evidence = evidence.get("evidence_class", UNKNOWN)
+        return str(evidence), witness if isinstance(witness, Mapping) else {}
+    return UNKNOWN, {}
+
+
+@_context_safe
+def freeze_linear_margin_coefficients(
+    participant_states: Mapping[Any, Sequence[Any]] | Sequence[Sequence[Any]],
+    evaluator: Callable[[Any], MarginResult],
+    *,
+    strategy_ids: Sequence[Any] | None = None,
+    declared_grid: Mapping[Any, Sequence[Any]] | Sequence[Sequence[Any]] | None = None,
+) -> MarginCoefficientResult:
+    """Freeze conservative linear IM/MM rates from fixed execution states.
+
+    ``participant_states`` maps each strategy to ``(notional, state)`` samples.
+    A sequence is accepted for compact fixtures when ``strategy_ids`` is given.
+    Every supplied state is evaluated; unknown or malformed state data blocks
+    sizing rather than silently becoming zero.
+    """
+    declared = declared_grid
+    if isinstance(participant_states, Mapping):
+        ordered_ids = tuple(participant_states)
+        samples_by_id = tuple(participant_states[item] for item in ordered_ids)
+    else:
+        samples_by_id = tuple(participant_states)
+        if strategy_ids is None or len(strategy_ids) != len(samples_by_id):
+            return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_COEFFICIENT_SHAPE_MISMATCH")
+        ordered_ids = tuple(strategy_ids)
+    try:
+        if len(set(ordered_ids)) != len(ordered_ids):
+            return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "STRATEGY_ID_NOT_UNIQUE")
+    except TypeError:
+        return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "STRATEGY_ID_NOT_UNIQUE")
+    if declared is None:
+        return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_COEFFICIENT_GRID_REQUIRED")
+    if declared is not None:
+        if isinstance(declared, Mapping):
+            expected_by_id = declared
+        else:
+            expected_by_id = dict(zip(ordered_ids, declared)) if len(declared) == len(ordered_ids) else {}
+        if set(expected_by_id) != set(ordered_ids):
+            return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_COEFFICIENT_GRID_COVERAGE_INCOMPLETE")
+    coefficients: list[MarginCoefficient] = []
+    evaluated_states = 0
+    witness: dict[str, Any] = {"states": {}}
+    try:
+        for strategy_id, samples in zip(ordered_ids, samples_by_id):
+            samples = tuple(samples)
+            if declared is not None:
+                expected = tuple(expected_by_id[strategy_id])
+                supplied_notionals = {sample[0] for sample in samples if isinstance(sample, Sequence) and not isinstance(sample, (str, bytes)) and len(sample) == 2}
+                expected_notionals = {
+                    item[0] if isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) == 2 else item
+                    for item in expected
+                }
+                try:
+                    supplied_notionals = {_decimal(item, "state nominal", nonnegative=True) for item in supplied_notionals}
+                    expected_notionals = {_decimal(item, "declared nominal", nonnegative=True) for item in expected_notionals}
+                except (TypeError, ValueError):
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_COEFFICIENT_GRID_COVERAGE_INCOMPLETE", evaluated_states, witness)
+                if not expected_notionals.issubset(supplied_notionals):
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_COEFFICIENT_GRID_COVERAGE_INCOMPLETE", evaluated_states, witness)
+                expected_pairs = {
+                    (_state_key(item[0]), _state_key(item[1]))
+                    for item in expected
+                    if isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) == 2
+                }
+                supplied_pairs = {
+                    (_state_key(item[0]), _state_key(item[1]))
+                    for item in samples
+                    if isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) == 2
+                }
+                if expected_pairs and not expected_pairs.issubset(supplied_pairs):
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_COEFFICIENT_GRID_COVERAGE_INCOMPLETE", evaluated_states, witness)
+            rates_im: list[Decimal] = []
+            rates_mm: list[Decimal] = []
+            for sample in samples:
+                if not isinstance(sample, Sequence) or isinstance(sample, (str, bytes)) or len(sample) != 2:
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_COEFFICIENT_STATE_INVALID", evaluated_states, witness)
+                nominal = _decimal(sample[0], "state nominal", nonnegative=True)
+                result = evaluator(sample[1])
+                evaluated_states += 1
+                if not isinstance(result, MarginResult) or result.status != PASS or result.evidence_class not in {OBSERVED, CALCULATED, CONSERVATIVE_BOUND} or not isinstance(result.denominator, Evidence) or result.denominator.evidence_class == UNKNOWN:
+                    reason = result.reason if isinstance(result, MarginResult) and result.reason else "MARGIN_BOUND_UNAVAILABLE"
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, reason, evaluated_states, witness)
+                initial, maintenance = _margin_result_values(result)
+                if initial is None or maintenance is None:
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_BOUND_UNAVAILABLE", evaluated_states, witness)
+                initial = _decimal(initial, "total_im", nonnegative=True)
+                maintenance = _decimal(maintenance, "total_mm", nonnegative=True)
+                try:
+                    denominator = _decimal(result.denominator.value, "denominator", positive=True)
+                except (TypeError, ValueError):
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_BOUND_UNAVAILABLE", evaluated_states, witness)
+                if denominator < initial or denominator < maintenance:
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_BOUND_FAILED", evaluated_states, witness)
+                if nominal == 0:
+                    if initial != 0 or maintenance != 0:
+                        return MarginCoefficientResult(FAIL, (), CONSERVATIVE_BOUND, "MARGIN_LINEARITY_FAILED", evaluated_states, witness)
+                    continue
+                initial_rate, _ = _divide_up(initial, nominal)
+                maintenance_rate, _ = _divide_up(maintenance, nominal)
+                rates_im.append(initial_rate)
+                rates_mm.append(maintenance_rate)
+            if not rates_im:
+                return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_COEFFICIENT_UNKNOWN", evaluated_states, witness)
+            a = max(rates_im)
+            b = max(rates_mm)
+            declared_notionals = tuple(
+                _decimal(
+                    item[0] if isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) == 2 else item,
+                    "declared nominal",
+                    nonnegative=True,
+                )
+                for item in expected
+            )
+            evaluated_notionals = tuple(_decimal(sample[0], "state nominal", nonnegative=True) for sample in samples)
+            coefficients.append(MarginCoefficient(
+                strategy_id,
+                a,
+                b,
+                CONSERVATIVE_BOUND,
+                {
+                    "samples": len(rates_im),
+                    "im_rates": tuple(rates_im),
+                    "mm_rates": tuple(rates_mm),
+                    "declared_state_count": len(expected),
+                    "evaluated_state_count": len(samples),
+                    "declared_notionals": declared_notionals,
+                    "evaluated_notionals": evaluated_notionals,
+                },
+                max(declared_notionals, default=Decimal(0)),
+            ))
+            witness["states"][str(strategy_id)] = {
+                "declared_state_count": len(expected),
+                "evaluated_state_count": len(samples),
+                "declared_notionals": declared_notionals,
+                "evaluated_notionals": evaluated_notionals,
+                "a": a,
+                "b": b,
+            }
+    except Exception:
+        return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_BOUND_UNAVAILABLE", evaluated_states, witness)
+    return MarginCoefficientResult(PASS, tuple(coefficients), CONSERVATIVE_BOUND, None, evaluated_states, witness)
+
+
+def _close_excess(
+    nominals: Sequence[Decimal],
+    priorities: Sequence[int],
+    strategy_ids: Sequence[Any],
+    count: int,
+) -> tuple[Any, ...]:
+    if count <= 0:
+        return ()
+    groups: list[tuple[int, list[int]]] = []
+    for priority in range(5, 0, -1):
+        indices = [index for index, value in enumerate(priorities) if value == priority and nominals[index] > 0]
+        if indices:
+            groups.append((priority, indices))
+    selected: list[int] = []
+    remaining = count
+    for _priority, indices in groups:
+        if remaining <= 0:
+            break
+        if len(indices) <= remaining:
+            selected.extend(indices)
+            remaining -= len(indices)
+        else:
+            selected.extend(sorted(indices, key=lambda index: (-nominals[index], _stable_id_key(strategy_ids[index])))[:remaining])
+            break
+    return tuple(strategy_ids[index] for index in selected)
+
+
+@_context_safe
+def evaluate_weighted_margin(
+    x: Sequence[Any],
+    coefficients: Sequence[Any] | Mapping[Any, Any],
+    *,
+    max_dd: Any = Decimal("0.20"),
+    reserve: Any = Decimal("0.40"),
+    max_mm_load: Any = Decimal("0.35"),
+    B_risk: Any = Decimal("1"),
+    L: int = 0,
+    priorities: Sequence[int] | Mapping[Any, int] | None = None,
+    strategy_ids: Sequence[Any] | None = None,
+    full_nominals: Sequence[Any] | Mapping[Any, Any] | None = None,
+    limiter_release_status: str = UNKNOWN,
+    release_evidence: Mapping[str, Any] | Evidence | None = None,
+    bank_available: Any | None = None,
+) -> WeightedMarginResult:
+    """Evaluate the fixed-x Phase 4 margin and limiter stress contract."""
+    values = tuple(_decimal(value, "x", nonnegative=True) for value in x)
+    n = len(values)
+    if not n:
+        raise ValueError("x must not be empty")
+    if strategy_ids is None:
+        return WeightedMarginResult(UNKNOWN, "STRATEGY_ID_REQUIRED", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+    ids = tuple(strategy_ids)
+    if len(ids) != n:
+        raise ValueError("MARGIN_STRATEGY_SHAPE_MISMATCH")
+    try:
+        if len(set(ids)) != n:
+            return WeightedMarginResult(UNKNOWN, "STRATEGY_ID_NOT_UNIQUE", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+    except TypeError:
+        return WeightedMarginResult(UNKNOWN, "STRATEGY_ID_NOT_UNIQUE", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+    if isinstance(coefficients, MarginCoefficientResult):
+        if coefficients.status != PASS or coefficients.evidence_class not in {OBSERVED, CALCULATED, CONSERVATIVE_BOUND}:
+            return WeightedMarginResult(UNKNOWN, coefficients.reason or "MARGIN_BOUND_UNAVAILABLE", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+        coefficients = coefficients.coefficients
+    try:
+        if isinstance(coefficients, Mapping):
+            if set(coefficients) != set(ids):
+                raise ValueError("MARGIN_COEFFICIENT_SHAPE_MISMATCH")
+            raw_coefficients = tuple(coefficients[item] for item in ids)
+        else:
+            if len(coefficients) != n:
+                raise ValueError("MARGIN_COEFFICIENT_SHAPE_MISMATCH")
+            raw_coefficients = tuple(coefficients)
+        if any(not _coefficient_is_known(value) for value in raw_coefficients):
+            raise ValueError("MARGIN_BOUND_UNAVAILABLE")
+        pairs = tuple(_coefficient_pair(value, item) for value, item in zip(raw_coefficients, ids))
+    except (TypeError, ValueError) as error:
+        return WeightedMarginResult(UNKNOWN, str(error) if str(error).startswith("MARGIN_COEFFICIENT_") else "MARGIN_BOUND_UNAVAILABLE", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+    for value, amount in zip(raw_coefficients, values):
+        domain = value.max_notional if isinstance(value, MarginCoefficient) else value.get("max_notional") if isinstance(value, Mapping) else None
+        try:
+            if domain is None:
+                raise ValueError
+            if amount > _decimal(domain, "max_notional", nonnegative=True):
+                return WeightedMarginResult(UNKNOWN, "MARGIN_COEFFICIENT_DOMAIN_EXCEEDED", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+        except (TypeError, ValueError):
+            return WeightedMarginResult(UNKNOWN, "MARGIN_BOUND_UNAVAILABLE", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+    if priorities is None:
+        return WeightedMarginResult(UNKNOWN, "PRIORITY_UNKNOWN", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+    elif isinstance(priorities, Mapping):
+        if set(priorities) != set(ids):
+            return WeightedMarginResult(UNKNOWN, "PRIORITY_UNKNOWN", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+        priority_values = tuple(priorities[item] for item in ids)
+    else:
+        priority_values = tuple(priorities)
+        if len(priority_values) != n:
+            raise ValueError("PRIORITY_SHAPE_MISMATCH")
+    if len(priority_values) != n or any(type(value) is not int or not 1 <= value <= 5 for value in priority_values):
+        return WeightedMarginResult(UNKNOWN, "PRIORITY_UNKNOWN", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+    if type(L) is not int or L < 0:
+        raise ValueError("L must be a non-negative integer")
+    if L != 0 and not 1 <= L < n:
+        return WeightedMarginResult(UNKNOWN, "LIMITER_RANGE_INVALID", None, None, None, None, None, None, L, None, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+    ell = n if L == 0 else L
+    dd = _decimal(max_dd, "max_dd", nonnegative=True)
+    r = _decimal(reserve, "reserve", nonnegative=True)
+    u = _decimal(max_mm_load, "max_mm_load", positive=True)
+    risk = _decimal(B_risk, "B_risk", positive=True)
+    if not dd < 1 or not r < 1 or not u < 1:
+        raise ValueError("margin fractions must be below one")
+    try:
+        if full_nominals is None:
+            nominals = values
+        elif isinstance(full_nominals, Mapping):
+            if set(full_nominals) != set(ids):
+                raise ValueError("FULL_NOMINAL_SHAPE_MISMATCH")
+            nominals = tuple(_decimal(full_nominals[item], "full_nominal", nonnegative=True) for item in ids)
+        else:
+            if len(full_nominals) != n:
+                raise ValueError("FULL_NOMINAL_SHAPE_MISMATCH")
+            nominals = tuple(_decimal(value, "full_nominal", nonnegative=True) for value in full_nominals)
+    except (TypeError, ValueError) as error:
+        return WeightedMarginResult(UNKNOWN, str(error) if str(error).endswith("SHAPE_MISMATCH") else "MARGIN_BOUND_UNAVAILABLE", None, None, None, None, None, None, L, ell, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED")
+    im_values = tuple(a * value for value, (a, _b) in zip(values, pairs))
+    mm_values = tuple(b * value for value, (_a, b) in zip(values, pairs))
+    i_all = sum(im_values, Decimal(0))
+    m_all = sum(mm_values, Decimal(0))
+    k_extra = n - ell
+    closed = _close_excess(nominals, priority_values, ids, k_extra)
+    loss_extra = Decimal("0.015") * sum((nominals[ids.index(item)] for item in closed), Decimal(0)) if closed else Decimal(0)
+    status = str(limiter_release_status).upper()
+    has_release_proof = False
+    if isinstance(release_evidence, Mapping):
+        reference = release_evidence.get("reference_evidence")
+        if reference is None or isinstance(reference, Mapping):
+            proof = reference if isinstance(reference, Mapping) else release_evidence
+            digest = proof.get("digest", proof.get("evidence_digest"))
+            identity = proof.get("identity", proof.get("reference_identity"))
+            has_release_proof = all(isinstance(value, str) and bool(value.strip()) for value in (digest, identity))
+    if status == "CONFIRMED" and not has_release_proof:
+        status = UNKNOWN
+    if status == "CONFIRMED":
+        held_indices = sorted(range(n), key=lambda index: (-im_values[index], _stable_id_key(ids[index])))[:ell]
+        i_held = sum((im_values[index] for index in held_indices), Decimal(0))
+        marker = "IM_RELEASE_CONFIRMED"
+    elif status == UNKNOWN:
+        i_held = i_all
+        marker = "IM_RELEASE_NOT_CONFIRMED"
+    else:
+        return WeightedMarginResult(UNKNOWN, "LIMITER_RELEASE_STATUS_UNKNOWN", i_all, m_all, i_all, loss_extra, None, None, L, ell, UNKNOWN, "IM_RELEASE_NOT_CONFIRMED", closed)
+    one_minus_m = Decimal(1) - dd
+    one_minus_r = Decimal(1) - r
+    candidates = (i_all, m_all / u, i_held / one_minus_r)
+    b_margin = (loss_extra + max(candidates)) / one_minus_m
+    # Decimal integer conversion with ROUND_UP is exact for positive values.
+    b_required = max(risk, b_margin, Decimal(1)).to_integral_value(rounding=ROUND_UP)
+    A = one_minus_m * b_required - loss_extra
+    checks = {
+        "A_positive": A > 0,
+        "I_all": i_all <= A,
+        "M_all": m_all <= u * A,
+        "I_held": i_held <= one_minus_r * A,
+    }
+    if bank_available is not None:
+        available = _decimal(bank_available, "bank_available", positive=True)
+        checks["bank_available"] = b_required <= available
+    result_status = PASS if all(checks.values()) else FAIL
+    reason = None if result_status == PASS else "MARGIN_BOUND_FAILED"
+    if "bank_available" in checks and not checks["bank_available"]:
+        reason = "BANK_UNAVAILABLE"
+    return WeightedMarginResult(result_status, reason, i_all, m_all, i_held, loss_extra, b_margin, b_required, L, ell, status, marker, closed, checks, {
+        "coefficients": pairs,
+        "coefficient_evidence": tuple(_coefficient_evidence(value) for value in (coefficients.values() if isinstance(coefficients, Mapping) else coefficients)),
+        "nominals": nominals,
+        "priorities": priority_values,
+        "k_extra": k_extra,
+        "A": A,
+        "release_proof": has_release_proof,
+    })
 
 
 @_context_safe

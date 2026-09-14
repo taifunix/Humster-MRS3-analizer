@@ -1,6 +1,7 @@
 from decimal import Decimal, Inexact, ROUND_FLOOR, localcontext
 from dataclasses import replace
 from enum import IntEnum
+from itertools import product
 import mrs3.portfolio as portfolio_package
 import mrs3.portfolio.margin as margin_module
 import pytest
@@ -22,6 +23,9 @@ from mrs3.portfolio.margin import (
     evaluate_limiter,
     evaluate_margin,
     evaluate_margin_envelope,
+    evaluate_weighted_margin,
+    MarginCoefficient,
+    freeze_linear_margin_coefficients,
     deposit_sufficiency,
     planned_leverages,
     planned_leverage_for_symbol,
@@ -30,6 +34,14 @@ from mrs3.portfolio.margin import (
     validate_applied_leverage,
     validate_quantity,
 )
+
+
+def _evidence_rates(rates, strategy_ids=None, *, max_notional=Decimal("1000000")):
+    ids = tuple(range(len(rates))) if strategy_ids is None else tuple(strategy_ids)
+    return tuple(
+        MarginCoefficient(strategy_id, initial, maintenance, CONSERVATIVE_BOUND, max_notional=max_notional)
+        for strategy_id, (initial, maintenance) in zip(ids, rates)
+    )
 
 
 TIERS = (
@@ -254,6 +266,169 @@ def test_adjusted_denominator_cannot_pass_when_margin_is_overcommitted():
     )
     assert result.status == FAIL and result.reason == "MARGIN_BOUND_FAILED"
     assert result.total_im is not None and result.total_mm is not None
+
+
+def test_weighted_margin_is_linear_and_uses_full_im_off() -> None:
+    result = evaluate_weighted_margin(
+        (Decimal("1000"), Decimal("1000")),
+        _evidence_rates(((Decimal("0.10"), Decimal("0")), (Decimal("0.10"), Decimal("0"))), (1, 2)),
+        max_dd=Decimal("0.10"), reserve=Decimal("0.40"), max_mm_load=Decimal("0.35"),
+        strategy_ids=(1, 2), priorities=(1, 1),
+    )
+    assert result.status == PASS
+    assert result.I_all == Decimal("200") and result.I_held == Decimal("200")
+    assert result.loss_extra == Decimal("0") and result.B_required == Decimal("371")
+    assert result.checks["I_all"] and result.checks["I_held"]
+
+
+def test_weighted_margin_confirmed_release_is_top_ell_and_unknown_keeps_loss() -> None:
+    x = tuple(Decimal("1000") for _ in range(15))
+    rates = tuple((Decimal("0.10"), Decimal("0.005")) for _ in x)
+    evidence_rates = _evidence_rates(rates, tuple(range(15)))
+    off = evaluate_weighted_margin(x, evidence_rates, max_dd=Decimal("0.10"), reserve=Decimal("0.40"), max_mm_load=Decimal("0.35"), strategy_ids=tuple(range(15)), priorities=(1,) * 15)
+    proof = {"digest": "fixture", "identity": "fixture-reference"}
+    confirmed = evaluate_weighted_margin(x, evidence_rates, max_dd=Decimal("0.10"), reserve=Decimal("0.40"), max_mm_load=Decimal("0.35"), L=10, strategy_ids=tuple(range(15)), priorities=(1,) * 15, limiter_release_status="CONFIRMED", release_evidence=proof)
+    confirmed_l9 = evaluate_weighted_margin(x, evidence_rates, max_dd=Decimal("0.10"), reserve=Decimal("0.40"), max_mm_load=Decimal("0.35"), L=9, strategy_ids=tuple(range(15)), priorities=(1,) * 15, limiter_release_status="CONFIRMED", release_evidence=proof)
+    unknown = evaluate_weighted_margin(x, evidence_rates, max_dd=Decimal("0.10"), reserve=Decimal("0.40"), max_mm_load=Decimal("0.35"), L=10, strategy_ids=tuple(range(15)), priorities=(1,) * 15, limiter_release_status="UNKNOWN")
+    assert off.B_required == Decimal("2778")
+    assert confirmed.B_required == Decimal("1936") and confirmed_l9.B_required == Decimal("1767")
+    assert evaluate_weighted_margin(x, evidence_rates, max_dd=Decimal("0.10"), reserve=Decimal("0.40"), max_mm_load=Decimal("0.35"), L=8, strategy_ids=tuple(range(15)), priorities=(1,) * 15, limiter_release_status="CONFIRMED", release_evidence=proof).B_required == Decimal("1784")
+    assert unknown.B_required == Decimal("2862") and unknown.I_held == unknown.I_all
+    assert unknown.release_marker == "IM_RELEASE_NOT_CONFIRMED" and unknown.loss_extra == Decimal("75")
+
+
+def test_weighted_margin_top_ell_and_priority_close_match_exhaustive_small_sets() -> None:
+    for n in range(1, 7):
+        ids = tuple(range(10, 10 + n))
+        x = tuple(Decimal(100 + 17 * index) for index in range(n))
+        rates = tuple((Decimal("0.01") + Decimal(index) / Decimal("100"), Decimal("0.001")) for index in range(n))
+        im = tuple(value * pair[0] for value, pair in zip(x, rates))
+        for ell in range(1, n + 1):
+            result = evaluate_weighted_margin(
+                x,
+                _evidence_rates(rates, ids),
+                L=0 if ell == n else ell,
+                strategy_ids=ids,
+                priorities=tuple(1 for _ in ids),
+                limiter_release_status="CONFIRMED",
+                    release_evidence={"digest": "fixture", "identity": "fixture-reference"},
+            )
+            assert result.I_held == sum(sorted(im, reverse=True)[:ell], Decimal(0))
+
+        nominals = tuple(Decimal(100 + 10 * index) for index in range(n))
+        for priorities in product(range(1, 6), repeat=n):
+            for count in range(n + 1):
+                remaining = count
+                expected = []
+                for priority in range(5, 0, -1):
+                    indices = [index for index, value in enumerate(priorities) if value == priority]
+                    if remaining <= 0:
+                        break
+                    if len(indices) <= remaining:
+                        expected.extend(ids[index] for index in indices)
+                        remaining -= len(indices)
+                    else:
+                        expected.extend(ids[index] for index in sorted(indices, key=lambda index: (-nominals[index], ids[index]))[:remaining])
+                        remaining = 0
+                assert margin_module._close_excess(nominals, priorities, ids, count) == tuple(expected)
+
+
+def test_weighted_margin_r_zero_and_full_mm_floor_do_not_gain_from_limiter() -> None:
+    x = (Decimal("1000"), Decimal("1000"))
+    rates = ((Decimal("0.10"), Decimal("0.005")),) * 2
+    evidence_rates = _evidence_rates(rates, (1, 2))
+    kwargs = dict(strategy_ids=(1, 2), priorities=(1, 1), limiter_release_status="CONFIRMED", release_evidence={"digest": "fixture", "identity": "fixture-reference"}, max_dd=Decimal("0.10"), reserve=Decimal("0"))
+    off = evaluate_weighted_margin(x, evidence_rates, L=0, **kwargs)
+    limited = evaluate_weighted_margin(x, evidence_rates, L=1, **kwargs)
+    assert limited.B_required >= off.B_required == Decimal("223")
+
+    mm_rates = ((Decimal("0.01"), Decimal("0.50")),) * 2
+    mm_evidence_rates = _evidence_rates(mm_rates, (1, 2))
+    mm_off = evaluate_weighted_margin(x, mm_evidence_rates, L=0, max_dd=Decimal("0.10"), reserve=Decimal("0.40"), max_mm_load=Decimal("0.35"), strategy_ids=(1, 2), priorities=(1, 1))
+    mm_limited = evaluate_weighted_margin(x, mm_evidence_rates, L=1, max_dd=Decimal("0.10"), reserve=Decimal("0.40"), max_mm_load=Decimal("0.35"), strategy_ids=(1, 2), priorities=(1, 1), limiter_release_status="CONFIRMED", release_evidence={"digest": "fixture", "identity": "fixture-reference"})
+    assert mm_limited.M_all == mm_off.M_all and mm_limited.B_required >= mm_off.B_required
+
+
+def test_weighted_margin_frozen_coefficients_fail_closed_when_bound_is_unknown() -> None:
+    result = freeze_linear_margin_coefficients(
+        {1: ((Decimal("0"), object()),)},
+        lambda _state: MarginResult(UNKNOWN, "MARGIN_BOUND_UNAVAILABLE", UNKNOWN, None, None, None, None, None, Evidence.unknown("MARGIN_BOUND_UNAVAILABLE")),
+        declared_grid={1: (Decimal("0"),)},
+    )
+    assert result.status == UNKNOWN and result.reason == "MARGIN_BOUND_UNAVAILABLE"
+
+
+def test_frozen_margin_coefficients_cover_zero_and_varying_known_states_with_conservative_max() -> None:
+    def evaluator(state):
+        nominal, im_rate, mm_rate = state
+        return MarginResult(
+            PASS, None, CALCULATED, nominal * im_rate, Decimal("0"), nominal * im_rate,
+            nominal * mm_rate, nominal * mm_rate, Evidence.calculated(Decimal("100"), provenance="fixture"),
+        )
+
+    frozen = freeze_linear_margin_coefficients(
+        {1: ((Decimal("0"), (Decimal("0"), Decimal("0"), Decimal("0"))),
+            (Decimal("100"), (Decimal("100"), Decimal("0.1"), Decimal("0.01"))),
+            (Decimal("200"), (Decimal("200"), Decimal("0.2"), Decimal("0.02"))))},
+        evaluator,
+        declared_grid={1: (Decimal("0"), Decimal("100"), Decimal("200"))},
+    )
+    assert frozen.status == PASS
+    assert frozen.coefficients[0].a == Decimal("0.2") and frozen.coefficients[0].b == Decimal("0.02")
+
+
+def test_frozen_margin_coefficients_reject_incomplete_declared_grid() -> None:
+    result = freeze_linear_margin_coefficients(
+        {1: ((Decimal("100"), MarginResult(PASS, None, CALCULATED, Decimal("10"), Decimal("0"), Decimal("10"), Decimal("1"), Decimal("1"), Evidence.calculated(Decimal("1"), provenance="fixture"))),)},
+        lambda state: state,
+        declared_grid={1: (Decimal("0"), Decimal("100"))},
+    )
+    assert result.status == UNKNOWN and result.reason == "MARGIN_COEFFICIENT_GRID_COVERAGE_INCOMPLETE"
+
+
+def test_frozen_margin_coefficients_require_declared_grid() -> None:
+    known = MarginResult(PASS, None, CALCULATED, Decimal("10"), Decimal("0"), Decimal("10"), Decimal("1"), Decimal("1"), Evidence.calculated(Decimal("1"), provenance="fixture"))
+    result = freeze_linear_margin_coefficients({1: ((Decimal("100"), known),)}, lambda state: state)
+    assert result.status == UNKNOWN and result.reason == "MARGIN_COEFFICIENT_GRID_REQUIRED"
+
+
+def test_frozen_margin_coefficients_rejects_missing_state_and_evaluator_errors() -> None:
+    known = MarginResult(PASS, None, CALCULATED, Decimal("10"), Decimal("0"), Decimal("10"), Decimal("1"), Decimal("1"), Evidence.calculated(Decimal("1"), provenance="fixture"))
+    incomplete = freeze_linear_margin_coefficients(
+        {1: ((Decimal("100"), "state-a"),)},
+        lambda _state: known,
+        declared_grid={1: ((Decimal("100"), "state-a"), (Decimal("100"), "state-b"))},
+    )
+    raised = freeze_linear_margin_coefficients(
+        {1: ((Decimal("100"), "state-a"),)},
+        lambda _state: (_ for _ in ()).throw(RuntimeError("bad evaluator")),
+        declared_grid={1: ((Decimal("100"), "state-a"),)},
+    )
+    assert incomplete.status == UNKNOWN and incomplete.reason == "MARGIN_COEFFICIENT_GRID_COVERAGE_INCOMPLETE"
+    assert raised.status == UNKNOWN and raised.reason == "MARGIN_BOUND_UNAVAILABLE"
+
+
+def test_weighted_margin_requires_explicit_unique_priorities() -> None:
+    missing = evaluate_weighted_margin((Decimal("10"),), _evidence_rates(((Decimal("0.1"), Decimal("0")),), (1,)), strategy_ids=(1,))
+    assert missing.status == UNKNOWN and missing.reason == "PRIORITY_UNKNOWN"
+    duplicate = evaluate_weighted_margin((Decimal("10"), Decimal("10")), _evidence_rates(((Decimal("0.1"), Decimal("0")),) * 2, (1, 1)), strategy_ids=(1, 1), priorities=(1, 1))
+    assert duplicate.status == UNKNOWN and duplicate.reason == "STRATEGY_ID_NOT_UNIQUE"
+
+
+def test_weighted_margin_consumes_mappings_strictly_and_requires_release_identity() -> None:
+    x = (Decimal("100"), Decimal("200"))
+    rates = dict(zip((1, 2), _evidence_rates(((Decimal("0.1"), Decimal("0.01")),) * 2, (1, 2))))
+    priorities = {1: 1, 2: 1}
+    missing = evaluate_weighted_margin(x, {1: rates[1]}, strategy_ids=(1, 2), priorities=priorities)
+    extra = evaluate_weighted_margin(x, {**rates, 3: rates[1]}, strategy_ids=(1, 2), priorities=priorities)
+    bad_proof = evaluate_weighted_margin(
+        x, rates, strategy_ids=(1, 2), priorities=priorities, L=1,
+        limiter_release_status="CONFIRMED", release_evidence={"digest": "fixture"},
+    )
+    assert missing.reason == extra.reason == "MARGIN_COEFFICIENT_SHAPE_MISMATCH"
+    assert bad_proof.release_status == UNKNOWN
+    assert bad_proof.release_marker == "IM_RELEASE_NOT_CONFIRMED"
+    assert bad_proof.I_held == bad_proof.I_all
 
 
 def test_under_limit_envelope_is_componentwise_and_keeps_metric_witnesses():

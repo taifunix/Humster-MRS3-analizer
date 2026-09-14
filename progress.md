@@ -21,16 +21,23 @@ after non-proportional sizing, recompute priorities and all dependent margin/rep
 facts, accept or reject once, and never start a hidden stabilization loop.
 An explicit implementation checklist is now in section 13. Reserved control
 joint-test slots remain unchanged.
-Current implementation handoff: Phase 3 of WS1.1 is accepted after independent
-Claude Opus 5 high `CODE_REVIEW_PASS`. The weighted SciPy/HiGHS LP, exact
+Current implementation handoff: Phase 3 of WS1.1 remains accepted after independent
+Claude Opus 5 high `CODE_REVIEW_PASS`. Its weighted SciPy/HiGHS LP, exact
 peak-equity drawdown and P30 capital checks, bounded adaptive frontier, compact
-candidate-search result types, and additive `WEIGHTED_VECTOR_V1` sizing seam
-are recorded in
+candidate-search result types, and additive `WEIGHTED_VECTOR_V1` sizing seam are
+recorded in
 `docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-phase-3-evidence.md`.
-Root final relevant verification passed 245 tests in 80.54s; the focused
-weighted/sizing suite passed 49 tests. No real tester, exchange request,
-migration, or generated artifact was used.
-Next: Phase 4 margin, limiter `L`, and priorities.
+Phase 4 margin/limiter/replay/priority integration is accepted at the fixture
+boundary after independent Claude Opus 5 high `CODE_REVIEW_PASS`, with the scope
+and conservative UNKNOWN boundary recorded in
+`docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-phase-4-evidence.md`.
+The executor focused suite passed 198 tests; root relevant broader verification
+passed 414 tests in 36.45s, and `git diff --check` is clean. No real tester,
+exchange, migration, database, network, or generated artifact was used.
+Root staged `git diff --cached --check` also exited 0 after the whitespace
+correction. Live release evidence remains unchecked and
+is deferred under separate authorization; the conservative UNKNOWN fallback is
+not legacy mode. Next: Phase 5 implementation after Phase 4 acceptance.
 
 Phase 0 remains complete: only mapping Campaign
 `PORTFOLIO_WEIGHTED_CAMPAIGN_V1` / `WEIGHTED_V1` / `WS1.1` is accepted, legacy
