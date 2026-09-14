@@ -355,6 +355,80 @@ def test_committed_tester_inbox_readiness_survives_panel_reload(tmp_path: Path) 
     assert controller._panel_jobs.get(job["job_id"])["inbox_ready"] is True
 
 
+def test_tester_progress_does_not_rewrite_registry_until_phase_or_evidence_changes(tmp_path: Path, monkeypatch) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    job = controller._panel_jobs.submit("strategies.tester.start", {}, "tester-progress", ("strategies.tester",))
+    controller._panel_jobs.transition(job["job_id"], "RUNNING")
+    saves = 0
+    original_save = controller._panel_jobs._save
+
+    def count_save() -> None:
+        nonlocal saves
+        saves += 1
+        original_save()
+
+    monkeypatch.setattr(controller._panel_jobs, "_save", count_save)
+    copies = 0
+    original_copy = controller._panel_jobs._copy
+
+    def count_copy(value: dict) -> dict:
+        nonlocal copies
+        copies += 1
+        return original_copy(value)
+
+    monkeypatch.setattr(controller._panel_jobs, "_copy", count_copy)
+    evidence = {"verified_reports": {"S0": "S0.html"}}
+    controller._record_special_job({
+        "job_id": job["job_id"], "state": "RUNNING", "phase": "BOT_RUN",
+        "progress": {"current": 0, "total": 1}, "evidence": evidence,
+    })
+    first = saves
+    copies_after_first = copies
+    controller._record_special_job({
+        "job_id": job["job_id"], "state": "RUNNING", "phase": "BOT_RUN",
+        "progress": {"current": 0, "total": 1, "active": 1}, "evidence": evidence,
+    })
+    assert saves == first
+    assert copies == copies_after_first
+    public = next(item for item in controller.panel_jobs() if item["job_id"] == job["job_id"])
+    assert public["progress"]["active"] == 1
+    assert public["evidence"]["verified_reports"] == 1
+
+    controller._record_special_job({
+        "job_id": job["job_id"], "state": "RUNNING", "phase": "REPORT_COLLECTION",
+        "progress": {"current": 1, "total": 1}, "evidence": evidence,
+    })
+    assert saves == first + 1
+    controller._record_special_job({
+        "job_id": job["job_id"], "state": "RUNNING", "phase": "REPORT_COLLECTION",
+        "progress": {"current": 1, "total": 1},
+        "evidence": {"verified_reports": {"S0": "S0.html", "S1": "S1.html"}},
+    })
+    assert saves == first + 2
+    persisted = json.loads(controller._panel_jobs.journal.read_text(encoding="utf-8"))[job["job_id"]]
+    assert persisted["phase"] == "REPORT_COLLECTION"
+    assert persisted["evidence"]["verified_reports"]["S1"] == "S1.html"
+
+
+def test_panel_jobs_projects_only_tester_verified_report_maps(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    tester = controller._panel_jobs.submit("strategies.tester.start", {}, "tester-public", ("strategies.tester",))
+    source = controller._panel_jobs.submit("source.local-import", {}, "source-public", ("source",))
+    controller._panel_jobs.sync(
+        tester["job_id"],
+        {"state": "QUEUED", "evidence": {"failed_names": ["S0"], "verified_reports": {"S0": "S0.html"}}},
+    )
+    controller._panel_jobs.sync(
+        source["job_id"],
+        {"state": "QUEUED", "evidence": {"verified_reports": {"source": "source.html"}}},
+    )
+
+    jobs = {item["job_id"]: item for item in controller.panel_jobs()}
+    assert jobs[tester["job_id"]]["evidence"] == {"failed_names": ["S0"], "verified_reports": 1}
+    assert jobs[source["job_id"]]["evidence"]["verified_reports"] == {"source": "source.html"}
+    assert controller._panel_jobs.get(tester["job_id"])["evidence"]["verified_reports"] == {"S0": "S0.html"}
+
+
 @pytest.mark.parametrize(("source_kind", "source_phase"), (("strategies.tester.native.start", "FAILED"), ("strategies.tester.retry", "BOT_RUN")))
 def test_failed_native_tester_can_start_a_tracked_retry(tmp_path: Path, source_kind: str, source_phase: str) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())

@@ -398,7 +398,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       group.append(title);
       const pair = value && typeof value === 'object' ? value : { value };
       for (const field of fields) {
-        const fieldLabels = { max_bp: 'Верхняя граница shift, bp', value: 'Значение', lower_min_bp: 'Нижняя граница, bp', lower_max_exclusive_bp: 'Верхняя граница (не включительно), bp', min_gap_bp: 'Минимальный gap, bp' };
+        const fieldLabels = { max_bp: 'Граница shift, bp', value: 'Значение', lower_min_bp: 'Диапазон меньшего shift: от', lower_max_exclusive_bp: 'Диапазон меньшего shift: до', min_gap_bp: 'Минимальное расстояние до следующего ордера, bp' };
         const fieldLabel = fieldLabels[field] || 'Значение';
         const fieldGroup = document.createElement('div'); fieldGroup.className = 'analysis-profile-pair-value';
         const fieldTitle = document.createElement('small'); fieldTitle.className = 'helper'; fieldTitle.textContent = fieldLabel;
@@ -410,33 +410,31 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     });
   };
   function renderAnalysisProfile(profile) {
-    const sections = ['eligibility', 'economics', 'geometry', 'plateau', 'ready', 'structures', 'workers'];
+    const sections = ['eligibility', 'frequency', 'economics', 'geometry', 'plateau', 'ready', 'structures'];
     sections.forEach((section) => { const container = document.querySelector(`#analysis-profile-${section}`); if (container) container.replaceChildren(); });
     const eligibility = document.querySelector('#analysis-profile-eligibility');
     analysisProfileInput(eligibility, 'analysis-history-days', 'Минимальная длительность истории, дней', analysisProfileValue(profile, 'eligibility', 'min_history_days'), { min: '1' });
-    analysisProfileInput(eligibility, 'analysis-floor-boundary', 'Граница абсолютного фильтра PnL, bp', analysisProfileValue(profile, 'eligibility', 'floor_boundary_bp'));
-    analysisProfileInput(eligibility, 'analysis-floor-low', 'Минимум сделок при PnL ниже границы', analysisProfileValue(profile, 'eligibility', 'floor_at_or_below'), { min: '0' });
-    analysisProfileInput(eligibility, 'analysis-floor-high', 'Минимум сделок при PnL выше границы', analysisProfileValue(profile, 'eligibility', 'floor_above'), { min: '0' });
-    analysisProfileInput(eligibility, 'analysis-min-events', 'Минимум событий в точке', analysisProfileValue(profile, 'eligibility', 'min_point_events'), { min: '1' });
-    analysisProfilePairs(eligibility, 'base-rates', analysisProfileValue(profile, 'eligibility', 'base_rates', {}), (key) => `Базовая ставка: ${key}`, ['value']);
-    analysisProfilePairs(eligibility, 'shift-factors', analysisProfileValue(profile, 'eligibility', 'shift_factors', []), () => 'Правило коэффициента shift', ['max_bp', 'value']);
+    analysisProfileInput(eligibility, 'analysis-floor-boundary', 'Граница shift для абсолютного минимума сделок, bp', analysisProfileValue(profile, 'eligibility', 'floor_boundary_bp'));
+    analysisProfileInput(eligibility, 'analysis-floor-low', 'Минимум сделок при shift ≤ границы', analysisProfileValue(profile, 'eligibility', 'floor_at_or_below'), { min: '0' });
+    analysisProfileInput(eligibility, 'analysis-floor-high', 'Минимум сделок при shift > границы', analysisProfileValue(profile, 'eligibility', 'floor_above'), { min: '0' });
+    const frequency = document.querySelector('#analysis-profile-frequency');
+    analysisProfileInput(frequency, 'analysis-min-events', 'Минимум событий в точке', analysisProfileValue(profile, 'eligibility', 'min_point_events'), { min: '1' });
+    analysisProfilePairs(frequency, 'base-rates', analysisProfileValue(profile, 'eligibility', 'base_rates', {}), (key) => `Базовая минимальная частота сделок в день: ${key}`, ['value']);
+    analysisProfilePairs(frequency, 'shift-factors', analysisProfileValue(profile, 'eligibility', 'shift_factors', []), () => 'Коэффициент для диапазона shift', ['max_bp', 'value']);
     const economics = document.querySelector('#analysis-profile-economics');
     analysisProfileInput(economics, 'analysis-min-pnl', 'Минимальный PnL, %', analysisProfileValue(profile, 'economics', 'min_pnl_pct'));
     analysisProfileInput(economics, 'analysis-min-win-rate', 'Минимальный win rate, %', analysisProfileValue(profile, 'economics', 'min_win_rate_pct'));
     analysisProfileInput(economics, 'analysis-max-dd', 'Максимальная просадка, %', analysisProfileValue(profile, 'economics', 'max_dd_pct'));
-    analysisProfileInput(economics, 'analysis-min-efficiency', 'Минимальная эффективность', analysisProfileValue(profile, 'economics', 'min_efficiency'));
+    analysisProfileInput(economics, 'analysis-min-efficiency', 'Минимальный PnL/DD', analysisProfileValue(profile, 'economics', 'min_efficiency'));
     const geometry = document.querySelector('#analysis-profile-geometry');
-    analysisProfileInput(geometry, 'analysis-canonical-shifts', 'Проверяемые shift, bp', analysisProfileValue(profile, 'geometry', 'canonical_shifts_bp'), { type: 'text', help: 'Через запятую; эти значения формируют срез поверхности.' });
-    analysisProfileInput(geometry, 'analysis-ma-radius', 'Радиус соседей при уточнении MA', analysisProfileValue(profile, 'geometry', 'ma_neighbor_radius'), { min: '0' });
+    analysisProfileInput(geometry, 'analysis-ma-radius', 'Радиус MA для проверки соседних точек, ±', analysisProfileValue(profile, 'geometry', 'ma_neighbor_radius'), { min: '0' });
     const plateau = document.querySelector('#analysis-profile-plateau');
-    for (const [id, label, key] of [['core-link', 'Порог CORE-связи', 'core_link_min'], ['envelope', 'Порог границы плато', 'envelope_min'], ['supported-link', 'Порог SUPPORTED-связи', 'supported_link_min'], ['isolated', 'Порог изолированного пика', 'isolated_peak_relative'], ['equivalent', 'Допуск эквивалентности', 'equivalent_tolerance'], ['close-core', 'Порог Close MA для CORE', 'close_core_min'], ['close-supported', 'Порог Close MA для SUPPORTED', 'close_supported_min']]) analysisProfileInput(plateau, `analysis-${id}`, label, analysisProfileValue(profile, 'plateau', key));
+    for (const [id, label, key] of [['core-link', 'Минимальная связь CORE', 'core_link_min'], ['envelope', 'Минимальная однородность всего плато', 'envelope_min'], ['supported-link', 'Минимальная связь SUPPORTED', 'supported_link_min'], ['equivalent', 'Допуск равноценности PnL и PnL/DD', 'equivalent_tolerance']]) analysisProfileInput(plateau, `analysis-${id}`, label, analysisProfileValue(profile, 'plateau', key));
     const ready = document.querySelector('#analysis-profile-ready');
-    for (const [id, label, key] of [['base-points', 'BASE 1ORD: минимум точек', 'base_min_points'], ['base-events', 'BASE 1ORD: событий в месяц', 'base_min_events_per_month'], ['base-slots', 'BASE 1ORD: число слотов', 'base_slots'], ['multi-points', 'Multi-order: минимум точек', 'multi_min_points'], ['multi-events', 'Multi-order: событий в месяц', 'multi_min_events_per_month']]) analysisProfileInput(ready, `analysis-${id}`, label, analysisProfileValue(profile, 'ready', key), { min: '0' });
+    for (const [id, label, key] of [['base-points', 'BASE 1ORD: минимум точек в плато', 'base_min_points'], ['base-events', 'BASE 1ORD: минимум событий плато за 30 дней', 'base_min_events_per_month'], ['base-slots', 'Максимум BASE 1ORD на пару/сторону/TF', 'base_slots'], ['multi-points', 'Multi-order: минимум точек в каждом плато', 'multi_min_points'], ['multi-events', 'Multi-order: минимум событий каждого плато за 30 дней', 'multi_min_events_per_month']]) analysisProfileInput(ready, `analysis-${id}`, label, analysisProfileValue(profile, 'ready', key), { min: '0' });
     const structures = document.querySelector('#analysis-profile-structures');
     analysisProfileInput(structures, 'analysis-max-orders', 'Максимум ордеров', analysisProfileValue(profile, 'structures', 'max_orders'), { min: '1' });
-    analysisProfileInput(structures, 'analysis-target-dd', 'Целевая просадка, %', analysisProfileValue(profile, 'structures', 'target_dd_pct'));
     analysisProfilePairs(structures, 'gap-rules', analysisProfileValue(profile, 'structures', 'gap_rules', []), () => 'Правило минимального gap', ['lower_min_bp', 'lower_max_exclusive_bp', 'min_gap_bp']);
-    analysisProfileInput(document.querySelector('#analysis-profile-workers'), 'analysis-workers', 'Количество параллельных процессов', profile?.workers, { min: '1', step: '1' });
   }
   const analysisProfilePairPayload = (selector, fields) => Object.fromEntries([...document.querySelectorAll(`[data-analysis-profile-pair="${selector}"]`)].reduce((entries, control) => {
     const value = entries.get(control.dataset.key) || {}; value[control.dataset.field] = control.value; entries.set(control.dataset.key, value); return entries;
@@ -448,18 +446,15 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       if (!/^-?\d+$/.test(raw)) throw new Error('Целочисленные поля профиля должны быть заполнены целыми числами.');
       return Number(raw);
     };
-    const shifts = value('analysis-canonical-shifts').split(',').map((item) => Number(item.trim()));
-    if (!shifts.length || shifts.some((item) => !Number.isInteger(item))) throw new Error('Проверяемые shift должны быть целыми числами через запятую.');
     const shiftFactors = Object.values(analysisProfilePairPayload('shift-factors', ['max_bp', 'value'])).map((pair) => ({ max_bp: Number(pair.max_bp), value: pair.value }));
     const gapRules = Object.values(analysisProfilePairPayload('gap-rules', ['lower_min_bp', 'lower_max_exclusive_bp', 'min_gap_bp'])).map((pair) => ({ lower_min_bp: Number(pair.lower_min_bp), lower_max_exclusive_bp: Number(pair.lower_max_exclusive_bp), min_gap_bp: Number(pair.min_gap_bp) }));
     return { profile: {
       eligibility: { min_history_days: integer('analysis-history-days'), base_rates: Object.fromEntries(Object.entries(analysisProfilePairPayload('base-rates', ['value'])).map(([key, pair]) => [key, pair.value])), shift_factors: shiftFactors, floor_boundary_bp: integer('analysis-floor-boundary'), floor_at_or_below: integer('analysis-floor-low'), floor_above: integer('analysis-floor-high'), min_point_events: integer('analysis-min-events') },
       economics: { min_pnl_pct: value('analysis-min-pnl'), min_win_rate_pct: value('analysis-min-win-rate'), max_dd_pct: value('analysis-max-dd'), min_efficiency: value('analysis-min-efficiency') },
-      geometry: { canonical_shifts_bp: shifts, ma_neighbor_radius: integer('analysis-ma-radius') },
-      plateau: { core_link_min: value('analysis-core-link'), envelope_min: value('analysis-envelope'), supported_link_min: value('analysis-supported-link'), isolated_peak_relative: value('analysis-isolated'), equivalent_tolerance: value('analysis-equivalent'), close_core_min: value('analysis-close-core'), close_supported_min: value('analysis-close-supported') },
+      geometry: { ma_neighbor_radius: integer('analysis-ma-radius') },
+      plateau: { core_link_min: value('analysis-core-link'), envelope_min: value('analysis-envelope'), supported_link_min: value('analysis-supported-link'), equivalent_tolerance: value('analysis-equivalent') },
       ready: { base_min_points: integer('analysis-base-points'), base_min_events_per_month: integer('analysis-base-events'), base_slots: integer('analysis-base-slots'), multi_min_points: integer('analysis-multi-points'), multi_min_events_per_month: integer('analysis-multi-events') },
-      structures: { gap_rules: gapRules, max_orders: integer('analysis-max-orders'), target_dd_pct: value('analysis-target-dd') },
-      workers: integer('analysis-workers'),
+      structures: { gap_rules: gapRules, max_orders: integer('analysis-max-orders') },
     } };
   }
   async function reloadAnalysisProfile() {
@@ -478,6 +473,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       }
       const paths = bootstrap.defaults?.panel?.path_defaults || {};
       const operational = bootstrap.defaults?.operational || {};
+      const workers = document.querySelector('#settings-import-workers');
+      if (workers && operational.import_workers !== undefined) workers.value = operational.import_workers;
       for (const [id, key] of [
         ['settings-source-root', 'source_db_path'], ['settings-output-root', 'output_root'],
       ]) {
@@ -1162,6 +1159,26 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       if (gapRun === surfacePreflightRunV2 && sourcePath === (surfaceSource?.value || '')) show('Gap report is unavailable. Run coverage preflight again.');
     }
   };
+  const surfaceNumberV2 = (value, digits = 2) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '—';
+    const factor = 10 ** digits;
+    return String(Math.round(number * factor) / factor);
+  };
+  const surfaceIntervalV2 = (interval) => {
+    if (!interval || !interval.start || !interval.end) return '—';
+    const suffix = interval.kind === 'RAW' ? ' · данные, не READY' : '';
+    return `${interval.start} — ${interval.end} (${interval.days ?? '—'} дн.)${suffix}`;
+  };
+  const surfacePnlV2 = (preview) => {
+    if (!preview?.available) return '—';
+    return `${preview.pnl_gt_10_count} / ${preview.total_points} · ${surfaceNumberV2(preview.pnl_gt_10_percent, 1)}%`;
+  };
+  const surfacePnlRangeV2 = (preview) => (
+    preview?.available
+      ? `${surfaceNumberV2(preview.pnl_median_pct)}% / ${surfaceNumberV2(preview.pnl_max_pct)}%`
+      : '—'
+  );
   const renderSurfaceScopesV2 = () => {
     if (!surfaceScopesV2) return;
     const filters = surfaceFiltersV2();
@@ -1172,7 +1189,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     surfaceScopesV2.replaceChildren();
     const table = document.createElement('div'); table.className = 'scope-table';
     const header = document.createElement('div'); header.className = 'scope-table-row scope-table-head';
-    ['', 'Pair · side', 'TF', 'Grid', 'READY interval', 'Status'].forEach((value) => { const node = document.createElement('span'); node.textContent = value; header.append(node); });
+    ['', 'Pair · side', 'TF', 'Период данных', 'PnL > 10%', 'PnL медиана / максимум', 'Status'].forEach((value) => { const node = document.createElement('span'); node.textContent = value; header.append(node); });
     table.append(header);
     let visible = 0;
     for (const group of surfaceGroupsV2) {
@@ -1187,18 +1204,24 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         if (groupNode.open) expandedSurfacePairs.add(groupKey); else expandedSurfacePairs.delete(groupKey);
       });
       const summary = document.createElement('summary');
-      const ready = items.filter((item) => item.status === 'READY').length;
-      const values = ['▸', `${group.pair} · ${group.side}`, `${items.length} TF`, '—', '—'];
+      const aggregate = group.summary || {};
+      const ready = aggregate.ready || { count: items.filter((item) => item.status === 'READY').length, total: items.length };
+      const values = [
+        '▸', `${group.pair} · ${group.side}`, `${aggregate.timeframes ?? items.length} TF`, surfaceIntervalV2(aggregate.common_interval),
+        surfacePnlV2(aggregate.pnl_preview), surfacePnlRangeV2(aggregate.pnl_preview),
+      ];
       values.forEach((value, index) => { const node = document.createElement('span'); node.textContent = value; if (index === 0) node.className = 'scope-group-toggle'; summary.append(node); });
-      const groupStatus = document.createElement('span'); groupStatus.className = `scope-table-status ${ready ? 'is-ready' : 'is-not-ready'}`; groupStatus.textContent = ready ? `READY · ${ready} / ${items.length}` : `n/r · 0 / ${items.length}`; summary.append(groupStatus); groupNode.append(summary);
+      const groupStatus = document.createElement('span'); groupStatus.className = `scope-table-status ${ready.count ? 'is-ready' : 'is-not-ready'}`; groupStatus.textContent = ready.count ? `READY · ${ready.count} / ${ready.total}` : `n/r · 0 / ${ready.total}`; summary.append(groupStatus); groupNode.append(summary);
       for (const item of items) {
         const row = document.createElement('label'); row.className = 'scope-table-row scope-timeframe-row';
         const check = document.createElement('input'); check.type = 'checkbox'; check.className = 'scope-checkbox'; check.value = item.scope_key; check.disabled = item.status !== 'READY'; check.checked = selectedSurfaceScopes.includes(item.scope_key); check.addEventListener('change', () => setSelectedSurfaceScopesV2(check.checked ? [...selectedSurfaceScopes, check.value] : selectedSurfaceScopes.filter((key) => key !== check.value)));
         const blank = document.createElement('span'); const timeframe = document.createElement('strong'); timeframe.textContent = item.timeframe;
-        const grid = document.createElement('span'); grid.textContent = '—'; const interval = document.createElement('span'); interval.textContent = '—';
+        const interval = document.createElement('span'); interval.textContent = surfaceIntervalV2(item.period);
+        const pnl = document.createElement('span'); pnl.textContent = surfacePnlV2(item.pnl_preview);
+        const pnlRange = document.createElement('span'); pnlRange.textContent = surfacePnlRangeV2(item.pnl_preview);
         const state = document.createElement(item.status === 'READY' ? 'span' : 'button'); state.className = `scope-table-status ${item.status === 'READY' ? 'is-ready' : 'is-not-ready'}`; state.textContent = item.status === 'READY' ? 'READY' : 'n/r - Check gaps';
         if (item.status !== 'READY') { state.type = 'button'; state.classList.add('text-link'); state.title = 'View gap details'; state.addEventListener('click', (event) => { event.preventDefault(); showGapReportV2(item); }); }
-        row.append(check, blank, timeframe, grid, interval, state); groupNode.append(row);
+        row.append(check, blank, timeframe, interval, pnl, pnlRange, state); groupNode.append(row);
       }
       table.append(groupNode);
     }
@@ -1357,6 +1380,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   let currentAnalysisId = '';
   let testerJobId = '';
   let testerPoller = 0;
+  let testerRetryTimer = 0;
+  let testerRetryable = false;
   let testerCommitted = false;
   let normalInboxReady = false;
   let normalImportAuthorized = false;
@@ -1560,6 +1585,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const testerTrack = testerCard?.querySelector('.progress-track span');
   const testerStart = document.querySelector('#tester-start');
   const testerStop = document.querySelector('#tester-stop');
+  const testerRetry = document.querySelector('#tester-retry');
   const testerStartDate = document.querySelector('#tester-start-date');
   const testerEndDate = document.querySelector('#tester-end-date');
   const validIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
@@ -1580,6 +1606,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const setTesterControls = (busy) => {
     if (testerStart) testerStart.disabled = busy;
     if (testerStop) testerStop.disabled = busy ? false : true;
+    if (testerRetry) testerRetry.disabled = busy || !testerRetryable;
     if (generateFresh) generateFresh.disabled = busy;
   };
   const renderTester = (job) => {
@@ -1590,13 +1617,14 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     const checked = Number(p.current || p.checked || 0);
     if (testerTrack) testerTrack.style.width = total ? `${Math.min(100, Math.round(checked * 100 / total))}%` : (job.state === 'COMMITTED' ? '100%' : '0%');
     const failed = Array.isArray(job.evidence?.failed_names) ? job.evidence.failed_names.length : 0;
+    const progressTail = ['FAILED', 'CANCELLED'].includes(job.state) ? `failed ${failed}` : `remaining ${Math.max(0, total - checked)}`;
     const stage = p.stage || job.phase || job.state || 'RUNNING';
     const startup = stage === 'BOT_START' && Number.isFinite(Number(p.startup_elapsed_seconds))
       ? ` · startup ${Number(p.startup_elapsed_seconds).toFixed(1)}s`
       : '';
     const native = stage === 'BOT_RUN' && p.native_status ? ` · tester ${p.native_status}` : '';
     const detail = singleMode
-      ? `${stage}${startup}${native} · batch ${p.batch_number || 0}/${p.batch_total || 0} · reports ${checked}/${total} · retries ${p.retries || 0} · failed ${failed}`
+      ? `${stage}${startup}${native} · batch ${p.batch_number || 0}/${p.batch_total || 0} · reports ${checked}/${total} · retries ${p.retries || 0} · ${progressTail}`
       : runs
         ? `${stage} · reports ${checked}/${total}`
         : `${stage} · reports ${checked}/${total}`;
@@ -1616,6 +1644,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       testerStatus.textContent = `${singleMode ? 'SINGLE_MODE' : 'Tester'}: ${detail} · ${gate}.${error}`;
     }
     if (testerStop) testerStop.disabled = !testerJobId || testerIsTerminal(job);
+    testerRetryable = singleMode && ['FAILED', 'CANCELLED'].includes(job.state) && job.job_id === testerJobId;
     setTesterControls(!testerIsTerminal(job));
     if (inboxVerifyV2) inboxVerifyV2.disabled = !committed || importAllowed;
     if (importStartV2) importStartV2.disabled = !importAllowed;
@@ -1663,6 +1692,33 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       setTesterControls(false);
     }
   });
+  testerRetry?.addEventListener('click', async () => {
+    if (!testerRetryable || !testerJobId) return;
+    const sourceJobId = testerJobId;
+    testerRetryable = false;
+    window.clearInterval(testerPoller); testerPoller = 0;
+    setTesterControls(true);
+    if (testerStop) testerStop.disabled = true;
+    const startedAt = Date.now();
+    const showRecovery = () => {
+      if (testerStatus) testerStatus.textContent = `Восстановление отчётов · проверяю уже готовые HTML · ${Math.floor((Date.now() - startedAt) / 1000)} с`;
+    };
+    showRecovery();
+    testerRetryTimer = window.setInterval(showRecovery, 1000);
+    try {
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.retry', request: { job_id: sourceJobId } });
+      const retryJobId = result.job?.job_id || '';
+      if (!retryJobId) throw new Error('missing job');
+      testerJobId = retryJobId;
+      renderTester(result.job); await pollTester(); startTesterPolling(1000);
+    } catch (error) {
+      testerRetryable = testerJobId === sourceJobId;
+      if (testerStatus) testerStatus.textContent = `Восстановление отчётов не выполнено: ${error?.message || 'request failed'}.`;
+      setTesterControls(false);
+    } finally {
+      window.clearInterval(testerRetryTimer); testerRetryTimer = 0;
+    }
+  });
   if (testerStop) testerStop.addEventListener('click', async () => {
     if (!testerJobId) return;
     normalImportAuthorized = false;
@@ -1683,6 +1739,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         .filter((job) => ['strategies.tester.start', 'strategies.tester.retry'].includes(job.kind) && job.retest !== true)
         .filter((job) => Number.isFinite(Date.parse(job.created_at_utc)) && (
           ['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)
+          || ['FAILED', 'CANCELLED'].includes(job.state)
           || (job.state === 'COMMITTED' && job.inbox_ready === true)
         ))
         .sort((a, b) => Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)
@@ -2699,10 +2756,15 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
        local_source_db_root: document.querySelector('#settings-source-root')?.value || '',
       local_output_root: document.querySelector('#settings-output-root')?.value || '',
     },
-  }, operational: {
+   }, operational: {
      source_db_path: document.querySelector('#settings-source-root')?.value || '',
-    output_root: document.querySelector('#settings-output-root')?.value || '',
-  } });
+     output_root: document.querySelector('#settings-output-root')?.value || '',
+     import_workers: Number(document.querySelector('#settings-import-workers')?.value || 0),
+   } });
+  const workerSettingsPayload = () => ({
+    panel: {},
+    operational: { import_workers: Number(document.querySelector('#settings-import-workers')?.value || 0) },
+  });
   const settingsButtons = [...document.querySelectorAll('#settings .settings-generic-actions')];
   settingsButtons.forEach((row, index) => {
     const [validate, save] = row.querySelectorAll('button');
@@ -2725,6 +2787,13 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         }
       } catch (_) { if (settingsStatus) settingsStatus.textContent = 'Settings operation failed.'; }
     });
+  });
+  document.querySelector('#settings-workers-save')?.addEventListener('click', async () => {
+    try {
+      await remoteRequest('/api/v2/settings/save', workerSettingsPayload());
+      await loadSafeDefaults();
+      if (settingsStatus) settingsStatus.textContent = 'Общий лимит рабочих процессов сохранён.';
+    } catch (_) { if (settingsStatus) settingsStatus.textContent = 'Общий лимит рабочих процессов не сохранён.'; }
   });
   document.querySelector('#analysis-profile-reload')?.addEventListener('click', async () => {
     try {

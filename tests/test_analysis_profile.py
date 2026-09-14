@@ -26,7 +26,12 @@ def test_profile_projects_only_fresh_analysis_fields_and_keeps_unknown_config(tm
     assert profile["economics"]["min_pnl_pct"] == "0"
     assert profile["ready"]["base_min_points"] == 3
     assert profile["ready"]["multi_min_events_per_month"] == 20
-    assert profile["workers"] == 15
+    assert "workers" not in profile
+    assert "canonical_shifts_bp" not in profile["geometry"]
+    assert "isolated_peak_relative" not in profile["plateau"]
+    assert "close_core_min" not in profile["plateau"]
+    assert "close_supported_min" not in profile["plateau"]
+    assert "target_dd_pct" not in profile["structures"]
     assert "private-host" not in json.dumps(profile)
     assert "private-secret" not in json.dumps(profile)
 
@@ -64,3 +69,29 @@ def test_profile_save_updates_only_whitelisted_values(tmp_path: Path) -> None:
     assert after["remote_runner"] == before["remote_runner"]
     assert after["duckdb_import"]["transaction_batch_size"] == 2000
     assert AlgorithmConfig.from_json(config).economic_min_pnl_pct == Decimal("7")
+
+
+def test_profile_save_preserves_hidden_analysis_values(tmp_path: Path) -> None:
+    from mrs3.analysis_profile import load_analysis_profile, save_analysis_profile
+
+    config = _config(tmp_path)
+    before = json.loads(config.read_text(encoding="utf-8"))
+    profile = load_analysis_profile(config)
+
+    save_analysis_profile(config, profile)
+    after = json.loads(config.read_text(encoding="utf-8"))
+
+    assert after["canonical_shifts_bp"] == before["canonical_shifts_bp"]
+    assert after["plateau"]["isolated_peak_relative"] == before["plateau"]["isolated_peak_relative"]
+    assert after["close_support"] == before["close_support"]
+    assert after["target_dd"] == before["target_dd"]
+
+
+def test_profile_rejects_legacy_worker_field(tmp_path: Path) -> None:
+    from mrs3.analysis_profile import load_analysis_profile, validate_analysis_profile
+
+    config = _config(tmp_path)
+    profile = load_analysis_profile(config)
+
+    with pytest.raises(ValueError, match="unknown analysis profile field"):
+        validate_analysis_profile(config, {**profile, "workers": 3})

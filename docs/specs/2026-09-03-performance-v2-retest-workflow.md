@@ -364,6 +364,18 @@ their resolved file is inside the configured report directory and passes the
 same regular-file, reparse-point, and SHA-256 checks. Missing or changed
 reports fail before any database mutation or cleanup.
 
+The ordinary SINGLE_MODE card exposes a disabled retry control labelled
+`Продолжить незавершённый тест`. It is enabled
+only for the currently rendered ordinary tester job in state `FAILED` or
+`CANCELLED`; RETEST jobs remain in their separate card. The control submits
+`POST /api/v2/jobs` with
+`{kind: "strategies.tester.retry", request: {job_id: <source job id>}}`.
+While synchronous report recovery is pending, the card shows the recovery
+phase and elapsed seconds and keeps tester actions disabled. The returned job
+replaces the current tester job, is polled immediately, and continues normal
+polling. Reload recovery includes the newest ordinary failed or cancelled
+SINGLE_MODE job so its retry remains available.
+
 ## Native startup and status heartbeat
 
 Native `SINGLE_MODE` completion requires result evidence for every strategy in
@@ -377,13 +389,33 @@ Transient loss of the tester status endpoint does not discard file evidence;
 the batch fails only after its configured evidence-stall or total timeout.
 Final acceptance still uses the strict strategy-settings, report-period and
 Performance-v2 HTML validation.
+When `wizard_result.json` is truncated, completion may instead be proven by a
+complete stable sequence of new or changed current-batch HTML files named
+`my_test_run_<index>_of_<batch_size>_<strategy>.html`; the batch-local baseline
+is captured before each native batch, the filename total must equal the active
+batch size, and indices must be distinct `1..N` for the configured stability
+polls. This filename evidence only releases the wait; authoritative report
+validation still accepts the batch and remains responsible for settings, date,
+layout, and retry handling.
+
+Authoritative collection validates only HTML files created or changed since
+the active batch baseline. Reports accepted by earlier batches are not read,
+hashed, or parsed again. Listing and stat checks may inspect the shared report
+directory, but collection cost stays proportional to the active batch rather
+than all reports accumulated by the job.
 
 A failed or cancelled native job is recoverable through the tracked
 `strategies.tester.retry` request. Recovery validates existing HTML once,
 preserves accepted reports, and submits only missing strategy names under a new
 job ID. A failed retry is itself retryable and repeats the same report recovery.
 After a panel restart, an interrupted native `RUNNING` manifest is recovered as
-a failed retry source; accepted reports are revalidated before reuse.
+a failed retry source. Each completed batch persists the accepted report name,
+size, and nanosecond modification time. Reload checks this bounded checkpoint
+without reopening accepted HTML; missing, malformed, changed, duplicate, linked,
+or out-of-directory evidence makes the retry fail closed. Only reports not yet
+accepted by a completed batch are parsed during recovery. Final inbox capture
+still hashes every accepted report and the Performance v2 import performs its
+normal strict validation before database mutation.
 If retry recovery finds every expected report, it creates the durable metadata
 inbox and publishes the complete `COMMITTED` snapshot before returning. A later
 inbox verification reloads the persisted counts and attempt totals, so it cannot

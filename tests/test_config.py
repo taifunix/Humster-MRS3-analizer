@@ -347,7 +347,8 @@ def test_direct_materialization_settings_defaults(tmp_path) -> None:
     assert settings.fetch_batch_size == 256
     assert settings.worker_chunk_size == 16
     assert settings.max_in_flight_chunks == 30
-    assert load_direct_materialization_settings(tmp_path / "missing.json") == settings
+    loaded = load_direct_materialization_settings(tmp_path / "missing.json")
+    assert loaded == replace(settings, workers=4)
 
 
 def test_direct_materialization_settings_round_trip_preserves_other_local_config(
@@ -373,6 +374,8 @@ def test_direct_materialization_settings_round_trip_preserves_other_local_config
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["panel"] == {"theme": "dark"}
     assert saved["direct_materialization"]["future"] == "keep"
+    assert "workers" not in saved["direct_materialization"]
+    assert saved["duckdb_import"]["workers"] == 4
 
 
 def test_direct_materialization_settings_valid_overrides(tmp_path) -> None:
@@ -380,11 +383,12 @@ def test_direct_materialization_settings_valid_overrides(tmp_path) -> None:
     path.write_text(
         json.dumps(
             {
+                "duckdb_import": {"workers": 3},
                 "direct_materialization": {
                     "workers": 8,
                     "fetch_batch_size": 64,
                     "worker_chunk_size": 4,
-                    "max_in_flight_chunks": 12,
+                    "max_in_flight_chunks": 2,
                 }
             }
         ),
@@ -394,7 +398,7 @@ def test_direct_materialization_settings_valid_overrides(tmp_path) -> None:
     loaded = load_direct_materialization_settings(path)
 
     assert loaded == DirectMaterializationSettings(
-        workers=8, fetch_batch_size=64, worker_chunk_size=4, max_in_flight_chunks=12
+        workers=3, fetch_batch_size=64, worker_chunk_size=4, max_in_flight_chunks=3
     )
 
 
@@ -404,10 +408,6 @@ def test_direct_materialization_settings_valid_overrides(tmp_path) -> None:
         (
             {"direct_materialization": []},
             "direct_materialization must be an object",
-        ),
-        (
-            {"direct_materialization": {"workers": True}},
-            "direct_materialization.workers must be a positive integer",
         ),
         (
             {"direct_materialization": {"fetch_batch_size": True}},
@@ -422,10 +422,6 @@ def test_direct_materialization_settings_valid_overrides(tmp_path) -> None:
             "direct_materialization.max_in_flight_chunks must be a positive integer",
         ),
         (
-            {"direct_materialization": {"workers": 0}},
-            "direct_materialization.workers must be a positive integer",
-        ),
-        (
             {"direct_materialization": {"fetch_batch_size": -1}},
             "direct_materialization.fetch_batch_size must be a positive integer",
         ),
@@ -436,10 +432,6 @@ def test_direct_materialization_settings_valid_overrides(tmp_path) -> None:
         (
             {"direct_materialization": {"max_in_flight_chunks": 0}},
             "direct_materialization.max_in_flight_chunks must be a positive integer",
-        ),
-        (
-            {"direct_materialization": {"workers": 15, "max_in_flight_chunks": 14}},
-            "direct_materialization.max_in_flight_chunks must be at least workers",
         ),
     ],
 )
@@ -483,11 +475,11 @@ def test_direct_materialization_defaults_match_tracked_example() -> None:
     defaults = DirectMaterializationSettings()
 
     assert raw["direct_materialization"] == {
-        "workers": defaults.workers,
         "fetch_batch_size": defaults.fetch_batch_size,
         "worker_chunk_size": defaults.worker_chunk_size,
         "max_in_flight_chunks": defaults.max_in_flight_chunks,
     }
+    assert raw["duckdb_import"]["workers"] == DuckDBImportSettings().workers
 
 
 def test_direct_materialization_settings_do_not_alter_algorithm_config_identity() -> None:

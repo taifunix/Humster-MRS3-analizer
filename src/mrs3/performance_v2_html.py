@@ -44,6 +44,7 @@ CURRENT_ACTION_HEADERS = (
 )
 _ACTION_HEADER_MARKERS = frozenset(("Timestamp", "Symbol", "Action", "PnL"))
 _INTEGER = re.compile(r"^[+-]?\d+$")
+_MAX_OPTIONAL_DECIMAL_TEXT = 256
 
 
 class _PerformanceV2Limits(Protocol):
@@ -66,6 +67,9 @@ class ParsedPerformanceV2Action:
     pnl: Decimal
     fee: Decimal
     balance: Decimal
+    price: Decimal | None = None
+    cost: Decimal | None = None
+    invalid_optional_fields: tuple[str, ...] = ()
 
     @property
     def timestamp(self) -> datetime:
@@ -136,6 +140,19 @@ def _decimal(value: object, field: str) -> Decimal:
     if not result.is_finite():
         raise PerformanceV2HtmlError(f"{field} must be a finite Decimal")
     return result
+
+
+def _optional_decimal(row: Mapping[str, str], field: str) -> tuple[Decimal | None, bool]:
+    """Read an optional execution decimal without rejecting the core report."""
+    if field not in row or not row[field].strip():
+        return None, False
+    text = row[field].strip()
+    if len(text) > _MAX_OPTIONAL_DECIMAL_TEXT:
+        return None, True
+    try:
+        return _decimal(text, field), False
+    except PerformanceV2HtmlError:
+        return None, True
 
 
 def _order_id(value: object) -> int:
@@ -210,6 +227,11 @@ def _typed_actions(
             or (post_size < 0 and post_side != "short")
         )):
             raise PerformanceV2HtmlError("Post Size sign is inconsistent with Post Side")
+        price, invalid_price = _optional_decimal(row, "Price")
+        cost, invalid_cost = _optional_decimal(row, "Cost")
+        invalid_optional_fields = tuple(
+            field for field, invalid in (("Price", invalid_price), ("Cost", invalid_cost)) if invalid
+        )
         result.append(
             ParsedPerformanceV2Action(
                 action_index,
@@ -223,6 +245,9 @@ def _typed_actions(
                 pnl,
                 fee,
                 balance,
+                price,
+                cost,
+                invalid_optional_fields,
             )
         )
     return tuple(sorted(result, key=lambda item: (item.timestamp_utc, item.action_index)))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import re
 from threading import RLock, Thread
@@ -30,6 +31,125 @@ from .error_sanitization import redact_local_paths
 
 
 _NOT_READY = "n/r - Check gaps"
+_PNL_THRESHOLD = Decimal("10")
+
+
+def _decimal_text(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _interval_payload(start: date, end: date, *, kind: str) -> dict[str, object]:
+    return {"kind": kind, "start": start.isoformat(), "end": end.isoformat(), "days": (end - start).days + 1}
+
+
+def _metadata_interval(items: Sequence[object]) -> dict[str, object] | None:
+    if not items:
+        return None
+    try:
+        start_ms = min(int(item.report_start_ms) for item in items)
+        end_ms = max(int(item.report_end_ms) for item in items)
+        start = _utc_day(start_ms)
+        end = _utc_day(end_ms - 1)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    if end < start:
+        return None
+    return _interval_payload(start, end, kind="RAW")
+
+
+def _pnl_value(metrics: Mapping[str, object]) -> Decimal | None:
+    values = [metrics[name] for name in ("TotalPnLPercent", "Total PnL, %") if name in metrics]
+    if not values:
+        return None
+    try:
+        parsed = tuple(Decimal(str(value).strip()) for value in values)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not parsed or any(not value.is_finite() for value in parsed) or len(set(parsed)) != 1:
+        return None
+    return parsed[0]
+
+
+def _pnl_preview_values(
+    items: Sequence[object], ready_interval: object | None,
+) -> tuple[Decimal, ...] | None:
+    if ready_interval is None or not items:
+        return None
+    try:
+        ready_start = ready_interval.start
+        ready_end = ready_interval.end
+        start_ms = int(datetime.combine(ready_start, datetime.min.time(), timezone.utc).timestamp() * 1000)
+        end_ms = int(datetime.combine(ready_end + timedelta(days=1), datetime.min.time(), timezone.utc).timestamp() * 1000)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    by_point: dict[str, list[object]] = {}
+    for item in items:
+        try:
+            by_point.setdefault(str(item.point.canonical_key), []).append(item)
+        except AttributeError:
+            return None
+    # A point with two metadata fragments cannot provide a trustworthy preview.
+    if any(len(fragments) != 1 for fragments in by_point.values()):
+        return None
+    values: list[Decimal] = []
+    for item in (fragments[0] for fragments in by_point.values()):
+        try:
+            if int(item.report_start_ms) > start_ms or int(item.report_end_ms) < end_ms:
+                return None
+            metrics = item.metrics
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        if not isinstance(metrics, Mapping):
+            return None
+        value = _pnl_value(metrics)
+        if value is None:
+            return None
+        values.append(value)
+    return tuple(values)
+
+
+def _pnl_preview(items: Sequence[object], ready_interval: object | None) -> dict[str, object]:
+    values = _pnl_preview_values(items, ready_interval)
+    if not values:
+        return {"available": False}
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / Decimal("2")
+    above = sum(value > _PNL_THRESHOLD for value in values)
+    percent = Decimal(above) * Decimal("100") / Decimal(len(values))
+    return {
+        "available": True,
+        "total_points": len(values),
+        "pnl_gt_10_count": above,
+        "pnl_gt_10_percent": _decimal_text(percent),
+        "pnl_median_pct": _decimal_text(median),
+        "pnl_max_pct": _decimal_text(max(values)),
+    }
+
+
+def _common_interval(intervals: Sequence[object]) -> dict[str, object] | None:
+    if not intervals:
+        return None
+    try:
+        start = max(item.start for item in intervals)
+        end = min(item.end for item in intervals)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return _interval_payload(start, end, kind="READY") if start <= end else None
+
+
+def _common_ready_witness(intervals: Sequence[object]) -> object | None:
+    if not intervals:
+        return None
+    try:
+        start = max(item.start for item in intervals)
+        end = min(item.end for item in intervals)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return SimpleNamespace(start=start, end=end) if start <= end else None
 
 
 def _safe_failure_reason(error: BaseException, output: Path) -> str:
@@ -137,29 +257,58 @@ class LocalSurfacesService:
                 required_close_lengths=CANONICAL_READINESS_CLOSE_LENGTHS,
             )
         )
-        ready_scopes = {str(getattr(interval, "scope_key")) for interval in intervals}
-        scope_keys = sorted({_item_scope(item) for item in metadata})
-        rows = tuple(
-            {
+        ready_by_scope = {
+            str(getattr(interval, "scope_key")): interval
+            for interval in intervals
+        }
+        metadata_by_scope: dict[str, list[object]] = {}
+        for item in metadata:
+            metadata_by_scope.setdefault(_item_scope(item), []).append(item)
+        scope_keys = sorted(metadata_by_scope)
+        rows_list: list[dict[str, object]] = []
+        for key in scope_keys:
+            members = metadata_by_scope[key]
+            ready_interval = ready_by_scope.get(key)
+            status = "READY" if ready_interval is not None and not quarantines else _NOT_READY
+            period = (
+                _interval_payload(ready_interval.start, ready_interval.end, kind="READY")
+                if status == "READY" else _metadata_interval(members)
+            )
+            row = {
                 "scope_key": key,
                 "pair": key.split("|", 2)[0],
                 "side": key.split("|", 2)[1],
                 "timeframe": key.split("|", 2)[2],
-                "status": "READY" if key in ready_scopes and not quarantines else _NOT_READY,
+                "status": status,
+                "period": period,
+                "pnl_preview": _pnl_preview(members, ready_interval if status == "READY" else None),
             }
-            for key in scope_keys
-        )
+            rows_list.append(row)
+        rows = tuple(rows_list)
         token = secrets.token_urlsafe(32)
         with self._lock:
             self._pending = _Pending(token, source, digest, metadata, rows)
         groups: list[dict[str, object]] = []
         for key in sorted({row["pair"] + "|" + row["side"] for row in rows}):
             pair, side = key.split("|", 1)
+            group_rows = tuple(row for row in rows if row["pair"] == pair and row["side"] == side)
+            ready_rows = tuple(row for row in group_rows if row["status"] == "READY")
+            group_items = tuple(item for row in ready_rows for item in metadata_by_scope[row["scope_key"]])
+            group_intervals = tuple(
+                ready_by_scope[row["scope_key"]] for row in ready_rows if row["scope_key"] in ready_by_scope
+            )
+            group_preview = _pnl_preview(group_items, _common_ready_witness(group_intervals))
             groups.append(
                 {
                     "pair": pair,
                     "side": side,
-                    "timeframes": [row for row in rows if row["pair"] == pair and row["side"] == side],
+                    "timeframes": list(group_rows),
+                    "summary": {
+                        "timeframes": len(group_rows),
+                        "common_interval": _common_interval(group_intervals),
+                        "ready": {"count": len(ready_rows), "total": len(group_rows)},
+                        "pnl_preview": group_preview,
+                    },
                 }
             )
         return {

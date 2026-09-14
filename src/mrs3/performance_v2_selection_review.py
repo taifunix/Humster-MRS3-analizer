@@ -298,6 +298,31 @@ def _normalize_retest(value: object) -> bool:
     raise SelectionReviewError("SELECTION_REVIEW_INVALID_RETEST")
 
 
+def _equivalent_selection_runs(
+    connection: duckdb.DuckDBPyConnection, run_id: str, latest_run_id: str
+) -> bool:
+    if run_id == latest_run_id:
+        return True
+    contracts = connection.execute(
+        "select request_sha256, config_sha256 from selection_runs where selection_run_id in (?, ?) order by selection_run_id",
+        [run_id, latest_run_id],
+    ).fetchall()
+    if len(contracts) != 2 or contracts[0] != contracts[1]:
+        return False
+    columns = (
+        "strategy_id, result_id_at_selection, auto_status, auto_score, auto_rank, "
+        "auto_reason, analog_group_key, auto_analog_of_strategy_id, prior_rejected, stage_trace_json"
+    )
+    rows = [
+        connection.execute(
+            f"select {columns} from selection_results where selection_run_id = ? order by strategy_id",
+            [selection_run_id],
+        ).fetchall()
+        for selection_run_id in (run_id, latest_run_id)
+    ]
+    return rows[0] == rows[1]
+
+
 def _parse_workbook(data: bytes) -> tuple[dict[str, str], list[dict[str, object]]]:
     _bounded_xlsx(data)
     try:
@@ -355,7 +380,8 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
         "select selection_run_id from selection_runs where symbol = ? and side = ? order by created_at_utc desc, selection_run_id desc limit 1",
         list(run),
     ).fetchone()
-    if latest != (run_id,):
+    latest_run_id = latest[0] if latest else ""
+    if latest_run_id != run_id and not _equivalent_selection_runs(connection, run_id, latest_run_id):
         raise SelectionReviewError("SELECTION_REVIEW_NOT_LATEST_RUN")
     workbook_hash = sha256(data).hexdigest()
     if connection.execute("select 1 from selection_review_imports where workbook_sha256 = ?", [workbook_hash]).fetchone():
@@ -380,9 +406,9 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
         status = str(row["User Status"] or "").strip().upper()
         if status not in STATUSES:
             raise SelectionReviewError("SELECTION_REVIEW_INVALID_STATUS")
-        rank = _whole_number(row["User Rank"], "SELECTION_REVIEW_INVALID_RANK")
+        rank = _whole_number(row["User Rank"], "SELECTION_REVIEW_INVALID_RANK") if status in {"FINALIST", "RESERVE"} else None
         if rank is not None:
-            if status not in {"FINALIST", "RESERVE"} or rank in ranks:
+            if rank in ranks:
                 raise SelectionReviewError("SELECTION_REVIEW_INVALID_RANK")
             ranks.add(rank)
         comment = "" if row["Comment"] is None else str(row["Comment"])
@@ -401,17 +427,17 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
                 or _whole_number(row["Auto Analog Of ID"], "SELECTION_REVIEW_AUTOMATIC_FIELDS_CHANGED") != auto_analog):
             raise SelectionReviewError("SELECTION_REVIEW_AUTOMATIC_FIELDS_CHANGED")
         status = str(row["User Status"]).strip().upper()
-        rank = _whole_number(row["User Rank"], "SELECTION_REVIEW_INVALID_RANK")
+        rank = _whole_number(row["User Rank"], "SELECTION_REVIEW_INVALID_RANK") if status in {"FINALIST", "RESERVE"} else None
         analog = _whole_number(row["Analog Of ID"], "SELECTION_REVIEW_INVALID_ANALOG")
         if status == "ANALOG":
             if analog is None or analog == strategy_id or analog not in submitted:
                 raise SelectionReviewError("SELECTION_REVIEW_INVALID_ANALOG")
+            target_status = str(submitted[analog]["User Status"] or "").strip().upper()
+            if target_status not in {"FINALIST", "RESERVE"}:
+                status, analog = "FILTERED", None
         elif analog is not None:
             raise SelectionReviewError("SELECTION_REVIEW_INVALID_ANALOG")
         decisions.append([strategy_id, status, rank, analog, "" if row["Comment"] is None else str(row["Comment"])])
-    statuses = {int(row[0]): str(row[1]) for row in decisions}
-    if any(row[3] is not None and statuses[int(row[3])] not in {"FINALIST", "RESERVE"} for row in decisions):
-        raise SelectionReviewError("SELECTION_REVIEW_INVALID_ANALOG")
     current = dict(connection.execute(
         "select strategy_id, current_result_id from strategies where strategy_id in (select unnest(?::bigint[]))", [list(snapshot)]
     ).fetchall())
@@ -425,7 +451,8 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
         latest_again = connection.execute(
             "select selection_run_id from selection_runs where symbol = ? and side = ? order by created_at_utc desc, selection_run_id desc limit 1", list(run)
         ).fetchone()
-        if latest_again != (run_id,):
+        latest_again_id = latest_again[0] if latest_again else ""
+        if latest_again_id != run_id and not _equivalent_selection_runs(connection, run_id, latest_again_id):
             raise SelectionReviewError("SELECTION_REVIEW_NOT_LATEST_RUN")
         current_again = dict(connection.execute(
             "select strategy_id, current_result_id from strategies where strategy_id in (select unnest(?::bigint[]))", [list(snapshot)]
@@ -480,6 +507,34 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
     return {"review_import_id": review_id, "selection_run_id": run_id, "row_count": len(decisions), "finalist_count": sum(row[1] == "FINALIST" for row in decisions)}
 
 
+def latest_user_reviews_by_strategy(
+    connection: duckdb.DuckDBPyConnection,
+    strategy_ids: Sequence[int] | None = None,
+) -> dict[int, dict[str, object]]:
+    """Return the newest accepted user row for each strategy identity."""
+    if strategy_ids is not None and not strategy_ids:
+        return {}
+    where = "where rows.strategy_id in (select unnest(?::bigint[]))" if strategy_ids is not None else ""
+    params = [list(strategy_ids)] if strategy_ids is not None else []
+    reviews: dict[int, dict[str, object]] = {}
+    for strategy_id, status, rank, analog, comment in connection.execute(
+        f"""select rows.strategy_id, rows.user_status, rows.user_rank,
+                          rows.user_analog_of_strategy_id, rows.comment
+                   from selection_review_rows rows
+                   join selection_review_imports imports using (review_import_id)
+                  {where}
+                  order by imports.imported_at_utc desc, imports.review_import_id desc""",
+        params,
+    ).fetchall():
+        reviews.setdefault(int(strategy_id), {
+            "user_status": str(status),
+            "user_rank": None if rank is None else int(rank),
+            "user_analog_of_strategy_id": None if analog is None else int(analog),
+            "comment": comment,
+        })
+    return reviews
+
+
 def effective_selection_decisions(
     connection: duckdb.DuckDBPyConnection,
     *,
@@ -487,12 +542,11 @@ def effective_selection_decisions(
 ) -> dict[int, tuple[str, int | None, str | None]]:
     """Resolve ordinary selection snapshots and reviewed scoped overlays.
 
-    A regular selection run is a complete replacement for its Pair+Side.  A
-    server scoped run (RETEST_COHORT or CURRENT_EFFECTIVE) is dormant until a
-    review is imported, then only its reviewed rows overlay the prior decision.
-    This lets an exported control workbook be persisted before review without
-    changing the effective universe, while a later review changes only the
-    rows the user explicitly submitted.
+    A regular selection run is a complete replacement for its Pair+Side, while
+    the newest accepted user row for a strategy identity survives later
+    unreviewed runs. A server scoped run (RETEST_COHORT or CURRENT_EFFECTIVE) is
+    dormant until a review is imported, then only its reviewed rows overlay the
+    prior decision.
     """
     clauses = "where symbol = ?" if symbol is not None else ""
     params = [symbol] if symbol is not None else []
@@ -502,6 +556,7 @@ def effective_selection_decisions(
               order by created_at_utc asc, selection_run_id asc""", params
     ).fetchall()
     states: dict[tuple[str, str], dict[int, tuple[str, int | None, str | None]]] = {}
+    latest_reviews = latest_user_reviews_by_strategy(connection)
     for run_id, run_symbol, run_side, raw_request in runs:
         group = (str(run_symbol), str(run_side))
         try:
@@ -534,8 +589,9 @@ def effective_selection_decisions(
             strategy_id = int(strategy_id)
             if overlay and strategy_id not in review_rows:
                 continue
-            if strategy_id in review_rows:
-                status, rank = review_rows[strategy_id]
+            if strategy_id in latest_reviews:
+                review_row = latest_reviews[strategy_id]
+                status, rank = review_row["user_status"], review_row["user_rank"]
                 state[strategy_id] = (status, None if rank is None else int(rank), str(run_id))
             else:
                 state[strategy_id] = (

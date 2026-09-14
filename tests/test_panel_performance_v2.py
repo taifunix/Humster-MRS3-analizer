@@ -5,6 +5,7 @@ from hashlib import sha256
 from http.client import HTTPConnection
 from decimal import Decimal
 import json
+from io import BytesIO
 from pathlib import Path
 import threading
 import time
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 import duckdb
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 import pytest
 
 from mrs3.performance_v2_store import (
@@ -38,6 +39,20 @@ from mrs3.performance_v2_windows import WindowMetrics
 
 FIXTURE = Path(__file__).parent / "fixtures" / "performance" / "report_current_v2.html"
 UTC = timezone.utc
+
+
+def test_panel_performance_v2_uses_common_import_workers(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"duckdb_import": {"workers": 7}}), encoding="utf-8")
+    (tmp_path / "config.performance.json").write_text(
+        json.dumps({"unified_performance_v2": {"database_root": "performance-v2", "workers": 1}}),
+        encoding="utf-8",
+    )
+    controller = PanelController(tmp_path, config)
+
+    assert controller._performance_v2_config().workers == 7
+    config.write_text(json.dumps({"duckdb_import": {"workers": 11}}), encoding="utf-8")
+    assert controller._performance_v2_config().workers == 11
 
 
 def _metrics_for_normalization(
@@ -910,6 +925,22 @@ def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_pa
         assert response.getheader("Content-Type") == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         assert "attachment; filename=\"performance-v2-finalists-BTCUSDT-LONG.xlsx\"" == response.getheader("Content-Disposition")
         assert body.startswith(b"PK")
+        exported_body = body
+        workbook = load_workbook(BytesIO(body))
+        sheet = workbook["All candidates"]
+        headers = {cell.value: cell.column for cell in sheet[1]}
+        for row in range(2, sheet.max_row + 1):
+            status = sheet.cell(row, headers["Auto Status"]).value
+            sheet.cell(row, headers["User Status"]).value = status
+            sheet.cell(row, headers["User Rank"]).value = (
+                sheet.cell(row, headers["Auto Rank"]).value if status in {"FINALIST", "RESERVE"} else None
+            )
+            sheet.cell(row, headers["Analog Of ID"]).value = (
+                sheet.cell(row, headers["Auto Analog Of ID"]).value if status == "ANALOG" else None
+            )
+        completed = BytesIO()
+        workbook.save(completed)
+        body = completed.getvalue()
         connection.close()
         connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
         connection.request(
@@ -927,7 +958,7 @@ def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_pa
         thread.join(timeout=2)
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute("select candidate_count, workbook_sha256 from selection_runs").fetchone() == (
-            1, sha256(body).hexdigest(),
+            1, sha256(exported_body).hexdigest(),
         )
         assert connection.execute("select count(*) from selection_results").fetchone() == (1,)
         assert connection.execute("select count(*) from selection_review_imports").fetchone() == (1,)

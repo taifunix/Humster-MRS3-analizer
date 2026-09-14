@@ -28,6 +28,7 @@ def _metadata(symbol: str, side: str, timeframe: str) -> SimpleNamespace:
         point=point,
         report_start_ms=1767225600000,
         report_end_ms=1767398400000,
+        metrics={},
     )
 
 
@@ -37,10 +38,11 @@ def _service(
     ready: tuple[ReadyInterval, ...] = (),
     missing_result: tuple[CoverageCell, ...] | None = None,
     quarantines: tuple[dict[str, object], ...] = (),
+    metadata: tuple[SimpleNamespace, ...] | None = None,
 ):
     source_db = (tmp_path / "private" / "committed-source.duckdb").resolve()
     calls: dict[str, object] = {"validated": [], "metadata": [], "ready": [], "gaps": [], "materialize": [], "publish": []}
-    metadata = (_metadata("BTCUSDT", "LONG", "1h"), _metadata("ETHUSDT", "SHORT", "4h"))
+    metadata = metadata or (_metadata("BTCUSDT", "LONG", "1h"), _metadata("ETHUSDT", "SHORT", "4h"))
 
     def validate(path: Path) -> None:
         calls["validated"].append(path)
@@ -114,6 +116,9 @@ def test_preflight_redacts_source_path_and_replaces_token(tmp_path: Path) -> Non
     rows = {row["scope_key"]: row for row in first["rows"]}
     assert rows["BTCUSDT|LONG|1h"]["status"] == "READY"
     assert rows["ETHUSDT|SHORT|4h"]["status"] == "n/r - Check gaps"
+    assert rows["ETHUSDT|SHORT|4h"]["period"] == {
+        "kind": "RAW", "start": "2026-01-01", "end": "2026-01-02", "days": 2,
+    }
     assert calls["validated"] == [source_db, source_db]
     assert calls["metadata"] == [source_db, source_db]
 
@@ -338,3 +343,97 @@ def test_controller_publish_methods_ignore_request_target_path(tmp_path: Path) -
     controller.surface_publish_start(request)
 
     assert calls == [Path(configured), Path(configured)]
+
+
+def test_preflight_attaches_inclusive_ready_period_and_decimal_safe_pnl_preview(tmp_path: Path) -> None:
+    first = _metadata("BTCUSDT", "LONG", "1h")
+    first.metrics = {"TotalPnLPercent": "10"}
+    second = _metadata("BTCUSDT", "LONG", "1h")
+    second.point.canonical_key += "|variant"
+    second.metrics = {"Total PnL, %": "20"}
+    service, source_db, _ = _service(
+        tmp_path,
+        metadata=(first, second),
+        ready=(ReadyInterval("BTCUSDT|LONG|1h", date(2026, 1, 1), date(2026, 1, 2)),),
+    )
+
+    result = service.preflight(source_db)
+
+    row = result["rows"][0]
+    assert row["period"] == {"kind": "READY", "start": "2026-01-01", "end": "2026-01-02", "days": 2}
+    assert row["pnl_preview"] == {
+        "available": True,
+        "total_points": 2,
+        "pnl_gt_10_count": 1,
+        "pnl_gt_10_percent": "50",
+        "pnl_median_pct": "15",
+        "pnl_max_pct": "20",
+    }
+
+
+def test_preflight_pnl_preview_is_unavailable_for_duplicate_canonical_points(tmp_path: Path) -> None:
+    first = _metadata("BTCUSDT", "LONG", "1h")
+    first.metrics = {"TotalPnLPercent": "20"}
+    second = _metadata("BTCUSDT", "LONG", "1h")
+    second.metrics = {"Total PnL, %": "20"}
+    service, source_db, _ = _service(
+        tmp_path,
+        metadata=(first, second),
+        ready=(ReadyInterval("BTCUSDT|LONG|1h", date(2026, 1, 1), date(2026, 1, 2)),),
+    )
+
+    result = service.preflight(source_db)
+
+    assert result["rows"][0]["pnl_preview"] == {"available": False}
+
+
+def test_preflight_pnl_preview_requires_full_ready_interval_coverage(tmp_path: Path) -> None:
+    first = _metadata("BTCUSDT", "LONG", "1h")
+    first.metrics = {"TotalPnLPercent": "20"}
+    second = _metadata("BTCUSDT", "LONG", "1h")
+    second.point.canonical_key += "|variant"
+    second.metrics = {"TotalPnLPercent": "30"}
+    service, source_db, _ = _service(
+        tmp_path,
+        metadata=(first, second),
+        ready=(ReadyInterval("BTCUSDT|LONG|1h", date(2026, 1, 1), date(2026, 1, 3)),),
+    )
+
+    result = service.preflight(source_db)
+
+    assert result["rows"][0]["pnl_preview"] == {"available": False}
+
+
+def test_preflight_aggregates_pair_summary_across_ready_timeframes(tmp_path: Path) -> None:
+    items = []
+    for timeframe, values in (("1h", ("10", "20")), ("4h", ("30", "40"))):
+        for index, value in enumerate(values):
+            item = _metadata("BTCUSDT", "LONG", timeframe)
+            item.point.canonical_key += f"|{index}"
+            item.fragment_id += f"-{index}"
+            item.metrics = {"TotalPnLPercent": value}
+            items.append(item)
+    service, source_db, _ = _service(
+        tmp_path,
+        metadata=tuple(items),
+        ready=(
+            ReadyInterval("BTCUSDT|LONG|1h", date(2026, 1, 1), date(2026, 1, 2)),
+            ReadyInterval("BTCUSDT|LONG|4h", date(2026, 1, 1), date(2026, 1, 2)),
+        ),
+    )
+
+    result = service.preflight(source_db)
+
+    assert result["groups"][0]["summary"] == {
+        "timeframes": 2,
+        "common_interval": {"kind": "READY", "start": "2026-01-01", "end": "2026-01-02", "days": 2},
+        "ready": {"count": 2, "total": 2},
+        "pnl_preview": {
+            "available": True,
+            "total_points": 4,
+            "pnl_gt_10_count": 3,
+            "pnl_gt_10_percent": "75",
+            "pnl_median_pct": "25",
+            "pnl_max_pct": "40",
+        },
+    }

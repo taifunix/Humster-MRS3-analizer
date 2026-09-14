@@ -86,6 +86,72 @@ def test_registry_syncs_worker_completion_and_keeps_runtime_private(tmp_path):
     assert PanelJobRegistry(tmp_path / "jobs.json").runtime("worker-job") == {"inbox_path": "private"}
 
 
+def test_registry_copy_removes_runtime_before_deep_copy(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json")
+    job = registry.submit("testing.local", {}, "copy-order")
+    registry.jobs[job["job_id"]]["runtime"] = {"private": object()}
+
+    copied = registry.get(job["job_id"])
+
+    assert "runtime" not in copied
+
+
+def test_registry_volatile_sync_guards_progress_and_rejects_invalid_states(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json")
+    job = registry.submit("strategies.tester", {}, "volatile")
+    registry.transition(job["job_id"], "RUNNING", phase="ACTIVE")
+    registry.sync(
+        job["job_id"],
+        {
+            "state": "RUNNING",
+            "phase": "ACTIVE",
+            "progress": {"current": 1, "total": 3},
+            "error": None,
+            "evidence": {"verified_reports": {"strategy": "private.html"}},
+        },
+    )
+    before = registry.get(job["job_id"])
+
+    registry.volatile_sync(
+        job["job_id"],
+        {"state": "RUNNING", "phase": "ACTIVE", "progress": {"current": 2, "total": 3}},
+        expected=registry._peek(job["job_id"]),
+    )
+    after = registry.get(job["job_id"])
+    assert after["progress"] == {"current": 2, "total": 3}
+    assert {key: value for key, value in after.items() if key != "progress"} == {
+        key: value for key, value in before.items() if key != "progress"
+    }
+
+    registry.volatile_sync(
+        job["job_id"],
+        {"state": "RUNNING", "phase": "ACTIVE", "progress": {"current": 3, "total": 3}},
+        expected={"state": "QUEUED", "phase": "ACTIVE", "error": None, "evidence": before["evidence"]},
+    )
+    assert registry.get(job["job_id"])["progress"] == {"current": 2, "total": 3}
+    with pytest.raises(PanelJobError, match="INVALID_REQUEST"):
+        registry.volatile_sync(job["job_id"], {"state": "QUEUED"})
+    with pytest.raises(PanelJobError, match="NOT_FOUND"):
+        registry.volatile_sync("missing", {"state": "RUNNING"})
+
+
+def test_registry_public_list_hides_verified_report_filenames(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json")
+    job = registry.submit("strategies.tester.native.start", {}, "public")
+    registry.sync(
+        job["job_id"],
+        {
+            "state": "RUNNING",
+            "phase": "RUNNING",
+            "progress": {"current": 0, "total": 1},
+            "evidence": {"verified_reports": {"strategy": "private-report.html"}},
+        },
+    )
+
+    assert registry.list()[0]["evidence"]["verified_reports"] == {"strategy": "private-report.html"}
+    assert registry.public_list()[0]["evidence"]["verified_reports"] == 1
+
+
 def test_registry_persists_creation_timestamp_for_restored_jobs(tmp_path):
     path = tmp_path / "jobs.json"
     registry = PanelJobRegistry(path)

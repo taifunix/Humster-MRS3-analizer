@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import date
-from hashlib import sha256
 import html
 import json
 import os
@@ -70,7 +69,9 @@ class _Job:
     inbox_path: Path | None = None
     single_mode: bool = False
     target_finalized: bool = False
-    report_baseline: dict[str, tuple[int, int, str]] = field(default_factory=dict)
+    report_baseline: dict[str, tuple[int, int, ...]] = field(default_factory=dict)
+    verified_report_evidence: dict[str, tuple[int, int]] = field(default_factory=dict)
+    checkpoint_valid: bool = True
 
 
 def _client(config: RunnerConfig) -> TesterHttpClient:
@@ -392,6 +393,10 @@ class LocalFastStrategyTestService:
             "max_strategy_attempts": (job.runtime_config or self.config).max_strategy_attempts,
             "attempt_counts": dict(sorted(job.attempt_counts.items())),
             "verified_reports": dict(sorted(job.verified_reports.items())),
+            "verified_report_evidence": {
+                name: list(signature)
+                for name, signature in sorted(job.verified_report_evidence.items())
+            },
             "failed_names": sorted(job.failed_names),
             "phase": job.phase,
             "inbox_ready": job.inbox_path is not None and job.state == "COMMITTED",
@@ -459,7 +464,7 @@ class LocalFastStrategyTestService:
             self._stop_bot(runtime_config)
             target_snapshot = capture_tester_settings(runtime_config)
             job.report_baseline = {
-                path.name: (path.stat().st_mtime_ns, path.stat().st_size, sha256(path.read_bytes()).hexdigest())
+                path.name: (path.stat().st_mtime_ns, path.stat().st_size)
                 for path in job.report_dir.glob("*.html")
                 if path.is_file() and not path.is_symlink()
             }
@@ -538,6 +543,8 @@ class LocalFastStrategyTestService:
                             if result.report_path.resolve() != target.resolve():
                                 shutil.copyfile(result.report_path, target)
                             job.verified_reports[name] = target.name
+                            stat = target.stat()
+                            job.verified_report_evidence[name] = (stat.st_mtime_ns, stat.st_size)
                             job.failed_names.discard(name)
                     job.failed_names.update(completion.failed_names)
                 self._stop_bot(runtime_config)
@@ -736,26 +743,75 @@ class LocalFastStrategyTestService:
             if not isinstance(attempts, Mapping) or not isinstance(verified, Mapping) or not isinstance(failed, list):
                 return None
             attempt_counts = {name: int(attempts.get(name, 0)) for name in expected}
-            verified_reports = {}
-            for name, value in verified.items():
-                if name not in expected:
-                    continue
-                filename = _safe_name(value)
-                if Path(filename).suffix.casefold() != ".html":
-                    continue
-                report = report_dir / filename
-                try:
-                    expected_settings = json.loads((manifest.strategy_source / f"{name}.json").read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                settings = extract_html_strategy_settings(report) if report.is_file() and not report.is_symlink() else None
-                if isinstance(expected_settings, Mapping) and isinstance(settings, Mapping) and settings.get("name") == name and _report_matches_run(report, settings, expected_settings, start, end):
+            verified_reports: dict[str, str] = {}
+            verified_report_evidence: dict[str, tuple[int, int]] = {}
+            checkpoint_valid = True
+            if single_mode:
+                evidence = document.get("verified_report_evidence")
+                if not isinstance(evidence, Mapping):
+                    checkpoint_valid = not bool(verified)
+                    evidence = {}
+                elif set(evidence) != set(verified):
+                    checkpoint_valid = False
+                seen_filenames: set[str] = set()
+                for name, value in verified.items():
+                    if name not in expected:
+                        checkpoint_valid = False
+                        continue
+                    try:
+                        filename = _safe_name(value)
+                    except FastStrategyTestError:
+                        checkpoint_valid = False
+                        continue
+                    if Path(filename).suffix.casefold() != ".html":
+                        checkpoint_valid = False
+                        continue
+                    if filename in seen_filenames:
+                        checkpoint_valid = False
+                        continue
+                    seen_filenames.add(filename)
+                    signature = evidence.get(name)
+                    if (
+                        not isinstance(signature, list)
+                        or len(signature) != 2
+                        or any(type(item) is not int or item < 0 for item in signature)
+                    ):
+                        checkpoint_valid = False
+                        continue
+                    report = report_dir / filename
+                    try:
+                        if report.is_symlink() or not report.is_file() or report.parent.resolve() != report_dir.resolve():
+                            checkpoint_valid = False
+                            continue
+                        stat = report.stat()
+                    except OSError:
+                        checkpoint_valid = False
+                        continue
+                    if (stat.st_mtime_ns, stat.st_size) != tuple(signature):
+                        checkpoint_valid = False
+                        continue
                     verified_reports[name] = filename
+                    verified_report_evidence[name] = (stat.st_mtime_ns, stat.st_size)
+            else:
+                for name, value in verified.items():
+                    if name not in expected:
+                        continue
+                    filename = _safe_name(value)
+                    if Path(filename).suffix.casefold() != ".html":
+                        continue
+                    report = report_dir / filename
+                    try:
+                        expected_settings = json.loads((manifest.strategy_source / f"{name}.json").read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    settings = extract_html_strategy_settings(report) if report.is_file() and not report.is_symlink() else None
+                    if isinstance(expected_settings, Mapping) and isinstance(settings, Mapping) and settings.get("name") == name and _report_matches_run(report, settings, expected_settings, start, end):
+                        verified_reports[name] = filename
             failed_names = {_safe_name(name) for name in failed}
         except (FastStrategyTestError, ValueError, OSError, TypeError):
             return None
         recovered_phase = "FAILED" if phase == "RUNNING" and single_mode else str(phase)
-        job = _Job(job_id, Path(generation_path).resolve(), manifest, expected, tuple(name for name in expected if name not in verified_reports), start, end, report_dir, strategy_dir, attempt_counts=attempt_counts, verified_reports=verified_reports, failed_names=failed_names, preserve_reports=True, state="FAILED" if recovered_phase == "FAILED" and single_mode else "COMMITTED", phase=recovered_phase, single_mode=single_mode)
+        job = _Job(job_id, Path(generation_path).resolve(), manifest, expected, tuple(name for name in expected if name not in verified_reports), start, end, report_dir, strategy_dir, attempt_counts=attempt_counts, verified_reports=verified_reports, verified_report_evidence=verified_report_evidence, checkpoint_valid=checkpoint_valid, failed_names=failed_names, preserve_reports=True, state="FAILED" if recovered_phase == "FAILED" and single_mode else "COMMITTED", phase=recovered_phase, single_mode=single_mode)
         return job
 
     def _load_persisted_job_for_inbox(self, job_id: str) -> _Job | None:
@@ -886,6 +942,8 @@ class LocalFastStrategyTestService:
                 raise FastStrategyTestError("Fast TEST job not found") from None
             if source_job.state not in {"COMMITTED", "CANCELLED", "FAILED"} or source_job.phase not in {"PARTIAL", "FAILED", "CANCELLED"}:
                 raise FastStrategyTestError("Fast TEST job has no recoverable failures")
+            if source_job.single_mode and not source_job.checkpoint_valid:
+                raise FastStrategyTestError("Fast TEST checkpoint evidence is unavailable")
             if source_job.thread is not None and source_job.thread.is_alive():
                 source_job.thread.join(timeout=1.0)
             identifier = _safe_name(job_id or str(uuid4()))
@@ -926,6 +984,8 @@ class LocalFastStrategyTestService:
                     pending.remove(name)
             for name, report in recovered.items():
                 source_job.verified_reports[name] = report.name
+                stat = report.stat()
+                source_job.verified_report_evidence[name] = (stat.st_mtime_ns, stat.st_size)
             failed = [name for name in failed if name not in recovered]
             job = _Job(
                 identifier,
@@ -941,6 +1001,8 @@ class LocalFastStrategyTestService:
                 attempt_limits={name: source_job.attempt_counts.get(name, 0) + 1 for name in failed},
                 attempt_counts=dict(source_job.attempt_counts),
                 verified_reports=dict(source_job.verified_reports),
+                verified_report_evidence=dict(source_job.verified_report_evidence),
+                checkpoint_valid=source_job.checkpoint_valid,
                 failed_names=set(failed),
                 preserve_reports=True,
                 single_mode=source_job.single_mode,
@@ -1044,7 +1106,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
         expected_settings: Mapping[str, Mapping[str, object]] | None = None,
         start: str | None = None,
         end: str | None = None,
-        baseline: Mapping[str, tuple[int, int, str]] | None = None,
+        baseline: Mapping[str, tuple[int, int, ...]] | None = None,
     ) -> dict[str, Path]:
         if (
             not isinstance(expected_settings, Mapping)
@@ -1058,14 +1120,13 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             if report.is_symlink() or not report.is_file():
                 continue
             try:
-                source = report.read_text(encoding="utf-8")
                 stat = report.stat()
                 modified = stat.st_mtime_ns
+                previous = baseline.get(report.name) if baseline is not None else None
+                if previous is not None and previous[:2] == (modified, stat.st_size):
+                    continue
+                source = report.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
-                continue
-            if baseline is not None and baseline.get(report.name) == (
-                modified, stat.st_size, sha256(report.read_bytes()).hexdigest()
-            ):
                 continue
             settings = extract_html_strategy_settings(report)
             name = settings.get("name") if isinstance(settings, Mapping) else None
@@ -1082,6 +1143,34 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             if previous is None or (modified, report.name) > (previous.stat().st_mtime_ns, previous.name):
                 found[name] = report
         return found
+
+    @staticmethod
+    def _native_filename_evidence(
+        config: RunnerConfig,
+        expected_count: int,
+        baseline: Mapping[str, tuple[int, int]] | None = None,
+    ) -> tuple[tuple[int, str, int, int], ...]:
+        baseline = baseline or {}
+        evidence: list[tuple[int, str, int, int]] = []
+        for report in config.report_dir.glob("*.html"):
+            match = re.fullmatch(r"my_test_run_(\d+)_of_(\d+)_.+\.html", report.name, flags=re.IGNORECASE)
+            if match is None or report.is_symlink() or not report.is_file():
+                continue
+            try:
+                index, total = (int(value) for value in match.groups()[:2])
+            except ValueError:
+                continue
+            if total != expected_count or index < 1 or index > total:
+                continue
+            try:
+                stat = report.stat()
+            except OSError:
+                continue
+            previous = baseline.get(report.name)
+            if previous is not None and previous[:2] == (stat.st_mtime_ns, stat.st_size):
+                continue
+            evidence.append((index, report.name, stat.st_mtime_ns, stat.st_size))
+        return tuple(sorted(evidence))
 
     @staticmethod
     def _native_result_evidence(job: _Job, config: RunnerConfig, expected: tuple[str, ...]) -> set[str]:
@@ -1116,11 +1205,23 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             found.add(strategies[0])
         return found
 
-    def _wait_for_native_idle(self, job: _Job, client: object, config: RunnerConfig, batch_number: int, batch_total: int, expected: tuple[str, ...]) -> None:
+    def _wait_for_native_idle(
+        self,
+        job: _Job,
+        client: object,
+        config: RunnerConfig,
+        batch_number: int,
+        batch_total: int,
+        expected: tuple[str, ...],
+        *,
+        batch_baseline: Mapping[str, tuple[int, int]] | None = None,
+    ) -> None:
         deadline = time.monotonic() + config.batch_timeout_seconds
         last_evidence_growth = time.monotonic()
         stable_evidence = 0
         observed_evidence: set[str] = set()
+        previous_filename_evidence: tuple[tuple[int, str, int, int], ...] = ()
+        stable_filename_evidence = 0
         while True:
             if job.cancel.is_set():
                 raise _FastCancelled()
@@ -1135,6 +1236,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             if job.cancel.is_set():
                 raise _FastCancelled()
             evidence = self._native_result_evidence(job, config, expected)
+            filename_evidence = self._native_filename_evidence(config, len(expected), batch_baseline)
             previous_count = len(observed_evidence)
             observed_evidence.update(evidence)
             now = time.monotonic()
@@ -1143,17 +1245,31 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 stable_evidence = 0
             else:
                 stable_evidence += 1
-            evidence_ready = set(expected).issubset(observed_evidence)
+            if filename_evidence != previous_filename_evidence:
+                previous_filename_evidence = filename_evidence
+                stable_filename_evidence = 0
+                if filename_evidence:
+                    last_evidence_growth = now
+            else:
+                stable_filename_evidence += 1
+            filename_indices = {item[0] for item in filename_evidence}
+            filename_complete = (
+                len(expected) == len(filename_evidence)
+                and filename_indices == set(range(1, len(expected) + 1))
+            )
+            wizard_ready = set(expected).issubset(observed_evidence) and stable_evidence >= config.report_stability_polls
+            filename_ready = filename_complete and stable_filename_evidence >= config.report_stability_polls
+            evidence_ready = wizard_ready or filename_ready
             self._set_phase(
                 job,
                 "BOT_RUN",
                 batch_number=batch_number,
                 batch_total=batch_total,
                 native_status=status,
-                current=len(job.verified_reports) + len(observed_evidence),
-                active=0 if evidence_ready and stable_evidence >= config.report_stability_polls else 1,
+                current=len(job.verified_reports) + max(len(observed_evidence), len(filename_indices)),
+                active=0 if evidence_ready else 1,
             )
-            if evidence_ready and stable_evidence >= config.report_stability_polls:
+            if evidence_ready:
                 return
             if now >= deadline:
                 raise TimeoutError("native SINGLE_MODE tester batch exceeded its timeout")
@@ -1194,6 +1310,11 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             self._stop_bot(config)
             _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
             _install_names(job.manifest.strategy_source, job.strategy_dir, names)
+            batch_baseline = {
+                path.name: (path.stat().st_mtime_ns, path.stat().st_size)
+                for path in job.report_dir.glob("*.html")
+                if path.is_file() and not path.is_symlink()
+            }
             self._set_phase(job, "BOT_START", batch_number=batch_number, batch_total=batch_total, active=1, startup_elapsed_seconds=0.0)
             self._start_native_bot(job, config, batch_number, batch_total)
             client = self._client_factory(config)
@@ -1203,7 +1324,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             for name in names:
                 job.attempt_counts[name] = job.attempt_counts.get(name, 0) + 1
             client.run_tester()
-            self._wait_for_native_idle(job, client, config, batch_number, batch_total, names)
+            self._wait_for_native_idle(job, client, config, batch_number, batch_total, names, batch_baseline=batch_baseline)
             self._set_phase(job, "REPORT_COLLECTION", batch_number=batch_number, batch_total=batch_total)
             expected_settings: dict[str, Mapping[str, object]] = {}
             for name in names:
@@ -1220,7 +1341,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 expected_settings=expected_settings,
                 start=job.start_date,
                 end=job.end_date,
-                baseline=job.report_baseline,
+                baseline=batch_baseline,
             )
         finally:
             try:
@@ -1255,6 +1376,8 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 reports = self._run_native_batch(job, pending, config, batch_number, len(batches))
                 for name, report in reports.items():
                     job.verified_reports[name] = report.name
+                    stat = report.stat()
+                    job.verified_report_evidence[name] = (stat.st_mtime_ns, stat.st_size)
                     job.failed_names.discard(name)
                 missing = tuple(name for name in pending if name not in reports)
                 self._set_progress(job, current=len(job.verified_reports), active=0, retries=sum(max(0, value - 1) for value in job.attempt_counts.values()), failed=len(missing))

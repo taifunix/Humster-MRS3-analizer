@@ -184,6 +184,38 @@ def test_parser_accepts_current_action_table_with_extra_columns() -> None:
     assert parsed.actions[1].pnl == Decimal("9.9")
 
 
+def test_parser_captures_optional_price_and_cost_without_changing_core_actions() -> None:
+    source = _current()
+    for old, new in (
+        (b"<th>Action</th><th>Fee</th>", b"<th>Action</th><th>Price</th><th>Cost</th><th>Fee</th>"),
+        (b"<td>opened</td><td>0.05</td>", b"<td>opened</td><td>1.2300</td><td>4.5600</td><td>0.05</td>"),
+        (b"<td>closed</td><td>0.05</td>", b"<td>closed</td><td>1.2300</td><td>4.5600</td><td>0.05</td>"),
+    ):
+        source = source.replace(old, new, 1)
+
+    parsed = parse_current_performance_v2_html(source, _limits())
+
+    assert parsed.actions[0].price == Decimal("1.2300")
+    assert parsed.actions[0].cost == Decimal("4.5600")
+    assert parsed.actions[0].invalid_optional_fields == ()
+
+
+def test_parser_marks_invalid_optional_price_cost_without_rejecting_report() -> None:
+    source = _current()
+    for old, new in (
+        (b"<th>Action</th><th>Fee</th>", b"<th>Action</th><th>Price</th><th>Cost</th><th>Fee</th>"),
+        (b"<td>opened</td><td>0.05</td>", b"<td>opened</td><td>NaN</td><td></td><td>0.05</td>"),
+        (b"<td>closed</td><td>0.05</td>", b"<td>closed</td><td></td><td></td><td>0.05</td>"),
+    ):
+        source = source.replace(old, new, 1)
+
+    parsed = parse_current_performance_v2_html(source, _limits())
+
+    assert parsed.actions[0].price is None
+    assert parsed.actions[0].cost is None
+    assert parsed.actions[0].invalid_optional_fields == ("Price",)
+
+
 def test_parser_does_not_treat_report_order_id_as_strategy_order_slot() -> None:
     source = _current().replace(b"<td>1</td><td>opened</td>", b"<td>2</td><td>opened</td>", 1)
     source = source.replace(b"<td>1</td><td>closed</td>", b"<td>2</td><td>closed</td>", 1)

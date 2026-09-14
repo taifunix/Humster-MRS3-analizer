@@ -308,17 +308,29 @@ class DirectMaterializationSettings:
 
 
 def load_direct_materialization_settings(path: Path) -> DirectMaterializationSettings:
+    workers = load_duckdb_import_settings(path).workers
     raw = _local_config_object(path)
     section = raw.get("direct_materialization")
     if section is None:
-        return DirectMaterializationSettings()
+        defaults = DirectMaterializationSettings()
+        return DirectMaterializationSettings(
+            workers=workers,
+            fetch_batch_size=defaults.fetch_batch_size,
+            worker_chunk_size=defaults.worker_chunk_size,
+            max_in_flight_chunks=max(defaults.max_in_flight_chunks, workers),
+        )
     if not isinstance(section, dict):
         raise ValueError("direct_materialization must be an object")
+    max_in_flight_chunks = section.get("max_in_flight_chunks", 30)
+    if isinstance(max_in_flight_chunks, int) and not isinstance(max_in_flight_chunks, bool) and max_in_flight_chunks > 0:
+        max_in_flight_chunks = max(max_in_flight_chunks, workers)
     return DirectMaterializationSettings(
-        workers=section.get("workers", 15),
+        # `direct_materialization.workers` is retained as a readable legacy
+        # key, but the common duckdb_import limit is authoritative.
+        workers=workers,
         fetch_batch_size=section.get("fetch_batch_size", 256),
         worker_chunk_size=section.get("worker_chunk_size", 16),
-        max_in_flight_chunks=section.get("max_in_flight_chunks", 30),
+        max_in_flight_chunks=max_in_flight_chunks,
     )
 
 
@@ -352,11 +364,14 @@ def save_direct_materialization_settings(
     if existing is not None and not isinstance(existing, dict):
         raise ValueError("direct_materialization must be an object")
     section = dict(existing or {})
-    section["workers"] = settings.workers
     section["fetch_batch_size"] = settings.fetch_batch_size
     section["worker_chunk_size"] = settings.worker_chunk_size
     section["max_in_flight_chunks"] = settings.max_in_flight_chunks
     raw["direct_materialization"] = section
+    importer = raw.get("duckdb_import")
+    if importer is not None and not isinstance(importer, dict):
+        raise ValueError("duckdb_import must be an object")
+    raw["duckdb_import"] = {**dict(importer or {}), "workers": settings.workers}
     _save_config_object(path, raw)
 
 

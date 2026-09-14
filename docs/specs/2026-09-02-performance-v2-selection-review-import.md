@@ -272,14 +272,21 @@ read-only.
 The workbook keeps existing metric and enabled-filter columns and adds:
 
 - `Auto Status` (read-only);
-- `User Status` (editable, initially equal to Auto Status, except an existing
-  durable `REJECTED` tag remains `REJECTED`);
+- `User Status` (editable, populated only from the latest accepted review row
+  for that Strategy ID, otherwise blank);
 - `Auto Rank` (read-only);
-- `User Rank` (editable, initially equal to Auto Rank only for a prefilled
-  `FINALIST` or `RESERVE`);
-- `Analog Of ID` (editable, initially equal to automatic representative ID only
-  when prefilled User Status is `ANALOG`);
-- `Comment` (editable, at most 1000 characters).
+- `User Rank` (editable, populated only from that review row, otherwise blank);
+- `Analog Of ID` (editable, populated only from that review row, otherwise
+  blank);
+- `Comment` (editable, populated only from that review row, otherwise blank,
+  at most 1000 characters).
+
+The latest accepted review fields are looked up by Strategy ID, independently
+of the selection run that produced the current result. They therefore survive a
+new unreviewed ordinary selection and a `REPLACE` current-result change. The
+automatic snapshot fields remain those of the new run. A workbook with blank
+User Status cells is an incomplete review and must be completed before import;
+automatic fields are never copied into user fields for an unseen strategy.
 
 It also contains a very-hidden `_MRS_SELECTION_META` sheet with workbook schema
 version, selection run ID, database instance ID, selection contract version and
@@ -296,7 +303,9 @@ Only `.xlsx` files produced by this contract are accepted. The whole workbook
 is rejected without partial writes when any condition fails:
 
 - metadata sheet, schema version, run ID or database instance mismatch;
-- run is not the latest saved run for its Pair + Side;
+- run is not the latest saved run for its Pair + Side and does not have the
+  same request/config hashes and complete immutable `selection_results` rows
+  as that latest run;
 - the uploaded workbook SHA-256 was already imported successfully;
 - workbook candidate set differs from the persisted snapshot;
 - any current `strategies.current_result_id` differs from
@@ -304,10 +313,10 @@ is rejected without partial writes when any condition fails:
 - an automatic decision field or hidden identity field was changed;
 - an imported cell contains a formula;
 - `User Status` is outside the closed vocabulary;
-- a non-empty `User Rank` is not a unique positive integer;
-- a non-empty `User Rank` belongs to a status other than `FINALIST` or
-  `RESERVE`;
-- `ANALOG` has no valid different `Analog Of ID` in the same run;
+- a non-empty `User Rank` on `FINALIST` or `RESERVE` is not a unique positive
+  integer;
+- `ANALOG` has no different `Analog Of ID` in the same run;
+- `ANALOG` points to a row outside the submitted row set or to itself;
 - non-`ANALOG` row contains an analog target;
 - comment exceeds 1000 characters.
 
@@ -324,19 +333,24 @@ different target in the same run whose submitted status is `FINALIST` or
 valid representative for its analog rows or changing those rows away from
 `ANALOG`; import never silently promotes a replacement.
 
-`User Rank` is optional; when present it is authoritative and displayed before
-rows without a user rank. It must be a positive integer unique within that
-workbook/run. Gaps are accepted. Import does not silently rewrite the
-operator's rank values. Ranks from different runs or sides are not comparable;
-any combined catalogue display must retain side/run context.
+`User Rank` is optional; when present on `FINALIST` or `RESERVE` it is
+authoritative and displayed before rows without a user rank. It must be a
+positive integer unique within those selectable rows; gaps are accepted. A
+rank on another status is normalized to blank on import. If an `ANALOG` target
+exists in the submitted row set but its submitted status is not `FINALIST` or
+`RESERVE`, that analog row is normalized to `FILTERED` and its target is
+cleared. Missing, self, or out-of-rowset targets remain errors. Ranks from
+different runs or sides are not comparable; any combined catalogue display
+must retain side/run context.
 
 After a successful import, effective status and analog target are the required
 submitted User Status and its validated target from the latest review. Effective
-rank is User Rank when present, otherwise Auto Rank. Before the first import,
-effective status is `REJECTED` when the run captured a prior tag and otherwise
-Auto Status; effective rank is Auto Rank. Automatic fields and prior reviews
-remain immutable. The complete snapshot row set is mandatory, so every strategy
-always has a defined effective status.
+rank is User Rank when present, otherwise Auto Rank. The latest accepted review
+for a Strategy ID remains effective across later unreviewed ordinary runs and
+current-result replacement; a strategy without an accepted review falls back to
+its automatic decision (or prior `REJECTED` evidence). Automatic fields and
+prior reviews remain immutable. The complete snapshot row set is mandatory, so
+every strategy in the current run always has a defined effective status.
 
 Top N constrains automatic assignment only. A deliberate review may produce
 fewer, exactly N, or more than N effective `FINALIST` rows, including promotion
@@ -348,15 +362,16 @@ Uploading exactly the same workbook again returns
 the still-latest run has a different content hash, appends a new review, and
 the newest review becomes effective.
 
-The pristine exported workbook is a valid first review import even though its
-hash equals `selection_runs.workbook_sha256`; duplicate detection applies only
-to hashes already present in `selection_review_imports`.
+The pristine exported workbook may contain blank User Status cells and must be
+completed before first import; its hash may equal
+`selection_runs.workbook_sha256`, because duplicate detection applies only to
+hashes already present in `selection_review_imports`.
 
 If current result IDs changed, the error lists affected Strategy IDs. The safe
-recovery is to export a new run and repeat non-durable edits. Existing
-`REJECTED` decisions are not lost: they are read from `strategy_tags` and
-prefilled in the new workbook. Other statuses, ranks and comments are not
-silently carried across changed tester evidence.
+recovery is to export a new run and repeat non-durable edits. Existing accepted
+review status, rank, analog target and comment are carried by Strategy ID into
+the new workbook; strategies without an accepted review have blank User fields.
+Automatic fields remain those from the new run.
 
 ## A/B “Только финалисты”
 
@@ -364,9 +379,10 @@ For a selected pair, the checkbox is enabled when at least one latest selection
 run exists for that pair. The catalogue takes the latest run independently for
 each available side and shows the union of strategies whose effective status is
 `FINALIST`. A side without a saved run contributes no strategies. Imported user
-decisions apply when a side's latest run has a review; otherwise its automatic
-decisions apply. A newer export for one Pair + Side supersedes only that side's
-older reviewed run.
+ decisions apply by Strategy ID from the latest accepted review; strategies
+ without a review use their latest automatic decision. A newer export for one
+ Pair + Side supersedes only that side's automatic snapshot while prior review
+ rows remain authoritative for strategies present in the new run.
 
 If saved runs exist but their effective union contains no finalists, the panel
 shows an explicit empty result; it does not disable or silently bypass the

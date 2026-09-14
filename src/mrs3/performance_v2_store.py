@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -9,13 +10,15 @@ from uuid import UUID, uuid4
 
 import duckdb
 
-from .config import PanelPathSettings, load_panel_path_settings
+from .config import PanelPathSettings, load_duckdb_import_settings, load_panel_path_settings
 
 
 _SCHEMA_VERSION = "4"
 _DATABASE_NAME = "strategy_performance.duckdb"
 _MAX_WORKERS = 64
 _DEFAULT_V1_PERFORMANCE_ROOT = PanelPathSettings().performance_db_root
+_OPTIMIZER_SOURCE_METADATA_VERSION = 1
+_PRICE_COST_SEMANTICS = "actual_fill_not_planned_position"
 
 
 class PerformanceV2StoreError(ValueError):
@@ -148,7 +151,7 @@ def load_performance_v2_config(
         raise ValueError("unified_performance_v2.strategy_root must be a relative path")
     return PerformanceV2Config(
         database_root=(path.parent / relative_root),
-        workers=section.get("workers", 16),
+        workers=load_duckdb_import_settings(path.with_name("config.local.json")).workers,
         max_html_bytes=section.get("max_html_bytes", 67_108_864),
         max_actions_per_report=section.get("max_actions_per_report", 1_000_000),
         v1_database_root=runtime_v1_root,
@@ -243,6 +246,7 @@ CREATE TABLE IF NOT EXISTS strategy_results (
     warmup_hours INTEGER,
     excluded_trade_count INTEGER,
     exclusion_reason VARCHAR,
+    optimizer_source_metadata_json VARCHAR,
     CHECK (report_end_utc >= report_start_utc)
 );
 
@@ -626,8 +630,46 @@ def _add_result_provenance_columns(connection: duckdb.DuckDBPyConnection) -> Non
         ("warmup_hours", "integer"),
         ("excluded_trade_count", "integer"),
         ("exclusion_reason", "varchar"),
+        ("optimizer_source_metadata_json", "varchar"),
     ):
         connection.execute(f"alter table strategy_results add column if not exists {name} {definition}")
+
+
+def decode_optimizer_source_metadata(
+    payload: object,
+    imported_at_utc: object,
+    source_report_sha256: str | None = None,
+) -> dict[str, object] | None:
+    """Return current optional source metadata, never stale or malformed data."""
+    if not isinstance(payload, str) or len(payload.encode("utf-8")) > 16_384:
+        return None
+    try:
+        document = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(document, dict) or document.get("schema_version") != _OPTIMIZER_SOURCE_METADATA_VERSION:
+        return None
+    if document.get("price_cost_semantics") != _PRICE_COST_SEMANTICS:
+        return None
+    stamp = document.get("imported_at_utc")
+    if not isinstance(stamp, str):
+        return None
+    if isinstance(imported_at_utc, datetime):
+        if imported_at_utc.tzinfo is None or imported_at_utc.utcoffset() is None:
+            return None
+        current_stamp = imported_at_utc.astimezone(timezone.utc).isoformat()
+    elif isinstance(imported_at_utc, str):
+        current_stamp = imported_at_utc
+    else:
+        return None
+    if stamp != current_stamp:
+        return None
+    stored_hash = document.get("source_report_sha256")
+    if not isinstance(stored_hash, str) or len(stored_hash) != 64:
+        return None
+    if source_report_sha256 is not None and stored_hash != source_report_sha256:
+        return None
+    return document
 
 
 def _rollback_quietly(connection: duckdb.DuckDBPyConnection) -> None:

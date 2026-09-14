@@ -214,6 +214,118 @@ def test_native_prevalidation_rejects_legacy_report_layout() -> None:
     assert not _has_current_performance_v2_layout(legacy_report.read_text(encoding="utf-8"))
 
 
+def test_native_reports_skips_unchanged_batch_baseline_before_reading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    prior = report_dir / "prior.html"
+    prior.write_bytes(b"\xff")
+    prior_stat = prior.stat()
+    current = report_dir / "current.html"
+    current.write_text(
+        CURRENT_REPORT.read_text(encoding="utf-8").replace('"name":"MRS3 Current v2"', '"name":"S0"', 1),
+        encoding="utf-8",
+    )
+    expected_settings = fast_strategy_module.extract_html_strategy_settings(current)
+    assert expected_settings is not None
+    reads: list[Path] = []
+    original_read_text = Path.read_text
+
+    def track_read(path: Path, *args: object, **kwargs: object) -> str:
+        reads.append(path)
+        if path == prior:
+            raise AssertionError("unchanged prior report was read")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", track_read)
+    parsed: list[Path] = []
+    original_extract = fast_strategy_module.extract_html_strategy_settings
+
+    def track_extract(path: Path) -> dict[str, object] | None:
+        parsed.append(path)
+        return original_extract(path)
+
+    monkeypatch.setattr(fast_strategy_module, "extract_html_strategy_settings", track_extract)
+
+    found = LocalSingleModeStrategyTestService._native_reports(
+        report_dir,
+        {"S0"},
+        expected_settings={"S0": expected_settings},
+        start="2026-01-01",
+        end="2026-01-09",
+        baseline={prior.name: (prior_stat.st_mtime_ns, prior_stat.st_size)},
+    )
+
+    assert found == {"S0": current}
+    assert prior not in reads
+    assert current in reads
+    assert prior not in parsed
+    assert current in parsed
+
+
+def test_single_mode_reload_uses_checkpoint_without_reading_prior_reports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest, names = _generation(tmp_path, 3)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    config.strategy_dir.mkdir(parents=True)
+    prior: dict[str, Path] = {}
+    evidence: dict[str, list[int]] = {}
+    for name in names[:2]:
+        report = config.report_dir / f"{name}.html"
+        report.write_bytes(b"authoritatively accepted")
+        stat = report.stat()
+        prior[name] = report
+        evidence[name] = [stat.st_mtime_ns, stat.st_size]
+    current = config.report_dir / f"{names[2]}.html"
+    current.write_text(
+        '<p>Test period: 2026-08-01 - 2026-08-31</p>'
+        f'<pre>{{"name":"{names[2]}","basic":{{"symbol":"BTCUSDT","time_frame":"1h"}}}}</pre>',
+        encoding="utf-8",
+    )
+    (config.report_dir / "tester_manifest.json").write_text(json.dumps({
+        "job_id": "checkpointed-native",
+        "mode": "SINGLE_MODE",
+        "phase": "RUNNING",
+        "generation_manifest_path": str(manifest),
+        "expected_names": list(names),
+        "start_date": "2026-08-01",
+        "end_date": "2026-08-31",
+        "attempt_counts": {name: 1 for name in names},
+        "verified_reports": {name: report.name for name, report in prior.items()},
+        "verified_report_evidence": evidence,
+        "failed_names": [names[2]],
+    }), encoding="utf-8")
+
+    reads: list[Path] = []
+    original_read_text = Path.read_text
+
+    def track_read(path: Path, *args: object, **kwargs: object) -> str:
+        if path.parent.resolve() == config.report_dir.resolve():
+            reads.append(path)
+            if path in prior.values():
+                raise AssertionError("accepted prior report was read")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", track_read)
+    parsed: list[Path] = []
+    original_extract = fast_strategy_module.extract_html_strategy_settings
+
+    def track_extract(path: Path) -> dict[str, object] | None:
+        parsed.append(path)
+        return original_extract(path)
+
+    monkeypatch.setattr(fast_strategy_module, "extract_html_strategy_settings", track_extract)
+    monkeypatch.setattr(fast_strategy_module, "capture_run_snapshot_inbox", lambda *_args, **_kwargs: tmp_path / "inbox")
+
+    service = LocalSingleModeStrategyTestService(config)
+    recovered = service.retry("checkpointed-native", job_id="checkpointed-native-retry")
+
+    assert recovered["state"] == "COMMITTED"
+    assert recovered["evidence"]["verified_reports"] == {name: f"{name}.html" for name in names}
+    assert all(report not in reads for report in prior.values())
+    assert all(report not in parsed for report in prior.values())
+    assert parsed == [current]
+
+
 def test_native_idle_waits_for_current_batch_result_files(tmp_path: Path) -> None:
     config = replace(_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=0.2, report_stability_polls=2)
     service = LocalSingleModeStrategyTestService(config)
@@ -252,6 +364,39 @@ def test_native_idle_waits_for_current_batch_result_files(tmp_path: Path) -> Non
     assert updates[-1]["current"] == 2
     assert updates[-1]["active"] == 0
     assert [update["current"] for update in updates] == sorted(update["current"] for update in updates)
+
+
+def test_native_idle_accepts_stable_batch_report_sequence_when_wizard_result_is_truncated(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=0.2, report_stability_polls=2)
+    service = LocalSingleModeStrategyTestService(config)
+    config.report_dir.mkdir(parents=True)
+    config.wizard_result.parent.mkdir(parents=True, exist_ok=True)
+    config.wizard_result.write_text("[]", encoding="utf-8")
+    for index in range(1, 4):
+        (config.report_dir / f"my_test_run_{index:03d}_of_003_previous_{index}.html").write_text("placeholder", encoding="utf-8")
+    baseline = {
+        path.name: (path.stat().st_mtime_ns, path.stat().st_size, sha256(path.read_bytes()).hexdigest())
+        for path in config.report_dir.glob("*.html")
+    }
+    assert LocalSingleModeStrategyTestService._native_filename_evidence(
+        config, 3, {name: values[:2] for name, values in baseline.items()}
+    ) == ()
+    for index in range(1, 4):
+        (config.report_dir / f"my_test_run_{index:03d}_of_003_strategy_{index}.html").write_text("placeholder", encoding="utf-8")
+    job = SimpleNamespace(cancel=Event(), phase="BOT_RUN", progress={}, verified_reports={}, report_baseline=baseline)
+    updates: list[dict[str, object]] = []
+    service._emit = lambda current_job: updates.append(dict(current_job.progress))
+
+    class Client:
+        def tester_status(self) -> str:
+            return "completed"
+
+    service._wait_for_native_idle(job, Client(), config, 1, 1, ("S0", "S1", "S2"), batch_baseline={
+        name: values[:2] for name, values in baseline.items()
+    })
+
+    assert updates[-1]["current"] == 3
+    assert updates[-1]["active"] == 0
 
 
 def test_native_idle_continues_after_transient_status_failure(tmp_path: Path) -> None:

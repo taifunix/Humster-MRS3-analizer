@@ -216,6 +216,7 @@ from .performance_v2_selection_review import (
     apply_prior_rejected,
     import_selection_review,
     latest_effective_finalists,
+    latest_user_reviews_by_strategy,
     new_run_metadata,
     persist_selection_snapshot,
     persist_selection_snapshots,
@@ -1750,7 +1751,7 @@ class PanelController:
             return {"profile": save_analysis_profile(self.default_config, profile)}
 
     def panel_jobs(self) -> list[dict]:
-        return self._panel_jobs.list()
+        return self._panel_jobs.public_list()
 
     def portfolio_readiness(self) -> dict[str, object]:
         return self._portfolio_service.readiness()
@@ -1791,7 +1792,11 @@ class PanelController:
             self._runs_batch_service is not None and self._runs_batch_service.has_active_job()
         ) or (
             self._single_mode_strategy_test_service is not None and self._single_mode_strategy_test_service.has_active_job()
-        ) or bool(self._fresh_generation_job and self._fresh_generation_job.get("running"))
+        ) or bool(self._fresh_generation_job and self._fresh_generation_job.get("running")) or (
+            self._import_job is not None and self._import_job.running
+        ) or (
+            self._import_preflight_job is not None and self._import_preflight_job.running
+        )
 
     def panel_job_submit(self, payload: Mapping[str, object]) -> dict:
         kind = payload.get("kind")
@@ -1875,7 +1880,7 @@ class PanelController:
             runtime["inbox_path"] = inbox
         public = {key: value for key, value in document.items() if key in {"state", "phase", "progress", "error", "evidence"}}
         try:
-            tracked = self._panel_jobs.get(job_id)
+            tracked = self._panel_jobs._peek(job_id)
         except PanelJobError:
             return
         if runtime:
@@ -1894,6 +1899,20 @@ class PanelController:
             and inbox
         ):
             public["inbox_ready"] = True
+        if (
+            tracked.get("kind") in {"strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry"}
+            and document.get("state") == tracked.get("state")
+            and document.get("phase") == tracked.get("phase")
+            and document.get("error") == tracked.get("error")
+            and document.get("evidence", tracked.get("evidence")) == tracked.get("evidence")
+            and not runtime
+            and "inbox_ready" not in public
+        ):
+            try:
+                self._panel_jobs.volatile_sync(job_id, public, expected=tracked)
+            except PanelJobError:
+                pass
+            return
         if tracked.get("kind") == "strategies.performance.v2.import" and document.get("state") in {"COMMITTED", "FAILED"}:
             result = self._performance_v2_result_snapshot(document)
             if result:
@@ -2099,21 +2118,26 @@ class PanelController:
             raise PanelTestingError("invalid testing request") from None
 
     def _local_source_jobs(self) -> tuple[LocalSourceDbService, LocalSourceDbJobRunner]:
+        try:
+            workers, source_settings, writer_limit = self._source_v6_import_options()
+            import_options = {
+                "write_batch_size": source_settings.write_batch_size,
+                "worker_chunk_size": source_settings.worker_chunk_size,
+                "max_in_flight_chunks": source_settings.max_in_flight_chunks,
+                "segment_writer_limit": writer_limit,
+                "hydrate_fragments": True,
+            }
+        except Exception:
+            workers = 1
+            import_options = {}
         if self._panel_source_service is None or self._panel_source_jobs is None:
-            try:
-                workers, source_settings, writer_limit = self._source_v6_import_options()
-                import_options = {
-                    "write_batch_size": source_settings.write_batch_size,
-                    "worker_chunk_size": source_settings.worker_chunk_size,
-                    "max_in_flight_chunks": source_settings.max_in_flight_chunks,
-                    "segment_writer_limit": writer_limit,
-                    "hydrate_fragments": True,
-                }
-            except Exception:
-                workers = 1
-                import_options = {}
             self._panel_source_service = LocalSourceDbService(workers=workers, import_options=import_options)
             self._panel_source_jobs = LocalSourceDbJobRunner(self._panel_source_service, on_update=self._record_special_job)
+        else:
+            # The service is cached for preflight tokens, but each new job must
+            # observe the current machine-wide import limit.
+            self._panel_source_service.workers = workers
+            self._panel_source_service.import_options = dict(import_options)
         return self._panel_source_service, self._panel_source_jobs
 
     def source_db_local_import_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -2304,12 +2328,16 @@ class PanelController:
         return self._sync_tracked_panel_job(result)
 
     def _surfaces(self) -> LocalSurfacesService:
+        try:
+            workers = max(1, int(self._import_settings().workers))
+        except Exception:
+            workers = 1
         if self._panel_surfaces is None:
-            try:
-                workers = min(16, max(1, int(self._import_settings().workers)))
-            except Exception:
-                workers = 1
             self._panel_surfaces = LocalSurfacesService(workers=workers)
+        else:
+            # Preserve preflight state while refreshing the worker knob for a
+            # subsequent publication.
+            self._panel_surfaces._workers = workers
         return self._panel_surfaces
 
     def surface_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -3116,10 +3144,11 @@ class PanelController:
         return value[0].strip(), value[1].strip()
 
     def _performance_v2_config(self):
-        return load_performance_v2_config(
+        config = load_performance_v2_config(
             self.default_config.with_name("config.performance.json"),
             v1_database_root=self._panel_path("performance_db_root"),
         )
+        return replace(config, workers=max(1, int(self._import_settings().workers)))
 
     @staticmethod
     def _retest_date(value: object, field: str) -> str:
@@ -4527,7 +4556,12 @@ class PanelController:
             with tempfile.TemporaryDirectory() as directory:
                 with duckdb.connect(str(target), read_only=True) as connection:
                     metadata = new_run_metadata(connection)
-                workbook = write_selection_workbook(result, Path(directory) / "finalists.xlsx", request, metadata)
+                    user_review_rows = latest_user_reviews_by_strategy(
+                        connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
+                    )
+                workbook = write_selection_workbook(
+                    result, Path(directory) / "finalists.xlsx", request, metadata, user_review_rows
+                )
                 data = workbook.read_bytes()
                 with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
                     persist_selection_snapshot(connection, request, selection_config, result, metadata, data)

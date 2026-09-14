@@ -218,6 +218,32 @@ def test_v2_local_source_service_uses_source_v6_throughput_settings(tmp_path: Pa
     }
 
 
+def test_cached_local_source_service_refreshes_common_workers(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"duckdb_import": {"workers": 3}}), encoding="utf-8")
+    controller = PanelController(tmp_path, config, browse_factory=lambda *_: ())
+
+    service, _ = controller._local_source_jobs()
+    config.write_text(json.dumps({"duckdb_import": {"workers": 6}}), encoding="utf-8")
+
+    refreshed, _ = controller._local_source_jobs()
+    assert refreshed is service
+    assert refreshed.workers == 6
+
+
+def test_cached_surface_service_refreshes_common_workers_without_restart(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"duckdb_import": {"workers": 3}}), encoding="utf-8")
+    controller = PanelController(tmp_path, config, browse_factory=lambda *_: ())
+
+    service = controller._surfaces()
+    config.write_text(json.dumps({"duckdb_import": {"workers": 20}}), encoding="utf-8")
+
+    refreshed = controller._surfaces()
+    assert refreshed is service
+    assert refreshed._workers == 20
+
+
 def test_static_panel_shell_contains_only_navigation_contract() -> None:
     panel_web = Path(panel_module.__file__).parent / "panel_web"
     html = (panel_web / "index.html").read_text(encoding="utf-8")
@@ -1407,7 +1433,7 @@ def test_direct_selected_start_forwards_local_materialization_settings_to_replay
             pass
 
     config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"direct_materialization": {"workers": 7}}), encoding="utf-8")
+    config.write_text(json.dumps({"duckdb_import": {"workers": 7}, "direct_materialization": {"workers": 99}}), encoding="utf-8")
 
     scan = _fake_coverage_scan(tmp_path)
     replay_settings: list[object] = []
@@ -1501,7 +1527,7 @@ def test_run_duckdb_direct_normal_prepare_uses_job_settings_and_retries_legacy_c
             pass
 
     config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"direct_materialization": {"workers": 7}}), encoding="utf-8")
+    config.write_text(json.dumps({"duckdb_import": {"workers": 7}, "direct_materialization": {"workers": 99}}), encoding="utf-8")
     settings = load_direct_materialization_settings(config)
 
     calls: list[dict[str, object]] = []

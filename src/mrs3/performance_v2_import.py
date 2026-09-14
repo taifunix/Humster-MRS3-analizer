@@ -54,6 +54,11 @@ _ACTION_COLUMNS = (
     "size", "post_size", "post_side", "pnl", "fee", "balance", "raw_action_json",
 )
 _EQUITY_COLUMNS = ("result_id", "sample_index", "timestamp_utc", "wallet", "equity")
+_SOURCE_METADATA_VERSION = 1
+_PRICE_COST_SEMANTICS = "actual_fill_not_planned_position"
+_MAX_ACTION_SOURCE_BYTES = 2_048
+_MAX_RESULT_SOURCE_BYTES = 16_384
+_MAX_SOURCE_VALUE_CHARS = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +325,114 @@ def _listing_datetime(value: object) -> datetime:
 
 def _format_decimal(value: Decimal) -> str:
     return format(value, "f")
+
+
+def _compact_json(document: Mapping[str, object], limit: int) -> str | None:
+    payload = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return payload if len(payload.encode("utf-8")) <= limit else None
+
+
+def _action_source_json(action: object) -> str | None:
+    price = getattr(action, "price", None)
+    cost = getattr(action, "cost", None)
+    invalid = tuple(getattr(action, "invalid_optional_fields", ()))
+    if price is None and cost is None and not invalid:
+        return None
+    document: dict[str, object] = {
+        "schema_version": _SOURCE_METADATA_VERSION,
+        "price_cost_semantics": _PRICE_COST_SEMANTICS,
+    }
+    if isinstance(price, Decimal):
+        document["price"] = str(price)
+    if isinstance(cost, Decimal):
+        document["cost"] = str(cost)
+    if invalid:
+        document["invalid_fields"] = list(invalid[:4])
+    payload = _compact_json(document, _MAX_ACTION_SOURCE_BYTES)
+    if payload is not None:
+        return payload
+    return _compact_json(
+        {
+            "schema_version": _SOURCE_METADATA_VERSION,
+            "price_cost_semantics": _PRICE_COST_SEMANTICS,
+            "invalid_fields": ["payload_oversize"],
+        },
+        _MAX_ACTION_SOURCE_BYTES,
+    )
+
+
+def _setting_source_value(value: object, *, boolean: bool) -> tuple[object | None, bool]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, False
+    if boolean:
+        return (value, False) if type(value) is bool else (None, True)
+    if type(value) is bool:
+        return None, True
+    text = str(value).strip()
+    if len(text) > _MAX_SOURCE_VALUE_CHARS:
+        return None, True
+    try:
+        parsed = Decimal(text)
+    except (InvalidOperation, TypeError, ValueError):
+        return None, True
+    return (str(parsed), False) if parsed.is_finite() else (None, True)
+
+
+def _optimizer_source_metadata_json(
+    settings: Mapping[str, object],
+    imported_at_utc: datetime,
+    source_report_sha256: str,
+) -> str | None:
+    allowlist = {
+        "exchange": (("use_upnl", True), ("use_frozen_balance", True)),
+        "basic": (
+            ("use_fix", True), ("my_fix_balance", False),
+            ("balance_percentage_long", False), ("balance_percentage_short", False),
+            ("risk_long", False), ("risk_short", False), ("lot_long", False),
+            ("lot_short", False), ("max_balance", False), ("leverage", False),
+            ("cross_margin", True),
+        ),
+    }
+    captured: dict[str, dict[str, object]] = {}
+    invalid: list[str] = []
+    for section, fields in allowlist.items():
+        values = settings.get(section)
+        if not isinstance(values, Mapping):
+            continue
+        selected: dict[str, object] = {}
+        for field, boolean in fields:
+            value, invalid_value = _setting_source_value(values.get(field), boolean=boolean)
+            if invalid_value:
+                invalid.append(f"{section}.{field}")
+            elif value is not None:
+                selected[field] = value
+        if selected:
+            captured[section] = selected
+    if not captured and not invalid:
+        return None
+    document: dict[str, object] = {
+        "schema_version": _SOURCE_METADATA_VERSION,
+        "price_cost_semantics": _PRICE_COST_SEMANTICS,
+        "imported_at_utc": imported_at_utc.astimezone(timezone.utc).isoformat(),
+        "source_report_sha256": source_report_sha256,
+        "settings": captured,
+    }
+    if invalid:
+        document["invalid_fields"] = invalid[:16]
+    payload = _compact_json(document, _MAX_RESULT_SOURCE_BYTES)
+    if payload is not None:
+        return payload
+    return _compact_json(
+        {
+            "schema_version": _SOURCE_METADATA_VERSION,
+            "price_cost_semantics": _PRICE_COST_SEMANTICS,
+            "imported_at_utc": imported_at_utc.astimezone(timezone.utc).isoformat(),
+            "source_report_sha256": source_report_sha256,
+            "settings": {},
+            "invalid_fields": ["payload_oversize"],
+        },
+        _MAX_RESULT_SOURCE_BYTES,
+    )
 
 
 def _warmup_report(
@@ -1284,6 +1397,9 @@ def _publish(
                 for table in ("strategy_actions", "strategy_equity", "window_metrics"):
                     connection.execute(f"delete from {table} where result_id = ?", [result_id])
             values = _result_values(entry, report, prepared.commission_contract, now)
+            source_metadata = _optimizer_source_metadata_json(
+                report.settings, now, report_hash(entry)
+            )
             if decision == "ADD":
                 result_id = int(connection.execute(
                     """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
@@ -1291,9 +1407,9 @@ def _publish(
                        max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc,
                        reported_start_utc, reported_end_utc, listing_date_utc, listing_date_raw,
                        listing_date_source, effective_start_utc, effective_end_utc, warmup_hours,
-                       excluded_trade_count, exclusion_reason)
-                       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
-                    [strategy_id, *values],
+                       excluded_trade_count, exclusion_reason, optimizer_source_metadata_json)
+                       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
+                    [strategy_id, *values, source_metadata],
                 ).fetchone()[0])
                 connection.execute("update strategies set current_result_id = ?, updated_at_utc = ? where strategy_id = ?", [result_id, now, strategy_id])
             else:
@@ -1303,8 +1419,8 @@ def _publish(
                        max_drawdown = ?, max_drawdown_pct = ?, total_fees = ?, total_trades = ?, imported_at_utc = ?,
                        reported_start_utc = ?, reported_end_utc = ?, listing_date_utc = ?, listing_date_raw = ?,
                        listing_date_source = ?, effective_start_utc = ?, effective_end_utc = ?, warmup_hours = ?,
-                       excluded_trade_count = ?, exclusion_reason = ? where result_id = ?""",
-                    [*values, result_id],
+                       excluded_trade_count = ?, exclusion_reason = ?, optimizer_source_metadata_json = ? where result_id = ?""",
+                    [*values, source_metadata, result_id],
                 )
                 connection.execute(
                     "update strategies set updated_at_utc = ? where strategy_id = ?",
@@ -1313,7 +1429,7 @@ def _publish(
             for action in report.actions:
                 action_rows.append((result_id, action.action_index, action.timestamp_utc, action.symbol,
                                     action.order_id, action.action, action.size, action.post_size, action.post_side,
-                                    action.pnl, action.fee, action.balance, None))
+                                    action.pnl, action.fee, action.balance, _action_source_json(action)))
             if len(action_rows) >= _APPEND_BATCH_ROWS:
                 _append_rows(connection, "strategy_actions", _ACTION_COLUMNS, action_rows)
                 action_rows.clear()

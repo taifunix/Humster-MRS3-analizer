@@ -25,6 +25,7 @@ from mrs3.performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
     PerformanceV2WriterLock,
+    decode_optimizer_source_metadata,
     initialize_performance_v2,
     performance_v2_database_path,
 )
@@ -180,6 +181,26 @@ def _rewrite_report(request: PerformanceV2ImportRequest, replacement: bytes) -> 
     manifest_path.write_text(json.dumps(manifest))
 
 
+def _report_with_source_metadata() -> bytes:
+    source = FIXTURE.read_bytes()
+    source = source.replace(
+        b'"use_upnl":true}',
+        b'"use_upnl":true,"use_frozen_balance":true,"account":"must-not-save"}',
+        1,
+    ).replace(
+        b'"use_short":false}',
+        b'"use_short":false,"max_balance":200,"risk_long":1.5}',
+        1,
+    )
+    for old, new in (
+        (b"<th>Action</th><th>Fee</th>", b"<th>Action</th><th>Price</th><th>Cost</th><th>Fee</th>"),
+        (b"<td>opened</td><td>0.05</td>", b"<td>opened</td><td>1.2300</td><td>4.5600</td><td>0.05</td>"),
+        (b"<td>closed</td><td>0.05</td>", b"<td>closed</td><td>1.2300</td><td>4.5600</td><td>0.05</td>"),
+    ):
+        source = source.replace(old, new, 1)
+    return source
+
+
 def test_append_rows_uses_duckdb_native_dataframe_append() -> None:
     class AppendOnlyConnection:
         def __init__(self) -> None:
@@ -253,6 +274,40 @@ def test_add_publishes_multiple_strategies_and_one_current_result_each(tmp_path:
     assert snapshot
 
 
+def test_import_persists_allowlisted_source_metadata_and_existing_action_slot(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _rewrite_report(request, _report_with_source_metadata())
+
+    assert import_performance_v2(request).imported_count == 1
+
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        result_id, imported_at, metadata = connection.execute(
+            "select result_id, imported_at_utc, optimizer_source_metadata_json from strategy_results"
+        ).fetchone()
+        columns = [row[0] for row in connection.execute(
+            "select column_name from information_schema.columns where table_name = 'strategy_actions' order by ordinal_position"
+        ).fetchall()]
+        action_payload = connection.execute(
+            "select raw_action_json from strategy_actions where result_id = ? order by action_index limit 1", [result_id]
+        ).fetchone()[0]
+
+    assert columns == [
+        "result_id", "action_index", "timestamp_utc", "symbol", "order_id", "action", "size",
+        "post_size", "post_side", "pnl", "fee", "balance", "raw_action_json",
+    ]
+    assert json.loads(action_payload) == {
+        "cost": "4.5600", "price": "1.2300", "price_cost_semantics": "actual_fill_not_planned_position",
+        "schema_version": 1,
+    }
+    decoded = decode_optimizer_source_metadata(metadata, imported_at)
+    assert decoded is not None
+    assert decoded["settings"] == {
+        "basic": {"max_balance": "200", "risk_long": "1.5"},
+        "exchange": {"use_frozen_balance": True, "use_upnl": True},
+    }
+    assert "must-not-save" not in metadata
+
+
 def test_import_reports_parse_progress_for_each_completed_report(tmp_path: Path) -> None:
     request, _ = _request(tmp_path, names=("alpha", "beta"))
     events: list[tuple[str, int, int]] = []
@@ -265,6 +320,48 @@ def test_import_reports_parse_progress_for_each_completed_report(tmp_path: Path)
     assert events[0] == ("PARSING", 0, 2)
     assert [completed for stage, completed, total in events if stage == "PARSING"] == [0, 1, 2]
     assert events[-1] == ("PUBLISHING", 2, 2)
+
+
+def test_replace_preserves_user_finalist_status_rank_and_comment(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _rewrite_report(request, _report_with_source_metadata())
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target)) as connection:
+        strategy_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies where strategy_name = 'alpha'"
+        ).fetchone()
+        now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+        connection.execute(
+            """insert into selection_runs values
+               ('selection-1', '00000000-0000-0000-0000-000000000001', 'ONUSDT', 'LONG', 'test',
+                '{}', 'a', '{}', 'b', 1, 1, 1, 1, 'c', ?)""",
+            [now],
+        )
+        connection.execute(
+            "insert into selection_review_imports values ('review-1', 'selection-1', 'd', ?, 1)", [now]
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-1', ?, 'FINALIST', 1, null, 'keep this')",
+            [strategy_id],
+        )
+    changed = _report_with_source_metadata().replace(b"1009.9", b"1019.9")
+    _rewrite_report(request, changed)
+    replacement = PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config, mode="REPLACE",
+        replacement_strategy_ids={"alpha": strategy_id}, expected_current_result_ids={"alpha": result_id},
+        listing_dates_path=request.listing_dates_path,
+    )
+
+    assert import_performance_v2(replacement).imported_count == 1
+
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select user_status, user_rank, comment from selection_review_rows where strategy_id = ?", [strategy_id]
+        ).fetchone() == ("FINALIST", 1, "keep this")
+        assert connection.execute(
+            "select current_result_id from strategies where strategy_id = ?", [strategy_id]
+        ).fetchone() == (result_id,)
 
 
 def test_add_accepts_tester_report_order_ids_outside_mrs3_order_slots(tmp_path: Path) -> None:

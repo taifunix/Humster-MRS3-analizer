@@ -114,6 +114,11 @@ def test_settings_semantic_ids_and_static_js_use_v2_testing_endpoints() -> None:
     assert '<form' in html
     assert 'for="settings-default-root"' in html
     assert 'id="settings-default-root"' in html
+    assert 'id="settings-import-workers"' in html
+    assert 'id="settings-workers-save"' in html
+    assert "Общий лимит рабочих процессов" in html
+    assert "operational.import_workers" in js
+    assert "operational: { import_workers:" in js
     assert 'aria-live="polite"' in html
     assert 'value="legacy"' in html
     assert 'value="static"' in html
@@ -142,13 +147,32 @@ def test_analysis_profile_is_one_flat_card_with_explicit_controls() -> None:
     assert "Импорт workers/batch" not in profile
     for label in (
         "Экономические фильтры",
-        "Сетка и уточнение",
-        "Плато и Close MA",
-        "READY-кандидаты",
+        "История и ограничения выборки",
+        "Ожидаемая частота сделок",
+        "Соседние точки и плато",
+        "Отбор READY-кандидатов",
         "Конструкция ордеров",
-        "Количество параллельных процессов",
     ):
         assert label in profile
+    for label in (
+        "Граница shift для абсолютного минимума сделок, bp",
+        "Минимум сделок при shift ≤ границы",
+        "Минимум сделок при shift > границы",
+        "Базовая минимальная частота сделок в день:",
+        "Минимальный PnL/DD",
+        "Радиус MA для проверки соседних точек, ±",
+        "Минимальная однородность всего плато",
+        "Допуск равноценности PnL и PnL/DD",
+        "BASE 1ORD: минимум точек в плато",
+        "BASE 1ORD: минимум событий плато за 30 дней",
+        "Максимум BASE 1ORD на пару/сторону/TF",
+        "Multi-order: минимум точек в каждом плато",
+        "Multi-order: минимум событий каждого плато за 30 дней",
+        "Диапазон меньшего shift: от",
+        "Диапазон меньшего shift: до",
+        "Минимальное расстояние до следующего ордера, bp",
+    ):
+        assert label in js
     assert 'id="analysis-profile-reload"' in profile
     assert 'id="analysis-profile-save"' in profile
     assert "'/api/v2/settings/analysis-profile'" in js
@@ -158,7 +182,9 @@ def test_analysis_profile_is_one_flat_card_with_explicit_controls() -> None:
     assert "lower_max_exclusive_bp: Number(pair.lower_max_exclusive_bp)" in js
     assert "'envelope_min'" in js
     assert "'base_slots'" in js
-    assert "shift должны быть целыми числами" in js
+    assert "analysis-canonical-shifts" not in js
+    assert "analysis-isolated" not in js
+    assert "analysis-target-dd" not in js
 
 
 def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
@@ -327,6 +353,15 @@ def test_finalist_retest_card_exposes_current_control_export_before_retest() -> 
     assert 'id="performance-v2-finalist-retest-export" class="button button-secondary" hidden' not in card
     assert "/api/v2/strategies/performance-v2/finalist-retest/export?include_reserve=" in js
     assert "finalistRetestHasSuccessfulExport" in js
+
+
+def test_finalist_retest_card_is_only_on_strategies_dd5_screen() -> None:
+    html = _read("index.html")
+    strategies_start = html.index('<section id="strategies-dd5"')
+    strategies_end = html.index('<section id="portfolio"', strategies_start)
+
+    assert html.count('id="performance-v2-finalist-retest-card"') == 1
+    assert 'id="performance-v2-finalist-retest-card"' in html[strategies_start:strategies_end]
 
 
 def test_retest_check_is_the_only_path_that_activates_a_recovered_job() -> None:
@@ -574,6 +609,22 @@ def test_surface_timeframe_rows_override_generic_scope_list_label_style() -> Non
     assert "overflow-x: auto;" in css
 
 
+def test_surface_scope_preview_uses_the_approved_columns_and_aggregate_contract() -> None:
+    js = _read("app.js")
+    css = _read("app.css")
+
+    assert "'Период данных'" in js
+    assert "'PnL > 10%'" in js
+    assert "'PnL медиана / максимум'" in js
+    assert "pnl_gt_10_count" in js
+    assert "aggregate.common_interval" in js
+    assert "aggregate.pnl_preview" in js
+    assert "surfaceNumberV2(preview.pnl_gt_10_percent, 1)" in js
+    assert "READY · ${ready.count} / ${ready.total}" in js
+    assert "'Grid'" not in js
+    assert "36px 190px 90px 170px 150px 170px" in css
+
+
 def test_surface_gap_link_opens_a_visible_report_dialog() -> None:
     html = _read("index.html")
     js = _read("app.js")
@@ -646,12 +697,18 @@ def test_tester_card_exposes_single_mode_and_hides_fast_controls() -> None:
     js = _read("app.js")
 
     assert 'id="tester-start"' in html
+    assert 'id="tester-retry"' in html
+    assert 'id="tester-retry" class="button button-secondary" disabled' in html
+    assert "Продолжить незавершённый тест" in html
     assert "SINGLE_MODE" in html
     assert 'id="tester-start-fast"' not in html
     assert 'id="tester-retry-fast"' not in html
     assert "strategies.tester.fast.start" not in js
     assert "strategies.tester.fast.retry" not in js
     assert "kind: 'strategies.tester.start'" in js
+    assert "testerRetry?.addEventListener('click'" in js
+    assert "kind: 'strategies.tester.retry'" in js
+    assert "request: { job_id: sourceJobId }" in js
     assert "inbox_ready" in js
     assert "READY" in js
     assert "setTesterControls(!testerIsTerminal(job))" in js
@@ -916,13 +973,27 @@ def test_normal_recovery_uses_created_date_and_suitable_job_priority() -> None:
     assert "Number.isFinite(Date.parse(job.created_at_utc))" in recovery
     assert "['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)" in recovery
     assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
+    assert "['FAILED', 'CANCELLED'].includes(job.state)" in recovery
     assert "Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)" in recovery
     assert "String(b.job_id).localeCompare(String(a.job_id))" in recovery
     assert "const tester = testerJobs[0];" in recovery
     assert ".reverse()" not in recovery
     assert "testerJobs.find((job) => !testerIsTerminal(job))" not in recovery
-    assert "job.state === 'FAILED'" not in recovery
-    assert "job.state === 'CANCELLED'" not in recovery
+
+
+def test_single_mode_retry_shows_recovery_progress_and_avoids_pending_as_failed() -> None:
+    js = _read("app.js")
+
+    render = js.split("const renderTester", 1)[1].split("const pollTester", 1)[0]
+    retry = js.split("testerRetry?.addEventListener", 1)[1].split("if (testerStop) testerStop.addEventListener", 1)[0]
+    assert "const progressTail = ['FAILED', 'CANCELLED'].includes(job.state) ? `failed ${failed}` : `remaining ${Math.max(0, total - checked)}`;" in render
+    assert "const startedAt = Date.now();" in retry
+    assert "Восстановление отчётов" in retry
+    assert "window.setInterval(showRecovery, 1000)" in retry
+    assert "window.clearInterval(testerRetryTimer); testerRetryTimer = 0;" in retry
+    assert "setTesterControls(true);" in retry
+    assert "testerStop.disabled = true;" in retry
+    assert "testerRetryable = testerJobId === sourceJobId;" in retry
 
 
 def test_import_recovery_ignores_stale_failed_jobs_and_uses_newest_suitable_snapshot() -> None:

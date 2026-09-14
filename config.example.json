@@ -1,7 +1,9 @@
 {
   "history_min_days": 7,
+  "duckdb_import": {
+    "workers": 4
+  },
   "direct_materialization": {
-    "workers": 15,
     "fetch_batch_size": 256,
     "worker_chunk_size": 16,
     "max_in_flight_chunks": 30

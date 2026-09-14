@@ -13,6 +13,7 @@ from mrs3.performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
     _SELECTION_SCHEMA_V3,
+    decode_optimizer_source_metadata,
     initialize_performance_v2,
     load_performance_v2_config,
     performance_v2_database_path,
@@ -42,12 +43,15 @@ def _strategy(connection: duckdb.DuckDBPyConnection, *, name: str = "BTC-long") 
     ).fetchone()[0]
 
 
-def test_config_uses_the_fixed_owned_target_and_ignores_v1_namespace(tmp_path: Path) -> None:
+def test_config_uses_common_workers_and_ignores_legacy_v2_worker_setting(tmp_path: Path) -> None:
+    (tmp_path / "config.local.json").write_text(
+        json.dumps({"duckdb_import": {"workers": 9}}), encoding="utf-8"
+    )
     config = load_performance_v2_config(
         _config(tmp_path / "config.performance.json", workers=99, performance_db_root="data/performanceDB")
     )
 
-    assert config.workers == 64
+    assert config.workers == 9
     assert performance_v2_database_path(config) == (
         tmp_path / "data" / "performance-v2" / "strategy_performance.duckdb"
     )
@@ -121,18 +125,18 @@ def test_legacy_root_is_rejected_before_any_duckdb_connection(
     assert not called
 
 
-@pytest.mark.parametrize("field", ["workers", "max_html_bytes", "max_actions_per_report"])
+@pytest.mark.parametrize("field", ["max_html_bytes", "max_actions_per_report"])
 @pytest.mark.parametrize("value", [True, 0, -1])
 def test_config_rejects_boolean_and_non_positive_limits(tmp_path: Path, field: str, value: object) -> None:
     with pytest.raises(ValueError, match=field):
         load_performance_v2_config(_config(tmp_path / "config.performance.json", **{field: value}))
 
 
-def test_config_defaults_workers_to_sixteen(tmp_path: Path) -> None:
-    assert load_performance_v2_config(_config(tmp_path / "config.performance.json")).workers == 16
+def test_config_defaults_workers_to_common_import_default(tmp_path: Path) -> None:
+    assert load_performance_v2_config(_config(tmp_path / "config.performance.json")).workers == 4
 
 
-def test_versioned_performance_config_keeps_the_configured_thirty_worker_default() -> None:
+def test_versioned_performance_config_uses_the_sibling_common_worker_setting() -> None:
     config_path = Path(__file__).resolve().parents[1] / "config.performance.json"
 
     assert load_performance_v2_config(config_path).workers == 30
@@ -212,6 +216,36 @@ def test_v4_reentry_adds_result_provenance_without_changing_existing_facts() -> 
         } <= columns
         assert connection.execute("select count(*) from strategy_results").fetchone() == (1,)
         initialize_performance_v2(connection)
+
+
+def test_v4_reentry_adds_optimizer_source_metadata_column_idempotently() -> None:
+    with duckdb.connect(":memory:") as connection:
+        initialize_performance_v2(connection)
+        initialize_performance_v2(connection)
+
+        columns = {
+            row[0] for row in connection.execute(
+                "select column_name from information_schema.columns where table_name = 'strategy_results'"
+            ).fetchall()
+        }
+        assert "optimizer_source_metadata_json" in columns
+        require_performance_v2(connection)
+
+
+def test_optimizer_source_metadata_decoder_rejects_stale_or_wrong_source() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    document = json.dumps({
+        "schema_version": 1,
+        "price_cost_semantics": "actual_fill_not_planned_position",
+        "imported_at_utc": now.isoformat(),
+        "source_report_sha256": "a" * 64,
+        "settings": {"exchange": {"use_upnl": True}},
+    }, separators=(",", ":"), sort_keys=True)
+
+    assert decode_optimizer_source_metadata(document, now, "a" * 64) is not None
+    assert decode_optimizer_source_metadata(document, now, "b" * 64) is None
+    assert decode_optimizer_source_metadata(document, now.replace(year=2027)) is None
+    assert decode_optimizer_source_metadata("{not-json", now) is None
 
 
 def test_v4_marker_with_foreign_catalog_is_rejected_before_window_repair() -> None:

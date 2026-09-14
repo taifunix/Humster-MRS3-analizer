@@ -1375,6 +1375,7 @@ def write_selection_workbook(
     path: Path,
     request: SelectionRequest,
     review_metadata: Mapping[str, str] | None = None,
+    user_review_rows: Mapping[int, Mapping[str, object]] | None = None,
 ) -> Path:
     """Write the one disposable selection workbook; internal A/B facts stay internal."""
     display = result.drop(columns=[
@@ -1493,22 +1494,20 @@ def write_selection_workbook(
         point_columns, lambda value: str(int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))),
     )
     if review_metadata is not None:
-        display["user_status"] = display.apply(
-            lambda row: "REJECTED" if bool(row.get("prior_rejected", False)) else row.get("auto_status"), axis=1
+        def review_value(row: pd.Series, key: str) -> object:
+            review = (user_review_rows or {}).get(int(row["strategy_id"]))
+            return review.get(key) if review else None
+
+        display["user_status"] = display.apply(lambda row: review_value(row, "user_status"), axis=1)
+        display["user_rank"] = display.apply(lambda row: review_value(row, "user_rank"), axis=1)
+        display["user_analog_of_strategy_id"] = display.apply(
+            lambda row: review_value(row, "user_analog_of_strategy_id"), axis=1
         )
         display["retest"] = display.apply(
             lambda row: "RETEST" if bool(row.get("prior_retest", False)) else None, axis=1
         )
         display["auto_rank"] = display.get("final_rank")
-        display["user_rank"] = display.apply(
-            lambda row: row.get("final_rank") if row.get("user_status") in {"FINALIST", "RESERVE"} else None,
-            axis=1,
-        )
-        display["user_analog_of_strategy_id"] = display.apply(
-            lambda row: row.get("auto_analog_of_strategy_id") if row.get("user_status") == "ANALOG" else None,
-            axis=1,
-        )
-        display["comment"] = None
+        display["comment"] = display.apply(lambda row: review_value(row, "comment"), axis=1)
     review_identity_columns = ["result_id"] if review_metadata is not None else []
     review_columns = [
         "auto_status", "user_status", "retest", "auto_rank", "user_rank", "auto_analog_of_strategy_id",

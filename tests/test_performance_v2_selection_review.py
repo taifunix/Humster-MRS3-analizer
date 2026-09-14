@@ -16,8 +16,10 @@ from mrs3.performance_v2_selection_review import (
     canonical_contract,
     import_selection_review,
     latest_effective_finalists,
+    latest_user_reviews_by_strategy,
     new_run_metadata,
     persist_selection_snapshot,
+    effective_selection_decisions,
 )
 from mrs3.panel import PanelController
 from mrs3.performance_v2_store import initialize_performance_v2
@@ -65,9 +67,19 @@ def _result() -> pd.DataFrame:
 
 def _export(connection: duckdb.DuckDBPyConnection, tmp_path: Path) -> tuple[Path, dict[str, str]]:
     request = _request()
+    result = _result()
     metadata = new_run_metadata(connection)
-    path = write_selection_workbook(_result(), tmp_path / "review.xlsx", request, metadata)
-    persist_selection_snapshot(connection, request, SelectionConfig(), _result(), metadata, path.read_bytes())
+    completed_review = {
+        int(row.strategy_id): {
+            "user_status": str(row.auto_status),
+            "user_rank": row.final_rank if row.auto_status in {"FINALIST", "RESERVE"} else None,
+            "user_analog_of_strategy_id": row.auto_analog_of_strategy_id if row.auto_status == "ANALOG" else None,
+            "comment": None,
+        }
+        for row in result.itertuples()
+    }
+    path = write_selection_workbook(result, tmp_path / "review.xlsx", request, metadata, completed_review)
+    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, path.read_bytes())
     return path, metadata
 
 
@@ -130,19 +142,97 @@ def test_production_selection_export_preserves_existing_tags_on_round_trip(tmp_p
     monkeypatch.setattr(panel_module, "load_selection_candidates", lambda *_args, **_kwargs: _result())
 
     _, data = controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
-    sheet = load_workbook(BytesIO(data))["All candidates"]
+    workbook = load_workbook(BytesIO(data))
+    sheet = workbook["All candidates"]
     headers = {cell.value: cell.column for cell in sheet[1]}
     exported = {sheet.cell(row, headers["ID"]).value: sheet.cell(row, headers["RETEST"]).value for row in range(2, sheet.max_row + 1)}
     assert exported == {1: "RETEST", 2: None}
+    assert all(
+        sheet.cell(row, headers[name]).value is None
+        for row in range(2, sheet.max_row + 1)
+        for name in ("User Status", "User Rank", "Analog Of ID", "Comment")
+    )
+    for row in range(2, sheet.max_row + 1):
+        sheet.cell(row, headers["User Status"]).value = "REJECTED" if sheet.cell(row, headers["ID"]).value == 1 else "FILTERED"
+    edited = BytesIO()
+    workbook.save(edited)
 
     with duckdb.connect(str(database_root / "strategy_performance.duckdb")) as connection:
-        response = import_selection_review(connection, data)
+        response = import_selection_review(connection, edited.getvalue())
         assert connection.execute(
             "select strategy_id, tag, source, source_ref from strategy_tags order by strategy_id, tag"
         ).fetchall() == [
             (1, "REJECTED", "SELECTION_REVIEW", response["review_import_id"]),
             (1, "RETEST", "SELECTION_REVIEW", response["review_import_id"]),
         ]
+
+
+def test_reviewed_decisions_survive_new_ordinary_run_and_result_replacement(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    first_path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(first_path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    ids = {sheet.cell(row, headers["ID"]).value: row for row in range(2, sheet.max_row + 1)}
+    sheet.cell(ids[1], headers["User Status"], "FINALIST")
+    sheet.cell(ids[1], headers["User Rank"], 1)
+    sheet.cell(ids[1], headers["Comment"], "reviewed finalist")
+    sheet.cell(ids[2], headers["User Status"], "RESERVE")
+    sheet.cell(ids[2], headers["User Rank"]).value = None
+    sheet.cell(ids[2], headers["Analog Of ID"]).value = None
+    sheet.cell(ids[2], headers["Comment"], "reviewed reserve")
+    reviewed = tmp_path / "reviewed.xlsx"
+    workbook.save(reviewed)
+    import_selection_review(connection, reviewed.read_bytes())
+
+    now = datetime(2026, 9, 3, tzinfo=UTC)
+    connection.execute(
+        """insert into strategies values (3, 'strategy-3', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run',
+           'candidate-3', 'ACTIVE', null, ?, ?)""", [now, now]
+    )
+    connection.execute("update strategies set current_result_id = null where strategy_id in (1, 2)")
+    connection.execute("delete from strategy_results where result_id in (101, 102)")
+    for strategy_id, result_id in ((1, 201), (2, 202), (3, 103)):
+        connection.execute(
+            """insert into strategy_results (
+                result_id, strategy_id, report_start_utc, report_end_utc, exchange,
+                commission_rate, initial_balance, final_balance, total_pnl, total_pnl_pct,
+                max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc
+            ) values (?, ?, ?, ?, 'Bybit', .0004, 100, 110, 10, 10, 5, 5, 1, 10, ?)""",
+            [result_id, strategy_id, now, now, now],
+        )
+        connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
+
+    changed = _result().copy()
+    changed.loc[changed["strategy_id"] == 1, ["result_id", "auto_status", "finalist", "final_rank"]] = [201, "FILTERED", False, None]
+    changed.loc[changed["strategy_id"] == 2, ["result_id", "auto_status", "finalist", "final_rank"]] = [202, "FILTERED", False, None]
+    changed = pd.concat([changed, changed.iloc[[1]].assign(
+        strategy_id=3, strategy_name="strategy-3", result_id=103, auto_status="FINALIST", finalist=True,
+        final_rank=1, final_score=70.0, auto_analog_of_strategy_id=None,
+    )], ignore_index=True)
+    metadata = new_run_metadata(connection)
+    path = write_selection_workbook(
+        changed, tmp_path / "replacement.xlsx", _request(), metadata,
+        latest_user_reviews_by_strategy(connection, [1, 2, 3]),
+    )
+    exported = load_workbook(path)["All candidates"]
+    headers = {cell.value: cell.column for cell in exported[1]}
+    rows = {exported.cell(row, headers["ID"]).value: row for row in range(2, exported.max_row + 1)}
+    assert exported.cell(rows[1], headers["Auto Status"]).value == "FILTERED"
+    assert exported.cell(rows[1], headers["User Status"]).value == "FINALIST"
+    assert exported.cell(rows[1], headers["User Rank"]).value == 1
+    assert exported.cell(rows[1], headers["Comment"]).value == "reviewed finalist"
+    assert exported.cell(rows[2], headers["Auto Status"]).value == "FILTERED"
+    assert exported.cell(rows[2], headers["User Status"]).value == "RESERVE"
+    assert exported.cell(rows[2], headers["User Rank"]).value is None
+    assert exported.cell(rows[2], headers["Comment"]).value == "reviewed reserve"
+    assert all(exported.cell(rows[3], headers[name]).value is None for name in ("User Status", "User Rank", "Analog Of ID", "Comment"))
+
+    persist_selection_snapshot(connection, _request(), SelectionConfig(), changed, metadata, path.read_bytes())
+    decisions = effective_selection_decisions(connection)
+    assert decisions[1][:2] == ("FINALIST", 1)
+    assert decisions[2][:2] == ("RESERVE", None)
+    assert decisions[3][:2] == ("FINALIST", 1)
 
 
 def test_review_accepts_blank_trailing_headers(tmp_path: Path) -> None:
@@ -352,11 +442,26 @@ def test_first_asserted_retest_has_full_provenance_and_coexists_with_rejected(tm
     ]
 
 
-def test_newer_export_makes_older_workbook_non_latest(tmp_path: Path) -> None:
+def test_equivalent_newer_export_keeps_older_workbook_importable(tmp_path: Path) -> None:
     connection = _database(tmp_path)
     old_path, _ = _export(connection, tmp_path)
     old_bytes = old_path.read_bytes()
     _export(connection, tmp_path)
+
+    imported = import_selection_review(connection, old_bytes)
+    assert imported["row_count"] == 2
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == (1,)
+
+
+def test_non_equivalent_newer_export_keeps_older_workbook_rejected(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    old_path, _ = _export(connection, tmp_path)
+    old_bytes = old_path.read_bytes()
+    _export(connection, tmp_path)
+    latest_id = connection.execute(
+        "select selection_run_id from selection_runs order by created_at_utc desc, selection_run_id desc limit 1"
+    ).fetchone()[0]
+    connection.execute("update selection_results set auto_score = auto_score + 1 where selection_run_id = ? and strategy_id = 1", [latest_id])
 
     with pytest.raises(SelectionReviewError, match="SELECTION_REVIEW_NOT_LATEST_RUN"):
         import_selection_review(connection, old_bytes)
@@ -410,8 +515,51 @@ def test_analog_must_target_a_finalist_or_reserve_in_same_run(tmp_path: Path) ->
     headers = {cell.value: cell.column for cell in sheet[1]}
     sheet.cell(2, headers["User Status"], "REJECTED")
     sheet.cell(2, headers["User Rank"]).value = None
+    sheet.cell(3, headers["Analog Of ID"], 999)
     invalid = tmp_path / "invalid-analog.xlsx"
     workbook.save(invalid)
 
     with pytest.raises(SelectionReviewError, match="SELECTION_REVIEW_INVALID_ANALOG"):
         import_selection_review(connection, invalid.read_bytes())
+
+
+def test_analog_target_that_is_not_selectable_is_normalized_to_filtered(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["User Status"], "FILTERED")
+    sheet.cell(2, headers["User Rank"]).value = None
+    sheet.cell(3, headers["User Status"], "ANALOG")
+    sheet.cell(3, headers["User Rank"]).value = 2
+    sheet.cell(3, headers["Analog Of ID"], 1)
+    edited = tmp_path / "filtered-analog.xlsx"
+    workbook.save(edited)
+
+    imported = import_selection_review(connection, edited.read_bytes())
+
+    assert imported["finalist_count"] == 0
+    assert connection.execute(
+        "select strategy_id, user_status, user_rank, user_analog_of_strategy_id from selection_review_rows where review_import_id = ? order by strategy_id",
+        [imported["review_import_id"]],
+    ).fetchall() == [(1, "FILTERED", None, None), (2, "FILTERED", None, None)]
+
+
+def test_rank_on_non_selectable_status_is_normalized_to_blank(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["User Status"], "FILTERED")
+    sheet.cell(2, headers["User Rank"], 1)
+    edited = tmp_path / "filtered-rank.xlsx"
+    workbook.save(edited)
+
+    imported = import_selection_review(connection, edited.read_bytes())
+
+    assert connection.execute(
+        "select user_status, user_rank from selection_review_rows where review_import_id = ? and strategy_id = 1",
+        [imported["review_import_id"]],
+    ).fetchone() == ("FILTERED", None)

@@ -71,9 +71,22 @@ class PanelJobRegistry:
 
     @staticmethod
     def _copy(job: dict) -> dict:
-        value = json.loads(json.dumps(job))
+        value = dict(job)
         value.pop("runtime", None)
-        return value
+        return json.loads(json.dumps(value))
+
+    @staticmethod
+    def _public_copy(job: dict) -> dict:
+        value = dict(job)
+        value.pop("runtime", None)
+        kind = value.get("kind")
+        if isinstance(kind, str) and (kind == "strategies.tester" or kind.startswith("strategies.tester.")):
+            evidence = value.get("evidence")
+            if isinstance(evidence, dict) and isinstance(evidence.get("verified_reports"), dict):
+                evidence = dict(evidence)
+                evidence["verified_reports"] = len(evidence["verified_reports"])
+                value["evidence"] = evidence
+        return PanelJobRegistry._copy(value)
 
     @staticmethod
     def _valid_submit(kind: object, request: object, idempotency_key: object, resource_keys: object) -> bool:
@@ -122,9 +135,53 @@ class PanelJobRegistry:
         try: return self._copy(self.jobs[job_id])
         except KeyError: raise PanelJobError("NOT_FOUND") from None
 
+    def _peek(self, job_id: str) -> dict:
+        with self.lock:
+            try: return dict(self.jobs[job_id])
+            except KeyError: raise PanelJobError("NOT_FOUND") from None
+
+    def volatile_sync(self, job_id: str, status: dict, *, expected: dict | None = None) -> None:
+        """Update live progress without making a durable journal checkpoint."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None or not isinstance(status, dict):
+                raise PanelJobError("NOT_FOUND" if job is None else "INVALID_REQUEST")
+            if expected is not None and any(
+                job.get(key) != expected.get(key)
+                for key in ("state", "phase", "error", "evidence")
+            ):
+                return
+            state = status.get("state")
+            if state not in _STATES:
+                raise PanelJobError("INVALID_REQUEST")
+            if state != job["state"]:
+                if state not in _TRANSITIONS.get(job["state"], set()):
+                    raise PanelJobError("INVALID_REQUEST")
+                job["state"] = state
+            phase = status.get("phase")
+            if isinstance(phase, str) and phase.strip() and len(phase) <= 128:
+                job["phase"] = phase
+            progress = status.get("progress")
+            if isinstance(progress, dict):
+                job["progress"] = dict(progress)
+            if "error" in status:
+                error = status["error"]
+                if error is None or isinstance(error, dict):
+                    job["error"] = dict(error) if isinstance(error, dict) else None
+            if "evidence" in status:
+                evidence = status["evidence"]
+                if evidence is None:
+                    job.pop("evidence", None)
+                elif isinstance(evidence, dict):
+                    job["evidence"] = dict(evidence)
+
     def list(self) -> list[dict]:
         with self.lock:
             return [self._copy(job) for job in self.jobs.values()]
+
+    def public_list(self) -> list[dict]:
+        with self.lock:
+            return [self._public_copy(job) for job in self.jobs.values()]
 
     def transition(self, job_id: str, state: str, *, phase: str | None = None) -> dict:
         with self.lock:
