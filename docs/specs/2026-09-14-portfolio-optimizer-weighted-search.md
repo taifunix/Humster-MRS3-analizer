@@ -23,9 +23,39 @@ CONFIRMED/UNKNOWN добавлена в §9 плана; runtime не измен�
 После принятия он имеет приоритет над противоречащими правилами прежнего
 PRETEST_PROXY: равными долями, uniform k, обязательным перебором одиночек/пар,
 исторической базой «стартовый банк × sum(lot_x)» и повторным daily→minute sizing.
-Остальные контракты Campaign/store/runner и старые режимы сохраняются.
-Отсутствующий search_mode означает прежний режим; неизвестное значение — ошибка,
-а не fallback. Существующие сохранённые Campaign не пересчитываются автоматически.
+
+Campaign читается и исполняется только при
+`campaign_contract_version=PORTFOLIO_WEIGHTED_CAMPAIGN_V1`,
+`search_mode=WEIGHTED_V1` и `weighted_algo_version=WS1.1`. Отсутствующее,
+неподдерживаемое или legacy-значение одного из этих полей отклоняется fail-closed;
+legacy Campaign не читаются. Сравнения точные, чувствительные к регистру и без
+нормализации пробелов. В `versions` должны быть как минимум те же три поля с
+точно равными top-level значениями; дополнительные provenance-поля разрешены.
+Наличие ключа `stage1_mode` top-level либо в `versions` запрещено независимо от
+его значения.
+
+До реализации `weighted_search.py` корректный новый Campaign сохраняется, но при
+исполнении завершится единственным блокером `WEIGHTED_SEARCH_NOT_IMPLEMENTED`;
+fallback на PRETEST_PROXY запрещён.
+
+Стабильные validation-коды: `CAMPAIGN_LEGACY_STAGE1_MODE_UNSUPPORTED`,
+`CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED`, `CAMPAIGN_SEARCH_MODE_REQUIRED`,
+`CAMPAIGN_LEGACY_SEARCH_MODE_UNSUPPORTED`, `CAMPAIGN_SEARCH_MODE_UNSUPPORTED`,
+`CAMPAIGN_WEIGHTED_ALGO_VERSION_REQUIRED`,
+`CAMPAIGN_WEIGHTED_ALGO_VERSION_UNSUPPORTED`, `CAMPAIGN_VERSIONS_MISMATCH`.
+`WEIGHTED_SEARCH_NOT_IMPLEMENTED` — adapter-only код, не код валидации.
+
+Проверка short-circuit выполняется в порядке: наличие `stage1_mode`, contract
+version, search mode, algorithm version, parity `versions`; возвращается только
+первая причина. Не-строка или пустая строка `search_mode`/`weighted_algo_version`
+соответствует `*_REQUIRED`; точный `PRETEST_PROXY` — legacy search-mode code;
+другая непустая строка — соответствующий `*_UNSUPPORTED`. Не-строка или пустая
+строка contract version также unsupported. При freeze/resume ошибка отображается
+как тот же typed code без записи Campaign; adapter возвращает единственный
+blocker с тем же кодом до загрузчиков, search и workers.
+Campaign должен быть mapping: не-mapping отклоняется
+`CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED` до field-order, поскольку у него нет
+top-level или `versions` ключей.
 
 MVP: один LONG FINALIST на symbol, ручной выбор имеет приоритет. Если выбора нет,
 минимальный заданный User Rank, затем strategy_id; отсутствующий rank — после

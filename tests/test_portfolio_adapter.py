@@ -1,327 +1,160 @@
-from decimal import Decimal
-from collections.abc import Mapping, Sequence
+import pytest
+from mrs3.portfolio import candidate_search, market_snapshot, minute_capacity, spread_screen
 
-from datetime import date, datetime, timedelta, timezone
-from types import SimpleNamespace
-
-from mrs3.portfolio.adapter import build_portfolio_candidates, run_portfolio_adapter
-from mrs3.portfolio.liquidity import ReferenceReader
-from mrs3.portfolio.minute_capacity import CapacityWindow, MinuteCapacityResult
-
-
-def capacity(symbol: str, cap: str, status: str = "READY") -> MinuteCapacityResult:
-    window = CapacityWindow(7, 10080, 100, 9980, Decimal("0.01"), Decimal("100000"), Decimal("10"), Decimal(cap), Decimal(cap))
-    return MinuteCapacityResult(status, symbol, None, None, 30, Decimal("50"), window, window, Decimal(cap), "CALENDAR_7D", (), ("fixture",), f"cap-{symbol}")
-
-
-def reference():
-    instruments = [
-        {"symbol": symbol, "status": "Trading", "contract_type": "LinearPerpetual", "tick_size": "0.1", "qty_step": "0.1", "min_qty": "0.1", "max_qty": "100", "leverage_step": "0.1", "max_leverage": "100", "min_notional": "1"}
-        for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT")
-    ]
-    tiers = [{"symbol": symbol, "risk_limit_value": "100000", "max_leverage": "50"} for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT")]
-    return ReferenceReader.from_records(instruments=instruments, risk_tiers=tiers, captured_at_ms=1_000)
-
-
-def finalist(strategy_id: int, symbol: str, *, pnl: str, dd: str, recovery: str, shift: int = 20):
+from mrs3.portfolio.adapter import (
+    CAMPAIGN_CONTRACT_VERSION,
+    CAMPAIGN_SEARCH_MODE,
+    CAMPAIGN_WEIGHTED_ALGO_VERSION,
+    CampaignContractError,
+    build_portfolio_candidates,
+    run_portfolio_adapter,
+    validate_campaign_contract,
+)
+def weighted_campaign():
     return {
-        "user_status": "FINALIST", "symbol": symbol, "side": "LONG",
-        "strategy_id": strategy_id, "result_id": strategy_id * 10, "user_rank": strategy_id,
-        "total_pnl": Decimal(pnl), "max_drawdown_pct": Decimal(dd),
-        "recovery_factor": Decimal(recovery),
-        "strategy_orders": ({"order_id": 1, "lot_x": Decimal("1"), "shift_bp": shift},),
-    }
-
-
-def document():
-    ranking = {"id": "portfolio_preliminary_ranking_v1", "parameters": {}}
-    return {
-        "search": {"max_enumerated_combinations": 100},
-        "scenarios": {"BALANCED": {"account": "BALANCED"}},
-        "profiles": {
-            "BALANCED": {
-                "individual_max_dd_pct": "20",
-                "individual_net_pnl_min_exclusive": "0",
-                "ranking": {**ranking, "top_n": 1},
-            }
+        "campaign_contract_version": CAMPAIGN_CONTRACT_VERSION,
+        "search_mode": CAMPAIGN_SEARCH_MODE,
+        "weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION,
+        "versions": {
+            "campaign_contract_version": CAMPAIGN_CONTRACT_VERSION,
+            "search_mode": CAMPAIGN_SEARCH_MODE,
+            "weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION,
         },
-        "liquidity": {"maximum_age_hours": 2},
     }
 
 
-def campaign():
-    return {
-        "campaign_id": "campaign-1",
-        "config_document": document(),
-        "launch": {"profiles": [{"profile_id": "BALANCED", "max_candidates": 3}]},
-    }
+@pytest.mark.parametrize(
+    ("campaign_value", "code"),
+    (
+        (None, "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"),
+        ({"stage1_mode": None}, "CAMPAIGN_LEGACY_STAGE1_MODE_UNSUPPORTED"),
+        ({"versions": {"stage1_mode": None}}, "CAMPAIGN_LEGACY_STAGE1_MODE_UNSUPPORTED"),
+        ({"campaign_contract_version": None}, "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"),
+        ({"campaign_contract_version": ""}, "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"),
+        ({"campaign_contract_version": "other"}, "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"),
+    ),
+)
+def test_campaign_contract_validation_short_circuits_early(campaign_value, code):
+    with pytest.raises(CampaignContractError) as error:
+        validate_campaign_contract(campaign_value)
+    assert error.value.code == code
 
 
-def test_adapter_sizes_screens_ranks_and_builds_true_multi_pair_candidate():
-    rows = (
-        finalist(1, "BTCUSDT", pnl="10", dd="10", recovery="1", shift=5),
-        finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2", shift=20),
-        finalist(3, "ETHUSDT", pnl="15", dd="10", recovery="3", shift=20),
-        finalist(4, "SOLUSDT", pnl="12", dd="10", recovery="2", shift=20),
-    )
-    result = build_portfolio_candidates(
-        rows,
-        campaign(),
-        capacities={"BTCUSDT": capacity("BTCUSDT", "600"), "ETHUSDT": capacity("ETHUSDT", "400", "PRELIMINARY"), "SOLUSDT": capacity("SOLUSDT", "300")},
-        reference=reference(),
-        mark_prices={"BTCUSDT": Decimal("100"), "ETHUSDT": Decimal("50"), "SOLUSDT": Decimal("25")},
-        spread_observations={"BTCUSDT": ({"spread_bps_p95": "10"},), "ETHUSDT": ({"spread_bps_p95": "10"},), "SOLUSDT": ({"spread_bps_p95": "10"},)},
-        spread_history_statuses={"BTCUSDT": "READY", "ETHUSDT": "PRELIMINARY", "SOLUSDT": "READY"},
-        now_ms=1_000,
-    )
-
-    assert result.status == "PASS"
-    assert len(result.variants) == 7
-    assert {variant["pair_count"] for variant in result.variants} == {1, 2, 3}
-    variant = next(
-        item for item in result.variants
-        if {row["symbol"] for row in item["members"]} == {"BTCUSDT", "ETHUSDT"}
-    )
-    assert variant["profile"] == "BALANCED"
-    assert variant["scenario_id"] == "BALANCED"
-    assert variant["member_count"] == 2
-    assert variant["pair_count"] == 2
-    assert [(row["symbol"], row["position_size_usdt"]) for row in variant["members"]] == [("BTCUSDT", Decimal("600")), ("ETHUSDT", Decimal("400"))]
-    assert any(item["selection_reason"] == "OVERLAPS_SPREAD" for item in result.excluded)
-    assert "SPREAD_HISTORY_PRELIMINARY" in result.warnings
-    assert "LIQUIDITY_CAPACITY_PRELIMINARY" in result.warnings
+@pytest.mark.parametrize("value", (None, "", 1, True, []))
+def test_campaign_contract_requires_search_mode(value):
+    request = weighted_campaign()
+    request["search_mode"] = value
+    with pytest.raises(CampaignContractError) as error:
+        validate_campaign_contract(request)
+    assert error.value.code == ("CAMPAIGN_SEARCH_MODE_REQUIRED" if not isinstance(value, str) or not value else "CAMPAIGN_SEARCH_MODE_UNSUPPORTED")
 
 
-def test_adapter_reports_profile_failure_without_discarding_other_profile_results():
-    config = document()
-    config["profiles"]["AGGRESSIVE"] = {
-        "individual_max_dd_pct": "30", "individual_net_pnl_min_exclusive": "100",
-        "ranking": {"id": "portfolio_preliminary_ranking_v1", "parameters": {}, "top_n": 1},
-    }
-    config["scenarios"]["AGGRESSIVE"] = {"account": "AGGRESSIVE"}
-    request = campaign()
-    request["config_document"] = config
-    request["launch"]["profiles"].append({"profile_id": "AGGRESSIVE", "max_candidates": 5})
-
-    result = build_portfolio_candidates(
-        (finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),), request,
-        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
-        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
-        spread_history_statuses={}, now_ms=1_000,
-    )
-
-    assert [item["profile"] for item in result.variants] == ["BALANCED"]
-    assert result.blockers == ("AGGRESSIVE:INSUFFICIENT_DIRECTIONAL_UNIVERSE",)
+def test_campaign_contract_rejects_legacy_and_unknown_search_modes():
+    for value, code in (("PRETEST_PROXY", "CAMPAIGN_LEGACY_SEARCH_MODE_UNSUPPORTED"), ("OTHER", "CAMPAIGN_SEARCH_MODE_UNSUPPORTED")):
+        request = weighted_campaign()
+        request["search_mode"] = value
+        with pytest.raises(CampaignContractError) as error:
+            validate_campaign_contract(request)
+        assert error.value.code == code
 
 
-def test_adapter_fails_closed_on_stale_global_reference():
-    result = build_portfolio_candidates(
-        (finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),), campaign(),
-        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
-        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
-        spread_history_statuses={}, now_ms=7_201_001,
-    )
+@pytest.mark.parametrize("value", (None, "", 1, True, []))
+def test_campaign_contract_requires_weighted_algorithm_version(value):
+    request = weighted_campaign()
+    request["weighted_algo_version"] = value
+    with pytest.raises(CampaignContractError) as error:
+        validate_campaign_contract(request)
+    assert error.value.code == ("CAMPAIGN_WEIGHTED_ALGO_VERSION_REQUIRED" if not isinstance(value, str) or not value else "CAMPAIGN_WEIGHTED_ALGO_VERSION_UNSUPPORTED")
+
+
+def test_campaign_contract_versions_require_exact_parity_but_ignore_extras():
+    request = weighted_campaign()
+    request["versions"]["provenance"] = "ignored"
+    validate_campaign_contract(request)
+    for key in ("campaign_contract_version", "search_mode", "weighted_algo_version"):
+        missing = weighted_campaign()
+        del missing["versions"][key]
+        with pytest.raises(CampaignContractError) as error:
+            validate_campaign_contract(missing)
+        assert error.value.code == "CAMPAIGN_VERSIONS_MISMATCH"
+    for versions in (None, [], {"campaign_contract_version": "wrong", "search_mode": CAMPAIGN_SEARCH_MODE, "weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION}):
+        invalid = weighted_campaign()
+        invalid["versions"] = versions
+        with pytest.raises(CampaignContractError) as error:
+            validate_campaign_contract(invalid)
+        assert error.value.code == "CAMPAIGN_VERSIONS_MISMATCH"
+
+    mismatch = weighted_campaign()
+    mismatch["versions"]["search_mode"] = "OTHER"
+    with pytest.raises(CampaignContractError) as error:
+        validate_campaign_contract(mismatch)
+    assert error.value.code == "CAMPAIGN_VERSIONS_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "code"),
+    (
+        (lambda value: value.update(stage1_mode=None), "CAMPAIGN_LEGACY_STAGE1_MODE_UNSUPPORTED"),
+        (lambda value: value.update(campaign_contract_version="OTHER"), "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"),
+        (lambda value: value.update(search_mode=None), "CAMPAIGN_SEARCH_MODE_REQUIRED"),
+        (lambda value: value.update(search_mode="PRETEST_PROXY"), "CAMPAIGN_LEGACY_SEARCH_MODE_UNSUPPORTED"),
+        (lambda value: value.update(search_mode="OTHER"), "CAMPAIGN_SEARCH_MODE_UNSUPPORTED"),
+        (lambda value: value.update(weighted_algo_version=None), "CAMPAIGN_WEIGHTED_ALGO_VERSION_REQUIRED"),
+        (lambda value: value.update(weighted_algo_version="OTHER"), "CAMPAIGN_WEIGHTED_ALGO_VERSION_UNSUPPORTED"),
+        (lambda value: value.update(versions={}), "CAMPAIGN_VERSIONS_MISMATCH"),
+    ),
+)
+def test_adapter_returns_one_exact_contract_blocker(mutate, code):
+    request = weighted_campaign()
+    mutate(request)
+    result = run_portfolio_adapter((), request, workspace_root=".")
+    assert (result.status, result.blockers) == ("FAIL", (code,))
+
+
+@pytest.mark.parametrize("campaign", (None, "not-a-campaign"))
+def test_adapter_rejects_nonmapping_campaign_without_throw(campaign):
+    result = run_portfolio_adapter((), campaign, workspace_root=".")
+    assert (result.status, result.blockers) == ("FAIL", ("CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED",))
+
+
+def test_valid_weighted_campaign_is_blocked_before_any_adapter_fact_work(monkeypatch):
+    calls = []
+    monkeypatch.setattr(candidate_search, "search_portfolio_candidates", lambda *args, **kwargs: calls.append("search"))
+    monkeypatch.setattr(market_snapshot, "load_market_snapshot", lambda *args, **kwargs: calls.append("market"))
+    monkeypatch.setattr(minute_capacity, "calculate_minute_capacity", lambda *args, **kwargs: calls.append("capacity"))
+    monkeypatch.setattr(minute_capacity, "backfill_missing_days", lambda *args, **kwargs: calls.append("backfill"))
+    monkeypatch.setattr(spread_screen, "read_spread_history", lambda *args, **kwargs: calls.append("spread"))
+    result = run_portfolio_adapter((), weighted_campaign(), workspace_root=".")
     assert result.status == "FAIL"
-    assert result.variants == ()
-    assert result.blockers == ("REFERENCE_STALE",)
+    assert result.blockers == ("WEIGHTED_SEARCH_NOT_IMPLEMENTED",)
+    assert calls == []
 
 
-def test_runtime_adapter_uses_partial_local_minutes_and_injected_current_market(tmp_path):
-    minute_root = tmp_path / "minutes" / "BTCUSDT"
-    minute_root.mkdir(parents=True)
-    day = date(2026, 9, 8)
-    stamp = int(datetime(2026, 9, 8, tzinfo=timezone.utc).timestamp() * 1000)
-    (minute_root / "BTCUSDT2026-09-08_1m.csv").write_text(
-        "timestamp,open,high,low,close,volume,buy_volume,sell_volume,trades\n"
-        f"{stamp},100,100,100,100,28800,14000,14800,2\n",
-        encoding="utf-8",
+def test_build_adapter_blocks_valid_weighted_campaign_before_legacy_search(monkeypatch):
+    monkeypatch.setattr(candidate_search, "search_portfolio_candidates", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy search reached")))
+    result = build_portfolio_candidates(
+        (), weighted_campaign(), capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={}, now_ms=0,
     )
-    request = campaign()
-    request["created_at_utc"] = "2026-09-09T12:00:00Z"
-    request["config_document"]["inputs"] = {"bybit_minute_data_root": "minutes", "collector_root": "collector"}
-    request["config_document"]["liquidity"] = {
-        "parameters": {"close_volume_participation_pct": 30}, "round_down_usdt": 50,
-            "minimum_coverage_pct": 90, "maximum_age_hours": 2, "weekend_start_utc": "SATURDAY 00:00",
-        "weekend_end_utc": "MONDAY 00:00", "archive_publication_lag_hours": 6,
-        "backfill_write_enabled": False,
-    }
+    assert (result.status, result.blockers) == ("FAIL", ("WEIGHTED_SEARCH_NOT_IMPLEMENTED",))
 
-    def market(feed, params):
-        symbol = params["symbol"]
-        if feed == "instruments-info":
-            items = [{"symbol": symbol, "status": "Trading", "contractType": "LinearPerpetual", "priceFilter": {"tickSize": "0.1"}, "lotSizeFilter": {"qtyStep": "0.1", "minOrderQty": "0.1", "maxLimitOrderQty": "100", "minNotionalValue": "1"}, "leverageFilter": {"leverageStep": "0.1", "maxLeverage": "100"}}]
-        elif feed == "risk-limit":
-            items = [{"symbol": symbol, "id": "1", "riskLimitValue": "100000", "maxLeverage": "50"}]
-        else:
-            items = [{"symbol": symbol, "markPrice": "100"}]
-        return {"retCode": 0, "result": {"category": "linear", "list": items, "nextPageCursor": ""}}
 
+def test_build_adapter_rejects_legacy_campaign_before_any_work(monkeypatch):
+    monkeypatch.setattr(candidate_search, "search_portfolio_candidates", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy search reached")))
+    request = weighted_campaign()
+    request["stage1_mode"] = None
+    result = build_portfolio_candidates(
+        (), request, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={}, now_ms=0,
+    )
+    assert (result.status, result.blockers) == ("FAIL", ("CAMPAIGN_LEGACY_STAGE1_MODE_UNSUPPORTED",))
+
+
+def test_runtime_adapter_blocks_weighted_campaign_before_fact_loading(tmp_path):
+    request = weighted_campaign()
     result = run_portfolio_adapter(
-        (finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),), request,
-        workspace_root=tmp_path, market_fetcher=market,
-        archive_fetcher=lambda *_: (_ for _ in ()).throw(AssertionError("disabled backfill fetched")),
-    )
-
-    assert result.status == "PASS"
-    assert result.variants[0]["members"][0]["position_size_usdt"] == Decimal("600")
-    assert "LIQUIDITY_CAPACITY_PRELIMINARY" in result.warnings
-
-
-def test_new_pretest_campaign_fails_closed_when_equity_paths_are_unavailable():
-    request = campaign()
-    request["stage1_mode"] = "PRETEST_PROXY"
-    result = build_portfolio_candidates(
-        (finalist(2, "BTCUSDT", pnl="20", dd="99", recovery="2"),), request,
-        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
-        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
-        spread_history_statuses={}, now_ms=1_000,
+        (), request, workspace_root=tmp_path,
     )
 
     assert result.status == "FAIL"
-    assert result.blockers == ("BALANCED:COMMON_PRETEST_PERIOD_UNAVAILABLE",)
-
-
-def test_pretest_process_search_rehydrates_final_sizing_without_bulk_payload():
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    path = tuple(
-        {"timestamp_utc": start + __import__("datetime").timedelta(days=index), "equity": Decimal("100")}
-        for index in range(14)
-    )
-    row = {
-        **finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),
-        "initial_balance": Decimal("100"), "equity": path,
-        "report_start_utc": start, "report_end_utc": start + __import__("datetime").timedelta(days=14),
-    }
-    request = campaign()
-    request["stage1_mode"] = "PRETEST_PROXY"
-    result = build_portfolio_candidates(
-        (row,), request,
-        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
-        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
-        spread_history_statuses={}, now_ms=1_000, workers=2,
-    )
-
-    assert result.status == "PASS"
-    assert result.variants[0]["members"][0]["position_size_usdt"] > 0
-    assert "equity" not in result.variants[0]["members"][0]
-    assert "equity_path" not in result.variants[0]["metrics"]
-
-
-def test_adapter_result_compacts_calculation_only_bulk_payloads():
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    path = tuple(
-        {"timestamp_utc": start + timedelta(days=index), "equity": Decimal("100")}
-        for index in range(14)
-    )
-    row = {
-        **finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),
-        "initial_balance": Decimal("100"),
-        "equity": path,
-        "minute_equity": path,
-        "actions": ({"timestamp_utc": start},),
-        "source_provenance": {"source": "fixture"},
-        "report_start_utc": start,
-        "report_end_utc": start + timedelta(days=14),
-    }
-    request = campaign()
-    request["stage1_mode"] = "PRETEST_PROXY"
-    result = build_portfolio_candidates(
-        (row,), request,
-        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
-        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
-        spread_history_statuses={}, now_ms=1_000, workers=1,
-    )
-
-    assert result.status == "PASS"
-    variant = result.variants[0]
-    bulk_fields = {
-        "equity", "equity_series", "equity_path", "minute_equity",
-        "actions", "action_series", "strategy_actions", "minute_actions",
-    }
-
-    def assert_compact(value):
-        if isinstance(value, Mapping):
-            assert not bulk_fields.intersection(value)
-            for item in value.values():
-                assert_compact(item)
-        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            for item in value:
-                assert_compact(item)
-
-    assert_compact(variant["members"])
-    assert_compact(variant["metrics"])
-    assert variant["members"][0]["source_provenance"] == {"source": "fixture"}
-    assert variant["metrics"]["proxy_pnl_usdt"] == Decimal("0.00000000")
-    assert variant["members"][0]["actual_size_usdt"] > 0
-
-
-def test_pretest_campaign_accepts_zero_activity_with_a_valid_initial_seed():
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    row = {
-        **finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),
-        "initial_balance": Decimal("100"),
-        "equity": (),
-        "actions": (),
-        "report_start_utc": start,
-        "report_end_utc": start + __import__("datetime").timedelta(days=14),
-    }
-    request = campaign()
-    request["stage1_mode"] = "PRETEST_PROXY"
-
-    result = build_portfolio_candidates(
-        (row,), request,
-        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
-        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
-        spread_history_statuses={}, now_ms=1_000,
-    )
-
-    assert result.status == "PASS"
-    assert result.variants[0]["pretest_period"]["evidence"]["path_policy"] == "SPARSE_OBSERVATION_FORWARD_FILL"
-    assert result.variants[0]["pretest_period"]["evidence"]["rows"]["BTCUSDT:LONG:2:20"]["reason"] == "ZERO_ACTIVITY_IN_WINDOW"
-
-
-def test_adapter_uses_minute_metrics_as_final_variant_metrics(monkeypatch):
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    daily_path = tuple(
-        {"timestamp_utc": start + __import__("datetime").timedelta(days=index), "equity": Decimal("100")}
-        for index in range(14)
-    )
-    row = {
-        **finalist(2, "BTCUSDT", pnl="20", dd="10", recovery="2"),
-        "initial_balance": Decimal("100"),
-        "equity": daily_path,
-        "equity_series": daily_path,
-        "report_start_utc": start,
-        "report_end_utc": start + __import__("datetime").timedelta(days=14),
-    }
-    request = campaign()
-    period = SimpleNamespace(
-        status="PASS", available=True, start_utc=start,
-        end_utc=start + __import__("datetime").timedelta(days=14),
-        coverage_pct={}, evidence={}, exclusions=(),
-        daily_paths={"BTCUSDT:LONG:2:20": daily_path},
-    )
-    monkeypatch.setattr("mrs3.portfolio.adapter.resolve_common_pretest_period", lambda *_args, **_kwargs: period)
-
-    def refine(shortlist, *_args, **_kwargs):
-        item = dict(shortlist[0])
-        item["minute_metrics"] = {
-            "status": "PASS", "proxy_pnl_usdt": Decimal("777"),
-            "proxy_recovery_factor": Decimal("9"),
-            "proxy_max_drawdown_pct": Decimal("1"),
-            "proxy_reserve_usdt": Decimal("100"),
-        }
-        item["members"] = tuple({**dict(member), "actual_size_usdt": Decimal("12")} for member in item["members"])
-        return SimpleNamespace(status="PASS", candidates=(item,))
-
-    monkeypatch.setattr("mrs3.portfolio.adapter.refine_pretest_shortlist", refine)
-    result = build_portfolio_candidates(
-        (row,), request,
-        capacities={"BTCUSDT": capacity("BTCUSDT", "600")}, reference=reference(),
-        mark_prices={"BTCUSDT": Decimal("100")}, spread_observations={},
-        spread_history_statuses={}, now_ms=1_000,
-    )
-
-    assert result.status == "PASS"
-    assert result.variants[0]["metrics"]["proxy_pnl_usdt"] == Decimal("777")
-    assert result.variants[0]["members"][0]["actual_size_usdt"] == Decimal("12")
+    assert result.blockers == ("WEIGHTED_SEARCH_NOT_IMPLEMENTED",)

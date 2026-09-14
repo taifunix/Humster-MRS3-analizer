@@ -21,7 +21,17 @@ after non-proportional sizing, recompute priorities and all dependent margin/rep
 facts, accept or reject once, and never start a hidden stabilization loop.
 An explicit implementation checklist is now in section 13. Reserved control
 joint-test slots remain unchanged.
-Current docs handoff: WS1.1 / plan R4.2 address user-supplied narrow PLAN_REVISE
+Current implementation handoff: Phase 0 of WS1.1 / plan R4.2 is complete after
+independent Opus `CODE_REVIEW_PASS`: only mapping Campaign
+`PORTFOLIO_WEIGHTED_CAMPAIGN_V1` / `WEIGHTED_V1` / `WS1.1` is accepted, legacy
+Campaign and `stage1_mode` fail closed, and a valid Campaign returns only
+`WEIGHTED_SEARCH_NOT_IMPLEMENTED` until the weighted search phases. Focused
+adapter/Panel tests passed 136, integration tests passed 46, and whole-repo
+collection found 3823 tests without import errors. No real tester, exchange, or
+database run occurred. Next: Phase 1 source-sizing calibration evidence on
+fixtures/fakes only; real tester authorization remains required separately.
+
+WS1.1 / plan R4.2 address user-supplied narrow PLAN_REVISE
 B1-B3: coefficient-times-x IM/MM, UNKNOWN release keeps full I_held=I_all,
 and candidate_search-qualified result types. Added phase-4 release evidence
 checkbox; exact half-upper seed target and shared bootstrap indices clarified.

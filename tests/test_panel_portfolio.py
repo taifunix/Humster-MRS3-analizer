@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from http.client import HTTPConnection
@@ -19,6 +20,12 @@ from mrs3.panel import PanelController, create_panel_server
 from mrs3.panel_portfolio import PortfolioPanelError, PortfolioPanelService, STAGES, _redact_text, _safe_cell
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
 from mrs3.portfolio.config import PortfolioConfigError, migrate_portfolio_config_document
+from mrs3.portfolio.adapter import (
+    CAMPAIGN_CONTRACT_VERSION,
+    CAMPAIGN_SEARCH_MODE,
+    CAMPAIGN_WEIGHTED_ALGO_VERSION,
+    CampaignContractError,
+)
 
 
 def _config() -> dict:
@@ -50,6 +57,160 @@ def _write_config(path: Path) -> str:
 
 def _profiled_variants(selected, *_):
     return tuple({**dict(item), "profile": "BALANCED"} for item in selected)
+
+
+def test_panel_freeze_emits_weighted_contract_without_legacy_stage1(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    finalists = [{"strategy_id": 7, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG", "user_status": "FINALIST", "user_rank": 1}]
+
+    class IdleThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("mrs3.panel_portfolio.threading.Thread", IdleThread)
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists)
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    campaign = service.registry.runtime(result["job_id"])["campaign"]
+    assert campaign["campaign_contract_version"] == CAMPAIGN_CONTRACT_VERSION
+    assert campaign["search_mode"] == CAMPAIGN_SEARCH_MODE
+    assert campaign["weighted_algo_version"] == CAMPAIGN_WEIGHTED_ALGO_VERSION
+    assert "stage1_mode" not in campaign
+    assert all(campaign["versions"][key] == campaign[key] for key in ("campaign_contract_version", "search_mode", "weighted_algo_version"))
+
+
+def test_invalid_resume_contract_maps_before_decode_or_runtime_writes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    registry = PanelJobRegistry(tmp_path / ".panel-jobs.json")
+    saved = registry.submit("portfolio.stage1", {}, "resume-contract", ("portfolio_optimizer",), job_id="resume-contract")
+    registry.reserve_runtime(saved["job_id"], "campaign", {"search_mode": "PRETEST_PROXY"})
+    service = PortfolioPanelService(tmp_path, registry=registry)
+    monkeypatch.setattr("mrs3.panel_portfolio.base64.b64decode", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("decode called")))
+    calls: list[str] = []
+    service.cutoff_selector = lambda *_args, **_kwargs: calls.append("cutoff")
+    service.variant_generator = lambda *_args, **_kwargs: calls.append("variants")
+
+    service._run(saved["job_id"])
+
+    persisted = registry.get(saved["job_id"])
+    runtime = registry.runtime(saved["job_id"])
+    assert persisted["state"] == "FAILED"
+    assert persisted["error"]["code"] == "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"
+    assert runtime["diagnostics"] == [{
+        "severity": "ERROR",
+        "code": "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED",
+        "message": "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED",
+    }]
+    assert runtime["journal"][-1]["code"] == "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"
+    assert calls == []
+
+
+def test_invalid_resume_nonmapping_runtime_persists_typed_contract_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    registry = PanelJobRegistry(tmp_path / ".panel-jobs.json")
+    saved = registry.submit("portfolio.stage1", {}, "resume-runtime", ("portfolio_optimizer",), job_id="resume-runtime")
+    service = PortfolioPanelService(tmp_path, registry=registry)
+    monkeypatch.setattr(registry, "runtime", lambda *_args: [])
+
+    service._run(saved["job_id"])
+
+    persisted = registry.get(saved["job_id"])
+    stored_runtime = registry.jobs[saved["job_id"]]["runtime"]
+    assert persisted["state"] == "FAILED"
+    assert persisted["error"]["code"] == "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"
+    assert stored_runtime["diagnostics"][0]["code"] == "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"
+
+
+def test_invalid_resume_nonmapping_campaign_persists_typed_contract_failure(tmp_path: Path) -> None:
+    registry = PanelJobRegistry(tmp_path / ".panel-jobs.json")
+    saved = registry.submit("portfolio.stage1", {}, "resume-campaign", ("portfolio_optimizer",), job_id="resume-campaign")
+    registry.reserve_runtime(saved["job_id"], "campaign", "not-a-campaign")
+    service = PortfolioPanelService(tmp_path, registry=registry)
+
+    service._run(saved["job_id"])
+
+    persisted = registry.get(saved["job_id"])
+    runtime = registry.runtime(saved["job_id"])
+    assert persisted["state"] == "FAILED"
+    assert persisted["error"]["code"] == "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"
+    assert runtime["diagnostics"][0]["code"] == "CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"
+
+
+@pytest.mark.parametrize("signal_type", (KeyboardInterrupt, SystemExit, GeneratorExit, asyncio.CancelledError))
+def test_worker_reraises_process_control_signals_before_failure_persistence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, signal_type: type[BaseException]) -> None:
+    registry = PanelJobRegistry(tmp_path / ".panel-jobs.json")
+    saved = registry.submit("portfolio.stage1", {}, f"signal-{signal_type.__name__}", ("portfolio_optimizer",), job_id=f"signal-{signal_type.__name__}")
+    campaign = {
+        "campaign_contract_version": CAMPAIGN_CONTRACT_VERSION,
+        "search_mode": CAMPAIGN_SEARCH_MODE,
+        "weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION,
+        "versions": {
+            "campaign_contract_version": CAMPAIGN_CONTRACT_VERSION,
+            "search_mode": CAMPAIGN_SEARCH_MODE,
+            "weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION,
+        },
+    }
+    registry.reserve_runtime(saved["job_id"], "campaign", campaign)
+    service = PortfolioPanelService(tmp_path, registry=registry)
+    original_transition = registry.transition
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise signal_type()
+        return original_transition(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "transition", fail_once)
+    with pytest.raises(signal_type):
+        service._run(saved["job_id"])
+
+    assert calls == 1
+    assert registry.get(saved["job_id"])["state"] == "QUEUED"
+
+
+def test_invalid_panel_create_contract_maps_before_registry_write(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: [])
+    monkeypatch.setattr(
+        "mrs3.panel_portfolio.validate_campaign_contract",
+        lambda _campaign: (_ for _ in ()).throw(CampaignContractError("CAMPAIGN_SEARCH_MODE_REQUIRED")),
+    )
+    payload = {
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    }
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_campaign(payload)
+    assert (error.value.code, error.value.status, str(error.value)) == (
+        "CAMPAIGN_SEARCH_MODE_REQUIRED", 422, "CAMPAIGN_SEARCH_MODE_REQUIRED"
+    )
+    assert service.registry.list() == []
+
+
+def test_valid_frozen_campaign_reaches_adapter_not_implemented(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    finalists = [{"strategy_id": 7, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG", "user_status": "FINALIST", "user_rank": 1}]
+
+    class IdleThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists)
+    monkeypatch.setattr("mrs3.panel_portfolio.threading.Thread", IdleThread)
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    campaign = service.registry.runtime(result["job_id"])["campaign"]
+    generated = service._package_variant_generator(finalists, campaign, campaign["launch"]["profiles"])
+    assert generated["variants"] == ()
+    assert generated["blockers"] == ["WEIGHTED_SEARCH_NOT_IMPLEMENTED"]
 
 
 def test_settings_get_put_uses_exact_byte_digest_and_cas(tmp_path: Path) -> None:
@@ -917,7 +1078,7 @@ def test_package_adapter_real_contract_rejects_invalid_campaign(tmp_path: Path) 
         ({"profile_id": "BALANCED", "max_candidates": 1},),
     )
     assert result["variants"] == ()
-    assert result["blockers"] == ["CAMPAIGN_CONFIG_INVALID"]
+    assert result["blockers"] == ["CAMPAIGN_CONTRACT_VERSION_UNSUPPORTED"]
 
 
 def test_package_adapter_passes_variants_to_profile_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

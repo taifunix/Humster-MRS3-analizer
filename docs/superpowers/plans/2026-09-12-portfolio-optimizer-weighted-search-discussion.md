@@ -1029,8 +1029,11 @@ Market reference загружается один раз, вне циклов к�
   входы/выходы, fail-closed UNKNOWN, лимиты 20 LP/3M x/M joint и DoD.
 - [x] Создать `docs/decisions/0036-portfolio-optimizer-weighted-search-contract.md`
   со ссылкой на этот план; старые ADR не изменять задним числом.
-- [ ] Зафиксировать отдельный `search_mode`/версию Campaign для нового пути;
-  старые Campaign продолжают читаться по прежнему контракту.
+- [x] Зафиксировать единственный Campaign contract: top-level и `versions`
+  содержат точные `campaign_contract_version=PORTFOLIO_WEIGHTED_CAMPAIGN_V1`,
+  `search_mode=WEIGHTED_V1`, `weighted_algo_version=WS1.1`; legacy Campaign
+  не читаются и `stage1_mode` запрещён. До `weighted_search.py` валидный
+  Campaign возвращает только `WEIGHTED_SEARCH_NOT_IMPLEMENTED`, без fallback.
 - [x] Получить независимый `PLAN_APPROVED` для WS1.1/ADR-0036: пользователь
   передал заключение Opus 2026-09-14, см. журнал review. Approval R4 относится
   к алгоритмическому плану и не закрывает этот пункт автоматически. Только после

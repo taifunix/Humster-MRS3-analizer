@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import asyncio
 import base64
 import hashlib
 import inspect
@@ -36,6 +37,13 @@ from .portfolio.config import (
 )
 from .config import load_duckdb_import_settings
 from .portfolio.input import apply_finalist_cutoff, read_current_finalists
+from .portfolio.adapter import (
+    CAMPAIGN_CONTRACT_VERSION,
+    CAMPAIGN_SEARCH_MODE,
+    CAMPAIGN_WEIGHTED_ALGO_VERSION,
+    CampaignContractError,
+    validate_campaign_contract,
+)
 
 
 STAGES = (
@@ -193,6 +201,13 @@ def _safe_cell(value: Any, *, key: str = "") -> Any:
             return "'" + text
         return text
     return _redact_text(value)
+
+
+def _validate_frozen_campaign(campaign: Any) -> None:
+    try:
+        validate_campaign_contract(campaign)
+    except CampaignContractError as error:
+        raise PortfolioPanelError(error.code, error.code, status=422) from error
 
 
 def _portfolio_search_workers(root: Path) -> int:
@@ -465,7 +480,7 @@ class PortfolioPanelService:
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
         pairs = tuple((pair["pair"], side) for pair in launch["pairs"] for side in ("LONG", "SHORT"))
         try:
-            # Campaign snapshots need the bulk series for PRETEST_PROXY.
+            # Campaign snapshots retain the finalist evidence needed by search.
             loaded = _invoke(self.finalists_reader, database, pairs, True)
             finalists_list = []
             for row in (loaded or ()):
@@ -716,7 +731,29 @@ class PortfolioPanelService:
                     frozen_raw = self._encode_document(document)
             except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
                 raise PortfolioPanelError("CONFIG_INVALID", "portfolio settings are invalid", status=422) from None
-            campaign = {"campaign_id": campaign_id, "created_at_utc": _now(), "input_digest": input_digest, "config_digest": config_digest, "frozen_config_digest": _digest(frozen_raw), "config_bytes": base64.b64encode(frozen_raw).decode("ascii"), "config_document": _plain(document), "launch": _plain(launch), "finalists": finalists, "stage1_mode": "PRETEST_PROXY", "versions": {"schema_version": SCHEMA_VERSION, "policy_version": POLICY_VERSION, "algorithm_versions": _plain(document.get("algorithm_versions", {}))}}
+            campaign = {
+                "campaign_id": campaign_id,
+                "created_at_utc": _now(),
+                "input_digest": input_digest,
+                "config_digest": config_digest,
+                "frozen_config_digest": _digest(frozen_raw),
+                "config_bytes": base64.b64encode(frozen_raw).decode("ascii"),
+                "config_document": _plain(document),
+                "launch": _plain(launch),
+                "finalists": finalists,
+                "campaign_contract_version": CAMPAIGN_CONTRACT_VERSION,
+                "search_mode": CAMPAIGN_SEARCH_MODE,
+                "weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION,
+                "versions": {
+                    "campaign_contract_version": CAMPAIGN_CONTRACT_VERSION,
+                    "search_mode": CAMPAIGN_SEARCH_MODE,
+                    "weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION,
+                    "schema_version": SCHEMA_VERSION,
+                    "policy_version": POLICY_VERSION,
+                    "algorithm_versions": _plain(document.get("algorithm_versions", {})),
+                },
+            }
+            _validate_frozen_campaign(campaign)
             saved = None
             submission_key = f"portfolio:{campaign_id}"
 
@@ -896,7 +933,13 @@ class PortfolioPanelService:
     def _run(self, job_id: str) -> None:
         published: Path | None = None
         previous: bytes | None = None
+        saved = self.registry.get(job_id)
+        if saved.get("state") in _TERMINAL:
+            return
         try:
+            runtime = self.registry.runtime(job_id)
+            campaign = runtime.get("campaign") if isinstance(runtime, Mapping) else None
+            _validate_frozen_campaign(campaign)
             self.registry.transition(job_id, "RUNNING", phase=STAGES[0])
             saved = self.registry.get(job_id)
             runtime = self.registry.runtime(job_id)
@@ -1041,6 +1084,8 @@ class PortfolioPanelService:
                 published = None
                 raise
             return
+        except (KeyboardInterrupt, SystemExit, GeneratorExit, asyncio.CancelledError):
+            raise
         except BaseException as error:
             if self._cancelled(job_id):
                 try:
@@ -1051,7 +1096,8 @@ class PortfolioPanelService:
             if published is not None:
                 self._rollback_result(published, previous)
             try:
-                failed_runtime = self.registry.runtime(job_id)
+                failed_runtime_value = self.registry.runtime(job_id)
+                failed_runtime = dict(failed_runtime_value) if isinstance(failed_runtime_value, Mapping) else {}
                 candidate = failed_runtime.get("staged_workbook_path")
                 if not isinstance(candidate, str):
                     campaign = failed_runtime.get("campaign")
@@ -1073,12 +1119,14 @@ class PortfolioPanelService:
                 code = error.code if isinstance(error, PortfolioPanelError) else "PORTFOLIO_JOB_FAILED"
                 message = str(error) if isinstance(error, PortfolioPanelError) else "portfolio calculation failed"
                 diagnostics = [{"severity": "ERROR", "code": code, "message": _redact_text(message)}]
-                failed_runtime = self.registry.runtime(job_id)
+                failed_runtime_value = self.registry.runtime(job_id)
+                failed_runtime = dict(failed_runtime_value) if isinstance(failed_runtime_value, Mapping) else {}
                 failed_runtime.pop("workbook_path", None)
                 entries = failed_runtime.get("journal") if isinstance(failed_runtime.get("journal"), list) else []
                 stage_index = failed_runtime.get("stage_index")
                 stage = STAGES[stage_index] if isinstance(stage_index, int) and 0 <= stage_index < len(STAGES) else "FAILED"
-                entries.append({"timestamp_utc": _now(), "stage": stage, "severity": "ERROR", "code": code if code.startswith("PORTFOLIO_JOB_") else f"PORTFOLIO_JOB_{code}", "text": _redact_text(message), "counters": _plain(failed_runtime.get("counters", {}))})
+                journal_code = code if code.startswith(("PORTFOLIO_JOB_", "CAMPAIGN_")) else f"PORTFOLIO_JOB_{code}"
+                entries.append({"timestamp_utc": _now(), "stage": stage, "severity": "ERROR", "code": journal_code, "text": _redact_text(message), "counters": _plain(failed_runtime.get("counters", {}))})
                 failed_runtime["journal"] = entries[-200:]
                 self.registry.sync(job_id, {"state": "FAILED", "phase": "FAILED", "error": {"code": code, "message": _redact_text(message)}, "result": {}}, runtime={**failed_runtime, "diagnostics": diagnostics, "finished_at": _now()})
             except PanelJobError:
