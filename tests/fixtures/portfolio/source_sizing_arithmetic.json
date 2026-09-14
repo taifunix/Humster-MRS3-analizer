@@ -1,0 +1,8 @@
+{
+  "x": 50,
+  "use_fix": false,
+  "rows": [
+    {"cycle": "t1", "delta": 10, "S": 100},
+    {"cycle": "t2", "delta": 20, "S": 200}
+  ]
+}

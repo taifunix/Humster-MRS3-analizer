@@ -21,15 +21,25 @@ after non-proportional sizing, recompute priorities and all dependent margin/rep
 facts, accept or reject once, and never start a hidden stabilization loop.
 An explicit implementation checklist is now in section 13. Reserved control
 joint-test slots remain unchanged.
-Current implementation handoff: Phase 0 of WS1.1 / plan R4.2 is complete after
-independent Opus `CODE_REVIEW_PASS`: only mapping Campaign
+Current implementation handoff: Phase 1 of WS1.1 / plan R4.2 is complete after
+independent Opus `CODE_REVIEW_PASS`. Two controls are fixed in Phase 1 evidence:
+one-level strategy 16618 and three-level strategy 19081. Source sizing remains
+dynamic (`use_fix=false`): for the current 100%/risk=1 LONG contract, S_i,k is
+the sizing balance before an opening from flat and changes with accumulated
+balance; an unknown boundary cycle remains UNKNOWN. Price/Cost remain execution
+facts, not S. Legacy REPLACE now clears absent optional source fields instead of
+inheriting the prior revision while preserving FINALIST review fields and the v4
+result ID. Focused Phase 1 tests passed 145; the existing false-UPNL parser gate
+passed separately. No real tester, mass retest, or exchange request occurred.
+Next: Phase 2 common data preparation and reference integration on fixtures/fakes.
+
+Phase 0 remains complete: only mapping Campaign
 `PORTFOLIO_WEIGHTED_CAMPAIGN_V1` / `WEIGHTED_V1` / `WS1.1` is accepted, legacy
 Campaign and `stage1_mode` fail closed, and a valid Campaign returns only
 `WEIGHTED_SEARCH_NOT_IMPLEMENTED` until the weighted search phases. Focused
 adapter/Panel tests passed 136, integration tests passed 46, and whole-repo
 collection found 3823 tests without import errors. No real tester, exchange, or
-database run occurred. Next: Phase 1 source-sizing calibration evidence on
-fixtures/fakes only; real tester authorization remains required separately.
+database run occurred. Real tester authorization remains required separately.
 
 WS1.1 / plan R4.2 address user-supplied narrow PLAN_REVISE
 B1-B3: coefficient-times-x IM/MM, UNKNOWN release keeps full I_held=I_all,
@@ -57,12 +67,10 @@ Current Panel
 search runs through adapter/candidate_search, not the older search/integration
 fixture path. Plan reuses Campaign/results/sizing/market-data/tester seams and
 replaces only the new-mode composition generator and dependent sizing metrics.
-Luna read-only audit confirmed that current reports cannot recover planned
-per-cycle notional under dynamic UPNL/frozen sizing. Price/Cost are actual fills.
-Existing mass retest sets my_fix_balance but does not enable use_fix in the
-template; a known fixed-sizing calibration must be verified explicitly.
-Next implementation step: two representative source-basis checks and a copied-DB
-mass REPLACE preservation check; no production migration or tester run performed.
+Luna implemented the Phase 1 regression and Opus accepted it. The imported reports
+and user-confirmed dynamic tester contract establish the current per-cycle sizing
+basis without enabling use_fix. Price/Cost remain actual fills. Boundary cycles
+without a known opening basis stay UNKNOWN. No tester run was performed.
 Research arithmetic check: 14 direct-bank/bootstrap identities and 10 finite-
 source slot-model checks passed against independent small-state enumeration.
 These checks do not establish trading-model accuracy or end-to-end performance.

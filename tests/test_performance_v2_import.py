@@ -308,6 +308,17 @@ def test_import_persists_allowlisted_source_metadata_and_existing_action_slot(tm
     assert "must-not-save" not in metadata
 
 
+def test_source_metadata_keeps_invalid_field_evidence_with_legacy_exchange_setting() -> None:
+    metadata = import_module._optimizer_source_metadata_json(
+        {"exchange": {"use_upnl": True}, "basic": {"use_fix": "invalid"}},
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "a" * 64,
+    )
+
+    assert metadata is not None
+    assert json.loads(metadata)["invalid_fields"] == ["basic.use_fix"]
+
+
 def test_import_reports_parse_progress_for_each_completed_report(tmp_path: Path) -> None:
     request, _ = _request(tmp_path, names=("alpha", "beta"))
     events: list[tuple[str, int, int]] = []
@@ -362,6 +373,37 @@ def test_replace_preserves_user_finalist_status_rank_and_comment(tmp_path: Path)
         assert connection.execute(
             "select current_result_id from strategies where strategy_id = ?", [strategy_id]
         ).fetchone() == (result_id,)
+
+        first_result = result_id
+        first_actions = connection.execute(
+            "select count(*) from strategy_actions where result_id = ? and raw_action_json is not null", [result_id]
+        ).fetchone()[0]
+        assert first_actions > 0
+        assert connection.execute(
+            "select optimizer_source_metadata_json is not null from strategy_results where result_id = ?", [result_id]
+        ).fetchone() == (True,)
+
+    _rewrite_report(request, FIXTURE.read_bytes())
+    replacement = PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config, mode="REPLACE",
+        replacement_strategy_ids={"alpha": strategy_id}, expected_current_result_ids={"alpha": first_result},
+        listing_dates_path=request.listing_dates_path,
+    )
+    assert import_performance_v2(replacement).imported_count == 1
+
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select current_result_id from strategies where strategy_id = ?", [strategy_id]
+        ).fetchone() == (first_result,)
+        assert connection.execute(
+            "select user_status, user_rank, comment from selection_review_rows where strategy_id = ?", [strategy_id]
+        ).fetchone() == ("FINALIST", 1, "keep this")
+        assert connection.execute(
+            "select raw_action_json from strategy_actions where result_id = ? order by action_index", [first_result]
+        ).fetchall() == [(None,), (None,)]
+        assert connection.execute(
+            "select optimizer_source_metadata_json from strategy_results where result_id = ?", [first_result]
+        ).fetchone() == (None,)
 
 
 def test_add_accepts_tester_report_order_ids_outside_mrs3_order_slots(tmp_path: Path) -> None:

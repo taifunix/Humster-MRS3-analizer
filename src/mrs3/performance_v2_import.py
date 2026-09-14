@@ -408,6 +408,8 @@ def _optimizer_source_metadata_json(
                 selected[field] = value
         if selected:
             captured[section] = selected
+    if captured == {"exchange": {"use_upnl": True}} and not invalid:
+        return None
     if not captured and not invalid:
         return None
     document: dict[str, object] = {

@@ -6,6 +6,7 @@ from pathlib import Path
 from hashlib import sha256
 from io import BytesIO
 import json
+import math
 import pytest
 from openpyxl import load_workbook
 
@@ -29,6 +30,9 @@ import duckdb
 from mrs3.panel_strategy_batch import validate_strategy_manifest
 
 
+PORTFOLIO_ARITHMETIC_FIXTURE = Path(__file__).parent / "fixtures" / "portfolio" / "source_sizing_arithmetic.json"
+
+
 def test_canonical_json_encodes_typed_values_and_omits_runtime_provenance() -> None:
     value = {
         "b": Decimal("1.20"),
@@ -39,6 +43,18 @@ def test_canonical_json_encodes_typed_values_and_omits_runtime_provenance() -> N
     }
 
     assert canonical_json(value) == '{"a":"2026-01-02","b":"1.20","n":7}'
+
+
+def test_dynamic_source_sizing_arithmetic_uses_per_cycle_basis_and_reconstructs() -> None:
+    values = json.loads(PORTFOLIO_ARITHMETIC_FIXTURE.read_text(encoding="utf-8"))
+    assert values["use_fix"] is False
+    assert values["rows"][0]["S"] != values["rows"][1]["S"]
+    normalized = [row["delta"] / row["S"] for row in values["rows"]]
+    increments = [value * values["x"] for value in normalized]
+    assert normalized == [0.1, 0.1]
+    assert increments == [5.0, 5.0]
+    for row, increment in zip(values["rows"], increments, strict=True):
+        assert math.isclose(increment * row["S"] / values["x"], row["delta"], rel_tol=1e-8, abs_tol=1e-8)
 
 
 def test_cohort_digest_is_member_order_and_timestamp_independent() -> None:
@@ -190,6 +206,9 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
     assert validate_strategy_manifest(batch.manifest_path).analysis_run_id == "bulk-1"
     strategy = json.loads((batch.strategies_path / "final.json").read_text(encoding="utf-8"))
     assert strategy["name"] == "final"
+    assert strategy["basic"]["use_fix"] is False
+    assert strategy["exchange"]["use_upnl"] is True
+    assert strategy["exchange"]["use_frozen_balance"] is True
     assert strategy["basic"]["my_fix_balance"] == 1000.0
 
 
