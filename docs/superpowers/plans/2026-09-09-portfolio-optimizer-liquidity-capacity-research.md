@@ -3,7 +3,50 @@
 **Date:** 2026-09-09
 **Status:** simplified design proposal; implementation requires approval
 
-## Goal
+Последовательное описание дальнейшего поиска, долей участия, лимитера,
+приоритетов, DD с запасом и маржинальных проверок собрано в
+[обсуждении алгоритма от 2026-09-12](2026-09-12-portfolio-optimizer-weighted-search-discussion.md).
+Этот документ сохраняет детали расчёта ликвидностной ёмкости.
+
+## Discussion update — participation weights and DD reserve (2026-09-11)
+
+User provisionally accepted the following MVP risk estimate for further design
+discussion. This records intent, not implementation or reviewed acceptance.
+
+- Start with AGGRESSIVE, one LONG finalist per symbol. Each symbol has an
+  independently adjustable full-position participation weight from zero to
+  its liquidity ceiling as a percentage of the scenario bank. Zero excludes
+  the symbol; a weight or the sum of weights may exceed 100% subject to risk
+  and margin constraints. Liquidity is a maximum, not a mandatory actual size.
+- High individual DD alone must not exclude a finalist. Composition and
+  position weights are selected jointly. Existing individual-DD gate rules
+  need a subsequent contract revision; no runtime change is made here.
+- On a common historical window, scale monetary equity changes to the chosen
+  sizes and sum them with the scenario bank counted once. Compute monetary
+  drawdown from that aggregate path: D_history. Compute D_sum as the sum of
+  each scaled member's monetary maximum drawdown on the same window/grid.
+- Proposed configurable reserve alpha in [0, 1], initially 0.5:
+  D_selection = D_history + alpha * (D_sum - D_history).
+  Compare 100 * D_selection / scenario_bank with the profile risk limit.
+  This is a percent-of-scenario-bank constraint, not peak-equity percentage DD.
+- Show historical DD and reserve-adjusted DD separately. Alpha=0 trusts the
+  observed diversification; alpha=1 gives no credit for it. This is a chosen
+  historical stress heuristic, not a calibrated confidence bound or a
+  guarantee of future risk. Pairwise correlation of strategy equity changes
+  remains explanatory and does not replace the DD calculation.
+- Acceptance examples for future implementation: D_history=600 and
+  D_sum=1400 give D_selection=1000 at alpha=0.5; single-member portfolios
+  receive no artificial diversification discount.
+- Max candidates is the number of ranked pre-test allocations submitted to
+  joint tick tests, not the first compositions in enumeration order.
+- Next discussion: jointly choose the simultaneous-position limiter L and
+  participation weights. The no-limiter aggregate curve does not predict
+  limiter-induced cancelled entries, changed position cycles, or forced exits.
+  Reuse and verify the existing count-by-pair/partial-fill/priority contract
+  before defining a limiter replay and ranking algorithm. Limiter search,
+  priorities, and the final allocation algorithm are still undecided.
+
+## Capacity goal
 
 Give the Optimizer a deliberately coarse maximum full-position/closing-order
 estimate with a useful resolution of 50 USDT, warn about strategy shifts

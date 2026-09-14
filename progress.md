@@ -1,7 +1,480 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-10
+**Updated:** 2026-09-14
 **Current branch:** `main`
+
+2026-09-14 current planning task: root (explicit user override of Planner Sol)
+replaced the accumulated weighted-search discussion with a technical plan at
+`docs/superpowers/plans/2026-09-12-portfolio-optimizer-weighted-search-discussion.md`.
+Opus remains the independent Advisor; two automatic review calls timed out after
+300 s. The user then supplied an external PLAN_REVISE for R1 (B1-B7, O1-O7).
+Root revised the plan through R2/R3 and recorded dispositions and counterexamples in
+`docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-review-response.md`.
+The user then supplied narrow PLAN_REVISE and finally PLAN_APPROVED for R3.
+After R3 approval the user rejected loss of limiter sizing benefit and requested
+a correction. Root prepared R4: full IM coverage and full profile MM before
+reaction; profile free reserve for retained positions after reaction. Existing
+account drawdown and 1.5% all-in excess-position loss remain. Initial LP and
+pruning now retain x that fails off but passes with L. The user supplied an Opus
+PLAN_APPROVED for R4. Its one optional clarification is adopted in R4.1:
+after non-proportional sizing, recompute priorities and all dependent margin/replay
+facts, accept or reject once, and never start a hidden stabilization loop.
+An explicit implementation checklist is now in section 13. Reserved control
+joint-test slots remain unchanged.
+Current docs handoff: WS1.1 / plan R4.2 address user-supplied narrow PLAN_REVISE
+B1-B3: coefficient-times-x IM/MM, UNKNOWN release keeps full I_held=I_all,
+and candidate_search-qualified result types. Added phase-4 release evidence
+checkbox; exact half-upper seed target and shared bootstrap indices clarified.
+WS1.1 at docs/specs/2026-09-14-portfolio-optimizer-weighted-search.md
+and ADR-0036 received user-forwarded Opus PLAN_APPROVED on 2026-09-14.
+The optional section-9 qualifier is adopted: top-ell only when CONFIRMED,
+full I_all when UNKNOWN. Main spec amendment and ADR are accepted; phase-0
+document/spec approval checkboxes are complete. Runtime Campaign-version and
+implementation phases remain unchecked. Next: phase-1 source sizing calibration.
+WS1 defines missing-data dependencies, a Campaign-memory cache, bootstrap RNG,
+margin/excess-position rules, versioned mode and acceptance evidence. Runtime unchanged.
+The R4 executable synthetic check passed: off/L10/L9/L8 margin banks are
+2778/1936/1767/1784 USDT rounded up for fifteen 1000-USDT positions; at B=2000
+proportional position capacity is 720 off versus 1033.49 with L10 before qtyStep.
+Checks cover all state inequalities, arbitrary retained subsets, DD/liquidity
+constraints and no guaranteed benefit when reserve=0 or full MM binds.
+This is arithmetic evidence, not actual exchange rates or trading results.
+Parallel execution uses the existing single duckdb_import.workers panel setting;
+no new solver/bootstrap worker knobs. User hardware is 36 cores/200GB, while
+os.cpu_count() reports 34 visible logical CPUs in this agent environment.
+Budget defaults require measurement of concurrent tasks and dependent rounds.
+Current Panel
+search runs through adapter/candidate_search, not the older search/integration
+fixture path. Plan reuses Campaign/results/sizing/market-data/tester seams and
+replaces only the new-mode composition generator and dependent sizing metrics.
+Luna read-only audit confirmed that current reports cannot recover planned
+per-cycle notional under dynamic UPNL/frozen sizing. Price/Cost are actual fills.
+Existing mass retest sets my_fix_balance but does not enable use_fix in the
+template; a known fixed-sizing calibration must be verified explicitly.
+Next implementation step: two representative source-basis checks and a copied-DB
+mass REPLACE preservation check; no production migration or tester run performed.
+Research arithmetic check: 14 direct-bank/bootstrap identities and 10 finite-
+source slot-model checks passed against independent small-state enumeration.
+These checks do not establish trading-model accuracy or end-to-end performance.
+The R2 research check also covers fixed-bank homogeneity, baseline versus
+counterfactual occupancy, the omitted drawdown/overflow state, top-k epigraph
+and empirical-quantile definition; it counts LP dimensions, not solver runtime.
+Engset is removed; frozen-cycle replay supplies MODEL ordering for L, with
+UNKNOWN on missing attribution. Limited joint comparisons stay within
+Max candidates per profile. The R3 synthetic check passed using current margin.py:
+pending IM differs from position IM; limiter loss affects reserve and required B.
+LP calls share a proposed cap of 20 per profile, up to eight adaptive PnL goals
+and two CDaR alternatives; operational time defaults follow measurement.
+No optimizer runtime code/config was changed in this planning task. Earlier
+entries below are historical evidence; the technical plan supersedes their
+draft section references and discarded proposals, not their verification facts.
+
+2026-09-13 finalist refresh decision: user chose new reports for all 21 current
+finalists instead of further source discovery. Draft section 3.1 separates a
+one-time compatible enrichment/REPLACE path from the future automatic importer
+contract. Disposable migrated-schema probe: 7 existing ADD/REPLACE/review tests
+passed in 12.29 s (20 extended-schema initializations). A nullable result metadata
+column preserves these paths; adding action columns would break positional append.
+Reuse existing raw_action_json for Price/Cost, with revision-checked result metadata.
+The first stdin-based probe failed on Windows multiprocessing spawn; rerunning
+from a real guarded script passed. No production migration, new retest or new
+report load performed; one-time loader and copy verification remain to implement.
+Evidence: docs/superpowers/plans/2026-09-13-portfolio-optimizer-finalist-sizing-audit.md.
+
+Portfolio search discussion revised 2026-09-13: the Russian design is in
+`docs/superpowers/plans/2026-09-12-portfolio-optimizer-weighted-search-discussion.md`.
+It proposes liquidity-capped position notionals and required capital as joint
+outputs: a PnL30/capital frontier, model-minimum bank and model saturation bank.
+Proposed CDaR-assisted search with a separate MaxDD constraint replaces the draft's weight grid,
+D_base and 50% diversification discount. A stationary-bootstrap shortlist check
+may raise the required bank; this checked capital is not a proven global optimum.
+Both research papers were examined, including the user-supplied 2026 journal PDF.
+The synthetic NumPy bootstrap-only benchmark took a median 6.53 s for 12
+allocations x 1000 scenarios over 90 days at 5-minute resolution, sampled process
+RSS about 51 MiB. This excludes DB load, LP, margin and tester; no production
+performance claim is made.
+Prior agreements remain: configurable 5-minute grid, full-position liquidity
+caps, shared Max candidates, no entry queue, bot priorities 5-to-1/random ties,
+SlotScore as an initial priority heuristic, and basic.max_balance with full lot_x
+sizing. User confirms bot/tester are the same program. Real execution remains
+subject to joint testing; the linear model grants no limiter risk discount.
+User clarified available history: about 1-2 months jointly and up to 3-4 months
+individually; extending the common history is not feasible. Draft sections 3/3.1
+now separate full-history individual preparation from common-window portfolio
+calculations. Code inspection found existing raw actions/equity, window cache
+and holding median/p95. Proposed additions reuse them while distinguishing
+flat-boundary/geometric selection metrics from synchronous linear portfolio
+metrics; derived caches must invalidate on REPLACE even when result_id is kept.
+Section 12.1 proposes adding a strategy with old USD position sizes fixed,
+reusing prepared series and optimizing only the addition and bank, followed by
+new whole-portfolio risk/limiter testing. This is not implemented or approved.
+User approved MaxDD 20/10/5 by profile, then explicitly approved prior-peak
+total equity as the denominator. Section 6.1 and ADR-0035 record this narrow
+decision. Sections 7-10 now use the peak-relative path constraint for capital
+and the proposed bootstrap check; dollar MaxDD divided by the cap is removed.
+The user requested a case-specific CDaR recommendation recorded in the draft.
+Section 6.2 recommends relative peak CDaR80, CDaR90 sensitivity and no separate
+CDaR hard gate for the first version. For each positive PnL target, find minimum
+bank under peak MaxDD/margin, then at that same bank minimize dollar CDaR80 as
+a surrogate alternative generator. Recompute true relative metrics on BOTH
+solutions; no claim of global relative-CDaR optimality or guaranteed improvement.
+MaxDD numbers and denominator are accepted; CDaR remains a recommendation.
+The user also accepted checking margin at selected position sizes and at the
+profile drawdown boundary, including temporary limiter overflow. Insufficient
+collateral requires smaller positions or more capital and a new constraint
+check. The user then delegated analysis and the reserve choice; root recommends
+retaining ADR-0029 values 20/40/60 for the first version. Section 9 records that
+choice, not a claim of optimal calibration. A 10000 peak/initial-bank illustration
+with USDT-only collateral and no adjustments gives post-DD IM caps 6400/5400/3800.
+At otherwise fixed inputs an IM-bound bank is 25% higher with 60% reserve than
+with 50%; a DD-bound bank may be unaffected. Decimal arithmetic checked both
+effects. Proposed output identifies the binding risk/margin constraint and
+liquidity saturation; sensitivity on fixed positions does not multiply joint
+tests or automatically relax profiles. The user has now explicitly accepted
+MM limits 50/35/20; exact stress states remain open. No runtime/config or old
+ADR change was made.
+The user accepted mass execution of all concurrently resting entry orders
+before limiter action as a required stress. In response to their simplification
+question, the user accepted bounded maximum IM/MM instead of replaying a
+separate historical margin series for pretest. Bounds use chosen scenario
+position sizes (not all liquidity caps), existing positions and remaining
+orders without double counting, and post-DD collateral. Historical equity
+for PnL/DD/CDaR and joint testing remain required. Price/sizing envelopes and
+coverage of mixed filled/unfilled states still need a justified contract;
+this design acceptance does not mean a valid bound is already implemented.
+The user also accepted bootstrap horizon H equal to the common available
+history of the selected universe, fixed across all candidates in a run.
+Dropping a member from a candidate does not extend its comparison horizon.
+The user accepted stationary bootstrap with mean block lengths 1/3/7 days,
+editable as a list in Optimizer settings and frozen in each run snapshot.
+These defaults are project calibration choices, not paper-established optima.
+Section 15.1 records the UI/JSON requirement; no settings implementation was
+made during this design discussion. The user accepted default p95 and the maximum
+of historical MaxDD and each block-length scenario percentile as an initial
+gate to evaluate on the data, with an editable percentile. Capital adjustment
+keeps USD position sizes fixed and rechecks margin; this is not a calibrated
+future-risk guarantee. Draft section 10.1 records the analysis protocol:
+same-bank comparisons, capital uplift and binding constraint, tail diagnostics,
+block/seed sensitivity, joint-tester comparison and later-period follow-up.
+The user accepted 1000 scenarios per block length per shortlisted portfolio
+(3000 with default lengths), editable in settings and frozen in the snapshot.
+Batching and fixed-scenario reuse during capital search remain required;
+these calculations do not multiply joint tester runs. The user accepted a
+bootstrap shortlist cap of 3 * Max candidates per profile, with editable
+multiplier, deduplication and diversity of capital/PnL/risk alternatives.
+The cap does not require filling the list; all final L/priority variants
+remain inside Max candidates. Exact diversity selection and additional
+sensitivity-check budgets remain open; no runtime was changed.
+Section 9 now explains reserve/MM coupling on one collateral base:
+I/M <= min(1-r,q/k), k=MM/IM for each nonzero state. With illustrative k=0.5,
+accepted reserves imply MM loads 40/30/20, so proposed MM caps 50/35/20 add no
+tightening. With k=0.7, BALANCED's proposed MM cap forces 50% free reserve.
+Exact Fraction checks passed. These are arithmetic examples, not observed
+pair coefficients; MM caps are now accepted as starting values for the new search.
+Root's starting MM recommendation remains 50/35/20 after this coupled analysis:
+an additional cap when the accepted IM reserve is insufficient, with no extra
+tightening at illustrative k=0.5. Public risk-limit reads for five finalist
+symbols returned URLError, so current rates and real-portfolio calibration
+were not obtained; official formulas and algebra support only the stated
+conditional examples. The user explicitly accepted these MM numbers.
+The user also requested all adjustable Optimizer parameters in the Panel
+Settings block using the same local JSON, including advanced fields and risk
+limits. Draft section 15.1 records the UI/config inventory, field descriptions,
+bounds, save/reload checks and immutable run snapshots; new editable risk
+policy semantics must be versioned before runtime implementation.
+Section 15.2 records mandatory Bybit rate-limit investigation and protection
+before another real data-loading run after the user reported an earlier ban:
+shared worker/process budget, headroom for other clients on the same IP,
+fresh snapshot reuse, response-aware backoff and durable cooldown, Panel status
+and fake-API verification. Official IP/UID/endpoint rules checked on 2026-09-13;
+the reported incident's exact cause is not yet verified. These are planned
+requirements, not implemented UI or API protection.
+A fixed relative MaxDD cap also admits linear constraints for the additive
+pretest model; that does not establish linearity of relative CDaR or bot sizing.
+Root one-off checks passed for empirical tail arithmetic (including 200
+fractional-boundary cases), zeros and scale/capital behavior. Synthetic 15-series,
+60-day, 5-minute, 60-candidate curve + MaxDD + CDaR80/90 benchmark median:
+0.0540 s (source matrix 1.98 MiB), excluding DB, LP, bootstrap, margin and tester.
+Read-only follow-up confirmed 21 explicit User Status FINALIST strategies across
+15 active pairs, all present in the Panel's effective selection view. The
+Optimizer reader incorrectly requires user marks on the latest selection run;
+the Panel instead preserves each strategy's latest accepted user status across
+later analyses. Missing review rows on a new run are not missing user finalists
+or database corruption. Record this reader mismatch for implementation; do not
+require the user to re-mark finalists. The effective view also includes two
+automatic finalists; they were excluded from this explicit-user inspection.
+Result metadata for the 21 user finalists reports a common 29-day interval
+(2026-07-30 through 2026-08-28 UTC), with individual histories of 29-70 days.
+This checks selection and period metadata, not equity completeness or CDaR
+calibration. No statuses, data or runtime code were changed.
+Configured Opus Advisor status was ready, but the single review_plan call exited
+with error and returned no decision. CDaR proposal is NOT_ADVISOR_APPROVED;
+no Executor was released and no implementation acceptance is claimed.
+Open: independent validation and calibration of the CDaR proposal,
+implementation details of input validation, margin stress
+contract, bootstrap calibration and preliminary search budget,
+frontier/limiter budgets and final recommendation rule. The draft is
+not an approved implementation plan; active runtime specs were not amended.
+The user tentatively accepted 20 configurable PnL targets (j/20 of the
+profile's attainable P_cap), up to 40 initial primary/CDaR alternatives before
+deduplication. Capacity solves and repair retries are additional work, not
+included in that candidate count. This is an initial budget to evaluate,
+not a calibrated optimum; the optional portfolio PnL floor is specified below.
+The user accepted up to 3 repair recalculations per original candidate,
+excluding its initial solve. The counter survives subsequent member exclusions;
+exclusions remain local to the candidate. Every repair rechecks feasibility,
+and a valid primary solution survives failure of its CDaR alternative.
+The editable retry limit and rejection diagnostics are recorded for the UI.
+The user accepted admission of selected explicit user FINALIST strategies
+regardless of negative net PnL on the common or full individual period.
+Losses retain their sign in portfolio objectives; positive portfolio targets
+and all risk/margin/liquidity/order constraints remain. No discarded strategies
+are added, and no per-strategy presence enumeration is introduced. Reports
+flag losses and distinguish common/full-period net PnL and dates. Priority
+group handling of negative scores remains open. Runtime filters are unchanged.
+The user accepted an optional portfolio net PnL floor in USDT per 30 days,
+disabled by default. Portfolio objectives remain strictly positive; this
+does not filter individual strategies. Show P30 in USDT, required capital and
+P30/capital together. Enabled floors constrain target generation without
+increasing K; duplicate targets collapse, and an unattainable floor is reported.
+The UI/JSON requirement is recorded, not implemented.
+The user accepted one startup validation of all selected finalists: valid but
+short/sparse histories produce warnings with periods and completed-position
+counts; missing mandatory inputs prevent search with explicit per-finalist
+reasons. No silent exclusion or zero-risk imputation. Candidate search reuses
+the validated snapshot; a changed input set is validated in a new run.
+Per-candidate sizing/risk/margin checks remain required. No runtime changes.
+Limiter discussion now considers a synthetic no-queue slot model from entry
+frequency and paired holding-time/PnL observations, rather than historical
+entry replay; its generative assumptions and budgets are not approved.
+The user excluded overflow-entry and forced-close PnL from the preliminary
+model; joint tester and the existing worst-case margin check remain necessary.
+Section 14 records a synthetic event-model timing experiment and its limits:
+3.246 s for 100 scenarios across each of 13 limits, 5.943 s for 20 scenarios
+per limit at tenfold event frequency; 32.5/297.1 s per composition at 1000
+are extrapolations, not full-run measurements. Process memory measurement failed.
+The user wants whole-Optimizer timing before deciding whether simplification
+is necessary. Stage wall times and actual work counts are required; profiles
+and unique compositions can multiply work, but slot simulation must not be
+nested inside every risk-bootstrap path or capital-search step. No full runtime
+or relative stage share has been measured. The earlier automatic 100/1000
+refinement proposal is replaced by the accepted budget below; about 16 minutes
+is not an accepted timeout.
+The user clarified overflow positions are closed by market, normally within
+minutes, and proposed a fixed 1.5% total-loss stress per excess full-position
+notional. Section 9 records this editable scenario assumption instead of
+holding every excess position through its full historical drawdown. Closing
+fees and slippage are now included in the fixed 1.5% by the user's latest
+clarification; no additional fee/slippage surcharge applies to this stress.
+Source net PnL and actual tester fees are unchanged. Costs already in equity
+are not duplicated. Loss remains after closure;
+pre-close margin is not released early. Only the excess set receives this
+charge, with a disjoint surviving set following limiter priorities. It is a
+single-episode collateral stress, not an automatic deduction from monthly PnL.
+Examples checked: three excess positions of 1000 cost 45 USDT including costs;
+seven cost 105. The 1.5% is not an execution guarantee. No runtime changes.
+The user accepted preliminary limiter values 1..N-1 plus disabled (0), with
+editable integer step default 1. N counts positive-sized participants. Under
+the initial one-slot/all-participating model, L=N duplicates disabled and is
+omitted; N=1 uses disabled only. All final variants still share Max candidates.
+The user accepted default 100 slot-model scenarios per composition/L, editable
+independently of risk-bootstrap scenario count. Compared L values share
+generated entry opportunities and paired holding/PnL observations. A separate
+1000-scenario analysis run is available by changing the setting; no automatic
+refinement stage is introduced. Full generative assumptions remain to specify.
+The user accepted narrowing expensive slot simulations via a cheap collateral
+stress scan for fixed composition, sizes, bank and priorities. Select the largest
+passing L plus a few stricter passing neighbors (or disabled plus nearby limits
+if disabled passes); neighbor count is still open. The prior 1..N-1/disabled
+grid now applies to the cheap scan, not mandatory simulations of every L.
+A full candidate includes composition, USD sizes, bank, limiter and priorities.
+Changing sizes or bank creates a new candidate with fresh order/liquidity/risk/
+margin and limiter-range checks while reusing unchanged inputs. Each joint test
+still consumes one Max candidates slot. The user accepted one additional sizing
+pass over the original shortlist, fixing bank, limiter and source priorities.
+Reoptimize member sizes within all existing constraints, without adding new
+strategies or implicitly reducing bank. Recheck candidate metrics and active
+composition; keep valid originals and deduplicate alternatives. New alternatives
+do not spawn another pass. Config default 1, 0 disables (MVP supports 0/1).
+The separate three-attempt order-repair budget and shared Max candidates remain.
+The exact fixed-L solver formulation still needs its implementation contract;
+the accepted pass budget is not proof of a linear model or improved slot PnL.
+The user accepted one ranking objective for all profiles: maximize net P30 at
+the same bank subject to profile constraints (MaxDD 20/10/5, free reserve
+20/40/60, MM load 50/35/20). Preliminary income accounts for blocked entries in
+the limiter model; keep lower-risk alternatives at comparable income. Different
+banks retain capital/income alternatives rather than one absolute-PnL winner.
+Final ranking and constraint checks use joint tester results. Section 13 removes
+the earlier open profile-specific Recovery ordering. Income closeness and the
+allocation of Max candidates across capital levels/alternatives remain open.
+The user expects liquidity caps/basic.max_balance to leave available capital
+unused for further position growth. Section 13 records saturation-aware capital
+levels rather than mandatory equal quotas extending to all available cash.
+Show required checked capital, model saturation and additional available funds
+separately; excess over checked capital is not guaranteed withdrawable cash.
+Position-cap sums are not account capital. Additional bank alone need not fill
+tester slots, but changed sizing dynamics or collateral scenarios are distinct
+full candidates; analytical sensitivity does not replace joint evidence.
+The user accepted preserving a high-income candidate near model saturation,
+some lower-capital alternatives when slots permit, and other promising
+composition/size/limiter variants. Most slots serve distinct trading variants;
+there is no mandatory idle-cash grid or requirement to fill Max candidates.
+Exact quotas and diversity criteria remain open.
+The user accepted two stricter passing limiter neighbors by default, plus the
+main passing choice: up to three slot-PnL evaluations at fixed composition,
+sizes, bank and priorities. Pick neighbors from the passing cheap grid; disabled
+as the main choice is followed by the largest passing finite limits. Fewer
+passing choices means fewer evaluations; no passing choice means infeasible.
+The nonnegative neighbor count is editable in UI/JSON and frozen in the run;
+0 keeps only the main choice. Joint tests still share Max candidates.
+The user accepted coarse grouping of similar SlotScore values into no more
+than five priority groups. Higher net USD per adjusted occupied-slot hour gets
+a lower numerical priority; use 1..5, never exempt priority 0. Do not require
+five populated groups or equal group sizes, and keep identical scores together.
+This replaces the proposed fixed 1/3/5 grouping. Numerical similarity and
+insufficient-data handling remain to specify; negative scores remain signed.
+The user rejected capping max_balance at starting capital: retain native sizing
+growth/shrinkage including UPNL up to each liquidity-derived cap. No separate
+capital-growth trajectory search is introduced. Section 12 uses the actual bot
+sizing base and requires B_sat_candidate=max(member max_balance) for each fixed
+configuration, distinct from the freely reoptimized B_sat_model. Report surplus
+above this threshold as saturation surplus, not guaranteed withdrawable funds;
+remaining collateral and exchange transferability still matter. New pairs use
+the partial-update/joint-check path. Native sizing dynamics remain a joint-test
+responsibility; no runtime or settings change was made.
+The user delegated choosing the averaged limiter-income model. Section 11.1
+specifies empirical paired wait/holding/net-reward cycles, independently sampled
+per strategy, shared schedules/seeds across L, no queue or invented retries after
+a rejected cycle. Rejected virtual cycles consume no slot but preserve that
+strategy's schedule. Warmup defaults to H, then measure H; entry-cohort full-cycle
+rewards estimate throughput, not ending equity. Apply the mean signed reward
+difference from disabled to the original common-equity P30; L=0 is unchanged.
+This preserves the baseline and avoids division by weak/negative PnL. Boundary
+and independent-arrival assumptions are explicit and need joint-test calibration.
+Missing cycle/normalization inputs produce unavailable diagnostics, not invented
+signals. Event processing, cached schedules and focused invariants are specified;
+the new model has not been implemented or benchmarked. UI/JSON includes warmup.
+The user accepted the MVP risk link: limiter-aware margin with overflow stress,
+no arbitrary discount to historical/bootstrap DD, real limiter DD verified by
+joint testing. This can miss beneficial limiter-dependent risk allocations;
+unlimited historical DD is not guaranteed to bound limited actual DD.
+Requested pruning is now specified in section 11: record all active constraints,
+skip infeasible uniform-growth directions under DD/liquidity, but retain the
+bounded redistribution pass; reject invalid full variants before expensive
+checks and deduplicate exact executable configurations. Historical/bootstrap
+risk is reused across L at identical x/B and risk inputs; stress/PnL differ.
+Model dominance requires comparable objectives and is not a joint-test proof;
+do not infer monotonic income in L or global optimality from an active DD cap.
+An exact Fraction check passed: uniform scaling at the derived bound satisfies
+peak-relative DD, and a larger scale violates it on the example path.
+Documentation whitespace checks passed; no runtime implementation was changed.
+The user approved per-position-cycle source normalization with use_upnl=true.
+Sections 3.1/5 now use full planned source notional S_i,k per cycle, applying one
+linear factor to its net PnL/equity increments when uniform scaling is supported;
+normalize before resampling, preserve partial actions, losses and boundary UPNL.
+Code confirms typed actions and episode reconstruction, not USD units or actual
+order-sizing provenance. Placement-time sizing may differ from entry-time balance;
+use_frozen_balance and within-cycle proportionality need real-data verification.
+Unknown bases cannot silently become initial-bank or average-size substitutes.
+Original results stay unchanged; derived caches are versioned. No mandatory
+bulk retest or disabling UPNL; runtime normalization is not implemented here.
+Real finalist read-only audit completed; evidence:
+docs/superpowers/plans/2026-09-13-portfolio-optimizer-finalist-sizing-audit.md.
+21 manual/effective finalists on 15 pairs have 12,231 actions, 97,179 equity
+samples and 2,582 completed cycles; 1,626 cycles fit the 29-day common window.
+13 original HTML reports found by name match retained DB actions and equity at
+stored decimal precision, with six filtered prefixes. Size is asset quantity;
+HTML Price/Cost are absent from typed DB actions and raw_action_json is null
+throughout this set. Stored commission_rate is TakerFee while actual fee/Cost
+ratios include maker and taker, so fee-based notional recovery is invalid.
+Initial report bank is not first retained-cycle bank. Full planned sizing still
+needs provenance: actual fill Cost alone does not establish full intended size.
+No DB changes/retest performed. Draft records one-time source enrichment as a
+prerequisite to justified normalization, not a failure of finalist selection.
+Next discussion: source enrichment/sizing denominator and consolidation. UI settings and Bybit request
+budget requirements are recorded for implementation.
+Short-history statistical limitations remain explicit.
+Documentation only; no runtime/config change, dependency installation into the
+project, production-data mutation or tester run.
+
+## Performance v2 resilient review import (2026-09-11)
+
+Review import now accepts an older XLSX when the newest Pair+Side selection run
+has the same request/config hashes and identical immutable result rows. A rank
+left on a non-selectable status is cleared; an `ANALOG` whose submitted target
+is no longer `FINALIST`/`RESERVE` becomes `FILTERED`. Missing, self-referential
+and out-of-snapshot analog targets remain invalid. Focused review tests pass
+(`28 passed`); related Panel Performance v2 tests pass (`69 passed, 2 skipped`).
+The six previously rejected production files (`BMNR`, `FWDI`, `RDW`, `SNOW`,
+`TSLL`, `UVXY`) were imported successfully without restarting the Panel.
+
+## Performance v2 user-review preservation (2026-09-11)
+
+Accepted User Status, User Rank, analog target and comment now remain
+authoritative by Strategy ID across `REPLACE` result changes and later
+unreviewed automatic selections. A new XLSX exports those persisted values
+only; unseen strategies receive blank User fields instead of copies of Auto
+Status/Rank. Existing review history in the working database was intact and
+required no repair. Focused selection/review/Panel/retest verification passes
+(`240 passed, 4 skipped`). The running Panel was not restarted.
+
+## Performance v2 stale-result pruning (2026-09-11)
+
+A new standalone maintenance command previews old Performance v2 strategies
+and preserves every strategy whose result ends on/after the UTC cutoff or is a
+`FINALIST` in the latest imported user review for its Pair+Side. Explicit
+`--apply` takes the existing writer lock, creates a full backup under
+`data/performance-v2/backups`, and removes the remaining strategies with their
+result-dependent rows. If a later delete fails, the working database is
+restored from that backup; selection and import audit history stays intact.
+
+The cleanup was applied for cutoff `2026-09-06`: 11,381 strategies, 7,684,514
+actions, 53,542,061 equity samples, 97,215 window metrics and 27,565 orders were
+removed. The working database now contains 5,212 strategies/results: 5,186
+fresh rows plus all 31 current user finalists, with overlap. The post-apply
+preview reports zero removable rows; schema validation passes and selection/
+review history remains present. The full 12,054,966,272-byte backup is
+`data/performance-v2/backups/strategy_performance.prune-20260906-20260911T063807999929Z.duckdb`.
+Focused verification passes (`3 passed`).
+The adjacent store/selection suite has `62 passed` plus one pre-existing dirty-
+config mismatch (`config.performance.json` currently resolves 16 workers while
+its edited test expects 30).
+
+## Native SINGLE_MODE truncated result recovery (2026-09-11)
+
+Native batch waiting now accepts a complete stable sequence of new or changed
+`my_test_run_<index>_of_<batch_size>_<strategy>.html` files when the tester's
+`wizard_result.json` is truncated. A stat-only baseline is captured per batch;
+the existing hashed baseline and authoritative settings/date/layout validation
+remain in place. Focused Panel/native checks pass (`29` and `65` tests).
+
+The ordinary SINGLE_MODE tester card now exposes a retry control for the latest
+failed or cancelled job, keeps RETEST jobs separate, and shows elapsed report
+recovery time while the synchronous retry request is pending.
+
+Live retry job `f9b52e419fd5491aa29f315fdf0b74b0` exposed a separate collection
+cost after each 1,000-strategy batch: strict validation reparsed every HTML
+accumulated by prior batches, so the second transition spent about 20 minutes
+in `REPORT_COLLECTION` before advancing normally. Collection now uses the
+batch-local stat baseline and reads/parses only new or changed current-batch
+reports; strict settings, report-period and Performance-v2 layout validation
+is unchanged. The running Panel process still uses its loaded pre-fix code and
+was not restarted. Focused SINGLE_MODE/runner verification passes (`55 passed`).
+
+## Panel common worker and analysis profile settings (2026-09-10)
+
+Static Panel General settings now saves `operational.import_workers` through
+the existing settings endpoint. `duckdb_import.workers` is authoritative for
+Panel DUCKDB_DIRECT, Source DB services, surfaces, and Performance v2; legacy
+duplicate worker keys remain readable for compatibility but do not override
+the common value. Direct materialization keeps its other tuning fields and
+normalizes `max_in_flight_chunks` to the common worker count when needed.
+
+Analysis Profile now projects only visible fresh-analysis controls. Hidden
+canonical grid, isolated peak, Close MA support, and target DD values remain
+unchanged in config saves. The static form uses semantic sections and the
+agreed labels. Focused settings/profile/Panel/static verification passes;
+Python compilation, JavaScript syntax, and `git diff --check` pass.
 
 ## Local tester preparation from Panel (2026-09-10)
 
@@ -48,7 +521,16 @@ observations with a valid prior/initial seed, carries them through the terminal
 UTC boundary, and records density/gap as diagnostics. Search acceleration is in
 place: the built-in evaluator uses bounded processes from the existing
 machine-wide `duckdb_import.workers` setting, commits results deterministically,
-and keeps full equity/action payloads only for source rows and final winners.
+and keeps full equity/action payloads in source rows only while calculations
+need them.
+
+Live profiling of a 29-finalist Campaign found that the first implementation
+restored those series into final winners and then recursively froze duplicate
+copies after the process pool had completed. The visible workers were idle
+while the Panel consumed one core and grew past 2.5 GB in this serial output
+step. The adapter now removes calculation-only equity/action series after final
+sizing/refinement and before `AdapterResult` freezing; scalar output facts are
+unchanged. The focused adapter/search/minute/Panel contour passes (`126 passed`).
 
 Root verification on the current read-only PerformanceDB selected 31 finalists
 over 12 pairs. With `duckdb_import.workers=25` and the configured 100,000 search
@@ -1914,3 +2396,34 @@ validation for real balance mismatches. Import
 `82f311f5b7014b0eaade73016ab9f6ea` then replaced exactly those 185 current
 FWDI results: `185 imported`, `0 skipped`, `0 rejected`, with 185 verified
 replacement dispositions.
+
+## Unified local worker limit and Analysis Profile cleanup (2026-09-10)
+
+Static Panel Settings now exposes `duckdb_import.workers` under General as the
+single local CPU worker limit. Subsequent Panel jobs use it for HTML/DuckDB and
+Source v6 import/merge, surface materialization/publication, fresh analysis,
+DUCKDB_DIRECT, Performance v2 import/selection, and Portfolio Search. Tester
+submission and API/network concurrency remain separate. Legacy per-subsystem
+worker keys no longer override the common value and were removed from tracked
+examples.
+
+Analysis Profile now contains only the approved visible analysis controls,
+uses the clarified Russian labels and separated semantic sections, and
+preserves hidden algorithm values on save. Focused verification passes `470
+passed, 2 skipped`; JavaScript syntax, Python compileall and `git diff --check`
+pass. Panel was not restarted.
+
+## Source v6 READY preflight preview (2026-09-10)
+
+The READY-scope table now shows the actual canonical data period, source-point
+`PnL > 10%` count/total/percentage, source PnL median/maximum, and status for
+each timeframe, with the same aggregate fields and `READY x/y` at Pair+Side
+level. The unused Grid column was removed. Preview metrics reuse the metadata
+already loaded by preflight, remain display-only, and fail closed for duplicate
+points, malformed PnL, or incomplete READY-period coverage.
+
+Focused verification passes `107 passed`; the related Panel suite passes `261
+passed`. JavaScript syntax, Python compileall, and `git diff --check` pass. A
+read-only preflight of the current Source v6 database completed in 4.319 s and
+returned `BABAUSDT LONG 3h = 172 / 684 · 25.1%, median 7.75%, max 18.27%` for
+`2026-07-11..2026-08-24`. Panel was not restarted.

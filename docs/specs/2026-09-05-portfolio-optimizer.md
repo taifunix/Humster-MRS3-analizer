@@ -1,5 +1,11 @@
 # Portfolio Optimizer — спецификация по фазам
 
+**Принятый новый контракт поиска:** [WEIGHTED_V1 / WS1.1](2026-09-14-portfolio-optimizer-weighted-search.md),
+[ADR-0036](../decisions/0036-portfolio-optimizer-weighted-search-contract.md).
+Пакет получил отдельный Opus PLAN_APPROVED 2026-09-14; runtime ещё не внедрён.
+WS1.1 заменяет противоречащие правила PRETEST_PROXY только для
+WEIGHTED_V1; старые Campaign/режимы и исторические evidence сохраняются.
+
 **Дата:** 2026-09-05
 
 **Статус:** Draft D7 — независимый Opus plan/spec review D4–D7:
@@ -1441,7 +1447,10 @@ scheduling input and is absent from Campaign identity and the Portfolio UI.
 Arbitrary injected evaluators remain serial. Workers return results to one
 ordered parent commit path, so worker completion order cannot change candidate
 identity, budget accounting, ranking, or output. Search retains compact member
-and metric facts; source equity/actions are stored once and restored only for
-the final shortlist before minute refinement and artifact output.
+and metric facts; source equity/actions are stored once and restored only while
+final sizing and minute refinement still need them. Calculation-only series are
+removed again at the adapter output boundary. Workbook/API variants contain
+scalar sizing, ranking and diagnostic facts, but never duplicate raw
+equity/action series inside members or metrics.
 При реализации проверяется актуальная версия и фиксируется reference date;
 эти ссылки не заменяют сохранённые campaign facts и не задают наши risk limits.
