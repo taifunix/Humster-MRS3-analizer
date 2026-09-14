@@ -1,11 +1,11 @@
 from copy import deepcopy
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 
 from mrs3.portfolio.liquidity import ReferenceReader
 from mrs3.portfolio.minute_capacity import CapacityWindow, MinuteCapacityResult
-from mrs3.portfolio.position_sizing import enrich_finalist_rows
+from mrs3.portfolio.position_sizing import enrich_finalist_rows, size_composition_vector
 
 
 def _window(cap: str) -> CapacityWindow:
@@ -18,12 +18,12 @@ def _capacity(symbol: str, cap: str = "600", *, status: str = "READY", step: str
     )
 
 
-def _reference(*, captured_at_ms: int = 1_000, max_qty: str = "100", tier_limit: str = "1000", tier_leverage: str = "50"):
+def _reference(*, captured_at_ms: int = 1_000, max_qty: str = "100", tier_limit: str = "1000", tier_leverage: str = "50", min_qty: str = "0.1", min_notional: str = "1"):
     return ReferenceReader.from_records(
         instruments=[{
             "symbol": "BTCUSDT", "status": "Trading", "contract_type": "LinearPerpetual",
-            "tick_size": "0.1", "qty_step": "0.1", "min_qty": "0.1", "max_qty": max_qty,
-            "leverage_step": "0.1", "max_leverage": "100", "min_notional": "1",
+            "tick_size": "0.1", "qty_step": "0.1", "min_qty": min_qty, "max_qty": max_qty,
+            "leverage_step": "0.1", "max_leverage": "100", "min_notional": min_notional,
         }],
         risk_tiers=[{"symbol": "BTCUSDT", "risk_limit_value": tier_limit, "max_leverage": tier_leverage}],
         captured_at_ms=captured_at_ms,
@@ -149,3 +149,170 @@ def test_sizing_digest_binds_full_order_geometry() -> None:
     changed = enrich_finalist_rows([changed_row], *args, now_ms=1_000, maximum_age_hours=2)
 
     assert first.rows[0]["sizing_digest"] != changed.rows[0]["sizing_digest"]
+
+
+def test_weighted_vector_seam_rounds_each_target_without_changing_legacy_sizing() -> None:
+    row = _row()
+    row["x_usdt"] = Decimal("550")
+    result = size_composition_vector(
+        [row], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(), {"BTCUSDT": Decimal("100")},
+    )
+
+    assert result.status == "PASS"
+    sized = result.members[0]
+    assert sized["target_x_usdt"] == Decimal("550")
+    assert sized["capacity_usdt"] == Decimal("600")
+    assert sized["quantity"] == Decimal("5.5")
+    assert sized["actual_size_usdt"] == Decimal("550")
+    allocations = sized["opening_allocations"]
+    with localcontext() as context:
+        context.prec = 64
+        assert sum(item["target_notional_usdt"] for item in allocations) == Decimal("550")
+    assert allocations[2]["target_notional_usdt"] == Decimal("275")
+
+
+def test_weighted_vector_seam_exposes_zero_target_as_removed_member() -> None:
+    row = _row()
+    row["x_usdt"] = Decimal("0")
+    result = size_composition_vector(
+        [row], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(), {"BTCUSDT": Decimal("100")},
+    )
+
+    assert result.status == "FAIL"
+    assert result.reason == "NO_NONZERO_TARGET"
+    assert result.exclusions[0].reason == "SIZE_ZERO"
+
+
+def test_weighted_vector_seam_rejects_actual_size_below_minimum_notional() -> None:
+    row = _row()
+    row["x_usdt"] = Decimal("10")
+    result = size_composition_vector(
+        [row], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(min_notional="20"), {"BTCUSDT": Decimal("100")},
+    )
+
+    assert result.status == "FAIL"
+    assert result.reason == "NO_NONZERO_TARGET"
+    assert result.exclusions[0].reason == "SIZE_BELOW_MINIMUM_NOTIONAL"
+
+
+def test_weighted_vector_seam_preserves_positive_below_min_qty_cause() -> None:
+    row = _row()
+    row["x_usdt"] = Decimal("10")
+    result = size_composition_vector(
+        [row], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(min_qty="0.2"), {"BTCUSDT": Decimal("100")},
+    )
+
+    assert result.status == "FAIL"
+    assert result.reason == "NO_NONZERO_TARGET"
+    assert result.exclusions[0].reason == "SIZE_BELOW_MINIMUM_QTY"
+
+
+def test_weighted_vector_seam_rejects_aggregate_capacity_for_shared_symbol() -> None:
+    first = _row()
+    second = _row()
+    second["strategy_id"] = 8
+    second["result_id"] = 80
+    first["x_usdt"] = Decimal("400")
+    second["x_usdt"] = Decimal("300")
+    result = size_composition_vector(
+        [first, second], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(), {"BTCUSDT": Decimal("100")},
+    )
+
+    assert result.status == "FAIL"
+    assert result.reason == "CAPACITY_EXCEEDED"
+
+
+def test_weighted_vector_seam_applies_max_qty_to_effective_capacity() -> None:
+    row = _row()
+    row["x_usdt"] = Decimal("550")
+    result = size_composition_vector(
+        [row], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(max_qty="5.03"), {"BTCUSDT": Decimal("101")},
+    )
+
+    assert result.status == "FAIL"
+    assert result.reason == "CAPACITY_EXCEEDED"
+
+
+def test_weighted_vector_seam_rejects_ambiguous_symbol_target_mapping() -> None:
+    first = _row()
+    second = _row()
+    second["strategy_id"] = 8
+    second["result_id"] = 80
+    result = size_composition_vector(
+        [first, second], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(), {"BTCUSDT": Decimal("100")}, targets={"BTCUSDT": Decimal("300")},
+    )
+
+    assert result.status == "FAIL"
+    assert result.reason == "AMBIGUOUS_TARGET_KEY"
+
+
+def test_weighted_vector_target_mapping_rejects_collisions_and_missing_member_keys() -> None:
+    first = _row()
+    second = _row()
+    second["strategy_id"] = 8
+    second["result_id"] = 80
+    collision = size_composition_vector(
+        [first], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(), {"BTCUSDT": Decimal("100")}, targets={7: Decimal("100"), "7": Decimal("200")},
+    )
+    missing = size_composition_vector(
+        [first, second], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(), {"BTCUSDT": Decimal("100")}, targets={7: Decimal("100")},
+    )
+    assert collision.reason == "AMBIGUOUS_TARGET_KEY"
+    assert missing.reason == "MISSING_TARGET_8"
+
+
+def test_weighted_vector_target_mapping_rejects_unknown_keys() -> None:
+    row = _row()
+    row["x_usdt"] = Decimal("100")
+    result = size_composition_vector(
+        [row], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(), {"BTCUSDT": Decimal("100")}, targets={7: Decimal("100"), "stale": Decimal("1")},
+    )
+    assert result.status == "FAIL"
+    assert result.reason == "UNKNOWN_TARGET_KEY"
+
+
+def test_weighted_vector_allocations_assign_exact_remainder_to_last_order() -> None:
+    row = _row()
+    row["x_usdt"] = Decimal("551")
+    row["strategy_orders"] = tuple({"order_id": index, "lot_x": Decimal("1")} for index in range(3))
+    result = size_composition_vector(
+        [row], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(), {"BTCUSDT": Decimal("100")},
+    )
+
+    assert result.status == "PASS"
+    allocations = result.members[0]["opening_allocations"]
+    with localcontext() as context:
+        context.prec = 64
+        assert sum(item["target_notional_usdt"] for item in allocations) == result.members[0]["actual_size_usdt"]
+    assert abs(allocations[-1]["target_notional_usdt"] - Decimal("550") / Decimal("3")) <= Decimal("0.0000000000000000000000001")
+
+
+def test_weighted_vector_requires_order_geometry() -> None:
+    missing = _row()
+    missing.pop("strategy_orders")
+    empty = _row()
+    empty["strategy_orders"] = ()
+    invalid = _row()
+    invalid["strategy_orders"] = ({"order_id": 1, "lot_x": Decimal("1")}, "bad")
+    for row, reason in ((missing, "MISSING_ORDER_GEOMETRY"), (empty, "MISSING_ORDER_GEOMETRY"), (invalid, "INVALID_ORDER_GEOMETRY")):
+        row["x_usdt"] = Decimal("100")
+        result = size_composition_vector(
+            [row], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(), {"BTCUSDT": Decimal("100")},
+        )
+        assert result.status == "FAIL"
+        assert result.reason == reason
+
+
+def test_weighted_vector_rejects_multiple_order_fields_and_duplicate_order_ids() -> None:
+    multiple = _row()
+    multiple["x_usdt"] = Decimal("100")
+    multiple["orders"] = ({"order_id": 2, "lot_x": Decimal("1")},)
+    duplicate = _row()
+    duplicate["x_usdt"] = Decimal("100")
+    duplicate["strategy_orders"] = ({"order_id": 1, "lot_x": Decimal("1")}, {"order_id": 1, "lot_x": Decimal("2")})
+    for row in (multiple, duplicate):
+        result = size_composition_vector(
+            [row], {"BTCUSDT": _capacity("BTCUSDT")}, _reference(), {"BTCUSDT": Decimal("100")},
+        )
+        assert result.status == "FAIL"
+        assert result.reason == "INVALID_ORDER_GEOMETRY"

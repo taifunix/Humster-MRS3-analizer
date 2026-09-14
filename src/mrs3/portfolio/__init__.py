@@ -132,6 +132,13 @@ from .position_sizing import (
     size_composition,
     size_portfolio_composition,
     calculate_composition_sizing,
+    size_composition_vector,
+)
+from .weighted_search import (
+    WEIGHTED_V1,
+    bank_for_path,
+    evaluate_weighted_path,
+    weighted_search,
 )
 from .minute_refinement import (
     MinuteRefinementResult,
@@ -357,6 +364,11 @@ __all__ = [
     "size_composition",
     "size_portfolio_composition",
     "calculate_composition_sizing",
+    "size_composition_vector",
+    "WEIGHTED_V1",
+    "bank_for_path",
+    "evaluate_weighted_path",
+    "weighted_search",
     "MinuteRefinementResult",
     "refine_minute_shortlist",
     "refine_pretest_candidates",

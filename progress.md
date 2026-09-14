@@ -21,15 +21,16 @@ after non-proportional sizing, recompute priorities and all dependent margin/rep
 facts, accept or reject once, and never start a hidden stabilization loop.
 An explicit implementation checklist is now in section 13. Reserved control
 joint-test slots remain unchanged.
-Current implementation handoff: Phase 2 of WS1.1 is accepted after independent
-Opus `CODE_REVIEW_PASS`. The focused Phase 2 suite passed 198 tests in
-25.28s; dynamic
-source settings, read-only input preparation, cycle attribution, per-member
-validity, cache identity, minute-capacity reuse, and fake-clock reference
-limiting are recorded in
-`docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-phase-2-evidence.md`.
-No real tester, exchange request, migration, or Phase 3 search was performed.
-Next: Phase 3 weighted generator and capital logic.
+Current implementation handoff: Phase 3 of WS1.1 is accepted after independent
+Claude Opus 5 high `CODE_REVIEW_PASS`. The weighted SciPy/HiGHS LP, exact
+peak-equity drawdown and P30 capital checks, bounded adaptive frontier, compact
+candidate-search result types, and additive `WEIGHTED_VECTOR_V1` sizing seam
+are recorded in
+`docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-phase-3-evidence.md`.
+Root final relevant verification passed 245 tests in 80.54s; the focused
+weighted/sizing suite passed 49 tests. No real tester, exchange request,
+migration, or generated artifact was used.
+Next: Phase 4 margin, limiter `L`, and priorities.
 
 Phase 0 remains complete: only mapping Campaign
 `PORTFOLIO_WEIGHTED_CAMPAIGN_V1` / `WEIGHTED_V1` / `WS1.1` is accepted, legacy

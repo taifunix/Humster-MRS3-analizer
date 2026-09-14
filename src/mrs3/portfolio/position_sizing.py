@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 from .liquidity import Instrument, LiquidityError, ReferenceSnapshot
 from .minute_capacity import CapacityWindow, MinuteCapacityResult
 from .pretest_proxy import ProxyMetrics, compute_proxy_metrics
+from .weighted_search import _precision_for
 
 
 PASS = "PASS"
@@ -613,8 +614,160 @@ size_candidate_composition = size_composition
 calculate_composition_sizing = size_composition
 
 
+def size_composition_vector(
+    members: Sequence[Mapping[str, Any]],
+    capacities: Mapping[str, Any],
+    reference: Any,
+    mark_prices: Mapping[str, Any],
+    *,
+    targets: Sequence[Any] | Mapping[Any, Any] | None = None,
+) -> CompositionSizingResult:
+    """Apply per-member weighted targets while reusing exchange geometry.
+
+    ``size_composition`` intentionally remains the shared-capacity/k API used
+    by existing callers.  This small versioned seam only rounds the supplied
+    ``x_usdt`` target for each member and allocates its existing ``lot_x``
+    geometry; it does not infer a new target or run margin/limiter logic.
+    """
+    raw_members = tuple(dict(member) for member in members)
+    if not raw_members:
+        return CompositionSizingResult(FAIL, reason="EMPTY_COMPOSITION")
+    try:
+        if targets is not None and isinstance(targets, (str, bytes)):
+            raise ValueError("INVALID_TARGET_VECTOR")
+        if targets is not None and not isinstance(targets, (Sequence, Mapping)):
+            raise ValueError("INVALID_TARGET_VECTOR")
+        if isinstance(targets, Sequence) and not isinstance(targets, (str, bytes)) and len(targets) != len(raw_members):
+            raise ValueError("TARGET_SHAPE_MISMATCH")
+        consumed_target_keys: list[Any] = []
+        if isinstance(targets, Mapping):
+            symbol_counts: dict[str, int] = {}
+            for row in raw_members:
+                symbol = str(row.get("symbol", ""))
+                symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
+            if any(symbol_counts.get(str(key), 0) > 1 for key in targets):
+                raise ValueError("AMBIGUOUS_TARGET_KEY")
+
+        def target_for(index: int, row: Mapping[str, Any]) -> Decimal:
+            if targets is None:
+                value = row.get("x_usdt", row.get("target_size_usdt"))
+            elif isinstance(targets, Mapping):
+                strategy_id = row.get("strategy_id")
+                if strategy_id is None:
+                    raise ValueError(f"MISSING_TARGET_{index}")
+                keys = [strategy_id]
+                if str(strategy_id) != strategy_id:
+                    keys.append(str(strategy_id))
+                matches = [key for key in keys if key in targets]
+                if len(matches) > 1:
+                    raise ValueError("AMBIGUOUS_TARGET_KEY")
+                if not matches:
+                    if any(str(key) == str(row.get("symbol")) for key in targets):
+                        raise ValueError("AMBIGUOUS_TARGET_KEY")
+                    raise ValueError(f"MISSING_TARGET_{strategy_id}")
+                consumed_target_keys.append(matches[0])
+                value = targets[matches[0]]
+            else:
+                value = targets[index]
+            return _decimal(value, "target_x_usdt", nonnegative=True)
+
+        selected = tuple(
+            (dict(row), target_for(index, row))
+            for index, row in enumerate(raw_members)
+        )
+        if isinstance(targets, Mapping) and any(key not in consumed_target_keys for key in targets):
+            raise ValueError("UNKNOWN_TARGET_KEY")
+        if any(row.get("side") not in {"LONG", "SHORT"} for row, _ in selected):
+            raise ValueError("INVALID_DIRECTION")
+        by_symbol: dict[str, list[tuple[dict[str, Any], Decimal]]] = {}
+        for row, target in selected:
+            by_symbol.setdefault(str(row.get("symbol", "")), []).append((row, target))
+        sized: list[Mapping[str, Any]] = []
+        exclusions: list[CompositionSizingExclusion] = []
+        for symbol, symbol_rows in sorted(by_symbol.items()):
+            if not symbol:
+                raise ValueError("MISSING_SYMBOL")
+            if symbol not in capacities or symbol not in mark_prices:
+                raise ValueError(f"MISSING_{symbol}")
+            capacity, round_down = _composition_capacity(capacities[symbol])
+            mark = _decimal(mark_prices[symbol], f"mark_prices.{symbol}", positive=True)
+            instrument = _instrument_for(reference, symbol)
+            if instrument is None:
+                instrument = capacities[symbol] if isinstance(capacities[symbol], Mapping) else None
+            if instrument is None:
+                raise ValueError("MISSING_REFERENCE")
+            max_qty = _map_decimal(instrument, "max_qty", nonnegative=True)
+            cap = _floor_step(min(capacity, max_qty * mark), round_down)
+            if sum((target for _, target in symbol_rows), Decimal(0)) > cap + MONEY_EPS:
+                raise ValueError("CAPACITY_EXCEEDED")
+            for row, target in sorted(symbol_rows, key=lambda item: _member_sort_key(item[0])):
+                if target == 0:
+                    exclusions.append(CompositionSizingExclusion((row,), "SIZE_ZERO"))
+                    continue
+                qty_step = _map_decimal(instrument, "qty_step", "quantity_step", positive=True)
+                min_qty = _map_decimal(instrument, "min_qty", "min_order_qty", nonnegative=True)
+                rounded_quantity = _floor_step(target / mark, qty_step)
+                if rounded_quantity > 0 and rounded_quantity < min_qty:
+                    exclusions.append(CompositionSizingExclusion((row,), "SIZE_BELOW_MINIMUM_QTY"))
+                    continue
+                quantity, actual = _qty_round(target, mark, instrument, cap=target)
+                if quantity == 0 or actual == 0:
+                    exclusions.append(CompositionSizingExclusion((row,), "SIZE_ROUNDED_TO_ZERO"))
+                    continue
+                min_notional = _field(instrument, "min_notional", default=None)
+                if min_notional is not None and actual < _decimal(min_notional, "min_notional", positive=True):
+                    exclusions.append(CompositionSizingExclusion((row,), "SIZE_BELOW_MINIMUM_NOTIONAL"))
+                    continue
+                order_keys = ("strategy_orders", "orders", "opening_orders")
+                present_order_keys = tuple(key for key in order_keys if key in row)
+                if len(present_order_keys) > 1:
+                    raise ValueError("INVALID_ORDER_GEOMETRY")
+                orders = row[present_order_keys[0]] if present_order_keys else None
+                if orders is None or (isinstance(orders, Sequence) and not isinstance(orders, (str, bytes)) and not orders):
+                    raise ValueError("MISSING_ORDER_GEOMETRY")
+                if isinstance(orders, (str, bytes)) or not isinstance(orders, Sequence) or any(not isinstance(item, Mapping) for item in orders):
+                    raise ValueError("INVALID_ORDER_GEOMETRY")
+                parsed_orders = tuple(sorted(orders, key=lambda item: json.dumps(_canonical(item.get("order_id")), sort_keys=True, separators=(",", ":"), ensure_ascii=True)))
+                if any(item.get("order_id") is None or item.get("lot_x") is None for item in parsed_orders):
+                    raise ValueError("INVALID_ORDER_GEOMETRY")
+                order_keys_seen = tuple(json.dumps(_canonical(item.get("order_id")), sort_keys=True, separators=(",", ":"), ensure_ascii=True) for item in parsed_orders)
+                if len(order_keys_seen) != len(set(order_keys_seen)):
+                    raise ValueError("INVALID_ORDER_GEOMETRY")
+                lots = tuple(_decimal(item.get("lot_x"), "lot_x", positive=True) for item in parsed_orders)
+                with localcontext() as context:
+                    context.prec = _precision_for(actual, lots)
+                    lot_total = sum(lots, Decimal(0))
+                    allocations_list: list[dict[str, Any]] = []
+                    remaining = actual
+                    for index, (item, lot) in enumerate(zip(parsed_orders, lots)):
+                        amount = remaining if index == len(lots) - 1 else actual * lot / lot_total
+                        allocations_list.append({"order_id": item.get("order_id"), "lot_x": lot, "target_notional_usdt": amount})
+                        remaining -= amount
+                    allocations = tuple(allocations_list)
+                enriched = dict(row)
+                enriched.update({
+                    "position_size_usdt": actual,
+                    "actual_size_usdt": actual,
+                    "quantity": quantity,
+                    "target_x_usdt": target,
+                    "capacity_usdt": cap,
+                    "opening_allocations": allocations,
+                    "sizing_basis": "WEIGHTED_VECTOR_V1",
+                    "sizing_digest": _digest({"basis": "WEIGHTED_VECTOR_V1", "row": row, "target_x_usdt": target, "capacity_usdt": cap, "quantity": quantity, "actual_size_usdt": actual, "mark": mark}),
+                })
+                sized.append(_freeze(enriched))
+        sized.sort(key=_member_sort_key)
+        if not sized:
+            return CompositionSizingResult(FAIL, (), "NO_NONZERO_TARGET", exclusions=tuple(exclusions))
+        return CompositionSizingResult(PASS, tuple(sized), exclusions=tuple(exclusions))
+    except KeyError as error:
+        return CompositionSizingResult(FAIL, reason=f"MISSING_{str(error).strip(chr(39)).upper()}")
+    except (ArithmeticError, TypeError, ValueError, InvalidOperation) as error:
+        return CompositionSizingResult(FAIL, reason=str(error) if str(error).isupper() else "INVALID_VECTOR")
+
+
 __all__ = [
     "FAIL", "PASS", "FLOAT_ABS_EPS", "FLOAT_REL_EPS", "MONEY_EPS", "PositionSizingExclusion", "PositionSizingResult",
     "CompositionSizingExclusion", "CompositionSizingResult", "enrich_finalist_rows", "size_finalist_rows",
-    "size_composition", "size_portfolio_composition", "size_candidate_composition", "calculate_composition_sizing",
+    "size_composition", "size_portfolio_composition", "size_candidate_composition", "calculate_composition_sizing", "size_composition_vector",
 ]
