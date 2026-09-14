@@ -1054,17 +1054,17 @@ Market reference загружается один раз, вне циклов к�
 
 ### Фаза 2. Единая подготовка данных и reference
 
-- [ ] Подключить nullable source metadata к input и один кэш матрицы/метрик на ревизию.
-- [ ] Реализовать общий период, 5-минутный шаг, границы циклов и данные накопления.
-- [ ] Добавить тонкий адаптер полных actions для `reconstruct_cycles`: текущий
+- [x] Подключить nullable source metadata к input и один кэш матрицы/метрик на ревизию.
+- [x] Реализовать общий период, 5-минутный шаг, границы циклов и данные накопления.
+- [x] Добавить тонкий адаптер полных actions для `reconstruct_cycles`: текущий
   read_current_finalists проецирует actions до ID/timestamp; полного источника
   для replay там нет. Маппинг opened/increased/decreased/closed в нормализованные
   события переиспользует reports.py, а не вводит второй восстановитель циклов.
   maximum_position — количество, не S в USDT; funding и UPnL оттуда не выводятся.
-- [ ] Сохранить существующие minute_capacity/backfill; добавить общий API throttling/cooldown.
-- [ ] Проверить: REPLACE инвалидирует кэш при том же ID; нулевая минута != потерянный
+- [x] Сохранить существующие minute_capacity/backfill; добавить общий API throttling/cooldown.
+- [x] Проверить: REPLACE инвалидирует кэш при том же ID; нулевая минута != потерянный
   день; разные листинги; no-lookahead; API-limit fake-clock, без запросов на биржу.
-- [ ] Записать evidence фазы 2 и получить независимый `CODE_REVIEW_PASS`.
+- [x] Записать evidence фазы 2 и получить независимый `CODE_REVIEW_PASS`.
 
 ### Фаза 3. Взвешенный генератор и капитал
 

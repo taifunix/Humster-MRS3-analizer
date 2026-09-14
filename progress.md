@@ -21,17 +21,15 @@ after non-proportional sizing, recompute priorities and all dependent margin/rep
 facts, accept or reject once, and never start a hidden stabilization loop.
 An explicit implementation checklist is now in section 13. Reserved control
 joint-test slots remain unchanged.
-Current implementation handoff: Phase 1 of WS1.1 / plan R4.2 is complete after
-independent Opus `CODE_REVIEW_PASS`. Two controls are fixed in Phase 1 evidence:
-one-level strategy 16618 and three-level strategy 19081. Source sizing remains
-dynamic (`use_fix=false`): for the current 100%/risk=1 LONG contract, S_i,k is
-the sizing balance before an opening from flat and changes with accumulated
-balance; an unknown boundary cycle remains UNKNOWN. Price/Cost remain execution
-facts, not S. Legacy REPLACE now clears absent optional source fields instead of
-inheriting the prior revision while preserving FINALIST review fields and the v4
-result ID. Focused Phase 1 tests passed 145; the existing false-UPNL parser gate
-passed separately. No real tester, mass retest, or exchange request occurred.
-Next: Phase 2 common data preparation and reference integration on fixtures/fakes.
+Current implementation handoff: Phase 2 of WS1.1 is accepted after independent
+Opus `CODE_REVIEW_PASS`. The focused Phase 2 suite passed 198 tests in
+25.28s; dynamic
+source settings, read-only input preparation, cycle attribution, per-member
+validity, cache identity, minute-capacity reuse, and fake-clock reference
+limiting are recorded in
+`docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-phase-2-evidence.md`.
+No real tester, exchange request, migration, or Phase 3 search was performed.
+Next: Phase 3 weighted generator and capital logic.
 
 Phase 0 remains complete: only mapping Campaign
 `PORTFOLIO_WEIGHTED_CAMPAIGN_V1` / `WEIGHTED_V1` / `WS1.1` is accepted, legacy

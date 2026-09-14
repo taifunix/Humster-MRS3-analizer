@@ -16,6 +16,7 @@ from mrs3.performance_v2_selection import (
 )
 from mrs3.panel_portfolio import _plain
 from mrs3.portfolio import input as portfolio_input
+from mrs3.portfolio import reports as portfolio_reports
 from mrs3.portfolio.input import (
     SOURCE_SNAPSHOT_UNAVAILABLE,
     DecisionCampaign,
@@ -25,10 +26,14 @@ from mrs3.portfolio.input import (
     read_and_select_finalists,
     read_current_finalists,
     read_performance_snapshot,
+    preparation_cache_key,
+    prepare_weighted_input,
     resolve_common_pretest_period,
+    _cycle_records,
 )
 from mrs3.portfolio.store import PortfolioStore
 from tests.test_performance_v2_selection import _candidate_db
+from mrs3.portfolio.reports import PositionCycle
 
 
 REQUEST = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
@@ -924,6 +929,53 @@ def test_read_current_finalists_returns_physical_facts_and_panel_safe_values(tmp
     assert database.read_bytes() == before
 
 
+def test_read_current_finalists_exposes_decoded_optimizer_source_metadata(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        result_id, imported_at = connection.execute(
+            "select result_id, imported_at_utc from strategy_results"
+        ).fetchone()
+        metadata = {
+            "schema_version": 1,
+            "price_cost_semantics": "actual_fill_not_planned_position",
+            "imported_at_utc": imported_at.astimezone(timezone.utc).isoformat(),
+            "source_report_sha256": "a" * 64,
+            "settings": {"basic": {"risk_long": "1"}},
+        }
+        connection.execute(
+            "update strategy_results set optimizer_source_metadata_json = ? where result_id = ?",
+            [json.dumps(metadata), result_id],
+        )
+
+    row = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+
+    assert row["optimizer_source_metadata"] == {
+        "schema_version": 1,
+        "price_cost_semantics": "actual_fill_not_planned_position",
+        "source_report_sha256": "a" * 64,
+        "settings": {"basic": {"risk_long": "1"}},
+        "imported_at_utc": imported_at.astimezone(timezone.utc).isoformat(),
+    }
+    assert row["optimizer_source_metadata"]["imported_at_utc"] == imported_at.astimezone(timezone.utc).isoformat()
+    assert "optimizer_source_metadata_json" not in row
+    with pytest.raises(TypeError):
+        row["optimizer_source_metadata"]["settings"]["basic"]["risk_long"] = "2"  # type: ignore[index]
+    assert row["actions"][0]["action"] == "closed"
+    assert row["actions"][0]["post_size"] == Decimal("0")
+    assert row["actions"][0]["balance"] == Decimal("100")
+
+
+def test_read_current_finalists_feeds_prepare_weighted_input_from_duckdb(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+
+    rows = read_current_finalists(database, [("BTCUSDT", "LONG")])
+    prepared = prepare_weighted_input(rows)
+
+    assert prepared.strategy_ids == (rows[0]["strategy_id"],)
+    assert prepared.cycles
+    assert prepared.timestamps_utc[0] == "2026-01-01T00:00:00Z"
+
+
 def test_read_current_finalists_accepts_legacy_null_optional_ranges(tmp_path: Path) -> None:
     database = _database(tmp_path)
     with duckdb.connect(str(database)) as connection:
@@ -1063,6 +1115,560 @@ def test_common_period_seeds_from_latest_prior_real_sample_and_forward_fills_ini
     assert seeded.available
     assert seeded.daily_paths["A:LONG:1:1"][0]["equity"] == Decimal("100")
     assert seeded.daily_paths["A:LONG:1:1"][0]["seed"] is True
+
+
+def test_prepare_weighted_input_uses_dynamic_cycle_basis_and_last_known_equity() -> None:
+    start = "2026-01-01T00:00:00Z"
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": "2026-01-15T00:00:00Z",
+        "effective_start_utc": start, "effective_end_utc": "2026-01-15T00:00:00Z",
+        "imported_at_utc": start,
+        "optimizer_source_metadata": {
+            "source_report_sha256": "a" * 64,
+            "settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+                "use_fix": False, "balance_percentage_long": "100", "risk_long": "1", "max_balance": "0",
+            }},
+        },
+        "actions": ({
+            "action_index": 0, "timestamp_utc": start, "symbol": "A", "action": "opened",
+            "size": "1", "post_size": "1", "post_side": "LONG", "pnl": "0", "fee": "0", "balance": "100",
+        }, {
+            "action_index": 1, "timestamp_utc": "2026-01-15T00:00:00Z", "symbol": "A", "action": "closed",
+            "size": "1", "post_size": "0", "post_side": "LONG", "pnl": "20", "fee": "0", "balance": "120",
+        }),
+        "equity": (
+            {"timestamp_utc": start, "equity": "100"},
+            {"timestamp_utc": "2026-01-01T00:07:00Z", "equity": "110"},
+            {"timestamp_utc": "2026-01-01T00:12:00Z", "equity": "120"},
+        ),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    assert prepared.history_step_minutes == 5
+    assert prepared.timestamps_utc[1] == "2026-01-01T00:05:00Z"
+    assert prepared.normalized_delta[0][0] == Decimal("0")
+    assert prepared.normalized_delta[1][0] == Decimal("0.1")
+    assert all(prepared.valid[index][0] for index in range(2))
+    assert prepared.cycles["A:LONG:1:1"][0]["source_basis"] == Decimal("100")
+    diagnostics = prepared.diagnostics["rows"]["A:LONG:1:1"]
+    assert diagnostics["cycle_count"] == 1
+    assert diagnostics["known_hold_durations_seconds"] == (Decimal("1209600"),)
+    assert diagnostics["occupied_duration_seconds"] == Decimal("1209600")
+    assert diagnostics["occupied_ratio"] == Decimal("1")
+    assert diagnostics["source_bases"] == (Decimal("100"),)
+    assert diagnostics["median_source_basis"] == Decimal("100")
+
+
+def test_prepare_weighted_input_attributes_right_node_open_to_new_cycle() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": "100", "risk_long": "1", "max_balance": "0",
+        }}},
+        "actions": ({"action_index": 0, "timestamp_utc": "2026-01-01T00:05:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},),
+        "equity": (
+            {"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},
+            {"timestamp_utc": "2026-01-01T00:05:00Z", "equity": "110"},
+        ),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    assert prepared.normalized_delta[0][0] == Decimal("0.1")
+    assert prepared.valid[0][0] is True
+
+
+def test_prepare_weighted_input_rejects_period_that_peels_a_finalist() -> None:
+    rows = (
+        {
+            "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+            "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-31T00:00:00Z",
+            "initial_balance": "100", "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+        },
+        {
+            "symbol": "B", "side": "LONG", "strategy_id": 2, "result_id": 2,
+            "report_start_utc": "2026-01-20T00:00:00Z", "report_end_utc": "2026-01-31T00:00:00Z",
+            "initial_balance": "100", "equity": ({"timestamp_utc": "2026-01-20T00:00:00Z", "equity": "100"},),
+        },
+    )
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input(rows)
+
+    assert error.value.code == "COMMON_PERIOD_UNIVERSE_CHANGED"
+
+
+def test_prepare_weighted_input_keeps_validity_and_reason_per_participant() -> None:
+    start = "2026-01-01T00:00:00Z"
+    valid_row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start, "report_end_utc": "2026-01-15T00:00:00Z",
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": "100", "risk_long": "1", "max_balance": "0",
+        }}},
+        "actions": ({"action_index": 0, "timestamp_utc": start, "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},),
+        "equity": ({"timestamp_utc": start, "equity": "100"},),
+    }
+    invalid_row = {
+        "symbol": "B", "side": "LONG", "strategy_id": 2, "result_id": 2,
+        "report_start_utc": start, "report_end_utc": "2026-01-15T00:00:00Z", "initial_balance": "100",
+        "equity": ({"timestamp_utc": "2026-01-01T01:00:00Z", "equity": "110"},),
+    }
+
+    prepared = prepare_weighted_input((valid_row, invalid_row))
+
+    assert prepared.valid[0] == (True, True)
+    assert prepared.reasons[0][0] is None
+    assert prepared.valid[11] == (True, False)
+    assert "symbol=B" in prepared.reasons[11][1]
+    assert "strategy_id=2" in prepared.reasons[11][1]
+    assert "result_id=2" in prepared.reasons[11][1]
+
+
+def test_prepare_weighted_input_zeroes_partial_delta_when_later_segment_is_unknown() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": (
+            {"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},
+            {"action_index": 1, "timestamp_utc": "2026-01-01T00:02:00Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "110", "pnl": "10", "fee": "0"},
+        ),
+        "equity": (
+            {"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},
+            {"timestamp_utc": "2026-01-01T00:02:00Z", "equity": "110"},
+            {"timestamp_utc": "2026-01-01T00:04:00Z", "equity": "120"},
+        ),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    assert prepared.normalized_delta[0][0] == Decimal("0")
+    assert prepared.valid[0][0] is False
+    assert "UNATTRIBUTABLE_EQUITY" in prepared.reasons[0][0]
+
+
+def test_prepare_weighted_input_rejects_unrecognized_equity_point_shape() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "initial_balance": "100",
+        "equity": (("2026-01-01T00:00:00Z", "100"),),
+    }
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input((row,))
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def test_prepare_weighted_input_rejects_non_sequence_equity_container() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "initial_balance": "100",
+        "equity": {"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},
+    }
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input((row,))
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def test_common_weighted_period_uses_each_effective_range_full_utc_days() -> None:
+    rows = (
+        {
+            "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+            "report_start_utc": "2026-01-01T12:00:00Z", "report_end_utc": "2026-01-31T12:00:00Z",
+            "effective_start_utc": "2026-01-01T06:00:00Z", "effective_end_utc": "2026-01-31T06:00:00Z",
+            "initial_balance": "100", "equity": (),
+        },
+        {
+            "symbol": "B", "side": "LONG", "strategy_id": 2, "result_id": 2,
+            "report_start_utc": "2026-01-01T12:00:00Z", "report_end_utc": "2026-01-31T12:00:00Z",
+            "effective_start_utc": "2026-01-03T06:00:00Z", "effective_end_utc": "2026-01-20T06:00:00Z",
+            "initial_balance": "100", "equity": (),
+        },
+    )
+
+    period = resolve_common_pretest_period(rows, minimum_common_days=14)
+
+    assert period.available
+    assert period.start_utc == datetime(2026, 1, 4, tzinfo=timezone.utc)
+    assert period.end_utc == datetime(2026, 1, 20, tzinfo=timezone.utc)
+
+
+def test_prepare_weighted_input_marks_carry_in_change_unknown() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": "100", "risk_long": "1", "max_balance": "0",
+        }}},
+        "actions": ({"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},),
+        "equity": (
+            {"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},
+            {"timestamp_utc": "2026-01-01T00:07:00Z", "equity": "110"},
+        ),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    assert prepared.cycles["A:LONG:1:1"][0]["carry_in"] is True
+    assert prepared.valid[1][0] is False
+    assert "UNATTRIBUTABLE_EQUITY" in prepared.reasons[1][0]
+
+
+def test_prepare_weighted_input_carry_in_occupancy_starts_at_common_window() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "actions": ({"action_index": 0, "timestamp_utc": "2026-01-08T00:00:00Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},),
+        "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    diagnostics = prepared.diagnostics["rows"]["A:LONG:1:1"]
+    assert diagnostics["occupied_duration_seconds"] == Decimal("604800")
+    assert diagnostics["occupied_ratio"] == Decimal("0.5")
+
+
+@pytest.mark.parametrize("action_name", ["increased", "decreased"])
+def test_cycle_records_leading_non_opening_has_no_dynamic_source_basis(action_name: str) -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": (
+            {"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": action_name, "post_size": "2", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},
+            {"action_index": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "101", "pnl": "1", "fee": "0"},
+            {"action_index": 2, "timestamp_utc": "2026-01-01T00:00:02Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "101", "pnl": "0", "fee": "0"},
+        ),
+    }
+
+    cycles = _cycle_records(row, datetime(2026, 1, 1, 0, 0, 3, tzinfo=timezone.utc))
+
+    assert cycles[0]["carry_in"] is True
+    assert cycles[0]["source_basis"] is None
+    assert cycles[1]["carry_in"] is False
+
+
+def test_cycle_records_consumes_same_timestamp_opening_sources_in_order() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": (
+            {"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},
+            {"action_index": 1, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "110", "pnl": "10", "fee": "0"},
+            {"action_index": 2, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "200", "pnl": "0", "fee": "0"},
+            {"action_index": 3, "timestamp_utc": "2026-01-01T00:00:01Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "220", "pnl": "20", "fee": "0"},
+        ),
+    }
+
+    cycles = _cycle_records(row, datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc))
+
+    assert tuple(cycle["source_basis"] for cycle in cycles) == (Decimal("100"), Decimal("200"))
+
+
+def test_cycle_records_uses_positional_ordinal_for_action_rows_without_index() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": (
+            {"timestamp_utc": "2026-01-01T00:00:02Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "200", "pnl": "0", "fee": "0"},
+            {"timestamp_utc": "2026-01-01T00:00:03Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "220", "pnl": "20", "fee": "0"},
+            {"timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},
+            {"timestamp_utc": "2026-01-01T00:00:01Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "110", "pnl": "10", "fee": "0"},
+        ),
+    }
+
+    actions = portfolio_reports.performance_rows_to_report_actions(row["actions"])
+    assert tuple(action.source_ordinal for action in actions) == (2, 3, 0, 1)
+
+    cycles = _cycle_records(row, datetime(2026, 1, 1, 0, 0, 4, tzinfo=timezone.utc))
+
+    assert tuple(cycle["source_basis"] for cycle in cycles) == (Decimal("100"), Decimal("200"))
+
+
+def test_cycle_records_defaults_null_opening_pnl_and_fee_to_zero() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": ({"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": None, "fee": None},),
+        "equity": (
+            {"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},
+            {"timestamp_utc": "2026-01-01T00:07:00Z", "equity": "110"},
+        ),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    assert prepared.cycles["A:LONG:1:1"][0]["source_basis"] == Decimal("100")
+    assert prepared.valid[1][0] is True
+
+
+def test_cycle_records_rejects_malformed_opening_numeric_source() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": ({"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "not-a-number", "pnl": "0", "fee": "0"},),
+    }
+
+    with pytest.raises(PortfolioInputError) as error:
+        _cycle_records(row, datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc))
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def test_cycle_records_unmatched_opening_is_diagnostic_and_does_not_consume_later_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": ({"action_index": 0, "timestamp_utc": "2026-01-01T00:00:01Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},),
+    }
+    monkeypatch.setattr(portfolio_reports, "reconstruct_cycles", lambda *_args, **_kwargs: (
+        PositionCycle("A", 0, "2026-01-01T00:00:00.000000Z", "2026-01-01T00:00:00.500000Z", Decimal("0.5"), False, False, "LONG", None, None, Decimal("1"), 1),
+        PositionCycle("A", 1, "2026-01-01T00:00:01.000000Z", None, None, True, False, "LONG", None, None, Decimal("1"), 1),
+    ))
+
+    cycles = _cycle_records(row, datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc))
+
+    assert cycles[0]["source_basis"] is None
+    assert "SOURCE_OPENING_ROW_UNMATCHED" in cycles[0]["diagnostics"]
+    assert cycles[1]["source_basis"] == Decimal("100")
+
+
+@pytest.mark.parametrize("strategy_id", [None, "1", 1.0, True])
+def test_prepare_weighted_input_rejects_non_integer_strategy_id(strategy_id: object) -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": strategy_id, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "initial_balance": "100", "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+    }
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input((row,))
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def test_prepare_weighted_input_rejects_duplicate_participant_key() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "initial_balance": "100", "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+    }
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input((row, dict(row)))
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def test_prepare_weighted_input_attributes_equal_endpoint_intra_cell_changes() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": (
+            {"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},
+            {"action_index": 1, "timestamp_utc": "2026-01-01T00:02:00Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "110", "pnl": "10", "fee": "0"},
+            {"action_index": 2, "timestamp_utc": "2026-01-01T00:02:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "200", "pnl": "0", "fee": "0"},
+            {"action_index": 3, "timestamp_utc": "2026-01-01T00:04:00Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "190", "pnl": "-10", "fee": "0"},
+        ),
+        "equity": (
+            {"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},
+            {"timestamp_utc": "2026-01-01T00:02:00Z", "equity": "110"},
+            {"timestamp_utc": "2026-01-01T00:04:00Z", "equity": "100"},
+        ),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    assert prepared.normalized_delta[0][0] == Decimal("0.05")
+    assert prepared.valid[0][0] is True
+
+
+def test_prepare_weighted_input_invalidates_equal_endpoint_carry_in_movement() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "actions": ({"action_index": 0, "timestamp_utc": "2026-01-01T00:02:00Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},),
+        "equity": (
+            {"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},
+            {"timestamp_utc": "2026-01-01T00:02:00Z", "equity": "110"},
+            {"timestamp_utc": "2026-01-01T00:04:00Z", "equity": "100"},
+        ),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    assert prepared.normalized_delta[0][0] == Decimal("0")
+    assert prepared.valid[0][0] is False
+    assert "UNATTRIBUTABLE_EQUITY" in prepared.reasons[0][0]
+
+
+@pytest.mark.parametrize("side", ["SHORT"])
+def test_prepare_weighted_input_rejects_non_long_side(side: str) -> None:
+    row = {
+        "symbol": "A", "side": side, "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "initial_balance": "100", "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+    }
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input((row,))
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def test_prepare_weighted_input_rejects_duplicate_symbol() -> None:
+    base = {
+        "symbol": "A", "side": "LONG", "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "initial_balance": "100", "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+    }
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input((dict(base, strategy_id=1, result_id=1), dict(base, strategy_id=2, result_id=2)))
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def test_prepare_weighted_input_rejects_duplicate_strategy_id_across_symbols() -> None:
+    base = {
+        "side": "LONG", "strategy_id": 1, "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "initial_balance": "100", "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+    }
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input((dict(base, symbol="A", result_id=1), dict(base, symbol="B", result_id=2)))
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def test_prepare_weighted_input_orders_participants_deterministically() -> None:
+    def row(symbol: str, strategy_id: int, result_id: int) -> dict:
+        return {
+            "symbol": symbol, "side": "LONG", "strategy_id": strategy_id, "result_id": result_id,
+            "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+            "initial_balance": "100", "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+        }
+
+    first = (row("B", 1, 1), row("A", 2, 2))
+    second = tuple(reversed(first))
+    cache: dict[str, object] = {}
+    prepared_first = prepare_weighted_input(first, cache=cache)  # type: ignore[arg-type]
+    prepared_second = prepare_weighted_input(second, cache=cache)  # type: ignore[arg-type]
+
+    assert prepared_first.strategy_ids == (2, 1)
+    assert prepared_second is prepared_first
+
+
+def test_prepare_weighted_input_includes_period_end_for_non_dividing_step() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+    }
+
+    prepared = prepare_weighted_input((row,), history_step_minutes=11)
+
+    assert prepared.timestamps_utc[0] == "2026-01-01T00:00:00Z"
+    assert prepared.timestamps_utc[-1] == "2026-01-15T00:00:00Z"
+
+
+def test_prepare_weighted_input_numeric_dynamic_settings_match_exact_values() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100.0, "risk_long": 1.0, "max_balance": 0.0,
+        }}},
+        "actions": ({"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},),
+        "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    assert prepared.cycles["A:LONG:1:1"][0]["source_basis"] == Decimal("100")
+
+
+def test_prepare_weighted_input_cache_result_is_deep_frozen() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "actions": ({"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},),
+        "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+    }
+    cache: dict[str, object] = {}
+    prepared = prepare_weighted_input((row,), cache=cache)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError):
+        prepared.cycles["A:LONG:1:1"][0]["source_basis"] = Decimal("1")  # type: ignore[index]
+    with pytest.raises(TypeError):
+        prepared.diagnostics["rows"]["A:LONG:1:1"]["cycle_count"] = 0  # type: ignore[index]
+
+    cached = prepare_weighted_input((row,), cache=cache)  # type: ignore[arg-type]
+    assert cached.cycles["A:LONG:1:1"][0]["source_basis"] is None
+
+
+def test_prepare_weighted_input_cache_misses_same_result_id_after_source_revision_change() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "imported_at_utc": "2026-01-01T00:00:00Z",
+        "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+    }
+    cache: dict[str, object] = {}
+    first = prepare_weighted_input((row,), cache=cache)  # type: ignore[arg-type]
+    changed = dict(row, optimizer_source_metadata={"source_report_sha256": "b" * 64})
+    second = prepare_weighted_input((changed,), cache=cache)  # type: ignore[arg-type]
+    changed_imported = dict(changed, imported_at_utc="2026-01-02T00:00:00Z")
+    third = prepare_weighted_input((changed_imported,), cache=cache)  # type: ignore[arg-type]
+    minimum_changed = prepare_weighted_input((changed_imported,), minimum_common_days=13, cache=cache)  # type: ignore[arg-type]
+    series_changed = dict(changed_imported, equity=({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "101"},))
+    fourth = prepare_weighted_input((series_changed,), minimum_common_days=13, cache=cache)  # type: ignore[arg-type]
+
+    assert first is not second
+    assert second is not third
+    assert third is not minimum_changed
+    assert minimum_changed is not fourth
+    assert len(cache) == 5
+
+
+def test_preparation_cache_key_includes_campaign_weighted_algo_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "imported_at_utc": "2026-01-01T00:00:00Z",
+    }
+
+    first = preparation_cache_key((row,))
+    monkeypatch.setattr(portfolio_input, "CAMPAIGN_WEIGHTED_ALGO_VERSION", "WS1.2")
+
+    second = preparation_cache_key((row,))
+
+    assert first != second
 
 
 def test_current_result_prior_sample_older_than_diagnostic_gap_still_passes() -> None:

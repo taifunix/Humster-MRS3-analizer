@@ -6,9 +6,11 @@ from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 import math
+import json
+import hashlib
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, MutableMapping, Sequence
 
 import duckdb
 
@@ -25,6 +27,7 @@ from ..performance_v2_selection import (
     parse_selection_request,
 )
 from ..performance_v2_store import require_performance_v2
+from ..performance_v2_store import decode_optimizer_source_metadata
 from ..performance_v2_windows import (
     METRICS_VERSION,
     WindowMetrics,
@@ -47,6 +50,7 @@ from .canonical import (
     typed_value,
     unknown_value,
 )
+from .adapter import CAMPAIGN_WEIGHTED_ALGO_VERSION
 
 
 SOURCE_SNAPSHOT_UNAVAILABLE = "SOURCE_SNAPSHOT_UNAVAILABLE"
@@ -1054,6 +1058,15 @@ def _source_text(value: object, field: str) -> str:
     return value
 
 
+def _decode_optimizer_source_metadata(value: object, imported_at_utc: str) -> Mapping[str, Any] | None:
+    try:
+        imported = _utc(imported_at_utc)
+    except (PortfolioInputError, TypeError, ValueError):
+        return None
+    decoded = decode_optimizer_source_metadata(value, imported)
+    return _frozen(decoded) if decoded is not None else None
+
+
 def _finalist_provenance(
     facts: Mapping[tuple[str, str, int, int], Mapping[str, Any]],
     strategy: Mapping[str, Any],
@@ -1225,7 +1238,10 @@ def read_current_finalists(
 
                 for result_id in result_ids:
                     actions_by_result[int(result_id)] = tuple(
-                        _frozen(_public_series_row(row, ("result_id", "action_index", "timestamp_utc")))
+                        _frozen(_public_series_row(row, (
+                            "result_id", "action_index", "timestamp_utc", "symbol", "order_id", "action",
+                            "size", "post_size", "post_side", "pnl", "fee", "balance", "raw_action_json",
+                        )))
                         for row in sorted(
                             (item for item in action_rows if int(item.get("result_id")) == int(result_id)),
                             key=lambda item: (item.get("timestamp_utc"), item.get("action_index")),
@@ -1348,6 +1364,10 @@ def read_current_finalists(
                     "review_import_id": provenance["review_import_id"],
                     "source_provenance": provenance,
                 }
+                source_metadata = _decode_optimizer_source_metadata(
+                    source_result.get("optimizer_source_metadata_json"), result_row["imported_at_utc"]
+                )
+                result_row["optimizer_source_metadata"] = source_metadata
                 if include_series:
                     result_row.update({
                         "actions": actions_by_result.get(result_id, ()),
@@ -1433,6 +1453,310 @@ class CommonPretestPeriodResult:
     @property
     def end(self) -> datetime | None:
         return self.end_utc
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedWeightedInput:
+    """T+1 UTC boundary timestamps with T x N participant matrices."""
+    period_start_utc: datetime
+    period_end_utc: datetime
+    history_step_minutes: int
+    timestamps_utc: tuple[str, ...]
+    strategy_ids: tuple[int, ...]
+    normalized_delta: tuple[tuple[Decimal, ...], ...]
+    valid: tuple[tuple[bool, ...], ...]
+    reasons: tuple[tuple[str | None, ...], ...]
+    cycles: Mapping[str, tuple[Mapping[str, Any], ...]]
+    diagnostics: Mapping[str, Any]
+    preparation_key: str
+
+    @property
+    def period(self) -> tuple[datetime, datetime]:
+        return self.period_start_utc, self.period_end_utc
+
+
+def preparation_cache_key(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    history_step_minutes: int = 5,
+    minimum_common_days: int = 14,
+    period: CommonPretestPeriodResult | None = None,
+) -> str:
+    if type(history_step_minutes) is not int or history_step_minutes <= 0:
+        raise ValueError("history_step_minutes must be a positive integer")
+    if type(minimum_common_days) is not int or minimum_common_days <= 0:
+        raise ValueError("minimum_common_days must be positive")
+    def clean(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): clean(value[key]) for key in sorted(value, key=str)}
+        if isinstance(value, (tuple, list)):
+            return [clean(item) for item in value]
+        if isinstance(value, Decimal):
+            return format(value, "f")
+        if isinstance(value, datetime):
+            return _utc(value).isoformat()
+        return value
+    identities = []
+    for row in sorted(rows, key=_period_sort_key):
+        metadata = row.get("optimizer_source_metadata", row.get("optimizer_source_metadata_json"))
+        identities.append({
+            "symbol": row.get("symbol"), "side": row.get("side"),
+            "strategy_id": row.get("strategy_id"), "result_id": row.get("result_id"),
+            "imported_at_utc": row.get("imported_at_utc"),
+            "effective_start_utc": row.get("effective_start_utc"),
+            "effective_end_utc": row.get("effective_end_utc"),
+            "source_provenance": row.get("source_provenance"),
+            "optimizer_source_metadata": metadata,
+            "series": {
+                "actions": row.get("actions", row.get("action_series", ())),
+                "equity": row.get("equity", row.get("equity_series", row.get("equity_path", ()))),
+            },
+        })
+    period_identity = None if period is None else (period.start_utc, period.end_utc, period.status)
+    payload = json.dumps(clean({"weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION, "history_step_minutes": history_step_minutes, "minimum_common_days": minimum_common_days, "period": period_identity, "rows": identities}), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _numeric_setting(value: Any, expected: int) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return number.is_finite() and number == Decimal(expected)
+
+
+def _cycle_records(row: Mapping[str, Any], period_end: datetime) -> tuple[Mapping[str, Any], ...]:
+    from .reports import performance_rows_to_report_actions, reconstruct_cycles
+    source_rows = tuple(row.get("actions", row.get("action_series", ())))
+    for source in source_rows:
+        if isinstance(source, Mapping):
+            for field in ("balance", "pnl", "fee"):
+                value = source.get(field)
+                if value is not None:
+                    try:
+                        _to_decimal(value)
+                    except (PortfolioInputError, InvalidOperation, TypeError, ValueError) as error:
+                        raise PortfolioInputError(f"invalid source action {field}", code="INVALID_SOURCE_VALUE") from error
+    actions = performance_rows_to_report_actions(source_rows)
+    reconstructed = reconstruct_cycles(actions, report_end=period_end.isoformat().replace("+00:00", "Z"))
+    by_ordinal = {
+        int(item["action_index"]) if item.get("action_index") is not None else fallback: item
+        for fallback, item in enumerate(source_rows) if isinstance(item, Mapping)
+    }
+    metadata = row.get("optimizer_source_metadata", row.get("optimizer_source_metadata_json"))
+    if isinstance(metadata, str):
+        metadata = _decode_optimizer_source_metadata(metadata, str(row.get("imported_at_utc", "")))
+    settings = metadata.get("settings", {}) if isinstance(metadata, Mapping) else {}
+    exchange = settings.get("exchange", {}) if isinstance(settings, Mapping) else {}
+    basic = settings.get("basic", {}) if isinstance(settings, Mapping) else {}
+    dynamic_basis = (
+        isinstance(exchange, Mapping) and exchange.get("use_upnl") is True and exchange.get("use_frozen_balance") is True
+        and isinstance(basic, Mapping) and basic.get("use_fix") is False
+        and _numeric_setting(basic.get("balance_percentage_long"), 100)
+        and _numeric_setting(basic.get("risk_long"), 1)
+        and _numeric_setting(basic.get("max_balance"), 0)
+    )
+    result: list[dict[str, Any]] = []
+    opening_candidates: dict[str, list[Any]] = {}
+    for action in actions:
+        if action.pre_size == Decimal("0") and action.post_size not in (None, Decimal("0")):
+            opening_candidates.setdefault(action.timestamp_utc, []).append(action)
+    for cycle in reconstructed:
+        basis = None
+        diagnostics = cycle.diagnostics
+        if cycle.opened_at is not None:
+            opening_queue = opening_candidates.get(cycle.opened_at, [])
+            opening = opening_queue.pop(0) if opening_queue else None
+            if opening is None:
+                diagnostics = tuple(dict.fromkeys((*diagnostics, "SOURCE_OPENING_ROW_UNMATCHED")))
+            if opening is not None:
+                source = by_ordinal.get(opening.source_ordinal, {})
+                try:
+                    if dynamic_basis:
+                        balance = _to_decimal(source.get("balance"))
+                        pnl = _to_decimal(source["pnl"]) if source.get("pnl") is not None else Decimal("0")
+                        fee = _to_decimal(source["fee"]) if source.get("fee") is not None else Decimal("0")
+                        basis = balance - pnl + fee
+                    if basis is not None and basis <= 0:
+                        basis = None
+                except (PortfolioInputError, InvalidOperation, TypeError, ValueError):
+                    raise PortfolioInputError("invalid source opening numeric", code="INVALID_SOURCE_VALUE")
+        result.append({
+            "cycle_id": cycle.cycle_id, "opened_at": cycle.opened_at, "closed_at": cycle.closed_at,
+            "duration_seconds": cycle.duration_seconds, "censored": cycle.censored, "carry_in": cycle.carry_in,
+            "side": cycle.side, "realized_pnl": cycle.realized_pnl, "fees": cycle.fees,
+            "close_attribution": cycle.close_attribution,
+            "source_basis": basis, "maximum_position": cycle.maximum_position,
+            "execution_count": cycle.execution_count, "diagnostics": diagnostics,
+        })
+    return tuple(result)
+
+
+def _grid_value(samples: Sequence[tuple[datetime, Decimal]], node: datetime, cursor: int, last: tuple[datetime, Decimal] | None) -> tuple[int, tuple[datetime, Decimal] | None]:
+    while cursor < len(samples) and samples[cursor][0] <= node:
+        last = samples[cursor]
+        cursor += 1
+    return cursor, last
+
+
+def _cycle_diagnostics(cycles: Sequence[Mapping[str, Any]], start: datetime, end: datetime) -> Mapping[str, Any]:
+    known_holds = tuple(
+        cycle["duration_seconds"]
+        for cycle in cycles
+        if not cycle.get("censored") and cycle.get("duration_seconds") is not None
+    )
+    occupied = Decimal("0")
+    for cycle in cycles:
+        if cycle.get("opened_at"):
+            opened = _utc(cycle["opened_at"])
+        elif cycle.get("carry_in"):
+            opened = start
+        else:
+            continue
+        closed = _utc(cycle["closed_at"]) if cycle.get("closed_at") else end
+        left, right = max(start, opened), min(end, closed)
+        if right > left:
+            occupied += Decimal(str((right - left).total_seconds()))
+    window_seconds = Decimal(str((end - start).total_seconds()))
+    bases = tuple(cycle["source_basis"] for cycle in cycles if cycle.get("source_basis") is not None)
+    ordered_bases = sorted(bases)
+    if ordered_bases:
+        middle = len(ordered_bases) // 2
+        median = ordered_bases[middle] if len(ordered_bases) % 2 else (ordered_bases[middle - 1] + ordered_bases[middle]) / Decimal("2")
+    else:
+        median = None
+    return {
+        "cycle_count": len(cycles),
+        "known_hold_durations_seconds": known_holds,
+        "occupied_duration_seconds": occupied,
+        "occupied_ratio": occupied / window_seconds if window_seconds > 0 else None,
+        "source_bases": bases,
+        "median_source_basis": median,
+    }
+
+
+def prepare_weighted_input(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    history_step_minutes: int = 5,
+    minimum_common_days: int = 14,
+    cache: MutableMapping[str, PreparedWeightedInput] | None = None,
+) -> PreparedWeightedInput:
+    if type(history_step_minutes) is not int or history_step_minutes <= 0:
+        raise ValueError("history_step_minutes must be a positive integer")
+    participant_keys: set[str] = set()
+    participant_symbols: set[str] = set()
+    participant_strategy_ids: set[int] = set()
+    for row in rows:
+        strategy_id = row.get("strategy_id")
+        if type(strategy_id) is not int:
+            raise PortfolioInputError("strategy_id must be an integer", code="INVALID_SOURCE_VALUE")
+        if str(row.get("side", "")).upper() != "LONG":
+            raise PortfolioInputError("weighted input requires LONG participants", code="INVALID_SOURCE_VALUE")
+        symbol = str(row.get("symbol", "")).upper()
+        if symbol in participant_symbols:
+            raise PortfolioInputError("duplicate participant symbol", code="INVALID_SOURCE_VALUE")
+        if strategy_id in participant_strategy_ids:
+            raise PortfolioInputError("duplicate participant strategy_id", code="INVALID_SOURCE_VALUE")
+        participant_symbols.add(symbol)
+        participant_strategy_ids.add(strategy_id)
+        key_row = _period_row_key(row)
+        if key_row in participant_keys:
+            raise PortfolioInputError("duplicate participant key", code="INVALID_SOURCE_VALUE")
+        participant_keys.add(key_row)
+    period = resolve_common_pretest_period(rows, minimum_common_days=minimum_common_days)
+    if not period.available or period.start_utc is None or period.end_utc is None:
+        raise PortfolioInputError(period.reason or "common pretest period unavailable", code="COMMON_PERIOD_UNAVAILABLE")
+    if period.evidence.get("excluded_identities") or period.evidence.get("binding_removals"):
+        raise PortfolioInputError("common pretest period changed the finalist universe", code="COMMON_PERIOD_UNIVERSE_CHANGED")
+    key = preparation_cache_key(rows, history_step_minutes=history_step_minutes, minimum_common_days=minimum_common_days, period=period)
+    cached = cache.get(key) if cache is not None else None
+    if cached is not None:
+        return cached
+    start, end = period.start_utc, period.end_utc
+    step = timedelta(minutes=history_step_minutes)
+    grid = [start]
+    while grid[-1] < end:
+        grid.append(min(end, grid[-1] + step))
+    timestamps = tuple(grid)
+    ordered = tuple(sorted(rows, key=_period_sort_key))
+    strategy_ids = tuple(row["strategy_id"] for row in ordered)
+    columns = [[Decimal("0") for _ in ordered] for _ in range(max(0, len(timestamps) - 1))]
+    valid = [[True] * len(ordered) for _ in range(max(0, len(timestamps) - 1))]
+    reasons: list[list[str | None]] = [[None] * len(ordered) for _ in range(max(0, len(timestamps) - 1))]
+    cycles: dict[str, tuple[Mapping[str, Any], ...]] = {}
+    diagnostic_rows: dict[str, Any] = {}
+    for col, row in enumerate(ordered):
+        symbol = str(row.get("symbol", ""))
+        key_row = _period_row_key(row)
+        cycle_values = _cycle_records(row, end)
+        cycles[key_row] = cycle_values
+        diagnostic_rows[key_row] = _cycle_diagnostics(cycle_values, start, end)
+        raw_samples = row.get("equity", row.get("equity_series", row.get("equity_path", ())))
+        if not isinstance(raw_samples, Sequence) or isinstance(raw_samples, (str, bytes)):
+            raise PortfolioInputError("invalid equity series shape", code="INVALID_SOURCE_VALUE")
+        samples: list[tuple[datetime, Decimal]] = []
+        for item in raw_samples:
+            if not isinstance(item, Mapping):
+                raise PortfolioInputError("invalid equity sample shape", code="INVALID_SOURCE_VALUE")
+            samples.append((_utc(item.get("timestamp_utc", item.get("timestamp"))), _to_decimal(item.get("equity", item.get("value")))))
+        samples.sort(key=lambda item: item[0])
+        initial = row.get("initial_balance", row.get("source_initial_balance"))
+        if initial is not None and (not samples or samples[0][0] > start):
+            samples.insert(0, (start, _to_decimal(initial)))
+        cursor = 0
+        last: tuple[datetime, Decimal] | None = None
+        values: list[Decimal | None] = []
+        for node in timestamps:
+            cursor, last = _grid_value(samples, node, cursor, last)
+            values.append(last[1] if last is not None else None)
+        for index in range(len(timestamps) - 1):
+            left, right = timestamps[index], timestamps[index + 1]
+            left_value, right_value = values[index], values[index + 1]
+            reason = None
+            if left_value is None or right_value is None:
+                reason = f"LOST_EQUITY symbol={symbol} strategy_id={row.get('strategy_id')} result_id={row.get('result_id')} bounds={left.isoformat()}..{right.isoformat()}"
+            else:
+                boundaries = {left, right}
+                boundaries.update(
+                    datetime.fromisoformat(value["opened_at"].replace("Z", "+00:00"))
+                    for value in cycle_values
+                    if value.get("opened_at") and left < datetime.fromisoformat(value["opened_at"].replace("Z", "+00:00")) <= right
+                )
+                boundaries.update(
+                    datetime.fromisoformat(value["closed_at"].replace("Z", "+00:00"))
+                    for value in cycle_values
+                    if value.get("closed_at") and left < datetime.fromisoformat(value["closed_at"].replace("Z", "+00:00")) <= right
+                )
+                boundaries.update(sample[0] for sample in samples if left < sample[0] <= right)
+                boundaries = sorted(boundaries)
+                points: list[Decimal | None] = []
+                for boundary in boundaries:
+                    prior = [sample[1] for sample in samples if sample[0] <= boundary]
+                    points.append(prior[-1] if prior else None)
+                for segment, (segment_start, segment_end) in enumerate(zip(boundaries, boundaries[1:])):
+                    delta = (points[segment + 1] or Decimal("0")) - (points[segment] or Decimal("0"))
+                    if not delta:
+                        continue
+                    middle = segment_start + (segment_end - segment_start) / 2
+                    active = next((cycle for cycle in cycle_values if cycle.get("opened_at") and datetime.fromisoformat(cycle["opened_at"].replace("Z", "+00:00")) <= middle and (not cycle.get("closed_at") or middle < datetime.fromisoformat(cycle["closed_at"].replace("Z", "+00:00")))), None)
+                    if active is None:
+                        # A right-node opening owns the endpoint delta; this is the explicit [first fill, final flat) boundary rule.
+                        active = next((cycle for cycle in cycle_values if cycle.get("opened_at") and datetime.fromisoformat(cycle["opened_at"].replace("Z", "+00:00")) == segment_end), None)
+                    if active is None or active.get("source_basis") is None:
+                        reason = f"UNATTRIBUTABLE_EQUITY symbol={symbol} strategy_id={row.get('strategy_id')} result_id={row.get('result_id')} bounds={segment_start.isoformat()}..{segment_end.isoformat()}"
+                        break
+                    columns[index][col] += delta / active["source_basis"]
+            if reason:
+                columns[index][col] = Decimal("0")
+                valid[index][col] = False
+                reasons[index][col] = reason
+    prepared = PreparedWeightedInput(start, end, history_step_minutes, tuple(item.isoformat().replace("+00:00", "Z") for item in timestamps), strategy_ids, tuple(tuple(row) for row in columns), tuple(tuple(row) for row in valid), tuple(tuple(row) for row in reasons), _frozen(cycles), _frozen({"rows": diagnostic_rows, "period": period.evidence}), key)
+    if cache is not None:
+        cache[key] = prepared
+    return prepared
 
 
 def _day_floor(value: datetime) -> datetime:

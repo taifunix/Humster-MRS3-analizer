@@ -6,7 +6,10 @@ import json
 import pytest
 
 from mrs3.portfolio.reports import (
+    ReportAction,
     ReportNormalizationError,
+    performance_rows_to_report_actions,
+    reconstruct_cycles,
     compare_semantic_results,
     normalize_report,
 )
@@ -40,6 +43,100 @@ def test_sanitized_fixture_preserves_decimal_order_and_unavailable_series():
     assert report.cycles[0].realized_pnl == Decimal("4")
     assert report.cycles[0].maximum_position == Decimal("2")
     assert report.cycles[0].execution_count == 2
+
+
+def test_performance_rows_adapter_reuses_cycle_reconstructor_for_partial_fills():
+    actions = performance_rows_to_report_actions([
+        {"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT", "action": "opened", "size": "1", "post_size": "1", "post_side": "LONG", "pnl": "0", "fee": "1", "balance": "1000"},
+        {"action_index": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "symbol": "BTCUSDT", "action": "increased", "size": "1", "post_size": "2", "post_side": "LONG", "pnl": "0", "fee": "1", "balance": "1000"},
+        {"action_index": 2, "timestamp_utc": "2026-01-01T00:00:02Z", "symbol": "BTCUSDT", "action": "decreased", "size": "1", "post_size": "1", "post_side": "LONG", "pnl": "0", "fee": "1", "balance": "1000"},
+        {"action_index": 3, "timestamp_utc": "2026-01-01T00:00:03Z", "symbol": "BTCUSDT", "action": "closed", "size": "1", "post_size": "0", "post_side": "LONG", "pnl": "5", "fee": "1", "balance": "1005"},
+    ])
+
+    cycles = reconstruct_cycles(actions, report_end="2026-01-01T00:00:04Z")
+
+    assert len(cycles) == 1
+    assert cycles[0].maximum_position == Decimal("2")
+    assert cycles[0].execution_count == 4
+    assert cycles[0].realized_pnl == Decimal("5")
+
+
+def test_performance_rows_adapter_preserves_unknown_leading_close_as_carry_in():
+    actions = performance_rows_to_report_actions([
+        {"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT", "action": "closed", "size": "1", "post_side": "LONG", "pnl": "0", "fee": "0", "balance": "100"},
+    ])
+
+    cycles = reconstruct_cycles(actions, report_end="2026-01-01T00:00:01Z")
+
+    assert actions[0].pre_size is None
+    assert actions[0].post_size is None
+    assert actions[0].qty_delta is None
+    assert len(cycles) == 1
+    assert cycles[0].carry_in is True
+
+
+@pytest.mark.parametrize("action_name", ["increased", "decreased"])
+def test_performance_rows_adapter_treats_unseen_non_opening_as_carry_in(action_name):
+    actions = performance_rows_to_report_actions([
+        {"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT", "action": action_name, "size": "1", "post_size": "2", "post_side": "LONG", "pnl": "0", "fee": "0", "balance": "100"},
+        {"action_index": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "symbol": "BTCUSDT", "action": "closed", "size": "2", "post_size": "0", "post_side": "LONG", "pnl": "1", "fee": "0", "balance": "101"},
+        {"action_index": 2, "timestamp_utc": "2026-01-01T00:00:02Z", "symbol": "BTCUSDT", "action": "opened", "size": "1", "post_size": "1", "post_side": "LONG", "pnl": "0", "fee": "0", "balance": "101"},
+    ])
+
+    cycles = reconstruct_cycles(actions, report_end="2026-01-01T00:00:03Z")
+
+    assert actions[0].pre_size is None
+    assert cycles[0].carry_in is True
+    assert cycles[0].opened_at is None
+    assert len(cycles) == 2
+    assert cycles[1].carry_in is False
+
+
+@pytest.mark.parametrize(("action", "side"), [("BUY", "LONG"), ("SELL", "SHORT")])
+def test_first_buy_or_sell_opens_from_flat(action, side):
+    cycles = reconstruct_cycles([
+        ReportAction(
+            "2026-01-01T00:00:00Z", 0, "BTCUSDT", action, side,
+            size=Decimal("1"),
+        ),
+    ], report_end="2026-01-01T00:00:01Z")
+
+    assert len(cycles) == 1
+    assert cycles[0].carry_in is False
+    assert cycles[0].opened_at == "2026-01-01T00:00:00.000000Z"
+
+
+@pytest.mark.parametrize("raw_action_json", ["{not-json", "[]"])
+def test_performance_rows_adapter_rejects_present_malformed_raw_action_json(raw_action_json):
+    with pytest.raises(ReportNormalizationError) as error:
+        performance_rows_to_report_actions([{
+            "action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT",
+            "action": "opened", "post_size": "1", "post_side": "LONG", "raw_action_json": raw_action_json,
+        }])
+
+    assert error.value.code == "REPORT_SCHEMA_INVALID"
+
+
+def test_performance_rows_adapter_rejects_known_close_without_post_size():
+    with pytest.raises(ReportNormalizationError) as error:
+        performance_rows_to_report_actions([{
+            "action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT",
+            "action": "opened", "post_size": "1", "post_side": "LONG",
+        }, {
+            "action_index": 1, "timestamp_utc": "2026-01-01T00:00:01Z", "symbol": "BTCUSDT",
+            "action": "closed", "post_side": "LONG",
+        }])
+
+    assert error.value.code == "REPORT_SCHEMA_INVALID"
+
+
+def test_performance_rows_adapter_uses_position_for_missing_action_index_source_order():
+    actions = performance_rows_to_report_actions([
+        {"timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT", "action": "opened", "post_size": "1", "post_side": "LONG"},
+        {"timestamp_utc": "2026-01-01T00:00:01Z", "symbol": "BTCUSDT", "action": "closed", "post_size": "0", "post_side": "LONG"},
+    ])
+
+    assert tuple(action.source_ordinal for action in actions) == (0, 1)
 
 
 @pytest.mark.parametrize("change", [

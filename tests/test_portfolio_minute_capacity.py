@@ -94,6 +94,20 @@ def test_missing_days_are_preliminary_without_turning_them_into_zero(tmp_path: P
     assert result.calendar_7d.mean_minute_turnover == Decimal("100") / Decimal(1_440)
 
 
+def test_zero_trade_minutes_are_counted_but_missing_days_are_not(tmp_path: Path):
+    day = date(2026, 9, 13)
+    write_day(tmp_path, "BTCUSDT", day, [minute(day, 0)])
+
+    result = calculate_minute_capacity(
+        tmp_path, "BTCUSDT", end_date=day, participation_pct=30,
+        now=datetime(2026, 9, 14, 8, tzinfo=timezone.utc), publication_lag_hours=6,
+    )
+
+    assert result.calendar_7d.clock_minutes == 1_440
+    assert result.calendar_7d.zero_trade_minutes == 1_439
+    assert len(result.missing_days) == 6
+
+
 def test_no_available_days_fails_closed(tmp_path: Path):
     with pytest.raises(MinuteCapacityError, match="no valid daily CSV"):
         calculate_minute_capacity(

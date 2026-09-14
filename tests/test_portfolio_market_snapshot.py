@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
-from mrs3.portfolio.market_snapshot import MarketSnapshotError, load_market_snapshot
+from mrs3.portfolio import market_snapshot as market_snapshot_module
+from mrs3.portfolio.market_snapshot import ApiRateLimiter, MarketSnapshotError, load_market_snapshot
 
 
 def instrument(symbol: str, *, status: str = "Trading", contract: str = "LinearPerpetual") -> dict:
@@ -66,6 +68,27 @@ def test_loads_complete_snapshot_deterministically_independent_of_input_order() 
     assert calls[0] == ("instruments-info", {"category": "linear", "symbol": "BTCUSDT"})
     with pytest.raises(TypeError):
         first.mark_prices["BTCUSDT"] = Decimal("1")  # type: ignore[index]
+
+
+def test_load_market_snapshot_requires_limiter_for_default_fetcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(market_snapshot_module, "_http_fetch", lambda *_: pytest.fail("default fetch must not run"))
+    with pytest.raises(MarketSnapshotError, match="limiter"):
+        load_market_snapshot(("BTCUSDT",), captured_at_ms=0)
+
+
+def test_load_market_snapshot_routes_every_reference_fetch_through_limiter() -> None:
+    fetch, calls = fetcher_for(("BTCUSDT",))
+    limited: list[str] = []
+
+    class Limiter:
+        def call(self, raw_fetch, feed, params):
+            limited.append(feed)
+            return raw_fetch(feed, params)
+
+    load_market_snapshot(("BTCUSDT",), captured_at_ms=0, fetcher=fetch, limiter=Limiter())  # type: ignore[arg-type]
+
+    assert len(limited) == len(calls)
+    assert limited == [feed for feed, _params in calls]
 
 
 def test_paginates_reference_feeds_and_detects_repeated_cursor() -> None:
@@ -199,3 +222,94 @@ def test_wraps_fetcher_errors_as_global_typed_failure() -> None:
 
     with pytest.raises(MarketSnapshotError, match="fetch failed"):
         load_market_snapshot(("BTCUSDT",), captured_at_ms=0, fetcher=fetch)
+
+
+def test_shared_api_limiter_retries_charged_attempts_and_persists_403_cooldown(tmp_path):
+    now = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    sleeps: list[float] = []
+    limiter = ApiRateLimiter(tmp_path / "cooldown.json", clock=lambda: now[0], sleep=lambda seconds: (sleeps.append(seconds), now.__setitem__(0, now[0] + timedelta(seconds=seconds))))
+    calls = 0
+
+    def retryable(_feed, _params):
+        nonlocal calls
+        calls += 1
+        return {"retCode": 10006, "result": {}} if calls < 3 else {"retCode": 0, "result": {}}
+
+    assert limiter.call(retryable, "tickers", {})["retCode"] == 0
+    assert calls == 3
+    assert len(sleeps) >= 2
+
+    class TooFrequent(RuntimeError):
+        status_code = 403
+
+        def __str__(self):
+            return "access too frequent"
+
+    with pytest.raises(TooFrequent):
+        limiter.call(lambda *_: (_ for _ in ()).throw(TooFrequent()), "tickers", {})
+    blocked_calls = 0
+    restored = ApiRateLimiter(tmp_path / "cooldown.json", clock=lambda: now[0], sleep=lambda seconds: None)
+
+    def blocked(*_):
+        nonlocal blocked_calls
+        blocked_calls += 1
+        return {}
+
+    with pytest.raises(MarketSnapshotError, match="cooldown"):
+        restored.call(blocked, "tickers", {})
+    assert blocked_calls == 0
+
+
+def test_shared_api_limiter_requires_persisted_state_path():
+    with pytest.raises(MarketSnapshotError, match="state_path"):
+        ApiRateLimiter(clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc), sleep=lambda _seconds: None)
+
+
+def test_shared_api_limiter_fails_closed_after_final_retryable_payload(tmp_path):
+    calls = 0
+
+    def exhausted(_feed, _params):
+        nonlocal calls
+        calls += 1
+        return {"retCode": 10006, "result": {}}
+
+    limiter = ApiRateLimiter(tmp_path / "cooldown.json", clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc), sleep=lambda _seconds: None)
+
+    with pytest.raises(MarketSnapshotError, match="retry budget exhausted"):
+        limiter.call(exhausted, "tickers", {})
+    assert calls == 3
+
+
+def test_shared_api_limiter_clamps_retry_after_to_one_minute(tmp_path):
+    sleeps: list[float] = []
+    limiter = ApiRateLimiter(tmp_path / "cooldown.json", clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc), sleep=sleeps.append)
+
+    with pytest.raises(MarketSnapshotError, match="retry budget exhausted"):
+        limiter.call(lambda *_: {"retCode": 10006, "headers": {"Retry-After": "120"}}, "tickers", {})
+
+    assert sleeps
+    assert max(sleeps) <= 60
+
+
+def test_shared_api_limiter_retries_mapping_status_code_429_and_exhausts(tmp_path):
+    now = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    calls = 0
+    limiter = ApiRateLimiter(tmp_path / "cooldown.json", clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + timedelta(seconds=seconds)))
+
+    def exhausted(_feed, _params):
+        nonlocal calls
+        calls += 1
+        return {"statusCode": 429}
+
+    with pytest.raises(MarketSnapshotError, match="retry budget exhausted"):
+        limiter.call(exhausted, "tickers", {})
+
+    assert calls == 3
+
+
+def test_shared_api_limiter_rejects_malformed_persisted_cooldown(tmp_path):
+    state = tmp_path / "cooldown.json"
+    state.write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(MarketSnapshotError, match="persisted"):
+        ApiRateLimiter(state, clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc), sleep=lambda _seconds: None)

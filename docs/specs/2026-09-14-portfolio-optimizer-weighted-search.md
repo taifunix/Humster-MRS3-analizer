@@ -98,6 +98,7 @@ m=0.20/0.10/0.05, r=0.20/0.40/0.60, u=0.50/0.35/0.20.
 
 Минимальные подготовленные данные на участника:
 strategy/result revision; UTC boundaries; normalized_delta[T]; valid[T];
+timestamps_utc содержит T+1 UTC-границ интервалов; normalized_delta, valid и reasons — T×N по участникам.
 cycles с интервалами [first fill, final flat), базой S и атрибутируемыми
 приращениями equity; индивидуальные hold/count/occupancy и source-scale diagnostics.
 Матрица normalized_delta имеет форму T×N, порядок колонок — stable strategy_id.
@@ -117,15 +118,13 @@ normalized_delta_i,t = delta_equity_i,t / S_i,k. Net equity включает р�
 и UPnL; realized-only не заменяет её. Price/Cost действий — actual fills,
 не плановый полный S. Максимальная quantity также не является S в USDT.
 
-Для MVP основной способ получить известный S — fixed-basis calibration retest
-через существующий массовый FINALIST retest. Восстановление S из исходного
-отчёта разрешено только при доказанной плановой базе для каждого цикла.
-Сначала два представителя: одноуровневый и многоуровневый, минимальные stable
-strategy_id в соответствующих группах; если группы нет — явное сообщение.
-Root фиксирует их IDs, JSON, отчёты и проверенную семантику sizing в evidence
-фазы 1. Кодер не угадывает значения override из use_fix/use_frozen_balance.
-При неизвестной семантике зависимый этап блокируется до этой проверки.
-Динамические настройки итогового кандидата калибровкой не подменяются.
+Для WS1.1 источник S подтверждён фазой 1 буквально: use_fix=false,
+use_upnl=true, use_frozen_balance=true, balance_percentage_long=100,
+risk_long=1 и max_balance=0. Для каждого не carry-in цикла S берётся из
+первого opening-from-flat как balance - pnl + fee; одна база сохраняется для
+всего цикла, включая partial fills. Carry-in или неизвестная база дают
+UNKNOWN для зависимого normalized return. Price/Cost, maximum quantity,
+initial balance и fixed-basis calibration не являются заменой S.
 
 Без округления контроль нормализации: delta=10,S=100 и delta=20,S=200 дают
 normalized increments 0.1/0.1; при x=50 вклад равен 5/5 USDT.

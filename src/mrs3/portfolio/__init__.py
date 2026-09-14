@@ -8,10 +8,13 @@ from .input import (
     USER_RANK_MISSING,
     apply_finalist_cutoff,
     CommonPretestPeriodResult,
+    PreparedWeightedInput,
     build_common_pretest_period,
     common_pretest_period,
     read_and_select_finalists,
     read_current_finalists,
+    preparation_cache_key,
+    prepare_weighted_input,
     resolve_common_pretest_period,
 )
 from .config import (
@@ -172,6 +175,7 @@ from .reports import (
     parse_report,
     reconstruct_cycles,
     reconstruct_position_cycles,
+    performance_rows_to_report_actions,
     raw_sha256,
 )
 from .runner import (
@@ -233,6 +237,7 @@ from .export import (
     replay_decision,
     replay_portfolio_decision,
 )
+from .market_snapshot import ApiRateLimiter
 
 __all__ = [
     "PAIR_UNSELECTED",
@@ -243,10 +248,13 @@ __all__ = [
     "apply_finalist_cutoff",
     "read_current_finalists",
     "CommonPretestPeriodResult",
+    "PreparedWeightedInput",
     "build_common_pretest_period",
     "common_pretest_period",
     "resolve_common_pretest_period",
     "read_and_select_finalists",
+    "preparation_cache_key",
+    "prepare_weighted_input",
     "ALGORITHM_VERSIONS",
     "POLICY_VERSION",
     "PROFILE_NAMES",
@@ -388,6 +396,7 @@ __all__ = [
     "parse_report",
     "reconstruct_cycles",
     "reconstruct_position_cycles",
+    "performance_rows_to_report_actions",
     "raw_sha256",
     "Artifact",
     "ArtifactMismatchError",
@@ -441,4 +450,5 @@ __all__ = [
     "export_portfolio_package",
     "replay_decision",
     "replay_portfolio_decision",
+    "ApiRateLimiter",
 ]

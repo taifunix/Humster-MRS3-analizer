@@ -599,14 +599,24 @@ def reconstruct_cycles(actions: Iterable[ReportAction], *, report_end: str | Non
                 and action.qty_delta is None
                 and kind in _CLOSING_ACTIONS
             )
+            unknown_leading_transition = (
+                before == 0
+                and action.pre_size is None
+                and kind in (_CLOSING_ACTIONS | {"increase", "add", "increase_long", "increase_short"})
+                and not unknown_leading_close
+            )
             delta = Decimal("0") if unknown_leading_close else _signed_size(action, before)
             after = action.post_size
             if after is None:
                 after = before + delta
             if action.post_side and after:
                 after = abs(after) if action.post_side != "SHORT" else -abs(after)
-            if active is None and unknown_leading_close:
-                active = _cycle_state(None, True, None, Decimal("0"), ["CARRY_IN", "CARRY_IN_DIRECTION_UNKNOWN"])
+            if active is None and (unknown_leading_close or unknown_leading_transition):
+                side = None if after == 0 else ("SHORT" if after < 0 else "LONG")
+                diagnostics = ["CARRY_IN"]
+                if side is None:
+                    diagnostics.append("CARRY_IN_DIRECTION_UNKNOWN")
+                active = _cycle_state(None, True, side, abs(after), diagnostics)
             if active is None and before != 0:
                 active = _cycle_state(None, True, "SHORT" if before < 0 else "LONG", abs(before), ["CARRY_IN"])
             if active is None and before == 0 and after != 0:
@@ -645,6 +655,59 @@ def reconstruct_cycles(actions: Iterable[ReportAction], *, report_end: str | Non
         if active is not None:
             result.append(_finish_cycle(symbol, cycle_number, active, None, True, None, report_end))
             cycle_number += 1
+    return tuple(result)
+
+
+def performance_rows_to_report_actions(rows: Iterable[Mapping[str, Any]]) -> tuple[ReportAction, ...]:
+    """Adapt full PerformanceDB action rows without reimplementing cycles."""
+    names = {"opened": "open", "open": "open", "increased": "increase", "increase": "increase", "decreased": "decrease", "decrease": "decrease", "closed": "close", "close": "close"}
+    current: dict[str, Decimal] = {}
+    result: list[ReportAction] = []
+    materialized = tuple(enumerate(rows))
+    ordered = sorted(materialized, key=lambda item: (
+        _timestamp(item[1].get("timestamp_utc", item[1].get("timestamp"))),
+        int(item[1]["action_index"]) if item[1].get("action_index") is not None else item[0],
+    ))
+    for original_position, row in ordered:
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            raise ReportNormalizationError("performance action symbol is required", code="REPORT_SCHEMA_INVALID")
+        action_name = names.get(str(row.get("action", "")).strip().casefold())
+        if action_name is None:
+            raise ReportNormalizationError("unsupported performance action", code="REPORT_SCHEMA_INVALID")
+        before = current.get(symbol, Decimal("0"))
+        unseen_non_opening = symbol not in current and action_name != "open"
+        post = _decimal(row.get("post_size"), "post_size", optional=True)
+        leading_close = action_name == "close" and symbol not in current
+        if post is None and not leading_close:
+            raise ReportNormalizationError("post_size is required for supported action", code="REPORT_SCHEMA_INVALID")
+        post = before if post is None else abs(post) * (-1 if str(row.get("post_side") or "").strip().upper() == "SHORT" else 1)
+        unknown_leading_close = leading_close and post == 0
+        if unknown_leading_close:
+            post = None
+        raw = row.get("raw_action_json")
+        payload: Mapping[str, Any] = {}
+        if raw:
+            try:
+                decoded = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError) as error:
+                raise ReportNormalizationError("raw_action_json is malformed", code="REPORT_SCHEMA_INVALID") from error
+            if not isinstance(decoded, Mapping):
+                raise ReportNormalizationError("raw_action_json must decode to an object", code="REPORT_SCHEMA_INVALID")
+            payload = decoded
+        ordinal = int(row["action_index"]) if row.get("action_index") is not None else original_position
+        result.append(ReportAction(
+            _timestamp(row.get("timestamp_utc", row.get("timestamp"))), ordinal, symbol, action_name,
+            "SHORT" if (post or before) < 0 else "LONG", str(row["order_id"]) if row.get("order_id") is not None else None,
+            _decimal(row.get("size"), "size", optional=True), _decimal(payload.get("price"), "price", optional=True),
+            _decimal(payload.get("cost"), "cost", optional=True), _decimal(row.get("fee"), "fee", optional=True), None,
+            _decimal(row.get("pnl"), "pnl", optional=True), _decimal(row.get("balance"), "balance", optional=True),
+            None if unknown_leading_close else abs(post), str(row.get("post_side") or "").strip().upper() or None,
+            None, None if unknown_leading_close else post - before, None,
+            None if (unknown_leading_close or unseen_non_opening) else abs(before),
+            None if (unknown_leading_close or unseen_non_opening) else ("SHORT" if before < 0 else ("LONG" if before > 0 else None)),
+        ))
+        current[symbol] = before if unknown_leading_close else post
     return tuple(result)
 
 
@@ -891,6 +954,6 @@ def canonical_semantic_digest(value: NormalizedReport | Any) -> str:
 __all__ = [
     "REPORT_CONTRACT", "REPORT_SCHEMA", "REPORT_VERSION", "PARSER_VERSION", "METRICS_VERSION", "SERIES_NAMES", "BLOCKING_DIAGNOSTICS",
     "ReportNormalizationError", "ReportProvenance", "ReportSeriesPoint", "ReportAction", "PositionCycle", "NormalizedReport", "ReportNormalizer", "PortfolioReportNormalizer",
-    "normalize_report", "normalize_portfolio_report", "parse_report", "normalize", "PortfolioReport", "NormalizedPortfolioReport", "Action", "SeriesPoint", "Cycle", "reconstruct_cycles", "reconstruct_position_cycles",
+    "normalize_report", "normalize_portfolio_report", "parse_report", "normalize", "PortfolioReport", "NormalizedPortfolioReport", "Action", "SeriesPoint", "Cycle", "performance_rows_to_report_actions", "reconstruct_cycles", "reconstruct_position_cycles",
     "compare_semantic_results", "classify_semantic_identity", "raw_sha256", "canonical_semantic_digest",
 ]
