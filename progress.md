@@ -7,8 +7,29 @@ PerformanceDB review-state prerequisite (2026-09-15): automatic selection now
 populates only Auto Status/Auto Rank. Effective finalists require explicit
 imported User decisions; imported decisions survive later unreviewed runs, and
 auto-only runs cannot create a current-effective cohort or export. Focused
-selection-review and Panel regressions pass. Next: benchmark the 13 prepared
-rows using the explicit imported User review decisions; Phase 5 remains open.
+selection-review and Panel regressions pass.
+
+Weighted-search Phase 5 handoff (2026-09-15): implementation, focused/relevant
+tests, benchmark, and experimental defaults are recorded in
+`docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-phase-5-evidence.md`.
+The directed benchmark used 13 prepared explicit imported User FINALIST rows
+(13 strategies, 10 symbols); benchmark-only aliases exercised N=13 for three
+duplicate symbols and do not change the production one-LONG-per-symbol MVP.
+The factual matrix is T=12672 at 5-minute cadence over 2026-07-27..2026-09-09,
+with 0 invalid cells, 6519 actions, and 65646 equity samples. Local seven-day
+minute capacities are READY for all 10 symbols. Input/preparation/LP/replay/
+margin/render wall times were 3.197/5.852/29.016/1.697/0.113/0.165 s;
+margin is factual UNKNOWN because reference coefficients were unavailable.
+Bootstrap workers 1/30 PASSed in 387.581/43.589 s (8.89x; semantic outputs
+equal after operational fields). Full weighted_search workers 1 was correctly
+partial at 1100/3000 with WALL_TIME_LIMIT (982.201 s), while workers 30
+PASSed all 3000 scenarios and 8 candidates in 269.187 s. Experimental defaults
+remain K=8, wall=900 s, solver=30 s; workers remains the existing
+  `duckdb_import.workers` setting. Independent Opus implementation review
+  returned `CODE_REVIEW_PASS` after P5-R4a, P5-R5a, P5-R5a-T1, and P5-DOC1
+  were resolved. Phase 5 is accepted; commit/push is next, followed by Phase 6.
+  No real tester, exchange, network, retest, database write, or trading-readiness
+  claim is made.
 
 2026-09-14 current planning task: root (explicit user override of Planner Sol)
 replaced the accumulated weighted-search discussion with a technical plan at

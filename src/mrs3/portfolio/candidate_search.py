@@ -6,14 +6,14 @@ import hashlib
 import inspect
 import json
 import math
-import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from numbers import Real
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from itertools import combinations, product
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
+
+from mrs3._portfolio_process_worker import _ProcessBatchEvaluator
 
 from .config import RANKING_METRICS
 
@@ -49,8 +49,6 @@ _PAYLOAD_FIELDS = frozenset({
     "action_series", "strategy_actions", "minute_actions", "source_provenance",
 })
 _SOURCE_KEY = "_source_key"
-_PROCESS_EVALUATOR: Callable[..., Any] | None = None
-_PROCESS_CONTEXT: Any = None
 
 
 def _freeze(value: Any) -> Any:
@@ -156,47 +154,6 @@ def _evaluator_arity(evaluator: Callable[..., Any] | None) -> int:
     return 2 if any(parameter.kind == parameter.VAR_POSITIONAL for parameter in parameters) or len(parameters) > 1 else 1
 
 
-def _process_initializer(evaluator: Callable[..., Any], context: Any) -> None:
-    global _PROCESS_EVALUATOR, _PROCESS_CONTEXT
-    _PROCESS_EVALUATOR = evaluator
-    _PROCESS_CONTEXT = context
-
-
-def _process_task(task: tuple[int, tuple[Mapping[str, Any], ...]]) -> tuple[int, Any]:
-    index, members = task
-    evaluator = _PROCESS_EVALUATOR
-    if evaluator is None:
-        return index, {"status": "UNKNOWN", "reason": "PROCESS_EVALUATOR_UNAVAILABLE"}
-    try:
-        return index, evaluator(members, _PROCESS_CONTEXT)
-    except (ArithmeticError, KeyError, TypeError, ValueError, OSError):
-        return index, {"status": "UNKNOWN", "reason": "PRETEST_EVALUATION_INVALID"}
-
-
-class _ProcessBatchEvaluator:
-    """Small bounded process bridge; the parent owns ordering and accounting."""
-
-    def __init__(self, evaluator: Callable[..., Any], context: Any, workers: int, task_count: int) -> None:
-        width = min(max(1, int(workers)), max(1, int(task_count)), os.cpu_count() or 1, 61 if os.name == "nt" else 2**31 - 1)
-        self.width = width
-        self.pool = ProcessPoolExecutor(
-            max_workers=width,
-            initializer=_process_initializer,
-            initargs=(evaluator, context),
-        )
-
-    def __call__(self, tasks: Sequence[tuple[int, tuple[Mapping[str, Any], ...]]]) -> tuple[tuple[int, Any], ...]:
-        futures = [self.pool.submit(_process_task, task) for task in tasks]
-        try:
-            return tuple(sorted((future.result() for future in as_completed(futures)), key=lambda item: item[0]))
-        except BaseException:
-            self.close()
-            raise
-
-    def close(self) -> None:
-        self.pool.shutdown(wait=True)
-
-
 def _semantic_facts(member: Mapping[str, Any]) -> dict[str, Any]:
     return {field: member.get(field) for field in _IDENTITY_FIELDS}
 
@@ -271,6 +228,10 @@ class SearchResult:
     suggested_budget: int = 0
     warnings: tuple[str, ...] = ()
     mode: str = "LEGACY"
+    manifest: Mapping[str, Any] = MappingProxyType({})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "manifest", _freeze(self.manifest))
 
 
 Candidate = PortfolioCandidate

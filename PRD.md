@@ -126,7 +126,11 @@ analysis runs и lineage согласно уже реализованной
 для этой редакции 2026-09-14; оговорка CONFIRMED/UNKNOWN добавлена в §9 плана.
 Приняты [спецификация WS1.1](docs/specs/2026-09-14-portfolio-optimizer-weighted-search.md)
 и [ADR-0036](docs/decisions/0036-portfolio-optimizer-weighted-search-contract.md)
-как контракт нового режима; реализация ещё не начата.
+как контракт нового режима. Phase 5 implementation, verification, and the
+directed benchmark are recorded in
+[Phase 5 evidence](docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-phase-5-evidence.md);
+independent Opus implementation review returned `CODE_REVIEW_PASS`, so Phase 5
+is accepted.
 История и
 [ответ на замечания](docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-review-response.md)
 сохраняют основания решения и изменение области резерва (§8.1 плана).
@@ -139,7 +143,8 @@ FINALIST на символ, подбор полных размеров и тре
 инфраструктура Campaign/экспорта переиспользуются. MaxDD 20/10/5% от пика equity,
 резерв 20/40/60% и MM 50/35/20% сохраняются. Настройки остаются в том же JSON
 с понятными полями панели; предусмотрена защита от повторного API-бана.
-Это план, а не реализованный новый алгоритм. Нормализация исходных динамических
+Фаза 5 принята только как fixture/local evidence implementation, а не как
+runtime или trading release. Нормализация исходных динамических
 лотов требует контрольной проверки; обычный повторный импорт не восстанавливает
 отсутствующий плановый sizing. Обновление active-spec перед изменением поведения,
 фазы реализации и критерии приёмки перечислены в плане. Действующие runtime-

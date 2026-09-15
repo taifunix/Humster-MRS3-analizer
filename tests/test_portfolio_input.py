@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -1161,6 +1161,43 @@ def test_prepare_weighted_input_uses_dynamic_cycle_basis_and_last_known_equity()
     assert diagnostics["median_source_basis"] == Decimal("100")
 
 
+def test_prepare_weighted_input_uses_indexed_dense_equity_lookups(monkeypatch: pytest.MonkeyPatch) -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 3, tzinfo=timezone.utc)
+    samples = tuple(
+        {"timestamp_utc": (start + timedelta(minutes=index)).isoformat().replace("+00:00", "Z"), "equity": str(100 + index)}
+        for index in range(2 * 24 * 60 + 1)
+    )
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": start.isoformat().replace("+00:00", "Z"),
+        "report_end_utc": end.isoformat().replace("+00:00", "Z"),
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": (
+            {"action_index": 0, "timestamp_utc": start.isoformat().replace("+00:00", "Z"), "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},
+            {"action_index": 1, "timestamp_utc": end.isoformat().replace("+00:00", "Z"), "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": str(100 + 2 * 24 * 60), "pnl": str(2 * 24 * 60), "fee": "0"},
+        ),
+        "equity": samples,
+    }
+    calls: list[int] = []
+    original = getattr(portfolio_input, "bisect_right", None)
+
+    def count_calls(values, needle):
+        calls.append(len(values))
+        assert original is not None
+        return original(values, needle)
+
+    monkeypatch.setattr(portfolio_input, "bisect_right", count_calls, raising=False)
+
+    prepared = prepare_weighted_input((row,), history_step_minutes=60, minimum_common_days=1)
+
+    assert calls
+    assert prepared.normalized_delta[0][0] == Decimal("0.6")
+    assert all(prepared.valid[index][0] for index in range(len(prepared.valid)))
+
+
 def test_prepare_weighted_input_attributes_right_node_open_to_new_cycle() -> None:
     row = {
         "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
@@ -1378,6 +1415,8 @@ def test_cycle_records_consumes_same_timestamp_opening_sources_in_order() -> Non
     cycles = _cycle_records(row, datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc))
 
     assert tuple(cycle["source_basis"] for cycle in cycles) == (Decimal("100"), Decimal("200"))
+    assert tuple(cycle["source_ordinal"] for cycle in cycles) == (0, 2)
+    assert tuple(cycle["normalized_pnl"] for cycle in cycles) == (Decimal("0.10"), Decimal("0.10"))
 
 
 def test_cycle_records_uses_positional_ordinal_for_action_rows_without_index() -> None:
@@ -1508,6 +1547,76 @@ def test_prepare_weighted_input_attributes_equal_endpoint_intra_cell_changes() -
 
     assert prepared.normalized_delta[0][0] == Decimal("0.05")
     assert prepared.valid[0][0] is True
+    cycles = prepared.cycles["A:LONG:1:1"]
+    assert cycles[0]["strategy_id"] == 1
+    assert cycles[0]["source_ordinal"] == 0
+    assert cycles[0]["common_window_normalized_return"] == Decimal("0.10")
+    assert cycles[0]["attribution_complete"] is True
+    assert cycles[0]["normalized_pnl"] == Decimal("0.10")
+    assert cycles[1]["source_ordinal"] == 2
+    assert cycles[1]["common_window_normalized_return"] == Decimal("-0.05")
+    assert cycles[1]["attribution_complete"] is True
+    assert cycles[1]["normalized_pnl"] == Decimal("-0.05")
+
+
+def test_prepare_weighted_input_rolls_back_partial_cell_attribution_on_unknown_owner() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": (
+            {"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},
+            {"action_index": 1, "timestamp_utc": "2026-01-01T00:01:00Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "balance": "110", "pnl": "10", "fee": "0"},
+            {"action_index": 2, "timestamp_utc": "2026-01-01T00:02:00Z", "symbol": "A", "action": "increased", "post_size": "1", "post_side": "LONG", "balance": "0", "pnl": "0", "fee": "0"},
+            {"action_index": 3, "timestamp_utc": "2026-01-01T00:03:00Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "pnl": "10", "fee": "0"},
+        ),
+        "equity": (
+            {"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},
+            {"timestamp_utc": "2026-01-01T00:01:00Z", "equity": "110"},
+            {"timestamp_utc": "2026-01-01T00:02:00Z", "equity": "110"},
+            {"timestamp_utc": "2026-01-01T00:03:00Z", "equity": "120"},
+        ),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    assert prepared.normalized_delta[0][0] == Decimal("0")
+    assert prepared.valid[0][0] is False
+    cycles = prepared.cycles["A:LONG:1:1"]
+    assert all(cycle["common_window_normalized_return"] is None for cycle in cycles)
+    assert all(cycle["attribution_complete"] is False for cycle in cycles)
+
+
+def test_cycle_records_keeps_clipped_return_separate_from_unknown_full_cycle_net() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "optimizer_source_metadata": {"settings": {"exchange": {"use_upnl": True, "use_frozen_balance": True}, "basic": {
+            "use_fix": False, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0,
+        }}},
+        "actions": (
+            {"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "100", "pnl": "0", "fee": "0"},
+            {"action_index": 1, "timestamp_utc": "2026-01-01T00:01:00Z", "symbol": "A", "action": "closed", "post_size": "0", "post_side": "LONG", "pnl": "10", "fee": "0"},
+            {"action_index": 2, "timestamp_utc": "2026-01-01T00:01:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "200", "pnl": "0", "fee": "0"},
+        ),
+        "equity": (
+            {"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},
+            {"timestamp_utc": "2026-01-01T00:01:00Z", "equity": "110"},
+            {"timestamp_utc": "2026-01-01T00:02:00Z", "equity": "120"},
+        ),
+    }
+
+    prepared = prepare_weighted_input((row,))
+    cycles = prepared.cycles["A:LONG:1:1"]
+
+    assert cycles[0]["common_window_normalized_return"] == Decimal("0.10")
+    assert cycles[0]["attribution_complete"] is True
+    assert cycles[0]["normalized_pnl"] is None
+    assert cycles[1]["common_window_normalized_return"] == Decimal("0.05")
+    assert cycles[1]["attribution_complete"] is True
+    assert cycles[1]["normalized_pnl"] is None
 
 
 def test_prepare_weighted_input_invalidates_equal_endpoint_carry_in_movement() -> None:

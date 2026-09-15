@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
+from bisect import bisect_right
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
+import heapq
 import math
 import json
 import hashlib
@@ -1560,11 +1562,15 @@ def _cycle_records(row: Mapping[str, Any], period_end: datetime) -> tuple[Mappin
     )
     result: list[dict[str, Any]] = []
     opening_candidates: dict[str, list[Any]] = {}
+    closing_candidates: dict[str, list[Any]] = {}
     for action in actions:
         if action.pre_size == Decimal("0") and action.post_size not in (None, Decimal("0")):
             opening_candidates.setdefault(action.timestamp_utc, []).append(action)
+        if action.post_size == Decimal("0") and action.pre_size not in (None, Decimal("0")):
+            closing_candidates.setdefault(action.timestamp_utc, []).append(action)
     for cycle in reconstructed:
         basis = None
+        opening_source_ordinal = None
         diagnostics = cycle.diagnostics
         if cycle.opened_at is not None:
             opening_queue = opening_candidates.get(cycle.opened_at, [])
@@ -1572,6 +1578,7 @@ def _cycle_records(row: Mapping[str, Any], period_end: datetime) -> tuple[Mappin
             if opening is None:
                 diagnostics = tuple(dict.fromkeys((*diagnostics, "SOURCE_OPENING_ROW_UNMATCHED")))
             if opening is not None:
+                opening_source_ordinal = opening.source_ordinal
                 source = by_ordinal.get(opening.source_ordinal, {})
                 try:
                     if dynamic_basis:
@@ -1583,6 +1590,17 @@ def _cycle_records(row: Mapping[str, Any], period_end: datetime) -> tuple[Mappin
                         basis = None
                 except (PortfolioInputError, InvalidOperation, TypeError, ValueError):
                     raise PortfolioInputError("invalid source opening numeric", code="INVALID_SOURCE_VALUE")
+        closing_balance = None
+        if not cycle.censored and cycle.closed_at is not None:
+            closing_queue = closing_candidates.get(cycle.closed_at, [])
+            closing = closing_queue.pop(0) if closing_queue else None
+            if closing is not None:
+                closing_balance = closing.balance
+        normalized_pnl = None
+        if basis is not None and closing_balance is not None and not cycle.censored:
+            with localcontext() as context:
+                context.prec = max(64, len(basis.as_tuple().digits) + len(closing_balance.as_tuple().digits) + 16)
+                normalized_pnl = (closing_balance - basis) / basis
         result.append({
             "cycle_id": cycle.cycle_id, "opened_at": cycle.opened_at, "closed_at": cycle.closed_at,
             "duration_seconds": cycle.duration_seconds, "censored": cycle.censored, "carry_in": cycle.carry_in,
@@ -1590,6 +1608,9 @@ def _cycle_records(row: Mapping[str, Any], period_end: datetime) -> tuple[Mappin
             "close_attribution": cycle.close_attribution,
             "source_basis": basis, "maximum_position": cycle.maximum_position,
             "execution_count": cycle.execution_count, "diagnostics": diagnostics,
+            "strategy_id": row.get("strategy_id"), "source_ordinal": opening_source_ordinal,
+            "normalized_pnl": normalized_pnl, "common_window_normalized_return": None,
+            "attribution_complete": False,
         })
     return tuple(result)
 
@@ -1694,6 +1715,8 @@ def prepare_weighted_input(
         cycle_values = _cycle_records(row, end)
         cycles[key_row] = cycle_values
         diagnostic_rows[key_row] = _cycle_diagnostics(cycle_values, start, end)
+        cycle_returns = {id(cycle): Decimal("0") for cycle in cycle_values}
+        attribution_complete = True
         raw_samples = row.get("equity", row.get("equity_series", row.get("equity_path", ())))
         if not isinstance(raw_samples, Sequence) or isinstance(raw_samples, (str, bytes)):
             raise PortfolioInputError("invalid equity series shape", code="INVALID_SOURCE_VALUE")
@@ -1706,53 +1729,103 @@ def prepare_weighted_input(
         initial = row.get("initial_balance", row.get("source_initial_balance"))
         if initial is not None and (not samples or samples[0][0] > start):
             samples.insert(0, (start, _to_decimal(initial)))
+        sample_times = [item[0] for item in samples]
+        sample_values = [item[1] for item in samples]
+        opening_events = sorted(
+            (datetime.fromisoformat(cycle["opened_at"].replace("Z", "+00:00")), cycle_index)
+            for cycle_index, cycle in enumerate(cycle_values)
+            if cycle.get("opened_at")
+        )
+        closing_events = sorted(
+            (datetime.fromisoformat(cycle["closed_at"].replace("Z", "+00:00")), cycle_index)
+            for cycle_index, cycle in enumerate(cycle_values)
+            if cycle.get("closed_at")
+        )
+        opening_times = [event[0] for event in opening_events]
+        closing_times = [event[0] for event in closing_events]
+        opening_at = {timestamp: cycle_index for timestamp, cycle_index in reversed(opening_events)}
         cursor = 0
         last: tuple[datetime, Decimal] | None = None
         values: list[Decimal | None] = []
         for node in timestamps:
             cursor, last = _grid_value(samples, node, cursor, last)
             values.append(last[1] if last is not None else None)
+        opening_cursor = 0
+        closing_cursor = 0
+        active_heap: list[int] = []
+        closed_indices: set[int] = set()
         for index in range(len(timestamps) - 1):
             left, right = timestamps[index], timestamps[index + 1]
             left_value, right_value = values[index], values[index + 1]
             reason = None
+            cell_returns: dict[int, Decimal] = {}
+            cell_attribution_complete = True
             if left_value is None or right_value is None:
                 reason = f"LOST_EQUITY symbol={symbol} strategy_id={row.get('strategy_id')} result_id={row.get('result_id')} bounds={left.isoformat()}..{right.isoformat()}"
             else:
                 boundaries = {left, right}
                 boundaries.update(
-                    datetime.fromisoformat(value["opened_at"].replace("Z", "+00:00"))
-                    for value in cycle_values
-                    if value.get("opened_at") and left < datetime.fromisoformat(value["opened_at"].replace("Z", "+00:00")) <= right
+                    opening_times[bisect_right(opening_times, left):bisect_right(opening_times, right)]
                 )
                 boundaries.update(
-                    datetime.fromisoformat(value["closed_at"].replace("Z", "+00:00"))
-                    for value in cycle_values
-                    if value.get("closed_at") and left < datetime.fromisoformat(value["closed_at"].replace("Z", "+00:00")) <= right
+                    closing_times[bisect_right(closing_times, left):bisect_right(closing_times, right)]
                 )
-                boundaries.update(sample[0] for sample in samples if left < sample[0] <= right)
+                boundaries.update(sample_times[bisect_right(sample_times, left):bisect_right(sample_times, right)])
                 boundaries = sorted(boundaries)
                 points: list[Decimal | None] = []
                 for boundary in boundaries:
-                    prior = [sample[1] for sample in samples if sample[0] <= boundary]
-                    points.append(prior[-1] if prior else None)
+                    sample_index = bisect_right(sample_times, boundary) - 1
+                    points.append(sample_values[sample_index] if sample_index >= 0 else None)
                 for segment, (segment_start, segment_end) in enumerate(zip(boundaries, boundaries[1:])):
                     delta = (points[segment + 1] or Decimal("0")) - (points[segment] or Decimal("0"))
-                    if not delta:
-                        continue
                     middle = segment_start + (segment_end - segment_start) / 2
-                    active = next((cycle for cycle in cycle_values if cycle.get("opened_at") and datetime.fromisoformat(cycle["opened_at"].replace("Z", "+00:00")) <= middle and (not cycle.get("closed_at") or middle < datetime.fromisoformat(cycle["closed_at"].replace("Z", "+00:00")))), None)
+                    while opening_cursor < len(opening_events) and opening_events[opening_cursor][0] <= middle:
+                        heapq.heappush(active_heap, opening_events[opening_cursor][1])
+                        opening_cursor += 1
+                    while closing_cursor < len(closing_events) and closing_events[closing_cursor][0] <= middle:
+                        closed_indices.add(closing_events[closing_cursor][1])
+                        closing_cursor += 1
+                    while active_heap and active_heap[0] in closed_indices:
+                        heapq.heappop(active_heap)
+                    active = cycle_values[active_heap[0]] if active_heap else None
                     if active is None:
                         # A right-node opening owns the endpoint delta; this is the explicit [first fill, final flat) boundary rule.
-                        active = next((cycle for cycle in cycle_values if cycle.get("opened_at") and datetime.fromisoformat(cycle["opened_at"].replace("Z", "+00:00")) == segment_end), None)
-                    if active is None or active.get("source_basis") is None:
+                        active_index = opening_at.get(segment_end)
+                        active = cycle_values[active_index] if active_index is not None else None
+                    if active is None:
+                        if not delta:
+                            continue
+                        attribution_complete = False
+                        cell_attribution_complete = False
                         reason = f"UNATTRIBUTABLE_EQUITY symbol={symbol} strategy_id={row.get('strategy_id')} result_id={row.get('result_id')} bounds={segment_start.isoformat()}..{segment_end.isoformat()}"
                         break
-                    columns[index][col] += delta / active["source_basis"]
+                    if active.get("source_basis") is None:
+                        attribution_complete = False
+                        cell_attribution_complete = False
+                        if not delta:
+                            continue
+                        reason = f"UNATTRIBUTABLE_EQUITY symbol={symbol} strategy_id={row.get('strategy_id')} result_id={row.get('result_id')} bounds={segment_start.isoformat()}..{segment_end.isoformat()}"
+                        break
+                    if delta:
+                        contribution = delta / active["source_basis"]
+                        columns[index][col] += contribution
+                        cell_returns[id(active)] = cell_returns.get(id(active), Decimal("0")) + contribution
             if reason:
+                attribution_complete = False
                 columns[index][col] = Decimal("0")
                 valid[index][col] = False
                 reasons[index][col] = reason
+            elif cell_attribution_complete:
+                for cycle_id, contribution in cell_returns.items():
+                    cycle_returns[cycle_id] += contribution
+        if attribution_complete and all(cycle.get("source_basis") is not None for cycle in cycle_values):
+            for cycle in cycle_values:
+                cycle["common_window_normalized_return"] = cycle_returns[id(cycle)]
+                cycle["attribution_complete"] = True
+        else:
+            for cycle in cycle_values:
+                cycle["common_window_normalized_return"] = None
+                cycle["attribution_complete"] = False
     prepared = PreparedWeightedInput(start, end, history_step_minutes, tuple(item.isoformat().replace("+00:00", "Z") for item in timestamps), strategy_ids, tuple(tuple(row) for row in columns), tuple(tuple(row) for row in valid), tuple(tuple(row) for row in reasons), _frozen(cycles), _frozen({"rows": diagnostic_rows, "period": period.evidence}), key)
     if cache is not None:
         cache[key] = prepared

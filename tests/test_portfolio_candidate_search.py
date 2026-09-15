@@ -1,8 +1,12 @@
 from decimal import Decimal
+import json
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
-from mrs3.portfolio.candidate_search import search_portfolio_candidates
+from mrs3.portfolio.candidate_search import SearchResult, search_portfolio_candidates
 
 
 def finalist(symbol, side, strategy, *, pnl="10", dd="5", recovery="2", rank=1):
@@ -55,6 +59,21 @@ def test_candidates_use_any_nonempty_subset_and_same_symbol_both_counts_twice():
     assert result.candidates[0].schema_version == "portfolio_candidate_v1"
     assert result.candidates[0].profile_id == "BALANCED"
     assert result.candidates[0].scenario_id == "BALANCED"
+    assert result.manifest == {}
+
+
+def test_search_result_freezes_caller_owned_nested_manifest_metadata():
+    manifest = {
+        "ready_task_ids": ["task-1"],
+        "tasks": {"task-1": {"status": "PASS", "residuals": ["r1"]}},
+    }
+
+    result = SearchResult(status="PASS", manifest=manifest)
+    manifest["ready_task_ids"].append("task-2")
+    manifest["tasks"]["task-1"]["residuals"].append("r2")
+
+    assert result.manifest["ready_task_ids"] == ("task-1",)
+    assert result.manifest["tasks"]["task-1"]["residuals"] == ("r1",)
 
 
 def test_individual_gates_and_profile_ranking_reduce_each_direction_before_combinations():
@@ -202,3 +221,23 @@ def test_all_selected_symbols_without_usable_options_fail():
 
     assert (result.status, result.reason) == ("FAIL", "INSUFFICIENT_DIRECTIONAL_UNIVERSE")
     assert result.total_combinations == 0
+
+
+def test_process_worker_import_is_light_in_fresh_subprocess() -> None:
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, sys; sys.path.insert(0, 'src'); import mrs3._portfolio_process_worker as worker; print(json.dumps({'module': worker.__name__, 'weighted': 'mrs3.portfolio.weighted_search' in sys.modules, 'scipy': 'scipy.optimize' in sys.modules, 'psutil': 'psutil' in sys.modules}, sort_keys=True))",
+        ],
+        cwd=Path(__file__).parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(probe.stdout) == {
+        "module": "mrs3._portfolio_process_worker",
+        "weighted": False,
+        "scipy": False,
+        "psutil": False,
+    }

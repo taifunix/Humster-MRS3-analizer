@@ -1118,30 +1118,41 @@ Market reference загружается один раз, вне циклов к�
 
 ### Фаза 5. Bootstrap, бюджет и короткий список
 
-- [ ] Реализовать прямой расчёт банка, shared blocks, nearest-rank,
+**Статус на 2026-09-15:** реализация, focused/relevant tests, профильный
+benchmark и экспериментальные defaults проверены; evidence записано в
+[Phase 5 evidence](2026-09-14-portfolio-optimizer-weighted-search-phase-5-evidence.md).
+Независимое implementation review Opus вернуло `CODE_REVIEW_PASS`; фаза принята.
+
+- [x] Реализовать прямой расчёт банка, shared blocks, nearest-rank,
   пакетную обработку памяти и воспроизводимый seed.
-- [ ] Проверить conditional screening, повторное использование первых сценариев
+- [x] Проверить conditional screening, повторное использование первых сценариев
   и полный bootstrap после единственного дополнительного LP со свидетелем p95.
-- [ ] На коротком окне вычислять p95 и предупреждение о малом числе блоков;
+- [x] На коротком окне вычислять p95 и предупреждение о малом числе блоков;
   не отключать 7 дней автоматически и не превращать квантиль в гарантию.
-- [ ] Проверить границы: до 3M сценарно проверенных x, один дополнительный проход,
+- [x] Проверить границы: до 3M сценарно проверенных x, один дополнительный проход,
   максимум M joint, все solver-вызовы внутри 20/профиль, соседние L внутри M.
-- [ ] Проверить независимость полного результата от порядка выполнения workers;
+- [x] Проверить независимость полного результата от порядка выполнения workers;
   при wall-stop сохранять фактический manifest частичного результата.
-- [ ] Проверить cancellation/time limit, частичный результат и отсутствие
+- [x] Проверить cancellation/time limit, частичный результат и отсутствие
   заполнения бюджета дубликатами.
 - [x] Phase 5 prerequisite: the benchmark consumes only explicit imported
   User Status/User Rank decisions; Auto Status/Auto Rank never populate User
   fields. Evidence: selection-review and Panel regressions keep auto-only
   ordinary runs out of the effective finalist cohort and preserve imported
-  decisions across later unreviewed runs. Phase 5 remains open.
-- [ ] Выполнить профильный замер на 15–21 стратегиях и фактической длине матрицы:
+  decisions across later unreviewed runs.
+- [x] Выполнить профильный замер на 13 подготовленных explicit imported User
+  FINALIST rows (13 стратегий, 10 symbols; benchmark-only aliases для трёх
+  duplicate symbols вместо недоступных 15–21) и фактической длине матрицы:
   отдельно load, LP, margin/replay, bootstrap, render; сравнить одиночный запуск
   и пул по единому workers, записать wall/CPU time и суммарный peak RSS.
   Проверить отсутствие вложенных pool/BLAS/HiGHS потоков сверх этого лимита.
-  Пока такого end-to-end замера нет, время полного Optimizer не прогнозируем.
-- [ ] После замера утвердить либо изменить K/wall/solver defaults в плане и настройках.
-- [ ] Записать evidence фазы 5 и получить независимый `CODE_REVIEW_PASS`.
+  Полный single-worker результат корректно partial; benchmark-only aliases не
+  меняют production MVP с одним LONG finalist на symbol.
+- [x] После замера сохранить экспериментальные defaults `K=8`, `wall=900 s`,
+  `solver=30 s` в качестве измерительного решения; production/runtime defaults
+  и MVP этим не объявляются готовыми к выпуску.
+- [x] Записать evidence фазы 5 и получить независимый `CODE_REVIEW_PASS` —
+  Opus подтвердил P5-R4a, P5-R5a, P5-R5a-T1 и P5-DOC1.
 
 ### Фаза 6. Panel, экспорт и проверка всего пути
 
