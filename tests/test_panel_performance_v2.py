@@ -26,7 +26,13 @@ from mrs3.performance_v2_store import (
 from mrs3.panel import PanelController, create_panel_server
 from mrs3.performance_v2_import import PerformanceV2ImportError, PerformanceV2ImportResult
 from mrs3.performance_v2_finalist_retest import FinalistRetestError, combined_control_workbook_bytes
-from mrs3.performance_v2_selection import PerformanceV2SelectionError, parse_selection_request, write_selection_workbook
+from mrs3.performance_v2_selection import (
+    PerformanceV2SelectionError,
+    SelectionConfig,
+    parse_selection_request,
+    selection_cache_missing_strategy_ids,
+    write_selection_workbook,
+)
 from mrs3.panel_performance_v2 import (
     PerformanceV2ApiError,
     PerformanceV2PanelRequest,
@@ -1308,6 +1314,91 @@ def test_selection_recalculate_passes_only_missing_strategy_ids(tmp_path: Path, 
 
     assert controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"}) == {"status": "READY"}
     assert calls and calls[0][-1] == (17, 23)
+
+
+def test_selection_recalculate_tracks_only_new_current_results_for_add_replace_and_repeat(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+    request = parse_selection_request(payload)
+    controller.strategies_performance_v2_recalculate(payload)
+
+    def add_current(connection: duckdb.DuckDBPyConnection, name: str, owner_id: int | None = None) -> tuple[int, int]:
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        if owner_id is None:
+            strategy_id = int(connection.execute(
+                """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+                   order_count, analysis_run_id, candidate_identity, lifecycle_status,
+                   created_at_utc, updated_at_utc) values (?, 'BTCUSDT', 'LONG', '1h',
+                   3, 1, 'run', ?, 'ACTIVE', ?, ?) returning strategy_id""",
+                [name, name, now, now],
+            ).fetchone()[0])
+        else:
+            old_result_id = int(connection.execute(
+                "select current_result_id from strategies where strategy_id = ?", [owner_id]
+            ).fetchone()[0])
+            old_holder_id = int(connection.execute(
+                """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+                   order_count, analysis_run_id, candidate_identity, lifecycle_status,
+                   created_at_utc, updated_at_utc) values (?, 'BTCUSDT', 'LONG', '1h',
+                   3, 1, 'run', ?, 'DISCARDED', ?, ?) returning strategy_id""",
+                [f"{name}-old-holder", f"{name}-old-holder", now, now],
+            ).fetchone()[0])
+            connection.execute("update strategies set current_result_id = null where strategy_id = ?", [owner_id])
+            for table in ("strategy_actions", "strategy_equity", "window_metrics"):
+                connection.execute(f"delete from {table} where result_id = ?", [old_result_id])
+            connection.execute("update strategy_results set strategy_id = ? where result_id = ?", [old_holder_id, old_result_id])
+            strategy_id = owner_id
+        result_id = int(connection.execute(
+            """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
+               commission_rate, initial_balance, final_balance, total_pnl, total_pnl_pct,
+               max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc)
+               values (?, ?, ?, 'Bybit', .0004, 100, 110, 10, 10, 0, 0, 2, 2, ?) returning result_id""",
+            [strategy_id, now, datetime(2026, 1, 5, tzinfo=UTC), now],
+        ).fetchone()[0])
+        connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
+        connection.executemany(
+            "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (result_id, 0, now, "BTCUSDT", 1, "opened", 1, 1, "long", 0, 1, 100, None),
+                (result_id, 1, datetime(2026, 1, 2, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 10, 1, 110, None),
+            ],
+        )
+        connection.executemany(
+            "insert into strategy_equity values (?, ?, ?, ?, ?)",
+            [
+                (result_id, 0, now, 100, 100),
+                (result_id, 1, datetime(2026, 1, 2, tzinfo=UTC), 110, 110),
+                (result_id, 2, datetime(2026, 1, 5, tzinfo=UTC), 110, 110),
+            ],
+        )
+        return strategy_id, result_id
+
+    with duckdb.connect(str(database)) as connection:
+        beta_id, _ = add_current(connection, "beta")
+        assert selection_cache_missing_strategy_ids(connection, request, SelectionConfig()) == (beta_id,)
+    controller.strategies_performance_v2_recalculate(payload)
+
+    with duckdb.connect(str(database)) as connection:
+        alpha_id = int(connection.execute("select strategy_id from strategies where strategy_name = 'alpha'").fetchone()[0])
+        replacement_id, _ = add_current(connection, "alpha-replacement", alpha_id)
+        assert replacement_id == alpha_id
+        assert selection_cache_missing_strategy_ids(connection, request, SelectionConfig()) == (alpha_id,)
+    controller.strategies_performance_v2_recalculate(payload)
+    with duckdb.connect(str(database)) as connection:
+        assert selection_cache_missing_strategy_ids(connection, request, SelectionConfig()) == ()
+
+    import mrs3.panel as panel_module
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *args: calls.append(args))
+    assert controller.strategies_performance_v2_recalculate(payload) == {"status": "READY"}
+    assert calls and calls[0][-1] == ()
+    calls.clear()
+    assert controller.strategies_performance_v2_recalculate_all() == {
+        "status": "READY", "total_pairs": 1, "recalculated_pairs": 0, "ready_pairs": 1,
+    }
+    assert calls == []
 
 
 def test_normalization_30d_does_not_compress_idle_tail_to_event_span() -> None:

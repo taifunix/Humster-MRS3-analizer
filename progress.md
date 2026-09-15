@@ -2529,3 +2529,32 @@ be prepared or recalculated, and preserves the server-provided download name
 on success. Full verification passes `4461 passed, 7 skipped`; JavaScript
 syntax and `git diff --check` pass. Independent final review returned
 `CODE_REVIEW_PASS`.
+
+## Performance v2 tester yesterday ceiling and incremental recalc regression (2026-09-15)
+
+The tester end date is now capped at local current date minus one day in the
+Panel UI, shared native SINGLE_MODE/FAST validation, and Performance v2 import.
+Every imported report requires a parseable range; missing or malformed ranges
+fail closed on all paths, including `check_range=False` revalidation. Committed
+inbox metadata and parsed report ranges fail closed when their end is later than
+yesterday, so stale or forged inboxes cannot publish rows. Range shortcuts clamp
+future anchors to the same maximum. Selection cache recalc keeps
+its existing incremental implementation; a regression test verifies ADD and
+REPLACE identify only the new current strategy and repeated pair/all-pairs calls
+process zero once current Result IDs are cached.
+
+Evidence: `.venv\Scripts\python.exe -m pytest tests/test_single_mode_handoff.py
+tests/test_panel_static_ui.py tests/test_performance_v2_import.py
+tests/test_panel_performance_v2.py tests/test_performance_v2_selection.py -q`
+— `345 passed, 2 skipped`; `node --check src/mrs3/panel_web/app.js`; targeted
+`compileall`; and `git diff --check` all passed. No tester, Bybit, real
+PerformanceDB, or generated report was used or changed.
+
+Operator evidence after recalculating all missing pairs on 2026-09-15 confirms
+that the A/B deterioration and time-window filters work and that the XLSX export
+contains the A/B PnL/30, individual window values, and Positive windows data.
+This accepts the repaired current-cache path; the separate Phase 8 typed
+Price/Cost and prepared-series/cycle persistence task remains open.
+Independent Opus review returned `CODE_REVIEW_PASS` after the fail-closed
+no-legacy period requirement and midnight-refresh correction; final root
+verification was `346 passed, 2 skipped`.

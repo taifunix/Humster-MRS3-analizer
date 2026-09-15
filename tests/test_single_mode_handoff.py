@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date, timedelta
 from hashlib import sha256
 import json
 import os
@@ -225,6 +226,20 @@ def test_single_mode_config_flag_is_scoped_to_native_helper(tmp_path: Path) -> N
 
     _write_fast_tester_config(config, "2026-08-01", "2026-08-31")
     assert json.loads(config.tester_config.read_text(encoding="utf-8"))["single_mode"] is False
+
+
+def test_native_single_mode_rejects_tester_end_after_yesterday(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path)
+    service = LocalSingleModeStrategyTestService(_runner_config(tmp_path))
+
+    with pytest.raises(ValueError, match="end_date must not be later than yesterday"):
+        service.start(
+            manifest,
+            analysis_run_id="a" * 64,
+            start_date="2026-08-01",
+            end_date=(date.today() + timedelta(days=1)).isoformat(),
+            job_id="native-future-end",
+        )
 
 
 def test_native_single_mode_rejects_unchanged_preexisting_report(tmp_path: Path) -> None:

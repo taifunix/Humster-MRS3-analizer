@@ -1655,6 +1655,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const testerStartDate = document.querySelector('#tester-start-date');
   const testerEndDate = document.querySelector('#tester-end-date');
   const validIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+  const testerMaxDate = () => { const value = new Date(); value.setHours(0, 0, 0, 0); value.setDate(value.getDate() - 1); return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`; };
+  if (testerEndDate) testerEndDate.max = testerMaxDate();
   const shiftDateMonths = (value, months) => {
     if (!validIsoDate(value)) return '';
     const [year, month, day] = value.split('-').map(Number);
@@ -1664,8 +1666,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     return target.toISOString().slice(0, 10);
   };
   [1, 2, 3].forEach((months) => document.querySelector(`#tester-range-${months}m`)?.addEventListener('click', () => {
-    const anchor = testerEndDate?.value || new Date().toISOString().slice(0, 10);
-    if (testerEndDate && !testerEndDate.value) testerEndDate.value = anchor;
+    const maxDate = testerMaxDate();
+    if (testerEndDate) testerEndDate.max = maxDate;
+    const anchor = testerEndDate?.value && testerEndDate.value <= maxDate ? testerEndDate.value : maxDate;
+    if (testerEndDate) testerEndDate.value = anchor;
     if (testerStartDate) testerStartDate.value = shiftDateMonths(anchor, -months);
   }));
   const testerIsTerminal = (job) => ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
@@ -1742,6 +1746,9 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     const startDate = testerStartDate?.value || '';
     const endDate = testerEndDate?.value || '';
     if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Enter valid tester start and end dates.'; return; }
+    const maxDate = testerMaxDate();
+    if (testerEndDate) testerEndDate.max = maxDate;
+    if (endDate > maxDate) { if (testerStatus) testerStatus.textContent = 'Tester end date must not be later than yesterday.'; return; }
     if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Tester start date must not be after end date.'; return; }
     normalImportAuthorized = false;
     authorizedTesterJobId = '';

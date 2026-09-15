@@ -23,6 +23,7 @@ from .performance_v2_input import (
     PreparedV2Entry,
     PreparedV2Input,
     _shift_from_multiplier,
+    _latest_tester_end_date,
     create_v2_parser_staging,
     read_performance_v2_inbox,
     remove_v2_parser_staging,
@@ -162,6 +163,8 @@ class PerformanceV2ImportRequest:
                 raise ValueError("test_start and test_end must be ISO dates") from error
             if parsed_start.isoformat() != test_start or parsed_end.isoformat() != test_end or parsed_end < parsed_start:
                 raise ValueError("test_start and test_end must be ISO dates")
+            if parsed_end > _latest_tester_end_date():
+                raise ValueError("test_end must not be later than yesterday")
         object.__setattr__(self, "inbox", Path(inbox))
         object.__setattr__(self, "report_root", Path(report_root))
         object.__setattr__(self, "config", config)
@@ -890,11 +893,16 @@ def _validate_report(
     configured_end = getattr(prepared, "test_end", None)
     if request is not None and request.test_start is not None and (request.test_start, request.test_end) != (configured_start, configured_end):
         raise PerformanceV2ImportError("request test range does not match the prepared inbox")
-    if check_range and configured_start is not None and configured_end is not None:
-        try:
-            reported_start, reported_end = report_range(report.metrics)
-        except PerformanceParseError as error:
-            raise PerformanceV2ImportError(f"report period is invalid for strategy {entry.strategy_name!r}") from error
+    strict_range = check_range and configured_start is not None and configured_end is not None
+    try:
+        reported_start, reported_end = report_range(report.metrics)
+    except PerformanceParseError as error:
+        raise PerformanceV2ImportError(f"report period is invalid for strategy {entry.strategy_name!r}") from error
+    if reported_end.date() > _latest_tester_end_date():
+        raise PerformanceV2ImportError(
+            f"report end date must not be later than yesterday for strategy {entry.strategy_name!r}"
+        )
+    if strict_range:
         if (reported_start.date().isoformat(), reported_end.date().isoformat()) != (configured_start, configured_end):
             raise PerformanceV2ImportError(f"report range does not match configured batch for strategy {entry.strategy_name!r}")
 

@@ -1193,6 +1193,20 @@ benchmark и экспериментальные defaults проверены; evi
   подготовленные ряды/циклы при обычном анализе. Аддитивная миграция, старый
   контракт импорта сохраняется. Не нужно ждать этой фазы для фаз 1–7.
 
+Phase 8 guardrails: tester `end_date` is capped at authoritative current date
+minus one day in UI, shared tester validation, and Performance v2 inbox/report
+validation. Every imported report requires a parseable `Report range`, including
+the `check_range=False` revalidation path; missing or malformed ranges fail
+closed. Imports also fail closed for future metadata or parsed report ends.
+Selection cache recalculation processes only missing current `Result ID`s; ADD
+and REPLACE isolate the new current strategy, and repeated per-pair/all-pairs
+recalculation processes zero once cache rows are present.
+Operator verification on 2026-09-15 confirmed that after recalculation the A/B
+deterioration and time-window filters work and XLSX contains all window data.
+The scoped date/cache repair passed independent Opus `CODE_REVIEW_PASS` with
+`346 passed, 2 skipped`. The typed Price/Cost and prepared-series/cycle item
+above remains open.
+
 ### Фаза 9. Несколько финалистов и LONG+SHORT
 
 - [ ] Выбирать одну стратегию на каждую сторону символа из нескольких

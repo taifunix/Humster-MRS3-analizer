@@ -181,6 +181,27 @@ normalized listing date, warm-up hours, excluded-trade
 count and exclusion reason. Pre-amendment records have null effective/listing
 provenance; readers must not infer that effective and reported ranges match.
 
+### Tester end-date ceiling and incremental cache warming
+
+The inclusive tester `end_date` must not be later than the authoritative local
+current date minus one calendar day. The Panel date input exposes that value as
+its maximum; month shortcuts anchor to it and clamp an existing value to it.
+Native `SINGLE_MODE` (and the shared FAST path) reject a later end date before
+starting work. Performance v2 import rejects closed metadata/inbox contracts
+and parsed reports whose test or report end is later than the same ceiling;
+these checks are fail-closed so stale or forged inboxes cannot be imported.
+
+Every imported report must contain a parseable `Report range`; missing or
+malformed periods fail closed on every import path, including revalidation with
+`check_range=False`. A parseable report end later than local yesterday is
+rejected, and a configured `test_start`/`test_end` additionally requires an
+exact range match.
+
+Selection cache recalculation is incremental: for each pair/side it processes
+only strategies whose current `Result ID` is missing from the cache. ADD and
+REPLACE therefore identify only the new current result, and repeated per-pair
+or all-pairs recalculation does no work after those cache rows exist.
+
 ### Канонические шаблоны
 
 Все отслеживаемые шаблоны стратегий находятся только в

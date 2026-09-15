@@ -803,6 +803,8 @@ def test_tester_date_guard_is_iso_validated_before_network_request() -> None:
     tester = js.split("if (testerStart) testerStart.addEventListener", 1)[1].split("if (testerStop)", 1)[0]
     assert "validIsoDate" in tester
     assert "!validIsoDate(startDate) || !validIsoDate(endDate)" in tester
+    assert "const maxDate = testerMaxDate();" in tester
+    assert "endDate > maxDate" in tester
     assert "start_date" in tester and "end_date" in tester
     stop = js.split("if (testerStop) testerStop.addEventListener", 1)[1].split("const renderPerformance", 1)[0]
     assert "start_date" not in stop and "end_date" not in stop
@@ -835,6 +837,9 @@ def test_tester_range_shortcuts_are_local_only() -> None:
 
     ranges = js.split("[1, 2, 3].forEach", 1)[1].split("const testerIsTerminal", 1)[0]
     assert "testerStartDate" in ranges and "testerEndDate" in ranges
+    assert "const testerMaxDate = () =>" in js
+    assert "testerEndDate.max = testerMaxDate();" in js
+    assert "const maxDate = testerMaxDate();" in ranges
     assert "remoteRequest" not in ranges and "fetch(" not in ranges
 
 

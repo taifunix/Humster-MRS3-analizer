@@ -4,7 +4,7 @@ from dataclasses import replace
 from hashlib import sha256
 import csv
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -20,7 +20,7 @@ from mrs3.performance_v2_import import (
     import_performance_v2,
 )
 from mrs3.performance_v2_html import parse_current_performance_v2_html
-from mrs3.performance_v2_input import read_performance_v2_inbox
+from mrs3.performance_v2_input import PerformanceV2InputError, read_performance_v2_inbox
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
@@ -996,6 +996,54 @@ def test_single_mode_without_listing_dates_fails_closed(tmp_path: Path) -> None:
 
     assert filtered == (None,)
     assert failures and failures[0]["reason"] == "LISTING_MISSING"
+
+
+def test_inbox_rejects_test_end_after_yesterday(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update({
+        "run_mode": "SINGLE_MODE",
+        "test_start": "2026-01-01",
+        "test_end": (date.today() + timedelta(days=1)).isoformat(),
+    })
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2InputError, match="test end date must not be later than yesterday"):
+        read_performance_v2_inbox(request.inbox, request.report_root)
+
+
+def test_import_rejects_parsed_report_end_after_yesterday(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    future_end = (date.today() + timedelta(days=1)).isoformat()
+    replacement = FIXTURE.read_bytes().replace(
+        b"2026-01-01 - 2026-01-09", f"2026-01-01 - {future_end}".encode()
+    )
+    _rewrite_report(request, replacement)
+
+    result = import_performance_v2(request)
+
+    assert result.status == "FAILED"
+    assert result.imported_count == 0
+    assert result.rejected_count == 1
+    assert "yesterday" in str(result.failures[0]["error"])
+
+
+def test_check_range_false_requires_parseable_report_range_and_rejects_future_end(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, initialize_db=False)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root, config=request.config)
+    prepared = replace(prepared, test_start="2026-01-01", test_end="2026-01-09")
+    report = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    entry = prepared.entries[0]
+
+    validate_report = import_module._validate_report
+    with pytest.raises(PerformanceV2ImportError, match="report period is invalid"):
+        validate_report(entry, replace(report, metrics={"Report range": "not-a-period"}), prepared, request, check_range=False)
+
+    future_end = (date.today() + timedelta(days=1)).isoformat()
+    future_report = replace(report, metrics={"Report range": f"2026-01-01 - {future_end}"})
+    with pytest.raises(PerformanceV2ImportError, match="later than yesterday"):
+        validate_report(entry, future_report, prepared, request, check_range=False)
 
 
 def test_all_invalid_reports_fail_without_empty_in_clause(tmp_path: Path) -> None:

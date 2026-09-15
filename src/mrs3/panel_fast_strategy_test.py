@@ -20,6 +20,7 @@ from .panel_strategy_batch import ValidatedStrategyManifest, validate_strategy_m
 from .panel_testing import mrs3_tester_config_template
 from .performance import PerformanceParseError, _raw_markup, _series
 from .performance_v2_html import CURRENT_ACTION_HEADERS
+from .performance_v2_input import _latest_tester_end_date
 from .runner.config import RunnerConfig
 from .runner.files import capture_tester_settings, restore_tester_settings, validate_runner_paths
 from .runner.http import TesterHttpClient
@@ -120,6 +121,8 @@ def _dates(start_date: object, end_date: object) -> tuple[str, str]:
         raise FastStrategyTestError("start_date and end_date must be ISO dates") from None
     if start.isoformat() != start_date or end.isoformat() != end_date or start > end:
         raise FastStrategyTestError("start_date must be on or before end_date")
+    if end > _latest_tester_end_date():
+        raise FastStrategyTestError("end_date must not be later than yesterday")
     return start_date, end_date
 
 

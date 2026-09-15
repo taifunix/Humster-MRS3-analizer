@@ -9,7 +9,7 @@ identity before a caller starts workers.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import hmac
@@ -24,6 +24,10 @@ from uuid import uuid4
 
 class PerformanceV2InputError(ValueError):
     """Raised when a committed Performance v2 inbox is not trustworthy."""
+
+
+def _latest_tester_end_date() -> date:
+    return date.today() - timedelta(days=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,6 +633,8 @@ def read_performance_v2_inbox(
                 raise PerformanceV2InputError("inbox test range must be ISO dates") from error
             if parsed_start.isoformat() != raw_test_start or parsed_end.isoformat() != raw_test_end or parsed_end < parsed_start:
                 raise PerformanceV2InputError("inbox test range is invalid")
+            if parsed_end > _latest_tester_end_date():
+                raise PerformanceV2InputError("inbox test end date must not be later than yesterday")
             test_start, test_end = raw_test_start, raw_test_end
         if run_mode == "SINGLE_MODE" and test_start is None:
             raise PerformanceV2InputError("SINGLE_MODE inbox test range is missing")
