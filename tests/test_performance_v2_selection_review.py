@@ -102,6 +102,57 @@ def test_export_persists_exact_snapshot_and_review_contract(tmp_path: Path) -> N
     assert connection.execute("select count(*) from selection_results").fetchone() == (2,)
 
 
+def test_auto_only_snapshot_has_no_effective_user_decision_or_review_rows(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    request = _request()
+    result = _result()
+    metadata = new_run_metadata(connection)
+    path = write_selection_workbook(result, tmp_path / "automatic.xlsx", request, metadata)
+
+    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, path.read_bytes())
+
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    assert all(
+        sheet.cell(row, headers[name]).value is None
+        for row in range(2, sheet.max_row + 1)
+        for name in ("User Status", "User Rank", "Analog Of ID", "Comment")
+    )
+    assert effective_selection_decisions(connection) == {}
+    assert latest_effective_finalists(connection, "BTCUSDT") == (True, set())
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == (0,)
+    assert connection.execute("select count(*) from selection_review_rows").fetchone() == (0,)
+
+
+def test_prior_rejected_without_review_does_not_propagate_auto_rank(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    request = _request()
+    result = _result().iloc[[0]].copy()
+    result.loc[:, "prior_rejected"] = True
+    result.loc[:, "final_rank"] = 7
+    metadata = new_run_metadata(connection)
+    path = write_selection_workbook(result, tmp_path / "prior-rejected.xlsx", request, metadata)
+    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, path.read_bytes())
+
+    assert effective_selection_decisions(connection) == {
+        1: ("REJECTED", None, metadata["selection_run_id"]),
+    }
+
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["User Status"]).value = "FINALIST"
+    sheet.cell(2, headers["User Rank"]).value = 1
+    edited = BytesIO()
+    workbook.save(edited)
+    import_selection_review(connection, edited.getvalue())
+
+    assert effective_selection_decisions(connection) == {
+        1: ("FINALIST", 1, metadata["selection_run_id"]),
+    }
+
+
 def test_export_includes_current_retest_tag_and_editable_validation(tmp_path: Path) -> None:
     connection = _database(tmp_path)
     connection.execute(
@@ -232,7 +283,7 @@ def test_reviewed_decisions_survive_new_ordinary_run_and_result_replacement(tmp_
     decisions = effective_selection_decisions(connection)
     assert decisions[1][:2] == ("FINALIST", 1)
     assert decisions[2][:2] == ("RESERVE", None)
-    assert decisions[3][:2] == ("FINALIST", 1)
+    assert 3 not in decisions
 
 
 def test_review_accepts_blank_trailing_headers(tmp_path: Path) -> None:

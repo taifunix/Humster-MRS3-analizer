@@ -1,7 +1,14 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-14
+**Updated:** 2026-09-15
 **Current branch:** `main`
+
+PerformanceDB review-state prerequisite (2026-09-15): automatic selection now
+populates only Auto Status/Auto Rank. Effective finalists require explicit
+imported User decisions; imported decisions survive later unreviewed runs, and
+auto-only runs cannot create a current-effective cohort or export. Focused
+selection-review and Panel regressions pass. Next: benchmark the 13 prepared
+rows using the explicit imported User review decisions; Phase 5 remains open.
 
 2026-09-14 current planning task: root (explicit user override of Planner Sol)
 replaced the accumulated weighted-search discussion with a technical plan at

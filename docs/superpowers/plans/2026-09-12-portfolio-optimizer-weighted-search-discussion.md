@@ -1130,6 +1130,11 @@ Market reference загружается один раз, вне циклов к�
   при wall-stop сохранять фактический manifest частичного результата.
 - [ ] Проверить cancellation/time limit, частичный результат и отсутствие
   заполнения бюджета дубликатами.
+- [x] Phase 5 prerequisite: the benchmark consumes only explicit imported
+  User Status/User Rank decisions; Auto Status/Auto Rank never populate User
+  fields. Evidence: selection-review and Panel regressions keep auto-only
+  ordinary runs out of the effective finalist cohort and preserve imported
+  decisions across later unreviewed runs. Phase 5 remains open.
 - [ ] Выполнить профильный замер на 15–21 стратегиях и фактической длине матрицы:
   отдельно load, LP, margin/replay, bootstrap, render; сравнить одиночный запуск
   и пул по единому workers, записать wall/CPU time и суммарный peak RSS.

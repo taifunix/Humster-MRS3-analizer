@@ -137,6 +137,14 @@ def test_freeze_uses_effective_user_status_and_listing_warmup_without_writes() -
         connection.execute(
             """insert into selection_review_rows values ('review-2', 2, 'RESERVE', 4, null, 'keep')"""
         )
+        connection.execute(
+            """insert into selection_review_imports
+               values ('review-1', 'run-1', ?, ?, 1)""",
+            ["e" * 64, now],
+        )
+        connection.execute(
+            """insert into selection_review_rows values ('review-1', 1, 'FINALIST', 1, null, 'keep')"""
+        )
         before = connection.execute("select count(*) from selection_review_imports").fetchone()
 
         finalist = freeze_finalist_cohort(
@@ -187,6 +195,14 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
         )
         connection.execute(
             "insert into selection_results (selection_run_id, strategy_id, result_id_at_selection, auto_status, auto_rank, prior_rejected, stage_trace_json) values ('selection-1', 1, 11, 'FINALIST', 1, false, '{}')"
+        )
+        connection.execute(
+            """insert into selection_review_imports
+               values ('review-1', 'selection-1', ?, ?, 1)""",
+            ["d" * 64, now],
+        )
+        connection.execute(
+            """insert into selection_review_rows values ('review-1', 1, 'FINALIST', 1, null, 'keep')"""
         )
         batch = build_finalist_retest_manifest(
             connection,
