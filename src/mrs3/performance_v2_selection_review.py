@@ -593,12 +593,8 @@ def effective_selection_decisions(
                 review_row = latest_reviews[strategy_id]
                 status, rank = review_row["user_status"], review_row["user_rank"]
                 state[strategy_id] = (status, None if rank is None else int(rank), str(run_id))
-            else:
-                state[strategy_id] = (
-                    "REJECTED" if prior_rejected else str(auto_status),
-                    None if auto_rank is None else int(auto_rank),
-                    str(run_id),
-                )
+            elif prior_rejected:
+                state[strategy_id] = ("REJECTED", None, str(run_id))
     return {strategy_id: decision for state in states.values() for strategy_id, decision in state.items()}
 
 

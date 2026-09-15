@@ -124,6 +124,30 @@ def test_current_control_export_is_read_only_until_review_and_preserves_outside_
             }
 
     before = effective()
+    assert before == {}
+    with pytest.raises(FinalistRetestError, match="there are no current effective finalists"):
+        controller.strategies_performance_v2_finalist_retest_export({"include_reserve": True})
+    with pytest.raises(FinalistRetestError, match="there are no current effective finalists"):
+        controller.strategies_performance_v2_finalist_retest_export({"include_reserve": False})
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("select count(*) from selection_review_imports").fetchone() == (0,)
+        assert connection.execute("select count(*) from selection_review_rows").fetchone() == (0,)
+        assert connection.execute("select count(*) from selection_runs").fetchone() == (1,)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """insert into selection_review_imports
+               (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count)
+               values ('reviewed', 'ordinary', ?, ?, 2)""", ["a" * 64, now],
+        )
+        connection.executemany(
+            """insert into selection_review_rows
+               (review_import_id, strategy_id, user_status, user_rank, user_analog_of_strategy_id, comment)
+               values ('reviewed', ?, ?, ?, null, null)""",
+            [(1, "FINALIST", 1), (beta_id, "RESERVE", None)],
+        )
+    before = effective()
+    assert before[1][:2] == ("FINALIST", 1)
+    assert before[beta_id][:2] == ("RESERVE", None)
     reserve_filename, reserve_issued = controller.strategies_performance_v2_finalist_retest_export({"include_reserve": True})
     assert reserve_filename == "performance-v2-current-finalists-with-reserve.xlsx"
     reserve_sheet = load_workbook(BytesIO(reserve_issued))["Candidates"]

@@ -83,6 +83,15 @@ SHORT/BOTH, подбор нескольких стратегий на сторо
 
 Для AGGRESSIVE/BALANCED/CONSERVATIVE соответственно:
 m=0.20/0.10/0.05, r=0.20/0.40/0.60, u=0.50/0.35/0.20.
+
+### Phase 5 benchmark prerequisite
+
+The Phase 5 benchmark may consume only explicit imported User Status/User Rank
+decisions. Automatic filtering and ranking populate Auto Status/Auto Rank only;
+they never create or fill User Status/User Rank. An ordinary unreviewed run is
+therefore absent from the effective user finalist universe until its edited
+workbook is imported. This prerequisite is evidence for the benchmark and does
+not mark Phase 5 complete.
 Все профили максимизируют net PnL/30 при своих ограничениях. Допустимо
 0<m,u<1 и 0<=r<1. B_available отсутствует либо конечный >0.
 
