@@ -537,7 +537,11 @@ def write_source_v6_segment(
     else:
         ordered, _, rows = _validate_segment_inputs(outcomes, prepared_rows)
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.{token}.tmp")
+    # Keep the private scratch name short.  The import token is already
+    # persisted in the manifest; repeating its 64 hexadecimal characters in
+    # every temporary filename can push otherwise valid Windows targets over
+    # MAX_PATH when the target has a descriptive name.
+    temporary = target.with_name(f".segment-{uuid4().hex}.tmp")
     if temporary.exists():
         raise SourceV6StorageError(f"segment temporary target already exists: {temporary}")
     segment_id = uuid4().hex

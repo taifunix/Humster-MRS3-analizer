@@ -113,6 +113,23 @@ def test_sealed_segment_has_exact_schema_and_fingerprint(tmp_path: Path) -> None
     assert not Path(f"{segment}.wal").exists()
 
 
+def test_segment_temp_path_stays_usable_for_long_target_names(tmp_path: Path) -> None:
+    fragment = _fragment()
+    segment = tmp_path / ("segment-" + ("x" * 80) + ".duckdb")
+    run_token = "r" * 64
+
+    receipt = _write_leaf(
+        segment,
+        [_accepted_outcome(0, fragment)],
+        [(0, fragment, encode_fragment(fragment))],
+        run_token=run_token,
+    )
+
+    assert receipt.path == segment.resolve()
+    assert segment.exists()
+    assert not list(segment.parent.glob(f".{segment.name}.*.tmp"))
+
+
 def test_segment_outcomes_and_compact_rows_correspond_by_ordinal(tmp_path: Path) -> None:
     fragment = _fragment()
     quarantine_sha = sha256(b"stable parse failure").hexdigest()

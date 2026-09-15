@@ -2639,3 +2639,14 @@ recommendation state was used or changed. See
 [ADR-0039](docs/decisions/0039-portfolio-optimizer-ws12-directional-shared-cap.md)
 and [Phase 9 evidence](docs/superpowers/plans/2026-09-18-portfolio-optimizer-weighted-search-phase-9-evidence.md).
 The next implementation item is Phase 10.
+
+## Source v6 import with descriptive Windows target (2026-09-15)
+
+An import into a new Source v6 target failed before writing data because each
+segment scratch filename repeated the 64-character run token. With a
+descriptive target name this exceeded Windows `MAX_PATH` even though the final
+target itself was valid. Segment writes now use a short unique scratch name
+in the target directory and still publish atomically. The regression test and
+related Source v6 checks pass (`140 passed`). A real import of 21,888 reports
+completed with `COMMITTED`, `quarantined=0`; the resulting target contains the
+expected Source v6 tables and no leftover segment scratch directory.
