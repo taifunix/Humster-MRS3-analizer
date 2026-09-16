@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .canonical import PORTFOLIO_REASON_V1
+from .liquidity import ReferenceSnapshot
 
 
 
@@ -126,6 +127,19 @@ def _decimal(value: Any, name: str, *, positive: bool = False, nonnegative: bool
         raise ValueError(f"{name} must be a Decimal") from exc
     if not result.is_finite() or (positive and result <= 0) or (nonnegative and result < 0):
         raise ValueError(f"{name} has an invalid value")
+    return result
+
+
+def _margin_rate(value: Any, name: str, *, inclusive_one: bool = False) -> Decimal:
+    """Parse a rate at the reference-evidence boundary."""
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a rate")
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(f"{name} must be a rate") from exc
+    if not result.is_finite() or result < 0 or (result > 1 if inclusive_one else result >= 1):
+        raise ValueError(f"{name} must be in [0, 1)")
     return result
 
 
@@ -1704,6 +1718,158 @@ def freeze_linear_margin_coefficients(
     except Exception:
         return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_BOUND_UNAVAILABLE", evaluated_states, witness)
     return MarginCoefficientResult(PASS, tuple(coefficients), CONSERVATIVE_BOUND, None, evaluated_states, witness)
+
+
+@_context_safe
+def derive_reference_margin_coefficients(
+    reference: ReferenceSnapshot,
+    members: Sequence[Mapping[str, Any]],
+    *,
+    open_fee_rate: Decimal | int | str,
+    close_fee_rate: Decimal | int | str,
+    order_loss_rate: Decimal | int | str = Decimal("0"),
+    policy_id: str,
+) -> MarginCoefficientResult:
+    """Derive conservative linear IM/MM bounds from one frozen reference."""
+    base_witness: dict[str, Any] = {}
+    try:
+        if not isinstance(reference, ReferenceSnapshot):
+            return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_REFERENCE_INVALID")
+        if not isinstance(reference.content_digest, str) or not reference.content_digest.strip():
+            return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_REFERENCE_INVALID")
+        if type(reference.captured_at_ms) is not int or reference.captured_at_ms < 0:
+            return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_REFERENCE_INVALID")
+        if not isinstance(policy_id, str) or not policy_id.strip():
+            return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_POLICY_INVALID")
+        try:
+            common_rates = {
+                "open_fee_rate": _margin_rate(open_fee_rate, "open_fee_rate"),
+                "close_fee_rate": _margin_rate(close_fee_rate, "close_fee_rate"),
+                "order_loss_rate": _margin_rate(order_loss_rate, "order_loss_rate"),
+            }
+        except (TypeError, ValueError):
+            return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_RATE_INVALID")
+        if isinstance(members, (str, bytes)) or not isinstance(members, Sequence) or not members:
+            return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_MEMBER_INVALID")
+        base_witness = {
+            "reference_digest": reference.content_digest,
+            "captured_at_ms": reference.captured_at_ms,
+            "policy_id": policy_id,
+            **common_rates,
+        }
+    except (ArithmeticError, TypeError, ValueError, OverflowError):
+        return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_INPUT_INVALID")
+
+    coefficients: list[MarginCoefficient] = []
+    member_witnesses: list[Mapping[str, Any]] = []
+    seen_ids: set[Any] = set()
+    try:
+        for member in members:
+            if not isinstance(member, Mapping):
+                return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_MEMBER_INVALID", len(coefficients), base_witness)
+            strategy_id = member.get("strategy_id")
+            symbol = member.get("symbol")
+            if strategy_id is None or not isinstance(symbol, str) or not symbol.strip():
+                return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_MEMBER_INVALID", len(coefficients), base_witness)
+            if not symbol.endswith("USDT"):
+                return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_NON_USDT_SYMBOL", len(coefficients), base_witness)
+            try:
+                if strategy_id in seen_ids:
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_STRATEGY_ID_NOT_UNIQUE", len(coefficients), base_witness)
+                seen_ids.add(strategy_id)
+            except TypeError:
+                return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_MEMBER_INVALID", len(coefficients), base_witness)
+            planned_leverage = _decimal(member.get("planned_leverage"), "planned_leverage", positive=True)
+            capacity = _decimal(member.get("position_size_usdt"), "position_size_usdt", positive=True)
+            try:
+                instrument = reference.instrument(symbol)
+                tiers = reference.tiers(symbol)
+            except Exception:
+                return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_REFERENCE_FACTS_UNAVAILABLE", len(coefficients), base_witness)
+            if instrument.status != "Trading" or instrument.contract_type != "LinearPerpetual":
+                return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_INSTRUMENT_INACTIVE", len(coefficients), base_witness)
+
+            limits: list[Decimal] = []
+            applicable: list[Any] = []
+            previous_limit = Decimal("0")
+            covered = False
+            for tier in tiers:
+                limit = _decimal(tier.risk_limit_value, "risk_limit_value", positive=True)
+                if limit <= previous_limit:
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_REFERENCE_INVALID", len(coefficients), base_witness)
+                if previous_limit > capacity:
+                    break
+                limits.append(limit)
+                applicable.append(tier)
+                if capacity < limit:
+                    covered = True
+                    break
+                previous_limit = limit
+            if not covered:
+                return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_EXPOSURE_UNAVAILABLE", len(coefficients), base_witness)
+            try:
+                max_leverage = _decimal(reference.maximum_symbol_leverage(symbol, capacity, active_order_exposure=0), "max_leverage", positive=True)
+            except Exception:
+                return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_EXPOSURE_UNAVAILABLE", len(coefficients), base_witness)
+            if planned_leverage > max_leverage:
+                return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_LEVERAGE_EXCEEDS_REFERENCE", len(coefficients), base_witness)
+
+            initial_rates: list[Decimal] = []
+            maintenance_rates: list[Decimal] = []
+            tier_facts: list[Mapping[str, Any]] = []
+            for tier, limit in zip(applicable, limits):
+                try:
+                    initial = _margin_rate(tier.initial_margin, "initial_margin", inclusive_one=True)
+                    maintenance = _margin_rate(tier.maintenance_margin, "maintenance_margin")
+                    tier_max_leverage = _decimal(tier.max_leverage, "max_leverage", positive=True)
+                except (ArithmeticError, TypeError, ValueError, OverflowError):
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_TIER_RATE_UNKNOWN", len(coefficients), base_witness)
+                if tier_max_leverage <= 0:
+                    return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_REFERENCE_INVALID", len(coefficients), base_witness)
+                leverage_rate, _ = _divide_up(Decimal("1"), planned_leverage)
+                initial_rates.append(max(initial, leverage_rate))
+                maintenance_rates.append(maintenance)
+                tier_facts.append({
+                    "risk_limit_value": limit,
+                    "risk_id": tier.risk_id,
+                    "initial_margin": initial,
+                    "maintenance_margin": maintenance,
+                    "max_leverage": tier_max_leverage,
+                })
+            a, _ = _add_up(max(initial_rates), common_rates["open_fee_rate"])
+            a, _ = _add_up(a, common_rates["close_fee_rate"])
+            a, _ = _add_up(a, common_rates["order_loss_rate"])
+            b, _ = _add_up(max(maintenance_rates), common_rates["close_fee_rate"])
+            witness = {
+                **base_witness,
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "position_size_usdt": capacity,
+                "planned_leverage": planned_leverage,
+                "reference_max_leverage": max_leverage,
+                "tiers_used": tuple(f"{symbol}:{limit}" for limit in limits),
+                "tier_facts": tuple(tier_facts),
+                "initial_margin_rates": tuple(initial_rates),
+                "maintenance_margin_rates": tuple(maintenance_rates),
+                "mm_deduction_omitted": True,
+                "order_loss_scope": "ENTRY_SIDE_LINEAR_ONLY",
+                "order_loss_in_a": True,
+                "order_loss_in_b": False,
+                "a": a,
+                "b": b,
+            }
+            coefficients.append(MarginCoefficient(strategy_id, a, b, CONSERVATIVE_BOUND, witness, capacity))
+            member_witnesses.append(witness)
+    except Exception:
+        return MarginCoefficientResult(UNKNOWN, (), UNKNOWN, "MARGIN_INPUT_INVALID", len(coefficients), base_witness)
+    return MarginCoefficientResult(
+        PASS,
+        tuple(coefficients),
+        CONSERVATIVE_BOUND,
+        None,
+        len(coefficients),
+        {**base_witness, "members": tuple(member_witnesses)},
+    )
 
 
 def _close_excess(

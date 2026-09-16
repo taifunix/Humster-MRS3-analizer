@@ -48,12 +48,64 @@ const portfolioSettingsHelpers = (() => {
     const scale = Math.max(a.scale, b.scale); const av = a.scaled * 10n ** BigInt(scale - a.scale); const bv = b.scaled * 10n ** BigInt(scale - b.scale);
     return av < bv ? -1 : av > bv ? 1 : 0;
   };
+  const weightedIntegerRules = Object.freeze({
+    history_step_minutes: { positive: true }, base_vectors: { positive: true }, scenarios: { positive: true },
+    bootstrap_scenarios_per_block: { positive: true }, bootstrap_diagnostic_scenarios: { positive: true },
+    bootstrap_low_block_common_days: { positive: true }, limiter_step: { positive: true },
+    wall_time_seconds: { positive: true }, solver_time_seconds: { positive: true }, max_targets: { positive: true, maximum: 8 },
+    api_requests_per_second: { positive: true }, api_concurrency: { positive: true },
+    reference_max_age_hours: { positive: true }, csv_download_concurrency: { positive: true },
+    lp_solutions_per_profile: { positive: true, maximum: 20 }, repair_attempts: { positive: true, maximum: 3 },
+    additional_passes: { positive: true, maximum: 1 }, alternatives_per_profile: { maximum: 2 },
+    limiter_controls: { maximum: 2 }, priority_groups: { positive: true, maximum: 5 }, api_retries: {},
+  });
+  const weightedNumberRules = Object.freeze({
+    cdar_pct: { positive: true, maximumExclusive: 100 }, diagnostic_cdar_pct: { positive: true, maximumExclusive: 100 },
+    p30_tolerance_pct: { minimum: 0, maximumExclusive: 100 }, scale_warning_multiple: { positive: true },
+    limiter_stress_pct: { minimum: 0, maximumExclusive: 100 }, priority_beta: { minimum: 0, maximum: 1 },
+    priority_close_ratio: { minimumExclusive: 1 },
+  });
+  const weightedSearchKeys = Object.freeze([
+    ...Object.keys(weightedIntegerRules), ...Object.keys(weightedNumberRules), 'bootstrap_block_days', 'bootstrap_p95',
+  ]);
+  const weightedSearchValid = (weighted) => {
+    if (!weighted || typeof weighted !== 'object' || Array.isArray(weighted) || Object.keys(weighted).sort().join(',') !== [...weightedSearchKeys].sort().join(',')) return false;
+    for (const [name, rule] of Object.entries(weightedIntegerRules)) {
+      const value = weighted[name];
+      if (!Number.isSafeInteger(value) || (rule.positive ? value <= 0 : value < 0) || (rule.maximum !== undefined && value > rule.maximum)) return false;
+    }
+    for (const [name, rule] of Object.entries(weightedNumberRules)) {
+      const value = weighted[name];
+      if (typeof value !== 'number' || !Number.isFinite(value) || !settingsDecimalParts(String(value)) || (rule.positive && value <= 0) || (rule.minimum !== undefined && value < rule.minimum) || (rule.minimumExclusive !== undefined && value <= rule.minimumExclusive) || (rule.maximum !== undefined && value > rule.maximum) || (rule.maximumExclusive !== undefined && value >= rule.maximumExclusive)) return false;
+    }
+    return Array.isArray(weighted.bootstrap_block_days) && JSON.stringify(weighted.bootstrap_block_days) === '[1,3,7]' && typeof weighted.bootstrap_p95 === 'boolean' && weighted.bootstrap_diagnostic_scenarios <= weighted.bootstrap_scenarios_per_block;
+  };
+  const weightedIntegerValue = (raw, rule) => {
+    const value = settingsIntegerValue(raw, !rule.positive);
+    if (rule.maximum !== undefined && value > rule.maximum) throw new Error('integer');
+    return value;
+  };
+  const weightedNumberValue = (raw, rule) => {
+    const parts = settingsDecimalParts(String(raw ?? '').trim()); const value = Number(parts?.text);
+    if (!parts || !Number.isFinite(value) || !settingsDecimalParts(String(value)) || (rule.positive && value <= 0) || (rule.minimum !== undefined && value < rule.minimum) || (rule.minimumExclusive !== undefined && value <= rule.minimumExclusive) || (rule.maximum !== undefined && value > rule.maximum) || (rule.maximumExclusive !== undefined && value >= rule.maximumExclusive)) throw new Error('number');
+    return value;
+  };
+  const revealInvalidField = (field) => { const details = field?.closest?.('details'); if (details) details.open = !!1; field?.focus?.(); };
+  const settingsValidationFeedback = (error, query, meta, reveal = revealInvalidField) => {
+    const field = error?.field ? query(`#portfolio-settings-${error.field}`) : null;
+    reveal(field);
+    if (field) { field.setAttribute('aria-invalid', 'true'); field.setCustomValidity('Введите корректное значение для поля.'); }
+    const label = field?.closest?.('.field-group')?.querySelector('label')?.textContent || 'Поле настроек';
+    if (meta) meta.textContent = `${label}: Введите корректное значение для поля.`;
+    return field;
+  };
   const validMoney = (money) => !!money && typeof money === 'object' && !Array.isArray(money) && Object.keys(money).sort().join(',') === 'amount,currency' && typeof money.currency === 'string' && !!money.currency.trim() && !!settingsMoneyParts(money.amount);
   const validSettingsDocument = (doc) => {
     const liquidity = doc?.liquidity; const parameters = liquidity?.parameters;
+    const weighted = doc?.search?.weighted_search;
     const start = settingsWeekdayMinutes(liquidity?.weekend_start_utc); const end = settingsWeekdayMinutes(liquidity?.weekend_end_utc);
     const rounding = settingsDecimalParts(liquidity?.round_down_usdt);
-    if (!doc || typeof doc !== 'object' || Array.isArray(doc) || doc.schema_version !== 2 || !Number.isSafeInteger(doc.search?.total_test_budget) || doc.search.total_test_budget <= 0 || doc.search.sizing_mode !== 'liquidity_cap_single' || !Number.isSafeInteger(doc.search.max_enumerated_combinations) || doc.search.max_enumerated_combinations <= 0 || !Number.isSafeInteger(parameters?.close_volume_participation_pct) || parameters.close_volume_participation_pct < 1 || parameters.close_volume_participation_pct > 200 || !rounding || rounding.negative || rounding.scaled === 0n || !Number.isSafeInteger(liquidity.minimum_coverage_pct) || liquidity.minimum_coverage_pct < 1 || liquidity.minimum_coverage_pct > 100 || !Number.isSafeInteger(liquidity.maximum_age_hours) || liquidity.maximum_age_hours <= 0 || start === null || end === null || start === end || !Number.isSafeInteger(liquidity.archive_publication_lag_hours) || liquidity.archive_publication_lag_hours < 0 || liquidity.archive_publication_lag_hours > 48 || typeof liquidity.backfill_write_enabled !== 'boolean') return false;
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc) || doc.schema_version !== 2 || !Number.isSafeInteger(doc.search?.total_test_budget) || doc.search.total_test_budget <= 0 || doc.search.sizing_mode !== 'liquidity_cap_single' || !Number.isSafeInteger(doc.search.max_enumerated_combinations) || doc.search.max_enumerated_combinations <= 0 || !weightedSearchValid(weighted) || !Number.isSafeInteger(parameters?.close_volume_participation_pct) || parameters.close_volume_participation_pct < 1 || parameters.close_volume_participation_pct > 200 || !rounding || rounding.negative || rounding.scaled === 0n || !Number.isSafeInteger(liquidity.minimum_coverage_pct) || liquidity.minimum_coverage_pct < 1 || liquidity.minimum_coverage_pct > 100 || !Number.isSafeInteger(liquidity.maximum_age_hours) || liquidity.maximum_age_hours <= 0 || start === null || end === null || start === end || !Number.isSafeInteger(liquidity.archive_publication_lag_hours) || liquidity.archive_publication_lag_hours < 0 || liquidity.archive_publication_lag_hours > 48 || typeof liquidity.backfill_write_enabled !== 'boolean') return false;
     for (const profile of profiles) {
       const scenario = doc.scenarios?.[profile]; const profileDocument = doc.profiles?.[profile]; const ranking = profileDocument?.ranking;
       if (!scenario || !validMoney(scenario.deposit) || !validMoney(scenario.collateral) || !validMoney(scenario.max_balance) || !validMoney(scenario.sizing?.upper_bound) || scenario.sizing.grid !== undefined || !settingsDecimalParts(profileDocument?.individual_max_dd_pct) || settingsDecimalParts(profileDocument.individual_max_dd_pct).negative || settingsDecimalParts(profileDocument.individual_max_dd_pct).scaled === 0n || !settingsDecimalParts(profileDocument.individual_net_pnl_min_exclusive) || !Number.isSafeInteger(ranking?.top_n) || ranking.top_n <= 0) return false;
@@ -74,6 +126,20 @@ const portfolioSettingsHelpers = (() => {
     try { const end = settingsWeekdayMinutes(String(values.weekend_end_utc ?? '').trim()); if (end === null || end === settingsWeekdayMinutes(payload.liquidity.weekend_start_utc)) throw new Error('time'); payload.liquidity.weekend_end_utc = String(values.weekend_end_utc).trim(); } catch (error) { error.field = 'weekend-end-utc'; throw error; }
     if (typeof values.backfill_write_enabled !== 'boolean') { const error = new Error('boolean'); error.field = 'backfill-write-enabled'; throw error; }
     payload.liquidity.backfill_write_enabled = values.backfill_write_enabled;
+    const weightedValues = values.weighted_search || {};
+    for (const [name, rule] of Object.entries(weightedIntegerRules)) {
+      try { payload.search.weighted_search[name] = weightedIntegerValue(weightedValues[name] ?? document.search.weighted_search[name], rule); } catch (error) { error.field = `weighted-${name.replaceAll('_', '-')}`; throw error; }
+    }
+    for (const [name, rule] of Object.entries(weightedNumberRules)) {
+      try { payload.search.weighted_search[name] = weightedNumberValue(weightedValues[name] ?? document.search.weighted_search[name], rule); } catch (error) { error.field = `weighted-${name.replaceAll('_', '-')}`; throw error; }
+    }
+    try {
+      const bootstrap = payload.search.weighted_search;
+      if (bootstrap.bootstrap_diagnostic_scenarios > bootstrap.bootstrap_scenarios_per_block) { const error = new Error('integer'); error.field = 'weighted-bootstrap-diagnostic-scenarios'; throw error; }
+      if (weightedValues.bootstrap_p95 !== undefined && typeof weightedValues.bootstrap_p95 !== 'boolean') { const error = new Error('boolean'); error.field = 'weighted-bootstrap-p95'; throw error; }
+      if (weightedValues.bootstrap_block_days !== undefined && weightedValues.bootstrap_block_days !== '1,3,7') { const error = new Error('integer'); error.field = 'weighted-bootstrap-block-days'; throw error; }
+      bootstrap.bootstrap_p95 = weightedValues.bootstrap_p95 ?? document.search.weighted_search.bootstrap_p95;
+    } catch (error) { error.field = error.field || 'weighted-bootstrap-p95'; throw error; }
     for (const profile of profiles) {
       const source = document.scenarios[profile]; const scenario = payload.scenarios[profile]; const value = values.profiles[profile];
       for (const name of ['deposit', 'collateral', 'max_balance']) {
@@ -86,7 +152,7 @@ const portfolioSettingsHelpers = (() => {
     }
     return payload;
   };
-  return { profiles, clone, settingsMoneyParts, settingsMoneyValue, settingsIntegerValue, settingsDecimalParts, settingsDecimalValue, settingsWeekdayMinutes, settingsCompareMoney, validSettingsDocument, settingsPatch };
+  return { profiles, clone, settingsMoneyParts, settingsMoneyValue, settingsIntegerValue, settingsDecimalParts, settingsDecimalValue, settingsWeekdayMinutes, settingsCompareMoney, revealInvalidField, settingsValidationFeedback, weightedSearchKeys, validSettingsDocument, settingsPatch };
 })();
 if (typeof globalThis !== 'undefined') globalThis.portfolioSettingsHelpers = portfolioSettingsHelpers;
 
@@ -2836,7 +2902,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const counts = row.finalist_counts || row.counts || {};
       const long = Number(row.current_finalist_long ?? row.finalist_long ?? row.finalistLong ?? counts.LONG ?? counts.long ?? 0);
       const short = Number(row.current_finalist_short ?? row.finalist_short ?? row.finalistShort ?? counts.SHORT ?? counts.short ?? 0);
-      return { pair: String(row.pair || row.symbol || row.name || ''), finalistLong: Number.isFinite(long) ? Math.max(0, long) : 0, finalistShort: Number.isFinite(short) ? Math.max(0, short) : 0, long: Number(row.max_finalist_long ?? 0), short: Number(row.max_finalist_short ?? 0), selected: row.selected === true };
+      return { pair: String(row.pair || row.symbol || row.name || ''), finalistLong: Number.isFinite(long) ? Math.max(0, long) : 0, finalistShort: Number.isFinite(short) ? Math.max(0, short) : 0, long: 1, short: 0, selected: row.selected === true };
     }).filter((row) => row.pair);
   }
 
@@ -2865,7 +2931,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         return digits !== '' && Math.max(scale, 0) <= 12 && Math.max(digits.length - scale, 0) <= 26;
       };
       const portfolioSafeInteger = (value, minimum = 0) => { const raw = String(value ?? '').trim(); const number = Number(raw); return raw !== '' && Number.isSafeInteger(number) && number >= minimum; };
-      const copyPortfolioMaximum = (selector) => { const value = query(selector)?.value; return portfolioSafeInteger(value, 0) ? Number(value) : 0; };
+      const copyPortfolioMaximum = (selector) => selector === '#portfolio-default-long' ? 1 : 0;
       const freezeStatus = (status) => `${status}${state.settingsChanged ? ' · SETTINGS_CHANGED_SINCE_FREEZE' : ''}`;
       const updateFreezeStatus = (job) => {
         const changed = job?.settings_changed_since_freeze === true || (state.configDigest && job?.config_digest && state.configDigest !== job.config_digest);
@@ -2891,7 +2957,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
           const candidates = query(`#portfolio-candidates-${profile}`)?.value || '';
           return { profile, equity, maxBalance, candidates };
         });
-        const profilesValid = profiles.length > 0 && profiles.every((profile) => portfolioDecimal(profile.equity) && (!String(profile.maxBalance).trim() || portfolioDecimal(profile.maxBalance)) && portfolioSafeInteger(profile.candidates, 1));
+        const profilesValid = profiles.length > 0 && profiles.every((profile) => portfolioDecimal(profile.equity) && (!String(profile.maxBalance).trim() || portfolioDecimal(profile.maxBalance)) && portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= 50);
         return { rows, selectedPairs, activePair, selectedProfiles, profiles, valid: state.readiness?.stage1?.enabled === true && pairFieldsValid && activePair && profilesValid };
       };
       const blockerItems = (readiness) => [
@@ -2935,7 +3001,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
           const grid = document.createElement('div'); grid.className = 'portfolio-pair-grid';
           for (const [side, countValue] of [['LONG', row.long], ['SHORT', row.short]]) {
             const field = document.createElement('label'); field.className = 'field-group'; field.textContent = `Maximum ${side}`;
-            const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.step = '1'; input.value = String(countValue); input.dataset.portfolioPair = row.pair; input.dataset.portfolioSide = side; input.setAttribute('aria-label', `${row.pair} maximum ${side}`);
+            const input = document.createElement('input'); input.type = 'number'; input.min = side === 'LONG' ? '1' : '0'; input.max = side === 'LONG' ? '1' : '0'; input.step = '1'; input.value = String(countValue); input.readOnly = true; input.dataset.portfolioPair = row.pair; input.dataset.portfolioSide = side; input.setAttribute('aria-label', `${row.pair} maximum ${side}`);
             input.addEventListener('input', () => { row[side.toLowerCase()] = Number(input.value); updateControls(); }); field.append(input); grid.append(field);
           }
           card.append(grid); container.append(card);
@@ -3014,7 +3080,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       runButton?.addEventListener('click', async () => {
         const launch = portfolioLaunchForm();
         if (!launch.valid) { if (formStatus) formStatus.textContent = 'Fix the server readiness and form blockers before calculating.'; updateControls(); return; }
-        const selectedPairs = launch.selectedPairs.map((row) => ({ pair: row.pair, max_finalist_long: row.long, max_finalist_short: row.short }));
+        const selectedPairs = launch.selectedPairs.map((row) => ({ pair: row.pair, max_finalist_long: 1, max_finalist_short: 0 }));
         const profiles = launch.profiles.map((profile) => {
           const item = { profile_id: profile.profile.toUpperCase(), equity_usdt: profile.equity, max_candidates: Number(profile.candidates) };
           if (String(profile.maxBalance).trim()) item.max_balance_usdt = profile.maxBalance;
@@ -3055,7 +3121,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
 
   function loadPortfolioSettings(force = false) {
     if (!loadPortfolioSettings.state) {
-      const { profiles, clone, settingsPatch, validSettingsDocument } = portfolioSettingsHelpers;
+      const { profiles, clone, settingsPatch, validSettingsDocument, weightedSearchKeys, revealInvalidField, settingsValidationFeedback } = portfolioSettingsHelpers;
       const state = { digest: null, document: null, readOnly: true, dirty: false, loading: null, conflictMessage: '' };
       const readOnlyStates = ['MISSING', 'INVALID', 'UNSUPPORTED_SCHEMA'];
       const query = (selector) => document.querySelector(selector);
@@ -3064,12 +3130,14 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const linkDescriptions = () => controls().forEach((control) => { const description = control.closest('.field-group')?.querySelector('small'); if (description) { description.id = `${control.id}-description`; control.setAttribute('aria-describedby', description.id); } });
       linkDescriptions();
       const setBadge = (value, kind) => { const node = query('#portfolio-settings-state'); if (node) { node.className = `state-badge state-${kind}`; node.textContent = value; } };
-      const displayMoney = (money) => String(money?.amount ?? '');
-      const input = (profile, name) => query(`#portfolio-settings-${profile.toLowerCase()}-${name}`);
-      const renderDocument = () => {
-         const doc = state.document; if (!doc) { controls().forEach((control) => { if (control.type === 'checkbox') control.checked = false; else control.value = ''; }); return; }
-         const budget = query('#portfolio-settings-max-enumerated-combinations'); if (budget) budget.value = String(doc.search.max_enumerated_combinations);
-         const participation = query('#portfolio-settings-close-volume-participation-pct'); if (participation) participation.value = String(doc.liquidity.parameters.close_volume_participation_pct);
+       const displayMoney = (money) => String(money?.amount ?? '');
+       const input = (profile, name) => query(`#portfolio-settings-${profile.toLowerCase()}-${name}`);
+       const weightedInput = (name) => query(`#portfolio-settings-weighted-${name === 'csv_download_concurrency' ? 'archive-download-concurrency' : name.replaceAll('_', '-')}`);
+       const renderDocument = () => {
+          const doc = state.document; if (!doc) { controls().forEach((control) => { if (control.type === 'checkbox') control.checked = false; else control.value = ''; }); return; }
+          const budget = query('#portfolio-settings-max-enumerated-combinations'); if (budget) budget.value = String(doc.search.max_enumerated_combinations);
+          for (const name of weightedSearchKeys) { const control = weightedInput(name); if (!control) continue; if (control.type === 'checkbox') control.checked = !!doc.search.weighted_search[name]; else control.value = name === 'bootstrap_block_days' ? doc.search.weighted_search[name].join(',') : String(doc.search.weighted_search[name]); }
+          const participation = query('#portfolio-settings-close-volume-participation-pct'); if (participation) participation.value = String(doc.liquidity.parameters.close_volume_participation_pct);
          const rounding = query('#portfolio-settings-round-down-usdt'); if (rounding) rounding.value = String(doc.liquidity.round_down_usdt);
          const coverage = query('#portfolio-settings-minimum-coverage-pct'); if (coverage) coverage.value = String(doc.liquidity.minimum_coverage_pct);
          const age = query('#portfolio-settings-maximum-age-hours'); if (age) age.value = String(doc.liquidity.maximum_age_hours);
@@ -3085,7 +3153,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       };
       const setDisabled = (disabled) => { controls().forEach((control) => { control.disabled = disabled; }); if (save) save.disabled = disabled; };
       const show = (result) => {
-        const stateName = result?.state || 'INVALID'; state.digest = stateName === 'READY' ? (result?.digest ?? null) : null; state.document = null; if (stateName === 'READY' && result?.document) state.document = clone(result.document); state.dirty = false; state.readOnly = readOnlyStates.includes(stateName) || stateName !== 'READY' || !state.document || !validSettingsDocument(state.document);
+         const stateName = result?.state || 'INVALID'; state.digest = stateName === 'READY' ? (result?.digest ?? null) : null; state.document = null; if (stateName === 'READY' && result?.document) { const candidate = clone(result.document); if (validSettingsDocument(candidate)) state.document = candidate; } state.dirty = false; state.readOnly = readOnlyStates.includes(stateName) || stateName !== 'READY' || !state.document;
         renderDocument(); clearInvalid(); setDisabled(state.readOnly); setBadge(stateName, stateName === 'READY' && !state.readOnly ? 'ready' : 'pending');
         if (meta) meta.textContent = state.readOnly ? (stateName === 'READY' ? 'Серверные настройки содержат недопустимые значения. Сохранение отключено.' : `${stateName}: настройки доступны только для чтения.`) : (state.conflictMessage || `READY · digest ${state.digest || '—'}`);
       };
@@ -3095,8 +3163,9 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         state.loading = requestJson('/api/v2/portfolio/settings').then((result) => { show(result); return true; }).catch((error) => { state.document = null; state.digest = null; state.dirty = false; state.readOnly = true; state.conflictMessage = ''; renderDocument(); clearInvalid(); setDisabled(true); if (meta) meta.textContent = portfolioErrorMessage(error); return false; }).finally(() => { state.loading = null; });
         return state.loading;
       };
-      const collect = () => {
-        const values = { max_enumerated_combinations: query('#portfolio-settings-max-enumerated-combinations')?.value, close_volume_participation_pct: query('#portfolio-settings-close-volume-participation-pct')?.value, round_down_usdt: query('#portfolio-settings-round-down-usdt')?.value, minimum_coverage_pct: query('#portfolio-settings-minimum-coverage-pct')?.value, maximum_age_hours: query('#portfolio-settings-maximum-age-hours')?.value, archive_publication_lag_hours: query('#portfolio-settings-archive-publication-lag-hours')?.value, weekend_start_utc: query('#portfolio-settings-weekend-start-utc')?.value, weekend_end_utc: query('#portfolio-settings-weekend-end-utc')?.value, backfill_write_enabled: !!query('#portfolio-settings-backfill-write-enabled')?.checked, profiles: {} };
+       const collect = () => {
+         const weighted_search = Object.fromEntries(weightedSearchKeys.map((name) => [name, weightedInput(name)?.type === 'checkbox' ? !!weightedInput(name)?.checked : weightedInput(name)?.value]));
+         const values = { max_enumerated_combinations: query('#portfolio-settings-max-enumerated-combinations')?.value, close_volume_participation_pct: query('#portfolio-settings-close-volume-participation-pct')?.value, round_down_usdt: query('#portfolio-settings-round-down-usdt')?.value, minimum_coverage_pct: query('#portfolio-settings-minimum-coverage-pct')?.value, maximum_age_hours: query('#portfolio-settings-maximum-age-hours')?.value, archive_publication_lag_hours: query('#portfolio-settings-archive-publication-lag-hours')?.value, weekend_start_utc: query('#portfolio-settings-weekend-start-utc')?.value, weekend_end_utc: query('#portfolio-settings-weekend-end-utc')?.value, backfill_write_enabled: !!query('#portfolio-settings-backfill-write-enabled')?.checked, weighted_search, profiles: {} };
         for (const profile of profiles) {
           values.profiles[profile] = {
             deposit: input(profile, 'deposit')?.value,
@@ -3119,10 +3188,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         state.conflictMessage = '';
         clearInvalid();
         let payload; try { payload = collect(); } catch (error) {
-          const field = error?.field ? query(`#portfolio-settings-${error.field}`) : null;
-          if (field) { field.setAttribute('aria-invalid', 'true'); field.setCustomValidity('Введите корректное значение.'); }
-          const label = field?.closest('.field-group')?.querySelector('label')?.textContent || 'Поле настроек';
-          if (meta) meta.textContent = `${label}: введите положительное значение; для сетки используйте строгий порядок.`;
+           settingsValidationFeedback(error, query, meta, revealInvalidField);
           return;
         }
         save.disabled = true;

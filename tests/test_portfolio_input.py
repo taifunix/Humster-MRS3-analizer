@@ -870,6 +870,45 @@ def test_read_current_finalists_returns_exact_review_facts_without_writes(tmp_pa
     assert database.read_bytes() == before
 
 
+def test_read_current_finalists_preserves_source_geometry_and_identity(tmp_path: Path) -> None:
+    row = read_current_finalists(_database(tmp_path), [("BTCUSDT", "LONG")])[0]
+
+    assert {field: row[field] for field in ("close_ma_len", "order_count", "analysis_run_id", "candidate_identity")} == {
+        "close_ma_len": 3,
+        "order_count": 1,
+        "analysis_run_id": "run",
+        "candidate_identity": "candidate",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("close_ma_len", None), ("analysis_run_id", ""), ("candidate_identity", "")],
+)
+def test_read_current_finalists_rejects_invalid_source_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    database = _database(tmp_path)
+    original = portfolio_input._records_for_ids
+
+    def corrupted(connection, table, column, ids):
+        rows = original(connection, table, column, ids)
+        if table == "strategies":
+            return tuple({**row, field: value} for row in rows)
+        return rows
+
+    monkeypatch.setattr(portfolio_input, "_records_for_ids", corrupted)
+
+    with pytest.raises(PortfolioInputError) as error:
+        read_current_finalists(database, [("BTCUSDT", "LONG")])
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+    assert field in str(error.value)
+
+
 def test_read_current_finalists_can_skip_large_series_for_metadata_consumers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

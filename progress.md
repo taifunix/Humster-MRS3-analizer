@@ -1,8 +1,40 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-15
-**Current branch:** `main`
+**Updated:** 2026-09-16
+**Current branch:** `feat/weighted-phase6`
 
+Weighted-search Phase 6 implementation evidence is recorded in
+[Phase 6 evidence](docs/superpowers/plans/2026-09-16-portfolio-optimizer-weighted-search-phase-6-evidence.md).
+The final Opus high re-review returned `CODE_REVIEW_PASS`; Phase 6 is accepted.
+
+Accepted implementation slices cover strict weighted-search settings and
+migration, the long-only frozen Campaign boundary, private weighted source
+rows and source geometry, the dedicated template (`position_priority=3`),
+the normal official local fact path, reference-derived margin coefficients
+across tiers `[0, C]`, executable JSON payloads, deterministic executable
+identity, typed A0/full-position readback, and weighted Summary/Members
+projection with two reserves and explicit `UNKNOWN` diagnostics.
+
+Legacy Campaign modes remain rejected; legacy export/render and DuckDB
+finalist-input compatibility remain separate and unchanged.  Stage 2 and
+tester submission remain disabled and no tester, network, Bybit, retest, or
+database write was run.  The configured local minute root has 3712 CSV files;
+this evidence does not claim live-data verification.
+
+Verification recorded for this worktree:
+- adapter suite: `263 passed`;
+- Panel suite: `151 passed`;
+- minute-capacity suite: `22 passed`;
+- combined adapter/config/input/margin/minute-capacity/export/render/Panel/
+  static-UI/finalist-retest command: `930 passed in 146.60s`;
+- exact reruns of the reviewer-requested full-suite failures: corrected static
+  Panel and common-worker cases pass; the unchanged PerformanceDB HTTP test
+  passed on both parent commit `a452958` and the current tree after one local
+  two-second scheduling timeout;
+- `git diff --check`: clean (existing line-ending warnings only).
+
+Slice-level independent reviews and the final full-Phase-6 Opus high re-review
+returned `CODE_REVIEW_PASS`; all Phase 6 checklist items are closed.
 PerformanceDB review-state prerequisite (2026-09-15): automatic selection now
 populates only Auto Status/Auto Rank. Effective finalists require explicit
 imported User decisions; imported decisions survive later unreviewed runs, and

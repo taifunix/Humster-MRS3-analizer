@@ -252,6 +252,7 @@ def test_static_panel_shell_contains_only_navigation_contract() -> None:
         assert label in html
     for excluded in ("Artefacts", "CSV", "DUCKDB_DIRECT", "credential", "password", "token"):
         assert excluded.casefold() not in html.casefold()
+    for excluded in ("Artefacts", "DUCKDB_DIRECT", "credential", "password", "token"):
         assert excluded.casefold() not in script.casefold()
     assert "/api/v2/" in script
     assert "/api/ui/" not in script

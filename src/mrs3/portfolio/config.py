@@ -78,6 +78,40 @@ LIQUIDITY_DEFAULTS = MappingProxyType(
         "backfill_write_enabled": False,
     }
 )
+WEIGHTED_SEARCH_DEFAULTS = MappingProxyType(
+    {
+        "history_step_minutes": 5,
+        "lp_solutions_per_profile": 20,
+        "repair_attempts": 3,
+        "additional_passes": 1,
+        "base_vectors": 2_000_000,
+        "scenarios": 3_000_000,
+        "cdar_pct": 80,
+        "diagnostic_cdar_pct": 90,
+        "alternatives_per_profile": 2,
+        "p30_tolerance_pct": 5,
+        "bootstrap_block_days": (1, 3, 7),
+        "bootstrap_scenarios_per_block": 1_000,
+        "bootstrap_p95": True,
+        "bootstrap_diagnostic_scenarios": 100,
+        "bootstrap_low_block_common_days": 10,
+        "scale_warning_multiple": 10,
+        "limiter_step": 1,
+        "limiter_controls": 2,
+        "limiter_stress_pct": 1.5,
+        "priority_groups": 5,
+        "priority_beta": 0.5,
+        "priority_close_ratio": 2,
+        "wall_time_seconds": 900,
+        "solver_time_seconds": 30,
+        "max_targets": 8,
+        "api_requests_per_second": 2,
+        "api_concurrency": 1,
+        "api_retries": 3,
+        "reference_max_age_hours": 2,
+        "csv_download_concurrency": 2,
+    }
+)
 RESEARCH_RISK_POLICY = MappingProxyType(
     {
         "AGGRESSIVE": MappingProxyType(
@@ -103,6 +137,12 @@ RESEARCH_RISK_POLICY = MappingProxyType(
         ),
     }
 )
+
+
+def _weighted_search_defaults() -> dict[str, Any]:
+    defaults = dict(WEIGHTED_SEARCH_DEFAULTS)
+    defaults["bootstrap_block_days"] = list(WEIGHTED_SEARCH_DEFAULTS["bootstrap_block_days"])
+    return defaults
 
 
 class PortfolioConfigError(ValueError):
@@ -400,8 +440,69 @@ def _parse_liquidity(value: Any) -> Mapping[str, Any]:
     return MappingProxyType(result)
 
 
+def _parse_weighted_search(value: Any) -> Mapping[str, Any]:
+    raw = _object(value, "search.weighted_search", tuple(WEIGHTED_SEARCH_DEFAULTS))
+    result = {}
+    integer_fields = (
+        "history_step_minutes", "base_vectors", "scenarios", "bootstrap_scenarios_per_block",
+        "bootstrap_diagnostic_scenarios", "bootstrap_low_block_common_days", "limiter_step",
+        "wall_time_seconds", "solver_time_seconds", "max_targets", "api_requests_per_second",
+        "api_concurrency", "reference_max_age_hours", "csv_download_concurrency",
+    )
+    for key in integer_fields:
+        result[key] = _integer(raw[key], f"search.weighted_search.{key}", positive=True)
+    if result["max_targets"] > 8:
+        raise PortfolioConfigError("search.weighted_search.max_targets must be between 1 and 8")
+    for key, maximum in (("lp_solutions_per_profile", 20), ("repair_attempts", 3), ("additional_passes", 1)):
+        result[key] = _integer(raw[key], f"search.weighted_search.{key}", positive=True)
+        if result[key] > maximum:
+            raise PortfolioConfigError(f"search.weighted_search.{key} must be at most {maximum}")
+    result["alternatives_per_profile"] = _integer(raw["alternatives_per_profile"], "search.weighted_search.alternatives_per_profile", nonnegative=True)
+    if result["alternatives_per_profile"] > 2:
+        raise PortfolioConfigError("search.weighted_search.alternatives_per_profile must be at most 2")
+    for key in ("cdar_pct", "diagnostic_cdar_pct"):
+        result[key] = _finite_number(raw[key], f"search.weighted_search.{key}", positive=True)
+        if result[key] >= 100:
+            raise PortfolioConfigError(f"search.weighted_search.{key} must be less than 100")
+    tolerance = _finite_number(raw["p30_tolerance_pct"], "search.weighted_search.p30_tolerance_pct")
+    if tolerance < 0 or tolerance >= 100:
+        raise PortfolioConfigError("search.weighted_search.p30_tolerance_pct must be between 0 and 100")
+    result["p30_tolerance_pct"] = tolerance
+    block_days = raw["bootstrap_block_days"]
+    if not isinstance(block_days, list) or any(type(item) is not int for item in block_days) or block_days != [1, 3, 7]:
+        raise PortfolioConfigError("search.weighted_search.bootstrap_block_days must be [1, 3, 7]")
+    result["bootstrap_block_days"] = tuple(block_days)
+    if type(raw["bootstrap_p95"]) is not bool:
+        raise PortfolioConfigError("search.weighted_search.bootstrap_p95 must be a boolean")
+    result["bootstrap_p95"] = raw["bootstrap_p95"]
+    result["scale_warning_multiple"] = _finite_number(
+        raw["scale_warning_multiple"], "search.weighted_search.scale_warning_multiple", positive=True
+    )
+    result["limiter_controls"] = _integer(raw["limiter_controls"], "search.weighted_search.limiter_controls", nonnegative=True)
+    if result["limiter_controls"] > 2:
+        raise PortfolioConfigError("search.weighted_search.limiter_controls must be at most 2")
+    result["limiter_stress_pct"] = _finite_number(raw["limiter_stress_pct"], "search.weighted_search.limiter_stress_pct")
+    if result["limiter_stress_pct"] < 0 or result["limiter_stress_pct"] >= 100:
+        raise PortfolioConfigError("search.weighted_search.limiter_stress_pct must be between 0 and 100")
+    result["priority_groups"] = _integer(raw["priority_groups"], "search.weighted_search.priority_groups", positive=True)
+    if result["priority_groups"] > 5:
+        raise PortfolioConfigError("search.weighted_search.priority_groups must be between 1 and 5")
+    result["priority_beta"] = _finite_number(raw["priority_beta"], "search.weighted_search.priority_beta")
+    if result["priority_beta"] < 0 or result["priority_beta"] > 1:
+        raise PortfolioConfigError("search.weighted_search.priority_beta must be between 0 and 1")
+    result["priority_close_ratio"] = _finite_number(
+        raw["priority_close_ratio"], "search.weighted_search.priority_close_ratio"
+    )
+    if result["priority_close_ratio"] <= 1:
+        raise PortfolioConfigError("search.weighted_search.priority_close_ratio must be greater than 1")
+    result["api_retries"] = _integer(raw["api_retries"], "search.weighted_search.api_retries", nonnegative=True)
+    if result["bootstrap_diagnostic_scenarios"] > result["bootstrap_scenarios_per_block"]:
+        raise PortfolioConfigError("search.weighted_search.bootstrap_diagnostic_scenarios must not exceed bootstrap_scenarios_per_block")
+    return MappingProxyType(result)
+
+
 def _parse_groups(raw: dict[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
-    search_raw = _object(raw["search"], "search", ("universe", "composition", "sizing", "limiter", "priority", "seed", "rounds", "total_test_budget", "sizing_mode", "max_enumerated_combinations"))
+    search_raw = _object(raw["search"], "search", ("universe", "composition", "sizing", "limiter", "priority", "seed", "rounds", "total_test_budget", "sizing_mode", "max_enumerated_combinations", "weighted_search"))
     search = {key: _descriptor(search_raw[key], f"search.{key}") for key in ("universe", "sizing", "limiter", "priority")}
     search["composition"] = resolve_composition_parameters(search_raw["composition"])
     search.update({key: _integer(search_raw[key], f"search.{key}", positive=True if key != "seed" else False, nonnegative=key == "seed") for key in ("seed", "rounds", "total_test_budget")})
@@ -409,6 +510,7 @@ def _parse_groups(raw: dict[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, 
         raise PortfolioConfigError("search.sizing_mode is unsupported")
     search["sizing_mode"] = SIZING_MODE
     search["max_enumerated_combinations"] = _integer(search_raw["max_enumerated_combinations"], "search.max_enumerated_combinations", positive=True)
+    search["weighted_search"] = _parse_weighted_search(search_raw["weighted_search"])
 
     research_raw = _object(raw["research"], "research", ("development_window", "validation_window", "warmup", "boundary", "evidence_minimum"))
     research = {
@@ -451,15 +553,18 @@ def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict
         # remain unchanged until an explicit save.
         if active.get("algorithm_versions") == dict(LEGACY_ALGORITHM_VERSIONS):
             active["algorithm_versions"] = dict(ALGORITHM_VERSIONS)
-        search = active.get("search") if isinstance(active.get("search"), dict) else {}
-        composition = search.get("composition") if isinstance(search.get("composition"), dict) else None
-        if composition is not None:
-            parameters = composition.get("parameters") if isinstance(composition.get("parameters"), dict) else {}
-            for key, default in COMPOSITION_PARAMETER_DEFAULTS.items():
-                parameters.setdefault(key, default)
-            composition["parameters"] = parameters
-            search["composition"] = composition
+        search = active.get("search")
+        if isinstance(search, dict):
+            search.setdefault("weighted_search", _weighted_search_defaults())
             active["search"] = search
+            composition = search.get("composition") if isinstance(search.get("composition"), dict) else None
+            if composition is not None:
+                parameters = composition.get("parameters") if isinstance(composition.get("parameters"), dict) else {}
+                for key, default in COMPOSITION_PARAMETER_DEFAULTS.items():
+                    parameters.setdefault(key, default)
+                composition["parameters"] = parameters
+                search["composition"] = composition
+                active["search"] = search
         return active, False
     if document.get("schema_version") != LEGACY_SCHEMA_VERSION:
         return deepcopy(dict(document)), False
@@ -470,29 +575,31 @@ def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict
     inputs = migrated.get("inputs") if isinstance(migrated.get("inputs"), dict) else {}
     inputs.setdefault("bybit_minute_data_root", f"{runner.get('root', '.')}/tester/data/bybit")
     migrated["inputs"] = inputs
-    search = migrated.get("search") if isinstance(migrated.get("search"), dict) else {}
-    search.setdefault("sizing_mode", SIZING_MODE)
-    search.setdefault("max_enumerated_combinations", 100000)
-    composition = search.get("composition") if isinstance(search.get("composition"), dict) else None
-    if composition is not None:
-        parameters = composition.get("parameters") if isinstance(composition.get("parameters"), dict) else {}
-        # v1 descriptors accepted opaque operator parameters. Preserve them in
-        # an explicit compatibility namespace; v2 fields remain strict.
-        unknown = {
-            key: value for key, value in parameters.items()
-            if key not in COMPOSITION_PARAMETER_DEFAULTS and key != "operator_supplied"
-        }
-        parameters = {
-            key: value for key, value in parameters.items()
-            if key in COMPOSITION_PARAMETER_DEFAULTS or key == "operator_supplied"
-        }
-        if unknown:
-            parameters[_LEGACY_COMPOSITION_PARAMETERS] = unknown
-        for key, default in COMPOSITION_PARAMETER_DEFAULTS.items():
-            parameters.setdefault(key, default)
-        composition["parameters"] = parameters
-        search["composition"] = composition
-    migrated["search"] = search
+    search = migrated.get("search")
+    if isinstance(search, dict):
+        search.setdefault("sizing_mode", SIZING_MODE)
+        search.setdefault("max_enumerated_combinations", 100000)
+        search.setdefault("weighted_search", _weighted_search_defaults())
+        composition = search.get("composition") if isinstance(search.get("composition"), dict) else None
+        if composition is not None:
+            parameters = composition.get("parameters") if isinstance(composition.get("parameters"), dict) else {}
+            # v1 descriptors accepted opaque operator parameters. Preserve them in
+            # an explicit compatibility namespace; v2 fields remain strict.
+            unknown = {
+                key: value for key, value in parameters.items()
+                if key not in COMPOSITION_PARAMETER_DEFAULTS and key != "operator_supplied"
+            }
+            parameters = {
+                key: value for key, value in parameters.items()
+                if key in COMPOSITION_PARAMETER_DEFAULTS or key == "operator_supplied"
+            }
+            if unknown:
+                parameters[_LEGACY_COMPOSITION_PARAMETERS] = unknown
+            for key, default in COMPOSITION_PARAMETER_DEFAULTS.items():
+                parameters.setdefault(key, default)
+            composition["parameters"] = parameters
+            search["composition"] = composition
+        migrated["search"] = search
     liquidity = migrated.get("liquidity") if isinstance(migrated.get("liquidity"), dict) else {}
     parameters = liquidity.get("parameters") if isinstance(liquidity.get("parameters"), dict) else {}
     parameters.setdefault("close_volume_participation_pct", LIQUIDITY_DEFAULTS["close_volume_participation_pct"])

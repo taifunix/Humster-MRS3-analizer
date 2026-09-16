@@ -10,6 +10,7 @@ from mrs3.portfolio.config import (
     RANKING_METRICS,
     SCHEMA_VERSION,
     SIZING_MODE,
+    WEIGHTED_SEARCH_DEFAULTS,
     PortfolioConfigError,
     load_portfolio_config,
     migrate_portfolio_config_document,
@@ -79,6 +80,168 @@ def _v1_config():
 
 def _v2_config():
     return migrate_portfolio_config_document(_v1_config())[0]
+
+
+def test_v1_migration_adds_weighted_search_defaults_and_rejects_invalid_value(tmp_path):
+    migrated, changed = migrate_portfolio_config_document(_v1_config())
+
+    assert changed
+    assert migrated["search"]["weighted_search"] == {
+        "history_step_minutes": 5,
+        "lp_solutions_per_profile": 20,
+        "repair_attempts": 3,
+        "additional_passes": 1,
+        "base_vectors": 2_000_000,
+        "scenarios": 3_000_000,
+        "cdar_pct": 80,
+        "diagnostic_cdar_pct": 90,
+        "alternatives_per_profile": 2,
+        "p30_tolerance_pct": 5,
+        "bootstrap_block_days": [1, 3, 7],
+        "bootstrap_scenarios_per_block": 1_000,
+        "bootstrap_p95": True,
+        "bootstrap_diagnostic_scenarios": 100,
+        "bootstrap_low_block_common_days": 10,
+        "scale_warning_multiple": 10,
+        "limiter_step": 1,
+        "limiter_controls": 2,
+        "limiter_stress_pct": 1.5,
+        "priority_groups": 5,
+        "priority_beta": 0.5,
+        "priority_close_ratio": 2,
+        "wall_time_seconds": 900,
+        "solver_time_seconds": 30,
+        "max_targets": 8,
+        "api_requests_per_second": 2,
+        "api_concurrency": 1,
+        "api_retries": 3,
+        "reference_max_age_hours": 2,
+        "csv_download_concurrency": 2,
+    }
+
+    migrated["search"]["weighted_search"]["bootstrap_scenarios_per_block"] = 0
+    with pytest.raises(PortfolioConfigError, match="bootstrap_scenarios_per_block"):
+        load_portfolio_config(_write(tmp_path, migrated))
+
+
+def test_v2_loader_adds_missing_weighted_search_defaults_in_memory(tmp_path):
+    value = _v2_config()
+    value["search"].pop("weighted_search")
+    path = _write(tmp_path, value)
+    before = path.read_bytes()
+
+    loaded = load_portfolio_config(path)
+
+    expected = dict(WEIGHTED_SEARCH_DEFAULTS)
+    assert loaded.search["weighted_search"] == {**expected, "bootstrap_block_days": (1, 3, 7)}
+    assert "weighted_search" not in value["search"]
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("malformed_search", ["missing", None, []])
+def test_v2_migration_preserves_missing_or_nonmapping_search_for_parser_rejection(tmp_path, malformed_search):
+    original = _v2_config()
+    if malformed_search == "missing":
+        del original["search"]
+    else:
+        original["search"] = malformed_search
+    before = json.loads(json.dumps(original))
+
+    migrated, changed = migrate_portfolio_config_document(original)
+
+    assert not changed
+    assert original == before
+    if malformed_search == "missing":
+        assert "search" not in migrated
+    else:
+        assert migrated["search"] == malformed_search
+    with pytest.raises(PortfolioConfigError, match="search"):
+        load_portfolio_config(_write(tmp_path, migrated))
+
+
+@pytest.mark.parametrize("malformed_search", ["missing", None, []])
+def test_v1_migration_preserves_missing_or_nonmapping_search_for_parser_rejection(tmp_path, malformed_search):
+    original = _v1_config()
+    if malformed_search == "missing":
+        del original["search"]
+    else:
+        original["search"] = malformed_search
+    before = json.loads(json.dumps(original))
+
+    migrated, changed = migrate_portfolio_config_document(original)
+
+    assert changed
+    assert original == before
+    if malformed_search == "missing":
+        assert "search" not in migrated
+    else:
+        assert migrated["search"] == malformed_search
+    with pytest.raises(PortfolioConfigError, match="search"):
+        load_portfolio_config(_write(tmp_path, migrated))
+
+
+def test_weighted_search_rejects_boolean_bootstrap_block_day(tmp_path):
+    value = _v2_config()
+    value["search"]["weighted_search"]["bootstrap_block_days"] = [True, 3, 7]
+
+    with pytest.raises(PortfolioConfigError, match="bootstrap_block_days"):
+        load_portfolio_config(_write(tmp_path, value))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lp_solutions_per_profile", 21),
+        ("repair_attempts", 4),
+        ("additional_passes", 2),
+        ("alternatives_per_profile", -1),
+        ("cdar_pct", 100),
+        ("diagnostic_cdar_pct", 100),
+        ("p30_tolerance_pct", 100),
+        ("limiter_stress_pct", 100),
+        ("bootstrap_diagnostic_scenarios", 1001),
+        ("limiter_controls", -1),
+        ("limiter_controls", 3),
+        ("priority_groups", 0),
+        ("priority_groups", 6),
+        ("priority_beta", -0.1),
+        ("priority_beta", 1.1),
+        ("priority_close_ratio", 1),
+        ("max_targets", 0),
+        ("max_targets", 9),
+        ("api_requests_per_second", 0),
+        ("api_concurrency", 0),
+        ("reference_max_age_hours", 0),
+        ("csv_download_concurrency", 0),
+        ("limiter_stress_pct", -1),
+    ],
+)
+def test_weighted_search_plan_bounds_fail_closed(tmp_path, field, value):
+    config = _v2_config()
+    config["search"]["weighted_search"][field] = value
+
+    with pytest.raises(PortfolioConfigError, match=field):
+        load_portfolio_config(_write(tmp_path, config))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("alternatives_per_profile", 0),
+        ("p30_tolerance_pct", 0),
+        ("limiter_stress_pct", 0),
+        ("limiter_controls", 0),
+        ("priority_beta", 0),
+        ("api_retries", 0),
+    ],
+)
+def test_weighted_search_plan_zero_bounds_are_explicit(tmp_path, field, value):
+    config = _v2_config()
+    config["search"]["weighted_search"][field] = value
+
+    loaded = load_portfolio_config(_write(tmp_path, config))
+
+    assert loaded.search["weighted_search"][field] == value
 
 
 def _write(tmp_path: Path, value):

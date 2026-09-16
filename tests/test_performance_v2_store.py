@@ -8,6 +8,7 @@ from uuid import UUID
 import duckdb
 import pytest
 
+from mrs3.config import load_duckdb_import_settings
 from mrs3.performance_import import PerformanceImportRequest, allocate_performance_database
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
@@ -139,7 +140,9 @@ def test_config_defaults_workers_to_common_import_default(tmp_path: Path) -> Non
 def test_versioned_performance_config_uses_the_sibling_common_worker_setting() -> None:
     config_path = Path(__file__).resolve().parents[1] / "config.performance.json"
 
-    assert load_performance_v2_config(config_path).workers == 30
+    assert load_performance_v2_config(config_path).workers == load_duckdb_import_settings(
+        config_path.with_name("config.local.json")
+    ).workers
 
 
 def test_initialize_is_idempotent_and_requires_internal_schema_v4() -> None:

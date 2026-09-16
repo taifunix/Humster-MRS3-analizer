@@ -1282,6 +1282,18 @@ def test_portfolio_pair_selection_copies_global_maxima_without_auto_selection() 
     assert "label.append(selected, name, count)" in portfolio
     assert "#portfolio-default-long" in portfolio
     assert "#portfolio-default-short" in portfolio
+    assert "portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= 50" in portfolio
+
+
+def test_portfolio_launch_pins_mvp_finalist_limits() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert 'id="portfolio-default-long" type="number" min="1" max="1" step="1" value="1" readonly' in html
+    assert 'id="portfolio-default-short" type="number" min="0" max="0" step="1" value="0" readonly' in html
+    assert "max_finalist_long: 1" in portfolio
+    assert "max_finalist_short: 0" in portfolio
 
 
 def test_portfolio_recovery_and_polling_use_server_job_endpoints_only() -> None:
@@ -1372,6 +1384,9 @@ def test_portfolio_settings_uses_human_form_for_all_profiles_and_keeps_technical
     assert "Не удалось загрузить актуальные настройки после конфликта. Сохранение отключено." in js
     assert "aria-invalid" in js
     assert "linkDescriptions" in js
+    assert "Введите корректное значение для поля." in js
+    assert "const { profiles, clone, settingsPatch, validSettingsDocument, weightedSearchKeys, revealInvalidField, settingsValidationFeedback } = portfolioSettingsHelpers;" in js
+    assert "settingsValidationFeedback(error, query, meta, revealInvalidField)" in js
 
 
 def test_portfolio_settings_patches_only_exposed_leaves_and_preserves_money_lexemes() -> None:
@@ -1384,10 +1399,198 @@ def test_portfolio_settings_patches_only_exposed_leaves_and_preserves_money_lexe
     assert "scenario.sizing.upper_bound.amount" in js
     assert "scenario.sizing.grid !== undefined" in js
     assert "payload.profiles[profile].ranking.top_n" in js
-    assert "state.document = clone(result.document)" in js
+    assert "const candidate = clone(result.document)" in js
+    assert "if (validSettingsDocument(candidate)) state.document = candidate" in js
     assert "document: payload" in js
     assert "const result = await requestJson('/api/v2/portfolio/settings'" in js
     assert "state.conflictMessage = '';\n        clearInvalid();\n        let payload" in js
+
+
+def test_portfolio_settings_helpers_patch_the_weighted_search_document_without_losing_hidden_fields() -> None:
+    document = {
+        "schema_version": 2,
+        "scenarios": {
+            profile: {
+                "deposit": {"amount": 10, "currency": "USDT"},
+                "collateral": {"amount": 20, "currency": "USDT"},
+                "max_balance": {"amount": 30, "currency": "USDT"},
+                "sizing": {"upper_bound": {"amount": 30, "currency": "USDT"}},
+            }
+            for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
+        },
+        "profiles": {profile: {"individual_max_dd_pct": 20, "individual_net_pnl_min_exclusive": 0, "ranking": {"top_n": 2}} for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")},
+        "liquidity": {
+            "parameters": {"close_volume_participation_pct": 30},
+            "round_down_usdt": 50,
+            "minimum_coverage_pct": 90,
+            "maximum_age_hours": 2,
+            "weekend_start_utc": "SATURDAY 00:00",
+            "weekend_end_utc": "MONDAY 00:00",
+            "archive_publication_lag_hours": 6,
+            "backfill_write_enabled": False,
+        },
+        "search": {
+            "total_test_budget": 9,
+            "sizing_mode": "liquidity_cap_single",
+            "max_enumerated_combinations": 100000,
+            "weighted_search": {
+                "history_step_minutes": 5,
+                "lp_solutions_per_profile": 20,
+                "repair_attempts": 3,
+                "additional_passes": 1,
+                "base_vectors": 100,
+                "scenarios": 200,
+                "cdar_pct": 80,
+                "diagnostic_cdar_pct": 90,
+                "alternatives_per_profile": 2,
+                "p30_tolerance_pct": 5,
+                "bootstrap_block_days": [1, 3, 7],
+                "bootstrap_scenarios_per_block": 1000,
+                "bootstrap_p95": True,
+                "bootstrap_diagnostic_scenarios": 100,
+                "bootstrap_low_block_common_days": 10,
+                "scale_warning_multiple": 10,
+                "limiter_step": 1,
+                "limiter_controls": 2,
+                "limiter_stress_pct": 1.5,
+                "priority_groups": 5,
+                "priority_beta": 0.5,
+                "priority_close_ratio": 2,
+                "wall_time_seconds": 900,
+                "solver_time_seconds": 30,
+                "max_targets": 8,
+                "api_requests_per_second": 2,
+                "api_concurrency": 1,
+                "api_retries": 3,
+                "reference_max_age_hours": 2,
+                "csv_download_concurrency": 2,
+            },
+        },
+        "runner": {"root": "hidden", "token": {"keep": True}},
+    }
+    values = {
+        "max_enumerated_combinations": "100000",
+        "close_volume_participation_pct": "30",
+        "round_down_usdt": "50",
+        "minimum_coverage_pct": "90",
+        "maximum_age_hours": "2",
+        "archive_publication_lag_hours": "6",
+        "weekend_start_utc": "SATURDAY 00:00",
+        "weekend_end_utc": "MONDAY 00:00",
+        "backfill_write_enabled": False,
+        "profiles": {
+            profile: {"deposit": "10", "collateral": "20", "max_balance": "30", "upper_bound": "30", "individual_max_dd_pct": "20", "individual_net_pnl_min_exclusive": "0", "top_n": "2"}
+            for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
+        },
+        "weighted_search": {
+            "history_step_minutes": "10",
+            "lp_solutions_per_profile": "10",
+            "repair_attempts": "2",
+            "additional_passes": "1",
+            "base_vectors": "101",
+            "scenarios": "201",
+            "cdar_pct": "70",
+            "diagnostic_cdar_pct": "80",
+            "alternatives_per_profile": "1",
+            "p30_tolerance_pct": "4.5",
+            "bootstrap_block_days": "1,3,7",
+            "bootstrap_scenarios_per_block": "900",
+            "bootstrap_p95": False,
+            "bootstrap_diagnostic_scenarios": "90",
+            "bootstrap_low_block_common_days": "9",
+            "scale_warning_multiple": "9",
+            "limiter_step": "2",
+            "limiter_controls": "1",
+            "limiter_stress_pct": "1.25",
+            "priority_groups": "4",
+            "priority_beta": "0.4",
+            "priority_close_ratio": "2.5",
+            "wall_time_seconds": "800",
+            "solver_time_seconds": "20",
+            "max_targets": "7",
+            "api_requests_per_second": "3",
+            "api_concurrency": "2",
+            "api_retries": "2",
+            "reference_max_age_hours": "3",
+            "csv_download_concurrency": "3",
+        }
+    }
+    script = _read("app.js").split("const ORDER_BUCKETS", 1)[0] + f"""
+const h = globalThis.portfolioSettingsHelpers;
+const document = {json.dumps(document)};
+const values = {json.dumps(values)};
+const errorField = (callback) => {{ try {{ callback(); return ''; }} catch (error) {{ return error.field || ''; }} }};
+const weightedWith = (name, value) => ({{...values, weighted_search: {{...values.weighted_search, [name]: value}}}});
+const patched = h.settingsPatch(document, values);
+const weighted = patched.search.weighted_search;
+const maximums = h.clone(values.weighted_search);
+Object.assign(maximums, {{ lp_solutions_per_profile: '20', repair_attempts: '3', additional_passes: '1', alternatives_per_profile: '2', cdar_pct: '99.9', diagnostic_cdar_pct: '99.9', p30_tolerance_pct: '99.9', bootstrap_scenarios_per_block: '900', bootstrap_diagnostic_scenarios: '900', limiter_controls: '2', limiter_stress_pct: '99.9', priority_groups: '5', priority_beta: '1' }});
+const zeros = h.clone(values.weighted_search);
+Object.assign(zeros, {{ alternatives_per_profile: '0', p30_tolerance_pct: '0', limiter_controls: '0', limiter_stress_pct: '0', priority_beta: '0', api_retries: '0', bootstrap_scenarios_per_block: '1', bootstrap_diagnostic_scenarios: '1' }});
+const badDays = h.clone(document); badDays.search.weighted_search.bootstrap_block_days = [1, 3, 5];
+const shortDays = h.clone(document); shortDays.search.weighted_search.bootstrap_block_days = [1, 3];
+const stringDay = h.clone(document); stringDay.search.weighted_search.bootstrap_block_days = [1, '3', 7];
+const extraKey = h.clone(document); extraKey.search.weighted_search.extra = 1;
+const missingKey = h.clone(document); delete missingKey.search.weighted_search.api_retries;
+const invalidDiagnostic = h.clone(document); invalidDiagnostic.search.weighted_search.bootstrap_diagnostic_scenarios = 1001;
+const scientificNumber = h.clone(document); scientificNumber.search.weighted_search.scale_warning_multiple = 1e-7;
+const advancedDetails = {{ open: false }};
+const advancedState = {{ ariaInvalid: '', validity: '', focused: false }};
+const advancedLabel = {{ textContent: 'Advanced field' }};
+const advancedGroup = {{ querySelector: () => advancedLabel }};
+const advancedControl = {{ closest: (selector) => selector === 'details' ? advancedDetails : (selector === '.field-group' ? advancedGroup : null), setAttribute: (name, value) => {{ advancedState.ariaInvalid = value; }}, setCustomValidity: (value) => {{ advancedState.validity = value; }}, focus: () => {{ advancedState.focused = true; }} }};
+const advancedMeta = {{ textContent: '' }};
+const advancedQuery = (selector) => selector === '#portfolio-settings-weighted-bootstrap-p95' ? advancedControl : null;
+const maxRuleField = (name, value) => errorField(() => h.settingsPatch(document, weightedWith(name, value)));
+const checks = {{
+  hiddenPreserved: patched.runner.root === 'hidden' && patched.runner.token.keep === true,
+  weightedInteger: weighted.history_step_minutes === 10 && weighted.base_vectors === 101 && weighted.csv_download_concurrency === 3,
+  weightedFloat: weighted.p30_tolerance_pct === 4.5 && weighted.priority_close_ratio === 2.5,
+  weightedBoolean: weighted.bootstrap_p95 === false,
+  fixedBlockPreserved: JSON.stringify(weighted.bootstrap_block_days) === '[1,3,7]',
+  invalidWeightedInteger: (() => {{ const invalid = h.clone(document); invalid.search.weighted_search.history_step_minutes = 0; return h.validSettingsDocument(invalid) === false; }})(),
+  invalidWeightedFloat: (() => {{ const invalid = h.clone(document); invalid.search.weighted_search.priority_close_ratio = 1; return h.validSettingsDocument(invalid) === false; }})(),
+  invalidWeightedBoolean: (() => {{ try {{ h.settingsPatch(document, {{...values, weighted_search: {{...values.weighted_search, bootstrap_p95: 'false'}}}}); return false; }} catch (_) {{ return true; }} }})(),
+  diagnosticBound: h.validSettingsDocument(invalidDiagnostic) === false && errorField(() => h.settingsPatch(document, {{...values, weighted_search: {{...values.weighted_search, bootstrap_diagnostic_scenarios: '901'}}}})) === 'weighted-bootstrap-diagnostic-scenarios',
+  fixedDaysRejected: h.validSettingsDocument(badDays) === false && h.validSettingsDocument(shortDays) === false && h.validSettingsDocument(stringDay) === false,
+  fixedDaysError: errorField(() => h.settingsPatch(document, {{...values, weighted_search: {{...values.weighted_search, bootstrap_block_days: '1,3,5'}}}})) === 'weighted-bootstrap-block-days',
+  fixedDaysUiError: errorField(() => h.settingsPatch(document, {{...values, weighted_search: {{...values.weighted_search, bootstrap_block_days: '1,3,7,9'}}}})) === 'weighted-bootstrap-block-days',
+  p95Error: errorField(() => h.settingsPatch(document, {{...values, weighted_search: {{...values.weighted_search, bootstrap_p95: 'false'}}}})) === 'weighted-bootstrap-p95',
+  representativeMaximums: h.settingsPatch(document, {{...values, weighted_search: maximums}}).search.weighted_search.priority_groups === 5,
+  zeroAllowed: (() => {{ const zero = h.settingsPatch(document, {{...values, weighted_search: zeros}}).search.weighted_search; return zero.alternatives_per_profile === 0 && zero.p30_tolerance_pct === 0 && zero.limiter_controls === 0 && zero.limiter_stress_pct === 0 && zero.priority_beta === 0 && zero.api_retries === 0; }})(),
+  strictWeightedKeys: h.validSettingsDocument(extraKey) === false && h.validSettingsDocument(missingKey) === false,
+  advancedReveal: (h.settingsValidationFeedback({{field: 'weighted-bootstrap-p95'}}, advancedQuery, advancedMeta), advancedDetails.open === true && advancedState.focused && advancedState.ariaInvalid === 'true' && advancedState.validity === 'Введите корректное значение для поля.' && advancedMeta.textContent.includes('Advanced field')),
+  scientificNotationRejected: h.validSettingsDocument(scientificNumber) === false,
+  roundTripP30Field: maxRuleField('p30_tolerance_pct', '0.0000001') === 'weighted-p30-tolerance-pct',
+  roundTripLimiterField: maxRuleField('limiter_stress_pct', '0.0000001') === 'weighted-limiter-stress-pct',
+  maxRuleFields: maxRuleField('lp_solutions_per_profile', '21') === 'weighted-lp-solutions-per-profile' && maxRuleField('repair_attempts', '4') === 'weighted-repair-attempts' && maxRuleField('additional_passes', '2') === 'weighted-additional-passes' && maxRuleField('alternatives_per_profile', '3') === 'weighted-alternatives-per-profile' && maxRuleField('limiter_controls', '3') === 'weighted-limiter-controls' && maxRuleField('priority_groups', '6') === 'weighted-priority-groups' && maxRuleField('max_targets', '9') === 'weighted-max-targets' && maxRuleField('cdar_pct', '100') === 'weighted-cdar-pct' && maxRuleField('p30_tolerance_pct', '100') === 'weighted-p30-tolerance-pct' && maxRuleField('priority_beta', '1.1') === 'weighted-priority-beta' && maxRuleField('priority_close_ratio', '1') === 'weighted-priority-close-ratio',
+}};
+if (Object.values(checks).some((value) => !value)) process.exit(1);
+"""
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_portfolio_settings_exposes_only_the_exact_weighted_search_schema() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    weighted_fields = (
+        "history_step_minutes", "lp_solutions_per_profile", "repair_attempts", "additional_passes", "base_vectors", "scenarios",
+        "cdar_pct", "diagnostic_cdar_pct", "alternatives_per_profile", "p30_tolerance_pct", "bootstrap_block_days",
+        "bootstrap_scenarios_per_block", "bootstrap_p95", "bootstrap_diagnostic_scenarios", "bootstrap_low_block_common_days",
+        "scale_warning_multiple", "limiter_step", "limiter_controls", "limiter_stress_pct", "priority_groups", "priority_beta",
+        "priority_close_ratio", "wall_time_seconds", "solver_time_seconds", "max_targets", "api_requests_per_second",
+        "api_concurrency", "api_retries", "reference_max_age_hours", "csv_download_concurrency",
+    )
+    for field in weighted_fields:
+        field_id = "archive-download-concurrency" if field == "csv_download_concurrency" else field.replace("_", "-")
+        assert f'id="portfolio-settings-weighted-{field_id}"' in html
+    assert 'id="portfolio-settings-weighted-advanced"' in html
+    assert not re.search(r'<details id="portfolio-settings-weighted-advanced"[^>]*\bopen(?:\s|>)', html)
+    assert 'id="portfolio-settings-document"' not in html
+    assert "weightedSearchValid" in js
+    assert "payload.search.weighted_search" in js
+    assert "values.weighted_search" in js
 
 
 def test_portfolio_settings_helpers_validate_v2_lexemes_and_hidden_fields() -> None:
@@ -1413,7 +1616,22 @@ def test_portfolio_settings_helpers_validate_v2_lexemes_and_hidden_fields() -> N
             "archive_publication_lag_hours": 6,
             "backfill_write_enabled": False,
         },
-        "search": {"total_test_budget": 9, "sizing_mode": "liquidity_cap_single", "max_enumerated_combinations": 100000},
+        "search": {
+            "total_test_budget": 9,
+            "sizing_mode": "liquidity_cap_single",
+            "max_enumerated_combinations": 100000,
+            "weighted_search": {
+                "history_step_minutes": 5, "lp_solutions_per_profile": 20, "repair_attempts": 3, "additional_passes": 1,
+                "base_vectors": 100, "scenarios": 200, "cdar_pct": 80, "diagnostic_cdar_pct": 90,
+                "alternatives_per_profile": 2, "p30_tolerance_pct": 5, "bootstrap_block_days": [1, 3, 7],
+                "bootstrap_scenarios_per_block": 1000, "bootstrap_p95": True, "bootstrap_diagnostic_scenarios": 100,
+                "bootstrap_low_block_common_days": 10, "scale_warning_multiple": 10, "limiter_step": 1,
+                "limiter_controls": 2, "limiter_stress_pct": 1.5, "priority_groups": 5, "priority_beta": 0.5,
+                "priority_close_ratio": 2, "wall_time_seconds": 900, "solver_time_seconds": 30, "max_targets": 8,
+                "api_requests_per_second": 2, "api_concurrency": 1, "api_retries": 3, "reference_max_age_hours": 2,
+                "csv_download_concurrency": 2,
+            },
+        },
         "runner": {"root": "hidden", "token": {"keep": True}},
     }
     values = {
@@ -1429,6 +1647,17 @@ def test_portfolio_settings_helpers_validate_v2_lexemes_and_hidden_fields() -> N
         "weekend_start_utc": "SATURDAY 00:00",
         "weekend_end_utc": "MONDAY 00:00",
         "backfill_write_enabled": False,
+        "weighted_search": {
+            "history_step_minutes": "5", "lp_solutions_per_profile": "20", "repair_attempts": "3", "additional_passes": "1",
+            "base_vectors": "100", "scenarios": "200", "cdar_pct": "80", "diagnostic_cdar_pct": "90",
+            "alternatives_per_profile": "2", "p30_tolerance_pct": "5", "bootstrap_block_days": "1,3,7",
+            "bootstrap_scenarios_per_block": "1000", "bootstrap_p95": True, "bootstrap_diagnostic_scenarios": "100",
+            "bootstrap_low_block_common_days": "10", "scale_warning_multiple": "10", "limiter_step": "1",
+            "limiter_controls": "2", "limiter_stress_pct": "1.5", "priority_groups": "5", "priority_beta": "0.5",
+            "priority_close_ratio": "2", "wall_time_seconds": "900", "solver_time_seconds": "30", "max_targets": "8",
+            "api_requests_per_second": "2", "api_concurrency": "1", "api_retries": "3", "reference_max_age_hours": "2",
+            "csv_download_concurrency": "2",
+        },
     }
     changed = json.loads(json.dumps(values))
     changed["round_down_usdt"] = "25"

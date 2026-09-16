@@ -25,6 +25,7 @@ from mrs3.portfolio.margin import (
     evaluate_margin_envelope,
     evaluate_weighted_margin,
     MarginCoefficient,
+    derive_reference_margin_coefficients,
     freeze_linear_margin_coefficients,
     deposit_sufficiency,
     planned_leverages,
@@ -356,6 +357,158 @@ def test_weighted_margin_frozen_coefficients_fail_closed_when_bound_is_unknown()
         declared_grid={1: (Decimal("0"),)},
     )
     assert result.status == UNKNOWN and result.reason == "MARGIN_BOUND_UNAVAILABLE"
+
+
+def _reference_snapshot_for_margin():
+    return portfolio_package.ReferenceReader.from_records(
+        instruments=[
+            {"symbol": "BTCUSDT", "status": "Trading", "contract_type": "LinearPerpetual", "tick_size": "0.1", "qty_step": "0.001", "min_qty": "0.001", "max_qty": "100000", "leverage_step": "1", "max_leverage": "50"},
+            {"symbol": "ETHUSDT", "status": "Trading", "contract_type": "LinearPerpetual", "tick_size": "0.1", "qty_step": "0.001", "min_qty": "0.001", "max_qty": "100000", "leverage_step": "1", "max_leverage": "25"},
+        ],
+        risk_tiers=[
+            {"symbol": "BTCUSDT", "risk_limit_value": "100", "max_leverage": "50", "initial_margin": "0.02", "maintenance_margin": "0.01"},
+            {"symbol": "BTCUSDT", "risk_limit_value": "500", "max_leverage": "20", "initial_margin": "0.05", "maintenance_margin": "0.025"},
+            {"symbol": "ETHUSDT", "risk_limit_value": "1000", "max_leverage": "25", "initial_margin": "0.04", "maintenance_margin": "0.02"},
+        ],
+        captured_at_ms=123,
+    )
+
+
+def test_reference_margin_coefficients_use_snapshot_tiers_and_member_leverage() -> None:
+    result = derive_reference_margin_coefficients(
+        _reference_snapshot_for_margin(),
+        (
+            {"strategy_id": 1, "symbol": "BTCUSDT", "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("200")},
+            {"strategy_id": 2, "symbol": "ETHUSDT", "planned_leverage": Decimal("5"), "position_size_usdt": Decimal("200")},
+        ),
+        open_fee_rate=Decimal("0.001"), close_fee_rate=Decimal("0.002"),
+        policy_id="margin-policy-v1",
+    )
+    assert result.status == PASS
+    assert result.evidence_class == CONSERVATIVE_BOUND
+    assert result.by_strategy[1].a == Decimal("0.103")
+    assert result.by_strategy[1].b == Decimal("0.027")
+    assert result.by_strategy[2].a == Decimal("0.203")
+    assert result.by_strategy[2].b == Decimal("0.022")
+    assert result.by_strategy[1].max_notional == Decimal("200")
+    assert result.by_strategy[1].witness["reference_digest"] == _reference_snapshot_for_margin().content_digest
+    assert result.by_strategy[1].witness["policy_id"] == "margin-policy-v1"
+    assert result.by_strategy[1].witness["tiers_used"] == ("BTCUSDT:100", "BTCUSDT:500")
+    assert result.by_strategy[1].witness["order_loss_in_a"] is True
+    assert result.by_strategy[1].witness["order_loss_in_b"] is False
+
+
+def test_reference_margin_coefficients_include_tier_at_capacity_boundary() -> None:
+    result = derive_reference_margin_coefficients(
+        _reference_snapshot_for_margin(),
+        ({"strategy_id": 1, "symbol": "BTCUSDT", "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("100")},),
+        open_fee_rate=Decimal("0"), close_fee_rate=Decimal("0"), policy_id="margin-policy-v1",
+    )
+    assert result.status == PASS
+    assert result.by_strategy[1].a == Decimal("0.1")
+    assert result.by_strategy[1].b == Decimal("0.025")
+    assert len(result.by_strategy[1].witness["tiers_used"]) == 2
+
+
+def test_reference_margin_coefficients_fail_closed_for_missing_tier_rate() -> None:
+    member = ({"strategy_id": 1, "symbol": "BTCUSDT", "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("200")},)
+    # The second BTC tier lacks its required initial-margin rate.
+    snapshot = portfolio_package.ReferenceReader.from_records(
+        instruments=[{"symbol": "BTCUSDT", "status": "Trading", "contract_type": "LinearPerpetual", "tick_size": "0.1", "qty_step": "0.001", "min_qty": "0.001", "max_qty": "100000", "leverage_step": "1", "max_leverage": "50"}],
+        risk_tiers=[
+            {"symbol": "BTCUSDT", "risk_limit_value": "100", "max_leverage": "50", "initial_margin": "0.02", "maintenance_margin": "0.01"},
+            {"symbol": "BTCUSDT", "risk_limit_value": "500", "max_leverage": "20", "maintenance_margin": "0.025"},
+        ],
+        captured_at_ms=123,
+    )
+    result = derive_reference_margin_coefficients(snapshot, member, open_fee_rate=Decimal("0"), close_fee_rate=Decimal("0"), policy_id="margin-policy-v1")
+    assert result.status == UNKNOWN and result.reason == "MARGIN_TIER_RATE_UNKNOWN"
+
+
+def test_reference_margin_coefficients_reject_overleverage_and_malformed_members() -> None:
+    snapshot = _reference_snapshot_for_margin()
+    over = derive_reference_margin_coefficients(
+        snapshot,
+        ({"strategy_id": 1, "symbol": "BTCUSDT", "planned_leverage": Decimal("51"), "position_size_usdt": Decimal("50")},),
+        open_fee_rate=Decimal("0"), close_fee_rate=Decimal("0"), policy_id="margin-policy-v1",
+    )
+    malformed = derive_reference_margin_coefficients(
+        snapshot,
+        ({"strategy_id": 1, "symbol": "BTCUSDT", "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("50")}, {"strategy_id": 1, "symbol": "ETHUSDT", "planned_leverage": Decimal("5"), "position_size_usdt": Decimal("50")}),
+        open_fee_rate=Decimal("0"), close_fee_rate=Decimal("0"), policy_id="margin-policy-v1",
+    )
+    assert over.status == UNKNOWN and over.reason == "MARGIN_LEVERAGE_EXCEEDS_REFERENCE"
+    assert malformed.status == UNKNOWN and malformed.reason == "MARGIN_STRATEGY_ID_NOT_UNIQUE"
+
+
+def test_reference_margin_coefficients_parse_fee_rates_deterministically() -> None:
+    result = derive_reference_margin_coefficients(
+        _reference_snapshot_for_margin(),
+        ({"strategy_id": 1, "symbol": "BTCUSDT", "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("50")},),
+        open_fee_rate=0.001, close_fee_rate="0.002", order_loss_rate=0.003,
+        policy_id="margin-policy-v1",
+    )
+    assert result.status == PASS and result.by_strategy[1].a == Decimal("0.106")
+
+
+def test_reference_margin_coefficients_reject_rate_outside_unit_interval() -> None:
+    result = derive_reference_margin_coefficients(
+        _reference_snapshot_for_margin(),
+        ({"strategy_id": 1, "symbol": "BTCUSDT", "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("50")},),
+        open_fee_rate=Decimal("1"), close_fee_rate=Decimal("0"), policy_id="margin-policy-v1",
+    )
+    assert result.status == UNKNOWN and result.reason == "MARGIN_RATE_INVALID"
+
+
+def test_reference_margin_coefficients_reject_non_usdt_linear_symbol() -> None:
+    snapshot = portfolio_package.ReferenceReader.from_records(
+        instruments=[{"symbol": "BTCUSD", "status": "Trading", "contract_type": "LinearPerpetual", "tick_size": "0.1", "qty_step": "0.001", "min_qty": "0.001", "max_qty": "100000", "leverage_step": "1", "max_leverage": "50"}],
+        risk_tiers=[{"symbol": "BTCUSD", "risk_limit_value": "500", "max_leverage": "20", "initial_margin": "0.05", "maintenance_margin": "0.025"}],
+        captured_at_ms=123,
+    )
+    result = derive_reference_margin_coefficients(
+        snapshot,
+        ({"strategy_id": 1, "symbol": "BTCUSD", "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("50")},),
+        open_fee_rate=Decimal("0"), close_fee_rate=Decimal("0"), policy_id="margin-policy-v1",
+    )
+    assert result.status == UNKNOWN and result.reason == "MARGIN_NON_USDT_SYMBOL"
+
+
+def test_reference_margin_coefficients_allow_unit_initial_margin_rate() -> None:
+    snapshot = portfolio_package.ReferenceReader.from_records(
+        instruments=[{"symbol": "BTCUSDT", "status": "Trading", "contract_type": "LinearPerpetual", "tick_size": "0.1", "qty_step": "0.001", "min_qty": "0.001", "max_qty": "100000", "leverage_step": "1", "max_leverage": "50"}],
+        risk_tiers=[{"symbol": "BTCUSDT", "risk_limit_value": "500", "max_leverage": "20", "initial_margin": "1", "maintenance_margin": "0.025"}],
+        captured_at_ms=123,
+    )
+    result = derive_reference_margin_coefficients(
+        snapshot,
+        ({"strategy_id": 1, "symbol": "BTCUSDT", "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("50")},),
+        open_fee_rate=Decimal("0.001"), close_fee_rate=Decimal("0.002"), order_loss_rate=Decimal("0.003"), policy_id="margin-policy-v1",
+    )
+    assert result.status == PASS and result.by_strategy[1].a == Decimal("1.006")
+
+
+@pytest.mark.parametrize(
+    ("symbol", "contract_type", "expected"),
+    (
+        ("btcusdt", "LinearPerpetual", "MARGIN_NON_USDT_SYMBOL"),
+        ("BtcUsdt", "LinearPerpetual", "MARGIN_NON_USDT_SYMBOL"),
+        ("BTCUSDC", "LinearPerpetual", "MARGIN_NON_USDT_SYMBOL"),
+        ("BTCUSDT", "InversePerpetual", "MARGIN_INSTRUMENT_INACTIVE"),
+    ),
+)
+def test_reference_margin_coefficients_pin_symbol_predicate(symbol, contract_type, expected) -> None:
+    snapshot = portfolio_package.ReferenceReader.from_records(
+        instruments=[{"symbol": symbol, "status": "Trading", "contract_type": contract_type, "tick_size": "0.1", "qty_step": "0.001", "min_qty": "0.001", "max_qty": "100000", "leverage_step": "1", "max_leverage": "50"}],
+        risk_tiers=[{"symbol": symbol, "risk_limit_value": "500", "max_leverage": "20", "initial_margin": "0.05", "maintenance_margin": "0.025"}],
+        captured_at_ms=123,
+    )
+    result = derive_reference_margin_coefficients(
+        snapshot,
+        ({"strategy_id": 1, "symbol": symbol, "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("50")},),
+        open_fee_rate=Decimal("0"), close_fee_rate=Decimal("0"), policy_id="margin-policy-v1",
+    )
+    assert result.status == UNKNOWN and result.reason == expected
 
 
 def test_frozen_margin_coefficients_cover_zero_and_varying_known_states_with_conservative_max() -> None:

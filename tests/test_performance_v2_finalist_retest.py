@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -27,10 +28,58 @@ from mrs3.performance_v2_finalist_retest import (
 )
 from mrs3.performance_v2_store import initialize_performance_v2
 import duckdb
+from mrs3.panel_testing import render_strategy
 from mrs3.panel_strategy_batch import validate_strategy_manifest
 
 
 PORTFOLIO_ARITHMETIC_FIXTURE = Path(__file__).parent / "fixtures" / "portfolio" / "source_sizing_arithmetic.json"
+
+
+def test_weighted_template_only_changes_name_and_mrs_priority() -> None:
+    root = Path(__file__).resolve().parents[1]
+    original_text = (root / "templates/strategies/retest-mrs3/base.json").read_text(encoding="utf-8")
+    weighted_text = (root / "templates/strategies/portfolio-weighted-mrs/base.json").read_text(encoding="utf-8")
+    original = json.loads(original_text)
+    weighted = json.loads(weighted_text)
+
+    assert original["mrs"] is None
+    assert weighted["mrs"] == {"position_priority": 3}
+    assert type(weighted["mrs"]["position_priority"]) is int
+    assert weighted["exchange"]["use_upnl"] is True
+    assert weighted["exchange"]["use_frozen_balance"] is True
+    assert weighted["basic"]["use_fix"] is False
+    assert weighted["basic"]["use_long"] is True
+    assert weighted["basic"]["use_short"] is False
+    assert isinstance(weighted["name"], str) and weighted["name"]
+    assert weighted["name"] != original["name"]
+
+    def keys(value: object):
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                yield key
+                yield from keys(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                yield from keys(nested)
+
+    assert not set(keys(weighted)).intersection({"open_positions_limiter", "k", "size_composition_vector"})
+
+    normalized = deepcopy(original)
+    normalized["name"] = weighted["name"]
+    normalized["mrs"] = weighted["mrs"]
+    assert weighted == normalized
+
+    original_filename, rendered_original = render_strategy(original_text, "ONUSDT", "LONG")
+    weighted_filename, rendered_weighted = render_strategy(weighted_text, "ONUSDT", "LONG")
+    assert original_filename == f'{original["name"]}.json'
+    assert weighted_filename == f'{weighted["name"]}.json'
+    assert rendered_original["basic"]["symbol"] == "ONUSDT"
+    assert rendered_weighted["basic"]["symbol"] == "ONUSDT"
+    assert rendered_original["basic"]["use_long"] is True
+    assert rendered_original["basic"]["use_short"] is False
+    assert rendered_weighted["basic"]["use_long"] is True
+    assert rendered_weighted["basic"]["use_short"] is False
+    assert rendered_weighted["mrs"]["position_priority"] == 3
 
 
 def test_canonical_json_encodes_typed_values_and_omits_runtime_provenance() -> None:

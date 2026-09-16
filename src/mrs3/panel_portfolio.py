@@ -64,6 +64,7 @@ _PATH = re.compile(
     r"|(?<![\w])(?:[^\\/\s,;)]+[\\/])+\.\.(?:[\\/][^\s,;)]*)?"
     r"|(?<![\w])\.\.(?:[\\/][^\s,;)]*)+"
 )
+_WEIGHTED_TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "templates" / "strategies" / "portfolio-weighted-mrs" / "base.json"
 SUMMARY_HEADERS = ("Key", "Value")
 FINALIST_HEADERS = (
     "Campaign ID", "Strategy ID", "Result ID", "Pair", "Direction", "User Status", "User Rank",
@@ -86,6 +87,7 @@ MEMBER_HEADERS = (
     "Capacity Status", "7d Available Days", "7d Mean Minute Turnover USDT", "7d Position Cap USDT",
     "5d Available Days", "5d Mean Minute Turnover USDT", "5d Analytic Cap USDT", "Spread Status",
     "Mean p95 Spread bps", "Sizing Digest", "Capacity Digest", "Reference Digest",
+    "Finalist", "Side", "x USDT", "C USDT", "q", "Priority", "max_balance", "Source Scale", "Hold90", "Warnings",
 )
 EXCLUDED_HEADERS = (
     "Campaign ID", "Scope", "Object ID", "Pair", "Direction", "Profile", "Stage", "Gate Result",
@@ -114,6 +116,19 @@ def _now() -> str:
 
 def _digest(value: bytes | str) -> str:
     return hashlib.sha256(value if isinstance(value, bytes) else value.encode("utf-8")).hexdigest()
+
+
+def _load_weighted_template() -> tuple[dict[str, Any], str]:
+    try:
+        raw = _WEIGHTED_TEMPLATE_PATH.read_bytes()
+        template = json.loads(raw.decode("utf-8"))
+        if not isinstance(template, Mapping):
+            raise ValueError("template must be an object")
+        frozen = _plain(template)
+        json.dumps(frozen, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        return frozen, _digest(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise PortfolioPanelError("PORTFOLIO_TEMPLATE_INVALID", "portfolio strategy template is invalid", status=422) from None
 
 
 def _json(value: Any) -> str:
@@ -203,6 +218,68 @@ def _safe_cell(value: Any, *, key: str = "") -> Any:
     return _redact_text(value)
 
 
+def _weighted_payload_pairs(variant: Any) -> tuple[tuple[Any, Any], ...]:
+    members = _get(variant, "members", ())
+    payloads = _get(variant, "strategy_payloads", ())
+    if isinstance(members, (str, bytes)) or not isinstance(members, Sequence):
+        members = ()
+    if isinstance(payloads, (str, bytes)) or not isinstance(payloads, Sequence):
+        payloads = ()
+    payload_by_symbol: dict[str, Any] = {}
+    invalid_symbols: set[str] = set()
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            continue
+        basic = _get(_get(payload, "strategy", {}), "basic", {})
+        symbol = _get(basic, "symbol")
+        if not isinstance(symbol, str) or not symbol.strip():
+            continue
+        if symbol in payload_by_symbol:
+            invalid_symbols.add(symbol)
+            payload_by_symbol.pop(symbol, None)
+            continue
+        if symbol not in invalid_symbols:
+            payload_by_symbol[symbol] = payload
+    member_symbols: dict[str, int] = {}
+    for member in members:
+        symbol = _get(member, "symbol", _get(member, "pair"))
+        if isinstance(symbol, str):
+            member_symbols[symbol] = member_symbols.get(symbol, 0) + 1
+    pairs = []
+    for member in members:
+        payload = None
+        try:
+            positive = Decimal(str(_get(member, "x_usdt"))) > 0
+        except (InvalidOperation, TypeError, ValueError):
+            positive = False
+        if positive:
+            symbol = _get(member, "symbol", _get(member, "pair"))
+            side = _get(member, "side", _get(member, "direction"))
+            if side == "LONG" and isinstance(symbol, str) and symbol.strip() and member_symbols.get(symbol) == 1 and symbol not in invalid_symbols:
+                payload = payload_by_symbol.get(symbol)
+        pairs.append((member, payload))
+    return tuple(pairs)
+
+
+def _weighted_value(item: Any, *keys: str, default: Any = "UNKNOWN") -> Any:
+    for key in keys:
+        value = _get(item, key, None)
+        if value is not None:
+            return value
+    return default
+
+
+def _weighted_number(item: Any, *keys: str) -> Any:
+    value = _weighted_value(item, *keys)
+    if (isinstance(value, str) and value == "UNKNOWN") or isinstance(value, bool):
+        return "UNKNOWN"
+    try:
+        number = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return "UNKNOWN"
+    return value if number.is_finite() and number > 0 else "UNKNOWN"
+
+
 def _validate_frozen_campaign(campaign: Any) -> None:
     try:
         validate_campaign_contract(campaign)
@@ -212,16 +289,7 @@ def _validate_frozen_campaign(campaign: Any) -> None:
 
 def _portfolio_search_workers(root: Path) -> int:
     """Read the existing importer width; it is scheduling-only campaign input."""
-    path = root / "config.local.json"
-    if not path.is_file():
-        return 16
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    section = raw.get("duckdb_import") if isinstance(raw, Mapping) else None
-    if section is None:
-        return 16
-    if isinstance(section, Mapping) and "workers" not in section:
-        return 16
-    return load_duckdb_import_settings(path).workers
+    return load_duckdb_import_settings(root / "config.local.json").workers
 
 
 class PortfolioPanelService:
@@ -475,29 +543,82 @@ class PortfolioPanelService:
             "current_finalists": finalists,
         }
 
-    def _snapshot_finalists(self, document: Mapping[str, Any], launch: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    def _snapshot_finalists(self, document: Mapping[str, Any], launch: Mapping[str, Any]) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
         inputs = document.get("inputs") if isinstance(document.get("inputs"), Mapping) else {}
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
-        pairs = tuple((pair["pair"], side) for pair in launch["pairs"] for side in ("LONG", "SHORT"))
+        pairs = tuple((pair["pair"], "LONG") for pair in launch["pairs"])
         try:
             # Campaign snapshots retain the finalist evidence needed by search.
             loaded = _invoke(self.finalists_reader, database, pairs, True)
             finalists_list = []
-            for row in (loaded or ()):
+            weighted_input_rows = []
+            weighted_fields = (
+                "symbol", "side", "strategy_id", "result_id", "imported_at_utc",
+                "effective_start_utc", "effective_end_utc", "report_start_utc", "report_end_utc",
+                "initial_balance", "source_initial_balance", "optimizer_source_metadata", "source_provenance",
+            )
+            for index, row in enumerate(loaded or ()):
                 if not isinstance(row, Mapping):
-                    continue
+                    raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "portfolio finalist row is unavailable", status=422)
                 item = _plain(dict(row))
-                for field in ("actions", "action_series", "minute_actions"):
+                missing_identity = next(
+                    (field for field in ("symbol", "side", "strategy_id", "result_id") if field not in item),
+                    None,
+                )
+                if missing_identity is not None:
+                    raise PortfolioPanelError(
+                        "PORTFOLIO_FINALISTS_UNAVAILABLE",
+                        "portfolio finalist identity is unavailable",
+                        status=422,
+                        field_errors=[{
+                            "field": f"finalists[{index}].{missing_identity}",
+                            "code": "MISSING_FINALIST_IDENTITY",
+                            "message": f"finalist {missing_identity} identity is unavailable",
+                        }],
+                    )
+                if (
+                    not isinstance(item.get("symbol"), str) or not item["symbol"].strip()
+                    or not isinstance(item.get("side"), str) or not item["side"].strip()
+                    or type(item.get("strategy_id")) is not int
+                    or type(item.get("result_id")) is not int
+                ):
+                    raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "portfolio finalist identity is unavailable", status=422)
+
+                def series(*aliases: str) -> Any:
+                    for alias in aliases:
+                        value = item.get(alias)
+                        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                            return value
+                    field = aliases[0]
+                    raise PortfolioPanelError(
+                        "PORTFOLIO_FINALISTS_UNAVAILABLE",
+                        "portfolio finalist series is unavailable",
+                        status=422,
+                        field_errors=[{
+                            "field": f"finalists[{index}].{field}",
+                            "code": "MISSING_FINALIST_SERIES",
+                            "message": f"finalist {field} series is unavailable",
+                        }],
+                    )
+
+                weighted_input_rows.append({
+                    **{field: item[field] for field in weighted_fields if field in item},
+                    "actions": series("actions", "action_series", "minute_actions"),
+                    "equity": series("equity", "equity_series"),
+                })
+                for field in ("actions", "action_series", "minute_actions", "equity", "equity_series"):
                     item.pop(field, None)
-                item.pop("equity_series", None)
                 finalists_list.append(item)
             finalists = tuple(finalists_list)
-            json.dumps(finalists, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            try:
+                json.dumps((finalists, tuple(weighted_input_rows)), ensure_ascii=False, sort_keys=True, allow_nan=False)
+            except (TypeError, ValueError) as error:
+                raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "portfolio finalists are not JSON serializable", status=422) from error
         except PortfolioPanelError:
             raise
         except Exception as error:
             raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "portfolio finalists are unavailable", status=422) from error
-        return finalists
+        return finalists, tuple(weighted_input_rows)
 
     def _package_variant_generator(self, selected: Sequence[Mapping[str, Any]], campaign: Mapping[str, Any], _profiles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         """Run the package-owned current-facts adapter for one frozen Campaign."""
@@ -537,7 +658,27 @@ class PortfolioPanelService:
             if not isinstance(symbol, str) or not symbol.strip() or symbol in seen_pairs:
                 raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign fields are invalid", status=422, field_errors=[{"field": f"pairs[{index}].pair", "code": "INVALID_PAIR", "message": "pair must be unique"}])
             seen_pairs.add(symbol)
-            pairs.append({"pair": symbol, "max_finalist_long": _integer(value["max_finalist_long"], f"pairs[{index}].max_finalist_long", nonnegative=True), "max_finalist_short": _integer(value["max_finalist_short"], f"pairs[{index}].max_finalist_short", nonnegative=True)})
+            max_finalist_long = _integer(value["max_finalist_long"], f"pairs[{index}].max_finalist_long", nonnegative=True)
+            max_finalist_short = _integer(value["max_finalist_short"], f"pairs[{index}].max_finalist_short", nonnegative=True)
+            if max_finalist_long != 1 or max_finalist_short != 0:
+                invalid_field = (
+                    f"pairs[{index}].max_finalist_long"
+                    if max_finalist_long != 1
+                    else f"pairs[{index}].max_finalist_short"
+                )
+                raise PortfolioPanelError(
+                    "PORTFOLIO_CAMPAIGN_INVALID",
+                    "campaign finalist limits are unsupported",
+                    status=422,
+                    field_errors=[
+                        {
+                            "field": invalid_field,
+                            "code": "MVP_FINALIST_LIMIT",
+                            "message": "MVP requires one LONG finalist and no SHORT finalists",
+                        }
+                    ],
+                )
+            pairs.append({"pair": symbol, "max_finalist_long": max_finalist_long, "max_finalist_short": max_finalist_short})
         profiles: list[dict[str, Any]] = []
         seen_profiles: set[str] = set()
         configured = getattr(config, "profiles", {})
@@ -556,11 +697,22 @@ class PortfolioPanelService:
             max_balance = value.get("max_balance_usdt") if "max_balance_usdt" in value else None
             if "max_balance_usdt" in value and max_balance is None:
                 raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign fields are invalid", status=422)
-            max_candidates = _integer(value.get("max_candidates"), f"profiles[{index}].max_candidates")
+            max_candidates = value.get("max_candidates")
+            if type(max_candidates) is not int or not 1 <= max_candidates <= 50:
+                raise PortfolioPanelError(
+                    "PORTFOLIO_CAMPAIGN_INVALID",
+                    "campaign fields are invalid",
+                    status=422,
+                    field_errors=[{
+                        "field": f"profiles[{index}].max_candidates",
+                        "code": "MAX_CANDIDATES_RANGE",
+                        "message": "max_candidates must be between 1 and 50",
+                    }],
+                )
             profiles.append({"profile_id": profile_id, "equity_usdt": _decimal(value.get("equity_usdt"), f"profiles[{index}].equity_usdt"), "max_balance_usdt": _decimal(max_balance, f"profiles[{index}].max_balance_usdt") if max_balance is not None else None, "max_candidates": max_candidates})
         launch = {"pairs": pairs, "profiles": profiles}
-        launch["selected_pairs"] = [[pair["pair"], side] for pair in pairs for side in ("LONG", "SHORT")]
-        launch["maximums"] = {f"{pair['pair']}|LONG": pair["max_finalist_long"] for pair in pairs} | {f"{pair['pair']}|SHORT": pair["max_finalist_short"] for pair in pairs}
+        launch["selected_pairs"] = [[pair["pair"], "LONG"] for pair in pairs]
+        launch["maximums"] = {f"{pair['pair']}|LONG": pair["max_finalist_long"] for pair in pairs}
         return launch
 
     def _campaign_by_id(self, campaign_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -723,7 +875,8 @@ class PortfolioPanelService:
                     raise PortfolioPanelError("PORTFOLIO_JOB_ACTIVE_DUPLICATE", "an identical campaign is active", status=409)
             if active_jobs:
                 raise PortfolioPanelError("PORTFOLIO_JOB_BUSY", "portfolio optimizer is busy", status=409)
-            finalists = self._snapshot_finalists(document, launch)
+            strategy_template, strategy_template_digest = _load_weighted_template()
+            finalists, weighted_input_rows = self._snapshot_finalists(document, launch)
             campaign_id = f"campaign-{uuid4().hex}"
             frozen_raw = raw
             try:
@@ -741,6 +894,9 @@ class PortfolioPanelService:
                 "config_document": _plain(document),
                 "launch": _plain(launch),
                 "finalists": finalists,
+                "weighted_input_rows": weighted_input_rows,
+                "strategy_template": strategy_template,
+                "strategy_template_digest": strategy_template_digest,
                 "campaign_contract_version": CAMPAIGN_CONTRACT_VERSION,
                 "search_mode": CAMPAIGN_SEARCH_MODE,
                 "weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION,
@@ -1157,7 +1313,7 @@ class PortfolioPanelService:
             if isinstance(profile, Mapping)
         }
         status = optimizer_status or ("PASS" if variants and not blockers else ("PARTIAL" if variants else "FAIL"))
-        return {
+        summary = {
             "optimizer_status": status,
             "finalists_read": len(finalists),
             "candidates_selected": len(selected),
@@ -1175,6 +1331,59 @@ class PortfolioPanelService:
             "optimizer_warnings": warnings,
             "campaign_id": campaign["campaign_id"],
         }
+        weighted_variants = tuple(item for item in variants if _get(item, "search_mode") == CAMPAIGN_SEARCH_MODE)
+        if weighted_variants:
+            variant = weighted_variants[0]
+            metrics = _get(variant, "metrics", {})
+            if not isinstance(metrics, Mapping):
+                metrics = {}
+            profile_id = _get(variant, "profile", _get(variant, "profile_id"))
+            summary["Weighted candidate ID"] = _weighted_value(variant, "candidate_id", "strategy_id", "id")
+            available = _weighted_value(metrics, "B_available_usdt", "bank_available_usdt", "available_bank_usdt")
+            if available == "UNKNOWN":
+                profiles = _get(_get(campaign, "launch", {}), "profiles", ())
+                if isinstance(profiles, Sequence) and not isinstance(profiles, (str, bytes)):
+                    profile = next((item for item in profiles if _get(item, "profile_id") == profile_id), None)
+                    available = _weighted_value(profile, "equity_usdt") if profile is not None else "UNKNOWN"
+            payload_pairs = _weighted_payload_pairs(variant)
+            max_balances = tuple(
+                _weighted_number(_get(_get(payload, "strategy", {}), "basic", {}), "max_balance")
+                for _member, payload in payload_pairs
+                if isinstance(payload, Mapping)
+                and isinstance(_get(payload, "strategy", {}), Mapping)
+                and isinstance(_get(_get(payload, "strategy", {}), "basic", {}), Mapping)
+                and _weighted_number(_get(_get(payload, "strategy", {}), "basic", {}), "max_balance") != "UNKNOWN"
+            )
+            saturation = _weighted_value(metrics, "B_sat_settings_usdt", "B_saturation_usdt", "B_sat_usdt")
+            if saturation == "UNKNOWN" and max_balances:
+                saturation = max(max_balances, key=lambda value: Decimal(str(value)))
+            before_reserve = _weighted_value(metrics, "reserve_before_limiter_pct", "reserve_full_load_pct", "reserve_before_pct")
+            after_reserve = _weighted_value(metrics, "reserve_after_limiter_pct", "reserve_after_pct")
+            release_status = _weighted_value(metrics, "limiter_release_status")
+            reserve_reason = _weighted_value(metrics, "reserve_unknown_reason")
+            summary.update({
+                "B required USDT": _weighted_value(metrics, "B_required_usdt", "required_bank_usdt", "B_required_margin_usdt"),
+                "B available USDT": available,
+                "B saturation USDT": saturation,
+                "B margin USDT": _weighted_value(metrics, "B_margin_usdt"),
+                "P30 common USDT/30d": _weighted_value(metrics, "p30_common_usdt_30d"),
+                "P30 limiter USDT/30d": _weighted_value(metrics, "p30_limiter_model_usdt_30d"),
+                "MaxDD %": _weighted_value(metrics, "max_drawdown_pct"),
+                "CDaR peak80 USDT": _weighted_value(metrics, "cdar_peak80_usdt"),
+                "CDaR peak90 USDT": _weighted_value(metrics, "cdar_peak90_usdt"),
+                "Reserve before limiter": before_reserve,
+                "Reserve after limiter": after_reserve,
+                "Reserve UNKNOWN reason": reserve_reason,
+                "MM all USDT": _weighted_value(metrics, "M_all_usdt"),
+                "Bottleneck": _weighted_value(metrics, "bottleneck", "limiter_bottleneck", "margin_bottleneck"),
+                "Limiter L": _weighted_value(metrics, "limiter_L"),
+                "Limiter P30 status": _weighted_value(metrics, "limiter_p30_status", "p30_status"),
+                "Limiter release status": release_status,
+                "Joint status": _weighted_value(metrics, "joint_status", "joint_metrics", default="NOT_TESTED"),
+                "Search status": _weighted_value(variant, "status", default=_weighted_value(metrics, "status", default="NOT_TESTED")),
+                "Budget status": _weighted_value(metrics, "budget_status", "budget_limited"),
+            })
+        return summary
 
     @staticmethod
     def _cap_variants(variants: Sequence[Any], profiles: Sequence[Mapping[str, Any]]) -> tuple[tuple[Any, ...], tuple[dict[str, Any], ...], tuple[str, ...]]:
@@ -1224,7 +1433,10 @@ class PortfolioPanelService:
             profile = val(variant, "profile", default="")
             directions = val(variant, "directions")
             members = val(variant, "members")
-            member_count = len(directions) if isinstance(directions, Mapping) else (len(members) if isinstance(members, Sequence) else val(variant, "member_count"))
+            members_is_sequence = isinstance(members, Sequence) and not isinstance(members, (str, bytes))
+            if not members_is_sequence:
+                members = ()
+            member_count = len(directions) if isinstance(directions, Mapping) else (len(members) if members_is_sequence else val(variant, "member_count"))
             pair_count = val(variant, "pair_count")
             if pair_count is None:
                 symbols = {
@@ -1249,10 +1461,34 @@ class PortfolioPanelService:
                 for ordinal, (direction, details) in enumerate(directions.items(), 1):
                     member_rows.append([campaign["campaign_id"], candidate_id, profile, ordinal, val(details, "strategy_id", "strategyId"), val(details, "result_id", "resultId"), val(details, "symbol", "pair", default=val(variant, "symbol")), direction, val(details, "user_rank"), val(details, "scalar", "scalar_pct"), val(details, "quantity", "rounded_quantity"), val(details, "leverage"), val(details, "notional_usdt"), val(details, "estimated_individual_dd_usdt"), val(details, "estimated_individual_dd_pct"), val(details, "liquidity_scalar_ceiling_pct"), val(details, "calculated_initial_margin_usdt"), val(details, "gate", "gate_result", default="UNKNOWN"), val(details, "reasons", default=""), *([None] * 12)])
             elif isinstance(members, Sequence):
+                weighted = val(variant, "search_mode") == CAMPAIGN_SEARCH_MODE
+                payload_pairs = _weighted_payload_pairs(variant) if weighted else ()
                 for ordinal, details in enumerate(members, 1):
+                    if weighted:
+                        payload = payload_pairs[ordinal - 1][1] if ordinal <= len(payload_pairs) else None
+                        facts = _get(payload, "facts", {})
+                        basic = _get(_get(payload, "strategy", {}), "basic", {})
+                        strategy_id = val(details, "strategy_id", "strategyId")
+                        result_id = val(details, "result_id", "resultId")
+                        finalist = f"{strategy_id}/{result_id}" if strategy_id is not None and result_id is not None else "UNKNOWN"
+                        warnings_value = val(details, "warnings", "warning", default="UNKNOWN")
+                        member_rows.append([
+                            campaign["campaign_id"], candidate_id, profile, ordinal, strategy_id, result_id,
+                            val(details, "symbol", "pair", default="UNKNOWN"), val(details, "side", default="UNKNOWN"),
+                            val(details, "user_rank", default="UNKNOWN"), "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN",
+                            "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", val(variant, "gate", "gate_result", default="UNKNOWN"),
+                            warnings_value, "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN",
+                            "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN",
+                            finalist, val(details, "side", default="UNKNOWN"), val(details, "x_usdt", default="UNKNOWN"),
+                            val(details, "capacity_usdt", default="UNKNOWN"), _weighted_number(facts, "q"),
+                            val(details, "priority", default="UNKNOWN"), _weighted_number(basic, "max_balance"),
+                            val(details, "source_scale", "source_scale_pct", "scale", "size_scale"),
+                            val(details, "hold90", "hold90_hours", "hold_90", "p90_hold"), warnings_value,
+                        ])
+                        continue
                     calendar = val(details, "calendar_7d", default={})
                     weekday = val(details, "weekday_5d", default={})
-                    member_rows.append([campaign["campaign_id"], candidate_id, profile, ordinal, val(details, "strategy_id", "strategyId"), val(details, "result_id", "resultId"), val(details, "symbol", "pair"), val(details, "side", "direction"), val(details, "user_rank"), None, val(details, "quantity", "maximum_closing_quantity"), val(details, "planned_leverage"), val(details, "actual_size_usdt", "position_size_usdt"), None, val(details, "max_drawdown_pct"), None, None, "PASS", val(details, "spread_diagnostics", default=""), val(details, "capacity_status"), val(calendar, "available_days"), val(calendar, "mean_minute_turnover"), val(calendar, "rounded_cap_usdt"), val(weekday, "available_days"), val(weekday, "mean_minute_turnover"), val(weekday, "rounded_cap_usdt"), val(details, "spread_status"), val(details, "spread_mean_bps"), val(details, "sizing_digest"), val(details, "capacity_digest"), val(details, "reference_digest")])
+                    member_rows.append([campaign["campaign_id"], candidate_id, profile, ordinal, val(details, "strategy_id", "strategyId"), val(details, "result_id", "resultId"), val(details, "symbol", "pair"), val(details, "side", "direction"), val(details, "user_rank"), None, val(details, "quantity", "maximum_closing_quantity"), val(details, "planned_leverage"), val(details, "actual_size_usdt", "position_size_usdt"), None, val(details, "max_drawdown_pct"), None, None, "PASS", val(details, "spread_diagnostics", default=""), val(details, "capacity_status"), val(calendar, "available_days"), val(calendar, "mean_minute_turnover"), val(calendar, "rounded_cap_usdt"), val(weekday, "available_days"), val(weekday, "mean_minute_turnover"), val(weekday, "rounded_cap_usdt"), val(details, "spread_status"), val(details, "spread_mean_bps"), val(details, "sizing_digest"), val(details, "capacity_digest"), val(details, "reference_digest"), *([None] * 10)])
         profile_status_rows = []
         pretest_mode = any(val(item, "search_mode") == "PRETEST_PROXY" or (isinstance(val(item, "metrics"), Mapping) and val(item, "metrics").get("metric_basis") == "PRETEST_PROXY") for item in variants)
         if pretest_mode:
