@@ -142,9 +142,13 @@ score и причины являются подсказкой и immutable audit
 Control workbook содержит все строки выбранного scope ровно один раз и минимум
 следующие листы:
 
-- `Candidates` — Pair, Direction, Strategy/Result ID, период, ключевые raw и
-  window metrics, `Auto Status`, `Auto Rank`, immutable reason/score,
-  редактируемые `User Status`, `User Rank`, `RETEST`, `Comment`;
+- `Candidates` — the canonical rich `All candidates` schema rendered by
+  `write_selection_workbook`: strategy parameters, PnL/DD/window metrics,
+  order summaries, automatic selection facts, effective `User Status`/`User
+  Rank`, `RETEST`, analog fields, and `Comment`. Its ordering, fills, hidden
+  columns, number formats, and data validation are inherited from that ordinary
+  renderer. `Candidates` is the sole editable/import-authoritative sheet;
+  the former narrow control-only header is no longer accepted;
 - `Groups` — счётчики до/после фильтров и automatic status по каждой
   `(Pair, Direction)`;
 - `Retest Failures` — отсутствующие/отклонённые отчёты и reason codes;
@@ -173,6 +177,7 @@ comment length и ZIP limits сохраняются для каждой стро
 - общий `Test start` и `Test end` с описанными defaults;
 - всегда доступная кнопка `Скачать текущий контрольный XLSX`; до ретеста она
   выгружает текущие effective `FINALIST` и, при включённом чекбоксе, `RESERVE`;
+- current control export requires a ready selection cache; otherwise it reports typed `SELECTION_CACHE_INCOMPLETE` and returns no workbook;
 - после успешного массового ретеста та же кнопка выгружает его новый общий
   control workbook;
 - существующий выборочный RETEST остаётся доступен.

@@ -348,11 +348,23 @@ def test_finalist_retest_card_exposes_current_control_export_before_retest() -> 
     html = _read("index.html")
     js = _read("app.js")
     card = html.split('id="performance-v2-finalist-retest-card"', 1)[1].split("</details>", 1)[0]
+    export_handler = js.split("finalistRetestExport?.addEventListener", 1)[1].split("finalistRetestImport?.addEventListener", 1)[0]
 
     assert 'id="performance-v2-finalist-retest-export" class="button button-secondary"' in card
     assert 'id="performance-v2-finalist-retest-export" class="button button-secondary" hidden' not in card
     assert "/api/v2/strategies/performance-v2/finalist-retest/export?include_reserve=" in js
     assert "finalistRetestHasSuccessfulExport" in js
+    assert "event.preventDefault()" in export_handler
+    assert "fetch(finalistRetestExport.href)" in export_handler
+    assert "SELECTION_CACHE_INCOMPLETE" in export_handler
+    assert "Prepare or recalculate the selection cache first." in export_handler
+    assert "response.blob()" in export_handler
+    assert "response.headers.get('Content-Disposition')" in export_handler
+    assert "filename=" in export_handler
+    assert "download: filename" in export_handler
+    assert "performance-v2-finalist-retest.xlsx" in export_handler
+    assert "Control workbook downloaded." in export_handler
+    assert "finalistRetestStatus.textContent" in export_handler
 
 
 def test_finalist_retest_card_is_only_on_strategies_dd5_screen() -> None:
@@ -510,6 +522,9 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     click_handler = js.split("selectionXlsButton?.addEventListener", 1)[1].split("renderSelectionPreviewOrder();", 1)[0]
     dirty_handler = js.split("const markSelectionPreviewDirty", 1)[1].split("const selectionStages", 1)[0]
     assert "fetch('/api/v2/strategies/performance-v2/selection'" in click_handler
+    assert "SELECTION_CACHE_INCOMPLETE" in click_handler
+    assert "Prepare or recalculate the selection cache first." in click_handler
+    assert "selectionPreviewStatus" in click_handler
     assert "/api/v2/strategies/performance-v2/selection-cache-status" in js
     assert "selectionXlsButton) selectionXlsButton.disabled = !cache.ready" in js
     assert "selectionCacheStatusRevision" in js

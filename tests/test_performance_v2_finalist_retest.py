@@ -8,8 +8,10 @@ from hashlib import sha256
 from io import BytesIO
 import json
 import math
+from tempfile import TemporaryDirectory
 import pytest
-from openpyxl import load_workbook
+import pandas as pd
+from openpyxl import Workbook, load_workbook
 
 from mrs3.performance_v2_finalist_retest import (
     canonical_json,
@@ -25,14 +27,58 @@ from mrs3.performance_v2_finalist_retest import (
     FinalistRetestError,
     import_combined_control_workbook,
     finalist_retest_config_digest,
+    _control_reason,
 )
 from mrs3.performance_v2_store import initialize_performance_v2
+from mrs3.performance_v2_selection import (
+    SELECTION_REASON_ALIASES, SelectionRequest, parse_selection_request, write_selection_workbook,
+)
 import duckdb
 from mrs3.panel_testing import render_strategy
 from mrs3.panel_strategy_batch import validate_strategy_manifest
 
 
 PORTFOLIO_ARITHMETIC_FIXTURE = Path(__file__).parent / "fixtures" / "portfolio" / "source_sizing_arithmetic.json"
+
+
+def test_selection_reason_aliases_are_shared_and_reversible() -> None:
+    assert SELECTION_REASON_ALIASES == {"PARETO_PLATEAU_POINTS_PER_ORDER": "PARETO_PL_PTS_PER_ORDER"}
+    for reason, alias in SELECTION_REASON_ALIASES.items():
+        assert _control_reason(alias) == reason
+        assert _control_reason(f"7. {alias}") == reason
+
+
+def _candidate_workbook(rows, request: SelectionRequest | None = None) -> bytes:
+    request = request or parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    normalized = []
+    reviews = {}
+    for source in rows:
+        row = dict(source)
+        row.update({
+            "strategy_id": source.get("strategy_id"), "result_id": source.get("result_id"),
+            "strategy_name": source.get("strategy_name", f"strategy-{source.get('strategy_id')}"),
+            "symbol": source.get("symbol", request.symbol), "side": source.get("side", request.side),
+            "timeframe": source.get("timeframe", "1h"), "order_count": source.get("order_count", 1),
+            "close_ma_len": source.get("close_ma_len", 5),
+            "auto_status": source.get("auto_status", source.get("user_status", "FINALIST")),
+            "finalist": source.get("finalist", source.get("user_status", "FINALIST") in {"FINALIST", "RESERVE"}),
+            "final_rank": source.get("final_rank", source.get("auto_rank")),
+            "final_score": source.get("final_score", source.get("score")),
+            "elimination_reason": source.get("elimination_reason", source.get("auto_reason")),
+            "auto_analog_of_strategy_id": source.get("auto_analog_of_strategy_id"),
+            "prior_rejected": False,
+        })
+        normalized.append(row)
+        reviews[int(row["strategy_id"])] = {
+            "user_status": source.get("user_status", "FINALIST"), "user_rank": source.get("user_rank"),
+            "user_analog_of_strategy_id": source.get("user_analog_of_strategy_id"), "comment": source.get("comment"),
+        }
+    with TemporaryDirectory() as directory:
+        path = write_selection_workbook(
+            pd.DataFrame(normalized), Path(directory) / "candidates.xlsx", request,
+            {"workbook_schema_version": "2"}, reviews,
+        )
+        return path.read_bytes()
 
 
 def test_weighted_template_only_changes_name_and_mrs_priority() -> None:
@@ -327,6 +373,10 @@ def test_combined_control_workbook_has_fixed_sheets_and_group_local_ranks() -> N
         [{"symbol": "BTCUSDT", "side": "LONG", "frozen_count": 1}],
         [{"symbol": "DOGEUSDT", "side": "SHORT", "strategy_id": 3, "reason": "REPORT_MISSING"}],
         {"ranking_scope": "RETEST_COHORT", "bulk_retest_job_id": "bulk-1"},
+        candidate_workbook=_candidate_workbook([
+            {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 11, "user_status": "FINALIST", "user_rank": 1},
+            {"symbol": "ETHUSDT", "side": "LONG", "strategy_id": 2, "result_id": 12, "user_status": "FINALIST", "user_rank": 1},
+        ]),
     )
     metadata, candidates, groups, failures = validate_combined_control_workbook(data)
     assert metadata["ranking_scope"] == "RETEST_COHORT"
@@ -337,9 +387,46 @@ def test_combined_control_workbook_has_fixed_sheets_and_group_local_ranks() -> N
           "user_status": "FINALIST", "user_rank": 1},
          {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 2, "result_id": 12,
           "user_status": "FINALIST", "user_rank": 1}], metadata={},
+        candidate_workbook=_candidate_workbook([
+            {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 11, "user_status": "FINALIST", "user_rank": 1},
+            {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 2, "result_id": 12, "user_status": "FINALIST", "user_rank": 1},
+        ]),
     )
     with pytest.raises(FinalistRetestError, match="CONTROL_DUPLICATE_RANK"):
         validate_combined_control_workbook(duplicate)
+
+
+def test_old_narrow_and_duplicate_alias_candidate_headers_are_rejected() -> None:
+    workbook = Workbook()
+    workbook.active.title = "Candidates"
+    workbook["Candidates"].append([
+        "Pair", "Direction", "Strategy ID", "Result ID", "User Status", "User Rank", "RETEST", "Comment",
+        "Auto Status", "Auto Rank", "Auto Analog Of ID", "Analog Of ID", "Auto Reason", "Score",
+    ])
+    workbook.create_sheet("Groups").append(list(("Pair", "Direction", "Frozen Count", "Success Count", "Failure Count", "Auto Status Count")))
+    workbook.create_sheet("Retest Failures").append(list(("Pair", "Direction", "Strategy ID", "Strategy", "Result ID", "Reason")))
+    metadata = workbook.create_sheet("_MRS_SELECTION_META")
+    metadata.sheet_state = "veryHidden"
+    narrow_io = BytesIO()
+    workbook.save(narrow_io)
+    with pytest.raises(FinalistRetestError, match="CONTROL_SCHEMA_MISMATCH"):
+        validate_combined_control_workbook(narrow_io.getvalue())
+
+    rich_bytes = combined_control_workbook_bytes(
+        [{"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 11,
+          "user_status": "FINALIST", "user_rank": 1}],
+        metadata={},
+        candidate_workbook=_candidate_workbook([
+            {"strategy_id": 1, "result_id": 11, "user_status": "FINALIST", "user_rank": 1},
+        ]),
+    )
+    rich = load_workbook(BytesIO(rich_bytes))
+    candidate_sheet = rich["Candidates"]
+    candidate_sheet.cell(1, candidate_sheet.max_column + 1).value = "Pair"
+    duplicate_io = BytesIO()
+    rich.save(duplicate_io)
+    with pytest.raises(FinalistRetestError, match="CONTROL_SCHEMA_MISMATCH"):
+        validate_combined_control_workbook(duplicate_io.getvalue())
 
 
 def test_combined_control_import_is_atomic_and_idempotent() -> None:
@@ -360,6 +447,9 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
         data = combined_control_workbook_bytes(
             [{"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 11, "user_status": "REJECTED", "user_rank": None, "auto_status": "FINALIST", "auto_rank": 1}],
             metadata={"database_instance_id": instance},
+            candidate_workbook=_candidate_workbook([
+                {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 11, "user_status": "REJECTED", "user_rank": None, "auto_status": "FINALIST", "auto_rank": 1},
+            ]),
         )
         result = import_combined_control_workbook(connection, data)
         assert result["group_count"] == 1
@@ -368,7 +458,12 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
         assert replay["review_import_ids"] == result["review_import_ids"]
 
 
-def test_server_issued_control_accepts_user_edits_and_failure_only_group() -> None:
+@pytest.mark.parametrize("reason", [
+    "LOT_VARIANT_REDUNDANT", "ANALOG", "PRIOR_USER_REJECTED",
+    "RANK_NOT_EVALUATED_INSUFFICIENT_DATA", "AB_NOT_EVALUATED_INSUFFICIENT_DATA",
+    "PARETO_PLATEAU_POINTS_PER_ORDER",
+])
+def test_server_issued_control_accepts_user_edits_and_failure_only_group(reason: str) -> None:
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
@@ -384,7 +479,7 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group() -> No
         exact = {
             "Pair": "BTCUSDT", "Direction": "LONG", "Strategy ID": 1, "Result ID": 11,
             "Auto Status": "FINALIST", "Auto Rank": 1, "Auto Analog Of ID": None,
-            "Auto Reason": None, "Effective Start": "2026-01-01", "Effective End": "2026-02-01", "Score": 5,
+            "Auto Reason": reason, "Score": 5.5,
         }
         exact_rowsets = {"BTCUSDT|LONG": [exact]}
         groups = [
@@ -412,8 +507,17 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group() -> No
         issued = combined_control_workbook_bytes(
             [{"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 11,
               "user_status": "FINALIST", "user_rank": None, "auto_status": "FINALIST", "auto_rank": 1,
-              "effective_start": "2026-01-01", "effective_end": "2026-02-01", "score": 5}],
+              "auto_reason": reason, "score": Decimal("5.5")}],
             groups, failures, metadata,
+            candidate_workbook=_candidate_workbook([
+                {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 11,
+                 "user_status": "FINALIST", "user_rank": None, "auto_status": "FINALIST", "auto_rank": 1,
+                 "auto_reason": reason, "score": Decimal("5.5")},
+            ], request=parse_selection_request({
+                "symbol": "BTCUSDT", "side": "LONG", "stages": [{
+                    "id": "pareto_plateau_points_per_order", "enabled": True, "scope": "pair_side",
+                }],
+            }) if reason == "PARETO_PLATEAU_POINTS_PER_ORDER" else None),
         )
         request_json = canonical_json({
             "ranking_scope": "RETEST_COHORT", "bulk_retest_job_id": "bulk-1",
@@ -433,12 +537,21 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group() -> No
             """insert into selection_results
                (selection_run_id, strategy_id, result_id_at_selection, auto_status, auto_score, auto_rank,
                 auto_reason, analog_group_key, auto_analog_of_strategy_id, prior_rejected, stage_trace_json)
-               values ('sel', 1, 11, 'FINALIST', 5, 1, null, null, null, false, '{}')"""
+                values ('sel', 1, 11, 'FINALIST', 5.5, 1, ?, null, null, false, '{}')""", [reason]
         )
 
         workbook = load_workbook(BytesIO(issued))
-        workbook["Candidates"].cell(2, 5).value = "RESERVE"
-        workbook["Candidates"].cell(2, 6).value = 1
+        headers = {cell.value: cell.column for cell in workbook["Candidates"][1]}
+        rendered_reason = workbook["Candidates"].cell(2, headers["Причина"]).value
+        expected_reason = (
+            "1. PARETO_PL_PTS_PER_ORDER" if reason == "PARETO_PLATEAU_POINTS_PER_ORDER"
+            else reason
+        )
+        assert rendered_reason == expected_reason
+        unedited = import_combined_control_workbook(connection, issued)
+        assert unedited["group_count"] == unedited["row_count"] == 1
+        workbook["Candidates"].cell(2, headers["User Status"]).value = "RESERVE"
+        workbook["Candidates"].cell(2, headers["User Rank"]).value = 1
         edited_io = BytesIO()
         workbook.save(edited_io)
         edited = edited_io.getvalue()
@@ -447,17 +560,21 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group() -> No
 
         assert imported["group_count"] == 1 and imported["row_count"] == 1
         assert replay["review_import_ids"] == imported["review_import_ids"]
-        assert connection.execute("select user_status, user_rank from selection_review_rows").fetchone() == ("RESERVE", 1)
+        assert connection.execute(
+            "select user_status, user_rank from selection_review_rows order by rowid desc limit 1"
+        ).fetchone() == ("RESERVE", 1)
 
         tampered = load_workbook(BytesIO(issued))
-        tampered["Candidates"].cell(2, 9).value = "RESERVE"
+        tampered_headers = {cell.value: cell.column for cell in tampered["Candidates"][1]}
+        tampered["Candidates"].cell(2, tampered_headers["Auto Status"]).value = "RESERVE"
         tampered_io = BytesIO()
         tampered.save(tampered_io)
         with pytest.raises(FinalistRetestError, match="CONTROL_IMMUTABLE_FIELDS_CHANGED"):
             import_combined_control_workbook(connection, tampered_io.getvalue())
 
         bad_analog = load_workbook(BytesIO(issued))
-        bad_analog["Candidates"].cell(2, 5).value = "ANALOG"
+        bad_analog_headers = {cell.value: cell.column for cell in bad_analog["Candidates"][1]}
+        bad_analog["Candidates"].cell(2, bad_analog_headers["User Status"]).value = "ANALOG"
         bad_analog_io = BytesIO()
         bad_analog.save(bad_analog_io)
         with pytest.raises(FinalistRetestError, match="CONTROL_INVALID_ANALOG"):

@@ -51,6 +51,7 @@ _STAGE_IDS = frozenset((
     "rank_robust_top_n",
 ))
 _SCOPES = frozenset(("pair_side", "pair_side_timeframe"))
+SELECTION_REASON_ALIASES = {"PARETO_PLATEAU_POINTS_PER_ORDER": "PARETO_PL_PTS_PER_ORDER"}
 _CANDIDATE_COLUMNS = (
     "strategy_id", "strategy_name", "symbol", "side", "timeframe", "close_ma_len", "order_count",
     "result_id", "total_pnl", "total_pnl_pct", "max_drawdown", "max_drawdown_pct", "total_fees",
@@ -1386,7 +1387,6 @@ def write_selection_workbook(
     ] + ["total_pnl", "total_pnl_pct", "max_drawdown", "total_fees", "risk_scale", "scaled_lot_sum", "daily_log_return"], errors="ignore").copy()
     if "ab_pnl_change_30d_pct" not in display:
         display["ab_pnl_change_30d_pct"] = None
-    reason_aliases = {"PARETO_PLATEAU_POINTS_PER_ORDER": "PARETO_PL_PTS_PER_ORDER"}
     enabled_stages = [stage for stage in request.stages if stage.enabled]
     reason_positions = {stage.id.upper(): index for index, stage in enumerate(enabled_stages, start=1)}
     reason_colors = {
@@ -1403,8 +1403,8 @@ def write_selection_workbook(
     if "elimination_reason" in display:
         display["elimination_reason"] = display["elimination_reason"].map(
             lambda reason: (
-                f"{reason_positions[reason]}. {reason_aliases.get(reason, reason)}"
-                if reason in reason_positions else reason_aliases.get(reason, reason)
+                f"{reason_positions[reason]}. {SELECTION_REASON_ALIASES.get(reason, reason)}"
+                if reason in reason_positions else SELECTION_REASON_ALIASES.get(reason, reason)
             ) if isinstance(reason, str) else reason
         )
     for column in ("pnl_30d_pct", "profit_factor", "win_rate_pct"):

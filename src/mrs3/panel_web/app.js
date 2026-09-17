@@ -2182,6 +2182,33 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   finalistRetestCard?.addEventListener('toggle', () => { if (finalistRetestCard.open) loadFinalistRetestPreview(); });
   finalistRetestReserve?.addEventListener('change', () => { loadFinalistRetestPreview(); updateFinalistRetestExport(); });
   updateFinalistRetestExport();
+  finalistRetestExport?.addEventListener('click', async (event) => {
+    event.preventDefault();
+    try {
+      const response = await fetch(finalistRetestExport.href);
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        const message = result.error?.code === 'SELECTION_CACHE_INCOMPLETE'
+          ? 'Prepare or recalculate the selection cache first.'
+          : result.error?.message || 'control workbook export failed';
+        throw new Error(message);
+      }
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const filenameMatch = disposition.match(/filename=(?:"([^"]+)"|([^;]+))/i);
+      const filename = filenameMatch?.[1] || filenameMatch?.[2]?.trim() || (
+        finalistRetestJobId ? 'performance-v2-finalist-retest.xlsx' : 'performance-v2-current-finalists.xlsx'
+      );
+      const url = URL.createObjectURL(await response.blob());
+      Object.assign(document.createElement('a'), {
+        href: url,
+        download: filename,
+      }).click();
+      URL.revokeObjectURL(url);
+      if (finalistRetestStatus) finalistRetestStatus.textContent = 'Control workbook downloaded.';
+    } catch (error) {
+      if (finalistRetestStatus) finalistRetestStatus.textContent = `Control workbook export failed: ${error?.message || 'request failed'}.`;
+    }
+  });
   finalistRetestImport?.addEventListener('click', async () => {
     if (!finalistRetestJobId) return;
     finalistRetestImport.disabled = true;
@@ -2772,7 +2799,13 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(selectionPayload()),
       });
-      if (!response.ok) throw new Error((await response.json()).error?.message || 'selection failed');
+      if (!response.ok) {
+        const result = await response.json();
+        const message = result.error?.code === 'SELECTION_CACHE_INCOMPLETE'
+          ? 'Prepare or recalculate the selection cache first.'
+          : result.error?.message || 'selection failed';
+        throw new Error(message);
+      }
       const url = URL.createObjectURL(await response.blob());
       Object.assign(document.createElement('a'), { href: url, download: 'performance-v2-finalists.xlsx' }).click();
       URL.revokeObjectURL(url); selectionPreviewDirty = false;

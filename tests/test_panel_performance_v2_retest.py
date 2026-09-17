@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from http.client import HTTPConnection
 import json
 from pathlib import Path
@@ -9,15 +10,16 @@ import threading
 from types import SimpleNamespace
 
 import duckdb
+import pandas as pd
 from openpyxl import Workbook, load_workbook
 from io import BytesIO
 import pytest
 
 import mrs3.panel as panel_module
-from mrs3.panel import PerformanceV2ApiError, PanelController, create_panel_server
+from mrs3.panel import PerformanceV2ApiError, PanelController, _control_score, create_panel_server
 from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_retest import RetestBatch
-from mrs3.performance_v2_finalist_retest import FinalistRetestError
+from mrs3.performance_v2_finalist_retest import FinalistRetestError, validate_combined_control_workbook
 
 
 def _controller(tmp_path: Path, *, seed: bool = True) -> PanelController:
@@ -82,7 +84,44 @@ def _controller(tmp_path: Path, *, seed: bool = True) -> PanelController:
     return PanelController(tmp_path, config_path)
 
 
-def test_current_control_export_is_read_only_until_review_and_preserves_outside_scope(tmp_path: Path) -> None:
+def test_control_score_drops_missing_and_non_finite_values() -> None:
+    assert [_control_score(value) for value in (
+        None, pd.NA, float("nan"), float("inf"), float("-inf"),
+        Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity"),
+    )] == [None] * 8
+    assert _control_score(Decimal("5.5")) == 5.5
+
+
+def test_finalist_control_candidate_workbook_normalizes_rank_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = _controller(tmp_path, seed=False)
+    captured: dict[str, object] = {}
+
+    def capture_writer(result, path, request, review_metadata, user_review_rows):
+        captured["result"] = result.copy()
+        captured["reviews"] = user_review_rows
+        path.write_bytes(b"candidate-workbook")
+        return path
+
+    monkeypatch.setattr(panel_module, "write_selection_workbook", capture_writer)
+    controller._finalist_control_candidate_workbook(
+        [{
+            "strategy_id": 1, "result_id": 11, "strategy_name": "alpha", "symbol": "BTCUSDT", "side": "LONG",
+            "timeframe": "1h", "order_count": 1, "close_ma_len": 20, "auto_status": "FINALIST", "finalist": True,
+            "user_status": "FINALIST", "user_rank": pd.NA, "auto_rank": float("inf"), "final_rank": float("-inf"),
+        }],
+        panel_module.SelectionRequest("BTCUSDT", "LONG", ()),
+    )
+
+    result = captured["result"].iloc[0]
+    assert result["user_rank"] is None
+    assert result["auto_rank"] is None
+    assert result["final_rank"] is None
+    assert captured["reviews"][1]["user_rank"] is None
+
+
+def test_current_control_export_is_read_only_until_review_and_preserves_outside_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     controller = _controller(tmp_path)
     database = tmp_path / "performance-v2" / "strategy_performance.duckdb"
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -99,7 +138,23 @@ def test_current_control_export_is_read_only_until_review_and_preserves_outside_
                values (?, '2026-01-01', '2026-01-09', 'Bybit', .0004, 100, 101, ?)
                returning result_id""", [beta_id, now],
         ).fetchone()[0]
-        alpha_result_id = connection.execute("select current_result_id from strategies where strategy_name = 'alpha'").fetchone()[0]
+        previous_alpha_result_id = connection.execute("select current_result_id from strategies where strategy_name = 'alpha'").fetchone()[0]
+        connection.execute(
+            """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len, order_count,
+               analysis_run_id, candidate_identity, lifecycle_status, created_at_utc, updated_at_utc)
+               values ('old-alpha', 'BTCUSDT', 'LONG', '1h', 20, 1, 'old-run', 'old-alpha', 'DISCARDED', ?, ?)""",
+            [now, now],
+        )
+        old_holder_id = connection.execute("select strategy_id from strategies where strategy_name = 'old-alpha'").fetchone()[0]
+        connection.execute("update strategies set current_result_id = null where strategy_id = 1")
+        connection.execute("update strategy_results set strategy_id = ? where result_id = ?", [old_holder_id, previous_alpha_result_id])
+        alpha_result_id = connection.execute(
+            """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
+               commission_rate, initial_balance, final_balance, imported_at_utc)
+               values (1, '2026-01-02', '2026-01-10', 'Bybit', .0004, 100, 102, ?)
+               returning result_id""", [now],
+        ).fetchone()[0]
+        connection.execute("update strategies set current_result_id = ? where strategy_id = 1", [alpha_result_id])
         connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [beta_result_id, beta_id])
         instance = connection.execute("select value from schema_info where key = 'database_instance_id'").fetchone()[0]
         connection.execute(
@@ -112,7 +167,8 @@ def test_current_control_export_is_read_only_until_review_and_preserves_outside_
         connection.executemany(
             """insert into selection_results (selection_run_id, strategy_id, result_id_at_selection, auto_status,
                auto_score, auto_rank, prior_rejected, stage_trace_json) values ('ordinary', ?, ?, ?, ?, ?, false, '{}')""",
-            [(1, alpha_result_id, "FINALIST", 90, 1), (beta_id, beta_result_id, "RESERVE", 80, 1)],
+            # Strategy IDs deliberately run opposite to rank/score order.
+            [(1, alpha_result_id, "FINALIST", 80, 2), (beta_id, beta_result_id, "RESERVE", 90, 1)],
         )
 
     def effective() -> dict[int, tuple[object, object, object]]:
@@ -148,20 +204,148 @@ def test_current_control_export_is_read_only_until_review_and_preserves_outside_
     before = effective()
     assert before[1][:2] == ("FINALIST", 1)
     assert before[beta_id][:2] == ("RESERVE", None)
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("select count(*) from window_metrics").fetchone() == (0,)
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        http = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        http.request("GET", "/api/v2/strategies/performance-v2/finalist-retest/export?include_reserve=true")
+        response = http.getresponse()
+        body = response.read()
+        content_type = response.getheader("Content-Type", "")
+        http.close()
+        assert response.status == 409
+        assert content_type.startswith("application/json")
+        assert not body.startswith(b"PK")
+        document = json.loads(body.decode("utf-8"))
+        assert document["error"]["code"] == "SELECTION_CACHE_INCOMPLETE"
+        assert any(token in document["error"]["message"].casefold() for token in ("cache", "prepare", "recalculate"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    with pytest.raises(FinalistRetestError, match="prepare.*cache|cache.*prepare"):
+        controller.strategies_performance_v2_finalist_retest_export({"include_reserve": True})
+    assert controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"}) == {"status": "READY"}
     reserve_filename, reserve_issued = controller.strategies_performance_v2_finalist_retest_export({"include_reserve": True})
     assert reserve_filename == "performance-v2-current-finalists-with-reserve.xlsx"
     reserve_sheet = load_workbook(BytesIO(reserve_issued))["Candidates"]
     assert reserve_sheet.max_row == 3
+    reserve_headers = {cell.value: cell.column for cell in reserve_sheet[1]}
+    assert {reserve_sheet.cell(row, reserve_headers["ID"]).value for row in range(2, reserve_sheet.max_row + 1)} == {1, beta_id}
+    reserve_rows = {
+        reserve_sheet.cell(row, reserve_headers["ID"]).value: row
+        for row in range(2, reserve_sheet.max_row + 1)
+    }
+    assert reserve_sheet.cell(reserve_rows[1], reserve_headers["Auto Rank"]).value == 2
+    assert reserve_sheet.cell(reserve_rows[beta_id], reserve_headers["Auto Rank"]).value == 1
+    assert reserve_sheet.cell(reserve_rows[1], reserve_headers["Final score (Pair+Side)"]).value == 80
+    assert reserve_sheet.cell(reserve_rows[beta_id], reserve_headers["Final score (Pair+Side)"]).value == 90
+    unedited = controller.strategies_performance_v2_finalist_retest_control_import(reserve_issued)
+    assert unedited["group_count"] == 1 and unedited["row_count"] == 2
+    fresh_filename, fresh_issued = controller.strategies_performance_v2_finalist_retest_export({"include_reserve": True})
+    assert fresh_filename == "performance-v2-current-finalists-with-reserve.xlsx"
+    fresh_workbook = load_workbook(BytesIO(fresh_issued))
+    fresh_sheet = fresh_workbook["Candidates"]
+    fresh_headers = {cell.value: cell.column for cell in fresh_sheet[1]}
+    fresh_beta_row = next(
+        row for row in range(2, fresh_sheet.max_row + 1)
+        if fresh_sheet.cell(row, fresh_headers["ID"]).value == beta_id
+    )
+    fresh_sheet.cell(fresh_beta_row, fresh_headers["Comment"]).value = "fresh allowed edit"
+    edited_io = BytesIO()
+    fresh_workbook.save(edited_io)
+    edited = controller.strategies_performance_v2_finalist_retest_control_import(edited_io.getvalue())
+    assert edited["group_count"] == 1 and edited["row_count"] == 2
     filename, issued = controller.strategies_performance_v2_finalist_retest_export({"include_reserve": False})
     assert filename == "performance-v2-current-finalists.xlsx"
-    assert effective() == before
+    assert {strategy_id: decision[:2] for strategy_id, decision in effective().items()} == {
+        strategy_id: decision[:2] for strategy_id, decision in before.items()
+    }
     with duckdb.connect(str(database), read_only=True) as connection:
-        assert connection.execute("select count(*) from selection_runs").fetchone() == (3,)
+        assert connection.execute("select count(*) from selection_runs").fetchone() == (4,)
 
     workbook = load_workbook(BytesIO(issued))
     sheet = workbook["Candidates"]
     headers = {cell.value: cell.column for cell in sheet[1]}
-    assert sheet.max_row == 2 and sheet.cell(2, headers["Strategy ID"]).value == 1
+    assert sheet.max_row == 2 and sheet.cell(2, headers["ID"]).value == 1
+    assert sheet.cell(2, headers["Result ID"]).value == alpha_result_id
+    assert {sheet.cell(row, headers["ID"]).value for row in range(2, sheet.max_row + 1)} == {1}
+    assert {"PnL/30", "DD", "Lots", "Close", "User Status", "User Rank", "RETEST", "Analog Of ID", "Comment"}.issubset(headers)
+    assert "Pair" not in headers
+    assert any(validation.formula1 == '"FINALIST,RESERVE,ANALOG,FILTERED,REJECTED"' for validation in sheet.data_validations.dataValidation)
+    forbidden_refs = ("Finalists", "All candidates", "_MRS_SELECTION_META")
+    for worksheet in workbook.worksheets:
+        for row in worksheet.iter_rows():
+            for cell in row:
+                assert cell.data_type != "f"
+                if cell.data_type == "f":
+                    assert not any(reference in str(cell.value) for reference in forbidden_refs)
+        for validation in worksheet.data_validations.dataValidation:
+            assert not any(reference in str(validation.formula1) for reference in forbidden_refs)
+            assert not any(reference in str(validation.sqref) for reference in forbidden_refs)
+        for sqref in worksheet.conditional_formatting:
+            assert not any(reference in str(sqref) for reference in forbidden_refs)
+            for rule in worksheet.conditional_formatting[sqref]:
+                for formula in rule.formula or ():
+                    assert not any(forbidden_reference in str(formula) for forbidden_reference in forbidden_refs)
+    assert not workbook.defined_names
+    with duckdb.connect(str(database), read_only=True) as connection:
+        config = panel_module.load_selection_config(controller.default_config.with_name("config.performance.json"))
+        request = panel_module.SelectionRequest("BTCUSDT", "LONG", ())
+        ordinary = panel_module.load_selection_candidates(connection, request, config, cache_only=True)
+    ordinary = ordinary.copy()
+    ordinary = ordinary.loc[ordinary["strategy_id"] == 1].copy()
+    ordinary["auto_status"] = "FINALIST"
+    ordinary["finalist"] = True
+    ordinary["final_rank"] = 1
+    ordinary["final_score"] = 90
+    ordinary_path = panel_module.write_selection_workbook(
+        ordinary, tmp_path / "ordinary-candidates.xlsx", request, {"workbook_schema_version": "2"},
+        {1: {"user_status": "FINALIST", "user_rank": 1, "user_analog_of_strategy_id": None, "comment": None}},
+    )
+    ordinary_sheet = load_workbook(ordinary_path)["All candidates"]
+    ordinary_headers = [cell.value for cell in ordinary_sheet[1]]
+    assert all(isinstance(header, str) and header.strip() for header in ordinary_headers)
+    assert len(ordinary_headers) == len(set(ordinary_headers))
+    assert list(headers) == ordinary_headers
+    for name in ("Close", "Lots", "User Status"):
+        current_cell = sheet.cell(1, headers[name])
+        ordinary_cell = ordinary_sheet.cell(1, ordinary_headers.index(name) + 1)
+        assert current_cell.style_id == ordinary_cell.style_id
+        assert sheet.column_dimensions[current_cell.column_letter].hidden == ordinary_sheet.column_dimensions[ordinary_cell.column_letter].hidden
+        assert sheet.cell(2, headers[name]).number_format == ordinary_sheet.cell(2, ordinary_headers.index(name) + 1).number_format
+    assert {(validation.formula1, str(validation.sqref)) for validation in sheet.data_validations.dataValidation} == {
+        (validation.formula1, str(validation.sqref)) for validation in ordinary_sheet.data_validations.dataValidation
+    }
+    original_loader = panel_module.load_selection_candidates
+
+    def mismatched_loader(*args, **kwargs):
+        loaded = original_loader(*args, **kwargs)
+        loaded = loaded.copy()
+        loaded.loc[:, "result_id"] = 999999
+        return loaded
+
+    with monkeypatch.context() as context:
+        context.setattr(panel_module, "load_selection_candidates", mismatched_loader)
+        with pytest.raises(FinalistRetestError) as raised:
+            controller.strategies_performance_v2_finalist_retest_export({"include_reserve": False})
+    assert raised.value.code == "CONTROL_CANONICAL_ROW_MISMATCH"
+    assert "BTCUSDT" in str(raised.value) and "LONG" in str(raised.value)
+    assert "recalculate" in str(raised.value)
+    def missing_loader(*args, **kwargs):
+        loaded = original_loader(*args, **kwargs)
+        return loaded.iloc[0:0].copy()
+
+    with monkeypatch.context() as context:
+        context.setattr(panel_module, "load_selection_candidates", missing_loader)
+        with pytest.raises(FinalistRetestError) as missing:
+            controller.strategies_performance_v2_finalist_retest_export({"include_reserve": False})
+    assert missing.value.code == "CONTROL_CANONICAL_ROW_MISMATCH"
+    assert "BTCUSDT" in str(missing.value) and "LONG" in str(missing.value)
+    assert "recalculate" in str(missing.value)
     sheet.cell(2, headers["User Status"]).value = "REJECTED"
     sheet.cell(2, headers["User Rank"]).value = None
     sheet.cell(2, headers["RETEST"]).value = "RETEST"
@@ -171,7 +355,7 @@ def test_current_control_export_is_read_only_until_review_and_preserves_outside_
     assert imported["group_count"] == imported["row_count"] == 1
     after = effective()
     assert after[1][0:2] == ("REJECTED", None)
-    assert after[beta_id] == before[beta_id]
+    assert after[beta_id][0:2] == before[beta_id][0:2]
     replay = controller.strategies_performance_v2_finalist_retest_control_import(edited_io.getvalue())
     assert replay["review_import_ids"] == imported["review_import_ids"]
     with duckdb.connect(str(database)) as connection:
@@ -179,8 +363,98 @@ def test_current_control_export_is_read_only_until_review_and_preserves_outside_
             "select selection_run_id from selection_runs where request_json like '%CURRENT_EFFECTIVE%' order by created_at_utc desc limit 1"
         ).fetchone()[0]
         connection.execute("update selection_runs set request_json = '{}' where selection_run_id = ?", [current_run_id])
-    with pytest.raises(FinalistRetestError, match="CONTROL_SCOPE_MISMATCH"):
-        controller.strategies_performance_v2_finalist_retest_control_import(edited_io.getvalue())
+        with pytest.raises(FinalistRetestError, match="CONTROL_SCOPE_MISMATCH"):
+            controller.strategies_performance_v2_finalist_retest_control_import(edited_io.getvalue())
+
+
+def test_current_control_export_import_keeps_multiple_pair_side_groups_local(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    database = tmp_path / "performance-v2" / "strategy_performance.duckdb"
+    now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    with duckdb.connect(str(database)) as connection:
+        eth_id = connection.execute(
+            """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len, order_count,
+               analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc)
+               values ('eth', 'ETHUSDT', 'SHORT', '1h', 7, 1, 'run-eth', 'eth', 'ACTIVE', null, ?, ?)
+               returning strategy_id""", [now, now],
+        ).fetchone()[0]
+        eth_result_id = connection.execute(
+            """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
+               commission_rate, initial_balance, final_balance, imported_at_utc)
+               values (?, '2026-01-01', '2026-01-09', 'Bybit', .0004, 100, 103, ?)
+               returning result_id""", [eth_id, now],
+        ).fetchone()[0]
+        connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [eth_result_id, eth_id])
+        instance = connection.execute("select value from schema_info where key = 'database_instance_id'").fetchone()[0]
+        alpha_result_id = connection.execute("select current_result_id from strategies where strategy_id = 1").fetchone()[0]
+        for run_id, strategy_id, result_id, symbol, side, auto_score, auto_rank, user_rank, auto_reason in (
+                ("ordinary-btc", 1, alpha_result_id, "BTCUSDT", "LONG", Decimal("90"), 1, 1, None),
+                ("ordinary-eth", eth_id, eth_result_id, "ETHUSDT", "SHORT", Decimal("80.523456789123456789"), 2, 2, "LOT_VARIANT_REDUNDANT"),
+        ):
+            connection.execute(
+                """insert into selection_runs (selection_run_id, database_instance_id, symbol, side, selection_contract_version,
+                   request_json, request_sha256, config_json, config_sha256, candidate_count, representative_count,
+                   auto_finalist_count, top_n, workbook_sha256, created_at_utc)
+                   values (?, ?, ?, ?, 'v1', '{}', ?, '{}', ?, 1, 1, 1, 20, ?, ?)""",
+                [run_id, instance, symbol, side, "r" * 64, "s" * 64, "w" * 64, now],
+            )
+            connection.execute(
+                """insert into selection_results (selection_run_id, strategy_id, result_id_at_selection, auto_status,
+                   auto_score, auto_rank, auto_reason, prior_rejected, stage_trace_json)
+                   values (?, ?, ?, 'FINALIST', ?, ?, ?, false, '{}')""",
+                [run_id, strategy_id, result_id, auto_score, auto_rank, auto_reason],
+            )
+            connection.execute(
+                """insert into selection_review_imports
+                   (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count)
+                   values (?, ?, ?, ?, 1)""", [f"review-{run_id}", run_id, ("a" if strategy_id == 1 else "b") * 64, now],
+            )
+            connection.execute(
+                """insert into selection_review_rows
+                   (review_import_id, strategy_id, user_status, user_rank, user_analog_of_strategy_id, comment)
+                   values (?, ?, 'FINALIST', ?, null, null)""", [f"review-{run_id}", strategy_id, user_rank],
+            )
+
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+    controller.strategies_performance_v2_recalculate({"symbol": "ETHUSDT", "side": "SHORT"})
+    filename, issued = controller.strategies_performance_v2_finalist_retest_export({"include_reserve": False})
+    assert filename == "performance-v2-current-finalists.xlsx"
+    metadata, candidates, groups, failures = validate_combined_control_workbook(issued)
+    assert len(candidates) == 2 and len(groups) == 2 and not failures
+    assert {(row["Pair"], row["Direction"]) for row in candidates} == {("BTCUSDT", "LONG"), ("ETHUSDT", "SHORT")}
+    candidates_by_group = {(row["Pair"], row["Direction"]): row for row in candidates}
+    assert candidates_by_group[("BTCUSDT", "LONG")]["Score"] == 90
+    assert candidates_by_group[("BTCUSDT", "LONG")]["Auto Reason"] is None
+    assert candidates_by_group[("ETHUSDT", "SHORT")]["Score"] == pytest.approx(80.523456789123456789)
+    assert candidates_by_group[("ETHUSDT", "SHORT")]["Auto Rank"] == 2
+    assert candidates_by_group[("ETHUSDT", "SHORT")]["User Rank"] == 2
+    assert candidates_by_group[("ETHUSDT", "SHORT")]["Auto Reason"] == "LOT_VARIANT_REDUNDANT"
+    assert set(json.loads(str(metadata["exact_rowsets_json"]))) == {"BTCUSDT|LONG", "ETHUSDT|SHORT"}
+    unedited = controller.strategies_performance_v2_finalist_retest_control_import(issued)
+    assert unedited["group_count"] == unedited["row_count"] == 2
+
+    workbook = load_workbook(BytesIO(issued))
+    sheet = workbook["Candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    rows_by_group = {
+        (sheet.cell(row, headers["Пара"]).value, sheet.cell(row, headers["Side"]).value): row
+        for row in range(2, sheet.max_row + 1)
+    }
+    assert set(rows_by_group) == {("BTCUSDT", "LONG"), ("ETHUSDT", "SHORT")}
+    sheet.cell(rows_by_group[("BTCUSDT", "LONG")], headers["User Status"]).value = "REJECTED"
+    sheet.cell(rows_by_group[("BTCUSDT", "LONG")], headers["User Rank"]).value = None
+    sheet.cell(rows_by_group[("ETHUSDT", "SHORT")], headers["User Status"]).value = "RESERVE"
+    sheet.cell(rows_by_group[("ETHUSDT", "SHORT")], headers["User Rank"]).value = 1
+    edited_io = BytesIO()
+    workbook.save(edited_io)
+    imported = controller.strategies_performance_v2_finalist_retest_control_import(edited_io.getvalue())
+    assert imported["group_count"] == imported["row_count"] == 2
+    with duckdb.connect(str(database), read_only=True) as connection:
+        from mrs3.performance_v2_selection_review import effective_selection_decisions
+
+        decisions = effective_selection_decisions(connection)
+    assert decisions[1][:2] == ("REJECTED", None)
+    assert decisions[eth_id][:2] == ("RESERVE", 1)
 
 
 def test_retest_status_is_db_authoritative_and_defaults_from_current_result(tmp_path: Path) -> None:

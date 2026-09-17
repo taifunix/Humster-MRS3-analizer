@@ -2511,3 +2511,21 @@ passed`. JavaScript syntax, Python compileall, and `git diff --check` pass. A
 read-only preflight of the current Source v6 database completed in 4.319 s and
 returned `BABAUSDT LONG 3h = 172 / 684 · 25.1%, median 7.75%, max 18.27%` for
 `2026-07-11..2026-08-24`. Panel was not restarted.
+
+## Finalist control rich Candidates workbook accepted (2026-09-17)
+
+The current-finalist and completed-retest control exports now reuse the
+canonical Performance v2 `All candidates` renderer as the editable `Candidates`
+sheet. The exported population remains effective `FINALIST`, with `RESERVE`
+included only when requested, while the sheet carries the full strategy,
+PnL/DD, window, order, automatic-selection, user-review and comment fields.
+The existing multi-group control importer remains authoritative; the former
+narrow Candidates schema is no longer accepted.
+
+Current-control and Pareto/filter XLSX exports fail closed with typed
+`SELECTION_CACHE_INCOMPLETE` when their selection cache is not ready and return
+no workbook. The Panel keeps the user on the page, reports that the cache must
+be prepared or recalculated, and preserves the server-provided download name
+on success. Full verification passes `4461 passed, 7 skipped`; JavaScript
+syntax and `git diff --check` pass. Independent final review returned
+`CODE_REVIEW_PASS`.

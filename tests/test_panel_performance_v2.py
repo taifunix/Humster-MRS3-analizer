@@ -13,9 +13,11 @@ from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 import duckdb
+import pandas as pd
 from openpyxl import Workbook, load_workbook
 import pytest
 
+import mrs3.panel as panel_module
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
     initialize_performance_v2,
@@ -23,8 +25,8 @@ from mrs3.performance_v2_store import (
 )
 from mrs3.panel import PanelController, create_panel_server
 from mrs3.performance_v2_import import PerformanceV2ImportError, PerformanceV2ImportResult
-from mrs3.performance_v2_finalist_retest import FinalistRetestError
-from mrs3.performance_v2_selection import PerformanceV2SelectionError
+from mrs3.performance_v2_finalist_retest import FinalistRetestError, combined_control_workbook_bytes
+from mrs3.performance_v2_selection import PerformanceV2SelectionError, parse_selection_request, write_selection_workbook
 from mrs3.panel_performance_v2 import (
     PerformanceV2ApiError,
     PerformanceV2PanelRequest,
@@ -776,10 +778,28 @@ def test_finalist_retest_preview_http_uses_server_owned_scope(tmp_path: Path, mo
 def test_current_finalist_control_export_http_accepts_reserve_scope_without_job(tmp_path: Path, monkeypatch) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     seen: list[dict[str, object]] = []
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    ordinary_path = write_selection_workbook(
+        pd.DataFrame([{
+            "strategy_id": 1, "result_id": 11, "strategy_name": "alpha", "symbol": "BTCUSDT", "side": "LONG",
+            "timeframe": "1h", "order_count": 1, "close_ma_len": 7, "pnl_30d_pct": Decimal("12"),
+            "dd5_proxy": Decimal("4"), "max_drawdown_pct": Decimal("8"), "order_1_open_ma_len": 7,
+            "order_1_lot_x": Decimal("0.25"), "order_1_plateau_point_count": 4, "auto_status": "FINALIST",
+            "finalist": True, "final_rank": 1, "final_score": Decimal("5.5"), "elimination_reason": None,
+        }]),
+        tmp_path / "ordinary-candidates.xlsx", request, {"workbook_schema_version": "2"},
+        {1: {"user_status": "FINALIST", "user_rank": 1, "user_analog_of_strategy_id": None, "comment": None}},
+    )
+    control_data = combined_control_workbook_bytes(
+        [{"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 11,
+          "user_status": "FINALIST", "user_rank": 1, "auto_status": "FINALIST", "auto_rank": 1,
+          "score": Decimal("5.5")}],
+        metadata={}, candidate_workbook=ordinary_path.read_bytes(),
+    )
 
     def export(payload: dict[str, object]) -> tuple[str, bytes]:
         seen.append(payload)
-        return "current.xlsx", b"PK-current"
+        return "performance-v2-current-finalists-with-reserve.xlsx", control_data
 
     monkeypatch.setattr(controller, "strategies_performance_v2_finalist_retest_export", export)
     server, thread = _http_server(controller)
@@ -788,7 +808,22 @@ def test_current_finalist_control_export_http_accepts_reserve_scope_without_job(
         connection.request("GET", "/api/v2/strategies/performance-v2/finalist-retest/export?include_reserve=true")
         response = connection.getresponse()
         assert response.status == 200
-        assert response.read() == b"PK-current"
+        assert response.getheader("Content-Disposition") == 'attachment; filename="performance-v2-current-finalists-with-reserve.xlsx"'
+        document = response.read()
+        issued_sheet = load_workbook(BytesIO(document))["Candidates"]
+        ordinary_sheet = load_workbook(ordinary_path)["All candidates"]
+        issued_headers = [cell.value for cell in issued_sheet[1]]
+        ordinary_headers = [cell.value for cell in ordinary_sheet[1]]
+        assert issued_headers == ordinary_headers
+        assert all(isinstance(header, str) and header.strip() for header in ordinary_headers)
+        assert len(ordinary_headers) == len(set(ordinary_headers))
+        headers = {header: index + 1 for index, header in enumerate(issued_headers)}
+        assert issued_sheet.cell(2, headers["PnL/30"]).value == 12
+        assert issued_sheet.cell(2, headers["DD"]).value == 8
+        assert issued_sheet.cell(2, headers["Lots"]).value == "25"
+        assert issued_sheet.cell(2, headers["Points"]).value == "4"
+        assert issued_sheet.cell(2, headers["MA"]).value == "7"
+        assert issued_sheet.cell(2, headers["Close"]).value == 7
         assert seen == [{"include_reserve": True}]
         connection.close()
 
@@ -801,6 +836,134 @@ def test_current_finalist_control_export_http_accepts_reserve_scope_without_job(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_current_finalist_control_export_http_empty_scope_is_unavailable(tmp_path: Path) -> None:
+    (tmp_path / "config.local.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "config.performance.json").write_text(
+        json.dumps({"unified_performance_v2": {"database_root": "performance-v2", "workers": 1}}),
+        encoding="utf-8",
+    )
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    database = tmp_path / "performance-v2" / "strategy_performance.duckdb"
+    database.parent.mkdir()
+    with duckdb.connect(str(database)) as connection:
+        initialize_performance_v2(connection)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection.request("GET", "/api/v2/strategies/performance-v2/finalist-retest/export?include_reserve=false")
+        response = connection.getresponse()
+        status = response.status
+        content_type = response.getheader("Content-Type", "")
+        body = response.read()
+        connection.close()
+        assert status == 409
+        assert "spreadsheet" not in content_type.casefold()
+        assert not body.startswith(b"PK")
+        document = json.loads(body.decode("utf-8"))
+        assert document["error"]["code"] == "CONTROL_EXPORT_UNAVAILABLE"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_current_finalist_control_export_http_hides_untrusted_error_details(tmp_path: Path, monkeypatch) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    leaked_path = tmp_path / "private" / "secret.xlsx"
+
+    def export(_payload: dict[str, object]) -> tuple[str, bytes]:
+        raise FinalistRetestError("UNSAFE_INTERNAL", f"failed to open {leaked_path}")
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_finalist_retest_export", export)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection.request("GET", "/api/v2/strategies/performance-v2/finalist-retest/export?include_reserve=false")
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        assert response.status == 409
+        document = json.loads(body.decode("utf-8"))
+        assert document["error"] == {
+            "code": "CONTROL_EXPORT_UNAVAILABLE",
+            "message": "bulk control workbook is unavailable",
+        }
+        assert str(leaked_path) not in body.decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_job_id_finalist_export_uses_stage_free_rich_control_schema(tmp_path: Path, monkeypatch) -> None:
+    controller, database, result_id = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.executemany(
+            "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (result_id, 2, datetime(2026, 1, 2, 12, tzinfo=UTC), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 1, 110, None),
+                (result_id, 3, datetime(2026, 1, 3, 12, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 5, 1, 115, None),
+                (result_id, 4, datetime(2026, 1, 3, 18, tzinfo=UTC), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 1, 115, None),
+                (result_id, 5, datetime(2026, 1, 4, 12, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 5, 1, 120, None),
+            ],
+        )
+        connection.execute(
+            "insert into strategy_equity values (?, ?, ?, ?, ?)",
+            [result_id, 3, datetime(2026, 1, 3, 12, tzinfo=UTC), 115, 115],
+        )
+        connection.execute(
+            "insert into strategy_equity values (?, ?, ?, ?, ?)",
+            [result_id, 4, datetime(2026, 1, 4, 12, tzinfo=UTC), 120, 120],
+        )
+        connection.execute("update strategy_equity set wallet = 120, equity = 120 where result_id = ? and sample_index = 2", [result_id])
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+    _, ordinary_data = controller.strategies_performance_v2_selection(
+        {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+    )
+    ordinary_sheet = load_workbook(BytesIO(ordinary_data))["All candidates"]
+    ordinary_headers = [cell.value for cell in ordinary_sheet[1]]
+    stageful_payload = {
+        "symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0.3"},
+        ],
+    }
+    _, stageful_data = controller.strategies_performance_v2_selection(stageful_payload)
+    stageful_headers = [cell.value for cell in load_workbook(BytesIO(stageful_data))["All candidates"][1]]
+    assert "eliminated_by_filter_min_shift" in stageful_headers
+    stageful_request = parse_selection_request(stageful_payload)
+    runtime = {
+        "bulk_retest": True, "scope": "FINALIST", "cohort_sha256": "c" * 64,
+        "manifest_sha256": "m" * 64, "config_sha256": "g" * 64,
+        "successful_replacements": [{"strategy_id": 1, "new_result_id": result_id}],
+        "cohort_members": [{
+            "strategy_id": 1, "strategy_name": "alpha", "symbol": "BTCUSDT", "side": "LONG",
+            "result_id": result_id, "effective_status": "FINALIST", "effective_rank": 1,
+            "effective_start": "2026-01-01", "effective_end": "2026-01-05",
+        }],
+    }
+    monkeypatch.setattr(controller, "_bulk_retest_status_document", lambda _job_id: {"state": "COMMITTED"})
+    monkeypatch.setattr(controller._panel_jobs, "runtime", lambda _job_id: runtime)
+    monkeypatch.setattr(panel_module, "parse_selection_request", lambda _payload: stageful_request)
+    filename, issued = controller.strategies_performance_v2_finalist_retest_export({"job_id": "bulk-export"})
+    assert filename == "performance-v2-finalist-retest-bulk-export.xlsx"
+    workbook = load_workbook(BytesIO(issued))
+    sheet = workbook["Candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    assert headers == ordinary_headers
+    assert headers != stageful_headers
+    assert "eliminated_by_filter_min_shift" not in headers
+    columns = {header: index + 1 for index, header in enumerate(headers)}
+    assert sheet.cell(2, columns["PnL/30"]).value is not None
+    assert sheet.cell(2, columns["DD"]).value == 0
+    assert sheet.cell(2, columns["Lots"]).value == "100"
+    assert sheet.cell(2, columns["Points"]).value == "12"
+    assert sheet.cell(2, columns["MA"]).value == "7"
+    assert sheet.cell(2, columns["Close"]).value == 3
+    assert not any(cell.data_type == "f" for worksheet in workbook.worksheets for row in worksheet.iter_rows() for cell in row)
+    imported = controller.strategies_performance_v2_finalist_retest_control_import(issued)
+    assert imported["group_count"] == imported["row_count"] == 1
 
 
 def test_finalist_retest_start_rejects_client_member_ids_before_io(tmp_path: Path) -> None:
@@ -962,6 +1125,32 @@ def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_pa
         )
         assert connection.execute("select count(*) from selection_results").fetchone() == (1,)
         assert connection.execute("select count(*) from selection_review_imports").fetchone() == (1,)
+
+
+def test_selection_http_missing_cache_returns_typed_json_without_xlsx(tmp_path: Path) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST", "/api/v2/strategies/performance-v2/selection",
+            body=json.dumps({"symbol": "BTCUSDT", "side": "LONG", "stages": []}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = response.read()
+        content_type = response.getheader("Content-Type", "")
+        connection.close()
+        assert response.status == 409
+        assert content_type.startswith("application/json")
+        assert not body.startswith(b"PK")
+        document = json.loads(body.decode("utf-8"))
+        assert document["error"]["code"] == "SELECTION_CACHE_INCOMPLETE"
+        assert any(token in document["error"]["message"].casefold() for token in ("cache", "recalculate", "prepare"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_selection_preview_returns_current_stage_counts(tmp_path: Path) -> None:
@@ -1175,7 +1364,7 @@ def test_selection_recalculate_all_skips_pairs_with_ready_facts(tmp_path: Path) 
 def test_selection_xlsx_rejects_incomplete_cache(tmp_path: Path) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
 
-    with pytest.raises(PerformanceV2ApiError, match="recalculation") as raised:
+    with pytest.raises(PerformanceV2ApiError, match="recalculate|recalculation") as raised:
         controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
 
     assert raised.value.code == "SELECTION_CACHE_INCOMPLETE"

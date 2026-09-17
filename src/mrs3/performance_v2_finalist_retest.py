@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import duckdb
-from openpyxl import Workbook, load_workbook
+from openpyxl import load_workbook
 
 from .config import AlgorithmConfig
 from .lots import LotMethod
 from .performance_v2_store import PerformanceV2StoreError, require_performance_v2
+from .performance_v2_selection import SELECTION_REASON_ALIASES
 from .performance_v2_selection_review import effective_selection_decisions
 from .strategy_json import generate_strategy
 
@@ -307,14 +308,31 @@ import_finalist_retest = apply_finalist_retest_outcomes
 
 
 CONTROL_WORKBOOK_SHEETS = ("Candidates", "Groups", "Retest Failures", "_MRS_SELECTION_META")
-CONTROL_CANDIDATE_HEADERS = (
-    "Pair", "Direction", "Strategy ID", "Result ID", "User Status", "User Rank", "RETEST", "Comment",
-    "Auto Status", "Auto Rank", "Auto Analog Of ID", "Analog Of ID", "Auto Reason", "Effective Start", "Effective End", "Score",
-)
 CONTROL_GROUP_HEADERS = (
     "Pair", "Direction", "Frozen Count", "Success Count", "Failure Count", "Auto Status Count",
 )
 CONTROL_FAILURE_HEADERS = ("Pair", "Direction", "Strategy ID", "Strategy", "Result ID", "Reason")
+CONTROL_CANDIDATE_REQUIRED_HEADERS = frozenset({
+    "ID", "Result ID", "Стратегия", "Пара", "Side", "ТФ", "ORD", "Close", "PnL/30", "PnL DD5/30",
+    "Lots", "Points", "MA", "Final", "Auto Status", "User Status", "RETEST", "Analog Of ID", "Comment",
+})
+_CONTROL_CANDIDATE_ALIASES = {
+    "Pair": ("Пара", "Pair"),
+    "Direction": ("Side", "Direction"),
+    "Strategy ID": ("ID", "Strategy ID"),
+    "Result ID": ("Result ID",),
+    "User Status": ("User Status",),
+    "User Rank": ("User Rank",),
+    "RETEST": ("RETEST",),
+    "Comment": ("Comment",),
+    "Auto Status": ("Auto Status",),
+    "Auto Rank": ("Auto Rank",),
+    "Auto Analog Of ID": ("Auto Analog Of ID",),
+    "Analog Of ID": ("Analog Of ID",),
+    "Auto Reason": ("Причина", "Auto Reason"),
+    "Score": ("Final score (Pair+Side)", "Score"),
+}
+_CONTROL_REASON_ALIASES = {alias: reason for reason, alias in SELECTION_REASON_ALIASES.items()}
 
 
 def _control_row_value(row: Mapping[str, object], *keys: str) -> object:
@@ -349,28 +367,46 @@ def _metadata_json(metadata: Mapping[str, object], key: str, default: object = N
         return value
 
 
+def _control_reason(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    prefix, separator, reason = text.partition(". ")
+    if separator and prefix.isdigit():
+        text = reason
+    return _CONTROL_REASON_ALIASES.get(text, text)
+
+
 def write_combined_control_workbook(
     candidates: Sequence[Mapping[str, object]],
     groups: Sequence[Mapping[str, object]] = (),
     failures: Sequence[Mapping[str, object]] = (),
     metadata: Mapping[str, object] | None = None,
     path: Path | None = None,
+    *,
+    candidate_workbook: bytes,
 ) -> Path:
     """Write the fixed, reviewable bulk control workbook atomically."""
     candidate_rows = _control_records(candidates)
     group_rows = _control_records(groups)
     failure_rows = _control_records(failures)
-    workbook = Workbook()
-    first = workbook.active
-    first.title = "Candidates"
-    sheets = {name: (first if name == "Candidates" else workbook.create_sheet(name)) for name in CONTROL_WORKBOOK_SHEETS}
-    for name, headers in (
-        ("Candidates", CONTROL_CANDIDATE_HEADERS),
-        ("Groups", CONTROL_GROUP_HEADERS),
-        ("Retest Failures", CONTROL_FAILURE_HEADERS),
-    ):
-        sheet = workbook[name]
+    workbook = load_workbook(BytesIO(candidate_workbook))
+    if "All candidates" not in workbook.sheetnames:
+        raise FinalistRetestError("CONTROL_SCHEMA_MISMATCH")
+    workbook["All candidates"].title = "Candidates"
+    for name in tuple(workbook.sheetnames):
+        if name != "Candidates":
+            del workbook[name]
+    sheets = {"Candidates": workbook["Candidates"]}
+    for name, headers in (("Groups", CONTROL_GROUP_HEADERS), ("Retest Failures", CONTROL_FAILURE_HEADERS)):
+        sheet = workbook.create_sheet(name)
         sheet.append(list(headers))
+        sheets[name] = sheet
+    meta = workbook.create_sheet("_MRS_SELECTION_META")
+    sheets["_MRS_SELECTION_META"] = meta
+
+    # The canonical renderer already wrote the full Candidates rows.  The
+    # control rows below remain the source of truth for immutable digests.
     candidate_rows.sort(key=lambda row: (
         str(_control_row_value(row, "Pair", "symbol") or ""),
         str(_control_row_value(row, "Direction", "side") or ""),
@@ -384,19 +420,6 @@ def write_combined_control_workbook(
         if key in seen:
             raise FinalistRetestError("CONTROL_ROWSET_DUPLICATE", "combined workbook contains duplicate candidates")
         seen.add(key)
-        values = [
-            _control_row_value(row, "Pair", "symbol"), _control_row_value(row, "Direction", "side"),
-            strategy_id, result_id,
-            _control_row_value(row, "User Status", "user_status", "effective_status"),
-            _control_row_value(row, "User Rank", "user_rank"), _control_row_value(row, "RETEST", "retest"),
-            _control_row_value(row, "Comment", "comment"),
-            _control_row_value(row, "Auto Status", "auto_status"), _control_row_value(row, "Auto Rank", "auto_rank"),
-            _control_row_value(row, "Auto Analog Of ID", "auto_analog_of_strategy_id"), _control_row_value(row, "Analog Of ID", "analog_of_strategy_id"),
-            _control_row_value(row, "Auto Reason", "auto_reason", "elimination_reason"),
-            _control_row_value(row, "Effective Start", "effective_start"), _control_row_value(row, "Effective End", "effective_end"),
-            _control_row_value(row, "Score", "score", "final_score"),
-        ]
-        sheets["Candidates"].append(values)
     for row in sorted(group_rows, key=lambda item: (str(_control_row_value(item, "Pair", "symbol") or ""), str(_control_row_value(item, "Direction", "side") or ""))):
         sheets["Groups"].append([
             _control_row_value(row, "Pair", "symbol"), _control_row_value(row, "Direction", "side"),
@@ -410,7 +433,6 @@ def write_combined_control_workbook(
             _control_row_value(row, "Strategy ID", "strategy_id"), _control_row_value(row, "Strategy", "strategy_name"),
             _control_row_value(row, "Result ID", "result_id"), _control_row_value(row, "Reason", "reason"),
         ])
-    meta = sheets["_MRS_SELECTION_META"]
     for key, value in sorted((metadata or {}).items(), key=lambda item: str(item[0])):
         meta.append([str(key), _control_metadata_value(value)])
     meta.sheet_state = "veryHidden"
@@ -433,12 +455,17 @@ def combined_control_workbook_bytes(
     groups: Sequence[Mapping[str, object]] = (),
     failures: Sequence[Mapping[str, object]] = (),
     metadata: Mapping[str, object] | None = None,
+    *,
+    candidate_workbook: bytes,
 ) -> bytes:
     """Build control bytes before any database write."""
     import tempfile
 
     with tempfile.TemporaryDirectory() as directory:
-        path = write_combined_control_workbook(candidates, groups, failures, metadata, Path(directory) / "control.xlsx")
+        path = write_combined_control_workbook(
+            candidates, groups, failures, metadata, Path(directory) / "control.xlsx",
+            candidate_workbook=candidate_workbook,
+        )
         return path.read_bytes()
 
 
@@ -461,11 +488,37 @@ def validate_combined_control_workbook(data: bytes) -> tuple[dict[str, object], 
             raise FinalistRetestError("CONTROL_SCHEMA_MISMATCH")
         if any(cell.data_type == "f" for sheet in workbook.worksheets for row in sheet.iter_rows() for cell in row):
             raise FinalistRetestError("CONTROL_FORMULA_FORBIDDEN")
-        expected = {
-            "Candidates": CONTROL_CANDIDATE_HEADERS, "Groups": CONTROL_GROUP_HEADERS, "Retest Failures": CONTROL_FAILURE_HEADERS,
-        }
         parsed: dict[str, list[dict[str, object]]] = {}
-        for name, headers in expected.items():
+        candidate_sheet = workbook["Candidates"]
+        candidate_headers = tuple(cell.value for cell in candidate_sheet[1])
+        if len(candidate_headers) != len(set(candidate_headers)) or any(
+            sum(alias in candidate_headers for alias in aliases) > 1
+            for aliases in _CONTROL_CANDIDATE_ALIASES.values()
+        ):
+            raise FinalistRetestError("CONTROL_SCHEMA_MISMATCH")
+        if not CONTROL_CANDIDATE_REQUIRED_HEADERS.issubset(candidate_headers):
+            raise FinalistRetestError("CONTROL_SCHEMA_MISMATCH")
+        candidate_indexes = {
+            name: next((candidate_headers.index(alias) for alias in aliases if alias in candidate_headers), None)
+            for name, aliases in _CONTROL_CANDIDATE_ALIASES.items()
+        }
+        for required in ("Pair", "Direction", "Strategy ID", "Result ID", "User Status", "User Rank", "RETEST", "Comment", "Auto Status", "Auto Rank", "Auto Analog Of ID", "Analog Of ID", "Auto Reason", "Score"):
+            if candidate_indexes[required] is None:
+                raise FinalistRetestError("CONTROL_SCHEMA_MISMATCH")
+        candidate_rows: list[dict[str, object]] = []
+        for values in candidate_sheet.iter_rows(min_row=2, values_only=True):
+            if all(value is None for value in values):
+                continue
+            if any(isinstance(value, str) and value.startswith("=") for value in values):
+                raise FinalistRetestError("CONTROL_FORMULA_FORBIDDEN")
+            parsed_row = {
+                name: values[index] if index is not None and index < len(values) else None
+                for name, index in candidate_indexes.items()
+            }
+            parsed_row["Auto Reason"] = _control_reason(parsed_row["Auto Reason"])
+            candidate_rows.append(parsed_row)
+        parsed["Candidates"] = candidate_rows
+        for name, headers in (("Groups", CONTROL_GROUP_HEADERS), ("Retest Failures", CONTROL_FAILURE_HEADERS)):
             sheet = workbook[name]
             actual = tuple(cell.value for cell in sheet[1])
             if actual != headers:
@@ -536,7 +589,7 @@ def validate_combined_control_workbook(data: bytes) -> tuple[dict[str, object], 
         for item in parsed["Candidates"]:
             immutable.append({key: item.get(key) for key in (
                 "Pair", "Direction", "Strategy ID", "Result ID", "Auto Status", "Auto Rank",
-                "Auto Analog Of ID", "Auto Reason", "Effective Start", "Effective End", "Score",
+                "Auto Analog Of ID", "Auto Reason", "Score",
             )})
         if metadata.get("immutable_content_sha256") is not None and str(metadata["immutable_content_sha256"]) != canonical_digest(immutable):
             raise FinalistRetestError("CONTROL_IMMUTABLE_FIELDS_CHANGED")
@@ -682,9 +735,8 @@ def import_combined_control_workbook(
     """Apply a server-issued combined workbook after exact provenance checks.
 
     Workbooks produced by the finalist retest exporter carry exact selection
-    run IDs and immutable rowset digests.  The old hand-authored workbook shape
-    remains accepted for the ordinary compatibility tests and is delegated to
-    the historical implementation above.
+    run IDs and immutable rowset digests.  Canonical rich Candidates workbooks
+    without those optional provenance keys use the historical import path.
     """
     metadata, rows, groups, failures = validate_combined_control_workbook(data)
     if "group_run_ids_json" not in metadata:
@@ -846,7 +898,7 @@ def import_combined_control_workbook(
             if normalized(row["Auto Status"]) != normalized(snap[2]) or normalized(row["Auto Rank"]) != normalized(snap[4]) or normalized(row["Auto Reason"]) != normalized(snap[5]) or normalized(row["Auto Analog Of ID"]) != normalized(snap[6]) or not score_matches:
                 raise FinalistRetestError("CONTROL_IMMUTABLE_FIELDS_CHANGED")
             exact_rows.append({key_name: row.get(key_name) for key_name in (
-                "Pair", "Direction", "Strategy ID", "Result ID", "Auto Status", "Auto Rank", "Auto Analog Of ID", "Auto Reason", "Effective Start", "Effective End", "Score",
+                "Pair", "Direction", "Strategy ID", "Result ID", "Auto Status", "Auto Rank", "Auto Analog Of ID", "Auto Reason", "Score",
             )})
         exact_rowsets[key] = exact_rows
         prepared.append((symbol, side, group, snapshot, run_id))

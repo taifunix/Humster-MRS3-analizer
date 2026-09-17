@@ -240,6 +240,23 @@ from .runner.workflow import BatchPlan, _load_saved_result_evidence, _load_saved
 from .error_sanitization import has_local_path
 
 
+def _control_score(value: object) -> object:
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        number = Decimal(str(value))
+    except (ArithmeticError, ValueError):
+        return value
+    if not number.is_finite():
+        return None
+    return int(number) if number == number.to_integral_value() else float(number)
+
+
 _DIRECT_MATERIALIZER_VERSION = CANONICAL_MATERIALIZER_VERSION
 _DIRECT_POINT_CONFIG_HASH = canonical_point_materialization_config_hash(tuple(AlgorithmConfig().canonical_shifts_bp))
 _TESTER_START_PATTERN = re.compile(r"^\[RUN (\d+)/(\d+)\] start\.")
@@ -4142,6 +4159,34 @@ class PanelController:
 
     strategies_performance_v2_bulk_retest_import = strategies_performance_v2_finalist_retest_import
 
+    def _finalist_control_candidate_workbook(
+        self,
+        rows: Sequence[Mapping[str, object]],
+        request: SelectionRequest,
+    ) -> bytes:
+        normalized_rows = []
+        for source in rows:
+            row = dict(source)
+            for field in ("user_rank", "auto_rank", "final_rank"):
+                row[field] = _control_score(row.get(field))
+            normalized_rows.append(row)
+        reviews = {
+            int(row["strategy_id"]): {
+                "user_status": row.get("user_status"),
+                "user_rank": row.get("user_rank"),
+                "user_analog_of_strategy_id": row.get("user_analog_of_strategy_id"),
+                "comment": row.get("comment"),
+            }
+            for row in normalized_rows
+            if row.get("strategy_id") is not None
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_selection_workbook(
+                pd.DataFrame(normalized_rows), Path(directory) / "candidates.xlsx", request,
+                {"workbook_schema_version": "2"}, reviews,
+            )
+            return path.read_bytes()
+
     def _export_current_effective_finalist_control(self, include_reserve: bool) -> tuple[str, bytes]:
         if type(include_reserve) is not bool:
             raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
@@ -4161,8 +4206,32 @@ class PanelController:
             specs: list[dict[str, object]] = []
             for (symbol, side), group_members in sorted(grouped.items()):
                 origin_runs = {str(member["selection_run_id"]) for member in group_members}
+                request = SelectionRequest(symbol, side, ())
+                if not selection_cache_status(connection, request, selection_config).get("ready"):
+                    raise FinalistRetestError(
+                        "SELECTION_CACHE_INCOMPLETE",
+                        "selection cache is not ready; prepare or recalculate it before exporting the control workbook",
+                    )
+                loaded = load_selection_candidates(connection, request, selection_config, cache_only=True)
+                canonical_by_strategy = {
+                    int(item["strategy_id"]): dict(item)
+                    for item in loaded.to_dict(orient="records")
+                    if item.get("strategy_id") is not None
+                }
+                for member in group_members:
+                    canonical = canonical_by_strategy.get(int(member["strategy_id"]))
+                    try:
+                        canonical_result_id = int(canonical["result_id"]) if canonical is not None else None
+                    except (TypeError, ValueError, OverflowError):
+                        canonical_result_id = None
+                    if canonical_result_id != int(member["result_id"]):
+                        raise FinalistRetestError(
+                            "CONTROL_CANONICAL_ROW_MISMATCH",
+                            f"selection cache does not match the current result for {symbol}/{side}; "
+                            "recalculate the selection cache before exporting the control workbook",
+                        )
                 snapshots: dict[tuple[str, int], tuple[object, ...]] = {}
-                reviewed: dict[tuple[str, int], tuple[object, object, object]] = {}
+                reviewed: dict[tuple[str, int], tuple[object, object, object, object]] = {}
                 for origin_run_id in origin_runs:
                     snapshots.update({
                         (origin_run_id, int(row[0])): row
@@ -4178,9 +4247,9 @@ class PanelController:
                     ).fetchone()
                     if review:
                         reviewed.update({
-                            (origin_run_id, int(row[0])): (row[1], row[2], row[3])
+                            (origin_run_id, int(row[0])): (row[1], row[2], row[3], row[4])
                             for row in connection.execute(
-                                "select strategy_id, user_status, user_rank, comment from selection_review_rows where review_import_id = ?", [review[0]]
+                                "select strategy_id, user_status, user_rank, user_analog_of_strategy_id, comment from selection_review_rows where review_import_id = ?", [review[0]]
                             ).fetchall()
                         })
                 records: list[dict[str, object]] = []
@@ -4192,31 +4261,38 @@ class PanelController:
                     reviewed_row = reviewed.get(origin_key)
                     auto_status = snap[2] if snap else member["effective_status"]
                     auto_score = snap[3] if snap else None
-                    auto_rank = snap[4] if snap else None
+                    auto_rank = _control_score(snap[4]) if snap else None
                     auto_reason = snap[5] if snap else None
                     auto_analog = snap[6] if snap else None
                     user_status = reviewed_row[0] if reviewed_row else member["effective_status"]
-                    user_rank = reviewed_row[1] if reviewed_row else member.get("effective_rank")
-                    comment = reviewed_row[2] if reviewed_row else None
+                    user_rank = _control_score(reviewed_row[1] if reviewed_row else member.get("effective_rank"))
+                    user_analog = reviewed_row[2] if reviewed_row else None
+                    comment = reviewed_row[3] if reviewed_row else None
                     records.append({
                         "strategy_id": strategy_id, "result_id": int(member["result_id"]), "auto_status": str(auto_status),
                         "final_score": auto_score, "final_rank": auto_rank, "elimination_reason": auto_reason,
                         "auto_analog_of_strategy_id": auto_analog, "prior_rejected": False,
                     })
-                    workbook_row = {
+                    canonical = canonical_by_strategy.get(strategy_id, {}).copy()
+                    canonical.update({
                         "symbol": symbol, "side": side, "strategy_id": strategy_id, "result_id": int(member["result_id"]),
                         "user_status": user_status, "user_rank": user_rank, "retest": None, "comment": comment,
+                        "user_analog_of_strategy_id": user_analog,
                         "auto_status": auto_status, "auto_rank": auto_rank, "auto_analog_of_strategy_id": auto_analog,
                         "auto_reason": auto_reason, "effective_start": _json_value(member.get("effective_start")),
                         "effective_end": _json_value(member.get("effective_end")),
-                        "score": None if auto_score is None else str(auto_score),
-                    }
-                    workbook_rows.append(workbook_row)
+                        "final_score": _control_score(auto_score), "final_rank": auto_rank,
+                        "score": _control_score(auto_score),
+                        "elimination_reason": auto_reason, "finalist": auto_status in {"FINALIST", "RESERVE"},
+                    })
+                    workbook_rows.append(canonical)
                 specs.append({
                     "symbol": symbol, "side": side, "rows": workbook_rows, "result": pd.DataFrame(records),
                     "request": SelectionRequest(symbol, side, ()), "run_id": str(uuid.uuid4()),
                 })
         candidates = [row for spec in specs for row in spec["rows"]]
+        if not specs or not candidates:
+            raise FinalistRetestError("COHORT_EMPTY", "there are no current effective finalists")
         groups = [{
             "symbol": spec["symbol"], "side": spec["side"], "frozen_count": len(spec["rows"]),
             "success_count": len(spec["rows"]), "failure_count": 0,
@@ -4226,7 +4302,7 @@ class PanelController:
         workbook_names = {
             "Pair": "symbol", "Direction": "side", "Strategy ID": "strategy_id", "Result ID": "result_id",
             "Auto Status": "auto_status", "Auto Rank": "auto_rank", "Auto Analog Of ID": "auto_analog_of_strategy_id",
-            "Auto Reason": "auto_reason", "Effective Start": "effective_start", "Effective End": "effective_end", "Score": "score",
+            "Auto Reason": "auto_reason", "Score": "score",
         }
         exact_rowsets = {
             f"{spec['symbol']}|{spec['side']}": [
@@ -4247,7 +4323,10 @@ class PanelController:
             "groups_sha256": canonical_digest(group_digest_rows), "failures_sha256": canonical_digest([]),
             "selection_config_sha256": canonical_digest(asdict(selection_config)),
         }
-        data = combined_control_workbook_bytes(candidates, groups, (), metadata)
+        candidate_workbook = self._finalist_control_candidate_workbook(
+            candidates, SelectionRequest(str(candidates[0]["symbol"]), str(candidates[0]["side"]), ()),
+        )
+        data = combined_control_workbook_bytes(candidates, groups, (), metadata, candidate_workbook=candidate_workbook)
         snapshots = [{
             "request": spec["request"], "config": selection_config, "result": spec["result"],
             "metadata": {"selection_run_id": spec["run_id"], "database_instance_id": instance, "selection_contract_version": "performance-v2-selection-review-v1"},
@@ -4357,12 +4436,15 @@ class PanelController:
                         if member is None:
                             continue
                         rows.append({
+                            **raw,
                             "symbol": symbol, "side": side, "strategy_id": strategy_id,
                             "result_id": int(raw["result_id"]), "user_status": member.get("effective_status"),
                             "user_rank": None, "retest": None, "comment": None,
-                            "auto_status": raw.get("auto_status"), "auto_rank": raw.get("final_rank"),
+                            "user_analog_of_strategy_id": None,
+                            "auto_status": raw.get("auto_status"), "auto_rank": _control_score(raw.get("final_rank")),
                             "auto_analog_of_strategy_id": raw.get("auto_analog_of_strategy_id"),
-                            "auto_reason": raw.get("elimination_reason"), "score": raw.get("final_score"),
+                            "auto_reason": raw.get("elimination_reason"), "score": _control_score(raw.get("final_score")),
+                            "final_score": _control_score(raw.get("final_score")), "finalist": bool(raw.get("finalist")),
                             "effective_start": member.get("effective_start"), "effective_end": member.get("effective_end"),
                         })
                     run_specs.append({
@@ -4379,6 +4461,8 @@ class PanelController:
             raise FinalistRetestError(str(error)) from error
 
         candidates = [row for spec in run_specs for row in spec["rows"]]
+        if not run_specs or not candidates:
+            raise FinalistRetestError("RETEST_COHORT_NO_SUCCESSFUL_MEMBERS")
         groups: list[dict[str, object]] = []
         all_failures: list[dict[str, object]] = []
         failures_by_group: dict[tuple[str, str], list[dict[str, object]]] = {}
@@ -4412,7 +4496,7 @@ class PanelController:
         workbook_names = {
             "Pair": "symbol", "Direction": "side", "Strategy ID": "strategy_id", "Result ID": "result_id",
             "Auto Status": "auto_status", "Auto Rank": "auto_rank", "Auto Analog Of ID": "auto_analog_of_strategy_id",
-            "Auto Reason": "auto_reason", "Effective Start": "effective_start", "Effective End": "effective_end", "Score": "score",
+            "Auto Reason": "auto_reason", "Score": "score",
         }
         exact_rowsets = {
             key: [
@@ -4444,7 +4528,13 @@ class PanelController:
         }
         with duckdb.connect(str(target), read_only=True) as connection:
             metadata["database_instance_id"] = connection.execute("select value from schema_info where key='database_instance_id'").fetchone()[0]
-        data = combined_control_workbook_bytes(candidates, groups, all_failures, metadata)
+        candidate_workbook = self._finalist_control_candidate_workbook(
+            candidates,
+            SelectionRequest(str(candidates[0]["symbol"]), str(candidates[0]["side"]), ()),
+        )
+        data = combined_control_workbook_bytes(
+            candidates, groups, all_failures, metadata, candidate_workbook=candidate_workbook,
+        )
         snapshots = []
         for spec in run_specs:
             snapshot_metadata = {
@@ -4494,7 +4584,10 @@ class PanelController:
                 connection.execute(f"set threads to {performance_config.workers}")
                 require_performance_v2(connection)
                 if not selection_cache_status(connection, request, selection_config)["ready"]:
-                    raise PerformanceV2ApiError("SELECTION_CACHE_INCOMPLETE", status=409, message="Selection facts require recalculation")
+                    raise PerformanceV2ApiError(
+                        "SELECTION_CACHE_INCOMPLETE", status=409,
+                        message="Selection cache is not ready; prepare or recalculate it before exporting XLSX",
+                    )
                 result_token = tuple(connection.execute(
                     """select s.strategy_id, s.current_result_id from strategies s
                          join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
@@ -7430,7 +7523,18 @@ class _PanelHandler(BaseHTTPRequestHandler):
                     if raw not in {"true", "false"}:
                         raise ValueError("include_reserve must be true or false")
                     filename, data = self.server.controller.strategies_performance_v2_finalist_retest_export({"include_reserve": raw == "true"})
-            except (KeyError, ValueError, FinalistRetestError):
+            except FinalistRetestError as error:
+                safe_messages = {
+                    "SELECTION_CACHE_INCOMPLETE": "selection cache is not ready; prepare or recalculate it before exporting the control workbook",
+                    "CONTROL_CANONICAL_ROW_MISMATCH": "selection cache does not match current results; recalculate the selection cache before exporting the control workbook",
+                }
+                message = safe_messages.get(error.code)
+                if message is None:
+                    self._json(409, {"error": {"code": "CONTROL_EXPORT_UNAVAILABLE", "message": "bulk control workbook is unavailable"}})
+                else:
+                    self._json(409, {"error": {"code": error.code, "message": message}})
+                return
+            except (KeyError, ValueError):
                 self._json(409, {"error": {"code": "CONTROL_EXPORT_UNAVAILABLE", "message": "bulk control workbook is unavailable"}})
                 return
             self.send_response(200)
