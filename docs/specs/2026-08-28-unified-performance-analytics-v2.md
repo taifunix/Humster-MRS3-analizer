@@ -131,6 +131,10 @@ size, post_size, post_side, pnl, fee, balance
 retained only for report fields not represented by the typed schema; it is not
 a replacement for typed window inputs.
 
+The additive schema-v5 Phase 8 enrichment for optional Price/Cost, exact WS1.1
+sizing settings and revision-bound prepared optimizer inputs is defined in
+[Performance v2 optimizer prepared inputs](2026-09-17-performance-v2-optimizer-prepared-inputs.md).
+
 Minimal import-run/file evidence remains for transaction audit and guarded HTML
 cleanup. It must not duplicate the full strategy JSON or become an analytics
 source.

@@ -71,7 +71,7 @@ def _database(tmp_path: Path) -> Path:
                 [strategy_id],
             )
             connection.execute(
-                "insert into strategy_actions values (?, 0, ?, 'BTCUSDT', 1, 'opened', 1, 1, 'LONG', 0, 0, 100, '{}')",
+                "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, 0, ?, 'BTCUSDT', 1, 'opened', 1, 1, 'LONG', 0, 0, 100, '{}')",
                 [result_id, report_end],
             )
             connection.execute(

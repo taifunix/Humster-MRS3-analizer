@@ -274,6 +274,25 @@ def test_add_publishes_multiple_strategies_and_one_current_result_each(tmp_path:
     assert snapshot
 
 
+def test_equity_batch_flush_uses_schema_columns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    request, _ = _request(tmp_path)
+    monkeypatch.setattr(import_module, "_APPEND_BATCH_ROWS", 1)
+
+    result = import_performance_v2(request)
+
+    assert result.imported_count == 1
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        result_id = connection.execute("select current_result_id from strategies").fetchone()[0]
+        action_count, equity_count = connection.execute(
+            """select
+                   (select count(*) from strategy_actions where result_id = ?),
+                   (select count(*) from strategy_equity where result_id = ?)""",
+            [result_id, result_id],
+        ).fetchone()
+        assert action_count > 0
+        assert equity_count > 0
+
+
 def test_import_persists_allowlisted_source_metadata_and_existing_action_slot(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
     _rewrite_report(request, _report_with_source_metadata())
@@ -284,6 +303,13 @@ def test_import_persists_allowlisted_source_metadata_and_existing_action_slot(tm
         result_id, imported_at, metadata = connection.execute(
             "select result_id, imported_at_utc, optimizer_source_metadata_json from strategy_results"
         ).fetchone()
+        typed_price, typed_cost, typed_upnl, typed_frozen, typed_risk, typed_max = connection.execute(
+            """select a.price, a.cost, r.sizing_use_upnl, r.sizing_use_frozen_balance,
+                      r.sizing_risk_long, r.sizing_max_balance
+                 from strategy_actions a join strategy_results r on r.result_id = a.result_id
+                where a.result_id = ? order by a.action_index limit 1""",
+            [result_id],
+        ).fetchone()
         columns = [row[0] for row in connection.execute(
             "select column_name from information_schema.columns where table_name = 'strategy_actions' order by ordinal_position"
         ).fetchall()]
@@ -293,12 +319,16 @@ def test_import_persists_allowlisted_source_metadata_and_existing_action_slot(tm
 
     assert columns == [
         "result_id", "action_index", "timestamp_utc", "symbol", "order_id", "action", "size",
-        "post_size", "post_side", "pnl", "fee", "balance", "raw_action_json",
+        "post_size", "post_side", "pnl", "fee", "balance", "price", "cost", "raw_action_json",
     ]
     assert json.loads(action_payload) == {
         "cost": "4.5600", "price": "1.2300", "price_cost_semantics": "actual_fill_not_planned_position",
         "schema_version": 1,
     }
+    assert (typed_price, typed_cost) == (Decimal("1.2300"), Decimal("4.5600"))
+    assert (typed_upnl, typed_frozen, typed_risk, typed_max) == (
+        True, True, Decimal("1.500000000000"), Decimal("200.000000000000")
+    )
     decoded = decode_optimizer_source_metadata(metadata, imported_at)
     assert decoded is not None
     assert decoded["settings"] == {
@@ -306,6 +336,87 @@ def test_import_persists_allowlisted_source_metadata_and_existing_action_slot(tm
         "exchange": {"use_frozen_balance": True, "use_upnl": True},
     }
     assert "must-not-save" not in metadata
+
+
+def test_import_persists_phase8_typed_facts_and_one_prepared_status(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+
+    assert import_performance_v2(request).imported_count == 1
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        result_id, action_price, action_cost, sizing = connection.execute(
+            """select r.result_id, a.price, a.cost, r.sizing_use_upnl
+               from strategy_results r join strategy_actions a on a.result_id = r.result_id
+               order by a.action_index limit 1"""
+        ).fetchone()
+        prepared = connection.execute(
+            """select availability_status, unavailable_reason, preparation_version,
+                      source_digest, prepared_json
+                 from optimizer_prepared_inputs where result_id = ?""",
+            [result_id],
+        ).fetchone()
+
+    assert action_price is None and action_cost is None
+    assert sizing is True
+    assert prepared[0:3] == ("UNAVAILABLE", "MISSING_TYPED_FACTS", "5")
+    assert isinstance(prepared[3], str) and len(prepared[3]) == 64
+    assert prepared[4] is None
+
+
+def test_import_persists_available_prepared_artifact_and_digest(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    report = FIXTURE.read_bytes()
+    report = report.replace(
+        b'"use_upnl":true}',
+        b'"use_upnl":true,"use_frozen_balance":true}',
+        1,
+    ).replace(
+        b'"use_short":false}',
+        b'"use_short":false,"use_fix":false,"balance_percentage_long":100,"risk_long":1,"max_balance":0}',
+        1,
+    )
+    report = report.replace(
+        b"<th>Action</th><th>Fee</th>",
+        b"<th>Action</th><th>Price</th><th>Cost</th><th>Fee</th>",
+    ).replace(
+        b"<td>opened</td><td>0.05</td>",
+        b"<td>opened</td><td>1.2300</td><td>4.5600</td><td>0.05</td>",
+    ).replace(
+        b"<td>closed</td><td>0.05</td>",
+        b"<td>closed</td><td>1.2300</td><td>4.5600</td><td>0.05</td>",
+    )
+    _rewrite_report(request, report)
+
+    assert import_performance_v2(request).imported_count == 1
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        status, reason, digest, payload = connection.execute(
+            "select availability_status, unavailable_reason, source_digest, prepared_json from optimizer_prepared_inputs"
+        ).fetchone()
+
+    assert (status, reason) == ("AVAILABLE", None)
+    assert isinstance(digest, str) and len(digest) == 64
+    assert isinstance(payload, str) and len(payload.encode("utf-8")) <= 16 * 1024 * 1024
+
+
+def test_over_scale_price_keeps_exact_raw_provenance_when_typed_value_is_null(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    report = _report_with_source_metadata()
+    report = report.replace(b"1.2300", b"1.2345678901234", 1).replace(b"4.5600", b"4.5678901234567", 1)
+    _rewrite_report(request, report)
+
+    assert import_performance_v2(request).imported_count == 1
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        typed_price, typed_cost, raw_action, status, reason = connection.execute(
+            """select a.price, a.cost, a.raw_action_json, p.availability_status, p.unavailable_reason
+                 from strategy_actions a
+                 join optimizer_prepared_inputs p on p.result_id = a.result_id
+                order by a.action_index limit 1"""
+        ).fetchone()
+
+    assert typed_price is None
+    assert typed_cost is None
+    assert json.loads(raw_action)["price"] == "1.2345678901234"
+    assert json.loads(raw_action)["cost"] == "4.5678901234567"
+    assert (status, reason) == ("UNAVAILABLE", "MISSING_TYPED_FACTS")
 
 
 def test_source_metadata_keeps_invalid_field_evidence_with_legacy_exchange_setting() -> None:

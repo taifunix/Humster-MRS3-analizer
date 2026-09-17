@@ -30,10 +30,16 @@ from mrs3.portfolio.input import (
     prepare_weighted_input,
     resolve_common_pretest_period,
     _cycle_records,
+    _PreparedResultRow,
 )
 from mrs3.portfolio.store import PortfolioStore
 from tests.test_performance_v2_selection import _candidate_db
 from mrs3.portfolio.reports import PositionCycle
+from mrs3.performance_v2_optimizer import (
+    OptimizerSourceInput,
+    build_prepared_input,
+    prepare_current_optimizer_inputs,
+)
 
 
 REQUEST = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
@@ -90,9 +96,13 @@ def _database(tmp_path: Path) -> Path:
     connection.execute(
         """update strategy_results set reported_start_utc = report_start_utc,
            reported_end_utc = report_end_utc, effective_start_utc = report_start_utc,
-           effective_end_utc = report_end_utc where result_id = ?""",
+           effective_end_utc = report_end_utc, sizing_use_upnl = true,
+           sizing_use_frozen_balance = true, sizing_use_fix = false,
+           sizing_balance_percentage_long = 100, sizing_risk_long = 1,
+           sizing_max_balance = 0 where result_id = ?""",
         [result_id],
     )
+    connection.execute("update strategy_actions set price = 10, cost = 10")
     selection_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
     _add_review(
         connection,
@@ -106,6 +116,7 @@ def _database(tmp_path: Path) -> Path:
         selection_time=selection_time,
     )
     connection.close()
+    prepare_current_optimizer_inputs(str(tmp_path / "strategy_performance.duckdb"), [result_id])
     return tmp_path / "strategy_performance.duckdb"
 
 
@@ -492,7 +503,7 @@ def test_snapshot_assembly_wraps_generic_errors_and_preserves_coded_errors(tmp_p
 def test_snapshot_contains_full_candidate_source_and_digest(tmp_path: Path) -> None:
     snapshot = _snapshot(_database(tmp_path), [REQUEST])
 
-    assert snapshot.source_schema_version == "4"
+    assert snapshot.source_schema_version == "5"
     assert snapshot.database_kind == "unified_performance_v2"
     assert snapshot.database_instance_id
     assert snapshot.candidates[0]["result_id"]
@@ -607,7 +618,7 @@ def test_series_keep_source_ordinals_per_result_identity(tmp_path: Path) -> None
         )
         connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
         connection.executemany(
-            "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [(result_id, 0, start, "BTCUSDT", 1, "closed", 1, 0, "", 0, 0, 100, None), (result_id, 1, datetime(2026, 1, 2, tzinfo=timezone.utc), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 0, 100, None), (result_id, 2, datetime(2026, 1, 3, tzinfo=timezone.utc), "BTCUSDT", 1, "closed", 1, 0, "", 10, 2, 110, None)],
         )
         connection.executemany(
@@ -698,7 +709,7 @@ def test_current_result_replacement_same_strategy_changes_input_digest(tmp_path:
             ],
         )
         connection.executemany(
-            "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (result_id, 0, start, "BTCUSDT", 1, "closed", 1, 0, "", 0, 0, 100, None),
                 (result_id, 1, datetime(2026, 1, 4, tzinfo=timezone.utc), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 0, 100, None),
@@ -868,6 +879,63 @@ def test_read_current_finalists_returns_exact_review_facts_without_writes(tmp_pa
         "user_rank": 1,
     } == rows[0]
     assert database.read_bytes() == before
+
+
+def test_read_current_finalists_include_series_uses_one_read_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _database(tmp_path)
+    calls: list[bool] = []
+    original_connect = portfolio_input.duckdb.connect
+
+    def tracked_connect(*args, **kwargs):
+        calls.append(kwargs.get("read_only", False))
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(portfolio_input.duckdb, "connect", tracked_connect)
+
+    rows = read_current_finalists(database, [("BTCUSDT", "LONG")], include_series=True)
+
+    assert rows[0]["actions"]
+    assert rows[0]["equity"]
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "stale", "unavailable"])
+def test_read_current_finalists_include_series_uses_one_snapshot_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        result_id = connection.execute("select current_result_id from strategies").fetchone()[0]
+        if mutation == "missing":
+            connection.execute("delete from optimizer_prepared_inputs where result_id = ?", [result_id])
+        elif mutation == "stale":
+            connection.execute(
+                "update optimizer_prepared_inputs set source_digest = ? where result_id = ?",
+                ["0" * 64, result_id],
+            )
+        else:
+            connection.execute(
+                """update optimizer_prepared_inputs
+                   set availability_status = 'UNAVAILABLE', unavailable_reason = 'MISSING_TYPED_FACTS',
+                       prepared_json = null where result_id = ?""",
+                [result_id],
+            )
+    calls: list[bool] = []
+    original_connect = portfolio_input.duckdb.connect
+
+    def tracked_connect(*args, **kwargs):
+        calls.append(kwargs.get("read_only", False))
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(portfolio_input.duckdb, "connect", tracked_connect)
+
+    with pytest.raises(PortfolioInputError) as error:
+        read_current_finalists(database, [("BTCUSDT", "LONG")], include_series=True)
+
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+    assert calls == [True]
 
 
 def test_read_current_finalists_preserves_source_geometry_and_identity(tmp_path: Path) -> None:
@@ -1154,6 +1222,58 @@ def test_common_period_seeds_from_latest_prior_real_sample_and_forward_fills_ini
     assert seeded.available
     assert seeded.daily_paths["A:LONG:1:1"][0]["equity"] == Decimal("100")
     assert seeded.daily_paths["A:LONG:1:1"][0]["seed"] is True
+
+
+def test_legacy_fixture_and_prepared_db_paths_are_exactly_equivalent_for_cycles() -> None:
+    start = "2026-01-01T00:00:00Z"
+    end = "2026-01-15T00:00:00Z"
+    actions = (
+        {"action_index": 0, "timestamp_utc": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT", "order_id": 1, "action": "opened", "size": "2", "post_size": "2", "post_side": "long", "pnl": "0", "fee": "1", "balance": "100", "price": "7", "cost": "8"},
+        {"action_index": 1, "timestamp_utc": "2026-01-02T00:00:00Z", "symbol": "BTCUSDT", "order_id": 1, "action": "closed", "size": "2", "post_size": "0", "post_side": "", "pnl": "20", "fee": "2", "balance": "120", "price": "9", "cost": "18"},
+        {"action_index": 2, "timestamp_utc": "2026-01-03T00:00:00Z", "symbol": "BTCUSDT", "order_id": 2, "action": "opened", "size": "3", "post_size": "3", "post_side": "long", "pnl": "0", "fee": "1", "balance": "120", "price": "11", "cost": "12"},
+        {"action_index": 3, "timestamp_utc": "2026-01-04T00:00:00Z", "symbol": "BTCUSDT", "order_id": 2, "action": "closed", "size": "3", "post_size": "0", "post_side": "", "pnl": "30", "fee": "3", "balance": "150", "price": "13", "cost": "39"},
+    )
+    equity = tuple(
+        {"sample_index": index, "timestamp_utc": timestamp, "equity": value}
+        for index, (timestamp, value) in enumerate(
+            (("2026-01-01T00:00:00Z", "100"), ("2026-01-02T00:00:00Z", "120"),
+             ("2026-01-03T00:00:00Z", "120"), ("2026-01-04T00:00:00Z", "150"),
+             (end, "150"))
+        )
+    )
+    common = {
+        "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 17,
+        "report_start_utc": start, "report_end_utc": end,
+        "effective_start_utc": start, "effective_end_utc": end,
+        "imported_at_utc": "2026-01-15T00:00:00Z", "initial_balance": Decimal("100"),
+        "sizing_use_upnl": True, "sizing_use_frozen_balance": True, "sizing_use_fix": False,
+        "sizing_balance_percentage_long": Decimal("100"), "sizing_risk_long": Decimal("1"),
+        "sizing_max_balance": Decimal("0"), "actions": actions, "equity": equity,
+    }
+    legacy = {**common, "_source_origin": "LEGACY_FIXTURE"}
+    source = OptimizerSourceInput(
+        source_document_version="performance-v2", result_id=17, strategy_id=11,
+        symbol="BTCUSDT", side="LONG", revision_timestamp_utc=common["imported_at_utc"],
+        report_start_utc=start, report_end_utc=end, effective_start_utc=start,
+        effective_end_utc=end, initial_balance=Decimal("100"), sizing_use_upnl=True,
+        sizing_use_frozen_balance=True, sizing_use_fix=False,
+        sizing_balance_percentage_long=Decimal("100"), sizing_risk_long=Decimal("1"),
+        sizing_max_balance=Decimal("0"), actions=actions, equity=equity,
+    )
+    prepared = build_prepared_input(source)
+    prepared_row = _PreparedResultRow({**common, "actions": prepared.actions, "equity": prepared.equity})
+    prepared_row._optimizer_prepared = prepared
+
+    legacy_result = prepare_weighted_input((legacy,), minimum_common_days=1)
+    prepared_result = prepare_weighted_input((prepared_row,), minimum_common_days=1)
+    key = "BTCUSDT:LONG:11:17"
+
+    assert legacy_result.cycles[key] == prepared_result.cycles[key]
+    assert legacy_result.normalized_delta == prepared_result.normalized_delta
+    assert legacy_result.valid == prepared_result.valid
+    assert legacy_result.cycles[key][0]["source_basis"] == Decimal("101")
+    assert legacy_result.cycles[key][1]["source_basis"] == Decimal("121")
+    assert legacy_result.cycles[key][0]["source_basis"] not in {Decimal("7"), Decimal("8")}
 
 
 def test_prepare_weighted_input_uses_dynamic_cycle_basis_and_last_known_equity() -> None:

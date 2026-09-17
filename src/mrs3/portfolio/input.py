@@ -30,6 +30,13 @@ from ..performance_v2_selection import (
 )
 from ..performance_v2_store import require_performance_v2
 from ..performance_v2_store import decode_optimizer_source_metadata
+from ..performance_v2_optimizer import (
+    OptimizerSourceInput,
+    OptimizerIntegrityError,
+    PreparedOptimizerInput,
+    _read_prepared_optimizer_inputs,
+)
+from ..performance_v2_optimizer import _cycle_records as _optimizer_cycle_records
 from ..performance_v2_windows import (
     METRICS_VERSION,
     WindowMetrics,
@@ -173,6 +180,13 @@ class _SourceSeries:
     equity: tuple[Mapping[str, Any], ...]
 
 
+class _PreparedResultRow(dict[str, Any]):
+    """Public result mapping with private prepared state for the adapter."""
+
+    _optimizer_prepared: PreparedOptimizerInput | None = None
+    _source_origin: str = "PERFORMANCE_V2_DB"
+
+
 def _utc(value: object) -> datetime:
     if isinstance(value, datetime):
         result = value
@@ -309,6 +323,8 @@ _DECIMAL_FIELD_TYPES: dict[str, tuple[str, str]] = {
     "pnl_30d_pct": ("percent", "%"),
     "pnl": ("money", "currency"),
     "fee": ("money", "currency"),
+    "price": ("money", "currency"),
+    "cost": ("money", "currency"),
     "balance": ("money", "currency"),
     "wallet": ("money", "currency"),
     "equity": ("money", "currency"),
@@ -323,6 +339,9 @@ _DECIMAL_FIELD_TYPES: dict[str, tuple[str, str]] = {
     "profit_factor": ("ratio", "1"),
     "holding_seconds": ("duration", "seconds"),
     "time_in_market_pct": ("percent", "%"),
+    "sizing_balance_percentage_long": ("percent", "%"),
+    "sizing_risk_long": ("scalar", "1"),
+    "sizing_max_balance": ("money", "currency"),
 }
 for _field in (
     "total_pnl_pct", "max_drawdown_pct", "return_pct", "daily_growth_pct", "fees_pct", "win_rate_pct",
@@ -1224,37 +1243,47 @@ def read_current_finalists(
             order_rows = _records_for_ids(connection, "strategy_orders", "strategy_id", strategy_ids)
             actions_by_result: dict[int, tuple[Mapping[str, Any], ...]] = {}
             equities_by_result: dict[int, tuple[Mapping[str, Any], ...]] = {}
+            prepared_by_result: dict[int, PreparedOptimizerInput] = {}
             if include_series:
-                # Bulk reads keep the optimizer on the read-only snapshot path
-                # and avoid one query per finalist when constructing proxy
-                # paths.  Freeze only the fields consumed by the optimizer;
-                # full DB rows can contain large or irrelevant payloads.
-                action_rows = _records_for_ids(connection, "strategy_actions", "result_id", result_ids)
-                equity_rows = _records_for_ids(connection, "strategy_equity", "result_id", result_ids)
-
-                def _public_series_row(row: Mapping[str, Any], fields: tuple[str, ...]) -> Mapping[str, Any]:
-                    value = {field: row[field] for field in fields if field in row}
-                    if value.get("timestamp_utc") is not None:
-                        value["timestamp_utc"] = _utc(value["timestamp_utc"]).isoformat().replace("+00:00", "Z")
-                    return value
-
-                for result_id in result_ids:
-                    actions_by_result[int(result_id)] = tuple(
-                        _frozen(_public_series_row(row, (
-                            "result_id", "action_index", "timestamp_utc", "symbol", "order_id", "action",
-                            "size", "post_size", "post_side", "pnl", "fee", "balance", "raw_action_json",
-                        )))
-                        for row in sorted(
-                            (item for item in action_rows if int(item.get("result_id")) == int(result_id)),
-                            key=lambda item: (item.get("timestamp_utc"), item.get("action_index")),
-                        )
+                # Imported v5 results use only the strict prepared path.
+                try:
+                    prepared_rows = _read_prepared_optimizer_inputs(connection, result_ids)
+                except OptimizerIntegrityError as error:
+                    raise PortfolioInputError("prepared optimizer input is invalid", code=SOURCE_SNAPSHOT_UNAVAILABLE) from error
+                unavailable = next((item for item in prepared_rows if not item.availability.available), None)
+                if unavailable is not None:
+                    raise PortfolioInputError(
+                        unavailable.availability.reason or SOURCE_SNAPSHOT_UNAVAILABLE,
+                        code=SOURCE_SNAPSHOT_UNAVAILABLE,
                     )
-                    equities_by_result[int(result_id)] = tuple(
-                        _frozen(_public_series_row(row, ("result_id", "sample_index", "timestamp_utc", "equity")))
-                        for row in sorted(
-                            (item for item in equity_rows if int(item.get("result_id")) == int(result_id)),
-                            key=lambda item: (item.get("timestamp_utc"), item.get("sample_index")),
-                        )
+                for item in prepared_rows:
+                    assert item.prepared is not None
+                    prepared_by_result[item.source.result_id] = item.prepared
+
+                def _artifact_row(value: Mapping[str, Any], result_id: int) -> dict[str, Any]:
+                    converted = dict(value)
+                    converted["result_id"] = result_id
+                    for field in (
+                        "size", "price", "cost", "fee", "pnl", "balance", "post_size", "pre_size",
+                        "qty_delta", "equity", "duration_seconds", "realized_pnl", "fees",
+                        "maximum_position", "normalized_pnl", "source_basis",
+                    ):
+                        if converted.get(field) is not None:
+                            converted[field] = Decimal(str(converted[field]))
+                    return converted
+
+                for item in prepared_rows:
+                    assert item.prepared is not None
+                    actions_by_result[item.source.result_id] = tuple(
+                        _frozen(_artifact_row(row, item.source.result_id)) for row in item.prepared.actions
+                    )
+                    equities_by_result[item.source.result_id] = tuple(
+                        _frozen(_artifact_row(row, item.source.result_id)) for row in item.prepared.equity
+                    )
+                if len(prepared_rows) != len(result_ids):
+                    raise PortfolioInputError(
+                        "prepared optimizer input is missing",
+                        code=SOURCE_SNAPSHOT_UNAVAILABLE,
                     )
             orders_by_strategy: dict[int, list[dict[str, Any]]] = {}
             for order in order_rows:
@@ -1336,7 +1365,7 @@ def read_current_finalists(
                         "status": "UNKNOWN",
                         "reason": "MAX_DRAWDOWN_NOT_POSITIVE",
                     }
-                result_row = {
+                result_row = _PreparedResultRow({
                     "strategy_id": strategy_id,
                     "result_id": result_id,
                     "strategy_name": _source_text(source.get("strategy_name"), "strategy_name"),
@@ -1369,7 +1398,7 @@ def read_current_finalists(
                     "selection_run_id": provenance["selection_run_id"],
                     "review_import_id": provenance["review_import_id"],
                     "source_provenance": provenance,
-                }
+                })
                 source_metadata = _decode_optimizer_source_metadata(
                     source_result.get("optimizer_source_metadata_json"), result_row["imported_at_utc"]
                 )
@@ -1381,6 +1410,8 @@ def read_current_finalists(
                         "action_series": actions_by_result.get(result_id, ()),
                         "equity_series": equities_by_result.get(result_id, ()),
                     })
+                    if result_id in prepared_by_result:
+                        result_row._optimizer_prepared = prepared_by_result[result_id]
                 result.append(result_row)
             connection.execute("commit")
     except PortfolioInputError:
@@ -1534,89 +1565,42 @@ def _numeric_setting(value: Any, expected: int) -> bool:
 
 
 def _cycle_records(row: Mapping[str, Any], period_end: datetime) -> tuple[Mapping[str, Any], ...]:
-    from .reports import performance_rows_to_report_actions, reconstruct_cycles
-    source_rows = tuple(row.get("actions", row.get("action_series", ())))
-    for source in source_rows:
-        if isinstance(source, Mapping):
-            for field in ("balance", "pnl", "fee"):
-                value = source.get(field)
-                if value is not None:
-                    try:
-                        _to_decimal(value)
-                    except (PortfolioInputError, InvalidOperation, TypeError, ValueError) as error:
-                        raise PortfolioInputError(f"invalid source action {field}", code="INVALID_SOURCE_VALUE") from error
-    actions = performance_rows_to_report_actions(source_rows)
-    reconstructed = reconstruct_cycles(actions, report_end=period_end.isoformat().replace("+00:00", "Z"))
-    by_ordinal = {
-        int(item["action_index"]) if item.get("action_index") is not None else fallback: item
-        for fallback, item in enumerate(source_rows) if isinstance(item, Mapping)
-    }
     metadata = row.get("optimizer_source_metadata", row.get("optimizer_source_metadata_json"))
     if isinstance(metadata, str):
         metadata = _decode_optimizer_source_metadata(metadata, str(row.get("imported_at_utc", "")))
     settings = metadata.get("settings", {}) if isinstance(metadata, Mapping) else {}
     exchange = settings.get("exchange", {}) if isinstance(settings, Mapping) else {}
     basic = settings.get("basic", {}) if isinstance(settings, Mapping) else {}
-    dynamic_basis = (
-        isinstance(exchange, Mapping) and exchange.get("use_upnl") is True and exchange.get("use_frozen_balance") is True
-        and isinstance(basic, Mapping) and basic.get("use_fix") is False
-        and _numeric_setting(basic.get("balance_percentage_long"), 100)
-        and _numeric_setting(basic.get("risk_long"), 1)
-        and _numeric_setting(basic.get("max_balance"), 0)
-    )
-    result: list[dict[str, Any]] = []
-    opening_candidates: dict[str, list[Any]] = {}
-    closing_candidates: dict[str, list[Any]] = {}
-    for action in actions:
-        if action.pre_size == Decimal("0") and action.post_size not in (None, Decimal("0")):
-            opening_candidates.setdefault(action.timestamp_utc, []).append(action)
-        if action.post_size == Decimal("0") and action.pre_size not in (None, Decimal("0")):
-            closing_candidates.setdefault(action.timestamp_utc, []).append(action)
-    for cycle in reconstructed:
-        basis = None
-        opening_source_ordinal = None
-        diagnostics = cycle.diagnostics
-        if cycle.opened_at is not None:
-            opening_queue = opening_candidates.get(cycle.opened_at, [])
-            opening = opening_queue.pop(0) if opening_queue else None
-            if opening is None:
-                diagnostics = tuple(dict.fromkeys((*diagnostics, "SOURCE_OPENING_ROW_UNMATCHED")))
-            if opening is not None:
-                opening_source_ordinal = opening.source_ordinal
-                source = by_ordinal.get(opening.source_ordinal, {})
-                try:
-                    if dynamic_basis:
-                        balance = _to_decimal(source.get("balance"))
-                        pnl = _to_decimal(source["pnl"]) if source.get("pnl") is not None else Decimal("0")
-                        fee = _to_decimal(source["fee"]) if source.get("fee") is not None else Decimal("0")
-                        basis = balance - pnl + fee
-                    if basis is not None and basis <= 0:
-                        basis = None
-                except (PortfolioInputError, InvalidOperation, TypeError, ValueError):
-                    raise PortfolioInputError("invalid source opening numeric", code="INVALID_SOURCE_VALUE")
-        closing_balance = None
-        if not cycle.censored and cycle.closed_at is not None:
-            closing_queue = closing_candidates.get(cycle.closed_at, [])
-            closing = closing_queue.pop(0) if closing_queue else None
-            if closing is not None:
-                closing_balance = closing.balance
-        normalized_pnl = None
-        if basis is not None and closing_balance is not None and not cycle.censored:
-            with localcontext() as context:
-                context.prec = max(64, len(basis.as_tuple().digits) + len(closing_balance.as_tuple().digits) + 16)
-                normalized_pnl = (closing_balance - basis) / basis
-        result.append({
-            "cycle_id": cycle.cycle_id, "opened_at": cycle.opened_at, "closed_at": cycle.closed_at,
-            "duration_seconds": cycle.duration_seconds, "censored": cycle.censored, "carry_in": cycle.carry_in,
-            "side": cycle.side, "realized_pnl": cycle.realized_pnl, "fees": cycle.fees,
-            "close_attribution": cycle.close_attribution,
-            "source_basis": basis, "maximum_position": cycle.maximum_position,
-            "execution_count": cycle.execution_count, "diagnostics": diagnostics,
-            "strategy_id": row.get("strategy_id"), "source_ordinal": opening_source_ordinal,
-            "normalized_pnl": normalized_pnl, "common_window_normalized_return": None,
-            "attribution_complete": False,
-        })
-    return tuple(result)
+    report_end = _utc(period_end)
+    report_start = _utc(row.get("report_start_utc", report_end))
+    def setting(name: str, group: Mapping[str, Any], fallback: Any = None) -> Any:
+        return row.get(name, group.get(name, fallback)) if isinstance(group, Mapping) else row.get(name, fallback)
+    try:
+        source = OptimizerSourceInput(
+            source_document_version="performance-v2",
+            result_id=int(row.get("result_id", 0)),
+            strategy_id=int(row.get("strategy_id", 0)),
+            symbol=str(row.get("symbol", "")),
+            side=str(row.get("side", "LONG")),
+            revision_timestamp_utc=row.get("imported_at_utc", report_end),
+            report_start_utc=report_start,
+            report_end_utc=report_end,
+            effective_start_utc=row.get("effective_start_utc", report_start),
+            effective_end_utc=row.get("effective_end_utc", report_end),
+            initial_balance=row.get("initial_balance", row.get("source_initial_balance", Decimal("0"))),
+            sizing_use_upnl=setting("sizing_use_upnl", exchange, exchange.get("use_upnl") if isinstance(exchange, Mapping) else None),
+            sizing_use_frozen_balance=setting("sizing_use_frozen_balance", exchange, exchange.get("use_frozen_balance") if isinstance(exchange, Mapping) else None),
+            sizing_use_fix=setting("sizing_use_fix", basic, basic.get("use_fix") if isinstance(basic, Mapping) else None),
+            sizing_balance_percentage_long=setting("sizing_balance_percentage_long", basic, setting("balance_percentage_long", basic)),
+            sizing_risk_long=setting("sizing_risk_long", basic, setting("risk_long", basic)),
+            sizing_max_balance=setting("sizing_max_balance", basic, setting("max_balance", basic)),
+            actions=tuple(row.get("actions", row.get("action_series", ()))),
+            equity=tuple(row.get("equity", row.get("equity_series", row.get("equity_path", ())))),
+        )
+        cycles = _optimizer_cycle_records(source)
+    except (OptimizerIntegrityError, InvalidOperation, TypeError, ValueError, KeyError) as error:
+        raise PortfolioInputError("invalid optimizer source", code="INVALID_SOURCE_VALUE") from error
+    return tuple({**cycle, "common_window_normalized_return": None, "attribution_complete": False} for cycle in cycles)
 
 
 def _grid_value(samples: Sequence[tuple[datetime, Decimal]], node: datetime, cursor: int, last: tuple[datetime, Decimal] | None) -> tuple[int, tuple[datetime, Decimal] | None]:
@@ -1716,7 +1700,35 @@ def prepare_weighted_input(
     for col, row in enumerate(ordered):
         symbol = str(row.get("symbol", ""))
         key_row = _period_row_key(row)
-        cycle_values = _cycle_records(row, end)
+        prepared_source = row.get("_prepared_optimizer_input")
+        if not isinstance(prepared_source, PreparedOptimizerInput):
+            prepared_source = getattr(row, "_optimizer_prepared", None)
+        prepared_cycles = prepared_source.cycles if isinstance(prepared_source, PreparedOptimizerInput) else row.get("_prepared_cycles")
+        if prepared_cycles is None and getattr(row, "_source_origin", row.get("_source_origin")) == "PERFORMANCE_V2_DB":
+            raise PortfolioInputError(
+                "prepared optimizer input is required for Performance v2 rows",
+                code="SOURCE_SNAPSHOT_UNAVAILABLE",
+            )
+        if isinstance(prepared_cycles, Sequence) and not isinstance(prepared_cycles, (str, bytes)):
+            if any(not isinstance(cycle, Mapping) for cycle in prepared_cycles):
+                raise PortfolioInputError("invalid prepared cycle series", code="INVALID_SOURCE_VALUE")
+            cycle_values = tuple(
+                {
+                    **{
+                        key: Decimal(str(value))
+                        if key in {
+                            "realized_pnl", "fees", "maximum_position", "normalized_pnl", "source_basis",
+                        } and value is not None
+                        else value
+                        for key, value in cycle.items()
+                    },
+                    "common_window_normalized_return": None,
+                    "attribution_complete": False,
+                }
+                for cycle in prepared_cycles
+            )
+        else:
+            cycle_values = _cycle_records(row, end)
         cycles[key_row] = cycle_values
         diagnostic_rows[key_row] = _cycle_diagnostics(cycle_values, start, end)
         cycle_returns = {id(cycle): Decimal("0") for cycle in cycle_values}

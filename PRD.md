@@ -131,6 +131,11 @@ directed benchmark are recorded in
 [Phase 5 evidence](docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-phase-5-evidence.md);
 independent Opus implementation review returned `CODE_REVIEW_PASS`, so Phase 5
 is accepted.
+Phase 8 is also accepted: Performance v2 schema v5 persists nullable typed
+action Price/Cost, six nullable WS1.1 sizing facts, and one private, versioned,
+digest-bound, per-result prepared optimizer input;
+see the [Phase 8 specification](docs/specs/2026-09-17-performance-v2-optimizer-prepared-inputs.md)
+and [acceptance evidence](docs/superpowers/plans/2026-09-17-performance-v2-optimizer-prepared-inputs-evidence.md).
 История и
 [ответ на замечания](docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-review-response.md)
 сохраняют основания решения и изменение области резерва (§8.1 плана).
@@ -225,6 +230,7 @@ M5 не зависит от UI. README не меняется до появлен
 | Accepted through U1 | [Portfolio Optimizer Panel UI](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [ADR-0031](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md) | local launch form, persisted Stage 1 job, settings CAS, summary and XLSX | backend optimizer capabilities; Stage 2 also requires M5/M6 and explicit authorization |
 | Phase 2A accepted / Phase 2B server accepted | [Phase 2A spec](docs/specs/2026-09-07-portfolio-optimizer-phase2a-execution-research.md), [Phase 2A evidence](docs/superpowers/plans/2026-09-08-portfolio-optimizer-phase2a-evidence.md), [Phase 2B spec](docs/specs/2026-09-07-portfolio-optimizer-phase2b-live-account-monitor.md), [Phase 2B server evidence](docs/superpowers/plans/2026-09-09-portfolio-optimizer-phase2b-server-evidence.md), [Revision 6 plan](docs/superpowers/plans/2026-09-07-portfolio-optimizer-phase2a-2b.md), [ADR-0032](docs/decisions/0032-portfolio-live-monitor-storage-and-reconcile.md) | immutable execution research; fixture/fake LiveStore, reconcile, read models, order projection and exact charts accepted; Panel 2B-9 pending | no real REST/WS, credentials, tester, trading, admission or deployment |
 | Accepted Stage-1 amendment / implemented read-only | [ADR-0034](docs/decisions/0034-portfolio-optimizer-pretest-search-and-sizing.md) | PRETEST_PROXY period, shared-cap sizing, mandatory search budget, deterministic bounded process search from machine-wide workers, top-N preliminary output and metric labels | no tester/runtime/recommendation |
+| Implemented / accepted | [Performance v2 optimizer prepared inputs](docs/specs/2026-09-17-performance-v2-optimizer-prepared-inputs.md), [Phase 8 evidence](docs/superpowers/plans/2026-09-17-performance-v2-optimizer-prepared-inputs-evidence.md), [ADR-0037](docs/decisions/0037-performance-v2-optimizer-prepared-inputs.md), [ADR-0038](docs/decisions/0038-performance-v2-prepared-canonicalization-and-locking.md) | schema v5 typed Price/Cost and WS1.1 sizing facts; private digest-bound per-result prepared input | no tester/runtime/recommendation/live permission |
 | Proposed | [ADR-0025](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md) | optimizer data boundaries, replay and MVP/post-MVP scope | ADR-0001/0020/0024; approval deferred |
 | Accepted | [ADR-0029](docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md) | research-only DD/free-margin/MM profile defaults | Portfolio Optimizer D5; not runtime/trading permission |
 | Accepted | [ADR-0030](docs/decisions/0030-portfolio-optimizer-m2-admission-and-sizing-contract.md) | FINALIST admission, liquidity/lot ceiling, leverage and individual-DD sizing semantics | Portfolio Optimizer D6; not runtime/trading permission |

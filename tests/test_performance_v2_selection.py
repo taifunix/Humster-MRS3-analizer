@@ -433,7 +433,7 @@ def _candidate_db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
         [strategy_id],
     )
     connection.executemany(
-        "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (result_id, 0, start, "BTCUSDT", 1, "closed", 1, 0, "", 0, 0, 100, None),
             (result_id, 1, datetime(2026, 1, 2, tzinfo=UTC), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 0, 100, None),
@@ -458,7 +458,7 @@ def test_loader_derives_proxy_holding_and_order_plateau_counts(tmp_path: Path) -
     try:
         result_id = connection.execute("select result_id from strategy_results").fetchone()[0]
         connection.execute(
-            "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [result_id, 3, datetime(2026, 1, 3, 12, tzinfo=UTC), "BTCUSDT", 1, "fee", 1, 0, "", -2, 0, 108, None],
         )
         row = load_selection_candidates(connection, request).iloc[0]
@@ -500,7 +500,7 @@ def test_signed_short_actions_feed_holding_and_best_trade_metrics(tmp_path: Path
         [result_id],
     )
     connection.executemany(
-        "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (result_id, 3, datetime(2026, 1, 25, tzinfo=UTC), "BTCUSDT", 1, "opened", -1, -1, "short", 0, 0, 110, None),
             (result_id, 4, datetime(2026, 1, 26, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 5, 0, 115, None),
@@ -540,7 +540,7 @@ def test_loader_exports_pnl_without_best_as_pct_of_initial_balance(tmp_path: Pat
     try:
         result_id = connection.execute("select result_id from strategy_results").fetchone()[0]
         connection.executemany(
-            "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (result_id, 3, datetime(2026, 1, 4, tzinfo=UTC), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 0, 110, None),
                 (result_id, 4, datetime(2026, 1, 5, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 5, 1, 115, None),
@@ -559,7 +559,7 @@ def test_holding_p95_uses_all_closed_positions(tmp_path: Path) -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
     result_id = connection.execute("select result_id from strategy_results").fetchone()[0]
     connection.executemany(
-        "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (result_id, 3, datetime(2026, 1, 5, tzinfo=UTC), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 0, 110, None),
             (result_id, 4, datetime(2026, 1, 7, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 0, 0, 110, None),

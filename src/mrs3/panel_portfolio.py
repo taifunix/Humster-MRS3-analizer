@@ -560,6 +560,7 @@ class PortfolioPanelService:
             for index, row in enumerate(loaded or ()):
                 if not isinstance(row, Mapping):
                     raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "portfolio finalist row is unavailable", status=422)
+                prepared_source = getattr(row, "_optimizer_prepared", None)
                 item = _plain(dict(row))
                 missing_identity = next(
                     (field for field in ("symbol", "side", "strategy_id", "result_id") if field not in item),
@@ -601,11 +602,14 @@ class PortfolioPanelService:
                         }],
                     )
 
-                weighted_input_rows.append({
+                weighted_row = {
                     **{field: item[field] for field in weighted_fields if field in item},
                     "actions": series("actions", "action_series", "minute_actions"),
                     "equity": series("equity", "equity_series"),
-                })
+                }
+                if prepared_source is not None:
+                    weighted_row["_prepared_cycles"] = _plain(prepared_source.cycles)
+                weighted_input_rows.append(weighted_row)
                 for field in ("actions", "action_series", "minute_actions", "equity", "equity_series"):
                     item.pop(field, None)
                 finalists_list.append(item)

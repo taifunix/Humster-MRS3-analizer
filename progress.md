@@ -2558,3 +2558,33 @@ Price/Cost and prepared-series/cycle persistence task remains open.
 Independent Opus review returned `CODE_REVIEW_PASS` after the fail-closed
 no-legacy period requirement and midnight-refresh correction; final root
 verification was `346 passed, 2 skipped`.
+
+## Performance v2 optimizer prepared inputs accepted (2026-09-17)
+
+Phase 8 upgrades Performance v2 additively to schema v5. It persists nullable
+typed action Price/Cost, six nullable WS1.1 sizing facts, and one private,
+versioned, digest-bound, per-result prepared optimizer input with
+normalization-ready actions, equity and reconstructed cycles. ADD/REPLACE writes
+the artifact inside the existing import transaction. The v4 migration backfills
+only exact revision-checked saved JSON facts and does not eagerly rebuild
+history.
+
+Ordinary Performance recalculation prepares missing/stale requested current
+results using the existing `duckdb_import.workers`; workers receive immutable
+Python snapshots and never access DuckDB, while the writer transaction reloads
+identity and digest before replacing a row. Strict PerformanceDB reads have no
+compatibility-JSON fallback, and prepared data remains absent from public API,
+Members and XLSX.
+
+Independent Opus implementation review returned `CODE_REVIEW_PASS`. Final root
+verification passed `4503 passed, 7 skipped, 25 warnings` in 1628.68 seconds;
+focused migration/import/optimizer/input and protected Panel/selection/Portfolio
+suites also passed. See the
+[specification](docs/specs/2026-09-17-performance-v2-optimizer-prepared-inputs.md),
+[ADR-0037](docs/decisions/0037-performance-v2-optimizer-prepared-inputs.md),
+[ADR-0038](docs/decisions/0038-performance-v2-prepared-canonicalization-and-locking.md)
+and [acceptance evidence](docs/superpowers/plans/2026-09-17-performance-v2-optimizer-prepared-inputs-evidence.md).
+No production database, tester execution, network access, recommendation
+surface change, runtime path change or live authorization occurred. Phase 7
+real tester calibration remains separately gated; the next implementation item
+is Phase 9.

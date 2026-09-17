@@ -36,6 +36,12 @@ from .performance_v2_store import (
     require_performance_v2,
     PerformanceV2WriterLock,
 )
+from .performance_v2_optimizer import (
+    OptimizerSourceInput,
+    PREPARATION_VERSION,
+    prepare_optimizer_input,
+    source_digest,
+)
 
 
 class PerformanceV2ImportError(RuntimeError):
@@ -52,7 +58,7 @@ _WARMUP_HOURS = 120
 _INTERVAL_MISSING = object()
 _ACTION_COLUMNS = (
     "result_id", "action_index", "timestamp_utc", "symbol", "order_id", "action",
-    "size", "post_size", "post_side", "pnl", "fee", "balance", "raw_action_json",
+    "size", "post_size", "post_side", "pnl", "fee", "balance", "price", "cost", "raw_action_json",
 )
 _EQUITY_COLUMNS = ("result_id", "sample_index", "timestamp_utc", "wallet", "equity")
 _SOURCE_METADATA_VERSION = 1
@@ -361,6 +367,122 @@ def _action_source_json(action: object) -> str | None:
             "invalid_fields": ["payload_oversize"],
         },
         _MAX_ACTION_SOURCE_BYTES,
+    )
+
+
+def _phase8_decimal(value: object) -> Decimal | None:
+    """Keep only exact values representable by DECIMAL(38,12)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not parsed.is_finite() or parsed.as_tuple().exponent < -12 or parsed.adjusted() >= 26:
+        return None
+    return parsed
+
+
+def _phase8_sizing_facts(settings: Mapping[str, object]) -> tuple[object | None, ...]:
+    exchange = settings.get("exchange")
+    basic = settings.get("basic")
+    exchange = exchange if isinstance(exchange, Mapping) else {}
+    basic = basic if isinstance(basic, Mapping) else {}
+    def boolean(values: Mapping[str, object], name: str) -> bool | None:
+        value = values.get(name)
+        return value if type(value) is bool else None
+    def decimal(values: Mapping[str, object], name: str) -> Decimal | None:
+        return _phase8_decimal(values.get(name))
+    return (
+        boolean(exchange, "use_upnl"),
+        boolean(exchange, "use_frozen_balance"),
+        boolean(basic, "use_fix"),
+        decimal(basic, "balance_percentage_long"),
+        decimal(basic, "risk_long"),
+        decimal(basic, "max_balance"),
+    )
+
+
+def _phase8_source_input(
+    connection: duckdb.DuckDBPyConnection,
+    result_id: int,
+    strategy_id: int,
+    entry: PreparedV2Entry,
+) -> OptimizerSourceInput:
+    result = connection.execute(
+        """select report_start_utc, report_end_utc, imported_at_utc,
+                  effective_start_utc, effective_end_utc, initial_balance,
+                  sizing_use_upnl, sizing_use_frozen_balance, sizing_use_fix,
+                  sizing_balance_percentage_long, sizing_risk_long, sizing_max_balance
+             from strategy_results where result_id = ? and strategy_id = ?""",
+        [result_id, strategy_id],
+    ).fetchone()
+    if result is None:
+        raise PerformanceV2ImportError("phase8 source result readback failed")
+    actions = tuple(
+        {
+            "action_index": row[0], "timestamp_utc": row[1], "symbol": row[2],
+            "order_id": row[3], "action": row[4], "size": row[5], "post_size": row[6],
+            "post_side": row[7], "pnl": row[8], "fee": row[9], "balance": row[10],
+            "price": row[11], "cost": row[12],
+        }
+        for row in connection.execute(
+            """select action_index, timestamp_utc, symbol, order_id, action, size,
+                      post_size, post_side, pnl, fee, balance, price, cost
+                 from strategy_actions where result_id = ? order by action_index""",
+            [result_id],
+        ).fetchall()
+    )
+    equity = tuple(
+        {"sample_index": row[0], "timestamp_utc": row[1], "equity": row[2]}
+        for row in connection.execute(
+            """select sample_index, timestamp_utc, equity from strategy_equity
+                 where result_id = ? order by sample_index""",
+            [result_id],
+        ).fetchall()
+    )
+    report_start, report_end, imported_at, effective_start, effective_end, initial_balance = result[:6]
+    sizing = result[6:]
+    return OptimizerSourceInput(
+        source_document_version="performance-v2",
+        result_id=result_id,
+        strategy_id=strategy_id,
+        symbol=entry.identity.symbol,
+        side=entry.identity.side,
+        revision_timestamp_utc=imported_at,
+        report_start_utc=report_start,
+        report_end_utc=report_end,
+        effective_start_utc=effective_start or report_start,
+        effective_end_utc=effective_end or report_end,
+        initial_balance=initial_balance,
+        sizing_use_upnl=sizing[0],
+        sizing_use_frozen_balance=sizing[1],
+        sizing_use_fix=sizing[2],
+        sizing_balance_percentage_long=sizing[3],
+        sizing_risk_long=sizing[4],
+        sizing_max_balance=sizing[5],
+        actions=actions,
+        equity=equity,
+    )
+
+
+def _persist_phase8_prepared(
+    connection: duckdb.DuckDBPyConnection,
+    source: OptimizerSourceInput,
+    prepared_at_utc: datetime,
+) -> None:
+    digest = source_digest(source)
+    availability, prepared = prepare_optimizer_input(source, preparation_version=PREPARATION_VERSION)
+    prepared_json = prepared.to_json() if prepared is not None else None
+    connection.execute(
+        """insert into optimizer_prepared_inputs
+           (result_id, preparation_version, source_digest, availability_status,
+            unavailable_reason, prepared_json, prepared_at_utc)
+           values (?, ?, ?, ?, ?, ?, ?)""",
+        [
+            source.result_id, PREPARATION_VERSION, digest, availability.status,
+            availability.reason, prepared_json, prepared_at_utc,
+        ],
     )
 
 
@@ -1336,6 +1458,7 @@ def _publish(
         equity_rows: list[tuple[object, ...]] = []
         result_files: dict[str, tuple[str, str, int, int, int, str]] = {}
         written_results: list[tuple[int, int, int]] = []
+        written_phase8: list[tuple[int, int, PreparedV2Entry]] = []
         status_priority = {"REJECTED": 0, "SKIPPED": 1, "IMPORTED": 2, "REPLACED": 2}
         published_plateaus = {
             (entry.analysis_run_id, order.plateau_id)
@@ -1404,12 +1527,13 @@ def _publish(
                 result_id = int(old[10])  # type: ignore[index]
                 # Keep the existing result identity for v4 databases, whose
                 # strategy_id uniqueness permits one current result per strategy.
-                for table in ("strategy_actions", "strategy_equity", "window_metrics"):
+                for table in ("strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs"):
                     connection.execute(f"delete from {table} where result_id = ?", [result_id])
             values = _result_values(entry, report, prepared.commission_contract, now)
             source_metadata = _optimizer_source_metadata_json(
                 report.settings, now, report_hash(entry)
             )
+            sizing_facts = _phase8_sizing_facts(report.settings)
             if decision == "ADD":
                 result_id = int(connection.execute(
                     """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
@@ -1417,9 +1541,11 @@ def _publish(
                        max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc,
                        reported_start_utc, reported_end_utc, listing_date_utc, listing_date_raw,
                        listing_date_source, effective_start_utc, effective_end_utc, warmup_hours,
-                       excluded_trade_count, exclusion_reason, optimizer_source_metadata_json)
-                       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
-                    [strategy_id, *values, source_metadata],
+                       excluded_trade_count, exclusion_reason, optimizer_source_metadata_json,
+                       sizing_use_upnl, sizing_use_frozen_balance, sizing_use_fix,
+                       sizing_balance_percentage_long, sizing_risk_long, sizing_max_balance)
+                       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
+                    [strategy_id, *values, source_metadata, *sizing_facts],
                 ).fetchone()[0])
                 connection.execute("update strategies set current_result_id = ?, updated_at_utc = ? where strategy_id = ?", [result_id, now, strategy_id])
             else:
@@ -1429,8 +1555,11 @@ def _publish(
                        max_drawdown = ?, max_drawdown_pct = ?, total_fees = ?, total_trades = ?, imported_at_utc = ?,
                        reported_start_utc = ?, reported_end_utc = ?, listing_date_utc = ?, listing_date_raw = ?,
                        listing_date_source = ?, effective_start_utc = ?, effective_end_utc = ?, warmup_hours = ?,
-                       excluded_trade_count = ?, exclusion_reason = ?, optimizer_source_metadata_json = ? where result_id = ?""",
-                    [*values, source_metadata, result_id],
+                       excluded_trade_count = ?, exclusion_reason = ?, optimizer_source_metadata_json = ?,
+                       sizing_use_upnl = ?, sizing_use_frozen_balance = ?, sizing_use_fix = ?,
+                       sizing_balance_percentage_long = ?, sizing_risk_long = ?, sizing_max_balance = ?
+                       where result_id = ?""",
+                    [*values, source_metadata, *sizing_facts, result_id],
                 )
                 connection.execute(
                     "update strategies set updated_at_utc = ? where strategy_id = ?",
@@ -1439,7 +1568,8 @@ def _publish(
             for action in report.actions:
                 action_rows.append((result_id, action.action_index, action.timestamp_utc, action.symbol,
                                     action.order_id, action.action, action.size, action.post_size, action.post_side,
-                                    action.pnl, action.fee, action.balance, _action_source_json(action)))
+                                    action.pnl, action.fee, action.balance, _phase8_decimal(action.price),
+                                    _phase8_decimal(action.cost), _action_source_json(action)))
             if len(action_rows) >= _APPEND_BATCH_ROWS:
                 _append_rows(connection, "strategy_actions", _ACTION_COLUMNS, action_rows)
                 action_rows.clear()
@@ -1455,6 +1585,7 @@ def _publish(
             if previous is None or status_priority[status] >= status_priority[previous[5].split(":", 1)[0]]:
                 result_files[record[1]] = record
             written_results.append((result_id, len(report.actions), len(report.equity_series)))
+            written_phase8.append((result_id, strategy_id, entry))
             imported += 1
 
         _append_rows(connection, "strategy_actions", _ACTION_COLUMNS, action_rows)
@@ -1473,6 +1604,9 @@ def _publish(
             actual_equity = int(connection.execute("select count(*) from strategy_equity where result_id = ?", [result_id]).fetchone()[0])
             if (actual_actions, actual_equity) != (expected_actions, expected_equity):
                 raise PerformanceV2ImportError("result child readback count mismatch")
+        for result_id, strategy_id, entry in written_phase8:
+            source = _phase8_source_input(connection, result_id, strategy_id, entry)
+            _persist_phase8_prepared(connection, source, now)
         # RETEST is removed only after all replacement readbacks pass.  Since
         # this remains in the same transaction, any later failure preserves
         # both the old result and its tag.

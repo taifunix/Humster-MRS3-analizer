@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+from decimal import Decimal, InvalidOperation
 from typing import BinaryIO
 from uuid import UUID, uuid4
 
@@ -13,7 +14,7 @@ import duckdb
 from .config import PanelPathSettings, load_duckdb_import_settings, load_panel_path_settings
 
 
-_SCHEMA_VERSION = "4"
+_SCHEMA_VERSION = "5"
 _DATABASE_NAME = "strategy_performance.duckdb"
 _MAX_WORKERS = 64
 _DEFAULT_V1_PERFORMANCE_ROOT = PanelPathSettings().performance_db_root
@@ -247,6 +248,12 @@ CREATE TABLE IF NOT EXISTS strategy_results (
     excluded_trade_count INTEGER,
     exclusion_reason VARCHAR,
     optimizer_source_metadata_json VARCHAR,
+    sizing_use_upnl BOOLEAN,
+    sizing_use_frozen_balance BOOLEAN,
+    sizing_use_fix BOOLEAN,
+    sizing_balance_percentage_long DECIMAL(38,12),
+    sizing_risk_long DECIMAL(38,12),
+    sizing_max_balance DECIMAL(38,12),
     CHECK (report_end_utc >= report_start_utc)
 );
 
@@ -263,6 +270,8 @@ CREATE TABLE IF NOT EXISTS strategy_actions (
     pnl DECIMAL(38,12) NOT NULL,
     fee DECIMAL(38,12) NOT NULL,
     balance DECIMAL(38,12) NOT NULL,
+    price DECIMAL(38,12),
+    cost DECIMAL(38,12),
     raw_action_json VARCHAR,
     PRIMARY KEY (result_id, action_index)
 );
@@ -330,6 +339,20 @@ CREATE TABLE IF NOT EXISTS import_files (
 CREATE INDEX IF NOT EXISTS strategy_results_strategy_id_idx ON strategy_results(strategy_id);
 CREATE INDEX IF NOT EXISTS strategy_actions_result_timestamp_idx ON strategy_actions(result_id, timestamp_utc);
 CREATE INDEX IF NOT EXISTS strategy_equity_result_timestamp_idx ON strategy_equity(result_id, timestamp_utc);
+
+CREATE TABLE IF NOT EXISTS optimizer_prepared_inputs (
+    result_id BIGINT PRIMARY KEY REFERENCES strategy_results(result_id),
+    preparation_version VARCHAR NOT NULL CHECK (length(trim(preparation_version)) > 0),
+    source_digest VARCHAR NOT NULL CHECK (length(trim(source_digest)) > 0),
+    availability_status VARCHAR NOT NULL CHECK (availability_status IN ('AVAILABLE', 'UNAVAILABLE')),
+    unavailable_reason VARCHAR,
+    prepared_json VARCHAR,
+    prepared_at_utc TIMESTAMPTZ NOT NULL,
+    CHECK (
+        (availability_status = 'AVAILABLE' AND unavailable_reason IS NULL AND prepared_json IS NOT NULL)
+        OR (availability_status = 'UNAVAILABLE' AND unavailable_reason IN ('MISSING_TYPED_FACTS', 'UNSUPPORTED_SIZING', 'PREPARED_TOO_LARGE') AND prepared_json IS NULL)
+    )
+);
 """
 
 _SELECTION_SCHEMA = """
@@ -435,7 +458,7 @@ _V2_TABLE_NAMES = {
     "import_files",
 }
 
-_EXPECTED_TABLES = frozenset(
+_V4_EXPECTED_TABLES = frozenset(
     ("main", name)
     for name in _V2_TABLE_NAMES | {
         "selection_runs",
@@ -445,6 +468,7 @@ _EXPECTED_TABLES = frozenset(
         "strategy_tags",
     }
 )
+_EXPECTED_TABLES = frozenset({("main", "optimizer_prepared_inputs")}) | _V4_EXPECTED_TABLES
 _V2_EXPECTED_TABLES = frozenset(("main", name) for name in _V2_TABLE_NAMES)
 _EXPECTED_SEQUENCES = frozenset(
     ("main", name)
@@ -467,7 +491,36 @@ _EXPECTED_INDEXES = frozenset(
         ("main", "strategy_tags_tag_idx"),
     }
 )
+_V4_EXPECTED_INDEXES = _EXPECTED_INDEXES
 _V2_EXPECTED_INDEXES = frozenset(index for index in _EXPECTED_INDEXES if not index[1].startswith(("selection_", "strategy_tags_")))
+
+_V4_ACTION_COLUMNS = frozenset(
+    {
+        "result_id", "action_index", "timestamp_utc", "symbol", "order_id", "action",
+        "size", "post_size", "post_side", "pnl", "fee", "balance", "raw_action_json",
+    }
+)
+_V5_ACTION_COLUMNS = _V4_ACTION_COLUMNS | {"price", "cost"}
+_V4_RESULT_COLUMNS = frozenset(
+    {
+        "result_id", "strategy_id", "report_start_utc", "report_end_utc", "exchange",
+        "commission_rate", "initial_balance", "final_balance", "total_pnl", "total_pnl_pct",
+        "max_drawdown", "max_drawdown_pct", "total_fees", "total_trades", "imported_at_utc",
+        "reported_start_utc", "reported_end_utc", "listing_date_utc", "listing_date_raw",
+        "listing_date_source", "effective_start_utc", "effective_end_utc", "warmup_hours",
+        "excluded_trade_count", "exclusion_reason", "optimizer_source_metadata_json",
+    }
+)
+_V5_RESULT_COLUMNS = _V4_RESULT_COLUMNS | {
+    "sizing_use_upnl", "sizing_use_frozen_balance", "sizing_use_fix",
+    "sizing_balance_percentage_long", "sizing_risk_long", "sizing_max_balance",
+}
+_PREPARED_COLUMNS = frozenset(
+    {
+        "result_id", "preparation_version", "source_digest", "availability_status",
+        "unavailable_reason", "prepared_json", "prepared_at_utc",
+    }
+)
 
 
 def _schema_version(connection: duckdb.DuckDBPyConnection) -> str | None:
@@ -512,6 +565,16 @@ def _catalog_is_empty(connection: duckdb.DuckDBPyConnection) -> bool:
     return not tables and not sequences and not indexes
 
 
+def _table_columns(connection: duckdb.DuckDBPyConnection, table_name: str) -> frozenset[str]:
+    return frozenset(
+        row[0]
+        for row in connection.execute(
+            "select column_name from information_schema.columns where table_schema = 'main' and table_name = ?",
+            [table_name],
+        ).fetchall()
+    )
+
+
 def _schema_markers(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
     try:
         return dict(connection.execute("select key, value from schema_info").fetchall())
@@ -536,9 +599,25 @@ def _require_v4_catalog(connection: duckdb.DuckDBPyConnection) -> None:
     _require_v4_markers(connection)
     tables, sequences, indexes = _catalog_objects(connection)
     if (
+        tables != _V4_EXPECTED_TABLES
+        or sequences != _EXPECTED_SEQUENCES
+        or indexes != _V4_EXPECTED_INDEXES
+        or _table_columns(connection, "strategy_actions") != _V4_ACTION_COLUMNS
+        or _table_columns(connection, "strategy_results") != _V4_RESULT_COLUMNS
+    ):
+        raise PerformanceV2StoreError("Performance database has an unexpected catalog")
+
+
+def _require_v5_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_v4_markers(connection)
+    tables, sequences, indexes = _catalog_objects(connection)
+    if (
         tables != _EXPECTED_TABLES
         or sequences != _EXPECTED_SEQUENCES
         or indexes != _EXPECTED_INDEXES
+        or _table_columns(connection, "strategy_actions") != _V5_ACTION_COLUMNS
+        or _table_columns(connection, "strategy_results") != _V5_RESULT_COLUMNS
+        or _table_columns(connection, "optimizer_prepared_inputs") != _PREPARED_COLUMNS
     ):
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
 
@@ -546,8 +625,8 @@ def _require_v4_catalog(connection: duckdb.DuckDBPyConnection) -> None:
 def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     """Fail closed unless the connection already contains the v2 schema."""
     if _schema_version(connection) != _SCHEMA_VERSION:
-        raise PerformanceV2StoreError("Performance database does not have schema version 4")
-    _require_v4_catalog(connection)
+        raise PerformanceV2StoreError("Performance database does not have schema version 5")
+    _require_v5_catalog(connection)
 
 
 def _require_schema_v2_for_migration(connection: duckdb.DuckDBPyConnection) -> None:
@@ -572,7 +651,7 @@ def _require_schema_v3_for_migration(connection: duckdb.DuckDBPyConnection) -> N
     except (KeyError, ValueError, AttributeError):
         raise PerformanceV2StoreError("Performance database has invalid instance identity") from None
     tables, sequences, indexes = _catalog_objects(connection)
-    if tables != _EXPECTED_TABLES or sequences != _EXPECTED_SEQUENCES or indexes != _EXPECTED_INDEXES:
+    if tables != _V4_EXPECTED_TABLES or sequences != _EXPECTED_SEQUENCES or indexes != _EXPECTED_INDEXES:
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
 
 
@@ -635,6 +714,156 @@ def _add_result_provenance_columns(connection: duckdb.DuckDBPyConnection) -> Non
         connection.execute(f"alter table strategy_results add column if not exists {name} {definition}")
 
 
+def _exact_optional_decimal(value: object) -> Decimal | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite():
+        return None
+    exponent = parsed.as_tuple().exponent
+    scale = -exponent if exponent < 0 else 0
+    precision = len(parsed.as_tuple().digits) + (exponent if exponent > 0 else 0)
+    if scale > 12 or precision > 38 or (parsed != 0 and parsed.adjusted() >= 26):
+        return None
+    return parsed
+
+
+def _decode_action_optional_facts(payload: object) -> tuple[Decimal | None, Decimal | None]:
+    if not isinstance(payload, str) or len(payload.encode("utf-8")) > 16_384:
+        return None, None
+    try:
+        document = json.loads(payload)
+    except (TypeError, ValueError):
+        return None, None
+    if not isinstance(document, dict):
+        return None, None
+    if document.get("schema_version") != _OPTIMIZER_SOURCE_METADATA_VERSION:
+        return None, None
+    if document.get("price_cost_semantics") != _PRICE_COST_SEMANTICS:
+        return None, None
+    invalid = document.get("invalid_fields")
+    invalid_fields = set(invalid) if isinstance(invalid, list) and all(isinstance(item, str) for item in invalid) else set()
+    price = None if "price" in invalid_fields else _exact_optional_decimal(document.get("price"))
+    cost = None if "cost" in invalid_fields else _exact_optional_decimal(document.get("cost"))
+    return price, cost
+
+
+def _decode_sizing_facts(
+    payload: object, imported_at_utc: object, source_report_sha256: str | None = None
+) -> tuple[bool | None, bool | None, bool | None, Decimal | None, Decimal | None, Decimal | None]:
+    metadata = decode_optimizer_source_metadata(payload, imported_at_utc, source_report_sha256)
+    if metadata is None:
+        return (None,) * 6
+    settings = metadata.get("settings")
+    if not isinstance(settings, dict):
+        return (None,) * 6
+    invalid = metadata.get("invalid_fields")
+    invalid_fields = set(invalid) if isinstance(invalid, list) and all(isinstance(item, str) for item in invalid) else set()
+    exchange = settings.get("exchange")
+    basic = settings.get("basic")
+    exchange = exchange if isinstance(exchange, dict) else {}
+    basic = basic if isinstance(basic, dict) else {}
+
+    def boolean(section: str, key: str, values: object) -> bool | None:
+        return values.get(key) if type(values.get(key)) is bool and f"{section}.{key}" not in invalid_fields else None
+
+    def decimal(section: str, key: str, values: object) -> Decimal | None:
+        return None if f"{section}.{key}" in invalid_fields else _exact_optional_decimal(values.get(key))
+
+    return (
+        boolean("exchange", "use_upnl", exchange),
+        boolean("exchange", "use_frozen_balance", exchange),
+        boolean("basic", "use_fix", basic),
+        decimal("basic", "balance_percentage_long", basic),
+        decimal("basic", "risk_long", basic),
+        decimal("basic", "max_balance", basic),
+    )
+
+
+def _backfill_phase8_typed_facts(connection: duckdb.DuckDBPyConnection) -> None:
+    action_rows = connection.execute(
+        "select result_id, action_index, raw_action_json from strategy_actions where raw_action_json is not null"
+    ).fetchall()
+    for result_id, action_index, payload in action_rows:
+        price, cost = _decode_action_optional_facts(payload)
+        connection.execute(
+            "update strategy_actions set price = ?, cost = ? where result_id = ? and action_index = ?",
+            [price, cost, result_id, action_index],
+        )
+    source_hashes = {
+        str(row[0])
+        for row in connection.execute("select distinct source_html_sha256 from import_files").fetchall()
+        if isinstance(row[0], str) and len(row[0]) == 64
+    }
+    result_rows = connection.execute(
+        "select result_id, imported_at_utc, optimizer_source_metadata_json from strategy_results"
+    ).fetchall()
+    for result_id, imported_at_utc, payload in result_rows:
+        metadata_hash = None
+        if source_hashes:
+            try:
+                decoded = json.loads(payload) if isinstance(payload, str) else None
+                metadata_hash = decoded.get("source_report_sha256") if isinstance(decoded, dict) else None
+            except (TypeError, ValueError):
+                metadata_hash = None
+            sizing = (
+                _decode_sizing_facts(payload, imported_at_utc, metadata_hash)
+                if metadata_hash in source_hashes
+                else (None,) * 6
+            )
+        else:
+            sizing = _decode_sizing_facts(payload, imported_at_utc)
+        connection.execute(
+            """update strategy_results set sizing_use_upnl = ?, sizing_use_frozen_balance = ?, sizing_use_fix = ?,
+               sizing_balance_percentage_long = ?, sizing_risk_long = ?, sizing_max_balance = ? where result_id = ?""",
+            [*sizing, result_id],
+        )
+
+
+_PHASE8_SCHEMA = """
+CREATE TABLE optimizer_prepared_inputs (
+    result_id BIGINT PRIMARY KEY REFERENCES strategy_results(result_id),
+    preparation_version VARCHAR NOT NULL CHECK (length(trim(preparation_version)) > 0),
+    source_digest VARCHAR NOT NULL CHECK (length(trim(source_digest)) > 0),
+    availability_status VARCHAR NOT NULL CHECK (availability_status IN ('AVAILABLE', 'UNAVAILABLE')),
+    unavailable_reason VARCHAR,
+    prepared_json VARCHAR,
+    prepared_at_utc TIMESTAMPTZ NOT NULL,
+    CHECK (
+        (availability_status = 'AVAILABLE' AND unavailable_reason IS NULL AND prepared_json IS NOT NULL)
+        OR (availability_status = 'UNAVAILABLE' AND unavailable_reason IN ('MISSING_TYPED_FACTS', 'UNSUPPORTED_SIZING', 'PREPARED_TOO_LARGE') AND prepared_json IS NULL)
+    )
+)
+"""
+
+
+def _migrate_schema_v4_to_v5(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_v4_catalog(connection)
+    try:
+        connection.execute("begin transaction")
+        connection.execute("alter table strategy_actions add column price decimal(38,12)")
+        connection.execute("alter table strategy_actions add column cost decimal(38,12)")
+        for name, definition in (
+            ("sizing_use_upnl", "boolean"),
+            ("sizing_use_frozen_balance", "boolean"),
+            ("sizing_use_fix", "boolean"),
+            ("sizing_balance_percentage_long", "decimal(38,12)"),
+            ("sizing_risk_long", "decimal(38,12)"),
+            ("sizing_max_balance", "decimal(38,12)"),
+        ):
+            connection.execute(f"alter table strategy_results add column {name} {definition}")
+        connection.execute(_PHASE8_SCHEMA)
+        _backfill_phase8_typed_facts(connection)
+        connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+        connection.execute("commit")
+    except Exception as error:
+        _rollback_quietly(connection)
+        raise PerformanceV2StoreError("Performance database schema migration failed") from error
+
+
 def decode_optimizer_source_metadata(
     payload: object,
     imported_at_utc: object,
@@ -680,9 +909,9 @@ def _rollback_quietly(connection: duckdb.DuckDBPyConnection) -> None:
 
 
 def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
-    """Initialize or migrate the isolated Performance v2 schema to v4."""
+    """Initialize or migrate the isolated Performance v2 schema to v5."""
     version = _schema_version(connection)
-    if version is not None and version not in {"2", "3", _SCHEMA_VERSION}:
+    if version is not None and version not in {"2", "3", "4", _SCHEMA_VERSION}:
         raise PerformanceV2StoreError("Performance database has an unsupported schema version")
     if version == "2":
         _require_schema_v2_for_migration(connection)
@@ -699,10 +928,11 @@ def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
             _rollback_quietly(connection)
             raise PerformanceV2StoreError("Performance database schema migration failed") from error
         _migrate_schema_v3_to_v4(connection)
+        _migrate_schema_v4_to_v5(connection)
         require_performance_v2(connection)
         return
     if version == _SCHEMA_VERSION:
-        _require_v4_catalog(connection)
+        _require_v5_catalog(connection)
         try:
             connection.execute("begin transaction")
             _add_window_columns(connection)
@@ -715,6 +945,11 @@ def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
         return
     if version == "3":
         _migrate_schema_v3_to_v4(connection)
+        _migrate_schema_v4_to_v5(connection)
+        require_performance_v2(connection)
+        return
+    if version == "4":
+        _migrate_schema_v4_to_v5(connection)
         require_performance_v2(connection)
         return
     if not _catalog_is_empty(connection):

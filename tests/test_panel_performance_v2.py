@@ -188,7 +188,7 @@ def _db(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, int]:
         [strategy_id],
     )
     connection.executemany(
-        "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (result_id, 0, now, "BTCUSDT", 1, "opened", 1, 1, "long", 0, 1, 100, None),
             (result_id, 1, datetime(2026, 1, 2, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 10, 1, 110, None),
@@ -907,7 +907,7 @@ def test_job_id_finalist_export_uses_stage_free_rich_control_schema(tmp_path: Pa
     controller, database, result_id = _controller_for_windows(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.executemany(
-            "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (result_id, 2, datetime(2026, 1, 2, 12, tzinfo=UTC), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 1, 110, None),
                 (result_id, 3, datetime(2026, 1, 3, 12, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 5, 1, 115, None),
@@ -1346,7 +1346,7 @@ def test_selection_recalculate_tracks_only_new_current_results_for_add_replace_a
                 [f"{name}-old-holder", f"{name}-old-holder", now, now],
             ).fetchone()[0])
             connection.execute("update strategies set current_result_id = null where strategy_id = ?", [owner_id])
-            for table in ("strategy_actions", "strategy_equity", "window_metrics"):
+            for table in ("strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs"):
                 connection.execute(f"delete from {table} where result_id = ?", [old_result_id])
             connection.execute("update strategy_results set strategy_id = ? where result_id = ?", [old_holder_id, old_result_id])
             strategy_id = owner_id
@@ -1359,7 +1359,7 @@ def test_selection_recalculate_tracks_only_new_current_results_for_add_replace_a
         ).fetchone()[0])
         connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
         connection.executemany(
-            "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (result_id, 0, now, "BTCUSDT", 1, "opened", 1, 1, "long", 0, 1, 100, None),
                 (result_id, 1, datetime(2026, 1, 2, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 10, 1, 110, None),
@@ -1706,7 +1706,7 @@ def test_v2_current_result_switch_does_not_reuse_r1_window_cache(tmp_path: Path)
             [1, now, datetime(2026, 1, 5, tzinfo=UTC), now],
         ).fetchone()[0]
         connection.executemany(
-            "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (r2_id, 0, now, "BTCUSDT", 1, "opened", 1, 1, "long", 0, 0, 100, None),
                 (r2_id, 1, datetime(2026, 1, 2, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 5, 0, 105, None),

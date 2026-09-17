@@ -145,6 +145,13 @@ normalized increments 0.1/0.1; при x=50 вклад равен 5/5 USDT.
 Кэш MVP — в памяти одного Campaign, без нового persistent store/lock framework.
 Ключ: версии аналитики, упорядоченные source revisions/hashes, общее окно,
 history step и digest настроек подготовки. Матрица источника независима от B/L.
+
+Phase 8 разрешает Performance v2 сохранять только per-result подготовленную
+основу, описанную в
+[Performance v2 optimizer prepared inputs](2026-09-17-performance-v2-optimizer-prepared-inputs.md).
+Финальная общая T×N сетка остаётся Campaign-кэшем с тем же ключом: persistent
+артефакт не зависит от будущих B/L, не фиксирует состав портфеля и не заменяет
+проверку source revision при чтении.
 Маржинальные факты дополнительно ключуются reference digest и margin policy.
 Другой imported_at или hash при том же result_id даёт другой ключ; старые
 optional metadata при REPLACE не наследуются. Запись/сбор результатов — в parent.

@@ -946,6 +946,12 @@ def test_campaign_freezes_private_weighted_rows_without_public_series_aliases(mo
     assert not aliases.intersection(campaign["finalists"][0])
     public_job = service.job(result["job_id"])
     assert not aliases.intersection(public_job)
+    private_prepared_fields = {
+        "prepared_json", "source_digest", "preparation_version", "_prepared_cycles",
+        "raw_action_series", "raw_equity_series",
+    }
+    assert not private_prepared_fields.intersection(campaign["finalists"][0])
+    assert not private_prepared_fields.intersection(public_job)
     assert "weighted_input_rows" not in public_job
 
 
@@ -1379,6 +1385,12 @@ def test_workbook_keeps_raw_series_out_of_public_cells(tmp_path: Path) -> None:
         "actions": "PRIVATE_ACTIONS",
         "equity": "PRIVATE_EQUITY",
         "raw": "PRIVATE_RAW",
+        "prepared_json": "PRIVATE_PREPARED_JSON",
+        "source_digest": "PRIVATE_SOURCE_DIGEST",
+        "preparation_version": "PRIVATE_PREPARATION_VERSION",
+        "_prepared_cycles": "PRIVATE_PREPARED_CYCLES",
+        "raw_action_series": "PRIVATE_RAW_ACTION_SERIES",
+        "raw_equity_series": "PRIVATE_RAW_EQUITY_SERIES",
     },)
     variants = ({
         "candidate_id": "candidate",
@@ -1393,9 +1405,22 @@ def test_workbook_keeps_raw_series_out_of_public_cells(tmp_path: Path) -> None:
     workbook = load_workbook(workbook_path, data_only=False)
     try:
         values = [cell.value for sheet in workbook.worksheets for row in sheet.iter_rows() for cell in row]
+        headers = {
+            cell.value
+            for worksheet in workbook.worksheets
+            for cell in worksheet[1]
+        }
     finally:
         workbook.close()
-    assert not {"PRIVATE_ACTIONS", "PRIVATE_EQUITY", "PRIVATE_RAW", "PRIVATE_MEMBER_RAW", "PRIVATE_METRICS_RAW"}.intersection(values)
+    assert not {
+        "PRIVATE_ACTIONS", "PRIVATE_EQUITY", "PRIVATE_RAW", "PRIVATE_MEMBER_RAW", "PRIVATE_METRICS_RAW",
+        "PRIVATE_PREPARED_JSON", "PRIVATE_SOURCE_DIGEST", "PRIVATE_PREPARATION_VERSION",
+        "PRIVATE_PREPARED_CYCLES", "PRIVATE_RAW_ACTION_SERIES", "PRIVATE_RAW_EQUITY_SERIES",
+    }.intersection(values)
+    assert not {
+        "prepared_json", "source_digest", "preparation_version", "_prepared_cycles",
+        "raw_action_series", "raw_equity_series",
+    }.intersection(headers)
 
 
 def test_workbook_preserves_decimal_cells_as_exact_text(tmp_path: Path) -> None:

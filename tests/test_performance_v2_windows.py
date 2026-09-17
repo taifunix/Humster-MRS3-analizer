@@ -60,7 +60,7 @@ def _db(tmp_path, *, scale: Decimal = Decimal("1")) -> tuple[duckdb.DuckDBPyConn
         (result_id, 5, datetime(2026, 1, 4, 12, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", Decimal("2") * scale, Decimal("0.2") * scale, Decimal("112") * scale, None),
     ]
     connection.executemany(
-        "insert into strategy_actions values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", actions
+        "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", actions
     )
     equity = [
         (result_id, 0, datetime(2026, 1, 1, tzinfo=UTC), 100 * scale, 100 * scale),

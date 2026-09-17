@@ -1187,11 +1187,18 @@ benchmark и экспериментальные defaults проверены; evi
   Провал всех тестов — честный результат, а не автоматическое повышение порогов.
 - [ ] Записать evidence фазы 7 и получить независимый `CODE_REVIEW_PASS`.
 
+Фаза 7 остаётся открытой и отдельно заблокированной до явного разрешения на
+реальные tester-запуски и принятой калибровки.
+
 ### Фаза 8. Постоянная аналитика PerformanceDB
 
-- [ ] Отдельной задачей добавить typed-поля цены/стоимости, настройки sizing и заранее
+- [x] Отдельной задачей добавить typed-поля цены/стоимости, настройки sizing и заранее
   подготовленные ряды/циклы при обычном анализе. Аддитивная миграция, старый
   контракт импорта сохраняется. Не нужно ждать этой фазы для фаз 1–7.
+  Утверждённый контракт: schema v5 сохраняет nullable typed action Price/Cost,
+  шесть nullable WS1.1 sizing-фактов и один private, versioned, digest-bound,
+  per-result prepared optimizer input; новой БД или сервиса нет. Старые строки
+  обогащаются только из точных сохранённых JSON-фактов, без догадок.
 
 Phase 8 guardrails: tester `end_date` is capped at authoritative current date
 minus one day in UI, shared tester validation, and Performance v2 inbox/report
@@ -1204,8 +1211,9 @@ recalculation processes zero once cache rows are present.
 Operator verification on 2026-09-15 confirmed that after recalculation the A/B
 deterioration and time-window filters work and XLSX contains all window data.
 The scoped date/cache repair passed independent Opus `CODE_REVIEW_PASS` with
-`346 passed, 2 skipped`. The typed Price/Cost and prepared-series/cycle item
-above remains open.
+`346 passed, 2 skipped`. Performance v2 typed Price/Cost and prepared-series/cycle
+implementation is accepted: [Phase 8 evidence](2026-09-17-performance-v2-optimizer-prepared-inputs-evidence.md),
+independent `CODE_REVIEW_PASS`, and final full suite `4503 passed, 7 skipped, 25 warnings`.
 
 ### Фаза 9. Несколько финалистов и LONG+SHORT
 

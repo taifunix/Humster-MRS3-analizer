@@ -198,6 +198,7 @@ from .performance_v2_store import (
     performance_v2_database_path,
     require_performance_v2,
 )
+from .performance_v2_optimizer import prepare_current_optimizer_inputs
 from .performance_v2_selection import (
     PerformanceV2SelectionError,
     SelectionRequest,
@@ -4722,6 +4723,17 @@ class PanelController:
             performance_config = self._performance_v2_config()
             target = performance_v2_database_path(performance_config)
             self._ensure_performance_v2_schema(target)
+            with duckdb.connect(str(target), read_only=True) as connection:
+                require_performance_v2(connection)
+                current_result_ids = tuple(
+                    int(row[0]) for row in connection.execute(
+                        """select s.current_result_id from strategies s
+                            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
+                              and s.current_result_id is not null order by s.current_result_id""",
+                        [request.symbol, request.side],
+                    ).fetchall()
+                )
+            prepare_current_optimizer_inputs(str(target), current_result_ids, workers=performance_config.workers)
             with self._performance_v2_writer_lock:
                 with duckdb.connect(str(target), read_only=True) as connection:
                     missing_strategy_ids = selection_cache_missing_strategy_ids(connection, request, config)
@@ -4752,6 +4764,7 @@ class PanelController:
                     missing_strategy_ids = selection_cache_missing_strategy_ids(connection, request, config)
                     if missing_strategy_ids:
                         pending.append((request, missing_strategy_ids))
+            prepare_current_optimizer_inputs(str(target), workers=performance_config.workers)
             with self._performance_v2_writer_lock:
                 for request, missing_strategy_ids in pending:
                     prepare_selection_window_cache(target, request, config, performance_config.workers, missing_strategy_ids)
