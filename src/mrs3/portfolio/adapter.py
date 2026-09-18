@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 import json
+from itertools import product
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -26,7 +27,7 @@ from .spread_screen import read_spread_history
 CAMPAIGN_CONTRACT_VERSION = "PORTFOLIO_WEIGHTED_CAMPAIGN_V1"
 CAMPAIGN_SEARCH_MODE = "WEIGHTED_V1"
 CAMPAIGN_LEGACY_SEARCH_MODE = "PRETEST_PROXY"
-CAMPAIGN_WEIGHTED_ALGO_VERSION = "WS1.1"
+CAMPAIGN_WEIGHTED_ALGO_VERSION = "WS1.2"
 WEIGHTED_SEARCH_NOT_IMPLEMENTED = "WEIGHTED_SEARCH_NOT_IMPLEMENTED"
 WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE = "WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE"
 WEIGHTED_INPUT_PREPARATION_FAILED = "WEIGHTED_INPUT_PREPARATION_FAILED"
@@ -42,8 +43,9 @@ _WEIGHTED_SEARCH_CONFIG_INVALID = "WEIGHTED_SEARCH_CONFIG_INVALID"
 class CampaignContractError(ValueError):
     """A stable fail-closed Campaign contract error."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, exclusions: Sequence[Mapping[str, Any]] = ()) -> None:
         self.code = code
+        self.exclusions = tuple(exclusions)
         super().__init__(code)
 
 
@@ -91,6 +93,27 @@ def _weighted_decimal_text(value: Decimal) -> str:
 
 def _weighted_json_number(value: Decimal) -> int | float:
     return int(value) if value == value.to_integral_value() else float(value)
+
+
+def _weighted_symbol(value: Any) -> str:
+    if not isinstance(value, str):
+        raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
+    symbol = str(value).strip().upper()
+    if not symbol:
+        raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
+    return symbol
+
+
+def _weighted_spread_statuses(value: Any) -> Mapping[str, str]:
+    if not isinstance(value, Mapping):
+        raise CampaignContractError("SPREAD_HISTORY_STATUS_UNKNOWN")
+    result: dict[str, str] = {}
+    for raw_symbol, status in value.items():
+        symbol = _weighted_symbol(raw_symbol)
+        if symbol in result:
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        result[symbol] = status
+    return result
 
 
 def _weighted_close(left: Decimal, right: Decimal) -> bool:
@@ -200,19 +223,27 @@ def build_weighted_strategy_payload(
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
     if exchange.get("use_upnl") is not True or exchange.get("use_frozen_balance") is not True:
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
-    if basic.get("use_fix") is not False or basic.get("use_long") is not True or basic.get("use_short") is not False:
+    side = str(member.get("side", "")).strip().upper()
+    if side not in {"LONG", "SHORT"}:
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
+    if basic.get("use_fix") is not False:
+        raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
+    if any(
+        key in basic and type(basic[key]) is not bool
+        for key in ("use_long", "use_short")
+    ):
+        raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
+    if basic.get("use_long") is not True or basic.get("use_short") is not False:
+        raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
+    balance_field = f"balance_percentage_{side.lower()}"
+    risk_field = f"risk_{side.lower()}"
     if _weighted_decimal(basic.get("balance_percentage_long")) != Decimal("100"):
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
     if _weighted_decimal(basic.get("risk_long")) != Decimal("1"):
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
     if _weighted_decimal(basic.get("max_balance")) != Decimal("0"):
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
-    symbol = member.get("symbol")
-    if not isinstance(symbol, str) or not symbol.strip():
-        raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
-    if member.get("side") != "LONG":
-        raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
+    symbol = _weighted_symbol(member.get("symbol"))
     priority = member.get("priority")
     if type(priority) is not int or not 1 <= priority <= 5:
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
@@ -240,11 +271,17 @@ def build_weighted_strategy_payload(
 
     strategy["basic"] = dict(basic)
     strategy["basic"]["symbol"] = symbol
-    strategy["basic"]["balance_percentage_long"] = json_balance
+    strategy["basic"]["use_long"] = side == "LONG"
+    strategy["basic"]["use_short"] = side == "SHORT"
+    strategy["basic"]["balance_percentage_long"] = 0 if side == "SHORT" else json_balance
+    strategy["basic"]["balance_percentage_short"] = 0 if side == "LONG" else json_balance
+    strategy["basic"]["risk_long"] = 1 if side == "LONG" else 0
+    strategy["basic"]["risk_short"] = 1 if side == "SHORT" else 0
     strategy["basic"]["max_balance"] = json_max_balance
     strategy["mrs"] = dict(mrs)
     strategy["mrs"]["position_priority"] = priority
     payload = {
+        "side": side,
         "strategy": strategy,
         "account": {"open_positions_limiter": open_positions_limiter},
         "facts": {
@@ -266,15 +303,19 @@ def build_weighted_strategy_payload(
         recomputed_q = read_x / read_bank
         recomputed_balance = Decimal("100") * read_q
         recomputed_max_balance = (read_capacity * read_bank) / read_x
-        read_balance = _weighted_decimal(read_basic["balance_percentage_long"])
+        read_balance = _weighted_decimal(read_basic[balance_field])
         read_max_balance = _weighted_decimal(read_basic["max_balance"])
         expected_balance = _weighted_json_number(recomputed_balance)
         expected_max_balance = _weighted_json_number(recomputed_max_balance)
         if (
             read_q != recomputed_q
-            or typed_payload["strategy"]["basic"]["balance_percentage_long"] != expected_balance
+            or typed_payload["strategy"]["basic"][balance_field] != expected_balance
             or typed_payload["strategy"]["basic"]["max_balance"] != expected_max_balance
-            or _weighted_decimal(read_basic["risk_long"]) != Decimal("1")
+            or _weighted_decimal(read_basic[risk_field]) != Decimal("1")
+            or _weighted_decimal(read_basic[f"balance_percentage_{'short' if side == 'LONG' else 'long'}"]) != Decimal("0")
+            or _weighted_decimal(read_basic[f"risk_{'short' if side == 'LONG' else 'long'}"]) != Decimal("0")
+            or read_basic["use_long"] is not (side == "LONG")
+            or read_basic["use_short"] is not (side == "SHORT")
             or read_mrs["position_priority"] != priority
             or "position_priority" in read_basic
             or not _weighted_close(read_max_balance * read_q, read_capacity)
@@ -301,12 +342,102 @@ def _weighted_input_identity(row: Any) -> tuple[str, str, int, int]:
     strategy_id, result_id = row["strategy_id"], row["result_id"]
     if (
         not isinstance(symbol, str) or not symbol.strip()
-        or side != "LONG"
+        or str(side).strip().upper() not in {"LONG", "SHORT"}
         or type(strategy_id) is not int
         or type(result_id) is not int
     ):
         raise CampaignContractError(WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE)
-    return symbol, side, strategy_id, result_id
+    return symbol.strip().upper(), str(side).strip().upper(), strategy_id, result_id
+
+
+def _enumerate_weighted_compositions(
+    selected_rows: Sequence[Mapping[str, Any]],
+    launch: Mapping[str, Any],
+    max_enumerated_combinations: int,
+) -> tuple[tuple[Mapping[str, Any], ...], ...]:
+    """Build the exact Cartesian product of enabled finalist slot pools."""
+    if (
+        isinstance(selected_rows, (str, bytes))
+        or not isinstance(selected_rows, Sequence)
+        or not isinstance(launch, Mapping)
+        or type(max_enumerated_combinations) is not int
+        or max_enumerated_combinations <= 0
+    ):
+        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+    pairs = launch.get("pairs")
+    if isinstance(pairs, (str, bytes)) or not isinstance(pairs, Sequence):
+        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+    enabled: dict[tuple[str, str], int] = {}
+    symbols: set[str] = set()
+    seen_pair_symbols: set[str] = set()
+    for pair in pairs:
+        if not isinstance(pair, Mapping):
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        symbol = _weighted_symbol(pair.get("pair"))
+        if symbol in seen_pair_symbols:
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        seen_pair_symbols.add(symbol)
+        long_max = pair.get("max_finalist_long")
+        short_max = pair.get("max_finalist_short")
+        if type(long_max) is not int or long_max < 0 or type(short_max) is not int or short_max < 0:
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        if long_max == 0 and short_max == 0:
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        symbols.add(symbol)
+        if long_max:
+            enabled[(symbol, "LONG")] = long_max
+        if short_max:
+            enabled[(symbol, "SHORT")] = short_max
+    by_slot: dict[tuple[str, str], list[Mapping[str, Any]]] = {key: [] for key in enabled}
+    for raw in selected_rows:
+        if not isinstance(raw, Mapping):
+            continue
+        if "selection_status" in raw and raw.get("selection_status") != "SELECTED":
+            continue
+        symbol = _weighted_symbol(raw.get("symbol"))
+        side = str(raw.get("side", "")).strip().upper()
+        if (symbol, side) in by_slot:
+            if type(raw.get("strategy_id")) is not int or type(raw.get("result_id")) is not int:
+                raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+            by_slot[(symbol, side)].append({**raw, "symbol": symbol, "side": side})
+    for symbol in sorted(symbols):
+        if not any(by_slot.get((symbol, side)) for side in ("LONG", "SHORT")):
+            excluded = tuple(dict(row) for row in selected_rows if isinstance(row, Mapping) and str(row.get("symbol", "")).strip().upper() == symbol)
+            error = CampaignContractError(f"FINALIST_SLOT_UNAVAILABLE:{symbol}", excluded)
+            raise error
+    slots: list[tuple[str, str, tuple[Mapping[str, Any], ...]]] = []
+    for symbol in sorted(symbols):
+        for side in ("LONG", "SHORT"):
+            rows = by_slot.get((symbol, side), ())
+            if not rows:
+                continue
+            def rank_key(value: Any) -> tuple[int, Any]:
+                if value is None:
+                    return (1, 0)
+                if isinstance(value, bool) or type(value) is not int or value <= 0:
+                    raise CampaignContractError("USER_RANK_MISSING")
+                return (0, value)
+            ranks = [row.get("user_rank") for row in rows]
+            if len(rows) > 1:
+                if any(rank is None for rank in ranks):
+                    raise CampaignContractError("USER_RANK_MISSING")
+                if any(isinstance(rank, bool) or type(rank) is not int or rank <= 0 for rank in ranks):
+                    raise CampaignContractError("USER_RANK_MISSING")
+                if len(set(ranks)) != len(ranks):
+                    raise CampaignContractError("USER_RANK_DUPLICATE")
+            rows = tuple(sorted(rows, key=lambda row: (
+                rank_key(row.get("user_rank")),
+                row["strategy_id"],
+                row["result_id"],
+            )))
+            rows = rows[:enabled[(symbol, side)]]
+            slots.append((symbol, side, rows))
+    total = 1
+    for _symbol, _side, rows in slots:
+        total *= len(rows)
+    if total > max_enumerated_combinations:
+        raise CampaignContractError("COMBINATION_LIMIT_EXCEEDED")
+    return tuple(tuple(choice for choice in choices) for choices in product(*(rows for _symbol, _side, rows in slots)))
 
 
 def _weighted_geometry_int(value: Any, *, minimum: int) -> int:
@@ -647,13 +778,22 @@ def _safe_weighted_variant(candidate: Any, result: Any) -> Mapping[str, Any]:
     if any(not isinstance(member, Mapping) for member in members):
         raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
     symbols = []
+    seen_pairs: set[tuple[str, str]] = set()
+    normalized_members: list[Mapping[str, Any]] = []
     for member in members:
         symbol = member.get("symbol")
-        if type(symbol) is not str or not symbol or symbol != symbol.strip() or member.get("side") != "LONG":
+        side = str(member.get("side", "")).strip().upper()
+        if not isinstance(symbol, str) or not symbol.strip() or side not in {"LONG", "SHORT"}:
             raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
-        symbols.append(symbol)
-    if len(set(symbols)) != len(symbols):
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        pair = (symbol.strip().upper(), side)
+        if pair in seen_pairs:
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        seen_pairs.add(pair)
+        normalized = dict(member)
+        normalized.update({"symbol": pair[0], "side": pair[1]})
+        normalized_members.append(normalized)
+        symbols.append(pair[0])
+    members = tuple(normalized_members)
     search_mode = getattr(result, "mode", None)
     if search_mode != CAMPAIGN_SEARCH_MODE:
         raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
@@ -890,6 +1030,7 @@ def _weighted_executable_identity(
             "profile_id": profile_id,
             "scenario_id": scenario_id,
             "B": _weighted_decimal_text(_weighted_decimal(bank_usdt)),
+            "source_rows": tuple(_weighted_input_identity(row) for row in source_rows),
             "members": ordered_members,
         }
         for field in ("input_digest", "config_digest", "frozen_config_digest", "strategy_template_digest"):
@@ -915,7 +1056,7 @@ def _profile_margin_blockers(profiles: Sequence[Any]) -> tuple[str, ...]:
     return tuple("PROFILE:" + MARGIN_BOUND_UNAVAILABLE for _ in profiles)
 
 
-def build_portfolio_candidates(
+def _build_portfolio_candidates_single(
     selected_rows: Sequence[Mapping[str, Any]],
     campaign: Mapping[str, Any],
     *,
@@ -928,6 +1069,7 @@ def build_portfolio_candidates(
     workers: int = 1,
     margin_coefficients: Any = None,
     strategy_template: Mapping[str, Any] | None = None,
+    retain_profile_failures: bool = False,
 ) -> AdapterResult:
     """Build scalar weighted variants from one frozen Campaign snapshot."""
     try:
@@ -935,8 +1077,10 @@ def build_portfolio_candidates(
     except CampaignContractError as error:
         return AdapterResult("FAIL", blockers=(error.code,))
 
-    if not isinstance(spread_history_statuses, Mapping):
-        return AdapterResult("FAIL", blockers=("SPREAD_HISTORY_STATUS_UNKNOWN",))
+    try:
+        spread_history_statuses = _weighted_spread_statuses(spread_history_statuses)
+    except CampaignContractError as error:
+        return AdapterResult("FAIL", blockers=(error.code,))
 
     selected_for_adapter = selected_rows
     spread_excluded: tuple[Mapping[str, Any], ...] = ()
@@ -944,8 +1088,9 @@ def build_portfolio_candidates(
         eligible_rows = []
         excluded_rows = []
         for row in selected_rows:
-            symbol = row.get("symbol") if isinstance(row, Mapping) else None
-            status = spread_history_statuses.get(symbol) if isinstance(symbol, str) else None
+            raw_symbol = row.get("symbol") if isinstance(row, Mapping) else None
+            symbol = raw_symbol.strip().upper() if isinstance(raw_symbol, str) else None
+            status = spread_history_statuses.get(symbol) if symbol is not None else None
             if status not in {"READY", "PRELIMINARY"}:
                 excluded = dict(_normalise_scalar_exclusion(row))
                 reason = (
@@ -1073,10 +1218,15 @@ def build_portfolio_candidates(
     excluded: list[Mapping[str, Any]] = list(spread_excluded) + list(sizing_excluded)
     blockers: list[str] = []
     warnings: list[str] = []
+    def profile_blocker(profile_id: Any, reason: str) -> str:
+        if reason.startswith(("SYMBOL_CAPACITY_MISMATCH:", "SYMBOL_CAPACITY_EXCEEDED:", "MISSING_SYMBOL")):
+            return reason
+        return f"PROFILE:{profile_id}:{reason}" if retain_profile_failures else f"PROFILE:{reason}"
+
     for profile in profiles:
         profile_id = profile.get("profile_id")
         if type(profile_id) is not str or not profile_id or profile_id not in RESEARCH_RISK_POLICY:
-            blockers.append("PROFILE:" + _WEIGHTED_SEARCH_CONFIG_INVALID)
+            blockers.append(profile_blocker(profile_id, _WEIGHTED_SEARCH_CONFIG_INVALID))
             continue
         profile_with_scenario = dict(profile)
         profile_with_scenario["scenario_id"] = profile_id
@@ -1090,33 +1240,40 @@ def build_portfolio_candidates(
                 workers=workers,
             )
         except CampaignContractError as error:
-            blockers.append("PROFILE:" + error.code)
+            blockers.append(profile_blocker(profile_id, error.code))
+            continue
+        except ValueError as error:
+            reason = str(error)
+            if reason.startswith(("SYMBOL_CAPACITY_MISMATCH:", "SYMBOL_CAPACITY_EXCEEDED:", "MISSING_SYMBOL")):
+                blockers.append(profile_blocker(profile_id, reason))
+            else:
+                blockers.append(profile_blocker(profile_id, "WEIGHTED_SEARCH_FAILED"))
             continue
         except Exception:
-            blockers.append("PROFILE:WEIGHTED_SEARCH_FAILED")
+            blockers.append(profile_blocker(profile_id, "WEIGHTED_SEARCH_FAILED"))
             continue
         status = getattr(search_result, "status", None)
         try:
             warnings.extend(_safe_search_warnings(getattr(search_result, "warnings", ())))
         except CampaignContractError as error:
-            blockers.append("PROFILE:" + error.code)
+            blockers.append(profile_blocker(profile_id, error.code))
             continue
         if status != "PASS":
             reason = getattr(search_result, "reason", None) or "WEIGHTED_SEARCH_FAILED"
-            blockers.append("PROFILE:" + str(reason))
+            blockers.append(profile_blocker(profile_id, str(reason)))
             search_excluded = getattr(search_result, "excluded", ())
             if isinstance(search_excluded, Sequence) and not isinstance(search_excluded, (str, bytes)):
                 excluded.extend(_normalise_scalar_exclusion(item) for item in search_excluded)
             continue
         if getattr(search_result, "mode", None) != CAMPAIGN_SEARCH_MODE:
-            blockers.append("PROFILE:" + _WEIGHTED_SEARCH_CONFIG_INVALID)
+            blockers.append(profile_blocker(profile_id, _WEIGHTED_SEARCH_CONFIG_INVALID))
             continue
         candidates = getattr(search_result, "candidates", ())
         if isinstance(candidates, (str, bytes)) or not isinstance(candidates, Sequence):
-            blockers.append("PROFILE:" + _WEIGHTED_SEARCH_CONFIG_INVALID)
+            blockers.append(profile_blocker(profile_id, _WEIGHTED_SEARCH_CONFIG_INVALID))
             continue
         if not candidates:
-            blockers.append("PROFILE:WEIGHTED_SEARCH_FAILED")
+            blockers.append(profile_blocker(profile_id, "WEIGHTED_SEARCH_FAILED"))
             continue
         try:
             profile_variants = []
@@ -1152,7 +1309,7 @@ def build_portfolio_candidates(
                     )
                 profile_variants.append(variant)
         except CampaignContractError as error:
-            blockers.append("PROFILE:" + error.code)
+            blockers.append(profile_blocker(profile_id, error.code))
         else:
             variants.extend(profile_variants)
 
@@ -1160,9 +1317,250 @@ def build_portfolio_candidates(
         identities = [variant["identity"] for variant in variants]
         if len(identities) != len(set(identities)):
             blockers.append("PROFILE:" + WEIGHTED_EXECUTABLE_IDENTITY_COLLISION)
+    ordinary = {"NO_POSITIVE_TARGET", "LP_INFEASIBLE", "FRONTIER_INFEASIBLE", "TARGET_INFEASIBLE"}
+    if not retain_profile_failures and variants and blockers and all(
+        blocker.startswith("PROFILE:") and blocker.split(":", 1)[1] in ordinary
+        for blocker in blockers
+    ):
+        warnings.extend(blockers)
+        blockers.clear()
     if blockers:
-        return AdapterResult("FAIL", excluded=excluded, blockers=blockers, warnings=warnings)
+        ordinary = {"NO_POSITIVE_TARGET", "LP_INFEASIBLE", "FRONTIER_INFEASIBLE", "TARGET_INFEASIBLE"}
+        retain = retain_profile_failures and all(
+            blocker.startswith("PROFILE:") and blocker.rsplit(":", 1)[-1] in ordinary
+            for blocker in blockers
+        )
+        return AdapterResult("FAIL", variants=variants if retain else (), excluded=excluded, blockers=blockers, warnings=warnings)
     return AdapterResult("PASS", variants=variants, excluded=excluded, warnings=warnings)
+
+
+def build_portfolio_candidates(
+    selected_rows: Sequence[Mapping[str, Any]],
+    campaign: Mapping[str, Any],
+    *,
+    capacities: Mapping[str, MinuteCapacityResult],
+    reference: ReferenceSnapshot,
+    mark_prices: Mapping[str, Any],
+    spread_observations: Mapping[str, Sequence[Mapping[str, Any]]],
+    spread_history_statuses: Mapping[str, str],
+    now_ms: int,
+    workers: int = 1,
+    margin_coefficients: Any = None,
+    strategy_template: Mapping[str, Any] | None = None,
+) -> AdapterResult:
+    """Enumerate fixed finalist compositions, then run each profile."""
+    try:
+        validate_campaign_contract(campaign)
+    except CampaignContractError as error:
+        return AdapterResult("FAIL", blockers=(error.code,))
+    launch = campaign.get("launch") if isinstance(campaign, Mapping) else None
+    if not isinstance(launch, Mapping) or "pairs" not in launch:
+        return _build_portfolio_candidates_single(
+            selected_rows,
+            campaign,
+            capacities=capacities,
+            reference=reference,
+            mark_prices=mark_prices,
+            spread_observations=spread_observations,
+            spread_history_statuses=spread_history_statuses,
+            now_ms=now_ms,
+            workers=workers,
+            margin_coefficients=margin_coefficients,
+            strategy_template=strategy_template,
+        )
+    if isinstance(launch.get("pairs"), (str, bytes)) or not isinstance(launch.get("pairs"), Sequence) or not launch.get("pairs"):
+        return AdapterResult("FAIL", blockers=(_WEIGHTED_SEARCH_CONFIG_INVALID,))
+    try:
+        spread_history_statuses = _weighted_spread_statuses(spread_history_statuses)
+    except CampaignContractError as error:
+        return AdapterResult("FAIL", blockers=(error.code,))
+    eligible_rows: list[Mapping[str, Any]] = []
+    spread_excluded: list[Mapping[str, Any]] = []
+    for row in selected_rows:
+        symbol = row.get("symbol") if isinstance(row, Mapping) else None
+        symbol = symbol.strip().upper() if isinstance(symbol, str) else None
+        status = spread_history_statuses.get(symbol) if symbol is not None else None
+        if status in {"READY", "PRELIMINARY"}:
+            eligible_rows.append(row)
+        else:
+            excluded_row = dict(_normalise_scalar_exclusion(row))
+            excluded_row["reason"] = (
+                f"SPREAD_HISTORY_STATUS_{status}"
+                if status in {"CLEAR", "OVERLAPS_SPREAD"}
+                else "SPREAD_HISTORY_STATUS_UNKNOWN"
+            )
+            spread_excluded.append(excluded_row)
+    if not eligible_rows:
+        return AdapterResult("FAIL", excluded=tuple(spread_excluded), blockers=((spread_excluded[0]["reason"] if spread_excluded else "SPREAD_HISTORY_STATUS_UNKNOWN"),))
+    try:
+        config_document = campaign.get("config_document")
+        search = config_document.get("search") if isinstance(config_document, Mapping) else None
+        max_combinations = search.get("max_enumerated_combinations") if isinstance(search, Mapping) else None
+        compositions = _enumerate_weighted_compositions(tuple(eligible_rows), launch, max_combinations)
+    except CampaignContractError as error:
+        return AdapterResult(
+            "FAIL",
+            excluded=tuple(spread_excluded) + tuple(error.exclusions),
+            blockers=(error.code,),
+        )
+    raw_profiles = launch.get("profiles")
+    if isinstance(raw_profiles, (str, bytes)) or not isinstance(raw_profiles, Sequence) or not raw_profiles:
+        return AdapterResult("FAIL", excluded=tuple(spread_excluded), blockers=(_WEIGHTED_SEARCH_CONFIG_INVALID,))
+    profiles_by_id: dict[str, Mapping[str, Any]] = {}
+    for profile in raw_profiles:
+        if not isinstance(profile, Mapping):
+            return AdapterResult("FAIL", excluded=tuple(spread_excluded), blockers=(_WEIGHTED_SEARCH_CONFIG_INVALID,))
+        profile_id = profile.get("profile_id")
+        max_candidates = profile.get("max_candidates")
+        if (
+            type(profile_id) is not str
+            or profile_id not in RESEARCH_RISK_POLICY
+            or profile_id in profiles_by_id
+            or type(max_candidates) is not int
+            or not 1 <= max_candidates <= 50
+        ):
+            return AdapterResult("FAIL", excluded=tuple(spread_excluded), blockers=(_WEIGHTED_SEARCH_CONFIG_INVALID,))
+        profiles_by_id[profile_id] = profile
+    retained_by_profile: dict[str, list[Mapping[str, Any]]] = {}
+    retained_keys: dict[str, set[tuple[str, str]]] = {}
+    excluded: list[Mapping[str, Any]] = []
+    excluded_keys: set[str] = set()
+
+    def add_excluded(
+        items: Sequence[Any],
+        *,
+        composition_ordinal: int | None = None,
+        composition_identity: tuple[tuple[str, str, int, int], ...] | None = None,
+    ) -> None:
+        for value in items:
+            item = dict(value) if isinstance(value, Mapping) else dict(_normalise_scalar_exclusion(value))
+            if composition_ordinal is not None and composition_identity is not None:
+                item["composition_ordinal"] = composition_ordinal
+                item["composition_identity"] = composition_identity
+            key = json.dumps(item, sort_keys=True, default=str, separators=(",", ":"), ensure_ascii=True)
+            if key not in excluded_keys:
+                excluded_keys.add(key)
+                excluded.append(item)
+
+    add_excluded(spread_excluded)
+    warnings: list[str] = []
+    failures: dict[tuple[str, str], int] = {}
+    allowed_failures = {"NO_POSITIVE_TARGET", "LP_INFEASIBLE", "FRONTIER_INFEASIBLE", "TARGET_INFEASIBLE"}
+
+    def metric_for(item: Mapping[str, Any], *names: str) -> Decimal:
+        metrics = item.get("metrics")
+        if not isinstance(metrics, Mapping):
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        for name in names:
+            if name not in metrics:
+                continue
+            try:
+                value = Decimal(str(metrics[name]))
+            except (ArithmeticError, TypeError, ValueError):
+                raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+            if value.is_finite():
+                return value
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+
+    for ordinal, composition in enumerate(compositions):
+        composition_identity = tuple(
+            (
+                str(row.get("symbol", "")).strip().upper(),
+                str(row.get("side", "")).strip().upper(),
+                row.get("strategy_id"),
+                row.get("result_id"),
+            )
+            for row in composition
+        )
+        result = _build_portfolio_candidates_single(
+            composition,
+            campaign,
+            capacities=capacities,
+            reference=reference,
+            mark_prices=mark_prices,
+            spread_observations=spread_observations,
+            spread_history_statuses=spread_history_statuses,
+            now_ms=now_ms,
+            workers=workers,
+            margin_coefficients=margin_coefficients,
+            strategy_template=strategy_template,
+            retain_profile_failures=True,
+        )
+        add_excluded(
+            result.excluded,
+            composition_ordinal=ordinal,
+            composition_identity=composition_identity,
+        )
+        warnings.extend(result.warnings)
+        if result.status != "PASS":
+            parsed_failures: list[tuple[str, str]] = []
+            for blocker in result.blockers:
+                parts = blocker.split(":", 2)
+                if blocker.startswith(("SYMBOL_CAPACITY_MISMATCH:", "SYMBOL_CAPACITY_EXCEEDED:", "MISSING_SYMBOL")):
+                    return AdapterResult("FAIL", excluded=tuple(excluded), blockers=(blocker,), warnings=tuple(warnings))
+                if len(parts) != 3 or parts[0] != "PROFILE" or parts[1] not in profiles_by_id:
+                    return AdapterResult("FAIL", excluded=tuple(excluded), blockers=result.blockers, warnings=tuple(warnings))
+                profile_id, reason = parts[1], parts[2]
+                if reason not in allowed_failures:
+                    return AdapterResult("FAIL", excluded=tuple(excluded), blockers=result.blockers, warnings=tuple(warnings))
+                parsed_failures.append((profile_id, reason))
+            for profile_id, reason in parsed_failures:
+                failures[(profile_id, reason)] = failures.get((profile_id, reason), 0) + 1
+            if not result.variants:
+                continue
+        for variant in result.variants:
+            profile_id = str(variant.get("profile_id", ""))
+            item = dict(variant)
+            item["composition_ordinal"] = ordinal
+            item["composition_identity"] = composition_identity
+            try:
+                metric_for(item, "p30_common_usdt_30d", "p30_common")
+                metric_for(item, "cdar_peak80_usdt", "cdar_peak80")
+                metric_for(item, "required_bank_usdt", "B_required_usdt", "B_required_margin_usdt")
+            except CampaignContractError as error:
+                return AdapterResult("FAIL", excluded=tuple(excluded), blockers=("PROFILE:" + error.code,), warnings=tuple(warnings))
+            key = (str(item.get("composition_identity", "")), str(item.get("identity", "")))
+            keys = retained_keys.setdefault(profile_id, set())
+            if key in keys:
+                continue
+            keys.add(key)
+            retained = retained_by_profile.setdefault(profile_id, [])
+            retained.append(item)
+            retained.sort(key=lambda value: (
+                -metric_for(value, "p30_common_usdt_30d", "p30_common"),
+                metric_for(value, "cdar_peak80_usdt", "cdar_peak80"),
+                metric_for(value, "required_bank_usdt", "B_required_usdt", "B_required_margin_usdt"),
+                value.get("composition_identity", ()),
+                str(value.get("identity", "")),
+                str(value.get("profile_id", "")),
+            ))
+            if profile_id not in profiles_by_id:
+                return AdapterResult("FAIL", excluded=tuple(excluded), blockers=(_WEIGHTED_SEARCH_CONFIG_INVALID,), warnings=tuple(warnings))
+            limit = profiles_by_id[profile_id]["max_candidates"]
+            if len(retained) > limit:
+                removed = retained.pop()
+                keys.discard((str(removed.get("composition_identity", "")), str(removed.get("identity", ""))))
+    variants: list[Mapping[str, Any]] = []
+    for profile_variants in retained_by_profile.values():
+        variants.extend(profile_variants)
+    if not variants:
+        blockers = tuple(
+            f"PROFILE:{profile_id}:{reason}:COUNT={count}"
+            for (profile_id, reason), count in sorted(failures.items())
+        )
+        return AdapterResult("FAIL", excluded=tuple(excluded), blockers=blockers or ("WEIGHTED_SEARCH_FAILED",), warnings=tuple(warnings))
+    warnings.extend(
+        f"PROFILE:{profile_id}:{reason}:COUNT={count}"
+        for (profile_id, reason), count in sorted(failures.items())
+    )
+    identities = [
+        (variant.get("composition_identity"), variant.get("identity"))
+        for variant in variants
+    ]
+    if len(identities) != len(set(identities)):
+        return AdapterResult("FAIL", excluded=tuple(excluded), blockers=(f"PROFILE:{WEIGHTED_EXECUTABLE_IDENTITY_COLLISION}",), warnings=tuple(warnings))
+    return AdapterResult("PASS", variants=tuple(variants), excluded=tuple(excluded), warnings=tuple(warnings))
 
 
 def run_portfolio_adapter(
@@ -1198,7 +1596,7 @@ def run_portfolio_adapter(
 
         now = datetime.now(timezone.utc)
         now_ms = int(now.timestamp() * 1000)
-        symbols = tuple(sorted({row["symbol"] for row in selected_rows if isinstance(row, Mapping) and isinstance(row.get("symbol"), str) and row["symbol"]}))
+        symbols = tuple(sorted({row["symbol"].strip().upper() for row in selected_rows if isinstance(row, Mapping) and isinstance(row.get("symbol"), str) and row["symbol"].strip()}))
         if not symbols:
             return AdapterResult("FAIL", blockers=("NO_SELECTED_SYMBOLS",))
 

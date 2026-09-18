@@ -1305,15 +1305,15 @@ def test_portfolio_pair_selection_copies_global_maxima_without_auto_selection() 
     assert "portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= 50" in portfolio
 
 
-def test_portfolio_launch_pins_mvp_finalist_limits() -> None:
+def test_portfolio_launch_exposes_directional_finalist_limits() -> None:
     html = _read("index.html")
     js = _read("app.js")
     portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
 
-    assert 'id="portfolio-default-long" type="number" min="1" max="1" step="1" value="1" readonly' in html
-    assert 'id="portfolio-default-short" type="number" min="0" max="0" step="1" value="0" readonly' in html
-    assert "max_finalist_long: 1" in portfolio
-    assert "max_finalist_short: 0" in portfolio
+    assert 'id="portfolio-default-long" type="number" min="0" step="1" value="1"' in html
+    assert 'id="portfolio-default-short" type="number" min="0" step="1" value="1"' in html
+    assert "max_finalist_long: row.long" in portfolio
+    assert "max_finalist_short: row.short" in portfolio
 
 
 def test_portfolio_recovery_and_polling_use_server_job_endpoints_only() -> None:

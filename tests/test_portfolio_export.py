@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -12,6 +13,7 @@ from mrs3.portfolio.export import (
     ExportError,
     _invoke,
     _store_row_exists,
+    _strategy_payloads,
     canonical_export_json,
     composition_digest,
     export_portfolio,
@@ -638,6 +640,16 @@ def test_repeated_selected_variants_keep_order_independent_slots(tmp_path: Path)
     assert len(strategy["slots"]) == len(variants)
     assert all("candidate_ids" in slot and "result_ids" in slot for slot in strategy["slots"])
     assert first.manifest_digest == second.manifest_digest
+
+
+def test_strategy_payloads_ignore_sideless_fallback_when_side_tagged_payload_exists():
+    result = SimpleNamespace(accounts={})
+    payloads = _strategy_payloads(result, (
+        {"symbol": "BTCUSDT", "candidate": "fallback"},
+        {"symbol": "BTCUSDT", "side": "LONG", "candidate": "side"},
+    ))
+
+    assert payloads["BTCUSDT"]["candidate"]["candidate"] == "side"
 
 
 def test_omitted_attempt_id_uses_durable_readback_attempt_in_manifest_and_gate(tmp_path: Path):

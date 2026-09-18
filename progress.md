@@ -2588,3 +2588,27 @@ No production database, tester execution, network access, recommendation
 surface change, runtime path change or live authorization occurred. Phase 7
 real tester calibration remains separately gated; the next implementation item
 is Phase 9.
+
+## Portfolio Optimizer Phase 9 accepted (2026-09-18)
+
+WS1.2 replaces the LONG-only executable revision. Panel finalist bounds are
+nonnegative per side, User Rank defines each top-N slot pool, and the adapter
+enumerates the exact fixed-slot Cartesian product. Distinct chosen compositions
+remain distinct even when a member receives zero weight; every profile uses one
+bounded global ranking before any separately authorized real test.
+
+LONG and SHORT for one canonical symbol may coexist. They share one liquidity
+cap in discovery, redistribution, validation, rescue, target calculation and
+sizing; margin remains additive without side netting and limiter replay keeps
+the strategies as distinct slots. Directional payloads and XLSX rows preserve
+side and chosen-member identity.
+
+Independent Opus implementation review returned `CODE_REVIEW_PASS` after three
+finding rounds. Root verification passed the focused Phase 9 contour
+(`1093 passed`) and the final full suite
+(`4552 passed, 7 skipped, 25 warnings` in 1028.47 seconds); `git diff --check`
+was clean. No tester, network, production database, live execution or
+recommendation state was used or changed. See
+[ADR-0039](docs/decisions/0039-portfolio-optimizer-ws12-directional-shared-cap.md)
+and [Phase 9 evidence](docs/superpowers/plans/2026-09-18-portfolio-optimizer-weighted-search-phase-9-evidence.md).
+The next implementation item is Phase 10.

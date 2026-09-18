@@ -225,26 +225,42 @@ def _weighted_payload_pairs(variant: Any) -> tuple[tuple[Any, Any], ...]:
         members = ()
     if isinstance(payloads, (str, bytes)) or not isinstance(payloads, Sequence):
         payloads = ()
+    payload_by_identity: dict[tuple[str, str], Any] = {}
     payload_by_symbol: dict[str, Any] = {}
-    invalid_symbols: set[str] = set()
+    tagged_symbols: set[str] = set()
+    ambiguous_symbols: set[str] = set()
+    invalid_identities: set[tuple[str, str]] = set()
     for payload in payloads:
         if not isinstance(payload, Mapping):
             continue
         basic = _get(_get(payload, "strategy", {}), "basic", {})
         symbol = _get(basic, "symbol")
+        side = _get(_get(payload, "strategy", {}), "side", _get(payload, "side"))
         if not isinstance(symbol, str) or not symbol.strip():
             continue
-        if symbol in payload_by_symbol:
-            invalid_symbols.add(symbol)
-            payload_by_symbol.pop(symbol, None)
+        symbol = symbol.strip().upper()
+        if not isinstance(side, str) or side.strip().upper() not in {"LONG", "SHORT"}:
+            if symbol in payload_by_symbol:
+                ambiguous_symbols.add(symbol)
+                payload_by_symbol.pop(symbol, None)
+            elif symbol not in ambiguous_symbols:
+                payload_by_symbol[symbol] = payload
             continue
-        if symbol not in invalid_symbols:
-            payload_by_symbol[symbol] = payload
-    member_symbols: dict[str, int] = {}
+        identity = (symbol, side.strip().upper())
+        tagged_symbols.add(symbol)
+        if identity in payload_by_identity:
+            invalid_identities.add(identity)
+            payload_by_identity.pop(identity, None)
+            continue
+        if identity not in invalid_identities:
+            payload_by_identity[identity] = payload
+    member_identities: dict[tuple[str, str], int] = {}
     for member in members:
         symbol = _get(member, "symbol", _get(member, "pair"))
-        if isinstance(symbol, str):
-            member_symbols[symbol] = member_symbols.get(symbol, 0) + 1
+        side = _get(member, "side", _get(member, "direction"))
+        if isinstance(symbol, str) and isinstance(side, str) and side.strip().upper() in {"LONG", "SHORT"}:
+            identity = (symbol.strip().upper(), side.strip().upper())
+            member_identities[identity] = member_identities.get(identity, 0) + 1
     pairs = []
     for member in members:
         payload = None
@@ -255,8 +271,16 @@ def _weighted_payload_pairs(variant: Any) -> tuple[tuple[Any, Any], ...]:
         if positive:
             symbol = _get(member, "symbol", _get(member, "pair"))
             side = _get(member, "side", _get(member, "direction"))
-            if side == "LONG" and isinstance(symbol, str) and symbol.strip() and member_symbols.get(symbol) == 1 and symbol not in invalid_symbols:
-                payload = payload_by_symbol.get(symbol)
+            identity = (
+                symbol.strip().upper(),
+                side.strip().upper(),
+            ) if isinstance(symbol, str) and isinstance(side, str) and side.strip().upper() in {"LONG", "SHORT"} else None
+            if identity is not None and member_identities.get(identity) == 1 and identity not in invalid_identities:
+                payload = payload_by_identity.get(identity)
+            if payload is None and isinstance(symbol, str) and isinstance(side, str):
+                symbol_key = symbol.strip().upper()
+                if side.strip().upper() == "LONG" and symbol_key not in tagged_symbols and member_identities.get(identity, 0) == 1 and sum(count for (candidate_symbol, _candidate_side), count in member_identities.items() if candidate_symbol == symbol_key) == 1 and symbol_key not in ambiguous_symbols:
+                    payload = payload_by_symbol.get(symbol_key)
         pairs.append((member, payload))
     return tuple(pairs)
 
@@ -514,12 +538,16 @@ class PortfolioPanelService:
                 try:
                     with duckdb.connect(str(database), read_only=True) as connection:
                         pair_rows = connection.execute("select distinct symbol, side from selection_runs order by symbol, side").fetchall()
-                    pair_keys = tuple((str(symbol), str(side).upper()) for symbol, side in pair_rows if str(side).upper() in {"LONG", "SHORT"})
+                    pair_keys = tuple((str(symbol).strip().upper(), str(side).strip().upper()) for symbol, side in pair_rows if str(side).strip().upper() in {"LONG", "SHORT"})
                     # Readiness only needs current finalist metadata.  Keep
                     # large action/equity series out of this hot path.
                     rows = _invoke(self.finalists_reader, database, pair_keys, False)
                     for row in rows:
-                        pair = f"{row.get('symbol')}|{row.get('side')}"
+                        symbol = row.get("symbol") if isinstance(row, Mapping) else None
+                        side = row.get("side") if isinstance(row, Mapping) else None
+                        if not isinstance(symbol, str) or not isinstance(side, str) or side.strip().upper() not in {"LONG", "SHORT"}:
+                            continue
+                        pair = f"{symbol.strip().upper()}|{side.strip().upper()}"
                         finalists[pair] = finalists.get(pair, 0) + 1
                     pairs = sorted(finalists)
                 except Exception:
@@ -546,7 +574,12 @@ class PortfolioPanelService:
     def _snapshot_finalists(self, document: Mapping[str, Any], launch: Mapping[str, Any]) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
         inputs = document.get("inputs") if isinstance(document.get("inputs"), Mapping) else {}
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
-        pairs = tuple((pair["pair"], "LONG") for pair in launch["pairs"])
+        pairs = tuple(
+            (pair["pair"], side)
+            for pair in launch["pairs"]
+            for side, maximum in (("LONG", pair["max_finalist_long"]), ("SHORT", pair["max_finalist_short"]))
+            if maximum > 0
+        )
         try:
             # Campaign snapshots retain the finalist evidence needed by search.
             loaded = _invoke(self.finalists_reader, database, pairs, True)
@@ -579,11 +612,13 @@ class PortfolioPanelService:
                     )
                 if (
                     not isinstance(item.get("symbol"), str) or not item["symbol"].strip()
-                    or not isinstance(item.get("side"), str) or not item["side"].strip()
+                    or not isinstance(item.get("side"), str) or item["side"].strip().upper() not in {"LONG", "SHORT"}
                     or type(item.get("strategy_id")) is not int
                     or type(item.get("result_id")) is not int
                 ):
                     raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "portfolio finalist identity is unavailable", status=422)
+                item["symbol"] = item["symbol"].strip().upper()
+                item["side"] = item["side"].strip().upper()
 
                 def series(*aliases: str) -> Any:
                     for alias in aliases:
@@ -654,31 +689,30 @@ class PortfolioPanelService:
         if not isinstance(raw_pairs, list) or not raw_pairs or not isinstance(raw_profiles, list) or not raw_profiles:
             raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "pairs and profiles are required", status=422)
         pairs: list[dict[str, Any]] = []
-        seen_pairs: set[str] = set()
+        seen_symbols: set[str] = set()
         for index, value in enumerate(raw_pairs):
             if not isinstance(value, Mapping) or set(value) != {"pair", "max_finalist_long", "max_finalist_short"}:
                 raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign fields are invalid", status=422, field_errors=[{"field": f"pairs[{index}]", "code": "INVALID_PAIR", "message": "pair fields are invalid"}])
             symbol = value.get("pair")
-            if not isinstance(symbol, str) or not symbol.strip() or symbol in seen_pairs:
+            if not isinstance(symbol, str) or not symbol.strip():
                 raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign fields are invalid", status=422, field_errors=[{"field": f"pairs[{index}].pair", "code": "INVALID_PAIR", "message": "pair must be unique"}])
-            seen_pairs.add(symbol)
+            symbol = symbol.strip().upper()
+            if symbol in seen_symbols:
+                raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign fields are invalid", status=422, field_errors=[{"field": f"pairs[{index}].pair", "code": "INVALID_PAIR", "message": "pair must be unique"}])
+            seen_symbols.add(symbol)
             max_finalist_long = _integer(value["max_finalist_long"], f"pairs[{index}].max_finalist_long", nonnegative=True)
             max_finalist_short = _integer(value["max_finalist_short"], f"pairs[{index}].max_finalist_short", nonnegative=True)
-            if max_finalist_long != 1 or max_finalist_short != 0:
-                invalid_field = (
-                    f"pairs[{index}].max_finalist_long"
-                    if max_finalist_long != 1
-                    else f"pairs[{index}].max_finalist_short"
-                )
+            if max_finalist_long == 0 and max_finalist_short == 0:
+                invalid_field = f"pairs[{index}].max_finalist_long"
                 raise PortfolioPanelError(
                     "PORTFOLIO_CAMPAIGN_INVALID",
-                    "campaign finalist limits are unsupported",
+                    "campaign finalist limits are invalid",
                     status=422,
                     field_errors=[
                         {
                             "field": invalid_field,
-                            "code": "MVP_FINALIST_LIMIT",
-                            "message": "MVP requires one LONG finalist and no SHORT finalists",
+                            "code": "FINALIST_LIMIT_RANGE",
+                            "message": "at least one direction must be enabled",
                         }
                     ],
                 )
@@ -715,8 +749,18 @@ class PortfolioPanelService:
                 )
             profiles.append({"profile_id": profile_id, "equity_usdt": _decimal(value.get("equity_usdt"), f"profiles[{index}].equity_usdt"), "max_balance_usdt": _decimal(max_balance, f"profiles[{index}].max_balance_usdt") if max_balance is not None else None, "max_candidates": max_candidates})
         launch = {"pairs": pairs, "profiles": profiles}
-        launch["selected_pairs"] = [[pair["pair"], "LONG"] for pair in pairs]
-        launch["maximums"] = {f"{pair['pair']}|LONG": pair["max_finalist_long"] for pair in pairs}
+        launch["selected_pairs"] = [
+            [pair["pair"], side]
+            for pair in pairs
+            for side, maximum in (("LONG", pair["max_finalist_long"]), ("SHORT", pair["max_finalist_short"]))
+            if maximum > 0
+        ]
+        launch["maximums"] = {
+            f"{pair['pair']}|{side}": maximum
+            for pair in pairs
+            for side, maximum in (("LONG", pair["max_finalist_long"]), ("SHORT", pair["max_finalist_short"]))
+            if maximum > 0
+        }
         return launch
 
     def _campaign_by_id(self, campaign_id: str) -> tuple[dict[str, Any], dict[str, Any]]:

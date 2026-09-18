@@ -1217,11 +1217,15 @@ independent `CODE_REVIEW_PASS`, and final full suite `4503 passed, 7 skipped, 25
 
 ### Фаза 9. Несколько финалистов и LONG+SHORT
 
-- [ ] Выбирать одну стратегию на каждую сторону символа из нескольких
+- [x] Выбирать одну стратегию на каждую сторону символа из нескольких
   FINALIST по стороне. Если у включённой пары доступны обе стороны, итоговый
   портфель включает выбранные LONG и SHORT вместе. Это не XOR между сторонами.
   Нужны общий symbol-cap, одновременная маржа обеих сторон и отдельный
   подтверждённый учёт слотов. Не включать автоматически в LONG-only MVP.
+
+Phase 9 is accepted: [evidence](2026-09-18-portfolio-optimizer-weighted-search-phase-9-evidence.md),
+independent Opus `CODE_REVIEW_PASS`, and final full suite
+`4552 passed, 7 skipped, 25 warnings`.
 
 ### Фаза 10. Расширение портфеля и обновление ликвидности
 

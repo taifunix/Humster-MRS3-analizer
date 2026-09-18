@@ -251,7 +251,7 @@ def _strategy_payloads(result: IntegrationResult, selected_variants: Iterable[An
             attempt.variant for attempt in result.attempts
             if attempt.identity == result.selected and attempt.variant is not None
         )
-    grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    grouped: dict[str, list[tuple[str, dict[str, Any], bool]]] = {}
     for variant in variants:
         if isinstance(variant, Variant):
             symbol = str(variant.slot.symbol)
@@ -282,16 +282,19 @@ def _strategy_payloads(result: IntegrationResult, selected_variants: Iterable[An
                 }
             else:
                 continue
-        grouped.setdefault(symbol, []).append((export_digest(payload), payload))
+        side_tagged = (isinstance(variant, Variant) and bool(variant.directions)) or bool(_first(variant, "side", default=None))
+        grouped.setdefault(symbol, []).append((export_digest(payload), payload, side_tagged))
     payloads: dict[str, dict[str, Any]] = {}
     for symbol, entries in grouped.items():
+        if any(side_tagged for _digest, _payload, side_tagged in entries):
+            entries = [entry for entry in entries if entry[2]]
         entries.sort(key=lambda item: item[0])
         if len(entries) == 1:
             payloads[symbol] = entries[0][1]
         else:
             slots = [
                 {"slot_id": f"{digest}:{index}", **payload}
-                for index, (digest, payload) in enumerate(entries)
+                for index, (digest, payload, _side_tagged) in enumerate(entries)
             ]
             payloads[symbol] = {
                 "schema": "portfolio_strategy_v1",

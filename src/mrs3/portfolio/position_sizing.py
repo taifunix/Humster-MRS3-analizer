@@ -643,9 +643,9 @@ def size_composition_vector(
         if isinstance(targets, Mapping):
             symbol_counts: dict[str, int] = {}
             for row in raw_members:
-                symbol = str(row.get("symbol", ""))
+                symbol = str(row.get("symbol", "")).strip().upper()
                 symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
-            if any(symbol_counts.get(str(key), 0) > 1 for key in targets):
+            if any(symbol_counts.get(str(key).strip().upper(), 0) > 1 for key in targets):
                 raise ValueError("AMBIGUOUS_TARGET_KEY")
 
         def target_for(index: int, row: Mapping[str, Any]) -> Decimal:
@@ -662,7 +662,7 @@ def size_composition_vector(
                 if len(matches) > 1:
                     raise ValueError("AMBIGUOUS_TARGET_KEY")
                 if not matches:
-                    if any(str(key) == str(row.get("symbol")) for key in targets):
+                    if any(str(key).strip().upper() == str(row.get("symbol", "")).strip().upper() for key in targets):
                         raise ValueError("AMBIGUOUS_TARGET_KEY")
                     raise ValueError(f"MISSING_TARGET_{strategy_id}")
                 consumed_target_keys.append(matches[0])
@@ -672,9 +672,27 @@ def size_composition_vector(
             return _decimal(value, "target_x_usdt", nonnegative=True)
 
         selected = tuple(
-            (dict(row), target_for(index, row))
+            (
+                {**dict(row), "symbol": str(row.get("symbol", "")).strip().upper()},
+                target_for(index, row),
+            )
             for index, row in enumerate(raw_members)
         )
+        def canonical_map(values: Mapping[Any, Any], name: str) -> dict[str, Any]:
+            if not isinstance(values, Mapping):
+                raise ValueError("INVALID_VECTOR")
+            result: dict[str, Any] = {}
+            for key, value in values.items():
+                symbol = str(key).strip().upper()
+                if not symbol:
+                    raise ValueError(f"MISSING_{name.upper()}")
+                if symbol in result:
+                    raise ValueError(f"AMBIGUOUS_{name.upper()}_KEY")
+                result[symbol] = value
+            return result
+
+        capacity_values = canonical_map(capacities, "capacity")
+        mark_values = canonical_map(mark_prices, "mark_price")
         if isinstance(targets, Mapping) and any(key not in consumed_target_keys for key in targets):
             raise ValueError("UNKNOWN_TARGET_KEY")
         if any(row.get("side") not in {"LONG", "SHORT"} for row, _ in selected):
@@ -683,23 +701,30 @@ def size_composition_vector(
         for row, target in selected:
             by_symbol.setdefault(str(row.get("symbol", "")), []).append((row, target))
         sized: list[Mapping[str, Any]] = []
+        actual_totals: dict[str, Decimal] = {}
         exclusions: list[CompositionSizingExclusion] = []
         for symbol, symbol_rows in sorted(by_symbol.items()):
             if not symbol:
                 raise ValueError("MISSING_SYMBOL")
-            if symbol not in capacities or symbol not in mark_prices:
+            if symbol not in capacity_values or symbol not in mark_values:
                 raise ValueError(f"MISSING_{symbol}")
-            capacity, round_down = _composition_capacity(capacities[symbol])
-            mark = _decimal(mark_prices[symbol], f"mark_prices.{symbol}", positive=True)
+            capacity, round_down = _composition_capacity(capacity_values[symbol])
+            mark = _decimal(mark_values[symbol], f"mark_prices.{symbol}", positive=True)
             instrument = _instrument_for(reference, symbol)
             if instrument is None:
-                instrument = capacities[symbol] if isinstance(capacities[symbol], Mapping) else None
+                instrument = capacity_values[symbol] if isinstance(capacity_values[symbol], Mapping) else None
             if instrument is None:
                 raise ValueError("MISSING_REFERENCE")
             max_qty = _map_decimal(instrument, "max_qty", nonnegative=True)
             cap = _floor_step(min(capacity, max_qty * mark), round_down)
-            if sum((target for _, target in symbol_rows), Decimal(0)) > cap + MONEY_EPS:
-                raise ValueError("CAPACITY_EXCEEDED")
+            combined_target = sum((target for _row, target in symbol_rows), Decimal(0))
+            if combined_target > cap + MONEY_EPS:
+                return CompositionSizingResult(
+                    FAIL,
+                    (),
+                    f"CAPACITY_EXCEEDED_{symbol}",
+                    exclusions=tuple(exclusions),
+                )
             for row, target in sorted(symbol_rows, key=lambda item: _member_sort_key(item[0])):
                 if target == 0:
                     exclusions.append(CompositionSizingExclusion((row,), "SIZE_ZERO"))
@@ -718,6 +743,7 @@ def size_composition_vector(
                 if min_notional is not None and actual < _decimal(min_notional, "min_notional", positive=True):
                     exclusions.append(CompositionSizingExclusion((row,), "SIZE_BELOW_MINIMUM_NOTIONAL"))
                     continue
+                actual_totals[symbol] = actual_totals.get(symbol, Decimal(0)) + actual
                 order_keys = ("strategy_orders", "orders", "opening_orders")
                 present_order_keys = tuple(key for key in order_keys if key in row)
                 if len(present_order_keys) > 1:
@@ -756,6 +782,8 @@ def size_composition_vector(
                     "sizing_digest": _digest({"basis": "WEIGHTED_VECTOR_V1", "row": row, "target_x_usdt": target, "capacity_usdt": cap, "quantity": quantity, "actual_size_usdt": actual, "mark": mark}),
                 })
                 sized.append(_freeze(enriched))
+            if actual_totals.get(symbol, Decimal(0)) > cap + MONEY_EPS:
+                return CompositionSizingResult(FAIL, (), f"CAPACITY_EXCEEDED_{symbol}", exclusions=tuple(exclusions))
         sized.sort(key=_member_sort_key)
         if not sized:
             return CompositionSizingResult(FAIL, (), "NO_NONZERO_TARGET", exclusions=tuple(exclusions))

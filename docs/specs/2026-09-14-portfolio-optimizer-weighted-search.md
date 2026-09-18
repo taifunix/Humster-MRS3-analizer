@@ -1,9 +1,11 @@
 # Portfolio Optimizer — контракт weighted search
 
-Дата: 2026-09-14. Версия: WS1.1. Статус: PLAN_APPROVED от Opus,
-заключение передано пользователем 2026-09-14. B1–B3 закрыты.
+Дата: 2026-09-14. Версия: WS1.2. Статус: Phase 9 accepted after independent
+Opus `CODE_REVIEW_PASS` on 2026-09-18. B1–B3 закрыты.
 Алгоритмический план R4 и этот контракт приняты. Необязательная оговорка
 CONFIRMED/UNKNOWN добавлена в §9 плана; runtime не изменён.
+
+Acceptance evidence: [Phase 9](../superpowers/plans/2026-09-18-portfolio-optimizer-weighted-search-phase-9-evidence.md).
 
 План реализации и чек-лист: [weighted search R4.2](../superpowers/plans/2026-09-12-portfolio-optimizer-weighted-search-discussion.md).
 Архитектурное решение: [ADR-0036](../decisions/0036-portfolio-optimizer-weighted-search-contract.md).
@@ -26,7 +28,7 @@ PRETEST_PROXY: равными долями, uniform k, обязательным 
 
 Campaign читается и исполняется только при
 `campaign_contract_version=PORTFOLIO_WEIGHTED_CAMPAIGN_V1`,
-`search_mode=WEIGHTED_V1` и `weighted_algo_version=WS1.1`. Отсутствующее,
+`search_mode=WEIGHTED_V1` и `weighted_algo_version=WS1.2`. Отсутствующее,
 неподдерживаемое или legacy-значение одного из этих полей отклоняется fail-closed;
 legacy Campaign не читаются. Сравнения точные, чувствительные к регистру и без
 нормализации пробелов. В `versions` должны быть как минимум те же три поля с
@@ -415,3 +417,58 @@ relevant broader checks и `git diff --check`. Флажки закрывает r
 не исполнитель по собственному заявлению. Реальные calibration/joint tester
 запуски, production REPLACE и API требуют отдельного назначения в соответствующей
 фазе; fixture tests разрешены scope реализации. Этот пакет авторизует только docs.
+## WS1.2 - directional shared-cap revision
+
+WS1.2 keeps `campaign_contract_version=PORTFOLIO_WEIGHTED_CAMPAIGN_V1`,
+`search_mode=WEIGHTED_V1`, and the single adapter gate. The exact supported
+`weighted_algo_version` is `WS1.2`; the same value must be mirrored exactly in
+`campaign.versions`. Missing/empty values remain `*_REQUIRED`, WS1.1 and other
+values remain `*_UNSUPPORTED`, and a non-matching `versions` mirror remains
+`CAMPAIGN_VERSIONS_MISMATCH`. No compatibility branch accepts WS1.1.
+
+The canonical symbol is exactly `str(symbol).strip().upper()`. It is used for
+finalist cutoff/input keys, transported member identity and order, weighted
+grouping, sizing grouping, and export ordering. Directions are exactly
+`LONG` or `SHORT`. A selected pair may include one finalist per enabled side;
+the Panel defaults each side maximum to 1, accepts each bound as a nonnegative
+integer, and rejects a pair with both bounds zero. The snapshot of enabled directions and
+the existing User Rank cutoff are reused; missing or duplicate rank remains
+fail-closed. If an enabled side has no finalist, that side is simply absent.
+
+`prepare_weighted_input` accepts at most one canonical `(symbol, side)` pair,
+requires unique strategy IDs, and orders data deterministically by canonical
+symbol, side, strategy ID, then result ID. It does not transport members;
+adapter and Panel boundaries normalize transported rows as needed.
+
+For every canonical symbol represented by at least two source members, all
+member capacities must agree within the existing solver tolerance. A mismatch
+fails before a solver call with `SYMBOL_CAPACITY_MISMATCH:<SYMBOL>`. The first
+deterministic capacity is the shared `C_s`; per-member bounds remain in force
+and the LP adds `sum(x_i for symbol=s) <= C_s`. Singleton symbols receive no
+extra row and retain WS1.1 numerics. The same invariant is checked after
+candidate conversion, proposed-vector validation, rescue scaling, upper-target
+calculation, and immediately before sizing. An overflow fails closed with
+`SYMBOL_CAPACITY_EXCEEDED:<SYMBOL>`; values are never clamped or repaired.
+The upper target is `sum_s C_s * max(0, max_i(coefficient_i))`.
+
+The directional rows retain independent cloned executable templates. LONG
+payloads set LONG fields/flags; SHORT payloads set SHORT fields/flags. Member
+identity and deterministic order include canonical symbol, side, strategy ID,
+result ID, and executable payload. Same-symbol opposite-side rows remain two
+rows in API/workbook output.
+
+`size_composition_vector` reuses its existing floor, cap, drop, and no
+redistribution behavior. It groups by canonical symbol and checks actual
+post-rounding group totals; overflow returns the existing FAIL result with
+exact reason `CAPACITY_EXCEEDED_<SYMBOL>` and an empty member list.
+
+The existing derived margin `a,b` bounds are accepted only when conservative
+at fractional and tier-boundary allocations. Opposite-side margin is additive
+on the shared USDT collateral base; no LONG/SHORT netting is permitted.
+Replay fixtures with overlapping opposite-side cycles retain both distinct
+strategy/result identities: limiter `L=1` admits one, `L=2` admits both, and
+input reordering cannot change the deterministic result.
+
+Non-goals remain binary/enumeration modes, new database/service/dependencies,
+tester/network/live/recommendation execution, and changes to historical WS1.1
+evidence.
