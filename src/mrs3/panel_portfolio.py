@@ -36,6 +36,7 @@ from .portfolio.config import (
     migrate_portfolio_config_document,
 )
 from .config import load_duckdb_import_settings
+from .performance_v2_optimizer import prepare_current_optimizer_inputs
 from .portfolio.input import apply_finalist_cutoff, read_current_finalists
 from .portfolio.adapter import (
     CAMPAIGN_CONTRACT_VERSION,
@@ -301,20 +302,23 @@ class PortfolioPanelService:
         config_path: str | Path | None = None,
         *,
         registry: PanelJobRegistry | None = None,
-        finalists_reader: Callable[..., Any] = read_current_finalists,
+        finalists_reader: Callable[..., Any] | None = None,
         finalists_loader: Callable[..., Any] | None = None,
         cutoff_selector: Callable[..., Any] = apply_finalist_cutoff,
         variant_generator: Callable[..., Any] | None = None,
         variant_validator: Callable[..., Any] | None = None,
         workbook_builder: Callable[..., Any] | None = None,
         lock: threading.RLock | None = None,
+        optimizer_input_preparer: Callable[..., Any] | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         raw_config = Path(config_path) if config_path is not None else self.root / "portfolio_optimizer.local.json"
         self.config_path = raw_config if raw_config.is_absolute() else self.root / raw_config
         self.config_path = self.config_path.resolve()
         self.registry = registry or PanelJobRegistry(self.root / ".panel-jobs.json")
-        self.finalists_reader = finalists_loader or finalists_reader
+        self.finalists_reader = finalists_loader or finalists_reader or read_current_finalists
+        self._uses_production_finalists_reader = finalists_reader is None and finalists_loader is None
+        self.optimizer_input_preparer = optimizer_input_preparer or prepare_current_optimizer_inputs
         self.cutoff_selector = cutoff_selector
         self.variant_generator = variant_generator
         self.variant_validator = variant_validator
@@ -549,6 +553,24 @@ class PortfolioPanelService:
         pairs = tuple((pair["pair"], "LONG") for pair in launch["pairs"])
         try:
             # Campaign snapshots retain the finalist evidence needed by search.
+            if self._uses_production_finalists_reader:
+                metadata_rows = _invoke(self.finalists_reader, database, pairs, False)
+                metadata_result_ids: list[int] = []
+                for index, row in enumerate(metadata_rows or ()):
+                    if not isinstance(row, Mapping) or type(row.get("result_id")) is not int:
+                        raise PortfolioPanelError(
+                            "PORTFOLIO_FINALISTS_UNAVAILABLE",
+                            f"portfolio finalist metadata result_id is invalid at row {index}",
+                            status=422,
+                        )
+                    metadata_result_ids.append(row["result_id"])
+                result_ids = tuple(dict.fromkeys(metadata_result_ids))
+                if result_ids:
+                    self.optimizer_input_preparer(
+                        database,
+                        result_ids,
+                        workers=_portfolio_search_workers(self.root),
+                    )
             loaded = _invoke(self.finalists_reader, database, pairs, True)
             finalists_list = []
             weighted_input_rows = []

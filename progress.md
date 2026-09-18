@@ -2599,3 +2599,20 @@ reused 1,000 verified reports, tested only the remaining 44 strategies, and
 committed `1044/1044` with zero failures. Focused Panel/runner verification
 passes (`90 passed, 1 skipped`). Independent Opus review returned
 `CODE_REVIEW_PASS`.
+
+## Performance v2 incremental cache regression (2026-09-18)
+
+The 1,044-report import completed, but the following selection-cache request
+also invoked an unscoped optimizer-artifact warmup. That path loaded all 14,452
+current results and their action/equity history before checking the prepared
+cache, so the Panel appeared to recalculate for about ten hours and did not
+finish normally. The database remained consistent; a read-only audit found
+exactly 1,044 missing selection-cache strategies across the four newly imported
+pair/side groups.
+
+Selection recalculation now updates only missing current Result IDs and never
+invokes optimizer preparation. Portfolio campaign snapshotting prepares only
+the exact current `FINALIST` Result IDs before its strict read. Import no longer
+rereads every newly written action/equity series: it builds the optimizer source
+from the normalized parsed reports and validates child counts with two grouped
+queries. Focused integrated verification passes `499 passed, 2 skipped`.

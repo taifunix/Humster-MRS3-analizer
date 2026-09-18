@@ -22,6 +22,7 @@ from mrs3.performance_v2_optimizer import (
     read_prepared_optimizer_inputs,
     source_digest,
 )
+import mrs3.performance_v2_optimizer as optimizer_module
 
 
 def _source(**overrides) -> OptimizerSourceInput:
@@ -319,6 +320,18 @@ def test_current_preparation_requires_positive_integer_workers(tmp_path: Path, w
         prepare_current_optimizer_inputs(str(tmp_path / "missing.duckdb"), (), workers=workers)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("result_ids", [None, "71", (True,)])
+def test_current_preparation_requires_finite_integer_id_sequence(tmp_path: Path, result_ids: object) -> None:
+    with pytest.raises(TypeError):
+        prepare_current_optimizer_inputs(str(tmp_path / "missing.duckdb"), result_ids)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("result_ids", [None, "71", True])
+def test_source_rows_requires_finite_non_string_sequence(result_ids: object) -> None:
+    with pytest.raises(TypeError, match="finite sequence"):
+        optimizer_module._source_rows(object(), result_ids)  # type: ignore[arg-type]
+
+
 def test_parallel_current_preparation_matches_serial_bytes_on_two_results(tmp_path: Path) -> None:
     source, result_ids = _typed_candidate_database(tmp_path / "source", two_results=True)
     serial = tmp_path / "serial.duckdb"
@@ -326,8 +339,8 @@ def test_parallel_current_preparation_matches_serial_bytes_on_two_results(tmp_pa
     shutil.copy2(source, serial)
     shutil.copy2(source, parallel)
 
-    serial_result = prepare_current_optimizer_inputs(str(serial), None, workers=1)
-    parallel_result = prepare_current_optimizer_inputs(str(parallel), None, workers=2)
+    serial_result = prepare_current_optimizer_inputs(str(serial), result_ids, workers=1)
+    parallel_result = prepare_current_optimizer_inputs(str(parallel), result_ids, workers=2)
 
     assert [item.availability for item in serial_result] == [item.availability for item in parallel_result]
     assert tuple(item.source.result_id for item in serial_result) == result_ids
@@ -350,14 +363,14 @@ def test_parallel_worker_failure_happens_before_writer_and_leaves_no_rows(tmp_pa
         )
 
     with pytest.raises(Exception, match="unsupported performance action"):
-        prepare_current_optimizer_inputs(str(database), None, workers=2)
+        prepare_current_optimizer_inputs(str(database), result_ids, workers=2)
 
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute("select count(*) from optimizer_prepared_inputs").fetchone() == (0,)
 
 
 def test_second_lazy_writer_insert_failure_rolls_back_all_prepared_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    database, _result_ids = _typed_candidate_database(tmp_path, two_results=True)
+    database, result_ids = _typed_candidate_database(tmp_path, two_results=True)
     real_connect = duckdb.connect
     insert_count = 0
 
@@ -391,7 +404,7 @@ def test_second_lazy_writer_insert_failure_rolls_back_all_prepared_rows(tmp_path
 
     monkeypatch.setattr(duckdb, "connect", connect)
     with pytest.raises(RuntimeError, match="second prepared insert failure"):
-        prepare_current_optimizer_inputs(str(database), None, workers=1)
+        prepare_current_optimizer_inputs(str(database), result_ids, workers=1)
 
     with real_connect(str(database), read_only=True) as connection:
         assert connection.execute("select count(*) from optimizer_prepared_inputs").fetchone() == (0,)

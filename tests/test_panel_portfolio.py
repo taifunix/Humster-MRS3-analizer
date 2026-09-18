@@ -21,6 +21,7 @@ from mrs3.panel import PanelController, create_panel_server
 from mrs3.panel_portfolio import PortfolioPanelError, PortfolioPanelService, STAGES, _redact_text, _safe_cell
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
 from mrs3.config import DuckDBImportSettings
+from mrs3.performance_v2_store import PerformanceV2StoreError
 from mrs3.portfolio.config import PortfolioConfigError, migrate_portfolio_config_document
 from mrs3.portfolio.adapter import (
     CAMPAIGN_CONTRACT_VERSION,
@@ -953,6 +954,180 @@ def test_campaign_freezes_private_weighted_rows_without_public_series_aliases(mo
     assert not private_prepared_fields.intersection(campaign["finalists"][0])
     assert not private_prepared_fields.intersection(public_job)
     assert "weighted_input_rows" not in public_job
+
+
+def test_campaign_prepares_exact_production_finalist_result_ids_before_strict_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import mrs3.panel_portfolio as panel_portfolio_module
+
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    (tmp_path / "config.local.json").write_text(json.dumps({"duckdb_import": {"workers": 3}}), encoding="utf-8")
+    metadata_rows = [
+        {"result_id": 22},
+        {"result_id": 11},
+        {"result_id": 22},
+    ]
+    full_rows = [
+        _finalist(strategy_id=8, result_id=22),
+        _finalist(strategy_id=7, result_id=11),
+    ]
+    reader_calls: list[tuple[Path, tuple[tuple[str, str], ...], bool]] = []
+    preparation_calls: list[tuple[Path, tuple[int, ...], int]] = []
+
+    def production_reader(database, pairs, include_series=True):
+        reader_calls.append((database, tuple(pairs), include_series))
+        return metadata_rows if not include_series else full_rows
+
+    def preparer(database, result_ids, *, workers):
+        preparation_calls.append((database, tuple(result_ids), workers))
+
+    monkeypatch.setattr(panel_portfolio_module, "read_current_finalists", production_reader)
+
+    class IdleThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(panel_portfolio_module.threading, "Thread", IdleThread)
+    service = PortfolioPanelService(
+        tmp_path,
+        path,
+        optimizer_input_preparer=preparer,
+    )
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    })
+
+    assert result["status"] == "QUEUED"
+    assert [call[2] for call in reader_calls] == [False, True]
+    assert preparation_calls == [(tmp_path / "performance.duckdb", (22, 11), 3)]
+
+
+def test_campaign_rejects_invalid_production_metadata_result_id_before_preparation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import mrs3.panel_portfolio as panel_portfolio_module
+
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    preparation_calls: list[tuple[object, ...]] = []
+
+    def production_reader(_database, _pairs, include_series=True):
+        return [{"result_id": True}] if not include_series else []
+
+    def preparer(*args, **kwargs):
+        preparation_calls.append((*args, *kwargs.values()))
+
+    monkeypatch.setattr(panel_portfolio_module, "read_current_finalists", production_reader)
+    service = PortfolioPanelService(
+        tmp_path,
+        path,
+        optimizer_input_preparer=preparer,
+    )
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_campaign({
+            "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "expected_config_digest": digest,
+        })
+
+    assert error.value.code == "PORTFOLIO_FINALISTS_UNAVAILABLE"
+    assert preparation_calls == []
+
+
+def test_production_preparation_lock_failure_is_a_typed_snapshot_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import mrs3.panel_portfolio as panel_portfolio_module
+
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    monkeypatch.setattr(
+        panel_portfolio_module,
+        "read_current_finalists",
+        lambda *_args, **_kwargs: [{"result_id": 11}],
+    )
+
+    def locked(*_args, **_kwargs):
+        raise PerformanceV2StoreError("writer lock busy")
+
+    service = PortfolioPanelService(tmp_path, path, optimizer_input_preparer=locked)
+    with pytest.raises(PortfolioPanelError) as error:
+        service._snapshot_finalists(_config(), {"pairs": [{"pair": "BTCUSDT"}]})
+
+    assert error.value.code == "PORTFOLIO_FINALISTS_UNAVAILABLE"
+    assert error.value.status == 422
+
+
+def test_finalist_reader_wiring_controls_production_preparation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+
+    default_service = PortfolioPanelService(tmp_path, path)
+    custom_service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: ())
+
+    assert default_service._uses_production_finalists_reader is True
+    assert custom_service._uses_production_finalists_reader is False
+
+
+def test_default_snapshot_prepares_only_current_finalist_artifacts(tmp_path: Path) -> None:
+    from datetime import datetime, timezone
+    from tests.test_performance_v2_selection import _candidate_db
+    from tests.test_portfolio_input import _add_review
+
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "performance.duckdb"
+    try:
+        strategy_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies"
+        ).fetchone()
+        connection.execute(
+            """update strategy_results set reported_start_utc = report_start_utc,
+               reported_end_utc = report_end_utc, effective_start_utc = report_start_utc,
+               effective_end_utc = report_end_utc, sizing_use_upnl = true,
+               sizing_use_frozen_balance = true, sizing_use_fix = false,
+               sizing_balance_percentage_long = 100, sizing_risk_long = 1,
+               sizing_max_balance = 0 where result_id = ?""",
+            [result_id],
+        )
+        connection.execute("update strategy_actions set price = 10, cost = 10")
+        _add_review(
+            connection,
+            run_id="run-default",
+            review_id="review-default",
+            symbol="BTCUSDT",
+            side="LONG",
+            strategy_id=strategy_id,
+            result_id=result_id,
+            user_status="FINALIST",
+            selection_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+    finally:
+        connection.close()
+    (tmp_path / "strategy_performance.duckdb").replace(database)
+
+    service = PortfolioPanelService(tmp_path, path)
+    finalists, weighted_rows = service._snapshot_finalists(
+        _config(), {"pairs": [{"pair": "BTCUSDT"}]}
+    )
+
+    assert [row["result_id"] for row in finalists] == [result_id]
+    assert len(weighted_rows) == 1
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select result_id from optimizer_prepared_inputs order by result_id"
+        ).fetchall() == [(result_id,)]
 
 
 def test_campaign_resolves_ordered_series_aliases_into_private_weighted_rows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

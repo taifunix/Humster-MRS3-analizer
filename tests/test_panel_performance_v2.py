@@ -1309,11 +1309,28 @@ def test_selection_recalculate_passes_only_missing_strategy_ids(tmp_path: Path, 
     controller, _, _ = _controller_for_windows(tmp_path)
     import mrs3.panel as panel_module
     calls = []
+    monkeypatch.setattr(
+        panel_module,
+        "prepare_current_optimizer_inputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("optimizer preparation is not part of selection recalculation")),
+    )
     monkeypatch.setattr(panel_module, "selection_cache_missing_strategy_ids", lambda *_args: (17, 23))
     monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *args: calls.append(args))
 
     assert controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"}) == {"status": "READY"}
     assert calls and calls[0][-1] == (17, 23)
+
+
+def test_selection_recalculate_all_does_not_prepare_optimizer_inputs(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    import mrs3.panel as panel_module
+    monkeypatch.setattr(
+        panel_module,
+        "prepare_current_optimizer_inputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("optimizer preparation is not part of selection recalculation")),
+    )
+
+    assert controller.strategies_performance_v2_recalculate_all()["status"] == "READY"
 
 
 def test_selection_recalculate_tracks_only_new_current_results_for_add_replace_and_repeat(

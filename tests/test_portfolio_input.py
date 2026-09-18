@@ -1000,6 +1000,16 @@ def test_read_current_finalists_can_skip_large_series_for_metadata_consumers(
     assert "equity_series" not in row
 
 
+def test_read_current_finalists_metadata_contract_returns_plain_int_result_id(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+
+    rows = read_current_finalists(database, [("BTCUSDT", "LONG")], include_series=False)
+
+    assert rows and type(rows[0]["result_id"]) is int
+    assert "actions" not in rows[0]
+    assert "equity" not in rows[0]
+
+
 def test_read_current_finalists_returns_physical_facts_and_panel_safe_values(tmp_path: Path) -> None:
     database = _database(tmp_path)
     with duckdb.connect(str(database)) as connection:

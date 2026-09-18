@@ -272,6 +272,40 @@ def test_v4_marker_with_foreign_catalog_is_rejected_before_window_repair() -> No
         assert connection.execute("select count(*) from information_schema.tables where table_name = 'window_metrics'").fetchone() == (0,)
 
 
+def test_v4_foreign_database_kind_is_rejected_without_catalog_mutation() -> None:
+    with duckdb.connect(":memory:") as connection:
+        _initialize_v4_fixture(connection)
+        connection.execute("update schema_info set value = 'foreign_database' where key = 'database_kind'")
+        before_tables = connection.execute(
+            """select table_schema, table_name, table_type
+                 from information_schema.tables
+                where table_schema = 'main'
+                order by table_schema, table_name"""
+        ).fetchall()
+        before_columns = connection.execute(
+            """select table_schema, table_name, column_name, ordinal_position, data_type
+                 from information_schema.columns
+                where table_schema = 'main'
+                order by table_schema, table_name, ordinal_position"""
+        ).fetchall()
+
+        with pytest.raises(PerformanceV2StoreError, match="unified performance v2"):
+            initialize_performance_v2(connection)
+
+        assert connection.execute(
+            """select table_schema, table_name, table_type
+                 from information_schema.tables
+                where table_schema = 'main'
+                order by table_schema, table_name"""
+        ).fetchall() == before_tables
+        assert connection.execute(
+            """select table_schema, table_name, column_name, ordinal_position, data_type
+                 from information_schema.columns
+                where table_schema = 'main'
+                order by table_schema, table_name, ordinal_position"""
+        ).fetchall() == before_columns
+
+
 def test_v4_invalid_instance_id_is_rejected_before_window_repair() -> None:
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
@@ -308,6 +342,26 @@ def test_initialize_migrates_schema_v2_through_v4_without_changing_existing_fact
         assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("5",)
         assert connection.execute("select count(*) from information_schema.tables where table_name = 'strategy_tags'").fetchone() == (1,)
         assert connection.execute("select count(*) from information_schema.columns where table_name = 'window_metrics' and column_name in ('holding_seconds', 'time_in_market_pct')").fetchone() == (2,)
+
+
+def test_v4_to_v5_phase8_columns_are_appended_in_contract_order() -> None:
+    with duckdb.connect(":memory:") as connection:
+        _initialize_v4_fixture(connection)
+        connection.execute("update schema_info set value = '4' where key = 'schema_version'")
+
+        initialize_performance_v2(connection)
+
+        action_columns = [row[0] for row in connection.execute(
+            "select column_name from information_schema.columns where table_name = 'strategy_actions' order by ordinal_position"
+        ).fetchall()]
+        result_columns = [row[0] for row in connection.execute(
+            "select column_name from information_schema.columns where table_name = 'strategy_results' order by ordinal_position"
+        ).fetchall()]
+        assert action_columns[-2:] == ["price", "cost"]
+        assert result_columns[-6:] == [
+            "sizing_use_upnl", "sizing_use_frozen_balance", "sizing_use_fix",
+            "sizing_balance_percentage_long", "sizing_risk_long", "sizing_max_balance",
+        ]
 
 
 def _as_v3_fixture(connection: duckdb.DuckDBPyConnection) -> None:

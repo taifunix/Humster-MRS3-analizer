@@ -483,19 +483,19 @@ class PreparedCurrentResult:
 
 def _source_rows(
     connection: Any,
-    result_ids: Sequence[int] | None,
+    result_ids: Sequence[int],
     *,
     current_only: bool = False,
 ) -> tuple[OptimizerSourceInput, ...]:
-    if result_ids is not None and not result_ids:
+    if isinstance(result_ids, (str, bytes)) or not isinstance(result_ids, Sequence):
+        raise TypeError("result_ids must be a finite sequence")
+    if any(type(result_id) is not int for result_id in result_ids):
+        raise TypeError("result_ids must contain integer IDs")
+    if not result_ids:
         return ()
-    if result_ids is not None:
-        placeholders = ",".join("?" for _ in result_ids)
-        predicate = f"where r.result_id in ({placeholders})" + (" and s.current_result_id = r.result_id" if current_only else "")
-        parameters: list[Any] = list(result_ids)
-    else:
-        predicate = "where s.current_result_id is not null"
-        parameters = []
+    placeholders = ",".join("?" for _ in result_ids)
+    predicate = f"where r.result_id in ({placeholders})" + (" and s.current_result_id = r.result_id" if current_only else "")
+    parameters: list[Any] = list(result_ids)
     result_rows = connection.execute(
         f"""select r.result_id, r.strategy_id, s.symbol, s.side,
                   r.report_start_utc, r.report_end_utc, r.imported_at_utc,
@@ -555,7 +555,7 @@ def _prepare_current_worker(source: OptimizerSourceInput) -> PreparedCurrentResu
     return PreparedCurrentResult(source, availability, prepared)
 
 
-def prepare_current_optimizer_inputs(database: str, result_ids: Sequence[int] | None = None, *, workers: int = 1) -> tuple[PreparedCurrentResult, ...]:
+def prepare_current_optimizer_inputs(database: str, result_ids: Sequence[int], *, workers: int = 1) -> tuple[PreparedCurrentResult, ...]:
     """Prepare current rows using a closed read snapshot and one writer batch."""
     from concurrent.futures import ProcessPoolExecutor
     import duckdb
@@ -563,7 +563,11 @@ def prepare_current_optimizer_inputs(database: str, result_ids: Sequence[int] | 
 
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("workers must be a positive integer")
-    if result_ids is not None and not result_ids:
+    if isinstance(result_ids, (str, bytes)) or not isinstance(result_ids, Sequence):
+        raise TypeError("result_ids must be a finite sequence")
+    if any(type(result_id) is not int for result_id in result_ids):
+        raise TypeError("result_ids must contain integer IDs")
+    if not result_ids:
         return ()
     path = str(database)
     reusable: dict[int, PreparedCurrentResult] = {}

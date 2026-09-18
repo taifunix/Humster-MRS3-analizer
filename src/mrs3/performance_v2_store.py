@@ -908,7 +908,11 @@ def _rollback_quietly(connection: duckdb.DuckDBPyConnection) -> None:
         pass
 
 
-def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
+def initialize_performance_v2(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    create_if_missing: bool = True,
+) -> None:
     """Initialize or migrate the isolated Performance v2 schema to v5."""
     version = _schema_version(connection)
     if version is not None and version not in {"2", "3", "4", _SCHEMA_VERSION}:
@@ -952,6 +956,8 @@ def initialize_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
         _migrate_schema_v4_to_v5(connection)
         require_performance_v2(connection)
         return
+    if not create_if_missing:
+        raise PerformanceV2StoreError("Performance database does not have a supported schema")
     if not _catalog_is_empty(connection):
         raise PerformanceV2StoreError("Performance v2 target catalog is not empty")
     try:

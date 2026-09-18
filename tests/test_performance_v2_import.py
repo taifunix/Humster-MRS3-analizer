@@ -21,10 +21,13 @@ from mrs3.performance_v2_import import (
 )
 from mrs3.performance_v2_html import parse_current_performance_v2_html
 from mrs3.performance_v2_input import PerformanceV2InputError, read_performance_v2_inbox
+from mrs3.performance_v2_optimizer import read_prepared_optimizer_inputs, source_digest
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
     PerformanceV2WriterLock,
+    _SCHEMA,
+    _SELECTION_SCHEMA,
     decode_optimizer_source_metadata,
     initialize_performance_v2,
     performance_v2_database_path,
@@ -201,6 +204,29 @@ def _report_with_source_metadata() -> bytes:
     return source
 
 
+def _report_with_available_prepared_input() -> bytes:
+    source = FIXTURE.read_bytes()
+    source = source.replace(
+        b'"use_upnl":true}',
+        b'"use_upnl":true,"use_frozen_balance":true}',
+        1,
+    ).replace(
+        b'"use_short":false}',
+        b'"use_short":false,"use_fix":false,"balance_percentage_long":100,"risk_long":1,"max_balance":0}',
+        1,
+    )
+    return source.replace(
+        b"<th>Action</th><th>Fee</th>",
+        b"<th>Action</th><th>Price</th><th>Cost</th><th>Fee</th>",
+    ).replace(
+        b"<td>opened</td><td>0.05</td>",
+        b"<td>opened</td><td>1.2300</td><td>4.5600</td><td>0.05</td>",
+    ).replace(
+        b"<td>closed</td><td>0.05</td>",
+        b"<td>closed</td><td>1.2300</td><td>4.5600</td><td>0.05</td>",
+    )
+
+
 def test_append_rows_uses_duckdb_native_dataframe_append() -> None:
     class AppendOnlyConnection:
         def __init__(self) -> None:
@@ -209,6 +235,9 @@ def test_append_rows_uses_duckdb_native_dataframe_append() -> None:
 
         def append(self, table: str, frame) -> None:
             self.connection.append(table, frame)
+
+        def execute(self, *args: object):
+            return self.connection.execute(*args)
 
         def executemany(self, *_args: object) -> None:
             raise AssertionError("large report rows must not use executemany")
@@ -226,10 +255,16 @@ def test_append_rows_uses_duckdb_native_dataframe_append() -> None:
 
 def test_append_rows_rounds_long_decimal_before_dataframe_type_inference() -> None:
     class CaptureConnection:
-        frame = None
+        def __init__(self) -> None:
+            self.frame = None
+            self.connection = duckdb.connect(":memory:")
+            self.connection.execute("create table rows_to_append (id integer, amount decimal(38, 12))")
 
         def append(self, _table: str, frame) -> None:
             self.frame = frame
+
+        def execute(self, *args: object):
+            return self.connection.execute(*args)
 
     connection = CaptureConnection()
 
@@ -253,6 +288,119 @@ def test_append_rows_rounds_long_decimal_before_dataframe_type_inference() -> No
     assert target.execute("select amount from rows_to_append").fetchone() == (
         Decimal("-29.769149208742"),
     )
+
+
+def test_append_rows_uses_main_catalog_when_attached_catalog_repeats_table_name() -> None:
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute("create table rows_to_append (id integer, amount decimal(38, 12))")
+        connection.execute("attach ':memory:' as attached")
+        connection.execute("create table attached.rows_to_append (id integer, unrelated integer)")
+
+        import_module._append_rows(
+            connection, "rows_to_append", ("id", "amount"), [(1, Decimal("1.25"))]
+        )
+
+        assert connection.execute("select * from rows_to_append").fetchall() == [
+            (1, Decimal("1.250000000000")),
+        ]
+    finally:
+        connection.close()
+
+
+def test_phase8_source_input_uses_normalized_report_and_persisted_value_inputs(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    raw = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    normalized, failures = import_module._prepare_listing_ranges(request, prepared, (raw,))
+    assert not failures and normalized[0] is not None
+    report = normalized[0]
+    entry = prepared.entries[0]
+    now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    result_values = import_module._result_values(entry, report, prepared.commission_contract, now)  # type: ignore[arg-type]
+
+    source = import_module._phase8_source_input(
+        result_id=71,
+        strategy_id=31,
+        entry=entry,
+        report=report,
+        result_values=result_values,
+        sizing_facts=import_module._phase8_sizing_facts(report.settings),
+    )
+
+    assert source.result_id == 71
+    assert source.strategy_id == 31
+    assert source.symbol == entry.identity.symbol
+    assert source.revision_timestamp_utc == now
+    assert source.actions and source.equity
+    assert set(result_values) == set(import_module._RESULT_VALUE_FIELDS)
+
+
+def test_import_add_prepared_input_passes_strict_canonical_readback(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _rewrite_report(request, _report_with_available_prepared_input())
+
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        result_id, stored_digest = connection.execute(
+            "select result_id, source_digest from optimizer_prepared_inputs"
+        ).fetchone()
+    readback = read_prepared_optimizer_inputs(str(target), [result_id])[0]
+    assert readback.prepared is not None
+    assert stored_digest == source_digest(readback.source)
+
+
+def test_import_replace_prepared_input_passes_strict_canonical_readback(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _rewrite_report(request, _report_with_available_prepared_input())
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        strategy_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies where strategy_name = 'alpha'"
+        ).fetchone()
+
+    changed = _report_with_available_prepared_input().replace(b"1009.9", b"1019.9")
+    _rewrite_report(request, changed)
+    replacement = PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config, mode="REPLACE",
+        replacement_strategy_ids={"alpha": strategy_id}, expected_current_result_ids={"alpha": result_id},
+        listing_dates_path=request.listing_dates_path,
+    )
+
+    assert import_performance_v2(replacement).imported_count == 1
+    readback = read_prepared_optimizer_inputs(str(target), [result_id])[0]
+    assert readback.prepared is not None
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select source_digest from optimizer_prepared_inputs where result_id = ?", [result_id]
+        ).fetchone() == (source_digest(readback.source),)
+
+
+def test_child_readback_uses_two_grouped_queries_and_zero_fills_missing_groups() -> None:
+    raw = duckdb.connect(":memory:")
+    try:
+        raw.execute("create table strategy_actions (result_id integer)")
+        raw.execute("create table strategy_equity (result_id integer)")
+        raw.execute("insert into strategy_actions values (10)")
+        raw.execute("insert into strategy_equity values (10)")
+        grouped: list[str] = []
+
+        class CountingConnection:
+            def execute(self, sql: str, parameters=None):
+                if "group by result_id" in sql.casefold():
+                    grouped.append(sql)
+                return raw.execute(sql, parameters) if parameters is not None else raw.execute(sql)
+
+        with pytest.raises(PerformanceV2ImportError, match=r"20: expected actions=2 actual=0") as error:
+            import_module._verify_child_counts(
+                CountingConnection(), ((10, 1, 1), (20, 2, 1))
+            )
+        assert "20: expected actions=2 actual=0 equity=1 actual=0" in str(error.value)
+        assert len(grouped) == 2
+    finally:
+        raw.close()
 
 
 def test_add_publishes_multiple_strategies_and_one_current_result_each(tmp_path: Path) -> None:
@@ -364,27 +512,7 @@ def test_import_persists_phase8_typed_facts_and_one_prepared_status(tmp_path: Pa
 
 def test_import_persists_available_prepared_artifact_and_digest(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
-    report = FIXTURE.read_bytes()
-    report = report.replace(
-        b'"use_upnl":true}',
-        b'"use_upnl":true,"use_frozen_balance":true}',
-        1,
-    ).replace(
-        b'"use_short":false}',
-        b'"use_short":false,"use_fix":false,"balance_percentage_long":100,"risk_long":1,"max_balance":0}',
-        1,
-    )
-    report = report.replace(
-        b"<th>Action</th><th>Fee</th>",
-        b"<th>Action</th><th>Price</th><th>Cost</th><th>Fee</th>",
-    ).replace(
-        b"<td>opened</td><td>0.05</td>",
-        b"<td>opened</td><td>1.2300</td><td>4.5600</td><td>0.05</td>",
-    ).replace(
-        b"<td>closed</td><td>0.05</td>",
-        b"<td>closed</td><td>1.2300</td><td>4.5600</td><td>0.05</td>",
-    )
-    _rewrite_report(request, report)
+    _rewrite_report(request, _report_with_available_prepared_input())
 
     assert import_performance_v2(request).imported_count == 1
     with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
@@ -405,8 +533,9 @@ def test_over_scale_price_keeps_exact_raw_provenance_when_typed_value_is_null(tm
 
     assert import_performance_v2(request).imported_count == 1
     with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
-        typed_price, typed_cost, raw_action, status, reason = connection.execute(
-            """select a.price, a.cost, a.raw_action_json, p.availability_status, p.unavailable_reason
+        result_id, typed_price, typed_cost, raw_action, status, reason, stored_digest = connection.execute(
+            """select a.result_id, a.price, a.cost, a.raw_action_json, p.availability_status, p.unavailable_reason,
+                        p.source_digest
                  from strategy_actions a
                  join optimizer_prepared_inputs p on p.result_id = a.result_id
                 order by a.action_index limit 1"""
@@ -417,6 +546,12 @@ def test_over_scale_price_keeps_exact_raw_provenance_when_typed_value_is_null(tm
     assert json.loads(raw_action)["price"] == "1.2345678901234"
     assert json.loads(raw_action)["cost"] == "4.5678901234567"
     assert (status, reason) == ("UNAVAILABLE", "MISSING_TYPED_FACTS")
+    readback = read_prepared_optimizer_inputs(
+        str(performance_v2_database_path(request.config)), [result_id]
+    )[0]
+    assert stored_digest == source_digest(readback.source)
+    assert readback.source.to_document()["actions"][0].get("price") is None
+    assert readback.source.to_document()["actions"][0].get("cost") is None
 
 
 def test_source_metadata_keeps_invalid_field_evidence_with_legacy_exchange_setting() -> None:
@@ -777,10 +912,67 @@ def test_empty_target_fails_schema_gate_without_staging_or_audit(tmp_path: Path)
     target.parent.mkdir(parents=True)
     target.touch()
 
-    with pytest.raises(PerformanceV2ImportError, match="schema version 2"):
+    with pytest.raises(PerformanceV2ImportError, match="supported schema"):
         import_performance_v2(request)
 
     assert target.exists()
+    assert not (request.config.database_root / ".staging").exists()
+    assert not (request.config.database_root / "import_audit.v2.json").exists()
+
+
+def test_import_migrates_existing_v4_target_before_current_schema_gate(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, initialize_db=False)
+    target = performance_v2_database_path(request.config)
+    target.parent.mkdir(parents=True)
+    with duckdb.connect(str(target)) as connection:
+        schema = _SCHEMA.split("\nCREATE TABLE IF NOT EXISTS optimizer_prepared_inputs", 1)[0]
+        for definition in (
+            "    sizing_use_upnl BOOLEAN,\n",
+            "    sizing_use_frozen_balance BOOLEAN,\n",
+            "    sizing_use_fix BOOLEAN,\n",
+            "    sizing_balance_percentage_long DECIMAL(38,12),\n",
+            "    sizing_risk_long DECIMAL(38,12),\n",
+            "    sizing_max_balance DECIMAL(38,12),\n",
+            "    price DECIMAL(38,12),\n",
+            "    cost DECIMAL(38,12),\n",
+        ):
+            schema = schema.replace(definition, "")
+        connection.execute("create table schema_info (key varchar primary key, value varchar not null)")
+        connection.execute(schema)
+        connection.execute(_SELECTION_SCHEMA)
+        connection.executemany(
+            "insert into schema_info values (?, ?)",
+            [
+                ("schema_version", "4"),
+                ("database_kind", "unified_performance_v2"),
+                ("database_instance_id", "00000000-0000-0000-0000-000000000001"),
+            ],
+        )
+    _rewrite_report(request, _report_with_source_metadata())
+
+    result = import_performance_v2(request)
+
+    assert result.status == "COMMITTED"
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select value from schema_info where key = 'schema_version'"
+        ).fetchone() == ("5",)
+
+
+def test_bare_duckdb_target_is_not_initialized_by_import(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, initialize_db=False)
+    target = performance_v2_database_path(request.config)
+    target.parent.mkdir(parents=True)
+    with duckdb.connect(str(target)):
+        pass
+
+    with pytest.raises(PerformanceV2ImportError, match="supported schema"):
+        import_performance_v2(request)
+
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select count(*) from information_schema.tables where table_schema = 'main'"
+        ).fetchone() == (0,)
     assert not (request.config.database_root / ".staging").exists()
     assert not (request.config.database_root / "import_audit.v2.json").exists()
 
@@ -932,7 +1124,8 @@ def test_result_values_persist_full_precision_effective_provenance(tmp_path: Pat
         prepared.entries[0], parsed, {"TakerFee": "0.0004"}, datetime(2026, 1, 10, tzinfo=timezone.utc)
     )
 
-    assert values[0:2] == [effective_start, effective_end]
+    assert values["report_start_utc"] == effective_start
+    assert values["report_end_utc"] == effective_end
 
 
 def test_warmup_does_not_publish_when_the_only_trade_crosses_warmup(tmp_path: Path) -> None:
@@ -1374,6 +1567,43 @@ def test_misaligned_equity_series_rejects_only_that_report(tmp_path: Path) -> No
     assert "wallet/equity sample counts must match" in result.failure_report_path.read_text(encoding="utf-8")
 
 
+def test_misaligned_equal_length_equity_series_fails_with_deterministic_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    request, _ = _request(tmp_path)
+    report_path = request.report_root / "alpha.html"
+    original = FIXTURE.read_bytes()
+    broken = original.replace(
+        b'const equitySeries = [[1767225600000,"1000"],[1767229200000,"999.95"],[1767402000000,"1009.9"]];',
+        b'const equitySeries = [[1767225600000,"1000"],[1767232800000,"999.95"],[1767402000000,"1009.9"]];',
+    )
+    report_path.write_bytes(broken)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"][0]["source_report_sha256"] = sha256(broken).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    original_parser = import_module.parse_current_performance_v2_html
+
+    def parse_misaligned(data: bytes, config: PerformanceV2Config):
+        parsed = original_parser(original if data == broken else data, config)
+        if data == broken:
+            parsed = replace(
+                parsed,
+                equity_series=tuple(
+                    (timestamp + timedelta(hours=1), value) if index == 1 else (timestamp, value)
+                    for index, (timestamp, value) in enumerate(parsed.equity_series)
+                ),
+            )
+        return parsed
+
+    monkeypatch.setattr(import_module, "parse_current_performance_v2_html", parse_misaligned)
+    object.__setattr__(request, "config", replace(request.config, workers=1))
+
+    with pytest.raises(PerformanceV2ImportError, match="wallet/equity timestamps are misaligned"):
+        import_performance_v2(request)
+
+
 def test_invalid_schema_fails_before_staging_or_audit(tmp_path: Path) -> None:
     request, _ = _request(tmp_path, initialize_db=False)
     target = performance_v2_database_path(request.config)
@@ -1381,7 +1611,7 @@ def test_invalid_schema_fails_before_staging_or_audit(tmp_path: Path) -> None:
     with duckdb.connect(str(target)) as connection:
         connection.execute("create table not_v2 (value integer)")
 
-    with pytest.raises(PerformanceV2ImportError, match="schema version 2"):
+    with pytest.raises(PerformanceV2ImportError, match="supported schema"):
         import_performance_v2(request)
 
     assert not (request.config.database_root / ".staging").exists()

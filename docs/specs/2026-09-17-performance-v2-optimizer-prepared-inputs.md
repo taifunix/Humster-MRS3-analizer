@@ -86,11 +86,23 @@ valid `raw_action_json` and revision-checked `optimizer_source_metadata_json`.
 No Price, Cost or sizing value is inferred from fees, quantities, initial
 balance or defaults. Rows without exact saved evidence remain `NULL`.
 
-Migration does not eagerly rebuild every historical result. The existing normal
-analysis/recalculation path prepares missing or stale current-result artifacts
-with the already configured `duckdb_import.workers`; subsequent runs reuse an
-artifact only when its source digest and preparation version match. Schema v5
-does not accept stale v4 values through an implicit JSON fallback.
+Every Performance import migrates an existing valid v2/v3/v4 target under the
+normal writer lock before enforcing the current v5 schema gate. Import never
+initializes an absent, zero-byte, bare, or foreign database target.
+
+Migration does not eagerly rebuild every historical result. Performance
+selection recalculation remains a separate incremental cache operation and
+never prepares optimizer artifacts. A portfolio campaign first metadata-reads
+its exact current `FINALIST` result IDs, prepares only missing or stale
+artifacts for that finite set with the configured `duckdb_import.workers`, and
+then performs the strict full read. Subsequent campaigns reuse an artifact only
+when its source digest and preparation version match. Schema v5 does not accept
+stale v4 values through an implicit JSON fallback.
+
+ADD/REPLACE builds the new result's optimizer source directly from the already
+normalized parsed report and persisted parent values. It does not reread the
+new action/equity rows one result at a time. Child-row verification uses one
+grouped query per child table and treats an absent group as a zero count.
 
 Older report/inbox inputs remain accepted. Existing consumers that do not need
 Phase 8 fields retain their behavior. A v5 database remains fail-closed to code

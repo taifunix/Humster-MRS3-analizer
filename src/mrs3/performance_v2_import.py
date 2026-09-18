@@ -66,6 +66,13 @@ _PRICE_COST_SEMANTICS = "actual_fill_not_planned_position"
 _MAX_ACTION_SOURCE_BYTES = 2_048
 _MAX_RESULT_SOURCE_BYTES = 16_384
 _MAX_SOURCE_VALUE_CHARS = 256
+_RESULT_VALUE_FIELDS = (
+    "report_start_utc", "report_end_utc", "exchange", "commission_rate", "initial_balance",
+    "final_balance", "total_pnl", "total_pnl_pct", "max_drawdown", "max_drawdown_pct",
+    "total_fees", "total_trades", "imported_at_utc", "reported_start_utc", "reported_end_utc",
+    "listing_date_utc", "listing_date_raw", "listing_date_source", "effective_start_utc",
+    "effective_end_utc", "warmup_hours", "excluded_trade_count", "exclusion_reason",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,21 +270,33 @@ def _append_rows(
     rows: list[tuple[object, ...]],
 ) -> None:
     if rows:
-        connection.append(
-            table,
-            pd.DataFrame.from_records(
-                [
-                    tuple(
-                        format(value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_UP), "f")
-                        if isinstance(value, Decimal)
-                        else value
-                        for value in row
-                    )
-                    for row in rows
-                ],
-                columns=columns,
-            ),
+        frame = pd.DataFrame.from_records(
+            [
+                tuple(
+                    format(value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_UP), "f")
+                    if isinstance(value, Decimal)
+                    else value
+                    for value in row
+                )
+                for row in rows
+            ],
+            columns=columns,
         )
+        target_columns = tuple(
+            row[0]
+            for row in connection.execute(
+                """select column_name from information_schema.columns
+                   where table_catalog = current_database()
+                     and table_schema = 'main' and table_name = ?
+                   order by ordinal_position""",
+                [table],
+            ).fetchall()
+        )
+        if tuple(frame.columns) != columns:
+            raise PerformanceV2ImportError(f"append frame columns do not match {table}")
+        if len(target_columns) != len(columns) or set(target_columns) != set(columns):
+            raise PerformanceV2ImportError(f"append columns do not match {table}")
+        connection.append(table, frame.loc[:, list(target_columns)])
 
 
 def _parse_reports(
@@ -403,46 +422,54 @@ def _phase8_sizing_facts(settings: Mapping[str, object]) -> tuple[object | None,
     )
 
 
+def _phase8_db_decimal(value: object) -> Decimal:
+    # Core action/equity and initial-balance values feed NOT NULL columns;
+    # optional price/cost facts alone may remain None when over-scale.
+    if not isinstance(value, Decimal):
+        raise PerformanceV2ImportError("phase8 source decimal is invalid")
+    try:
+        return value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_UP)
+    except InvalidOperation as error:
+        raise PerformanceV2ImportError("phase8 source decimal is invalid") from error
+
+
 def _phase8_source_input(
-    connection: duckdb.DuckDBPyConnection,
+    *,
     result_id: int,
     strategy_id: int,
     entry: PreparedV2Entry,
+    report: ParsedPerformanceV2Report,
+    result_values: Mapping[str, object],
+    sizing_facts: tuple[object | None, ...],
 ) -> OptimizerSourceInput:
-    result = connection.execute(
-        """select report_start_utc, report_end_utc, imported_at_utc,
-                  effective_start_utc, effective_end_utc, initial_balance,
-                  sizing_use_upnl, sizing_use_frozen_balance, sizing_use_fix,
-                  sizing_balance_percentage_long, sizing_risk_long, sizing_max_balance
-             from strategy_results where result_id = ? and strategy_id = ?""",
-        [result_id, strategy_id],
-    ).fetchone()
-    if result is None:
-        raise PerformanceV2ImportError("phase8 source result readback failed")
     actions = tuple(
         {
-            "action_index": row[0], "timestamp_utc": row[1], "symbol": row[2],
-            "order_id": row[3], "action": row[4], "size": row[5], "post_size": row[6],
-            "post_side": row[7], "pnl": row[8], "fee": row[9], "balance": row[10],
-            "price": row[11], "cost": row[12],
+            "action_index": action.action_index, "timestamp_utc": action.timestamp_utc,
+            "symbol": action.symbol, "order_id": action.order_id, "action": action.action,
+            "size": _phase8_db_decimal(action.size), "post_size": _phase8_db_decimal(action.post_size),
+            "post_side": action.post_side, "pnl": _phase8_db_decimal(action.pnl),
+            "fee": _phase8_db_decimal(action.fee), "balance": _phase8_db_decimal(action.balance),
+            "price": _phase8_decimal(action.price),
+            "cost": _phase8_decimal(action.cost),
         }
-        for row in connection.execute(
-            """select action_index, timestamp_utc, symbol, order_id, action, size,
-                      post_size, post_side, pnl, fee, balance, price, cost
-                 from strategy_actions where result_id = ? order by action_index""",
-            [result_id],
-        ).fetchall()
+        for action in report.actions
     )
     equity = tuple(
-        {"sample_index": row[0], "timestamp_utc": row[1], "equity": row[2]}
-        for row in connection.execute(
-            """select sample_index, timestamp_utc, equity from strategy_equity
-                 where result_id = ? order by sample_index""",
-            [result_id],
-        ).fetchall()
+        {"sample_index": sample_index, "timestamp_utc": timestamp, "equity": _phase8_db_decimal(equity_value)}
+        for sample_index, ((timestamp, _wallet), (_equity_timestamp, equity_value)) in enumerate(
+            zip(report.wallet_series, report.equity_series, strict=True)
+        )
     )
-    report_start, report_end, imported_at, effective_start, effective_end, initial_balance = result[:6]
-    sizing = result[6:]
+    if set(result_values) != set(_RESULT_VALUE_FIELDS) or len(sizing_facts) != 6:
+        raise PerformanceV2ImportError("phase8 source result values are incomplete")
+    report_start = result_values["report_start_utc"]
+    report_end = result_values["report_end_utc"]
+    initial_balance = result_values["initial_balance"]
+    imported_at = result_values["imported_at_utc"]
+    effective_start = result_values["effective_start_utc"]
+    effective_end = result_values["effective_end_utc"]
+    if not isinstance(imported_at, datetime):
+        raise PerformanceV2ImportError("phase8 source revision timestamp is invalid")
     return OptimizerSourceInput(
         source_document_version="performance-v2",
         result_id=result_id,
@@ -454,13 +481,13 @@ def _phase8_source_input(
         report_end_utc=report_end,
         effective_start_utc=effective_start or report_start,
         effective_end_utc=effective_end or report_end,
-        initial_balance=initial_balance,
-        sizing_use_upnl=sizing[0],
-        sizing_use_frozen_balance=sizing[1],
-        sizing_use_fix=sizing[2],
-        sizing_balance_percentage_long=sizing[3],
-        sizing_risk_long=sizing[4],
-        sizing_max_balance=sizing[5],
+        initial_balance=_phase8_db_decimal(initial_balance),
+        sizing_use_upnl=sizing_facts[0],
+        sizing_use_frozen_balance=sizing_facts[1],
+        sizing_use_fix=sizing_facts[2],
+        sizing_balance_percentage_long=sizing_facts[3],
+        sizing_risk_long=sizing_facts[4],
+        sizing_max_balance=sizing_facts[5],
         actions=actions,
         equity=equity,
     )
@@ -484,6 +511,43 @@ def _persist_phase8_prepared(
             availability.reason, prepared_json, prepared_at_utc,
         ],
     )
+
+
+def _verify_child_counts(
+    connection: duckdb.DuckDBPyConnection,
+    written_results: tuple[tuple[int, int, int], ...],
+) -> None:
+    if not written_results:
+        return
+    result_ids = tuple(dict.fromkeys(result_id for result_id, _actions, _equity in written_results))
+    placeholders = ",".join("?" for _ in result_ids)
+    action_counts = {
+        int(result_id): int(count)
+        for result_id, count in connection.execute(
+            f"select result_id, count(*) from strategy_actions where result_id in ({placeholders}) group by result_id",
+            list(result_ids),
+        ).fetchall()
+    }
+    equity_counts = {
+        int(result_id): int(count)
+        for result_id, count in connection.execute(
+            f"select result_id, count(*) from strategy_equity where result_id in ({placeholders}) group by result_id",
+            list(result_ids),
+        ).fetchall()
+    }
+    mismatches = []
+    for result_id, expected_actions, expected_equity in written_results:
+        actual_actions = action_counts.get(result_id, 0)
+        actual_equity = equity_counts.get(result_id, 0)
+        if (actual_actions, actual_equity) != (expected_actions, expected_equity):
+            mismatches.append(
+                f"{result_id}: expected actions={expected_actions} actual={actual_actions} "
+                f"equity={expected_equity} actual={actual_equity}"
+            )
+    if mismatches:
+        raise PerformanceV2ImportError(
+            "result child readback count mismatch: " + "; ".join(mismatches)
+        )
 
 
 def _setting_source_value(value: object, *, boolean: bool) -> tuple[object | None, bool]:
@@ -1458,7 +1522,7 @@ def _publish(
         equity_rows: list[tuple[object, ...]] = []
         result_files: dict[str, tuple[str, str, int, int, int, str]] = {}
         written_results: list[tuple[int, int, int]] = []
-        written_phase8: list[tuple[int, int, PreparedV2Entry]] = []
+        written_phase8: list[tuple[int, int, PreparedV2Entry, ParsedPerformanceV2Report, Mapping[str, object], tuple[object | None, ...]]] = []
         status_priority = {"REJECTED": 0, "SKIPPED": 1, "IMPORTED": 2, "REPLACED": 2}
         published_plateaus = {
             (entry.analysis_run_id, order.plateau_id)
@@ -1530,6 +1594,7 @@ def _publish(
                 for table in ("strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs"):
                     connection.execute(f"delete from {table} where result_id = ?", [result_id])
             values = _result_values(entry, report, prepared.commission_contract, now)
+            ordered_values = tuple(values[field] for field in _RESULT_VALUE_FIELDS)
             source_metadata = _optimizer_source_metadata_json(
                 report.settings, now, report_hash(entry)
             )
@@ -1545,7 +1610,7 @@ def _publish(
                        sizing_use_upnl, sizing_use_frozen_balance, sizing_use_fix,
                        sizing_balance_percentage_long, sizing_risk_long, sizing_max_balance)
                        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
-                    [strategy_id, *values, source_metadata, *sizing_facts],
+                        [strategy_id, *ordered_values, source_metadata, *sizing_facts],
                 ).fetchone()[0])
                 connection.execute("update strategies set current_result_id = ?, updated_at_utc = ? where strategy_id = ?", [result_id, now, strategy_id])
             else:
@@ -1559,7 +1624,7 @@ def _publish(
                        sizing_use_upnl = ?, sizing_use_frozen_balance = ?, sizing_use_fix = ?,
                        sizing_balance_percentage_long = ?, sizing_risk_long = ?, sizing_max_balance = ?
                        where result_id = ?""",
-                    [*values, source_metadata, *sizing_facts, result_id],
+                        [*ordered_values, source_metadata, *sizing_facts, result_id],
                 )
                 connection.execute(
                     "update strategies set updated_at_utc = ? where strategy_id = ?",
@@ -1585,7 +1650,7 @@ def _publish(
             if previous is None or status_priority[status] >= status_priority[previous[5].split(":", 1)[0]]:
                 result_files[record[1]] = record
             written_results.append((result_id, len(report.actions), len(report.equity_series)))
-            written_phase8.append((result_id, strategy_id, entry))
+            written_phase8.append((result_id, strategy_id, entry, report, values, sizing_facts))
             imported += 1
 
         _append_rows(connection, "strategy_actions", _ACTION_COLUMNS, action_rows)
@@ -1599,13 +1664,16 @@ def _publish(
                equity_sample_count = excluded.equity_sample_count, status = excluded.status""",
              [[run_id, name, digest, size, actions, equity, status] for name, digest, size, actions, equity, status in result_files.values()],
         )
-        for result_id, expected_actions, expected_equity in written_results:
-            actual_actions = int(connection.execute("select count(*) from strategy_actions where result_id = ?", [result_id]).fetchone()[0])
-            actual_equity = int(connection.execute("select count(*) from strategy_equity where result_id = ?", [result_id]).fetchone()[0])
-            if (actual_actions, actual_equity) != (expected_actions, expected_equity):
-                raise PerformanceV2ImportError("result child readback count mismatch")
-        for result_id, strategy_id, entry in written_phase8:
-            source = _phase8_source_input(connection, result_id, strategy_id, entry)
+        _verify_child_counts(connection, tuple(written_results))
+        for result_id, strategy_id, entry, report, values, sizing_facts in written_phase8:
+            source = _phase8_source_input(
+                result_id=result_id,
+                strategy_id=strategy_id,
+                entry=entry,
+                report=report,
+                result_values=values,
+                sizing_facts=sizing_facts,
+            )
             _persist_phase8_prepared(connection, source, now)
         # RETEST is removed only after all replacement readbacks pass.  Since
         # this remains in the same transaction, any later failure preserves
@@ -1640,7 +1708,7 @@ def _publish(
         raise PerformanceV2ImportError(str(error) or "Performance v2 transaction failed") from error
 
 
-def _result_values(entry: PreparedV2Entry, report: ParsedPerformanceV2Report, contract: Mapping[str, str], now: datetime) -> list[object]:
+def _result_values(entry: PreparedV2Entry, report: ParsedPerformanceV2Report, contract: Mapping[str, str], now: datetime) -> dict[str, object]:
     try:
         start, end = report_range(report.metrics)
     except PerformanceParseError as error:
@@ -1653,7 +1721,7 @@ def _result_values(entry: PreparedV2Entry, report: ParsedPerformanceV2Report, co
     reported_end = (report.reported_end_utc or end).astimezone(timezone.utc)
     effective_start = (report.effective_start_utc or reported_start).astimezone(timezone.utc)
     effective_end = (report.effective_end_utc or reported_end).astimezone(timezone.utc)
-    return [
+    values = [
         effective_start,
         effective_end,
         exchange_name,
@@ -1678,6 +1746,7 @@ def _result_values(entry: PreparedV2Entry, report: ParsedPerformanceV2Report, co
         report.excluded_trade_count,
         report.exclusion_reason,
     ]
+    return dict(zip(_RESULT_VALUE_FIELDS, values, strict=True))
 
 
 def report_hash(entry: PreparedV2Entry) -> str:
@@ -1729,7 +1798,7 @@ def import_performance_v2(
         raise PerformanceV2ImportError("invalid Performance v2 target") from error
     if not target.is_file() or target.stat().st_size == 0:
         raise PerformanceV2ImportError(
-            "Performance v2 target does not exist or does not have schema version 2"
+            "Performance v2 target does not exist or does not have a supported schema"
         )
     connection: duckdb.DuckDBPyConnection | None = None
     staging: Path | None = None
@@ -1748,7 +1817,7 @@ def import_performance_v2(
         except PerformanceV2StoreError as error:
             if "root does not exist" in str(error).casefold():
                 raise PerformanceV2ImportError(
-                    "Performance v2 target does not exist or does not have schema version 2"
+                    "Performance v2 target does not exist or does not have a supported schema"
                 ) from error
             raise PerformanceV2LockedError("Performance v2 database writer is busy") from error
         try:
@@ -1756,17 +1825,16 @@ def import_performance_v2(
         except duckdb.Error as error:
             if "lock" in str(error).casefold():
                 raise PerformanceV2LockedError("Performance v2 database is locked") from error
-            raise PerformanceV2ImportError("Performance v2 target does not have schema version 2") from error
+            raise PerformanceV2ImportError("Performance v2 target does not have a supported schema") from error
+        # The existing non-empty target may be an older supported schema. Migrate
+        # it under the writer lock, but never initialize a bare database here.
         try:
+            initialize_performance_v2(connection, create_if_missing=False)
             require_performance_v2(connection)
         except (PerformanceV2StoreError, duckdb.Error) as error:
-            raise PerformanceV2ImportError("Performance v2 target does not have schema version 2") from error
-        # Migrate additive v2 columns only after the existing target has passed
-        # the lock and schema gates; this cannot create a missing database.
-        try:
-            initialize_performance_v2(connection)
-        except (PerformanceV2StoreError, duckdb.Error) as error:
-            raise PerformanceV2ImportError("Performance v2 target migration failed") from error
+            raise PerformanceV2ImportError(
+                "Performance v2 target does not have a supported schema or migration failed"
+            ) from error
         lock_acquired = True
         prepared = read_performance_v2_inbox(
             request.inbox,
