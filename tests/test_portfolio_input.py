@@ -792,7 +792,7 @@ def _finalist_row(strategy_id: int, symbol: str = "BTCUSDT", side: str = "LONG",
 
 def test_finalist_cutoff_applies_pair_direction_rules_independently() -> None:
     rows = [
-        _finalist_row(1), _finalist_row(2),
+        _finalist_row(1, rank=1), _finalist_row(2, rank=2),
         _finalist_row(4, side="SHORT"),
     ]
 
@@ -822,14 +822,25 @@ def test_finalist_cutoff_uses_user_rank_only_and_marks_cutoff_rows() -> None:
     assert result[1]["user_rank"] == 1
 
 
-def test_finalist_cutoff_accepts_missing_rank_when_count_is_within_maximum() -> None:
+def test_finalist_cutoff_rejects_missing_rank_for_multirow_pool() -> None:
     result = apply_finalist_cutoff(
         [_finalist_row(1), _finalist_row(2, rank=2)],
         selected_pairs={("BTCUSDT", "LONG")},
         maximums={("BTCUSDT", "LONG"): 2},
     )
 
-    assert all(row["selection_status"] == "SELECTED" for row in result)
+    assert all(row["selection_status"] == "EXCLUDED" for row in result)
+    assert all(row["selection_reason"] == "USER_RANK_MISSING" for row in result)
+
+
+@pytest.mark.parametrize("invalid_rank", (0, -1, "bad", []))
+def test_finalist_cutoff_rejects_invalid_multirow_ranks_without_sorting_crash(invalid_rank) -> None:
+    result = apply_finalist_cutoff(
+        [_finalist_row(1, rank=invalid_rank), _finalist_row(2, rank=2)],
+        selected_pairs={("BTCUSDT", "LONG")},
+        maximums={("BTCUSDT", "LONG"): 1},
+    )
+    assert all(row["selection_reason"] == "USER_RANK_MISSING" for row in result)
 
 
 @pytest.mark.parametrize(
@@ -1808,17 +1819,15 @@ def test_prepare_weighted_input_invalidates_equal_endpoint_carry_in_movement() -
 
 
 @pytest.mark.parametrize("side", ["SHORT"])
-def test_prepare_weighted_input_rejects_non_long_side(side: str) -> None:
+def test_prepare_weighted_input_accepts_short_side(side: str) -> None:
     row = {
         "symbol": "A", "side": side, "strategy_id": 1, "result_id": 1,
         "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
         "initial_balance": "100", "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
     }
 
-    with pytest.raises(PortfolioInputError) as error:
-        prepare_weighted_input((row,))
-
-    assert error.value.code == "INVALID_SOURCE_VALUE"
+    prepared = prepare_weighted_input((row,))
+    assert prepared.strategy_ids == (1,)
 
 
 def test_prepare_weighted_input_rejects_duplicate_symbol() -> None:
@@ -1874,6 +1883,20 @@ def test_prepare_weighted_input_includes_period_end_for_non_dividing_step() -> N
 
     assert prepared.timestamps_utc[0] == "2026-01-01T00:00:00Z"
     assert prepared.timestamps_utc[-1] == "2026-01-15T00:00:00Z"
+
+
+def test_prepare_weighted_input_accepts_opposite_sides_for_one_symbol_and_canonicalizes_order() -> None:
+    def row(symbol: str, side: str, strategy_id: int) -> dict:
+        return {
+            "symbol": symbol, "side": side, "strategy_id": strategy_id, "result_id": strategy_id,
+            "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+            "initial_balance": "100", "equity": ({"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},),
+        }
+
+    prepared = prepare_weighted_input((row(" btcusdt ", "short", 2), row("BTCUSDT", "LONG", 1)))
+
+    assert prepared.strategy_ids == (1, 2)
+    assert tuple(prepared.cycles) == ("BTCUSDT:LONG:1:1", "BTCUSDT:SHORT:2:2")
 
 
 def test_prepare_weighted_input_numeric_dynamic_settings_match_exact_values() -> None:
@@ -1942,7 +1965,7 @@ def test_preparation_cache_key_includes_campaign_weighted_algo_version(monkeypat
     }
 
     first = preparation_cache_key((row,))
-    monkeypatch.setattr(portfolio_input, "CAMPAIGN_WEIGHTED_ALGO_VERSION", "WS1.2")
+    monkeypatch.setattr(portfolio_input, "CAMPAIGN_WEIGHTED_ALGO_VERSION", "WS9.9")
 
     second = preparation_cache_key((row,))
 

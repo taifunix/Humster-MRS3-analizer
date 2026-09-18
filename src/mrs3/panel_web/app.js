@@ -2971,7 +2971,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         return digits !== '' && Math.max(scale, 0) <= 12 && Math.max(digits.length - scale, 0) <= 26;
       };
       const portfolioSafeInteger = (value, minimum = 0) => { const raw = String(value ?? '').trim(); const number = Number(raw); return raw !== '' && Number.isSafeInteger(number) && number >= minimum; };
-      const copyPortfolioMaximum = (selector) => selector === '#portfolio-default-long' ? 1 : 0;
+      const copyPortfolioMaximum = (selector) => {
+        const input = query(selector);
+        return portfolioSafeInteger(input?.value, 0) ? Number(input.value) : 0;
+      };
       const freezeStatus = (status) => `${status}${state.settingsChanged ? ' · SETTINGS_CHANGED_SINCE_FREEZE' : ''}`;
       const updateFreezeStatus = (job) => {
         const changed = job?.settings_changed_since_freeze === true || (state.configDigest && job?.config_digest && state.configDigest !== job.config_digest);
@@ -2989,7 +2992,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
           if (!portfolioSafeInteger(input.value, 0)) pairFieldsValid = false;
         }
         const selectedPairs = rows.filter((row) => row.selected);
-        const activePair = selectedPairs.some((row) => row.long > 0 || row.short > 0);
+        const defaultsValid = ['#portfolio-default-long', '#portfolio-default-short'].every((selector) => portfolioSafeInteger(query(selector)?.value, 0));
+        const activePair = selectedPairs.length > 0 && selectedPairs.every((row) => row.long > 0 || row.short > 0);
         const selectedProfiles = ['aggressive', 'balanced', 'conservative'].filter((profile) => query(`#portfolio-profile-${profile}`)?.checked);
         const profiles = selectedProfiles.map((profile) => {
           const equity = query(`#portfolio-equity-${profile}`)?.value || '';
@@ -2998,7 +3002,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
           return { profile, equity, maxBalance, candidates };
         });
         const profilesValid = profiles.length > 0 && profiles.every((profile) => portfolioDecimal(profile.equity) && (!String(profile.maxBalance).trim() || portfolioDecimal(profile.maxBalance)) && portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= 50);
-        return { rows, selectedPairs, activePair, selectedProfiles, profiles, valid: state.readiness?.stage1?.enabled === true && pairFieldsValid && activePair && profilesValid };
+         return { rows, selectedPairs, activePair, selectedProfiles, profiles, valid: state.readiness?.stage1?.enabled === true && pairFieldsValid && defaultsValid && activePair && profilesValid };
       };
       const blockerItems = (readiness) => [
         ...portfolioValues(readiness?.stage1?.blockers || readiness?.blockers),
@@ -3041,7 +3045,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
           const grid = document.createElement('div'); grid.className = 'portfolio-pair-grid';
           for (const [side, countValue] of [['LONG', row.long], ['SHORT', row.short]]) {
             const field = document.createElement('label'); field.className = 'field-group'; field.textContent = `Maximum ${side}`;
-            const input = document.createElement('input'); input.type = 'number'; input.min = side === 'LONG' ? '1' : '0'; input.max = side === 'LONG' ? '1' : '0'; input.step = '1'; input.value = String(countValue); input.readOnly = true; input.dataset.portfolioPair = row.pair; input.dataset.portfolioSide = side; input.setAttribute('aria-label', `${row.pair} maximum ${side}`);
+            const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.step = '1'; input.value = String(countValue); input.dataset.portfolioPair = row.pair; input.dataset.portfolioSide = side; input.setAttribute('aria-label', `${row.pair} maximum ${side}`);
             input.addEventListener('input', () => { row[side.toLowerCase()] = Number(input.value); updateControls(); }); field.append(input); grid.append(field);
           }
           card.append(grid); container.append(card);
@@ -3120,7 +3124,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       runButton?.addEventListener('click', async () => {
         const launch = portfolioLaunchForm();
         if (!launch.valid) { if (formStatus) formStatus.textContent = 'Fix the server readiness and form blockers before calculating.'; updateControls(); return; }
-        const selectedPairs = launch.selectedPairs.map((row) => ({ pair: row.pair, max_finalist_long: 1, max_finalist_short: 0 }));
+        const selectedPairs = launch.selectedPairs.map((row) => ({ pair: row.pair, max_finalist_long: row.long, max_finalist_short: row.short }));
         const profiles = launch.profiles.map((profile) => {
           const item = { profile_id: profile.profile.toUpperCase(), equity_usdt: profile.equity, max_candidates: Number(profile.candidates) };
           if (String(profile.maxBalance).trim()) item.max_balance_usdt = profile.maxBalance;

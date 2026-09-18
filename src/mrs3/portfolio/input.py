@@ -1023,7 +1023,7 @@ def _pair(value: object) -> tuple[str, str]:
     side = side.strip().upper()
     if side not in {"LONG", "SHORT"}:
         raise PortfolioInputError("pair side is invalid", code="INVALID_REQUEST")
-    return symbol.strip(), side
+    return symbol.strip().upper(), side
 
 
 def _maximum(value: object) -> int:
@@ -1151,15 +1151,23 @@ def apply_finalist_cutoff(
     selected = {_pair(pair) for pair in selected_pairs}
     rows: list[dict[str, Any]] = []
     groups: dict[tuple[str, str], list[int]] = {}
+    invalid_rank_indexes: set[int] = set()
     for candidate in candidates:
         if candidate.get("user_status") != "FINALIST":
             continue
         row = dict(candidate)
         pair = _pair((row.get("symbol"), row.get("side")))
         row["symbol"], row["side"] = pair
-        row["user_rank"] = _user_rank(row.get("user_rank"))
+        invalid_rank = False
+        try:
+            row["user_rank"] = _user_rank(row.get("user_rank"))
+        except PortfolioInputError:
+            row["user_rank"] = None
+            invalid_rank = True
         row["effective_maximum"] = limits.get(pair, 0)
         rows.append(row)
+        if invalid_rank:
+            invalid_rank_indexes.add(len(rows) - 1)
         groups.setdefault(pair, []).append(len(rows) - 1)
 
     for pair, indexes in groups.items():
@@ -1168,22 +1176,28 @@ def apply_finalist_cutoff(
             status, reason = "EXCLUDED", PAIR_UNSELECTED
         elif limit == 0:
             status, reason = "EXCLUDED", DIRECTION_DISABLED
-        elif len(indexes) <= limit:
-            status, reason = "SELECTED", "WITHIN_MAXIMUM"
-            for index in indexes:
-                rows[index]["selection_status"] = status
-                rows[index]["selection_reason"] = reason
-            continue
         else:
             ranks = [rows[index]["user_rank"] for index in indexes]
-            if any(rank is None for rank in ranks):
+            if any(index in invalid_rank_indexes for index in indexes):
                 status, reason = "EXCLUDED", USER_RANK_MISSING
                 for index in indexes:
                     rows[index]["selection_status"] = status
                     rows[index]["selection_reason"] = reason
                 continue
-            if len(set(ranks)) != len(ranks):
+            if len(indexes) > 1 and any(rank is None for rank in ranks):
+                status, reason = "EXCLUDED", USER_RANK_MISSING
+                for index in indexes:
+                    rows[index]["selection_status"] = status
+                    rows[index]["selection_reason"] = reason
+                continue
+            if len(indexes) > 1 and len(set(ranks)) != len(ranks):
                 status, reason = "EXCLUDED", USER_RANK_DUPLICATE
+                for index in indexes:
+                    rows[index]["selection_status"] = status
+                    rows[index]["selection_reason"] = reason
+                continue
+            if len(indexes) <= limit:
+                status, reason = "SELECTED", "WITHIN_MAXIMUM"
                 for index in indexes:
                     rows[index]["selection_status"] = status
                     rows[index]["selection_reason"] = reason
@@ -1656,31 +1670,37 @@ def prepare_weighted_input(
     if type(history_step_minutes) is not int or history_step_minutes <= 0:
         raise ValueError("history_step_minutes must be a positive integer")
     participant_keys: set[str] = set()
-    participant_symbols: set[str] = set()
+    participant_pairs: set[tuple[str, str]] = set()
     participant_strategy_ids: set[int] = set()
-    for row in rows:
+    normalized_rows: list[dict[str, Any]] = []
+    for source_row in rows:
+        row = dict(source_row)
         strategy_id = row.get("strategy_id")
         if type(strategy_id) is not int:
             raise PortfolioInputError("strategy_id must be an integer", code="INVALID_SOURCE_VALUE")
-        if str(row.get("side", "")).upper() != "LONG":
-            raise PortfolioInputError("weighted input requires LONG participants", code="INVALID_SOURCE_VALUE")
-        symbol = str(row.get("symbol", "")).upper()
-        if symbol in participant_symbols:
-            raise PortfolioInputError("duplicate participant symbol", code="INVALID_SOURCE_VALUE")
+        symbol = str(row.get("symbol", "")).strip().upper()
+        side = str(row.get("side", "")).strip().upper()
+        if not symbol or side not in {"LONG", "SHORT"}:
+            raise PortfolioInputError("weighted input requires LONG or SHORT participants", code="INVALID_SOURCE_VALUE")
+        row["symbol"], row["side"] = symbol, side
+        pair = (symbol, side)
+        if pair in participant_pairs:
+            raise PortfolioInputError("duplicate participant pair-side", code="INVALID_SOURCE_VALUE")
         if strategy_id in participant_strategy_ids:
             raise PortfolioInputError("duplicate participant strategy_id", code="INVALID_SOURCE_VALUE")
-        participant_symbols.add(symbol)
+        participant_pairs.add(pair)
         participant_strategy_ids.add(strategy_id)
         key_row = _period_row_key(row)
         if key_row in participant_keys:
             raise PortfolioInputError("duplicate participant key", code="INVALID_SOURCE_VALUE")
         participant_keys.add(key_row)
-    period = resolve_common_pretest_period(rows, minimum_common_days=minimum_common_days)
+        normalized_rows.append(row)
+    period = resolve_common_pretest_period(normalized_rows, minimum_common_days=minimum_common_days)
     if not period.available or period.start_utc is None or period.end_utc is None:
         raise PortfolioInputError(period.reason or "common pretest period unavailable", code="COMMON_PERIOD_UNAVAILABLE")
     if period.evidence.get("excluded_identities") or period.evidence.get("binding_removals"):
         raise PortfolioInputError("common pretest period changed the finalist universe", code="COMMON_PERIOD_UNIVERSE_CHANGED")
-    key = preparation_cache_key(rows, history_step_minutes=history_step_minutes, minimum_common_days=minimum_common_days, period=period)
+    key = preparation_cache_key(normalized_rows, history_step_minutes=history_step_minutes, minimum_common_days=minimum_common_days, period=period)
     cached = cache.get(key) if cache is not None else None
     if cached is not None:
         return cached
@@ -1690,7 +1710,7 @@ def prepare_weighted_input(
     while grid[-1] < end:
         grid.append(min(end, grid[-1] + step))
     timestamps = tuple(grid)
-    ordered = tuple(sorted(rows, key=_period_sort_key))
+    ordered = tuple(sorted(normalized_rows, key=_period_sort_key))
     strategy_ids = tuple(row["strategy_id"] for row in ordered)
     columns = [[Decimal("0") for _ in ordered] for _ in range(max(0, len(timestamps) - 1))]
     valid = [[True] * len(ordered) for _ in range(max(0, len(timestamps) - 1))]

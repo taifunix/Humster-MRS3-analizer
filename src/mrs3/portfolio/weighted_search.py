@@ -673,6 +673,46 @@ def _solver_tolerance(*values: Any) -> Decimal:
         return max(_EPS, scale * _RELATIVE_SOLVER_EPS)
 
 
+def _symbol_cap_groups(
+    source_members: Sequence[Mapping[str, Any]],
+    capacities: Sequence[Any],
+) -> dict[str, tuple[int, ...]]:
+    """Group member indices by canonical symbol and validate shared caps."""
+    if len(source_members) != len(capacities):
+        raise ValueError("CAPACITY_SHAPE_MISMATCH")
+    groups: dict[str, list[int]] = {}
+    caps = tuple(_decimal(value, "capacity", nonnegative=True) for value in capacities)
+    for index, member in enumerate(source_members):
+        raw_symbol = member.get("symbol")
+        if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+            raise ValueError("MISSING_SYMBOL")
+        symbol = raw_symbol.strip().upper()
+        groups.setdefault(symbol, []).append(index)
+    for symbol, indexes in groups.items():
+        first = caps[indexes[0]]
+        if any(abs(caps[index] - first) > _solver_tolerance(first, caps[index]) for index in indexes[1:]):
+            raise ValueError(f"SYMBOL_CAPACITY_MISMATCH:{symbol}")
+    return {symbol: tuple(indexes) for symbol, indexes in groups.items()}
+
+
+def _validate_symbol_cap_vector(
+    x: Sequence[Any],
+    source_members: Sequence[Mapping[str, Any]],
+    capacities: Sequence[Any],
+) -> None:
+    """Reject a vector whose combined same-symbol allocation exceeds its cap."""
+    values = tuple(_decimal(value, "x", nonnegative=True) for value in x)
+    caps = tuple(_decimal(value, "capacity", nonnegative=True) for value in capacities)
+    groups = _symbol_cap_groups(source_members, caps)
+    if len(values) != len(caps):
+        raise ValueError("VECTOR_SHAPE_MISMATCH")
+    for symbol, indexes in groups.items():
+        total = sum((values[index] for index in indexes), Decimal(0))
+        cap = caps[indexes[0]]
+        if total > cap + _solver_tolerance(total, cap):
+            raise ValueError(f"SYMBOL_CAPACITY_EXCEEDED:{symbol}")
+
+
 def stationary_bootstrap_indices(
     T: int,
     D: Any,
@@ -1317,6 +1357,7 @@ def _solve_lp_unchecked(
     margin_a: Sequence[Any] | None = None,
     margin_b: Sequence[Any] | None = None,
     max_mm_load: Any | None = None,
+    symbol_cap_groups: Mapping[str, Sequence[int]],
     time_limit: Any = Decimal("30"),
 ) -> _SolveOutcome:
     t = len(normalized_delta)
@@ -1393,6 +1434,18 @@ def _solve_lp_unchecked(
             tuple((x_start + index, -float(value)) for index, value in enumerate(coefficients)),
             -float(target),
         )
+    if symbol_cap_groups is not None:
+        for indexes in symbol_cap_groups.values():
+            if len(indexes) >= 2:
+                cap = capacities[indexes[0]]
+                _append_sparse_constraint(
+                    a_rows,
+                    a_columns,
+                    a_values,
+                    b_ub,
+                    tuple((x_start + index, 1.0) for index in indexes),
+                    float(cap),
+                )
     a_ub = coo_matrix((a_values, (a_rows, a_columns)), shape=(len(b_ub), size), dtype=float).tocsr()
     upper_bank = None if bank_available is None else float(bank_available)
     bounds = [(1.0, upper_bank)] + [(0.0, float(value)) for value in capacities] + [(0.0, None)] * t
@@ -1473,6 +1526,13 @@ def _solve_lp_unchecked(
                 reason="LP_SOLUTION_INVALID",
                 **metadata,
             )
+        if symbol_cap_groups is not None:
+            for indexes in symbol_cap_groups.values():
+                if len(indexes) >= 2:
+                    total = sum((raw_x[index] for index in indexes), Decimal(0))
+                    cap = capacities[indexes[0]]
+                    if total > cap + _solver_tolerance(total, cap):
+                        return _SolveOutcome("ERROR", reason="LP_SOLUTION_INVALID", **metadata)
         if bank_available is not None and raw_bank > bank_available + _solver_tolerance(raw_bank, bank_available):
             return _SolveOutcome(
                 "ERROR",
@@ -1637,6 +1697,7 @@ def _solve_additional_lp(
     time_limit: Any = Decimal("30"),
     p30_floor: Any | None = None,
     p30_floor_coefficients: Sequence[Any] | None = None,
+    symbol_cap_groups: Mapping[str, Sequence[int]],
     _cdar: bool = False,
 ) -> _SolveOutcome:
     """Solve one fixed-bank redistribution LP without wiring search orchestration."""
@@ -1756,6 +1817,18 @@ def _solve_additional_lp(
                 tuple([(bank_index, -float(drawdown))] + [(x_start + index, -float(value)) for index, value in enumerate(row)] + [(h_index, float(one_minus_m))]),
                 0.0,
             )
+
+    if symbol_cap_groups is not None:
+        for indexes in symbol_cap_groups.values():
+            if len(indexes) >= 2:
+                _append_sparse_constraint(
+                    a_rows,
+                    a_columns,
+                    a_values,
+                    b_ub,
+                    tuple((x_start + index, 1.0) for index in indexes),
+                    float(caps[indexes[0]]),
+                )
 
     _append_sparse_constraint(
         a_rows,
@@ -1924,6 +1997,12 @@ def _solve_additional_lp(
         return _SolveOutcome("ERROR", reason="LP_SOLUTION_INVALID", **metadata)
     if any(value < -tolerance or value > cap + tolerance for value, cap in zip(raw_x, caps)) or raw_le < -tolerance:
         return _SolveOutcome("ERROR", reason="LP_SOLUTION_INVALID", **metadata)
+    if symbol_cap_groups is not None:
+        for indexes in symbol_cap_groups.values():
+            if len(indexes) >= 2:
+                total = sum((raw_x[index] for index in indexes), Decimal(0))
+                if total > caps[indexes[0]] + tolerance:
+                    return _SolveOutcome("ERROR", reason="LP_SOLUTION_INVALID", **metadata)
     path_required_banks = tuple(bank_for_path(_path(path, raw_x), drawdown) for path in paths)
     if any(required > bank + tolerance for required in path_required_banks):
         return _SolveOutcome("ERROR", reason="BANK_UNAVAILABLE", **metadata)
@@ -2317,6 +2396,13 @@ def _candidates_for_solution(
     bank_feasible_override: bool | None = None,
     failure_reason: list[str] | None = None,
 ) -> tuple[PortfolioCandidate, ...]:
+    try:
+        _validate_symbol_cap_vector(solution.x, source_members, capacities)
+        symbol_cap_groups = _symbol_cap_groups(source_members, capacities)
+    except ValueError as error:
+        if failure_reason is not None:
+            failure_reason.append(str(error))
+        return ()
     evaluated = evaluate_weighted_path(normalized_delta, solution.x, max_dd=max_dd, common_days=common_days)
     with localcontext() as context:
         context.prec = _precision_for(evaluated["bank_for_path"], solution.bank)
@@ -2414,11 +2500,18 @@ def _candidates_for_solution(
                             context.prec = _precision_for(bank_available, denominator, capacities, solution.x)
                             cap_scale = min(
                                 (
-                                    capacity / value
-                                    for capacity, value in zip(capacities, solution.x)
-                                    if value > 0
+                                    capacities[indexes[0]] / sum((solution.x[index] for index in indexes), Decimal(0))
+                                    for indexes in symbol_cap_groups.values()
+                                    if len(indexes) >= 2 and sum((solution.x[index] for index in indexes), Decimal(0)) > 0
                                 ),
                                 default=Decimal("Infinity"),
+                            )
+                            cap_scale = min(
+                                cap_scale,
+                                min(
+                                    (capacity / value for capacity, value in zip(capacities, solution.x) if value > 0),
+                                    default=Decimal("Infinity"),
+                                ),
                             )
                             scale = min(bank_available / denominator, cap_scale)
                         if scale.is_finite() and Decimal(0) < scale < Decimal(1):
@@ -2557,6 +2650,7 @@ def _revalidate_proposed_x(
     margin_kwargs: Mapping[str, Any] | None = None,
     bank_available: Decimal | None = None,
     validator: Callable[[tuple[Decimal, ...]], bool] | None = None,
+    failure_reason: list[str] | None = None,
 ) -> tuple[PortfolioCandidate, ...]:
     """Validate one externally proposed x exactly once; failed proposals vanish."""
     original_candidates = (original,) if isinstance(original, PortfolioCandidate) else tuple(original)
@@ -2564,6 +2658,7 @@ def _revalidate_proposed_x(
         x = tuple(_decimal(value, "proposed_x", nonnegative=True) for value in proposed_x)
         if len(x) != len(capacities) or any(value > capacity for value, capacity in zip(x, capacities)):
             return original_candidates
+        _validate_symbol_cap_vector(x, source_members, capacities)
         if validator is not None and not validator(x):
             return original_candidates
         evaluated = evaluate_weighted_path(normalized_delta, x, max_dd=max_dd, common_days=common_days)
@@ -2586,7 +2681,13 @@ def _revalidate_proposed_x(
             bank_available=bank_available,
             allow_rescue=False,
         )
-    except (ArithmeticError, TypeError, ValueError, InvalidOperation):
+    except ValueError as error:
+        if failure_reason is not None:
+            reason = str(error)
+            if reason.startswith(("SYMBOL_CAPACITY_", "MISSING_SYMBOL")):
+                failure_reason.append(reason)
+        return original_candidates
+    except (ArithmeticError, TypeError, InvalidOperation):
         return original_candidates
     return original_candidates + proposed if proposed else original_candidates
 
@@ -2630,6 +2731,12 @@ def _candidate_vector_by_strategy_id(
             if isinstance(priority, bool) or not isinstance(priority, int) or not 1 <= priority <= 5:
                 raise ValueError("CANDIDATE_PRIORITY_INVALID")
             priorities[index] = priority
+    present_indexes = tuple(positions[member.get("strategy_id")] for member in candidate_members)
+    _validate_symbol_cap_vector(
+        tuple(values[index] for index in present_indexes),
+        tuple(candidate_members),
+        tuple(caps[index] for index in present_indexes),
+    )
     return tuple(values), tuple(priorities)
 
 
@@ -3341,6 +3448,7 @@ def weighted_search(
     elif isinstance(capacities, (str, bytes)) or not isinstance(capacities, Sequence) or len(capacities) != n:
         raise ValueError("CAPACITY_SHAPE_MISMATCH")
     caps = tuple(_member_capacity(capacities, index, strategy_id, member) for index, (strategy_id, member) in enumerate(zip(prepared.strategy_ids, source_members)))
+    symbol_cap_groups = _symbol_cap_groups(source_members, caps)
     coefficients = _coefficients(normalized_delta, n, days)
     if margin is not None and (margin_coefficients is not None or margin_kwargs is not None):
         raise ValueError("MARGIN_OPTION_CONFLICT")
@@ -3369,7 +3477,13 @@ def weighted_search(
             return _result(FAIL, "MARGIN_BOUND_UNAVAILABLE")
     target = None if target_p30 is None else _decimal(target_p30, "target_p30", positive=True)
     available = None if bank_available is None else _decimal(bank_available, "bank_available", positive=True)
-    upper_target = _sum_products(caps, tuple(max(coefficient, Decimal(0)) for coefficient in coefficients))
+    upper_target = sum(
+        (
+            caps[indexes[0]] * max((max(coefficients[index], Decimal(0)) for index in indexes), default=Decimal(0))
+            for indexes in symbol_cap_groups.values()
+        ),
+        Decimal(0),
+    )
     if target is None and upper_target <= 0:
         return _result(FAIL, "NO_POSITIVE_TARGET")
     calls = 0
@@ -3408,6 +3522,7 @@ def weighted_search(
             margin_a=margin_a,
             margin_b=margin_b,
             max_mm_load=max_mm_load,
+            symbol_cap_groups=symbol_cap_groups,
             time_limit=solver_seconds,
         )
         solver_calls.append({
@@ -3855,6 +3970,7 @@ def weighted_search(
                         time_limit=solver_seconds,
                         p30_floor=target_value,
                         p30_floor_coefficients=coefficients,
+                        symbol_cap_groups=symbol_cap_groups,
                     )
                 except (ArithmeticError, TypeError, ValueError, RuntimeError):
                     outcome = _SolveOutcome("ERROR", reason="SOLVER_ERROR")
@@ -4097,6 +4213,7 @@ def weighted_search(
                     time_limit=solver_seconds,
                     p30_floor=cdar_floor,
                     p30_floor_coefficients=coefficients,
+                    symbol_cap_groups=symbol_cap_groups,
                 )
             except (ArithmeticError, TypeError, ValueError, RuntimeError):
                 outcome = _SolveOutcome("ERROR", reason="SOLVER_ERROR")
@@ -4269,6 +4386,7 @@ def weighted_search(
     cdar_manifest["scenario_checked_x_count"] = base_full_checked_count + len(new_x_digests)
 
     if proposed_x is not None and ordered_candidates and budget_reason is None:
+        proposal_failure: list[str] = []
         ordered_candidates = list(_revalidate_proposed_x(
             tuple(ordered_candidates),
             proposed_x,
@@ -4284,7 +4402,10 @@ def weighted_search(
             margin_kwargs=margin_kwargs,
             bank_available=available,
             validator=proposal_validator,
+            failure_reason=proposal_failure,
         ))
+        if proposal_failure:
+            error_reason = proposal_failure[0]
     for candidate in ordered_candidates:
         candidate_origins.setdefault(candidate.identity, "scale")
     ordered_candidates, shortlist_manifest = _select_shortlist(

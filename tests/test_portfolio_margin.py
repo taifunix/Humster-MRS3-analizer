@@ -410,6 +410,42 @@ def test_reference_margin_coefficients_include_tier_at_capacity_boundary() -> No
     assert len(result.by_strategy[1].witness["tiers_used"]) == 2
 
 
+def test_opposite_side_margin_is_additive_and_conservative_at_fractional_and_full_tiers() -> None:
+    zero_fees = FeeSchedule(Decimal("0"), Decimal("0"), "backtest_manifest", "zero-fees")
+    coefficient = derive_reference_margin_coefficients(
+        _reference_snapshot_for_margin(),
+        ({"strategy_id": 1, "symbol": "BTCUSDT", "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("100")},),
+        open_fee_rate=Decimal("0"), close_fee_rate=Decimal("0"), policy_id="margin-policy-v1",
+    )
+    assert coefficient.status == PASS
+    bound = coefficient.by_strategy[1]
+    assert bound.a == Decimal("0.1") and bound.b == Decimal("0.025")
+
+    fractional = margin(
+        [Position("BTCUSDT", "LONG", "0.4", "100"), Position("BTCUSDT", "SHORT", "0.4", "100")],
+        tiers=TIERS, leverage={"BTCUSDT": Decimal("10")}, leverage_steps={"BTCUSDT": "1"},
+        fees=zero_fees, margin_balance=Decimal("1000"), collateral_haircut="0", order_loss="0",
+    )
+    one_fractional = margin(
+        [Position("BTCUSDT", "LONG", "0.4", "100")],
+        tiers=TIERS, leverage={"BTCUSDT": Decimal("10")}, leverage_steps={"BTCUSDT": "1"},
+        fees=zero_fees, margin_balance=Decimal("1000"), collateral_haircut="0", order_loss="0",
+    )
+    assert fractional.status == one_fractional.status == PASS
+    assert fractional.total_im == 2 * one_fractional.total_im
+    assert fractional.total_im <= bound.a * Decimal("80")
+    assert fractional.total_mm <= bound.b * Decimal("80")
+
+    full_boundary = margin(
+        [Position("BTCUSDT", "LONG", "0.5", "100"), Position("BTCUSDT", "SHORT", "0.5", "100")],
+        tiers=TIERS, leverage={"BTCUSDT": Decimal("10")}, leverage_steps={"BTCUSDT": "1"},
+        fees=zero_fees, margin_balance=Decimal("1000"), collateral_haircut="0", order_loss="0",
+    )
+    assert full_boundary.status == PASS
+    assert full_boundary.total_im <= bound.a * Decimal("100")
+    assert full_boundary.total_mm <= bound.b * Decimal("100")
+
+
 def test_reference_margin_coefficients_fail_closed_for_missing_tier_rate() -> None:
     member = ({"strategy_id": 1, "symbol": "BTCUSDT", "planned_leverage": Decimal("10"), "position_size_usdt": Decimal("200")},)
     # The second BTC tier lacks its required initial-margin rate.

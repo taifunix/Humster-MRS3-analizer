@@ -136,14 +136,22 @@ action Price/Cost, six nullable WS1.1 sizing facts, and one private, versioned,
 digest-bound, per-result prepared optimizer input;
 see the [Phase 8 specification](docs/specs/2026-09-17-performance-v2-optimizer-prepared-inputs.md)
 and [acceptance evidence](docs/superpowers/plans/2026-09-17-performance-v2-optimizer-prepared-inputs-evidence.md).
+Phase 9 is accepted as WS1.2: each enabled canonical `(symbol, side)` slot
+contributes one finalist from its configured top-N pool, all fixed-slot
+compositions are ranked on equal terms, and same-symbol LONG+SHORT share one
+liquidity cap while retaining additive margin and distinct limiter slots.
+See [ADR-0039](docs/decisions/0039-portfolio-optimizer-ws12-directional-shared-cap.md)
+and [Phase 9 evidence](docs/superpowers/plans/2026-09-18-portfolio-optimizer-weighted-search-phase-9-evidence.md).
 История и
 [ответ на замечания](docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-review-response.md)
 сохраняют основания решения и изменение области резерва (§8.1 плана).
 При полной нагрузке до реакции резерв может быть ниже профильного порога;
 оба значения должны быть видны в отчёте; это входит в одобренную R4.
 Параллельные вычисления используют единственное поле панели duckdb_import.workers;
-бюджет учитывает доступные CPU/RAM и подтверждается замером. MVP: один выбранный LONG
-FINALIST на символ, подбор полных размеров и требуемого капитала, ограниченный
+бюджет учитывает доступные CPU/RAM и подтверждается замером. WS1.2 выбирает по
+одному FINALIST из настроенного top-N для каждой включённой стороны символа;
+разные составы участвуют в общем ранжировании. Подбор полных размеров и
+требуемого капитала формирует ограниченный
 список совместных тестов. Существующий путь adapter/candidate_search и
 инфраструктура Campaign/экспорта переиспользуются. MaxDD 20/10/5% от пика equity,
 резерв 20/40/60% и MM 50/35/20% сохраняются. Настройки остаются в том же JSON

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from decimal import Decimal, getcontext, localcontext
 import importlib
+import inspect
 import sys
 from types import SimpleNamespace
 
@@ -903,6 +904,7 @@ def test_lp_uses_sparse_constraints_without_changing_authoritative_bank(monkeypa
         target=None,
         bank_available=Decimal("100"),
         maximize=True,
+        symbol_cap_groups={},
     )
 
     assert outcome.status == "PASS"
@@ -938,6 +940,7 @@ def test_lp_enforces_initial_im_and_mm_bounds(
         margin_a=a_values,
         margin_b=b_values,
         max_mm_load=Decimal("0.5"),
+        symbol_cap_groups={},
     )
 
     assert outcome.status == "PASS"
@@ -956,6 +959,7 @@ def test_lp_margin_bounds_do_not_add_initial_off_reserve_constraint() -> None:
         maximize=True,
         margin_a=(Decimal("1"),),
         margin_b=(Decimal("0.1"),),
+        symbol_cap_groups={},
         max_mm_load=Decimal("0.5"),
     )
 
@@ -975,6 +979,7 @@ def test_lp_reports_margin_dominated_bank_when_path_has_no_drawdown() -> None:
         target=None,
         bank_available=Decimal("10"),
         maximize=True,
+        symbol_cap_groups={},
         margin_a=(Decimal("1"),),
         margin_b=(Decimal("0.1"),),
         max_mm_load=Decimal("0.5"),
@@ -995,6 +1000,7 @@ def test_lp_margin_rate_vectors_are_a_strict_trust_boundary() -> None:
         target=None,
         bank_available=Decimal("10"),
         maximize=True,
+        symbol_cap_groups={},
         margin_a=(Decimal("0.1"),),
         margin_b=(Decimal("0.1"),),
     )
@@ -1024,6 +1030,7 @@ def test_lp_forwards_fixed_highs_resource_options(monkeypatch: pytest.MonkeyPatc
         target=None,
         bank_available=Decimal("10"),
         maximize=True,
+        symbol_cap_groups={},
         time_limit=Decimal("30"),
     )
 
@@ -1040,12 +1047,18 @@ def test_lp_keeps_only_compact_solver_residual_summary() -> None:
         target=None,
         bank_available=Decimal("10"),
         maximize=True,
+        symbol_cap_groups={},
     )
 
     assert outcome.status == "PASS"
     assert outcome.residuals is not None
     assert set(outcome.residuals) == {"ineqlin", "lower", "upper"}
     assert all(isinstance(value, Decimal) for value in outcome.residuals.values())
+
+
+def test_internal_lp_builders_require_symbol_cap_groups() -> None:
+    assert inspect.signature(_solve_lp_unchecked).parameters["symbol_cap_groups"].default is inspect.Parameter.empty
+    assert inspect.signature(_solve_additional_lp).parameters["symbol_cap_groups"].default is inspect.Parameter.empty
 
 
 def test_time_limited_valid_incumbent_is_budget_limited_not_optimal(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1070,6 +1083,7 @@ def test_time_limited_valid_incumbent_is_budget_limited_not_optimal(monkeypatch:
         target=None,
         bank_available=Decimal("10"),
         maximize=True,
+        symbol_cap_groups={},
     )
 
     assert observed["called"] is True
@@ -1096,6 +1110,7 @@ def test_time_limited_result_without_incumbent_fails_closed(monkeypatch: pytest.
         target=None,
         bank_available=Decimal("10"),
         maximize=True,
+        symbol_cap_groups={},
     )
 
     assert outcome.status == "ERROR"
@@ -1115,6 +1130,7 @@ def _additional_lp_kwargs() -> dict[str, object]:
         "margin_b": (Decimal("0"), Decimal("0")),
         "max_mm_load": Decimal("0.35"),
         "reserve": Decimal("0.40"),
+        "symbol_cap_groups": {},
     }
 
 
@@ -1168,6 +1184,7 @@ def test_additional_lp_n6_epigraph_rows_match_hand_enumerated_loss_and_held_top_
         margin_b=(Decimal("0"),) * 6,
         max_mm_load=Decimal("0.35"),
         reserve=Decimal("0.40"),
+        symbol_cap_groups={},
         limiter_release_status="CONFIRMED",
     )
     assert outcome.status == "PASS"
@@ -1210,6 +1227,7 @@ def test_additional_lp_rejects_fixed_bank_when_incumbent_needs_more_bank(monkeyp
         margin_b=(Decimal("0"),),
         max_mm_load=Decimal("0.35"),
         reserve=Decimal("0.40"),
+        symbol_cap_groups={},
     )
     assert outcome.status == "ERROR"
     assert outcome.reason == "BANK_UNAVAILABLE"
@@ -1237,6 +1255,7 @@ def test_additional_lp_regenerates_one_p95_witness_and_stays_sparse(monkeypatch:
         margin_b=(Decimal("0"),),
         max_mm_load=Decimal("0.35"),
         reserve=Decimal("0.40"),
+        symbol_cap_groups={},
         p95_witness={"family_ordinal": 0, "scenario_index": 3},
         bootstrap_manifest={
             "seed": 17,
@@ -1277,6 +1296,7 @@ def test_additional_lp_timeout_incumbent_and_no_incumbent_are_fail_closed(monkey
         margin_b=(Decimal("0"),),
         max_mm_load=Decimal("0.35"),
         reserve=Decimal("0.40"),
+        symbol_cap_groups={},
     )
     limited = _solve_additional_lp(**kwargs)
     assert limited.status == "PASS" and limited.budget_limited and not limited.optimal
@@ -1310,6 +1330,7 @@ def test_cdar80_money_and_fixed_bank_lp_use_money_tail() -> None:
         margin_b=(Decimal("0"),),
         max_mm_load=Decimal("0.35"),
         reserve=Decimal("0.40"),
+        symbol_cap_groups={},
     )
     assert outcome.status == "PASS"
     assert outcome.solution is not None and outcome.solution.bank == Decimal("100")
@@ -1654,6 +1675,100 @@ def test_limiter_replay_releases_before_equal_timestamp_starts_and_skips_without
     assert result.p30_limiter == Decimal("1200")
 
 
+def test_same_symbol_opposite_sides_share_one_lp_capacity_and_candidate_cap() -> None:
+    module = importlib.import_module("mrs3.portfolio.weighted_search")
+    prepared = _prepared((("1", "1"),), strategy_ids=(1, 2))
+    members = (
+        {"symbol": " btcusdt ", "side": "LONG", "strategy_id": 1, "result_id": 101},
+        {"symbol": "BTCUSDT", "side": "SHORT", "strategy_id": 2, "result_id": 102},
+    )
+
+    with pytest.raises(ValueError, match=r"SYMBOL_CAPACITY_MISMATCH:BTCUSDT"):
+        weighted_search(
+            prepared,
+            (Decimal("100"), Decimal("101")),
+            members=members,
+            max_dd=Decimal("0.2"),
+            common_days=Decimal("1"),
+            max_targets=1,
+        )
+
+    with pytest.raises(ValueError, match=r"MISSING_SYMBOL"):
+        module._symbol_cap_groups(({"strategy_id": 1},), (Decimal("100"),))
+    with pytest.raises(ValueError, match=r"MISSING_SYMBOL"):
+        module._symbol_cap_groups(({"strategy_id": 1, "symbol": None},), (Decimal("100"),))
+    with pytest.raises(ValueError, match=r"MISSING_SYMBOL"):
+        module._symbol_cap_groups(({"strategy_id": 1, "pair": "BTCUSDT"},), (Decimal("100"),))
+
+    with pytest.raises(ValueError, match=r"SYMBOL_CAPACITY_EXCEEDED:BTCUSDT"):
+        module._validate_symbol_cap_vector(
+            (Decimal("60"), Decimal("50")), members, (Decimal("100"), Decimal("100"))
+        )
+    module._validate_symbol_cap_vector(
+        (Decimal("60"), Decimal("40")), members, (Decimal("100"), Decimal("100"))
+    )
+
+    failure_reason: list[str] = []
+    assert module._candidates_for_solution(
+        _Solution(Decimal("1000"), (Decimal("60"), Decimal("50"))),
+        prepared.normalized_delta,
+        members,
+        (Decimal("100"), Decimal("100")),
+        max_dd=Decimal("0.2"),
+        common_days=Decimal("1"),
+        target=None,
+        profile_id="P",
+        scenario_id="S",
+        failure_reason=failure_reason,
+    ) == ()
+    assert failure_reason == ["SYMBOL_CAPACITY_EXCEEDED:BTCUSDT"]
+
+    outcome = _solve_lp_unchecked(
+        ((Decimal("1"), Decimal("1")),),
+        (Decimal("100"), Decimal("100")),
+        (Decimal("1"), Decimal("1")),
+        max_dd=Decimal("0.2"),
+        target=Decimal("150"),
+        bank_available=None,
+        maximize=False,
+        symbol_cap_groups={"BTCUSDT": (0, 1)},
+    )
+    assert outcome.status == "INFEASIBLE" and outcome.reason == "LP_INFEASIBLE"
+
+
+def test_replay_same_symbol_opposite_sides_use_distinct_slots() -> None:
+    cycles = (
+        {
+            "cycle_id": "long",
+            "strategy_id": 1,
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "first_fill": 0,
+            "final_flat": 2,
+            "common_window_normalized_return": "10",
+            "equity_attribution": True,
+            "attribution_complete": True,
+        },
+        {
+            "cycle_id": "short",
+            "strategy_id": 2,
+            "symbol": "BTCUSDT",
+            "side": "SHORT",
+            "first_fill": 0,
+            "final_flat": 2,
+            "common_window_normalized_return": "20",
+            "equity_attribution": True,
+            "attribution_complete": True,
+        },
+    )
+    one = replay_limiter(cycles, 1, common_days=Decimal("1"))
+    two = replay_limiter(cycles, 2, common_days=Decimal("1"))
+    assert one.accepted_cycle_ids == ("long",)
+    assert one.rejected_cycle_ids == ("short",)
+    assert two.accepted_cycle_ids == ("long", "short")
+    assert two.rejected_cycle_ids == ()
+
+
 def test_limiter_model_coefficients_follow_replay_mask_and_scale_by_x() -> None:
     cycles = (
         {"cycle_id": "A", "strategy_id": 1, "first_fill": 0, "final_flat": 2, "common_window_normalized_return": "0.10", "attribution_complete": True},
@@ -1947,7 +2062,7 @@ def test_rounding_out_a_planned_diversifier_recomputes_realized_drawdown() -> No
 
 def _margin15_fixture():
     x = (Decimal("1000"),) * 15
-    members = tuple({"strategy_id": index, "mean_hold": "1", "hold90": "1", "mean_net_pnl": "1"} for index in range(15))
+    members = tuple({"strategy_id": index, "symbol": f"S{index}", "mean_hold": "1", "hold90": "1", "mean_net_pnl": "1"} for index in range(15))
     coefficients = _evidence_coefficients(((Decimal("0.10"), Decimal("0.005")),) * 15, range(15), max_notional=Decimal("1000"))
     cycles = tuple({
         "cycle_id": index, "strategy_id": index, "first_fill": index * 2,
@@ -2008,8 +2123,8 @@ def test_margin_candidate_recomputes_priority_and_identity_for_supplied_x() -> N
 
 def test_path_bank_dominates_margin_risk_and_fixed_bank_eligibility() -> None:
     members = (
-        {"strategy_id": 1, "mean_hold": "1", "hold90": "1", "mean_net_pnl": "1"},
-        {"strategy_id": 2, "mean_hold": "1", "hold90": "1", "mean_net_pnl": "1"},
+        {"strategy_id": 1, "symbol": "A", "mean_hold": "1", "hold90": "1", "mean_net_pnl": "1"},
+        {"strategy_id": 2, "symbol": "B", "mean_hold": "1", "hold90": "1", "mean_net_pnl": "1"},
     )
     candidate = _candidates_for_solution(
         _Solution(Decimal("1800"), (Decimal("100"), Decimal("100"))),
@@ -2166,8 +2281,8 @@ def test_bundled_margin_applies_coefficients_and_options_to_candidate_metrics() 
 
 def test_sequence_priorities_are_published_in_strategy_id_order() -> None:
     members = (
-        {"strategy_id": 1, "mean_hold": "1", "hold90": "1", "mean_net_pnl": "1"},
-        {"strategy_id": 2, "mean_hold": "1", "hold90": "1", "mean_net_pnl": "1"},
+        {"strategy_id": 1, "symbol": "A", "mean_hold": "1", "hold90": "1", "mean_net_pnl": "1"},
+        {"strategy_id": 2, "symbol": "B", "mean_hold": "1", "hold90": "1", "mean_net_pnl": "1"},
     )
     coefficients = tuple(MarginCoefficient(index + 1, Decimal("0.1"), Decimal("0.01"), "CONSERVATIVE_BOUND", max_notional=Decimal("100")) for index in range(2))
     candidate = _candidates_for_solution(
@@ -2404,8 +2519,8 @@ def test_additional_model_objective_requires_nonempty_model_coefficients(
         scenario_id="WEIGHTED_V1",
         identity="objective-primary",
         members=(
-            {"strategy_id": 2, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 2},
-            {"strategy_id": 1, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 5},
+            {"strategy_id": 2, "symbol": "S2", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 2},
+            {"strategy_id": 1, "symbol": "S1", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 5},
         ),
         metrics={"limiter_L": 1, "limiter_release_status": "CONFIRMED", "B_margin_usdt": Decimal("10"), "B_required_margin_usdt": Decimal("10"), "B_risk_usdt": Decimal("1"), "max_drawdown_fraction": Decimal("0"), "p30_common_usdt_30d": Decimal("10")},
         status="PASS",
@@ -2530,7 +2645,7 @@ def test_additional_pass_skips_missing_risk_bank_instead_of_treating_it_as_zero(
         profile_id="WEIGHTED",
         scenario_id="WEIGHTED_V1",
         identity="missing-risk",
-        members=tuple({"strategy_id": index + 1, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 1} for index in range(2)),
+        members=tuple({"strategy_id": index + 1, "symbol": f"S{index + 1}", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 1} for index in range(2)),
         metrics={"limiter_L": 1, "limiter_release_status": "UNKNOWN", "B_margin_usdt": Decimal("10"), "B_required_margin_usdt": Decimal("10"), "B_risk_usdt": None, "max_drawdown_fraction": Decimal("0"), "p30_common_usdt_30d": Decimal("10")},
         status="PASS",
     )
@@ -2587,7 +2702,7 @@ def test_additional_seed_invalid_metrics_skip_without_destroying_valid_base(
         profile_id="WEIGHTED",
         scenario_id="WEIGHTED_V1",
         identity=f"invalid-{metric}-{value}",
-        members=tuple({"strategy_id": index + 1, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 1} for index in range(2)),
+        members=tuple({"strategy_id": index + 1, "symbol": f"S{index + 1}", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 1} for index in range(2)),
         metrics=metrics,
         status="PASS",
     )
@@ -2629,14 +2744,14 @@ def test_additional_seed_invalid_metrics_skip_without_destroying_valid_base(
 def test_candidate_seed_vector_is_keyed_by_strategy_id_and_allows_zero_dropped_members() -> None:
     module = importlib.import_module("mrs3.portfolio.weighted_search")
     reordered = (
-        {"strategy_id": 2, "x_usdt": Decimal("2"), "capacity_usdt": Decimal("20"), "priority": 2},
-        {"strategy_id": 1, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("10"), "priority": 5},
+        {"strategy_id": 2, "symbol": "B", "x_usdt": Decimal("2"), "capacity_usdt": Decimal("20"), "priority": 2},
+        {"strategy_id": 1, "symbol": "A", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("10"), "priority": 5},
     )
     assert module._candidate_vector_by_strategy_id(reordered, (1, 2), (Decimal("10"), Decimal("20"))) == (
         (Decimal("1"), Decimal("2")),
         (5, 2),
     )
-    zero_dropped = ({"strategy_id": 2, "x_usdt": Decimal("2"), "capacity_usdt": Decimal("20"), "priority": 2},)
+    zero_dropped = ({"strategy_id": 2, "symbol": "B", "x_usdt": Decimal("2"), "capacity_usdt": Decimal("20"), "priority": 2},)
     assert module._candidate_vector_by_strategy_id(zero_dropped, (1, 2), (Decimal("10"), Decimal("20"))) == (
         (Decimal("0"), Decimal("2")),
         (None, 2),
@@ -2645,6 +2760,26 @@ def test_candidate_seed_vector_is_keyed_by_strategy_id_and_allows_zero_dropped_m
         module._candidate_vector_by_strategy_id(({"strategy_id": 3, "x_usdt": Decimal("1")},), (1, 2), (Decimal("10"), Decimal("20")))
     with pytest.raises(ValueError, match="CANDIDATE_STRATEGY_ID_DUPLICATE"):
         module._candidate_vector_by_strategy_id((reordered[0], reordered[0]), (1, 2), (Decimal("10"), Decimal("20")))
+
+
+@pytest.mark.parametrize(
+    "candidate_members",
+    (
+        ({"strategy_id": 1, "pair": "BTCUSDT", "x_usdt": Decimal("1")},),
+        (
+            {"strategy_id": 1, "symbol": "BTCUSDT", "x_usdt": Decimal("1")},
+            {"strategy_id": 2, "x_usdt": Decimal("1")},
+        ),
+    ),
+)
+def test_candidate_seed_vector_requires_symbol_on_every_member(candidate_members) -> None:
+    module = importlib.import_module("mrs3.portfolio.weighted_search")
+    with pytest.raises(ValueError, match="MISSING_SYMBOL"):
+        module._candidate_vector_by_strategy_id(
+            candidate_members,
+            tuple(range(1, len(candidate_members) + 1)),
+            (Decimal("10"),) * len(candidate_members),
+        )
 
 
 def test_additional_seed_sort_skips_malformed_p30_common_and_keeps_valid_base(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2664,7 +2799,7 @@ def test_additional_seed_sort_skips_malformed_p30_common_and_keeps_valid_base(mo
             profile_id="WEIGHTED",
             scenario_id="WEIGHTED_V1",
             identity=f"seed-{solution.x[0]}",
-            members=tuple({"strategy_id": index + 1, "x_usdt": value, "capacity_usdt": Decimal("100"), "priority": 1} for index, value in enumerate(solution.x)),
+            members=tuple({"strategy_id": index + 1, "symbol": f"S{index + 1}", "x_usdt": value, "capacity_usdt": Decimal("100"), "priority": 1} for index, value in enumerate(solution.x)),
             metrics={"limiter_L": 1, "limiter_release_status": "UNKNOWN", "B_margin_usdt": Decimal("10"), "B_required_margin_usdt": Decimal("10"), "B_risk_usdt": Decimal("1"), "max_drawdown_fraction": Decimal("0"), "p30_common_usdt_30d": p30},
             status="PASS",
         ),)
@@ -2709,7 +2844,7 @@ def test_additional_seed_uses_largest_p95_family_and_earliest_tie_witness(monkey
         profile_id="WEIGHTED",
         scenario_id="WEIGHTED_V1",
         identity="p95-primary",
-        members=tuple({"strategy_id": index + 1, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 1} for index in range(2)),
+        members=tuple({"strategy_id": index + 1, "symbol": f"S{index + 1}", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 1} for index in range(2)),
         metrics={"limiter_L": 1, "limiter_release_status": "UNKNOWN", "B_margin_usdt": Decimal("10"), "B_required_margin_usdt": Decimal("10"), "B_risk_usdt": Decimal("1"), "max_drawdown_fraction": Decimal("0"), "p30_common_usdt_30d": Decimal("10")},
         status="PASS",
     )
@@ -2767,7 +2902,7 @@ def test_additional_risk_boundary_accepts_just_below_solver_tolerance(monkeypatc
         profile_id="WEIGHTED",
         scenario_id="WEIGHTED_V1",
         identity="risk-boundary",
-        members=tuple({"strategy_id": index + 1, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 1} for index in range(2)),
+        members=tuple({"strategy_id": index + 1, "symbol": f"S{index + 1}", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 1} for index in range(2)),
         metrics={"limiter_L": 1, "limiter_release_status": "UNKNOWN", "B_margin_usdt": Decimal("10"), "B_required_margin_usdt": Decimal("10"), "B_risk_usdt": Decimal("10.00000005"), "max_drawdown_fraction": Decimal("0"), "p30_common_usdt_30d": Decimal("10")},
         status="PASS",
     )
@@ -2809,8 +2944,8 @@ def test_additional_pass_uses_primary_variant_for_seed(monkeypatch: pytest.Monke
         scenario_id="WEIGHTED_V1",
         identity="z-primary",
         members=(
-            {"strategy_id": 2, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 2},
-            {"strategy_id": 1, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 5},
+            {"strategy_id": 2, "symbol": "S2", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 2},
+            {"strategy_id": 1, "symbol": "S1", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 5},
         ),
         metrics={"limiter_L": 1, "limiter_release_status": "CONFIRMED", "B_margin_usdt": Decimal("10"), "B_required_margin_usdt": Decimal("10"), "B_risk_usdt": Decimal("1"), "max_drawdown_fraction": Decimal("0"), "p30_common_usdt_30d": Decimal("10")},
         status="PASS",
@@ -2950,7 +3085,7 @@ def test_additional_revalidation_uses_derived_fixed_bank_when_available_is_none(
         profile_id="WEIGHTED",
         scenario_id="WEIGHTED_V1",
         identity="fixed-bank-primary",
-        members=tuple({"strategy_id": index + 1, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 1} for index in range(2)),
+        members=tuple({"strategy_id": index + 1, "symbol": f"S{index + 1}", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), "priority": 1} for index in range(2)),
         metrics={"limiter_L": 1, "limiter_release_status": "UNKNOWN", "B_margin_usdt": Decimal("10"), "B_required_margin_usdt": Decimal("10"), "B_risk_usdt": Decimal("1"), "required_bank_usdt": Decimal("10"), "max_drawdown_fraction": Decimal("0"), "p30_common_usdt_30d": Decimal("10")},
         status="PASS",
     )
@@ -3002,7 +3137,7 @@ def test_additional_early_skip_reports_factual_fixed_bank_or_priority_reason(
     metrics = {"limiter_L": 1, "limiter_release_status": "UNKNOWN", "B_margin_usdt": Decimal("10"), "B_required_margin_usdt": Decimal("10"), "B_risk_usdt": Decimal("1"), "required_bank_usdt": Decimal("10"), "max_drawdown_fraction": Decimal("0"), "p30_common_usdt_30d": Decimal("10")}
     if failure == "bank":
         metrics["required_bank_usdt"] = None
-    seed_members = tuple({"strategy_id": index + 1, "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), **({} if failure == "priority" else {"priority": 1})} for index in range(2))
+    seed_members = tuple({"strategy_id": index + 1, "symbol": f"S{index + 1}", "x_usdt": Decimal("1"), "capacity_usdt": Decimal("100"), **({} if failure == "priority" else {"priority": 1})} for index in range(2))
     primary = PortfolioCandidate(
         schema_version="MRS3_PORTFOLIO_CANDIDATE_V1",
         profile_id="WEIGHTED",
@@ -3411,7 +3546,7 @@ def test_cdar_remains_eligible_after_each_additional_outcome(
             profile_id="WEIGHTED",
             scenario_id="WEIGHTED_V1",
             identity=identity,
-            members=({"strategy_id": 1, "x_usdt": x[0], "capacity_usdt": Decimal("100"), "priority": 1},),
+            members=({"strategy_id": 1, "symbol": "S1", "x_usdt": x[0], "capacity_usdt": Decimal("100"), "priority": 1},),
             metrics=metrics,
             status="PASS",
         ),)
@@ -3486,7 +3621,7 @@ def test_cdar_obeys_shared_solver_and_full_scenario_quotas(monkeypatch: pytest.M
             scenario_id="WEIGHTED_V1",
             identity=identity,
             members=tuple(
-                {"strategy_id": index + 1, "x_usdt": value, "capacity_usdt": Decimal("100"), "priority": 1}
+                {"strategy_id": index + 1, "symbol": f"S{index + 1}", "x_usdt": value, "capacity_usdt": Decimal("100"), "priority": 1}
                 for index, value in enumerate(x) if value > 0
             ),
             metrics={

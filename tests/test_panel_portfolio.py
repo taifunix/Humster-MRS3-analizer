@@ -18,7 +18,7 @@ import pytest
 import duckdb
 
 from mrs3.panel import PanelController, create_panel_server
-from mrs3.panel_portfolio import PortfolioPanelError, PortfolioPanelService, STAGES, _redact_text, _safe_cell
+from mrs3.panel_portfolio import PortfolioPanelError, PortfolioPanelService, STAGES, _redact_text, _safe_cell, _weighted_payload_pairs
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
 from mrs3.config import DuckDBImportSettings
 from mrs3.performance_v2_store import PerformanceV2StoreError
@@ -224,7 +224,7 @@ def test_panel_freeze_rejects_missing_weighted_template_before_reader(monkeypatc
     assert service.registry.list() == []
 
 
-def test_campaign_launch_is_long_only_mvp(tmp_path: Path) -> None:
+def test_campaign_launch_accepts_directional_shared_symbol_limits(tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     digest = _write_config(path)
     service = PortfolioPanelService(tmp_path, path)
@@ -232,7 +232,7 @@ def test_campaign_launch_is_long_only_mvp(tmp_path: Path) -> None:
 
     launch = service._normalise_campaign(
         {
-            "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+            "pairs": [{"pair": " btCusdt ", "max_finalist_long": 1, "max_finalist_short": 1}],
             "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         },
@@ -240,8 +240,28 @@ def test_campaign_launch_is_long_only_mvp(tmp_path: Path) -> None:
         digest,
     )
 
-    assert launch["selected_pairs"] == [["BTCUSDT", "LONG"]]
-    assert launch["maximums"] == {"BTCUSDT|LONG": 1}
+    assert launch["selected_pairs"] == [["BTCUSDT", "LONG"], ["BTCUSDT", "SHORT"]]
+    assert launch["maximums"] == {"BTCUSDT|LONG": 1, "BTCUSDT|SHORT": 1}
+
+
+def test_campaign_launch_accepts_one_enabled_direction(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(tmp_path, path)
+    config, _raw, _document = service._config()
+
+    launch = service._normalise_campaign(
+        {
+            "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 0, "max_finalist_short": 1}],
+            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "expected_config_digest": digest,
+        },
+        config,
+        digest,
+    )
+
+    assert launch["selected_pairs"] == [["BTCUSDT", "SHORT"]]
+    assert launch["maximums"] == {"BTCUSDT|SHORT": 1}
 
 
 def test_campaign_launch_keeps_distinct_pairs_in_stable_long_only_order(tmp_path: Path) -> None:
@@ -269,9 +289,16 @@ def test_campaign_launch_keeps_distinct_pairs_in_stable_long_only_order(tmp_path
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("max_finalist_long", 0), ("max_finalist_long", 2), ("max_finalist_short", 1)],
+    [
+        ("max_finalist_long", -1),
+        ("max_finalist_short", -1),
+        ("max_finalist_long", True),
+        ("max_finalist_short", False),
+        ("max_finalist_long", 1.5),
+        ("max_finalist_short", "1"),
+    ],
 )
-def test_campaign_rejects_non_mvp_finalist_limits_before_reader(tmp_path: Path, field: str, value: int) -> None:
+def test_campaign_rejects_invalid_finalist_limits_before_reader(tmp_path: Path, field: str, value: int) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     digest = _write_config(path)
     calls: list[tuple[object, ...]] = []
@@ -281,7 +308,7 @@ def test_campaign_rejects_non_mvp_finalist_limits_before_reader(tmp_path: Path, 
         return ()
 
     service = PortfolioPanelService(tmp_path, path, finalists_reader=reader)
-    pair = {"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}
+    pair = {"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 1}
     pair[field] = value
 
     with pytest.raises(PortfolioPanelError) as error:
@@ -294,11 +321,49 @@ def test_campaign_rejects_non_mvp_finalist_limits_before_reader(tmp_path: Path, 
         )
 
     assert error.value.code == "PORTFOLIO_CAMPAIGN_INVALID"
-    assert error.value.field_errors == [{
-        "field": f"pairs[0].{field}",
-        "code": "MVP_FINALIST_LIMIT",
-        "message": "MVP requires one LONG finalist and no SHORT finalists",
-    }]
+    assert error.value.field_errors[0]["field"] == f"pairs[0].{field}"
+    assert calls == []
+
+
+def test_campaign_rejects_missing_finalist_limit_with_field_error_before_reader(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    calls: list[tuple[object, ...]] = []
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *args: calls.append(args) or ())
+    pair = {"pair": "BTCUSDT", "max_finalist_short": 1}
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_campaign(
+            {
+                "pairs": [pair],
+                "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+                "expected_config_digest": digest,
+            }
+        )
+
+    assert error.value.status == 422
+    assert error.value.field_errors[0]["field"] == "pairs[0]"
+    assert error.value.field_errors[0]["code"] == "INVALID_PAIR"
+    assert calls == []
+
+
+def test_campaign_rejects_both_directions_disabled_before_reader(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    calls: list[tuple[object, ...]] = []
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *args: calls.append(args) or ())
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_campaign(
+            {
+                "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 0, "max_finalist_short": 0}],
+                "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+                "expected_config_digest": digest,
+            }
+        )
+
+    assert error.value.code == "PORTFOLIO_CAMPAIGN_INVALID"
+    assert error.value.field_errors[0]["field"] == "pairs[0].max_finalist_long"
     assert calls == []
 
 
@@ -1760,6 +1825,26 @@ def test_weighted_workbook_joins_payloads_by_symbol_without_shifting_rows(tmp_pa
             assert rows[symbol][headers["Notional USDT"]].value == "UNKNOWN"
     finally:
         workbook.close()
+
+
+def test_weighted_payload_pairing_keeps_same_symbol_long_and_short_distinct() -> None:
+    members = (
+        {"strategy_id": 1, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG", "x_usdt": Decimal("100")},
+        {"strategy_id": 2, "result_id": 22, "symbol": "BTCUSDT", "side": "SHORT", "x_usdt": Decimal("100")},
+    )
+    payloads = (
+        {"side": "LONG", "strategy": {"basic": {"symbol": "BTCUSDT"}}},
+        {"side": "SHORT", "strategy": {"basic": {"symbol": "BTCUSDT"}}},
+    )
+    pairs = _weighted_payload_pairs({"members": members, "strategy_payloads": payloads})
+    assert [payload["side"] for _member, payload in pairs] == ["LONG", "SHORT"]
+
+
+def test_weighted_payload_pairing_ignores_missing_payload_side_without_crashing() -> None:
+    members = ({"strategy_id": 1, "result_id": 11, "symbol": "BTCUSDT", "side": "SHORT", "x_usdt": Decimal("100")},)
+    payloads = ({"strategy": {"basic": {"symbol": "BTCUSDT"}}},)
+
+    assert _weighted_payload_pairs({"members": members, "strategy_payloads": payloads}) == ((members[0], None),)
 
 
 def test_weighted_workbook_marks_invalid_projected_numbers_unknown(tmp_path: Path) -> None:

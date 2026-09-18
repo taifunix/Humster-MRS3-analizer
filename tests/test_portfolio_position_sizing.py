@@ -219,7 +219,7 @@ def test_weighted_vector_seam_rejects_aggregate_capacity_for_shared_symbol() -> 
     )
 
     assert result.status == "FAIL"
-    assert result.reason == "CAPACITY_EXCEEDED"
+    assert result.reason == "CAPACITY_EXCEEDED_BTCUSDT"
 
 
 def test_weighted_vector_seam_applies_max_qty_to_effective_capacity() -> None:
@@ -230,7 +230,7 @@ def test_weighted_vector_seam_applies_max_qty_to_effective_capacity() -> None:
     )
 
     assert result.status == "FAIL"
-    assert result.reason == "CAPACITY_EXCEEDED"
+    assert result.reason == "CAPACITY_EXCEEDED_BTCUSDT"
 
 
 def test_weighted_vector_seam_rejects_ambiguous_symbol_target_mapping() -> None:
