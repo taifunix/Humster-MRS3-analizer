@@ -1,7 +1,62 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-16
-**Current branch:** `feat/weighted-phase6`
+**Updated:** 2026-09-18
+**Current branch:** `main`
+
+## Pair screener (SCREENER 01) — spec amended, implementation started (2026-09-18)
+
+Active spec: [docs/specs/2026-09-18-pair-screener.md](docs/specs/2026-09-18-pair-screener.md)
+(DRAFT). Handoff:
+[docs/superpowers/plans/2026-09-18-pair-screener-handoff.md](docs/superpowers/plans/2026-09-18-pair-screener-handoff.md).
+
+On the first practical screening run (`D:\!Humster\tester\report\my_test`,
+16 pairs, confirmed full 304-run/pair grid — not the ~2% the handoff
+expected, 4864 `reports_history.csv` rows, no gaps/dupes): section 6.1a is
+resolved as **CSV-only** — the CSV already carries explicit per-run
+parameter columns (symbol/time_frame/ma_close_long.len/ma_long.len/
+ma_long.multiplier), confirmed by an 81-report spot check against
+`extract_html_strategy_settings` (0 mismatches); no order-based
+reconstruction and no HTML parsing needed for evaluation. Verdicts computed
+for all 16 pairs (section 6.4 thresholds): GO — MSTRUSDT, KORUUSDT,
+SOXLUSDT; CHECK — INTCUSDT, SKHYUSDT, SNDKUSDT, CRCLUSDT, CLUSDT, SNXXUSDT,
+TSLAUSDT, XAGUSDT; STOP — AAPLUSDT, NVDAUSDT, XAUUSDT, BZUSDT, GOOGLUSDT;
+INCOMPLETE — 0. Result saved to `data/screener_verdicts_2026-09-18.csv`
+(gitignored).
+
+**Known blocker, accepted by the user (2026-09-18):** spec section 9's
+full-collection cross-validation (2+ pairs per verdict bucket, full 5472-run
+collect+analyze) was explicitly skipped in favor of starting screen
+implementation now. Section 6.4 thresholds are therefore unconfirmed on new
+pairs; if the first real full collections on GO/STOP pairs don't match the
+expected pattern (STOP pairs not reaching ≥100 good points; GO pairs
+reaching it), thresholds must be revisited immediately — see spec section 9/10.
+
+Note: the bot/tester root moved since the 2026-09-18 handoff was written —
+it names `D:\SHARE\!MN\hamster\hb`, but the actual root used for this run
+(and confirmed by the user) is `D:\!Humster`. The handoff has been annotated
+with this; the implementation plan below was authored fresh and uses only
+the current `D:\!Humster` path throughout.
+
+Implementation plan (approved, committed at
+[docs/superpowers/plans/2026-09-18-pair-screener-implementation.md](docs/superpowers/plans/2026-09-18-pair-screener-implementation.md)):
+new `src/mrs3/screener/` package (config/render/listing/evaluate), a new
+`templates/tester/mrs2/config_tester_long_screen.json`, additive
+`config_template_path`/`render_config` kwargs on
+`LocalTestingService.prepare()`/`fill()` (RUNNER 01 behavior unchanged by
+default), new `/api/v2/testing/screener/*` panel endpoints reusing the same
+`LocalTestingService`/`TesterTargetLock`, and a new SCREENER 01 panel card.
+Six staged commits (docs → config → render → evaluate/listing → panel
+backend → UI). An independent review of the Этап 0 docs diff found and fixed
+several issues before commit: unhandled `reports_history_p*.csv` partition
+files, a section-8/section-6.4 contradiction (per-pair INCOMPLETE vs.
+whole-evaluation abort), an unbounded/undocumented Bybit `launchTime`
+fallback (the project has a prior real Bybit rate-limit ban incident, see
+above), a DD=0 special case that diverged from the already-measured 99.4%
+`economic_pass` agreement figure, and a section-4/section-8 contradiction
+about which `parameter_mining` entries get a dynamically fixed `end`. All are
+resolved in the spec and the implementation plan. Next step: Этап 1
+(`src/mrs3/screener/config.py` + `ScreenerConfig`/`load_screener_config` +
+tests) — test file written, implementation in progress.
 
 Weighted-search Phase 6 implementation evidence is recorded in
 [Phase 6 evidence](docs/superpowers/plans/2026-09-16-portfolio-optimizer-weighted-search-phase-6-evidence.md).
