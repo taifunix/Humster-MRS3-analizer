@@ -38,25 +38,46 @@ with this; the implementation plan below was authored fresh and uses only
 the current `D:\!Humster` path throughout.
 
 Implementation plan (approved, committed at
-[docs/superpowers/plans/2026-09-18-pair-screener-implementation.md](docs/superpowers/plans/2026-09-18-pair-screener-implementation.md)):
-new `src/mrs3/screener/` package (config/render/listing/evaluate), a new
-`templates/tester/mrs2/config_tester_long_screen.json`, additive
-`config_template_path`/`render_config` kwargs on
-`LocalTestingService.prepare()`/`fill()` (RUNNER 01 behavior unchanged by
-default), new `/api/v2/testing/screener/*` panel endpoints reusing the same
-`LocalTestingService`/`TesterTargetLock`, and a new SCREENER 01 panel card.
-Six staged commits (docs → config → render → evaluate/listing → panel
-backend → UI). An independent review of the Этап 0 docs diff found and fixed
-several issues before commit: unhandled `reports_history_p*.csv` partition
-files, a section-8/section-6.4 contradiction (per-pair INCOMPLETE vs.
-whole-evaluation abort), an unbounded/undocumented Bybit `launchTime`
-fallback (the project has a prior real Bybit rate-limit ban incident, see
-above), a DD=0 special case that diverged from the already-measured 99.4%
-`economic_pass` agreement figure, and a section-4/section-8 contradiction
-about which `parameter_mining` entries get a dynamically fixed `end`. All are
-resolved in the spec and the implementation plan. Next step: Этап 1
-(`src/mrs3/screener/config.py` + `ScreenerConfig`/`load_screener_config` +
-tests) — test file written, implementation in progress.
+[docs/superpowers/plans/2026-09-18-pair-screener-implementation.md](docs/superpowers/plans/2026-09-18-pair-screener-implementation.md),
+kept in sync with progress as each stage lands): scope grew twice mid-
+implementation by explicit user decision, both folded into the same pass —
+SHORT side is now in v1 alongside LONG (own tester-config template
+`config_tester_short_screen.json`, own multiplier parsing — comma decimal
+separator, `>1`), and screening now reads/writes a TradFi liquidity
+registry workbook (`input/bybit_tradfi_liquidity.xlsx`, copied in from the
+user's working copy): reads the pair universe and listing dates from its
+read-only `Пары` sheet, and records its own findings in a `Скрининг` sheet
+it exclusively owns (atomic upsert, never touches the other sheets, never
+overwrites manually-filled final-decision columns).
+
+**Этапы 0–3 are done.** `src/mrs3/screener/` now has `config.py`
+(`ScreenerConfig`, incl. `liquidity_registry_path`), `render.py`
+(`render_screener_tester_config`, side-agnostic), `errors.py`
+(`ScreenerEvaluationError`), `registry.py` (registry read/write),
+`listing.py` (listing-date resolution: registry → dates.xlsx → Bybit), and
+`evaluate.py` (the actual per-report verdict computation for both sides).
+`tests/screener` is 72/72 passing; every file went through several rounds
+of independent review until a round returned zero findings.
+
+The Bybit fallback's rate-limit protection was removed then restored in the
+same session: it was first dropped as "overcautious" per an explicit user
+call, then the user asked for it back with real research behind it. Fetched
+Bybit's official docs
+(https://bybit-exchange.github.io/docs/v5/rate-limit,
+https://bybit-exchange.github.io/docs/v5/market/instrument): the concrete,
+documented mechanism is 600 requests/5s per IP → HTTP 403 → automatic
+10-minute IP ban; `instruments-info` is public/no-key with no
+endpoint-specific stricter limit. The implemented margin: a client-side
+throttle enforcing >=250ms between Bybit requests (<=20 req/5s, ~30x
+headroom), persisting across separate `resolve_listing_dates()` calls (the
+ban is keyed to a rolling window, not a "call"), plus explicit HTTP 403
+detection that stops immediately with a clear "wait ~10 minutes" error
+instead of continuing to hit a blocked IP for remaining symbols.
+
+Next step: Этап 4 — `panel_testing.py` (additive `config_template_path`/
+`render_config` kwargs on `prepare()`/`fill()`, RUNNER 01 default behavior
+unchanged) and `panel.py` (`local_screener_*` controller methods, new
+`/api/v2/testing/screener/*` routes).
 
 Weighted-search Phase 6 implementation evidence is recorded in
 [Phase 6 evidence](docs/superpowers/plans/2026-09-16-portfolio-optimizer-weighted-search-phase-6-evidence.md).
