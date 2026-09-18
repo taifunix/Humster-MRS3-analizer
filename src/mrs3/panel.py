@@ -198,7 +198,6 @@ from .performance_v2_store import (
     performance_v2_database_path,
     require_performance_v2,
 )
-from .performance_v2_optimizer import prepare_current_optimizer_inputs
 from .performance_v2_selection import (
     PerformanceV2SelectionError,
     SelectionRequest,

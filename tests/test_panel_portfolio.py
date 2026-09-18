@@ -1125,7 +1125,10 @@ def test_production_preparation_lock_failure_is_a_typed_snapshot_error(
 
     service = PortfolioPanelService(tmp_path, path, optimizer_input_preparer=locked)
     with pytest.raises(PortfolioPanelError) as error:
-        service._snapshot_finalists(_config(), {"pairs": [{"pair": "BTCUSDT"}]})
+        service._snapshot_finalists(
+            _config(),
+            {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}]},
+        )
 
     assert error.value.code == "PORTFOLIO_FINALISTS_UNAVAILABLE"
     assert error.value.status == 422
@@ -1184,7 +1187,8 @@ def test_default_snapshot_prepares_only_current_finalist_artifacts(tmp_path: Pat
 
     service = PortfolioPanelService(tmp_path, path)
     finalists, weighted_rows = service._snapshot_finalists(
-        _config(), {"pairs": [{"pair": "BTCUSDT"}]}
+        _config(),
+        {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}]},
     )
 
     assert [row["result_id"] for row in finalists] == [result_id]
