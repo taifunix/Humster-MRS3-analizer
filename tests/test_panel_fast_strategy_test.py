@@ -112,6 +112,100 @@ def _wait(service: LocalFastStrategyTestService, job_id: str) -> dict[str, objec
     raise AssertionError("Fast TEST did not finish")
 
 
+def test_runtime_directory_cleanup_keeps_root_and_retries_windows_sharing_violation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "settings_strategy"
+    runtime.mkdir()
+    locked = runtime / "strategy.json"
+    locked.write_text("{}", encoding="utf-8")
+    real_unlink = Path.unlink
+    attempts = 0
+
+    def fail_once(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        if path == locked and attempts == 0:
+            attempts += 1
+            error = PermissionError(13, "sharing violation", path)
+            error.winerror = 32
+            raise error
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_once)
+    fast_strategy_module._clear_directory(runtime, expected=runtime)
+
+    assert attempts == 1
+    assert runtime.is_dir()
+    assert list(runtime.iterdir()) == []
+
+
+@pytest.mark.parametrize(("winerror", "timeout"), ((5, 30.0), (32, 0.0)))
+def test_runtime_directory_cleanup_propagates_non_transient_or_expired_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int, timeout: float
+) -> None:
+    runtime = tmp_path / "settings_strategy"
+    runtime.mkdir()
+    locked = runtime / "strategy.json"
+    locked.write_text("{}", encoding="utf-8")
+    attempts = 0
+
+    def always_fail(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        error = PermissionError(13, "access denied", path)
+        error.winerror = winerror
+        raise error
+
+    monkeypatch.setattr(Path, "unlink", always_fail)
+    monkeypatch.setattr(fast_strategy_module, "_WINDOWS_FILE_RELEASE_SECONDS", timeout)
+
+    with pytest.raises(PermissionError):
+        fast_strategy_module._clear_directory(runtime, expected=runtime)
+
+    assert attempts == 1
+
+
+def test_runtime_directory_cleanup_retries_locked_nested_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "settings_strategy"
+    nested = runtime / "nested"
+    nested.mkdir(parents=True)
+    (nested / "strategy.json").write_text("{}", encoding="utf-8")
+    real_rmtree = fast_strategy_module.shutil.rmtree
+    attempts = 0
+
+    def fail_once(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        if Path(path) == nested and attempts == 0:
+            attempts += 1
+            error = PermissionError(13, "sharing violation", path)
+            error.winerror = 32
+            raise error
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(fast_strategy_module.shutil, "rmtree", fail_once)
+
+    fast_strategy_module._clear_directory(runtime, expected=runtime)
+
+    assert attempts == 1
+    assert runtime.is_dir()
+    assert list(runtime.iterdir()) == []
+
+
+def test_runtime_directory_cleanup_fails_if_deleted_entry_remains_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "settings_strategy"
+    runtime.mkdir()
+    (runtime / "strategy.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(Path, "unlink", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(fast_strategy_module, "_WINDOWS_FILE_RELEASE_SECONDS", 0.0)
+
+    with pytest.raises(FastStrategyTestError, match="runtime directory could not be cleared"):
+        fast_strategy_module._clear_directory(runtime, expected=runtime)
+
+
 def test_fast_writer_starts_from_template_and_preserves_unrelated_keys(tmp_path: Path) -> None:
     config = _config(tmp_path)
     template = tmp_path / "config-template.json"

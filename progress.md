@@ -2588,3 +2588,14 @@ No production database, tester execution, network access, recommendation
 surface change, runtime path change or live authorization occurred. Phase 7
 real tester calibration remains separately gated; the next implementation item
 is Phase 9.
+
+## Native SINGLE_MODE Windows sharing-violation recovery (2026-09-17)
+
+Batch preparation now keeps the configured `settings_strategy` directory and
+removes only its contents. A transient Windows sharing violation after tester
+shutdown is retried for up to 30 seconds; unrelated filesystem failures still
+fail closed. Live retry job `c76d9ea0f02344bf8abec30d6ee609e8`
+reused 1,000 verified reports, tested only the remaining 44 strategies, and
+committed `1044/1044` with zero failures. Focused Panel/runner verification
+passes (`90 passed, 1 skipped`). Independent Opus review returned
+`CODE_REVIEW_PASS`.

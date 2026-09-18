@@ -379,6 +379,10 @@ copied or archived during cleanup.
 The tester strategy directory is validated as a strict child of the configured
 `tester_runner.bot_root`; if one of the three cleanups fails after commit, the
 panel returns a non-fatal warning naming the failed root.
+Native `SINGLE_MODE` batch preparation also retains the configured strategy
+directory itself. It removes only its contents and retries a transient Windows
+sharing violation for a bounded interval after tester shutdown; other file
+errors remain fail-closed.
 New `SINGLE_MODE` values are one filename component (no absolute path,
 separators, `.` or `..`); older absolute values remain readable only when
 their resolved file is inside the configured report directory and passes the

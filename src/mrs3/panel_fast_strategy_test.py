@@ -80,6 +80,7 @@ def _client(config: RunnerConfig) -> TesterHttpClient:
 
 
 _CURRENT_METRIC_HEADERS = ("Metric", "Value")
+_WINDOWS_FILE_RELEASE_SECONDS = 30.0
 
 
 def _has_current_performance_v2_layout(source: str) -> bool:
@@ -135,8 +136,27 @@ def _clear_directory(path: Path, *, expected: Path) -> None:
     if resolved.exists():
         if not resolved.is_dir() or resolved.is_symlink():
             raise FastStrategyTestError(f"runtime path is not a directory: {resolved}")
-        shutil.rmtree(resolved)
-    resolved.mkdir(parents=True, exist_ok=True)
+    else:
+        resolved.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + _WINDOWS_FILE_RELEASE_SECONDS
+    for entry in tuple(resolved.iterdir()):
+        while True:
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink(missing_ok=True)
+                break
+            except PermissionError as error:
+                if getattr(error, "winerror", None) not in {32, 33} or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
+    while remaining := tuple(resolved.iterdir()):
+        if time.monotonic() >= deadline:
+            raise FastStrategyTestError(
+                f"runtime directory could not be cleared: {resolved} ({remaining[0].name})"
+            )
+        time.sleep(0.1)
 
 
 def _install_names(source: Path, target: Path, names: tuple[str, ...]) -> None:
