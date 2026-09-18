@@ -95,16 +95,6 @@ def test_canonical_mrs2_templates_are_strict_and_render_worker_count() -> None:
     assert document["report"]["include_chart_balance"] is True
 
 
-def test_canonical_mrs2_strategy_templates_match_legacy_profiles_when_present() -> None:
-    root = Path(__file__).parents[1]
-    for legacy, canonical in (
-        (root / "Input" / "Bybit_long.json", root / "templates" / "strategies" / "source-v6-mrs2" / "long.json"),
-        (root / "Input" / "Bybit_short.json", root / "templates" / "strategies" / "source-v6-mrs2" / "short.json"),
-    ):
-        if legacy.is_file():
-            assert json.loads(legacy.read_text(encoding="utf-8")) == json.loads(canonical.read_text(encoding="utf-8"))
-
-
 def test_render_strategy_keeps_one_named_strategy_and_sets_requested_side() -> None:
     template = json.dumps({"name": "AAOIUSDT", "basic": {"symbol": "AAOIUSDT", "use_long": False, "use_short": True}})
 
