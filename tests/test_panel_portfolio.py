@@ -1064,13 +1064,17 @@ def test_campaign_prepares_exact_production_finalist_result_ids_before_strict_re
         optimizer_input_preparer=preparer,
     )
     result = service.submit_campaign({
-        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 1}],
         "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     })
 
     assert result["status"] == "QUEUED"
-    assert [call[2] for call in reader_calls] == [False, True]
+    expected_pairs = (("BTCUSDT", "LONG"), ("BTCUSDT", "SHORT"))
+    assert reader_calls == [
+        (tmp_path / "performance.duckdb", expected_pairs, False),
+        (tmp_path / "performance.duckdb", expected_pairs, True),
+    ]
     assert preparation_calls == [(tmp_path / "performance.duckdb", (22, 11), 3)]
 
 
@@ -1127,7 +1131,7 @@ def test_production_preparation_lock_failure_is_a_typed_snapshot_error(
     with pytest.raises(PortfolioPanelError) as error:
         service._snapshot_finalists(
             _config(),
-            {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}]},
+            {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 1}]},
         )
 
     assert error.value.code == "PORTFOLIO_FINALISTS_UNAVAILABLE"
