@@ -348,7 +348,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       let result;
       try { result = await response.json(); } catch (_) { throw new Error('Backend returned invalid JSON.'); }
       if (!response.ok) {
-        const code = typeof result?.error === 'string' && (endpoint.startsWith('/api/v2/strategies/fresh/') || endpoint.startsWith('/api/v2/surfaces/') || /^[A-Z_]+$/.test(result.error)) ? result.error : 'Server validation failed.';
+        const code = typeof result?.error === 'string' && (endpoint.startsWith('/api/v2/strategies/fresh/') || endpoint.startsWith('/api/v2/surfaces/') || endpoint.startsWith('/api/v2/testing/screener/') || /^[A-Z_]+$/.test(result.error)) ? result.error : 'Server validation failed.';
         const payload = result?.error;
         const typedCode = payload && typeof payload === 'object' && typeof payload.code === 'string' ? payload.code : code;
         const typedMessage = payload && typeof payload === 'object' && typeof payload.message === 'string'
@@ -595,6 +595,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       if (target) target.textContent = local.preflight_ok
         ? `Runner ready · ${Math.floor((local.disk_free_bytes || 0) / 1024 ** 3)} GB free`
         : 'Runner preflight is not ready.';
+      const screenerStatus = document.querySelector('#screener-status');
+      if (screenerStatus) screenerStatus.textContent = local.preflight_ok
+        ? `Runner ready · ${Math.floor((local.disk_free_bytes || 0) / 1024 ** 3)} GB free`
+        : 'Runner preflight is not ready.';
     } catch (_) {
       if (status) status.textContent = 'Backend connection is unavailable.';
     }
@@ -719,6 +723,160 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       }
     });
   }
+
+  function screenerStatus(message) {
+    const target = document.querySelector('#screener-status');
+    if (target) target.textContent = message;
+  }
+
+  let screenerVerdicts = [];
+
+  function renderScreenerVerdicts() {
+    const body = document.querySelector('#screener-verdicts-body');
+    const empty = document.querySelector('#screener-verdicts-empty');
+    if (!body) return;
+    body.replaceChildren();
+    for (const verdict of screenerVerdicts) {
+      const row = document.createElement('tr');
+      const cell = (value) => {
+        const td = document.createElement('td');
+        td.textContent = value === null || value === undefined || value === '' ? '—' : String(value);
+        return td;
+      };
+      row.append(
+        cell(verdict.symbol), cell(verdict.side), cell(verdict.verdict),
+        cell(verdict.big_shift ? 'да' : 'нет'), cell(verdict.n_good), cell(verdict.n_good_big_shift),
+        cell(verdict.best_timeframe), cell(verdict.best_shift_bp), cell(verdict.best_close_len),
+        cell(verdict.best_pnl30), cell(verdict.best_dd_pct), cell(verdict.effective_days),
+      );
+      body.append(row);
+    }
+    if (empty) empty.hidden = screenerVerdicts.length > 0;
+    const transfer = document.querySelector('#screener-transfer');
+    if (transfer) transfer.disabled = !screenerVerdicts.some((v) => v.verdict === 'GO');
+  }
+
+  const screenerCheck = document.querySelector('#screener-check');
+  if (screenerCheck) screenerCheck.addEventListener('click', loadSafeDefaults);
+
+  const screenerFill = document.querySelector('#screener-fill');
+  if (screenerFill) screenerFill.addEventListener('click', async () => {
+    const value = (id) => document.querySelector(id)?.value || '';
+    try {
+      const result = await requestJson('/api/v2/testing/screener/fill', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbols: value('#screener-pairs'), side: value('#screener-side'),
+          start: value('#screener-start-date'), end: value('#screener-end-date'),
+          delete_old_reports: document.querySelector('#screener-delete-old-reports')?.checked === true,
+        }),
+      });
+      const expected = document.querySelector('#screener-expected-runs');
+      if (expected) expected.textContent = Number.isFinite(result.expected_runs)
+        ? `Ожидаемое число прогонов: ${result.expected_runs}.`
+        : 'Ожидаемое число прогонов недоступно.';
+      screenerStatus(result.reports_cleared
+        ? `Файлы подготовлены, старые отчеты удалены: ${result.strategy_name}, ${result.symbols.join(', ')}.`
+        : `Файлы подготовлены: ${result.strategy_name}, ${result.symbols.join(', ')}.`);
+    } catch (error) {
+      screenerStatus(error.code === 'TESTER_FILES_PREPARED'
+        ? 'Файлы уже подготовлены. Если что-то изменилось, сначала нажмите Стоп.'
+        : (error?.message || 'Не удалось подготовить файлы скрининга.'));
+    }
+  });
+
+  for (const [id, action, message] of [
+    ['#screener-start', 'start', 'Локальный tester получил команду запуска.'],
+    ['#screener-stop', 'stop', 'Локальный bot остановлен.'],
+  ]) {
+    const button = document.querySelector(id);
+    if (!button) continue;
+    button.addEventListener('click', async () => {
+      try {
+        const result = await requestJson(`/api/v2/testing/screener/${action}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        screenerStatus(action === 'start' && result.tester_status
+          ? `${message} Статус tester: ${result.tester_status}.`
+          : message);
+      } catch (error) {
+        screenerStatus(error?.message || `Не удалось выполнить: ${action}.`);
+      }
+    });
+  }
+
+  const screenerEvaluate = document.querySelector('#screener-evaluate');
+  if (screenerEvaluate) screenerEvaluate.addEventListener('click', async () => {
+    try {
+      const result = await requestJson('/api/v2/testing/screener/evaluate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      screenerVerdicts = Array.isArray(result.verdicts) ? result.verdicts : [];
+      renderScreenerVerdicts();
+      screenerStatus(`Оценено пар: ${screenerVerdicts.length}.`);
+    } catch (error) {
+      screenerStatus(error?.message || 'Не удалось оценить папку отчётов.');
+    }
+  });
+
+  const screenerExport = document.querySelector('#screener-export');
+  if (screenerExport) screenerExport.addEventListener('click', async (event) => {
+    event.preventDefault();
+    try {
+      const response = await fetch(screenerExport.href);
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(typeof result.error === 'string' ? result.error : 'экспорт вердиктов не удался');
+      }
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const filenameMatch = disposition.match(/filename=(?:"([^"]+)"|([^;]+))/i);
+      const filename = filenameMatch?.[1] || filenameMatch?.[2]?.trim() || 'screener_verdicts.csv';
+      const url = URL.createObjectURL(await response.blob());
+      Object.assign(document.createElement('a'), { href: url, download: filename }).click();
+      URL.revokeObjectURL(url);
+      screenerStatus('Вердикты скачаны.');
+    } catch (error) {
+      screenerStatus(error?.message || 'Не удалось скачать вердикты.');
+    }
+  });
+
+  const screenerLoadUnscreened = document.querySelector('#screener-load-unscreened');
+  if (screenerLoadUnscreened) screenerLoadUnscreened.addEventListener('click', async () => {
+    try {
+      const side = document.querySelector('#screener-side')?.value || '';
+      const result = await requestJson(`/api/v2/testing/screener/registry-pairs?side=${encodeURIComponent(side)}`);
+      const textarea = document.querySelector('#screener-pairs');
+      if (textarea) {
+        const existing = new Set(
+          (textarea.value || '').split(/[,\s]+/).map((entry) => entry.trim().toUpperCase()).filter(Boolean),
+        );
+        const additions = (Array.isArray(result.symbols) ? result.symbols : []).filter((symbol) => !existing.has(symbol));
+        if (additions.length) {
+          textarea.value = [...(textarea.value ? [textarea.value] : []), ...additions].join(', ');
+        }
+        screenerStatus(additions.length
+          ? `Добавлено пар из реестра: ${additions.length}.`
+          : 'В реестре нет новых неотскринированных пар для этой стороны.');
+      }
+    } catch (error) {
+      screenerStatus(error?.message || 'Не удалось загрузить пары из реестра.');
+    }
+  });
+
+  const screenerTransfer = document.querySelector('#screener-transfer');
+  if (screenerTransfer) screenerTransfer.addEventListener('click', () => {
+    const includeCheck = document.querySelector('#screener-transfer-include-check')?.checked === true;
+    const wanted = includeCheck ? new Set(['GO', 'CHECK']) : new Set(['GO']);
+    const chosen = screenerVerdicts
+      .filter((v) => wanted.has(v.verdict))
+      .sort((a, b) => Number(b.n_good || 0) - Number(a.n_good || 0));
+    if (!chosen.length) return;
+    const pairInput = document.querySelector('#local-pair');
+    const sideSelect = document.querySelector('#local-side');
+    if (pairInput) pairInput.value = chosen.map((v) => v.symbol).join(', ');
+    if (sideSelect) sideSelect.value = chosen[0].side;
+    screenerStatus(`Передано в RUNNER 01: ${chosen.length} пар.`);
+  });
 
   function sourceStatus(card, message) {
     const target = card?.querySelector('.progress-block p, .card-status');

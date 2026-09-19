@@ -11,6 +11,7 @@ from mrs3.screener.registry import (
     SCREENING_HEADER,
     SCREENING_SHEET,
     ScreeningRow,
+    list_unscreened_symbols,
     read_registry_listing_dates,
     write_screening_results,
 )
@@ -173,3 +174,94 @@ def test_write_screening_results_rejects_unexpected_existing_header(tmp_path: Pa
 def test_write_screening_results_missing_file_raises_clear_error(tmp_path: Path) -> None:
     with pytest.raises(ScreenerEvaluationError, match="cannot open liquidity registry"):
         write_screening_results(tmp_path / "missing.xlsx", (_row(),))
+
+
+def test_list_unscreened_symbols_excludes_pairs_already_screened_for_side(
+    tmp_path: Path,
+) -> None:
+    path = _build_registry(
+        tmp_path,
+        [("SOXLUSDT", "2026-05-19"), ("XAUUSDT", "2026-03-09"), ("MSTRUSDT", "2026-01-01")],
+    )
+    write_screening_results(path, (_row("SOXLUSDT", "LONG"),))
+
+    assert list_unscreened_symbols(path, "LONG") == ("XAUUSDT", "MSTRUSDT")
+
+
+def test_list_unscreened_symbols_treats_sides_independently(tmp_path: Path) -> None:
+    path = _build_registry(tmp_path, [("SOXLUSDT", "2026-05-19")])
+    write_screening_results(path, (_row("SOXLUSDT", "LONG"),))
+
+    assert list_unscreened_symbols(path, "SHORT") == ("SOXLUSDT",)
+    assert list_unscreened_symbols(path, "LONG") == ()
+
+
+def test_list_unscreened_symbols_returns_all_pairs_when_screening_sheet_missing(
+    tmp_path: Path,
+) -> None:
+    path = _build_registry(tmp_path, [("SOXLUSDT", "2026-05-19"), ("XAUUSDT", "2026-03-09")])
+
+    assert list_unscreened_symbols(path, "LONG") == ("SOXLUSDT", "XAUUSDT")
+
+
+def test_list_unscreened_symbols_normalizes_case_and_whitespace(tmp_path: Path) -> None:
+    path = _build_registry(tmp_path, [(" soxlusdt ", "2026-05-19")])
+
+    assert list_unscreened_symbols(path, "LONG") == ("SOXLUSDT",)
+
+
+def test_list_unscreened_symbols_rejects_same_symbol_in_different_case(
+    tmp_path: Path,
+) -> None:
+    # Normalization happens before duplicate detection, so a registry row
+    # duplicated only by case/whitespace is caught the same way an exact
+    # duplicate is (see test_list_unscreened_symbols_rejects_duplicate_symbols_in_pairs_sheet).
+    path = _build_registry(tmp_path, [("soxlusdt", "2026-05-19"), ("SOXLUSDT ", "2026-05-19")])
+
+    with pytest.raises(ScreenerEvaluationError, match="duplicate symbols"):
+        list_unscreened_symbols(path, "LONG")
+
+
+def test_list_unscreened_symbols_rejects_invalid_side(tmp_path: Path) -> None:
+    path = _build_registry(tmp_path, [("SOXLUSDT", "2026-05-19")])
+    with pytest.raises(ScreenerEvaluationError, match="invalid screener side"):
+        list_unscreened_symbols(path, "BOTH")
+
+
+def test_list_unscreened_symbols_missing_file_raises_clear_error(tmp_path: Path) -> None:
+    with pytest.raises(ScreenerEvaluationError, match="cannot read liquidity registry"):
+        list_unscreened_symbols(tmp_path / "missing.xlsx", "LONG")
+
+
+def test_list_unscreened_symbols_rejects_duplicate_symbols_in_pairs_sheet(
+    tmp_path: Path,
+) -> None:
+    path = _build_registry(
+        tmp_path, [("SOXLUSDT", "2026-05-19"), ("SOXLUSDT", "2026-05-20")]
+    )
+    with pytest.raises(ScreenerEvaluationError, match="duplicate symbols"):
+        list_unscreened_symbols(path, "LONG")
+
+
+def test_list_unscreened_symbols_rejects_empty_pairs_sheet(tmp_path: Path) -> None:
+    workbook = Workbook()
+    pairs = workbook.active
+    pairs.title = "Пары"
+    path = tmp_path / "registry.xlsx"
+    workbook.save(path)
+
+    with pytest.raises(ScreenerEvaluationError, match="no header row"):
+        list_unscreened_symbols(path, "LONG")
+
+
+def test_list_unscreened_symbols_rejects_unexpected_screening_sheet_header(
+    tmp_path: Path,
+) -> None:
+    path = _build_registry(tmp_path, [("SOXLUSDT", "2026-05-19")])
+    workbook = load_workbook(path)
+    sheet = workbook.create_sheet(SCREENING_SHEET)
+    sheet.append(["Symbol", "Side"])
+    workbook.save(path)
+
+    with pytest.raises(ScreenerEvaluationError, match="unexpected header"):
+        list_unscreened_symbols(path, "LONG")

@@ -68,6 +68,29 @@
             </div>
           </article>
 
+          <article id="screener-local" class="panel-card runner-card">
+            <div class="card-heading">
+              <div><span class="card-index">SCREENER 01</span><h2>Скринер пар</h2></div>
+              <span class="state-badge state-ready">READY</span>
+            </div>
+            <div class="card-body">
+              <div class="field-group"><label for="screener-pairs">Пары для скрининга</label><textarea id="screener-pairs" name="screener_pairs" rows="3" placeholder="CXUSDT, BABAUSDT"></textarea></div>
+              <div class="button-row"><button type="button" id="screener-load-unscreened" class="button button-secondary">Загрузить неотскринированные пары</button></div>
+              <div class="field-group"><label for="screener-side">Сторона</label><select id="screener-side" name="screener_side"><option>LONG</option><option>SHORT</option></select></div>
+              <div class="field-grid"><div class="field-group"><label for="screener-start-date">Начало</label><input id="screener-start-date" name="screener_start_date" type="date" value="2026-07-15"></div><div class="field-group"><label for="screener-end-date">Конец</label><input id="screener-end-date" name="screener_end_date" type="date" value="2026-08-06"></div></div>
+              <div class="field-group"><label class="check" for="screener-delete-old-reports"><input id="screener-delete-old-reports" name="screener_delete_old_reports" type="checkbox" checked><span>Удалить старые отчеты перед стартом</span></label></div>
+              <div class="button-row"><button type="button" id="screener-check" class="button button-primary">Проверить runner и диск</button><button type="button" id="screener-fill" class="button button-primary">Подготовить файлы</button><button type="button" id="screener-start" class="button button-secondary">Старт</button><button type="button" id="screener-stop" class="button button-secondary">Стоп</button></div>
+              <p id="screener-expected-runs" class="helper">Ожидаемое число прогонов появится после подготовки файлов.</p>
+              <div class="progress-block"><div class="progress-track"><span style="width:0%"></span></div><p>Ожидание запуска.</p></div>
+              <p id="screener-status" class="card-status" role="status" aria-live="polite">Проверка runner ещё не выполнена.</p>
+              <div class="button-row"><button type="button" id="screener-evaluate" class="button button-primary">Оценить</button><a id="screener-export" class="button button-secondary" href="/api/v2/testing/screener/export">Скачать вердикты</a></div>
+              <div class="field-group"><label class="check" for="screener-transfer-include-check"><input id="screener-transfer-include-check" type="checkbox"><span>Включая CHECK при передаче</span></label></div>
+              <div class="button-row"><button type="button" id="screener-transfer" class="button button-secondary" disabled>Передать в RUNNER 01</button></div>
+              <div class="table-wrap"><table class="shortlist-table"><caption class="sr-only">Вердикты скрининга по парам</caption><thead><tr><th scope="col">Пара</th><th scope="col">Сторона</th><th scope="col">Вердикт</th><th scope="col">BIG_SHIFT</th><th scope="col">Хор. точек</th><th scope="col">Хор. точек ≥1%</th><th scope="col">ТФ</th><th scope="col">Сдвиг, bp</th><th scope="col">MA close</th><th scope="col">PnL30</th><th scope="col">DD</th><th scope="col">Дней</th></tr></thead><tbody id="screener-verdicts-body"></tbody></table></div>
+              <p id="screener-verdicts-empty" class="helper">Нажмите «Оценить», чтобы увидеть вердикты по текущей папке отчётов.</p>
+            </div>
+          </article>
+
           <article id="runner-remote" class="panel-card runner-card">
             <button type="button" id="remote-fill" class="button button-primary">Заполнить config_tester.json</button>
             <div class="card-heading"><div><span class="card-index">RUNNER 02</span><h2>Удалённый runner</h2></div><span class="state-badge state-ready">READY</span></div>

@@ -180,6 +180,7 @@ from .panel_testing import (
 from .screener.config import ScreenerConfig, load_screener_config
 from .screener.errors import ScreenerEvaluationError
 from .screener.evaluate import PairVerdict, evaluate_and_record, evaluate_pairs, export_verdicts_csv
+from .screener.registry import list_unscreened_symbols
 from .screener.render import render_screener_tester_config
 from .fresh_analysis_strategies import (
     filter_fresh_analysis_candidates,
@@ -2150,6 +2151,24 @@ class PanelController:
 
     def local_screener_stop(self) -> dict[str, str]:
         return self.local_testing_stop()
+
+    def local_screener_registry_pairs(self, side: str) -> dict[str, object]:
+        clean_side = side.strip().upper() if isinstance(side, str) else ""
+        if clean_side not in ("LONG", "SHORT"):
+            raise PanelTestingError("invalid testing request")
+        try:
+            screener_config = load_screener_config(self.default_config)
+        except ValueError as error:
+            raise PanelTestingError(_redact_screener_error(error)) from None
+        if screener_config.liquidity_registry_path is None:
+            raise PanelTestingError("liquidity registry is not configured")
+        try:
+            symbols = list_unscreened_symbols(screener_config.liquidity_registry_path, clean_side)
+        except ScreenerEvaluationError as error:
+            raise PanelTestingError(_redact_screener_error(error)) from None
+        except Exception:
+            raise PanelTestingError("invalid testing request") from None
+        return {"symbols": list(symbols)}
 
     def _screener_evaluate_inputs(
         self,
@@ -7590,6 +7609,19 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/v2/testing/screener/status":
             self._json(200, self.server.controller.local_screener_status())
+            return
+        if parsed.path == "/api/v2/testing/screener/registry-pairs":
+            side = parse_qs(parsed.query).get("side", [""])[0]
+            try:
+                result = self.server.controller.local_screener_registry_pairs(side)
+            except PanelTestingError as error:
+                self._json(400, {"error": str(error)})
+                return
+            except Exception:
+                _LOGGER.exception("Screener registry-pairs lookup failed")
+                self._json(500, {"error": {"code": "INTERNAL", "message": "Screener registry-pairs lookup failed"}})
+                return
+            self._json(200, result)
             return
         if parsed.path == "/api/v2/testing/screener/export":
             try:

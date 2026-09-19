@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 
+from openpyxl import Workbook
 import pandas as pd
 import pytest
 
@@ -17,6 +18,7 @@ from mrs3.panel_testing import (
 from mrs3.locking import TesterTargetBusyError, TesterTargetLock
 from mrs3.panel import PanelController, PanelTestingError
 from mrs3.runner.config import RunnerConfig
+from mrs3.screener.registry import ScreeningRow, write_screening_results
 from mrs3.screener.render import render_screener_tester_config
 
 
@@ -996,6 +998,66 @@ def test_local_screener_export_returns_downloadable_csv(tmp_path: Path) -> None:
     text = data.decode("utf-8-sig")
     assert "AUSDT" in text
     assert "GO" in text
+
+
+def _build_liquidity_registry(tmp_path: Path, symbols: list[str]) -> Path:
+    workbook = Workbook()
+    pairs = workbook.active
+    pairs.title = "Пары"
+    pairs.append(["Пара", "Дата листинга на Bybit (UTC)"])
+    for symbol in symbols:
+        pairs.append([symbol, "2020-01-01"])
+    path = tmp_path / "registry.xlsx"
+    workbook.save(path)
+    return path
+
+
+def _config_with_registry(config: RunnerConfig, registry_path: Path) -> dict[str, object]:
+    document = _tester_runner_document(config)
+    document["screener"] = {"liquidity_registry_path": str(registry_path)}
+    return document
+
+
+def test_local_screener_registry_pairs_returns_unscreened_symbols(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    registry_path = _build_liquidity_registry(tmp_path, ["AUSDT", "BUSDT"])
+    write_screening_results(
+        registry_path,
+        (
+            ScreeningRow(
+                symbol="AUSDT", side="LONG", verdict="GO", big_shift=True,
+                n_good=9, n_good_big_shift=9,
+                window_start="2026-08-01", window_end="2026-09-18",
+            ),
+        ),
+    )
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text(json.dumps(_config_with_registry(config, registry_path)), encoding="utf-8")
+    controller = PanelController(tmp_path, config_path)
+
+    assert controller.local_screener_registry_pairs("long") == {"symbols": ["BUSDT"]}
+    assert controller.local_screener_registry_pairs("SHORT") == {"symbols": ["AUSDT", "BUSDT"]}
+
+
+def test_local_screener_registry_pairs_rejects_invalid_side(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    registry_path = _build_liquidity_registry(tmp_path, ["AUSDT"])
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text(json.dumps(_config_with_registry(config, registry_path)), encoding="utf-8")
+    controller = PanelController(tmp_path, config_path)
+
+    with pytest.raises(PanelTestingError, match="invalid testing request"):
+        controller.local_screener_registry_pairs("BOTH")
+
+
+def test_local_screener_registry_pairs_requires_configured_registry(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text(json.dumps(_tester_runner_document(config)), encoding="utf-8")
+    controller = PanelController(tmp_path, config_path)
+
+    with pytest.raises(PanelTestingError, match="liquidity registry is not configured"):
+        controller.local_screener_registry_pairs("LONG")
 
 
 def test_local_screener_evaluate_redacts_local_paths_from_error_messages(tmp_path: Path) -> None:

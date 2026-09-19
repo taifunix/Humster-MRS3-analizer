@@ -85,6 +85,81 @@ def read_registry_listing_dates(
     return dict(zip(frame[_SYMBOL_COLUMN], listing_dates, strict=True))
 
 
+def _read_header_row(sheet, sheet_name: str) -> tuple:
+    try:
+        return tuple(cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1)))
+    except StopIteration:
+        raise ScreenerEvaluationError(f"{sheet_name!r} sheet has no header row") from None
+
+
+def list_unscreened_symbols(path: Path, side: str) -> tuple[str, ...]:
+    """Symbols from the read-only `Пары` sheet with no `Скрининг` row for `side`.
+
+    Feeds the panel's "load unscreened pairs" button (spec section 6.6): the
+    textarea is filled with these candidates, not replaced by them — the
+    operator can still add/remove symbols by hand afterward. Order follows
+    the `Пары` sheet's own row order. A duplicate symbol in `Пары` is a hard
+    error here too, matching `read_registry_listing_dates` — offering a
+    candidate that `evaluate_pairs` would later reject for the same reason
+    would be a worse operator experience than failing at the load step.
+    """
+    if side not in ("LONG", "SHORT"):
+        raise ScreenerEvaluationError(f"invalid screener side: {side!r}")
+    try:
+        workbook = load_workbook(path, read_only=True)
+    except (OSError, ValueError) as exc:
+        raise ScreenerEvaluationError(f"cannot read liquidity registry: {exc}") from exc
+    try:
+        if PAIRS_SHEET not in workbook.sheetnames:
+            raise ScreenerEvaluationError(f"liquidity registry is missing the {PAIRS_SHEET!r} sheet")
+        pairs_sheet = workbook[PAIRS_SHEET]
+        header = _read_header_row(pairs_sheet, PAIRS_SHEET)
+        try:
+            symbol_column = header.index(_SYMBOL_COLUMN)
+        except ValueError:
+            raise ScreenerEvaluationError(
+                f"{PAIRS_SHEET!r} sheet is missing column {_SYMBOL_COLUMN!r}"
+            ) from None
+        all_symbols: list[str] = []
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for row in pairs_sheet.iter_rows(min_row=2, values_only=True):
+            value = row[symbol_column] if symbol_column < len(row) else None
+            if value is None:
+                continue
+            symbol = str(value).strip().upper()
+            if not symbol:
+                continue
+            if symbol in seen:
+                duplicates.add(symbol)
+            else:
+                seen.add(symbol)
+                all_symbols.append(symbol)
+        if duplicates:
+            raise ScreenerEvaluationError(
+                f"liquidity registry has duplicate symbols in {PAIRS_SHEET!r}: {sorted(duplicates)}"
+            )
+
+        screened: set[str] = set()
+        if SCREENING_SHEET in workbook.sheetnames:
+            sheet = workbook[SCREENING_SHEET]
+            sheet_header = _read_header_row(sheet, SCREENING_SHEET)
+            if sheet_header != SCREENING_HEADER:
+                raise ScreenerEvaluationError(
+                    f"{SCREENING_SHEET!r} sheet has an unexpected header: {sheet_header!r}"
+                )
+            for row in sheet.iter_rows(min_row=2, max_col=2, values_only=True):
+                symbol, row_side = row
+                if symbol is None or row_side is None:
+                    continue
+                if str(row_side).strip().upper() == side:
+                    screened.add(str(symbol).strip().upper())
+    finally:
+        workbook.close()
+
+    return tuple(symbol for symbol in all_symbols if symbol not in screened)
+
+
 def _atomic_save_workbook(workbook, path: Path) -> None:
     fd, temp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".xlsx.tmp")
     os.close(fd)

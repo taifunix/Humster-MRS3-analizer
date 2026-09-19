@@ -109,8 +109,94 @@ remaining round-5 finding (double file-read of the same template inside
 `local_screener_fill`'s preview-count call) was deliberately not fixed —
 `expected_screener_runs` must also work standalone before any fill, for the
 Этап 5 live-preview UI, and the extra read is on a manual button click, not
-a hot path. Next step: Этап 5 (UI — `index.html` screener card, `app.js`,
-`app.css`).
+a hot path. Этап 4 committed locally as `2c0b644` (`main` only, no push).
+
+**Этап 5 is done (2026-09-19), plus a retroactive Этап-4 addendum found
+while starting it.** Spec section 6.6 describes a "load unscreened pairs"
+button that Этап 4 had skipped: added `src/mrs3/screener/registry.py::
+list_unscreened_symbols(path, side)` — single-workbook openpyxl read (no
+pandas; an earlier version opened the file twice, simplified after review),
+rejects duplicate symbols in the `Пары` sheet the same way `read_registry_
+listing_dates` does (so the button can't offer a candidate `evaluate` would
+later hard-reject), validates the `Скрининг` sheet's header before reading
+its columns positionally, and turns an empty/headerless sheet into a clear
+error instead of an uncaught `StopIteration` (all three review-driven
+fixes). New `panel.py::local_screener_registry_pairs` + `GET /api/v2/
+testing/screener/registry-pairs` route. 20 new tests in `tests/screener/
+test_registry.py`, 3 in `tests/test_panel_testing.py`; went through 4 rounds
+of independent review (including a parallel 5-agent pass) to convergence.
+
+UI: `index.html` gained a `#screener-local` card next to `#runner-local` in
+the same `.runner-grid` — pairs textarea, LONG/SHORT side, dates, delete-
+old-reports checkbox (default on, per spec section 5), a button to load
+unscreened pairs from the registry, check/fill/start/stop/evaluate buttons,
+an expected-run-count line filled from the fill response (the spec's "shown
+before start" wording, not a type-as-you-go live preview, so no separate
+preview endpoint was needed), an "include CHECK" checkbox, a transfer-to-
+RUNNER-01 button, and a flat verdicts table (one row per pair/side, unlike
+the nested shortlist table) with a CSV export link. `app.js` wired all of
+the above, reusing the existing blob-download pattern from finalist-retest
+export for the CSV link. Separately, found and fixed that `requestJson()`'s
+error-message allowlist only trusted `/fresh/`/`/surfaces/` endpoints and
+all-caps codes — every screener endpoint's deliberately actionable error
+text (USDT validation, mixed dates/sides, Bybit 403, unconfigured registry)
+was being silently flattened to "Server validation failed." before this
+fix; added `/api/v2/testing/screener/` to the allowlist, which affects all
+screener endpoints, not just the new button. `app.css` needed no changes
+(the card reuses existing classes).
+
+Verification: `node --check app.js` passes; `tests/test_panel_static_ui.py`
+is 97 passed (one conflict found along the way — a local JS variable named
+`token` tripped the project's existing "no literal 'token' in app.js" guard;
+renamed to `entry`). Combined `tests/screener tests/test_panel_testing.py
+tests/runner tests/test_panel.py tests/test_panel_static_ui.py` — 531
+passed, 1 skipped (unrelated). Beyond unit tests, ran a real end-to-end HTTP
+check: started the actual `create_panel_server` on localhost against an
+isolated tmp-path config (`panel.default_root=static`, no real bot_root or
+registry) and hit it with real socket requests — `GET /` serves the updated
+index.html with the screener card, `GET /panel-web/app.js` serves the new
+wiring, `GET .../registry-pairs` returns a clear 400 without a configured
+registry, `POST .../fill` renders for real (`expected_runs=608` for 2 LONG
+pairs), `POST .../evaluate` returns the expected GO verdict shape, and
+`GET .../export` returns a correct downloadable CSV. The real tester (the
+Start button against the real `D:\!Humster`) was not launched — that needs
+a separate explicit request. One review finding was investigated and found
+to be a false positive: `evaluate_pairs`'s `_detect_side` runs once on the
+whole merged report set and hard-fails the call if both LONG and SHORT
+columns are present, so a single successful evaluate can never produce
+mixed-side verdicts, making the "transfer picks the wrong side" scenario
+unreachable.
+
+**Этап 6 is done (2026-09-19): final real-data re-check plus PRD/progress
+wrap-up.** The plan's last manual-verification item — re-run evaluate on the
+same 16 pairs after Этап 5 and confirm the verdicts still match the
+2026-09-18 table — hit a real complication: the real report folder
+`D:\!Humster\tester\report\my_test` now mixed the original 4864-run
+screening batch with a second, ~27360-run batch the user had started
+separately since then (confirmed still actively writing files seconds
+before this check), so a read-only `evaluate_pairs` call against it
+correctly refused with "mixes more than one (StartDate, EndDate) window" —
+the section 7 invariant catching real, unplanned mixed input exactly as
+designed. Flagged this to the user rather than acting on the folder myself;
+they moved the original 4864 HTML reports out to a sibling `my_test1` folder
+by hand (the live batch's files were left untouched). A read-only
+`evaluate_pairs` call against `my_test1` (real `config.local.json`, real
+`AlgorithmConfig`/`ScreenerConfig`, real `input/dates.xlsx`) reproduced the
+2026-09-18 table exactly: GO — MSTRUSDT, KORUUSDT, SOXLUSDT; CHECK (8) —
+INTCUSDT, SKHYUSDT, SNDKUSDT, CRCLUSDT, CLUSDT, SNXXUSDT, TSLAUSDT, XAGUSDT;
+STOP (5) — AAPLUSDT, NVDAUSDT, XAUUSDT, BZUSDT, GOOGLUSDT; INCOMPLETE — 0.
+This is the full production code path (Этапы 3-5 combined), not the
+Этап-4/5 synthetic fixtures, confirming the whole pipeline end to end.
+`PRD.md`'s registry row for the pair screener is updated from "DRAFT /
+implementation started" to "Implemented / verified on production sample",
+noting this re-check and the still-open, explicitly accepted risks (section
+9's skipped full cross-validation; thresholds unconfirmed on pairs beyond
+the original 16). The spec's own DRAFT status header is intentionally left
+unchanged — it flags provisional thresholds, not incomplete code, and that
+caveat is still true. All six implementation-plan stages (0-5) plus this
+final stage are now closed; nothing beyond `2c0b644` (Этап 4) has been
+committed yet — Этап 5 and the retroactive registry-pairs addition remain
+pending changes awaiting the user's next explicit commit request.
 
 Weighted-search Phase 6 implementation evidence is recorded in
 [Phase 6 evidence](docs/superpowers/plans/2026-09-16-portfolio-optimizer-weighted-search-phase-6-evidence.md).
