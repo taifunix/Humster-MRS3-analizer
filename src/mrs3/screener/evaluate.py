@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import csv
+import dataclasses
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
+import io
 from pathlib import Path
 
 import pandas as pd
@@ -363,3 +366,42 @@ def evaluate_and_record(
         )
         write_screening_results(screener_config.liquidity_registry_path, rows)
     return verdicts
+
+
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, Decimal):
+        # Fixed-point, never scientific notation (str(Decimal) can render
+        # e.g. "3E-8"), so a plain-text/spreadsheet reader parses it as the
+        # same number every time.
+        return format(value, "f")
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        # Neutralize spreadsheet formula injection for genuinely
+        # string-valued fields only — this branch never sees a Decimal that
+        # was reformatted to a leading "-" above, since that return already
+        # happened.
+        return "'" + value
+    return value
+
+
+def export_verdicts_csv(verdicts: tuple[PairVerdict, ...]) -> bytes:
+    """Render `verdicts` as UTF-8 (with BOM) CSV bytes for panel download.
+
+    Header and row values both come from `dataclasses.fields(PairVerdict)`/
+    `dataclasses.asdict`, so they can't drift out of position with each
+    other the way two independently hand-written lists could.
+    """
+    field_names = [field.name for field in dataclasses.fields(PairVerdict)]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=field_names)
+    writer.writeheader()
+    for verdict in verdicts:
+        row = dataclasses.asdict(verdict)
+        writer.writerow({name: _csv_cell(value) for name, value in row.items()})
+    return buffer.getvalue().encode("utf-8-sig")

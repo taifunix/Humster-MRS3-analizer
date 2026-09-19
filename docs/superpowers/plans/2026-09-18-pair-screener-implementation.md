@@ -1,17 +1,19 @@
 # SCREENER 01 — план реализации экрана скринера пар
 
-**Статус (обновлено 2026-09-18):** ✅ Этапы 0–3 закрыты. `errors.py`,
+**Статус (обновлено 2026-09-19):** ✅ Этапы 0–4 закрыты. `errors.py`,
 `registry.py`, `listing.py` (реестр → dates.xlsx → Bybit по-символьно с
 троттлингом ≥250мс и распознаванием HTTP 403, восстановлено и обосновано
 после изучения официальной документации Bybit), `evaluate.py` (вердикты по
-CSV, обе стороны) — все реализованы, 72/72 теста `tests/screener` зелёные,
-каждый файл прошёл несколько раундов независимого review до схождения
-(0 замечаний в последнем раунде по каждому). ⏳ Следующий шаг — Этап 4
-(панель: `panel_testing.py` kwargs + `panel.py` контроллер-методы +
-роуты `/api/v2/testing/screener/*`). Всё без коммитов — по решению
-пользователя, изменения остаются pending до полной реализации, один общий
-коммит в конце. Контракт —
-[2026-09-18-pair-screener.md](../../specs/2026-09-18-pair-screener.md)
+CSV, обе стороны), `panel_testing.py`/`panel.py` (контроллер-методы SCREENER 01,
+роуты `/api/v2/testing/screener/*`) — все реализованы, `tests/screener` +
+`tests/test_panel_testing.py` + `tests/runner` + `tests/test_panel.py` —
+421/421 зелёных (1 skip не связан со скринером — symlink недоступен в
+Windows-окружении). Каждый файл прошёл несколько раундов независимого review
+до схождения (0 замечаний либо явно обоснованный отказ от косметической
+находки в последнем раунде). ⏳ Следующий шаг — Этап 5 (UI: `index.html`
+карта, `app.js`, `app.css`). Всё без коммитов — по решению пользователя,
+изменения остаются pending до полной реализации, один общий коммит в конце.
+Контракт — [2026-09-18-pair-screener.md](../../specs/2026-09-18-pair-screener.md)
 (там же — актуальные разделы про SHORT (раздел 4/5) и реестр ликвидности
 (раздел 6.6), которых не было на момент первой версии этого плана).
 
@@ -216,20 +218,75 @@ review). Тесты `tests/screener/test_evaluate.py` (все вердикты, 
 партиционных CSV, запись в реестр). Итог по всему Этапу 3:
 `tests/screener` — 72/72 зелёных.
 
-**Этап 4 (feat) — ⏳ не начат (следующий шаг).** `panel_testing.py`: у `prepare()`/`fill()` — два новых
-опциональных kwarg (`config_template_path`, `render_config`, решение 8);
-дефолты сохраняют текущее поведение RUNNER 01. Отдельная функция
-`expected_screener_runs(symbols)` — читает screener-шаблон и перемножает
-длины `values` всех записей × число символов (не хардкод 304). `panel.py`:
-контроллер-методы `local_screener_status/fill/start/stop/evaluate/export` по
-образцу `local_testing_*`, со своим парсером символов (comma/space/newline,
-uppercase, USDT fail-closed, дедуп), `side="LONG"`, `config_template_path`/
-`render_config` из решения 8; `evaluate/export` — только чтение текущего
-`report_dir`, без лока. Новые роуты `/api/v2/testing/screener/{status,fill,
-start,stop,evaluate,export}` в диспетчере и allow-list. Тесты по образцу
-`test_panel_testing.py` (в т.ч. регрессия: RUNNER 01 без новых kwarg
-рендерит побайтово как раньше) + тест взаимной эксклюзивности с RUNNER 01
-через общий `TesterTargetLock`.
+**Задним числом добавлено в Этап 3** (обнаружено при работе над Этапом 4:
+`export_verdicts` был в исходном плане Этапа 3, но пропущен при первой
+реализации): `export_verdicts_csv(verdicts) -> bytes` в `evaluate.py` —
+CSV-байты для скачивания из панели (не файл на диске — раздел 6.5 спеки
+уточнён под это). Заголовок и значения строк выводятся из
+`dataclasses.fields`/`asdict(PairVerdict)`, а не двух independent ручных
+списков (review дважды указал на риск рассинхронизации при добавлении
+нового поля — исправлено сразу). `Decimal`-поля форматируются как
+`format(value, "f")` (без научной нотации), строковые поля защищены от
+CSV/formula-injection (`=`/`+`/`-`/`@`-префиксы экранируются кавычкой) —
+но это не относится к числам, отформатированным из Decimal (отрицательный
+`best_dd_pct` не должен превращаться в текст). Тесты — `tests/screener` —
+76/76 зелёных.
+
+**Этап 4 (feat) — ✅ закрыт.**
+
+`panel_testing.py`. У `prepare()`/`fill()` — один новый опциональный kwarg
+`template_override: tuple[str, Callable] | None = None` (изначально сделал два
+отдельных kwarg — `config_template_path`/`render_config` — review дважды
+указал, что раздельные kwarg позволяют передать путь без соответствующего
+рендерера; объединил в одну неразделимую пару вместо рантайм-валидации
+согласованности). Дефолт `None` сохраняет текущее поведение RUNNER 01
+байт-в-байт (регрессия проверена явным тестом, сравнивающим omitted/`None`/
+явно указанный канонический LONG-шаблон). Отдельная функция
+`expected_screener_runs(repo_root, config_template_path, symbols)` — читает
+screener-шаблон и перемножает длины `values` всех записей (кроме единственной
+записи символа) × число символов (не хардкод 304); валидирует символы так же,
+как `render_tester_config`/`render_screener_tester_config` (uppercase, дедуп,
+формат, обязательный суффикс `USDT` — фикс review: раньше эта функция не
+проверяла `USDT`, хотя может вызываться отдельно, до fill, для live-превью в
+UI), отклоняет пустой список; чтение шаблона обёрнуто в `except OSError`
+(фикс review: раньше `.read_text()` без try/except мог уронить весь HTTP-
+запрос вместо контролируемой ошибки). Общий `_find_unique_symbol_entry`
+helper переиспользован и в `render_tester_config` (поведенчески идентичный
+рефакторинг, подтверждён полным regression-прогоном — это единственное
+послабление инварианта «не менять `render_tester_config`»: инвариант защищает
+поведение для RUNNER 01, а не буквально исходный код). Новый
+`_resolve_repo_path` — защита от выхода `config_template_path` за пределы
+`repo_root` (path traversal).
+
+`panel.py` — контроллер-методы `local_screener_status/fill/start/stop/
+evaluate/export`, свой парсер символов (comma/space/newline, uppercase, USDT
+fail-closed, дедуп — общий `_split_symbols_field` helper переиспользован и в
+RUNNER 01's `_local_testing_request`, фикс review против расхождения токенизации
+между RUNNER 01 и SCREENER 01), реальный выбор `side` (LONG/SHORT — решение
+10 сделало сторону настоящей) с соответствующим `template_override` по
+стороне; `evaluate/export` — только чтение текущего `report_dir`, без лока;
+`_serialize_screener_verdict` — сознательно не переиспользует существующий
+`PanelController._jsonable` (тот форматирует `Decimal` через `str(value)`,
+что может дать научную нотацию вроде `"3E-8"` — тот же класс бага, что уже
+чинили в `export_verdicts_csv`; `_jsonable` используется другими фичами
+(grid_contract, witnesses, portfolio), его поведение не меняем). Новые роуты
+`/api/v2/testing/screener/{status,fill,start,stop,evaluate,export}` в
+диспетчере и allow-list; GET `/screener/export` получил `except Exception:`
+с логированием и JSON 500 по образцу соседнего `/performance-v2/catalog`
+(фикс review — раньше неожиданное исключение обрывало соединение без
+ответа). Тесты по образцу существующих `local_testing_*`-контроллер-тестов +
+тест взаимной эксклюзивности с RUNNER 01 через общий `TesterTargetLock` +
+тест, что провал preview-подсчёта `expected_runs` не отменяет уже
+состоявшийся fill.
+
+Итог по Этапу 4: `tests/test_panel_testing.py` — 51 тест; полный прогон
+`tests/screener tests/test_panel_testing.py tests/runner tests/test_panel.py`
+— 421 passed, 1 skipped (skip не связан со скринером). Прошло 5 раундов
+независимого review до схождения; одна находка (двойное чтение шаблона в
+`local_screener_fill` ради preview-счётчика) сознательно оставлена как есть
+— `expected_screener_runs` обязана работать независимо от fill (нужна для
+live-превью в Этапе 5 UI до вызова fill), а само чтение — на ручном клике
+кнопки, не в горячем пути.
 
 **Этап 5 (feat, UI) — ⏳ не начат.** `index.html`: карта `#screener-local` (по образцу
 `#runner-local`) — textarea пар, статичная пометка LONG, даты, чекбокс

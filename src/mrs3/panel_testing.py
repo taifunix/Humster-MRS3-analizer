@@ -37,6 +37,7 @@ class TesterRunClient(Protocol):
 
 
 _SYMBOL = re.compile(r"^[A-Z0-9]{2,32}$")
+_SCREENER_USDT_SUFFIX = re.compile(r"USDT$")
 _TEMPLATES = {
     "LONG": ("templates/tester/mrs2/config_tester_long.json", "templates/strategies/source-v6-mrs2/long.json"),
     "SHORT": ("templates/tester/mrs2/config_tester_short.json", "templates/strategies/source-v6-mrs2/short.json"),
@@ -46,6 +47,74 @@ _TEMPLATES = {
 def mrs3_tester_config_template(repo_root: Path | None = None) -> Path:
     root = Path(repo_root).resolve() if repo_root is not None else Path(__file__).resolve().parents[2]
     return root / "templates/tester/mrs3/config_tester.json"
+
+
+def _resolve_repo_path(repo_root: Path, relative: str) -> Path:
+    """Resolve `relative` under `repo_root`, rejecting any escape from it."""
+    repo_root = Path(repo_root).resolve()
+    resolved = (repo_root / relative).resolve()
+    try:
+        resolved.relative_to(repo_root)
+    except ValueError:
+        raise PanelTestingError("invalid tester configuration") from None
+    return resolved
+
+
+def _find_unique_symbol_entry(mining: list) -> dict:
+    targets = [
+        entry
+        for entry in mining
+        if isinstance(entry, dict) and entry.get("name") == "settings[*].basic.symbol"
+    ]
+    if len(targets) != 1:
+        raise PanelTestingError("invalid tester configuration")
+    return targets[0]
+
+
+def expected_screener_runs(
+    repo_root: Path, config_template_path: str, symbols: tuple[str, ...] | list[str]
+) -> int:
+    """Total tester runs a screener config template would submit for `symbols`.
+
+    Reads the template's own `parameter_mining` list lengths (not a hardcoded
+    304) so this stays correct if the screening grid ever changes. Mirrors
+    render_screener_tester_config's USDT-suffix requirement so this preview
+    count can't accept a symbol list the actual render/fill would reject —
+    this function is also called standalone, before any fill, for the panel's
+    live run-count preview.
+    """
+    if not symbols:
+        raise PanelTestingError("invalid tester configuration")
+    clean_symbols = tuple(symbol.strip().upper() for symbol in symbols)
+    if (
+        len(set(clean_symbols)) != len(clean_symbols)
+        or any(not _SYMBOL.fullmatch(symbol) for symbol in clean_symbols)
+        or any(not _SCREENER_USDT_SUFFIX.search(symbol) for symbol in clean_symbols)
+    ):
+        raise PanelTestingError("invalid tester configuration")
+    try:
+        template = _resolve_repo_path(repo_root, config_template_path).read_text(encoding="utf-8")
+    except OSError:
+        raise PanelTestingError("invalid tester configuration") from None
+    try:
+        document = json.loads(_without_trailing_commas(template))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise PanelTestingError("invalid tester configuration") from None
+    if not isinstance(document, dict):
+        raise PanelTestingError("invalid tester configuration")
+    mining = document.get("parameter_mining")
+    if not isinstance(mining, list) or not mining:
+        raise PanelTestingError("invalid tester configuration")
+    symbol_entry = _find_unique_symbol_entry(mining)
+    combos_per_symbol = 1
+    for entry in mining:
+        if entry is symbol_entry:
+            continue
+        values = entry.get("values") if isinstance(entry, dict) else None
+        if not isinstance(values, list) or not values:
+            raise PanelTestingError("invalid tester configuration")
+        combos_per_symbol *= len(values)
+    return combos_per_symbol * len(symbols)
 
 
 def _without_trailing_commas(text: str) -> str:
@@ -103,14 +172,12 @@ def render_tester_config(
     mining = document.get("parameter_mining")
     if not isinstance(mining, list):
         raise PanelTestingError("invalid tester configuration")
-    targets = [entry for entry in mining if isinstance(entry, dict) and entry.get("name") == "settings[*].basic.symbol"]
-    if len(targets) != 1:
-        raise PanelTestingError("invalid tester configuration")
+    symbol_entry = _find_unique_symbol_entry(mining)
     document["StartDate"] = f"{start_date.isoformat()}T00:00:00"
     document["EndDate"] = f"{end_date.isoformat()}T00:00:00"
     if max_parallel_runs is not None:
         document["max_parallel_runs"] = max_parallel_runs
-    targets[0]["values"] = list(clean_symbols)
+    symbol_entry["values"] = list(clean_symbols)
     return json.dumps(document, ensure_ascii=False, indent=2) + "\n"
 
 
@@ -219,7 +286,19 @@ class LocalTestingService:
         start: str,
         end: str,
         output_dir: Path | None = None,
+        template_override: tuple[str, Callable[..., str]] | None = None,
     ) -> LocalTestingPreparation:
+        """Stage a rendered tester config and one strategy file.
+
+        `template_override`, if given, is `(config_template_path,
+        render_config)` — a config-template path and the renderer that
+        understands it, always used together (never one without the other,
+        so a screener-shaped template can't accidentally be rendered by the
+        wrong function). The strategy file is always `_TEMPLATES[side][1]`;
+        an override config template's own parameter naming (e.g. `ma_long.*`
+        vs `ma_short.*`) is still the caller's responsibility to match to
+        `side`.
+        """
         validate_runtime_preflight(self.config)
         side = side.strip().upper() if isinstance(side, str) else ""
         if side not in _TEMPLATES:
@@ -229,9 +308,16 @@ class LocalTestingService:
             raise PanelTestingError("at least one symbol is required")
 
         config_name, strategy_name = _TEMPLATES[side]
-        config_template = (self.repo_root / config_name).read_text(encoding="utf-8")
+        if template_override is not None:
+            config_template_path, render_config = template_override
+            config_template = _resolve_repo_path(self.repo_root, config_template_path).read_text(
+                encoding="utf-8"
+            )
+        else:
+            render_config = render_tester_config
+            config_template = (self.repo_root / config_name).read_text(encoding="utf-8")
         strategy_template = (self.repo_root / strategy_name).read_text(encoding="utf-8")
-        rendered_config = render_tester_config(
+        rendered_config = render_config(
             config_template,
             selected,
             start,
@@ -280,11 +366,18 @@ class LocalTestingService:
         start: str,
         end: str,
         delete_old_reports: bool = False,
+        template_override: tuple[str, Callable[..., str]] | None = None,
     ) -> dict[str, object]:
         """Install the requested single strategy and rendered tester config."""
         if not isinstance(delete_old_reports, bool):
             raise PanelTestingError("delete_old_reports must be a boolean")
-        prepared = self.prepare(side=side, symbols=symbols, start=start, end=end)
+        prepared = self.prepare(
+            side=side,
+            symbols=symbols,
+            start=start,
+            end=end,
+            template_override=template_override,
+        )
         owner: TesterTargetLock | None = None
         target_quiesced = True
         try:

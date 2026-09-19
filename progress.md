@@ -1,9 +1,9 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-18
+**Updated:** 2026-09-19
 **Current branch:** `main`
 
-## Pair screener (SCREENER 01) — spec amended, implementation started (2026-09-18)
+## Pair screener (SCREENER 01) — Этапы 0–4 done, UI (Этап 5) next (2026-09-19)
 
 Active spec: [docs/specs/2026-09-18-pair-screener.md](docs/specs/2026-09-18-pair-screener.md)
 (DRAFT). Handoff:
@@ -50,13 +50,18 @@ read-only `Пары` sheet, and records its own findings in a `Скрининг`
 it exclusively owns (atomic upsert, never touches the other sheets, never
 overwrites manually-filled final-decision columns).
 
-**Этапы 0–3 are done.** `src/mrs3/screener/` now has `config.py`
+**Этапы 0–3 are done** (including a retroactive Этап 3 addendum,
+`export_verdicts_csv`, added while starting Этап 4 — CSV bytes for a panel
+download, header/row values both derived from `dataclasses.fields`/
+`asdict(PairVerdict)` rather than two hand-written lists, with
+fixed-point Decimal formatting and spreadsheet-formula-injection escaping
+for string fields). `src/mrs3/screener/` now has `config.py`
 (`ScreenerConfig`, incl. `liquidity_registry_path`), `render.py`
 (`render_screener_tester_config`, side-agnostic), `errors.py`
 (`ScreenerEvaluationError`), `registry.py` (registry read/write),
 `listing.py` (listing-date resolution: registry → dates.xlsx → Bybit), and
-`evaluate.py` (the actual per-report verdict computation for both sides).
-`tests/screener` is 72/72 passing; every file went through several rounds
+`evaluate.py` (per-report verdict computation for both sides + CSV export).
+`tests/screener` is 76/76 passing; every file went through several rounds
 of independent review until a round returned zero findings.
 
 The Bybit fallback's rate-limit protection was removed then restored in the
@@ -69,15 +74,43 @@ documented mechanism is 600 requests/5s per IP → HTTP 403 → automatic
 10-minute IP ban; `instruments-info` is public/no-key with no
 endpoint-specific stricter limit. The implemented margin: a client-side
 throttle enforcing >=250ms between Bybit requests (<=20 req/5s, ~30x
-headroom), persisting across separate `resolve_listing_dates()` calls (the
-ban is keyed to a rolling window, not a "call"), plus explicit HTTP 403
-detection that stops immediately with a clear "wait ~10 minutes" error
-instead of continuing to hit a blocked IP for remaining symbols.
+headroom) within one `resolve_listing_dates()` call; a later review round
+found the first version wrongly persisted this across separate calls too
+(risking silently trusting a stale/bad prior read indefinitely) — reverted
+to per-call only, matching the spec's literal "на время вызова" wording;
+callers must pass the full symbol set in one call to keep the bound. Plus
+explicit HTTP 403 detection that stops immediately with a clear "wait ~10
+minutes" error instead of continuing to hit a blocked IP for remaining
+symbols.
 
-Next step: Этап 4 — `panel_testing.py` (additive `config_template_path`/
-`render_config` kwargs on `prepare()`/`fill()`, RUNNER 01 default behavior
-unchanged) and `panel.py` (`local_screener_*` controller methods, new
-`/api/v2/testing/screener/*` routes).
+**Этап 4 is done (2026-09-19).** `panel_testing.py`: additive
+`template_override: tuple[str, Callable] | None` kwarg on `prepare()`/
+`fill()` — originally two separate kwargs, unified after review flagged that
+separate kwargs let a caller pass a config path without its matching
+renderer; `expected_screener_runs()` (now also enforces the USDT suffix and
+wraps template reads in `except OSError`, both review-driven fixes); a new
+`_resolve_repo_path` path-traversal guard. `panel.py`: `local_screener_
+status/fill/start/stop/evaluate/export` controller methods sharing the same
+`LocalTestingService`/`TesterTargetLock` as RUNNER 01; a shared
+`_split_symbols_field` helper now used by both RUNNER 01 and SCREENER 01's
+symbol parsers (review-driven, so a future separator fix can't silently
+diverge between them); `_serialize_screener_verdict` deliberately does not
+reuse the existing `PanelController._jsonable` (that helper formats
+`Decimal` via `str(value)`, risking scientific notation for small pnl30/dd
+values — the same bug class already fixed in CSV export); new
+`/api/v2/testing/screener/{status,fill,start,stop,evaluate,export}` routes,
+with the GET `/export` route gaining an `except Exception` → logged JSON 500
+fallback matching the sibling `/performance-v2/catalog` route. `tests/test_
+panel_testing.py` is 51 passing. Combined `tests/screener tests/test_panel_
+testing.py tests/runner tests/test_panel.py` — 421 passed, 1 skipped (the
+skip is a pre-existing Windows symlink limitation unrelated to the
+screener). Went through 5 rounds of independent review to convergence; one
+remaining round-5 finding (double file-read of the same template inside
+`local_screener_fill`'s preview-count call) was deliberately not fixed —
+`expected_screener_runs` must also work standalone before any fill, for the
+Этап 5 live-preview UI, and the extra read is on a manual button click, not
+a hot path. Next step: Этап 5 (UI — `index.html` screener card, `app.js`,
+`app.css`).
 
 Weighted-search Phase 6 implementation evidence is recorded in
 [Phase 6 evidence](docs/superpowers/plans/2026-09-16-portfolio-optimizer-weighted-search-phase-6-evidence.md).

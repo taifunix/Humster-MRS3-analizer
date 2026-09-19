@@ -170,7 +170,17 @@ from .panel_remote_source_db import RemoteSourceDbExecutor, RemoteSourceDbError
 from .panel_source_db import LocalSourceDbService
 from .panel_source_jobs import LocalSourceDbJobRunner
 from .panel_surfaces import LocalSurfacesService
-from .panel_testing import LocalTestingService, PanelTestingError, _TEMPLATES, mrs3_tester_config_template
+from .panel_testing import (
+    LocalTestingService,
+    PanelTestingError,
+    _TEMPLATES,
+    expected_screener_runs,
+    mrs3_tester_config_template,
+)
+from .screener.config import ScreenerConfig, load_screener_config
+from .screener.errors import ScreenerEvaluationError
+from .screener.evaluate import PairVerdict, evaluate_and_record, evaluate_pairs, export_verdicts_csv
+from .screener.render import render_screener_tester_config
 from .fresh_analysis_strategies import (
     filter_fresh_analysis_candidates,
     generate_fresh_analysis_strategies,
@@ -238,7 +248,7 @@ from .performance_v2_finalist_retest import (
 from .runner.config import RunnerConfig
 from .runner.inbox import capture_verified_inbox
 from .runner.workflow import BatchPlan, _load_saved_result_evidence, _load_saved_results, plan_batch, run_batch
-from .error_sanitization import has_local_path
+from .error_sanitization import has_local_path, redact_local_paths
 
 
 def _control_score(value: object) -> object:
@@ -268,6 +278,16 @@ _DIRECT_GENERIC_ERROR = "direct build failed"
 _FRESH_ANALYSIS_LISTING_DATES_ERROR = (
     "Listing dates XLSX is missing. Add it and save Settings > Analysis profile."
 )
+_SCREENER_TEMPLATES = {
+    "LONG": "templates/tester/mrs2/config_tester_long_screen.json",
+    "SHORT": "templates/tester/mrs2/config_tester_short_screen.json",
+}
+_TESTING_SYMBOL_SPLIT = re.compile(r",")
+_SCREENER_SYMBOL_SPLIT = re.compile(r"[,\s]+")
+
+
+def _redact_screener_error(error: Exception) -> str:
+    return redact_local_paths(str(error))[:2048]
 
 
 def _fresh_analysis_error(message: str | None) -> str:
@@ -2003,10 +2023,19 @@ class PanelController:
         return self._local_testing_service_instance
 
     @staticmethod
+    def _split_symbols_field(value: str, pattern: "re.Pattern[str]") -> tuple[str, ...]:
+        """Tokenize a raw symbols field with `pattern`, trimming each token.
+
+        Shared by RUNNER 01 and SCREENER 01 so a future separator/whitespace
+        fix applies to both instead of silently diverging between them.
+        """
+        return tuple(token.strip() for token in pattern.split(value) if token.strip())
+
+    @staticmethod
     def _local_testing_request(payload: Mapping[str, object]) -> dict[str, object]:
         symbols = payload.get("symbols")
         if isinstance(symbols, str):
-            symbols = tuple(item.strip() for item in symbols.split(",") if item.strip())
+            symbols = PanelController._split_symbols_field(symbols, _TESTING_SYMBOL_SPLIT)
         if not isinstance(symbols, (tuple, list)) or not all(isinstance(item, str) for item in symbols):
             raise PanelTestingError("invalid testing request")
         try:
@@ -2017,25 +2046,38 @@ class PanelController:
         except Exception:  # pragma: no cover - protects the HTTP trust boundary.
             raise PanelTestingError("invalid testing request") from None
 
-    def local_testing_fill(self, payload: Mapping[str, object]) -> dict[str, object]:
+    def _run_local_fill(self, fill_kwargs: Mapping[str, object], *, redact: bool) -> dict[str, object]:
+        """Shared lock/error handling for both RUNNER 01 and SCREENER 01 fill.
+
+        `redact` controls whether a non-lock `PanelTestingError` message is
+        passed through (run through `_redact_screener_error` first) or
+        flattened to the generic "invalid testing request" — RUNNER 01 kept
+        its original always-generic behavior (`redact=False`).
+        """
         try:
-            delete_old_reports = payload.get("delete_old_reports", False)
-            if not isinstance(delete_old_reports, bool):
-                raise PanelTestingError("invalid testing request")
-            result = self._local_testing_service().fill(
-                **self._local_testing_request(payload),
-                delete_old_reports=delete_old_reports,
-            )
+            result = self._local_testing_service().fill(**fill_kwargs)
             self._local_testing_filled = True
             return result
         except PanelTestingError as error:
             if "tester target is already owned" in str(error):
                 raise PanelTestingError("TESTER_FILES_PREPARED") from None
+            if redact:
+                raise PanelTestingError(_redact_screener_error(error)) from None
             raise PanelTestingError("invalid testing request") from None
         except TesterTargetBusyError:
             raise PanelTestingError("TESTER_FILES_PREPARED") from None
         except Exception:
             raise PanelTestingError("invalid testing request") from None
+
+    def local_testing_fill(self, payload: Mapping[str, object]) -> dict[str, object]:
+        delete_old_reports = payload.get("delete_old_reports", False)
+        if not isinstance(delete_old_reports, bool):
+            raise PanelTestingError("invalid testing request")
+        fill_kwargs = {
+            **self._local_testing_request(payload),
+            "delete_old_reports": delete_old_reports,
+        }
+        return self._run_local_fill(fill_kwargs, redact=False)
 
     def local_testing_start(self) -> dict[str, str]:
         if not self._local_testing_filled:
@@ -2050,6 +2092,137 @@ class PanelController:
             return self._local_testing_service().stop()
         except Exception:
             raise PanelTestingError("invalid testing request") from None
+
+    # -- Pair screener (SCREENER 01): shares LocalTestingService/TesterTargetLock
+    # with RUNNER 01 above (decision 9, docs/superpowers/plans/
+    # 2026-09-18-pair-screener-implementation.md) — same bot, same lock, so
+    # only one of the two cards can hold it prepared at a time.
+
+    def local_screener_status(self) -> dict[str, object]:
+        return self.local_testing_status()
+
+    @staticmethod
+    def _local_screener_request(payload: Mapping[str, object]) -> dict[str, object]:
+        symbols = payload.get("symbols")
+        if isinstance(symbols, str):
+            symbols = PanelController._split_symbols_field(symbols, _SCREENER_SYMBOL_SPLIT)
+        if (
+            not isinstance(symbols, (tuple, list))
+            or not symbols
+            or not all(isinstance(item, str) for item in symbols)
+        ):
+            raise PanelTestingError("invalid testing request")
+        return {
+            "side": payload.get("side"), "symbols": tuple(symbols),
+            "start": payload.get("start"), "end": payload.get("end"),
+        }
+
+    def local_screener_fill(self, payload: Mapping[str, object]) -> dict[str, object]:
+        delete_old_reports = payload.get("delete_old_reports", False)
+        if not isinstance(delete_old_reports, bool):
+            raise PanelTestingError("invalid testing request")
+        request = self._local_screener_request(payload)
+        side = request["side"]
+        side = side.strip().upper() if isinstance(side, str) else ""
+        template_path = _SCREENER_TEMPLATES.get(side)
+        if template_path is None:
+            raise PanelTestingError("invalid testing request")
+        fill_kwargs = {
+            "side": side,
+            "symbols": request["symbols"],
+            "start": request["start"],
+            "end": request["end"],
+            "delete_old_reports": delete_old_reports,
+            "template_override": (template_path, render_screener_tester_config),
+        }
+        result = self._run_local_fill(fill_kwargs, redact=True)
+        try:
+            service = self._local_testing_service()
+            result["expected_runs"] = expected_screener_runs(
+                service.repo_root, template_path, request["symbols"]
+            )
+        except PanelTestingError:
+            pass  # Files are already staged; a preview-count failure must not undo that.
+        return result
+
+    def local_screener_start(self) -> dict[str, str]:
+        return self.local_testing_start()
+
+    def local_screener_stop(self) -> dict[str, str]:
+        return self.local_testing_stop()
+
+    def _screener_evaluate_inputs(
+        self,
+    ) -> tuple[RunnerConfig, "AlgorithmConfig", "ScreenerConfig", Path | None]:
+        try:
+            config = RunnerConfig.from_json(self.default_config)
+        except Exception:
+            raise PanelTestingError("invalid testing request") from None
+        try:
+            algorithm_config = self._analysis_config_loader(self.default_config)
+            screener_config = load_screener_config(self.default_config)
+        except ValueError as error:
+            # ValueError (incl. json.JSONDecodeError) covers every expected
+            # validation failure from these two loaders; anything else is an
+            # unanticipated bug and should propagate/crash loudly rather
+            # than have its raw exception text redacted-and-forwarded to
+            # the HTTP client as if it were an actionable message.
+            raise PanelTestingError(_redact_screener_error(error)) from None
+        try:
+            dates_path = self._workflow_default("listing_dates_path")
+        except ValueError:
+            dates_path = None
+        return config, algorithm_config, screener_config, dates_path
+
+    @staticmethod
+    def _serialize_screener_verdict(verdict: "PairVerdict") -> dict[str, object]:
+        # Derived from every dataclass field (like export_verdicts_csv's own
+        # dataclasses.asdict use), so the JSON API can't silently drift from
+        # the CSV export by missing a field one serializer forgot to list.
+        #
+        # Deliberately not PanelController._jsonable: that helper formats
+        # Decimal via str(value), which can emit scientific notation (e.g.
+        # "3E-8") for small pnl30/dd values — the same bug class already
+        # fixed in export_verdicts_csv's _csv_cell. format(value, "f") below
+        # keeps fixed-point output; _jsonable is shared by unrelated features
+        # (grid_contract, witnesses, portfolio results), so its behavior is
+        # not changed here.
+        row = asdict(verdict)
+        for key, value in row.items():
+            if isinstance(value, Decimal):
+                row[key] = format(value, "f")
+        return row
+
+    def local_screener_evaluate(self) -> dict[str, object]:
+        config, algorithm_config, screener_config, dates_path = self._screener_evaluate_inputs()
+        try:
+            verdicts = evaluate_and_record(
+                config.report_dir,
+                algorithm_config=algorithm_config,
+                screener_config=screener_config,
+                dates_path=dates_path,
+            )
+        except ScreenerEvaluationError as error:
+            raise PanelTestingError(_redact_screener_error(error)) from None
+        except Exception:
+            raise PanelTestingError("invalid testing request") from None
+        return {"verdicts": [self._serialize_screener_verdict(v) for v in verdicts]}
+
+    def local_screener_export(self) -> tuple[str, bytes]:
+        config, algorithm_config, screener_config, dates_path = self._screener_evaluate_inputs()
+        try:
+            verdicts = evaluate_pairs(
+                config.report_dir,
+                algorithm_config=algorithm_config,
+                screener_config=screener_config,
+                dates_path=dates_path,
+                registry_path=screener_config.liquidity_registry_path,
+            )
+        except ScreenerEvaluationError as error:
+            raise PanelTestingError(_redact_screener_error(error)) from None
+        except Exception:
+            raise PanelTestingError("invalid testing request") from None
+        return "screener_verdicts.csv", export_verdicts_csv(verdicts)
 
     def _remote_testing_service(self) -> RemoteTestingService:
         if self._remote_testing_service_instance is not None:
@@ -7415,6 +7588,28 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v2/testing/local/status":
             self._json(200, self.server.controller.local_testing_status())
             return
+        if parsed.path == "/api/v2/testing/screener/status":
+            self._json(200, self.server.controller.local_screener_status())
+            return
+        if parsed.path == "/api/v2/testing/screener/export":
+            try:
+                filename, data = self.server.controller.local_screener_export()
+            except PanelTestingError as error:
+                self._json(400, {"error": str(error)})
+                return
+            except Exception:
+                _LOGGER.exception("Screener export failed")
+                self._json(500, {"error": {"code": "INTERNAL", "message": "Screener export failed"}})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if parsed.path == "/api/v2/testing/remote/status":
             self._json(200, self.server.controller.remote_testing_status())
             return
@@ -7694,7 +7889,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_route = endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         portfolio_cancel_route = bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint))
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
-        if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
+        if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
             self._json(404, {"error": "not found"})
             return
         if portfolio_submission_route:
@@ -7791,6 +7986,14 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.local_testing_start()
             elif endpoint == "/api/v2/testing/local/stop":
                 result = self.server.controller.local_testing_stop()
+            elif endpoint == "/api/v2/testing/screener/fill":
+                result = self.server.controller.local_screener_fill(document)
+            elif endpoint == "/api/v2/testing/screener/start":
+                result = self.server.controller.local_screener_start()
+            elif endpoint == "/api/v2/testing/screener/stop":
+                result = self.server.controller.local_screener_stop()
+            elif endpoint == "/api/v2/testing/screener/evaluate":
+                result = self.server.controller.local_screener_evaluate()
             elif endpoint == "/api/v2/testing/remote/prepare":
                 result = self.server.controller.remote_testing_prepare(document)
             elif endpoint == "/api/v2/testing/remote/check-paths":
@@ -7945,6 +8148,22 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except PanelTestingError as error:
             if endpoint == "/api/v2/testing/local/fill" and str(error) == "TESTER_FILES_PREPARED":
                 self._json(409, {"error": "TESTER_FILES_PREPARED"})
+            elif endpoint.startswith("/api/v2/testing/screener/"):
+                if str(error) == "TESTER_FILES_PREPARED":
+                    self._json(409, {"error": "TESTER_FILES_PREPARED"})
+                else:
+                    # Screener errors are deliberately actionable (mixed
+                    # dates/sides, Bybit rate-limit, etc. — see
+                    # docs/specs/2026-09-18-pair-screener.md section 7/8),
+                    # unlike the generic message below used for every other
+                    # endpoint. fill/evaluate/export already ran their
+                    # PanelTestingError messages through
+                    # _redact_screener_error (error_sanitization.
+                    # redact_local_paths) before raising, so paths are
+                    # stripped by the time the message reaches here — do not
+                    # remove that call as "redundant", this handler applies
+                    # no redaction of its own.
+                    self._json(400, {"error": str(error)})
             else:
                 self._json(400, {"error": "invalid settings"})
             return

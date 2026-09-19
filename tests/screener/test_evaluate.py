@@ -11,7 +11,13 @@ import pytest
 from mrs3.config import AlgorithmConfig
 from mrs3.screener.config import ScreenerConfig
 from mrs3.screener.errors import ScreenerEvaluationError
-from mrs3.screener.evaluate import evaluate_and_record, evaluate_pairs
+from mrs3.screener.evaluate import (
+    PairVerdict,
+    _csv_cell,
+    evaluate_and_record,
+    evaluate_pairs,
+    export_verdicts_csv,
+)
 from mrs3.screener.registry import SCREENING_SHEET
 
 _ALGO = AlgorithmConfig.defaults()
@@ -349,3 +355,70 @@ def test_evaluate_and_record_writes_verdicts_to_registry(
     row = [cell.value for cell in next(sheet.iter_rows(min_row=2, max_row=2))]
     assert row[0] == "GOUSDT"
     assert row[2] == "GO"
+
+
+def test_export_verdicts_csv_round_trips_through_pandas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import io
+
+    report_dir = tmp_path / "my_test"
+    report_dir.mkdir()
+    rows = [
+        _row("GOUSDT", "1h", "0.99", "2", pnl=30, dd=5, win_rate=80, trades=20),
+        _row("GOUSDT", "2h", "0.98", "6", pnl=30, dd=5, win_rate=80, trades=20),
+        _row("STOPUSDT", "1h", "0.99", "2", pnl=30, dd=5, win_rate=10, trades=20),
+        _row("STOPUSDT", "2h", "0.98", "6", pnl=30, dd=5, win_rate=10, trades=20),
+    ]
+    _write_csv(report_dir / "reports_history.csv", rows)
+    _patch_listing(monkeypatch, ["GOUSDT", "STOPUSDT"])
+
+    verdicts = evaluate_pairs(
+        report_dir, algorithm_config=_ALGO, screener_config=_SCREENER, dates_path=None
+    )
+    csv_bytes = export_verdicts_csv(verdicts)
+
+    frame = pd.read_csv(io.BytesIO(csv_bytes), encoding="utf-8-sig")
+    assert list(frame["symbol"]) == ["GOUSDT", "STOPUSDT"]
+    assert list(frame["verdict"]) == ["GO", "STOP"]
+    go_row = frame[frame["symbol"] == "GOUSDT"].iloc[0]
+    assert go_row["big_shift"] == "yes"
+    stop_row = frame[frame["symbol"] == "STOPUSDT"].iloc[0]
+    assert pd.isna(stop_row["best_pnl30"])
+
+
+def test_csv_cell_formats_decimal_without_scientific_notation() -> None:
+    assert _csv_cell(Decimal("3E-8")) == "0.00000003"
+    assert _csv_cell(Decimal("-4.5")) == "-4.5"
+
+
+def test_csv_cell_neutralizes_formula_injection_in_string_fields() -> None:
+    assert _csv_cell("=CMD()") == "'=CMD()"
+    assert _csv_cell("+1+1") == "'+1+1"
+    assert _csv_cell("@SUM(A1)") == "'@SUM(A1)"
+    assert _csv_cell("AAAUSDT") == "AAAUSDT"
+
+
+def test_export_verdicts_csv_does_not_quote_negative_dd_as_formula() -> None:
+    verdict = PairVerdict(
+        symbol="AUSDT",
+        side="LONG",
+        verdict="STOP",
+        big_shift=False,
+        n_reports=2,
+        n_unique_combos=2,
+        n_good=0,
+        n_good_big_shift=0,
+        best_pnl30=None,
+        best_timeframe=None,
+        best_shift_bp=None,
+        best_close_len=None,
+        best_dd_pct=Decimal("-4.5"),
+        effective_days=Decimal("30"),
+        window_start="2026-08-01 00:00:00",
+        window_end="2026-08-31 00:00:00",
+    )
+    csv_bytes = export_verdicts_csv((verdict,))
+    text = csv_bytes.decode("utf-8-sig")
+    assert ",-4.5," in text
+    assert "'-4.5" not in text
