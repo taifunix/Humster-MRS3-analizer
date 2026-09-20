@@ -44,6 +44,21 @@ def test_the_catalog_lists_a_committed_analysis(tmp_path: Path) -> None:
     assert "path" not in entry
 
 
+def test_the_catalog_keeps_legacy_analysis_visible(tmp_path: Path) -> None:
+    directory = tmp_path / "analysis"
+    directory.mkdir()
+    analysis_id, _surface = _make_analysis(directory / "legacy.analysis-v6.duckdb", legacy=True)
+
+    controller = _controller(tmp_path)
+    result = controller.analysis_catalog()
+
+    assert [item["name"] for item in result["analyses"]] == ["legacy.analysis-v6.duckdb"]
+    assert result["analyses"][0]["analysis_run_id"] == analysis_id
+    opened = controller.strategies_fresh_open({"analysis_ref": "legacy.analysis-v6.duckdb"})
+    shortlist = controller.strategies_fresh_shortlist({"analysis_run_id": opened["analysis_run_id"]})
+    assert [item["candidate_id"] for item in shortlist["items"]] == ["STR-READY"]
+
+
 def test_an_artifact_that_is_not_a_fresh_analysis_is_skipped(tmp_path: Path) -> None:
     """A broken or foreign file must not appear as a choice."""
     directory = tmp_path / "analysis"

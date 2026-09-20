@@ -45,6 +45,7 @@ from .source_v6_surface_fresh import FINGERPRINT as SURFACE_FINGERPRINT, read_mu
 
 
 FINGERPRINT = "analysis-v6-fresh-compact-v2"
+LEGACY_FINGERPRINT = "analysis-v6-fresh-compact-v1"
 EVENT_MODE = "real_independent_events"
 GENERATOR_SCHEMA = f"{V6_READY_GENERATOR_SCHEMA}-fresh-compact"
 PRETEST_AB_CONTRACT = "source-v6-pretest-ab-v1"
@@ -66,6 +67,11 @@ _PRETEST_AB_FIELDS = {
     "contract_version", "status", "reason", "a_start_ms", "a_end_ms", "b_start_ms", "b_end_ms",
     "a_days", "b_days", "a_pnl", "b_pnl", "a_round_trips", "b_round_trips",
 }
+_LEGACY_SURFACE_FINGERPRINT = "surface-v6-fresh-compact-v2"
+
+
+def _supports_pretest_ab(manifest: Mapping[str, object]) -> bool:
+    return manifest.get("fingerprint") == FINGERPRINT
 
 
 def _plateau_diagnostics(structure: Mapping[str, object]) -> dict[str, object]:
@@ -168,10 +174,12 @@ def _read_analysis(path: Path) -> tuple[dict[str, object], str, str]:
             }
         except duckdb.Error as error:
             raise ValueError("analysis artifact has no manifest") from error
-        if manifest.get("fingerprint") != FINGERPRINT:
+        artifact_contract = (manifest.get("fingerprint"), manifest.get("surface_fingerprint"))
+        if artifact_contract not in {
+            (FINGERPRINT, SURFACE_FINGERPRINT),
+            (LEGACY_FINGERPRINT, _LEGACY_SURFACE_FINGERPRINT),
+        }:
             raise ValueError("unsupported analysis artifact; fresh compact analysis is required")
-        if manifest.get("surface_fingerprint") != SURFACE_FINGERPRINT:
-            raise ValueError("analysis artifact is not bound to a fresh compact surface")
         if manifest.get("event_mode") != EVENT_MODE:
             raise ValueError("fresh analysis requires event_mode real_independent_events")
         if manifest.get("build_mode") == "DUCKDB_DIRECT":
@@ -188,7 +196,8 @@ def _read_analysis(path: Path) -> tuple[dict[str, object], str, str]:
         scope_digests = manifest.get("scope_digests")
         if not isinstance(scope_digests, Mapping) or not scope_digests:
             raise ValueError("fresh analysis scope identity is missing")
-        for field in _HASH_FIELDS:
+        hash_fields = _HASH_FIELDS if _supports_pretest_ab(manifest) else _HASH_FIELDS[:-1]
+        for field in hash_fields:
             value = str(manifest.get(field, ""))
             if len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
                 raise ValueError(f"fresh analysis manifest has invalid {field}")
@@ -221,13 +230,14 @@ def _rows(connection: duckdb.DuckDBPyConnection, table: str, scope: str) -> list
     return result
 
 
-def _validate_points(points: Sequence[Mapping[str, object]], scopes: set[tuple[str, str, str]]) -> pd.DataFrame:
+def _validate_points(
+    points: Sequence[Mapping[str, object]], scopes: set[tuple[str, str, str]], *, require_pretest_ab: bool = True,
+) -> pd.DataFrame:
     required = {
         "point_id", "symbol", "side", "timeframe", "shift_bp", "shift_pct", "open_ma", "close_ma",
         "pnl_pct", "dd_pct", "efficiency", "trades", "plateau_id", "economic_pass",
         "standalone_eligible", "depth_eligible", "refine_required", "event_mode", "_event_ids",
         "event_ids_hash", "point_event_count",
-        "pretest_ab",
     }
     seen: set[str] = set()
     rows: list[dict[str, object]] = []
@@ -251,7 +261,10 @@ def _validate_points(points: Sequence[Mapping[str, object]], scopes: set[tuple[s
             raise ValueError("fresh point event count disagrees with exact event IDs")
         if str(raw["event_ids_hash"]) != sha256("|".join(event_ids).encode("utf-8")).hexdigest():
             raise ValueError("fresh point event-ID hash mismatch")
-        _validate_pretest_ab_evidence(raw["pretest_ab"])
+        if "pretest_ab" in raw:
+            _validate_pretest_ab_evidence(raw["pretest_ab"])
+        elif require_pretest_ab:
+            raise ValueError("fresh point is missing required fields: ['pretest_ab']")
         rows.append({**raw, "side": scope[1], "_event_ids": event_ids})
     if not rows:
         raise ValueError("fresh analysis has no points for selected scopes")
@@ -338,8 +351,9 @@ def _surface_binding(
         "surface_id": str(manifest["surface_id"]),
         "source_content_digest": str(manifest["source_content_digest"]),
         "scope_digests": dict(sorted((str(key), str(value)) for key, value in dict(manifest["scope_digests"]).items())),
-        "analysis_input_digest": str(manifest["analysis_input_digest"]),
     }
+    if "analysis_input_digest" in manifest:
+        identity["analysis_input_digest"] = str(manifest["analysis_input_digest"])
     binding: dict[str, object] = {
         **identity,
         "surface_identity_sha256": _canonical_digest(identity),
@@ -352,8 +366,9 @@ def _surface_binding(
             "surface_id": identity["surface_id"],
             "source_content_digest": identity["source_content_digest"],
             "scope_digests": identity["scope_digests"],
-            "analysis_input_digest": identity["analysis_input_digest"],
         }
+        if "analysis_input_digest" in identity:
+            expected["analysis_input_digest"] = identity["analysis_input_digest"]
         if any(actual.get(key) != value for key, value in expected.items()):
             raise ValueError("analysis and surface identities do not match")
         binding["surface_artifact_sha256"] = _file_digest(surface_path)
@@ -367,13 +382,15 @@ def read_fresh_analysis_identity(analysis_path: Path | str) -> dict[str, object]
     session; a file that does not validate must raise rather than be listed.
     """
     manifest, analysis_id, _artifact = _read_analysis(Path(analysis_path).resolve())
-    return {
+    result = {
         "analysis_run_id": analysis_id,
         "surface_id": str(manifest["surface_id"]),
         "algorithm_version": str(manifest.get("algorithm_version", "")),
-        "analysis_input_digest": str(manifest["analysis_input_digest"]),
         "scope_keys": sorted(dict(manifest["scope_digests"])),
     }
+    if "analysis_input_digest" in manifest:
+        result["analysis_input_digest"] = str(manifest["analysis_input_digest"])
+    return result
 
 
 def filter_fresh_analysis_candidates(
@@ -390,6 +407,9 @@ def filter_fresh_analysis_candidates(
     manifest, analysis_id, _ = _read_analysis(analysis_file)
     if str(analysis_run_id) != analysis_id:
         raise ValueError("fresh analysis run identity mismatch")
+    supports_pretest = _supports_pretest_ab(manifest)
+    if pretest_ab_enabled and not supports_pretest:
+        raise ValueError("PRETEST_AB_EVIDENCE_UNAVAILABLE: rebuild the Source v6 surface and analysis")
     if isinstance(criteria, Mapping) and (
         set(criteria).difference(CRITERIA) or any(type(value) is not bool for value in criteria.values())
     ):
@@ -406,7 +426,8 @@ def filter_fresh_analysis_candidates(
     connection = duckdb.connect(str(analysis_file), read_only=True)
     try:
         points = _validate_points(
-            [row for scope in scope_keys for row in _rows(connection, "points", scope)], scopes
+            [row for scope in scope_keys for row in _rows(connection, "points", scope)], scopes,
+            require_pretest_ab=supports_pretest,
         )
         structures = [
             row for scope in scope_keys for row in _rows(connection, "structures", scope)
@@ -416,7 +437,10 @@ def filter_fresh_analysis_candidates(
         connection.close()
     point_rows = points.to_dict("records")
     point_events = {str(row["point_id"]): int(row["point_event_count"]) for row in point_rows}
-    point_pretest = {str(row["point_id"]): dict(row["pretest_ab"]) for row in point_rows}
+    point_pretest = {
+        str(row["point_id"]): dict(row["pretest_ab"])
+        for row in point_rows if isinstance(row.get("pretest_ab"), Mapping)
+    }
     candidates: list[_Candidate] = []
     pretest_outcomes: dict[str, tuple[str, str, str | None]] = {}
     for structure in structures:
@@ -434,13 +458,18 @@ def filter_fresh_analysis_candidates(
             point_id = str(order.get("point_id", ""))
             if point_id not in point_events:
                 raise ValueError("READY fresh candidate references unknown point")
-            order_pretest.append(point_pretest[point_id])
+            if supports_pretest:
+                order_pretest.append(point_pretest[point_id])
             values["source_pnl"].append(_decimal(order.get("source_pnl_pct"), "source_pnl_pct"))
             values["efficiency"].append(_decimal(order.get("source_efficiency"), "source_efficiency"))
             values["close_support"].append(_decimal(order.get("close_support"), "close_support"))
             values["point_event_count"].append(point_events[point_id])
-        first_pretest = order_pretest[0]
-        outcome = _pretest_ab_outcome(first_pretest, pretest_ab_enabled)
+        first_pretest = order_pretest[0] if order_pretest else None
+        outcome = (
+            _pretest_ab_outcome(first_pretest, pretest_ab_enabled)
+            if isinstance(first_pretest, Mapping)
+            else ("DISABLED", "LEGACY_ANALYSIS", None)
+        )
         pretest_outcomes[candidate_id] = outcome
         payload = dict(structure)
         payload.update(
@@ -709,6 +738,7 @@ def generate_fresh_analysis_strategies(
         points = _validate_points(
             [row for scope in scopes for row in _rows(connection, "points", "|".join(scope))],
             scope_set,
+            require_pretest_ab=_supports_pretest_ab(manifest),
         )
         all_structures = [
             row for scope in scopes for table in _CANDIDATE_TABLES
@@ -775,7 +805,6 @@ def generate_fresh_analysis_strategies(
         "analysis_identity_sha256": analysis_id,
         "analysis_manifest_sha256": analysis_manifest_sha256,
         "analysis_artifact_sha256": analysis_artifact_sha256,
-        "analysis_input_digest": str(manifest["analysis_input_digest"]),
         "analysis_fingerprint": str(manifest["fingerprint"]),
         "algorithm_version": str(manifest["algorithm_version"]),
         "algorithm_config_sha256": str(manifest["algorithm_config_sha256"]),
@@ -792,6 +821,8 @@ def generate_fresh_analysis_strategies(
         },
         "generator_schema_version": GENERATOR_SCHEMA,
     }
+    if "analysis_input_digest" in manifest:
+        common["analysis_input_digest"] = str(manifest["analysis_input_digest"])
     generated: list[dict[str, object]] = []
     variants: list[dict[str, object]] = []
     candidate_diagnostics: dict[str, dict[str, object]] = {}

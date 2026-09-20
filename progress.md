@@ -2871,3 +2871,11 @@ Round-2 idle-path review fix also passed the affected materializer suite
 (`35 passed`): comparable genuine-zero B activity uses canonical flat metrics,
 reports `NO_B_TRADES`, and passes the optional gate; non-genuine empty-series
 reasons still raise. The full-suite post-fix count remains owned by root.
+
+Legacy fresh-analysis compatibility was restored after the PRETEST schema bump:
+the Panel again lists and opens exact v1-analysis/v2-surface artifacts while the
+new filter is disabled, but enabling PRETEST on them fails before generation
+with an actionable rebuild requirement. A read-only smoke check found all 12
+local analysis databases and opened the first with 95 shortlist items. Focused
+analysis, Panel, export, tester-file and fresh-analysis checks pass (`82 passed`);
+no database was modified.

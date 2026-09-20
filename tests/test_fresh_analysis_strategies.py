@@ -93,18 +93,21 @@ def _order(point: dict[str, object], number: int) -> dict[str, object]:
     }
 
 
-def _make_analysis(path: Path, *, event_mode: str = "real_independent_events", ready: bool = True) -> tuple[str, dict[str, object]]:
+def _make_analysis(
+    path: Path, *, event_mode: str = "real_independent_events", ready: bool = True, legacy: bool = False,
+) -> tuple[str, dict[str, object]]:
     config = AlgorithmConfig.defaults()
     config_hash = sha256(_canonical_json(_canonical(config)).encode()).hexdigest()
     surface_identity = {
         "surface_id": "SURFACE-1",
-        "surface_fingerprint": "surface-v6-fresh-compact-v3",
+        "surface_fingerprint": "surface-v6-fresh-compact-v2" if legacy else "surface-v6-fresh-compact-v3",
         "source_content_digest": "a" * 64,
         "scope_digests": {"BTCUSDT|LONG|1h": "d" * 64},
-        "analysis_input_digest": "c" * 64,
     }
+    if not legacy:
+        surface_identity["analysis_input_digest"] = "c" * 64
     identity = {
-        "fingerprint": "analysis-v6-fresh-compact-v2",
+        "fingerprint": "analysis-v6-fresh-compact-v1" if legacy else "analysis-v6-fresh-compact-v2",
         **surface_identity,
         "algorithm_version": "algo-v1",
         "algorithm_config_sha256": config_hash,
@@ -114,6 +117,9 @@ def _make_analysis(path: Path, *, event_mode: str = "real_independent_events", r
     analysis_id = sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     point_a = _point("BTCUSDT|LONG|1h|100|3|9", 100, 3, "event-a")
     point_b = _point("BTCUSDT|LONG|1h|300|4|9", 300, 4, "event-b")
+    if legacy:
+        point_a.pop("pretest_ab")
+        point_b.pop("pretest_ab")
     structure = {
         "structure_id": "STR-READY",
         "symbol": "BTCUSDT",
@@ -141,6 +147,40 @@ def _make_analysis(path: Path, *, event_mode: str = "real_independent_events", r
         connection.executemany(f"insert into {name} values (?, ?)", [(scope_key, json.dumps(row, sort_keys=True, separators=(",", ":"))) for row in rows])
     connection.close()
     return analysis_id, surface_identity
+
+
+def test_legacy_analysis_works_without_pretest_and_requires_rebuild_with_it(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import (
+        filter_fresh_analysis_candidates,
+        generate_fresh_analysis_strategies,
+        list_fresh_analysis_shortlist,
+    )
+
+    path = tmp_path / "legacy.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(path, legacy=True)
+
+    shortlist = list_fresh_analysis_shortlist(path, analysis_id, {})
+    assert [item["candidate_id"] for item in shortlist["items"]] == ["STR-READY"]
+    assert shortlist["items"][0]["filter_status"] == "READY_AFTER_FILTERS"
+    with pytest.raises(ValueError, match="PRETEST_AB_EVIDENCE_UNAVAILABLE"):
+        filter_fresh_analysis_candidates(path, analysis_id, {}, pretest_ab_enabled=True)
+
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+    generated = generate_fresh_analysis_strategies(
+        path, analysis_id, ["STR-READY"], [("BTCUSDT", "LONG", "1h")], template,
+        tmp_path / "legacy-out", AlgorithmConfig.defaults(), filters={},
+    )
+    manifest = json.loads(generated.manifest_path.read_text(encoding="utf-8"))
+    assert "analysis_input_digest" not in manifest
+
+    blocked = tmp_path / "blocked-out"
+    with pytest.raises(ValueError, match="PRETEST_AB_EVIDENCE_UNAVAILABLE"):
+        generate_fresh_analysis_strategies(
+            path, analysis_id, ["STR-READY"], [("BTCUSDT", "LONG", "1h")], template,
+            blocked, AlgorithmConfig.defaults(), pretest_ab_enabled=True,
+        )
+    assert not blocked.exists()
 
 
 def test_fresh_adapter_generates_only_selected_ready_candidate_and_binds_hashes(tmp_path: Path) -> None:

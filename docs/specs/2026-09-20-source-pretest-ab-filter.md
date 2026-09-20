@@ -59,7 +59,7 @@ The added derivative evidence changes the compact analysis-row contract. Per ADR
 
 - publish a new surface fingerprint and a new fresh-analysis fingerprint;
 - strictly validate the new nested evidence and bind it through the existing analysis-input digest;
-- reject old artifacts and require rebuild; do not silently synthesize or omit evidence;
+- keep old v1 analysis artifacts readable when PRETEST A/B is disabled; enabling it on an old artifact fails with an actionable rebuild requirement and never synthesizes evidence;
 - bind generated output to `pretest_ab_enabled`, the fixed 14-day window, the strict 95-percent threshold, and the evidence contract version.
 
 No new ADR is required: ADR-0017 already governs derivative-rule fingerprint changes and rebuilds.

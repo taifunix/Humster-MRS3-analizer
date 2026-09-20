@@ -2872,7 +2872,7 @@ class PanelController:
                 analysis_run_id=analysis_id,
                 tester_config_template=mrs3_tester_config_template(self.root),
                 pretest_ab_provenance=self._pretest_ab_provenance(pretest_ab_enabled),
-                analysis_input_digest=str(analysis_identity["analysis_input_digest"]),
+                analysis_input_digest=analysis_identity.get("analysis_input_digest"),
             )
         return {"phase": "COMMITTED", "analysis_run_id": analysis_id, **result}
 
