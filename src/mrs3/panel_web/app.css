@@ -245,6 +245,8 @@ tbody th { font-weight: 750; }
 .selection-objectives-table { min-width: 680px; }
 .selection-preview-output { display: grid; gap: 10px; margin-top: 16px; }
 .selection-preview-output .card-status { align-self: center; }
+#performance-v2-selection-review-results { display: grid; justify-items: start; gap: 4px; }
+.selection-review-import-result { max-width: 100%; white-space: normal; text-align: left; }
 
 .portfolio-grid { align-items: start; }
 .portfolio-stack { margin-top: 18px; }

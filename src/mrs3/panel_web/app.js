@@ -2682,6 +2682,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         : 'No active Performance v2 strategies found.';
     } catch (error) {
       if (performanceV2WindowStatus) performanceV2WindowStatus.textContent = `Strategy catalog unavailable: ${error?.message || 'request failed'}.`;
+      return error?.message || 'request failed';
     }
   };
   performanceV2WindowRefresh?.addEventListener('click', loadPerformanceV2Catalog);
@@ -2828,6 +2829,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const selectionXlsButton = document.querySelector('#performance-v2-selection-xls');
   const selectionReviewFile = document.querySelector('#performance-v2-selection-review-file');
   const selectionReviewImportButton = document.querySelector('#performance-v2-selection-review-import');
+  const selectionReviewImportResults = document.querySelector('#performance-v2-selection-review-results');
   let selectionCacheStatusRevision = 0;
   const refreshSelectionCacheStatus = async () => {
     const revision = ++selectionCacheStatusRevision;
@@ -2986,28 +2988,56 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       .sort((a, b) => a.lastModified - b.lastModified || a.name.localeCompare(b.name));
     if (!files.length) return;
     const imported = [];
-    const failed = [];
+    let unchanged = 0;
+    let failed = 0;
+    const importErrorText = {
+      SELECTION_REVIEW_INVALID_FILE: 'Некорректный XLSX-файл.',
+      SELECTION_REVIEW_SCHEMA_MISMATCH: 'Структура XLSX не соответствует шаблону.',
+      SELECTION_REVIEW_DATABASE_MISMATCH: 'Файл относится к другой базе результатов.',
+      SELECTION_REVIEW_INVALID_SELECTION: 'В файле указан некорректный отбор.',
+      SELECTION_REVIEW_INVALID_STATUS: 'Недопустимое значение в User Status.',
+      SELECTION_REVIEW_INVALID_RANK: 'Недопустимое значение в User Rank.',
+      SELECTION_REVIEW_INVALID_ANALOG: 'Недопустимое значение в Analog Of ID.',
+      SELECTION_REVIEW_INVALID_RETEST: 'Файл относится к недопустимому ретесту.',
+      SELECTION_REVIEW_ROWSET_MISMATCH: 'Состав строк XLSX не совпадает с отбором.',
+      SELECTION_REVIEW_NOT_LATEST_RUN: 'Файл не относится к последнему запуску отбора.',
+      SELECTION_REVIEW_STALE_RESULTS: 'Данные отбора успели измениться.',
+      SELECTION_REVIEW_AUTOMATIC_FIELDS_CHANGED: 'Изменены автоматические поля XLSX.',
+    };
+    selectionReviewImportResults?.replaceChildren();
     for (const [index, file] of files.entries()) {
+      const fileStatus = document.createElement('div');
+      fileStatus.className = 'selection-review-import-result state-badge state-running';
+      fileStatus.textContent = `… ${file.name} — импортируется (${index + 1}/${files.length})`;
+      selectionReviewImportResults?.append(fileStatus);
       try {
         if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Импорт XLSX ${index + 1}/${files.length}: ${file.name}`;
         const response = await fetch('/api/v2/strategies/performance-v2/selection-review-import', {
           method: 'POST', headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, body: file,
         });
         const result = await response.json().catch(() => ({}));
-        if (response.ok) imported.push(result);
-        else failed.push(`${file.name}: ${result.error?.code || result.error?.message || 'ошибка'}`);
+        const code = result.error?.code || '';
+        if (response.ok) {
+          imported.push(result);
+          fileStatus.className = 'selection-review-import-result state-badge state-ready';
+          fileStatus.textContent = `✓ ${file.name} — импортировано.`;
+        } else if (code === 'SELECTION_REVIEW_ALREADY_IMPORTED') {
+          unchanged += 1;
+          fileStatus.className = 'selection-review-import-result state-badge state-ready';
+          fileStatus.textContent = `✓ ${file.name} — без изменений: уже импортирован.`;
+        } else {
+          failed += 1;
+          fileStatus.className = 'selection-review-import-result state-badge state-pending';
+          fileStatus.textContent = `✗ ${file.name} — ${importErrorText[code] || result.error?.message || 'Ошибка импорта.'} (${code || 'UNKNOWN'})`;
+        }
       } catch (error) {
-        failed.push(`${file.name}: ${error.message || 'ошибка запроса'}`);
+        failed += 1;
+        fileStatus.className = 'selection-review-import-result state-badge state-pending';
+        fileStatus.textContent = `✗ ${file.name} — ошибка запроса: ${error.message || 'без описания'}.`;
       }
     }
-    try {
-      await loadPerformanceV2Catalog();
-    } catch (error) {
-      failed.push(`catalog: ${error.message || 'ошибка обновления'}`);
-    }
-    if (selectionPreviewStatus) selectionPreviewStatus.textContent = failed.length
-      ? `Импортировано ${imported.length}/${files.length}. Ошибки: ${failed.join('; ')}`
-      : `Импортировано файлов: ${imported.length}, строк: ${imported.reduce((sum, item) => sum + Number(item?.row_count || 0), 0)}.`;
+    const catalogError = await loadPerformanceV2Catalog() || '';
+    if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Импортировано ${imported.length}/${files.length}. Без изменений: ${unchanged}. Ошибок: ${failed}.${catalogError ? ` Каталог не обновлён: ${catalogError}.` : ''}`;
     selectionReviewFile.value = '';
   });
   renderSelectionPreviewOrder();

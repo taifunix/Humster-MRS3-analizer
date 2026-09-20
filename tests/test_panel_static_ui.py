@@ -1140,6 +1140,27 @@ def test_performance_v2_review_import_uses_a_folder_picker_and_bounded_endpoint(
     assert ".filter((file) => file.name.toLowerCase().endsWith('.xlsx'))" in js
 
 
+def test_selection_review_batch_import_reports_one_clear_status_per_file() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    handler = js.split("selectionReviewFile?.addEventListener", 1)[1].split("renderSelectionPreviewOrder();", 1)[0]
+
+    assert 'id="performance-v2-selection-review-results"' in html
+    assert "selectionReviewImportResults" in handler
+    assert "SELECTION_REVIEW_ALREADY_IMPORTED" in handler
+    assert "SELECTION_REVIEW_INVALID_STATUS" in handler
+    assert "SELECTION_REVIEW_NOT_LATEST_RUN" in handler
+    assert "SELECTION_REVIEW_DATABASE_MISMATCH" in handler
+    assert "SELECTION_REVIEW_INVALID_SELECTION" in handler
+    assert "SELECTION_REVIEW_STALE_RESULTS" in handler
+    assert "SELECTION_REVIEW_ROWSET_MISMATCH" in handler
+    assert "SELECTION_REVIEW_INVALID_RANK" in handler
+    assert "SELECTION_REVIEW_INVALID_ANALOG" in handler
+    assert "SELECTION_REVIEW_INVALID_RETEST" in handler
+    assert "const catalogError = await loadPerformanceV2Catalog() || '';" in handler
+    assert "failed.join('; ')" not in handler
+
+
 def test_finalist_retest_ui_loads_server_defaults_without_member_ids() -> None:
     html = _read("index.html")
     js = _read("app.js")
