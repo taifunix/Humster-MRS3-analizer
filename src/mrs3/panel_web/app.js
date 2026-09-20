@@ -176,6 +176,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   let shortlistItems = [];
   const selectedScopeKeys = new Set();
   const shortlistFilters = () => ({ source_pnl: !!document.querySelector('#shortlist-filter-source-pnl')?.checked, efficiency: !!document.querySelector('#shortlist-filter-efficiency')?.checked, close_support: !!document.querySelector('#shortlist-filter-close-support')?.checked, point_event_count: !!document.querySelector('#shortlist-filter-point-event-count')?.checked });
+  const pretestAbEnabled = () => !!document.querySelector('#shortlist-filter-pretest-ab')?.checked;
   const expandedPairs = new Set();
   const shortlistBadge = (kind, text) => {
     const badge = document.querySelector('#shortlist-badge');
@@ -1739,6 +1740,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         analysis_run_id: currentAnalysisId,
         candidate_ids: candidateIds,
         filters: shortlistFilters(),
+        pretest_ab_enabled: pretestAbEnabled(),
         selected_scopes: scopes.map((group) => [group.pair, group.side, group.timeframe]),
       });
       while (result.running) {
@@ -1756,8 +1758,9 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     }
   });
   const refreshFresh = document.querySelector('#shortlist-refresh');
-  const phase2Filters = document.querySelector('.phase2-filters');
-  if (phase2Filters && refreshFresh?.parentElement) {
+  const filterControls = document.querySelector('.shortlist-filter-controls');
+  const phase2Filters = filterControls?.querySelector('.phase2-filters');
+  if (filterControls && phase2Filters && refreshFresh?.parentElement) {
     const actions = refreshFresh.parentElement;
     phase2Filters.open = true;
     phase2Filters.querySelector('summary')?.addEventListener('keydown', (event) => {
@@ -1765,14 +1768,14 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     });
     const selection = document.createElement('div'); selection.className = 'button-row';
     ['#shortlist-select-all', '#shortlist-select-active', '#shortlist-select-none'].forEach((id) => { const button = document.querySelector(id); if (button) selection.append(button); });
-    actions.after(phase2Filters); phase2Filters.after(selection);
+    actions.after(filterControls); filterControls.after(selection);
   }
   if (refreshFresh?.parentElement) {
     const audit = document.createElement('button');
     audit.id = 'shortlist-audit'; audit.type = 'button'; audit.className = 'button button-secondary'; audit.textContent = 'Export filter audit';
     audit.addEventListener('click', async () => {
       if (!currentAnalysisId) return;
-      const response = await fetch('/api/v2/strategies/fresh/shortlist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ analysis_run_id: currentAnalysisId, filters: shortlistFilters(), audit: true }) });
+      const response = await fetch('/api/v2/strategies/fresh/shortlist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ analysis_run_id: currentAnalysisId, filters: shortlistFilters(), pretest_ab_enabled: pretestAbEnabled(), audit: true }) });
       const result = await response.json(); if (!response.ok) throw new Error(result.error || 'audit failed');
       strategyStatus(`Filter audit: ${result.filename}`);
     });
@@ -1781,7 +1784,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const refreshShortlist = async () => {
     if (!currentAnalysisId) { strategyStatus('Сначала запустите анализ.'); return; }
     try {
-      applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId, filters: shortlistFilters() }));
+      applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId, filters: shortlistFilters(), pretest_ab_enabled: pretestAbEnabled() }));
       strategyStatus(`Shortlist: ${shortlistItems.length} candidates.`);
     } catch (error) { strategyStatus(`Shortlist ошибка: ${error?.message || 'unknown error'}.`); }
   };
@@ -1789,6 +1792,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   document.querySelectorAll('.phase2-filters input[type="checkbox"]').forEach((node) => {
     node.addEventListener('change', refreshShortlist);
   });
+  document.querySelector('#shortlist-filter-pretest-ab')?.addEventListener('change', refreshShortlist);
   document.querySelector('#shortlist-select-all')?.addEventListener('click', () => {
     selectedScopeKeys.clear();
     for (const group of shortlistGroups) if (Number(group.ready_after_filters ?? group.ready ?? 0) > 0) selectedScopeKeys.add(group.scope_key);

@@ -44,19 +44,28 @@ from .source_v6 import _canonical_json
 from .source_v6_surface_fresh import FINGERPRINT as SURFACE_FINGERPRINT, read_multiscope_surface
 
 
-FINGERPRINT = "analysis-v6-fresh-compact-v1"
+FINGERPRINT = "analysis-v6-fresh-compact-v2"
 EVENT_MODE = "real_independent_events"
 GENERATOR_SCHEMA = f"{V6_READY_GENERATOR_SCHEMA}-fresh-compact"
+PRETEST_AB_CONTRACT = "source-v6-pretest-ab-v1"
+PRETEST_AB_WINDOW_DAYS = 14
+PRETEST_AB_THRESHOLD_PCT = Decimal("95")
 _TABLES = ("points", "structures")
 _CANDIDATE_TABLES = ("structures",)
 _ORDER_BUCKETS = (1, 2, 3, 4)
 _READY_STATUS = "READY_MRS3_STRUCTURE"
-_HASH_FIELDS = ("source_content_digest", "algorithm_config_sha256", "listing_dates_sha256")
+_HASH_FIELDS = (
+    "source_content_digest", "algorithm_config_sha256", "listing_dates_sha256", "analysis_input_digest",
+)
 _PLATEAU_DIAGNOSTIC_COLUMNS = (
     "plateau_point_count",
     "base_point_trades",
     "plateau_total_trades",
 )
+_PRETEST_AB_FIELDS = {
+    "contract_version", "status", "reason", "a_start_ms", "a_end_ms", "b_start_ms", "b_end_ms",
+    "a_days", "b_days", "a_pnl", "b_pnl", "a_round_trips", "b_round_trips",
+}
 
 
 def _plateau_diagnostics(structure: Mapping[str, object]) -> dict[str, object]:
@@ -218,6 +227,7 @@ def _validate_points(points: Sequence[Mapping[str, object]], scopes: set[tuple[s
         "pnl_pct", "dd_pct", "efficiency", "trades", "plateau_id", "economic_pass",
         "standalone_eligible", "depth_eligible", "refine_required", "event_mode", "_event_ids",
         "event_ids_hash", "point_event_count",
+        "pretest_ab",
     }
     seen: set[str] = set()
     rows: list[dict[str, object]] = []
@@ -241,10 +251,83 @@ def _validate_points(points: Sequence[Mapping[str, object]], scopes: set[tuple[s
             raise ValueError("fresh point event count disagrees with exact event IDs")
         if str(raw["event_ids_hash"]) != sha256("|".join(event_ids).encode("utf-8")).hexdigest():
             raise ValueError("fresh point event-ID hash mismatch")
+        _validate_pretest_ab_evidence(raw["pretest_ab"])
         rows.append({**raw, "side": scope[1], "_event_ids": event_ids})
     if not rows:
         raise ValueError("fresh analysis has no points for selected scopes")
     return pd.DataFrame(rows)
+
+
+def _validate_pretest_ab_evidence(value: object) -> dict[str, object]:
+    """Validate the persisted, versioned source PRETEST evidence strictly."""
+    if not isinstance(value, Mapping) or set(value) != _PRETEST_AB_FIELDS:
+        raise ValueError("fresh point has malformed pretest_ab evidence")
+    evidence = dict(value)
+    if evidence["contract_version"] != PRETEST_AB_CONTRACT:
+        raise ValueError("fresh point has unsupported pretest_ab contract")
+    status = evidence["status"]
+    reason = evidence["reason"]
+    expected_reasons = {
+        "COMPARABLE": "FULL_READY_WITNESS",
+        "INSUFFICIENT_HISTORY": "A_SHORTER_THAN_14_DAYS",
+    }
+    if status not in expected_reasons or reason != expected_reasons[status]:
+        raise ValueError("fresh point has invalid pretest_ab status")
+    integer_fields = ("a_start_ms", "a_end_ms", "b_start_ms", "b_end_ms", "a_days", "b_days", "a_round_trips", "b_round_trips")
+    if any(type(evidence[field]) is not int or evidence[field] < 0 for field in integer_fields):
+        raise ValueError("fresh point has invalid pretest_ab integer fields")
+    if evidence["a_end_ms"] < evidence["a_start_ms"] or evidence["b_end_ms"] != evidence["a_end_ms"]:
+        raise ValueError("fresh point has invalid pretest_ab bounds")
+    if evidence["b_end_ms"] - evidence["b_start_ms"] != PRETEST_AB_WINDOW_DAYS * 24 * 60 * 60 * 1000:
+        raise ValueError("fresh point has invalid pretest_ab window")
+    if evidence["a_days"] != (evidence["a_end_ms"] - evidence["a_start_ms"]) // (24 * 60 * 60 * 1000):
+        raise ValueError("fresh point has invalid pretest_ab day count")
+    if evidence["b_days"] != PRETEST_AB_WINDOW_DAYS:
+        raise ValueError("fresh point has invalid pretest_ab day count")
+    decimal_fields = ("a_pnl", "b_pnl")
+    for field in decimal_fields:
+        item = evidence[field]
+        if item is None:
+            if status == "COMPARABLE" or field == "a_pnl":
+                raise ValueError(f"fresh point has invalid pretest_ab {field}")
+            continue
+        if not isinstance(item, str):
+            raise ValueError(f"fresh point has invalid pretest_ab {field}")
+        try:
+            parsed = Decimal(item)
+        except Exception as error:
+            raise ValueError(f"fresh point has invalid pretest_ab {field}") from error
+        if not parsed.is_finite():
+            raise ValueError(f"fresh point has invalid pretest_ab {field}")
+    if status == "COMPARABLE" and evidence["a_days"] < PRETEST_AB_WINDOW_DAYS:
+        raise ValueError("fresh point has invalid pretest_ab history status")
+    if status == "INSUFFICIENT_HISTORY" and evidence["a_days"] >= PRETEST_AB_WINDOW_DAYS:
+        raise ValueError("fresh point has invalid pretest_ab history status")
+    return evidence
+
+
+def _pretest_ab_outcome(evidence: Mapping[str, object], enabled: bool) -> tuple[str, str, str | None]:
+    """Return status, diagnostic reason and the calculated decline percentage."""
+    if not enabled:
+        return "DISABLED", "DISABLED", None
+    _validate_pretest_ab_evidence(evidence)
+    if evidence["status"] == "INSUFFICIENT_HISTORY":
+        return "PASS", "INSUFFICIENT_HISTORY", None
+    if int(evidence["b_round_trips"]) == 0:
+        return "PASS", "NO_B_TRADES", None
+    a_pnl = Decimal(str(evidence["a_pnl"]))
+    b_pnl = Decimal(str(evidence["b_pnl"]))
+    a_daily = a_pnl / Decimal(int(evidence["a_days"]))
+    b_daily = b_pnl / Decimal(int(evidence["b_days"]))
+    if a_daily <= 0:
+        return "PASS", "NOT_COMPARABLE", None
+    decline = (a_daily - b_daily) / a_daily * Decimal("100")
+    decline_text = format(decline, "f")
+    return (
+        "REJECT" if decline > PRETEST_AB_THRESHOLD_PCT else "PASS",
+        "DECLINE_GT_THRESHOLD" if decline > PRETEST_AB_THRESHOLD_PCT else "DECLINE_WITHIN_THRESHOLD",
+        decline_text,
+    )
 
 
 def _surface_binding(
@@ -255,6 +338,7 @@ def _surface_binding(
         "surface_id": str(manifest["surface_id"]),
         "source_content_digest": str(manifest["source_content_digest"]),
         "scope_digests": dict(sorted((str(key), str(value)) for key, value in dict(manifest["scope_digests"]).items())),
+        "analysis_input_digest": str(manifest["analysis_input_digest"]),
     }
     binding: dict[str, object] = {
         **identity,
@@ -268,6 +352,7 @@ def _surface_binding(
             "surface_id": identity["surface_id"],
             "source_content_digest": identity["source_content_digest"],
             "scope_digests": identity["scope_digests"],
+            "analysis_input_digest": identity["analysis_input_digest"],
         }
         if any(actual.get(key) != value for key, value in expected.items()):
             raise ValueError("analysis and surface identities do not match")
@@ -286,6 +371,7 @@ def read_fresh_analysis_identity(analysis_path: Path | str) -> dict[str, object]
         "analysis_run_id": analysis_id,
         "surface_id": str(manifest["surface_id"]),
         "algorithm_version": str(manifest.get("algorithm_version", "")),
+        "analysis_input_digest": str(manifest["analysis_input_digest"]),
         "scope_keys": sorted(dict(manifest["scope_digests"])),
     }
 
@@ -294,8 +380,12 @@ def filter_fresh_analysis_candidates(
     analysis_path: Path | str,
     analysis_run_id: str,
     criteria: Mapping[str, object] | Sequence[str] | None,
+    *,
+    pretest_ab_enabled: bool = False,
 ) -> FilterResult:
     """Evaluate the immutable fresh READY candidates with Phase 2 Pareto rules."""
+    if type(pretest_ab_enabled) is not bool:
+        raise ValueError("pretest_ab_enabled must be a boolean")
     analysis_file = Path(analysis_path).resolve()
     manifest, analysis_id, _ = _read_analysis(analysis_file)
     if str(analysis_run_id) != analysis_id:
@@ -324,11 +414,11 @@ def filter_fresh_analysis_candidates(
         ]
     finally:
         connection.close()
-    point_events = {
-        str(row["point_id"]): int(row["point_event_count"])
-        for row in points.to_dict("records")
-    }
+    point_rows = points.to_dict("records")
+    point_events = {str(row["point_id"]): int(row["point_event_count"]) for row in point_rows}
+    point_pretest = {str(row["point_id"]): dict(row["pretest_ab"]) for row in point_rows}
     candidates: list[_Candidate] = []
+    pretest_outcomes: dict[str, tuple[str, str, str | None]] = {}
     for structure in structures:
         candidate_id = str(structure.get("candidate_id", structure.get("structure_id", ""))).strip()
         orders = structure.get("orders")
@@ -337,25 +427,55 @@ def filter_fresh_analysis_candidates(
         if int(structure.get("order_count", 0)) != len(orders):
             raise ValueError("READY fresh candidate order count disagrees with orders")
         values: dict[str, list[Decimal | int]] = {name: [] for name in CRITERIA}
+        order_pretest: list[dict[str, object]] = []
         for order in orders:
             if not isinstance(order, Mapping):
                 raise ValueError("READY fresh candidate has malformed order")
             point_id = str(order.get("point_id", ""))
             if point_id not in point_events:
                 raise ValueError("READY fresh candidate references unknown point")
+            order_pretest.append(point_pretest[point_id])
             values["source_pnl"].append(_decimal(order.get("source_pnl_pct"), "source_pnl_pct"))
             values["efficiency"].append(_decimal(order.get("source_efficiency"), "source_efficiency"))
             values["close_support"].append(_decimal(order.get("close_support"), "close_support"))
             values["point_event_count"].append(point_events[point_id])
+        first_pretest = order_pretest[0]
+        outcome = _pretest_ab_outcome(first_pretest, pretest_ab_enabled)
+        pretest_outcomes[candidate_id] = outcome
+        payload = dict(structure)
+        payload.update(
+            pretest_ab=first_pretest,
+            pretest_ab_orders=order_pretest,
+            pretest_ab_enabled=pretest_ab_enabled,
+            pretest_ab_status=outcome[0],
+            pretest_ab_reason=outcome[1],
+            pretest_ab_decline_pct=outcome[2],
+        )
         candidates.append(_Candidate(
             candidate_id,
             str(structure.get("structure_id", "")),
             _comparison_key(structure, candidate_id, False),
             {name: tuple(value) for name, value in values.items()},
-            dict(structure),
+            payload,
         ))
+    survivors = [candidate for candidate in candidates if pretest_outcomes[candidate.candidate_id][0] != "REJECT"]
+    pretest_deferred = tuple(
+        {
+            **candidate.payload,
+            "candidate_id": candidate.candidate_id,
+            "comparison_key": candidate.comparison_key,
+            "deferred_by": None,
+            "deferred_by_candidate_id": None,
+            "criterion": "pretest_ab",
+            "defer_reason": pretest_outcomes[candidate.candidate_id][1],
+            "filter_status": "DEFERRED_PRETEST_AB",
+            "enabled_criteria": list(enabled),
+        }
+        for candidate in candidates
+        if pretest_outcomes[candidate.candidate_id][0] == "REJECT"
+    )
     grouped: dict[str, list[_Candidate]] = defaultdict(list)
-    for candidate in candidates:
+    for candidate in survivors:
         grouped[candidate.comparison_key].append(candidate)
     standalone = {
         name: tuple(
@@ -373,6 +493,19 @@ def filter_fresh_analysis_candidates(
         ),
         key=lambda row: (str(row["comparison_key"]), str(row["candidate_id"])),
     ))
+    candidate_payloads = {candidate.candidate_id: candidate.payload for candidate in candidates}
+    combined = tuple(
+        {
+            **candidate_payloads.get(str(row["candidate_id"]), {}),
+            **row,
+            "filter_status": "DEFERRED_REDUNDANT",
+        }
+        for row in combined
+    )
+    combined_all = tuple(sorted(
+        (*pretest_deferred, *combined),
+        key=lambda row: (str(row["comparison_key"]), str(row["candidate_id"])),
+    ))
     deferred_by = {str(row["candidate_id"]): row for row in combined}
     sizes = Counter(candidate.comparison_key for candidate in candidates)
     rows = tuple(
@@ -381,7 +514,11 @@ def filter_fresh_analysis_candidates(
             "candidate_id": candidate.candidate_id,
             "comparison_key": candidate.comparison_key,
             "comparison_group_size": sizes[candidate.comparison_key],
-            "filter_status": "DEFERRED_REDUNDANT" if candidate.candidate_id in deferred_by else "READY_AFTER_FILTERS",
+            "filter_status": (
+                "DEFERRED_PRETEST_AB"
+                if pretest_outcomes[candidate.candidate_id][0] == "REJECT"
+                else "DEFERRED_REDUNDANT" if candidate.candidate_id in deferred_by else "READY_AFTER_FILTERS"
+            ),
             "deferred_by": deferred_by.get(candidate.candidate_id, {}).get("deferred_by"),
             "deferred_by_candidate_id": deferred_by.get(candidate.candidate_id, {}).get("deferred_by_candidate_id"),
             "enabled_criteria": list(enabled),
@@ -389,21 +526,32 @@ def filter_fresh_analysis_candidates(
         for candidate in sorted(candidates, key=lambda item: (item.comparison_key, item.candidate_id))
     )
     return FilterResult(
-        analysis_id, str(manifest["surface_id"]), enabled, rows, standalone, combined,
-        len(candidates), len(candidates) - len(combined), len(combined), len(sizes),
-        sum(size for size in sizes.values() if size > 1),
+        analysis_id, str(manifest["surface_id"]), enabled, rows, standalone, combined_all,
+        len(candidates), len(candidates) - len(combined_all), len(combined_all), len(sizes),
+        sum(size for size in sizes.values() if size > 1), pretest_ab_enabled,
     )
 
 
 def list_fresh_analysis_shortlist(
-    analysis_path: Path | str, analysis_run_id: str, criteria: Mapping[str, object] | Sequence[str] | None = None,
+    analysis_path: Path | str,
+    analysis_run_id: str,
+    criteria: Mapping[str, object] | Sequence[str] | None = None,
+    *,
+    pretest_ab_enabled: bool = False,
 ) -> dict[str, object]:
     """Return safe grouped candidate summaries from one immutable fresh analysis."""
+    if type(pretest_ab_enabled) is not bool:
+        raise ValueError("pretest_ab_enabled must be a boolean")
     analysis_file = Path(analysis_path).resolve()
     manifest, analysis_id, _ = _read_analysis(analysis_file)
     if str(analysis_run_id) != analysis_id:
         raise ValueError("fresh analysis run identity mismatch")
-    filtered = filter_fresh_analysis_candidates(analysis_file, analysis_id, criteria) if criteria is not None else None
+    filtered = (
+        filter_fresh_analysis_candidates(
+            analysis_file, analysis_id, criteria, pretest_ab_enabled=pretest_ab_enabled,
+        )
+        if criteria is not None or pretest_ab_enabled else None
+    )
     connection = duckdb.connect(str(analysis_file), read_only=True)
     try:
         scope_keys = sorted(dict(manifest["scope_digests"]))
@@ -441,6 +589,13 @@ def list_fresh_analysis_shortlist(
         }
         if filtered is not None:
             item["filter_status"] = phase2["filter_status"] if phase2 else "DEFERRED"
+            if phase2:
+                item.update({
+                    "pretest_ab_enabled": phase2["pretest_ab_enabled"],
+                    "pretest_ab_status": phase2["pretest_ab_status"],
+                    "pretest_ab_reason": phase2["pretest_ab_reason"],
+                    "pretest_ab_decline_pct": phase2["pretest_ab_decline_pct"],
+                })
         items.append(item)
     items.sort(key=lambda item: str(item["candidate_id"]))
     return {
@@ -448,6 +603,7 @@ def list_fresh_analysis_shortlist(
         "items": items,
         "groups": _shortlist_groups(items, scope_facts),
         "active_criteria": list(filtered.criteria) if filtered else [],
+        "pretest_ab_enabled": pretest_ab_enabled,
     }
 
 
@@ -527,8 +683,11 @@ def generate_fresh_analysis_strategies(
     *,
     surface_path: Path | str | None = None,
     filters: Mapping[str, object] | Sequence[str] | None = None,
+    pretest_ab_enabled: bool = False,
 ) -> FreshAnalysisStrategies:
     """Generate EQUAL/INCOME JSON for exact READY candidates in one fresh run."""
+    if type(pretest_ab_enabled) is not bool:
+        raise ValueError("pretest_ab_enabled must be a boolean")
     analysis_file = Path(analysis_path).resolve()
     manifest, analysis_id, analysis_artifact_sha256 = _read_analysis(analysis_file)
     if str(analysis_run_id) != analysis_id:
@@ -573,7 +732,12 @@ def generate_fresh_analysis_strategies(
             candidate = dict(raw)
             candidate["orders"] = tuple(dict(item) for item in orders)
             ready_by_id[identity] = candidate
-    filter_result = filter_fresh_analysis_candidates(analysis_file, analysis_id, filters) if filters is not None else None
+    filter_result = (
+        filter_fresh_analysis_candidates(
+            analysis_file, analysis_id, filters, pretest_ab_enabled=pretest_ab_enabled,
+        )
+        if filters is not None or pretest_ab_enabled else None
+    )
     selected = tuple(sorted(
         str(row["candidate_id"])
         for row in filter_result.rows
@@ -611,6 +775,7 @@ def generate_fresh_analysis_strategies(
         "analysis_identity_sha256": analysis_id,
         "analysis_manifest_sha256": analysis_manifest_sha256,
         "analysis_artifact_sha256": analysis_artifact_sha256,
+        "analysis_input_digest": str(manifest["analysis_input_digest"]),
         "analysis_fingerprint": str(manifest["fingerprint"]),
         "algorithm_version": str(manifest["algorithm_version"]),
         "algorithm_config_sha256": str(manifest["algorithm_config_sha256"]),
@@ -618,6 +783,13 @@ def generate_fresh_analysis_strategies(
         "event_mode": EVENT_MODE,
         "selected_scopes": [list(scope) for scope in scopes],
         "phase2_filters": list(filter_result.criteria) if filter_result else [],
+        "pretest_ab_enabled": pretest_ab_enabled,
+        "pretest_ab": {
+            "enabled": pretest_ab_enabled,
+            "window_days": PRETEST_AB_WINDOW_DAYS,
+            "decline_threshold_pct": "95",
+            "contract_version": PRETEST_AB_CONTRACT,
+        },
         "generator_schema_version": GENERATOR_SCHEMA,
     }
     generated: list[dict[str, object]] = []

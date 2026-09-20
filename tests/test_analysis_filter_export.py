@@ -29,6 +29,7 @@ class EngineFilterResult:
     rows: tuple[dict[str, object], ...]
     combined: tuple[dict[str, object], ...]
     standalone: MappingProxyType
+    pretest_ab_enabled: bool = False
 
 
 def _order(pnl: float, dd: float, support: float, events: int) -> dict[str, object]:
@@ -223,3 +224,18 @@ def test_export_filter_audit_flattens_real_engine_order_vectors(tmp_path: Path) 
         assert summary["algorithm_version"] == "v1"
     finally:
         connection.close()
+
+
+def test_fresh_audit_summary_keeps_pretest_flag_when_rows_are_empty(tmp_path: Path) -> None:
+    from mrs3.analysis_filter_export import export_fresh_filter_audit
+
+    result = EngineFilterResult(
+        rows=(), combined=(), standalone=MappingProxyType({}), pretest_ab_enabled=True,
+    )
+    output = export_fresh_filter_audit(result, tmp_path / "empty.xlsx")
+    summary = {
+        row[0]: row[1]
+        for row in load_workbook(output, data_only=True)["Summary"].iter_rows(min_row=2, values_only=True)
+    }
+    assert summary["pretest_ab_enabled"] is True
+    assert summary["pretest_ab_deferred_count"] == 0

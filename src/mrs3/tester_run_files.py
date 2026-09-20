@@ -156,12 +156,20 @@ def publish_run_snapshots(
     *,
     analysis_run_id: str,
     tester_config_template: Path | str | None = None,
+    pretest_ab_provenance: Mapping[str, object] | None = None,
+    analysis_input_digest: str | None = None,
 ) -> dict[str, object]:
     """Replace the exact tester runs directory with all selected snapshots."""
     if not structures:
         raise ValueError("tester run generation requires at least one candidate")
     if not isinstance(analysis_run_id, str) or len(analysis_run_id) != 64:
         raise ValueError("analysis_run_id must be a SHA-256 hash")
+    if analysis_input_digest is not None and (
+        not isinstance(analysis_input_digest, str)
+        or len(analysis_input_digest) != 64
+        or any(char not in "0123456789abcdef" for char in analysis_input_digest.lower())
+    ):
+        raise ValueError("analysis_input_digest must be a SHA-256 hash")
     root = Path(bot_root).resolve()
     runs = _inside(root / "tester" / "runs", root, "tester runs directory")
     tester_config = _inside(Path(tester_config_path), root, "tester config")
@@ -219,6 +227,10 @@ def publish_run_snapshots(
         "test_end": end_date,
         "entries": entries,
     }
+    if pretest_ab_provenance is not None:
+        unsigned["pretest_ab"] = dict(pretest_ab_provenance)
+    if analysis_input_digest is not None:
+        unsigned["analysis_input_digest"] = analysis_input_digest
     manifest = {**unsigned, "generation_manifest_sha256": _digest(unsigned)}
     _write_json(_inside(root / "tester" / "runs_manifest.json", root, "tester runs manifest"), manifest)
     return {"run_count": len(names), "run_names": names}

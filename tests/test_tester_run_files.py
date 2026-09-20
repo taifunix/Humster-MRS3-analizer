@@ -21,7 +21,17 @@ def test_publish_run_snapshots_configures_empty_runs_directory(tmp_path: Path) -
     tester_config = bot_root / "tester" / "config_tester.json"; tester_config.write_text('{"use_runs": false}', encoding="utf-8")
     structure = {"candidate_id": "CANDIDATE", "structure_id": "STR", "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "order_count": 1, "common_close_ma": 7, "orders": ({"point_id": "P", "plateau_id": "PLAT", "open_ma": 5, "shift_bp": 100, "close_support": 1.0, "source_pnl_pct": 10},)}
 
-    result = publish_run_snapshots(template, bot_root, tester_config, [structure], "2026-08-01", "2026-08-18", 7, AlgorithmConfig.defaults(), analysis_run_id="a" * 64)
+    pretest = {
+        "enabled": True,
+        "window_days": 14,
+        "decline_threshold_pct": "95",
+        "contract_version": "source-v6-pretest-ab-v1",
+    }
+    result = publish_run_snapshots(
+        template, bot_root, tester_config, [structure], "2026-08-01", "2026-08-18", 7,
+        AlgorithmConfig.defaults(), analysis_run_id="a" * 64, pretest_ab_provenance=pretest,
+        analysis_input_digest="c" * 64,
+    )
 
     files = list(runs.glob("*.json")); assert result["run_count"] == len(files) == 1
     snapshot = json.loads(files[0].read_text(encoding="utf-8")); settings = snapshot["settings"][0]
@@ -39,6 +49,8 @@ def test_publish_run_snapshots_configures_empty_runs_directory(tmp_path: Path) -
     assert snapshot["tester_config"]["use_runs"] is True
     manifest = json.loads((bot_root / "tester" / "runs_manifest.json").read_text(encoding="utf-8"))
     assert manifest["analysis_run_id"] == "a" * 64 and manifest["entries"][0]["strategy_name"] == settings["name"]
+    assert manifest["pretest_ab"] == pretest
+    assert manifest["analysis_input_digest"] == "c" * 64
 
     manifest_path = bot_root / "tester" / "runs_manifest.json"
     manifest["generation_manifest_sha256"] = "0" * 64

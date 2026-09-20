@@ -11,7 +11,13 @@ from typing import Callable, Sequence
 
 from .source_v6 import SourceV6Fragment, _decimal_text
 from .source_v6_coverage import ReadyInterval, canonical_ready_intervals
-from .source_v6_stitch import measure_points
+from .source_v6_stitch import (
+    GENUINE_ZERO_ACTIVITY,
+    SourceV6EmptySeriesError,
+    calculate_metrics,
+    flat_result_metrics,
+    measure_points,
+)
 from .source_v6_storage import decode_fragment_slice, fragment_metadata, quarantine_details, source_content_digest
 
 
@@ -58,6 +64,49 @@ def _witness_window(witness: ReadyInterval) -> tuple[int, int]:
 def _scope(fragment: SourceV6Fragment) -> str:
     point = fragment.point
     return f"{point.symbol}|{point.side}|{point.timeframe}"
+
+
+_PRETEST_AB_VERSION = "source-v6-pretest-ab-v1"
+_PRETEST_AB_DAYS = 14
+_DAY_MS = 24 * 60 * 60 * 1000
+
+
+def _pretest_ab_evidence(
+    metrics: object, fragments: Sequence[SourceV6Fragment], window: tuple[int, int],
+) -> dict[str, object]:
+    start_ms, end_ms = window
+    a_days = max(0, (end_ms - start_ms) // _DAY_MS)
+    b_start_ms = end_ms - _PRETEST_AB_DAYS * _DAY_MS
+    a_round_trips = len(tuple(getattr(metrics, "round_trips", ())))
+    a_pnl = metrics.total_pnl
+    evidence: dict[str, object] = {
+        "contract_version": _PRETEST_AB_VERSION,
+        "status": "COMPARABLE" if end_ms - start_ms >= _PRETEST_AB_DAYS * _DAY_MS else "INSUFFICIENT_HISTORY",
+        "reason": "FULL_READY_WITNESS" if end_ms - start_ms >= _PRETEST_AB_DAYS * _DAY_MS else "A_SHORTER_THAN_14_DAYS",
+        "a_start_ms": start_ms,
+        "a_end_ms": end_ms,
+        "b_start_ms": b_start_ms,
+        "b_end_ms": end_ms,
+        "a_days": a_days,
+        "b_days": _PRETEST_AB_DAYS,
+        "a_pnl": _decimal_text(a_pnl),
+        "b_pnl": None,
+        "a_round_trips": a_round_trips,
+        "b_round_trips": 0,
+    }
+    if evidence["status"] == "COMPARABLE":
+        try:
+            tail = calculate_metrics(fragments, start_ms=b_start_ms, end_ms=end_ms)
+        except SourceV6EmptySeriesError as error:
+            if error.reason != GENUINE_ZERO_ACTIVITY:
+                raise
+            tail = flat_result_metrics()
+        b_round_trips = len(tuple(getattr(tail, "round_trips", ())))
+        evidence.update(
+            b_pnl=_decimal_text(tail.total_pnl),
+            b_round_trips=b_round_trips,
+        )
+    return evidence
 
 
 def analysis_input_row(
@@ -107,6 +156,7 @@ def analysis_input_row(
         "event_ids_hash": sha256("|".join(event_ids).encode("utf-8")).hexdigest(),
         "event_mode": "real_independent_events",
         "events_last_30d": events_last_30d,
+        "pretest_ab": _pretest_ab_evidence(metrics, fragments, window),
     }
 
 

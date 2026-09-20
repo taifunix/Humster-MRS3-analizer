@@ -25,7 +25,7 @@ from .source_v6_coverage import ReadyInterval
 from .source_v6_storage import SourceV6StorageError, _insert_frame, source_content_digest, validate_source_v6_database
 
 
-FINGERPRINT = "surface-v6-fresh-compact-v2"
+FINGERPRINT = "surface-v6-fresh-compact-v3"
 SOURCE_FINGERPRINT = "source-v6-fresh-compact-v2"
 # Bounds the bind list of the pass-through copy, as the merge does.
 _COPY_BATCH = 512
@@ -33,36 +33,40 @@ _ANALYSIS_ROW_FIELDS = frozenset({
     "point_id", "symbol", "side", "timeframe", "shift_bp", "open_ma", "close_ma",
     "pnl_pct", "dd_pct", "trades", "wins", "losses", "win_rate_pct", "profit_factor",
     "weighted_trades", "max_equity_drawdown", "max_equity_drawdown_source",
-    "event_ids", "event_ids_hash", "event_mode", "events_last_30d",
+    "event_ids", "event_ids_hash", "event_mode", "events_last_30d", "pretest_ab",
 })
 _ANALYSIS_ROW_DECIMALS = ("pnl_pct", "dd_pct", "win_rate_pct", "weighted_trades", "max_equity_drawdown")
+_PRETEST_AB_FIELDS = frozenset({
+    "contract_version", "status", "reason", "a_start_ms", "a_end_ms", "b_start_ms", "b_end_ms",
+    "a_days", "b_days", "a_pnl", "b_pnl", "a_round_trips", "b_round_trips",
+})
 
 
 def _validate_analysis_row(row: object) -> dict[str, object]:
-    """Validate the canonical v2 compact analysis-row contract."""
+    """Validate the canonical v3 compact analysis-row contract."""
     if not isinstance(row, dict):
-        raise ValueError("invalid v2 analysis row fields")
+        raise ValueError("invalid v3 analysis row fields")
     missing = _ANALYSIS_ROW_FIELDS.difference(row)
     if "events_last_30d" in missing:
         raise ValueError("analysis row is missing events_last_30d; re-materialize the Source v6 surface")
     if set(row) != _ANALYSIS_ROW_FIELDS:
-        raise ValueError("invalid v2 analysis row fields")
+        raise ValueError("invalid v3 analysis row fields")
     for field in ("point_id", "symbol", "side", "timeframe", "event_ids_hash", "event_mode", "max_equity_drawdown_source"):
         if type(row[field]) is not str or not row[field]:
-            raise ValueError(f"invalid v2 analysis row {field}")
+            raise ValueError(f"invalid v3 analysis row {field}")
     if row["side"] not in {"LONG", "SHORT"} or row["event_mode"] != "real_independent_events":
-        raise ValueError("invalid v2 analysis row contract")
+        raise ValueError("invalid v3 analysis row contract")
     if row["max_equity_drawdown_source"] not in {"SERIES", "DECLARED"}:
-        raise ValueError("invalid v2 analysis row drawdown source")
+        raise ValueError("invalid v3 analysis row drawdown source")
     for field in ("shift_bp", "open_ma", "close_ma", "trades", "wins", "losses"):
         if type(row[field]) is not int or row[field] < 0:
-            raise ValueError(f"invalid v2 analysis row {field}")
+            raise ValueError(f"invalid v3 analysis row {field}")
     if type(row["events_last_30d"]) is not int or not 0 <= row["events_last_30d"] <= row["trades"]:
-        raise ValueError("invalid v2 analysis row events_last_30d")
+        raise ValueError("invalid v3 analysis row events_last_30d")
     for field in _ANALYSIS_ROW_DECIMALS:
         value = row[field]
         if type(value) is not str:
-            raise ValueError(f"invalid v2 analysis row {field}")
+            raise ValueError(f"invalid v3 analysis row {field}")
         try:
             parsed = Decimal(value)
         except (InvalidOperation, ValueError):
@@ -76,19 +80,59 @@ def _validate_analysis_row(row: object) -> dict[str, object]:
             raise ValueError("invalid v2 analysis row profit_factor")
         try:
             if not Decimal(row["profit_factor"]).is_finite():
-                raise ValueError("invalid v2 analysis row profit_factor")
+                raise ValueError("invalid v3 analysis row profit_factor")
         except (InvalidOperation, ValueError):
-            raise ValueError("invalid v2 analysis row profit_factor") from None
+            raise ValueError("invalid v3 analysis row profit_factor") from None
     event_ids = row["event_ids"]
     if type(event_ids) is not list or any(type(item) is not str or not item for item in event_ids):
-        raise ValueError("invalid v2 analysis row event_ids")
+        raise ValueError("invalid v3 analysis row event_ids")
     if event_ids != sorted(set(event_ids)):
-        raise ValueError("invalid v2 analysis row event_ids order")
+        raise ValueError("invalid v3 analysis row event_ids order")
     if row["trades"] != len(event_ids) or row["wins"] + row["losses"] > row["trades"]:
-        raise ValueError("invalid v2 analysis row trade counts")
+        raise ValueError("invalid v3 analysis row trade counts")
     expected_hash = sha256("|".join(event_ids).encode("utf-8")).hexdigest()
     if row["event_ids_hash"] != expected_hash:
-        raise ValueError("invalid v2 analysis row event_ids_hash")
+        raise ValueError("invalid v3 analysis row event_ids_hash")
+    evidence = row["pretest_ab"]
+    if not isinstance(evidence, dict) or set(evidence) != _PRETEST_AB_FIELDS:
+        raise ValueError("invalid v3 analysis row pretest_ab")
+    if evidence.get("contract_version") != "source-v6-pretest-ab-v1":
+        raise ValueError("invalid v3 analysis row pretest_ab contract")
+    if evidence.get("status") not in {"COMPARABLE", "INSUFFICIENT_HISTORY"}:
+        raise ValueError("invalid v3 analysis row pretest_ab status")
+    expected_reason = {
+        "COMPARABLE": "FULL_READY_WITNESS",
+        "INSUFFICIENT_HISTORY": "A_SHORTER_THAN_14_DAYS",
+    }[evidence["status"]]
+    if evidence.get("reason") != expected_reason:
+        raise ValueError("invalid v3 analysis row pretest_ab reason")
+    for field in ("a_start_ms", "a_end_ms", "b_start_ms", "b_end_ms", "a_days", "b_days", "a_round_trips", "b_round_trips"):
+        if type(evidence[field]) is not int or evidence[field] < 0:
+            raise ValueError(f"invalid v3 analysis row pretest_ab {field}")
+    if evidence["a_end_ms"] < evidence["a_start_ms"] or evidence["b_end_ms"] != evidence["a_end_ms"]:
+        raise ValueError("invalid v3 analysis row pretest_ab bounds")
+    if evidence["b_start_ms"] != evidence["b_end_ms"] - 14 * 24 * 60 * 60 * 1000:
+        raise ValueError("invalid v3 analysis row pretest_ab bounds")
+    if evidence["b_days"] != 14 or evidence["a_days"] != (evidence["a_end_ms"] - evidence["a_start_ms"]) // (24 * 60 * 60 * 1000):
+        raise ValueError("invalid v3 analysis row pretest_ab day counts")
+    if evidence["status"] == "COMPARABLE" and evidence["a_days"] < 14:
+        raise ValueError("invalid v3 analysis row pretest_ab history status")
+    if evidence["status"] == "INSUFFICIENT_HISTORY" and evidence["a_days"] >= 14:
+        raise ValueError("invalid v3 analysis row pretest_ab history status")
+    for field in ("a_pnl", "b_pnl"):
+        value = evidence[field]
+        if value is None and field == "b_pnl":
+            continue
+        if type(value) is not str or value in {"", "+0", "-0"}:
+            raise ValueError(f"invalid v3 analysis row pretest_ab {field}")
+        try:
+            parsed = Decimal(value)
+        except (InvalidOperation, ValueError):
+            raise ValueError(f"invalid v3 analysis row pretest_ab {field}") from None
+        if not parsed.is_finite():
+            raise ValueError(f"invalid v3 analysis row pretest_ab {field}")
+    if evidence["status"] == "COMPARABLE" and evidence["b_pnl"] is None:
+        raise ValueError("invalid v3 analysis row pretest_ab comparable values")
     return row
 
 

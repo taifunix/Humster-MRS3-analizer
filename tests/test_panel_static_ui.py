@@ -781,6 +781,25 @@ def test_phase_two_checkbox_change_refreshes_the_shortlist() -> None:
     assert "node.addEventListener('change', refreshShortlist);" in js
 
 
+def test_pretest_ab_checkbox_is_native_optional_and_sent_outside_phase2_filters() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert '<input id="shortlist-filter-pretest-ab" type="checkbox">' in html
+    assert '<input id="shortlist-filter-pretest-ab" type="checkbox" checked>' not in html
+    controls = html.index('<div class="shortlist-filter-controls">')
+    pretest = html.index('id="shortlist-filter-pretest-ab"')
+    pareto = html.index('<details class="phase2-filters"><summary>Paretto filters</summary>')
+    controls_end = html.index('</div>', pareto)
+    assert controls < pretest < pareto < controls_end
+    assert 'shortlist-filter-pretest-ab' not in html[pareto:html.index('</details>', pareto)]
+    assert "const pretestAbEnabled = () =>" in js
+    assert "pretest_ab_enabled: pretestAbEnabled()" in js
+    assert "const filterControls = document.querySelector('.shortlist-filter-controls');" in js
+    assert "actions.after(filterControls);" in js
+    assert "document.querySelector('#shortlist-filter-pretest-ab')?.addEventListener('change', refreshShortlist);" in js
+
+
 def test_accordion_status_badges_align_to_the_right() -> None:
     assert ".accordion > summary > .state-badge { margin-left: auto; }" in _read("app.css")
 

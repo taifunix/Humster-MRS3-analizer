@@ -30,6 +30,7 @@ class FilterResult:
     deferred_count: int
     comparison_group_count: int
     comparable_count: int
+    pretest_ab_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)

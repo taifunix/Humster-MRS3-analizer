@@ -2802,6 +2802,7 @@ class PanelController:
         if analysis_id not in self._fresh_analysis_paths:
             raise ValueError("fresh analysis is not available in this panel session")
         phase2_filters = self._phase2_filters(payload)
+        pretest_ab_enabled = self._pretest_ab_enabled(payload)
         with self._lock:
             if self._fresh_generation_job and self._fresh_generation_job["running"]:
                 raise ValueError("READY JSON generation is already running")
@@ -2812,6 +2813,7 @@ class PanelController:
             "candidate_ids": list(candidates),
             "selected_scopes": [list(item) for item in scopes],
             "filters": phase2_filters,
+            "pretest_ab_enabled": pretest_ab_enabled,
         }
         requested = payload.get("output_dir")
         if isinstance(requested, str):
@@ -2833,7 +2835,7 @@ class PanelController:
 
     def strategies_fresh_generate_runs(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Publish the selected filtered candidates as tester run snapshots."""
-        if set(payload).difference({"analysis_run_id", "filters", "selected_scopes", "start_date", "end_date"}):
+        if set(payload).difference({"analysis_run_id", "filters", "pretest_ab_enabled", "selected_scopes", "start_date", "end_date"}):
             raise ValueError("tester run request contains unsupported fields")
         scopes = payload.get("selected_scopes")
         if not isinstance(scopes, list) or not all(
@@ -2848,8 +2850,13 @@ class PanelController:
         analysis_path = self._fresh_analysis_paths.get(analysis_id)
         if analysis_path is None:
             raise ValueError("fresh analysis is not available in this panel session")
+        analysis_identity = read_fresh_analysis_identity(analysis_path)
         selected = {(pair, side.upper(), timeframe) for pair, side, timeframe in scopes}
-        filtered = filter_fresh_analysis_candidates(analysis_path, analysis_id, self._phase2_filters(payload))
+        pretest_ab_enabled = self._pretest_ab_enabled(payload)
+        filtered = filter_fresh_analysis_candidates(
+            analysis_path, analysis_id, self._phase2_filters(payload),
+            pretest_ab_enabled=pretest_ab_enabled,
+        )
         structures = sorted(
             (row for row in filtered.rows if row.get("filter_status") == "READY_AFTER_FILTERS" and
              (str(row.get("symbol", "")), str(row.get("side", "")).upper(), str(row.get("timeframe", ""))) in selected),
@@ -2864,6 +2871,8 @@ class PanelController:
                 start_date, end_date, runner.max_parallel_submissions, self._analysis_config_loader(self.default_config),
                 analysis_run_id=analysis_id,
                 tester_config_template=mrs3_tester_config_template(self.root),
+                pretest_ab_provenance=self._pretest_ab_provenance(pretest_ab_enabled),
+                analysis_input_digest=str(analysis_identity["analysis_input_digest"]),
             )
         return {"phase": "COMMITTED", "analysis_run_id": analysis_id, **result}
 
@@ -2903,6 +2912,7 @@ class PanelController:
             config,
             surface_path=self._fresh_analysis_surfaces.get(analysis_id),
             filters=payload.get("filters"),
+            pretest_ab_enabled=self._pretest_ab_enabled(payload),
         )
         self._fresh_strategy_manifests[analysis_id] = result.manifest_path
         return {
@@ -3023,9 +3033,17 @@ class PanelController:
         if payload.get("audit") is True:
             from .fresh_analysis_strategies import filter_fresh_analysis_candidates
             output = self.root / "Output" / f"{analysis_id}.phase2-filter-audit.xlsx"
-            export_fresh_filter_audit(filter_fresh_analysis_candidates(path, analysis_id, self._phase2_filters(payload)), output)
+            pretest_ab_enabled = self._pretest_ab_enabled(payload)
+            filtered = filter_fresh_analysis_candidates(
+                path, analysis_id, self._phase2_filters(payload),
+                pretest_ab_enabled=pretest_ab_enabled,
+            )
+            export_fresh_filter_audit(filtered, output)
             return {"filename": output.name}
-        return list_fresh_analysis_shortlist(path, analysis_id, self._phase2_filters(payload))
+        return list_fresh_analysis_shortlist(
+            path, analysis_id, self._phase2_filters(payload),
+            pretest_ab_enabled=self._pretest_ab_enabled(payload),
+        )
 
     def strategies_fresh_filter_audit(self, payload: Mapping[str, object]) -> dict[str, object]:
         analysis_id = self._required(payload, "analysis_run_id")
@@ -3034,7 +3052,12 @@ class PanelController:
             raise ValueError("fresh analysis is not available in this panel session")
         from .fresh_analysis_strategies import filter_fresh_analysis_candidates
         output = self.root / "Output" / f"{analysis_id}.phase2-filter-audit.xlsx"
-        export_fresh_filter_audit(filter_fresh_analysis_candidates(path, analysis_id, self._phase2_filters(payload)), output)
+        pretest_ab_enabled = self._pretest_ab_enabled(payload)
+        filtered = filter_fresh_analysis_candidates(
+            path, analysis_id, self._phase2_filters(payload),
+            pretest_ab_enabled=pretest_ab_enabled,
+        )
+        export_fresh_filter_audit(filtered, output)
         return {"filename": output.name}
 
     @staticmethod
@@ -3044,6 +3067,22 @@ class PanelController:
         if not isinstance(filters, Mapping) or set(filters).difference(names) or any(type(filters.get(name, False)) is not bool for name in filters):
             raise ValueError("Phase 2 filters must be booleans")
         return {name: bool(filters.get(name, False)) for name in names}
+
+    @staticmethod
+    def _pretest_ab_enabled(payload: Mapping[str, object]) -> bool:
+        value = payload.get("pretest_ab_enabled", False)
+        if type(value) is not bool:
+            raise ValueError("pretest_ab_enabled must be a boolean")
+        return value
+
+    @staticmethod
+    def _pretest_ab_provenance(enabled: bool) -> dict[str, object]:
+        return {
+            "enabled": enabled,
+            "window_days": 14,
+            "decline_threshold_pct": "95",
+            "contract_version": "source-v6-pretest-ab-v1",
+        }
 
     def _strategy_batch(self) -> LocalStrategyBatchService:
         if self._strategy_batch_service is None:

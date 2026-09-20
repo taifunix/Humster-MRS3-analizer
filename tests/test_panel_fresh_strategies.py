@@ -50,7 +50,53 @@ def test_generation_validation_does_not_poison_the_next_request(tmp_path: Path) 
             "filters": {"source_pnl": "true"},
         })
 
+
+def test_pretest_ab_flag_is_a_strict_top_level_boolean(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    analysis_id = "a" * 64
+    controller._fresh_analysis_paths[analysis_id] = tmp_path / "run.analysis-v6.duckdb"
+
+    with pytest.raises(ValueError, match="pretest_ab_enabled must be a boolean"):
+        controller.strategies_fresh_shortlist({
+            "analysis_run_id": analysis_id,
+            "filters": {},
+            "pretest_ab_enabled": "true",
+        })
+
+    with pytest.raises(ValueError, match="pretest_ab_enabled must be a boolean"):
+        controller.strategies_fresh_generate({
+            "analysis_run_id": analysis_id,
+            "candidate_ids": ["candidate"],
+            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
+            "pretest_ab_enabled": 1,
+        })
+
     assert controller._fresh_generation_job is None
+
+
+def test_fresh_generation_worker_keeps_pretest_ab_flag_strict(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    analysis_id = "a" * 64
+    controller._fresh_analysis_paths[analysis_id] = tmp_path / "run.analysis-v6.duckdb"
+    monkeypatch.setattr(controller, "_workflow_default", lambda *_args, **_kwargs: tmp_path / "template.json")
+    monkeypatch.setattr(
+        "mrs3.panel.generate_fresh_analysis_strategies",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            manifest_path=tmp_path / "manifest.json", run_id="a" * 64, surface_id="surface", strategy_count=0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="pretest_ab_enabled must be a boolean"):
+        controller._generate_fresh_strategies({
+            "analysis_run_id": analysis_id,
+            "candidate_ids": ["candidate"],
+            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
+            "pretest_ab_enabled": 1,
+        })
 
 
 def test_generation_thread_start_failure_does_not_poison_the_next_request(tmp_path: Path, monkeypatch) -> None:
@@ -203,7 +249,8 @@ def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -
         "timeframe": "1h", "order_count": 1, "common_close_ma": 7, "filter_status": "READY_AFTER_FILTERS",
         "orders": ({"point_id": f"P{index}", "plateau_id": "PLAT", "open_ma": 5, "shift_bp": 100, "close_support": 1.0, "source_pnl_pct": 10},),
     } for index in range(6))
-    monkeypatch.setattr("mrs3.panel.filter_fresh_analysis_candidates", lambda *_args: SimpleNamespace(rows=rows))
+    monkeypatch.setattr("mrs3.panel.filter_fresh_analysis_candidates", lambda *_args, **_kwargs: SimpleNamespace(rows=rows))
+    monkeypatch.setattr("mrs3.panel.read_fresh_analysis_identity", lambda _path: {"analysis_input_digest": "c" * 64})
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
     controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
 

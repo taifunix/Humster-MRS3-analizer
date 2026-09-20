@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -47,6 +48,12 @@ _AUDIT_HEADERS = _BASE_HEADERS + tuple(
     for order in range(1, 5)
     for side in ("a", "b")
     for metric, _aliases in _METRICS
+) + (
+    "pretest_ab_enabled",
+    "pretest_ab_status",
+    "pretest_ab_reason",
+    "pretest_ab_decline_pct",
+    "pretest_ab_json",
 )
 _MISSING = object()
 
@@ -159,6 +166,9 @@ def _normal_row(row: object, criteria: Sequence[str]) -> dict[str, object]:
         "defer_reason",
         default=("SAME_STRUCTURE_DOMINATED" if result["deferred_by"] else None),
     )
+    evidence = result.get("pretest_ab")
+    if isinstance(evidence, Mapping):
+        result["pretest_ab_json"] = json.dumps(dict(evidence), sort_keys=True, separators=(",", ":"))
     return result
 
 
@@ -290,11 +300,20 @@ def export_fresh_filter_audit(result: object, output_path: Path | str) -> Path:
     """Export an already validated fresh Phase 2 result without reopening legacy DBs."""
     enabled = _criteria(_result_field(result, "criteria", ()))
     rows = _sorted_rows(_result_field(result, "rows", ()), enabled)
+    pretest_rows = [row for row in rows if str(row.get("filter_status", "")) == "DEFERRED_PRETEST_AB"]
+    pretest_enabled = bool(_result_field(result, "pretest_ab_enabled", False))
+    summary_metrics = (
+        "input_count", "active_criteria", "ready_count", "deferred_count",
+        "pretest_ab_enabled", "pretest_ab_deferred_count", "pretest_ab_window_days",
+        "pretest_ab_decline_threshold_pct", "pretest_ab_contract_version",
+    )
+    summary_values = (
+        _result_field(result, "input_count", len(rows)), _display_criteria(enabled),
+        _result_field(result, "ready_count", 0), _result_field(result, "deferred_count", 0),
+        pretest_enabled, len(pretest_rows), 14, "95", "source-v6-pretest-ab-v1",
+    )
     tables: dict[str, pd.DataFrame] = {
-        "Summary": pd.DataFrame({"metric": ("input_count", "active_criteria", "ready_count", "deferred_count"), "value": (
-            _result_field(result, "input_count", len(rows)), _display_criteria(enabled),
-            _result_field(result, "ready_count", 0), _result_field(result, "deferred_count", 0),
-        )}),
+        "Summary": pd.DataFrame({"metric": summary_metrics, "value": summary_values}),
         "READY_AFTER_FILTERS": _table(row for row in rows if _is_ready(row)),
     }
     for criterion in enabled:

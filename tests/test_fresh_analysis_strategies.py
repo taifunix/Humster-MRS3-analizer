@@ -54,6 +54,21 @@ def _point(point_id: str, shift: int, open_ma: int, event: str) -> dict[str, obj
         "_event_ids": [event],
         "event_ids_hash": sha256(event.encode()).hexdigest(),
         "point_event_count": 1,
+        "pretest_ab": {
+            "contract_version": "source-v6-pretest-ab-v1",
+            "status": "COMPARABLE",
+            "reason": "FULL_READY_WITNESS",
+            "a_start_ms": 0,
+            "a_end_ms": 30 * 24 * 60 * 60 * 1000,
+            "b_start_ms": 16 * 24 * 60 * 60 * 1000,
+            "b_end_ms": 30 * 24 * 60 * 60 * 1000,
+            "a_days": 30,
+            "b_days": 14,
+            "a_pnl": "100",
+            "b_pnl": "70",
+            "a_round_trips": 10,
+            "b_round_trips": 2,
+        },
     }
 
 
@@ -83,12 +98,13 @@ def _make_analysis(path: Path, *, event_mode: str = "real_independent_events", r
     config_hash = sha256(_canonical_json(_canonical(config)).encode()).hexdigest()
     surface_identity = {
         "surface_id": "SURFACE-1",
-        "surface_fingerprint": "surface-v6-fresh-compact-v2",
+        "surface_fingerprint": "surface-v6-fresh-compact-v3",
         "source_content_digest": "a" * 64,
         "scope_digests": {"BTCUSDT|LONG|1h": "d" * 64},
+        "analysis_input_digest": "c" * 64,
     }
     identity = {
-        "fingerprint": "analysis-v6-fresh-compact-v1",
+        "fingerprint": "analysis-v6-fresh-compact-v2",
         **surface_identity,
         "algorithm_version": "algo-v1",
         "algorithm_config_sha256": config_hash,
@@ -142,6 +158,7 @@ def test_fresh_adapter_generates_only_selected_ready_candidate_and_binds_hashes(
         template,
         tmp_path / "out",
         AlgorithmConfig.defaults(),
+        pretest_ab_enabled=True,
     )
 
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -151,7 +168,15 @@ def test_fresh_adapter_generates_only_selected_ready_candidate_and_binds_hashes(
     assert manifest["source_surface_id"] == surface["surface_id"]
     assert manifest["source_content_digest"] == surface["source_content_digest"]
     assert manifest["scope_digests"] == surface["scope_digests"]
+    assert manifest["analysis_input_digest"] == "c" * 64
     assert manifest["candidate_identities"] == ["STR-READY"]
+    assert manifest["pretest_ab_enabled"] is True
+    assert manifest["pretest_ab"] == {
+        "enabled": True,
+        "window_days": 14,
+        "decline_threshold_pct": "95",
+        "contract_version": "source-v6-pretest-ab-v1",
+    }
     assert len(manifest["analysis_artifact_sha256"]) == 64
     assert len(manifest["analysis_manifest_sha256"]) == 64
     strategy = json.loads(next(result.strategies_path.glob("*.json")).read_text(encoding="utf-8"))
@@ -430,6 +455,98 @@ def test_fresh_phase2_source_pnl_defers_only_a_dominated_candidate(tmp_path: Pat
     assert shortlist["groups"][0]["counts"] == {"1ORD": 0, "2ORD": 1, "3ORD": 0, "4ORD": 0}
     assert shortlist["groups"][0]["ready_after_filters"] == 1
     assert shortlist["groups"][0]["deferred"] == 1
+
+
+def _set_point_pretest(database: Path, point_id: str, **changes: object) -> None:
+    connection = duckdb.connect(str(database))
+    try:
+        rows = connection.execute("select rowid, payload_json from points").fetchall()
+        for rowid, raw in rows:
+            point = json.loads(raw)
+            if point.get("point_id") != point_id:
+                continue
+            evidence = dict(point["pretest_ab"])
+            evidence.update(changes)
+            point["pretest_ab"] = evidence
+            connection.execute(
+                "update points set payload_json=? where rowid=?",
+                [json.dumps(point, sort_keys=True, separators=(",", ":")), rowid],
+            )
+            return
+    finally:
+        connection.close()
+    raise AssertionError(f"unknown point: {point_id}")
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_status", "expected_reason"),
+    [
+        ({"a_pnl": "3000", "b_pnl": "70"}, "PASS", "DECLINE_WITHIN_THRESHOLD"),
+        ({"a_pnl": "3000", "b_pnl": "69.86"}, "REJECT", "DECLINE_GT_THRESHOLD"),
+        ({"a_pnl": "3000", "b_pnl": "-14"}, "REJECT", "DECLINE_GT_THRESHOLD"),
+        ({"a_pnl": "3000", "b_pnl": "-140", "b_round_trips": 0}, "PASS", "NO_B_TRADES"),
+        ({"a_pnl": "0", "b_pnl": "-140"}, "PASS", "NOT_COMPARABLE"),
+        ({"status": "INSUFFICIENT_HISTORY", "reason": "A_SHORTER_THAN_14_DAYS", "a_start_ms": 14 * 24 * 60 * 60 * 1000, "a_end_ms": 27 * 24 * 60 * 60 * 1000, "b_start_ms": 13 * 24 * 60 * 60 * 1000, "b_end_ms": 27 * 24 * 60 * 60 * 1000, "a_days": 13, "a_pnl": "0", "b_pnl": None, "b_round_trips": 0}, "PASS", "INSUFFICIENT_HISTORY"),
+    ],
+)
+def test_fresh_pretest_ab_gate_has_strict_and_diagnostic_outcomes(
+    tmp_path: Path, changes: dict[str, object], expected_status: str, expected_reason: str,
+) -> None:
+    from mrs3.fresh_analysis_strategies import filter_fresh_analysis_candidates
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    first_point = "BTCUSDT|LONG|1h|100|3|9"
+    _set_point_pretest(database, first_point, **changes)
+
+    result = filter_fresh_analysis_candidates(database, analysis_id, {}, pretest_ab_enabled=True)
+    row = result.rows[0]
+    assert row["pretest_ab_enabled"] is True
+    assert row["pretest_ab_status"] == expected_status
+    assert row["pretest_ab_reason"] == expected_reason
+    assert row["pretest_ab"]["contract_version"] == "source-v6-pretest-ab-v1"
+    assert (row["filter_status"] == "DEFERRED_PRETEST_AB") is (expected_status == "REJECT")
+
+
+def test_fresh_pretest_ab_off_is_identity_preserving_and_does_not_extend_criteria(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import filter_fresh_analysis_candidates
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    result = filter_fresh_analysis_candidates(database, analysis_id, {"source_pnl": True})
+
+    assert result.criteria == ("source_pnl",)
+    assert result.rows[0]["pretest_ab_enabled"] is False
+    assert result.rows[0]["pretest_ab_status"] == "DISABLED"
+    assert result.rows[0]["filter_status"] == "READY_AFTER_FILTERS"
+
+
+def test_fresh_pretest_ab_evaluates_only_first_order_and_removes_rejected_before_pareto(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import filter_fresh_analysis_candidates
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    _set_point_pretest(database, "BTCUSDT|LONG|1h|300|4|9", a_pnl="3000", b_pnl="-1400")
+    result = filter_fresh_analysis_candidates(database, analysis_id, {"source_pnl": True}, pretest_ab_enabled=True)
+    assert result.rows[0]["filter_status"] == "READY_AFTER_FILTERS"
+
+    connection = duckdb.connect(str(database))
+    try:
+        original = json.loads(connection.execute("select payload_json from structures").fetchone()[0])
+        stronger = {
+            **original,
+            "structure_id": "STR-BETTER",
+            "candidate_id": "STR-BETTER",
+            "orders": [{**order, "source_pnl_pct": 99} for order in reversed(original["orders"])],
+        }
+        connection.execute("insert into structures values (?, ?)", ["BTCUSDT|LONG|1h", json.dumps(stronger, sort_keys=True, separators=(",", ":"))])
+    finally:
+        connection.close()
+    result = filter_fresh_analysis_candidates(database, analysis_id, {"source_pnl": True}, pretest_ab_enabled=True)
+    rows = {row["candidate_id"]: row for row in result.rows}
+    assert rows["STR-READY"]["filter_status"] == "READY_AFTER_FILTERS"
+    assert rows["STR-BETTER"]["filter_status"] == "DEFERRED_PRETEST_AB"
+    assert rows["STR-READY"]["deferred_by_candidate_id"] is None
 
 
 def test_filtered_shortlist_counts_preexisting_non_ready_candidate_as_deferred(tmp_path: Path) -> None:

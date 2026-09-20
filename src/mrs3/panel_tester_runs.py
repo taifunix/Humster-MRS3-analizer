@@ -119,7 +119,25 @@ class LocalRunsBatchService:
             if strategy_hash != entry.get("strategy_sha256") or name in strategies:
                 raise ValueError("RUNS snapshot hash does not match manifest")
             strategies[name], hashes[f"{name}.json"] = strategy, strategy_hash
-        return strategies, {"analysis_run_id": analysis_id, "generation_manifest_sha256": generation_hash, "strategy_json_sha256": hashes}, start, end
+        provenance = {
+            "analysis_run_id": analysis_id,
+            "generation_manifest_sha256": generation_hash,
+            "strategy_json_sha256": hashes,
+        }
+        if "pretest_ab" in manifest:
+            if not isinstance(manifest["pretest_ab"], dict):
+                raise ValueError("RUNS manifest pretest_ab provenance is invalid")
+            provenance["pretest_ab"] = dict(manifest["pretest_ab"])
+        if "analysis_input_digest" in manifest:
+            digest = manifest["analysis_input_digest"]
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest.lower())
+            ):
+                raise ValueError("RUNS manifest analysis_input_digest is invalid")
+            provenance["analysis_input_digest"] = digest
+        return strategies, provenance, start, end
 
     @staticmethod
     def _signature(path: Path) -> tuple[int, int, str]:

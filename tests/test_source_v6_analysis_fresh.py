@@ -92,6 +92,12 @@ def test_fresh_fallback_adds_events_last_30d_before_frame_conversion(monkeypatch
     import mrs3.source_v6_analysis_fresh as fresh
 
     fragment = normalize_source_v6(FIXTURE.read_bytes())
+    from mrs3.source_v6_stitch import calculate_metrics
+    full = calculate_metrics((fragment,))
+    monkeypatch.setattr(
+        "mrs3.source_v6_materializer.calculate_metrics",
+        lambda _fragments, **_kwargs: full,
+    )
     scope = SimpleNamespace(
         ready_witness=ReadyInterval("ONUSDT|LONG|1h", date(2026, 1, 1), date(2026, 1, 31)),
         facts=(fragment,),
@@ -218,8 +224,8 @@ def test_fresh_analysis_is_separate_and_binds_the_supplied_gap_rules(tmp_path: P
     connection = duckdb.connect(str(second), read_only=True)
     try:
         manifest = dict(connection.execute("select key, value from manifest").fetchall())
-        assert manifest["fingerprint"] == "analysis-v6-fresh-compact-v1"
-        assert manifest["surface_fingerprint"] == "surface-v6-fresh-compact-v2"
+        assert manifest["fingerprint"] == "analysis-v6-fresh-compact-v2"
+        assert manifest["surface_fingerprint"] == "surface-v6-fresh-compact-v3"
         assert manifest["algorithm_config_sha256"] != dict(duckdb.connect(str(first), read_only=True).execute("select key, value from manifest").fetchall())["algorithm_config_sha256"]
         assert manifest["algorithm_config_sha256"] != dict(duckdb.connect(str(third), read_only=True).execute("select key, value from manifest").fetchall())["algorithm_config_sha256"]
         assert connection.execute("select count(*) from points").fetchone()[0] == len(facts)
@@ -250,6 +256,46 @@ def test_fresh_analysis_uses_one_read_only_worker_per_scope(tmp_path: Path) -> N
         assert connection.execute("select count(*) from scope_runs").fetchone()[0] == 2
     finally:
         connection.close()
+
+
+def test_analysis_identity_binds_surface_analysis_input_digest(tmp_path: Path, monkeypatch) -> None:
+    from mrs3.config import AlgorithmConfig
+    from mrs3.source_v6 import canonical_fragment_bytes, normalize_source_v6
+    from mrs3.source_v6_coverage import CANONICAL_READINESS_CLOSE_LENGTHS, CANONICAL_READINESS_SHIFTS_BP
+    from mrs3.source_v6_materializer import materialize_source_v6
+    from mrs3.source_v6_surface_fresh import publish_multiscope_surface
+    import mrs3.source_v6_analysis_fresh as fresh
+
+    base = normalize_source_v6(FIXTURE.read_bytes())
+    facts = tuple(
+        replace(item, fragment_id=sha256(canonical_fragment_bytes(item)).hexdigest())
+        for item in (
+            replace(base, point=replace(base.point, shift_bp=shift, close_ma_length=close))
+            for shift in CANONICAL_READINESS_SHIFTS_BP
+            for close in CANONICAL_READINESS_CLOSE_LENGTHS
+        )
+    )
+    surface = publish_multiscope_surface(tmp_path / "surfaces", materialize_source_v6(facts, ("ONUSDT|LONG|1h",)))
+    first = fresh.run_multiscope_analysis(
+        surface, tmp_path / "analysis", AlgorithmConfig.defaults(), listing_dates={"ONUSDT": "2020-01-01"},
+    )
+    read_surface = fresh.read_multiscope_surface
+
+    def changed_digest(path, *, decode=False):
+        identity = dict(read_surface(path, decode=decode))
+        identity["analysis_input_digest"] = "e" * 64
+        return identity
+
+    monkeypatch.setattr(fresh, "read_multiscope_surface", changed_digest)
+    second = fresh.run_multiscope_analysis(
+        surface, tmp_path / "analysis", AlgorithmConfig.defaults(), listing_dates={"ONUSDT": "2020-01-01"},
+    )
+
+    assert second != first
+    import duckdb
+    with duckdb.connect(str(second), read_only=True) as connection:
+        manifest = dict(connection.execute("select key, value from manifest").fetchall())
+    assert manifest["analysis_input_digest"] == "e" * 64
 
 
 def test_fresh_analysis_cancellation_prevents_publication(tmp_path: Path) -> None:

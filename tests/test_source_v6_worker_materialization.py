@@ -149,7 +149,7 @@ def test_no_hydrated_fragment_crosses_the_worker_boundary(tmp_path: Path) -> Non
         "pnl_pct", "dd_pct", "trades", "wins", "losses", "win_rate_pct",
         "profit_factor", "event_ids", "event_ids_hash", "event_mode",
         "weighted_trades", "max_equity_drawdown", "max_equity_drawdown_source",
-        "events_last_30d",
+        "events_last_30d", "pretest_ab",
     }
     flattened = json.dumps(verdict, default=str)
     assert "SourceV6Fragment" not in flattened

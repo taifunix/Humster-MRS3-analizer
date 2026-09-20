@@ -297,7 +297,7 @@
           <p id="settings-status" class="global-status" aria-live="polite">Settings are local and validated before saving.</p>
         </form>
       </section>
-      <details class="phase2-filters"><summary>Phase 2 structural filters</summary><label class="check"><input id="shortlist-filter-source-pnl" type="checkbox">Source PnL per order</label><label class="check"><input id="shortlist-filter-efficiency" type="checkbox">PnL/DD per order</label><label class="check"><input id="shortlist-filter-close-support" type="checkbox">CloseSupport per order</label><label class="check"><input id="shortlist-filter-point-event-count" type="checkbox">PointEventCount per order</label></details>
+      <div class="shortlist-filter-controls"><label class="check"><input id="shortlist-filter-pretest-ab" type="checkbox">Source PRETEST A/B gate (optional, 14-day tail)</label><details class="phase2-filters"><summary>Paretto filters</summary><label class="check"><input id="shortlist-filter-source-pnl" type="checkbox">Source PnL per order</label><label class="check"><input id="shortlist-filter-efficiency" type="checkbox">PnL/DD per order</label><label class="check"><input id="shortlist-filter-close-support" type="checkbox">CloseSupport per order</label><label class="check"><input id="shortlist-filter-point-event-count" type="checkbox">PointEventCount per order</label></details></div>
     </main>
   </div>
   <script src="/panel-web/retest_recovery.js"></script>

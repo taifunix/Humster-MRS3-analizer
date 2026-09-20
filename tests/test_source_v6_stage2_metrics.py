@@ -258,18 +258,115 @@ def test_stage2_analysis_row_uses_canonical_decimal_audit_fields() -> None:
     assert row["events_last_30d"] == 3
 
 
+def test_stage2_analysis_row_persists_pretest_ab_evidence_from_full_and_tail_metrics(monkeypatch) -> None:
+    from mrs3.source_v6_materializer import analysis_input_row
+    from mrs3.source_v6_stitch import calculate_metrics
+
+    fragment = _fragment()
+    full = calculate_metrics((fragment,))
+    calls = []
+
+    def calculate_tail(fragments, *, start_ms=None, end_ms=None):
+        calls.append((start_ms, end_ms))
+        return replace(full, total_pnl=Decimal("-1"), total_trades=2, round_trips=full.round_trips[:2], round_trip_ids=full.round_trip_ids[:2])
+
+    monkeypatch.setattr("mrs3.source_v6_materializer.calculate_metrics", calculate_tail)
+    day = 24 * 60 * 60 * 1000
+    row = analysis_input_row(
+        fragment.point.canonical_key, fragment.point, full, (fragment,), (0, 30 * day)
+    )
+
+    assert calls == [(16 * day, 30 * day)]
+    assert row["pretest_ab"] == {
+        "contract_version": "source-v6-pretest-ab-v1",
+        "status": "COMPARABLE",
+        "reason": "FULL_READY_WITNESS",
+        "a_start_ms": 0,
+        "a_end_ms": 30 * day,
+        "b_start_ms": 16 * day,
+        "b_end_ms": 30 * day,
+        "a_days": 30,
+        "b_days": 14,
+        "a_pnl": "3",
+        "b_pnl": "-1",
+        "a_round_trips": 3,
+        "b_round_trips": 2,
+    }
+
+
+def test_stage2_empty_required_b_series_is_not_mislabeled_as_no_b_trades(monkeypatch) -> None:
+    from mrs3.source_v6_materializer import analysis_input_row
+    from mrs3.source_v6_stitch import SourceV6EmptySeriesError, calculate_metrics
+
+    fragment = _fragment()
+    full = calculate_metrics((fragment,))
+
+    def calculate_tail(*_args, **_kwargs):
+        raise SourceV6EmptySeriesError("required B series is empty")
+
+    monkeypatch.setattr("mrs3.source_v6_materializer.calculate_metrics", calculate_tail)
+    day = 24 * 60 * 60 * 1000
+    with pytest.raises(SourceV6EmptySeriesError, match="required B series"):
+        analysis_input_row(
+            fragment.point.canonical_key, fragment.point, full, (fragment,), (0, 30 * day)
+        )
+
+
+def test_stage2_comparable_idle_point_uses_flat_b_metrics_and_passes_pretest() -> None:
+    from mrs3.fresh_analysis_strategies import _pretest_ab_outcome
+    from mrs3.source_v6_materializer import analysis_input_row
+    from mrs3.source_v6_stitch import measure_points
+
+    idle = replace(
+        _fragment(), actions=(), cycles=(), events=(), wallet_samples=(), equity_samples=(),
+        open_tail_cycle_ids=(),
+    )
+    metrics, empty = measure_points((idle,))
+    assert empty[0]["reason"] == "NO_WALLET_OR_EQUITY_SAMPLES"
+
+    row = analysis_input_row(
+        idle.point.canonical_key, idle.point, metrics[idle.point.canonical_key], (idle,),
+        (0, 30 * 24 * 60 * 60 * 1000),
+    )
+    assert row["pretest_ab"]["b_round_trips"] == 0
+    assert row["pretest_ab"]["b_pnl"] == "0"
+    assert _pretest_ab_outcome(row["pretest_ab"], True) == ("PASS", "NO_B_TRADES", None)
+
+
+def test_stage2_analysis_row_marks_short_ready_witness_insufficient_history() -> None:
+    from mrs3.source_v6_materializer import analysis_input_row
+    from mrs3.source_v6_stitch import calculate_metrics
+
+    fragment = _fragment()
+    row = analysis_input_row(
+        fragment.point.canonical_key, fragment.point, calculate_metrics((fragment,)), (fragment,), (0, 100)
+    )
+
+    evidence = row["pretest_ab"]
+    assert evidence["status"] == "INSUFFICIENT_HISTORY"
+    assert evidence["reason"] == "A_SHORTER_THAN_14_DAYS"
+    assert evidence["a_days"] == 0
+    assert evidence["b_days"] == 14
+    assert evidence["b_pnl"] is None
+    assert evidence["b_round_trips"] == 0
+
+
 @pytest.mark.parametrize(
     ("timestamp_ms", "expected"),
     ((10 * 24 * 60 * 60 * 1000 - 1, 0), (10 * 24 * 60 * 60 * 1000, 1), (10 * 24 * 60 * 60 * 1000 + 1, 1)),
 )
 def test_stage2_events_last_30d_uses_explicit_half_open_cutoff(
-    timestamp_ms: int, expected: int,
+    timestamp_ms: int, expected: int, monkeypatch,
 ) -> None:
     from mrs3.source_v6_materializer import analysis_input_row
     from mrs3.source_v6_stitch import calculate_metrics
 
     fragment = _fragment()
     metrics = calculate_metrics((fragment,))
+    monkeypatch.setattr(
+        "mrs3.source_v6_materializer.calculate_metrics",
+        lambda _fragments, **_kwargs: metrics,
+    )
     trip = replace(metrics.round_trips[0], round_trip_id="boundary", timestamp_ms=timestamp_ms)
     metrics = replace(metrics, round_trip_ids=("boundary",), round_trips=(trip,))
 

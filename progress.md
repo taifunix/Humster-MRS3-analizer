@@ -2844,3 +2844,30 @@ in the target directory and still publish atomically. The regression test and
 related Source v6 checks pass (`140 passed`). A real import of 21,888 reports
 completed with `COMMITTED`, `quarantined=0`; the resulting target contains the
 expected Source v6 tables and no leftover segment scratch directory.
+
+## Optional Source PRETEST A/B filter (2026-09-20)
+
+Implementation is complete behind a separate unchecked `pretest_ab_enabled`
+flag. Materialization persists strict versioned A/B evidence from canonical
+metrics, and fresh shortlist/audit/READY generation plus tester-run manifests
+carry the diagnostic and provenance fields. The gate evaluates only the first
+order, uses the exact 14-day tail, and never labels source metrics as final
+MRS3 results. Genuinely idle points remain valid and pass as `NO_B_TRADES`;
+window, seam and corruption failures still fail closed.
+
+Independent Luna review returned `CODE_REVIEW_PASS` after two finding rounds.
+Final affected verification passed (`55 passed`); after the A/B control was
+placed in the same movable UI container above `Paretto filters`, the broader
+focused contour passed (`206 passed`), `node --check src/mrs3/panel_web/app.js` and
+`git diff --check` passed. A complete suite before the final idle-point guard
+reached `4710 passed, 7 skipped` with one unrelated failure in
+`tests/test_panel_testing.py::test_local_screener_status_matches_local_testing_status`
+because consecutive live `disk_free_bytes` reads differed. The final full
+rerun reproduced only that same failure before its detached output session was
+lost after 82%; the changed contour and the exact guard regression remained
+green. No tester, network, production database or live execution was used.
+
+Round-2 idle-path review fix also passed the affected materializer suite
+(`35 passed`): comparable genuine-zero B activity uses canonical flat metrics,
+reports `NO_B_TRADES`, and passes the optional gate; non-genuine empty-series
+reasons still raise. The full-suite post-fix count remains owned by root.

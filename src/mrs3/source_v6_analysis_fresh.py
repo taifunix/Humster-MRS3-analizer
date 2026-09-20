@@ -29,7 +29,7 @@ from .source_v6_surface_fresh import (
 )
 
 
-FINGERPRINT = "analysis-v6-fresh-compact-v1"
+FINGERPRINT = "analysis-v6-fresh-compact-v2"
 _TABLES = ("points", "refine_requests", "plateaus", "close_profiles", "base_one_order", "structures", "structure_diagnostics")
 _ADMISSION_ONLY_FIELDS = frozenset({"events_last_30d", "plateau_event_count"})
 
@@ -62,6 +62,7 @@ def _analysis_frame_row(row: Mapping[str, object], window: tuple, listing_dates:
         "profit_factor": None if profit_factor is None else float(profit_factor),
         "point_event_count": len(event_ids), "_event_ids": event_ids,
         "events_last_30d": int(row["events_last_30d"]),
+        "pretest_ab": dict(row["pretest_ab"]),
         "event_ids_hash": str(row["event_ids_hash"]), "event_mode": str(row["event_mode"]),
         "report_start": pd.Timestamp(start), "report_end": pd.Timestamp(end),
         "listing_date": pd.to_datetime(listing_dates[symbol], utc=True),
@@ -191,10 +192,15 @@ def run_multiscope_analysis(
     """Analyze each fresh scope independently and write one immutable artifact."""
     surface = read_multiscope_surface(surface_path, decode=False)
     scope_digests = surface["scope_digests"]
+    analysis_input_digest = str(surface.get("analysis_input_digest") or "")
+    if len(analysis_input_digest) != 64 or any(
+        char not in "0123456789abcdef" for char in analysis_input_digest.lower()
+    ):
+        raise ValueError("fresh surface has no valid analysis_input_digest")
     config_json = _canonical_json(_canonical(config))
     config_hash = sha256(config_json.encode("utf-8")).hexdigest()
     listing_json = _canonical_json(dict(sorted((str(key), str(value)) for key, value in listing_dates.items())))
-    identity = {"fingerprint": FINGERPRINT, "surface_fingerprint": SURFACE_FINGERPRINT, "surface_id": surface["surface_id"], "source_content_digest": surface["source_content_digest"], "scope_digests": scope_digests, "algorithm_version": algorithm_version, "algorithm_config_sha256": config_hash, "listing_dates_sha256": sha256(listing_json.encode("utf-8")).hexdigest(), "event_mode": "real_independent_events"}
+    identity = {"fingerprint": FINGERPRINT, "surface_fingerprint": SURFACE_FINGERPRINT, "surface_id": surface["surface_id"], "source_content_digest": surface["source_content_digest"], "scope_digests": scope_digests, "analysis_input_digest": analysis_input_digest, "algorithm_version": algorithm_version, "algorithm_config_sha256": config_hash, "listing_dates_sha256": sha256(listing_json.encode("utf-8")).hexdigest(), "event_mode": "real_independent_events"}
     analysis_id = sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
     with OutputDirectoryLock(Path(directory)):
         if callable(cancel_check) and cancel_check():
