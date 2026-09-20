@@ -13,6 +13,7 @@ from .source_v6 import SourceV6Fragment, _decimal_text
 from .source_v6_coverage import ReadyInterval, canonical_ready_intervals
 from .source_v6_stitch import (
     GENUINE_ZERO_ACTIVITY,
+    WINDOW_EXCLUDES_MEASURABLE_DATA,
     SourceV6EmptySeriesError,
     calculate_metrics,
     flat_result_metrics,
@@ -98,7 +99,10 @@ def _pretest_ab_evidence(
         try:
             tail = calculate_metrics(fragments, start_ms=b_start_ms, end_ms=end_ms)
         except SourceV6EmptySeriesError as error:
-            if error.reason != GENUINE_ZERO_ACTIVITY:
+            # Samples are recorded at events, so a point that traded before B
+            # or never at all has none inside B: a quiet fortnight, not a
+            # failure. Any other cause (open tail, unresolved seam) still raises.
+            if error.reason not in (GENUINE_ZERO_ACTIVITY, WINDOW_EXCLUDES_MEASURABLE_DATA):
                 raise
             tail = flat_result_metrics()
         b_round_trips = len(tuple(getattr(tail, "round_trips", ())))

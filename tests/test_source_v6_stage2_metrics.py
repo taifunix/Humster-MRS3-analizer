@@ -312,6 +312,47 @@ def test_stage2_empty_required_b_series_is_not_mislabeled_as_no_b_trades(monkeyp
         )
 
 
+def test_stage2_point_silent_in_b_records_flat_tail_and_passes_pretest() -> None:
+    """A point that traded before B, or never, has no samples in B and must not abort."""
+    from mrs3.fresh_analysis_strategies import _pretest_ab_outcome
+    from mrs3.source_v6_materializer import analysis_input_row
+    from mrs3.source_v6_stitch import calculate_metrics
+
+    day = 24 * 60 * 60 * 1000
+    fragment = _fragment()  # every action and sample lies in the first milliseconds
+    metrics = calculate_metrics((fragment,), start_ms=0, end_ms=30 * day)
+
+    row = analysis_input_row(
+        fragment.point.canonical_key, fragment.point, metrics, (fragment,), (0, 30 * day)
+    )
+
+    evidence = row["pretest_ab"]
+    assert evidence["status"] == "COMPARABLE"
+    assert evidence["b_start_ms"] == 16 * day
+    assert evidence["b_pnl"] == "0"
+    assert evidence["b_round_trips"] == 0
+    assert _pretest_ab_outcome(evidence, True) == ("PASS", "NO_B_TRADES", None)
+
+
+def test_stage2_never_traded_point_with_only_a_start_sample_records_flat_tail() -> None:
+    from mrs3.source_v6_materializer import analysis_input_row
+    from mrs3.source_v6_stitch import calculate_metrics
+
+    day = 24 * 60 * 60 * 1000
+    idle = replace(
+        _fragment(), actions=(), cycles=(), events=(), open_tail_cycle_ids=(),
+        wallet_samples=_fragment().wallet_samples[:1], equity_samples=_fragment().equity_samples[:1],
+    )
+    metrics = calculate_metrics((idle,), start_ms=0, end_ms=30 * day)
+
+    row = analysis_input_row(
+        idle.point.canonical_key, idle.point, metrics, (idle,), (0, 30 * day)
+    )
+
+    assert row["pretest_ab"]["b_pnl"] == "0"
+    assert row["pretest_ab"]["b_round_trips"] == 0
+
+
 def test_stage2_comparable_idle_point_uses_flat_b_metrics_and_passes_pretest() -> None:
     from mrs3.fresh_analysis_strategies import _pretest_ab_outcome
     from mrs3.source_v6_materializer import analysis_input_row

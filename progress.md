@@ -1,7 +1,43 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-20
+**Updated:** 2026-09-21
 **Current branch:** `main`
+
+## Surface build: PRETEST A/B tail aborted on quiet points (2026-09-21)
+
+Building a surface from the freshly imported 27,360-report Source DB failed
+with `SourceV6EmptySeriesError: the selected window hides every wallet/equity
+sample`. The message carried no point name, which located it: `measure_points`
+appends ` for <point>` to every emptiness error it re-raises, so this one came
+from a bare `calculate_metrics` call. That is `_pretest_ab_evidence`, added
+2026-09-20 by the PRETEST A/B filter (`645ad94`), which measures the last 14
+days of the READY witness separately.
+
+Samples are recorded at events, so a point that traded only before that
+fortnight, or never at all, has none inside it, and the tail measurement raised
+`WINDOW_EXCLUDES_MEASURABLE_DATA`. Measured on the real database that is 181 of
+684 points in one 5m scope and 21 in one 4h scope; every one had zero actions
+in the tail. The tail is now recorded as flat (`b_pnl = 0`, `b_round_trips = 0`),
+which the gate already passes as `NO_B_TRADES`. Other emptiness causes (an open
+tail hiding the data, an unresolved seam) still raise. The spec states the rule.
+
+Verified by running `materialize_source_v6_from_database` (the path the panel
+uses) over all 40 READY scopes of the real database with 14 workers: it
+completed in 3,086 s with 27,360 points, all `COMPARABLE`, of which 5,056 have
+no trades in B. The earlier draft carried a guard that re-raised when an action
+lay inside B; review pointed out it could falsely abort a quiet point on a
+seam, and no real point ever triggered it, so it was removed. A running panel
+holds the old code and must be restarted.
+
+Side finding, not acted on: 2,249 of the 27,360 runs (8.2%) end with a negative
+`FinalBalance` and 2,266 with at most 5% of the initial 1000. Position size is
+fixed, not proportional to the balance; after the balance first falls to 5%,
+61% of those points stop trading at once and 26% keep trading. The three
+reports with an "open tail" (`my_test_run_1445_of_27360_CRCLUSDT_5m_…`,
+`…_2045_of_27360_CRCLUSDT_5m_…`, `…_7164_of_27360_SNDKUSDT_5m_…`) are burned
+accounts, not real open positions: the balance goes negative on the last close
+and reads +10 in the same minute after the next open. That last observation is
+unexplained and should be put to whoever knows the tester.
 
 ## Source DB local import: out-of-memory at the tail (2026-09-20)
 

@@ -35,6 +35,7 @@ Materialization records versioned PRETEST evidence in each compact point-analysi
 - PnL is `CanonicalMetrics.total_pnl`, the existing canonical wallet-balance PnL. There is no separate commission adjustment.
 - Activity is the canonical round-trip count.
 - If A is shorter than 14 complete calendar days, evidence is `INSUFFICIENT_HISTORY` and the row is not rejected.
+- A point with no wallet/equity sample inside B is a quiet fortnight, not a failure: samples are recorded at events, so a point that traded only before B, or never at all, has none there. B is recorded as flat (`b_pnl = 0`, `b_round_trips = 0`), which the gate passes as `NO_B_TRADES`. Other emptiness causes (an open tail hiding the data, an unresolved seam) still raise. Measured on a real 119-day window, 202 of 1,368 points in two scopes had no sample in B, and none had an action there.
 
 The nested evidence object contains an exact contract version, evidence status/reason, exact millisecond bounds, calendar-day counts, A/B canonical net wallet PnL, and A/B round-trip counts. Numeric decimal values are persisted as canonical decimal text.
 
