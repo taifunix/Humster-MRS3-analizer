@@ -2937,9 +2937,8 @@ The live 171-strategy batch was recovered from the tester-side copies after all
 171 digests matched the generation manifest. The unreadable originals remain in
 `Output/strategies.unreadable-20260920-2248`; the active manifest validates all
 171 restored files. New SINGLE_MODE job `71c7ee7b7f0446519da9eb101112f0cf`
-reached `BOT_RUN`, tester status `running`, and produced its first five HTML
-reports; a later check confirmed `49/171` with zero failures. Related
-verification passes (`153 passed`) and
+completed and committed `171/171` verified reports with zero failures and a
+ready inbox. Related verification passes (`153 passed`) and
 `git diff --check` is clean. The external reviewer bridge was unavailable due
 to its existing authentication failure; the operator had already authorized
 self-review while that reviewer remains unavailable.
