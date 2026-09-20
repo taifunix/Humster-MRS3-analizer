@@ -9,7 +9,7 @@ Active spec: [docs/specs/2026-09-18-pair-screener.md](docs/specs/2026-09-18-pair
 (DRAFT). Handoff:
 [docs/superpowers/plans/2026-09-18-pair-screener-handoff.md](docs/superpowers/plans/2026-09-18-pair-screener-handoff.md).
 
-On the first practical screening run (`D:\!Humster\tester\report\my_test`,
+On the first practical screening run (`tester/report/my_test`,
 16 pairs, confirmed full 304-run/pair grid — not the ~2% the handoff
 expected, 4864 `reports_history.csv` rows, no gaps/dupes): section 6.1a is
 resolved as **CSV-only** — the CSV already carries explicit per-run
@@ -31,11 +31,10 @@ pairs; if the first real full collections on GO/STOP pairs don't match the
 expected pattern (STOP pairs not reaching ≥100 good points; GO pairs
 reaching it), thresholds must be revisited immediately — see spec section 9/10.
 
-Note: the bot/tester root moved since the 2026-09-18 handoff was written —
-it names `D:\SHARE\!MN\hamster\hb`, but the actual root used for this run
-(and confirmed by the user) is `D:\!Humster`. The handoff has been annotated
-with this; the implementation plan below was authored fresh and uses only
-the current `D:\!Humster` path throughout.
+Note: the bot/tester root moved since the 2026-09-18 handoff was written.
+The authoritative root is the `tester_runner.bot_root` key of the local
+config; paths in the handoff and in the implementation plan below are given
+relative to it (the report folder is `tester/report/my_test`).
 
 Implementation plan (approved, committed at
 [docs/superpowers/plans/2026-09-18-pair-screener-implementation.md](docs/superpowers/plans/2026-09-18-pair-screener-implementation.md),
@@ -159,7 +158,7 @@ wiring, `GET .../registry-pairs` returns a clear 400 without a configured
 registry, `POST .../fill` renders for real (`expected_runs=608` for 2 LONG
 pairs), `POST .../evaluate` returns the expected GO verdict shape, and
 `GET .../export` returns a correct downloadable CSV. The real tester (the
-Start button against the real `D:\!Humster`) was not launched — that needs
+Start button against the real bot root) was not launched — that needs
 a separate explicit request. One review finding was investigated and found
 to be a false positive: `evaluate_pairs`'s `_detect_side` runs once on the
 whole merged report set and hard-fails the call if both LONG and SHORT
@@ -171,7 +170,7 @@ unreachable.
 wrap-up.** The plan's last manual-verification item — re-run evaluate on the
 same 16 pairs after Этап 5 and confirm the verdicts still match the
 2026-09-18 table — hit a real complication: the real report folder
-`D:\!Humster\tester\report\my_test` now mixed the original 4864-run
+`tester/report/my_test` now mixed the original 4864-run
 screening batch with a second, ~27360-run batch the user had started
 separately since then (confirmed still actively writing files seconds
 before this check), so a read-only `evaluate_pairs` call against it
