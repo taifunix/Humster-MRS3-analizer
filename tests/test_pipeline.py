@@ -4,6 +4,7 @@ from dataclasses import replace
 from decimal import Decimal
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -12,7 +13,7 @@ from openpyxl import load_workbook
 
 from mrs3.config import AlgorithmConfig
 from mrs3.models import Side
-from mrs3.pipeline import ALGORITHM_VERSION, PipelineInput, SelectionInputs, _apply_package_event_unions, _pair_history, _publish_strategies, _write_json_atomic, run_published_pipeline, run_selection
+from mrs3.pipeline import ALGORITHM_VERSION, PipelineInput, SelectionInputs, _apply_package_event_unions, _pair_history, _publication_staging_dir, _publish_strategies, _write_json_atomic, run_published_pipeline, run_selection
 from tests.factories import write_selection_inputs
 from tests.test_package_loader import write_real_package
 
@@ -48,6 +49,29 @@ def test_strategy_json_writer_preserves_template_key_order(tmp_path: Path) -> No
     assert list(written["basic"]) == list(strategy["basic"])
     assert list(written["mrs3"]) == list(strategy["mrs3"])
     assert list(written["mrs3"]["ma_long"][0]) == list(strategy["mrs3"]["ma_long"][0])
+
+
+def test_publication_staging_uses_acl_inheriting_windows_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    modes: list[int] = []
+    original_mkdir = Path.mkdir
+
+    def tracked_mkdir(
+        path: Path,
+        mode: int = 0o777,
+        parents: bool = False,
+        exist_ok: bool = False,
+    ) -> None:
+        modes.append(mode)
+        original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", tracked_mkdir)
+    staging = _publication_staging_dir(tmp_path, ".stage-")
+
+    assert modes == [0o777 if os.name == "nt" else 0o700]
+    assert staging.parent == tmp_path
+    assert staging.name.startswith(".stage-")
 
 
 def test_published_pipeline_scopes_listing_dates_and_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:

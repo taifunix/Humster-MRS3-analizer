@@ -431,6 +431,28 @@ def test_retest_publication_replaces_existing_output_successfully(tmp_path: Path
     assert sorted(path.name for path in output.iterdir()) == ["strategies", "strategy_manifest.json"]
 
 
+def test_retest_publication_uses_acl_inheriting_outer_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
+    output = tmp_path / "output"
+    template = Path("templates/strategies/retest-mrs3/base.json")
+    original_stage = retest_module._publication_staging_dir
+    prefixes: list[str] = []
+
+    def tracked_stage(parent: Path, prefix: str) -> Path:
+        prefixes.append(prefix)
+        return original_stage(parent, prefix)
+
+    monkeypatch.setattr(retest_module, "_publication_staging_dir", tracked_stage)
+    try:
+        build_retest_manifest(connection, {"LONG": template}, output)
+    finally:
+        connection.close()
+
+    assert prefixes == [".retest-stage-"]
+
+
 def test_retest_publication_has_process_local_single_writer_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

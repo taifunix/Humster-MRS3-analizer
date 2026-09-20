@@ -4,11 +4,12 @@ from dataclasses import asdict, dataclass, fields, is_dataclass
 from decimal import Decimal
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
-import tempfile
 from numbers import Real
 from typing import Mapping
+from uuid import uuid4
 
 import pandas as pd
 
@@ -266,6 +267,12 @@ def _write_json_atomic(path: Path, value: object) -> None:
     temporary.replace(path)
 
 
+def _publication_staging_dir(parent: Path, prefix: str) -> Path:
+    staging = parent / f"{prefix}{uuid4().hex}"
+    staging.mkdir(mode=0o777 if os.name == "nt" else 0o700)
+    return staging
+
+
 def _publish_strategies(
     output_dir: Path,
     lot_variants: pd.DataFrame,
@@ -275,7 +282,7 @@ def _publish_strategies(
     backup = output_dir / ".strategies.mrs3-backup"
     if backup.exists():
         raise RuntimeError(f"strategy backup requires recovery: {backup}")
-    staging = Path(tempfile.mkdtemp(prefix=".strategies.mrs3-stage-", dir=output_dir))
+    staging = _publication_staging_dir(output_dir, ".strategies.mrs3-stage-")
     moved_existing: list[str] = []
     installed: list[str] = []
     rollback_failed = False

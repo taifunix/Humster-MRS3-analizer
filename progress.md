@@ -2922,3 +2922,24 @@ with an actionable rebuild requirement. A read-only smoke check found all 12
 local analysis databases and opened the first with 95 shortlist items. Focused
 analysis, Panel, export, tester-file and fresh-analysis checks pass (`82 passed`);
 no database was modified.
+
+## Windows strategy publication ACL recovery (2026-09-20)
+
+Python 3.13 created `tempfile.mkdtemp()` staging directories with a private
+Windows `0o700` ACL. Same-volume strategy publication preserved that ACL, so a
+restarted Panel could list `Output/strategies` but could not read any generated
+JSON. The shared READY publisher and Performance v2 RETEST publisher now create
+UUID staging directories that inherit the parent ACL on Windows while retaining
+private `0o700` staging on POSIX. Atomic rename, rollback, strategy contents and
+manifest hashes are unchanged.
+
+The live 171-strategy batch was recovered from the tester-side copies after all
+171 digests matched the generation manifest. The unreadable originals remain in
+`Output/strategies.unreadable-20260920-2248`; the active manifest validates all
+171 restored files. New SINGLE_MODE job `71c7ee7b7f0446519da9eb101112f0cf`
+reached `BOT_RUN`, tester status `running`, and produced its first five HTML
+reports; a later check confirmed `49/171` with zero failures. Related
+verification passes (`153 passed`) and
+`git diff --check` is clean. The external reviewer bridge was unavailable due
+to its existing authentication failure; the operator had already authorized
+self-review while that reviewer remains unavailable.

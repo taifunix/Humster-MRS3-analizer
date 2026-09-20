@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import tempfile
 import threading
 from typing import BinaryIO, Mapping
 from uuid import uuid4
@@ -21,7 +20,7 @@ from .config import AlgorithmConfig
 from .lots import LotMethod
 from .panel_strategy_batch import validate_strategy_manifest
 from .performance_v2_store import PerformanceV2StoreError, require_performance_v2
-from .pipeline import _publish_strategies, _write_json_atomic
+from .pipeline import _publication_staging_dir, _publish_strategies, _write_json_atomic
 from .strategy_json import generate_strategy
 from .performance_v2_input import adapt_strategy_identity
 
@@ -409,7 +408,7 @@ def _publish_retest_locked(
 ) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     _reconcile_retest_publication(output_dir)
-    stage = Path(tempfile.mkdtemp(prefix=".retest-stage-", dir=output_dir))
+    stage = _publication_staging_dir(output_dir, ".retest-stage-")
     target = output_dir / "strategies"
     target_manifest = output_dir / "strategy_manifest.json"
     backup = output_dir / f".retest-backup-{uuid4().hex}"
