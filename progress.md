@@ -1,7 +1,50 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-19
+**Updated:** 2026-09-20
 **Current branch:** `main`
+
+## Source DB local import: out-of-memory at the tail (2026-09-20)
+
+A 27,378-report local import (5 pairs, 119-day window, 7.8M trades) processed
+every report and then failed at the very end with a generic "Source DB import
+failed". The panel deliberately hides the error text, so it was reproduced
+directly: the tail phase `iter_fragments_parallel` raised `MemoryError` in a
+pool worker (`BrokenProcessPool`). The panel's local-import path passed
+`hydrate_fragments=True`, which decodes **every** fragment payload back into
+memory after the segments are reduced — measured about 2.1 MB per fragment,
+so roughly 57 GB for 27,360 fragments on a 64 GB machine. The throughput spec
+already lists this exact tail as a defect (it decoded all fragments to serve
+consumers that read metadata only) and the importer's lean mode is its fix.
+
+The local-import path now passes `hydrate_fragments=False`
+(`PanelController._local_source_jobs`). The lean mode is covered by the
+existing `test_import_without_hydration_publishes_the_same_database`, which
+asserts a byte-identical `source_content_digest` and row-for-row equal tables
+(compact_fragments, points, fragment_origins, day_ownership, quarantine,
+fact_ownership, fragment_resolutions). The legacy one-shot import-then-publish
+job (`_source_v6_job`) keeps the default, because it consumes the hydrated
+fragments in the same call.
+
+Measured on the real 27,360-fragment database, the lean tail
+(`fragment_metadata`) takes 198 MB in 1.0 s (7.4 KB per fragment) against about
+56 GB for the hydrating tail — roughly 290 times less. In this data every point
+has a single report (0 points with more than one), so only the 18 duplicated
+points are decoded in full. Known limit, not introduced here: in lean mode a
+point with several fragments is still decoded in full and its winners are kept
+in `active` for the rest of the import, so peak memory is reduced but not
+bounded when many points are stitched from many fragments. A peak-RSS check on
+such a set has not been run.
+
+Not changed and not the cause: the importer code (last touched 2026-09-15,
+path shortening only), duplicate reports (an isolated 36-file import of all 18
+duplicated points committed and quarantined them), the target-space check, and
+the import options (all importer validations pass for `workers=25`).
+
+Speed is a separate, still-open issue: about 1.5 CPU-seconds per report, so
+16 cores give roughly 10 reports/s (about 43 minutes for 27,378). The profile
+attributes about 48% to `_canonical_value`/`_canonical_json` and about 42% to
+report parsing; more workers than cores does not help. The earlier "10-15
+minute" imports were 41-day windows; this run is 119 days.
 
 ## Pair screener (SCREENER 01) — Этапы 0–4 done, UI (Этап 5) next (2026-09-19)
 

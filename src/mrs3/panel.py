@@ -2335,7 +2335,7 @@ class PanelController:
                 "worker_chunk_size": source_settings.worker_chunk_size,
                 "max_in_flight_chunks": source_settings.max_in_flight_chunks,
                 "segment_writer_limit": writer_limit,
-                "hydrate_fragments": True,
+                "hydrate_fragments": False,
             }
         except Exception:
             workers = 1

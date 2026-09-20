@@ -214,7 +214,10 @@ def test_v2_local_source_service_uses_source_v6_throughput_settings(tmp_path: Pa
         "worker_chunk_size": 8,
         "max_in_flight_chunks": 9,
         "segment_writer_limit": 3,
-        "hydrate_fragments": True,
+        # Hydrating decodes every fragment payload into memory after the
+        # segments are reduced (about 2 MB each), which exhausts RAM on a
+        # full 27k-report import. Publication reads the published database.
+        "hydrate_fragments": False,
     }
 
 
