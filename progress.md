@@ -37,12 +37,12 @@ reports and a finished Source v6 database as input and nothing else, so the
 property is kept where it is free, and `import_fragment`/`import_fragment_batch`
 keep a cheap assertion because they accept bytes they did not serialize.
 
-Full suite: 4,719 passed, 2 failed, both in the portfolio module, which shares
-no code with this change. The cross-process lease test fails the same way with
-the change stashed (`FileExistsError` from the Windows lock rename in
-`portfolio/store.py:272`) and is a pre-existing defect; the concurrent-campaign
-test failed only under full-suite load and passed in six consecutive runs
-afterwards.
+Full suite: 4,719 passed, 2 failed, both concurrency tests in unrelated modules
+that pass on their own; the portfolio cross-process lease failure is
+pre-existing and reproduces with the change stashed. Rebased onto `origin/main`
+afterwards (panel, performance_v2 and pipeline work, no shared file but
+`progress.md`) and re-run: 4,725 passed, and the two failures that run showed
+also pass in isolation.
 
 Not done, and deliberately left for its own spec: `calculate_metrics` still
 runs twice per point, once for the READY witness and once for the PRETEST B

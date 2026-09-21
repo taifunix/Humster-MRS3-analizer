@@ -88,19 +88,17 @@ canonical document (the rebuild function is replaced by one that raises) and
 that non-canonical stored bytes decode to the identity their bytes carry but are
 refused under `strict_canonical=True`.
 
-Full suite from `.venv`: 4,719 passed, 7 skipped, 2 failed, both in
-`tests/test_portfolio_store.py` and neither caused by this change, which shares
-no code with the portfolio module.
-`test_cross_process_busy_reclaim_and_manual_clear_are_safe` fails identically
-with this change stashed: `PortfolioDBLease` raises `FileExistsError` from the
-Windows lock rename in `portfolio/store.py:272`. It is pre-existing and left for
-the portfolio module and its own spec.
-`test_concurrent_exact_campaign_duplicate_returns_one_identity` spawns competing
-processes and failed only inside the loaded full-suite run; it passed in six
-consecutive runs of that file and of itself with this change in place. The same
-load sensitivity was seen earlier in
-`test_panel_performance_v2.py::test_v2_catalog_and_windows_http_are_typed_and_repeatable`,
-which also passes on its own.
+Full suite from `.venv`: 4,719 passed, 7 skipped, 2 failed, neither caused by
+this change, which shares no code with the modules involved. Every failure seen
+across the runs of this work is a concurrency test that passes when run on its
+own: `test_portfolio_store.py::test_cross_process_busy_reclaim_and_manual_clear_are_safe`
+(deterministic on a loaded machine, and failing identically with this change
+stashed: `FileExistsError` from the Windows lock rename in
+`portfolio/store.py:272`), `test_portfolio_store.py::test_concurrent_exact_campaign_duplicate_returns_one_identity`,
+`test_duckdb_import.py::test_concurrent_import_to_same_resolved_database_is_rejected_without_publication`
+and `test_panel_performance_v2.py::test_v2_catalog_and_windows_http_are_typed_and_repeatable`.
+Which of them fails varies with machine load; the portfolio lock defect is
+pre-existing and left for that module and its own spec.
 
 ## Not done
 
