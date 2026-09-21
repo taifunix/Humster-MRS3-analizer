@@ -9,6 +9,7 @@ import pytest
 
 from mrs3.runner.results import (
     ResultMismatchError,
+    ResultParseError,
     WizardResult,
     extract_html_strategy_name,
     load_wizard_results,
@@ -76,6 +77,78 @@ def test_supplied_json_maps_adm1_to_exact_report() -> None:
 
     assert result.strategy_names == ("ADM1",)
     assert result.report_name == REPORT_NAME
+
+
+def test_custom_report_folder_accepts_a_weighted_candidate_id(tmp_path: Path) -> None:
+    report_folder = "a" * 64
+    result_file = tmp_path / "wizard_result.json"
+    result_file.write_text(
+        json.dumps(
+            [
+                {
+                    "runId": "run-1",
+                    "strategies": ["A"],
+                    "stats": {},
+                    "chartUrl": f"/tester-report/{report_folder}/A.html",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = load_wizard_results(
+        result_file, expected_report_folder=report_folder
+    )[0]
+
+    assert result.report_name == "A.html"
+
+
+@pytest.mark.parametrize(
+    "report_folder",
+    ["", ".", "..", "unsafe/folder", "unsafe\\folder", "unsafe%2Ffolder", "a\nfolder", "a" * 65],
+)
+def test_custom_report_folder_rejects_unsafe_names(
+    tmp_path: Path, report_folder: str
+) -> None:
+    result_file = tmp_path / "wizard_result.json"
+    result_file.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ResultParseError, match="unsafe report folder"):
+        load_wizard_results(result_file, expected_report_folder=report_folder)
+
+
+@pytest.mark.parametrize(
+    "chart_url",
+    [
+        "/tester-report/my_test/A.html",
+        "/tester-report/a/nested/A.html",
+        "/tester-report/a/A.txt",
+        "/tester-report/a/A%2Fnested.html",
+        "/tester-report/a/%2e%2e/A.html",
+        "/tester-report/a/A.html/",
+    ],
+)
+def test_custom_report_folder_rejects_wrong_or_unsafe_chart_urls(
+    tmp_path: Path, chart_url: str
+) -> None:
+    report_folder = "a"
+    result_file = tmp_path / "wizard_result.json"
+    result_file.write_text(
+        json.dumps(
+            [
+                {
+                    "runId": "run-1",
+                    "strategies": ["A"],
+                    "stats": {},
+                    "chartUrl": chart_url,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ResultParseError, match="unsafe or unexpected chartUrl"):
+        load_wizard_results(result_file, expected_report_folder=report_folder)
 
 
 def test_verified_snapshot_supplies_report_name_for_blank_chart_url(tmp_path: Path) -> None:

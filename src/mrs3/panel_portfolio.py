@@ -1,25 +1,27 @@
-"""Small, local-only Panel adapter for the Portfolio Optimizer stage 1 flow.
+"""Small, local-only Panel adapter for the Portfolio Optimizer Panel flows.
 
 The adapter owns HTTP-facing validation and lifecycle plumbing.  Portfolio
 algorithms remain injected (and, by default, are the package primitives).
-There is deliberately no tester or runtime integration in this module.
+Stage 2 accepts only an injected local tester service and committed packages.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import asyncio
 import base64
 import hashlib
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import re
 import tempfile
 import threading
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -28,6 +30,9 @@ import pandas as pd
 
 from .audit import normalize_xlsx_workbook, write_audit_workbook
 from .panel_jobs import PanelJobError, PanelJobRegistry
+from .panel_testing import mrs3_tester_config_template
+from .runner.files import file_fingerprint, read_stable_file
+from .runner.results import CORE_METRICS, ResultParseError, WizardResult, load_wizard_results
 from .portfolio.config import (
     POLICY_VERSION,
     SCHEMA_VERSION,
@@ -56,6 +61,7 @@ STAGES = (
     "BUILD_WORKBOOK",
     "PUBLISH_RESULTS",
 )
+STAGE2_STAGES = ("PREPARE", "FILL_PREBUILT", "START", "READBACK")
 _TERMINAL = frozenset({"COMMITTED", "CANCELLED", "FAILED"})
 _SECRET = re.compile(r"(?:password|passwd|secret|token|credential|api[_-]?key|private[_-]?key)", re.I)
 _PATH = re.compile(
@@ -117,6 +123,30 @@ def _now() -> str:
 
 def _digest(value: bytes | str) -> str:
     return hashlib.sha256(value if isinstance(value, bytes) else value.encode("utf-8")).hexdigest()
+
+
+def _validate_pretest_period(value: Any) -> None:
+    if not isinstance(value, Mapping) or set(value) != {"start_utc", "end_utc"}:
+        raise ValueError("pretest period shape is invalid")
+    parsed: dict[str, datetime] = {}
+    for key in ("start_utc", "end_utc"):
+        text = value[key]
+        if not isinstance(text, str):
+            raise ValueError("pretest period timestamp is invalid")
+        try:
+            timestamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("pretest period timestamp is invalid") from error
+        if timestamp.tzinfo is None or timestamp.utcoffset() != timedelta(0):
+            raise ValueError("pretest period timestamp is not UTC")
+        timestamp = timestamp.astimezone(timezone.utc)
+        if timestamp.hour or timestamp.minute or timestamp.second or timestamp.microsecond:
+            raise ValueError("pretest period timestamp is not a UTC day boundary")
+        if text != timestamp.isoformat(timespec="seconds").replace("+00:00", "Z"):
+            raise ValueError("pretest period timestamp is not canonical")
+        parsed[key] = timestamp
+    if parsed["start_utc"] >= parsed["end_utc"] or parsed["end_utc"] - parsed["start_utc"] < timedelta(days=1):
+        raise ValueError("pretest period is too short")
 
 
 def _load_weighted_template() -> tuple[dict[str, Any], str]:
@@ -318,7 +348,7 @@ def _portfolio_search_workers(root: Path) -> int:
 
 
 class PortfolioPanelService:
-    """Server-owned stage 1 service with an injected package boundary."""
+    """Server-owned portfolio service with injected package and tester boundaries."""
 
     def __init__(
         self,
@@ -334,6 +364,7 @@ class PortfolioPanelService:
         workbook_builder: Callable[..., Any] | None = None,
         lock: threading.RLock | None = None,
         optimizer_input_preparer: Callable[..., Any] | None = None,
+        local_testing_service_provider: Callable[[], Any] | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         raw_config = Path(config_path) if config_path is not None else self.root / "portfolio_optimizer.local.json"
@@ -348,6 +379,7 @@ class PortfolioPanelService:
         self.variant_validator = variant_validator
         self.workbook_builder = workbook_builder
         self._lock = lock or threading.RLock()
+        self._local_testing_service_provider = local_testing_service_provider
         self._cancel_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._results_root = self.root / ".portfolio-results"
@@ -807,7 +839,7 @@ class PortfolioPanelService:
     def _project_orphan(self, saved: Mapping[str, Any]) -> dict[str, Any]:
         """Release a persisted nonterminal job after its worker has disappeared."""
         job_id = saved.get("job_id")
-        if saved.get("kind") != "portfolio.stage1" or not isinstance(job_id, str) or saved.get("state") not in {"QUEUED", "RUNNING", "CANCELLING"} or job_id in self._threads:
+        if saved.get("kind") not in {"portfolio.stage1", "portfolio.stage2"} or not isinstance(job_id, str) or saved.get("state") not in {"QUEUED", "RUNNING", "CANCELLING"} or job_id in self._threads:
             return dict(saved)
         projected = {**saved, "state": "FAILED", "phase": "FAILED", "error": {"code": "INTERRUPTED"}}
         try:
@@ -839,21 +871,26 @@ class PortfolioPanelService:
 
     def _public_job(self, saved: Mapping[str, Any], runtime: Mapping[str, Any] | None = None) -> dict[str, Any]:
         runtime = runtime or {}
+        stage2 = saved.get("kind") == "portfolio.stage2"
         campaign = runtime.get("campaign") if isinstance(runtime.get("campaign"), Mapping) else {}
+        if stage2 and not campaign:
+            binding = runtime.get("stage2") if isinstance(runtime.get("stage2"), Mapping) else {}
+            campaign = {"campaign_id": binding.get("campaign_id"), "input_digest": binding.get("input_digest"), "config_digest": binding.get("config_digest")}
         state = self._project_state(saved)
         completed = int(runtime.get("completed_stages", 0) or 0)
+        stage_names = STAGE2_STAGES if stage2 else STAGES
         if state == "SUCCEEDED":
-            completed = len(STAGES)
-        stage: dict[str, Any] = {"index": min(completed, len(STAGES) - 1), "name": STAGES[min(completed, len(STAGES) - 1)], "status": "SUCCEEDED" if state == "SUCCEEDED" else ("RUNNING" if state in {"RUNNING", "CANCEL_REQUESTED"} else state), "completed": int(runtime.get("stage_completed", 0) or 0)}
+            completed = len(stage_names)
+        stage: dict[str, Any] = {"index": min(completed, len(stage_names) - 1), "name": stage_names[min(completed, len(stage_names) - 1)], "status": "SUCCEEDED" if state == "SUCCEEDED" else ("RUNNING" if state in {"RUNNING", "CANCEL_REQUESTED"} else state), "completed": int(runtime.get("stage_completed", 0) or 0)}
         if state == "SUCCEEDED":
             stage.update(completed=1, total=1, percent=100)
         elif isinstance(runtime.get("stage_total"), int) and runtime["stage_total"] >= 0:
             stage["total"] = runtime["stage_total"]
         if isinstance(runtime.get("stage_percent"), int):
             stage["percent"] = runtime["stage_percent"]
-        overall = 100 if state == "SUCCEEDED" else min(99, (completed * 100) // len(STAGES))
+        overall = 100 if state == "SUCCEEDED" else min(99, (completed * 100) // len(stage_names))
         if state in {"CANCELLED", "FAILED", "INTERRUPTED"}:
-            overall = (completed * 100) // len(STAGES)
+            overall = (completed * 100) // len(stage_names)
         diagnostics = saved.get("diagnostics") if isinstance(saved.get("diagnostics"), list) else runtime.get("diagnostics", [])
         diagnostics = [
             {"severity": str(item.get("severity", "ERROR")), "code": str(item.get("code", "PORTFOLIO_JOB_FAILED")), "message": _redact_text(item.get("message", ""))}
@@ -878,7 +915,9 @@ class PortfolioPanelService:
         except OSError:
             pass
         frozen_digest = campaign.get("config_digest")
-        result = {"job_id": saved.get("job_id"), "campaign_id": campaign.get("campaign_id"), "kind": "STAGE1_CALCULATION", "status": state, "stage": stage, "overall_percent": overall, "counters": _plain(runtime.get("counters", {})), "diagnostics": diagnostics, "journal": journal, "input_digest": campaign.get("input_digest"), "config_digest": frozen_digest, "settings_changed_since_freeze": bool(frozen_digest and current_digest != frozen_digest), "created_at": saved.get("created_at_utc"), "started_at": runtime.get("started_at"), "finished_at": runtime.get("finished_at")}
+        result = {"job_id": saved.get("job_id"), "campaign_id": campaign.get("campaign_id"), "kind": "TESTER_SUBMISSION" if stage2 else "STAGE1_CALCULATION", "status": state, "stage": stage, "overall_percent": overall, "counters": _plain(runtime.get("counters", {})), "diagnostics": diagnostics, "journal": journal, "input_digest": campaign.get("input_digest"), "config_digest": frozen_digest, "settings_changed_since_freeze": bool(frozen_digest and current_digest != frozen_digest), "created_at": saved.get("created_at_utc"), "started_at": runtime.get("started_at"), "finished_at": runtime.get("finished_at")}
+        if stage2 and state == "SUCCEEDED" and isinstance(runtime.get("stage2_result"), Mapping):
+            result["result"] = _plain(runtime["stage2_result"])
         return result
 
     def job(self, job_id: str) -> dict[str, Any]:
@@ -895,7 +934,7 @@ class PortfolioPanelService:
         if not isinstance(saved, Mapping):
             raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500)
         saved = self._project_orphan(saved)
-        if saved.get("kind") != "portfolio.stage1":
+        if saved.get("kind") not in {"portfolio.stage1", "portfolio.stage2"}:
             raise PortfolioPanelError("PORTFOLIO_JOB_NOT_FOUND", "job is not available", status=404)
         try:
             runtime = self.registry.runtime(job_id)
@@ -911,7 +950,7 @@ class PortfolioPanelService:
         except (PanelJobError, KeyError, OSError, TypeError, ValueError) as error:
             raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500) from error
         for saved in jobs:
-            if saved.get("kind") != "portfolio.stage1":
+            if saved.get("kind") not in {"portfolio.stage1", "portfolio.stage2"}:
                 continue
             saved = self._project_orphan(saved)
             if saved.get("state") in _TERMINAL:
@@ -1059,15 +1098,30 @@ class PortfolioPanelService:
             return True
         return bool(event and event.is_set()) or state == "CANCELLING"
 
-    def _cancel_finish(self, job_id: str, published: Path | None = None, previous: bytes | None = None) -> None:
+    def _cancel_finish(
+        self,
+        job_id: str,
+        published: Path | None = None,
+        previous: bytes | None = None,
+        published_executables: Path | None = None,
+        previous_executables: bytes | None = None,
+        staged_executables: Path | None = None,
+    ) -> None:
         if published is not None:
             self._rollback_result(published, previous)
+        if published_executables is not None:
+            self._rollback_result(published_executables, previous_executables)
         runtime = self.registry.runtime(job_id)
         candidate = runtime.get("staged_workbook_path")
         if isinstance(candidate, str):
             try:
                 self._staging_path(Path(candidate), runtime["campaign"]["campaign_id"]).unlink(missing_ok=True)
             except (KeyError, OSError, PortfolioPanelError):
+                pass
+        if staged_executables is not None:
+            try:
+                staged_executables.unlink(missing_ok=True)
+            except OSError:
                 pass
         stage_index = runtime.get("stage_index")
         stage = STAGES[stage_index] if isinstance(stage_index, int) and 0 <= stage_index < len(STAGES) else "CANCELLED"
@@ -1126,6 +1180,520 @@ class PortfolioPanelService:
             raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "result root is unsafe", status=500)
         return directory / "stage1.xlsx"
 
+    def _stage1_executables_path(self, campaign_id: str, *, create: bool = False) -> Path:
+        if not isinstance(campaign_id, str) or re.fullmatch(r"campaign-[0-9a-f]{32}", campaign_id) is None:
+            raise PortfolioPanelError("PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE", "stage 1 executables are unavailable", status=409)
+        root = self._results_root
+        directory = root / campaign_id
+        path = directory / "stage1-executables.json"
+        if root.is_symlink() or directory.is_symlink() or path.is_symlink():
+            raise PortfolioPanelError("PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE", "stage 1 executables are unavailable", status=409)
+        try:
+            if create:
+                directory.mkdir(parents=True, exist_ok=True)
+            if root.resolve(strict=True) != root or directory.resolve(strict=True) != directory:
+                raise OSError("artifact path is outside the results root")
+            if path.exists() and not path.is_file():
+                raise OSError("artifact path is not a file")
+        except OSError as error:
+            raise PortfolioPanelError("PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE", "stage 1 executables are unavailable", status=409) from error
+        return path
+
+    def _staging_executables_path(self, campaign_id: str) -> Path:
+        if not isinstance(campaign_id, str) or re.fullmatch(r"campaign-[0-9a-f]{32}", campaign_id) is None:
+            raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "staging root is unsafe", status=500)
+        root = self._staging_root
+        directory = root / campaign_id
+        path = directory / "stage1-executables.json"
+        if root.is_symlink() or directory.is_symlink() or path.is_symlink():
+            raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "staging root is unsafe", status=500)
+        try:
+            if root.resolve(strict=True) != root or directory.resolve(strict=True) != directory:
+                raise OSError("staging path is outside the staging root")
+            if path.exists() and not path.is_file():
+                raise OSError("staged artifact is not a file")
+        except OSError as error:
+            raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "staging root is unsafe", status=500) from error
+        return path
+
+    @staticmethod
+    def _validate_stage1_executable_candidate(candidate: Mapping[str, Any]) -> None:
+        if (
+            candidate.get("search_mode") != CAMPAIGN_SEARCH_MODE
+            or type(candidate.get("limiter_L")) is not int
+            or candidate["limiter_L"] != 0
+            or not isinstance(candidate.get("candidate_id"), str)
+            or not candidate["candidate_id"]
+            or not isinstance(candidate.get("identity"), str)
+            or not candidate["identity"]
+            or not isinstance(candidate.get("profile"), str)
+            or not candidate["profile"]
+        ):
+            raise ValueError("candidate is not executable under the off-only policy")
+        _validate_pretest_period(candidate.get("pretest_period"))
+        metrics = candidate.get("metrics", {})
+        if isinstance(metrics, Mapping) and "limiter_L" in metrics and (type(metrics["limiter_L"]) is not int or metrics["limiter_L"] != 0):
+            raise ValueError("candidate metrics use a nonzero limiter")
+        payloads = candidate.get("strategy_payloads")
+        if isinstance(payloads, (str, bytes)) or not isinstance(payloads, Sequence) or len(payloads) < 2:
+            raise ValueError("candidate does not contain two executable strategies")
+        members = candidate.get("members")
+        if isinstance(members, (str, bytes)) or not isinstance(members, Sequence) or len(members) != len(payloads):
+            raise ValueError("candidate members do not match its executable strategies")
+        names: set[str] = set()
+        identities: set[tuple[str, str]] = set()
+        payload_identities = []
+        for payload in payloads:
+            if not isinstance(payload, Mapping):
+                raise ValueError("strategy payload is invalid")
+            strategy = payload.get("strategy")
+            basic = strategy.get("basic") if isinstance(strategy, Mapping) else None
+            mrs = strategy.get("mrs") if isinstance(strategy, Mapping) else None
+            account = payload.get("account")
+            facts = payload.get("facts")
+            symbol = basic.get("symbol") if isinstance(basic, Mapping) else None
+            side = payload.get("side")
+            name = strategy.get("name") if isinstance(strategy, Mapping) else None
+            if (
+                not isinstance(symbol, str) or not symbol or symbol != symbol.strip().upper()
+                or not isinstance(side, str) or side not in {"LONG", "SHORT"}
+                or not isinstance(name, str) or not name
+                or not isinstance(mrs, Mapping) or type(mrs.get("position_priority")) is not int or mrs["position_priority"] != 1
+                or not isinstance(account, Mapping) or type(account.get("open_positions_limiter")) is not int or account["open_positions_limiter"] != 0
+                or not isinstance(facts, Mapping)
+            ):
+                raise ValueError("strategy payload violates the off-only executable contract")
+            x = Decimal(str(facts.get("x")))
+            if not x.is_finite() or x <= 0 or name in names or (symbol, side) in identities:
+                raise ValueError("strategy payload identity or positive size is invalid")
+            names.add(name)
+            identities.add((symbol, side))
+            payload_identities.append((symbol, side))
+        member_identities = []
+        strategy_ids: set[int] = set()
+        result_ids: set[int] = set()
+        for member in members:
+            if not isinstance(member, Mapping) or set(member) != {"symbol", "side", "strategy_id", "result_id"}:
+                raise ValueError("candidate member identity is invalid")
+            symbol, side = member["symbol"], member["side"]
+            strategy_id, result_id = member["strategy_id"], member["result_id"]
+            if (
+                not isinstance(symbol, str) or not symbol or symbol != symbol.strip().upper()
+                or not isinstance(side, str) or side not in {"LONG", "SHORT"}
+                or type(strategy_id) is not int or strategy_id <= 0 or strategy_id in strategy_ids
+                or type(result_id) is not int or result_id <= 0 or result_id in result_ids
+                or (symbol, side) in member_identities
+            ):
+                raise ValueError("candidate member identity is ambiguous")
+            strategy_ids.add(strategy_id)
+            result_ids.add(result_id)
+            member_identities.append((symbol, side))
+        if member_identities != payload_identities:
+            raise ValueError("candidate members do not match executable strategy order")
+
+    @classmethod
+    def _build_stage1_executables(cls, campaign: Mapping[str, Any], variants: Sequence[Any]) -> dict[str, Any]:
+        candidates = []
+        for order, variant in enumerate(variants):
+            if not isinstance(variant, Mapping):
+                continue
+            metrics = variant.get("metrics")
+            if isinstance(metrics, Mapping) and "limiter_L" in metrics and (type(metrics["limiter_L"]) is not int or metrics["limiter_L"] != 0):
+                continue
+            candidate_id = variant.get("candidate_id", variant.get("identity"))
+            identity = variant.get("identity", candidate_id)
+            candidate = {
+                "candidate_id": candidate_id,
+                "identity": identity,
+                "profile": variant.get("profile", variant.get("profile_id")),
+                "order": order,
+                "search_mode": variant.get("search_mode"),
+                "limiter_L": variant.get("limiter_L"),
+                "pretest_period": _plain(variant.get("pretest_period")),
+                "strategy_payloads": _plain(variant.get("strategy_payloads", ())),
+            }
+            try:
+                source_members = variant.get("members")
+                if isinstance(source_members, (str, bytes)) or not isinstance(source_members, Sequence):
+                    continue
+                members = []
+                for member in source_members:
+                    if not isinstance(member, Mapping):
+                        raise ValueError("candidate member is invalid")
+                    x = Decimal(str(member.get("x_usdt")))
+                    if not x.is_finite():
+                        raise ValueError("candidate member size is invalid")
+                    if x > 0:
+                        members.append({key: member.get(key) for key in ("symbol", "side", "strategy_id", "result_id")})
+                candidate["members"] = members
+                cls._validate_stage1_executable_candidate(candidate)
+                candidate["candidate_digest"] = _digest(_json(candidate))
+            except (ArithmeticError, TypeError, ValueError):
+                continue
+            candidates.append(candidate)
+        if not candidates:
+            raise PortfolioPanelError("PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE", "no off-only executable candidate is available", status=422)
+        if (
+            not isinstance(campaign.get("campaign_id"), str)
+            or re.fullmatch(r"campaign-[0-9a-f]{32}", campaign["campaign_id"]) is None
+            or any(not isinstance(campaign.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", campaign[key]) is None for key in ("input_digest", "config_digest"))
+        ):
+            raise PortfolioPanelError("PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE", "stage 1 campaign bindings are invalid", status=422)
+        body = {
+            "schema_version": 1,
+            "campaign_id": campaign.get("campaign_id"),
+                "input_digest": campaign.get("input_digest"),
+                "config_digest": campaign.get("config_digest"),
+                "candidates": candidates,
+        }
+        body["payload_digest"] = _digest(_json(body))
+        return body
+
+    def _load_stage1_executables(
+        self,
+        campaign_id: str,
+        input_digest: str,
+        config_digest: str,
+        expected_digest: str,
+        *,
+        require_committed: bool = True,
+    ) -> dict[str, Any]:
+        try:
+            path = self._stage1_executables_path(campaign_id)
+            if require_committed:
+                saved, runtime = self._campaign_by_id(campaign_id)
+                campaign = runtime.get("campaign")
+                if (
+                    self._project_state(saved) != "SUCCEEDED"
+                    or not isinstance(campaign, Mapping)
+                    or campaign.get("input_digest") != input_digest
+                    or campaign.get("config_digest") != config_digest
+                    or runtime.get("executables_path") != str(path)
+                    or runtime.get("executables_digest") != expected_digest
+                ):
+                    raise ValueError("artifact is not tied to a committed Stage 1 job")
+            if not path.is_absolute() or path.resolve(strict=True) != path or not path.is_file():
+                raise ValueError("artifact path is invalid")
+            raw = path.read_bytes()
+            document = json.loads(raw.decode("utf-8"))
+            if (
+                not isinstance(document, dict)
+                or set(document) != {"schema_version", "campaign_id", "input_digest", "config_digest", "candidates", "payload_digest"}
+                or type(document["schema_version"]) is not int
+                or document["schema_version"] != 1
+                or document["campaign_id"] != campaign_id
+                or document["input_digest"] != input_digest
+                or document["config_digest"] != config_digest
+                or document["payload_digest"] != expected_digest
+                or raw != (_json(document) + "\n").encode("utf-8")
+            ):
+                raise ValueError("artifact binding is invalid")
+            candidates = document["candidates"]
+            if not isinstance(candidates, list) or not candidates:
+                raise ValueError("artifact candidates are invalid")
+            seen_ids: set[str] = set()
+            seen_identities: set[str] = set()
+            previous_order = -1
+            for candidate in candidates:
+                fields = {"candidate_id", "identity", "profile", "order", "search_mode", "limiter_L", "pretest_period", "strategy_payloads", "members", "candidate_digest"}
+                if not isinstance(candidate, dict) or set(candidate) != fields:
+                    raise ValueError("artifact candidate shape is invalid")
+                candidate_body = {key: value for key, value in candidate.items() if key != "candidate_digest"}
+                if (
+                    type(candidate.get("order")) is not int
+                    or candidate["order"] <= previous_order
+                    or candidate["candidate_id"] in seen_ids
+                    or candidate["identity"] in seen_identities
+                    or candidate["candidate_digest"] != _digest(_json(candidate_body))
+                ):
+                    raise ValueError("artifact candidate binding is invalid")
+                self._validate_stage1_executable_candidate(candidate)
+                seen_ids.add(candidate["candidate_id"])
+                seen_identities.add(candidate["identity"])
+                previous_order = candidate["order"]
+            body = {key: value for key, value in document.items() if key != "payload_digest"}
+            if document["payload_digest"] != _digest(_json(body)):
+                raise ValueError("artifact digest is invalid")
+            return document
+        except (ArithmeticError, OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            raise PortfolioPanelError("PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE", "stage 1 executables are unavailable", status=409) from error
+
+    def _prepare_stage2_baseline(self, campaign_id: str) -> dict[str, Any]:
+        """Build one exact Stage 2 input package without running or mutating anything."""
+        try:
+            saved, runtime = self._campaign_by_id(campaign_id)
+            campaign = runtime.get("campaign")
+            if not isinstance(campaign, Mapping):
+                raise ValueError("campaign is invalid")
+            input_digest = campaign.get("input_digest")
+            config_digest = campaign.get("config_digest")
+            artifact_digest = runtime.get("executables_digest")
+            if (
+                not isinstance(input_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", input_digest) is None
+                or not isinstance(config_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", config_digest) is None
+                or not isinstance(artifact_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", artifact_digest) is None
+            ):
+                raise ValueError("stage 1 bindings are invalid")
+            artifact = self._load_stage1_executables(campaign_id, input_digest, config_digest, artifact_digest)
+            candidate = artifact["candidates"][0]
+            candidate_id = candidate.get("candidate_id")
+            if (
+                not isinstance(candidate_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", candidate_id) is None
+                or candidate.get("identity") != candidate_id
+            ):
+                raise ValueError("candidate id is unsafe")
+
+            launch = campaign.get("launch")
+            profiles = launch.get("profiles") if isinstance(launch, Mapping) else None
+            profile_id = candidate.get("profile")
+            matches = [
+                profile
+                for profile in profiles or ()
+                if isinstance(profile, Mapping) and profile.get("profile_id") == profile_id
+            ]
+            if len(matches) != 1:
+                raise ValueError("candidate profile is not unique")
+            equity_raw = matches[0].get("equity_usdt")
+            if isinstance(equity_raw, bool) or equity_raw is None:
+                raise ValueError("profile equity is invalid")
+            try:
+                equity = Decimal(str(equity_raw))
+            except (InvalidOperation, TypeError, ValueError) as error:
+                raise ValueError("profile equity is invalid") from error
+            if not equity.is_finite() or equity <= 0:
+                raise ValueError("profile equity is invalid")
+
+            payloads = candidate.get("strategy_payloads")
+            if isinstance(payloads, (str, bytes)) or not isinstance(payloads, Sequence) or len(payloads) < 2:
+                raise ValueError("candidate strategies are invalid")
+            strategy_jsons: dict[str, str] = {}
+            for payload in payloads:
+                if not isinstance(payload, Mapping):
+                    raise ValueError("candidate strategy wrapper is invalid")
+                facts = payload.get("facts")
+                if not isinstance(facts, Mapping) or isinstance(facts.get("B"), bool) or facts.get("B") is None:
+                    raise ValueError("candidate bank is invalid")
+                try:
+                    bank = Decimal(str(facts["B"]))
+                except (InvalidOperation, TypeError, ValueError) as error:
+                    raise ValueError("candidate bank is invalid") from error
+                if not bank.is_finite() or bank <= 0 or bank != equity:
+                    raise ValueError("candidate bank does not match profile equity")
+                strategy = payload.get("strategy")
+                if not isinstance(strategy, Mapping):
+                    raise ValueError("candidate strategy is invalid")
+                name = strategy.get("name")
+                if not isinstance(name, str) or re.fullmatch(r"[A-Z0-9_]{1,128}", name) is None or name in strategy_jsons:
+                    raise ValueError("candidate strategy name is invalid")
+                strategy_jsons[name] = _json(strategy) + "\n"
+            if len(strategy_jsons) < 2:
+                raise ValueError("candidate strategies are invalid")
+
+            period = candidate["pretest_period"]
+            _validate_pretest_period(period)
+            start = datetime.fromisoformat(period["start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+            end = datetime.fromisoformat(period["end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc) - timedelta(days=1)
+            if start.date() > end.date():
+                raise ValueError("tester period is invalid")
+
+            template_path = mrs3_tester_config_template()
+            template = json.loads(template_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(template, dict)
+                or type(template.get("use_runs")) is not bool
+                or template.get("use_runs") is not False
+                or type(template.get("parameter_mining")) is not list
+                or template.get("parameter_mining") != []
+            ):
+                raise ValueError("tester template is invalid")
+            if equity == equity.to_integral_value():
+                initial_balance: int | float = int(equity)
+            else:
+                initial_balance = float(equity)
+                if not math.isfinite(initial_balance):
+                    raise ValueError("tester balance is invalid")
+            template.update({
+                "name_comment": candidate_id,
+                "StartDate": start.date().isoformat(),
+                "EndDate": end.date().isoformat(),
+                "InitialBalance": initial_balance,
+                "single_mode": False,
+                "UpdateData": False,
+            })
+            tester_config_json = _json(template) + "\n"
+            return {
+                "campaign_id": campaign_id,
+                "input_digest": input_digest,
+                "config_digest": config_digest,
+                "artifact_digest": artifact_digest,
+                "candidate_id": candidate_id,
+                "candidate_digest": candidate["candidate_digest"],
+                "portfolio_name": candidate_id,
+                "expected_names": list(strategy_jsons),
+                "pretest_period": _plain(period),
+                "tester_config_json": tester_config_json,
+                "strategy_jsons": strategy_jsons,
+            }
+        except PortfolioPanelError as error:
+            raise PortfolioPanelError("PORTFOLIO_STAGE2_INPUT_INVALID", "stage 2 baseline input is invalid", status=409) from error
+        except (ArithmeticError, OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            raise PortfolioPanelError("PORTFOLIO_STAGE2_INPUT_INVALID", "stage 2 baseline input is invalid", status=409) from error
+
+    @staticmethod
+    def _stage2_result(prepared: Mapping[str, Any], result: WizardResult) -> dict[str, Any]:
+        names = tuple(result.strategy_names)
+        expected = tuple(prepared["expected_names"])
+        if len(names) != len(set(names)) or len(names) < 2 or set(names) != set(expected):
+            raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester result strategy names are invalid", status=500)
+        metrics: dict[str, float] = {}
+        for key in CORE_METRICS:
+            value = result.stats.get(key)
+            if isinstance(value, bool) or value is None:
+                raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester result metrics are invalid", status=500)
+            try:
+                number = float(Decimal(str(value)))
+            except (ArithmeticError, TypeError, ValueError):
+                raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester result metrics are invalid", status=500) from None
+            if not math.isfinite(number):
+                raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester result metrics are invalid", status=500)
+            metrics[key] = number
+        return {
+            "campaign_id": prepared["campaign_id"],
+            "input_digest": prepared["input_digest"],
+            "config_digest": prepared["config_digest"],
+            "artifact_digest": prepared["artifact_digest"],
+            "candidate_id": prepared["candidate_id"],
+            "candidate_digest": prepared["candidate_digest"],
+            "report_folder": prepared["candidate_id"],
+            "name_comment": prepared["candidate_id"],
+            "strategy_names": list(names),
+            "period": result.period,
+            "pretest_period": _plain(prepared["pretest_period"]),
+            "run_id": result.run_id,
+            "report_name": result.report_name,
+            "report_link": result.chart_url or None,
+            "metrics": metrics,
+        }
+
+    def _stage2_cancel_finish(self, job_id: str) -> None:
+        try:
+            saved = self.registry.get(job_id)
+            if saved["state"] in {"QUEUED", "RUNNING"}:
+                saved = self.registry.cancel(job_id)
+            runtime = self.registry.runtime(job_id)
+            runtime.pop("stage2_result", None)
+            runtime["finished_at"] = _now()
+            if saved["state"] in {"QUEUED", "RUNNING", "CANCELLING"}:
+                self.registry.sync(job_id, {"state": "CANCELLED", "phase": "CANCELLED"}, runtime=runtime)
+            else:
+                self.registry.sync(job_id, {"state": saved["state"], "phase": saved.get("phase")}, runtime=runtime)
+        except PanelJobError:
+            pass
+
+    def _stage2_fail(self, job_id: str, error: BaseException) -> None:
+        try:
+            saved = self.registry.get(job_id)
+            code = error.code if isinstance(error, PortfolioPanelError) else "PORTFOLIO_JOB_STAGE2_FAILED"
+            message = str(error) if isinstance(error, PortfolioPanelError) else "portfolio tester submission failed"
+            diagnostics = [{"severity": "ERROR", "code": code, "message": _redact_text(message)}]
+            runtime = self.registry.runtime(job_id)
+            runtime.pop("stage2_result", None)
+            runtime["diagnostics"] = diagnostics
+            runtime["finished_at"] = _now()
+            if saved["state"] in _TERMINAL:
+                state, phase = saved["state"], saved.get("phase")
+            else:
+                state, phase = "FAILED", "FAILED"
+            self.registry.sync(job_id, {"state": state, "phase": phase, "error": {"code": code, "message": _redact_text(message)}, "result": {}}, runtime=runtime)
+        except PanelJobError:
+            pass
+
+    def _run_stage2(self, job_id: str, prepared: Mapping[str, Any]) -> None:
+        tester: Any = None
+        filled = False
+        failure: BaseException | None = None
+        completed_result: dict[str, Any] | None = None
+        try:
+            if self._cancelled(job_id):
+                raise asyncio.CancelledError
+            self.registry.transition(job_id, "RUNNING", phase=STAGE2_STAGES[0])
+            self._sync_runtime(job_id, started_at=_now(), stage_index=0, completed_stages=0)
+            tester = self._local_testing_service_provider()
+            if self._cancelled(job_id):
+                raise asyncio.CancelledError
+            tester.fill_prebuilt(
+                tester_config_json=prepared["tester_config_json"],
+                strategy_jsons=prepared["strategy_jsons"],
+                delete_old_reports=False,
+            )
+            filled = True
+            self._sync_runtime(job_id, stage_index=1, completed_stages=1)
+            if self._cancelled(job_id):
+                raise asyncio.CancelledError
+            baseline = file_fingerprint(tester.config.wizard_result)
+            if self._cancelled(job_id):
+                raise asyncio.CancelledError
+            tester.start()
+            if self._cancelled(job_id):
+                raise asyncio.CancelledError
+            self._sync_runtime(job_id, stage_index=2, completed_stages=2)
+            deadline = time.monotonic() + float(tester.config.stall_timeout_seconds)
+            while time.monotonic() < deadline:
+                if self._cancelled(job_id):
+                    raise asyncio.CancelledError
+                try:
+                    results = read_stable_file(
+                        tester.config.wizard_result,
+                        lambda path: load_wizard_results(path, expected_report_folder=prepared["candidate_id"]),
+                        baseline=baseline,
+                    )
+                except ResultParseError as error:
+                    raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester result is invalid", status=500) from error
+                if results is not None:
+                    if len(results) != 1:
+                        raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester result count is invalid", status=500)
+                    completed_result = self._stage2_result(prepared, results[0])
+                    self._sync_runtime(job_id, stage_index=3, completed_stages=3, stage2_result=completed_result)
+                    break
+                interval = float(getattr(tester.config, "poll_interval_seconds", 1.0))
+                event = self._cancel_events.get(job_id)
+                if event is None or not event.wait(interval):
+                    continue
+            else:
+                raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_TIMEOUT", "tester result did not become fresh", status=500)
+            if self._cancelled(job_id):
+                raise asyncio.CancelledError
+        except asyncio.CancelledError as error:
+            failure = error
+        except BaseException as error:
+            failure = error
+        finally:
+            if filled and tester is not None:
+                try:
+                    tester.stop()
+                except BaseException as error:
+                    if failure is None or isinstance(failure, asyncio.CancelledError):
+                        failure = error
+            if failure is None and completed_result is not None:
+                if self._cancelled(job_id):
+                    failure = asyncio.CancelledError()
+                else:
+                    try:
+                        runtime = self.registry.runtime(job_id)
+                        self.registry.sync(job_id, {"state": "COMMITTED", "phase": "COMMITTED", "result": completed_result}, runtime={**runtime, "finished_at": _now()})
+                    except BaseException as error:
+                        failure = asyncio.CancelledError() if self._cancelled(job_id) else error
+            if isinstance(failure, asyncio.CancelledError):
+                self._stage2_cancel_finish(job_id)
+            elif failure is not None:
+                self._stage2_fail(job_id, failure)
+            self._cancel_events.pop(job_id, None)
+            self._threads.pop(job_id, None)
+
     @staticmethod
     def _verify_workbook(path: Path) -> None:
         from openpyxl import load_workbook
@@ -1159,6 +1727,10 @@ class PortfolioPanelService:
     def _run(self, job_id: str) -> None:
         published: Path | None = None
         previous: bytes | None = None
+        published_executables: Path | None = None
+        previous_executables: bytes | None = None
+        staged_executables: Path | None = None
+        executable_document: dict[str, Any] | None = None
         saved = self.registry.get(job_id)
         if saved.get("state") in _TERMINAL:
             return
@@ -1189,8 +1761,9 @@ class PortfolioPanelService:
             optimizer_status = "PASS"
             for index, stage in enumerate(STAGES):
                 if self._cancelled(job_id):
-                    self._cancel_finish(job_id, published, previous)
+                    self._cancel_finish(job_id, published, previous, published_executables, previous_executables, staged_executables)
                     published = None
+                    published_executables = None
                     return
                 self._append_journal(job_id, stage=stage, severity="INFO", code="STAGE_STARTED", text=stage)
                 known_total = {
@@ -1270,6 +1843,12 @@ class PortfolioPanelService:
                 elif stage == "BUILD_WORKBOOK":
                     final_workbook = self._results_root / campaign["campaign_id"] / "stage1.xlsx"
                     workbook = self._staging_target(campaign["campaign_id"])
+                    executable_document = self._build_stage1_executables(campaign, variants)
+                    staged_executables = self._staging_executables_path(campaign["campaign_id"])
+                    executable_bytes = (_json(executable_document) + "\n").encode("utf-8")
+                    self._replace_bytes(staged_executables, executable_bytes)
+                    if staged_executables.read_bytes() != executable_bytes:
+                        raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "stage 1 executable artifact could not be verified", status=500)
                     if self.workbook_builder is not None:
                         built = _invoke(self.workbook_builder, workbook, campaign, finalists, selected, variants, excluded)
                         workbook = Path(built) if built is not None else workbook
@@ -1283,31 +1862,57 @@ class PortfolioPanelService:
                     pass
                 self._set_progress(job_id, stage_index=index + 1 if index + 1 < len(STAGES) else index, completed=index + 1)
             if self._cancelled(job_id):
-                self._cancel_finish(job_id, published, previous)
+                self._cancel_finish(job_id, published, previous, published_executables, previous_executables, staged_executables)
                 published = None
+                published_executables = None
                 return
             runtime = self.registry.runtime(job_id)
             staged = self._staging_path(Path(runtime["staged_workbook_path"]), campaign["campaign_id"])
             final = self._result_path(campaign["campaign_id"])
+            final_executables = self._stage1_executables_path(campaign["campaign_id"], create=True)
+            staged_executables = self._staging_executables_path(campaign["campaign_id"])
             if final.is_symlink():
                 raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "result workbook is unsafe", status=500)
+            if staged_executables.is_symlink() or staged_executables.resolve(strict=True).parent != staged.parent.resolve(strict=True):
+                raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "staged executable artifact is unsafe", status=500)
             if final.is_file():
                 previous = final.read_bytes()
+            if final_executables.is_file():
+                previous_executables = final_executables.read_bytes()
             os.replace(staged, final)
             published = final
+            os.replace(staged_executables, final_executables)
+            published_executables = final_executables
             self._verify_workbook(final)
+            if executable_document is None:
+                raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "stage 1 executable artifact is unavailable", status=500)
+            verified_executables = self._load_stage1_executables(
+                campaign["campaign_id"], campaign["input_digest"], campaign["config_digest"], executable_document["payload_digest"],
+                require_committed=False,
+            )
+            if verified_executables["payload_digest"] != executable_document["payload_digest"]:
+                raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "stage 1 executable artifact could not be verified", status=500)
             if self._cancelled(job_id):
-                self._cancel_finish(job_id, published, previous)
+                self._cancel_finish(job_id, published, previous, published_executables, previous_executables, staged_executables)
                 published = None
+                published_executables = None
                 return
             self._append_journal(job_id, stage="PUBLISH_RESULTS", severity="INFO", code="COMPLETED", text="stage1 workbook published")
             runtime = self.registry.runtime(job_id)
-            committed_runtime = {**runtime, "workbook_path": str(final), "finished_at": _now()}
+            committed_runtime = {
+                **runtime,
+                "workbook_path": str(final),
+                "executables_path": str(final_executables),
+                "executables_digest": verified_executables["payload_digest"],
+                "finished_at": _now(),
+            }
             try:
                 self.registry.sync(job_id, {"state": "COMMITTED", "phase": "COMMITTED", "result": runtime.get("summary", {})}, runtime=committed_runtime)
             except BaseException:
                 self._rollback_result(final, previous)
+                self._rollback_result(final_executables, previous_executables)
                 published = None
+                published_executables = None
                 raise
             return
         except (KeyboardInterrupt, SystemExit, GeneratorExit, asyncio.CancelledError):
@@ -1315,12 +1920,19 @@ class PortfolioPanelService:
         except BaseException as error:
             if self._cancelled(job_id):
                 try:
-                    self._cancel_finish(job_id, published, previous)
+                    self._cancel_finish(job_id, published, previous, published_executables, previous_executables, staged_executables)
                 except PanelJobError:
                     pass
                 return
             if published is not None:
                 self._rollback_result(published, previous)
+            if published_executables is not None:
+                self._rollback_result(published_executables, previous_executables)
+            if staged_executables is not None:
+                try:
+                    staged_executables.unlink(missing_ok=True)
+                except OSError:
+                    pass
             try:
                 failed_runtime_value = self.registry.runtime(job_id)
                 failed_runtime = dict(failed_runtime_value) if isinstance(failed_runtime_value, Mapping) else {}
@@ -1348,6 +1960,8 @@ class PortfolioPanelService:
                 failed_runtime_value = self.registry.runtime(job_id)
                 failed_runtime = dict(failed_runtime_value) if isinstance(failed_runtime_value, Mapping) else {}
                 failed_runtime.pop("workbook_path", None)
+                failed_runtime.pop("executables_path", None)
+                failed_runtime.pop("executables_digest", None)
                 entries = failed_runtime.get("journal") if isinstance(failed_runtime.get("journal"), list) else []
                 stage_index = failed_runtime.get("stage_index")
                 stage = STAGES[stage_index] if isinstance(stage_index, int) and 0 <= stage_index < len(STAGES) else "FAILED"
@@ -1634,7 +2248,7 @@ class PortfolioPanelService:
             raise PortfolioPanelError(code, "job is not available" if code == "PORTFOLIO_JOB_NOT_FOUND" else "portfolio job runtime is unavailable", status=404 if code == "PORTFOLIO_JOB_NOT_FOUND" else 500) from error
         except (OSError, TypeError, ValueError) as error:
             raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500) from error
-        if saved.get("kind") != "portfolio.stage1":
+        if saved.get("kind") not in {"portfolio.stage1", "portfolio.stage2"}:
             raise PortfolioPanelError("PORTFOLIO_JOB_NOT_FOUND", "job is not available", status=404)
         if saved["state"] in _TERMINAL:
             raise PortfolioPanelError("PORTFOLIO_JOB_TERMINAL", "job is terminal", status=409)
@@ -1709,7 +2323,73 @@ class PortfolioPanelService:
             raise PortfolioPanelError("PORTFOLIO_JOB_WORKBOOK_UNAVAILABLE", "workbook is not available", status=409) from None
 
     def submit_tester_submission(self, campaign_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-        raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED", "stage 2 is not authorized", status=409)
+        if self._local_testing_service_provider is None:
+            raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED", "stage 2 is not authorized", status=409)
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != {"confirmed", "campaign_id"}
+            or payload.get("confirmed") is not True
+            or payload.get("campaign_id") != campaign_id
+        ):
+            raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign confirmation is invalid", status=422)
+        with self._lock, self.registry.lock:
+            for saved in self.registry.list():
+                if saved.get("kind") != "portfolio.stage2":
+                    continue
+                try:
+                    runtime = self.registry.runtime(saved["job_id"])
+                except (PanelJobError, KeyError, OSError, TypeError, ValueError) as error:
+                    raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500) from error
+                binding = runtime.get("stage2") if isinstance(runtime.get("stage2"), Mapping) else {}
+                if binding.get("campaign_id") == campaign_id:
+                    return {"campaign_id": campaign_id, "job_id": saved["job_id"], "status": self._project_state(saved)}
+            saved_stage1, _runtime = self._campaign_by_id(campaign_id)
+            if self._project_state(saved_stage1) != "SUCCEEDED":
+                raise PortfolioPanelError("PORTFOLIO_STAGE2_CAMPAIGN_NOT_READY", "stage 1 campaign is not ready", status=409)
+            prepared = self._prepare_stage2_baseline(campaign_id)
+            binding = {
+                "campaign_id": prepared["campaign_id"],
+                "input_digest": prepared["input_digest"],
+                "config_digest": prepared["config_digest"],
+                "artifact_digest": prepared["artifact_digest"],
+                "candidate_id": prepared["candidate_id"],
+                "candidate_digest": prepared["candidate_digest"],
+                "expected_names": list(prepared["expected_names"]),
+                "pretest_period": _plain(prepared["pretest_period"]),
+            }
+            submission_key = f"portfolio-stage2:{campaign_id}"
+            created_job_id: str | None = None
+            try:
+                saved = self.registry.submit("portfolio.stage2", {"campaign_id": campaign_id, "candidate_id": prepared["candidate_id"]}, submission_key, ("portfolio_optimizer",))
+                created_job_id = saved["job_id"]
+                self.registry.reserve_runtime(saved["job_id"], "stage2", binding)
+            except PanelJobError as error:
+                if created_job_id is not None:
+                    try:
+                        self.registry.discard_queued(created_job_id)
+                    except Exception:
+                        pass
+                code = "PORTFOLIO_JOB_BUSY" if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED"} else error.code
+                raise PortfolioPanelError(code, "portfolio optimizer is busy" if code == "PORTFOLIO_JOB_BUSY" else code, status=409 if code == "PORTFOLIO_JOB_BUSY" else 400) from error
+            except Exception as error:
+                if created_job_id is not None:
+                    try:
+                        self.registry.discard_queued(created_job_id)
+                    except Exception:
+                        pass
+                raise PortfolioPanelError("PORTFOLIO_JOB_START_FAILED", "portfolio job could not start", status=503) from error
+            event = threading.Event()
+            self._cancel_events[saved["job_id"]] = event
+            try:
+                worker = threading.Thread(target=self._run_stage2, args=(saved["job_id"], prepared), name="mrs3-portfolio-stage2", daemon=True)
+                self._threads[saved["job_id"]] = worker
+                worker.start()
+            except BaseException as error:
+                self._threads.pop(saved["job_id"], None)
+                self._cancel_events.pop(saved["job_id"], None)
+                self.registry.discard_queued(saved["job_id"])
+                raise PortfolioPanelError("PORTFOLIO_JOB_START_FAILED", "portfolio job could not start", status=503) from error
+        return {"campaign_id": campaign_id, "job_id": saved["job_id"], "status": "QUEUED"}
 
 
 __all__ = ["PortfolioPanelError", "PortfolioPanelService", "STAGES"]

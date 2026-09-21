@@ -193,7 +193,10 @@ def test_build_adapter_keeps_distinct_compositions_that_only_change_zero_member(
         identity="same-search-identity", members=(positive,),
         metrics={"limiter_L": 2, "p30_common_usdt_30d": Decimal("10"), "cdar_peak80_usdt": Decimal("1"), "required_bank_usdt": Decimal("1")},
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
+        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
+    ))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -415,6 +418,8 @@ def test_run_weighted_search_forwards_profile_settings_and_capacities(monkeypatc
         "margin_kwargs": {
             "reserve": Decimal("0.40"),
             "max_mm_load": Decimal("0.35"),
+            "L": 0,
+            "priorities": {11: 1},
         },
         "max_targets": 4,
         "seed": 17,
@@ -589,6 +594,8 @@ def test_run_weighted_search_forwards_each_research_policy_fraction(profile_id, 
     assert kwargs["margin_kwargs"] == {
         "reserve": policy["min_calculated_free_margin_reserve_pct"] / Decimal("100"),
         "max_mm_load": policy["max_calculated_account_mm_load_pct"] / Decimal("100"),
+        "L": 0,
+        "priorities": {11: 1},
     }
 
 
@@ -1831,7 +1838,10 @@ def test_build_adapter_bridges_frozen_weighted_search_result(monkeypatch):
         k=9,
         size_composition_vector=(Decimal("0.5"),),
     ),)
-    prepared = object()
+    prepared = SimpleNamespace(
+        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
+    )
     margin = _margin_evidence(11)
     campaign = weighted_campaign()
     campaign.update({
@@ -2003,37 +2013,52 @@ def test_build_adapter_attaches_real_source_geometry_payloads_by_member_identity
         for row, capacity, leverage in zip(source_rows, (Decimal("800"), Decimal("400"), Decimal("100")), (Decimal("7"), Decimal("9"), Decimal("5")))
     )
     candidate_members = (
-        {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101, "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3},
-        {"symbol": "ETHUSDT", "side": "LONG", "strategy_id": 22, "result_id": 202, "x_usdt": Decimal("200"), "capacity_usdt": Decimal("800"), "priority": 2},
+        {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101, "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 1},
+        {"symbol": "ETHUSDT", "side": "LONG", "strategy_id": 22, "result_id": 202, "x_usdt": Decimal("200"), "capacity_usdt": Decimal("800"), "priority": 1},
         {"symbol": "SOLUSDT", "side": "LONG", "strategy_id": 33, "result_id": 303, "x_usdt": Decimal("0"), "capacity_usdt": Decimal("100"), "priority": 1},
     )
     candidate = candidate_search.PortfolioCandidate(
         schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
-        identity="candidate-BALANCED", members=candidate_members, metrics={"limiter_L": 2},
+        identity="candidate-BALANCED", members=candidate_members, metrics={"limiter_L": 0},
     )
+    calls = {}
     campaign = _weighted_build_campaign()
     template = _weighted_strategy_template_fixture()
     template_before = deepcopy(template)
     source_before = deepcopy(source_rows)
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
+        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
+    ))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),
     )
-    monkeypatch.setattr(
-        adapter_module, "_run_weighted_search",
-        lambda *_args, **_kwargs: candidate_search.SearchResult(
+    def capture_weighted_search(prepared_input, capacities, **kwargs):
+        calls["search"] = (prepared_input, capacities, kwargs)
+        return candidate_search.SearchResult(
             status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
-        ),
-    )
+        )
+
+    monkeypatch.setattr(adapter_module, "weighted_search", capture_weighted_search)
 
     result = build_portfolio_candidates(
         selected, campaign, capacities={}, reference=None, mark_prices={},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY", "ETHUSDT": "READY", "SOLUSDT": "READY"},
-        now_ms=0, margin_coefficients=_margin_evidence(11), strategy_template=template,
+        now_ms=0, margin_coefficients=_margin_evidence(11, 22, 33), strategy_template=template,
     )
 
     assert result.status == "PASS", (result.blockers, result.excluded)
+    search_prepared, capacities, search_kwargs = calls["search"]
+    assert search_prepared is not None
+    assert capacities == {22: Decimal("800"), 11: Decimal("400"), 33: Decimal("100")}
+    assert search_kwargs["margin_kwargs"]["L"] == 0
+    assert search_kwargs["margin_kwargs"]["priorities"] == {11: 1, 22: 1, 33: 1}
+    assert result.variants[0]["limiter_L"] == 0
+    assert result.variants[0]["pretest_period"] == {
+        "start_utc": "2026-01-01T00:00:00Z",
+        "end_utc": "2026-01-15T00:00:00Z",
+    }
     payloads = result.variants[0]["strategy_payloads"]
     by_symbol = {payload["strategy"]["basic"]["symbol"]: payload for payload in payloads}
     assert set(by_symbol) == {"BTCUSDT", "ETHUSDT"}
@@ -2054,14 +2079,14 @@ def test_build_adapter_attaches_real_source_geometry_payloads_by_member_identity
     assert by_symbol["ETHUSDT"]["facts"] == {"B": "1000", "C": "800", "q": "0.2", "x": "200"}
     assert by_symbol["BTCUSDT"]["strategy"]["basic"]["max_balance"] == 4000
     assert by_symbol["ETHUSDT"]["strategy"]["basic"]["max_balance"] == 4000
-    assert by_symbol["BTCUSDT"]["strategy"]["mrs"]["position_priority"] == 3
-    assert by_symbol["ETHUSDT"]["strategy"]["mrs"]["position_priority"] == 2
-    assert by_symbol["BTCUSDT"]["account"]["open_positions_limiter"] == 2
-    assert by_symbol["ETHUSDT"]["account"]["open_positions_limiter"] == 2
+    assert by_symbol["BTCUSDT"]["strategy"]["mrs"]["position_priority"] == 1
+    assert by_symbol["ETHUSDT"]["strategy"]["mrs"]["position_priority"] == 1
+    assert by_symbol["BTCUSDT"]["account"]["open_positions_limiter"] == 0
+    assert by_symbol["ETHUSDT"]["account"]["open_positions_limiter"] == 0
     payload_copy = adapter_module._copy_candidate_fields(by_symbol["BTCUSDT"])
     decoded_payload = json.loads(json.dumps(payload_copy))
     assert decoded_payload["facts"] == payload_copy["facts"]
-    assert decoded_payload["strategy"]["mrs"]["position_priority"] == 3
+    assert decoded_payload["strategy"]["mrs"]["position_priority"] == 1
     payload_keys = set()
     def collect_keys(value):
         if isinstance(value, dict):
@@ -2102,7 +2127,10 @@ def test_build_adapter_rebinds_identity_after_executable_payload_assembly(monkey
     )
     campaign = _weighted_build_campaign()
     template = _weighted_strategy_template_fixture()
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
+        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
+    ))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),
@@ -2149,7 +2177,10 @@ def test_build_adapter_reports_true_executable_identity_collision(monkeypatch):
         )
         for identity in ("search-a", "search-b")
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
+        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
+    ))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),

@@ -1,6 +1,6 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-21
+**Updated:** 2026-09-22
 **Current branch:** `main`
 
 ## Pair screener table readability and testing-screen layout (2026-09-21)
@@ -130,6 +130,89 @@ reports with an "open tail" (`my_test_run_1445_of_27360_CRCLUSDT_5m_…`,
 accounts, not real open positions: the balance goes negative on the last close
 and reads +10 in the same minute after the next open. That last observation is
 unexplained and should be put to whoever knows the tester.
+## Portfolio Optimizer Phase 7 off-only boundary (2026-09-21)
+
+The current production weighted Stage 1 adapter uses
+`LIMITER_DISABLED_OFF_ONLY`: it calls weighted search with `L=0` and priority 1
+for every member. Emitted variants and frozen payload wrappers use
+`account.open_positions_limiter=0`; executable strategy JSON retains
+`mrs.position_priority=1`. This wrapper value is internal candidate identity,
+not tester readback. Lower-level limiter APIs, calculations, tests, and history
+remain intact for Phase 13.
+
+Phase 4 is closed only for the off-only boundary. The prior live limiter-release
+evidence item moved to Phase 13; release remains `UNKNOWN` until real evidence.
+Phase 7 is an off-only joint baseline and its execution items remain open.
+Phase 13 holds bot limiter implementation, L comparisons, priority/order
+behavior, release evidence, replay and joint calibration.
+
+Separate explicit user authorization dated 2026-09-21 permits a bounded
+local-only off-only tester baseline. No tester run or result is complete;
+execution remains gated by implementation, focused tests, and review. No
+exchange actions, trading, or production PerformanceDB writes are authorized.
+
+The scoped off-only adapter check passes:
+`.venv\Scripts\python.exe -m pytest tests/test_portfolio_adapter.py
+tests/test_portfolio_weighted_search.py -q` — `504 passed`. `git diff --check`
+is clean. Stage 1 now also publishes a private canonical
+`stage1-executables.json` with exact off-only payloads and explicit member
+identities, committed/rolled back with the workbook and restart-loadable without
+rerunning finalists or the adapter. Final artifact checks pass: focused
+publication/load/rollback tests — `9 passed, 160 deselected`; full
+`tests/test_panel_portfolio.py` — `169 passed`; combined Panel/adapter/search
+before the final member-identity guard — `672 passed`. No tester run, exchange
+action, or production PerformanceDB write was used. The active plan status is
+P7-R3 / `NOT_ADVISOR_APPROVED`; configured Opus Advisor authentication is
+unavailable, and temporary root self-review is not `PLAN_APPROVED` or
+`CODE_REVIEW_PASS`.
+
+The exact prebuilt staging slice now reuses that path through
+`LocalTestingService.fill_prebuilt`: it validates the four off-only tester
+flags before mutation, installs every supplied strategy byte-for-byte, records
+file/config hashes, preserves reports by default, retains the target lock, and
+restores the prior config/strategy set through the existing `stop()` path.
+No render/resizing or tester request occurs in this method. Focused checks pass
+(`11 passed`) and the full `tests/test_panel_testing.py` passes (`67 passed`).
+
+The Phase 7 Stage 2 backend worker is now implemented and fake-verified. A
+confirmed submission loads exactly one committed Stage 1 candidate, persists a
+`portfolio.stage2` job, and runs the exact in-memory config/strategy package
+through the shared `LocalTestingService` singleton. It captures the current
+wizard-result fingerprint immediately before start, requires one fresh direct
+candidate-folder result via `name_comment`, validates the exact strategy set
+and all core finite metrics, and always restores through `stop()` after a
+successful fill. Duplicate submissions are idempotent; stale results timeout;
+invalid readbacks fail immediately; cancellation and restart project safely.
+The frontend control remains disabled, no report folder is copied or renamed,
+and no real tester run, exchange action, or PerformanceDB write was used.
+Focused Stage 2 checks pass (`12 passed`), including route reachability, the
+no-provider authorization guard, result cleanup on cancellation, and queued-job
+cleanup on reservation failure and cancellation/commit race handling. The full
+`tests/test_panel_portfolio.py` passes (`189 passed`). The active plan remains P7-R3 /
+`NOT_ADVISOR_APPROVED`; configured Opus Advisor authentication is unavailable,
+and this slice is not `CODE_REVIEW_PASS`.
+
+The authorized real local preflight on 2026-09-22 started the current Panel on
+`127.0.0.1:8766` and confirmed that no portfolio job was active, but did not
+start the tester or mutate its files. Stage 1 is currently blocked before job
+creation: PerformanceDB contains 49 pair/side selection histories, while the
+latest selection run for 25 of them has no imported user review. The strict
+current-review reader therefore reports `FINALISTS_UNAVAILABLE` / `NO_FINALISTS`.
+The four older committed Campaigns predate `stage1-executables.json` and cannot
+be reused for exact Stage 2. Next external prerequisite: import the intended
+review for the current selection runs, then create one new Stage 1 Campaign and
+submit its confirmed off-only Stage 2 baseline. Old `FINALIST` decisions were
+not copied forward automatically.
+
+The weighted executable candidate now freezes the exact common half-open UTC
+period from its existing `PreparedWeightedInput` as compact `pretest_period`
+(`start_utc`/`end_utc`). Stage 1 artifact build and restart-load validation
+require canonical UTC midnight boundaries, at least one full day, and include
+the period in candidate and payload digests; schema version remains 1. Focused
+period/artifact checks pass (`5 passed`), full `tests/test_portfolio_adapter.py`
+passes (`293 passed`), and full `tests/test_panel_portfolio.py` passes
+(`170 passed`). No tester run or PerformanceDB reread was used; review and
+approval status are unchanged.
 
 ## Source DB local import: out-of-memory at the tail (2026-09-20)
 

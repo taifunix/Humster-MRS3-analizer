@@ -4,19 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import hashlib
 import json
 from pathlib import Path
 import re
 import shutil
 import tempfile
 import time
-from typing import Callable, Protocol
+from typing import Callable, Mapping, Protocol
 
 from .locking import TesterTargetLock
 from .runner.config import RunnerConfig
 from .runner.files import (
     TesterSettingsSnapshot,
     capture_tester_settings,
+    inspect_strategy_batch,
     prepare_batch_files,
     restore_tester_settings,
     validate_runner_paths,
@@ -422,6 +424,139 @@ class LocalTestingService:
         finally:
             shutil.rmtree(prepared.tester_config.parent, ignore_errors=True)
 
+    def fill_prebuilt(
+        self,
+        *,
+        tester_config_json: str,
+        strategy_jsons: Mapping[str, str],
+        delete_old_reports: bool = False,
+    ) -> dict[str, object]:
+        """Install an already-rendered exact strategy batch without running it."""
+        if not isinstance(delete_old_reports, bool):
+            raise PanelTestingError("delete_old_reports must be a boolean")
+        validate_runtime_preflight(self.config)
+        if not isinstance(tester_config_json, str):
+            raise PanelTestingError("invalid tester configuration")
+        try:
+            tester_config = json.loads(tester_config_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise PanelTestingError("invalid tester configuration") from None
+        if (
+            not isinstance(tester_config, dict)
+            or type(tester_config.get("single_mode")) is not bool
+            or tester_config.get("single_mode") is not False
+            or type(tester_config.get("UpdateData")) is not bool
+            or tester_config.get("UpdateData") is not False
+            or type(tester_config.get("use_runs")) is not bool
+            or tester_config.get("use_runs") is not False
+            or tester_config.get("parameter_mining") != []
+        ):
+            raise PanelTestingError("invalid tester configuration")
+        if not isinstance(strategy_jsons, Mapping) or not strategy_jsons:
+            raise PanelTestingError("invalid strategy batch")
+
+        workspace = (self.config.inbox_root / "panel-testing").resolve()
+        try:
+            workspace.relative_to(self.config.bot_root.resolve())
+        except ValueError:
+            pass
+        else:
+            raise PanelTestingError("staging output must be outside bot_root")
+        workspace.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix="mrs3-testing-", dir=workspace))
+        source = staging / "strategies"
+        source.mkdir()
+        expected_filenames: set[str] = set()
+        expected_bytes: dict[str, bytes] = {}
+        try:
+            for key, payload in strategy_jsons.items():
+                if not isinstance(key, str) or not key.strip() or not isinstance(payload, str):
+                    raise PanelTestingError("invalid strategy batch")
+                filename = key if key.casefold().endswith(".json") else f"{key}.json"
+                path = Path(filename)
+                if path.name != filename or path.suffix.casefold() != ".json":
+                    raise PanelTestingError("invalid strategy batch")
+                try:
+                    strategy = json.loads(payload)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise PanelTestingError("invalid strategy batch") from None
+                if not isinstance(strategy, dict):
+                    raise PanelTestingError("invalid strategy batch")
+                name = strategy.get("name")
+                if (
+                    not isinstance(name, str)
+                    or not name.strip()
+                    or path.stem != name
+                    or path.name.casefold() in expected_filenames
+                ):
+                    raise PanelTestingError("invalid strategy batch")
+                expected_filenames.add(path.name.casefold())
+                payload_bytes = payload.encode("utf-8")
+                _atomic_write_bytes(source / path.name, payload_bytes)
+                if (source / path.name).read_bytes() != payload_bytes:
+                    raise PanelTestingError("strategy batch staging readback mismatch")
+                expected_bytes[path.name] = payload_bytes
+            inspection = inspect_strategy_batch(source)
+        except PanelTestingError:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        except Exception as error:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise PanelTestingError("invalid strategy batch") from error
+
+        owner: TesterTargetLock | None = None
+        target_quiesced = True
+        config_bytes = tester_config_json.encode("utf-8")
+        try:
+            if self._target_owner is not None:
+                raise PanelTestingError("tester target is already owned")
+            owner = TesterTargetLock(
+                self.config.bot_root,
+                reclaim_dead_after_reboot=True,
+            ).acquire()
+            try:
+                self._stop_bot(self.config)
+            except BaseException:
+                target_quiesced = False
+                raise
+            self._target_snapshot = capture_tester_settings(self.config)
+            if delete_old_reports:
+                _clear_report_contents(self.config)
+            _atomic_write_bytes(self.config.tester_config, config_bytes)
+            if self.config.tester_config.read_bytes() != config_bytes:
+                raise PanelTestingError("tester configuration readback mismatch")
+            self._install_batch(
+                self.config,
+                source,
+                expected_file_hashes=inspection.file_hashes,
+                selected_names=inspection.expected_names,
+                preserve_raw_artifacts=True,
+            )
+            for filename, payload in expected_bytes.items():
+                if (self.config.strategy_dir / filename).read_bytes() != payload:
+                    raise PanelTestingError("installed strategy batch readback mismatch")
+            readback = inspect_strategy_batch(self.config.strategy_dir)
+            if readback.file_hashes != inspection.file_hashes:
+                raise PanelTestingError("installed strategy batch readback mismatch")
+            self._target_owner = owner
+            return {
+                "strategy_names": list(inspection.expected_names),
+                "strategy_file_hashes": list(inspection.file_hashes),
+                "tester_config_hash": hashlib.sha256(config_bytes).hexdigest(),
+            }
+        except BaseException:
+            if owner is not None:
+                self._target_owner = owner
+                if target_quiesced:
+                    if self._target_snapshot is not None:
+                        restore_tester_settings(self.config, self._target_snapshot)
+                        self._target_snapshot = None
+                    owner.release()
+                    self._target_owner = None
+            raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
     def start(self) -> dict[str, str]:
         validate_runtime_preflight(self.config)
         owner = self._target_owner or TesterTargetLock(self.config.bot_root).acquire()
@@ -478,6 +613,19 @@ def _atomic_write(path: Path, text: str) -> None:
         ) as handle:
             temporary = Path(handle.name)
             handle.write(text)
+            handle.flush()
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
             handle.flush()
         temporary.replace(path)
     finally:

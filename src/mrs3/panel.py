@@ -1300,6 +1300,7 @@ class PanelController:
             self.root / "portfolio_optimizer.local.json",
             registry=self._panel_jobs,
             lock=self._lock,
+            local_testing_service_provider=lambda: self._local_testing_service(),
         )
         self._local_testing_filled = False
         self._remote_testing_filled = False
@@ -7977,9 +7978,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
             self._json(404, {"error": "not found"})
             return
-        if portfolio_submission_route:
-            self._portfolio_error(PortfolioPanelError("PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED", "stage 2 is not authorized", status=409))
-            return
         if endpoint == "/api/v2/strategies/performance-v2/selection-review-import":
             if self.headers.get("Content-Type", "").partition(";")[0].strip().casefold() != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
                 self._json(415, {"error": {"code": "SELECTION_REVIEW_INVALID_FILE", "message": "XLSX Content-Type required"}})
@@ -8292,7 +8290,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        accepted = portfolio_cancel_route or endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
+        accepted = portfolio_cancel_route or portfolio_submission_route or endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
         self._json(202 if accepted else 200, result)
 
 

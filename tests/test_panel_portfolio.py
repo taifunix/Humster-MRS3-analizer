@@ -60,7 +60,89 @@ def _write_config(path: Path) -> str:
 
 
 def _profiled_variants(selected, *_):
-    return tuple({**dict(item), "profile": "BALANCED"} for item in selected)
+    return tuple({
+        **dict(item),
+        "candidate_id": f"candidate-{index + 1}",
+        "identity": f"candidate-{index + 1}",
+        "profile": "BALANCED",
+        "search_mode": CAMPAIGN_SEARCH_MODE,
+        "limiter_L": 0,
+        "metrics": {"limiter_L": 0},
+        "pretest_period": {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"},
+        "members": (
+            {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 700, "result_id": 711, "x_usdt": Decimal("100")},
+            {"symbol": "BTCUSDT", "side": "SHORT", "strategy_id": 701, "result_id": 712, "x_usdt": Decimal("100")},
+        ),
+        "strategy_payloads": (
+            _executable_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_700_711"),
+            _executable_payload("BTCUSDT", "SHORT", name="PORTFOLIO_BTCUSDT_701_712"),
+        ),
+    } for index, item in enumerate(selected))
+
+
+def _executable_payload(symbol: str, side: str = "LONG", *, name: str | None = None, x: str = "100") -> dict:
+    return {
+        "side": side,
+        "strategy": {
+            "name": name or f"PORTFOLIO_{symbol}_{side}",
+            "basic": {"symbol": symbol},
+            "mrs": {"position_priority": 1},
+        },
+        "account": {"open_positions_limiter": 0},
+        "facts": {"x": x},
+    }
+
+
+def _candidate_member(symbol: str, side: str, strategy_id: int, result_id: int, x: str = "100") -> dict:
+    return {"symbol": symbol, "side": side, "strategy_id": strategy_id, "result_id": result_id, "x_usdt": Decimal(x)}
+
+
+def _weighted_executable_candidate(payloads: tuple[dict, ...], **updates) -> dict:
+    members = tuple(
+        _candidate_member(payload["strategy"]["basic"]["symbol"], payload["side"], index + 1, index + 101, payload["facts"]["x"])
+        for index, payload in enumerate(payloads)
+    )
+    return {
+        "candidate_id": "candidate-executable",
+        "profile": "BALANCED",
+        "search_mode": CAMPAIGN_SEARCH_MODE,
+        "limiter_L": 0,
+        "pretest_period": {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"},
+        "members": members,
+        "strategy_payloads": payloads,
+        **updates,
+    }
+
+
+def _stage2_payload(symbol: str, side: str, *, name: str, bank: str = "10000") -> dict:
+    payload = _executable_payload(symbol, side, name=name)
+    payload["facts"]["B"] = bank
+    return payload
+
+
+def _stage2_service(tmp_path: Path, candidate: dict) -> tuple[PortfolioPanelService, dict]:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(
+        tmp_path,
+        path,
+        finalists_reader=lambda *_: [_finalist()],
+        variant_generator=lambda *_: (candidate,),
+    )
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    })
+    assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
+    return service, result
+
+
+def _wait_stage1(service: PortfolioPanelService, result: dict) -> dict:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
+        time.sleep(0.01)
+    return service.job(result["job_id"])
 
 
 def _finalist(**updates) -> dict:
@@ -1408,6 +1490,7 @@ def test_invalid_published_workbook_fails_without_download(tmp_path: Path) -> No
 
     assert service.job(result["job_id"])["status"] == "FAILED"
     assert not (tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1.xlsx").exists()
+    assert not (tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json").exists()
     with pytest.raises(Exception):
         service.workbook(result["campaign_id"])
 
@@ -1433,6 +1516,7 @@ def test_commit_failure_rolls_back_published_workbook(tmp_path: Path) -> None:
 
     assert service.job(result["job_id"])["status"] == "FAILED"
     assert not (tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1.xlsx").exists()
+    assert not (tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json").exists()
     with pytest.raises(PortfolioPanelError) as error:
         service.workbook(result["campaign_id"])
     assert error.value.code == "PORTFOLIO_JOB_WORKBOOK_UNAVAILABLE"
@@ -2205,6 +2289,7 @@ def test_verify_workbook_rejects_hyperlinks_without_publishing(tmp_path: Path) -
 
     assert service.job(result["job_id"])["status"] == "FAILED"
     assert not (tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1.xlsx").exists()
+    assert not (tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json").exists()
     with pytest.raises(PortfolioPanelError):
         service.workbook(result["campaign_id"])
 
@@ -2314,6 +2399,7 @@ def test_cancel_during_publication_rolls_back_every_artifact(monkeypatch: pytest
     assert service.job(result["job_id"])["status"] == "CANCELLED"
     assert not (tmp_path / ".portfolio-staging" / result["campaign_id"] / "stage1.xlsx").exists()
     assert not (tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1.xlsx").exists()
+    assert not (tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json").exists()
     with pytest.raises(PortfolioPanelError):
         service.workbook(result["campaign_id"])
 
@@ -2550,9 +2636,549 @@ def test_stage1_success_publishes_exact_workbook_after_commit(tmp_path: Path) ->
     assert workbook["Metadata"].sheet_state == "hidden"
     assert [cell.value for cell in workbook["Finalists"][2]] == [result["campaign_id"], 7, 11, "BTCUSDT", "LONG", "FINALIST", 1, 1, "SELECTED", "WITHIN_MAXIMUM"]
     assert workbook["Portfolios"].max_row == 2
-    assert workbook["Portfolios"][2][6].value is None
+    assert workbook["Portfolios"][2][6].value == 2
     assert workbook["Portfolios"][2][7].value == 1
     assert workbook["Portfolios"][2][12].value == "UNKNOWN"
+
+
+def test_stage1_executables_are_digest_bound_deterministic_and_restart_loadable(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    payloads = (
+        _executable_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _executable_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    reader_calls: list[str] = []
+    generator_calls: list[str] = []
+
+    def reader(*_args):
+        reader_calls.append("read")
+        return [_finalist()]
+
+    def generator(*_args):
+        generator_calls.append("generate")
+        return (
+            _weighted_executable_candidate(payloads, candidate_id="candidate-l1", identity="candidate-l1", limiter_L=1),
+            _weighted_executable_candidate(payloads),
+        )
+
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=reader, variant_generator=generator)
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
+
+    artifact_path = tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json"
+    artifact_bytes = artifact_path.read_bytes()
+    artifact = json.loads(artifact_bytes)
+    assert artifact["schema_version"] == 1
+    assert artifact["campaign_id"] == result["campaign_id"]
+    assert artifact["input_digest"] == result["input_digest"]
+    assert artifact["config_digest"] == result["config_digest"]
+    assert len(artifact["candidates"]) == 1
+    assert artifact["candidates"][0]["candidate_id"] == "candidate-executable"
+    assert artifact["candidates"][0]["order"] == 1
+    assert artifact["candidates"][0]["members"] == [
+        {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 101},
+        {"symbol": "ETHUSDT", "side": "SHORT", "strategy_id": 2, "result_id": 102},
+    ]
+    assert artifact["candidates"][0]["strategy_payloads"] == list(payloads)
+    assert artifact["candidates"][0]["limiter_L"] == 0
+    assert artifact["candidates"][0]["pretest_period"] == {
+        "start_utc": "2026-01-01T00:00:00Z",
+        "end_utc": "2026-01-15T00:00:00Z",
+    }
+    for payload in artifact["candidates"][0]["strategy_payloads"]:
+        assert payload["account"]["open_positions_limiter"] == 0
+        assert payload["strategy"]["mrs"]["position_priority"] == 1
+    candidate = artifact["candidates"][0]
+    candidate_body = {key: value for key, value in candidate.items() if key != "candidate_digest"}
+    candidate_canonical = json.dumps(candidate_body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    assert candidate["candidate_digest"] == hashlib.sha256(candidate_canonical.encode("utf-8")).hexdigest()
+    body = {key: value for key, value in artifact.items() if key != "payload_digest"}
+    canonical = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    assert artifact["payload_digest"] == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    runtime = service.registry.runtime(result["job_id"])
+    assert runtime["executables_path"] == str(artifact_path)
+    assert runtime["executables_digest"] == artifact["payload_digest"]
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("Stage 1 inputs must not be recomputed on artifact load")
+
+    restarted = PortfolioPanelService(
+        tmp_path,
+        path,
+        finalists_reader=unexpected,
+        optimizer_input_preparer=unexpected,
+        variant_generator=unexpected,
+    )
+    loaded = restarted._load_stage1_executables(result["campaign_id"], result["input_digest"], result["config_digest"], runtime["executables_digest"])
+    assert loaded == artifact
+    assert artifact_path.read_bytes() == artifact_bytes
+    assert reader_calls == ["read"]
+    assert generator_calls == ["generate"]
+
+
+def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_payloads(tmp_path: Path) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    candidate = _weighted_executable_candidate(
+        payloads,
+        candidate_id="a" * 64,
+        identity="a" * 64,
+    )
+    service, result = _stage2_service(tmp_path, candidate)
+
+    prepared = service._prepare_stage2_baseline(result["campaign_id"])
+    assert prepared["campaign_id"] == result["campaign_id"]
+    assert prepared["input_digest"] == result["input_digest"]
+    assert prepared["config_digest"] == result["config_digest"]
+    assert prepared["artifact_digest"] == service.registry.runtime(result["job_id"])["executables_digest"]
+    assert "executables_digest" not in prepared
+    assert prepared["portfolio_name"] == "a" * 64
+    assert prepared["candidate_id"] == "a" * 64
+    assert prepared["expected_names"] == [payload["strategy"]["name"] for payload in payloads]
+    assert prepared["pretest_period"] == {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"}
+
+    config = json.loads(prepared["tester_config_json"])
+    template = json.loads((Path(__file__).parents[1] / "templates/tester/mrs3/config_tester.json").read_text(encoding="utf-8"))
+    expected_config = {**template, "name_comment": "a" * 64, "StartDate": "2026-01-01", "EndDate": "2026-01-14", "InitialBalance": 10000, "single_mode": False, "UpdateData": False}
+    assert config == expected_config
+    assert type(config["InitialBalance"]) is int
+    assert config["use_runs"] is False
+    assert config["parameter_mining"] == []
+    assert prepared["tester_config_json"].endswith("\n")
+
+    for payload in payloads:
+        name = payload["strategy"]["name"]
+        expected = json.dumps(payload["strategy"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+        assert prepared["strategy_jsons"][name] == expected
+
+
+def test_stage2_baseline_preparation_uses_candidate_after_filtered_order_zero(tmp_path: Path) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    candidate = _weighted_executable_candidate(payloads, candidate_id="b" * 64, identity="b" * 64)
+    invalid = _weighted_executable_candidate(payloads, candidate_id="c" * 64, identity="c" * 64, limiter_L=1)
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: [_finalist()], variant_generator=lambda *_: (invalid, candidate))
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    })
+    assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
+    artifact = json.loads((tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json").read_text(encoding="utf-8"))
+    assert artifact["candidates"][0]["order"] == 1
+    assert service._prepare_stage2_baseline(result["campaign_id"])["candidate_id"] == "b" * 64
+
+
+@pytest.mark.parametrize(
+    "candidate_update",
+    (
+        {"candidate_id": "unsafe"},
+        {"identity": "unsafe"},
+    ),
+)
+def test_stage2_baseline_preparation_rejects_unsafe_candidate_binding(tmp_path: Path, candidate_update: dict) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    candidate = _weighted_executable_candidate(payloads, candidate_id="d" * 64, identity="d" * 64)
+    candidate.update(candidate_update)
+    service, result = _stage2_service(tmp_path, candidate)
+    with pytest.raises(PortfolioPanelError) as error:
+        service._prepare_stage2_baseline(result["campaign_id"])
+    assert error.value.code == "PORTFOLIO_STAGE2_INPUT_INVALID"
+    assert error.value.status == 409
+
+
+def test_stage2_baseline_preparation_rejects_bank_mismatch(tmp_path: Path) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11", bank="9999"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    service, result = _stage2_service(tmp_path, _weighted_executable_candidate(payloads, candidate_id="e" * 64, identity="e" * 64))
+    with pytest.raises(PortfolioPanelError) as error:
+        service._prepare_stage2_baseline(result["campaign_id"])
+    assert error.value.code == "PORTFOLIO_STAGE2_INPUT_INVALID"
+    assert error.value.status == 409
+
+
+def test_stage2_baseline_preparation_rejects_unsafe_strategy_name(tmp_path: Path) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="BAD:NAME"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    service, result = _stage2_service(tmp_path, _weighted_executable_candidate(payloads, candidate_id="1" * 64, identity="1" * 64))
+    with pytest.raises(PortfolioPanelError) as error:
+        service._prepare_stage2_baseline(result["campaign_id"])
+    assert error.value.code == "PORTFOLIO_STAGE2_INPUT_INVALID"
+    assert error.value.status == 409
+
+
+def test_stage2_baseline_preparation_loads_restart_without_stage1_recomputation(tmp_path: Path) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    service, result = _stage2_service(tmp_path, _weighted_executable_candidate(payloads, candidate_id="f" * 64, identity="f" * 64))
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("stage 1 inputs must not be recomputed")
+
+    restarted = PortfolioPanelService(tmp_path, tmp_path / "portfolio_optimizer.local.json", finalists_reader=unexpected, optimizer_input_preparer=unexpected, variant_generator=unexpected)
+    prepared = restarted._prepare_stage2_baseline(result["campaign_id"])
+    assert prepared["candidate_id"] == "f" * 64
+
+
+class _FakeStage2Tester:
+    def __init__(self, root: Path, expected_names: tuple[str, ...], *, write_result: bool = True, result_names: tuple[str, ...] | None = None, result_stats: dict[str, object] | None = None, fill_error: Exception | None = None, fill_enter: threading.Event | None = None, fill_release: threading.Event | None = None, stop_error: Exception | None = None, stop_enter: threading.Event | None = None, stop_release: threading.Event | None = None) -> None:
+        self.config = SimpleNamespace(
+            wizard_result=root / "wizard-result.json",
+            report_dir=root / "tester" / "report" / "my_test",
+            poll_interval_seconds=0.001,
+            stall_timeout_seconds=0.05,
+            report_stability_polls=1,
+            metric_tolerance=Decimal("0.01"),
+        )
+        self.expected_names = expected_names
+        self.result_names = result_names or expected_names
+        self.result_stats = result_stats or {
+            "InitialBalance": 10000,
+            "FinalBalance": 10100,
+            "TotalPnL": 100,
+            "TotalPnLPercent": 1,
+            "TotalTrades": 2,
+            "WinRate": 50,
+            "MaxDrawdown": 10,
+            "MaxDrawdownPercent": 0.1,
+            "TotalFees": 1,
+        }
+        self.write_result = write_result
+        self.fill_error = fill_error
+        self.fill_enter = fill_enter
+        self.fill_release = fill_release
+        self.stop_error = stop_error
+        self.stop_enter = stop_enter
+        self.stop_release = stop_release
+        self.calls: list[tuple[str, object]] = []
+        self.config.wizard_result.write_text("[]", encoding="utf-8")
+
+    def fill_prebuilt(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("fill_prebuilt", kwargs))
+        if self.fill_enter is not None:
+            self.fill_enter.set()
+        if self.fill_release is not None:
+            self.fill_release.wait(timeout=2)
+        if self.fill_error is not None:
+            raise self.fill_error
+        return {"strategy_names": list(kwargs["strategy_jsons"])}
+
+    def start(self) -> dict[str, str]:
+        self.calls.append(("start", None))
+        if self.write_result:
+            self.config.wizard_result.write_text(json.dumps([{
+                "runId": "portfolio-run",
+                "strategies": list(self.result_names),
+                "stats": self.result_stats,
+                "chartUrl": f"/tester-report/{'a' * 64}/portfolio.html",
+                "period": "2026-01-01..2026-01-14",
+            }]), encoding="utf-8")
+        return {"state": "STARTED", "tester_status": "RUNNING"}
+
+    def stop(self) -> dict[str, str]:
+        self.calls.append(("stop", None))
+        if self.stop_enter is not None:
+            self.stop_enter.set()
+        if self.stop_release is not None:
+            self.stop_release.wait(timeout=2)
+        if self.stop_error is not None:
+            raise self.stop_error
+        return {"state": "STOPPED"}
+
+
+def test_stage2_submission_runs_one_prepared_candidate_and_stops_service(tmp_path: Path) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    service, stage1 = _stage2_service(
+        tmp_path,
+        _weighted_executable_candidate(payloads, candidate_id="a" * 64, identity="a" * 64),
+    )
+    fake = _FakeStage2Tester(tmp_path, tuple(payload["strategy"]["name"] for payload in payloads))
+    service._local_testing_service_provider = lambda: fake
+
+    submitted = service.submit_tester_submission(
+        stage1["campaign_id"],
+        {"confirmed": True, "campaign_id": stage1["campaign_id"]},
+    )
+    job = _wait_stage1(service, submitted)
+
+    assert job["status"] == "SUCCEEDED"
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"]
+    runtime = service.registry.runtime(submitted["job_id"])
+    assert runtime["stage2_result"]["candidate_id"] == "a" * 64
+    assert runtime["stage2_result"]["report_folder"] == "a" * 64
+    assert runtime["stage2_result"]["strategy_names"] == [payload["strategy"]["name"] for payload in payloads]
+    assert runtime["stage2_result"]["pretest_period"] == {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"}
+
+
+def _submit_stage2_with_fake(tmp_path: Path, *, fake_kwargs: dict[str, object] | None = None) -> tuple[PortfolioPanelService, dict, _FakeStage2Tester, dict]:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    service, stage1 = _stage2_service(
+        tmp_path,
+        _weighted_executable_candidate(payloads, candidate_id="a" * 64, identity="a" * 64),
+    )
+    names = tuple(payload["strategy"]["name"] for payload in payloads)
+    fake = _FakeStage2Tester(tmp_path, names, **(fake_kwargs or {}))
+    service._local_testing_service_provider = lambda: fake
+    submission = service.submit_tester_submission(stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]})
+    return service, stage1, fake, submission
+
+
+def test_stage2_submission_is_idempotent_for_campaign(tmp_path: Path) -> None:
+    service, stage1, fake, first = _submit_stage2_with_fake(tmp_path)
+    second = service.submit_tester_submission(stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]})
+    assert second["job_id"] == first["job_id"]
+    assert _wait_stage1(service, first)["status"] == "SUCCEEDED"
+    assert [call[0] for call in fake.calls].count("start") == 1
+
+
+@pytest.mark.parametrize(
+    "fake_kwargs",
+    (
+        {"result_names": ("PORTFOLIO_BTCUSDT_7_11", "WRONG")},
+        {"result_stats": {"InitialBalance": "NaN"}},
+    ),
+)
+def test_stage2_invalid_fresh_result_fails_immediately(tmp_path: Path, fake_kwargs: dict[str, object]) -> None:
+    service, _stage1, fake, submission = _submit_stage2_with_fake(tmp_path, fake_kwargs=fake_kwargs)
+    job = _wait_stage1(service, submission)
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_RESULT_INVALID"
+    assert [call[0] for call in fake.calls][-1] == "stop"
+
+
+def test_stage2_stale_result_times_out_and_restores(tmp_path: Path) -> None:
+    service, _stage1, fake, submission = _submit_stage2_with_fake(tmp_path, fake_kwargs={"write_result": False})
+    job = _wait_stage1(service, submission)
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_TIMEOUT"
+    assert [call[0] for call in fake.calls][-1] == "stop"
+
+
+def test_stage2_fill_failure_does_not_stop_unowned_service(tmp_path: Path) -> None:
+    service, _stage1, fake, submission = _submit_stage2_with_fake(tmp_path, fake_kwargs={"fill_error": RuntimeError("fill failed")})
+    assert _wait_stage1(service, submission)["status"] == "FAILED"
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt"]
+
+
+def test_stage2_cancel_stops_after_fill_and_never_starts_tester(tmp_path: Path) -> None:
+    entered, release = threading.Event(), threading.Event()
+    service, _stage1, fake, submission = _submit_stage2_with_fake(tmp_path, fake_kwargs={"fill_enter": entered, "fill_release": release})
+    assert entered.wait(timeout=2)
+    assert service.cancel(submission["job_id"])["status"] == "CANCEL_REQUESTED"
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and service.job(submission["job_id"])["status"] == "CANCEL_REQUESTED":
+        time.sleep(0.01)
+    assert service.job(submission["job_id"])["status"] == "CANCELLED"
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "stop"]
+
+
+def test_stage2_restore_failure_after_cancel_fails_job(tmp_path: Path) -> None:
+    entered, release = threading.Event(), threading.Event()
+    service, _stage1, fake, submission = _submit_stage2_with_fake(tmp_path, fake_kwargs={"fill_enter": entered, "fill_release": release, "stop_error": RuntimeError("restore failed")})
+    assert entered.wait(timeout=2)
+    service.cancel(submission["job_id"])
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and service.job(submission["job_id"])["status"] == "CANCEL_REQUESTED":
+        time.sleep(0.01)
+    assert service.job(submission["job_id"])["status"] == "FAILED"
+
+
+def test_stage2_cancel_removes_result_staged_before_restore(tmp_path: Path) -> None:
+    stop_enter, stop_release = threading.Event(), threading.Event()
+    service, _stage1, fake, submission = _submit_stage2_with_fake(tmp_path, fake_kwargs={"stop_enter": stop_enter, "stop_release": stop_release})
+    assert stop_enter.wait(timeout=2)
+    assert service.cancel(submission["job_id"])["status"] == "CANCEL_REQUESTED"
+    stop_release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and service.job(submission["job_id"])["status"] == "CANCEL_REQUESTED":
+        time.sleep(0.01)
+    assert service.job(submission["job_id"])["status"] == "CANCELLED"
+    assert "stage2_result" not in service.registry.runtime(submission["job_id"])
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"]
+
+
+def test_stage2_reserve_failure_discards_new_queued_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    service, stage1 = _stage2_service(
+        tmp_path,
+        _weighted_executable_candidate(payloads, candidate_id="a" * 64, identity="a" * 64),
+    )
+    service._local_testing_service_provider = lambda: object()
+
+    def fail_reserve(*_args: object, **_kwargs: object) -> None:
+        raise OSError("journal unavailable")
+
+    monkeypatch.setattr(service.registry, "reserve_runtime", fail_reserve)
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_tester_submission(stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]})
+    assert error.value.code == "PORTFOLIO_JOB_START_FAILED"
+    assert not any(saved.get("kind") == "portfolio.stage2" for saved in service.registry.list())
+
+
+def test_stage2_cancel_race_during_commit_becomes_cancelled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stop_enter, stop_release = threading.Event(), threading.Event()
+    service, _stage1, _fake, submission = _submit_stage2_with_fake(tmp_path, fake_kwargs={"stop_enter": stop_enter, "stop_release": stop_release})
+    assert stop_enter.wait(timeout=2)
+    original_sync = service.registry.sync
+    triggered = False
+
+    def sync_with_cancel(job_id: str, status: dict, *, runtime: dict | None = None) -> dict:
+        nonlocal triggered
+        if status.get("state") == "COMMITTED" and not triggered:
+            triggered = True
+            service.cancel(job_id)
+        return original_sync(job_id, status, runtime=runtime)
+
+    monkeypatch.setattr(service.registry, "sync", sync_with_cancel)
+    stop_release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and service.job(submission["job_id"])["status"] in {"RUNNING", "CANCEL_REQUESTED"}:
+        time.sleep(0.01)
+    assert service.job(submission["job_id"])["status"] == "CANCELLED"
+
+
+def test_stage2_restart_projects_nonterminal_job_as_interrupted(tmp_path: Path) -> None:
+    registry = PanelJobRegistry(tmp_path / ".panel-jobs.json")
+    saved = registry.submit("portfolio.stage2", {"campaign_id": "campaign"}, "stage2-restart", ("portfolio_optimizer",), job_id="stage2-restart")
+    registry.reserve_runtime("stage2-restart", "stage2", {"campaign_id": "campaign", "input_digest": "i", "config_digest": "c"})
+    registry.transition("stage2-restart", "RUNNING")
+    restarted = PortfolioPanelService(tmp_path, registry=PanelJobRegistry(tmp_path / ".panel-jobs.json"))
+    assert restarted.job(saved["job_id"])["status"] == "INTERRUPTED"
+
+
+def test_stage1_executable_loader_fails_closed_for_tampered_or_missing_artifact(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(
+        tmp_path,
+        path,
+        finalists_reader=lambda *_: [_finalist()],
+        variant_generator=lambda *_: (_weighted_executable_candidate((
+            _executable_payload("BTCUSDT", "LONG"),
+            _executable_payload("ETHUSDT", "SHORT"),
+        )),),
+    )
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
+    artifact_path = tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json"
+    artifact_digest = service.registry.runtime(result["job_id"])["executables_digest"]
+    restarted = PortfolioPanelService(tmp_path, path)
+
+    artifact_path.write_text('{"schema_version":1}', encoding="utf-8")
+    with pytest.raises(PortfolioPanelError) as tampered:
+        restarted._load_stage1_executables(result["campaign_id"], result["input_digest"], result["config_digest"], artifact_digest)
+    assert tampered.value.code == "PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE"
+
+    artifact_path.unlink()
+    with pytest.raises(PortfolioPanelError) as missing:
+        restarted._load_stage1_executables(result["campaign_id"], result["input_digest"], result["config_digest"], artifact_digest)
+    assert missing.value.code == "PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE"
+
+
+def test_stage1_executable_builder_and_loader_reject_invalid_pretest_period(tmp_path: Path) -> None:
+    campaign = {
+        "campaign_id": "campaign-" + "a" * 32,
+        "input_digest": "b" * 64,
+        "config_digest": "c" * 64,
+    }
+    candidate = _weighted_executable_candidate((
+        _executable_payload("BTCUSDT", "LONG"),
+        _executable_payload("ETHUSDT", "SHORT"),
+    ), pretest_period={"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-01T00:00:00Z"})
+    with pytest.raises(PortfolioPanelError) as build_error:
+        PortfolioPanelService._build_stage1_executables(campaign, (candidate,))
+    assert build_error.value.code == "PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE"
+
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(
+        tmp_path,
+        path,
+        finalists_reader=lambda *_: [_finalist()],
+        variant_generator=lambda *_: (_weighted_executable_candidate((
+            _executable_payload("BTCUSDT", "LONG"),
+            _executable_payload("ETHUSDT", "SHORT"),
+        )),),
+    )
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
+    artifact_path = tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json"
+    document = json.loads(artifact_path.read_text(encoding="utf-8"))
+    document["candidates"][0]["pretest_period"] = {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-01T00:00:00Z"}
+    candidate_body = {key: value for key, value in document["candidates"][0].items() if key != "candidate_digest"}
+    document["candidates"][0]["candidate_digest"] = hashlib.sha256(json.dumps(candidate_body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+    body = {key: value for key, value in document.items() if key != "payload_digest"}
+    document["payload_digest"] = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+    artifact_path.write_text(json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n", encoding="utf-8")
+    with pytest.raises(PortfolioPanelError) as load_error:
+        service._load_stage1_executables(result["campaign_id"], result["input_digest"], result["config_digest"], document["payload_digest"], require_committed=False)
+    assert load_error.value.code == "PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    (
+        _weighted_executable_candidate((
+            _executable_payload("BTCUSDT", "LONG"),
+            _executable_payload("ETHUSDT", "SHORT"),
+        ), limiter_L=1),
+        _weighted_executable_candidate((
+            _executable_payload("BTCUSDT", "LONG"),
+            _executable_payload("ETHUSDT", "SHORT", x="0"),
+        )),
+        _weighted_executable_candidate((
+            _executable_payload("BTCUSDT", "LONG"),
+            _executable_payload("ETHUSDT", "SHORT"),
+        ), members=(
+            _candidate_member("SOLUSDT", "LONG", 1, 101),
+            _candidate_member("ETHUSDT", "SHORT", 2, 102),
+        )),
+    ),
+)
+def test_stage1_with_no_eligible_off_only_executable_candidate_fails_closed(tmp_path: Path, candidate: dict) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(
+        tmp_path,
+        path,
+        finalists_reader=lambda *_: [_finalist()],
+        variant_generator=lambda *_: (candidate,),
+    )
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+
+    job = _wait_stage1(service, result)
+    result_dir = tmp_path / ".portfolio-results" / result["campaign_id"]
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE"
+    assert not (result_dir / "stage1.xlsx").exists()
+    assert not (result_dir / "stage1-executables.json").exists()
 
 
 def test_http_routes_use_typed_error_envelope(tmp_path: Path) -> None:
@@ -2568,8 +3194,8 @@ def test_http_routes_use_typed_error_envelope(tmp_path: Path) -> None:
         connection.request("POST", "/api/v2/portfolio/campaigns/missing/tester-submissions", body, {"Content-Type": "application/json"})
         response = connection.getresponse()
         payload = json.loads(response.read())
-        assert response.status == 409
-        assert payload["error"]["code"] == "PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED"
+        assert response.status == 404
+        assert payload["error"]["code"] == "PORTFOLIO_CAMPAIGN_NOT_FOUND"
         assert payload["error"]["field_errors"] == []
     finally:
         connection.close()
@@ -2594,8 +3220,8 @@ def test_http_stage2_rejects_before_request_parsing(tmp_path: Path, headers: dic
         connection.request("POST", "/api/v2/portfolio/campaigns/missing/tester-submissions", body=body, headers=headers)
         response = connection.getresponse()
         payload = json.loads(response.read())
-        assert response.status == 409
-        assert payload["error"]["code"] == "PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED"
+        assert response.status == (415 if not headers or "Content-Type" not in headers else (400 if not body else 422))
+        assert payload["error"]["code"] == "PORTFOLIO_CAMPAIGN_INVALID"
     finally:
         connection.close()
         server.shutdown()

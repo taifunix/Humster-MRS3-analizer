@@ -91,6 +91,28 @@ def _weighted_decimal_text(value: Decimal) -> str:
     return text or "0"
 
 
+def _prepared_pretest_period(prepared: Any) -> Mapping[str, str]:
+    try:
+        start = prepared.period_start_utc
+        end = prepared.period_end_utc
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise ValueError("period timestamps are invalid")
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("period timestamps must be timezone-aware")
+        start = start.astimezone(timezone.utc)
+        end = end.astimezone(timezone.utc)
+        if any((value.hour, value.minute, value.second, value.microsecond) != (0, 0, 0, 0) for value in (start, end)):
+            raise ValueError("period timestamps must be UTC day boundaries")
+        if end <= start or end - start < timedelta(days=1):
+            raise ValueError("period must contain one full day")
+        return {
+            "start_utc": start.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "end_utc": end.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+    except (AttributeError, TypeError, ValueError, OverflowError) as error:
+        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID) from error
+
+
 def _weighted_json_number(value: Decimal) -> int | float:
     return int(value) if value == value.to_integral_value() else float(value)
 
@@ -685,6 +707,8 @@ def _run_weighted_search(
         margin_kwargs = {
             "reserve": policy["min_calculated_free_margin_reserve_pct"] / Decimal("100"),
             "max_mm_load": policy["max_calculated_account_mm_load_pct"] / Decimal("100"),
+            "L": 0,
+            "priorities": {strategy_id: 1 for strategy_id in capacities},
         }
         kwargs = {
             "members": members,
@@ -1307,6 +1331,7 @@ def _build_portfolio_candidates_single(
                         variant["strategy_payloads"],
                         source_rows=selected_for_adapter,
                     )
+                    variant["pretest_period"] = _prepared_pretest_period(prepared)
                 profile_variants.append(variant)
         except CampaignContractError as error:
             blockers.append(profile_blocker(profile_id, error.code))

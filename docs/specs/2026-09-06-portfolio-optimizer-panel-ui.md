@@ -191,7 +191,7 @@ digest настроек отличается от зафиксированног
 | `POST /api/v2/portfolio/jobs/{job_id}/cancel` | нет | `202 {job_id,status}`; повтор в `CANCEL_REQUESTED` возвращает то же текущее состояние без второго действия | `404 PORTFOLIO_JOB_NOT_FOUND`; любое уже терминальное состояние — `409 PORTFOLIO_JOB_TERMINAL` |
 | `GET /api/v2/portfolio/campaigns/{campaign_id}/results` | нет | `200` только при `SUCCEEDED`: `{campaign_id,input_digest,config_digest,summary,blockers,workbook_available:true}` | неизвестный Campaign — `404 PORTFOLIO_CAMPAIGN_NOT_FOUND`; `QUEUED`, `RUNNING`, `CANCEL_REQUESTED`, `CANCELLED`, `FAILED` и `INTERRUPTED` — `409 PORTFOLIO_JOB_RESULTS_UNAVAILABLE` |
 | `GET /api/v2/portfolio/campaigns/{campaign_id}/stage1.xlsx` | нет | `200` с байтами XLSX только при `SUCCEEDED` | неизвестный Campaign — `404 PORTFOLIO_CAMPAIGN_NOT_FOUND`; любое состояние кроме `SUCCEEDED` — `409 PORTFOLIO_JOB_WORKBOOK_UNAVAILABLE` |
-| `POST /api/v2/portfolio/campaigns/{campaign_id}/tester-submissions` | `{confirmed:true,campaign_id}` | в будущем: `202 {campaign_id,job_id,status:"QUEUED"}` | сейчас маршрут объявлен, но не реализован и всегда возвращает `409 PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED`; несовпадение подтверждения отклоняется |
+| `POST /api/v2/portfolio/campaigns/{campaign_id}/tester-submissions` | `{confirmed:true,campaign_id}` | при подтверждённой committed Stage 1 Campaign и доступном общем `LocalTestingService`: `202 {campaign_id,job_id,status:"QUEUED"}` | без shared tester provider — `409 PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED`; несовпадение подтверждения и Campaign binding отклоняется |
 
 ```text
 Error = {
@@ -353,10 +353,25 @@ UI не определяет новый смысл этих причин.
 сохранённый `max_candidates`. XLSX не загружается обратно и не является
 входом.
 
-Кнопка и маршрут остаются отключёнными с точной причиной до завершения M5/M6 и
-отдельного явного разрешения на запуск тестера. Исследовательские пороги сами по
-себе не разрешают тестирование, `RECOMMENDATION_READY`, допуск к торговле или
-реальное использование.
+Кнопка UI остаётся отключённой с точной причиной до завершения M5/M6 и
+отдельного явного разрешения на запуск тестера. Backend-маршрут Phase 7
+доступен только для подтверждённой committed Stage 1 Campaign через общий
+`LocalTestingService`; без injected provider он fail-closed с
+`PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED`. Исследовательские пороги сами по себе не
+разрешают тестирование, `RECOMMENDATION_READY`, допуск к торговле или реальное
+использование.
+
+Для текущего Phase 7 разрешена подготовка и fake-verified local-only off-only
+baseline через backend-маршрут. Общий `LocalTestingService` получает уже готовые JSON из
+приватного Stage 1 artifact и не вызывает render/resizing. До изменения
+`hb/settings_strategy` он использует существующие target lock, stop и snapshot;
+затем устанавливает ровно всю пачку выбранного портфеля и tester config с
+`single_mode=false`, `UpdateData=false`, `use_runs=false` и пустым
+`parameter_mining`. Имена файлов обязаны совпадать с именами стратегий, а
+readback hashes — с замороженными payloads. Старые reports/wizard logs не
+удаляются. На success, error или timeout прежние config и strategies должны
+быть восстановлены существующим restore path до снятия lock. Этот helper сам
+не запускает tester и не меняет Stage 2 authorization.
 
 ## 12. Архитектурная граница
 
@@ -480,3 +495,87 @@ fields and are not editable Stage 1 gates. Stage 1 output is preliminary
 PRETEST_PROXY evidence, with joint metrics and recommendation fields shown as
 `UNKNOWN` or `NOT_TESTED`; a PARTIAL profile result remains visible in the
 workbook and Panel summary.
+
+## Current weighted Stage 1: limiter disabled, off only
+
+For `search_mode=WEIGHTED_V1`, this section governs current Stage 1 limiter and
+priority behavior; see [ADR-0040](../decisions/0040-portfolio-optimizer-phase7-off-only-local-stage2.md).
+
+For the production weighted adapter, bot `open_positions_limiter` is not
+operational. The adapter uses `LIMITER_DISABLED_OFF_ONLY`: it passes explicit
+`L=0` and a `priorities` mapping of 1 for every strategy. `L>0`, limiter replay,
+and `position_priority` do not participate in current candidate ranking or
+admission. The lower-level limiter math and APIs are preserved for Phase 13.
+
+The executable strategy JSON keeps `mrs.position_priority=1` for the existing
+template contract. Each frozen internal candidate payload has
+`account.open_positions_limiter=0`; this wrapper value contributes to candidate
+identity and is not tester readback. Phase 7 covers only the off baseline;
+its execution items remain open. Limiter implementation and all limiter
+comparisons/release evidence are deferred to Phase 13. This amendment does not
+grant blanket tester authorization; the Stage 2 route remains constrained to the
+confirmed committed-campaign/provider boundary. Separately, the
+user authorized a bounded local-only off-only tester baseline on 2026-09-21;
+no run or result is complete, and execution remains gated by implementation,
+focused tests, and review. Exchange actions, trading, and production database
+writes are not authorized.
+
+Every successful weighted Stage 1 publishes a private
+`.portfolio-results/<campaign_id>/stage1-executables.json` beside `stage1.xlsx`.
+The canonical, digest-bound artifact contains the server-ranked eligible
+off-only candidates, their explicit symbol/side/strategy/result identities and
+the exact strategy payload wrappers. Every executable candidate also contains
+the exact common half-open UTC `pretest_period` frozen from the single
+`PreparedWeightedInput` (`start_utc`, `end_utc` only). It is committed and
+rolled back with the workbook. A later Stage 2 may load it after Panel restart
+only when its campaign bindings, runtime path, digest and candidate payloads
+still validate; it must configure the tester with `StartDate=start date` and
+inclusive `EndDate=(exclusive end date - 1 day)`, without rereading finalists
+or PerformanceDB and without rerunning preparation. Raw payloads remain absent
+from the public Campaign summary, API response and XLSX.
+
+## Phase 7 Stage 2 off-only local orchestration (current slice)
+
+The backend Stage 2 orchestration is implemented and fake-verified for one
+already-prepared off-only candidate. It remains local-only and does not grant
+blanket tester authorization; the frontend submission control remains disabled
+in this slice. Without the injected shared `LocalTestingService`, the route
+stays fail-closed with `PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED`.
+
+Submission prepares one private baseline from a committed Stage 1 executable
+artifact, persists only compact bindings, and runs one asynchronous
+`portfolio.stage2` job. The worker uses the in-memory prepared package and
+committed Stage 1 bindings; it does not reread finalists/PerformanceDB or rerun
+adapter/preparation. It stages exact payloads through the shared
+`LocalTestingService.fill_prebuilt(..., delete_old_reports=false)`, starts the
+tester, reads a fresh stable wizard result, and always calls the same service's
+`stop()` after successful fill. Existing config/strategy restoration owns the
+rollback; no real tester run has occurred in this verification slice.
+
+The tester creates reports directly in the candidate folder through the exact
+64-lowercase-hex `name_comment`; Panel does not copy, move, rename, or delete
+report files/folders. Readback requires one portfolio result, the exact
+prepared strategy-name set (at least two names), and every core results metric
+as a finite number. The persisted/public projection includes only Campaign and
+Stage 1 bindings, candidate identity, report folder/name comment, names, period,
+report identity/link when available, and JSON-safe core metrics. A persisted
+nonterminal Stage 2 job after restart is projected as `INTERRUPTED` and is never
+resumed automatically.
+
+Valid confirmed submissions return the persisted asynchronous job, while
+malformed confirmation still follows the normal typed HTTP validation path.
+
+Preparation selects the first candidate in the persisted eligible artifact
+order, even when its saved `order` is greater than zero. The production
+`candidate_id` must be exactly 64 lowercase hexadecimal characters and is used
+verbatim as both the portfolio name and tester `name_comment`. The bank is
+authoritative from the matching `campaign.launch.profiles[*].equity_usdt`;
+every selected wrapper's finite positive `facts.B` must be Decimal-equal to
+that value. The frozen half-open UTC `pretest_period` maps to tester
+`StartDate=start` and inclusive `EndDate=end-1 day`. The canonical MRS3 tester
+template preserves all fields except `name_comment`, `StartDate`, `EndDate`,
+`InitialBalance`, `single_mode=false`, and `UpdateData=false`; `use_runs=false`
+and an empty `parameter_mining` remain required. Only each wrapper's nested
+`strategy` object is emitted as canonical deterministic UTF-8 JSON, keyed by
+its exact unique name, with at least two strategies. Invalid bindings fail
+closed with the single client-safe `PORTFOLIO_STAGE2_INPUT_INVALID` (HTTP 409).

@@ -2,13 +2,16 @@
 
 Дата: 2026-09-14. Версия: WS1.2. Статус: Phase 9 accepted after independent
 Opus `CODE_REVIEW_PASS` on 2026-09-18. B1–B3 закрыты.
-Алгоритмический план R4 и этот контракт приняты. Необязательная оговорка
-CONFIRMED/UNKNOWN добавлена в §9 плана; runtime не изменён.
+Алгоритмический план R4 и этот контракт приняты. Оговорка CONFIRMED/UNKNOWN
+добавлена в §9 плана. Текущая adapter-граница Phase 7 уточнена в ADR-0040;
+lower-level limiter math и APIs не изменены.
 
 Acceptance evidence: [Phase 9](../superpowers/plans/2026-09-18-portfolio-optimizer-weighted-search-phase-9-evidence.md).
 
 План реализации и чек-лист: [weighted search R4.2](../superpowers/plans/2026-09-12-portfolio-optimizer-weighted-search-discussion.md).
 Архитектурное решение: [ADR-0036](../decisions/0036-portfolio-optimizer-weighted-search-contract.md).
+Текущая production-граница Stage 1 — `LIMITER_DISABLED_OFF_ONLY`; см.
+[ADR-0040](../decisions/0040-portfolio-optimizer-phase7-off-only-local-stage2.md).
 Связанные контракты: [основной Optimizer](2026-09-05-portfolio-optimizer.md),
 [Panel](2026-09-06-portfolio-optimizer-panel-ui.md),
 [peak-DD](../decisions/0035-portfolio-optimizer-peak-equity-drawdown.md),
@@ -472,3 +475,29 @@ input reordering cannot change the deterministic result.
 Non-goals remain binary/enumeration modes, new database/service/dependencies,
 tester/network/live/recommendation execution, and changes to historical WS1.1
 evidence.
+
+## Current Stage 1 policy: limiter disabled, off only
+
+The bot's `open_positions_limiter` is not operational. The current production
+weighted adapter therefore calls `weighted_search` with explicit `L=0` and
+`priorities={strategy_id: 1}` for every member. No `L>0` candidate, limiter
+model, replay result, or `position_priority` ranking may participate in current
+Stage 1 ranking or admission. The lower-level weighted-search limiter APIs,
+math, and tests remain intact for Phase 13.
+
+While the limiter is off, `position_priority` is inert. The adapter supplies
+priority 1 for every member so priority cannot change candidate identity,
+tie-breaking, or admission. The executable strategy JSON still contains
+`mrs.position_priority=1` to satisfy the existing template contract. The
+frozen internal payload wrapper contains
+`account.open_positions_limiter=0`; this is candidate identity data, not tester
+readback.
+
+Phase 7 is an off-only joint baseline and remains open while its execution and
+evidence items are incomplete. Limiter implementation, L comparisons, release
+evidence, replay calibration, and same-size off/main/neighbor comparisons are
+deferred to Phase 13. The contract itself is not blanket tester authorization;
+separately, the user authorized a bounded local-only off-only tester baseline
+on 2026-09-21. No tester run or result is complete, and execution remains gated
+by implementation, focused tests, and review. Exchange actions, trading, and
+production PerformanceDB writes are not authorized.

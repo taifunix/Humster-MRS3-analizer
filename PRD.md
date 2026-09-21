@@ -142,6 +142,20 @@ compositions are ranked on equal terms, and same-symbol LONG+SHORT share one
 liquidity cap while retaining additive margin and distinct limiter slots.
 See [ADR-0039](docs/decisions/0039-portfolio-optimizer-ws12-directional-shared-cap.md)
 and [Phase 9 evidence](docs/superpowers/plans/2026-09-18-portfolio-optimizer-weighted-search-phase-9-evidence.md).
+Current production weighted Stage 1 follows `LIMITER_DISABLED_OFF_ONLY` because
+the bot's `open_positions_limiter` is not operational. The adapter passes `L=0`
+and priority 1 for every member; the executable strategy keeps
+`mrs.position_priority=1`, while the frozen internal payload wrapper records
+`account.open_positions_limiter=0` (not tester readback). Lower-level limiter
+math, APIs and tests remain intact for Phase 13. Phase 7 is now an off-only
+joint baseline and all its execution items remain open. P7-R3 is
+`NOT_ADVISOR_APPROVED`: configured Opus Advisor authentication is unavailable,
+and the user's temporary root self-review authorization is not
+`PLAN_APPROVED` or `CODE_REVIEW_PASS`. Separate explicit user authorization on
+2026-09-21 permits only a bounded local-only off-only tester baseline; no run
+or result is complete, and execution remains gated by implementation, focused
+tests, and review. Exchange actions, trading, and production PerformanceDB
+writes are not authorized. See [ADR-0040](docs/decisions/0040-portfolio-optimizer-phase7-off-only-local-stage2.md).
 История и
 [ответ на замечания](docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-review-response.md)
 сохраняют основания решения и изменение области резерва (§8.1 плана).
@@ -239,6 +253,7 @@ M5 не зависит от UI. README не меняется до появлен
 | Accepted through U1 | [Portfolio Optimizer Panel UI](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [ADR-0031](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md) | local launch form, persisted Stage 1 job, settings CAS, summary and XLSX | backend optimizer capabilities; Stage 2 also requires M5/M6 and explicit authorization |
 | Phase 2A accepted / Phase 2B server accepted | [Phase 2A spec](docs/specs/2026-09-07-portfolio-optimizer-phase2a-execution-research.md), [Phase 2A evidence](docs/superpowers/plans/2026-09-08-portfolio-optimizer-phase2a-evidence.md), [Phase 2B spec](docs/specs/2026-09-07-portfolio-optimizer-phase2b-live-account-monitor.md), [Phase 2B server evidence](docs/superpowers/plans/2026-09-09-portfolio-optimizer-phase2b-server-evidence.md), [Revision 6 plan](docs/superpowers/plans/2026-09-07-portfolio-optimizer-phase2a-2b.md), [ADR-0032](docs/decisions/0032-portfolio-live-monitor-storage-and-reconcile.md) | immutable execution research; fixture/fake LiveStore, reconcile, read models, order projection and exact charts accepted; Panel 2B-9 pending | no real REST/WS, credentials, tester, trading, admission or deployment |
 | Accepted Stage-1 amendment / implemented read-only | [ADR-0034](docs/decisions/0034-portfolio-optimizer-pretest-search-and-sizing.md) | PRETEST_PROXY period, shared-cap sizing, mandatory search budget, deterministic bounded process search from machine-wide workers, top-N preliminary output and metric labels | no tester/runtime/recommendation |
+| Phase 9 accepted / Phase 7 off-only baseline / Phase 13 limiter work open | [weighted-search spec](docs/specs/2026-09-14-portfolio-optimizer-weighted-search.md), [ADR-0040](docs/decisions/0040-portfolio-optimizer-phase7-off-only-local-stage2.md), [plan](docs/superpowers/plans/2026-09-12-portfolio-optimizer-weighted-search-discussion.md) | current Stage 1 admits only `L=0` with canonical priority 1; Phase 7 is off-only joint baseline | Phase 7 run/results and all Phase 13 limiter runtime/release/replay work remain open; bounded local-only off-only tester permission exists but no run/result is complete; no exchange, trading or production DB permission |
 | Implemented / accepted | [Performance v2 optimizer prepared inputs](docs/specs/2026-09-17-performance-v2-optimizer-prepared-inputs.md), [Phase 8 evidence](docs/superpowers/plans/2026-09-17-performance-v2-optimizer-prepared-inputs-evidence.md), [ADR-0037](docs/decisions/0037-performance-v2-optimizer-prepared-inputs.md), [ADR-0038](docs/decisions/0038-performance-v2-prepared-canonicalization-and-locking.md) | schema v5 typed Price/Cost and WS1.1 sizing facts; private digest-bound per-result prepared input | no tester/runtime/recommendation/live permission |
 | Proposed | [ADR-0025](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md) | optimizer data boundaries, replay and MVP/post-MVP scope | ADR-0001/0020/0024; approval deferred |
 | Accepted | [ADR-0029](docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md) | research-only DD/free-margin/MM profile defaults | Portfolio Optimizer D5; not runtime/trading permission |

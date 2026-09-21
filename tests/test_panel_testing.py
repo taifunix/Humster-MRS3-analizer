@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -432,6 +433,150 @@ def test_local_testing_fill_installs_exactly_one_strategy_and_config_without_cle
     assert not config.tester_config.exists()
 
 
+def _prebuilt_config() -> str:
+    return json.dumps({
+        "single_mode": False,
+        "UpdateData": False,
+        "use_runs": False,
+        "parameter_mining": [],
+    })
+
+
+def _prebuilt_strategies() -> dict[str, str]:
+    return {
+        "PORTFOLIO_AUSDT": json.dumps({"name": "PORTFOLIO_AUSDT", "basic": {"symbol": "AUSDT"}}),
+        "PORTFOLIO_BUSDT": json.dumps({"name": "PORTFOLIO_BUSDT", "basic": {"symbol": "BUSDT"}}),
+    }
+
+
+def test_local_testing_fill_prebuilt_installs_exact_batch_and_retains_lock(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    old_config = b'{"old":true}'
+    config.tester_config.write_bytes(old_config)
+    old_strategy = config.strategy_dir / "OLD.json"
+    old_strategy.write_bytes(b'{"name":"OLD"}')
+    existing_report = config.report_dir / "keep.html"
+    existing_report.write_text("keep", encoding="utf-8")
+    strategy_jsons = _prebuilt_strategies()
+    service = LocalTestingService(config, Path(__file__).parents[1], stop_bot=lambda _config: None)
+
+    filled = service.fill_prebuilt(
+        tester_config_json=_prebuilt_config(), strategy_jsons=strategy_jsons
+    )
+
+    assert [path.name for path in config.strategy_dir.glob("*.json")] == [
+        "PORTFOLIO_AUSDT.json", "PORTFOLIO_BUSDT.json",
+    ]
+    assert [path.read_text(encoding="utf-8") for path in sorted(config.strategy_dir.glob("*.json"))] == [
+        strategy_jsons["PORTFOLIO_AUSDT"], strategy_jsons["PORTFOLIO_BUSDT"],
+    ]
+    assert filled["strategy_names"] == ["PORTFOLIO_AUSDT", "PORTFOLIO_BUSDT"]
+    assert filled["strategy_file_hashes"] == [
+        ("PORTFOLIO_AUSDT.json", hashlib.sha256(strategy_jsons["PORTFOLIO_AUSDT"].encode()).hexdigest()),
+        ("PORTFOLIO_BUSDT.json", hashlib.sha256(strategy_jsons["PORTFOLIO_BUSDT"].encode()).hexdigest()),
+    ]
+    assert filled["tester_config_hash"] == hashlib.sha256(_prebuilt_config().encode()).hexdigest()
+    assert existing_report.read_text(encoding="utf-8") == "keep"
+    with pytest.raises(TesterTargetBusyError):
+        TesterTargetLock(config.bot_root).acquire()
+    service.stop()
+    assert config.tester_config.read_bytes() == old_config
+    assert old_strategy.read_bytes() == b'{"name":"OLD"}'
+    assert not tuple(config.strategy_dir.glob("PORTFOLIO_*.json"))
+
+
+def test_local_testing_fill_prebuilt_preserves_multiline_lf_bytes(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    tester_config = '{\n  "single_mode": false,\n  "UpdateData": false,\n  "use_runs": false,\n  "parameter_mining": []\n}\n'
+    strategy = '{\n  "name": "EXACT_A",\n  "basic": {"symbol": "AUSDT"}\n}\n'
+    service = LocalTestingService(config, Path(__file__).parents[1], stop_bot=lambda _config: None)
+
+    service.fill_prebuilt(tester_config_json=tester_config, strategy_jsons={"EXACT_A": strategy})
+
+    assert config.tester_config.read_bytes() == tester_config.encode("utf-8")
+    assert (config.strategy_dir / "EXACT_A.json").read_bytes() == strategy.encode("utf-8")
+    service.stop()
+
+
+def test_local_testing_fill_prebuilt_does_not_render_or_run_tester(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _runner_config(tmp_path)
+    monkeypatch.setattr("mrs3.panel_testing.render_strategy", lambda *args: (_ for _ in ()).throw(AssertionError("rendered")))
+    monkeypatch.setattr("mrs3.panel_testing.render_tester_config", lambda *args: (_ for _ in ()).throw(AssertionError("rendered")))
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        stop_bot=lambda _config: None,
+        client_factory=lambda _config: (_ for _ in ()).throw(AssertionError("tester run")),
+    )
+
+    service.fill_prebuilt(tester_config_json=_prebuilt_config(), strategy_jsons=_prebuilt_strategies())
+    service.stop()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("single_mode", True), ("UpdateData", True), ("use_runs", True), ("parameter_mining", [{"name": "x"}]),
+])
+def test_local_testing_fill_prebuilt_rejects_tester_flags_before_stop(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    config = _runner_config(tmp_path)
+    document = json.loads(_prebuilt_config())
+    document[field] = value
+    calls: list[str] = []
+    service = LocalTestingService(config, Path(__file__).parents[1], stop_bot=lambda _config: calls.append("stop"))
+
+    with pytest.raises(PanelTestingError, match="tester configuration"):
+        service.fill_prebuilt(tester_config_json=json.dumps(document), strategy_jsons=_prebuilt_strategies())
+
+    assert calls == []
+    assert not (config.bot_root / ".mrs3-tester-target.lock").exists()
+    assert not config.tester_config.exists()
+
+
+@pytest.mark.parametrize("strategy_jsons", [
+    {"one": "{"},
+    {"one": json.dumps({"name": "one"}), "two": json.dumps({"name": "one"})},
+    {"wrong": json.dumps({"name": "one"})},
+])
+def test_local_testing_fill_prebuilt_rejects_invalid_batch_before_stop(
+    tmp_path: Path, strategy_jsons: dict[str, str]
+) -> None:
+    config = _runner_config(tmp_path)
+    calls: list[str] = []
+    service = LocalTestingService(config, Path(__file__).parents[1], stop_bot=lambda _config: calls.append("stop"))
+
+    with pytest.raises(PanelTestingError, match="strategy batch"):
+        service.fill_prebuilt(tester_config_json=_prebuilt_config(), strategy_jsons=strategy_jsons)
+
+    assert calls == []
+    assert not (config.bot_root / ".mrs3-tester-target.lock").exists()
+    assert not config.tester_config.exists()
+    assert not tuple((config.inbox_root / "panel-testing").glob("mrs3-testing-*"))
+
+
+def test_local_testing_fill_prebuilt_restores_when_install_fails(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    old_config = b'{"old":true}'
+    config.tester_config.write_bytes(old_config)
+    old_strategy = config.strategy_dir / "OLD.json"
+    old_strategy.write_bytes(b'{"name":"OLD"}')
+
+    def install(target: RunnerConfig, source: Path, **_kwargs: object) -> None:
+        (target.strategy_dir / "BROKEN.json").write_bytes(b'{"name":"BROKEN"}')
+        raise RuntimeError("install failed")
+
+    service = LocalTestingService(config, Path(__file__).parents[1], install_batch=install, stop_bot=lambda _config: None)
+    with pytest.raises(RuntimeError, match="install failed"):
+        service.fill_prebuilt(tester_config_json=_prebuilt_config(), strategy_jsons=_prebuilt_strategies())
+
+    assert config.tester_config.read_bytes() == old_config
+    assert old_strategy.read_bytes() == b'{"name":"OLD"}'
+    assert not (config.strategy_dir / "BROKEN.json").exists()
+    assert not (config.bot_root / ".mrs3-tester-target.lock").exists()
+
+
 def test_local_testing_fill_reclaims_dead_same_machine_lock_from_previous_boot(
     tmp_path: Path,
 ) -> None:
@@ -804,7 +949,14 @@ def test_local_screener_status_matches_local_testing_status(tmp_path: Path) -> N
     config_path.write_text(json.dumps(_tester_runner_document(config)), encoding="utf-8")
     controller = PanelController(tmp_path, config_path)
 
-    assert controller.local_screener_status() == controller.local_testing_status()
+    screener_status = controller.local_screener_status()
+    testing_status = controller.local_testing_status()
+    assert {key: value for key, value in screener_status.items() if key != "disk_free_bytes"} == {
+        key: value for key, value in testing_status.items() if key != "disk_free_bytes"
+    }
+    for status in (screener_status, testing_status):
+        disk_free_bytes = status["disk_free_bytes"]
+        assert type(disk_free_bytes) is int and disk_free_bytes >= 0
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 import html as stdlib_html
 import hashlib
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import tempfile
 from typing import Mapping
@@ -52,21 +52,40 @@ class HtmlReport:
         return _parse_decimal(value) if value is not None else None
 
 
-def _report_basename(chart_url: str) -> str:
-    path = PurePosixPath(unquote(urlparse(chart_url).path))
+_REPORT_FOLDER_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
+
+
+def _validate_report_folder(expected_report_folder: str) -> str:
+    if not isinstance(expected_report_folder, str) or _REPORT_FOLDER_PATTERN.fullmatch(
+        expected_report_folder
+    ) is None:
+        raise ResultParseError(f"unsafe report folder: {expected_report_folder!r}")
+    return expected_report_folder
+
+
+def _report_basename(chart_url: str, expected_report_folder: str = "my_test") -> str:
+    expected_report_folder = _validate_report_folder(expected_report_folder)
+    path = unquote(urlparse(chart_url).path)
+    prefix = f"/tester-report/{expected_report_folder}/"
+    report_name = path[len(prefix) :] if path.startswith(prefix) else ""
     if (
-        len(path.parts) < 3
-        or tuple(part.casefold() for part in path.parts[-3:-1])
-        != ("tester-report", "my_test")
-        or not path.name.casefold().endswith(".html")
+        not report_name
+        or "/" in report_name
+        or "\\" in report_name
+        or any(ord(char) < 32 or ord(char) == 127 for char in path)
+        or not report_name.casefold().endswith(".html")
     ):
         raise ResultParseError(f"unsafe or unexpected chartUrl: {chart_url}")
-    return path.name
+    return report_name
 
 
 def load_wizard_results(
-    path: Path, *, fallback_report_names: Mapping[str, str] | None = None
+    path: Path,
+    *,
+    fallback_report_names: Mapping[str, str] | None = None,
+    expected_report_folder: str = "my_test",
 ) -> tuple[WizardResult, ...]:
+    expected_report_folder = _validate_report_folder(expected_report_folder)
     try:
         document = json.loads(
             path.read_text(encoding="utf-8"), parse_float=Decimal, parse_int=Decimal
@@ -111,7 +130,9 @@ def load_wizard_results(
             or not fallback_name.casefold().endswith(".html")
         ):
             raise ResultParseError(f"unsafe fallback report name: {fallback_name}")
-        report_name = fallback_name or _report_basename(chart_url)
+        report_name = fallback_name or _report_basename(
+            chart_url, expected_report_folder
+        )
         results.append(
             WizardResult(
                 run_id=run_id,
