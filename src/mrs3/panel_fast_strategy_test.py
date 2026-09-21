@@ -67,6 +67,7 @@ class _Job:
     error: dict[str, str] | None = None
     thread: Thread | None = None
     preserve_reports: bool = False
+    clear_reports: bool = False
     inbox_path: Path | None = None
     single_mode: bool = False
     target_finalized: bool = False
@@ -486,6 +487,11 @@ class LocalFastStrategyTestService:
         try:
             self._stop_bot(runtime_config)
             target_snapshot = capture_tester_settings(runtime_config)
+            if job.clear_reports:
+                _clear_directory(
+                    job.report_dir,
+                    expected=runtime_config.bot_root / "tester" / "report" / "my_test",
+                )
             job.report_baseline = {
                 path.name: (path.stat().st_mtime_ns, path.stat().st_size)
                 for path in job.report_dir.glob("*.html")
@@ -702,11 +708,14 @@ class LocalFastStrategyTestService:
         start_date: str,
         end_date: str,
         job_id: str | None = None,
+        clear_reports: bool = False,
     ) -> dict[str, object]:
         manifest = validate_strategy_manifest(Path(manifest_path))
         if manifest.analysis_run_id != analysis_run_id:
             raise FastStrategyTestError("strategy batch does not match analysis run")
         dates = _dates(start_date, end_date)
+        if type(clear_reports) is not bool:
+            raise FastStrategyTestError("clear_reports must be a boolean")
         strategy_dir, report_dir, _, _ = validate_runner_paths(self.config)
         names = self._expected(manifest)
         self._require_diagnostics(manifest, names)
@@ -716,7 +725,7 @@ class LocalFastStrategyTestService:
                 raise FastStrategyTestError("Fast TEST is already running")
             if identifier in self._jobs:
                 raise FastStrategyTestError("Fast TEST job id is already used")
-            job = _Job(identifier, Path(manifest_path).resolve(), manifest, names, names, *dates, report_dir, strategy_dir, single_mode=self.single_mode)
+            job = _Job(identifier, Path(manifest_path).resolve(), manifest, names, names, *dates, report_dir, strategy_dir, single_mode=self.single_mode, clear_reports=clear_reports)
             self._jobs[identifier] = job
             job.progress = {"current": 0, "total": len(names), "batch_current": 0, "batch_total": 0, "active": 0, "retries": 0, "failed": 0}
             job.thread = Thread(

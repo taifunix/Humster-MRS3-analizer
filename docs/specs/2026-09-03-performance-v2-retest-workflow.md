@@ -202,6 +202,13 @@ only strategies whose current `Result ID` is missing from the cache. ADD and
 REPLACE therefore identify only the new current result, and repeated per-pair
 or all-pairs recalculation does no work after those cache rows exist.
 
+Current-effective finalist control export reads the selection cache only for
+the exported `(Strategy ID, Result ID)` cohort. It must not load or recalculate
+unselected active candidates from the same pair/side.
+
+The persisted finalist-retest job runtime is JSON-safe, including cohort
+timestamps, before the native tester is started.
+
 ### Канонические шаблоны
 
 Все отслеживаемые шаблоны стратегий находятся только в
@@ -283,7 +290,9 @@ writer загружает канонический `templates/tester/mrs3/config
 сделки не подменяет календарную границу теста.
 
 `CHECK & RETEST` заканчивается созданием committed inbox и не меняет БД.
-Отдельная кнопка `IMPORT & REPLACE` является явным подтверждением мутации.
+Отдельная кнопка `IMPORT & REPLACE` является явным подтверждением мутации. Карточка опрашивает дочерний import job и показывает его phase, completed/total, batch, retries, failed и error до terminal state; кнопка не может завершиться молча без сохранённого job ID.
+
+Карточка массового retest имеет включенную по умолчанию опцию `Очистить папку с отчетами перед тестом` рядом с `Включая RESERVE`. При включении после остановки tester и до запуска удаляется только содержимое точного настроенного `tester_runner.report_dir`; небезопасный путь или reparse-point прерывает запуск без удаления.
 
 ## Пакетный REPLACE
 

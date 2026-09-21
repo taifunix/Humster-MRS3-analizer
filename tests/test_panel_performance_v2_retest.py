@@ -321,14 +321,24 @@ def test_current_control_export_is_read_only_until_review_and_preserves_outside_
         (validation.formula1, str(validation.sqref)) for validation in ordinary_sheet.data_validations.dataValidation
     }
     original_loader = panel_module.load_selection_candidates
+    original_cache_status = panel_module.selection_cache_status
+
+    def assert_finalist_cohort(connection, request, config):
+        assert request.ranking_scope == "RETEST_COHORT"
+        assert request.cohort_members == ((1, alpha_result_id),)
+        return original_cache_status(connection, request, config)
 
     def mismatched_loader(*args, **kwargs):
+        request = args[1]
+        assert request.ranking_scope == "RETEST_COHORT"
+        assert request.cohort_members == ((1, alpha_result_id),)
         loaded = original_loader(*args, **kwargs)
         loaded = loaded.copy()
         loaded.loc[:, "result_id"] = 999999
         return loaded
 
     with monkeypatch.context() as context:
+        context.setattr(panel_module, "selection_cache_status", assert_finalist_cohort)
         context.setattr(panel_module, "load_selection_candidates", mismatched_loader)
         with pytest.raises(FinalistRetestError) as raised:
             controller.strategies_performance_v2_finalist_retest_export({"include_reserve": False})

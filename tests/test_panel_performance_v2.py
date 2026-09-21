@@ -1042,7 +1042,10 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     template.write_text("{}", encoding="utf-8")
     manifest = tmp_path / "manifest.json"
     manifest.write_text("{}", encoding="utf-8")
-    cohort = SimpleNamespace(scope="FINALIST", cohort_sha256="new-cohort", members=({"strategy_id": 1},), exclusions=())
+    cohort = SimpleNamespace(
+        scope="FINALIST", cohort_sha256="new-cohort",
+        members=({"strategy_id": 1, "effective_start": datetime(2026, 1, 1, tzinfo=timezone.utc)},), exclusions=(),
+    )
 
     class Connection:
         def __enter__(self): return self
@@ -1061,7 +1064,11 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     monkeypatch.setattr(controller, "_workflow_defaults", lambda: {"strategy_templates": {"LONG": str(template)}})
     monkeypatch.setattr(controller, "_bulk_retest_range", lambda *_args: ("2025-01-01", "2026-09-07"))
     monkeypatch.setattr(controller, "_bulk_retest_status_document", lambda job_id: {"job_id": job_id, "replayed": True})
-    monkeypatch.setattr(controller, "_start_tracked_panel_job", lambda *_args, **_kwargs: {"job_id": "new"})
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        controller, "_start_tracked_panel_job",
+        lambda *_args, **kwargs: captured.update(runtime=kwargs["runtime"], request=_args[1], submit=_args[3]) or {"job_id": "new"},
+    )
     monkeypatch.setattr(panel_module, "performance_v2_database_path", lambda _config: database)
     monkeypatch.setattr(panel_module, "load_listing_dates", lambda _path: {})
     monkeypatch.setattr(panel_module.duckdb, "connect", lambda *_args, **_kwargs: Connection())
@@ -1072,9 +1079,35 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     ))
 
     controller._panel_jobs = Jobs("old-cohort")  # type: ignore[assignment]
-    assert controller.strategies_performance_v2_finalist_retest_start({})["job_id"] == "new"
+    started: dict[str, object] = {}
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(start=lambda *_args, **kwargs: started.update(kwargs)))
+    assert controller.strategies_performance_v2_finalist_retest_start({"clear_reports": True})["job_id"] == "new"
+    assert captured["runtime"]["cohort_members"] == [{"strategy_id": 1, "effective_start": "2026-01-01T00:00:00Z"}]
+    captured["submit"]("new")
+    assert captured["request"]["clear_reports"] is True
+    assert started["clear_reports"] is True
     controller._panel_jobs = Jobs("new-cohort")  # type: ignore[assignment]
     assert controller.strategies_performance_v2_finalist_retest_start({}) == {"job_id": "old", "replayed": True}
+
+
+def test_finalist_retest_status_exposes_started_import_job(tmp_path: Path, monkeypatch) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {}, "test", job_id="bulk-job",
+    )
+    controller._panel_jobs.transition("bulk-job", "RUNNING")
+    controller._panel_jobs.transition("bulk-job", "COMMITTED")
+    controller._panel_jobs.sync(
+        "bulk-job", {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={
+            "bulk_retest": True, "scope": "FINALIST", "cohort_sha256": "cohort",
+            "cohort_members": [], "successful_replacements": [], "failures": [],
+            "bulk_import_job_id": "import-job",
+        },
+    )
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(status=lambda _job_id: (_ for _ in ()).throw(KeyError())))
+
+    assert controller.strategies_performance_v2_finalist_retest_status("bulk-job")["import_job_id"] == "import-job"
 
 
 def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_path: Path) -> None:

@@ -2286,6 +2286,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const finalistRetestCard = document.querySelector('#performance-v2-finalist-retest-card');
   const finalistRetestImport = document.querySelector('#performance-v2-finalist-retest-import-button');
   const finalistRetestReserve = document.querySelector('#performance-v2-finalist-retest-reserve');
+  const finalistRetestClearReports = document.querySelector('#performance-v2-finalist-retest-clear-reports');
   const finalistRetestStartDate = document.querySelector('#performance-v2-finalist-retest-start');
   const finalistRetestEndDate = document.querySelector('#performance-v2-finalist-retest-end');
   const finalistRetestStatus = document.querySelector('#performance-v2-finalist-retest-status');
@@ -2296,6 +2297,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const finalistRetestControlFile = document.querySelector('#performance-v2-finalist-retest-control-file');
   const finalistRetestControlImport = document.querySelector('#performance-v2-finalist-retest-control-import');
   let finalistRetestJobId = '';
+  let finalistRetestImportJobId = '';
   let finalistRetestHasSuccessfulExport = false;
   let finalistRetestTimer = 0;
   const updateFinalistRetestExport = () => {
@@ -2324,10 +2326,19 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       if (finalistRetestCount) finalistRetestCount.textContent = String(job.cohort_count ?? 0);
       if (finalistRetestSuccesses) finalistRetestSuccesses.textContent = String(job.success_count ?? 0);
       if (finalistRetestFailures) finalistRetestFailures.textContent = String(job.failure_count ?? 0);
-      if (finalistRetestStatus) finalistRetestStatus.textContent = job.error?.code
+      if (job.import_job_id) finalistRetestImportJobId = job.import_job_id;
+      if (finalistRetestImportJobId) {
+        const imported = await requestJson(`/api/v2/strategies/performance-v2/import/status?job_id=${encodeURIComponent(finalistRetestImportJobId)}`);
+        const p = imported.progress || {};
+        const current = Number(p.current || 0);
+        const total = Number(p.total || 0);
+        const failed = Array.isArray(imported.evidence?.failed_names) ? imported.evidence.failed_names.length : Number(p.failed || 0);
+        if (finalistRetestStatus) finalistRetestStatus.textContent = `IMPORT & REPLACE: ${imported.phase || imported.state || 'IMPORTING'} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}${imported.error ? ` · ${formatErrorReason(imported.error)}` : ''}`;
+        if (finalistRetestImport) finalistRetestImport.disabled = imported.state !== 'FAILED' && imported.state !== 'CANCELLED';
+      } else if (finalistRetestStatus) finalistRetestStatus.textContent = job.error?.code
         ? `Global finalist retest: ${job.error.code}`
         : `Global finalist retest: ${job.phase || job.state || 'RUNNING'}`;
-      if (finalistRetestImport) finalistRetestImport.disabled = !(job.state === 'COMMITTED' && job.inbox_ready === true);
+      if (finalistRetestImport && !finalistRetestImportJobId) finalistRetestImport.disabled = !(job.state === 'COMMITTED' && job.inbox_ready === true);
       if (job.success_count > 0) finalistRetestHasSuccessfulExport = true;
       updateFinalistRetestExport();
       if (terminal) { window.clearInterval(finalistRetestTimer); if (finalistRetestStart) finalistRetestStart.disabled = false; }
@@ -2336,7 +2347,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   finalistRetestStart?.addEventListener('click', async () => {
     finalistRetestStart.disabled = true;
     try {
-      const payload = { include_reserve: Boolean(finalistRetestReserve?.checked) };
+      const payload = { include_reserve: Boolean(finalistRetestReserve?.checked), clear_reports: Boolean(finalistRetestClearReports?.checked) };
+      finalistRetestImportJobId = '';
       finalistRetestHasSuccessfulExport = false;
       updateFinalistRetestExport();
       if (finalistRetestStartDate?.value) payload.test_start = finalistRetestStartDate.value;
@@ -2351,8 +2363,25 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   finalistRetestCard?.addEventListener('toggle', () => { if (finalistRetestCard.open) loadFinalistRetestPreview(); });
   finalistRetestReserve?.addEventListener('change', () => { loadFinalistRetestPreview(); updateFinalistRetestExport(); });
   updateFinalistRetestExport();
+  const recoverFinalistRetestJob = async () => {
+    try {
+      const snapshot = await requestJson('/api/v2/jobs');
+      const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
+      const recovered = jobs
+        .filter((job) => job?.kind === 'strategies.performance.v2.finalist-retest' && job.state === 'COMMITTED' && job.inbox_ready === true && typeof job.job_id === 'string')
+        .sort((left, right) => String(right.created_at_utc || '').localeCompare(String(left.created_at_utc || '')))[0];
+      if (!recovered) return;
+      finalistRetestJobId = recovered.job_id;
+      if (finalistRetestStatus) finalistRetestStatus.textContent = 'Recovering latest global finalist retest...';
+      await pollFinalistRetest();
+    } catch (error) {
+      if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist retest recovery unavailable: ${error?.message || 'request failed'}.`;
+    }
+  };
+  recoverFinalistRetestJob();
   finalistRetestExport?.addEventListener('click', async (event) => {
     event.preventDefault();
+    if (finalistRetestStatus) finalistRetestStatus.textContent = 'Preparing control workbook...';
     try {
       const response = await fetch(finalistRetestExport.href);
       if (!response.ok) {
@@ -2379,11 +2408,16 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     }
   });
   finalistRetestImport?.addEventListener('click', async () => {
-    if (!finalistRetestJobId) return;
+    if (!finalistRetestJobId) {
+      if (finalistRetestStatus) finalistRetestStatus.textContent = 'IMPORT & REPLACE unavailable: run the retest from this panel first.';
+      return;
+    }
     finalistRetestImport.disabled = true;
     try {
-      await remoteRequest('/api/v2/strategies/performance-v2/finalist-retest/import', { tester_job_id: finalistRetestJobId });
-      if (finalistRetestStatus) finalistRetestStatus.textContent = 'Global finalist IMPORT & REPLACE started.';
+      const result = await remoteRequest('/api/v2/strategies/performance-v2/finalist-retest/import', { tester_job_id: finalistRetestJobId });
+      finalistRetestImportJobId = result.job_id || result.job?.job_id || '';
+      if (!finalistRetestImportJobId) throw new Error('missing global finalist import job');
+      if (finalistRetestStatus) finalistRetestStatus.textContent = 'IMPORT & REPLACE: queued.';
       window.clearInterval(finalistRetestTimer);
       finalistRetestTimer = window.setInterval(pollFinalistRetest, 1000);
       pollFinalistRetest();

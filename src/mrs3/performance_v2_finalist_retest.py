@@ -1013,6 +1013,7 @@ def build_finalist_retest_manifest(
     generated: list[dict[str, object]] = []
     strategy_runs: dict[str, str] = {}
     names_by_candidate: dict[str, list[str]] = {}
+    candidate_diagnostics: dict[str, dict[str, object]] = {}
     for member in cohort.members:
         try:
             template = templates[member["side"]]
@@ -1055,7 +1056,17 @@ def build_finalist_retest_manifest(
             })
         filename = f"{member['strategy_name']}.json"
         strategy_runs[filename] = str(member["analysis_run_id"])
-        names_by_candidate.setdefault(str(member["candidate_identity"]), []).append(str(member["strategy_name"]))
+        candidate_identity = str(member["candidate_identity"])
+        names_by_candidate.setdefault(candidate_identity, []).append(str(member["strategy_name"]))
+        candidate_diagnostics.setdefault(candidate_identity, {
+            "order_count": int(member["order_count"]),
+            "orders": [{
+                "order_id": int(item["order_id"]), "plateau_id": str(item["plateau_id"]),
+                "plateau_point_count": int(item["plateau_point_count"]),
+                "base_point_trades": int(item["base_point_trades"]),
+                "plateau_total_trades": int(item["plateau_total_trades"]),
+            } for item in member["orders"]],  # type: ignore[index]
+        })
         generated.append(strategy)
     hashes = {
         f"{member['strategy_name']}.json": canonical_digest(strategy)
@@ -1069,6 +1080,7 @@ def build_finalist_retest_manifest(
         "strategy_count": len(generated),
         "strategy_json_sha256": hashes,
         "strategy_analysis_run_ids": strategy_runs,
+        "candidate_diagnostics": candidate_diagnostics,
         "candidate_identity_to_strategy_names": {
             key: sorted(names) for key, names in sorted(names_by_candidate.items())
         },

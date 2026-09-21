@@ -355,6 +355,7 @@ def test_finalist_retest_card_exposes_current_control_export_before_retest() -> 
     assert "/api/v2/strategies/performance-v2/finalist-retest/export?include_reserve=" in js
     assert "finalistRetestHasSuccessfulExport" in js
     assert "event.preventDefault()" in export_handler
+    assert "Preparing control workbook..." in export_handler
     assert "fetch(finalistRetestExport.href)" in export_handler
     assert "SELECTION_CACHE_INCOMPLETE" in export_handler
     assert "Prepare or recalculate the selection cache first." in export_handler
@@ -365,6 +366,35 @@ def test_finalist_retest_card_exposes_current_control_export_before_retest() -> 
     assert "performance-v2-finalist-retest.xlsx" in export_handler
     assert "Control workbook downloaded." in export_handler
     assert "finalistRetestStatus.textContent" in export_handler
+
+
+def test_finalist_retest_card_can_clear_reports_before_testing() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    card = html.split('id="performance-v2-finalist-retest-card"', 1)[1].split("</details>", 1)[0]
+
+    reserve = '<label class="check"><input id="performance-v2-finalist-retest-reserve" type="checkbox">'
+    clear = '<label class="check"><input id="performance-v2-finalist-retest-clear-reports" type="checkbox" checked>'
+    assert reserve in card and clear in card
+    assert card.index(reserve) < card.index(clear)
+    assert "const finalistRetestClearReports" in js
+    assert "clear_reports: Boolean(finalistRetestClearReports?.checked)" in js
+
+
+def test_finalist_retest_import_reports_its_own_progress() -> None:
+    js = _read("app.js")
+    block = js.split("const finalistRetestStart", 1)[1].split("const performanceV2WindowSelect", 1)[0]
+
+    assert "let finalistRetestImportJobId = ''" in block
+    assert '"import_job_id"' in _read("../panel.py")
+    assert "/api/v2/strategies/performance-v2/import/status?job_id=" in block
+    assert "IMPORT & REPLACE: ${imported.phase || imported.state || 'IMPORTING'}" in block
+    assert "IMPORT & REPLACE unavailable: run the retest from this panel first." in block
+    assert "finalistRetestImportJobId = '';" in block
+    assert "const recoverFinalistRetestJob = async () =>" in block
+    assert "strategies.performance.v2.finalist-retest' && job.state === 'COMMITTED' && job.inbox_ready === true" in block
+    assert "Recovering latest global finalist retest..." in block
+    assert "recoverFinalistRetestJob();" in block
 
 
 def test_finalist_retest_card_is_only_on_strategies_dd5_screen() -> None:

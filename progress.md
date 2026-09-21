@@ -2942,3 +2942,18 @@ ready inbox. Related verification passes (`153 passed`) and
 `git diff --check` is clean. The external reviewer bridge was unavailable due
 to its existing authentication failure; the operator had already authorized
 self-review while that reviewer remains unavailable.
+
+## Global FINALIST retest panel recovery (2026-09-21)
+
+The global FINALIST card now clears the configured report directory only when
+the default-enabled operator checkbox requests it, after tester shutdown and
+before the native run. Its frozen manifest includes the diagnostics required by
+the native SINGLE_MODE validator, and control XLSX export reads only the exact
+current finalist cohort.
+
+The card retains and recovers the latest global retest job ID, exposes the
+child `IMPORT & REPLACE` job's server phase and counters, and reports a
+missing in-page job ID instead of silently doing nothing. Recovery is
+read-only: it never starts a tester or import. Focused verification passed
+(`5 passed`) and `git diff --check` is clean. The external reviewer bridge is
+currently unavailable because its Claude authentication check fails.

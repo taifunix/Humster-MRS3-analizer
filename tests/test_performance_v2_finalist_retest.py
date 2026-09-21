@@ -35,6 +35,7 @@ from mrs3.performance_v2_selection import (
 )
 import duckdb
 from mrs3.panel_testing import render_strategy
+from mrs3.panel_fast_strategy_test import LocalSingleModeStrategyTestService
 from mrs3.panel_strategy_batch import validate_strategy_manifest
 
 
@@ -314,7 +315,16 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
     assert manifest["scope"] == "FINALIST"
     assert manifest["finalist_retest"]["job_id"] == "bulk-1"
     assert manifest["finalist_retest"]["members"][0]["effective_end"] == "2026-06-01T00:00:00Z"
-    assert validate_strategy_manifest(batch.manifest_path).analysis_run_id == "bulk-1"
+    validated = validate_strategy_manifest(batch.manifest_path)
+    assert validated.analysis_run_id == "bulk-1"
+    assert manifest["candidate_diagnostics"] == {
+        "candidate": {
+            "order_count": 1,
+            "orders": [{"order_id": 1, "plateau_id": "P1", "plateau_point_count": 4,
+                        "base_point_trades": 20, "plateau_total_trades": 80}],
+        },
+    }
+    assert LocalSingleModeStrategyTestService._require_diagnostics(validated, ("final",)) == manifest["candidate_diagnostics"]
     strategy = json.loads((batch.strategies_path / "final.json").read_text(encoding="utf-8"))
     assert strategy["name"] == "final"
     assert strategy["basic"]["use_fix"] is False

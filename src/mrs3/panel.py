@@ -4101,7 +4101,7 @@ class PanelController:
 
     @staticmethod
     def _bulk_retest_range(payload: Mapping[str, object], listing_dates: Mapping[str, object], connection: duckdb.DuckDBPyConnection, include_reserve: bool) -> tuple[str, str]:
-        allowed = {"include_reserve", "test_start", "test_end", "start_date", "end_date"}
+        allowed = {"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date"}
         if set(payload).difference(allowed):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
         if type(include_reserve) is not bool:
@@ -4130,9 +4130,12 @@ class PanelController:
     def strategies_performance_v2_finalist_retest_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(payload, Mapping):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request must be an object")
-        if set(payload).difference({"include_reserve", "test_start", "test_end", "start_date", "end_date"}):
+        if set(payload).difference({"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date"}):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
         include_reserve = payload.get("include_reserve", False)
+        clear_reports = payload.get("clear_reports", False)
+        if type(clear_reports) is not bool:
+            raise FinalistRetestError("INVALID_REQUEST", "clear_reports must be a boolean")
         listing_path, listing_relative = self._retest_listing_context()
         try:
             listing_dates = load_listing_dates(listing_path)
@@ -4188,16 +4191,17 @@ class PanelController:
             "bulk_retest": True, "scope": batch.cohort.scope, "cohort_sha256": batch.cohort.cohort_sha256,
             "config_sha256": batch.config_sha256, "manifest_sha256": sha256(batch.manifest_path.read_bytes()).hexdigest(),
             "test_start": start, "test_end": end, "listing_dates_path": str(listing_relative),
-            "manifest_path": str(batch.manifest_path), "cohort_members": [dict(member) for member in batch.cohort.members],
+            "manifest_path": str(batch.manifest_path), "cohort_members": _json_value([dict(member) for member in batch.cohort.members]),
             "exclusions": [item.as_dict() for item in batch.cohort.exclusions],
             "successful_replacements": [], "failures": [item.as_dict() for item in batch.cohort.exclusions],
         }
-        request = {"scope": batch.cohort.scope, "test_start": start, "test_end": end, "retest": True}
+        request = {"scope": batch.cohort.scope, "test_start": start, "test_end": end, "retest": True, "clear_reports": clear_reports}
         return self._start_tracked_panel_job(
             "strategies.performance.v2.finalist-retest", request,
             ("strategies.tester", "performance-v2-finalist-retest"),
             lambda job_id: self._single_mode_strategy_test().start(
                 batch.manifest_path, analysis_run_id=batch.run_id, start_date=start, end_date=end, job_id=job_id,
+                clear_reports=clear_reports,
             ), runtime=runtime,
         )
 
@@ -4250,6 +4254,9 @@ class PanelController:
         if runtime.get("outcomes_finalized") is True and not runtime.get("successful_replacements"):
             bulk_error = {"code": "RETEST_COHORT_NO_SUCCESSFUL_MEMBERS", "message": "no finalist cohort member imported successfully"}
             runtime["error_code"] = bulk_error["code"]
+        import_job_id = runtime.get("bulk_import_job_id")
+        if not isinstance(import_job_id, str) or not import_job_id or import_job_id.startswith("pending:"):
+            import_job_id = None
         return {
             **tracked,
             "scope": runtime.get("scope"), "cohort_sha256": runtime.get("cohort_sha256"),
@@ -4261,6 +4268,7 @@ class PanelController:
             "outcomes_finalized": runtime.get("outcomes_finalized") is True,
             "successful_replacements": runtime.get("successful_replacements", []),
             "failures": runtime.get("failures", []),
+            "import_job_id": import_job_id,
             "error": bulk_error or tracked.get("error"),
         }
 
@@ -4438,7 +4446,10 @@ class PanelController:
             specs: list[dict[str, object]] = []
             for (symbol, side), group_members in sorted(grouped.items()):
                 origin_runs = {str(member["selection_run_id"]) for member in group_members}
-                request = SelectionRequest(symbol, side, ())
+                request = retest_cohort_request(
+                    SelectionRequest(symbol, side, ()), "current-effective-control",
+                    {int(member["strategy_id"]): int(member["result_id"]) for member in group_members},
+                )
                 if not selection_cache_status(connection, request, selection_config).get("ready"):
                     raise FinalistRetestError(
                         "SELECTION_CACHE_INCOMPLETE",

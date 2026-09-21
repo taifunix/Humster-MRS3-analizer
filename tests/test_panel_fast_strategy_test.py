@@ -420,6 +420,37 @@ def test_single_mode_reload_uses_checkpoint_without_reading_prior_reports(tmp_pa
     assert parsed == [current]
 
 
+def test_single_mode_clears_reports_before_native_run_when_requested(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    (config.report_dir / "old.html").write_text("old", encoding="utf-8")
+    events: list[str] = []
+    observed: list[tuple[str, ...]] = []
+    service = LocalSingleModeStrategyTestService(
+        config,
+        start_bot=lambda _config: None,
+        stop_bot=lambda _config: events.append("stop"),
+    )
+
+    def after_cleanup(job: object) -> None:
+        observed.append(tuple(path.name for path in config.report_dir.iterdir()))
+        raise RuntimeError("test stop")
+
+    service._run_native = after_cleanup
+    started = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        clear_reports=True,
+    )
+
+    assert _wait(service, str(started["job_id"]))["state"] == "FAILED"
+    assert events[0] == "stop"
+    assert observed == [()]
+
+
 def test_native_idle_waits_for_current_batch_result_files(tmp_path: Path) -> None:
     config = replace(_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=0.2, report_stability_polls=2)
     service = LocalSingleModeStrategyTestService(config)
