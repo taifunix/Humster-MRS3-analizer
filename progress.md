@@ -3,6 +3,34 @@
 **Updated:** 2026-09-21
 **Current branch:** `main`
 
+## Pair screener table readability and testing-screen layout (2026-09-21)
+
+SCREENER 01 now occupies the full first row of the Testing grid; RUNNER 01 and
+RUNNER 02 remain unchanged and follow side by side. The verdict table has an
+accessible two-row header that separates good-point counts from the best
+economically passing point, plus a one-line legend for rows with no passing
+point. Browser display rounds PnL30 to an integer and DD to one decimal while
+the evaluate verdict payload and CSV export retain their existing full Decimal
+precision.
+
+`POST /api/v2/testing/screener/evaluate` now returns the configured positive
+integer `big_shift_bp` once at the top level. The UI converts it from basis
+points to a percentage for the header and falls back to a neutral label for a
+missing or contract-invalid value. Independent review found that the first UI
+version coerced malformed booleans, strings, arrays, zero and fractional values;
+strict positive-safe-integer validation and regression cases closed the finding,
+and re-review returned `CODE_REVIEW_PASS`.
+
+Verification: the required screener/static/Panel-testing contour passed `246`
+tests; the four initial focused regressions passed; `node --check
+src/mrs3/panel_web/app.js` and `git diff --check` passed. The full repository
+run completed with `4728 passed, 7 skipped, 2 failed`: the unrelated two-second
+Performance v2 HTTP timeout passed on exact rerun, while the pre-existing
+Windows Portfolio cross-process lease failure reproduced both in the full run
+and in isolation. No Panel restart or real tester action was performed because
+the operator's screener run was active; manual browser acceptance of the loaded
+production Panel is deferred until that run can be left undisturbed.
+
 ## Materialization is 2.59x faster per point, with identical values (2026-09-21)
 
 A profile of one `measure_point_group` worker over 40 real points found two

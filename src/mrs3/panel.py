@@ -2225,7 +2225,10 @@ class PanelController:
             raise PanelTestingError(_redact_screener_error(error)) from None
         except Exception:
             raise PanelTestingError("invalid testing request") from None
-        return {"verdicts": [self._serialize_screener_verdict(v) for v in verdicts]}
+        return {
+            "big_shift_bp": screener_config.big_shift_bp,
+            "verdicts": [self._serialize_screener_verdict(v) for v in verdicts],
+        }
 
     def local_screener_export(self) -> tuple[str, bytes]:
         config, algorithm_config, screener_config, dates_path = self._screener_evaluate_inputs()

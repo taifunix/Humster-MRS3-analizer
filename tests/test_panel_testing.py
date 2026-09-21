@@ -964,6 +964,7 @@ def test_local_screener_evaluate_returns_serialized_verdicts(tmp_path: Path) -> 
 
     result = controller.local_screener_evaluate()
 
+    assert result["big_shift_bp"] == 1
     assert result["verdicts"] == [
         {
             "symbol": "AUSDT",

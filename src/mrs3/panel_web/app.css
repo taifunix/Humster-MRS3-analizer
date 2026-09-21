@@ -61,6 +61,7 @@ h2 { font-size: 1.05rem; }
 .state-running { color: var(--blue); background: var(--blue-soft); }
 .state-pending { color: var(--amber); background: var(--amber-soft); }
 .runner-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+#screener-local { grid-column: 1 / -1; }
 .stack { display: grid; gap: 16px; }
 .panel-card { border: 1px solid var(--line); border-radius: 13px; background: var(--card); box-shadow: var(--shadow); }
 .runner-card { overflow: hidden; }

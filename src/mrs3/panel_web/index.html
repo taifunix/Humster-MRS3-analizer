@@ -51,23 +51,6 @@
         </div>
 
         <div class="runner-grid">
-          <article id="runner-local" class="panel-card runner-card">
-            <div class="card-heading">
-              <div><span class="card-index">RUNNER 01</span><h2>Локальный runner</h2></div>
-              <span class="state-badge state-ready">READY</span>
-            </div>
-            <div class="card-body">
-              <div class="field-group"><label for="local-pair">Пара инструментов</label><input id="local-pair" name="local_pair" type="text" value="CXUSDT, BABAUSDT"></div>
-              <div class="field-group"><label for="local-side">Сторона</label><select id="local-side" name="local_side"><option>LONG</option><option>SHORT</option></select></div>
-              <div class="field-grid"><div class="field-group"><label for="local-start-date">Начало</label><input id="local-start-date" name="local_start_date" type="date" value="2026-07-15"></div><div class="field-group"><label for="local-end-date">Конец</label><input id="local-end-date" name="local_end_date" type="date" value="2026-08-06"></div></div>
-              <div class="field-group"><label class="check" for="local-delete-old-reports"><input id="local-delete-old-reports" name="local_delete_old_reports" type="checkbox"><span>Удалить старые отчеты перед стартом</span></label></div>
-              <div class="button-row"><button type="button" id="local-check" class="button button-primary">Проверить runner и диск</button><button type="button" id="local-fill" class="button button-primary">Подготовить файлы</button><button type="button" id="local-start" class="button button-secondary">Старт</button><button type="button" id="local-stop" class="button button-secondary">Стоп</button></div>
-              <details id="local-paths" class="nested-details"><summary>Пути локального задания <small>defaults из config</small></summary><div class="details-content"><div class="field-group"><label for="local-bot-root">Папка бота</label><input id="local-bot-root" name="local_bot_root" type="text" value="D:\\HamsterBot"></div><div class="field-group"><label for="local-runner-root">Папка runner</label><input id="local-runner-root" name="local_runner_root" type="text" value="D:\\HamsterBot\\runner"></div><div class="field-group"><label for="local-reports-root">Папка отчётов</label><input id="local-reports-root" name="local_reports_root" type="text" value="D:\\HamsterBot\\reports"></div><div class="field-group"><label for="local-output-root">Куда переносить готовое</label><input id="local-output-root" name="local_output_root" type="text" value="E:\\MRS3\\reports-archive"></div><div class="button-row"><button type="button" class="button button-secondary" data-pending="Пути локального runner проверяются backend">Проверить пути</button><button id="local-paths-save" type="button" class="button button-secondary">Сохранить пути</button></div></div></details>
-              <div class="progress-block"><div class="progress-track"><span style="width:0%"></span></div><p>Ожидание запуска.</p></div>
-              <p class="card-status" role="status" aria-live="polite">Проверка runner ещё не выполнена.</p>
-            </div>
-          </article>
-
           <article id="screener-local" class="panel-card runner-card">
             <div class="card-heading">
               <div><span class="card-index">SCREENER 01</span><h2>Скринер пар</h2></div>
@@ -86,8 +69,35 @@
               <div class="button-row"><button type="button" id="screener-evaluate" class="button button-primary">Оценить</button><a id="screener-export" class="button button-secondary" href="/api/v2/testing/screener/export">Скачать вердикты</a></div>
               <div class="field-group"><label class="check" for="screener-transfer-include-check"><input id="screener-transfer-include-check" type="checkbox"><span>Включая CHECK при передаче</span></label></div>
               <div class="button-row"><button type="button" id="screener-transfer" class="button button-secondary" disabled>Передать в RUNNER 01</button></div>
-              <div class="table-wrap"><table class="shortlist-table"><caption class="sr-only">Вердикты скрининга по парам</caption><thead><tr><th scope="col">Пара</th><th scope="col">Сторона</th><th scope="col">Вердикт</th><th scope="col">BIG_SHIFT</th><th scope="col">Хор. точек</th><th scope="col">Хор. точек ≥1%</th><th scope="col">ТФ</th><th scope="col">Сдвиг, bp</th><th scope="col">MA close</th><th scope="col">PnL30</th><th scope="col">DD</th><th scope="col">Дней</th></tr></thead><tbody id="screener-verdicts-body"></tbody></table></div>
+              <div class="table-wrap">
+                <table class="shortlist-table screener-verdicts-table">
+                  <caption class="sr-only">Вердикты скрининга по парам</caption>
+                  <thead>
+                    <tr><th scope="col" rowspan="2">Пара</th><th scope="col" rowspan="2">Сторона</th><th scope="col" rowspan="2">Вердикт</th><th scope="col" rowspan="2">BIG_SHIFT</th><th scope="colgroup" colspan="2">Хорошие точки</th><th scope="colgroup" colspan="5">Лучшая проходная точка</th><th scope="col" rowspan="2">Дней</th></tr>
+                    <tr><th scope="col">Всего</th><th id="screener-big-shift-heading" scope="col">Хор. точек с большим сдвигом</th><th scope="col">ТФ</th><th scope="col">Сдвиг, bp</th><th scope="col">MA close</th><th scope="col">PnL30</th><th scope="col">DD</th></tr>
+                  </thead>
+                  <tbody id="screener-verdicts-body"></tbody>
+                </table>
+              </div>
+              <p id="screener-verdicts-legend" class="helper">Прочерк означает, что ни одна точка не прошла экономический гейт.</p>
               <p id="screener-verdicts-empty" class="helper">Нажмите «Оценить», чтобы увидеть вердикты по текущей папке отчётов.</p>
+            </div>
+          </article>
+
+          <article id="runner-local" class="panel-card runner-card">
+            <div class="card-heading">
+              <div><span class="card-index">RUNNER 01</span><h2>Локальный runner</h2></div>
+              <span class="state-badge state-ready">READY</span>
+            </div>
+            <div class="card-body">
+              <div class="field-group"><label for="local-pair">Пара инструментов</label><input id="local-pair" name="local_pair" type="text" value="CXUSDT, BABAUSDT"></div>
+              <div class="field-group"><label for="local-side">Сторона</label><select id="local-side" name="local_side"><option>LONG</option><option>SHORT</option></select></div>
+              <div class="field-grid"><div class="field-group"><label for="local-start-date">Начало</label><input id="local-start-date" name="local_start_date" type="date" value="2026-07-15"></div><div class="field-group"><label for="local-end-date">Конец</label><input id="local-end-date" name="local_end_date" type="date" value="2026-08-06"></div></div>
+              <div class="field-group"><label class="check" for="local-delete-old-reports"><input id="local-delete-old-reports" name="local_delete_old_reports" type="checkbox"><span>Удалить старые отчеты перед стартом</span></label></div>
+              <div class="button-row"><button type="button" id="local-check" class="button button-primary">Проверить runner и диск</button><button type="button" id="local-fill" class="button button-primary">Подготовить файлы</button><button type="button" id="local-start" class="button button-secondary">Старт</button><button type="button" id="local-stop" class="button button-secondary">Стоп</button></div>
+              <details id="local-paths" class="nested-details"><summary>Пути локального задания <small>defaults из config</small></summary><div class="details-content"><div class="field-group"><label for="local-bot-root">Папка бота</label><input id="local-bot-root" name="local_bot_root" type="text" value="D:\\HamsterBot"></div><div class="field-group"><label for="local-runner-root">Папка runner</label><input id="local-runner-root" name="local_runner_root" type="text" value="D:\\HamsterBot\\runner"></div><div class="field-group"><label for="local-reports-root">Папка отчётов</label><input id="local-reports-root" name="local_reports_root" type="text" value="D:\\HamsterBot\\reports"></div><div class="field-group"><label for="local-output-root">Куда переносить готовое</label><input id="local-output-root" name="local_output_root" type="text" value="E:\\MRS3\\reports-archive"></div><div class="button-row"><button type="button" class="button button-secondary" data-pending="Пути локального runner проверяются backend">Проверить пути</button><button id="local-paths-save" type="button" class="button button-secondary">Сохранить пути</button></div></div></details>
+              <div class="progress-block"><div class="progress-track"><span style="width:0%"></span></div><p>Ожидание запуска.</p></div>
+              <p class="card-status" role="status" aria-live="polite">Проверка runner ещё не выполнена.</p>
             </div>
           </article>
 

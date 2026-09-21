@@ -170,6 +170,22 @@ const portfolioReasonHelpers = (() => {
 })();
 if (typeof globalThis !== 'undefined') globalThis.portfolioReasonHelpers = portfolioReasonHelpers;
 
+const screenerUiHelpers = (() => {
+  const fallbackBigShiftHeading = 'Хор. точек с большим сдвигом';
+  const bigShiftHeading = (value) => {
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) return fallbackBigShiftHeading;
+    return `Сдвиг ≥ ${String(value / 100).replace('.', ',')}%`;
+  };
+  const displayMetric = (value, fractionDigits) => {
+    if (value === null || value === undefined || value === '') return '—';
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '—';
+    return number.toFixed(fractionDigits).replace('.', ',');
+  };
+  return { bigShiftHeading, displayMetric };
+})();
+if (typeof globalThis !== 'undefined') globalThis.screenerUiHelpers = screenerUiHelpers;
+
 const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const { selectCommittedRetestTester, selectRetestTester } = window.retestRecovery;
   let shortlistGroups = [];
@@ -731,11 +747,14 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   }
 
   let screenerVerdicts = [];
+  let screenerBigShiftBp;
 
   function renderScreenerVerdicts() {
     const body = document.querySelector('#screener-verdicts-body');
     const empty = document.querySelector('#screener-verdicts-empty');
+    const bigShiftHeading = document.querySelector('#screener-big-shift-heading');
     if (!body) return;
+    if (bigShiftHeading) bigShiftHeading.textContent = screenerUiHelpers.bigShiftHeading(screenerBigShiftBp);
     body.replaceChildren();
     for (const verdict of screenerVerdicts) {
       const row = document.createElement('tr');
@@ -748,7 +767,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         cell(verdict.symbol), cell(verdict.side), cell(verdict.verdict),
         cell(verdict.big_shift ? 'да' : 'нет'), cell(verdict.n_good), cell(verdict.n_good_big_shift),
         cell(verdict.best_timeframe), cell(verdict.best_shift_bp), cell(verdict.best_close_len),
-        cell(verdict.best_pnl30), cell(verdict.best_dd_pct), cell(verdict.effective_days),
+        cell(screenerUiHelpers.displayMetric(verdict.best_pnl30, 0)),
+        cell(screenerUiHelpers.displayMetric(verdict.best_dd_pct, 1)), cell(verdict.effective_days),
       );
       body.append(row);
     }
@@ -812,6 +832,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const result = await requestJson('/api/v2/testing/screener/evaluate', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
       });
+      screenerBigShiftBp = result.big_shift_bp;
       screenerVerdicts = Array.isArray(result.verdicts) ? result.verdicts : [];
       renderScreenerVerdicts();
       screenerStatus(`Оценено пар: ${screenerVerdicts.length}.`);
