@@ -252,6 +252,57 @@ def test_readback_validation_rejects_a_corrupted_payload_at_any_worker_count(
     with pytest.raises(ValueError, match="payload checksum mismatch"):
         _validate_published_payloads(str(surface), materialized.scopes, None, workers)
 
+
+def test_readback_slice_worker_is_memory_bounded_and_reads_by_row_position(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slice worker must not scan the table or let DuckDB cache it whole.
+
+    Selecting by `fragment_id` against a `(scope_key, fragment_id)` key scans
+    every payload, and each of ~20 workers then kept up to a third of RAM of
+    buffer cache: a 27,360-point surface exhausted the commit limit and the
+    publication died with `MemoryError`. A slice is now a row-position range
+    read under a small explicit memory limit.
+    """
+    import duckdb
+
+    from mrs3 import source_v6_surface_fresh as fresh
+    from mrs3.source_v6_materializer import materialize_source_v6_from_database
+
+    facts, _idle_key = _grid_with_one_idle()
+    database = _source_db(tmp_path, facts)
+    scope = _scope_of(facts[0])
+    materialized = materialize_source_v6_from_database(database, (scope,), workers=1)
+    surface = fresh.publish_multiscope_surface(
+        tmp_path / "surfaces", materialized, source_database=database, workers=1,
+    )
+    connection = duckdb.connect(str(surface), read_only=True)
+    try:
+        rowids = [row[0] for row in connection.execute(
+            "select rowid from factual_fragments order by rowid"
+        ).fetchall()]
+    finally:
+        connection.close()
+
+    opened: list[dict] = []
+    real_connect = duckdb.connect
+
+    def recording_connect(*args, **kwargs):
+        opened.append(dict(kwargs.get("config") or {}))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(fresh.duckdb, "connect", recording_connect)
+    fresh.verify_surface_payload_slice(str(surface), rowids)
+
+    assert opened and all(config.get("memory_limit") and config.get("threads") == 1 for config in opened)
+    with pytest.raises(ValueError, match="slice is incomplete"):
+        fresh.verify_surface_payload_slice(str(surface), [*rowids, max(rowids) + 1])
+    # A range that holds rows the coordinator did not ask for is refused too.
+    assert len(rowids) > 2
+    with pytest.raises(ValueError, match="slice is incomplete"):
+        fresh.verify_surface_payload_slice(str(surface), [rowids[0], rowids[-1]])
+
+
 def test_the_surface_carries_its_own_measurements(tmp_path: Path) -> None:
     """W8: metrics and independent event ids, bound to the facts by a digest."""
     from mrs3.source_v6_materializer import materialize_source_v6_from_database

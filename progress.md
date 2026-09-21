@@ -3,6 +3,25 @@
 **Updated:** 2026-09-21
 **Current branch:** `main`
 
+## Surface publication: out-of-memory in read-back validation (2026-09-21)
+
+Publishing the 27,360-point surface failed with `MemoryError: Unable to allocate
+output buffer.` Windows logged virtual-memory exhaustion (event 2004) at the
+failure time with many `python.exe` at 4.5-5.7 GB each. Materialization is not
+the cause: measured on 8 scopes with 20 workers, workers stay at ~135 MB and
+commit is flat. The cause is `verify_surface_payload_slice`, the read-back
+check after the surface is written: it filtered by `fragment_id` against a
+`(scope_key, fragment_id)` key, so every slice scanned the whole 3.9 GB payload
+table and each worker cached it. Reproduced on a full-size copy with 20
+workers: 39.5 GB resident, commit free 0.4 GB, DuckDB out-of-memory.
+
+Fixed by slicing on `rowid` and opening each worker with `memory_limit=1GB,
+threads=1`; same checks, fail-closed on an incomplete slice. Full-size check:
+4.7 GB peak, 67.8 s. Spec addendum in
+`docs/specs/2026-08-21-source-v6-publication-throughput.md`. A running panel
+holds the old code and must be restarted; the failed materialization (~27 min
+on 20 workers) has to be redone.
+
 ## Surface build: PRETEST A/B tail aborted on quiet points (2026-09-21)
 
 Building a surface from the freshly imported 27,360-report Source DB failed

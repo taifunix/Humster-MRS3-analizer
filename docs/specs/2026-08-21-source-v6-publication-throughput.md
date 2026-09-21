@@ -480,6 +480,27 @@ All tests use `.venv\Scripts\python.exe -m pytest`. No `Input/`, `Output/`,
 `Data/`, HTML, DuckDB, segment, benchmark or generated bundle artifact may be
 committed.
 
+## Addendum 2026-09-21: bounded readback validation workers
+
+The read-back worker `verify_surface_payload_slice` selected its slice by
+`fragment_id`, but `factual_fragments` is keyed `(scope_key, fragment_id)`, so
+every slice scanned all payloads, and each worker process kept DuckDB's default
+buffer cache (a large share of RAM) of what it scanned. On a 27,360-point
+surface (3.9 GB of payloads) 20 workers reached a combined 39.5 GB resident,
+the Windows commit limit was exhausted (`commit free` 0.4 GB, resource-exhaustion
+events 2004) and publication ended with `MemoryError: Unable to allocate output
+buffer.` / DuckDB `Out of Memory Error`.
+
+Invariant: a slice worker reads only its own rows and holds a bounded amount of
+memory. The coordinator now slices by `rowid` (read together with the indexed
+columns it already fetches), each worker opens its connection with
+`memory_limit=1GB, threads=1`, reads `rowid between lo and hi`, and fails closed
+with `surface payload slice is incomplete` if the rows returned are not exactly
+the requested ones. The checked predicates (checksum, codec, JSON, schema,
+fragment id) are unchanged. Measured on the full-size table with 20 workers:
+peak combined resident 4.7 GB (was 39.5 GB and an out-of-memory failure),
+67.8 s.
+
 ## Known follow-up: orphaned segment-merge path
 
 C1, C2 and C4 were implemented against `merge_source_v6_segments` and its

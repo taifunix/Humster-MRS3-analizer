@@ -29,6 +29,10 @@ FINGERPRINT = "surface-v6-fresh-compact-v3"
 SOURCE_FINGERPRINT = "source-v6-fresh-compact-v2"
 # Bounds the bind list of the pass-through copy, as the merge does.
 _COPY_BATCH = 512
+# A validation worker holds one slice of payloads and nothing else. DuckDB's
+# default cache is a large share of RAM per process, which multiplied by every
+# worker exhausted the commit limit on a full-size surface.
+_SLICE_WORKER_CONFIG = {"memory_limit": "1GB", "threads": 1}
 _ANALYSIS_ROW_FIELDS = frozenset({
     "point_id", "symbol", "side", "timeframe", "shift_bp", "open_ma", "close_ma",
     "pnl_pct", "dd_pct", "trades", "wins", "losses", "win_rate_pct", "profit_factor",
@@ -264,25 +268,29 @@ def _copy_sealed_payloads(
             pass
 
 
-def verify_surface_payload_slice(path: str, ids: list[str]) -> None:
-    """Check the byte identity of one explicit id slice (W6).
+def verify_surface_payload_slice(path: str, rowids: list[int]) -> None:
+    """Check the byte identity of one explicit row-position slice (W6).
 
     Opens its own read-only connection so it is safe in a worker process, and
     returns nothing: the verdict is the absence of an exception, which is what
-    keeps the fan-out cheaper than what it verifies.
+    keeps the fan-out cheaper than what it verifies. Rows are addressed by
+    `rowid` range, so only the slice's row groups are read; the key is
+    `(scope_key, fragment_id)`, and a `fragment_id` filter scanned every payload.
     """
-    if not ids:
+    if not rowids:
         return
-    connection = duckdb.connect(path, read_only=True)
+    connection = duckdb.connect(path, read_only=True, config=_SLICE_WORKER_CONFIG)
     try:
-        placeholders = ", ".join("?" for _ in ids)
         rows = connection.execute(
-            "select scope_key, fragment_id, payload_blob, payload_sha256 from factual_fragments "
-            f"where fragment_id in ({placeholders})",
-            list(ids),
+            "select scope_key, fragment_id, payload_blob, payload_sha256, rowid from factual_fragments "
+            "where rowid between ? and ?",
+            [min(rowids), max(rowids)],
         ).fetchall()
     finally:
         connection.close()
+    if {int(row[4]) for row in rows} != set(rowids):
+        raise ValueError("surface payload slice is incomplete")
+    rows = [row[:4] for row in rows]
     for scope_key, fragment_id, payload, payload_sha256 in rows:
         blob = bytes(payload)
         if sha256(blob).hexdigest() != str(payload_sha256):
@@ -316,7 +324,7 @@ def _validate_published_payloads(
     W6 splits the check in two. The set, codec and scope-purity half is decided
     here from indexed columns, so no payload byte enters this process. The
     per-fragment `zlib` + `sha256` half is pure Python and independent per
-    fragment, so it runs over bounded id slices across processes. Both halves
+    fragment, so it runs over bounded rowid slices across processes. Both halves
     apply exactly the predicates the single-pass version applied, and worker
     count changes only elapsed time.
     """
@@ -324,7 +332,7 @@ def _validate_published_payloads(
     try:
         expected = {scope.scope_key: {item.fragment_id for item in scope.facts} for scope in scopes}
         rows = connection.execute(
-            "select scope_key, fragment_id, point_key, codec from factual_fragments"
+            "select scope_key, fragment_id, point_key, codec, rowid from factual_fragments order by rowid"
         ).fetchall()
     finally:
         connection.close()
@@ -332,7 +340,7 @@ def _validate_published_payloads(
     total = len(rows)
     if progress_callback is not None:
         progress_callback("VALIDATING", completed=0, total=total)
-    for scope_key, fragment_id, point_key, codec in rows:
+    for scope_key, fragment_id, point_key, codec, _rowid in rows:
         scope_key, fragment_id = str(scope_key), str(fragment_id)
         if scope_key not in expected or fragment_id not in expected[scope_key]:
             raise ValueError(f"surface holds an unexpected payload: {scope_key}")
@@ -345,8 +353,8 @@ def _validate_published_payloads(
         seen[scope_key].add(fragment_id)
     if seen != expected:
         raise ValueError("surface payload set does not match the materialized scopes")
-    ids = sorted(fragment_id for members in seen.values() for fragment_id in members)
-    slices = [ids[start : start + _COPY_BATCH] for start in range(0, len(ids), _COPY_BATCH)]
+    rowids = [int(row[4]) for row in rows]
+    slices = [rowids[start : start + _COPY_BATCH] for start in range(0, len(rowids), _COPY_BATCH)]
     completed = 0
     if max(1, int(workers)) < 2 or len(slices) < 2:
         for chunk in slices:
