@@ -56,6 +56,60 @@ def test_second_process_produces_identical_canonical_bytes_and_id() -> None:
     assert first.stdout == second.stdout
 
 
+def test_decoding_derives_identity_from_stored_bytes_without_rebuilding_them() -> None:
+    """The stored bytes are what the writer hashed, so reads must not re-canonicalize.
+
+    Rebuilding the canonical document on every read cost about a third of the
+    materialization time and re-derived an identity the bytes already carry.
+    """
+    from mrs3 import source_v6
+    from mrs3.source_v6 import decode_fragment, normalize_and_encode_source_v6
+
+    _fragment, encoded = normalize_and_encode_source_v6(FIXTURE.read_bytes())
+
+    def refuse(payload: object) -> str:
+        raise AssertionError("decoding must not rebuild the canonical document")
+
+    original = source_v6.canonical_fragment_id_from_payload
+    source_v6.canonical_fragment_id_from_payload = refuse
+    try:
+        decoded = decode_fragment(
+            encoded.payload, codec=encoded.codec, expected_fragment_id=encoded.fragment_id
+        )
+    finally:
+        source_v6.canonical_fragment_id_from_payload = original
+
+    assert decoded.fragment_id == encoded.fragment_id == sha256(encoded.canonical).hexdigest()
+
+
+def test_non_canonical_stored_bytes_are_refused_only_under_the_strict_check() -> None:
+    """Canonical form is a write-time invariant; the read-time check is opt-in.
+
+    A reader cannot tell a re-serialized document from the canonical one without
+    rebuilding it, so the audit that does rebuild it stays available by name.
+    """
+    from mrs3.source_v6 import SourceV6Error, decode_fragment, normalize_and_encode_source_v6
+
+    _fragment, encoded = normalize_and_encode_source_v6(FIXTURE.read_bytes())
+    # Same document, different bytes: separators the canonical form never emits.
+    loose = json.dumps(json.loads(encoded.canonical), sort_keys=True, separators=(", ", ": ")).encode("utf-8")
+    assert loose != encoded.canonical
+    payload = zlib.compress(loose, 9)
+
+    decoded = decode_fragment(payload, expected_fragment_id=sha256(loose).hexdigest())
+    assert decoded.fragment_id == sha256(loose).hexdigest() != encoded.fragment_id
+
+    with pytest.raises(SourceV6Error, match="not in canonical form"):
+        decode_fragment(payload, expected_fragment_id=sha256(loose).hexdigest(), strict_canonical=True)
+
+    # The audit is the only remaining canonical-form control, so it must also
+    # accept what the writer produces: a checker that always raises is useless.
+    accepted = decode_fragment(
+        encoded.payload, codec=encoded.codec, expected_fragment_id=encoded.fragment_id, strict_canonical=True
+    )
+    assert accepted.fragment_id == encoded.fragment_id
+
+
 def test_v1_payload_is_rejected_before_publication() -> None:
     from mrs3.source_v6 import SourceV6Error, decode_fragment, normalize_and_encode_source_v6
 

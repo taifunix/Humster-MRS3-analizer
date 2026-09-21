@@ -3,6 +3,51 @@
 **Updated:** 2026-09-21
 **Current branch:** `main`
 
+## Materialization is 2.59x faster per point, with identical values (2026-09-21)
+
+A profile of one `measure_point_group` worker over 40 real points found two
+places doing redundant work: rebuilding the whole canonical document on every
+decode to re-derive an id the stored bytes already carry (34.6%), and
+evaluating the first fragment's sample cutoff inside a comprehension over all
+wallet and equity samples, which made that scan quadratic (29.4%).
+
+Both are fixed. Measured wall-clock without a profiler on 60 real points from
+two differently shaped scopes, three runs per state of the code as ADR-0017
+requires: baseline 24.41/24.31/25.25 s, after the cutoff hoist
+13.48/13.60/13.87 s, after byte-derived identity 9.38/9.43/9.46 s. That is
+2.59x on both best and median runs, with a byte-identical sha256 of the full
+analysis-row dump at every step (`f1b2a902...a081`). Canonical form is now proven at write time and on demand
+through `decode_fragment(..., strict_canonical=True)`; that audit was run over
+24,790 of the database's 27,360 fragments (90.6%) and every one re-serialized
+to exactly its stored bytes. The move is decided in ADR-0040 and specified in
+`docs/specs/2026-09-21-source-v6-materialization-speed.md`.
+
+Independent review then found that because reads no longer re-prove canonical
+form, the two import APIs that accept caller-supplied payload bytes
+(`import_fragment`, `import_fragment_batch`) would accept a non-canonical
+payload whose id is the hash of its own bytes; the blob checksum, the stored id
+and W6 all pass such a forgery. Later rounds pushed the same proof deeper: the injected-worker branch, the
+segment writer, its compact-row input, then merge and reduce. Each was
+implemented, then reconsidered and removed, because the escalation was measured
+rather than argued: a fragment whose point identity was rewritten to
+`TOTALLYFAKEUSDT` seals and publishes through the checked path, since
+`encode_fragment` canonicalizes whatever it is given. Canonical form is a
+reproducibility property, not an authenticity one. The system takes tester HTML
+reports and a finished Source v6 database as input and nothing else, so the
+property is kept where it is free, and `import_fragment`/`import_fragment_batch`
+keep a cheap assertion because they accept bytes they did not serialize.
+
+Full suite: 4,719 passed, 2 failed, both in the portfolio module, which shares
+no code with this change. The cross-process lease test fails the same way with
+the change stashed (`FileExistsError` from the Windows lock rename in
+`portfolio/store.py:272`) and is a pre-existing defect; the concurrent-campaign
+test failed only under full-suite load and passed in six consecutive runs
+afterwards.
+
+Not done, and deliberately left for its own spec: `calculate_metrics` still
+runs twice per point, once for the READY witness and once for the PRETEST B
+fortnight (about a quarter of the worker).
+
 ## Surface publication: out-of-memory in read-back validation (2026-09-21)
 
 Publishing the 27,360-point surface failed with `MemoryError: Unable to allocate

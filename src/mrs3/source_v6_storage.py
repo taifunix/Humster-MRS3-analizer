@@ -26,6 +26,7 @@ from .source_v6 import (
     SOURCE_V6_SCHEMA_VERSION,
     SourceV6Error,
     SourceV6Fragment,
+    canonical_fragment_id,
     decode_fragment,
     encode_fragment,
 )
@@ -441,6 +442,22 @@ def _validate_segment_outcome_order(
     if ordinals != tuple(range(ordinals[0], ordinals[-1] + 1)):
         raise SourceV6StorageError("segment outcomes have an ordinal gap")
     return ordered
+
+
+def _assert_canonical_encoding(fragment: SourceV6Fragment, encoded: EncodedSourceV6Fragment) -> None:
+    """Prove caller-supplied payload bytes are the canonical serialization.
+
+    Readers derive identity from the stored bytes, so bytes whose id is the hash
+    of a non-canonical serialization stay self-consistent everywhere downstream:
+    the blob checksum, the stored id and W6 all pass. Only the boundary that
+    accepts bytes it did not serialize can decide this, and it decides it by
+    serializing the fragment itself. Payloads this module encodes are canonical
+    by construction, so nothing on the import path pays for the check twice.
+    """
+    if encoded.fragment_id != fragment.fragment_id:
+        raise SourceV6StorageError("encoded fragment identity mismatch")
+    if canonical_fragment_id(fragment) != encoded.fragment_id:
+        raise SourceV6StorageError("encoded fragment payload is not in canonical form")
 
 
 def _validate_segment_inputs(
@@ -1510,8 +1527,7 @@ def import_fragment_batch(path: str | Path, items: Iterable[tuple[SourceV6Fragme
             if fragment.source_sha256 in existing_by_sha:
                 receipts.append(ImportReceipt("IDEMPOTENT", existing_by_sha[fragment.source_sha256], database_id, generation, "YES", False, 0))
                 continue
-            if encoded.fragment_id != fragment.fragment_id:
-                raise SourceV6StorageError("encoded fragment identity mismatch")
+            _assert_canonical_encoding(fragment, encoded)
             existing_ids.add(fragment.fragment_id)
             existing_by_sha[fragment.source_sha256] = fragment.fragment_id
             started = _utc_now()
@@ -1583,9 +1599,10 @@ def import_fragment(path: str | Path, fragment: SourceV6Fragment, *, preflight_t
         duplicate = connection.execute("select fragment_id from compact_fragments where source_sha256 = ? or fragment_id = ?", [fragment.source_sha256, fragment.fragment_id]).fetchone()
         if duplicate:
             return ImportReceipt("IDEMPOTENT", str(duplicate[0]), info["database_id"], before, "YES", False, 0)
-        encoded = encoded or encode_fragment(fragment)
-        if encoded.fragment_id != fragment.fragment_id:
-            raise SourceV6StorageError("encoded fragment identity mismatch")
+        if encoded is None:
+            encoded = encode_fragment(fragment)
+        else:
+            _assert_canonical_encoding(fragment, encoded)
         started = _utc_now()
         connection.execute("begin")
         connection.execute("insert into import_audit values (?, ?, ?, ?, null, 'STARTED', ?, ?, 'NO', 0, null)", [audit_id, fragment.fragment_id, fragment.source_sha256, started, before, before])

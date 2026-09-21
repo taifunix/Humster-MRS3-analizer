@@ -1953,3 +1953,59 @@ def test_day_ownership_labels_a_normal_fragment_active(tmp_path: Path) -> None:
     finally:
         connection.close()
     assert rows == [("ACTIVE",)]
+
+
+def _forged_non_canonical(fragment):
+    """Same document, bytes the canonical serializer would never emit."""
+    import zlib
+
+    from mrs3.source_v6 import EncodedSourceV6Fragment
+
+    canonical = encode_fragment(fragment).canonical
+    loose = json.dumps(json.loads(canonical), sort_keys=True, separators=(", ", ": ")).encode("utf-8")
+    assert loose != canonical
+    forged_id = sha256(loose).hexdigest()
+    encoded = EncodedSourceV6Fragment(forged_id, loose, zlib.compress(loose, 9), "json+zlib-v1:9")
+    return replace(fragment, fragment_id=forged_id), encoded
+
+
+def test_import_refuses_caller_supplied_payload_that_is_not_canonical(tmp_path: Path) -> None:
+    """Bytes the importer did not serialize itself must prove their canonical form.
+
+    Readers derive `fragment_id` from the stored bytes, so a payload whose id is
+    the hash of a non-canonical serialization is self-consistent everywhere
+    downstream: the blob checksum, the stored id and W6 all pass. The boundary
+    that accepts foreign bytes is the only place the property can be enforced.
+    """
+    database = tmp_path / "source-v6.duckdb"
+    create_v6_database(database)
+    fragment, encoded = _forged_non_canonical(_fragment())
+
+    with pytest.raises(SourceV6StorageError, match="not in canonical form"):
+        import_fragment(
+            database, fragment, preflight_token=preflight_import(database, fragment), encoded=encoded
+        )
+
+    connection = duckdb.connect(str(database))
+    try:
+        assert connection.execute("select count(*) from compact_fragments").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_batch_import_refuses_caller_supplied_payload_that_is_not_canonical(tmp_path: Path) -> None:
+    """The batch boundary accepts the same foreign bytes and needs the same proof."""
+    from mrs3.source_v6_storage import import_fragment_batch
+
+    database = tmp_path / "source-v6.duckdb"
+    create_v6_database(database)
+    fragment, encoded = _forged_non_canonical(_fragment())
+
+    with pytest.raises(SourceV6StorageError, match="not in canonical form"):
+        import_fragment_batch(database, [(fragment, encoded)])
+
+    connection = duckdb.connect(str(database))
+    try:
+        assert connection.execute("select count(*) from compact_fragments").fetchone()[0] == 0
+    finally:
+        connection.close()

@@ -387,7 +387,7 @@ def encode_fragment(fragment: SourceV6Fragment, *, compression_level: int = 9) -
     return EncodedSourceV6Fragment(fragment_id, canonical, zlib.compress(canonical, compression_level), f"json+zlib-v1:{compression_level}")
 
 
-def _fragment_from_payload(payload: Mapping[str, object]) -> SourceV6Fragment:
+def _fragment_from_payload(payload: Mapping[str, object], *, fragment_id: str | None = None) -> SourceV6Fragment:
     try:
         expected_keys = {
             "schema_version", "point", "report_start_ms", "report_end_ms",
@@ -420,7 +420,8 @@ def _fragment_from_payload(payload: Mapping[str, object]) -> SourceV6Fragment:
             "upnl": Decimal(str(row["upnl"])),
         }) for row in payload["equity_samples"])
         return SourceV6Fragment(
-            schema_version=int(payload["schema_version"]), fragment_id=canonical_fragment_id_from_payload(payload),
+            schema_version=int(payload["schema_version"]),
+            fragment_id=canonical_fragment_id_from_payload(payload) if fragment_id is None else fragment_id,
             source_sha256="", source_name="", point=point,
             report_start_ms=int(payload["report_start_ms"]), report_end_ms=int(payload["report_end_ms"]),
             initial_balance=Decimal(str(payload["initial_balance"])),
@@ -440,23 +441,29 @@ def canonical_fragment_id_from_payload(payload: Mapping[str, object]) -> str:
     return sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
-def decode_fragment(payload: bytes, *, codec: str = "json+zlib-v1:9", expected_fragment_id: str | None = None) -> SourceV6Fragment:
+def decode_fragment(payload: bytes, *, codec: str = "json+zlib-v1:9", expected_fragment_id: str | None = None, strict_canonical: bool = False) -> SourceV6Fragment:
+    """Rebuild a fragment from the stored bytes, hashing them rather than rewriting them.
+
+    `raw` is the canonical document that `encode_fragment` hashed, so the
+    identity follows from the stored bytes. Canonical form itself is a
+    write-time invariant: `encode_fragment` serializes the document and refuses
+    a fragment whose id does not match those bytes. Re-serializing the document
+    on every read to re-derive an id the bytes already carry cost about a third
+    of materialization, so it is now the opt-in `strict_canonical` audit.
+    """
     try:
         if not codec.startswith("json+zlib-v1:"):
             raise SourceV6Error("unsupported compact codec")
         raw = zlib.decompress(bytes(payload))
-        # `raw` is the canonical document that `encode_fragment` hashed, so the
-        # identity follows from the stored bytes without rebuilding them.
         actual = sha256(raw).hexdigest()
         if expected_fragment_id is not None and actual != expected_fragment_id:
             raise SourceV6Error("canonical fragment identity mismatch")
         document = json.loads(raw.decode("utf-8"))
         if not isinstance(document, Mapping):
             raise SourceV6Error("canonical fragment must be an object")
-        fragment = _fragment_from_payload(document)
-        if actual != fragment.fragment_id:
-            raise SourceV6Error("canonical fragment identity mismatch")
-        return fragment
+        if strict_canonical and canonical_fragment_id_from_payload(document) != actual:
+            raise SourceV6Error("stored fragment is not in canonical form")
+        return _fragment_from_payload(document, fragment_id=actual)
     except SourceV6Error:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError, zlib.error, ValueError) as error:

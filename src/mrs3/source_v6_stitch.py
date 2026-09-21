@@ -895,8 +895,12 @@ def calculate_metrics(
     period_metrics: list[PeriodMetrics] = []
     for index, fragment in enumerate(ordered):
         if index == 0:
-            period_balance = tuple(sample for sample in adjusted_views[index]["wallet_samples"] if sample.timestamp_ms < (min((cycle.open_timestamp_ms for cycle in fragment.cycles if cycle.cycle_id in old_open_by_fragment[index]), default=fragment.report_end_ms)))
-            period_equity = tuple(sample for sample in adjusted_views[index]["equity_samples"] if sample.timestamp_ms < (min((cycle.open_timestamp_ms for cycle in fragment.cycles if cycle.cycle_id in old_open_by_fragment[index]), default=fragment.report_end_ms)))
+            # The cutoff depends only on the fragment's own old-open cycles, so
+            # it is decided once; evaluating it inside the filter made the scan
+            # quadratic in samples x cycles.
+            cutoff = min((cycle.open_timestamp_ms for cycle in fragment.cycles if cycle.cycle_id in old_open_by_fragment[index]), default=fragment.report_end_ms)
+            period_balance = tuple(sample for sample in adjusted_views[index]["wallet_samples"] if sample.timestamp_ms < cutoff)
+            period_equity = tuple(sample for sample in adjusted_views[index]["equity_samples"] if sample.timestamp_ms < cutoff)
         else:
             boundary = seam_boundaries[index - 1]
             retained = [cycle for cycle in fragment.cycles if cycle.cycle_id in retained_by_fragment[index] and cycle.open_timestamp_ms < boundary]
