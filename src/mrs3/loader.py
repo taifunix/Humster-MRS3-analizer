@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+from zipfile import BadZipFile
 
 import pandas as pd
+from openpyxl.utils.exceptions import InvalidFileException
 
 from .config import AlgorithmConfig
 from .models import InputAudit, Side
@@ -72,6 +74,7 @@ def normalize_shift(
 
 def _load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
     try:
+        registry_format = False
         if path.suffix.casefold() == ".csv":
             raw = pd.read_csv(path, dtype=str)
             required = {"ticker", "launch"}
@@ -84,13 +87,39 @@ def _load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
             if frame.empty or frame.isna().any().any() or frame["symbol"].str.strip().eq("").any():
                 raise InputError("CSV listing dates require non-empty ticker and launch values")
         else:
-            frame = pd.read_excel(
-                path, header=None, usecols=[0, 1], names=["symbol", "listing_date"]
-            ).dropna(subset=["symbol", "listing_date"])
+            with pd.ExcelFile(path) as workbook:
+                registry_sheet = "Пары"
+                registry_columns = {"Пара", "Дата листинга на Bybit (UTC)"}
+                if registry_sheet in workbook.sheet_names:
+                    header = set(pd.read_excel(workbook, sheet_name=registry_sheet, nrows=0).columns)
+                    missing = sorted(registry_columns.difference(header))
+                    if missing:
+                        raise InputError(
+                            "invalid listing dates: liquidity registry listing sheet "
+                            f"is missing columns: {missing}"
+                        )
+                    registry_format = True
+                    frame = pd.read_excel(
+                        workbook,
+                        sheet_name=registry_sheet,
+                        usecols=["Пара", "Дата листинга на Bybit (UTC)"],
+                    ).rename(
+                        columns={
+                            "Пара": "symbol",
+                            "Дата листинга на Bybit (UTC)": "listing_date",
+                        }
+                    )
+                else:
+                    frame = pd.read_excel(
+                        workbook, header=None, usecols=[0, 1], names=["symbol", "listing_date"]
+                    )
+            frame = frame.dropna(subset=["symbol", "listing_date"])
         frame = frame.copy()
         frame["symbol"] = frame["symbol"].astype(str).str.strip()
+        if registry_format:
+            frame["symbol"] = frame["symbol"].str.upper()
         frame["listing_date"] = pd.to_datetime(frame["listing_date"], errors="raise", utc=True)
-    except (OSError, ValueError, TypeError) as exc:
+    except (OSError, ValueError, TypeError, BadZipFile, InvalidFileException) as exc:
         if isinstance(exc, InputError):
             raise
         raise InputError(f"invalid listing dates: {exc}") from exc

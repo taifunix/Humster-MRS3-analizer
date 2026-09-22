@@ -82,6 +82,20 @@ def load_analysis_profile(config_path: Path) -> dict[str, object]:
     return _project(config_path)
 
 
+def load_analysis_settings(config_path: Path) -> dict[str, object]:
+    document, _ = _read(config_path)
+    workflow = document.get("panel_workflow", {})
+    if not isinstance(workflow, Mapping):
+        raise ValueError("panel_workflow must be an object")
+    listing_dates_path = workflow.get("listing_dates_path", "")
+    if not isinstance(listing_dates_path, str):
+        raise ValueError("listing dates path must be a string")
+    return {
+        "profile": _project(config_path),
+        "listing_dates_path": listing_dates_path,
+    }
+
+
 def _merge(document: dict[str, Any], profile: Mapping[str, object]) -> dict[str, Any]:
     if set(profile) != _TOP_LEVEL:
         raise ValueError("unknown analysis profile field")
@@ -134,3 +148,29 @@ def save_analysis_profile(config_path: Path, profile: Mapping[str, object]) -> d
         temporary.unlink(missing_ok=True)
     _atomic_write(config_path, merged, previous)
     return normalized
+
+
+def save_analysis_settings(
+    config_path: Path,
+    profile: Mapping[str, object],
+    listing_dates_path: object,
+) -> dict[str, object]:
+    if not isinstance(listing_dates_path, str) or not listing_dates_path.strip():
+        raise ValueError("listing dates path must be a non-empty string")
+    path_value = listing_dates_path.strip()
+    document, previous = _read(config_path)
+    merged = _merge(document, profile)
+    workflow = merged.get("panel_workflow", {})
+    if not isinstance(workflow, dict):
+        raise ValueError("panel_workflow must be an object")
+    merged["panel_workflow"] = {**workflow, "listing_dates_path": path_value}
+    temporary = config_path.with_name(f".{config_path.name}.analysis-profile-check")
+    try:
+        try:
+            normalized = _project(_write_validation_copy(merged, temporary))
+        except InvalidOperation as error:
+            raise ValueError("invalid analysis profile value") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+    _atomic_write(config_path, merged, previous)
+    return {"profile": normalized, "listing_dates_path": path_value}

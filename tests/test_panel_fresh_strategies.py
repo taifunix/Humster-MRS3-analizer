@@ -9,6 +9,7 @@ import threading
 from time import monotonic, sleep
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from mrs3.config import AlgorithmConfig
@@ -199,6 +200,104 @@ def test_http_fresh_analysis_reports_missing_listing_dates_actionably(tmp_path: 
 
     assert response.status == 400
     assert body == {"error": "Listing dates XLSX is missing. Add it and save Settings > Analysis profile."}
+
+
+@pytest.mark.parametrize(
+    ("raw_error", "expected"),
+    [
+        (
+            "invalid analysis inputs: duplicate listing dates: ['AMCUSDT']",
+            "Listing dates file contains duplicate symbols. Fix it or choose another file in Settings > Analysis profile.",
+        ),
+        (
+            "invalid analysis inputs: invalid listing dates: Permission denied",
+            "Listing dates file is locked or unreadable. Close it and try again, or choose another file in Settings > Analysis profile.",
+        ),
+        (
+            "invalid analysis inputs: invalid listing dates: unsupported workbook",
+            "Listing dates file has an invalid or unsupported format. Choose a two-column dates file or the liquidity registry in Settings > Analysis profile.",
+        ),
+    ],
+)
+def test_fresh_analysis_listing_date_errors_are_not_reported_as_missing(
+    raw_error: str, expected: str
+) -> None:
+    from mrs3.panel import _fresh_analysis_error
+
+    assert _fresh_analysis_error(raw_error) == expected
+
+
+def test_http_fresh_analysis_reports_corrupt_listing_dates_as_invalid_format(
+    tmp_path: Path, monkeypatch
+) -> None:
+    corrupt = tmp_path / "corrupt.xlsx"
+    corrupt.write_bytes(b"not-an-xlsx-archive")
+    config = tmp_path / "config.local.json"
+    config.write_text(
+        json.dumps({"panel_workflow": {"listing_dates_path": str(corrupt)}}),
+        encoding="utf-8",
+    )
+    surface = tmp_path / "surface.surface-v6.duckdb"
+    surface.write_bytes(b"surface")
+    monkeypatch.setattr(
+        "mrs3.panel.read_multiscope_surface", lambda *_args, **_kwargs: {"surface_id": "surface"}
+    )
+    controller = PanelController(
+        tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults()
+    )
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        payload = json.dumps({"surface_path": str(surface)}).encode("utf-8")
+        connection.request(
+            "POST",
+            "/api/v2/strategies/fresh/analyze",
+            payload,
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        status = response.status
+        body = json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    assert status == 200
+    assert body == {
+        "phase": "FAILED",
+        "error": "Listing dates file has an invalid or unsupported format. Choose a two-column dates file or the liquidity registry in Settings > Analysis profile."
+    }
+
+
+def test_http_fresh_analysis_reports_incomplete_registry_as_invalid_format(
+    tmp_path: Path, monkeypatch
+) -> None:
+    registry = tmp_path / "incomplete-registry.xlsx"
+    pd.DataFrame({"Пара": ["AAAUSDT"], "wrong date": ["2026-07-01"]}).to_excel(
+        registry, sheet_name="Пары", index=False
+    )
+    config = tmp_path / "config.local.json"
+    config.write_text(
+        json.dumps({"panel_workflow": {"listing_dates_path": str(registry)}}),
+        encoding="utf-8",
+    )
+    surface = tmp_path / "surface.surface-v6.duckdb"
+    surface.write_bytes(b"surface")
+    monkeypatch.setattr(
+        "mrs3.panel.read_multiscope_surface", lambda *_args, **_kwargs: {"surface_id": "surface"}
+    )
+    controller = PanelController(
+        tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults()
+    )
+
+    result = controller.strategies_fresh_analyze({"surface_path": str(surface)})
+
+    assert result == {
+        "phase": "FAILED",
+        "error": "Listing dates file has an invalid or unsupported format. Choose a two-column dates file or the liquidity registry in Settings > Analysis profile.",
+    }
 
 
 def test_http_generation_accepts_a_large_ready_selection_payload(tmp_path: Path) -> None:

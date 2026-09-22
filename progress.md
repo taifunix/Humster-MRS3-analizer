@@ -3,6 +3,28 @@
 **Updated:** 2026-09-22
 **Current branch:** `main`
 
+## Analysis listing-date input and registry support (2026-09-22)
+
+The root cause of the fresh-analysis setup failure was not a missing file or a
+Panel lock: the configured `input/dates.xlsx` existed but contained a duplicate
+`AMCUSDT` row. The generic error mapper incorrectly reported every listing-date
+parse failure as “XLSX is missing”. Missing, duplicate, locked/unreadable and
+invalid-format inputs now produce distinct operator guidance.
+
+`Settings > Analysis profile` now loads, browses, validates and atomically
+saves `panel_workflow.listing_dates_path` alongside the typed analysis profile.
+Fresh analysis accepts both the legacy two-column dates CSV/XLSX and the
+operator liquidity registry XLSX (`Пары`: `Пара`,
+`Дата листинга на Bybit (UTC)`). The real
+`input/bybit_tradfi_liquidity.xlsx` loaded successfully with 242 unique pairs,
+and local `config.local.json` was switched to that relative path without
+changing the workbook. Focused and extended verification passed: `11`, `209`
+and `482` tests respectively; JavaScript syntax and diff checks passed.
+Independent review identified and verified fixes for three malformed-input
+edges: safe browser display of profile errors, corrupt XLSX normalization and
+strict rejection of an incomplete `Пары` schema. Final re-review returned
+`CODE_REVIEW_PASS`.
+
 ## Pair screener table readability and testing-screen layout (2026-09-21)
 
 SCREENER 01 now occupies the full first row of the Testing grid; RUNNER 01 and
@@ -27,7 +49,7 @@ version coerced malformed booleans, strings, arrays, zero and fractional values;
 strict positive-safe-integer validation and regression cases closed the finding,
 and re-review returned `CODE_REVIEW_PASS`.
 
-Verification: the required screener/static/Panel-testing contour passed `248`
+Verification: the required screener/static/Panel-testing contour passed `259`
 tests; the four initial focused regressions passed; `node --check
 src/mrs3/panel_web/app.js` and `git diff --check` passed. The full repository
 run completed with `4728 passed, 7 skipped, 2 failed`: the unrelated two-second

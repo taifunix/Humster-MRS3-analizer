@@ -186,6 +186,20 @@ const screenerUiHelpers = (() => {
 })();
 if (typeof globalThis !== 'undefined') globalThis.screenerUiHelpers = screenerUiHelpers;
 
+const panelRequestErrorHelpers = (() => {
+  const safeStringPrefixes = [
+    '/api/v2/strategies/fresh/',
+    '/api/v2/surfaces/',
+    '/api/v2/testing/screener/',
+  ];
+  const safeStringEndpoints = new Set(['/api/v2/settings/analysis-profile']);
+  const allowsSafeString = (endpoint) => (
+    safeStringEndpoints.has(endpoint) || safeStringPrefixes.some((prefix) => endpoint.startsWith(prefix))
+  );
+  return { allowsSafeString };
+})();
+if (typeof globalThis !== 'undefined') globalThis.panelRequestErrorHelpers = panelRequestErrorHelpers;
+
 const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const { selectCommittedRetestTester, selectRetestTester } = window.retestRecovery;
   let shortlistGroups = [];
@@ -365,7 +379,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       let result;
       try { result = await response.json(); } catch (_) { throw new Error('Backend returned invalid JSON.'); }
       if (!response.ok) {
-        const code = typeof result?.error === 'string' && (endpoint.startsWith('/api/v2/strategies/fresh/') || endpoint.startsWith('/api/v2/surfaces/') || endpoint.startsWith('/api/v2/testing/screener/') || /^[A-Z_]+$/.test(result.error)) ? result.error : 'Server validation failed.';
+        const code = typeof result?.error === 'string' && (panelRequestErrorHelpers.allowsSafeString(endpoint) || /^[A-Z_]+$/.test(result.error)) ? result.error : 'Server validation failed.';
         const payload = result?.error;
         const typedCode = payload && typeof payload === 'object' && typeof payload.code === 'string' ? payload.code : code;
         const typedMessage = payload && typeof payload === 'object' && typeof payload.message === 'string'
@@ -531,7 +545,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     };
     const shiftFactors = Object.values(analysisProfilePairPayload('shift-factors', ['max_bp', 'value'])).map((pair) => ({ max_bp: Number(pair.max_bp), value: pair.value }));
     const gapRules = Object.values(analysisProfilePairPayload('gap-rules', ['lower_min_bp', 'lower_max_exclusive_bp', 'min_gap_bp'])).map((pair) => ({ lower_min_bp: Number(pair.lower_min_bp), lower_max_exclusive_bp: Number(pair.lower_max_exclusive_bp), min_gap_bp: Number(pair.min_gap_bp) }));
-    return { profile: {
+    return { listing_dates_path: value('analysis-listing-dates-path').trim(), profile: {
       eligibility: { min_history_days: integer('analysis-history-days'), base_rates: Object.fromEntries(Object.entries(analysisProfilePairPayload('base-rates', ['value'])).map(([key, pair]) => [key, pair.value])), shift_factors: shiftFactors, floor_boundary_bp: integer('analysis-floor-boundary'), floor_at_or_below: integer('analysis-floor-low'), floor_above: integer('analysis-floor-high'), min_point_events: integer('analysis-min-events') },
       economics: { min_pnl_pct: value('analysis-min-pnl'), min_win_rate_pct: value('analysis-min-win-rate'), max_dd_pct: value('analysis-max-dd'), min_efficiency: value('analysis-min-efficiency') },
       geometry: { ma_neighbor_radius: integer('analysis-ma-radius') },
@@ -541,7 +555,11 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     } };
   }
   async function reloadAnalysisProfile() {
-    const result = await requestJson('/api/v2/settings/analysis-profile'); renderAnalysisProfile(result.profile); return result.profile;
+    const result = await requestJson('/api/v2/settings/analysis-profile');
+    renderAnalysisProfile(result.profile);
+    const listingDates = document.querySelector('#analysis-listing-dates-path');
+    if (listingDates) listingDates.value = result.listing_dates_path || '';
+    return result;
   }
 
   async function loadSafeDefaults() {
@@ -3155,10 +3173,22 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       if (analysisProfileStatus) analysisProfileStatus.textContent = 'Профиль анализа загружен из config.local.json.';
     } catch (_) { if (analysisProfileStatus) analysisProfileStatus.textContent = 'Не удалось загрузить профиль анализа. Проверьте config.local.json.'; }
   });
+  document.querySelector('#analysis-listing-dates-browse')?.addEventListener('click', async () => {
+    try {
+      const result = await remoteRequest('/api/browse', { kind: 'dates', multiple: false });
+      const selected = Array.isArray(result.paths) ? result.paths[0] : '';
+      if (selected) document.querySelector('#analysis-listing-dates-path').value = selected;
+      if (analysisProfileStatus) analysisProfileStatus.textContent = selected ? 'Файл выбран. Нажмите «Сохранить».' : 'Выбор файла отменён.';
+    } catch (error) {
+      if (analysisProfileStatus) analysisProfileStatus.textContent = error?.message || 'Не удалось выбрать файл дат листинга.';
+    }
+  });
   document.querySelector('#analysis-profile-save')?.addEventListener('click', async () => {
     try {
       const result = await remoteRequest('/api/v2/settings/analysis-profile', analysisProfilePayload());
       renderAnalysisProfile(result.profile);
+      const listingDates = document.querySelector('#analysis-listing-dates-path');
+      if (listingDates) listingDates.value = result.listing_dates_path || '';
       if (analysisProfileStatus) analysisProfileStatus.textContent = 'Профиль анализа сохранён в config.local.json.';
     } catch (error) {
       if (analysisProfileStatus) analysisProfileStatus.textContent = error?.message || 'Профиль не сохранён: проверьте значения.';

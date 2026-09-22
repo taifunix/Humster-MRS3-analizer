@@ -24,6 +24,13 @@ the JSON keys remain an implementation detail and retain their existing names.
 | Multi-order structures | `gap_rules`, `max_orders`, `target_dd` |
 | Performance | `duckdb_import.workers`, explicitly labeled as shared parallelism for Source import, publication and analysis |
 
+The card also owns one operational input used by fresh analysis:
+`panel_workflow.listing_dates_path`. It is displayed as a path with a native
+file chooser and is saved atomically with the typed profile. The selected file
+may be the legacy two-column listing-date CSV/XLSX or the operator liquidity
+registry XLSX whose `Пары` sheet contains `Пара` and
+`Дата листинга на Bybit (UTC)`.
+
 ### Excluded fields
 
 Column mappings, materialization-only refine controls, shift-domain validation,
@@ -43,6 +50,8 @@ in the order above. Repeatable values use editable rows with explicit units
   failure and a saved confirmation on success.
 
 Import batch size and unrelated existing controls are removed from this card.
+The listing-date path is the only filesystem path exposed here because fresh
+analysis cannot run without it.
 
 ## Server contract
 
@@ -53,11 +62,13 @@ generic Panel path-defaults payload. The endpoint:
 2. accepts only the whitelist schema;
 3. merges only the whitelist values;
 4. validates the merged document through `AlgorithmConfig.from_json`;
-5. atomically writes the complete local config only after validation; and
-6. returns a non-sensitive profile projection.
+5. validates that the listing-date path names a readable supported file;
+6. atomically writes the complete local config, including the updated
+   `panel_workflow`, only after both validations; and
+7. returns a non-sensitive profile projection plus the configured path.
 
 Workers validate as a positive integer under the existing import settings
-contract. No endpoint accepts filesystem paths or secrets.
+contract. No other filesystem path or secret is accepted by this endpoint.
 
 ## Invariants
 
@@ -65,6 +76,8 @@ contract. No endpoint accepts filesystem paths or secrets.
 - The next fresh analysis reloads the config and receives a distinct config hash
   when a result-affecting value changes.
 - Invalid browser input never partially changes the configuration.
+- A missing, locked, malformed or duplicate-symbol listing-date file produces
+  a distinct actionable error and never writes the configuration.
 - The profile cannot overwrite import paths, runner settings, credentials,
   templates, or any unlisted configuration value.
 

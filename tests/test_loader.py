@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from mrs3.config import AlgorithmConfig
-from mrs3.loader import InputError, load_points, normalize_shift
+from mrs3.loader import InputError, load_listing_dates, load_points, normalize_shift
 from mrs3.models import Side
 
 
@@ -93,6 +93,59 @@ def test_load_points_accepts_bybit_csv_listing_dates(tmp_path: Path) -> None:
     points, _ = load_points(csv_path, dates_path, Side.LONG, _config())
 
     assert points.iloc[0]["listing_date"] == pd.Timestamp("2026-07-01", tz="UTC")
+
+
+def test_load_listing_dates_accepts_liquidity_registry_pairs_sheet(tmp_path: Path) -> None:
+    path = tmp_path / "bybit_tradfi_liquidity.xlsx"
+    frame = pd.DataFrame(
+        [
+            {"Пара": "AAAUSDT", "Дата листинга на Bybit (UTC)": "2026-07-01", "Средний оборот": 123},
+            {"Пара": "BBBUSDT", "Дата листинга на Bybit (UTC)": "2026-07-02", "Средний оборот": 456},
+            {"Пара": None, "Дата листинга на Bybit (UTC)": "2026-07-03", "Средний оборот": 789},
+        ]
+    )
+    with pd.ExcelWriter(path) as writer:
+        frame.to_excel(writer, sheet_name="Пары", index=False)
+        pd.DataFrame({"ignored": [1]}).to_excel(writer, sheet_name="Скрининг", index=False)
+
+    result = load_listing_dates(path)
+
+    assert result == {
+        "AAAUSDT": pd.Timestamp("2026-07-01", tz="UTC"),
+        "BBBUSDT": pd.Timestamp("2026-07-02", tz="UTC"),
+    }
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [
+        {"Пара": ["AAAUSDT"], "wrong date": ["2026-07-01"]},
+        {"wrong symbol": ["AAAUSDT"], "Дата листинга на Bybit (UTC)": ["2026-07-01"]},
+    ],
+)
+def test_load_listing_dates_rejects_incomplete_registry_pairs_sheet(
+    tmp_path: Path, columns: dict[str, list[str]]
+) -> None:
+    path = tmp_path / "incomplete-registry.xlsx"
+    with pd.ExcelWriter(path) as writer:
+        pd.DataFrame([["LEGACYUSDT", "2020-01-01"]]).to_excel(
+            writer, sheet_name="Сводка", index=False, header=False
+        )
+        pd.DataFrame(columns).to_excel(writer, sheet_name="Пары", index=False)
+
+    with pytest.raises(
+        InputError,
+        match="invalid listing dates: liquidity registry listing sheet is missing columns",
+    ):
+        load_listing_dates(path)
+
+
+def test_load_listing_dates_normalizes_corrupt_xlsx_error(tmp_path: Path) -> None:
+    path = tmp_path / "corrupt.xlsx"
+    path.write_bytes(b"not-an-xlsx-archive")
+
+    with pytest.raises(InputError, match="^invalid listing dates:"):
+        load_listing_dates(path)
 
 
 def test_load_points_normalizes_date_only_listing_and_report_times_to_utc(tmp_path: Path) -> None:

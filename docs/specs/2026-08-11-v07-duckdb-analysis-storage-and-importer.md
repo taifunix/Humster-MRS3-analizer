@@ -390,7 +390,12 @@ emits exactly the `EQUAL` and `INCOME` lot variants. Publication is atomic: a
 failure leaves a prior strategy directory intact. Its generated strategy
 directory becomes the default input to the subsequent Test plan and Run tests
 controls. Paths whose values cannot be inferred, such as the user-owned
-strategy template and listing-date file, remain explicit editable inputs.
+strategy template and listing-date file, remain explicit editable inputs. The
+static Panel edits the listing-date input in `Settings > Analysis profile`,
+persists it as `panel_workflow.listing_dates_path`, and uses it for the next
+fresh analysis without copying or rewriting the workbook. Supported inputs are
+the legacy two-column CSV/XLSX and the liquidity-registry XLSX `Пары` sheet
+with columns `Пара` and `Дата листинга на Bybit (UTC)`.
 
 The panel does not invent a Top-N reduction. The event-specification's exact
 same-behavior redundancy filter is available only to runs with real independent

@@ -161,7 +161,10 @@ from .panel_settings import (
     save_settings as save_panel_settings,
     validate_settings as validate_panel_settings,
 )
-from .analysis_profile import load_analysis_profile, save_analysis_profile
+from .analysis_profile import (
+    load_analysis_settings,
+    save_analysis_settings,
+)
 from .panel_jobs import PanelJobError, PanelJobRegistry
 from .panel_portfolio import PortfolioPanelError, PortfolioPanelService
 from .locking import TesterTargetBusyError, TesterTargetLock
@@ -294,6 +297,12 @@ def _redact_screener_error(error: Exception) -> str:
 def _fresh_analysis_error(message: str | None) -> str:
     """Map fresh-analysis failures to stable, non-sensitive operator guidance."""
     value = (message or "").casefold()
+    if "duplicate listing dates" in value:
+        return "Listing dates file contains duplicate symbols. Fix it or choose another file in Settings > Analysis profile."
+    if "listing" in value and ("permission denied" in value or "used by another process" in value or "locked" in value):
+        return "Listing dates file is locked or unreadable. Close it and try again, or choose another file in Settings > Analysis profile."
+    if "invalid listing dates" in value:
+        return "Listing dates file has an invalid or unsupported format. Choose a two-column dates file or the liquidity registry in Settings > Analysis profile."
     if "listing" in value and ("date" in value or "snapshot" in value):
         return _FRESH_ANALYSIS_LISTING_DATES_ERROR
     if "panel workflow default" in value:
@@ -308,6 +317,14 @@ def _fresh_analysis_error(message: str | None) -> str:
 def _analysis_profile_error(error: ValueError | InvalidOperation) -> str:
     """Expose a concise, actionable validation error for the analysis profile."""
     value = str(error).casefold()
+    if "duplicate listing dates" in value:
+        return "В файле дат листинга есть дубликаты символов. Исправьте файл или выберите другой."
+    if "permission denied" in value or "used by another process" in value or "locked" in value:
+        return "Файл дат листинга занят или недоступен. Закройте его и повторите сохранение."
+    if "listing dates path" in value or "listing dates file is missing" in value:
+        return "Выберите существующий CSV/XLSX с датами листинга."
+    if "invalid listing dates" in value or "unsupported listing dates" in value:
+        return "Формат файла дат листинга не поддерживается. Выберите двухколоночный файл или реестр ликвидности."
     if "unknown analysis profile field" in value or "profile fields mismatch" in value:
         return "Профиль анализа содержит недопустимые поля."
     if "min_plateau_points" in value:
@@ -1781,14 +1798,30 @@ class PanelController:
 
     def analysis_profile_get(self) -> dict[str, object]:
         with self._lock:
-            return {"profile": load_analysis_profile(self.default_config)}
+            return load_analysis_settings(self.default_config)
 
     def analysis_profile_save(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if "listing_dates_path" not in payload:
+            raise ValueError("listing dates path must be a non-empty string")
+        if set(payload) != {"profile", "listing_dates_path"}:
+            raise ValueError("analysis profile fields mismatch")
         profile = payload.get("profile")
         if not isinstance(profile, Mapping):
             raise ValueError("analysis profile fields mismatch")
         with self._lock:
-            return {"profile": save_analysis_profile(self.default_config, profile)}
+            raw_path = payload.get("listing_dates_path")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise ValueError("listing dates path must be a non-empty string")
+            path = self._path(raw_path.strip())
+            if path.suffix.casefold() not in {".csv", ".xlsx"}:
+                raise ValueError("unsupported listing dates file")
+            if not path.is_file():
+                raise ValueError("listing dates file is missing")
+            try:
+                self._source_v6_listing_dates_loader(path)
+            except Exception as error:
+                raise ValueError(str(error)) from error
+            return save_analysis_settings(self.default_config, profile, raw_path)
 
     def panel_jobs(self) -> list[dict]:
         return self._panel_jobs.public_list()

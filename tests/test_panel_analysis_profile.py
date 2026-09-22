@@ -5,12 +5,17 @@ import json
 from pathlib import Path
 import threading
 
+import pandas as pd
+
 from mrs3.panel import PanelController, create_panel_server
 
 
 def _config(tmp_path: Path) -> Path:
     document = json.loads(Path("config.example.json").read_text(encoding="utf-8"))
     document["duckdb_import"] = {"workers": 15, "transaction_batch_size": 2000}
+    dates = tmp_path / "input" / "dates.xlsx"
+    dates.parent.mkdir()
+    pd.DataFrame([["AAAUSDT", "2026-07-01"]]).to_excel(dates, index=False, header=False)
     path = tmp_path / "config.local.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
@@ -39,12 +44,45 @@ def test_http_analysis_profile_reloads_and_saves_whitelisted_values(tmp_path: Pa
         profile = body["profile"]
         assert isinstance(profile, dict)
         profile["economics"]["min_pnl_pct"] = "7"
-        status, saved = _request(server, "POST", "/api/v2/settings/analysis-profile", {"profile": profile})
+        status, saved = _request(
+            server,
+            "POST",
+            "/api/v2/settings/analysis-profile",
+            {"profile": profile, "listing_dates_path": body["listing_dates_path"]},
+        )
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
     assert status == 200
     assert saved["profile"]["economics"]["min_pnl_pct"] == "7"
+
+
+def test_http_analysis_profile_saves_validated_listing_dates_registry_path(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    registry = tmp_path / "bybit_tradfi_liquidity.xlsx"
+    pd.DataFrame(
+        [{"Пара": "AAAUSDT", "Дата листинга на Bybit (UTC)": "2026-07-01"}]
+    ).to_excel(registry, sheet_name="Пары", index=False)
+    controller = PanelController(tmp_path, config)
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _request(server, "GET", "/api/v2/settings/analysis-profile")
+        assert status == 200
+        status, saved = _request(
+            server,
+            "POST",
+            "/api/v2/settings/analysis-profile",
+            {"profile": body["profile"], "listing_dates_path": str(registry)},
+        )
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    assert status == 200
+    assert saved["listing_dates_path"] == str(registry)
+    document = json.loads(config.read_text(encoding="utf-8"))
+    assert document["panel_workflow"]["listing_dates_path"] == str(registry)
 
 
 def test_http_analysis_profile_returns_safe_validation_error(tmp_path: Path) -> None:
@@ -53,7 +91,12 @@ def test_http_analysis_profile_returns_safe_validation_error(tmp_path: Path) -> 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        status, body = _request(server, "POST", "/api/v2/settings/analysis-profile", {"profile": {"remote_runner": {}}})
+        status, body = _request(
+            server,
+            "POST",
+            "/api/v2/settings/analysis-profile",
+            {"profile": {"remote_runner": {}}, "listing_dates_path": "input/dates.xlsx"},
+        )
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
@@ -71,9 +114,86 @@ def test_http_analysis_profile_hides_invalid_number_details(tmp_path: Path) -> N
         profile = body["profile"]
         assert isinstance(profile, dict)
         profile["economics"]["min_pnl_pct"] = "not-a-number"
-        status, response = _request(server, "POST", "/api/v2/settings/analysis-profile", {"profile": profile})
+        status, response = _request(
+            server,
+            "POST",
+            "/api/v2/settings/analysis-profile",
+            {"profile": profile, "listing_dates_path": body["listing_dates_path"]},
+        )
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
     assert status == 400
     assert response == {"error": "Профиль анализа содержит недопустимые значения."}
+
+
+def test_http_analysis_profile_requires_listing_dates_path(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, _config(tmp_path))
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _, body = _request(server, "GET", "/api/v2/settings/analysis-profile")
+        status, response = _request(
+            server,
+            "POST",
+            "/api/v2/settings/analysis-profile",
+            {"profile": body["profile"]},
+        )
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    assert status == 400
+    assert response == {"error": "Выберите существующий CSV/XLSX с датами листинга."}
+
+
+def test_http_analysis_profile_reports_corrupt_xlsx_as_invalid_format(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, _config(tmp_path))
+    corrupt = tmp_path / "corrupt.xlsx"
+    corrupt.write_bytes(b"not-an-xlsx-archive")
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _, body = _request(server, "GET", "/api/v2/settings/analysis-profile")
+        status, response = _request(
+            server,
+            "POST",
+            "/api/v2/settings/analysis-profile",
+            {"profile": body["profile"], "listing_dates_path": str(corrupt)},
+        )
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    assert status == 400
+    assert response == {
+        "error": "Формат файла дат листинга не поддерживается. Выберите двухколоночный файл или реестр ликвидности."
+    }
+
+
+def test_http_analysis_profile_reports_incomplete_registry_as_invalid_format(
+    tmp_path: Path,
+) -> None:
+    controller = PanelController(tmp_path, _config(tmp_path))
+    registry = tmp_path / "incomplete-registry.xlsx"
+    pd.DataFrame({"Пара": ["AAAUSDT"], "wrong date": ["2026-07-01"]}).to_excel(
+        registry, sheet_name="Пары", index=False
+    )
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _, body = _request(server, "GET", "/api/v2/settings/analysis-profile")
+        status, response = _request(
+            server,
+            "POST",
+            "/api/v2/settings/analysis-profile",
+            {"profile": body["profile"], "listing_dates_path": str(registry)},
+        )
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    assert status == 400
+    assert response == {
+        "error": "Формат файла дат листинга не поддерживается. Выберите двухколоночный файл или реестр ликвидности."
+    }

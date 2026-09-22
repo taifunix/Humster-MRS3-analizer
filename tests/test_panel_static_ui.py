@@ -243,7 +243,12 @@ def test_analysis_profile_is_one_flat_card_with_explicit_controls() -> None:
         assert label in js
     assert 'id="analysis-profile-reload"' in profile
     assert 'id="analysis-profile-save"' in profile
+    assert 'id="analysis-listing-dates-path"' in profile
+    assert 'id="analysis-listing-dates-browse"' in profile
+    assert "Файл дат листинга" in profile
     assert "'/api/v2/settings/analysis-profile'" in js
+    assert "remoteRequest('/api/browse', { kind: 'dates', multiple: false })" in js
+    assert "listing_dates_path: value('analysis-listing-dates-path').trim()" in js
     assert "function analysisProfilePayload()" in js
     assert "Целочисленные поля профиля должны быть заполнены целыми числами." in js
     assert "if (!/^-?\\d+$/.test(raw))" in js
@@ -972,12 +977,13 @@ def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() 
     assert "normalImportAuthorized" in js
 
 
-def test_settings_does_not_edit_listing_dates_outside_workflow_config() -> None:
+def test_settings_analysis_profile_edits_listing_dates_workflow_path() -> None:
     html = _read("index.html")
     js = _read("app.js")
 
-    assert 'id="settings-dates"' not in html
-    assert "listing_dates_path: document.querySelector('#settings-dates')?.value || ''" not in js
+    assert 'id="analysis-listing-dates-path"' in html
+    assert "result.listing_dates_path" in js
+    assert "listing_dates_path: value('analysis-listing-dates-path').trim()" in js
 
 
 def test_shortlist_has_one_grouped_renderer_and_shared_candidate_state() -> None:
@@ -1043,6 +1049,27 @@ def test_shared_request_json_and_job_recovery_keep_errors_and_busy_state_truthfu
     assert "recoverJobs();" in js
     assert 'id="remote-paths"' not in html
     assert "remote-paths-save" not in js
+
+
+def test_request_error_helper_allows_only_declared_safe_string_endpoints() -> None:
+    js = _read("app.js")
+    script = js.split("const ORDER_BUCKETS", 1)[0] + """
+const allows = globalThis.panelRequestErrorHelpers.allowsSafeString;
+console.log(JSON.stringify({
+  profile: allows('/api/v2/settings/analysis-profile'),
+  fresh: allows('/api/v2/strategies/fresh/analyze'),
+  arbitrary: allows('/api/v2/settings/arbitrary'),
+}));
+"""
+
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "profile": True,
+        "fresh": True,
+        "arbitrary": False,
+    }
 
 
 def test_bulk_shortlist_actions_do_not_touch_pair_expansion_state() -> None:
@@ -1390,7 +1417,8 @@ def test_request_json_distinguishes_non_json_and_server_validation_safely() -> N
     assert "application/json" in helper
     assert "Backend returned invalid JSON." in helper
     assert "Server validation failed." in helper
-    assert "endpoint.startsWith('/api/v2/surfaces/')" in helper
+    assert "panelRequestErrorHelpers.allowsSafeString(endpoint)" in helper
+    assert "'/api/v2/surfaces/'" in js
     assert "Backend connection unavailable." in helper
 
 

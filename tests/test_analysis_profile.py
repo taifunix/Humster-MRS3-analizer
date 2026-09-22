@@ -95,3 +95,41 @@ def test_profile_rejects_legacy_worker_field(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="unknown analysis profile field"):
         validate_analysis_profile(config, {**profile, "workers": 3})
+
+
+def test_analysis_settings_load_and_atomically_save_listing_dates_path(tmp_path: Path) -> None:
+    from mrs3.analysis_profile import load_analysis_settings, save_analysis_settings
+
+    config = _config(tmp_path)
+    before = json.loads(config.read_text(encoding="utf-8"))
+    settings = load_analysis_settings(config)
+
+    assert settings["listing_dates_path"] == "input/dates.xlsx"
+
+    settings["profile"]["economics"]["min_pnl_pct"] = "7"
+    saved = save_analysis_settings(
+        config,
+        settings["profile"],
+        "input/bybit_tradfi_liquidity.xlsx",
+    )
+    after = json.loads(config.read_text(encoding="utf-8"))
+
+    assert saved["listing_dates_path"] == "input/bybit_tradfi_liquidity.xlsx"
+    assert saved["profile"]["economics"]["min_pnl_pct"] == "7"
+    assert after["panel_workflow"]["listing_dates_path"] == "input/bybit_tradfi_liquidity.xlsx"
+    assert after["remote_runner"] == before["remote_runner"]
+
+
+@pytest.mark.parametrize("value", ["", "   ", None, 7])
+def test_analysis_settings_reject_invalid_listing_dates_path_without_writing(
+    tmp_path: Path, value: object
+) -> None:
+    from mrs3.analysis_profile import load_analysis_profile, save_analysis_settings
+
+    config = _config(tmp_path)
+    before = config.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="listing dates path"):
+        save_analysis_settings(config, load_analysis_profile(config), value)
+
+    assert config.read_text(encoding="utf-8") == before
