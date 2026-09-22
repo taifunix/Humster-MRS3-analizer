@@ -185,6 +185,32 @@ tbody th { font-weight: 750; }
   .accordion > .details-content, .card-body { padding: 16px; }
 }
 
+.screener-verdicts-table { min-width: 860px; table-layout: fixed; }
+.screener-verdicts-table col.screener-col-pair { width: 100px; }
+.screener-verdicts-table col.screener-col-side { width: 72px; }
+.screener-verdicts-table col.screener-col-verdict { width: 70px; }
+.screener-verdicts-table col.screener-col-big-shift { width: 82px; }
+.screener-verdicts-table col.screener-col-good-total { width: 55px; }
+.screener-verdicts-table col.screener-col-good-shift { width: 92px; }
+.screener-verdicts-table col.screener-col-timeframe { width: 48px; }
+.screener-verdicts-table col.screener-col-shift { width: 70px; }
+.screener-verdicts-table col.screener-col-ma { width: 62px; }
+.screener-verdicts-table col.screener-col-pnl { width: 58px; }
+.screener-verdicts-table col.screener-col-dd { width: 52px; }
+.screener-verdicts-table col.screener-col-days { width: 58px; }
+.screener-verdicts-table th, .screener-verdicts-table td { padding: 9px 6px; }
+.screener-verdicts-table thead th { vertical-align: middle; text-align: center; white-space: normal; line-height: 1.2; }
+.screener-verdicts-table thead tr:first-child th:nth-child(-n+3) { text-align: left; }
+.screener-verdicts-table thead tr:first-child th:nth-child(n+5),
+.screener-verdicts-table thead tr:nth-child(2) th:first-child,
+.screener-verdicts-table thead tr:nth-child(2) th:nth-child(3) { border-left: 1px solid #5d7290; }
+.screener-verdicts-table tbody td:nth-child(n+4) { text-align: right; }
+.screener-verdicts-table tbody td:nth-child(4) { text-align: center; }
+.screener-verdicts-table tbody td:nth-child(5),
+.screener-verdicts-table tbody td:nth-child(7),
+.screener-verdicts-table tbody td:nth-child(12) { border-left: 1px solid var(--line); }
+.screener-verdicts-table abbr[title] { text-decoration: none; }
+
 /* Shortlist: a Pair - Side group row that opens into its TF rows. */
 .shortlist-table tbody tr.is-group > th,
 .shortlist-table tbody tr.is-group > td { background: rgba(107, 140, 255, 0.08); font-weight: 600; }

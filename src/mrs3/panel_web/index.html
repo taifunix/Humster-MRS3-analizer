@@ -70,11 +70,14 @@
               <div class="field-group"><label class="check" for="screener-transfer-include-check"><input id="screener-transfer-include-check" type="checkbox"><span>Включая CHECK при передаче</span></label></div>
               <div class="button-row"><button type="button" id="screener-transfer" class="button button-secondary" disabled>Передать в RUNNER 01</button></div>
               <div class="table-wrap">
-                <table class="shortlist-table screener-verdicts-table">
+                <table class="screener-verdicts-table">
                   <caption class="sr-only">Вердикты скрининга по парам</caption>
+                  <colgroup>
+                    <col class="screener-col-pair"><col class="screener-col-side"><col class="screener-col-verdict"><col class="screener-col-big-shift"><col class="screener-col-good-total"><col class="screener-col-good-shift"><col class="screener-col-timeframe"><col class="screener-col-shift"><col class="screener-col-ma"><col class="screener-col-pnl"><col class="screener-col-dd"><col class="screener-col-days">
+                  </colgroup>
                   <thead>
-                    <tr><th scope="col" rowspan="2">Пара</th><th scope="col" rowspan="2">Сторона</th><th scope="col" rowspan="2">Вердикт</th><th scope="col" rowspan="2">BIG_SHIFT</th><th scope="colgroup" colspan="2">Хорошие точки</th><th scope="colgroup" colspan="5">Лучшая проходная точка</th><th scope="col" rowspan="2">Дней</th></tr>
-                    <tr><th scope="col">Всего</th><th id="screener-big-shift-heading" scope="col">Хор. точек с большим сдвигом</th><th scope="col">ТФ</th><th scope="col">Сдвиг, bp</th><th scope="col">MA close</th><th scope="col">PnL30</th><th scope="col">DD</th></tr>
+                    <tr><th scope="col" rowspan="2">Пара</th><th scope="col" rowspan="2">Сторона</th><th scope="col" rowspan="2">Вердикт</th><th scope="col" rowspan="2">BIG_SHIFT</th><th scope="colgroup" colspan="2">Хорошие точки</th><th scope="colgroup" colspan="5">Лучшая проходная точка</th><th scope="col" rowspan="2">Дни</th></tr>
+                    <tr><th scope="col">Всего</th><th id="screener-big-shift-heading" scope="col">Большой сдвиг</th><th scope="col">ТФ</th><th scope="col">Сдвиг, bp</th><th scope="col"><abbr title="MA close">MA</abbr></th><th scope="col">PnL30</th><th scope="col">DD</th></tr>
                   </thead>
                   <tbody id="screener-verdicts-body"></tbody>
                 </table>

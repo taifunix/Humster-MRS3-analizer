@@ -99,7 +99,8 @@ def test_screener_card_precedes_runners_and_spans_the_testing_grid() -> None:
 
 def test_screener_table_groups_good_counts_and_best_passing_point_accessibly() -> None:
     html = _read("index.html")
-    table = html.split('<table class="shortlist-table screener-verdicts-table">', 1)[1].split("</table>", 1)[0]
+    assert '<table class="screener-verdicts-table">' in html
+    table = html.split('<table class="screener-verdicts-table">', 1)[1].split("</table>", 1)[0]
     head = table.split("<thead>", 1)[1].split("</thead>", 1)[0]
 
     assert table.count("<caption") == 1
@@ -108,25 +109,42 @@ def test_screener_table_groups_good_counts_and_best_passing_point_accessibly() -
     assert '<th scope="colgroup" colspan="5">Лучшая проходная точка</th>' in head
     assert head.count('scope="col"') == 12
     assert 'id="screener-big-shift-heading"' in head
+    assert '>Большой сдвиг</th>' in head
+    assert '<abbr title="MA close">MA</abbr>' in head
     assert 'id="screener-verdicts-legend"' in html
     assert "Прочерк означает, что ни одна точка не прошла экономический гейт." in html
 
 
+def test_screener_table_has_its_own_compact_twelve_column_layout() -> None:
+    html = _read("index.html")
+    css = _read("app.css")
+
+    assert 'class="shortlist-table screener-verdicts-table"' not in html
+    table = html.split('<table class="screener-verdicts-table">', 1)[1].split("</table>", 1)[0]
+    columns = table.split("<colgroup>", 1)[1].split("</colgroup>", 1)[0]
+
+    assert columns.count("<col") == 12
+    assert '.screener-verdicts-table { min-width: 860px; table-layout: fixed; }' in css
+    assert ".screener-verdicts-table th, .screener-verdicts-table td { padding: 9px 6px; }" in css
+
+
 def test_screener_ui_helpers_format_dynamic_threshold_and_display_metrics() -> None:
-    script = _read("app.js").split("const ORDER_BUCKETS", 1)[0] + """
+    js = _read("app.js")
+    script = js.split("const ORDER_BUCKETS", 1)[0] + """
 const h = globalThis.screenerUiHelpers;
 const checks = {
   configuredThreshold: h.bigShiftHeading(110) === 'Сдвиг ≥ 1,1%',
   changedThreshold: h.bigShiftHeading(150) === 'Сдвиг ≥ 1,5%',
-  missingThreshold: h.bigShiftHeading(undefined) === 'Хор. точек с большим сдвигом',
-  malformedThreshold: h.bigShiftHeading('not-a-number') === 'Хор. точек с большим сдвигом',
-  stringThreshold: h.bigShiftHeading('110') === 'Хор. точек с большим сдвигом',
-  booleanThreshold: h.bigShiftHeading(true) === 'Хор. точек с большим сдвигом',
-  zeroThreshold: h.bigShiftHeading(0) === 'Хор. точек с большим сдвигом',
-  fractionalThreshold: h.bigShiftHeading(110.5) === 'Хор. точек с большим сдвигом',
-  arrayThreshold: h.bigShiftHeading([110]) === 'Хор. точек с большим сдвигом',
+  missingThreshold: h.bigShiftHeading(undefined) === 'Большой сдвиг',
+  malformedThreshold: h.bigShiftHeading('not-a-number') === 'Большой сдвиг',
+  stringThreshold: h.bigShiftHeading('110') === 'Большой сдвиг',
+  booleanThreshold: h.bigShiftHeading(true) === 'Большой сдвиг',
+  zeroThreshold: h.bigShiftHeading(0) === 'Большой сдвиг',
+  fractionalThreshold: h.bigShiftHeading(110.5) === 'Большой сдвиг',
+  arrayThreshold: h.bigShiftHeading([110]) === 'Большой сдвиг',
   roundedPnl30: h.displayMetric('15.3223880597067', 0) === '15',
   roundedDd: h.displayMetric('4.49253767343284', 1) === '4,5',
+  roundedDays: h.displayMetric('45.5779652777777', 0) === '46',
   absentMetric: h.displayMetric(null, 1) === '—',
 };
 if (!h || Object.values(checks).some((value) => !value)) process.exit(1);
@@ -134,6 +152,7 @@ if (!h || Object.values(checks).some((value) => !value)) process.exit(1);
     completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
 
     assert completed.returncode == 0, completed.stderr or completed.stdout
+    assert "cell(screenerUiHelpers.displayMetric(verdict.effective_days, 0))" in js
 
 
 def test_source_surfaces_and_strategies_screens_have_approved_workflow_cards() -> None:

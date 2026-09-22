@@ -13,6 +13,12 @@ point. Browser display rounds PnL30 to an integer and DD to one decimal while
 the evaluate verdict payload and CSV export retain their existing full Decimal
 precision.
 
+A follow-up live screenshot exposed that reusing `.shortlist-table` also reused
+its unrelated fixed `nth-child` widths, causing the grouped screener headings
+to overlap. The screener table now has its own compact 12-column `colgroup`,
+shorter headings and integer display for effective days. A headless 1200 px
+render confirmed aligned headings and cells with no horizontal scrollbar.
+
 `POST /api/v2/testing/screener/evaluate` now returns the configured positive
 integer `big_shift_bp` once at the top level. The UI converts it from basis
 points to a percentage for the header and falls back to a neutral label for a
@@ -21,7 +27,7 @@ version coerced malformed booleans, strings, arrays, zero and fractional values;
 strict positive-safe-integer validation and regression cases closed the finding,
 and re-review returned `CODE_REVIEW_PASS`.
 
-Verification: the required screener/static/Panel-testing contour passed `246`
+Verification: the required screener/static/Panel-testing contour passed `248`
 tests; the four initial focused regressions passed; `node --check
 src/mrs3/panel_web/app.js` and `git diff --check` passed. The full repository
 run completed with `4728 passed, 7 skipped, 2 failed`: the unrelated two-second
