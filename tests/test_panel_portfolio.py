@@ -116,7 +116,8 @@ def _weighted_executable_candidate(payloads: tuple[dict, ...], **updates) -> dic
 
 def _stage2_payload(symbol: str, side: str, *, name: str, bank: str = "10000") -> dict:
     payload = _executable_payload(symbol, side, name=name)
-    payload["facts"]["B"] = bank
+    payload["facts"].update({"B": bank, "C": "100", "q": "1"})
+    payload["strategy"]["basic"]["max_balance"] = "100"
     return payload
 
 
@@ -2753,6 +2754,18 @@ def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_pa
         name = payload["strategy"]["name"]
         expected = json.dumps(payload["strategy"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
         assert prepared["strategy_jsons"][name] == expected
+    assert prepared["receipt"]["candidate_order"] == 0
+    assert prepared["receipt"]["profile"] == "BALANCED"
+    assert prepared["receipt"]["member_identities"] == [
+        {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 101},
+        {"symbol": "ETHUSDT", "side": "SHORT", "strategy_id": 2, "result_id": 102},
+    ]
+    assert prepared["receipt"]["tester_config_sha256"] == hashlib.sha256(
+        prepared["tester_config_json"].encode("utf-8")
+    ).hexdigest()
+    assert [item["filename"] for item in prepared["receipt"]["strategy_manifest"]] == [
+        "PORTFOLIO_BTCUSDT_7_11.json", "PORTFOLIO_ETHUSDT_8_12.json",
+    ]
 
 
 def test_stage2_baseline_preparation_uses_candidate_after_filtered_order_zero(tmp_path: Path) -> None:
@@ -2809,6 +2822,71 @@ def test_stage2_baseline_preparation_rejects_bank_mismatch(tmp_path: Path) -> No
     assert error.value.status == 409
 
 
+@pytest.mark.parametrize("missing", ("C", "max_balance"))
+def test_stage2_baseline_preparation_requires_complete_receipt_evidence(
+    tmp_path: Path, missing: str
+) -> None:
+    payloads = [
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    ]
+    if missing == "max_balance":
+        del payloads[0]["strategy"]["basic"][missing]
+    else:
+        del payloads[0]["facts"][missing]
+    service, result = _stage2_service(
+        tmp_path,
+        _weighted_executable_candidate(tuple(payloads), candidate_id="2" * 64, identity="2" * 64),
+    )
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service._prepare_stage2_baseline(result["campaign_id"])
+
+    assert error.value.code == "PORTFOLIO_STAGE2_INPUT_INVALID"
+
+
+def test_stage2_receipt_rechecks_artifact_sizing_and_max_balance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    service, result = _stage2_service(
+        tmp_path,
+        _weighted_executable_candidate(payloads, candidate_id="3" * 64, identity="3" * 64),
+    )
+    prepared = service._prepare_stage2_baseline(result["campaign_id"])
+    changed = service._load_stage1_executables(
+        prepared["campaign_id"], prepared["input_digest"], prepared["config_digest"], prepared["artifact_digest"]
+    )
+    changed["candidates"][0]["strategy_payloads"][0]["strategy"]["basic"]["max_balance"] = "200"
+    monkeypatch.setattr(service, "_load_stage1_executables", lambda *_args, **_kwargs: changed)
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service._verify_stage2_prepared(prepared)
+
+    assert error.value.code == "PORTFOLIO_JOB_STAGE2_INPUT_CHANGED"
+
+
+def test_stage2_rejects_receiptless_prepared_package(tmp_path: Path) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    service, result = _stage2_service(
+        tmp_path,
+        _weighted_executable_candidate(payloads, candidate_id="4" * 64, identity="4" * 64),
+    )
+    prepared = service._prepare_stage2_baseline(result["campaign_id"])
+    prepared.pop("receipt")
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service._verify_stage2_prepared(prepared)
+
+    assert error.value.code == "PORTFOLIO_JOB_STAGE2_INPUT_CHANGED"
+
+
 def test_stage2_baseline_preparation_rejects_unsafe_strategy_name(tmp_path: Path) -> None:
     payloads = (
         _stage2_payload("BTCUSDT", "LONG", name="BAD:NAME"),
@@ -2837,7 +2915,7 @@ def test_stage2_baseline_preparation_loads_restart_without_stage1_recomputation(
 
 
 class _FakeStage2Tester:
-    def __init__(self, root: Path, expected_names: tuple[str, ...], *, write_result: bool = True, result_names: tuple[str, ...] | None = None, result_stats: dict[str, object] | None = None, fill_error: Exception | None = None, fill_enter: threading.Event | None = None, fill_release: threading.Event | None = None, stop_error: Exception | None = None, stop_enter: threading.Event | None = None, stop_release: threading.Event | None = None) -> None:
+    def __init__(self, root: Path, expected_names: tuple[str, ...], *, write_result: bool = True, write_report: bool = True, delayed_report: bool = False, extra_report: bool = False, report_as_directory: bool = False, invalid_fill_readback: bool = False, after_fill: Any = None, after_start: Any = None, result_names: tuple[str, ...] | None = None, result_stats: dict[str, object] | None = None, fill_error: Exception | None = None, fill_enter: threading.Event | None = None, fill_release: threading.Event | None = None, stop_error: Exception | None = None, stop_enter: threading.Event | None = None, stop_release: threading.Event | None = None) -> None:
         self.config = SimpleNamespace(
             wizard_result=root / "wizard-result.json",
             report_dir=root / "tester" / "report" / "my_test",
@@ -2860,6 +2938,13 @@ class _FakeStage2Tester:
             "TotalFees": 1,
         }
         self.write_result = write_result
+        self.write_report = write_report
+        self.delayed_report = delayed_report
+        self.extra_report = extra_report
+        self.report_as_directory = report_as_directory
+        self.invalid_fill_readback = invalid_fill_readback
+        self.after_fill = after_fill
+        self.after_start = after_start
         self.fill_error = fill_error
         self.fill_enter = fill_enter
         self.fill_release = fill_release
@@ -2877,11 +2962,48 @@ class _FakeStage2Tester:
             self.fill_release.wait(timeout=2)
         if self.fill_error is not None:
             raise self.fill_error
-        return {"strategy_names": list(kwargs["strategy_jsons"])}
+        strategy_jsons = kwargs["strategy_jsons"]
+        assert isinstance(strategy_jsons, dict)
+        manifest = [
+            {
+                "filename": f"{name}.json",
+                "size": len(payload.encode("utf-8")),
+                "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            }
+            for name, payload in sorted(strategy_jsons.items())
+        ]
+        config = kwargs["tester_config_json"]
+        assert isinstance(config, str)
+        readback = {
+            "strategy_names": list(strategy_jsons),
+            "strategy_file_manifest": manifest,
+            "tester_config_hash": hashlib.sha256(config.encode("utf-8")).hexdigest(),
+        }
+        if self.invalid_fill_readback:
+            readback["tester_config_hash"] = "0" * 64
+        if self.after_fill is not None:
+            self.after_fill()
+        return readback
 
     def start(self) -> dict[str, str]:
         self.calls.append(("start", None))
         if self.write_result:
+            if self.write_report:
+                report = self.config.report_dir.parent / ("a" * 64) / "portfolio.html"
+                report.parent.mkdir(parents=True, exist_ok=True)
+                def write_report() -> None:
+                    if self.report_as_directory:
+                        report.mkdir()
+                    else:
+                        report.write_text("<html>fresh report</html>", encoding="utf-8")
+                    if self.extra_report:
+                        (report.parent / "second.html").write_text("<html>second</html>", encoding="utf-8")
+                if self.delayed_report:
+                    timer = threading.Timer(0.005, write_report)
+                    timer.daemon = True
+                    timer.start()
+                else:
+                    write_report()
             self.config.wizard_result.write_text(json.dumps([{
                 "runId": "portfolio-run",
                 "strategies": list(self.result_names),
@@ -2889,6 +3011,8 @@ class _FakeStage2Tester:
                 "chartUrl": f"/tester-report/{'a' * 64}/portfolio.html",
                 "period": "2026-01-01..2026-01-14",
             }]), encoding="utf-8")
+        if self.after_start is not None:
+            self.after_start()
         return {"state": "STARTED", "tester_status": "RUNNING"}
 
     def stop(self) -> dict[str, str]:
@@ -2923,10 +3047,39 @@ def test_stage2_submission_runs_one_prepared_candidate_and_stops_service(tmp_pat
     assert job["status"] == "SUCCEEDED"
     assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"]
     runtime = service.registry.runtime(submitted["job_id"])
+    assert runtime["stage2"]["receipt"]["candidate_order"] == 0
+    assert runtime["stage2"]["receipt"]["member_identities"] == [
+        {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 101},
+        {"symbol": "ETHUSDT", "side": "SHORT", "strategy_id": 2, "result_id": 102},
+    ]
     assert runtime["stage2_result"]["candidate_id"] == "a" * 64
     assert runtime["stage2_result"]["report_folder"] == "a" * 64
     assert runtime["stage2_result"]["strategy_names"] == [payload["strategy"]["name"] for payload in payloads]
     assert runtime["stage2_result"]["pretest_period"] == {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"}
+    evidence = runtime["stage2_result"]["report_evidence"]
+    assert evidence["fingerprint"]["size"] > 0
+    assert evidence["fingerprint"]["sha256"]
+    assert evidence["stable_polls"] >= 2
+    assert evidence["accepted_wall_ns"] >= evidence["start_wall_ns"]
+
+
+def test_stage2_accepts_reverse_alphabetical_candidate_order(tmp_path: Path) -> None:
+    payloads = (
+        _stage2_payload("ZUSDT", "LONG", name="PORTFOLIO_ZUSDT_7_11"),
+        _stage2_payload("AUSDT", "SHORT", name="PORTFOLIO_AUSDT_8_12"),
+    )
+    service, stage1 = _stage2_service(
+        tmp_path,
+        _weighted_executable_candidate(payloads, candidate_id="a" * 64, identity="a" * 64),
+    )
+    fake = _FakeStage2Tester(tmp_path, tuple(payload["strategy"]["name"] for payload in payloads))
+    service._local_testing_service_provider = lambda: fake
+
+    submission = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]}
+    )
+
+    assert _wait_stage1(service, submission)["status"] == "SUCCEEDED"
 
 
 def _submit_stage2_with_fake(tmp_path: Path, *, fake_kwargs: dict[str, object] | None = None) -> tuple[PortfolioPanelService, dict, _FakeStage2Tester, dict]:
@@ -2951,6 +3104,142 @@ def test_stage2_submission_is_idempotent_for_campaign(tmp_path: Path) -> None:
     assert second["job_id"] == first["job_id"]
     assert _wait_stage1(service, first)["status"] == "SUCCEEDED"
     assert [call[0] for call in fake.calls].count("start") == 1
+
+
+def _tamper_stage1_artifact(root: Path) -> None:
+    artifact = next((root / ".portfolio-results").glob("campaign-*/stage1-executables.json"))
+    artifact.write_bytes(artifact.read_bytes() + b" ")
+
+
+def test_stage2_fill_readback_mismatch_prevents_start_and_restores(tmp_path: Path) -> None:
+    service, _stage1, fake, submission = _submit_stage2_with_fake(
+        tmp_path, fake_kwargs={"invalid_fill_readback": True}
+    )
+
+    job = _wait_stage1(service, submission)
+
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_FILL_READBACK_INVALID"
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "stop"]
+
+
+def test_stage2_revalidates_artifact_before_start(tmp_path: Path) -> None:
+    service, _stage1, fake, submission = _submit_stage2_with_fake(
+        tmp_path, fake_kwargs={"after_fill": lambda: _tamper_stage1_artifact(tmp_path)}
+    )
+
+    job = _wait_stage1(service, submission)
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_INPUT_CHANGED"
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "stop"]
+
+
+def test_stage2_classifies_deleted_artifact_before_start(tmp_path: Path) -> None:
+    def remove_artifact() -> None:
+        next((tmp_path / ".portfolio-results").glob("campaign-*/stage1-executables.json")).unlink()
+
+    service, _stage1, fake, submission = _submit_stage2_with_fake(
+        tmp_path, fake_kwargs={"after_fill": remove_artifact}
+    )
+
+    job = _wait_stage1(service, submission)
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_INPUT_CHANGED"
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "stop"]
+
+
+def test_stage2_revalidates_artifact_before_result_acceptance(tmp_path: Path) -> None:
+    service, _stage1, fake, submission = _submit_stage2_with_fake(
+        tmp_path, fake_kwargs={"after_start": lambda: _tamper_stage1_artifact(tmp_path)}
+    )
+
+    job = _wait_stage1(service, submission)
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_INPUT_CHANGED"
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"]
+
+
+def test_stage2_rejects_unchanged_preexisting_report(tmp_path: Path) -> None:
+    report = tmp_path / "tester" / "report" / ("a" * 64) / "portfolio.html"
+    report.parent.mkdir(parents=True)
+    report.write_text("old", encoding="utf-8")
+    service, _stage1, fake, submission = _submit_stage2_with_fake(
+        tmp_path, fake_kwargs={"write_report": False}
+    )
+
+    job = _wait_stage1(service, submission)
+
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_TIMEOUT"
+    assert [call[0] for call in fake.calls][-1] == "stop"
+
+
+def test_stage2_waits_when_wizard_result_precedes_report(tmp_path: Path) -> None:
+    service, _stage1, fake, submission = _submit_stage2_with_fake(
+        tmp_path, fake_kwargs={"delayed_report": True}
+    )
+
+    assert _wait_stage1(service, submission)["status"] == "SUCCEEDED"
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"]
+
+
+@pytest.mark.parametrize("fake_kwargs", ({"extra_report": True}, {"report_as_directory": True}))
+def test_stage2_rejects_ambiguous_or_non_file_report(
+    tmp_path: Path, fake_kwargs: dict[str, object]
+) -> None:
+    service, _stage1, fake, submission = _submit_stage2_with_fake(
+        tmp_path, fake_kwargs=fake_kwargs
+    )
+
+    job = _wait_stage1(service, submission)
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_RESULT_INVALID"
+    assert [call[0] for call in fake.calls][-1] == "stop"
+
+
+def test_stage2_rejects_dangling_symlink_report_folder(tmp_path: Path) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    service, stage1 = _stage2_service(
+        tmp_path,
+        _weighted_executable_candidate(payloads, candidate_id="a" * 64, identity="a" * 64),
+    )
+    fake = _FakeStage2Tester(tmp_path, tuple(payload["strategy"]["name"] for payload in payloads))
+    report_root = fake.config.report_dir.parent
+    report_root.mkdir(parents=True, exist_ok=True)
+    try:
+        (report_root / ("a" * 64)).symlink_to(report_root / "missing", target_is_directory=True)
+    except OSError:
+        pytest.skip("symbolic links are unavailable in this test environment")
+    service._local_testing_service_provider = lambda: fake
+
+    submission = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]}
+    )
+    job = _wait_stage1(service, submission)
+
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_RESULT_INVALID"
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "stop"]
+
+
+def test_stage2_rejects_negative_drawdown(tmp_path: Path) -> None:
+    stats = {
+        "InitialBalance": 10000, "FinalBalance": 10100, "TotalPnL": 100,
+        "TotalPnLPercent": 1, "TotalTrades": 2, "WinRate": 50,
+        "MaxDrawdown": -1, "MaxDrawdownPercent": 0.1, "TotalFees": 1,
+    }
+    service, _stage1, fake, submission = _submit_stage2_with_fake(
+        tmp_path, fake_kwargs={"result_stats": stats}
+    )
+
+    job = _wait_stage1(service, submission)
+
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_RESULT_INVALID"
+    assert [call[0] for call in fake.calls][-1] == "stop"
 
 
 @pytest.mark.parametrize(

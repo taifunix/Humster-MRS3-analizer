@@ -148,14 +148,15 @@ and priority 1 for every member; the executable strategy keeps
 `mrs.position_priority=1`, while the frozen internal payload wrapper records
 `account.open_positions_limiter=0` (not tester readback). Lower-level limiter
 math, APIs and tests remain intact for Phase 13. Phase 7 is now an off-only
-joint baseline and all its execution items remain open. P7-R3 is
-`NOT_ADVISOR_APPROVED`: configured Opus Advisor authentication is unavailable,
-and the user's temporary root self-review authorization is not
-`PLAN_APPROVED` or `CODE_REVIEW_PASS`. Separate explicit user authorization on
-2026-09-21 permits only a bounded local-only off-only tester baseline; no run
-or result is complete, and execution remains gated by implementation, focused
-tests, and review. Exchange actions, trading, and production PerformanceDB
-writes are not authorized. See [ADR-0040](docs/decisions/0040-portfolio-optimizer-phase7-off-only-local-stage2.md).
+joint baseline and all its execution items remain open. The revised pre-run
+package P7-R4 received independent Opus high `PLAN_APPROVED` on 2026-09-22.
+Separate explicit user authorization on 2026-09-21 permits only a bounded
+local-only off-only tester baseline. The fake-only boundary passed focused and
+affected suites plus independent Opus high implementation review; no run or
+result is complete, and execution remains stopped for a fresh
+before-execution confirmation. Exchange actions, trading, and production
+PerformanceDB writes are not authorized. See
+[ADR-0040](docs/decisions/0040-portfolio-optimizer-phase7-off-only-local-stage2.md).
 История и
 [ответ на замечания](docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-review-response.md)
 сохраняют основания решения и изменение области резерва (§8.1 плана).

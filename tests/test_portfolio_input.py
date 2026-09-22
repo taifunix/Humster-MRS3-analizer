@@ -276,6 +276,17 @@ def test_snapshot_fails_closed_on_duplicate_selection_result_identity(tmp_path: 
     assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
 
 
+def test_snapshot_ignores_historical_selection_for_removed_strategy(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """insert into selection_results values
+               ('run-default', 999, 999, 'FILTERED', null, null, 'missing', '{}', null, false, '{}')"""
+        )
+
+    assert len(_snapshot(database, [REQUEST]).candidates) == 1
+
+
 def test_snapshot_fails_closed_on_duplicate_review_row_identity(tmp_path: Path) -> None:
     database = _database(tmp_path)
     with duckdb.connect(str(database)) as connection:
@@ -288,6 +299,42 @@ def test_snapshot_fails_closed_on_duplicate_review_row_identity(tmp_path: Path) 
 
     with pytest.raises(PortfolioInputError) as error:
         _snapshot(database, [REQUEST])
+
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+
+def test_snapshot_fails_closed_on_duplicate_durable_row_in_older_import(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        _replace_with_unconstrained_copy(connection, "selection_review_rows")
+        strategy_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies"
+        ).fetchone()
+        instance_id = connection.execute(
+            "select value from schema_info where key = 'database_instance_id'"
+        ).fetchone()[0]
+        connection.execute(
+            """insert into selection_runs values
+               ('run-older', ?, 'BTCUSDT', 'LONG', 'test-selection-v1', '{}',
+                'request-hash-older', '{}', 'config-hash-older', 1, 1, 1, 1,
+                'workbook-hash-older', ?)""",
+            [instance_id, datetime(2025, 12, 31, tzinfo=timezone.utc)],
+        )
+        connection.execute(
+            "insert into selection_results values ('run-older', ?, ?, 'FINALIST', 1, 1, 'older', '{}', null, false, '{}')",
+            [strategy_id, result_id],
+        )
+        connection.execute(
+            "insert into selection_review_imports values ('review-older', 'run-older', 'review-hash-older', ?, 2)",
+            [datetime(2026, 1, 2, tzinfo=timezone.utc)],
+        )
+        connection.executemany(
+            "insert into selection_review_rows values ('review-older', ?, 'RESERVE', 1, null, 'duplicate')",
+            [(strategy_id,), (strategy_id,)],
+        )
+
+    with pytest.raises(PortfolioInputError) as error:
+        read_current_finalists(database, [("BTCUSDT", "LONG")], False)
 
     assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
 
@@ -370,15 +417,117 @@ def test_snapshot_excludes_stale_non_finalist_alongside_valid_finalist(tmp_path:
     assert [candidate["symbol"] for candidate in snapshot.candidates] == ["BTCUSDT"]
 
 
-def test_snapshot_fails_closed_when_current_review_is_missing(tmp_path: Path) -> None:
+def test_snapshot_ignores_when_current_review_is_missing(tmp_path: Path) -> None:
     database = _database(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.execute("delete from selection_review_rows")
 
-    with pytest.raises(PortfolioInputError) as error:
-        _snapshot(database, [REQUEST])
+    assert _snapshot(database, [REQUEST]).candidates == ()
 
-    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+def test_read_current_finalists_ignores_later_auto_only_review_row(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies").fetchone()[0]
+        _replace_with_unconstrained_copy(connection, "selection_review_rows")
+        connection.execute(
+            "insert into selection_review_imports values ('review-auto', 'run-default', 'review-hash-auto', ?, 1)",
+            [datetime(2026, 1, 2, tzinfo=timezone.utc)],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-auto', ?, null, null, null, 'automatic-only')",
+            [strategy_id],
+        )
+
+    row = read_current_finalists(database, [("BTCUSDT", "LONG")], False)[0]
+
+    assert row["user_status"] == "FINALIST"
+    assert row["review_import_id"] == "review-default"
+
+
+def test_read_current_finalists_preserves_untouched_review_in_later_partial_run(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        first_strategy_id, first_result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies"
+        ).fetchone()
+        second_strategy_id = connection.execute(
+            """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+               order_count, analysis_run_id, candidate_identity, lifecycle_status,
+               created_at_utc, updated_at_utc) values
+               ('beta', 'BTCUSDT', 'LONG', '1h', 3, 1, 'run', 'candidate-beta', 'ACTIVE', ?, ?)
+               returning strategy_id""",
+            [datetime(2026, 1, 1, tzinfo=timezone.utc)] * 2,
+        ).fetchone()[0]
+        second_result_id = connection.execute(
+            """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
+               commission_rate, initial_balance, final_balance, total_pnl, total_pnl_pct,
+               max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc)
+               values (?, ?, ?, 'Bybit', .0004, 100, 110, 10, 10, 5, 5, 2, 2, ?)
+               returning result_id""",
+            [second_strategy_id, datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 31, tzinfo=timezone.utc), datetime(2026, 1, 1, tzinfo=timezone.utc)],
+        ).fetchone()[0]
+        connection.execute(
+            "update strategies set current_result_id = ? where strategy_id = ?",
+            [second_result_id, second_strategy_id],
+        )
+        connection.execute(
+            "insert into strategy_orders values (?, 1, 7, .995, 125, 1, 'run', 'P1', 8)",
+            [second_strategy_id],
+        )
+        connection.execute(
+            "insert into selection_results values ('run-default', ?, ?, 'FINALIST', 1, 1, 'selected', '{}', null, false, '{}')",
+            [second_strategy_id, second_result_id],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-default', ?, 'FINALIST', 2, null, 'selected')",
+            [second_strategy_id],
+        )
+        instance_id = connection.execute(
+            "select value from schema_info where key = 'database_instance_id'"
+        ).fetchone()[0]
+        connection.execute(
+            """insert into selection_runs values
+               ('run-partial', ?, 'BTCUSDT', 'LONG', 'test-selection-v1', '{}',
+                'request-hash-partial', '{}', 'config-hash-partial', 2, 2, 2, 2,
+                'workbook-hash-partial', ?)""",
+            [instance_id, datetime(2026, 1, 2, tzinfo=timezone.utc)],
+        )
+        connection.executemany(
+            "insert into selection_results values ('run-partial', ?, ?, 'FINALIST', 1, 1, 'selected', '{}', null, false, '{}')",
+            [(first_strategy_id, first_result_id), (second_strategy_id, second_result_id)],
+        )
+        connection.execute(
+            "insert into selection_review_imports values ('review-partial', 'run-partial', 'review-hash-partial', ?, 1)",
+            [datetime(2026, 1, 3, tzinfo=timezone.utc)],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-partial', ?, 'RESERVE', 1, null, 'partial')",
+            [first_strategy_id],
+        )
+
+    rows = read_current_finalists(database, [("BTCUSDT", "LONG")], False)
+
+    assert [(row["strategy_id"], row["review_import_id"]) for row in rows] == [(second_strategy_id, "review-default")]
+
+
+def test_read_current_finalists_uses_review_import_id_for_equal_imported_at(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies").fetchone()[0]
+        connection.execute(
+            "insert into selection_review_imports values ('review-z', 'run-default', 'review-hash-z', ?, 1)",
+            [datetime(2026, 1, 1, tzinfo=timezone.utc)],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-z', ?, 'FINALIST', 3, null, 'tie-break')",
+            [strategy_id],
+        )
+
+    row = read_current_finalists(database, [("BTCUSDT", "LONG")], False)[0]
+
+    assert row["review_import_id"] == "review-z"
+    assert row["user_rank"] == 3
 
 
 def test_snapshot_fails_closed_when_finalist_period_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -394,6 +543,23 @@ def test_snapshot_fails_closed_when_finalist_period_is_missing(tmp_path: Path, m
     monkeypatch.setattr(portfolio_input, "load_selection_candidates", missing_period)
 
     with pytest.raises(PortfolioInputError) as error:
+        _snapshot(database, [REQUEST])
+
+    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+
+def test_snapshot_fails_closed_when_finalist_candidate_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _database(tmp_path)
+    original = portfolio_input.load_selection_candidates
+
+    def missing_candidate(*args, **kwargs):
+        return original(*args, **kwargs).iloc[0:0]
+
+    monkeypatch.setattr(portfolio_input, "load_selection_candidates", missing_candidate)
+
+    with pytest.raises(PortfolioInputError, match="current finalist candidate is unavailable") as error:
         _snapshot(database, [REQUEST])
 
     assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
@@ -418,7 +584,7 @@ def test_snapshot_fails_closed_when_current_run_timestamps_tie(tmp_path: Path) -
     assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
 
 
-def test_snapshot_fails_closed_when_current_review_timestamps_tie(tmp_path: Path) -> None:
+def test_snapshot_ignores_current_review_timestamp_tie(tmp_path: Path) -> None:
     database = _database(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.execute(
@@ -426,10 +592,40 @@ def test_snapshot_fails_closed_when_current_review_timestamps_tie(tmp_path: Path
             [datetime(2026, 1, 1, tzinfo=timezone.utc)],
         )
 
-    with pytest.raises(PortfolioInputError) as error:
-        _snapshot(database, [REQUEST])
+    assert len(_snapshot(database, [REQUEST]).candidates) == 1
 
-    assert error.value.code == SOURCE_SNAPSHOT_UNAVAILABLE
+
+def test_snapshot_uses_review_import_id_to_break_durable_review_timestamp_tie(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies"
+        ).fetchone()
+        connection.execute(
+            "insert into selection_review_imports values ('review-tie', 'run-default', 'review-hash-tie', ?, 1)",
+            [datetime(2026, 1, 1, tzinfo=timezone.utc)],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-tie', ?, 'RESERVE', 1, null, 'tie')",
+            [strategy_id],
+        )
+        instance_id = connection.execute(
+            "select value from schema_info where key = 'database_instance_id'"
+        ).fetchone()[0]
+        connection.execute(
+            """insert into selection_runs values
+               ('run-new', ?, 'BTCUSDT', 'LONG', 'test-selection-v1', '{}',
+                'request-hash-new', '{}', 'config-hash-new', 1, 1, 1, 1,
+                'workbook-hash-new', ?)""",
+            [instance_id, datetime(2026, 1, 2, tzinfo=timezone.utc)],
+        )
+        connection.execute(
+            """insert into selection_results values
+               ('run-new', ?, ?, 'FINALIST', 1, 1, 'new', '{}', null, false, '{}')""",
+            [strategy_id, result_id],
+        )
+
+    assert _snapshot(database, [REQUEST]).candidates == ()
 
 
 def test_identical_requests_collapse_but_conflicting_stages_fail_closed(tmp_path: Path) -> None:
@@ -890,6 +1086,128 @@ def test_read_current_finalists_returns_exact_review_facts_without_writes(tmp_pa
         "user_rank": 1,
     } == rows[0]
     assert database.read_bytes() == before
+
+
+def test_read_current_finalists_does_not_promote_auto_only_rows(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("delete from selection_review_rows")
+        connection.execute("delete from selection_review_imports")
+
+    assert read_current_finalists(database, [("BTCUSDT", "LONG")], False) == ()
+    assert _snapshot(database, [REQUEST]).candidates == ()
+
+
+def test_read_current_finalists_allows_extra_historical_review_rows(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "insert into selection_review_rows values ('review-default', 999, 'FILTERED', null, null, 'historical')"
+        )
+
+    rows = read_current_finalists(database, [("BTCUSDT", "LONG")], False)
+
+    assert len(rows) == 1
+
+
+def test_current_strategy_without_result_is_outside_finalist_universe(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("update strategies set current_result_id = null")
+
+    assert read_current_finalists(database, [("BTCUSDT", "LONG")], False) == ()
+    assert _snapshot(database, [REQUEST]).candidates == ()
+
+
+def test_latest_import_wins_even_when_its_selection_run_is_older(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies"
+        ).fetchone()
+        instance_id = connection.execute(
+            "select value from schema_info where key = 'database_instance_id'"
+        ).fetchone()[0]
+        connection.execute(
+            """insert into selection_runs values
+               ('run-older', ?, 'BTCUSDT', 'LONG', 'test-selection-v1', '{}',
+                'request-hash-older', '{}', 'config-hash-older', 1, 1, 1, 1,
+                'workbook-hash-older', ?)""",
+            [instance_id, datetime(2025, 12, 31, tzinfo=timezone.utc)],
+        )
+        connection.execute(
+            """insert into selection_results values
+               ('run-older', ?, ?, 'RESERVE', 1, 1, 'older', '{}', null, false, '{}')""",
+            [strategy_id, result_id],
+        )
+        connection.execute(
+            "insert into selection_review_imports values ('review-late', 'run-older', 'review-hash-late', ?, 1)",
+            [datetime(2026, 1, 2, tzinfo=timezone.utc)],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-late', ?, 'RESERVE', 1, null, 'late')",
+            [strategy_id],
+        )
+
+    assert read_current_finalists(database, [("BTCUSDT", "LONG")], False) == ()
+
+
+def test_read_current_finalists_preserves_review_across_unreviewed_run_and_result_replacement(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    replacement_result_id = 9001
+    with duckdb.connect(str(database)) as connection:
+        strategy_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies"
+        ).fetchone()
+        for table in ("strategy_results", "strategy_actions", "strategy_equity"):
+            connection.execute(
+                f"create temp table replacement_{table} as "
+                f"select * replace (? as result_id) from {table} where result_id = ?",
+                [replacement_result_id, result_id],
+            )
+        connection.execute("delete from optimizer_prepared_inputs where result_id = ?", [result_id])
+        connection.execute("delete from window_metrics where result_id = ?", [result_id])
+        for table in ("strategy_actions", "strategy_equity", "strategy_results"):
+            connection.execute(f"delete from {table} where result_id = ?", [result_id])
+        for table in ("strategy_results", "strategy_actions", "strategy_equity"):
+            connection.execute(f"insert into {table} select * from replacement_{table}")
+        connection.execute(
+            "update strategies set current_result_id = ? where strategy_id = ?",
+            [replacement_result_id, strategy_id],
+        )
+    prepare_current_optimizer_inputs(str(database), [replacement_result_id])
+    replaced = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+    assert replaced["result_id"] == replacement_result_id
+    assert replaced["review_import_id"] == "review-default"
+
+    with duckdb.connect(str(database)) as connection:
+        instance_id = connection.execute(
+            "select value from schema_info where key = 'database_instance_id'"
+        ).fetchone()[0]
+        connection.execute(
+            """insert into selection_runs values
+               ('run-new', ?, 'BTCUSDT', 'LONG', 'test-selection-v1', '{}',
+                'request-hash-run-new', '{}', 'config-hash-run-new', 1, 1, 1, 1,
+                'workbook-hash-run-new', ?)""",
+            [instance_id, datetime(2026, 1, 2, tzinfo=timezone.utc)],
+        )
+        connection.execute(
+            """insert into selection_results values
+               ('run-new', ?, ?, 'FILTERED', 1, null, 'changed', '{}', null, false, '{}')""",
+            [strategy_id, replacement_result_id],
+        )
+
+    row = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+
+    assert row["result_id"] == replacement_result_id
+    assert row["selection_run_id"] == "run-default"
+    assert row["review_import_id"] == "review-default"
+    assert row["source_provenance"]["selection_run_id"] == "run-default"
+    assert row["source_provenance"]["review_import_id"] == "review-default"
+    assert row["actions"] and all(item["result_id"] == replacement_result_id for item in row["actions"])
+    assert row["equity"] and all(item["result_id"] == replacement_result_id for item in row["equity"])
 
 
 def test_read_current_finalists_include_series_uses_one_read_snapshot(

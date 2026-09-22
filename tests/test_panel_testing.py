@@ -16,6 +16,7 @@ from mrs3.panel_testing import (
     render_strategy,
     render_tester_config,
 )
+import mrs3.panel_testing as panel_testing_module
 from mrs3.locking import TesterTargetBusyError, TesterTargetLock
 from mrs3.panel import PanelController, PanelTestingError
 from mrs3.runner.config import RunnerConfig
@@ -475,6 +476,14 @@ def test_local_testing_fill_prebuilt_installs_exact_batch_and_retains_lock(tmp_p
         ("PORTFOLIO_AUSDT.json", hashlib.sha256(strategy_jsons["PORTFOLIO_AUSDT"].encode()).hexdigest()),
         ("PORTFOLIO_BUSDT.json", hashlib.sha256(strategy_jsons["PORTFOLIO_BUSDT"].encode()).hexdigest()),
     ]
+    assert filled["strategy_file_manifest"] == [
+        {
+            "filename": f"{name}.json",
+            "size": len(payload.encode("utf-8")),
+            "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        }
+        for name, payload in strategy_jsons.items()
+    ]
     assert filled["tester_config_hash"] == hashlib.sha256(_prebuilt_config().encode()).hexdigest()
     assert existing_report.read_text(encoding="utf-8") == "keep"
     with pytest.raises(TesterTargetBusyError):
@@ -483,6 +492,61 @@ def test_local_testing_fill_prebuilt_installs_exact_batch_and_retains_lock(tmp_p
     assert config.tester_config.read_bytes() == old_config
     assert old_strategy.read_bytes() == b'{"name":"OLD"}'
     assert not tuple(config.strategy_dir.glob("PORTFOLIO_*.json"))
+
+
+def test_local_testing_fill_prebuilt_manifest_is_sorted_for_reverse_input(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    strategies = _prebuilt_strategies()
+    reversed_input = {name: strategies[name] for name in reversed(tuple(strategies))}
+    service = LocalTestingService(config, Path(__file__).parents[1], stop_bot=lambda _config: None)
+
+    filled = service.fill_prebuilt(
+        tester_config_json=_prebuilt_config(), strategy_jsons=reversed_input
+    )
+
+    assert [item["filename"] for item in filled["strategy_file_manifest"]] == [
+        "PORTFOLIO_AUSDT.json", "PORTFOLIO_BUSDT.json",
+    ]
+    service.stop()
+
+
+def test_local_testing_stop_retains_lock_when_restoration_verification_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _runner_config(tmp_path)
+    config.tester_config.write_bytes(b'{"old":true}')
+    (config.strategy_dir / "OLD.json").write_bytes(b'{"name":"OLD"}')
+    (config.strategy_dir / "SECOND.json").write_bytes(b'{"name":"SECOND"}')
+    stop_calls: list[str] = []
+    service = LocalTestingService(
+        config, Path(__file__).parents[1], stop_bot=lambda _config: stop_calls.append("stop")
+    )
+    service.fill_prebuilt(
+        tester_config_json=_prebuilt_config(), strategy_jsons=_prebuilt_strategies()
+    )
+    original = panel_testing_module.capture_tester_settings
+    calls = 0
+
+    def mismatched_once(target: RunnerConfig):
+        nonlocal calls
+        calls += 1
+        snapshot = original(target)
+        return replace(snapshot, tester_config=b"mismatch") if calls == 1 else snapshot
+
+    monkeypatch.setattr(panel_testing_module, "capture_tester_settings", mismatched_once)
+
+    with pytest.raises(PanelTestingError, match="restoration verification"):
+        service.stop()
+    with pytest.raises(TesterTargetBusyError):
+        TesterTargetLock(config.bot_root).acquire()
+
+    service.stop()
+    assert stop_calls == ["stop", "stop", "stop"]
+    assert config.tester_config.read_bytes() == b'{"old":true}'
+    assert [(path.name, path.read_bytes()) for path in sorted(config.strategy_dir.glob("*.json"))] == [
+        ("OLD.json", b'{"name":"OLD"}'),
+        ("SECOND.json", b'{"name":"SECOND"}'),
+    ]
 
 
 def test_local_testing_fill_prebuilt_preserves_multiline_lf_bytes(tmp_path: Path) -> None:

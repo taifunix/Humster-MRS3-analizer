@@ -125,6 +125,52 @@ def _digest(value: bytes | str) -> str:
     return hashlib.sha256(value if isinstance(value, bytes) else value.encode("utf-8")).hexdigest()
 
 
+def _report_folder_snapshot(folder: Path) -> dict[str, tuple[int, int, str]]:
+    if not folder.exists():
+        return {}
+    if folder.is_symlink() or not folder.is_dir():
+        raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester report folder is invalid", status=500)
+    snapshot: dict[str, tuple[int, int, str]] = {}
+    for path in folder.iterdir():
+        if path.is_symlink() or not path.is_file():
+            continue
+        fingerprint = file_fingerprint(path)
+        if fingerprint is not None:
+            snapshot[path.name] = fingerprint
+    return snapshot
+
+
+def _fresh_report_fingerprint(
+    folder: Path,
+    report_name: str,
+    before: Mapping[str, tuple[int, int, str]],
+    start_wall_ns: int,
+) -> tuple[int, int, str] | None:
+    if Path(report_name).name != report_name or not report_name.casefold().endswith(".html"):
+        raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester report name is invalid", status=500)
+    if folder.is_symlink() or not folder.is_dir():
+        return None
+    now_ns = time.time_ns()
+    fresh: dict[str, tuple[int, int, str]] = {}
+    for path in folder.iterdir():
+        if not path.name.casefold().endswith(".html"):
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester report is not a regular file", status=500)
+        fingerprint = file_fingerprint(path)
+        if fingerprint is None:
+            continue
+        if fingerprint[0] > now_ns:
+            raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester report timestamp is invalid", status=500)
+        if fingerprint[0] >= start_wall_ns and before.get(path.name) != fingerprint:
+            fresh[path.name] = fingerprint
+    if not fresh:
+        return None
+    if set(fresh) != {report_name}:
+        raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester report set is ambiguous", status=500)
+    return fresh[report_name]
+
+
 def _validate_pretest_period(value: Any) -> None:
     if not isinstance(value, Mapping) or set(value) != {"start_utc", "end_utc"}:
         raise ValueError("pretest period shape is invalid")
@@ -147,6 +193,129 @@ def _validate_pretest_period(value: Any) -> None:
         parsed[key] = timestamp
     if parsed["start_utc"] >= parsed["end_utc"] or parsed["end_utc"] - parsed["start_utc"] < timedelta(days=1):
         raise ValueError("pretest period is too short")
+
+
+def _stage2_material(candidate: Mapping[str, Any], equity: Decimal) -> dict[str, Any]:
+    """Render the exact tester inputs and receipt from one committed candidate."""
+    candidate_id = candidate.get("candidate_id")
+    if (
+        not isinstance(candidate_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", candidate_id) is None
+        or candidate.get("identity") != candidate_id
+    ):
+        raise ValueError("candidate id is unsafe")
+    payloads = candidate.get("strategy_payloads")
+    if isinstance(payloads, (str, bytes)) or not isinstance(payloads, Sequence) or len(payloads) < 2:
+        raise ValueError("candidate strategies are invalid")
+    strategy_jsons: dict[str, str] = {}
+    sizing_by_name: dict[str, dict[str, Any]] = {}
+    max_balance_by_name: dict[str, Any] = {}
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            raise ValueError("candidate strategy wrapper is invalid")
+        facts = payload.get("facts")
+        if not isinstance(facts, Mapping) or any(
+            isinstance(facts.get(key), bool) or facts.get(key) is None for key in ("B", "C", "q", "x")
+        ):
+            raise ValueError("candidate sizing evidence is incomplete")
+        try:
+            numeric = {key: Decimal(str(facts[key])) for key in ("B", "C", "q", "x")}
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError("candidate sizing evidence is invalid") from error
+        if any(not value.is_finite() or value <= 0 for value in numeric.values()) or numeric["B"] != equity:
+            raise ValueError("candidate sizing evidence is invalid")
+        strategy = payload.get("strategy")
+        basic = strategy.get("basic") if isinstance(strategy, Mapping) else None
+        name = strategy.get("name") if isinstance(strategy, Mapping) else None
+        if (
+            not isinstance(strategy, Mapping)
+            or not isinstance(basic, Mapping)
+            or not isinstance(name, str)
+            or re.fullmatch(r"[A-Z0-9_]{1,128}", name) is None
+            or name in strategy_jsons
+            or isinstance(basic.get("max_balance"), bool)
+            or basic.get("max_balance") is None
+        ):
+            raise ValueError("candidate strategy is invalid")
+        try:
+            max_balance = Decimal(str(basic["max_balance"]))
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError("candidate max_balance is invalid") from error
+        if not max_balance.is_finite() or max_balance <= 0:
+            raise ValueError("candidate max_balance is invalid")
+        strategy_jsons[name] = _json(strategy) + "\n"
+        sizing_by_name[name] = {key: facts[key] for key in ("B", "C", "q", "x")}
+        max_balance_by_name[name] = basic["max_balance"]
+    if len(strategy_jsons) < 2:
+        raise ValueError("candidate strategies are invalid")
+
+    period = candidate.get("pretest_period")
+    _validate_pretest_period(period)
+    start = datetime.fromisoformat(period["start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    end = datetime.fromisoformat(period["end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc) - timedelta(days=1)
+    if start.date() > end.date():
+        raise ValueError("tester period is invalid")
+    template = json.loads(mrs3_tester_config_template().read_text(encoding="utf-8"))
+    if (
+        not isinstance(template, dict)
+        or type(template.get("use_runs")) is not bool
+        or template.get("use_runs") is not False
+        or type(template.get("parameter_mining")) is not list
+        or template.get("parameter_mining") != []
+    ):
+        raise ValueError("tester template is invalid")
+    initial_balance: int | float
+    if equity == equity.to_integral_value():
+        initial_balance = int(equity)
+    else:
+        initial_balance = float(equity)
+        if not math.isfinite(initial_balance):
+            raise ValueError("tester balance is invalid")
+    template.update({
+        "name_comment": candidate_id,
+        "StartDate": start.date().isoformat(),
+        "EndDate": end.date().isoformat(),
+        "InitialBalance": initial_balance,
+        "single_mode": False,
+        "UpdateData": False,
+    })
+    tester_config_json = _json(template) + "\n"
+    members = candidate.get("members")
+    if isinstance(members, (str, bytes)) or not isinstance(members, Sequence) or any(
+        not isinstance(member, Mapping) for member in members
+    ):
+        raise ValueError("candidate members are invalid")
+    receipt = {
+        "candidate_order": candidate.get("order"),
+        "profile": candidate.get("profile"),
+        "member_identities": [
+            {key: member.get(key) for key in ("symbol", "side", "strategy_id", "result_id")}
+            for member in members
+        ],
+        "tester_config_sha256": hashlib.sha256(tester_config_json.encode("utf-8")).hexdigest(),
+        "strategy_manifest": [
+            {
+                "filename": f"{name}.json",
+                "size": len(payload.encode("utf-8")),
+                "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            }
+            for name, payload in sorted(strategy_jsons.items())
+        ],
+        "expected_sizing": [
+            {"strategy_name": name, **sizing_by_name[name]} for name in sorted(strategy_jsons)
+        ],
+        "expected_max_balance": [
+            {"strategy_name": name, "max_balance": max_balance_by_name[name]} for name in sorted(strategy_jsons)
+        ],
+    }
+    return {
+        "candidate_id": candidate_id,
+        "expected_names": list(strategy_jsons),
+        "pretest_period": _plain(period),
+        "tester_config_json": tester_config_json,
+        "strategy_jsons": strategy_jsons,
+        "receipt": receipt,
+    }
 
 
 def _load_weighted_template() -> tuple[dict[str, Any], str]:
@@ -1439,13 +1608,6 @@ class PortfolioPanelService:
                 raise ValueError("stage 1 bindings are invalid")
             artifact = self._load_stage1_executables(campaign_id, input_digest, config_digest, artifact_digest)
             candidate = artifact["candidates"][0]
-            candidate_id = candidate.get("candidate_id")
-            if (
-                not isinstance(candidate_id, str)
-                or re.fullmatch(r"[0-9a-f]{64}", candidate_id) is None
-                or candidate.get("identity") != candidate_id
-            ):
-                raise ValueError("candidate id is unsafe")
 
             launch = campaign.get("launch")
             profiles = launch.get("profiles") if isinstance(launch, Mapping) else None
@@ -1466,85 +1628,74 @@ class PortfolioPanelService:
                 raise ValueError("profile equity is invalid") from error
             if not equity.is_finite() or equity <= 0:
                 raise ValueError("profile equity is invalid")
-
-            payloads = candidate.get("strategy_payloads")
-            if isinstance(payloads, (str, bytes)) or not isinstance(payloads, Sequence) or len(payloads) < 2:
-                raise ValueError("candidate strategies are invalid")
-            strategy_jsons: dict[str, str] = {}
-            for payload in payloads:
-                if not isinstance(payload, Mapping):
-                    raise ValueError("candidate strategy wrapper is invalid")
-                facts = payload.get("facts")
-                if not isinstance(facts, Mapping) or isinstance(facts.get("B"), bool) or facts.get("B") is None:
-                    raise ValueError("candidate bank is invalid")
-                try:
-                    bank = Decimal(str(facts["B"]))
-                except (InvalidOperation, TypeError, ValueError) as error:
-                    raise ValueError("candidate bank is invalid") from error
-                if not bank.is_finite() or bank <= 0 or bank != equity:
-                    raise ValueError("candidate bank does not match profile equity")
-                strategy = payload.get("strategy")
-                if not isinstance(strategy, Mapping):
-                    raise ValueError("candidate strategy is invalid")
-                name = strategy.get("name")
-                if not isinstance(name, str) or re.fullmatch(r"[A-Z0-9_]{1,128}", name) is None or name in strategy_jsons:
-                    raise ValueError("candidate strategy name is invalid")
-                strategy_jsons[name] = _json(strategy) + "\n"
-            if len(strategy_jsons) < 2:
-                raise ValueError("candidate strategies are invalid")
-
-            period = candidate["pretest_period"]
-            _validate_pretest_period(period)
-            start = datetime.fromisoformat(period["start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
-            end = datetime.fromisoformat(period["end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc) - timedelta(days=1)
-            if start.date() > end.date():
-                raise ValueError("tester period is invalid")
-
-            template_path = mrs3_tester_config_template()
-            template = json.loads(template_path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(template, dict)
-                or type(template.get("use_runs")) is not bool
-                or template.get("use_runs") is not False
-                or type(template.get("parameter_mining")) is not list
-                or template.get("parameter_mining") != []
-            ):
-                raise ValueError("tester template is invalid")
-            if equity == equity.to_integral_value():
-                initial_balance: int | float = int(equity)
-            else:
-                initial_balance = float(equity)
-                if not math.isfinite(initial_balance):
-                    raise ValueError("tester balance is invalid")
-            template.update({
-                "name_comment": candidate_id,
-                "StartDate": start.date().isoformat(),
-                "EndDate": end.date().isoformat(),
-                "InitialBalance": initial_balance,
-                "single_mode": False,
-                "UpdateData": False,
-            })
-            tester_config_json = _json(template) + "\n"
+            material = _stage2_material(candidate, equity)
             return {
                 "campaign_id": campaign_id,
                 "input_digest": input_digest,
                 "config_digest": config_digest,
                 "artifact_digest": artifact_digest,
-                "candidate_id": candidate_id,
+                "candidate_id": material["candidate_id"],
                 "candidate_digest": candidate["candidate_digest"],
-                "portfolio_name": candidate_id,
-                "expected_names": list(strategy_jsons),
-                "pretest_period": _plain(period),
-                "tester_config_json": tester_config_json,
-                "strategy_jsons": strategy_jsons,
+                "portfolio_name": material["candidate_id"],
+                "expected_names": material["expected_names"],
+                "pretest_period": material["pretest_period"],
+                "tester_config_json": material["tester_config_json"],
+                "strategy_jsons": material["strategy_jsons"],
+                "receipt": material["receipt"],
             }
         except PortfolioPanelError as error:
             raise PortfolioPanelError("PORTFOLIO_STAGE2_INPUT_INVALID", "stage 2 baseline input is invalid", status=409) from error
         except (ArithmeticError, OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             raise PortfolioPanelError("PORTFOLIO_STAGE2_INPUT_INVALID", "stage 2 baseline input is invalid", status=409) from error
 
+    def _verify_stage2_prepared(self, prepared: Mapping[str, Any]) -> None:
+        """Re-read the committed artifact and prove the Stage 2 receipt still matches."""
+        try:
+            artifact = self._load_stage1_executables(
+                prepared["campaign_id"],
+                prepared["input_digest"],
+                prepared["config_digest"],
+                prepared["artifact_digest"],
+            )
+            candidates = artifact.get("candidates")
+            receipt = prepared.get("receipt")
+            if not isinstance(candidates, list) or not candidates or not isinstance(receipt, Mapping):
+                raise ValueError("stage 2 receipt is invalid")
+            candidate = candidates[0]
+            if not isinstance(candidate, Mapping):
+                raise ValueError("stage 2 candidate is invalid")
+            payloads = candidate.get("strategy_payloads")
+            first = payloads[0] if isinstance(payloads, Sequence) and payloads else None
+            facts = first.get("facts") if isinstance(first, Mapping) else None
+            if not isinstance(facts, Mapping) or isinstance(facts.get("B"), bool) or facts.get("B") is None:
+                raise ValueError("stage 2 candidate bank is invalid")
+            equity = Decimal(str(facts["B"]))
+            material = _stage2_material(candidate, equity)
+            if (
+                candidate.get("candidate_id") != prepared.get("candidate_id")
+                or candidate.get("candidate_digest") != prepared.get("candidate_digest")
+                or material["expected_names"] != prepared.get("expected_names")
+                or material["pretest_period"] != prepared.get("pretest_period")
+                or material["tester_config_json"] != prepared.get("tester_config_json")
+                or material["strategy_jsons"] != prepared.get("strategy_jsons")
+                or material["receipt"] != receipt
+            ):
+                raise ValueError("stage 2 receipt no longer matches")
+        except (
+            ArithmeticError, InvalidOperation, KeyError, OSError, TypeError,
+            UnicodeDecodeError, ValueError, PortfolioPanelError,
+        ) as error:
+            raise PortfolioPanelError(
+                "PORTFOLIO_JOB_STAGE2_INPUT_CHANGED", "stage 2 receipt no longer matches", status=500
+            ) from error
+
     @staticmethod
-    def _stage2_result(prepared: Mapping[str, Any], result: WizardResult) -> dict[str, Any]:
+    def _stage2_result(
+        prepared: Mapping[str, Any],
+        result: WizardResult,
+        *,
+        report_evidence: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         names = tuple(result.strategy_names)
         expected = tuple(prepared["expected_names"])
         if len(names) != len(set(names)) or len(names) < 2 or set(names) != set(expected):
@@ -1560,8 +1711,10 @@ class PortfolioPanelService:
                 raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester result metrics are invalid", status=500) from None
             if not math.isfinite(number):
                 raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester result metrics are invalid", status=500)
+            if key in {"MaxDrawdown", "MaxDrawdownPercent"} and number < 0:
+                raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester result drawdown is invalid", status=500)
             metrics[key] = number
-        return {
+        output = {
             "campaign_id": prepared["campaign_id"],
             "input_digest": prepared["input_digest"],
             "config_digest": prepared["config_digest"],
@@ -1577,7 +1730,14 @@ class PortfolioPanelService:
             "report_name": result.report_name,
             "report_link": result.chart_url or None,
             "metrics": metrics,
+            "expected": {
+                "sizing": _plain(prepared["receipt"].get("expected_sizing", [])),
+                "max_balance": _plain(prepared["receipt"].get("expected_max_balance", [])),
+            },
         }
+        if report_evidence is not None:
+            output["report_evidence"] = dict(report_evidence)
+        return output
 
     def _stage2_cancel_finish(self, job_id: str) -> None:
         try:
@@ -1625,23 +1785,59 @@ class PortfolioPanelService:
             tester = self._local_testing_service_provider()
             if self._cancelled(job_id):
                 raise asyncio.CancelledError
-            tester.fill_prebuilt(
+            self._verify_stage2_prepared(prepared)
+            fill_readback = tester.fill_prebuilt(
                 tester_config_json=prepared["tester_config_json"],
                 strategy_jsons=prepared["strategy_jsons"],
                 delete_old_reports=False,
             )
             filled = True
+            receipt = prepared["receipt"]
+            actual_names = fill_readback.get("strategy_names") if isinstance(fill_readback, Mapping) else None
+            actual_manifest = fill_readback.get("strategy_file_manifest") if isinstance(fill_readback, Mapping) else None
+            if isinstance(actual_manifest, list):
+                actual_manifest = sorted(
+                    actual_manifest,
+                    key=lambda item: str(item.get("filename", "")) if isinstance(item, Mapping) else "",
+                )
+            if (
+                not isinstance(fill_readback, Mapping)
+                or fill_readback.get("tester_config_hash") != receipt["tester_config_sha256"]
+                or not isinstance(actual_names, Sequence)
+                or not all(isinstance(name, str) for name in actual_names)
+                or len(actual_names) != len(set(actual_names))
+                or sorted(actual_names) != sorted(prepared["expected_names"])
+                or actual_manifest != receipt["strategy_manifest"]
+            ):
+                raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_FILL_READBACK_INVALID", "tester staging readback is invalid", status=500)
             self._sync_runtime(job_id, stage_index=1, completed_stages=1)
             if self._cancelled(job_id):
                 raise asyncio.CancelledError
             baseline = file_fingerprint(tester.config.wizard_result)
+            candidate_id = prepared.get("candidate_id")
+            if not isinstance(candidate_id, str) or re.fullmatch(r"[0-9a-f]{64}", candidate_id) is None:
+                raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester report folder is invalid", status=500)
+            report_root = Path(tester.config.report_dir).parent.resolve()
+            report_folder = report_root / candidate_id
+            if report_folder.is_symlink():
+                raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester report folder is invalid", status=500)
+            report_folder = report_folder.resolve()
+            try:
+                report_folder.relative_to(report_root)
+            except ValueError as error:
+                raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester report folder is invalid", status=500) from error
+            folder_snapshot = _report_folder_snapshot(report_folder)
             if self._cancelled(job_id):
                 raise asyncio.CancelledError
+            self._verify_stage2_prepared(prepared)
+            start_wall_ns = time.time_ns()
             tester.start()
             if self._cancelled(job_id):
                 raise asyncio.CancelledError
             self._sync_runtime(job_id, stage_index=2, completed_stages=2)
             deadline = time.monotonic() + float(tester.config.stall_timeout_seconds)
+            previous_report_fingerprint: tuple[int, int, str] | None = None
+            stable_report_polls = 0
             while time.monotonic() < deadline:
                 if self._cancelled(job_id):
                     raise asyncio.CancelledError
@@ -1656,7 +1852,44 @@ class PortfolioPanelService:
                 if results is not None:
                     if len(results) != 1:
                         raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_RESULT_INVALID", "tester result count is invalid", status=500)
-                    completed_result = self._stage2_result(prepared, results[0])
+                    report_fingerprint = _fresh_report_fingerprint(
+                        report_folder,
+                        results[0].report_name,
+                        folder_snapshot,
+                        start_wall_ns,
+                    )
+                    if report_fingerprint is None:
+                        interval = float(getattr(tester.config, "poll_interval_seconds", 1.0))
+                        event = self._cancel_events.get(job_id)
+                        if event is not None:
+                            event.wait(interval)
+                        continue
+                    if report_fingerprint == previous_report_fingerprint:
+                        stable_report_polls += 1
+                    else:
+                        previous_report_fingerprint = report_fingerprint
+                        stable_report_polls = 1
+                    if stable_report_polls < 2:
+                        interval = float(getattr(tester.config, "poll_interval_seconds", 1.0))
+                        event = self._cancel_events.get(job_id)
+                        if event is not None:
+                            event.wait(interval)
+                        continue
+                    self._verify_stage2_prepared(prepared)
+                    completed_result = self._stage2_result(
+                        prepared,
+                        results[0],
+                        report_evidence={
+                            "fingerprint": {
+                                "mtime_ns": report_fingerprint[0],
+                                "size": report_fingerprint[1],
+                                "sha256": report_fingerprint[2],
+                            },
+                            "start_wall_ns": start_wall_ns,
+                            "accepted_wall_ns": time.time_ns(),
+                            "stable_polls": stable_report_polls,
+                        },
+                    )
                     self._sync_runtime(job_id, stage_index=3, completed_stages=3, stage2_result=completed_result)
                     break
                 interval = float(getattr(tester.config, "poll_interval_seconds", 1.0))
@@ -2356,6 +2589,7 @@ class PortfolioPanelService:
                 "candidate_digest": prepared["candidate_digest"],
                 "expected_names": list(prepared["expected_names"]),
                 "pretest_period": _plain(prepared["pretest_period"]),
+                "receipt": _plain(prepared["receipt"]),
             }
             submission_key = f"portfolio-stage2:{campaign_id}"
             created_job_id: str | None = None

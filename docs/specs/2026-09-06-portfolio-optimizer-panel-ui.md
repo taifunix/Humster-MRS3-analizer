@@ -579,3 +579,24 @@ and an empty `parameter_mining` remain required. Only each wrapper's nested
 `strategy` object is emitted as canonical deterministic UTF-8 JSON, keyed by
 its exact unique name, with at least two strategies. Invalid bindings fail
 closed with the single client-safe `PORTFOLIO_STAGE2_INPUT_INVALID` (HTTP 409).
+
+P7-R4 adds the final pre-run controls. Stage 2 must revalidate the committed
+artifact and exact first-candidate receipt immediately before staging and again
+before result acceptance. `fill_prebuilt` must return byte/hash readback for the
+effective tester config and exact strategy set; a mismatch prevents start. The
+existing tester target lock remains held through start, readback, stop, exact
+settings restoration and post-restore equality verification.
+
+Before start the worker snapshots the shared wizard result and the direct
+candidate report folder. A result is acceptable only when the wizard changed,
+the referenced regular non-link report is new or changed, lies inside the
+recorded tester time window and is stable. Every `CORE_METRICS` value is required
+and finite, with drawdown nonnegative. Expected weights, sizing and
+`max_balance` remain receipt-bound artifact facts, not invented tester metrics.
+Failure, timeout, cancellation, mismatch or missing evidence never triggers an
+automatic retry or parameter adjustment.
+
+The first persisted eligible artifact candidate remains authoritative; Stage 2
+does not rerank it. After fake-only implementation, tests and independent code
+review, execution stops for fresh user confirmation before creating a new
+Campaign or mutating tester state.

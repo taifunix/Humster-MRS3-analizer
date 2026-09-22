@@ -3,10 +3,11 @@
 Date: 2026-09-21.
 
 Status: The scoped policy is recorded under explicit user authorization. The
-active plan package is **P7-R3 / NOT_ADVISOR_APPROVED** because configured Opus
-Advisor authentication is unavailable. The user authorized temporary root
-self-review for this bounded change; this is not `PLAN_APPROVED` or
-`CODE_REVIEW_PASS`.
+revised pre-run package **P7-R4** received independent Opus high
+`PLAN_APPROVED` on 2026-09-22. This approval covers fake-only implementation
+and the stop-before-execution runbook. The resulting fake-only implementation
+received final Claude Opus 5 high `CODE_REVIEW_PASS`; this is not tester-result
+evidence.
 
 ## Context
 

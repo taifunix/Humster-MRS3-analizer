@@ -181,18 +181,13 @@ exchange actions, trading, or production PerformanceDB writes are authorized.
 
 The scoped off-only adapter check passes:
 `.venv\Scripts\python.exe -m pytest tests/test_portfolio_adapter.py
-tests/test_portfolio_weighted_search.py -q` — `504 passed`. `git diff --check`
-is clean. Stage 1 now also publishes a private canonical
-`stage1-executables.json` with exact off-only payloads and explicit member
-identities, committed/rolled back with the workbook and restart-loadable without
-rerunning finalists or the adapter. Final artifact checks pass: focused
-publication/load/rollback tests — `9 passed, 160 deselected`; full
-`tests/test_panel_portfolio.py` — `169 passed`; combined Panel/adapter/search
-before the final member-identity guard — `672 passed`. No tester run, exchange
-action, or production PerformanceDB write was used. The active plan status is
-P7-R3 / `NOT_ADVISOR_APPROVED`; configured Opus Advisor authentication is
-unavailable, and temporary root self-review is not `PLAN_APPROVED` or
-`CODE_REVIEW_PASS`.
+tests/test_portfolio_weighted_search.py -q` — `504 passed`. Stage 1 publishes a
+private canonical `stage1-executables.json` with exact off-only payloads and
+explicit member identities, committed/rolled back with the workbook and
+restart-loadable without rerunning finalists or the adapter. The active pre-run
+package is P7-R4 and received independent Opus high `PLAN_APPROVED` on
+2026-09-22. No tester run, exchange action, or production PerformanceDB write
+was used.
 
 The exact prebuilt staging slice now reuses that path through
 `LocalTestingService.fill_prebuilt`: it validates the four off-only tester
@@ -202,35 +197,38 @@ restores the prior config/strategy set through the existing `stop()` path.
 No render/resizing or tester request occurs in this method. Focused checks pass
 (`11 passed`) and the full `tests/test_panel_testing.py` passes (`67 passed`).
 
-The Phase 7 Stage 2 backend worker is now implemented and fake-verified. A
-confirmed submission loads exactly one committed Stage 1 candidate, persists a
+The Phase 7 Stage 2 backend worker is implemented and fake-verified. A confirmed
+submission loads exactly one committed Stage 1 candidate, persists a
 `portfolio.stage2` job, and runs the exact in-memory config/strategy package
-through the shared `LocalTestingService` singleton. It captures the current
-wizard-result fingerprint immediately before start, requires one fresh direct
-candidate-folder result via `name_comment`, validates the exact strategy set
-and all core finite metrics, and always restores through `stop()` after a
-successful fill. Duplicate submissions are idempotent; stale results timeout;
-invalid readbacks fail immediately; cancellation and restart project safely.
-The frontend control remains disabled, no report folder is copied or renamed,
-and no real tester run, exchange action, or PerformanceDB write was used.
-Focused Stage 2 checks pass (`12 passed`), including route reachability, the
-no-provider authorization guard, result cleanup on cancellation, and queued-job
-cleanup on reservation failure and cancellation/commit race handling. The full
-`tests/test_panel_portfolio.py` passes (`189 passed`). The active plan remains P7-R3 /
-`NOT_ADVISOR_APPROVED`; configured Opus Advisor authentication is unavailable,
-and this slice is not `CODE_REVIEW_PASS`.
+through the shared `LocalTestingService` singleton. Before fill, before start,
+and before accepting the result it rechecks the committed candidate identity,
+payload/config digests and exact strategy manifest. The result must be a fresh,
+stable direct report in the candidate `name_comment` folder; old/unchanged
+reports and negative DD are rejected. `stop()` verifies exact restoration of
+tester config and strategy files before releasing the target lock. The current
+local timeout is the existing configured 1800 seconds with one-second polls and
+no automatic retry. The full affected suites pass sequentially:
+`tests/test_panel_testing.py` — `68 passed`; `tests/test_panel_portfolio.py` —
+`203 passed, 1 skipped` (Windows symlink capability). The frontend control remains disabled, no report folder is copied
+or renamed, and no real tester run, exchange action, or PerformanceDB write was
+used. Final Claude Opus 5 high implementation re-review returned
+`CODE_REVIEW_PASS` after three rounds.
 
-The authorized real local preflight on 2026-09-22 started the current Panel on
-`127.0.0.1:8766` and confirmed that no portfolio job was active, but did not
-start the tester or mutate its files. Stage 1 is currently blocked before job
-creation: PerformanceDB contains 49 pair/side selection histories, while the
-latest selection run for 25 of them has no imported user review. The strict
-current-review reader therefore reports `FINALISTS_UNAVAILABLE` / `NO_FINALISTS`.
-The four older committed Campaigns predate `stage1-executables.json` and cannot
-be reused for exact Stage 2. Next external prerequisite: import the intended
-review for the current selection runs, then create one new Stage 1 Campaign and
-submit its confirmed off-only Stage 2 baseline. Old `FINALIST` decisions were
-not copied forward automatically.
+The authorized read-only local preflight on 2026-09-22 initially exposed a Portfolio
+reader regression: it required a review on the newest selection run even though
+the accepted review contract preserves the newest explicit User Status/User
+Rank across later unreviewed runs and current-result replacement. The shared
+reader now combines the newest selection membership and current result identity
+with durable accepted review provenance; auto-only rows remain excluded. The
+read-only real PerformanceDB check returns 33 explicit finalists across 22
+pair/sides, and a restarted Panel reports Stage 1 enabled with no blockers. The
+reader repair passes `133` portfolio-input tests and the neighboring review
+contract passes `30` tests with one pre-existing warning. Its first combined
+review findings are fixed; final Claude Opus 5 high disposition is
+`CODE_REVIEW_PASS`. No Campaign or tester job was created and no tester file was
+mutated. The four older committed Campaigns still predate
+`stage1-executables.json`. A fresh stop-and-confirm is required before creating
+one new Stage 1 Campaign or submitting its off-only Stage 2 baseline.
 
 The weighted executable candidate now freezes the exact common half-open UTC
 period from its existing `PreparedWeightedInput` as compact `pretest_period`

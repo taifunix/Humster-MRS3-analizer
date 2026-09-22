@@ -539,9 +539,18 @@ class LocalTestingService:
             if readback.file_hashes != inspection.file_hashes:
                 raise PanelTestingError("installed strategy batch readback mismatch")
             self._target_owner = owner
+            strategy_manifest = [
+                {
+                    "filename": filename,
+                    "size": len(expected_bytes[filename]),
+                    "sha256": digest,
+                }
+                for filename, digest in sorted(inspection.file_hashes, key=lambda item: item[0].casefold())
+            ]
             return {
                 "strategy_names": list(inspection.expected_names),
                 "strategy_file_hashes": list(inspection.file_hashes),
+                "strategy_file_manifest": strategy_manifest,
                 "tester_config_hash": hashlib.sha256(config_bytes).hexdigest(),
             }
         except BaseException:
@@ -597,8 +606,17 @@ class LocalTestingService:
         except BaseException:
             self._target_owner = owner
             raise
-        if self._target_snapshot is not None:
-            restore_tester_settings(self.config, self._target_snapshot)
+        snapshot = self._target_snapshot
+        if snapshot is not None:
+            try:
+                restore_tester_settings(self.config, snapshot)
+                restored = capture_tester_settings(self.config)
+            except BaseException as error:
+                self._target_owner = owner
+                raise PanelTestingError("tester settings restoration failed") from error
+            if restored != snapshot:
+                self._target_owner = owner
+                raise PanelTestingError("tester settings restoration verification failed")
             self._target_snapshot = None
         owner.release()
         self._target_owner = None

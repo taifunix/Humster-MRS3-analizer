@@ -19,12 +19,12 @@ CONFIRMED/UNKNOWN в §9 внесена без изменения алгорит
 подтверждённые документальные пункты фазы 0.
 Этот документ заменяет накопительный черновик на том же пути.
 
-Текущий пакет границы Phase 7: **P7-R3 / NOT_ADVISOR_APPROVED**. Настроенный
-Opus Advisor недоступен из-за ошибки авторизации; пользователь разрешил временную
-self-review root для этой ограниченной задачи. Это не `PLAN_APPROVED` и не
-`CODE_REVIEW_PASS`. Текущая production-политика Stage 1 —
+Текущий пакет границы Phase 7: **P7-R4 / PLAN_APPROVED** после независимого
+Opus high review 2026-09-22. Текущая production-политика Stage 1 —
 `LIMITER_DISABLED_OFF_ONLY`; Phase 7 сужена до off-only joint baseline, а все
-сравнения и runtime-работы limiter перенесены в Phase 13. Решение закреплено в
+сравнения и runtime-работы limiter перенесены в Phase 13. Fake-only реализация
+границы перед реальным запуском прошла affected tests и независимый Claude Opus
+5 high `CODE_REVIEW_PASS`. Решение закреплено в
 [ADR-0040](../../decisions/0040-portfolio-optimizer-phase7-off-only-local-stage2.md).
 
 ## 1. Результат и границы
@@ -1202,7 +1202,7 @@ focused tests и review. Run/results/evidence пункты остаются от
 - [x] Получено отдельное разрешение пользователя (2026-09-21) на local-only
   off-only tester baseline; scope исключает exchange actions, trading и записи
   в production PerformanceDB.
-- [ ] Перед baseline проверить, что Stage 2 принимает exact off-only Phase 6
+- [x] Перед baseline проверить, что Stage 2 принимает exact off-only Phase 6
   executable identity и payload без повторного render/resizing.
 - [ ] Запустить только off (`L=0`) baseline после прохождения implementation,
   focused tests и review gates в рамках полученного local-only разрешения.
@@ -1212,11 +1212,12 @@ focused tests и review. Run/results/evidence пункты остаются от
 - [ ] Сравнить off-only proxy с joint результатом, описать расхождения и вывод.
 - [ ] Записать evidence фазы 7 и получить независимый `CODE_REVIEW_PASS`.
 
-Текущий пакет P7-R3 остаётся `NOT_ADVISOR_APPROVED`: configured Opus Advisor
-authentication недоступна, а временное root self-review разрешено пользователем
-только для этой ограниченной границы. Это не означает approval плана или review
-реализации. Пользовательское разрешение не является выполнением или результатом
-тестера; исполнение ждёт проверки implementation, focused tests и review.
+Пакет P7-R4 получил независимый Opus high `PLAN_APPROVED` 2026-09-22. Он
+фиксирует bounded waits, no-auto-retry, повторную digest/manifest проверку,
+fresh-report evidence и точное восстановление tester settings. После fake-only
+implementation affected suites прошли, а финальный Claude Opus 5 high review
+вернул `CODE_REVIEW_PASS`. Теперь обязателен новый stop-and-confirm: до него
+нельзя создавать Campaign или запускать tester.
 Run/results/evidence items Phase 7 остаются открытыми.
 
 ### Фаза 8. Постоянная аналитика PerformanceDB

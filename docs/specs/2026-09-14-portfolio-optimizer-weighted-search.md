@@ -93,10 +93,17 @@ m=0.20/0.10/0.05, r=0.20/0.40/0.60, u=0.50/0.35/0.20.
 
 The Phase 5 benchmark may consume only explicit imported User Status/User Rank
 decisions. Automatic filtering and ranking populate Auto Status/Auto Rank only;
-they never create or fill User Status/User Rank. An ordinary unreviewed run is
-therefore absent from the effective user finalist universe until its edited
-workbook is imported. This prerequisite is evidence for the benchmark and does
-not mark Phase 5 complete.
+they never create or fill User Status/User Rank. The newest accepted user
+decision for a Strategy ID survives a later unreviewed ordinary run and a
+current-result replacement; the current result identity is used with the
+accepted review provenance. Among accepted decisions for one Strategy ID, the
+latest `imported_at_utc` wins regardless of the originating selection-run's
+creation time; `review_import_id` breaks an equal import timestamp tie.
+A newly appearing strategy without an accepted review remains absent from the
+user finalist universe until its edited workbook is imported. Strategies with
+no current result and immutable selection-history rows whose strategy no longer
+exists in the current `strategies` universe are ignored. This prerequisite is
+evidence for the benchmark and does not mark Phase 5 complete.
 Все профили максимизируют net PnL/30 при своих ограничениях. Допустимо
 0<m,u<1 и 0<=r<1. B_available отсутствует либо конечный >0.
 
