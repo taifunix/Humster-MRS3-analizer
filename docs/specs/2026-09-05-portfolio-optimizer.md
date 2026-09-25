@@ -1252,10 +1252,29 @@ risk-limit snapshots, Bybit formula engine или новой fee/funding под�
 ADR-0031 при любом конфликте о допуске, ликвидности, leverage, sizing и
 индивидуальном DD; D7 сохраняет соответствующий смысл D6 без изменений.
 
-Текущая строгая схема config v1 остаётся нормативной. Необязательный
-`max_balance_usdt` в запуске Campaign не является config-полем. Nullable или
-отсутствующий `scenarios[].max_balance` и UI defaults требуют отдельной принятой
-схемы v2, миграции и поддержки parser.
+Текущая строгая схема config v1 остаётся нормативной. Campaign-профиль может
+содержать только необязательный `bank_available_usdt` — максимальный доступный
+банк в USDT, `null`/отсутствие означает отсутствие потолка, а supplied value
+должно быть конечным положительным `DECIMAL(38,12)`. Старые
+`equity_usdt`/`max_balance_usdt` отклоняются с
+`LEGACY_PROFILE_FIELD_UNSUPPORTED`, без compatibility fallback.
+
+### Candidate bank authority
+
+This amendment is recorded in [ADR-0041](../decisions/0041-portfolio-optimizer-optional-bank-ceiling.md).
+
+Weighted search receives the optional ceiling as `B_available`; its
+authoritative candidate metric is `metrics.required_bank_usdt`. A candidate
+whose required bank exceeds a supplied ceiling is excluded and an exhausted
+profile reports `BANK_UNAVAILABLE`. The ceiling remains only in
+`campaign.launch.profiles` for audit/search/summary and never becomes an
+executable wrapper `facts.B` or tester `InitialBalance`. Every wrapper within
+one candidate uses the same required bank; different candidates may differ.
+For example, ceiling `5000` with required bank `1800` yields
+`facts.B=1800` and `InitialBalance=1800`; an uncapped candidate uses its own
+required bank identically. Stage 2 unconditionally requires committed
+`metrics.required_bank_usdt`, cross-checks every wrapper `facts.B`, and fails
+closed on missing, non-positive, non-finite, mixed, or mismatched values.
 
 Этап 1 фиксирует входы и config digest в неизменяемом Campaign и не запускает
 совместный тестер. Канонический отказ этапа 2 —
@@ -1342,7 +1361,7 @@ metric order is fixed per profile:
 | CONSERVATIVE | `recovery_factor DESC`, `max_dd_pct ASC`, `net_pnl DESC` |
 
 The global liquidity settings are `liquidity.parameters.close_volume_participation_pct`
-(integer 1..200, default 30), `round_down_usdt` (default 50),
+(integer 1..200, default 200), `round_down_usdt` (default 10),
 `maximum_age_hours` (default 2) for the market reference snapshot,
 `weekend_start_utc` (default `SATURDAY 00:00`),
 `weekend_end_utc` (default `MONDAY 00:00`), each configurable as a valid
@@ -1354,6 +1373,16 @@ to its `data/bybit` directory. With the default `backfill_write_enabled =
 false`, missing archive data is reported without writes. If explicitly enabled,
 an adapter may atomically publish a downloaded complete daily CSV; tests use an
 injected fetcher and temporary output root.
+
+`liquidity.spread_history_bypass_pretest` is a strict boolean, defaulting to
+`false`. Existing schema-v2 documents receive `false` during in-memory
+migration, and Settings Save materializes it. When `true`, the temporary
+pretest path does not call `read_spread_history`; it passes empty observations
+and `PRELIMINARY` status for every selected symbol and emits the stable warning
+`SPREAD_HISTORY_BYPASSED_PRETEST`. Minute capacity, the current Bybit market
+snapshot, sizing, margin evidence, and weighted search remain mandatory, and
+the output does not claim spread facts. When the flag is `false`, a missing or
+incomplete spread reader result blocks with `SPREAD_HISTORY_UNAVAILABLE`.
 
 ### Liquidity and individual gates
 
@@ -1417,6 +1446,13 @@ source initial balance must seed the first boundary; future observations never
 seed earlier boundaries. Observation density and maximum gap are preserved as
 diagnostics and do not reject an otherwise usable current result. Period
 exclusions and zero-activity windows are persisted as evidence.
+
+Если в начале общего периода equity меняется до первой записанной opening
+action, это carry-in без доказуемого владельца: общий период не сдвигается, но
+такие сегменты дают нулевой вклад этого кандидата в PRETEST_PROXY и считаются в
+diagnostics. Они не приписываются cycle и оставляют его attribution incomplete.
+Неназначенное движение после первой записанной opening action остаётся ошибкой
+`UNATTRIBUTABLE_EQUITY`; таким правилом нельзя скрыть пропуск внутри истории.
 
 For a source member, tested size is
 `source_initial_balance_usdt * sum(original opening lot_x)`. Its scaled daily

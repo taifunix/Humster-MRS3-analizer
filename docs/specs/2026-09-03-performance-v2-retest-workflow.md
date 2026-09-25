@@ -28,6 +28,12 @@ Performance-факты неполны или вызывают сомнения. 
 - на вкладке «Стратегии и DD5» появляется экран `CHECK & RETEST`;
 - экран показывает точное число `ACTIVE`-стратегий с тегом `RETEST`, предлагает
   диапазон теста и допускает его ручное изменение;
+- перед запуском в этом же экране доступен отдельный folder-import `RETEST`:
+  каждый файл проверяет только schema/скрытый ID экземпляра БД, Strategy ID
+  отмеченных строк и literal `RETEST`; `User Status`, ранги, текущий результат
+  и давность selection run не участвуют. Он добавляет тег только для явно
+  отмеченных строк, пустые `RETEST` не снимают существующий тег. Импорт не
+  запускает тестер и не заменяет Performance-факты;
 - `CHECK & RETEST` строит точные JSON-снимки из typed-параметров БД, запускает
   существующий native `SINGLE_MODE`, проверяет отчёты и создаёт обычный
   committed Performance inbox;
@@ -64,15 +70,23 @@ tag IN ('REJECTED', 'RETEST')
 ## XLSX round-trip
 
 `RETEST` — не значение `User Status`, а отдельный ортогональный признак.
-В `All candidates` добавляется колонка `RETEST`:
+В `All candidates` добавляются колонки `Start` и `End`: это соответственно
+`effective_start_utc` и `effective_end_utc`, отображённые как `ДД.ММ` без года.
+Они информационные и не участвуют в обратном импорте. Также добавляется
+колонка `RETEST`:
 
 - пусто — тег должен отсутствовать;
 - `RETEST` — тег должен присутствовать;
 - формулы и любые другие значения запрещены.
 
-Экспорт заполняет колонку по текущему тегу. Успешный обратный импорт в той же
-транзакции, что и review ledger, синхронизирует RETEST только для Strategy ID
-этого workbook. Остальные стратегии не затрагиваются.
+Экспорт заполняет колонку по текущему тегу. Полный обратный selection-review
+import в той же транзакции, что и review ledger, синхронизирует `RETEST` только
+для Strategy ID этого workbook. Отдельный RETEST-only import карточки CHECK &
+RETEST принимает старые workbook того же экземпляра БД без проверки статусов,
+рангов, результата или latest run; он добавляет `RETEST` только для строк с
+literal `RETEST`, оставляет пустые ячейки и все другие факты без изменений.
+Неизвестный отмеченный Strategy ID, другая БД, формула или некорректный XLSX
+отклоняют весь файл до записи. Остальные стратегии не затрагиваются.
 
 ## Выбор стратегий и окна
 
@@ -190,6 +204,8 @@ Native `SINGLE_MODE` (and the shared FAST path) reject a later end date before
 starting work. Performance v2 import rejects closed metadata/inbox contracts
 and parsed reports whose test or report end is later than the same ceiling;
 these checks are fail-closed so stale or forged inboxes cannot be imported.
+The tag-driven RETEST start API enforces the same ceiling before it creates a
+job; browser date limits are guidance, not the authority.
 
 Every imported report must contain a parseable `Report range`; missing or
 malformed periods fail closed on every import path, including revalidation with
@@ -205,6 +221,12 @@ or all-pairs recalculation does no work after those cache rows exist.
 Current-effective finalist control export reads the selection cache only for
 the exported `(Strategy ID, Result ID)` cohort. It must not load or recalculate
 unselected active candidates from the same pair/side.
+
+`EXPORT FROM PERFORMANCEDB` uses that same existing cached candidate data when
+it writes the agreed Pareto workbook, so its metric columns retain their
+available values. It reads only the exported cohort and never recalculates the
+cache; a metric that is absent from the cache remains an empty informational
+cell.
 
 The persisted finalist-retest job runtime is JSON-safe, including cohort
 timestamps, before the native tester is started.
