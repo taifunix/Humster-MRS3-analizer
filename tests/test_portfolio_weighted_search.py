@@ -86,6 +86,30 @@ def test_bootstrap_bank_arithmetic_does_not_depend_on_caller_decimal_precision()
     assert result.p95_banks == ((Decimal("18.4500"),),)
 
 
+def test_bootstrap_progress_callback_is_advisory_and_result_equivalent() -> None:
+    kwargs = {
+        "max_dd": Decimal("0.2"),
+        "common_days": Decimal("20"),
+        "seed": 17,
+        "block_days": (Decimal("1"),),
+        "scenarios_per_family": 2,
+        "batch_size": 1,
+        "workers": 1,
+    }
+    rows = ((Decimal("1"),), (Decimal("-1"),))
+    vectors = ((Decimal("1"),),)
+    baseline = bootstrap_banks(rows, vectors, **kwargs)
+    events = []
+    with_callback = bootstrap_banks(rows, vectors, progress_callback=events.append, **kwargs)
+    assert with_callback.historical_banks == baseline.historical_banks
+    assert with_callback.scenario_banks == baseline.scenario_banks
+    assert with_callback.p95_banks == baseline.p95_banks
+    assert with_callback.risk_banks == baseline.risk_banks
+    assert {key: value for key, value in with_callback.manifest.items() if key != "operational"} == {key: value for key, value in baseline.manifest.items() if key != "operational"}
+    assert events and all(set(event) == {"substage", "unit", "completed", "total", "detail"} for event in events)
+    assert all(len(event["detail"].encode("utf-8")) <= 160 for event in events)
+
+
 def test_batched_bootstrap_reuses_common_indices_for_cancellation_and_exposes_compact_metrics() -> None:
     result = bootstrap_banks(
         ((Decimal("1"), Decimal("-1")), (Decimal("2"), Decimal("-2")), (Decimal("-1"), Decimal("1"))),
@@ -517,6 +541,21 @@ def test_weighted_search_cancel_returns_budget_limited_manifest() -> None:
     assert result.status == "budget_limited"
     assert result.manifest["stopping_reason"] == "CANCELLED"
     assert result.manifest["complete"] is False
+
+
+def test_weighted_search_honors_configured_solver_call_limit() -> None:
+    result = weighted_search(
+        _prepared((("0.4", "0.1"), ("0.1", "0.1"))),
+        (Decimal("100"), Decimal("100")),
+        members=_members(),
+        bootstrap_scenarios=2,
+        screening_scenarios=1,
+        max_solver_calls=1,
+    )
+
+    assert (result.status, result.reason) == ("budget_limited", "SOLVER_CALL_LIMIT")
+    assert result.manifest["solver_call_count"] == 1
+    assert result.manifest["remaining_work"]["solver_call_slots"] == 0
 
 
 def test_weighted_search_cancellation_during_bootstrap_reports_unexplored_work(monkeypatch: pytest.MonkeyPatch) -> None:

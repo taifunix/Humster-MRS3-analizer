@@ -15,6 +15,17 @@ def test_registry_idempotency_collision_capacity_and_restart(tmp_path):
     assert restarted.get(first["job_id"])["error"]["code"] == "INTERRUPTED"
 
 
+def test_registry_can_defer_restart_recovery_until_owner_migrates(tmp_path):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path, recover_on_load=False)
+    job = registry.submit("testing.local", {}, "deferred")
+
+    assert registry.get(job["job_id"])["state"] == "QUEUED"
+    assert registry.recover_interrupted() is True
+    assert registry.get(job["job_id"])["state"] == "FAILED"
+    assert registry.recover_interrupted() is False
+
+
 def test_registry_cancel_transition_and_bounded_logs(tmp_path):
     registry = PanelJobRegistry(tmp_path / "jobs.json")
     job = registry.submit("source.local-import", {}, "a")

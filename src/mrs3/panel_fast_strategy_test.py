@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date
 import html
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -55,6 +56,7 @@ class _Job:
     end_date: str
     report_dir: Path
     strategy_dir: Path
+    initial_balance: float | None = None
     runtime_config: RunnerConfig | None = None
     attempt_limits: dict[str, int] = field(default_factory=dict)
     cancel: Event = field(default_factory=Event)
@@ -128,6 +130,18 @@ def _dates(start_date: object, end_date: object) -> tuple[str, str]:
     return start_date, end_date
 
 
+def parse_initial_balance(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise FastStrategyTestError("initial_balance must be a positive finite number")
+    try:
+        balance = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise FastStrategyTestError("initial_balance must be a positive finite number") from None
+    if not math.isfinite(balance) or balance <= 0:
+        raise FastStrategyTestError("initial_balance must be a positive finite number")
+    return balance
+
+
 def _clear_directory(path: Path, *, expected: Path) -> None:
     if path.is_symlink():
         raise FastStrategyTestError("refusing to clear a symlink runtime path")
@@ -184,6 +198,7 @@ def _write_fast_tester_config(
     end: str,
     *,
     single_mode: bool = False,
+    initial_balance: float | None = None,
     template_path: Path | None = None,
 ) -> None:
     path = Path(config.tester_config).resolve()
@@ -207,6 +222,8 @@ def _write_fast_tester_config(
         "enable_timing_logs": False,
     }
     document.update({"StartDate": start, "EndDate": end, "use_runs": False, "single_mode": single_mode, **report_settings})
+    if initial_balance is not None:
+        document["InitialBalance"] = parse_initial_balance(initial_balance)
     report = document.get("report")
     if not isinstance(report, dict):
         raise FastStrategyTestError("tester config report must be an object")
@@ -407,6 +424,7 @@ class LocalFastStrategyTestService:
             "generation_manifest_path": str(job.manifest_path),
             "start_date": job.start_date,
             "end_date": job.end_date,
+            "initial_balance": job.initial_balance,
             "expected_names": list(job.expected_names),
             "run_names": list(job.run_names),
             "strategy_json_sha256": job.manifest.provenance["strategy_json_sha256"],
@@ -505,6 +523,7 @@ class LocalFastStrategyTestService:
                 job.start_date,
                 job.end_date,
                 template_path=self.tester_config_template,
+                initial_balance=job.initial_balance,
             )
             job.report_dir.mkdir(parents=True, exist_ok=True)
             snapshot_dir = job.report_dir / f".fast-snapshots-{job.job_id}"
@@ -709,6 +728,7 @@ class LocalFastStrategyTestService:
         end_date: str,
         job_id: str | None = None,
         clear_reports: bool = False,
+        initial_balance: object | None = None,
     ) -> dict[str, object]:
         manifest = validate_strategy_manifest(Path(manifest_path))
         if manifest.analysis_run_id != analysis_run_id:
@@ -716,6 +736,7 @@ class LocalFastStrategyTestService:
         dates = _dates(start_date, end_date)
         if type(clear_reports) is not bool:
             raise FastStrategyTestError("clear_reports must be a boolean")
+        balance = None if initial_balance is None else parse_initial_balance(initial_balance)
         strategy_dir, report_dir, _, _ = validate_runner_paths(self.config)
         names = self._expected(manifest)
         self._require_diagnostics(manifest, names)
@@ -725,7 +746,7 @@ class LocalFastStrategyTestService:
                 raise FastStrategyTestError("Fast TEST is already running")
             if identifier in self._jobs:
                 raise FastStrategyTestError("Fast TEST job id is already used")
-            job = _Job(identifier, Path(manifest_path).resolve(), manifest, names, names, *dates, report_dir, strategy_dir, single_mode=self.single_mode, clear_reports=clear_reports)
+            job = _Job(identifier, Path(manifest_path).resolve(), manifest, names, names, *dates, report_dir, strategy_dir, initial_balance=balance, single_mode=self.single_mode, clear_reports=clear_reports)
             self._jobs[identifier] = job
             job.progress = {"current": 0, "total": len(names), "batch_current": 0, "batch_total": 0, "active": 0, "retries": 0, "failed": 0}
             job.thread = Thread(
@@ -766,6 +787,7 @@ class LocalFastStrategyTestService:
             expected = self._expected(manifest)
             self._require_diagnostics(manifest, expected)
             start, end = _dates(document.get("start_date"), document.get("end_date"))
+            balance = None if document.get("initial_balance") is None else parse_initial_balance(document["initial_balance"])
             strategy_dir, report_dir, _, _ = validate_runner_paths(self.config)
             if report_dir != self.config.report_dir.resolve() or tuple(document.get("expected_names", ())) != expected:
                 return None
@@ -843,7 +865,7 @@ class LocalFastStrategyTestService:
         except (FastStrategyTestError, ValueError, OSError, TypeError):
             return None
         recovered_phase = "FAILED" if phase == "RUNNING" and single_mode else str(phase)
-        job = _Job(job_id, Path(generation_path).resolve(), manifest, expected, tuple(name for name in expected if name not in verified_reports), start, end, report_dir, strategy_dir, attempt_counts=attempt_counts, verified_reports=verified_reports, verified_report_evidence=verified_report_evidence, checkpoint_valid=checkpoint_valid, failed_names=failed_names, preserve_reports=True, state="FAILED" if recovered_phase == "FAILED" and single_mode else "COMMITTED", phase=recovered_phase, single_mode=single_mode)
+        job = _Job(job_id, Path(generation_path).resolve(), manifest, expected, tuple(name for name in expected if name not in verified_reports), start, end, report_dir, strategy_dir, initial_balance=balance, attempt_counts=attempt_counts, verified_reports=verified_reports, verified_report_evidence=verified_report_evidence, checkpoint_valid=checkpoint_valid, failed_names=failed_names, preserve_reports=True, state="FAILED" if recovered_phase == "FAILED" and single_mode else "COMMITTED", phase=recovered_phase, single_mode=single_mode)
         return job
 
     def _load_persisted_job_for_inbox(self, job_id: str) -> _Job | None:
@@ -1029,6 +1051,7 @@ class LocalFastStrategyTestService:
                 source_job.end_date,
                 source_job.report_dir,
                 source_job.strategy_dir,
+                initial_balance=source_job.initial_balance,
                 runtime_config=replace(self.config, max_strategy_attempts=max((source_job.attempt_counts.get(name, 0) for name in failed), default=0) + 1),
                 attempt_limits={name: source_job.attempt_counts.get(name, 0) + 1 for name in failed},
                 attempt_counts=dict(source_job.attempt_counts),
@@ -1393,6 +1416,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             job.start_date,
             job.end_date,
             single_mode=True,
+            initial_balance=job.initial_balance,
             template_path=self.tester_config_template,
         )
         batches = [

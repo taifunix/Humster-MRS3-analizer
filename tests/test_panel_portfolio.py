@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 from http.client import HTTPConnection
+import os
 from pathlib import Path
+import subprocess
 import threading
 import time
 from decimal import Decimal
@@ -17,12 +20,27 @@ from openpyxl import Workbook
 import pytest
 import duckdb
 
+import mrs3.panel as panel_module
 from mrs3.panel import PanelController, create_panel_server
-from mrs3.panel_portfolio import PortfolioPanelError, PortfolioPanelService, STAGES, _redact_text, _safe_cell, _weighted_payload_pairs
+from mrs3.panel_portfolio import (
+    PORTFOLIO_SNAPSHOT_UNSERIALIZABLE,
+    PortfolioPanelError,
+    PortfolioPanelService,
+    STAGES,
+    _redact_text,
+    _repair_legacy_geometry,
+    _safe_cell,
+    _snapshot_bytes,
+    _PortfolioProgressReporter,
+    _stage2_material,
+    _weighted_entry_order_percentages,
+    _weighted_payload_pairs,
+    _weighted_source_maxdd_sum,
+)
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
 from mrs3.config import DuckDBImportSettings
 from mrs3.performance_v2_store import PerformanceV2StoreError
-from mrs3.portfolio.config import PortfolioConfigError, migrate_portfolio_config_document
+from mrs3.portfolio.config import WEIGHTED_SEARCH_DEFAULTS, PortfolioConfigError, migrate_portfolio_config_document
 from mrs3.portfolio.adapter import (
     CAMPAIGN_CONTRACT_VERSION,
     CAMPAIGN_SEARCH_MODE,
@@ -67,7 +85,7 @@ def _profiled_variants(selected, *_):
         "profile": "BALANCED",
         "search_mode": CAMPAIGN_SEARCH_MODE,
         "limiter_L": 0,
-        "metrics": {"limiter_L": 0},
+        "metrics": {"limiter_L": 0, "required_bank_usdt": Decimal("10000")},
         "pretest_period": {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"},
         "members": (
             {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 700, "result_id": 711, "x_usdt": Decimal("100")},
@@ -89,7 +107,7 @@ def _executable_payload(symbol: str, side: str = "LONG", *, name: str | None = N
             "mrs": {"position_priority": 1},
         },
         "account": {"open_positions_limiter": 0},
-        "facts": {"x": x},
+        "facts": {"B": "10000", "x": x},
     }
 
 
@@ -107,6 +125,7 @@ def _weighted_executable_candidate(payloads: tuple[dict, ...], **updates) -> dic
         "profile": "BALANCED",
         "search_mode": CAMPAIGN_SEARCH_MODE,
         "limiter_L": 0,
+        "metrics": {"required_bank_usdt": Decimal("10000")},
         "pretest_period": {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"},
         "members": members,
         "strategy_payloads": payloads,
@@ -132,7 +151,7 @@ def _stage2_service(tmp_path: Path, candidate: dict) -> tuple[PortfolioPanelServ
     )
     result = service.submit_campaign({
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     })
     assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
@@ -174,7 +193,7 @@ def test_panel_freeze_emits_weighted_contract_without_legacy_stage1(monkeypatch:
 
     monkeypatch.setattr("mrs3.panel_portfolio.threading.Thread", IdleThread)
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     campaign = service.registry.runtime(result["job_id"])["campaign"]
     assert campaign["campaign_contract_version"] == CAMPAIGN_CONTRACT_VERSION
     assert campaign["search_mode"] == CAMPAIGN_SEARCH_MODE
@@ -201,7 +220,7 @@ def test_panel_freeze_carries_dedicated_weighted_template_and_digest(monkeypatch
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: [_finalist()])
     result = service.submit_campaign({
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     })
 
@@ -230,7 +249,7 @@ def test_panel_freeze_keeps_template_snapshot_after_file_changes(monkeypatch: py
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: [_finalist()])
     result = service.submit_campaign({
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     })
     campaign = service.registry.runtime(result["job_id"])["campaign"]
@@ -275,7 +294,7 @@ def test_panel_freeze_rejects_malformed_or_non_object_weighted_template_before_r
     with pytest.raises(PortfolioPanelError) as error:
         service.submit_campaign({
             "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         })
 
@@ -298,7 +317,7 @@ def test_panel_freeze_rejects_missing_weighted_template_before_reader(monkeypatc
     with pytest.raises(PortfolioPanelError) as error:
         service.submit_campaign({
             "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         })
 
@@ -316,7 +335,7 @@ def test_campaign_launch_accepts_directional_shared_symbol_limits(tmp_path: Path
     launch = service._normalise_campaign(
         {
             "pairs": [{"pair": " btCusdt ", "max_finalist_long": 1, "max_finalist_short": 1}],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         },
         config,
@@ -336,7 +355,7 @@ def test_campaign_launch_accepts_one_enabled_direction(tmp_path: Path) -> None:
     launch = service._normalise_campaign(
         {
             "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 0, "max_finalist_short": 1}],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         },
         config,
@@ -359,7 +378,7 @@ def test_campaign_launch_keeps_distinct_pairs_in_stable_long_only_order(tmp_path
                 {"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0},
                 {"pair": "ETHUSDT", "max_finalist_long": 1, "max_finalist_short": 0},
             ],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         },
         config,
@@ -398,7 +417,7 @@ def test_campaign_rejects_invalid_finalist_limits_before_reader(tmp_path: Path, 
         service.submit_campaign(
             {
                 "pairs": [pair],
-                "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+                "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
                 "expected_config_digest": digest,
             }
         )
@@ -419,7 +438,7 @@ def test_campaign_rejects_missing_finalist_limit_with_field_error_before_reader(
         service.submit_campaign(
             {
                 "pairs": [pair],
-                "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+                "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
                 "expected_config_digest": digest,
             }
         )
@@ -440,7 +459,7 @@ def test_campaign_rejects_both_directions_disabled_before_reader(tmp_path: Path)
         service.submit_campaign(
             {
                 "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 0, "max_finalist_short": 0}],
-                "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+                "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
                 "expected_config_digest": digest,
             }
         )
@@ -477,10 +496,27 @@ def test_campaign_rejects_duplicate_or_malformed_limits_before_reader(tmp_path: 
         service.submit_campaign(
             {
                 "pairs": pairs,
-                "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+                "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
                 "expected_config_digest": digest,
             }
         )
+
+    assert error.value.code == "PORTFOLIO_CAMPAIGN_INVALID"
+    assert calls == []
+
+
+def test_campaign_rejects_empty_profiles_before_reader(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    calls: list[tuple[object, ...]] = []
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *args: calls.append(args) or ())
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_campaign({
+            "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+            "profiles": [],
+            "expected_config_digest": digest,
+        })
 
     assert error.value.code == "PORTFOLIO_CAMPAIGN_INVALID"
     assert calls == []
@@ -585,7 +621,7 @@ def test_invalid_panel_create_contract_maps_before_registry_write(monkeypatch: p
     )
     payload = {
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     }
     with pytest.raises(PortfolioPanelError) as error:
@@ -610,7 +646,7 @@ def test_valid_frozen_campaign_reaches_adapter_fact_blocker(monkeypatch: pytest.
 
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists)
     monkeypatch.setattr("mrs3.panel_portfolio.threading.Thread", IdleThread)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     campaign = service.registry.runtime(result["job_id"])["campaign"]
     generated = service._package_variant_generator(finalists, campaign, campaign["launch"]["profiles"])
     assert generated["variants"] == ()
@@ -632,6 +668,68 @@ def test_settings_get_put_uses_exact_byte_digest_and_cas(tmp_path: Path) -> None
     assert getattr(error.value, "code", None) == "CONFIG_CHANGED"
 
 
+def test_old_v2_settings_read_defaults_without_rewriting_source(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    document = _config()
+    for profile in document["profiles"].values():
+        for field in (
+            "max_actual_equity_dd_pct",
+            "min_calculated_free_margin_reserve_pct",
+            "max_calculated_account_mm_load_pct",
+        ):
+            profile.pop(field)
+    weighted = document["search"]["weighted_search"]
+    weighted["repair_attempts"] = 3
+    weighted.pop("lp_solutions_per_profile")
+    document["search"]["composition"]["parameters"].pop("minimum_common_days")
+    source = json.dumps(document, ensure_ascii=False, indent=2).encode()
+    path.write_bytes(source)
+    service = PortfolioPanelService(tmp_path, path)
+
+    settings = service.settings_get()
+
+    assert settings["digest"] == hashlib.sha256(source).hexdigest()
+    assert path.read_bytes() == source
+    assert settings["document"]["profiles"]["AGGRESSIVE"]["max_actual_equity_dd_pct"] == "20"
+    assert settings["document"]["profiles"]["BALANCED"]["min_calculated_free_margin_reserve_pct"] == "40"
+    assert settings["document"]["profiles"]["CONSERVATIVE"]["max_calculated_account_mm_load_pct"] == "20"
+    assert settings["document"]["search"]["weighted_search"] == dict(WEIGHTED_SEARCH_DEFAULTS)
+    assert settings["document"]["search"]["composition"]["parameters"]["minimum_common_days"] == 14
+
+
+def test_old_v2_campaign_freezes_effective_document_pair(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    document = _config()
+    for profile in document["profiles"].values():
+        profile.pop("max_actual_equity_dd_pct")
+        profile.pop("min_calculated_free_margin_reserve_pct")
+        profile.pop("max_calculated_account_mm_load_pct")
+    source = json.dumps(document, ensure_ascii=False, indent=2).encode()
+    path.write_bytes(source)
+
+    class IdleThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("mrs3.panel_portfolio.threading.Thread", IdleThread)
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: [_finalist()])
+    digest = hashlib.sha256(source).hexdigest()
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    })
+    campaign = service.registry.runtime(result["job_id"])["campaign"]
+    frozen = __import__("base64").b64decode(campaign["config_bytes"])
+
+    assert hashlib.sha256(source).hexdigest() == campaign["config_digest"]
+    assert hashlib.sha256(frozen).hexdigest() == campaign["frozen_config_digest"]
+    assert json.loads(frozen.decode()) == campaign["config_document"]
+
+
 def test_settings_save_migrates_legacy_v1_document_to_v2(tmp_path: Path) -> None:
     source = Path(__file__).parents[1] / "portfolio_optimizer.local.json.example"
     path = tmp_path / "portfolio_optimizer.local.json"
@@ -647,6 +745,23 @@ def test_settings_save_migrates_legacy_v1_document_to_v2(tmp_path: Path) -> None
     assert saved["schema_version"] == 2
     assert document["schema_version"] == 2
     assert all("grid" not in scenario["sizing"] for scenario in document["scenarios"].values())
+
+
+def test_settings_save_materializes_absent_v2_spread_history_bypass(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    document = _config()
+    document["liquidity"].pop("spread_history_bypass_pretest", None)
+    source = json.dumps(document, ensure_ascii=False, indent=2).encode()
+    path.write_bytes(source)
+    service = PortfolioPanelService(tmp_path, path)
+
+    loaded = service.settings_get()
+    assert loaded["document"]["liquidity"]["spread_history_bypass_pretest"] is False
+    assert path.read_bytes() == source
+
+    service.settings_put({"expected_digest": loaded["digest"], "document": loaded["document"]})
+
+    assert json.loads(path.read_text(encoding="utf-8"))["liquidity"]["spread_history_bypass_pretest"] is False
 
 
 def test_v2_legacy_algorithm_versions_are_resolved_for_panel_and_save(tmp_path: Path) -> None:
@@ -793,7 +908,7 @@ def test_active_campaign_conflict_is_reported_before_source_snapshot(tmp_path: P
     service = PortfolioPanelService(tmp_path, path, registry=registry, finalists_reader=reader)
     payload = {
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     }
     config, _raw, _document = service._config()
@@ -823,7 +938,7 @@ def test_other_active_campaign_is_busy_before_source_snapshot(tmp_path: Path) ->
     service = PortfolioPanelService(tmp_path, path, registry=registry, finalists_reader=reader)
     payload = {
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     }
     registry.submit("portfolio.stage1", {"campaign_id": "other", "input_digest": "other", "config_digest": digest}, "other", ("portfolio_optimizer",), job_id="other")
@@ -843,7 +958,7 @@ def test_campaign_profile_rejects_unknown_fields_exactly(tmp_path: Path) -> None
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: [])
     payload = {
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1, "unexpected": True}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1, "unexpected": True}],
         "expected_config_digest": digest,
     }
 
@@ -861,8 +976,8 @@ def test_campaign_profile_budgets_are_independent_of_configured_total(tmp_path: 
     payload = {
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
         "profiles": [
-            {"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 2},
-            {"profile_id": "AGGRESSIVE", "equity_usdt": "10000", "max_candidates": 3},
+            {"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 2},
+            {"profile_id": "AGGRESSIVE", "bank_available_usdt": "10000", "max_candidates": 3},
         ],
         "expected_config_digest": digest,
     }
@@ -884,7 +999,7 @@ def test_campaign_rejects_max_candidates_outside_adapter_contract(tmp_path: Path
         service._normalise_campaign(
             {
                 "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-                "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": max_candidates}],
+                "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": max_candidates}],
                 "expected_config_digest": digest,
             },
             config,
@@ -910,8 +1025,8 @@ def test_multi_profile_budget_and_summary_stay_consistent(tmp_path: Path) -> Non
     payload = {
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
         "profiles": [
-            {"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1},
-            {"profile_id": "AGGRESSIVE", "equity_usdt": "10000", "max_candidates": 1},
+            {"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1},
+            {"profile_id": "AGGRESSIVE", "bank_available_usdt": "10000", "max_candidates": 1},
         ],
         "expected_config_digest": digest,
     }
@@ -937,10 +1052,65 @@ def test_campaign_money_must_fit_decimal_38_12(tmp_path: Path, value: str) -> No
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: [])
 
     with pytest.raises(PortfolioPanelError) as error:
-        service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": value, "max_candidates": 1}], "expected_config_digest": digest})
+        service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": value, "max_candidates": 1}], "expected_config_digest": digest})
 
     assert error.value.code == "PORTFOLIO_CAMPAIGN_INVALID"
     assert service.registry.list() == []
+
+
+@pytest.mark.parametrize("value", ("0", "-1", "NaN", "Infinity", True, {}))
+def test_campaign_bank_ceiling_must_be_finite_and_positive(tmp_path: Path, value: object) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(tmp_path, path)
+    config, _raw, _document = service._config()
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service._normalise_campaign({
+            "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": value, "max_candidates": 1}],
+            "expected_config_digest": digest,
+        }, config, digest)
+
+    assert error.value.status == 422
+    assert error.value.field_errors[0]["field"] == "profiles[0].bank_available_usdt"
+
+
+@pytest.mark.parametrize("bank", (pytest.param(None, id="null"), pytest.param("missing", id="missing"), pytest.param("5000", id="capped"), pytest.param(0.1, id="fractional-float")))
+def test_campaign_profile_normalises_optional_bank_ceiling(tmp_path: Path, bank: object) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(tmp_path, path)
+    profile = {"profile_id": "BALANCED", "max_candidates": 1}
+    if bank != "missing":
+        profile["bank_available_usdt"] = bank
+    config, _raw, _document = service._config()
+
+    launch = service._normalise_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [profile],
+        "expected_config_digest": digest,
+    }, config, digest)
+
+    expected = None if bank in {None, "missing"} else str(bank)
+    assert launch["profiles"][0]["bank_available_usdt"] == expected
+
+
+@pytest.mark.parametrize("legacy_field", ("equity_usdt", "max_balance_usdt"))
+def test_campaign_profile_rejects_legacy_bank_fields(tmp_path: Path, legacy_field: str) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(tmp_path, path)
+    config, _raw, _document = service._config()
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service._normalise_campaign({
+            "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+            "profiles": [{"profile_id": "BALANCED", legacy_field: "5000", "max_candidates": 1}],
+            "expected_config_digest": digest,
+        }, config, digest)
+
+    assert error.value.field_errors[0]["code"] == "LEGACY_PROFILE_FIELD_UNSUPPORTED"
 
 
 def test_failed_campaign_snapshot_creates_no_job(tmp_path: Path) -> None:
@@ -954,7 +1124,7 @@ def test_failed_campaign_snapshot_creates_no_job(tmp_path: Path) -> None:
     service = PortfolioPanelService(tmp_path, path, registry=registry, finalists_reader=broken_reader)
     payload = {
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     }
 
@@ -982,7 +1152,7 @@ def test_runtime_reservation_failure_discards_queued_job_and_retry_succeeds(monk
     monkeypatch.setattr(service.registry, "reserve_runtime", fail_once)
     payload = {
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     }
 
@@ -1011,7 +1181,7 @@ def test_worker_start_failure_removes_queued_job(monkeypatch: pytest.MonkeyPatch
     service = PortfolioPanelService(tmp_path, path, registry=registry, finalists_reader=lambda *_: [])
 
     with pytest.raises(PortfolioPanelError) as error:
-        service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+        service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
 
     assert error.value.code == "PORTFOLIO_JOB_START_FAILED"
     assert registry.list() == []
@@ -1030,7 +1200,7 @@ def test_campaign_uses_frozen_finalist_snapshot_after_source_changes(tmp_path: P
     service = PortfolioPanelService(tmp_path, path, finalists_reader=reader, variant_generator=_profiled_variants)
     payload = {
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     }
     result = service.submit_campaign(payload)
@@ -1072,7 +1242,7 @@ def test_campaign_freezes_private_weighted_rows_without_public_series_aliases(mo
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: source_rows)
     result = service.submit_campaign({
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     })
 
@@ -1148,7 +1318,7 @@ def test_campaign_prepares_exact_production_finalist_result_ids_before_strict_re
     )
     result = service.submit_campaign({
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 1}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     })
 
@@ -1186,7 +1356,7 @@ def test_campaign_rejects_invalid_production_metadata_result_id_before_preparati
     with pytest.raises(PortfolioPanelError) as error:
         service.submit_campaign({
             "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         })
 
@@ -1311,7 +1481,7 @@ def test_campaign_resolves_ordered_series_aliases_into_private_weighted_rows(mon
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: source_rows)
     result = service.submit_campaign({
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     })
 
@@ -1338,7 +1508,7 @@ def test_campaign_rejects_missing_weighted_series_at_snapshot(monkeypatch: pytes
     with pytest.raises(PortfolioPanelError) as error:
         service.submit_campaign({
             "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         })
 
@@ -1363,7 +1533,7 @@ def test_campaign_rejects_non_json_weighted_series_at_snapshot(monkeypatch: pyte
     with pytest.raises(PortfolioPanelError) as error:
         service.submit_campaign({
             "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         })
 
@@ -1388,7 +1558,7 @@ def test_campaign_rejects_non_mapping_finalist_at_snapshot(monkeypatch: pytest.M
     with pytest.raises(PortfolioPanelError) as error:
         service.submit_campaign({
             "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         })
 
@@ -1423,7 +1593,7 @@ def test_campaign_rejects_missing_weighted_identity_at_snapshot(monkeypatch: pyt
     with pytest.raises(PortfolioPanelError) as error:
         service.submit_campaign({
             "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         })
 
@@ -1462,7 +1632,7 @@ def test_campaign_rejects_missing_weighted_series_with_field_error(monkeypatch: 
     with pytest.raises(PortfolioPanelError) as error:
         service.submit_campaign({
             "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-            "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
             "expected_config_digest": digest,
         })
 
@@ -1484,7 +1654,7 @@ def test_invalid_published_workbook_fails_without_download(tmp_path: Path) -> No
         return workbook_path
 
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists, variant_generator=_profiled_variants, workbook_builder=broken_builder)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
@@ -1510,7 +1680,7 @@ def test_commit_failure_rolls_back_published_workbook(tmp_path: Path) -> None:
 
     registry.sync = fail_commit
     service = PortfolioPanelService(tmp_path, path, registry=registry, finalists_reader=lambda *_: finalists, variant_generator=_profiled_variants)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
@@ -1528,7 +1698,7 @@ def test_journal_and_indeterminate_progress_are_public(tmp_path: Path) -> None:
     digest = _write_config(path)
     finalists = [_finalist()]
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists, variant_generator=_profiled_variants)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
@@ -1549,7 +1719,7 @@ def test_zero_variants_fail_without_results_or_download(tmp_path: Path) -> None:
     digest = _write_config(path)
     finalists = [_finalist()]
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists, variant_generator=lambda *_: [])
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
@@ -1576,12 +1746,65 @@ def test_zero_adapter_variants_report_actionable_gate_details(tmp_path: Path) ->
         "excluded": ({"symbol": "BTCUSDT", "selection_reason": "SIZE_BELOW_MINIMUM_QTY"},),
     }
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists, variant_generator=lambda *_: generated)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
 
     assert "BTCUSDT:SIZE_BELOW_MINIMUM_QTY" in service.job(result["job_id"])["diagnostics"][0]["message"]
+
+
+def test_typed_postsearch_blocker_survives_snapshot_cleanup_and_restart(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    typed_blocker = "PROFILE:AGGRESSIVE:WEIGHTED_CANDIDATE_BANK_INVALID"
+    generated = {"variants": (), "blockers": (typed_blocker,), "excluded": ()}
+    service = PortfolioPanelService(
+        tmp_path,
+        path,
+        finalists_reader=lambda *_: [_finalist()],
+        variant_generator=lambda *_: generated,
+    )
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "AGGRESSIVE", "bank_available_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    })
+
+    job = _wait_stage1(service, result)
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_VARIANTS_NOT_READY"
+    assert typed_blocker in job["diagnostics"][0]["message"]
+    assert any(typed_blocker in entry["text"] for entry in job["journal"])
+    snapshot = tmp_path / ".portfolio-results" / result["campaign_id"] / "campaign-input.json.gz"
+    cleanup_deadline = time.monotonic() + 1
+    while time.monotonic() < cleanup_deadline and snapshot.exists():
+        time.sleep(0.01)
+    assert not snapshot.exists()
+
+    persisted = None
+    journal_path = tmp_path / ".panel-jobs.json"
+    persisted_deadline = time.monotonic() + 1
+    while time.monotonic() < persisted_deadline and persisted is None:
+        try:
+            persisted = json.loads(journal_path.read_text(encoding="utf-8"))
+        except PermissionError:
+            time.sleep(0.01)
+    assert persisted is not None
+    record = persisted[result["job_id"]]
+    assert record["state"] == "FAILED"
+    assert typed_blocker in record["runtime"]["diagnostics"][0]["message"]
+    assert any(typed_blocker in entry["text"] for entry in record["runtime"]["journal"])
+
+    restarted = PortfolioPanelService(
+        tmp_path,
+        path,
+        registry=PanelJobRegistry(tmp_path / ".panel-jobs.json"),
+    )
+    recovered = restarted.job(result["job_id"])
+    assert recovered["status"] == "FAILED"
+    assert typed_blocker in recovered["diagnostics"][0]["message"]
+    assert any(typed_blocker in entry["text"] for entry in recovered["journal"])
 
 
 def test_job_messages_redact_paths_and_secret_terms(tmp_path: Path) -> None:
@@ -1623,7 +1846,7 @@ def test_known_stage_progress_reports_local_denominator(tmp_path: Path) -> None:
         return []
 
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists, variant_generator=generator)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     assert entered.wait(timeout=3)
     try:
         job = service.job(result["job_id"])
@@ -1804,120 +2027,31 @@ def test_workbook_exposes_adapter_capacity_spread_and_warning_diagnostics(tmp_pa
         assert row[headers["7d Position Cap USDT"]].value == "600"
         assert row[headers["5d Analytic Cap USDT"]].value == "500"
         assert row[headers["Spread Status"]].value == "CLEAR"
-        summary = {row[0].value: row[1].value for row in workbook["Summary"].iter_rows(min_row=2)}
+        summary_cells = {row[0].value: row[1] for row in workbook["Summary"].iter_rows(min_row=2)}
+        summary = {key: cell.value for key, cell in summary_cells.items()}
         assert "LIQUIDITY_CAPACITY_PRELIMINARY" in summary["optimizer_warnings"]
     finally:
         workbook.close()
 
 
-def test_weighted_workbook_projects_model_summary_and_member_facts(tmp_path: Path) -> None:
-    service = PortfolioPanelService(tmp_path)
-    campaign = {
-        "campaign_id": "campaign-weighted",
-        "input_digest": "i",
-        "config_digest": "c",
-        "versions": {"policy_version": "p"},
-        "created_at_utc": "2000-01-01T00:00:00Z",
-        "launch": {"profiles": [{"profile_id": "BALANCED", "equity_usdt": "2000", "max_candidates": 1}]},
-    }
-    member = {
-        "strategy_id": 7, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG",
-        "user_rank": 1, "x_usdt": Decimal("100"), "capacity_usdt": Decimal("500"),
-        "priority": 3, "source_scale": Decimal("0.25"), "hold90": Decimal("12"),
-        "warnings": ("HOLD_UNKNOWN",), "quantity": Decimal("99"),
-    }
-    variant = {
-        "candidate_id": "candidate-weighted", "profile": "BALANCED", "search_mode": "WEIGHTED_V1",
-        "members": (member,),
-        "strategy_payloads": ({
-            "facts": {"B": "2000", "C": "500", "q": "0.05", "x": "100"},
-            "strategy": {"basic": {"symbol": "BTCUSDT", "max_balance": 10000}},
-        },),
-        "metrics": {
-            "required_bank_usdt": Decimal("1200"), "B_margin_usdt": Decimal("1100"),
-            "p30_common_usdt_30d": Decimal("90"), "p30_limiter_model_usdt_30d": Decimal("80"),
-            "max_drawdown_pct": Decimal("10"), "cdar_peak80_usdt": Decimal("30"),
-            "cdar_peak90_usdt": Decimal("40"), "I_all_usdt": Decimal("100"),
-            "I_held_usdt": Decimal("100"), "M_all_usdt": Decimal("200"),
-            "limiter_L": 2, "limiter_p30_status": "MODEL", "limiter_release_status": "UNKNOWN",
-            "reserve_before_limiter_pct": Decimal("20"), "reserve_after_limiter_pct": Decimal("10"),
-            "budget_limited": True, "bottleneck": "MM",
+def test_weighted_summary_labels_missing_bank_ceiling_as_uncapped() -> None:
+    summary = PortfolioPanelService._summary(
+        {
+            "campaign_id": "campaign-fixed",
+            "launch": {"profiles": [{"profile_id": "BALANCED", "bank_available_usdt": None, "max_candidates": 1}]},
         },
-    }
-    path = tmp_path / "weighted.xlsx"
-    service._write_workbook(path, campaign, (), (), (variant,), ())
-
-    workbook = load_workbook(path, data_only=False)
-    try:
-        summary = {row[0].value: row[1].value for row in workbook["Summary"].iter_rows(min_row=2)}
-        assert summary["Weighted candidate ID"] == "candidate-weighted"
-        assert summary["B required USDT"] == "1200"
-        assert summary["B available USDT"] == "2000"
-        assert summary["B saturation USDT"] == 10000
-        assert summary["P30 common USDT/30d"] == "90"
-        assert summary["MaxDD %"] == "10"
-        assert summary["CDaR peak80 USDT"] == "30"
-        assert summary["MM all USDT"] == "200"
-        assert summary["P30 limiter USDT/30d"] == "80"
-        assert summary["Limiter P30 status"] == "MODEL"
-        assert summary["Joint status"] == "NOT_TESTED"
-        assert summary["Reserve before limiter"] == "20"
-        assert summary["Reserve after limiter"] == "10"
-        assert summary["Reserve UNKNOWN reason"] == "UNKNOWN"
-        assert summary["Bottleneck"] == "MM"
-        assert summary["Budget status"] == "True"
-
-        headers = {cell.value: index for index, cell in enumerate(workbook["Members"][1])}
-        row = workbook["Members"][2]
-        assert row[headers["Finalist"]].value == "7/11"
-        assert row[headers["Side"]].value == "LONG"
-        assert row[headers["x USDT"]].value == "100"
-        assert row[headers["C USDT"]].value == "500"
-        assert row[headers["q"]].value == "0.05"
-        assert row[headers["Priority"]].value == 3
-        assert row[headers["max_balance"]].value == 10000
-        assert row[headers["Source Scale"]].value == "0.25"
-        assert row[headers["Hold90"]].value == "12"
-        assert row[headers["Warnings"]].value == '["HOLD_UNKNOWN"]'
-        assert row[headers["Quantity"]].value == "UNKNOWN"
-    finally:
-        workbook.close()
-
-
-def test_weighted_workbook_joins_payloads_by_symbol_without_shifting_rows(tmp_path: Path) -> None:
-    service = PortfolioPanelService(tmp_path)
-    campaign = {"campaign_id": "campaign-weighted", "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z"}
-    members = (
-        {"strategy_id": 1, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG", "x_usdt": Decimal("100"), "capacity_usdt": Decimal("500")},
-        {"strategy_id": 2, "result_id": 22, "symbol": "ZEROUSDT", "side": "LONG", "x_usdt": Decimal("0"), "capacity_usdt": Decimal("300")},
-        {"strategy_id": 3, "result_id": 33, "symbol": "ETHUSDT", "side": "LONG", "x_usdt": Decimal("200"), "capacity_usdt": Decimal("600")},
-        {"strategy_id": 4, "result_id": 44, "symbol": "SOLUSDT", "side": "SHORT", "x_usdt": Decimal("300"), "capacity_usdt": Decimal("700")},
+        (), (),
+        ({
+            "candidate_id": "candidate-weighted",
+            "profile": "BALANCED",
+            "search_mode": "WEIGHTED_V1",
+            "metrics": {"required_bank_usdt": Decimal("1200")},
+        },),
+        (),
     )
-    payloads = (
-        {"facts": {"q": "0.2"}, "strategy": {"basic": {"symbol": "ETHUSDT", "max_balance": 2000}}},
-        {"facts": {"q": "0.1"}, "strategy": {"basic": {"symbol": "BTCUSDT", "max_balance": 1000}}},
-        {"facts": {"q": "0.9"}, "strategy": {"basic": {"symbol": "SOLUSDT", "max_balance": 9000}}},
-        None,
-        {"facts": {"q": "0.8"}, "strategy": {"basic": {"symbol": "EXTRAUSDT", "max_balance": 8000}}},
-    )
-    path = tmp_path / "weighted-join.xlsx"
-    service._write_workbook(path, campaign, (), (), ({"candidate_id": "candidate", "profile": "BALANCED", "search_mode": "WEIGHTED_V1", "members": members, "strategy_payloads": payloads, "metrics": {}},), ())
 
-    workbook = load_workbook(path, data_only=False)
-    try:
-        headers = {cell.value: index for index, cell in enumerate(workbook["Members"][1])}
-        rows = {workbook["Members"].cell(row=index, column=headers["Pair"] + 1).value: workbook["Members"][index] for index in range(2, 6)}
-        assert rows["BTCUSDT"][headers["q"]].value == "0.1"
-        assert rows["BTCUSDT"][headers["max_balance"]].value == 1000
-        assert rows["ETHUSDT"][headers["q"]].value == "0.2"
-        assert rows["ETHUSDT"][headers["max_balance"]].value == 2000
-        for symbol in ("ZEROUSDT", "SOLUSDT"):
-            assert rows[symbol][headers["q"]].value == "UNKNOWN"
-            assert rows[symbol][headers["max_balance"]].value == "UNKNOWN"
-            assert rows[symbol][headers["Quantity"]].value == "UNKNOWN"
-            assert rows[symbol][headers["Notional USDT"]].value == "UNKNOWN"
-    finally:
-        workbook.close()
+    assert summary["B required USDT"] == Decimal("1200")
+    assert summary["B available USDT"] == "UNCAPPED"
 
 
 def test_weighted_payload_pairing_keeps_same_symbol_long_and_short_distinct() -> None:
@@ -1938,209 +2072,6 @@ def test_weighted_payload_pairing_ignores_missing_payload_side_without_crashing(
     payloads = ({"strategy": {"basic": {"symbol": "BTCUSDT"}}},)
 
     assert _weighted_payload_pairs({"members": members, "strategy_payloads": payloads}) == ((members[0], None),)
-
-
-def test_weighted_workbook_marks_invalid_projected_numbers_unknown(tmp_path: Path) -> None:
-    service = PortfolioPanelService(tmp_path)
-    campaign = {"campaign_id": "campaign-weighted", "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z"}
-    members = (
-        {"strategy_id": 1, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG", "x_usdt": Decimal("100")},
-        {"strategy_id": 2, "result_id": 22, "symbol": "ETHUSDT", "side": "LONG", "x_usdt": Decimal("200")},
-    )
-    payloads = (
-        {"facts": {}, "strategy": {"basic": {"symbol": "BTCUSDT", "max_balance": "not-a-number"}}},
-        {"facts": {"q": "0.2"}, "strategy": {"basic": {"symbol": "ETHUSDT", "max_balance": 2000}}},
-    )
-    path = tmp_path / "weighted-invalid-numbers.xlsx"
-    service._write_workbook(path, campaign, (), (), ({"candidate_id": "candidate", "profile": "BALANCED", "search_mode": "WEIGHTED_V1", "members": members, "strategy_payloads": payloads, "metrics": {}},), ())
-    workbook = load_workbook(path, data_only=False)
-    try:
-        headers = {cell.value: index for index, cell in enumerate(workbook["Members"][1])}
-        rows = {workbook["Members"].cell(row=index, column=headers["Pair"] + 1).value: workbook["Members"][index] for index in range(2, 4)}
-        assert rows["BTCUSDT"][headers["q"]].value == "UNKNOWN"
-        assert rows["BTCUSDT"][headers["max_balance"]].value == "UNKNOWN"
-        assert rows["ETHUSDT"][headers["q"]].value == "0.2"
-        assert rows["ETHUSDT"][headers["max_balance"]].value == 2000
-        assert rows["ETHUSDT"][headers["Quantity"]].value == "UNKNOWN"
-        assert rows["ETHUSDT"][headers["Notional USDT"]].value == "UNKNOWN"
-    finally:
-        workbook.close()
-
-
-def test_weighted_workbook_coerces_missing_or_scalar_projection_inputs(tmp_path: Path) -> None:
-    service = PortfolioPanelService(tmp_path)
-    campaign = {"campaign_id": "campaign-weighted", "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z"}
-    member = {"strategy_id": 1, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG", "x_usdt": Decimal("100")}
-    missing_payloads = tmp_path / "weighted-none-payloads.xlsx"
-    service._write_workbook(missing_payloads, campaign, (), (), ({"candidate_id": "none", "profile": "BALANCED", "search_mode": "WEIGHTED_V1", "members": (member,), "strategy_payloads": None, "metrics": {}},), ())
-    scalar_members = tmp_path / "weighted-scalar-members.xlsx"
-    service._write_workbook(scalar_members, campaign, (), (), ({"candidate_id": "scalar", "profile": "BALANCED", "search_mode": "WEIGHTED_V1", "members": "scalar", "strategy_payloads": 1, "metrics": {}},), ())
-    workbook = load_workbook(missing_payloads, data_only=False)
-    try:
-        headers = {cell.value: index for index, cell in enumerate(workbook["Members"][1])}
-        row = workbook["Members"][2]
-        assert row[headers["q"]].value == "UNKNOWN"
-        assert row[headers["max_balance"]].value == "UNKNOWN"
-    finally:
-        workbook.close()
-    workbook = load_workbook(scalar_members, data_only=False)
-    try:
-        assert workbook["Members"].max_row == 1
-    finally:
-        workbook.close()
-
-
-@pytest.mark.parametrize(
-    "payloads,unknown_symbol",
-    [
-        (({"facts": {"q": "0.1"}, "strategy": {"basic": {"symbol": "BTCUSDT", "max_balance": 1000}}}, {"facts": {"q": "0.2"}, "strategy": {"basic": {"symbol": "BTCUSDT", "max_balance": 2000}}}, {"facts": {"q": "0.3"}, "strategy": {"basic": {"symbol": "ETHUSDT", "max_balance": 3000}}},), "BTCUSDT"),
-        (({"facts": {"q": "0.1"}, "strategy": {"basic": {"symbol": "BTCUSDT", "max_balance": 1000}}}, None,), "ETHUSDT"),
-        (({"facts": {"q": "0.1"}, "strategy": {"basic": {"symbol": "BTCUSDT", "max_balance": 1000}}}, {} ,), "ETHUSDT"),
-        (({"facts": {"q": "0.1"}, "strategy": {"basic": {"symbol": "BTCUSDT", "max_balance": 1000}}}, {"facts": {"q": "0.2"}, "strategy": {"basic": {"symbol": "", "max_balance": 2000}}},), "ETHUSDT"),
-    ],
-)
-def test_weighted_workbook_marks_ambiguous_payload_join_unknown(tmp_path: Path, payloads: tuple[Any, ...], unknown_symbol: str) -> None:
-    service = PortfolioPanelService(tmp_path)
-    campaign = {"campaign_id": "campaign-weighted", "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z"}
-    members = (
-        {"strategy_id": 1, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG", "x_usdt": Decimal("100"), "capacity_usdt": Decimal("500")},
-        {"strategy_id": 2, "result_id": 22, "symbol": "ETHUSDT", "side": "LONG", "x_usdt": Decimal("200"), "capacity_usdt": Decimal("600")},
-    )
-    path = tmp_path / "weighted-ambiguous.xlsx"
-    service._write_workbook(path, campaign, (), (), ({"candidate_id": "candidate", "profile": "BALANCED", "search_mode": "WEIGHTED_V1", "members": members, "strategy_payloads": payloads, "metrics": {}},), ())
-    workbook = load_workbook(path, data_only=False)
-    try:
-        headers = {cell.value: index for index, cell in enumerate(workbook["Members"][1])}
-        rows = {workbook["Members"].cell(row=index, column=headers["Pair"] + 1).value: workbook["Members"][index] for index in range(2, 4)}
-        assert rows[unknown_symbol][headers["q"]].value == "UNKNOWN"
-        assert rows[unknown_symbol][headers["max_balance"]].value == "UNKNOWN"
-        known_symbol = "ETHUSDT" if unknown_symbol == "BTCUSDT" else "BTCUSDT"
-        assert rows[known_symbol][headers["q"]].value == ("0.3" if known_symbol == "ETHUSDT" else "0.1")
-    finally:
-        workbook.close()
-
-
-def test_weighted_summary_selects_first_variant_and_keeps_candidate_label_before_metrics(tmp_path: Path) -> None:
-    service = PortfolioPanelService(tmp_path)
-    campaign = {"campaign_id": "campaign-weighted", "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z"}
-    variants = (
-        {"candidate_id": "candidate-a", "profile": "BALANCED", "search_mode": "WEIGHTED_V1", "metrics": {
-            "required_bank_usdt": Decimal("101"), "B_available_usdt": Decimal("1000"), "B_sat_settings_usdt": Decimal("2000"),
-            "p30_common_usdt_30d": Decimal("30"), "p30_limiter_model_usdt_30d": Decimal("25"), "max_drawdown_pct": Decimal("4"),
-            "cdar_peak80_usdt": Decimal("8"), "cdar_peak90_usdt": Decimal("9"), "reserve_before_limiter_pct": Decimal("20"),
-            "reserve_after_limiter_pct": Decimal("10"), "M_all_usdt": Decimal("12"), "bottleneck": "MM", "limiter_L": 1,
-            "limiter_p30_status": "MODEL", "limiter_release_status": "UNKNOWN", "budget_limited": True,
-        }},
-        {"candidate_id": "candidate-b", "profile": "BALANCED", "search_mode": "WEIGHTED_V1", "metrics": {"required_bank_usdt": Decimal("202")}},
-    )
-    path = tmp_path / "weighted-summary.xlsx"
-    service._write_workbook(path, campaign, (), (), variants, ())
-    workbook = load_workbook(path, data_only=False)
-    try:
-        keys = [row[0].value for row in workbook["Summary"].iter_rows(min_row=2)]
-        summary = {row[0].value: row[1].value for row in workbook["Summary"].iter_rows(min_row=2)}
-        candidate_index = keys.index("Weighted candidate ID")
-        weighted_keys = (
-            "B required USDT", "B available USDT", "B saturation USDT", "P30 common USDT/30d", "P30 limiter USDT/30d",
-            "MaxDD %", "CDaR peak80 USDT", "CDaR peak90 USDT", "Reserve before limiter", "Reserve after limiter",
-            "MM all USDT", "Bottleneck", "Limiter L", "Limiter P30 status", "Limiter release status", "Joint status",
-            "Search status", "Budget status", "Reserve UNKNOWN reason",
-        )
-        assert all(keys.index(key) > candidate_index for key in weighted_keys)
-        assert summary["Weighted candidate ID"] == "candidate-a"
-        assert summary["B required USDT"] == "101"
-        assert summary["B available USDT"] == "1000"
-        assert summary["B saturation USDT"] == "2000"
-        assert summary["P30 common USDT/30d"] == "30"
-        assert summary["P30 limiter USDT/30d"] == "25"
-        assert summary["MaxDD %"] == "4"
-        assert summary["CDaR peak80 USDT"] == "8"
-        assert summary["CDaR peak90 USDT"] == "9"
-        assert summary["Reserve before limiter"] == "20"
-        assert summary["Reserve after limiter"] == "10"
-        assert summary["Reserve UNKNOWN reason"] == "UNKNOWN"
-        assert summary["Bottleneck"] == "MM"
-        assert summary["Limiter P30 status"] == "MODEL"
-        assert summary["Limiter release status"] == "UNKNOWN"
-        assert summary["Budget status"] == "True"
-    finally:
-        workbook.close()
-
-
-def test_weighted_workbook_marks_duplicate_member_symbol_unknown(tmp_path: Path) -> None:
-    service = PortfolioPanelService(tmp_path)
-    campaign = {"campaign_id": "campaign-weighted", "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z"}
-    members = (
-        {"strategy_id": 1, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG", "x_usdt": Decimal("100")},
-        {"strategy_id": 2, "result_id": 22, "symbol": "BTCUSDT", "side": "LONG", "x_usdt": Decimal("200")},
-        {"strategy_id": 3, "result_id": 33, "symbol": "ETHUSDT", "side": "LONG", "x_usdt": Decimal("300")},
-    )
-    payloads = (
-        {"facts": {"q": "0.1"}, "strategy": {"basic": {"symbol": "BTCUSDT", "max_balance": 1000}}},
-        {"facts": {"q": "0.3"}, "strategy": {"basic": {"symbol": "ETHUSDT", "max_balance": 3000}}},
-    )
-    path = tmp_path / "weighted-duplicate-member.xlsx"
-    service._write_workbook(path, campaign, (), (), ({"candidate_id": "candidate", "profile": "BALANCED", "search_mode": "WEIGHTED_V1", "members": members, "strategy_payloads": payloads, "metrics": {}},), ())
-    workbook = load_workbook(path, data_only=False)
-    try:
-        headers = {cell.value: index for index, cell in enumerate(workbook["Members"][1])}
-        rows = {workbook["Members"].cell(row=index, column=headers["Pair"] + 1).value: [workbook["Members"][index], index] for index in range(2, 5)}
-        assert rows["ETHUSDT"][0][headers["q"]].value == "0.3"
-        assert rows["BTCUSDT"][0][headers["q"]].value == "UNKNOWN"
-        assert rows["BTCUSDT"][0][headers["max_balance"]].value == "UNKNOWN"
-    finally:
-        workbook.close()
-
-
-def test_weighted_summary_uses_explicit_reserve_unknown_reason_only(tmp_path: Path) -> None:
-    service = PortfolioPanelService(tmp_path)
-    campaign = {"campaign_id": "campaign-weighted", "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"}, "created_at_utc": "2000-01-01T00:00:00Z"}
-    variant = {
-        "candidate_id": "candidate", "profile": "BALANCED", "search_mode": "WEIGHTED_V1",
-        "metrics": {"reserve_before_limiter_pct": Decimal("10"), "reserve_after_limiter_pct": Decimal("5"), "reserve_unknown_reason": "EXPLICIT_REASON", "limiter_release_status": "UNKNOWN"},
-    }
-    path = tmp_path / "weighted-reserve-reason.xlsx"
-    service._write_workbook(path, campaign, (), (), (variant,), ())
-    workbook = load_workbook(path, data_only=False)
-    try:
-        summary = {row[0].value: row[1].value for row in workbook["Summary"].iter_rows(min_row=2)}
-        assert summary["Reserve before limiter"] == "10"
-        assert summary["Reserve after limiter"] == "5"
-        assert summary["Reserve UNKNOWN reason"] == "EXPLICIT_REASON"
-    finally:
-        workbook.close()
-
-
-def test_weighted_workbook_does_not_fallback_to_legacy_member_size_without_payload(tmp_path: Path) -> None:
-    service = PortfolioPanelService(tmp_path)
-    campaign = {
-        "campaign_id": "campaign-weighted",
-        "input_digest": "i", "config_digest": "c", "versions": {"policy_version": "p"},
-        "created_at_utc": "2000-01-01T00:00:00Z",
-    }
-    member = {
-        "strategy_id": 7, "result_id": 11, "symbol": "BTCUSDT", "side": "LONG",
-        "x_usdt": Decimal("100"), "capacity_usdt": Decimal("500"), "priority": 3,
-        "quantity": Decimal("99"), "maximum_closing_quantity": Decimal("88"),
-        "actual_size_usdt": Decimal("777"), "position_size_usdt": Decimal("666"),
-    }
-    path = tmp_path / "weighted-missing-payload.xlsx"
-    service._write_workbook(
-        path, campaign, (), (), ({"candidate_id": "candidate", "profile": "BALANCED", "search_mode": "WEIGHTED_V1", "members": (member,), "metrics": {}},), (),
-    )
-
-    workbook = load_workbook(path, data_only=False)
-    try:
-        headers = {cell.value: index for index, cell in enumerate(workbook["Members"][1])}
-        row = workbook["Members"][2]
-        assert row[headers["x USDT"]].value == "100"
-        assert row[headers["C USDT"]].value == "500"
-        assert row[headers["q"]].value == "UNKNOWN"
-        assert row[headers["max_balance"]].value == "UNKNOWN"
-        assert row[headers["Quantity"]].value == "UNKNOWN"
-        assert row[headers["Notional USDT"]].value == "UNKNOWN"
-    finally:
-        workbook.close()
 
 
 def test_workbook_uses_final_pretest_metrics_rank_and_composition_member_size(tmp_path: Path) -> None:
@@ -2283,7 +2214,7 @@ def test_verify_workbook_rejects_hyperlinks_without_publishing(tmp_path: Path) -
         return workbook_path
 
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists, variant_generator=_profiled_variants, workbook_builder=linked_builder)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
@@ -2315,10 +2246,7 @@ def test_package_adapter_uses_duckdb_import_workers_only(monkeypatch: pytest.Mon
         return SimpleNamespace(variants=(), blockers=(), excluded=(), warnings=())
 
     monkeypatch.setattr("mrs3.portfolio.adapter.run_portfolio_adapter", fake_adapter)
-    campaign = {"config_document": {"search": {"weighted_search": {
-        "api_concurrency": 99,
-        "csv_download_concurrency": 16,
-    }}}}
+    campaign = {"config_document": {"search": {"weighted_search": {}}}}
     PortfolioPanelService(tmp_path)._package_variant_generator((), campaign, ())
 
     assert observed["workers"] == 3
@@ -2389,7 +2317,7 @@ def test_cancel_during_publication_rolls_back_every_artifact(monkeypatch: pytest
         assert release.wait(timeout=3)
 
     monkeypatch.setattr(service, "_verify_workbook", blocked_verify)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     assert entered.wait(timeout=3)
     service.cancel(result["job_id"])
     release.set()
@@ -2440,7 +2368,7 @@ def test_staging_file_root_is_rejected_before_builder_runs(tmp_path: Path) -> No
         called.append(True)
 
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists, variant_generator=_profiled_variants, workbook_builder=builder)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
@@ -2454,7 +2382,7 @@ def test_workbook_rejects_path_outside_results_root(tmp_path: Path) -> None:
     digest = _write_config(path)
     finalists = [_finalist()]
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists, variant_generator=_profiled_variants)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
@@ -2496,7 +2424,7 @@ def test_threadless_orphan_with_runtime_failure_is_projected_and_releases_submit
     assert registry.get("orphan")["error"]["code"] == "INTERRUPTED"
 
     monkeypatch.setattr(registry, "runtime", original_runtime)
-    retry = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    retry = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     assert retry["status"] == "QUEUED"
 
 
@@ -2510,6 +2438,22 @@ def test_threadless_orphan_without_campaign_is_projected(tmp_path: Path) -> None
     assert service.active_job() is None
     assert registry.get("orphan-no-runtime")["state"] == "FAILED"
     assert registry.get("orphan-no-runtime")["error"]["code"] == "INTERRUPTED"
+
+
+def test_active_or_job_restores_latest_terminal_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    service = PortfolioPanelService(tmp_path)
+    jobs = [
+        {"job_id": "latest", "kind": "portfolio.stage1", "state": "FAILED", "created_at_utc": "2026-09-23T14:00:00+00:00"},
+        {"job_id": "unrelated", "kind": "strategies.tester", "state": "FAILED", "created_at_utc": "2026-09-23T15:00:00+00:00"},
+        {"job_id": "old", "kind": "portfolio.stage1", "state": "COMMITTED", "created_at_utc": "2026-09-22T14:00:00+00:00"},
+        {"job_id": "stale", "kind": "portfolio.stage1", "state": "RUNNING", "created_at_utc": "2026-09-24T14:00:00+00:00"},
+        {"job_id": "undated", "kind": "portfolio.stage1", "state": "FAILED", "created_at_utc": None},
+    ]
+    monkeypatch.setattr(service, "active_job", lambda: None)
+    monkeypatch.setattr(service.registry, "list", lambda: jobs)
+    monkeypatch.setattr(service, "job", lambda job_id: {"job_id": job_id, "status": "FAILED"})
+
+    assert service.active_or_job() == {"job_id": "latest", "status": "FAILED"}
 
 
 def test_stage2_route_is_permanently_blocked(tmp_path: Path) -> None:
@@ -2572,7 +2516,7 @@ def test_failed_finalization_does_not_wedge_future_submission(tmp_path: Path) ->
         finalists_reader=lambda *_: finalists,
         variant_generator=lambda *_: (_ for _ in ()).throw(RuntimeError("generation failed")),
     )
-    payload = {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest}
+    payload = {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest}
     first = service.submit_campaign({**payload})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and first["job_id"] in service._threads:
@@ -2605,7 +2549,7 @@ def test_running_transition_failure_releases_queued_orphan(tmp_path: Path) -> No
     registry.transition = fail_terminal_transition
     registry.sync = fail_terminal_sync
     service = PortfolioPanelService(tmp_path, path, registry=registry, finalists_reader=lambda *_: finalists)
-    payload = {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest}
+    payload = {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest}
     first = service.submit_campaign({**payload})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and first["job_id"] in service._threads:
@@ -2621,7 +2565,7 @@ def test_stage1_success_publishes_exact_workbook_after_commit(tmp_path: Path) ->
     digest = _write_config(path)
     finalists = [_finalist(strategy_name="fixture")]
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: finalists, variant_generator=_profiled_variants)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
@@ -2633,13 +2577,60 @@ def test_stage1_success_publishes_exact_workbook_after_commit(tmp_path: Path) ->
     workbook_path = tmp_path / "stage1.xlsx"
     workbook_path.write_bytes(workbook_bytes)
     workbook = load_workbook(workbook_path, data_only=False)
-    assert workbook.sheetnames == ["Summary", "Finalists", "Portfolios", "Members", "Excluded", "Metadata"]
+    assert workbook.sheetnames == ["Итог", "Варианты", "Состав", "Финалисты", "Исключено", "Metadata"]
     assert workbook["Metadata"].sheet_state == "hidden"
-    assert [cell.value for cell in workbook["Finalists"][2]] == [result["campaign_id"], 7, 11, "BTCUSDT", "LONG", "FINALIST", 1, 1, "SELECTED", "WITHIN_MAXIMUM"]
-    assert workbook["Portfolios"].max_row == 2
-    assert workbook["Portfolios"][2][6].value == 2
-    assert workbook["Portfolios"][2][7].value == 1
-    assert workbook["Portfolios"][2][12].value == "UNKNOWN"
+    assert [cell.value for cell in workbook["Финалисты"][2]] == [result["campaign_id"], 7, 11, "BTCUSDT", "LONG", "FINALIST", 1, 1, "SELECTED", "WITHIN_MAXIMUM"]
+    assert workbook["Варианты"].max_row == 2
+    assert workbook["Варианты"][2][3].value == 2
+    assert workbook["Варианты"][2][5].value is None
+    assert workbook["Состав"].max_row == 3
+
+
+def test_http_results_serializes_fractional_required_bank_as_json(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    payloads = (
+        _executable_payload("BTCUSDT", "LONG"),
+        _executable_payload("ETHUSDT", "SHORT"),
+    )
+    for payload in payloads:
+        payload["facts"]["B"] = "10000.125"
+    candidate = _weighted_executable_candidate(
+        payloads,
+        metrics={"required_bank_usdt": Decimal("10000.125")},
+    )
+    service = PortfolioPanelService(
+        tmp_path,
+        path,
+        finalists_reader=lambda *_: [_finalist()],
+        variant_generator=lambda *_: (candidate,),
+    )
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "20000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    })
+    assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
+
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    controller._portfolio_service = service
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("GET", f"/api/v2/portfolio/campaigns/{result['campaign_id']}/results")
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 200
+        assert payload["summary"]["B required USDT"] == "10000.125"
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_stage1_executables_are_digest_bound_deterministic_and_restart_loadable(tmp_path: Path) -> None:
@@ -2664,7 +2655,7 @@ def test_stage1_executables_are_digest_bound_deterministic_and_restart_loadable(
         )
 
     service = PortfolioPanelService(tmp_path, path, finalists_reader=reader, variant_generator=generator)
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
 
     artifact_path = tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json"
@@ -2716,6 +2707,493 @@ def test_stage1_executables_are_digest_bound_deterministic_and_restart_loadable(
     assert artifact_path.read_bytes() == artifact_bytes
     assert reader_calls == ["read"]
     assert generator_calls == ["generate"]
+
+
+def test_stage1_executable_digest_is_stable_across_decimal_metric_types() -> None:
+    campaign = {
+        "campaign_id": "campaign-" + "a" * 32,
+        "input_digest": "b" * 64,
+        "config_digest": "c" * 64,
+    }
+    payloads = (
+        _executable_payload("BTCUSDT", "LONG"),
+        _executable_payload("ETHUSDT", "SHORT"),
+    )
+    for payload in payloads:
+        payload["facts"]["B"] = "0.1"
+    decimal_artifact = PortfolioPanelService._build_stage1_executables(
+        campaign,
+        (_weighted_executable_candidate(payloads, metrics={"required_bank_usdt": Decimal("0.1")}),),
+    )
+    string_artifact = PortfolioPanelService._build_stage1_executables(
+        campaign,
+        (_weighted_executable_candidate(payloads, metrics={"required_bank_usdt": "0.1"}),),
+    )
+
+    assert decimal_artifact == string_artifact
+    assert decimal_artifact["candidates"][0]["candidate_digest"]
+    assert decimal_artifact["payload_digest"]
+
+
+def test_snapshot_bytes_are_canonical_deterministic_and_roundtrip() -> None:
+    value = {"z": [1, True, None, 1.5], "a": {"text": "Привет"}}
+    first = _snapshot_bytes(value)
+    second = _snapshot_bytes({"a": {"text": "Привет"}, "z": [1, True, None, 1.5]})
+    assert first == second
+    assert json.loads(__import__("gzip").decompress(first[1]).decode("utf-8")) == value
+    assert first[2] == hashlib.sha256(first[0]).hexdigest()
+
+
+@pytest.mark.parametrize("value", ({1: "bad"}, {"bad": float("nan")}, {"bad": object()}))
+def test_snapshot_bytes_reject_unsupported_values_with_typed_error(value) -> None:
+    with pytest.raises(PortfolioPanelError) as error:
+        _snapshot_bytes(value)
+    assert error.value.code == PORTFOLIO_SNAPSHOT_UNSERIALIZABLE
+
+
+def test_snapshot_path_rejects_actual_windows_junction(tmp_path: Path) -> None:
+    target = tmp_path / "junction-target"
+    target.mkdir()
+    root = tmp_path / ".portfolio-results"
+    try:
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(root), str(target)],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        pytest.skip("Windows junction creation unavailable")
+    if created.returncode != 0:
+        pytest.skip("Windows junction creation unavailable")
+    try:
+        with pytest.raises(PortfolioPanelError) as error:
+            PortfolioPanelService(tmp_path)._snapshot_path("campaign-" + "a" * 32)
+        assert error.value.code == "PORTFOLIO_SNAPSHOT_UNAVAILABLE"
+    finally:
+        os.rmdir(root)
+
+
+def test_progress_reporter_keeps_units_in_memory_and_heartbeats_bounded() -> None:
+    now = [0.0]
+    reporter = _PortfolioProgressReporter(lambda: now[0])
+    reporter.start("job")
+    first, first_persist = reporter.emit("job", {"substage": "PROFILE", "unit": "profile", "completed": 0, "total": 3, "detail": "start"})
+    assert first_persist is True
+    now[0] = 3.0
+    steady, steady_persist = reporter.emit("job", {"substage": "PROFILE", "unit": "profile", "completed": 2, "total": 3, "detail": "unit"})
+    assert steady_persist is False
+    assert steady["eta_seconds"] is not None
+    now[0] = 9.0
+    assert reporter.heartbeat("job")[1] is False
+    now[0] = 10.0
+    assert reporter.heartbeat("job")[1] is True
+    now[0] = 19.0
+    assert reporter.heartbeat("job")[1] is False
+    now[0] = 20.0
+    assert reporter.heartbeat("job")[1] is True
+    now[0] = 21.0
+    _, transition_persist = reporter.emit("job", {"substage": "BOOTSTRAP", "unit": "batch", "completed": 0, "total": 2, "detail": "transition"})
+    assert transition_persist is False
+    now[0] = 22.0
+    _, transition_persist = reporter.emit("job", {"substage": "SOLVER", "unit": "call", "completed": 0, "total": 1, "detail": "eligible transition"})
+    assert transition_persist is True
+
+
+def test_progress_reporter_eta_is_unknown_until_reliable_and_after_inconsistency() -> None:
+    now = [0.0]
+    reporter = _PortfolioProgressReporter(lambda: now[0])
+    reporter.start("job")
+    now[0] = 1.0
+    too_soon, _ = reporter.emit("job", {"substage": "EARLY", "completed": 2, "total": 3})
+    assert too_soon["eta_seconds"] is None
+    now[0] = 1.3
+    missing, _ = reporter.emit("job", {"substage": "PROFILE", "completed": 0, "total": None})
+    assert missing["eta_seconds"] is None
+    now[0] = 3.0
+    early, _ = reporter.emit("job", {"substage": "PROFILE", "completed": 1, "total": 3})
+    assert early["eta_seconds"] is None
+    now[0] = 3.3
+    reliable, _ = reporter.emit("job", {"substage": "PROFILE", "completed": 2, "total": 3})
+    assert reliable["eta_seconds"] is not None and reliable["eta_seconds"] >= 0
+    now[0] = 3.6
+    inconsistent, _ = reporter.emit("job", {"substage": "PROFILE", "completed": 2, "total": 4})
+    assert inconsistent["total"] is None
+    assert inconsistent["eta_seconds"] is None
+    assert inconsistent["indeterminate"] is True
+
+
+def test_progress_persistence_is_ignored_after_terminal_or_generation_invalidation(tmp_path: Path) -> None:
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.lock = threading.RLock()
+            self.jobs = {"job": {"job_id": "job", "state": "COMMITTED", "runtime": {}}}
+            self.writes = 0
+
+        def sync(self, *_args, **_kwargs):
+            self.writes += 1
+
+    registry = FakeRegistry()
+    service = PortfolioPanelService(tmp_path, registry=registry)
+    generation = service._activate_progress("job")
+    service._persist_progress("job", generation, {"substage": "PROFILE", "completed": 1})
+    assert registry.writes == 0
+    registry.jobs["job"]["state"] = "RUNNING"
+    generation = service._activate_progress("job")
+    service._deactivate_progress("job")
+    service._persist_progress("job", generation, {"substage": "PROFILE", "completed": 2})
+    assert registry.writes == 0
+
+
+def test_panel_controller_defers_registry_recovery_until_portfolio_startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[object] = []
+    original_registry = panel_module.PanelJobRegistry
+
+    def registry_factory(path, **kwargs):
+        calls.append(("registry", kwargs.get("recover_on_load")))
+        return original_registry(path, **kwargs)
+
+    class FakePortfolioService:
+        def __init__(self, *_args, **kwargs):
+            assert kwargs["registry"] is controller_registry[0]
+
+        def startup_recover(self):
+            calls.append("portfolio_recover")
+
+    controller_registry: list[object] = []
+
+    def registry_factory_with_capture(path, **kwargs):
+        registry = registry_factory(path, **kwargs)
+        controller_registry.append(registry)
+        return registry
+
+    monkeypatch.setattr(panel_module, "PanelJobRegistry", registry_factory_with_capture)
+    monkeypatch.setattr(panel_module, "PortfolioPanelService", FakePortfolioService)
+    monkeypatch.setattr(PanelController, "_reconcile_interrupted_remote_source_jobs", lambda self: None)
+    monkeypatch.setattr(PanelController, "_reconcile_interrupted_tester_jobs", lambda self: None)
+    PanelController(tmp_path, tmp_path / "panel-config.json")
+    assert calls == [("registry", False), "portfolio_recover"]
+
+
+def test_startup_migrates_scaled_legacy_campaigns_before_recovery(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seed_root = tmp_path / "seed"
+    seed_root.mkdir()
+    seed_path = seed_root / "portfolio_optimizer.local.json"
+    seed_digest = _write_config(seed_path)
+
+    class IdleThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("mrs3.panel_portfolio.threading.Thread", IdleThread)
+    seed_service = PortfolioPanelService(seed_root, seed_path, finalists_reader=lambda *_: [_finalist(
+        timeframe="1h", close_ma_len=21, order_count=1, strategy_orders=[{"open_ma_len": 10}],
+    )])
+    seed_result = seed_service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": seed_digest,
+    })
+    base_campaign = seed_service.registry.runtime(seed_result["job_id"])["campaign"]
+
+    path = tmp_path / ".panel-jobs.json"
+    registry = PanelJobRegistry(path, capacity=20, recover_on_load=False)
+
+    def campaign(index: int) -> dict[str, Any]:
+        value = copy.deepcopy(base_campaign)
+        value["campaign_id"] = f"campaign-{index:032x}"
+        return value
+
+    jobs: list[tuple[str, dict[str, Any]]] = []
+    for index in range(14):
+        value = campaign(index)
+        saved = registry.submit(
+            "portfolio.stage1",
+            {"campaign_id": value["campaign_id"], "input_digest": value["input_digest"], "config_digest": value["config_digest"]},
+            f"legacy-{index}", (f"portfolio-{index}",),
+            job_id=f"legacy-{index}",
+        )
+        registry.reserve_runtime(saved["job_id"], "campaign", value)
+        jobs.append((saved["job_id"], value))
+        if index < 4:
+            registry.transition(saved["job_id"], "RUNNING")
+            registry.transition(saved["job_id"], "COMMITTED")
+        elif index < 8:
+            registry.transition(saved["job_id"], "RUNNING")
+            registry.transition(saved["job_id"], "FAILED")
+        elif index < 10:
+            registry.cancel(saved["job_id"])
+
+    service = PortfolioPanelService(tmp_path, registry=registry)
+    service.startup_recover()
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert len(persisted) == 14
+    assert not (path.with_name(".panel-jobs.snapshot-migration.bak")).exists()
+    assert path.stat().st_size < 256 * 1024
+    for job_id, _value in jobs:
+        record = persisted[job_id]
+        runtime = record.get("runtime", {})
+        assert "weighted_input_rows" not in record and "weighted_input_rows" not in runtime
+        assert "finalists" not in record and "finalists" not in runtime
+        if record["state"] == "COMMITTED":
+            assert runtime["campaign_snapshot"]["state"] == "available"
+            descriptor = runtime["campaign_snapshot"]
+            assert service._hydrate_campaign(record, runtime, allow_terminal=True, expected_campaign_id=descriptor["campaign_id"])["campaign_id"] == descriptor["campaign_id"]
+        else:
+            assert "campaign" not in runtime or set(runtime["campaign"]) <= {"campaign_id", "input_digest", "config_digest"}
+
+    restarted = PanelJobRegistry(path, capacity=20, recover_on_load=False)
+    PortfolioPanelService(tmp_path, registry=restarted).startup_recover()
+    assert json.loads(path.read_text(encoding="utf-8")) == persisted
+
+
+def test_startup_migration_fault_restores_journal_and_retries_one_fixed_snapshot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seed_root = tmp_path / "seed"
+    seed_root.mkdir()
+    seed_path = seed_root / "portfolio_optimizer.local.json"
+    seed_digest = _write_config(seed_path)
+
+    class IdleThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("mrs3.panel_portfolio.threading.Thread", IdleThread)
+    seed_service = PortfolioPanelService(seed_root, seed_path, finalists_reader=lambda *_: [_finalist(
+        timeframe="1h", close_ma_len=21, order_count=1, strategy_orders=[{"open_ma_len": 10}],
+    )])
+    seed_result = seed_service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": seed_digest,
+    })
+    campaign = seed_service.registry.runtime(seed_result["job_id"])["campaign"]
+    path = tmp_path / ".panel-jobs.json"
+    registry = PanelJobRegistry(path, recover_on_load=False)
+    saved = registry.submit("portfolio.stage1", {}, "legacy", job_id="legacy")
+    registry.reserve_runtime(saved["job_id"], "campaign", campaign)
+    registry.transition(saved["job_id"], "RUNNING")
+    registry.transition(saved["job_id"], "COMMITTED")
+    original_journal = path.read_bytes()
+    original_jobs = copy.deepcopy(registry.jobs)
+    service = PortfolioPanelService(tmp_path, registry=registry)
+    verify = service._verify_migrated_registry
+    calls = 0
+
+    def fail_once() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected verification fault")
+        verify()
+
+    monkeypatch.setattr(service, "_verify_migrated_registry", fail_once)
+    service.startup_recover()
+
+    snapshot = tmp_path / ".portfolio-results" / campaign["campaign_id"] / "campaign-input.json.gz"
+    backup = path.with_name(".panel-jobs.snapshot-migration.bak")
+    assert calls == 1
+    assert path.read_bytes() == original_journal
+    assert registry.jobs == original_jobs
+    assert backup.exists()
+    assert snapshot.is_file()
+    assert len(list((tmp_path / ".portfolio-results").rglob("campaign-input.json.gz"))) == 1
+
+    restarted = PanelJobRegistry(path, capacity=4, recover_on_load=False)
+    PortfolioPanelService(tmp_path, registry=restarted).startup_recover()
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    descriptor = persisted["legacy"]["runtime"]["campaign_snapshot"]
+    assert descriptor["path"] == snapshot.relative_to(tmp_path).as_posix()
+    assert descriptor["state"] == "available"
+    assert not backup.exists()
+    assert len(list((tmp_path / ".portfolio-results").rglob("campaign-input.json.gz"))) == 1
+
+
+def test_startup_disk_preflight_is_atomic_one_byte_below_required_space(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / ".panel-jobs.json"
+    registry = PanelJobRegistry(path, recover_on_load=False)
+    campaign = {"campaign_id": "campaign-" + "a" * 32, "input_digest": "i", "config_digest": "c"}
+    saved = registry.submit("portfolio.stage1", {}, "legacy", job_id="legacy")
+    registry.reserve_runtime(saved["job_id"], "campaign", campaign)
+    original_journal = path.read_bytes()
+    original_jobs = copy.deepcopy(registry.jobs)
+    original_files = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    _raw, compressed, _digest = _snapshot_bytes(campaign)
+    required = 2 * len(original_journal) + len(compressed) + 64 * 1024 * 1024
+    monkeypatch.setattr("mrs3.panel_portfolio.shutil.disk_usage", lambda _path: type("Usage", (), {"free": required - 1})())
+
+    PortfolioPanelService(tmp_path, registry=registry).startup_recover()
+
+    assert path.read_bytes() == original_journal
+    assert registry.jobs == original_jobs
+    assert {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()} == original_files
+    assert not path.with_name(".panel-jobs.snapshot-migration.bak").exists()
+
+
+def test_unrepairable_active_campaign_preflights_before_recovery(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / ".panel-jobs.json"
+    registry = PanelJobRegistry(path, recover_on_load=False)
+    campaign = {
+        "campaign_id": "campaign-" + "a" * 32,
+        "input_digest": "i",
+        "config_digest": "c",
+        "finalists": [],
+        "weighted_input_rows": [{"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11}],
+    }
+    saved = registry.submit("portfolio.stage1", {}, "legacy", job_id="legacy")
+    registry.reserve_runtime(saved["job_id"], "campaign", campaign)
+    registry.transition(saved["job_id"], "RUNNING")
+    original_journal = path.read_bytes()
+    original_jobs = copy.deepcopy(registry.jobs)
+    original_files = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    required = 2 * len(original_journal) + 64 * 1024 * 1024
+    monkeypatch.setattr("mrs3.panel_portfolio.shutil.disk_usage", lambda _path: type("Usage", (), {"free": required - 1})())
+
+    PortfolioPanelService(tmp_path, registry=registry).startup_recover()
+
+    assert path.read_bytes() == original_journal
+    assert registry.jobs == original_jobs
+    assert {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()} == original_files
+    assert not path.with_name(".panel-jobs.snapshot-migration.bak").exists()
+
+
+def test_startup_recompacts_unrepairable_active_job_after_recovery_without_snapshot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seed_root = tmp_path / "seed"
+    seed_root.mkdir()
+    seed_path = seed_root / "portfolio_optimizer.local.json"
+    seed_digest = _write_config(seed_path)
+
+    class IdleThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("mrs3.panel_portfolio.threading.Thread", IdleThread)
+    seed_service = PortfolioPanelService(seed_root, seed_path, finalists_reader=lambda *_: [_finalist(
+        timeframe="1h", close_ma_len=21, order_count=1, strategy_orders=[{"open_ma_len": 10}],
+    )])
+    seed_result = seed_service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": seed_digest,
+    })
+    base_campaign = seed_service.registry.runtime(seed_result["job_id"])["campaign"]
+    path = tmp_path / ".panel-jobs.json"
+    registry = PanelJobRegistry(path, recover_on_load=False)
+    good = copy.deepcopy(base_campaign)
+    good["campaign_id"] = "campaign-" + "a" * 32
+    bad = {
+        "campaign_id": "campaign-" + "b" * 32,
+        "input_digest": good["input_digest"],
+        "config_digest": good["config_digest"],
+        "finalists": [],
+        "weighted_input_rows": [{"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11}],
+    }
+    good_job = registry.submit("portfolio.stage1", {}, "good", job_id="good")
+    registry.reserve_runtime(good_job["job_id"], "campaign", good)
+    registry.transition(good_job["job_id"], "RUNNING")
+    registry.transition(good_job["job_id"], "COMMITTED")
+    bad_job = registry.submit("portfolio.stage1", {}, "bad", job_id="bad")
+    registry.reserve_runtime(bad_job["job_id"], "campaign", bad)
+    registry.transition(bad_job["job_id"], "RUNNING")
+
+    service = PortfolioPanelService(tmp_path, registry=registry)
+    monkeypatch.setattr("mrs3.panel_portfolio.shutil.disk_usage", lambda _path: type("Usage", (), {"free": 2**40})())
+    service.startup_recover()
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+
+    assert persisted["good"]["state"] == "COMMITTED"
+    assert persisted["good"]["runtime"]["campaign_snapshot"]["state"] == "available"
+    assert persisted["bad"]["state"] == "FAILED"
+    assert persisted["bad"]["runtime"]["campaign"] == {"campaign_id": bad["campaign_id"], "input_digest": bad["input_digest"], "config_digest": bad["config_digest"]}
+    assert "campaign_snapshot" not in persisted["bad"]["runtime"]
+    assert "finalists" not in persisted["bad"]["runtime"]
+    assert "weighted_input_rows" not in persisted["bad"]["runtime"]
+
+    restarted = PanelJobRegistry(path, capacity=4, recover_on_load=False)
+    PortfolioPanelService(tmp_path, registry=restarted).startup_recover()
+    assert json.loads(path.read_text(encoding="utf-8")) == persisted
+
+
+def test_terminal_snapshot_cleanup_removes_only_empty_campaign_directory(tmp_path: Path) -> None:
+    path = tmp_path / ".panel-jobs.json"
+    registry = PanelJobRegistry(path)
+    saved = registry.submit("portfolio.stage1", {}, "terminal", job_id="terminal")
+    registry.transition(saved["job_id"], "RUNNING")
+    registry.transition(saved["job_id"], "FAILED")
+    campaign_id = "campaign-" + "c" * 32
+    snapshot = tmp_path / ".portfolio-results" / campaign_id / "campaign-input.json.gz"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_bytes(b"snapshot")
+    registry.reserve_runtime(saved["job_id"], "campaign_snapshot", {
+        "schema": "portfolio-campaign-input-v1", "campaign_id": campaign_id,
+        "path": snapshot.relative_to(tmp_path).as_posix(), "state": "available",
+    })
+
+    service = PortfolioPanelService(tmp_path, registry=registry)
+    service._cleanup_terminal_snapshot(saved["job_id"])
+
+    assert not snapshot.exists()
+    assert not snapshot.parent.exists()
+
+
+def test_terminal_snapshot_cleanup_preserves_nonempty_campaign_directory(tmp_path: Path) -> None:
+    path = tmp_path / ".panel-jobs.json"
+    registry = PanelJobRegistry(path)
+    saved = registry.submit("portfolio.stage1", {}, "terminal", job_id="terminal")
+    registry.transition(saved["job_id"], "RUNNING")
+    registry.transition(saved["job_id"], "FAILED")
+    campaign_id = "campaign-" + "d" * 32
+    snapshot = tmp_path / ".portfolio-results" / campaign_id / "campaign-input.json.gz"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_bytes(b"snapshot")
+    (snapshot.parent / "stage1.xlsx").write_bytes(b"workbook")
+    registry.reserve_runtime(saved["job_id"], "campaign_snapshot", {
+        "schema": "portfolio-campaign-input-v1", "campaign_id": campaign_id,
+        "path": snapshot.relative_to(tmp_path).as_posix(), "state": "available",
+    })
+
+    PortfolioPanelService(tmp_path, registry=registry)._cleanup_terminal_snapshot(saved["job_id"])
+
+    assert not snapshot.exists()
+    assert snapshot.parent.exists()
+
+
+def test_legacy_geometry_repair_joins_exact_identity_without_mutating_source() -> None:
+    finalist = {
+        "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11,
+        "timeframe": "3h", "close_ma_len": 55, "order_count": 1,
+        "strategy_orders": ({"open_ma_len": 34, "shift_bp": 50, "lot_x": "1"},),
+    }
+    campaign = {"finalists": [finalist], "weighted_input_rows": [{"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11}]}
+    repaired = _repair_legacy_geometry(campaign, strict=True)
+    assert repaired["weighted_input_rows"][0]["strategy_orders"] == finalist["strategy_orders"]
+    assert "strategy_orders" not in campaign["weighted_input_rows"][0]
+
+
+@pytest.mark.parametrize(
+    "finalists",
+    (
+        (),
+        ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11, "timeframe": "3h"},
+         {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11, "timeframe": "3h"}),
+    ),
+)
+def test_legacy_geometry_repair_rejects_zero_or_multiple_finalists(finalists) -> None:
+    campaign = {
+        "finalists": finalists,
+        "weighted_input_rows": [{"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11}],
+    }
+    with pytest.raises(PortfolioPanelError) as error:
+        _repair_legacy_geometry(campaign, strict=True)
+    assert error.value.code == "PORTFOLIO_INPUT_GEOMETRY_INVALID"
 
 
 def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_payloads(tmp_path: Path) -> None:
@@ -2780,7 +3258,7 @@ def test_stage2_baseline_preparation_uses_candidate_after_filtered_order_zero(tm
     service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: [_finalist()], variant_generator=lambda *_: (invalid, candidate))
     result = service.submit_campaign({
         "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-        "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
         "expected_config_digest": digest,
     })
     assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
@@ -2815,11 +3293,64 @@ def test_stage2_baseline_preparation_rejects_bank_mismatch(tmp_path: Path) -> No
         _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11", bank="9999"),
         _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
     )
-    service, result = _stage2_service(tmp_path, _weighted_executable_candidate(payloads, candidate_id="e" * 64, identity="e" * 64))
+    candidate = _weighted_executable_candidate(payloads, candidate_id="e" * 64, identity="e" * 64)
+    with pytest.raises(ValueError, match="sizing evidence"):
+        _stage2_material(candidate)
+
+
+def test_stage1_rejects_candidate_bank_mismatch() -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11", bank="9999"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    candidate = _weighted_executable_candidate(payloads, candidate_id="e" * 64, identity="e" * 64)
+    campaign = {"campaign_id": "campaign-" + "a" * 32, "input_digest": "b" * 64, "config_digest": "c" * 64}
+
+    with pytest.raises(PortfolioPanelError) as error:
+        PortfolioPanelService._build_stage1_executables(campaign, (candidate,))
+
+    assert error.value.code == "PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE"
+
+
+def test_stage2_maps_tampered_bank_mismatch_to_typed_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+    )
+    service, result = _stage2_service(
+        tmp_path,
+        _weighted_executable_candidate(payloads, candidate_id="e" * 64, identity="e" * 64),
+    )
+    runtime = service.registry.runtime(result["job_id"])
+    artifact = service._load_stage1_executables(
+        result["campaign_id"], runtime["campaign"]["input_digest"], runtime["campaign"]["config_digest"], runtime["executables_digest"]
+    )
+    artifact["candidates"][0]["metrics"]["required_bank_usdt"] = "9999"
+    monkeypatch.setattr(service, "_load_stage1_executables", lambda *_args, **_kwargs: artifact)
+
     with pytest.raises(PortfolioPanelError) as error:
         service._prepare_stage2_baseline(result["campaign_id"])
-    assert error.value.code == "PORTFOLIO_STAGE2_INPUT_INVALID"
-    assert error.value.status == 409
+
+    assert (error.value.code, error.value.status) == ("PORTFOLIO_STAGE2_INPUT_INVALID", 409)
+
+
+@pytest.mark.parametrize("bank", ("1800", "0.1", "1234.567890123456", "0.000000000001"))
+def test_stage2_initial_balance_uses_exact_required_bank(bank: str) -> None:
+    payloads = (
+        _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11", bank=bank),
+        _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12", bank=bank),
+    )
+    candidate = _weighted_executable_candidate(
+        payloads,
+        candidate_id="f" * 64,
+        identity="f" * 64,
+        metrics={"required_bank_usdt": Decimal(bank)},
+    )
+
+    material = _stage2_material(candidate)
+
+    assert Decimal(str(json.loads(material["tester_config_json"])["InitialBalance"])) == Decimal(bank)
+    assert material["required_bank_usdt"] == bank
 
 
 @pytest.mark.parametrize("missing", ("C", "max_balance"))
@@ -3374,7 +3905,7 @@ def test_stage1_executable_loader_fails_closed_for_tampered_or_missing_artifact(
             _executable_payload("ETHUSDT", "SHORT"),
         )),),
     )
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
     artifact_path = tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json"
     artifact_digest = service.registry.runtime(result["job_id"])["executables_digest"]
@@ -3389,6 +3920,307 @@ def test_stage1_executable_loader_fails_closed_for_tampered_or_missing_artifact(
     with pytest.raises(PortfolioPanelError) as missing:
         restarted._load_stage1_executables(result["campaign_id"], result["input_digest"], result["config_digest"], artifact_digest)
     assert missing.value.code == "PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE"
+
+
+def test_weighted_summary_enriches_identity_only_members_from_payload_facts() -> None:
+    campaign = {
+        "campaign_id": "campaign-weighted",
+        "launch": {"profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "5000", "max_candidates": 1}]},
+    }
+    variant = {
+        "candidate_id": "candidate-weighted",
+        "profile": "BALANCED",
+        "search_mode": CAMPAIGN_SEARCH_MODE,
+        "members": ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11},),
+        "strategy_payloads": ({
+            "side": "LONG",
+            "facts": {"B": "200", "C": "500", "q": "0.25", "x": "100"},
+            "strategy": {"basic": {"symbol": "BTCUSDT", "leverage": "3"}},
+        },),
+        "metrics": {
+            "required_bank_usdt": Decimal("200"),
+            "B_sat_settings_usdt": Decimal("400"),
+            "historical_bank_usdt": Decimal("150"),
+            "B_risk_usdt": Decimal("180"),
+            "B_margin_usdt": Decimal("120"),
+            "I_all_usdt": Decimal("40"),
+            "M_all_usdt": Decimal("20"),
+            "cdar_peak80_usdt": Decimal("10"),
+            "cdar_peak90_usdt": Decimal("14"),
+        },
+    }
+
+    summary = PortfolioPanelService._summary(campaign, (), (), (variant,), ())
+
+    assert summary["Historical bank USDT"] == Decimal("150")
+    assert summary["Stress bank P95 USDT"] == Decimal("180")
+    assert summary["IM all USDT"] == Decimal("40")
+    assert summary["CDaR peak80 %"] == Decimal("2.5")
+    assert summary["CDaR peak90 %"] == Decimal("3.5")
+    assert summary["Weighted members"] == [{
+        "pair": "BTCUSDT",
+        "direction": "LONG",
+        "strategy_id": 7,
+        "result_id": 11,
+        "position_usdt": Decimal("100"),
+        "bank_share_pct": Decimal("25.00"),
+        "balance_percentage": Decimal("25.00"),
+        "pair_multiplier_pct": Decimal("25.00"),
+        "max_balance": None,
+        "entry_order_percentages": "UNKNOWN",
+            "timeframe": None,
+            "user_rank": None,
+            "source_pnl": None,
+            "source_max_drawdown_usdt": None,
+            "source_max_drawdown_pct": None,
+            "order_count": None,
+            "liquidity_utilization_pct": Decimal("20.0"),
+            "scaled_max_drawdown_usdt": None,
+            "leverage": "3",
+            "capacity_usdt": "500",
+    }]
+
+    without_saturation = {
+        **variant,
+        "metrics": {key: value for key, value in variant["metrics"].items() if key != "B_sat_settings_usdt"},
+    }
+    unavailable = PortfolioPanelService._summary(campaign, (), (), (without_saturation,), ())
+    assert unavailable["CDaR peak80 %"] == "UNKNOWN"
+    assert unavailable["CDaR peak90 %"] == "UNKNOWN"
+
+    uncapped = PortfolioPanelService._summary(
+        {**campaign, "launch": {"profiles": [{"profile_id": "BALANCED", "bank_available_usdt": None, "max_candidates": 1}]}},
+        (), (), (variant,), (),
+    )
+    assert uncapped["Target bank USDT"] == "UNCAPPED"
+    assert uncapped["CDaR peak80 target %"] == "—"
+
+    zero_target = PortfolioPanelService._summary(
+        campaign, (), (), ({**variant, "metrics": {**variant["metrics"], "B_available_usdt": "0"}},), (),
+    )
+    assert zero_target["CDaR peak80 target %"] == "UNKNOWN"
+
+
+def test_weighted_summary_adds_source_maxdd_and_payload_composition_facts() -> None:
+    campaign = {
+        "campaign_id": "campaign-weighted",
+        "config_document": {"profiles": {"BALANCED": {"max_actual_equity_dd_pct": "10"}}},
+        "launch": {"profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "500", "max_candidates": 1}]},
+        "finalists": ({
+            "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11,
+            "timeframe": "3h", "user_rank": 2, "order_count": 2,
+            "strategy_orders": ({"lot_x": "0.5"}, {"lot_x": "0.5"}),
+            "total_pnl": "123.4", "max_drawdown": "40", "max_drawdown_pct": "4.5", "source_initial_balance": "1000",
+        },),
+    }
+    payload = {
+        "side": "LONG",
+        "facts": {"B": "400", "C": "500", "q": "0.25", "x": "100"},
+        "strategy": {
+            "basic": {"symbol": "BTCUSDT", "leverage": "3", "balance_percentage_long": "25", "max_balance": "500"},
+            "mrs3": {"ma_long": [{"lot_x": "0.5"}, {"lot_x": "0.5"}]},
+        },
+    }
+    variant = {
+        "candidate_id": "candidate-weighted", "profile": "BALANCED", "search_mode": CAMPAIGN_SEARCH_MODE,
+        "members": ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11},),
+        "strategy_payloads": (payload,),
+        "metrics": {"B_sat_settings_usdt": Decimal("400"), "cdar_peak80_usdt": Decimal("130.32"), "I_all_usdt": Decimal("40"), "M_all_usdt": Decimal("20")},
+    }
+
+    summary = PortfolioPanelService._summary(campaign, (), (), (variant,), ())
+
+    assert summary["Profile DD limit %"] == "10"
+    assert summary["Weighted members"][0]["position_usdt"] == Decimal("100")
+    assert summary["MaxDD SUM USDT"] == Decimal("4")
+    member = summary["Weighted members"][0]
+    assert member["balance_percentage"] == "25"
+    assert member["max_balance"] == "500"
+    assert member["entry_order_percentages"] == (Decimal("50"), Decimal("50"))
+    assert member["timeframe"] == "3h"
+    assert member["user_rank"] == 2
+    assert member["source_pnl"] == "123.4"
+    assert member["source_max_drawdown_usdt"] == "40"
+    assert member["source_max_drawdown_pct"] == "4.5"
+    assert member["order_count"] == 2
+    assert member["liquidity_utilization_pct"] == Decimal("20")
+    assert member["scaled_max_drawdown_usdt"] == Decimal("4")
+    assert summary["CDaR peak80 target %"] == Decimal("26.064")
+    assert summary["CDaR peak80 saturation %"] == Decimal("32.58")
+    assert summary["IM target %"] == Decimal("8")
+    assert summary["MM saturation %"] == Decimal("5")
+    assert _weighted_entry_order_percentages(payload, "UNKNOWN") == "UNKNOWN"
+    for invalid_x in ("not-a-number", "0", "-1", "NaN"):
+        assert _weighted_source_maxdd_sum(campaign, ({
+            "pair": "BTCUSDT", "direction": "LONG", "strategy_id": 7, "result_id": 11,
+            "position_usdt": invalid_x,
+        },)) == "UNKNOWN"
+
+
+def test_weighted_results_enriches_existing_committed_campaign_from_artifact(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    payload = _executable_payload("BTCUSDT", "LONG")
+    payload["facts"].update({"B": "200", "C": "500", "q": "0.25", "x": "100"})
+    payload["strategy"]["basic"].update({"leverage": "3"})
+    second_payload = _executable_payload("ETHUSDT", "SHORT")
+    second_payload["facts"]["B"] = "200"
+    candidate = _weighted_executable_candidate(
+        (payload, second_payload),
+        metrics={
+            "required_bank_usdt": Decimal("200"),
+            "historical_bank_usdt": Decimal("150"),
+            "B_risk_usdt": Decimal("180"),
+            "B_margin_usdt": Decimal("120"),
+            "I_all_usdt": Decimal("40"),
+            "M_all_usdt": Decimal("20"),
+            "cdar_peak80_usdt": Decimal("10"),
+            "cdar_peak90_usdt": Decimal("14"),
+        },
+    )
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: [_finalist()], variant_generator=lambda *_: (candidate,))
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "5000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    })
+    assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
+
+    runtime = service.registry.runtime(result["job_id"])
+    legacy_summary = dict(runtime["summary"])
+    for key in (
+        "weighted_result_schema",
+        "Historical bank USDT", "Stress bank P95 USDT", "Margin-only bank USDT",
+        "IM all USDT", "CDaR peak80 %", "CDaR peak90 %", "Total full notional USDT", "Weighted members",
+    ):
+        legacy_summary.pop(key, None)
+    runtime["summary"] = legacy_summary
+    service.registry.sync(result["job_id"], {"state": service.registry.get(result["job_id"])["state"]}, runtime=runtime)
+    artifact_path = tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json"
+    artifact_before = artifact_path.read_bytes()
+
+    restarted = PortfolioPanelService(tmp_path, path)
+    enriched = restarted.results(result["campaign_id"])
+
+    assert enriched["summary"]["Historical bank USDT"] == "150"
+    assert enriched["summary"]["weighted_result_schema"] == 1
+    assert enriched["summary"]["Stress bank P95 USDT"] == "180"
+    assert enriched["summary"]["Weighted members"][0]["position_usdt"] == "100"
+    assert enriched["summary"]["Weighted members"][0]["bank_share_pct"] == "25.00"
+    assert restarted.registry.runtime(result["job_id"])["summary"] == legacy_summary
+    assert artifact_path.read_bytes() == artifact_before
+
+    tampered_runtime = restarted.registry.runtime(result["job_id"])
+    original_digest = tampered_runtime["executables_digest"]
+    tampered_runtime["executables_digest"] = "0" * 64
+    restarted.registry.sync(result["job_id"], {"state": restarted.registry.get(result["job_id"])["state"]}, runtime=tampered_runtime)
+    assert "Weighted members" not in PortfolioPanelService(tmp_path, path).results(result["campaign_id"])["summary"]
+
+    tampered_runtime["executables_digest"] = original_digest
+    tampered_runtime["executables_path"] = str(tmp_path / "outside" / "stage1-executables.json")
+    restarted.registry.sync(result["job_id"], {"state": restarted.registry.get(result["job_id"])["state"]}, runtime=tampered_runtime)
+    assert "Weighted members" not in PortfolioPanelService(tmp_path, path).results(result["campaign_id"])["summary"]
+    assert artifact_path.read_bytes() == artifact_before
+
+
+def test_weighted_workbook_uses_operator_sheets_and_rounds_derived_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = PortfolioPanelService(tmp_path)
+    campaign = {
+        "campaign_id": "campaign-weighted",
+        "input_digest": "i",
+        "config_digest": "c",
+        "versions": {"policy_version": "p"},
+        "created_at_utc": "2000-01-01T00:00:00Z",
+        "config_document": {"profiles": {"BALANCED": {"max_actual_equity_dd_pct": "10"}}},
+        "launch": {"profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "5000", "max_candidates": 1}]},
+        "finalists": ({
+            "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11,
+            "timeframe": "3h", "user_rank": 2, "order_count": 4,
+            "strategy_orders": ({"lot_x": "0.1"}, {"lot_x": "0.2"}, {"lot_x": "0.3"}, {"lot_x": "0.4"}),
+            "total_pnl": "123.4", "max_drawdown": "40", "max_drawdown_pct": "4.5", "source_initial_balance": "1000",
+        },),
+    }
+    variant = {
+        "candidate_id": "candidate-weighted",
+        "profile": "BALANCED",
+        "search_mode": CAMPAIGN_SEARCH_MODE,
+        "final_pretest_rank": 1,
+        "members": ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11},),
+        "strategy_payloads": ({
+            "side": "LONG",
+            "facts": {"B": "200", "C": "500", "q": "0.25", "x": "100.126"},
+            "strategy": {"basic": {"symbol": "BTCUSDT", "leverage": "3", "balance_percentage_long": "25", "max_balance": "500"}, "mrs3": {"ma_long": [{"lot_x": "0.1"}, {"lot_x": "0.2"}, {"lot_x": "0.3"}, {"lot_x": "0.4"}]}},
+        },),
+        "metrics": {
+            "required_bank_usdt": Decimal("200.126"),
+            "B_sat_settings_usdt": Decimal("200.126"),
+            "historical_bank_usdt": Decimal("150.125"),
+            "B_risk_usdt": Decimal("180.124"),
+            "B_margin_usdt": Decimal("120.123"),
+            "p30_common_usdt_30d": Decimal("90.126"),
+            "max_drawdown_pct": Decimal("10.125"),
+            "I_all_usdt": Decimal("40.125"),
+            "M_all_usdt": Decimal("20.125"),
+            "cdar_peak80_usdt": Decimal("10.125"),
+            "cdar_peak90_usdt": Decimal("14.125"),
+        },
+    }
+    path = tmp_path / "weighted.xlsx"
+    monkeypatch.setattr(duckdb, "connect", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("weighted export must not read PerformanceDB")))
+    service._write_workbook(path, campaign, (), (), (variant,), ())
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        assert workbook.sheetnames == ["Итог", "Варианты", "Состав", "Финалисты", "Исключено", "Metadata"]
+        assert workbook["Metadata"].sheet_state == "hidden"
+        summary = {row[0].value: row[1].value for row in workbook["Итог"].iter_rows(min_row=2)}
+        assert summary["Минимальный банк для DD ≤ 10.00% на истории"] == "150.13"
+        assert summary["Банк для DD ≤ 10.00% в 95% стресс-сценариев"] == "180.12"
+        assert summary["CDaR худшие 20%, USDT · target/saturation"] == "10.13 USDT · 0.20% / 5.06%"
+        variant_headers = {str(cell.value).replace("\n", " "): index for index, cell in enumerate(workbook["Варианты"][1])}
+        variant_row = workbook["Варианты"][2]
+        assert variant_row[variant_headers["Банк насыщ., USDT"]].value == "200.13"
+        assert variant_row[variant_headers["Банк лимитов, USDT"]].value == "120.12"
+        assert variant_row[variant_headers["IM USDT · ц/н"]].value == "40.13 USDT · 0.80% / 20.05%"
+        assert variant_row[variant_headers["MM USDT · ц/н"]].value == "20.13 USDT · 0.40% / 10.06%"
+        assert workbook["Варианты"].row_dimensions[1].height >= 30
+        assert all(cell.alignment.wrap_text for cell in workbook["Варианты"][1])
+        assert max(cell.width for cell in workbook["Варианты"].column_dimensions.values() if cell.width) <= 30
+        composition_headers = {str(cell.value).replace("\n", " "): index for index, cell in enumerate(workbook["Состав"][1])}
+        member_row = workbook["Состав"][2]
+        assert member_row[composition_headers["Позиция, USDT"]].value == "100.13"
+        assert member_row[composition_headers["Множитель пары, %"]].value == "25.00"
+        assert member_row[composition_headers["Max balance, USDT"]].value == "500.00"
+        assert member_row[composition_headers["TF"]].value == "3h"
+        assert member_row[composition_headers["User Rank"]].value == "2"
+        assert member_row[composition_headers["Source PnL, USDT"]].value == "123.40"
+        assert member_row[composition_headers["Source MaxDD, USDT"]].value == "40.00"
+        assert member_row[composition_headers["Source MaxDD, %"]].value == "4.50%"
+        assert member_row[composition_headers["ORD_N"]].value == "4"
+        assert member_row[composition_headers["X, %"]].value == "10.00%"
+        assert member_row[composition_headers["Y, %"]].value == "20.00%"
+        assert member_row[composition_headers["Z, %"]].value == "30.00%"
+        assert member_row[composition_headers["W, %"]].value == "40.00%"
+        assert member_row[composition_headers["Исп. ликв. x/C, %"]].value == "20.03%"
+        assert member_row[composition_headers["Инд. MaxDD, USDT"]].value == "4.01"
+        for sheet_name in ("Итог", "Варианты", "Состав", "Финалисты", "Исключено"):
+            assert workbook[sheet_name].row_dimensions[1].height >= 48
+            assert all(cell.alignment.wrap_text for cell in workbook[sheet_name][1])
+            assert all(str(cell.value).count("\n") <= 2 for cell in workbook[sheet_name][1])
+        assert all(cell.value != "UNKNOWN" for row in workbook["Состав"].iter_rows(min_row=2) for cell in row)
+    finally:
+        workbook.close()
+
+    unknown_path = tmp_path / "weighted-unknown.xlsx"
+    service._write_workbook(unknown_path, {**campaign, "finalists": ()}, (), (), (variant,), ())
+    unknown_workbook = load_workbook(unknown_path, data_only=False)
+    try:
+        unknown_summary = {row[0].value: row[1].value for row in unknown_workbook["Итог"].iter_rows(min_row=2)}
+        assert unknown_summary["MaxDD SUM, USDT"] == "—"
+        unknown_headers = {str(cell.value).replace("\n", " "): index for index, cell in enumerate(unknown_workbook["Варианты"][1])}
+        assert unknown_workbook["Варианты"][2][unknown_headers["MaxDD SUM, USDT"]].value == "—"
+    finally:
+        unknown_workbook.close()
 
 
 def test_stage1_executable_builder_and_loader_reject_invalid_pretest_period(tmp_path: Path) -> None:
@@ -3416,7 +4248,7 @@ def test_stage1_executable_builder_and_loader_reject_invalid_pretest_period(tmp_
             _executable_payload("ETHUSDT", "SHORT"),
         )),),
     )
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
     assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
     artifact_path = tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json"
     document = json.loads(artifact_path.read_text(encoding="utf-8"))
@@ -3460,7 +4292,7 @@ def test_stage1_with_no_eligible_off_only_executable_candidate_fails_closed(tmp_
         finalists_reader=lambda *_: [_finalist()],
         variant_generator=lambda *_: (candidate,),
     )
-    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "equity_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
+    result = service.submit_campaign({"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}], "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}], "expected_config_digest": digest})
 
     job = _wait_stage1(service, result)
     result_dir = tmp_path / ".portfolio-results" / result["campaign_id"]

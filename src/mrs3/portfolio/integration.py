@@ -18,7 +18,7 @@ import math
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .config import POLICY_VERSION, PROFILE_NAMES, RESEARCH_RISK_POLICY
+from .config import POLICY_VERSION, PROFILE_NAMES, PortfolioConfigError, effective_profile_risk
 from .metrics import PortfolioMetrics, calculate_metrics
 from .reports import NormalizedReport
 from .search import Variant, canonical_candidate_identity, search_portfolios
@@ -838,12 +838,41 @@ def _margin_unknown_reason(evidence: Any) -> str:
     return "MARGIN_EVIDENCE_UNAVAILABLE"
 
 
-def evaluate_research_risk(evidence: Any, *, profile: str, policy_id: str = POLICY_VERSION, now_ms: int | None = None, freshness_contract: Mapping[str, Any] | None = None) -> RiskEvaluation:
-    """Evaluate DD, reserve, and MM jointly with fixed v1 thresholds."""
+def _frozen_campaign_risk_policy(campaign: FrozenCampaign) -> Mapping[str, Any] | None:
+    """Read profile thresholds only from facts frozen into the campaign."""
+    facts = campaign.search_facts
+    if not isinstance(facts, Mapping):
+        return None
+    for key in ("risk_policy", "profile_risk", "risk_thresholds"):
+        value = facts.get(key)
+        if isinstance(value, Mapping):
+            selected = value.get(campaign.profile_id)
+            return selected if isinstance(selected, Mapping) else value
+    profiles = facts.get("profiles")
+    if isinstance(profiles, Mapping) and isinstance(profiles.get(campaign.profile_id), Mapping):
+        return profiles[campaign.profile_id]
+    return None
+
+
+def _risk_thresholds(profile: str, explicit: Mapping[str, Any] | None) -> Mapping[str, Decimal] | None:
+    source: Mapping[str, Any] = explicit if explicit is not None else {}
+    if isinstance(source.get(profile), Mapping):
+        source = source[profile]
+    try:
+        return effective_profile_risk(source, profile)
+    except (PortfolioConfigError, TypeError, ValueError):
+        return None
+
+
+def evaluate_research_risk(evidence: Any, *, profile: str, policy_id: str = POLICY_VERSION, now_ms: int | None = None, freshness_contract: Mapping[str, Any] | None = None, thresholds: Mapping[str, Any] | None = None) -> RiskEvaluation:
+    """Evaluate DD, reserve, and MM jointly with frozen or legacy thresholds."""
     if profile not in PROFILE_NAMES or policy_id != POLICY_VERSION:
         checks = tuple(RiskCheck(name, UNKNOWN, None, None, "RISK_POLICY_UNAVAILABLE") for name in ("actual_equity_dd", "free_margin_reserve", "account_mm_load"))
         return RiskEvaluation(policy_id, profile, UNKNOWN, checks, "RISK_POLICY_UNAVAILABLE")
-    thresholds = RESEARCH_RISK_POLICY[profile]
+    resolved_thresholds = _risk_thresholds(profile, thresholds)
+    if resolved_thresholds is None:
+        checks = tuple(RiskCheck(name, UNKNOWN, None, None, "RISK_POLICY_UNAVAILABLE") for name in ("actual_equity_dd", "free_margin_reserve", "account_mm_load"))
+        return RiskEvaluation(policy_id, profile, UNKNOWN, checks, "RISK_POLICY_UNAVAILABLE")
     clock_available = now_ms is not None and not isinstance(now_ms, bool)
     if clock_available:
         try:
@@ -856,7 +885,7 @@ def evaluate_research_risk(evidence: Any, *, profile: str, policy_id: str = POLI
             clock_available = False
     if not clock_available:
         checks = tuple(
-            RiskCheck(name, UNKNOWN, None, thresholds[threshold], "EVALUATION_CLOCK_UNAVAILABLE")
+            RiskCheck(name, UNKNOWN, None, resolved_thresholds[threshold], "EVALUATION_CLOCK_UNAVAILABLE")
             for name, threshold in (
                 ("actual_equity_dd", "max_actual_equity_dd_pct"),
                 ("free_margin_reserve", "min_calculated_free_margin_reserve_pct"),
@@ -865,19 +894,19 @@ def evaluate_research_risk(evidence: Any, *, profile: str, policy_id: str = POLI
         )
         return RiskEvaluation(policy_id, profile, UNKNOWN, checks, "EVALUATION_CLOCK_UNAVAILABLE")
     dd, dd_reason, dd_witness = _equity_dd(evidence, now_ms, freshness_contract)
-    dd_check = RiskCheck("actual_equity_dd", UNKNOWN if dd is None else (PASS if dd <= thresholds["max_actual_equity_dd_pct"] else FAIL), dd, thresholds["max_actual_equity_dd_pct"], dd_reason, dd_witness)
+    dd_check = RiskCheck("actual_equity_dd", UNKNOWN if dd is None else (PASS if dd <= resolved_thresholds["max_actual_equity_dd_pct"] else FAIL), dd, resolved_thresholds["max_actual_equity_dd_pct"], dd_reason, dd_witness)
     states = _margin_states(evidence, now_ms, freshness_contract)
     if states is None:
         unknown_reason = _margin_unknown_reason(evidence)
-        reserve_check = RiskCheck("free_margin_reserve", UNKNOWN, None, thresholds["min_calculated_free_margin_reserve_pct"], unknown_reason)
-        mm_check = RiskCheck("account_mm_load", UNKNOWN, None, thresholds["max_calculated_account_mm_load_pct"], unknown_reason)
+        reserve_check = RiskCheck("free_margin_reserve", UNKNOWN, None, resolved_thresholds["min_calculated_free_margin_reserve_pct"], unknown_reason)
+        mm_check = RiskCheck("account_mm_load", UNKNOWN, None, resolved_thresholds["max_calculated_account_mm_load_pct"], unknown_reason)
     else:
         reserves = tuple((balance - total_im) / balance * Decimal("100") for balance, total_im, _, _ in states)
         loads = tuple(total_mm / balance * Decimal("100") for balance, _, total_mm, _ in states)
         reserve = min(reserves)
         load = max(loads)
-        reserve_check = RiskCheck("free_margin_reserve", PASS if reserve >= thresholds["min_calculated_free_margin_reserve_pct"] else FAIL, reserve, thresholds["min_calculated_free_margin_reserve_pct"], None, {"states": len(states), "formula": "(MarginBalance-calculated_total_IM)/MarginBalance*100"})
-        mm_check = RiskCheck("account_mm_load", PASS if load <= thresholds["max_calculated_account_mm_load_pct"] else FAIL, load, thresholds["max_calculated_account_mm_load_pct"], None, {"states": len(states), "formula": "calculated_total_MM/MarginBalance*100"})
+        reserve_check = RiskCheck("free_margin_reserve", PASS if reserve >= resolved_thresholds["min_calculated_free_margin_reserve_pct"] else FAIL, reserve, resolved_thresholds["min_calculated_free_margin_reserve_pct"], None, {"states": len(states), "formula": "(MarginBalance-calculated_total_IM)/MarginBalance*100"})
+        mm_check = RiskCheck("account_mm_load", PASS if load <= resolved_thresholds["max_calculated_account_mm_load_pct"] else FAIL, load, resolved_thresholds["max_calculated_account_mm_load_pct"], None, {"states": len(states), "formula": "calculated_total_MM/MarginBalance*100"})
     checks = (dd_check, reserve_check, mm_check)
     if any(check.status == FAIL for check in checks):
         status, reason = FAIL, next(check.name.upper() + "_FAILED" for check in checks if check.status == FAIL)
@@ -1280,7 +1309,7 @@ class PortfolioIntegration:
                         record(Attempt(identity, "development", "FAILED", identity, variant, "IMPORT_FAILED", None, budget_index=budget_used))
                         done.add(identity)
                         continue
-                    risk = evaluate_research_risk(imported, profile=self.campaign.profile_id, policy_id=_policy_identifier(_first(self.campaign.policy_ids, "risk", "policy", default="")), now_ms=self.campaign.evaluation_clock_ms, freshness_contract=self.campaign.freshness_contract)
+                    risk = evaluate_research_risk(imported, profile=self.campaign.profile_id, policy_id=_policy_identifier(_first(self.campaign.policy_ids, "risk", "policy", default="")), now_ms=self.campaign.evaluation_clock_ms, freshness_contract=self.campaign.freshness_contract, thresholds=_frozen_campaign_risk_policy(self.campaign))
                     risk_values[identity] = risk
                     if risk.status != PASS:
                         record(Attempt(identity, "development", "FAILED", identity, variant, risk.reason or "RISK_GATE_FAILED", imported, risk, budget_used))
@@ -1388,7 +1417,7 @@ class PortfolioIntegration:
                 if imported is None:
                     record(Attempt(validation_identity, "validation", "VALIDATION_FAILED", identity, variant, "IMPORT_FAILED", None, budget_index=budget_used))
                     continue
-                risk = evaluate_research_risk(imported, profile=self.campaign.profile_id, policy_id=_policy_identifier(_first(self.campaign.policy_ids, "risk", "policy", default="")), now_ms=self.campaign.evaluation_clock_ms, freshness_contract=self.campaign.freshness_contract)
+                risk = evaluate_research_risk(imported, profile=self.campaign.profile_id, policy_id=_policy_identifier(_first(self.campaign.policy_ids, "risk", "policy", default="")), now_ms=self.campaign.evaluation_clock_ms, freshness_contract=self.campaign.freshness_contract, thresholds=_frozen_campaign_risk_policy(self.campaign))
                 risk_values[identity] = risk
                 if risk.status != PASS:
                     record(Attempt(validation_identity, "validation", "VALIDATION_FAILED", identity, variant, risk.reason or "RISK_GATE_FAILED", imported, risk, budget_used))

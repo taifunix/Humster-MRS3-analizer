@@ -23,6 +23,7 @@ from mrs3.portfolio.adapter import (
     CAMPAIGN_WEIGHTED_ALGO_VERSION,
     CampaignContractError,
     MARGIN_BOUND_UNAVAILABLE,
+    PORTFOLIO_INPUT_GEOMETRY_INVALID,
     WEIGHTED_INPUT_PREPARATION_FAILED,
     WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE,
     WEIGHTED_EXECUTABLE_IDENTITY_COLLISION,
@@ -51,6 +52,30 @@ def test_weighted_composition_enumerator_orders_slots_and_rows() -> None:
         [("A", "LONG", 4), ("B", "LONG", 1), ("B", "SHORT", 3)],
         [("A", "LONG", 4), ("B", "LONG", 2), ("B", "SHORT", 3)],
     ]
+
+
+def test_geometry_preflight_rejects_partial_frozen_geometry_before_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign = _weighted_build_campaign()
+    campaign["weighted_input_rows"] = ({
+        **campaign["weighted_input_rows"][0],
+        "timeframe": "3h",
+        "close_ma_len": 55,
+        "order_count": 1,
+    },)
+    selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
+    monkeypatch.setattr(adapter_module, "_run_weighted_search", lambda *_args, **_kwargs: pytest.fail("search reached"))
+    result = build_portfolio_candidates(
+        selected,
+        campaign,
+        capacities={},
+        reference=None,
+        mark_prices={},
+        spread_observations={},
+        spread_history_statuses={"BTCUSDT": "READY"},
+        now_ms=0,
+        margin_coefficients={11: {"status": "PASS"}},
+    )
+    assert result.blockers == (PORTFOLIO_INPUT_GEOMETRY_INVALID,)
 
 
 def test_weighted_composition_enumerator_uses_rightmost_slot_fastest() -> None:
@@ -131,7 +156,7 @@ def test_build_adapter_evaluates_all_compositions_and_keeps_profile_top_k(monkey
     campaign["config_document"]["search"]["max_enumerated_combinations"] = 6
     campaign["launch"] = {
         "pairs": ({"pair": "S", "max_finalist_long": 2, "max_finalist_short": 3},),
-        "profiles": ({"profile_id": "BALANCED", "equity_usdt": Decimal("1000"), "max_candidates": 2},),
+        "profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": 2},),
     }
     selected = tuple(
         {"symbol": "S", "side": side, "user_rank": index, "strategy_id": index, "result_id": index}
@@ -165,7 +190,7 @@ def test_build_adapter_keeps_distinct_compositions_that_only_change_zero_member(
             {"pair": "A", "max_finalist_long": 1, "max_finalist_short": 0},
             {"pair": "B", "max_finalist_long": 2, "max_finalist_short": 0},
         ),
-        "profiles": ({"profile_id": "BALANCED", "equity_usdt": Decimal("1000"), "max_candidates": 2},),
+        "profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": 2},),
     }
     source_rows = tuple(
         {
@@ -242,7 +267,7 @@ def test_build_adapter_decorates_composition_exclusions_with_provenance(monkeypa
             {"pair": "A", "max_finalist_long": 1, "max_finalist_short": 0},
             {"pair": "B", "max_finalist_long": 2, "max_finalist_short": 0},
         ),
-        "profiles": ({"profile_id": "BALANCED", "equity_usdt": Decimal("1000"), "max_candidates": 2},),
+        "profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": 2},),
     }
     selected = (
         {"symbol": "A", "side": "LONG", "user_rank": 1, "strategy_id": 1, "result_id": 10},
@@ -301,8 +326,8 @@ def test_build_adapter_keeps_passing_profile_variants_with_ordinary_failure(monk
     campaign["launch"] = {
         "pairs": ({"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0},),
         "profiles": (
-            {"profile_id": "BALANCED", "equity_usdt": Decimal("1000"), "max_candidates": 1},
-            {"profile_id": "AGGRESSIVE", "equity_usdt": Decimal("1000"), "max_candidates": 1},
+            {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": 1},
+            {"profile_id": "AGGRESSIVE", "bank_available_usdt": Decimal("1000"), "max_candidates": 1},
         ),
     }
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "user_rank": 1, "strategy_id": 11, "result_id": 101},)
@@ -321,7 +346,7 @@ def test_build_adapter_keeps_passing_profile_variants_with_ordinary_failure(monk
 def test_build_adapter_preserves_shared_capacity_blocker(reason: str, monkeypatch: pytest.MonkeyPatch) -> None:
     campaign = _weighted_build_campaign()
     campaign["config_document"]["search"]["max_enumerated_combinations"] = 1
-    campaign["launch"] = {"pairs": ({"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0},), "profiles": ({"profile_id": "BALANCED", "equity_usdt": Decimal("1000"), "max_candidates": 1},)}
+    campaign["launch"] = {"pairs": ({"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0},), "profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": 1},)}
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "user_rank": 1, "strategy_id": 11, "result_id": 101},)
     monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", lambda *args, **kwargs: adapter_module.AdapterResult("FAIL", blockers=(reason,)))
     result = build_portfolio_candidates(selected, campaign, capacities={}, reference=None, mark_prices={}, spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0)
@@ -331,7 +356,7 @@ def test_build_adapter_preserves_shared_capacity_blocker(reason: str, monkeypatc
 def test_build_adapter_uses_canonical_spread_status_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     campaign = _weighted_build_campaign()
     campaign["config_document"]["search"]["max_enumerated_combinations"] = 1
-    campaign["launch"] = {"pairs": ({"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0},), "profiles": ({"profile_id": "BALANCED", "equity_usdt": Decimal("1000"), "max_candidates": 1},)}
+    campaign["launch"] = {"pairs": ({"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0},), "profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": 1},)}
     selected = ({"symbol": " btcusdt ", "side": "LONG", "user_rank": 1, "strategy_id": 11, "result_id": 101},)
     monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", lambda *args, **kwargs: adapter_module.AdapterResult("PASS", variants=({"identity": "v", "profile_id": "BALANCED", "metrics": {"p30_common_usdt_30d": Decimal("2"), "cdar_peak80_usdt": Decimal("1"), "required_bank_usdt": Decimal("1")}},)))
     result = build_portfolio_candidates(selected, campaign, capacities={}, reference=None, mark_prices={}, spread_observations={}, spread_history_statuses={" btcusdt ": "READY"}, now_ms=0)
@@ -344,6 +369,7 @@ def _weighted_search_bridge_campaign():
             "search": {
                 "seed": 17,
                 "weighted_search": {
+                    "lp_solutions_per_profile": 6,
                     "max_targets": 4,
                     "bootstrap_scenarios_per_block": 101,
                     "bootstrap_diagnostic_scenarios": 7,
@@ -380,7 +406,7 @@ def test_run_weighted_search_forwards_profile_settings_and_capacities(monkeypatc
     profile = {
         "profile_id": "BALANCED",
         "scenario_id": "SCENARIO-1",
-        "equity_usdt": Decimal("1000"),
+        "bank_available_usdt": Decimal("1000"),
         "max_candidates": 9,
     }
     margin = _margin_evidence(11)
@@ -422,6 +448,7 @@ def test_run_weighted_search_forwards_profile_settings_and_capacities(monkeypatc
             "priorities": {11: 1},
         },
         "max_targets": 4,
+        "max_solver_calls": 6,
         "seed": 17,
         "bootstrap_scenarios": 101,
         "screening_scenarios": 7,
@@ -429,6 +456,58 @@ def test_run_weighted_search_forwards_profile_settings_and_capacities(monkeypatc
         "wall_time": 12,
         "solver_time": 3,
     }
+
+
+def test_run_weighted_search_applies_solver_call_limit_independently_per_profile(monkeypatch):
+    calls = []
+    members = ({"strategy_id": 11, "symbol": "BTCUSDT", "position_size_usdt": Decimal("123")},)
+    margin = _margin_evidence(11)
+    campaign = _weighted_search_bridge_campaign()
+
+    monkeypatch.setattr(
+        adapter_module,
+        "weighted_search",
+        lambda *_args, **kwargs: calls.append((kwargs["profile_id"], kwargs["max_solver_calls"])) or "search-result",
+    )
+
+    for profile_id in ("BALANCED", "AGGRESSIVE"):
+        adapter_module._run_weighted_search(
+            object(),
+            members,
+            campaign,
+            {"profile_id": profile_id, "scenario_id": profile_id, "bank_available_usdt": Decimal("1000")},
+            margin,
+            workers=1,
+        )
+
+    assert calls == [("BALANCED", 6), ("AGGRESSIVE", 6)]
+
+
+def test_run_weighted_search_uses_frozen_profile_risk_values(monkeypatch):
+    calls = []
+    campaign = _weighted_search_bridge_campaign()
+    campaign["config_document"]["profiles"] = {
+        "BALANCED": {
+            "max_actual_equity_dd_pct": "10.000000000001",
+            "min_calculated_free_margin_reserve_pct": "40.000000000001",
+            "max_calculated_account_mm_load_pct": "35.000000000001",
+        },
+    }
+    monkeypatch.setattr(adapter_module, "weighted_search", lambda *args, **kwargs: calls.append(kwargs) or "ok")
+
+    result = adapter_module._run_weighted_search(
+        object(),
+        ({"strategy_id": 11, "position_size_usdt": Decimal("123")},),
+        campaign,
+        {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
+        _margin_evidence(11),
+        workers=1,
+    )
+
+    assert result == "ok"
+    assert calls[0]["max_dd"] == Decimal("0.10000000000001")
+    assert calls[0]["margin_kwargs"]["reserve"] == Decimal("0.40000000000001")
+    assert calls[0]["margin_kwargs"]["max_mm_load"] == Decimal("0.35000000000001")
 
 
 def test_run_weighted_search_requires_margin_before_calling_search(monkeypatch):
@@ -440,7 +519,7 @@ def test_run_weighted_search_requires_margin_before_calling_search(monkeypatch):
             object(),
             ({"strategy_id": 11, "position_size_usdt": Decimal("123")},),
             _weighted_search_bridge_campaign(),
-            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000")},
+            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
             None,
             workers=1,
         )
@@ -471,7 +550,7 @@ def test_run_weighted_search_requires_covered_margin_evidence(margin, members, m
     with pytest.raises(CampaignContractError) as error:
         adapter_module._run_weighted_search(
             object(), members, _weighted_search_bridge_campaign(),
-            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000")},
+            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
             margin, workers=1,
         )
 
@@ -488,7 +567,7 @@ def test_run_weighted_search_propagates_search_error(monkeypatch):
         adapter_module._run_weighted_search(
             object(), ({"strategy_id": 11, "position_size_usdt": Decimal("123")},),
             _weighted_search_bridge_campaign(),
-            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000")},
+            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
             _margin_evidence(11), workers=1,
         )
 
@@ -497,8 +576,9 @@ def test_run_weighted_search_kwargs_bind_real_signature_with_and_without_max_can
     calls = []
     monkeypatch.setattr(adapter_module, "weighted_search", lambda *args, **kwargs: calls.append((args, kwargs)) or "ok")
     for profile in (
-        {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000"), "max_candidates": 9},
-        {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000")},
+        {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000"), "max_candidates": 9},
+        {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
+        {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": None},
     ):
         prepared = object()
         result = adapter_module._run_weighted_search(
@@ -508,6 +588,7 @@ def test_run_weighted_search_kwargs_bind_real_signature_with_and_without_max_can
         assert result == "ok"
         args, kwargs = calls[-1]
         inspect.signature(real_weighted_search).bind(args[0], args[1], **kwargs)
+    assert calls[-1][1]["bank_available"] is None
 
 
 def test_run_weighted_search_maps_missing_margin_validator_to_margin_blocker(monkeypatch):
@@ -519,7 +600,7 @@ def test_run_weighted_search_maps_missing_margin_validator_to_margin_blocker(mon
         adapter_module._run_weighted_search(
             object(), ({"strategy_id": 11, "position_size_usdt": Decimal("123")},),
             _weighted_search_bridge_campaign(),
-            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000")},
+            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
             _margin_evidence(11), workers=1,
         )
 
@@ -527,15 +608,14 @@ def test_run_weighted_search_maps_missing_margin_validator_to_margin_blocker(mon
     assert calls == []
 
 
-@pytest.mark.parametrize("equity", (None, Decimal("-1")))
-def test_run_weighted_search_rejects_invalid_equity(equity, monkeypatch):
+def test_run_weighted_search_rejects_invalid_bank_ceiling(monkeypatch):
     calls = []
     monkeypatch.setattr(adapter_module, "weighted_search", lambda *args, **kwargs: calls.append(True))
     with pytest.raises(CampaignContractError) as error:
         adapter_module._run_weighted_search(
             object(), ({"strategy_id": 11, "position_size_usdt": Decimal("123")},),
             _weighted_search_bridge_campaign(),
-            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": equity},
+            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("-1")},
             _margin_evidence(11), workers=1,
         )
     assert error.value.code == "WEIGHTED_SEARCH_CONFIG_INVALID"
@@ -549,7 +629,7 @@ def test_run_weighted_search_rejects_non_decimal_position_size(monkeypatch):
         adapter_module._run_weighted_search(
             object(), ({"strategy_id": 11, "position_size_usdt": "123"},),
             _weighted_search_bridge_campaign(),
-            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000")},
+            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
             _margin_evidence(11), workers=1,
         )
     assert error.value.code == "WEIGHTED_SEARCH_CONFIG_INVALID"
@@ -563,7 +643,7 @@ def test_run_weighted_search_rejects_missing_prepared_input(monkeypatch):
         adapter_module._run_weighted_search(
             None, ({"strategy_id": 11, "position_size_usdt": Decimal("123")},),
             _weighted_search_bridge_campaign(),
-            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000")},
+            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
             _margin_evidence(11), workers=1,
         )
     assert error.value.code == WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE
@@ -579,7 +659,7 @@ def test_run_weighted_search_forwards_each_research_policy_fraction(profile_id, 
     result = adapter_module._run_weighted_search(
         prepared, members,
         _weighted_search_bridge_campaign(),
-        {"profile_id": profile_id, "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000")},
+        {"profile_id": profile_id, "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
         _margin_evidence(11), workers=1,
     )
     assert result == "ok"
@@ -609,7 +689,7 @@ def test_run_weighted_search_rejects_malformed_inputs(case, monkeypatch):
     calls = []
     monkeypatch.setattr(adapter_module, "weighted_search", lambda *args, **kwargs: calls.append(True))
     campaign = _weighted_search_bridge_campaign()
-    profile = {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000"), "max_candidates": 9}
+    profile = {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000"), "max_candidates": 9}
     members = ({"strategy_id": 11, "position_size_usdt": Decimal("123")},)
     workers = 1
     margin = _margin_evidence(11)
@@ -689,7 +769,7 @@ def test_run_weighted_search_rejects_malformed_frozen_config(campaign, monkeypat
             object(),
             ({"strategy_id": 11, "position_size_usdt": Decimal("123")},),
             campaign,
-            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000")},
+            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
             {11: {"a": Decimal("1"), "b": Decimal("0")}},
             workers=1,
         )
@@ -703,7 +783,7 @@ def test_run_weighted_search_uses_stable_config_error_code(monkeypatch):
     with pytest.raises(CampaignContractError) as error:
         adapter_module._run_weighted_search(
             object(), ({"strategy_id": 11, "position_size_usdt": Decimal("123")},), {},
-            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "equity_usdt": Decimal("1000")},
+            {"profile_id": "BALANCED", "scenario_id": "SCENARIO-1", "bank_available_usdt": Decimal("1000")},
             _margin_evidence(11), workers=1,
         )
     assert error.value.code == "WEIGHTED_SEARCH_CONFIG_INVALID"
@@ -745,6 +825,7 @@ def _weighted_build_campaign():
                 "seed": 17,
                 "weighted_search": {
                     "history_step_minutes": 5,
+                    "lp_solutions_per_profile": 20,
                     "max_targets": 4,
                     "bootstrap_scenarios_per_block": 101,
                     "bootstrap_diagnostic_scenarios": 7,
@@ -754,14 +835,14 @@ def _weighted_build_campaign():
                 "composition": {"parameters": {"minimum_common_days": 1}},
             },
         },
-        "launch": {"profiles": ({"profile_id": "BALANCED", "equity_usdt": Decimal("1000")},)},
+        "launch": {"profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},)},
     })
     return campaign
 
 
 def test_build_adapter_rejects_empty_launch_pairs_without_scalar_fallback(monkeypatch):
     campaign = _weighted_build_campaign()
-    campaign["launch"] = {"pairs": (), "profiles": ({"profile_id": "BALANCED", "equity_usdt": Decimal("1000")},)}
+    campaign["launch"] = {"pairs": (), "profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},)}
     monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", lambda *args, **kwargs: pytest.fail("scalar fallback reached"))
 
     result = build_portfolio_candidates(
@@ -925,8 +1006,427 @@ def _weighted_candidate(profile_id="BALANCED", *, members=None, scenario_id=None
             "result_id": 101,
             "position_size_usdt": Decimal("123"),
         },)),
-        metrics={"limiter_L": Decimal("2")},
+        metrics={"limiter_L": Decimal("2"), "required_bank_usdt": Decimal("100")},
     )
+
+
+def _patch_post_search_setup(monkeypatch, search_result, *, members=None):
+    selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
+    enriched = tuple(members or (dict(selected[0], position_size_usdt=Decimal("123")),))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(
+        adapter_module,
+        "enrich_finalist_rows",
+        lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),
+    )
+    monkeypatch.setattr(adapter_module, "_run_weighted_search", lambda *_args, **_kwargs: search_result)
+    return selected, _weighted_build_campaign(), enriched
+
+
+def test_build_adapter_maps_malformed_weighted_search_result_to_result_blocker(monkeypatch):
+    search_result = SimpleNamespace(status="PASS", candidates="not-a-sequence", warnings=(), mode=CAMPAIGN_SEARCH_MODE)
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers) == ("FAIL", ("PROFILE:WEIGHTED_SEARCH_RESULT_INVALID",))
+
+
+def test_build_adapter_accepts_valid_budget_limited_candidates_with_warning(monkeypatch):
+    candidate = _weighted_candidate()
+    search_result = candidate_search.SearchResult(
+        status="budget_limited",
+        reason="WALL_TIME_LIMIT",
+        candidates=(candidate,),
+        warnings=(),
+        mode=CAMPAIGN_SEARCH_MODE,
+    )
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert result.status == "PASS"
+    assert len(result.variants) == 1
+    assert result.blockers == ()
+    assert result.warnings == ("PROFILE:BALANCED:WEIGHTED_SEARCH_BUDGET_LIMITED:WALL_TIME_LIMIT",)
+
+
+def test_build_adapter_reports_empty_budget_limited_result_without_calling_it_invalid(monkeypatch):
+    search_result = candidate_search.SearchResult(
+        status="budget_limited", reason="WALL_TIME_LIMIT", candidates=(), mode=CAMPAIGN_SEARCH_MODE,
+    )
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers) == (
+        "FAIL", ("PROFILE:BALANCED:WEIGHTED_SEARCH_BUDGET_LIMITED:WALL_TIME_LIMIT",),
+    )
+
+
+def test_build_adapter_rejects_unsafe_budget_limited_reason(monkeypatch):
+    sentinel = r"C:\private\secret\weighted-search"
+    search_result = candidate_search.SearchResult(
+        status="budget_limited",
+        reason=sentinel,
+        candidates=(_weighted_candidate(),),
+        mode=CAMPAIGN_SEARCH_MODE,
+    )
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers) == ("FAIL", ("PROFILE:WEIGHTED_SEARCH_RESULT_INVALID",))
+    assert sentinel not in str(result)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "WALL_TIME_LIMIT",
+        "SOLVER_CALL_LIMIT",
+        "SOLVER_TIME_LIMIT",
+        "NEW_X_LIMIT",
+        "BOOTSTRAP_INCOMPLETE",
+        "CANCELLED",
+        "WORKER_FAILURE",
+    ),
+)
+def test_safe_budget_reason_accepts_every_weighted_search_reason(reason):
+    assert adapter_module._safe_budget_reason(reason) == reason
+
+
+@pytest.mark.parametrize("reason", (None, b"WALL_TIME_LIMIT", 1, "X" * 65))
+def test_build_adapter_rejects_malformed_budget_limited_reason(monkeypatch, reason):
+    search_result = SimpleNamespace(
+        status="budget_limited",
+        reason=reason,
+        candidates=(_weighted_candidate(),),
+        warnings=(),
+        mode=CAMPAIGN_SEARCH_MODE,
+    )
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers, result.variants) == (
+        "FAIL", ("PROFILE:WEIGHTED_SEARCH_RESULT_INVALID",), (),
+    )
+
+
+@pytest.mark.parametrize("status", ("BUDGET_LIMITED", "budget limited", " budget_limited", "", None, 1))
+def test_build_adapter_rejects_near_miss_budget_limited_status(monkeypatch, status):
+    search_result = SimpleNamespace(
+        status=status,
+        reason="WALL_TIME_LIMIT",
+        candidates=(_weighted_candidate(),),
+        warnings=(),
+        mode=CAMPAIGN_SEARCH_MODE,
+    )
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers, result.variants) == (
+        "FAIL", ("PROFILE:WEIGHTED_SEARCH_RESULT_INVALID",), (),
+    )
+
+
+def test_build_adapter_rejects_nonsequence_budget_limited_candidates(monkeypatch):
+    search_result = SimpleNamespace(
+        status="budget_limited",
+        reason="WALL_TIME_LIMIT",
+        candidates=None,
+        warnings=(),
+        mode=CAMPAIGN_SEARCH_MODE,
+    )
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers, result.variants) == (
+        "FAIL", ("PROFILE:WEIGHTED_SEARCH_RESULT_INVALID",), (),
+    )
+
+
+def test_build_adapter_budget_limited_is_all_or_nothing_when_one_candidate_is_invalid(monkeypatch):
+    search_result = candidate_search.SearchResult(
+        status="budget_limited",
+        reason="WALL_TIME_LIMIT",
+        candidates=(_weighted_candidate(identity="good"), _weighted_candidate("AGGRESSIVE", identity="bad")),
+        mode=CAMPAIGN_SEARCH_MODE,
+    )
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers, result.variants, result.warnings) == (
+        "FAIL", ("PROFILE:WEIGHTED_CANDIDATE_SHAPE_INVALID",), (), (),
+    )
+
+
+@pytest.mark.parametrize("reason", ("CANCELLED", "WORKER_FAILURE", "SHUTDOWN"))
+def test_build_adapter_does_not_publish_interrupted_budget_limited_candidates(monkeypatch, reason):
+    search_result = candidate_search.SearchResult(
+        status="budget_limited",
+        reason=reason,
+        candidates=(_weighted_candidate(),),
+        mode=CAMPAIGN_SEARCH_MODE,
+    )
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers, result.variants, result.warnings) == (
+        "FAIL", (f"PROFILE:BALANCED:WEIGHTED_SEARCH_BUDGET_LIMITED:{reason}",), (), (),
+    )
+
+
+def test_build_adapter_keeps_budget_warning_when_target_bank_excludes_all_candidates(monkeypatch):
+    search_result = candidate_search.SearchResult(
+        status="budget_limited",
+        reason="WALL_TIME_LIMIT",
+        candidates=(_weighted_candidate(),),
+        mode=CAMPAIGN_SEARCH_MODE,
+    )
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+    campaign["launch"]["profiles"][0]["bank_available_usdt"] = Decimal("50")
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers, result.variants) == (
+        "FAIL", ("PROFILE:BANK_UNAVAILABLE",), (),
+    )
+    assert result.warnings == ("PROFILE:BALANCED:WEIGHTED_SEARCH_BUDGET_LIMITED:WALL_TIME_LIMIT",)
+
+
+def test_build_adapter_postsearch_invalid_result_does_not_leak_raw_content(monkeypatch):
+    sentinel = r"C:\private\secret\post-search-raw-" + ("X" * 2000)
+    search_result = SimpleNamespace(status="PASS", candidates=sentinel, warnings=(), mode=CAMPAIGN_SEARCH_MODE)
+    selected, campaign, _members = _patch_post_search_setup(monkeypatch, search_result)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers) == ("FAIL", ("PROFILE:WEIGHTED_SEARCH_RESULT_INVALID",))
+    assert sentinel not in str(result)
+
+
+def test_build_adapter_maps_bad_required_bank_to_candidate_bank_blocker(monkeypatch):
+    selected, campaign, members = _patch_post_search_setup(monkeypatch, None)
+    candidate = candidate_search.PortfolioCandidate(
+        schema_version="portfolio_candidate_v1",
+        profile_id="BALANCED",
+        scenario_id="BALANCED",
+        identity="candidate-BALANCED",
+        members=tuple(members),
+        metrics={"limiter_L": Decimal("2"), "required_bank_usdt": "not-a-decimal"},
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_run_weighted_search",
+        lambda *_args, **_kwargs: candidate_search.SearchResult(
+            status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers) == ("FAIL", ("PROFILE:WEIGHTED_CANDIDATE_BANK_INVALID",))
+
+
+def test_build_adapter_maps_nonmapping_candidate_metrics_to_shape_blocker(monkeypatch):
+    selected, campaign, members = _patch_post_search_setup(monkeypatch, None)
+    candidate = SimpleNamespace(
+        profile_id="BALANCED", scenario_id="BALANCED", identity="candidate-BALANCED",
+        schema_version="portfolio_candidate_v1", members=tuple(members), metrics=[],
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_run_weighted_search",
+        lambda *_args, **_kwargs: candidate_search.SearchResult(
+            status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers) == ("FAIL", ("PROFILE:WEIGHTED_CANDIDATE_SHAPE_INVALID",))
+
+
+def test_build_adapter_maps_duplicate_candidate_symbol_side_to_duplicate_blocker(monkeypatch):
+    selected, campaign, members = _patch_post_search_setup(monkeypatch, None)
+    candidate = _weighted_candidate(members=tuple(members) + tuple(members))
+    monkeypatch.setattr(
+        adapter_module,
+        "_run_weighted_search",
+        lambda *_args, **_kwargs: candidate_search.SearchResult(
+            status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers) == ("FAIL", ("PROFILE:WEIGHTED_CANDIDATE_SLOT_DUPLICATE",))
+
+
+def test_build_adapter_maps_malformed_limiter_to_limiter_blocker(monkeypatch):
+    selected, campaign, members = _patch_post_search_setup(monkeypatch, None)
+    candidate = SimpleNamespace(
+        profile_id="BALANCED", scenario_id="BALANCED", identity="candidate-BALANCED",
+        schema_version="portfolio_candidate_v1", members=tuple(members),
+        metrics={"limiter_L": "not-an-integer", "required_bank_usdt": Decimal("100")},
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_run_weighted_search",
+        lambda *_args, **_kwargs: candidate_search.SearchResult(
+            status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11), strategy_template={},
+    )
+
+    assert (result.status, result.blockers) == ("FAIL", ("PROFILE:WEIGHTED_CANDIDATE_LIMITER_INVALID",))
+
+
+def test_build_adapter_remaps_downstream_config_error_to_postsearch_config(monkeypatch):
+    selected, campaign, members = _patch_post_search_setup(monkeypatch, None)
+    candidate = SimpleNamespace(
+        profile_id="BALANCED", scenario_id="BALANCED", identity="candidate-BALANCED",
+        schema_version="portfolio_candidate_v1", members=tuple(members),
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_run_weighted_search",
+        lambda *_args, **_kwargs: candidate_search.SearchResult(
+            status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+
+    def fail_payload(*_args, **_kwargs):
+        raise CampaignContractError("WEIGHTED_SEARCH_CONFIG_INVALID")
+
+    monkeypatch.setattr(adapter_module, "_build_strategy_payloads", fail_payload)
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11), strategy_template={},
+    )
+
+    assert (result.status, result.blockers) == ("FAIL", ("PROFILE:WEIGHTED_POST_SEARCH_CONFIG_INVALID",))
+
+
+def test_build_adapter_maps_invalid_postsearch_period_to_pretest_period_blocker(monkeypatch):
+    selected, campaign, members = _patch_post_search_setup(monkeypatch, None)
+    candidate = SimpleNamespace(
+        profile_id="BALANCED", scenario_id="BALANCED", identity="candidate-BALANCED",
+        schema_version="portfolio_candidate_v1", members=tuple(members),
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_run_weighted_search",
+        lambda *_args, **_kwargs: candidate_search.SearchResult(
+            status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
+        period_start_utc=None, period_end_utc=None,
+    ))
+    monkeypatch.setattr(adapter_module, "_build_strategy_payloads", lambda *_args, **_kwargs: ({},))
+    monkeypatch.setattr(adapter_module, "_weighted_executable_identity", lambda *_args, **_kwargs: "identity")
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11), strategy_template={},
+    )
+
+    assert (result.status, result.blockers) == ("FAIL", ("PROFILE:WEIGHTED_PRETEST_PERIOD_INVALID",))
+
+
+@pytest.mark.parametrize("symbol", (None, 123))
+def test_safe_weighted_variant_rejects_non_string_symbol_as_shape(symbol):
+    member = {"symbol": symbol, "side": "LONG", "strategy_id": 11, "result_id": 101}
+    candidate = _weighted_candidate(members=(member,))
+
+    with pytest.raises(CampaignContractError) as error:
+        adapter_module._safe_weighted_variant(candidate, SimpleNamespace(mode=CAMPAIGN_SEARCH_MODE))
+
+    assert error.value.code == "WEIGHTED_CANDIDATE_SHAPE_INVALID"
+
+
+def test_safe_weighted_variant_detects_duplicate_normalized_sides():
+    candidate = _weighted_candidate(members=(
+        {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},
+        {"symbol": "BTCUSDT", "side": " long ", "strategy_id": 12, "result_id": 102},
+    ))
+
+    with pytest.raises(CampaignContractError) as error:
+        adapter_module._safe_weighted_variant(candidate, SimpleNamespace(mode=CAMPAIGN_SEARCH_MODE))
+
+    assert error.value.code == "WEIGHTED_CANDIDATE_SLOT_DUPLICATE"
 
 
 @pytest.mark.parametrize(
@@ -1031,11 +1531,11 @@ def test_build_adapter_does_not_publish_partial_profile_variants_when_later_cand
     )
 
     assert (result.status, result.blockers, result.variants) == (
-        "FAIL", ("PROFILE:WEIGHTED_SEARCH_CONFIG_INVALID",), (),
+        "FAIL", ("PROFILE:WEIGHTED_CANDIDATE_BANK_INVALID",), (),
     )
 
 
-@pytest.mark.parametrize("profile", ({"equity_usdt": Decimal("1000")}, {"profile_id": "", "equity_usdt": Decimal("1000")}, {"profile_id": 1, "equity_usdt": Decimal("1000")}))
+@pytest.mark.parametrize("profile", ({"bank_available_usdt": Decimal("1000")}, {"profile_id": "", "bank_available_usdt": Decimal("1000")}, {"profile_id": 1, "bank_available_usdt": Decimal("1000")}))
 def test_build_adapter_validates_profile_id_before_search_call(monkeypatch, profile):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
@@ -1096,9 +1596,8 @@ def test_build_adapter_publishes_only_weighted_candidates_for_requested_profile(
         margin_coefficients=_margin_evidence(11),
     )
 
-    assert (result.status, result.blockers, result.variants) == (
-        "FAIL", ("PROFILE:WEIGHTED_SEARCH_CONFIG_INVALID",), (),
-    )
+    expected = "WEIGHTED_SEARCH_RESULT_INVALID" if mode != CAMPAIGN_SEARCH_MODE else "WEIGHTED_CANDIDATE_SHAPE_INVALID"
+    assert (result.status, result.blockers, result.variants) == ("FAIL", (f"PROFILE:{expected}",), ())
 
 
 @pytest.mark.parametrize(
@@ -1135,7 +1634,7 @@ def test_build_adapter_requires_candidate_profile_and_scenario_to_match_request(
     )
 
     assert (result.status, result.blockers, result.variants) == (
-        "FAIL", ("PROFILE:WEIGHTED_SEARCH_CONFIG_INVALID",), (),
+        "FAIL", ("PROFILE:WEIGHTED_CANDIDATE_SHAPE_INVALID",), (),
     )
 
 
@@ -1144,8 +1643,8 @@ def test_build_adapter_rejects_duplicate_launch_profiles_before_enrichment_or_se
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
     campaign = _weighted_build_campaign()
     campaign["launch"] = {"profiles": (
-        {"profile_id": "BALANCED", "equity_usdt": Decimal("1000")},
-        {"profile_id": "BALANCED", "equity_usdt": Decimal("1000")},
+        {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},
+        {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},
     )}
     calls = []
 
@@ -1175,8 +1674,8 @@ def test_build_adapter_reports_typed_candidate_identity_collision(monkeypatch):
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
     campaign = _weighted_build_campaign()
     campaign["launch"] = {"profiles": (
-        {"profile_id": "BALANCED", "equity_usdt": Decimal("1000")},
-        {"profile_id": "AGGRESSIVE", "equity_usdt": Decimal("1000")},
+        {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},
+        {"profile_id": "AGGRESSIVE", "bank_available_usdt": Decimal("1000")},
     )}
     candidates = {
         "BALANCED": _weighted_candidate("BALANCED", members=members, identity="duplicate"),
@@ -1234,7 +1733,7 @@ def test_build_adapter_rejects_invalid_search_warning_without_coercion(monkeypat
     )
 
     assert (result.status, result.blockers, result.variants, result.warnings) == (
-        "FAIL", ("PROFILE:WEIGHTED_SEARCH_CONFIG_INVALID",), (), (),
+        "FAIL", ("PROFILE:WEIGHTED_SEARCH_RESULT_INVALID",), (), (),
     )
 
 
@@ -1267,10 +1766,69 @@ def test_build_adapter_rejects_pass_search_with_no_candidates(monkeypatch):
     )
 
 
+def test_build_adapter_maps_capped_lp_infeasible_to_bank_unavailable(monkeypatch):
+    selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
+    members = (dict(selected[0], position_size_usdt=Decimal("123")),)
+
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(
+        adapter_module,
+        "enrich_finalist_rows",
+        lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=members, exclusions=(), reason=None),
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_run_weighted_search",
+        lambda *_args, **_kwargs: candidate_search.SearchResult(
+            status="FAIL", reason="LP_INFEASIBLE", mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+
+    result = build_portfolio_candidates(
+        selected, _weighted_build_campaign(), capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers, result.variants) == (
+        "FAIL", ("PROFILE:BANK_UNAVAILABLE", "PROFILE:LP_INFEASIBLE"), (),
+    )
+
+
+def test_build_adapter_excludes_candidate_above_bank_ceiling(monkeypatch):
+    selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
+    members = (dict(selected[0], position_size_usdt=Decimal("123")),)
+    campaign = _weighted_build_campaign()
+    campaign["launch"]["profiles"][0]["bank_available_usdt"] = Decimal("50")
+    candidate = _weighted_candidate(members=members)
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(
+        adapter_module,
+        "enrich_finalist_rows",
+        lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=members, exclusions=(), reason=None),
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_run_weighted_search",
+        lambda *_args, **_kwargs: candidate_search.SearchResult(
+            status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11),
+    )
+
+    assert (result.status, result.blockers, result.variants) == ("FAIL", ("PROFILE:BANK_UNAVAILABLE",), ())
+    assert result.excluded[-1]["reason"] == "BANK_UNAVAILABLE"
+
+
 def test_build_adapter_scenario_injection_does_not_mutate_campaign_profile(monkeypatch):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
-    profile = {"profile_id": "BALANCED", "equity_usdt": Decimal("1000")}
+    profile = {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")}
     campaign = _weighted_build_campaign()
     campaign["launch"] = {"profiles": (profile,)}
     captured = []
@@ -1295,8 +1853,8 @@ def test_build_adapter_scenario_injection_does_not_mutate_campaign_profile(monke
         margin_coefficients=_margin_evidence(11),
     )
 
-    assert profile == {"profile_id": "BALANCED", "equity_usdt": Decimal("1000")}
-    assert captured == [{"profile_id": "BALANCED", "equity_usdt": Decimal("1000"), "scenario_id": "BALANCED"}]
+    assert profile == {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")}
+    assert captured == [{"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "scenario_id": "BALANCED"}]
 
 
 def test_build_adapter_runs_all_profiles_and_keeps_only_failed_profile_blocker(monkeypatch):
@@ -1304,8 +1862,8 @@ def test_build_adapter_runs_all_profiles_and_keeps_only_failed_profile_blocker(m
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
     campaign = _weighted_build_campaign()
     campaign["launch"] = {"profiles": (
-        {"profile_id": "BALANCED", "equity_usdt": Decimal("1000")},
-        {"profile_id": "AGGRESSIVE", "equity_usdt": Decimal("1000")},
+        {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},
+        {"profile_id": "AGGRESSIVE", "bank_available_usdt": Decimal("1000")},
     )}
     calls = []
     candidate = _weighted_candidate(members=members)
@@ -1352,7 +1910,7 @@ def test_safe_weighted_variant_rejects_duplicate_same_side_members():
 
     with pytest.raises(CampaignContractError) as error:
         adapter_module._safe_weighted_variant(candidate, SimpleNamespace(mode=CAMPAIGN_SEARCH_MODE))
-    assert error.value.code == "WEIGHTED_SEARCH_CONFIG_INVALID"
+    assert error.value.code == "WEIGHTED_CANDIDATE_SLOT_DUPLICATE"
 
 
 def test_safe_weighted_variant_accepts_short_member():
@@ -1370,7 +1928,7 @@ def test_safe_weighted_variant_rejects_whitespace_padded_duplicate_symbol():
 
     with pytest.raises(CampaignContractError) as error:
         adapter_module._safe_weighted_variant(candidate, SimpleNamespace(mode=CAMPAIGN_SEARCH_MODE))
-    assert error.value.code == "WEIGHTED_SEARCH_CONFIG_INVALID"
+    assert error.value.code == "WEIGHTED_CANDIDATE_SLOT_DUPLICATE"
 
 
 @pytest.mark.parametrize("raw_location", ("member", "metrics"))
@@ -1392,7 +1950,7 @@ def test_safe_weighted_variant_rejects_known_raw_candidate_fields(raw_location):
 
     with pytest.raises(CampaignContractError) as error:
         adapter_module._safe_weighted_variant(candidate, SimpleNamespace(mode=CAMPAIGN_SEARCH_MODE))
-    assert error.value.code == "WEIGHTED_SEARCH_CONFIG_INVALID"
+    assert error.value.code == "WEIGHTED_CANDIDATE_SHAPE_INVALID"
 
 
 @pytest.mark.parametrize(
@@ -1510,6 +2068,109 @@ def test_runtime_adapter_reaches_builder_with_injected_local_facts(monkeypatch, 
         "workers": 3,
         "strategy_template": {"template": "frozen"},
     }
+
+
+def test_runtime_adapter_pretest_bypasses_spread_history_with_preliminary_statuses(monkeypatch, tmp_path):
+    selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
+    campaign = _runtime_weighted_campaign()
+    campaign["config_document"]["liquidity"]["spread_history_bypass_pretest"] = True
+    calls = {}
+
+    monkeypatch.setattr(adapter_module, "backfill_missing_days", lambda *_args, **_kwargs: SimpleNamespace(failed={}))
+    monkeypatch.setattr(adapter_module, "calculate_minute_capacity", lambda *_args, **_kwargs: calls.setdefault("capacity", True) or "capacity")
+    monkeypatch.setattr(adapter_module, "load_market_snapshot", lambda *_args, **_kwargs: SimpleNamespace(reference="reference", mark_prices={"BTCUSDT": "100"}))
+    monkeypatch.setattr(adapter_module, "read_spread_history", lambda *_args, **_kwargs: pytest.fail("spread history reached"))
+    monkeypatch.setattr(
+        adapter_module,
+        "build_portfolio_candidates",
+        lambda rows, _campaign, **kwargs: calls.update(build=(rows, kwargs)) or adapter_module.AdapterResult("PASS", variants=({"candidate_id": "candidate"},), warnings=("builder-warning",)),
+    )
+
+    result = run_portfolio_adapter(selected, campaign, workspace_root=tmp_path)
+
+    assert result.status == "PASS"
+    assert result.warnings == ("builder-warning", "SPREAD_HISTORY_BYPASSED_PRETEST")
+    assert calls["capacity"] is True
+    assert calls["build"][1]["spread_observations"] == {"BTCUSDT": ()}
+    assert calls["build"][1]["spread_history_statuses"] == {"BTCUSDT": "PRELIMINARY"}
+
+
+def test_outer_builder_accepts_empty_preliminary_spread_facts_for_all_symbols(monkeypatch):
+    selected = (
+        {"symbol": "BTCUSDT", "side": "LONG", "user_rank": 1, "strategy_id": 11, "result_id": 101},
+        {"symbol": "ETHUSDT", "side": "LONG", "user_rank": 1, "strategy_id": 12, "result_id": 102},
+    )
+    campaign = _weighted_build_campaign()
+    campaign["config_document"]["search"]["max_enumerated_combinations"] = 2
+    campaign["weighted_input_rows"] = tuple(dict(row, symbol=symbol, strategy_id=strategy_id, result_id=result_id) for row, symbol, strategy_id, result_id in zip(campaign["weighted_input_rows"] * 2, ("BTCUSDT", "ETHUSDT"), (11, 12), (101, 102)))
+    campaign["launch"] = {
+        "pairs": (
+            {"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0},
+            {"pair": "ETHUSDT", "max_finalist_long": 1, "max_finalist_short": 0},
+        ),
+        "profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": 1},),
+    }
+    captured = []
+    candidate = candidate_search.PortfolioCandidate(
+        schema_version="portfolio_candidate_v1",
+        profile_id="BALANCED",
+        scenario_id="BALANCED",
+        identity="both-symbols",
+        members=tuple(dict(row, position_size_usdt=Decimal("123"), planned_leverage=Decimal("1")) for row in selected),
+        metrics={"limiter_L": Decimal("2"), "required_bank_usdt": Decimal("100"), "p30_common_usdt_30d": Decimal("10"), "cdar_peak80_usdt": Decimal("1")},
+    )
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(
+        adapter_module,
+        "enrich_finalist_rows",
+        lambda rows, *_args, **_kwargs: captured.append(tuple(row["symbol"] for row in rows)) or SimpleNamespace(
+            status="PASS",
+            rows=tuple(dict(row, position_size_usdt=Decimal("123"), planned_leverage=Decimal("1")) for row in rows),
+            exclusions=(),
+        ),
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_run_weighted_search",
+        lambda _prepared, members, *_args, **_kwargs: candidate_search.SearchResult(
+            status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+
+    result = build_portfolio_candidates(
+        selected,
+        campaign,
+        capacities={},
+        reference=None,
+        mark_prices={},
+        spread_observations={"BTCUSDT": (), "ETHUSDT": ()},
+        spread_history_statuses={"BTCUSDT": "PRELIMINARY", "ETHUSDT": "PRELIMINARY"},
+        now_ms=0,
+        margin_coefficients=_margin_evidence(11, 12),
+    )
+
+    assert result.status == "PASS", result.blockers
+    assert captured == [("BTCUSDT", "ETHUSDT")]
+
+
+def test_runtime_adapter_pretest_keeps_bypass_warning_when_builder_raises(monkeypatch, tmp_path):
+    campaign = _runtime_weighted_campaign()
+    campaign["config_document"]["liquidity"]["spread_history_bypass_pretest"] = True
+    monkeypatch.setattr(adapter_module, "backfill_missing_days", lambda *_args, **_kwargs: SimpleNamespace(failed={}))
+    monkeypatch.setattr(adapter_module, "calculate_minute_capacity", lambda *_args, **_kwargs: "capacity")
+    monkeypatch.setattr(adapter_module, "load_market_snapshot", lambda *_args, **_kwargs: SimpleNamespace(reference="reference", mark_prices={"BTCUSDT": "100"}))
+    monkeypatch.setattr(adapter_module, "read_spread_history", lambda *_args, **_kwargs: pytest.fail("spread history reached"))
+    monkeypatch.setattr(adapter_module, "build_portfolio_candidates", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("builder exploded")))
+
+    result = run_portfolio_adapter(
+        ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},),
+        campaign,
+        workspace_root=tmp_path,
+    )
+
+    assert (result.status, result.blockers, result.warnings) == (
+        "FAIL", ("ADAPTER_BUILD_FAILED",), ("SPREAD_HISTORY_BYPASSED_PRETEST",),
+    )
 
 
 def test_runtime_adapter_canonicalizes_raw_symbols_for_fact_loaders(monkeypatch, tmp_path):
@@ -1774,7 +2435,7 @@ def test_runtime_adapter_rejects_empty_spread_facts_before_builder(monkeypatch, 
         archive_fetcher=lambda *_args, **_kwargs: b"archive",
     )
 
-    assert (result.status, result.blockers, calls) == ("FAIL", ("ADAPTER_FACTS_UNAVAILABLE",), [])
+    assert (result.status, result.blockers, calls) == ("FAIL", ("SPREAD_HISTORY_UNAVAILABLE",), [])
 
 
 @pytest.mark.parametrize("template", (None, [], "not-a-template"))
@@ -1861,7 +2522,7 @@ def test_build_adapter_bridges_frozen_weighted_search_result(monkeypatch):
                 "composition": {"parameters": {"minimum_common_days": 1}},
             },
         },
-        "launch": {"profiles": ({"profile_id": "BALANCED", "equity_usdt": Decimal("1000")},)},
+        "launch": {"profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},)},
     })
     calls = {}
     candidate = candidate_search.PortfolioCandidate(
@@ -1875,6 +2536,7 @@ def test_build_adapter_bridges_frozen_weighted_search_result(monkeypatch):
             "proxy_pnl_usdt": Decimal("1"),
             "k": 7,
             "size_composition_vector": (Decimal("0.5"),),
+            "required_bank_usdt": Decimal("100"),
         },
     )
     search_result = candidate_search.SearchResult(
@@ -1923,7 +2585,7 @@ def test_build_adapter_bridges_frozen_weighted_search_result(monkeypatch):
     assert search_args[0] is prepared
     assert search_args[1] is members
     assert search_args[2] is campaign
-    assert search_args[3] == {"profile_id": "BALANCED", "equity_usdt": Decimal("1000"), "scenario_id": "BALANCED"}
+    assert search_args[3] == {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "scenario_id": "BALANCED"}
     assert search_args[4] is margin
     assert search_kwargs == {"workers": 3}
     assert result.warnings == ("search-warning",)
@@ -2019,7 +2681,8 @@ def test_build_adapter_attaches_real_source_geometry_payloads_by_member_identity
     )
     candidate = candidate_search.PortfolioCandidate(
         schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
-        identity="candidate-BALANCED", members=candidate_members, metrics={"limiter_L": 0},
+        identity="candidate-BALANCED", members=candidate_members,
+        metrics={"limiter_L": 0, "required_bank_usdt": Decimal("100")},
     )
     calls = {}
     campaign = _weighted_build_campaign()
@@ -2075,10 +2738,10 @@ def test_build_adapter_attaches_real_source_geometry_payloads_by_member_identity
     assert [entry["multiplier"] for entry in eth["mrs3"]["ma_long"]] == [0.99, 0.975]
     assert [entry["lot_x"] for entry in eth["mrs3"]["ma_long"]] == [0.4, 0.6]
     assert eth["mrs3"]["ma_close_long"]["len"] == 21
-    assert by_symbol["BTCUSDT"]["facts"] == {"B": "1000", "C": "400", "q": "0.1", "x": "100"}
-    assert by_symbol["ETHUSDT"]["facts"] == {"B": "1000", "C": "800", "q": "0.2", "x": "200"}
-    assert by_symbol["BTCUSDT"]["strategy"]["basic"]["max_balance"] == 4000
-    assert by_symbol["ETHUSDT"]["strategy"]["basic"]["max_balance"] == 4000
+    assert by_symbol["BTCUSDT"]["facts"] == {"B": "100", "C": "400", "q": "1", "x": "100"}
+    assert by_symbol["ETHUSDT"]["facts"] == {"B": "100", "C": "800", "q": "2", "x": "200"}
+    assert by_symbol["BTCUSDT"]["strategy"]["basic"]["max_balance"] == 400
+    assert by_symbol["ETHUSDT"]["strategy"]["basic"]["max_balance"] == 400
     assert by_symbol["BTCUSDT"]["strategy"]["mrs"]["position_priority"] == 1
     assert by_symbol["ETHUSDT"]["strategy"]["mrs"]["position_priority"] == 1
     assert by_symbol["BTCUSDT"]["account"]["open_positions_limiter"] == 0
@@ -2123,7 +2786,7 @@ def test_build_adapter_rebinds_identity_after_executable_payload_assembly(monkey
             {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101,
              "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3},
         )),
-        metrics={"limiter_L": 2},
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
     campaign = _weighted_build_campaign()
     template = _weighted_strategy_template_fixture()
@@ -2156,6 +2819,47 @@ def test_build_adapter_rebinds_identity_after_executable_payload_assembly(monkey
     assert len(variant["identity"]) == 64
 
 
+def test_build_adapter_maps_identity_evidence_conflict_to_profile_blocker(monkeypatch):
+    source = _weighted_required_evidence({
+        "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101,
+        "timeframe": "3h", "close_ma_len": 55, "order_count": 1,
+        "strategy_orders": ({"order_id": 1, "open_ma_len": 34, "shift_bp": 50, "lot_x": Decimal("1")},),
+    })
+    selected = (source,)
+    enriched = (dict(source, position_size_usdt=Decimal("400"), planned_leverage=Decimal("9"), report_end_utc="2026-01-16T00:00:00Z"),)
+    candidate = candidate_search.PortfolioCandidate(
+        schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
+        identity="candidate-BALANCED", members=((
+            {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101,
+             "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3},
+        )), metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
+    )
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
+        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
+    ))
+    monkeypatch.setattr(
+        adapter_module, "enrich_finalist_rows",
+        lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),
+    )
+    monkeypatch.setattr(
+        adapter_module, "_run_weighted_search",
+        lambda *_args, **_kwargs: candidate_search.SearchResult(
+            status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+
+    result = build_portfolio_candidates(
+        selected, _weighted_build_campaign(), capacities={}, reference=None, mark_prices={},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11), strategy_template=_weighted_strategy_template_fixture(),
+    )
+
+    assert (result.status, result.blockers, result.variants) == (
+        "FAIL", ("PROFILE:WEIGHTED_EXECUTABLE_IDENTITY_INVALID",), (),
+    )
+
+
 def test_build_adapter_reports_true_executable_identity_collision(monkeypatch):
     source_rows = ({
         "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101,
@@ -2173,7 +2877,8 @@ def test_build_adapter_reports_true_executable_identity_collision(monkeypatch):
     candidates = tuple(
         candidate_search.PortfolioCandidate(
             schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
-            identity=identity, members=(member,), metrics={"limiter_L": 2},
+            identity=identity, members=(member,),
+            metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
         )
         for identity in ("search-a", "search-b")
     )
@@ -2303,6 +3008,7 @@ def test_weighted_executable_identity_is_stable_and_binds_mutable_inputs():
     identity = adapter_module._weighted_executable_identity(
         campaign, "BALANCED", "BALANCED", Decimal("1000"), (member,), (enriched,), (payload,)
     )
+    assert identity == "f90b129e76301eb7d259282eae9fbafc296dcf36e3d74164428294eb43201dbf"
     assert identity == adapter_module._weighted_executable_identity(
         campaign, "BALANCED", "BALANCED", Decimal("1000"), (member,), (enriched,), (payload,)
     )
@@ -2356,6 +3062,61 @@ def test_weighted_executable_identity_is_stable_and_binds_mutable_inputs():
         )
 
 
+def test_weighted_executable_identity_accepts_frozen_source_metadata():
+    campaign = weighted_campaign()
+    member = {
+        "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101,
+        "x_usdt": "100",
+    }
+    enriched = _weighted_required_evidence(member)
+    payload = {
+        "strategy": {"name": "PORTFOLIO_BTCUSDT_11_101", "basic": {"symbol": "BTCUSDT"}},
+        "account": {}, "facts": {},
+    }
+    frozen = dict(enriched, optimizer_source_metadata=MappingProxyType({
+        "settings": MappingProxyType({"basic": MappingProxyType({"symbol": "BTCUSDT"})}),
+    }))
+    plain = dict(enriched, optimizer_source_metadata={"settings": {"basic": {"symbol": "BTCUSDT"}}})
+
+    identity = adapter_module._weighted_executable_identity(
+        campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (frozen,), (payload,),
+    )
+
+    assert len(identity) == 64 and all(char in "0123456789abcdef" for char in identity)
+    assert identity == adapter_module._weighted_executable_identity(
+        campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (plain,), (payload,),
+    )
+
+    invalid = dict(enriched, optimizer_source_metadata=MappingProxyType({"bad": Decimal("1")}))
+    with pytest.raises(CampaignContractError) as error:
+        adapter_module._weighted_executable_identity(
+            campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (invalid,), (payload,),
+        )
+    assert error.value.code == "WEIGHTED_EXECUTABLE_IDENTITY_INVALID"
+
+
+def test_weighted_executable_identity_does_not_mask_unexpected_base_exception(monkeypatch):
+    campaign = weighted_campaign()
+    member = {
+        "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101,
+        "x_usdt": "100",
+    }
+    enriched = _weighted_required_evidence(member)
+    payload = {
+        "strategy": {"name": "PORTFOLIO_BTCUSDT_11_101", "basic": {"symbol": "BTCUSDT"}},
+        "account": {}, "facts": {},
+    }
+
+    def explode(*_args, **_kwargs):
+        raise MemoryError("identity sentinel")
+
+    monkeypatch.setattr(adapter_module.json, "dumps", explode)
+    with pytest.raises(MemoryError):
+        adapter_module._weighted_executable_identity(
+            campaign, "BALANCED", "BALANCED", Decimal("1000"), (member,), (enriched,), (payload,)
+        )
+
+
 def test_weighted_executable_identity_binds_ordered_zero_member_source_rows():
     campaign = weighted_campaign()
     member = {
@@ -2406,7 +3167,7 @@ def test_weighted_executable_identity_rejects_reversed_payload_association():
             (payloads[1], payloads[0]),
         )
 
-    assert error.value.code == "WEIGHTED_SEARCH_CONFIG_INVALID"
+    assert error.value.code == "WEIGHTED_EXECUTABLE_IDENTITY_INVALID"
 
 
 def test_weighted_executable_identity_rejects_missing_or_conflicting_evidence():
@@ -2423,7 +3184,7 @@ def test_weighted_executable_identity_rejects_missing_or_conflicting_evidence():
         adapter_module._weighted_executable_identity(
             campaign, "BALANCED", "BALANCED", Decimal("1000"), (member,), (missing,), (payload,)
         )
-    assert missing_error.value.code == "WEIGHTED_SEARCH_CONFIG_INVALID"
+    assert missing_error.value.code == "WEIGHTED_EXECUTABLE_IDENTITY_INVALID"
 
     conflict = dict(enriched, report_end_utc="2026-01-16T00:00:00Z")
     with pytest.raises(CampaignContractError) as conflict_error:
@@ -2431,7 +3192,7 @@ def test_weighted_executable_identity_rejects_missing_or_conflicting_evidence():
             campaign, "BALANCED", "BALANCED", Decimal("1000"), (member,), (enriched,), (payload,),
             source_rows=(conflict,),
         )
-    assert conflict_error.value.code == "WEIGHTED_SEARCH_CONFIG_INVALID"
+    assert conflict_error.value.code == "WEIGHTED_EXECUTABLE_IDENTITY_INVALID"
 
 
 def test_weighted_payload_invalid_member_x_preserves_payload_error_code():
@@ -2482,7 +3243,7 @@ def test_build_adapter_rejects_template_payload_without_exact_source_geometry(mo
     candidate = candidate_search.PortfolioCandidate(
         schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
         identity="candidate-BALANCED", members=(dict(selected[0], x_usdt=Decimal("100"), capacity_usdt=Decimal("400"), priority=3),),
-        metrics={"limiter_L": 2},
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
     monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
     monkeypatch.setattr(
@@ -2517,7 +3278,7 @@ def test_build_adapter_rejects_negative_x_for_template_payload(monkeypatch):
     candidate = candidate_search.PortfolioCandidate(
         schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
         identity="candidate-BALANCED", members=(dict(selected[0], x_usdt=Decimal("-1"), capacity_usdt=Decimal("400"), priority=3),),
-        metrics={"limiter_L": 2},
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
     monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
     monkeypatch.setattr(
@@ -2553,7 +3314,7 @@ def test_build_adapter_rejects_ambiguous_template_source_geometry(monkeypatch):
     candidate = candidate_search.PortfolioCandidate(
         schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
         identity="candidate-BALANCED", members=(dict(source, x_usdt=Decimal("100"), capacity_usdt=Decimal("400"), priority=3),),
-        metrics={"limiter_L": 2},
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
     monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
     monkeypatch.setattr(
@@ -2591,7 +3352,7 @@ def test_build_adapter_rejects_candidate_capacity_mismatch_with_enriched_source(
         identity="candidate-BALANCED", members=(
             {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101,
              "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3},
-        ), metrics={"limiter_L": 2},
+        ), metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
     monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
     monkeypatch.setattr(
@@ -2747,7 +3508,8 @@ def test_build_adapter_rejects_template_branch_with_no_positive_allocations(monk
     }
     candidate = candidate_search.PortfolioCandidate(
         schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
-        identity="candidate-BALANCED", members=(member,), metrics={"limiter_L": 2},
+        identity="candidate-BALANCED", members=(member,),
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
     monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
     monkeypatch.setattr(
@@ -2809,7 +3571,8 @@ def test_build_adapter_rejects_duplicate_symbol_candidate_deterministically(monk
         identity="candidate-BALANCED", members=tuple({
             "symbol": "BTCUSDT", "side": "LONG", "strategy_id": strategy_id, "result_id": result_id,
             "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3,
-        } for strategy_id, result_id in ((11, 101), (12, 102))), metrics={"limiter_L": 2},
+        } for strategy_id, result_id in ((11, 101), (12, 102))),
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
     enriched = tuple(dict(row, position_size_usdt=Decimal("400"), planned_leverage=Decimal("9")) for row in source_rows)
     monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
@@ -2831,7 +3594,7 @@ def test_build_adapter_rejects_duplicate_symbol_candidate_deterministically(monk
     )
 
     assert (result.status, result.blockers, result.variants) == (
-        "FAIL", ("PROFILE:WEIGHTED_SEARCH_CONFIG_INVALID",), (),
+        "FAIL", ("PROFILE:WEIGHTED_CANDIDATE_SLOT_DUPLICATE",), (),
     )
 
 
@@ -2847,7 +3610,7 @@ def test_build_adapter_prepares_frozen_input_before_enrichment(monkeypatch):
                 "composition": {"parameters": {"minimum_common_days": 1}},
             },
         },
-        "launch": {"profiles": ({"profile_id": "BALANCED", "equity_usdt": Decimal("1000")},)},
+        "launch": {"profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},)},
     })
     order = []
 
@@ -2946,7 +3709,15 @@ def test_build_adapter_prefixes_search_failure_and_never_falls_back(monkeypatch)
     assert calls == [True]
 
 
-def test_build_adapter_maps_unexpected_weighted_search_exception_to_profile_blocker(monkeypatch):
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    (
+        (RuntimeError("search exploded"), "WEIGHTED_SEARCH_EXCEPTION_RUNTIME_ERROR"),
+        (ValueError("NORMALIZED_DELTA_SHAPE_MISMATCH"), "NORMALIZED_DELTA_SHAPE_MISMATCH"),
+        (ValueError("untrusted details"), "WEIGHTED_SEARCH_EXCEPTION_VALUE_ERROR"),
+    ),
+)
+def test_build_adapter_reports_safe_weighted_search_exception_code(monkeypatch, error, expected):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
 
@@ -2959,7 +3730,7 @@ def test_build_adapter_maps_unexpected_weighted_search_exception_to_profile_bloc
     monkeypatch.setattr(
         adapter_module,
         "_run_weighted_search",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("search exploded")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
     )
 
     result = build_portfolio_candidates(
@@ -2975,8 +3746,17 @@ def test_build_adapter_maps_unexpected_weighted_search_exception_to_profile_bloc
     )
 
     assert (result.status, result.blockers, result.variants) == (
-        "FAIL", ("PROFILE:WEIGHTED_SEARCH_FAILED",), (),
+        "FAIL", ("PROFILE:" + expected,), (),
     )
+
+
+def test_weighted_search_exception_code_bounds_long_exception_class_name():
+    long_named_error = type("E" * 128, (RuntimeError,), {})
+
+    code = adapter_module._weighted_search_exception_code(long_named_error())
+
+    assert code == "WEIGHTED_SEARCH_EXCEPTION"
+    assert len(code) <= 64
 
 
 def test_build_adapter_maps_unexpected_enrichment_exception_to_single_sizing_blocker(monkeypatch):
@@ -2990,8 +3770,8 @@ def test_build_adapter_maps_unexpected_enrichment_exception_to_single_sizing_blo
     )
     campaign = _weighted_build_campaign()
     campaign["launch"] = {"profiles": (
-        {"profile_id": "BALANCED", "equity_usdt": Decimal("1000")},
-        {"profile_id": "AGGRESSIVE", "equity_usdt": Decimal("1000")},
+        {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},
+        {"profile_id": "AGGRESSIVE", "bank_available_usdt": Decimal("1000")},
     )}
 
     result = build_portfolio_candidates(
@@ -3498,7 +4278,7 @@ def test_build_adapter_rejects_selected_identity_mismatch_before_enrichment_or_s
                 "composition": {"parameters": {"minimum_common_days": 1}},
             },
         },
-        "launch": {"profiles": ({"profile_id": "BALANCED", "equity_usdt": Decimal("1000")},)},
+        "launch": {"profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},)},
     })
     calls = []
     monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: calls.append("enrich"))

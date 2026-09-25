@@ -1811,6 +1811,8 @@ def prepare_weighted_input(
         opening_times = [event[0] for event in opening_events]
         closing_times = [event[0] for event in closing_events]
         opening_at = {timestamp: cycle_index for timestamp, cycle_index in reversed(opening_events)}
+        first_recorded_open = opening_times[0] if opening_times else None
+        unattributed_prefix_equity_cells = 0
         cursor = 0
         last: tuple[datetime, Decimal] | None = None
         values: list[Decimal | None] = []
@@ -1862,6 +1864,17 @@ def prepare_weighted_input(
                     if active is None:
                         if not delta:
                             continue
+                        prefix_basis = points[segment]
+                        if (
+                            first_recorded_open is not None
+                            and segment_end <= first_recorded_open
+                            and prefix_basis is not None
+                            and prefix_basis > 0
+                        ):
+                            unattributed_prefix_equity_cells += 1
+                            attribution_complete = False
+                            cell_attribution_complete = False
+                            continue
                         attribution_complete = False
                         cell_attribution_complete = False
                         reason = f"UNATTRIBUTABLE_EQUITY symbol={symbol} strategy_id={row.get('strategy_id')} result_id={row.get('result_id')} bounds={segment_start.isoformat()}..{segment_end.isoformat()}"
@@ -1893,6 +1906,7 @@ def prepare_weighted_input(
             for cycle in cycle_values:
                 cycle["common_window_normalized_return"] = None
                 cycle["attribution_complete"] = False
+        diagnostic_rows[key_row]["unattributed_prefix_equity_cells"] = unattributed_prefix_equity_cells
     prepared = PreparedWeightedInput(start, end, history_step_minutes, tuple(item.isoformat().replace("+00:00", "Z") for item in timestamps), strategy_ids, tuple(tuple(row) for row in columns), tuple(tuple(row) for row in valid), tuple(tuple(row) for row in reasons), _frozen(cycles), _frozen({"rows": diagnostic_rows, "period": period.evidence}), key)
     if cache is not None:
         cache[key] = prepared

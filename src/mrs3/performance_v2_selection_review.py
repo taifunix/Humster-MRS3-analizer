@@ -368,6 +368,55 @@ def _parse_workbook(data: bytes) -> tuple[dict[str, str], list[dict[str, object]
         workbook.close()
 
 
+def import_retest_tags(connection: duckdb.DuckDBPyConnection, data: bytes) -> dict[str, int]:
+    """Apply only explicit RETEST cells from a trusted review workbook."""
+    try:
+        metadata, rows = _parse_workbook(data)
+    except SelectionReviewError as error:
+        raise SelectionReviewError("RETEST_TAG_IMPORT_INVALID_FILE") from error
+    try:
+        instance_id = database_instance_id(connection)
+    except SelectionReviewError as error:
+        raise SelectionReviewError("RETEST_TAG_IMPORT_DATABASE_MISMATCH") from error
+    if metadata.get("database_instance_id") != instance_id:
+        raise SelectionReviewError("RETEST_TAG_IMPORT_DATABASE_MISMATCH")
+    try:
+        strategy_ids = {
+            _whole_number(row["ID"], "RETEST_TAG_IMPORT_STRATEGY_MISMATCH", optional=False)
+            for row in rows if _normalize_retest(row["RETEST"])
+        }
+    except SelectionReviewError as error:
+        code = "RETEST_TAG_IMPORT_INVALID_RETEST" if error.code == "SELECTION_REVIEW_INVALID_RETEST" else error.code
+        raise SelectionReviewError(code) from error
+    if not strategy_ids:
+        return {"row_count": 0, "retest_count": 0}
+    existing = {
+        int(row[0]) for row in connection.execute(
+            "select strategy_id from strategies where strategy_id in (select unnest(?::bigint[]))", [list(strategy_ids)]
+        ).fetchall()
+    }
+    if existing != strategy_ids:
+        raise SelectionReviewError("RETEST_TAG_IMPORT_STRATEGY_MISMATCH", details=sorted(strategy_ids - existing))
+    now = datetime.now(timezone.utc)
+    rows_to_insert = [[strategy_id, "RETEST", "RETEST_WORKFLOW", sha256(data).hexdigest(), now] for strategy_id in sorted(strategy_ids)]
+    connection.execute("begin transaction")
+    try:
+        connection.executemany(
+            """insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc)
+               values (?, ?, ?, ?, ?)
+               on conflict (strategy_id, tag) do update set
+                   source = excluded.source,
+                   source_ref = excluded.source_ref,
+                   updated_at_utc = excluded.updated_at_utc""",
+            rows_to_insert,
+        )
+        connection.execute("commit")
+    except Exception:
+        _rollback_quietly(connection)
+        raise
+    return {"row_count": len(strategy_ids), "retest_count": len(strategy_ids)}
+
+
 def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) -> dict[str, object]:
     metadata, rows = _parse_workbook(data)
     if metadata.get("database_instance_id") != database_instance_id(connection):

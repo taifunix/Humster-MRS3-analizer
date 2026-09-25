@@ -1498,23 +1498,48 @@ def write_selection_workbook(
             review = (user_review_rows or {}).get(int(row["strategy_id"]))
             return review.get(key) if review else None
 
-        display["user_status"] = display.apply(lambda row: review_value(row, "user_status"), axis=1)
-        display["user_rank"] = display.apply(lambda row: review_value(row, "user_rank"), axis=1)
-        display["user_analog_of_strategy_id"] = display.apply(
-            lambda row: review_value(row, "user_analog_of_strategy_id"), axis=1
-        )
-        display["retest"] = display.apply(
-            lambda row: "RETEST" if bool(row.get("prior_retest", False)) else None, axis=1
-        )
+        if display.empty:
+            display["user_status"] = pd.Series(dtype=object)
+            display["user_rank"] = pd.Series(dtype=object)
+            display["user_analog_of_strategy_id"] = pd.Series(dtype=object)
+            display["retest"] = pd.Series(dtype=object)
+            display["comment"] = pd.Series(dtype=object)
+        else:
+            display["user_status"] = display.apply(lambda row: review_value(row, "user_status"), axis=1)
+            display["user_rank"] = display.apply(lambda row: review_value(row, "user_rank"), axis=1)
+            display["user_analog_of_strategy_id"] = display.apply(
+                lambda row: review_value(row, "user_analog_of_strategy_id"), axis=1
+            )
+            display["retest"] = display.apply(
+                lambda row: "RETEST" if bool(row.get("prior_retest", False)) else None, axis=1
+            )
+            display["comment"] = display.apply(lambda row: review_value(row, "comment"), axis=1)
         display["auto_rank"] = display.get("final_rank")
-        display["comment"] = display.apply(lambda row: review_value(row, "comment"), axis=1)
+    def effective_date(value: object) -> str | None:
+        if not _present(value):
+            return None
+        try:
+            timestamp = pd.Timestamp(value)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if pd.isna(timestamp):
+            return None
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert(timezone.utc)
+        return timestamp.strftime("%d.%m")
+
+    for column in ("effective_start_utc", "effective_end_utc"):
+        if column not in display:
+            display[column] = None
+        else:
+            display[column] = display[column].map(effective_date)
     review_identity_columns = ["result_id"] if review_metadata is not None else []
     review_columns = [
         "auto_status", "user_status", "retest", "auto_rank", "user_rank", "auto_analog_of_strategy_id",
         "user_analog_of_strategy_id", "comment",
     ] if review_metadata is not None else []
     column_order = [
-        "strategy_id", *review_identity_columns, "strategy_name", "symbol", "side", "timeframe", "order_count", "close_ma_len",
+        "strategy_id", *review_identity_columns, "strategy_name", "symbol", "side", "timeframe", "effective_start_utc", "effective_end_utc", "order_count", "close_ma_len",
         "pnl_30d_pct", "dd5_proxy", "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "positive_quarter_count",
         "capital_efficiency", "profit_factor", "max_drawdown_pct", "win_rate_pct", "total_trades", "trades_30d", "capital_proxy",
         "holding_p95_minutes", "holding_median_minutes", "total_plateau_point_count", "minimum_plateau_point_count",
@@ -1533,7 +1558,7 @@ def write_selection_workbook(
     display = display.reindex(columns=column_order)
     display = display.rename(columns={
         "strategy_id": "ID", "result_id": "Result ID", "strategy_name": "Стратегия", "symbol": "Пара", "side": "Side", "timeframe": "ТФ",
-        "close_ma_len": "Close", "order_count": "ORD",
+        "close_ma_len": "Close", "order_count": "ORD", "effective_start_utc": "Start", "effective_end_utc": "End",
         "pnl_30d_pct": "PnL/30", "dd5_proxy": "PnL DD5/30", "profit_factor": "PF",
         "ab_pnl_change_30d_pct": "∆ PnL A/B", "ab_return_a_30d_pct": "PnL A/30д, %", "ab_calendar_days_a": "Дней A", "ab_return_b_30d_pct": "PnL B/30д, %", "ab_calendar_days_b": "Дней B", "capital_efficiency": "CE",
         "max_drawdown_pct": "DD", "win_rate_pct": "W/R", "total_trades": "Trades", "capital_proxy": "Lot DD5",

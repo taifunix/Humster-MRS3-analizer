@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 import json
@@ -15,7 +15,7 @@ from ..config import AlgorithmConfig
 from ..lots import LotMethod
 from ..strategy_json import generate_strategy
 from . import minute_capacity
-from .config import RESEARCH_RISK_POLICY
+from .config import PROFILE_NAMES, PortfolioConfigError, effective_profile_risk
 from .canonical import CanonicalEnvelope, canonical_digest_v1, typed_value
 from .liquidity import ReferenceSnapshot
 from .margin import derive_reference_margin_coefficients
@@ -35,9 +35,23 @@ MARGIN_BOUND_UNAVAILABLE = "MARGIN_BOUND_UNAVAILABLE"
 MINUTE_CAPACITY_UNAVAILABLE = "MINUTE_CAPACITY_UNAVAILABLE"
 MARKET_SNAPSHOT_UNAVAILABLE = "MARKET_SNAPSHOT_UNAVAILABLE"
 ADAPTER_FACTS_UNAVAILABLE = "ADAPTER_FACTS_UNAVAILABLE"
+SPREAD_HISTORY_UNAVAILABLE = "SPREAD_HISTORY_UNAVAILABLE"
+SPREAD_HISTORY_BYPASSED_PRETEST = "SPREAD_HISTORY_BYPASSED_PRETEST"
 ADAPTER_BUILD_FAILED = "ADAPTER_BUILD_FAILED"
 WEIGHTED_EXECUTABLE_IDENTITY_COLLISION = "WEIGHTED_EXECUTABLE_IDENTITY_COLLISION"
+WEIGHTED_SEARCH_RESULT_INVALID = "WEIGHTED_SEARCH_RESULT_INVALID"
+WEIGHTED_SEARCH_BUDGET_LIMITED = "WEIGHTED_SEARCH_BUDGET_LIMITED"
+WEIGHTED_CANDIDATE_BANK_INVALID = "WEIGHTED_CANDIDATE_BANK_INVALID"
+WEIGHTED_CANDIDATE_SHAPE_INVALID = "WEIGHTED_CANDIDATE_SHAPE_INVALID"
+# TODO: Temporary diagnostics; revisit/remove after root cause fix and one successful real Campaign.
+WEIGHTED_CANDIDATE_SLOT_DUPLICATE = "WEIGHTED_CANDIDATE_SLOT_DUPLICATE"
+WEIGHTED_CANDIDATE_LIMITER_INVALID = "WEIGHTED_CANDIDATE_LIMITER_INVALID"
+WEIGHTED_PRETEST_PERIOD_INVALID = "WEIGHTED_PRETEST_PERIOD_INVALID"
+WEIGHTED_POST_SEARCH_CONFIG_INVALID = "WEIGHTED_POST_SEARCH_CONFIG_INVALID"
+WEIGHTED_EXECUTABLE_IDENTITY_INVALID = "WEIGHTED_EXECUTABLE_IDENTITY_INVALID"
+PORTFOLIO_INPUT_GEOMETRY_INVALID = "PORTFOLIO_INPUT_GEOMETRY_INVALID"
 _WEIGHTED_SEARCH_CONFIG_INVALID = "WEIGHTED_SEARCH_CONFIG_INVALID"
+_LEGACY_PROFILE_FIELD_UNSUPPORTED = "LEGACY_PROFILE_FIELD_UNSUPPORTED"
 
 
 class CampaignContractError(ValueError):
@@ -52,6 +66,13 @@ class CampaignContractError(ValueError):
 _WEIGHTED_PAYLOAD_ERROR = "WEIGHTED_PAYLOAD_INVALID"
 _WEIGHTED_RELATIVE_TOLERANCE = Decimal("1e-12")
 _WEIGHTED_MAX_ADJUSTED_EXPONENT = 38  # Keep persisted money values bounded before fixed-point formatting.
+_PUBLISHABLE_BUDGET_REASONS = frozenset({
+    "WALL_TIME_LIMIT",
+    "SOLVER_CALL_LIMIT",
+    "SOLVER_TIME_LIMIT",
+    "NEW_X_LIMIT",
+    "BOOTSTRAP_INCOMPLETE",
+})
 _RAW_SERIES_KEYS = frozenset({"actions", "action_series", "minute_actions", "equity", "equity_series"})
 _STRATEGY_DROPPED_KEYS = _RAW_SERIES_KEYS | {"raw", "open_positions_limiter", "k", "size_composition_vector"}
 
@@ -110,7 +131,7 @@ def _prepared_pretest_period(prepared: Any) -> Mapping[str, str]:
             "end_utc": end.isoformat(timespec="seconds").replace("+00:00", "Z"),
         }
     except (AttributeError, TypeError, ValueError, OverflowError) as error:
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID) from error
+        raise CampaignContractError(WEIGHTED_PRETEST_PERIOD_INVALID) from error
 
 
 def _weighted_json_number(value: Decimal) -> int | float:
@@ -468,6 +489,49 @@ def _weighted_geometry_int(value: Any, *, minimum: int) -> int:
     return value
 
 
+def _validate_input_geometry(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Reject missing/ambiguous typed geometry before market/search work."""
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence) or not rows:
+        raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID)
+    seen: set[tuple[str, str, int, int]] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID)
+        try:
+            identity = _weighted_input_identity(row)
+            if identity in seen:
+                raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID)
+            seen.add(identity)
+            symbol = _weighted_symbol(row.get("symbol"))
+            side = row.get("side")
+            if not isinstance(side, str) or side.strip().upper() not in {"LONG", "SHORT"}:
+                raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID)
+            timeframe = row.get("timeframe")
+            if not isinstance(timeframe, str) or not timeframe.strip():
+                raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID)
+            order_count = _weighted_geometry_int(row.get("order_count"), minimum=1)
+            _weighted_geometry_int(row.get("close_ma_len"), minimum=1)
+            orders = row.get("strategy_orders")
+            if isinstance(orders, (str, bytes)) or not isinstance(orders, Sequence) or len(orders) != order_count:
+                raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID)
+            for order in orders:
+                if not isinstance(order, Mapping):
+                    raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID)
+                _weighted_geometry_int(order.get("open_ma_len"), minimum=1)
+                shift_bp = _weighted_geometry_int(order.get("shift_bp"), minimum=0)
+                if side.strip().upper() == "LONG" and shift_bp >= 10000:
+                    raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID)
+                lot = _weighted_decimal(order.get("lot_x"))
+                if lot <= 0:
+                    raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID)
+            if symbol != str(row.get("symbol")).strip().upper():
+                raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID)
+        except CampaignContractError:
+            raise
+        except (ArithmeticError, TypeError, ValueError, OverflowError):
+            raise CampaignContractError(PORTFOLIO_INPUT_GEOMETRY_INVALID) from None
+
+
 def _prepare_frozen_weighted_input(
     selected_rows: Sequence[Mapping[str, Any]],
     campaign: Mapping[str, Any],
@@ -598,6 +662,14 @@ def _freeze(value: Any) -> Any:
     return value
 
 
+def _plain_json_containers(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _plain_json_containers(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json_containers(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class AdapterResult:
     status: str
@@ -620,6 +692,57 @@ def _adapter_gate(campaign: Any) -> AdapterResult:
     return AdapterResult("FAIL", blockers=(WEIGHTED_SEARCH_NOT_IMPLEMENTED,))
 
 
+def _progress_detail(value: Any) -> str:
+    raw = str(value).encode("utf-8")[:160]
+    return raw.decode("utf-8", "ignore")
+
+
+def _progress_sink(callback: Callable[[Mapping[str, Any]], Any] | None) -> Callable[[Mapping[str, Any]], None] | None:
+    """Keep optimizer progress advisory: callback failures never escape the adapter."""
+    if callback is None:
+        return None
+    failures = 0
+    disabled = False
+    last_emit = 0.0
+    last_substage: str | None = None
+
+    def emit(event: Mapping[str, Any]) -> None:
+        nonlocal failures, disabled, last_emit, last_substage
+        if disabled:
+            return
+        try:
+            payload = {
+                "substage": str(event.get("substage", "")),
+                "unit": str(event.get("unit", "")),
+                "completed": max(0, int(event.get("completed", 0))),
+                "total": None if event.get("total") is None else max(0, int(event["total"])),
+                "detail": _progress_detail(event.get("detail", "")),
+            }
+            now = time.monotonic()
+            force = payload["substage"] != last_substage or (payload["total"] is not None and payload["completed"] >= payload["total"] > 0)
+            if not force and now - last_emit < 0.25:
+                return
+            last_emit = now
+            last_substage = payload["substage"]
+            callback(payload)
+        except Exception:
+            failures += 1
+            if failures >= 3:
+                disabled = True
+
+    return emit
+
+
+def _frozen_profile_risk(campaign: Mapping[str, Any], profile_id: str) -> Mapping[str, Decimal]:
+    document = campaign.get("config_document")
+    profiles = document.get("profiles") if isinstance(document, Mapping) else None
+    profile = profiles.get(profile_id, {}) if isinstance(profiles, Mapping) else {}
+    try:
+        return effective_profile_risk(profile, profile_id)
+    except PortfolioConfigError as error:
+        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID) from error
+
+
 def _run_weighted_search(
     prepared: Any,
     members: Sequence[Mapping[str, Any]],
@@ -628,6 +751,7 @@ def _run_weighted_search(
     margin_coefficients: Any,
     *,
     workers: int,
+    progress_callback: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> Any:
     """Call weighted search once with one launch profile and frozen capacities."""
     try:
@@ -647,7 +771,7 @@ def _run_weighted_search(
         if not isinstance(settings, Mapping):
             raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
         required_settings = (
-            "max_targets", "bootstrap_scenarios_per_block", "bootstrap_diagnostic_scenarios",
+            "lp_solutions_per_profile", "max_targets", "bootstrap_scenarios_per_block", "bootstrap_diagnostic_scenarios",
             "wall_time_seconds", "solver_time_seconds",
         )
         if "seed" not in search or any(key not in settings for key in required_settings):
@@ -655,6 +779,7 @@ def _run_weighted_search(
         if (
             type(search["seed"]) is not int or search["seed"] < 0
             or any(type(settings[key]) is not int or settings[key] <= 0 for key in required_settings)
+            or settings["lp_solutions_per_profile"] > 20
             or not 1 <= settings["max_targets"] <= 8
             or settings["bootstrap_diagnostic_scenarios"] > settings["bootstrap_scenarios_per_block"]
         ):
@@ -688,21 +813,30 @@ def _run_weighted_search(
             raise CampaignContractError(MARGIN_BOUND_UNAVAILABLE) from error
         if not margin_covers_members or not margin_known:
             raise CampaignContractError(MARGIN_BOUND_UNAVAILABLE)
+        if "equity_usdt" in launch_profile or "max_balance_usdt" in launch_profile:
+            raise CampaignContractError(_LEGACY_PROFILE_FIELD_UNSUPPORTED)
         profile_id = launch_profile.get("profile_id")
         scenario_id = launch_profile.get("scenario_id")
-        equity_usdt = launch_profile.get("equity_usdt")
-        if not isinstance(profile_id, str) or not profile_id or profile_id not in RESEARCH_RISK_POLICY:
+        if not isinstance(profile_id, str) or not profile_id or profile_id not in PROFILE_NAMES:
             raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
         if not isinstance(scenario_id, str) or not scenario_id:
             raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
-        if not isinstance(equity_usdt, Decimal) or not equity_usdt.is_finite() or equity_usdt <= 0:
-            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raw_available = launch_profile.get("bank_available_usdt")
+        if raw_available is None:
+            bank_available = None
+        else:
+            try:
+                bank_available = _weighted_decimal(raw_available)
+            except CampaignContractError as error:
+                raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID) from error
+            if bank_available <= 0:
+                raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
         if "max_candidates" in launch_profile and (
             type(launch_profile["max_candidates"]) is not int
             or not 1 <= launch_profile["max_candidates"] <= 50
         ):
             raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
-        policy = RESEARCH_RISK_POLICY[profile_id]
+        policy = _frozen_profile_risk(campaign, profile_id)
         max_dd = policy["max_actual_equity_dd_pct"] / Decimal("100")
         margin_kwargs = {
             "reserve": policy["min_calculated_free_margin_reserve_pct"] / Decimal("100"),
@@ -712,13 +846,14 @@ def _run_weighted_search(
         }
         kwargs = {
             "members": members,
-            "bank_available": equity_usdt,
+            "bank_available": bank_available,
             "profile_id": profile_id,
             "scenario_id": scenario_id,
             "margin_coefficients": margin_coefficients,
             "max_dd": max_dd,
             "margin_kwargs": margin_kwargs,
             "max_targets": settings["max_targets"],
+            "max_solver_calls": settings["lp_solutions_per_profile"],
             "seed": search["seed"],
             "bootstrap_scenarios": settings["bootstrap_scenarios_per_block"],
             "screening_scenarios": settings["bootstrap_diagnostic_scenarios"],
@@ -728,6 +863,8 @@ def _run_weighted_search(
         }
         if "max_candidates" in launch_profile:
             kwargs["max_candidates"] = launch_profile["max_candidates"]
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
     except CampaignContractError:
         raise
     except (KeyError, TypeError, ValueError, ArithmeticError) as error:
@@ -754,17 +891,29 @@ def _normalise_scalar_exclusion(item: Any) -> Mapping[str, Any]:
 
 def _safe_search_warnings(value: Any) -> tuple[str, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raise CampaignContractError(WEIGHTED_SEARCH_RESULT_INVALID)
     warnings = tuple(value)
     if any(not isinstance(warning, str) or not warning for warning in warnings):
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raise CampaignContractError(WEIGHTED_SEARCH_RESULT_INVALID)
     return warnings
+
+
+def _safe_budget_reason(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or not value.isascii()
+        or any(character != "_" and not character.isdigit() and not "A" <= character <= "Z" for character in value)
+    ):
+        raise CampaignContractError(WEIGHTED_SEARCH_RESULT_INVALID)
+    return value
 
 
 def _assert_no_raw_series(value: Any) -> None:
     if isinstance(value, Mapping):
         if any(key in _RAW_SERIES_KEYS or key == "raw" for key in value):
-            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+            raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
         for item in value.values():
             _assert_no_raw_series(item)
     elif isinstance(value, (list, tuple)):
@@ -776,16 +925,16 @@ def _safe_weighted_variant(candidate: Any, result: Any) -> Mapping[str, Any]:
     members = getattr(candidate, "members", None)
     metrics = getattr(candidate, "metrics", None)
     if isinstance(members, (str, bytes)) or not isinstance(members, Sequence) or not isinstance(metrics, Mapping):
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
     for member in members:
         _assert_no_raw_series(member)
     _assert_no_raw_series(metrics)
     members = tuple(_copy_candidate_fields(member) for member in members)
     if not members:
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
     metrics = _copy_candidate_fields(metrics)
     if not isinstance(metrics, Mapping):
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
     _assert_no_raw_series(members)
     _assert_no_raw_series(metrics)
     candidate_identity = getattr(candidate, "identity", None)
@@ -798,9 +947,9 @@ def _safe_weighted_variant(candidate: Any, result: Any) -> Mapping[str, Any]:
         or not isinstance(scenario_id, str) or not scenario_id
         or not isinstance(schema_version, str) or not schema_version
     ):
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
     if any(not isinstance(member, Mapping) for member in members):
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
     symbols = []
     seen_pairs: set[tuple[str, str]] = set()
     normalized_members: list[Mapping[str, Any]] = []
@@ -808,10 +957,10 @@ def _safe_weighted_variant(candidate: Any, result: Any) -> Mapping[str, Any]:
         symbol = member.get("symbol")
         side = str(member.get("side", "")).strip().upper()
         if not isinstance(symbol, str) or not symbol.strip() or side not in {"LONG", "SHORT"}:
-            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+            raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
         pair = (symbol.strip().upper(), side)
         if pair in seen_pairs:
-            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+            raise CampaignContractError(WEIGHTED_CANDIDATE_SLOT_DUPLICATE)
         seen_pairs.add(pair)
         normalized = dict(member)
         normalized.update({"symbol": pair[0], "side": pair[1]})
@@ -820,7 +969,7 @@ def _safe_weighted_variant(candidate: Any, result: Any) -> Mapping[str, Any]:
     members = tuple(normalized_members)
     search_mode = getattr(result, "mode", None)
     if search_mode != CAMPAIGN_SEARCH_MODE:
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
     variant: dict[str, Any] = {
         "candidate_id": candidate_identity,
         "identity": candidate_identity,
@@ -850,7 +999,7 @@ def _build_strategy_payloads(
     open_positions_limiter: Any,
 ) -> tuple[Mapping[str, Any], ...]:
     if not isinstance(template, Mapping):
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
     source_by_identity: dict[tuple[str, str, int, int], Mapping[str, Any]] = {}
     for row in source_rows:
         identity = _weighted_input_identity(row)
@@ -986,15 +1135,15 @@ def _weighted_executable_identity(
             or isinstance(source_rows, (str, bytes))
             or not isinstance(source_rows, Sequence)
         ):
-            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+            raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
         positive_members = []
         for member in members:
             if not isinstance(member, Mapping):
-                raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+                raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
             if _weighted_decimal(member.get("x_usdt")) > 0:
                 positive_members.append((_weighted_input_identity(member), member))
         if len(positive_members) != len(payloads):
-            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+            raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
         evidence_by_identity: dict[tuple[str, str, int, int], dict[str, Any]] = {}
         evidence_fields = (
             "reference_digest", "sizing_digest", "capacity_digest",
@@ -1006,20 +1155,20 @@ def _weighted_executable_identity(
             for row in rows:
                 identity = _weighted_input_identity(row)
                 if identity in seen:
-                    raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+                    raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
                 seen.add(identity)
                 evidence = evidence_by_identity.setdefault(identity, {})
                 for field in evidence_fields:
                     if field not in row:
                         continue
                     if field in evidence and evidence[field] != row[field]:
-                        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+                        raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
                     evidence[field] = row[field]
 
         ordered_members = []
         for (identity, _member), payload in sorted(zip(positive_members, payloads), key=lambda item: item[0][0]):
             if not isinstance(payload, Mapping):
-                raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+                raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
             strategy = payload.get("strategy")
             basic = strategy.get("basic") if isinstance(strategy, Mapping) else None
             expected_name = f"PORTFOLIO_{identity[0]}_{identity[2]}_{identity[3]}"
@@ -1029,13 +1178,13 @@ def _weighted_executable_identity(
                 or basic.get("symbol") != identity[0]
                 or strategy.get("name") != expected_name
             ):
-                raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+                raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
             evidence = evidence_by_identity.get(identity)
             if evidence is None:
-                raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+                raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
             for field in ("reference_digest", "sizing_digest", "capacity_digest", "report_start_utc", "report_end_utc"):
                 if type(evidence.get(field)) is not str or not evidence[field]:
-                    raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+                    raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
             ordered_members.append({
                 "identity": {
                     "symbol": identity[0],
@@ -1060,7 +1209,13 @@ def _weighted_executable_identity(
         for field in ("input_digest", "config_digest", "frozen_config_digest", "strategy_template_digest"):
             if field in campaign:
                 envelope_values[field] = campaign[field]
-        encoded = json.dumps(envelope_values, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        encoded = json.dumps(
+            _plain_json_containers(envelope_values),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
         return canonical_digest_v1(
             CanonicalEnvelope(
                 "portfolio_weighted_executable",
@@ -1073,11 +1228,29 @@ def _weighted_executable_identity(
     except CampaignContractError:
         raise
     except (KeyError, TypeError, ValueError, OverflowError, ArithmeticError) as error:
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID) from error
+        raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID) from error
 
 
 def _profile_margin_blockers(profiles: Sequence[Any]) -> tuple[str, ...]:
     return tuple("PROFILE:" + MARGIN_BOUND_UNAVAILABLE for _ in profiles)
+
+
+def _weighted_search_exception_code(error: Exception) -> str:
+    """Expose only a safe exception class when the search escapes its result contract."""
+    name = type(error).__name__
+    if not name.isascii() or not name.isidentifier() or len(name) > 32:
+        return "WEIGHTED_SEARCH_EXCEPTION"
+    return "WEIGHTED_SEARCH_EXCEPTION_" + "".join(
+        ("_" if index and character.isupper() else "") + character.upper()
+        for index, character in enumerate(name)
+    )
+
+
+def _safe_weighted_search_value_error_code(error: ValueError) -> str:
+    code = str(error)
+    if code and code.isascii() and all(character == "_" or character.isdigit() or "A" <= character <= "Z" for character in code):
+        return code
+    return _weighted_search_exception_code(error)
 
 
 def _build_portfolio_candidates_single(
@@ -1094,6 +1267,7 @@ def _build_portfolio_candidates_single(
     margin_coefficients: Any = None,
     strategy_template: Mapping[str, Any] | None = None,
     retain_profile_failures: bool = False,
+    progress_callback: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> AdapterResult:
     """Build scalar weighted variants from one frozen Campaign snapshot."""
     try:
@@ -1134,6 +1308,29 @@ def _build_portfolio_candidates_single(
                 excluded=spread_excluded,
                 blockers=(spread_excluded[0]["reason"],),
             )
+
+    # Cutoff rows may intentionally contain only identity fields in older
+    # fixtures.  When frozen rows carry any geometry, validate the complete
+    # joined set here; this keeps the legacy identity-only seam intact while
+    # rejecting partial geometry before enrichment/search.
+    frozen_rows = campaign.get("weighted_input_rows") if isinstance(campaign, Mapping) else None
+    geometry_rows: list[Mapping[str, Any]] = []
+    if isinstance(frozen_rows, Sequence) and not isinstance(frozen_rows, (str, bytes)):
+        selected_ids = {_weighted_input_identity(row) for row in selected_for_adapter if isinstance(row, Mapping)}
+        for row in frozen_rows:
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                identity = _weighted_input_identity(row)
+            except CampaignContractError:
+                continue
+            if identity in selected_ids and any(key in row for key in ("timeframe", "close_ma_len", "order_count", "strategy_orders")):
+                geometry_rows.append(row)
+    try:
+        if geometry_rows:
+            _validate_input_geometry(tuple(geometry_rows))
+    except CampaignContractError as error:
+        return AdapterResult("FAIL", excluded=spread_excluded, blockers=(error.code,))
 
     try:
         prepared = _prepare_frozen_weighted_input(selected_for_adapter, campaign)
@@ -1247,57 +1444,153 @@ def _build_portfolio_candidates_single(
             return reason
         return f"PROFILE:{profile_id}:{reason}" if retain_profile_failures else f"PROFILE:{reason}"
 
-    for profile in profiles:
+    progress = _progress_sink(progress_callback)
+    profile_total = len(profiles)
+    def finish_profile(profile_index: int, profile_id: Any) -> None:
+        if progress is not None:
+            progress({"substage": "PROFILE", "unit": "profile", "completed": profile_index + 1, "total": profile_total, "detail": f"profile {profile_id or 'invalid'} completed"})
+
+    for profile_index, profile in enumerate(profiles):
         profile_id = profile.get("profile_id")
-        if type(profile_id) is not str or not profile_id or profile_id not in RESEARCH_RISK_POLICY:
+        if progress is not None:
+            progress({
+                "substage": "PROFILE",
+                "unit": "profile",
+                "completed": profile_index,
+                "total": profile_total,
+                "detail": f"profile {profile_id or 'invalid'} started",
+            })
+        if type(profile_id) is not str or not profile_id or profile_id not in PROFILE_NAMES:
             blockers.append(profile_blocker(profile_id, _WEIGHTED_SEARCH_CONFIG_INVALID))
+            finish_profile(profile_index, profile_id)
             continue
         profile_with_scenario = dict(profile)
         profile_with_scenario["scenario_id"] = profile_id
         try:
+            search_kwargs = {"workers": workers}
+            if progress is not None:
+                search_kwargs["progress_callback"] = progress
             search_result = _run_weighted_search(
                 prepared,
                 members,
                 campaign,
                 profile_with_scenario,
                 margin_coefficients,
-                workers=workers,
+                **search_kwargs,
             )
         except CampaignContractError as error:
             blockers.append(profile_blocker(profile_id, error.code))
+            finish_profile(profile_index, profile_id)
             continue
         except ValueError as error:
             reason = str(error)
             if reason.startswith(("SYMBOL_CAPACITY_MISMATCH:", "SYMBOL_CAPACITY_EXCEEDED:", "MISSING_SYMBOL")):
                 blockers.append(profile_blocker(profile_id, reason))
             else:
-                blockers.append(profile_blocker(profile_id, "WEIGHTED_SEARCH_FAILED"))
+                blockers.append(profile_blocker(profile_id, _safe_weighted_search_value_error_code(error)))
+            finish_profile(profile_index, profile_id)
             continue
-        except Exception:
-            blockers.append(profile_blocker(profile_id, "WEIGHTED_SEARCH_FAILED"))
+        except Exception as error:
+            blockers.append(profile_blocker(profile_id, _weighted_search_exception_code(error)))
+            finish_profile(profile_index, profile_id)
             continue
         status = getattr(search_result, "status", None)
+        if not isinstance(status, str) or status not in {"PASS", "FAIL", "budget_limited"}:
+            blockers.append(profile_blocker(profile_id, WEIGHTED_SEARCH_RESULT_INVALID))
+            finish_profile(profile_index, profile_id)
+            continue
         try:
             warnings.extend(_safe_search_warnings(getattr(search_result, "warnings", ())))
         except CampaignContractError as error:
             blockers.append(profile_blocker(profile_id, error.code))
+            finish_profile(profile_index, profile_id)
             continue
-        if status != "PASS":
+        budget_reason = None
+        budget_notice = None
+        if status == "budget_limited":
+            try:
+                budget_reason = _safe_budget_reason(getattr(search_result, "reason", None))
+            except CampaignContractError as error:
+                blockers.append(profile_blocker(profile_id, error.code))
+                finish_profile(profile_index, profile_id)
+                continue
+            budget_notice = f"PROFILE:{profile_id}:{WEIGHTED_SEARCH_BUDGET_LIMITED}:{budget_reason}"
+            if budget_reason not in _PUBLISHABLE_BUDGET_REASONS:
+                blockers.append(budget_notice)
+                finish_profile(profile_index, profile_id)
+                continue
+        if status == "FAIL":
             reason = getattr(search_result, "reason", None) or "WEIGHTED_SEARCH_FAILED"
+            if not isinstance(reason, str):
+                blockers.append(profile_blocker(profile_id, WEIGHTED_SEARCH_RESULT_INVALID))
+                finish_profile(profile_index, profile_id)
+                continue
+            if reason == "LP_INFEASIBLE" and profile_with_scenario.get("bank_available_usdt") is not None:
+                blockers.append(profile_blocker(profile_id, "BANK_UNAVAILABLE"))
             blockers.append(profile_blocker(profile_id, str(reason)))
             search_excluded = getattr(search_result, "excluded", ())
             if isinstance(search_excluded, Sequence) and not isinstance(search_excluded, (str, bytes)):
                 excluded.extend(_normalise_scalar_exclusion(item) for item in search_excluded)
+            finish_profile(profile_index, profile_id)
             continue
         if getattr(search_result, "mode", None) != CAMPAIGN_SEARCH_MODE:
-            blockers.append(profile_blocker(profile_id, _WEIGHTED_SEARCH_CONFIG_INVALID))
+            blockers.append(profile_blocker(profile_id, WEIGHTED_SEARCH_RESULT_INVALID))
+            finish_profile(profile_index, profile_id)
             continue
         candidates = getattr(search_result, "candidates", ())
         if isinstance(candidates, (str, bytes)) or not isinstance(candidates, Sequence):
-            blockers.append(profile_blocker(profile_id, _WEIGHTED_SEARCH_CONFIG_INVALID))
+            blockers.append(profile_blocker(profile_id, WEIGHTED_SEARCH_RESULT_INVALID))
+            finish_profile(profile_index, profile_id)
+            continue
+        try:
+            raw_available = profile_with_scenario.get("bank_available_usdt")
+            try:
+                bank_available = None if raw_available is None else _weighted_decimal(raw_available)
+            except CampaignContractError as error:
+                raise CampaignContractError(WEIGHTED_CANDIDATE_BANK_INVALID) from error
+            if bank_available is not None and bank_available <= 0:
+                raise CampaignContractError(WEIGHTED_CANDIDATE_BANK_INVALID)
+            eligible_candidates = []
+            excluded_by_bank = False
+            for candidate in candidates:
+                metrics = getattr(candidate, "metrics", None)
+                if not isinstance(metrics, Mapping):
+                    raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
+                required_raw = metrics.get("required_bank_usdt")
+                if isinstance(required_raw, bool) or required_raw is None:
+                    raise CampaignContractError(WEIGHTED_CANDIDATE_BANK_INVALID)
+                try:
+                    required_bank = _weighted_decimal(required_raw)
+                except CampaignContractError as error:
+                    raise CampaignContractError(WEIGHTED_CANDIDATE_BANK_INVALID) from error
+                if required_bank <= 0:
+                    raise CampaignContractError(WEIGHTED_CANDIDATE_BANK_INVALID)
+                if bank_available is not None and required_bank > bank_available:
+                    excluded_by_bank = True
+                    excluded.append({
+                        "profile": profile_id,
+                        "stage": "WEIGHTED_SEARCH",
+                        "candidate_id": getattr(candidate, "identity", ""),
+                        "reason": "BANK_UNAVAILABLE",
+                    })
+                    continue
+                eligible_candidates.append(candidate)
+            candidates = tuple(eligible_candidates)
+        except CampaignContractError as error:
+            blockers.append(profile_blocker(profile_id, error.code))
+            finish_profile(profile_index, profile_id)
             continue
         if not candidates:
-            blockers.append(profile_blocker(profile_id, "WEIGHTED_SEARCH_FAILED"))
+            if budget_reason is not None and not excluded_by_bank:
+                blockers.append(budget_notice)
+            else:
+                blockers.append(profile_blocker(
+                    profile_id,
+                    "BANK_UNAVAILABLE" if excluded_by_bank else "WEIGHTED_SEARCH_FAILED",
+                ))
+                if budget_notice is not None:
+                    warnings.append(budget_notice)
+            finish_profile(profile_index, profile_id)
             continue
         try:
             profile_variants = []
@@ -1306,18 +1599,27 @@ def _build_portfolio_candidates_single(
                     getattr(candidate, "profile_id", None) != profile_id
                     or getattr(candidate, "scenario_id", None) != profile_id
                 ):
-                    raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+                    raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
                 variant = dict(_safe_weighted_variant(candidate, search_result))
+                variant_metrics = variant.get("metrics")
+                if not isinstance(variant_metrics, Mapping):
+                    raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
+                try:
+                    required_bank = _weighted_decimal(variant_metrics.get("required_bank_usdt"))
+                except CampaignContractError as error:
+                    raise CampaignContractError(WEIGHTED_CANDIDATE_BANK_INVALID) from error
+                if required_bank <= 0:
+                    raise CampaignContractError(WEIGHTED_CANDIDATE_BANK_INVALID)
                 if strategy_template is not None:
                     limiter = variant.get("limiter_L")
                     if type(limiter) is not int or limiter < 0:
-                        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+                        raise CampaignContractError(WEIGHTED_CANDIDATE_LIMITER_INVALID)
                     variant["strategy_payloads"] = _build_strategy_payloads(
                         strategy_template,
                         variant["members"],
                         selected_for_adapter,
                         members,
-                        profile.get("equity_usdt"),
+                        required_bank,
                         limiter,
                     )
                     variant["search_identity"] = variant["identity"]
@@ -1325,7 +1627,7 @@ def _build_portfolio_candidates_single(
                         campaign,
                         variant["profile_id"],
                         variant["scenario_id"],
-                        profile.get("equity_usdt"),
+                        required_bank,
                         variant["members"],
                         members,
                         variant["strategy_payloads"],
@@ -1334,9 +1636,17 @@ def _build_portfolio_candidates_single(
                     variant["pretest_period"] = _prepared_pretest_period(prepared)
                 profile_variants.append(variant)
         except CampaignContractError as error:
-            blockers.append(profile_blocker(profile_id, error.code))
+            code = (
+                WEIGHTED_POST_SEARCH_CONFIG_INVALID
+                if error.code == _WEIGHTED_SEARCH_CONFIG_INVALID
+                else error.code
+            )
+            blockers.append(profile_blocker(profile_id, code))
         else:
+            if budget_notice is not None:
+                warnings.append(budget_notice)
             variants.extend(profile_variants)
+        finish_profile(profile_index, profile_id)
 
     if not blockers:
         identities = [variant["identity"] for variant in variants]
@@ -1372,6 +1682,7 @@ def build_portfolio_candidates(
     workers: int = 1,
     margin_coefficients: Any = None,
     strategy_template: Mapping[str, Any] | None = None,
+    progress_callback: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> AdapterResult:
     """Enumerate fixed finalist compositions, then run each profile."""
     try:
@@ -1392,6 +1703,7 @@ def build_portfolio_candidates(
             workers=workers,
             margin_coefficients=margin_coefficients,
             strategy_template=strategy_template,
+            progress_callback=progress_callback,
         )
     if isinstance(launch.get("pairs"), (str, bytes)) or not isinstance(launch.get("pairs"), Sequence) or not launch.get("pairs"):
         return AdapterResult("FAIL", blockers=(_WEIGHTED_SEARCH_CONFIG_INVALID,))
@@ -1439,7 +1751,7 @@ def build_portfolio_candidates(
         max_candidates = profile.get("max_candidates")
         if (
             type(profile_id) is not str
-            or profile_id not in RESEARCH_RISK_POLICY
+            or profile_id not in PROFILE_NAMES
             or profile_id in profiles_by_id
             or type(max_candidates) is not int
             or not 1 <= max_candidates <= 50
@@ -1475,18 +1787,18 @@ def build_portfolio_candidates(
     def metric_for(item: Mapping[str, Any], *names: str) -> Decimal:
         metrics = item.get("metrics")
         if not isinstance(metrics, Mapping):
-            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+            raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
         for name in names:
             if name not in metrics:
                 continue
             try:
                 value = Decimal(str(metrics[name]))
             except (ArithmeticError, TypeError, ValueError):
-                raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+                raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
             if value.is_finite():
                 return value
-            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
-        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+            raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
+        raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
 
     for ordinal, composition in enumerate(compositions):
         composition_identity = tuple(
@@ -1511,6 +1823,7 @@ def build_portfolio_candidates(
             margin_coefficients=margin_coefficients,
             strategy_template=strategy_template,
             retain_profile_failures=True,
+            progress_callback=progress_callback,
         )
         add_excluded(
             result.excluded,
@@ -1561,7 +1874,7 @@ def build_portfolio_candidates(
                 str(value.get("profile_id", "")),
             ))
             if profile_id not in profiles_by_id:
-                return AdapterResult("FAIL", excluded=tuple(excluded), blockers=(_WEIGHTED_SEARCH_CONFIG_INVALID,), warnings=tuple(warnings))
+                return AdapterResult("FAIL", excluded=tuple(excluded), blockers=(WEIGHTED_CANDIDATE_SHAPE_INVALID,), warnings=tuple(warnings))
             limit = profiles_by_id[profile_id]["max_candidates"]
             if len(retained) > limit:
                 removed = retained.pop()
@@ -1596,6 +1909,7 @@ def run_portfolio_adapter(
     market_fetcher: Any = None,
     archive_fetcher: Any = None,
     workers: int = 1,
+    progress_callback: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> AdapterResult:
     """Load official public/local facts for one frozen weighted Campaign."""
     try:
@@ -1617,6 +1931,9 @@ def run_portfolio_adapter(
         liquidity = document.get("liquidity") if isinstance(document, Mapping) else None
         parameters = liquidity.get("parameters") if isinstance(liquidity, Mapping) else None
         if not isinstance(inputs, Mapping) or not isinstance(liquidity, Mapping) or not isinstance(parameters, Mapping):
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        spread_bypass_pretest = liquidity.get("spread_history_bypass_pretest", False)
+        if not isinstance(spread_bypass_pretest, bool):
             raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
 
         now = datetime.now(timezone.utc)
@@ -1668,27 +1985,34 @@ def run_portfolio_adapter(
         mark_prices = getattr(market, "mark_prices", None)
         if getattr(market, "reference", None) is None or not isinstance(mark_prices, Mapping) or any(symbol not in mark_prices for symbol in symbols):
             raise MarketSnapshotError("market snapshot facts are incomplete")
-        spread = read_spread_history(
-            Path(workspace_root) / Path(str(inputs["collector_root"])),
-            symbols,
-            now_ms=now_ms,
-            minimum_coverage_pct=liquidity["minimum_coverage_pct"],
-        )
-        spread_observations = getattr(spread, "observations", None)
-        spread_statuses = getattr(spread, "statuses", None)
-        if (
-            not isinstance(spread_observations, Mapping)
-            or not isinstance(spread_statuses, Mapping)
-            or any(
-                symbol not in spread_observations
-                or symbol not in spread_statuses
-                or isinstance(spread_observations[symbol], (str, bytes))
-                or not isinstance(spread_observations[symbol], Sequence)
-                or not spread_observations[symbol]
-                for symbol in symbols
-            )
-        ):
-            raise ValueError("spread history facts are incomplete")
+        if spread_bypass_pretest:
+            spread_observations = {symbol: () for symbol in symbols}
+            spread_statuses = {symbol: "PRELIMINARY" for symbol in symbols}
+        else:
+            try:
+                spread = read_spread_history(
+                    Path(workspace_root) / Path(str(inputs["collector_root"])),
+                    symbols,
+                    now_ms=now_ms,
+                    minimum_coverage_pct=liquidity["minimum_coverage_pct"],
+                )
+            except Exception:
+                return AdapterResult("FAIL", blockers=(SPREAD_HISTORY_UNAVAILABLE,))
+            spread_observations = getattr(spread, "observations", None)
+            spread_statuses = getattr(spread, "statuses", None)
+            if (
+                not isinstance(spread_observations, Mapping)
+                or not isinstance(spread_statuses, Mapping)
+                or any(
+                    symbol not in spread_observations
+                    or symbol not in spread_statuses
+                    or isinstance(spread_observations[symbol], (str, bytes))
+                    or not isinstance(spread_observations[symbol], Sequence)
+                    or not spread_observations[symbol]
+                    for symbol in symbols
+                )
+            ):
+                return AdapterResult("FAIL", blockers=(SPREAD_HISTORY_UNAVAILABLE,))
 
     except MinuteCapacityError:
         return AdapterResult("FAIL", blockers=(MINUTE_CAPACITY_UNAVAILABLE,))
@@ -1700,20 +2024,28 @@ def run_portfolio_adapter(
         return AdapterResult("FAIL", blockers=(ADAPTER_FACTS_UNAVAILABLE,))
 
     try:
-        return build_portfolio_candidates(
-            selected_rows,
-            campaign,
-            capacities=capacities,
-            reference=market.reference,
-            mark_prices=mark_prices,
-            spread_observations=spread_observations,
-            spread_history_statuses=spread_statuses,
-            now_ms=now_ms,
-            workers=workers,
-            strategy_template=strategy_template,
-        )
+        build_kwargs = {
+            "capacities": capacities,
+            "reference": market.reference,
+            "mark_prices": mark_prices,
+            "spread_observations": spread_observations,
+            "spread_history_statuses": spread_statuses,
+            "now_ms": now_ms,
+            "workers": workers,
+            "strategy_template": strategy_template,
+        }
+        if progress_callback is not None:
+            build_kwargs["progress_callback"] = progress_callback
+        result = build_portfolio_candidates(selected_rows, campaign, **build_kwargs)
     except Exception:
-        return AdapterResult("FAIL", blockers=(ADAPTER_BUILD_FAILED,))
+        return AdapterResult(
+            "FAIL",
+            blockers=(ADAPTER_BUILD_FAILED,),
+            warnings=(SPREAD_HISTORY_BYPASSED_PRETEST,) if spread_bypass_pretest else (),
+        )
+    if spread_bypass_pretest:
+        return replace(result, warnings=result.warnings + (SPREAD_HISTORY_BYPASSED_PRETEST,))
+    return result
 
 
 __all__ = [
@@ -1727,9 +2059,20 @@ __all__ = [
     "MARGIN_BOUND_UNAVAILABLE",
     "MINUTE_CAPACITY_UNAVAILABLE",
     "MARKET_SNAPSHOT_UNAVAILABLE",
+    "SPREAD_HISTORY_UNAVAILABLE",
+    "SPREAD_HISTORY_BYPASSED_PRETEST",
     "WEIGHTED_EXECUTABLE_IDENTITY_COLLISION",
+    "WEIGHTED_SEARCH_RESULT_INVALID",
+    "WEIGHTED_CANDIDATE_BANK_INVALID",
+    "WEIGHTED_CANDIDATE_SHAPE_INVALID",
+    "WEIGHTED_CANDIDATE_SLOT_DUPLICATE",
+    "WEIGHTED_CANDIDATE_LIMITER_INVALID",
+    "WEIGHTED_PRETEST_PERIOD_INVALID",
+    "WEIGHTED_POST_SEARCH_CONFIG_INVALID",
+    "WEIGHTED_EXECUTABLE_IDENTITY_INVALID",
     "ADAPTER_FACTS_UNAVAILABLE",
     "ADAPTER_BUILD_FAILED",
+    "PORTFOLIO_INPUT_GEOMETRY_INVALID",
     "WEIGHTED_SEARCH_NOT_IMPLEMENTED",
     "AdapterResult",
     "build_weighted_strategy_payload",

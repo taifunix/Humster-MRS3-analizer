@@ -29,6 +29,7 @@ from mrs3.performance_v2_finalist_retest import FinalistRetestError, combined_co
 from mrs3.performance_v2_selection import (
     PerformanceV2SelectionError,
     SelectionConfig,
+    SelectionRequest,
     parse_selection_request,
     selection_cache_missing_strategy_ids,
     write_selection_workbook,
@@ -634,6 +635,11 @@ def test_v2_panel_controller_injects_server_owned_listing_root(tmp_path: Path, m
     assert controller._panel_jobs.runtime("tester-root")["performance_v2_import_verified"] is False
     with pytest.raises(ValueError, match="explicit inbox verification"):
         controller.strategies_performance_v2_import({"tester_job_id": "tester-root"})
+    runtime = controller._panel_jobs.runtime("tester-root")
+    runtime["performance_v2_import_verified"] = True
+    controller._panel_jobs.sync("tester-root", {"state": "COMMITTED"}, runtime=runtime)
+    with pytest.raises(ValueError, match="listing_dates_path is configured by the server"):
+        controller.strategies_performance_v2_import({"tester_job_id": "tester-root", "listing_dates_path": "override.xlsx"})
 
 
 def test_v2_panel_controller_rejects_committed_job_without_verified_inbox(tmp_path: Path) -> None:
@@ -705,6 +711,132 @@ def _http_server(controller: PanelController):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread
+
+
+def test_performance_v2_export_downloads_current_retest_xlsx_without_writing_database(tmp_path: Path) -> None:
+    controller, database, result_id = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies where strategy_name = 'alpha'").fetchone()[0]
+        connection.execute(
+            """update strategy_results
+               set effective_start_utc = '2026-02-11 23:30:00+00',
+                   effective_end_utc = '2026-09-03 00:00:00+00'
+               where result_id = ?""",
+            [result_id],
+        )
+        connection.execute(
+            "insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc) values (?, 'RETEST', 'TEST', 'fixture', now())",
+            [strategy_id],
+        )
+    before = (database.stat().st_size, sha256(database.read_bytes()).hexdigest())
+
+    filename, payload = controller.strategies_performance_v2_export(
+        panel_module.parse_performance_v2_export_query("retest=1"),
+        now=datetime(2026, 9, 24, 12, 34, 56, tzinfo=UTC),
+    )
+
+    assert filename == "performance_v2_strategies_20260924T123456Z.xlsx"
+    workbook = load_workbook(BytesIO(payload), data_only=False)
+    assert workbook.sheetnames == ["All candidates", "Finalists", "_MRS_SELECTION_META"]
+    sheet = workbook["All candidates"]
+    rows = list(sheet.values)
+    headers = {value: column for column, value in enumerate(rows[0], start=1)}
+    assert rows[0][0:9] == ("ID", "Result ID", "Стратегия", "Пара", "Side", "ТФ", "Start", "End", "ORD")
+    assert (sheet.cell(2, headers["Стратегия"]).value, sheet.cell(2, headers["Пара"]).value, sheet.cell(2, headers["Side"]).value) == ("alpha", "BTCUSDT", "LONG")
+    assert (sheet.cell(2, headers["Start"]).value, sheet.cell(2, headers["End"]).value) == ("11.02", "03.09")
+    assert sheet.cell(2, headers["RETEST"]).value == "RETEST"
+    assert before == (database.stat().st_size, sha256(database.read_bytes()).hexdigest())
+
+
+def test_performance_v2_export_uses_cached_metrics_for_selected_rows(tmp_path: Path) -> None:
+    controller, database, result_id = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies where strategy_name = 'alpha'").fetchone()[0]
+        connection.execute(
+            "insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc) values (?, 'RETEST', 'TEST', 'fixture', now())",
+            [strategy_id],
+        )
+        connection.executemany(
+            "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (result_id, 2, datetime(2026, 1, 3, tzinfo=UTC), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 1, 110, None),
+                (result_id, 3, datetime(2026, 1, 4, tzinfo=UTC), "BTCUSDT", 1, "closed", 1, 0, "", 10, 1, 120, None),
+            ],
+        )
+        connection.executemany(
+            "insert into strategy_equity values (?, ?, ?, ?, ?)",
+            [
+                (result_id, 3, datetime(2026, 1, 3, tzinfo=UTC), 110, 110),
+                (result_id, 4, datetime(2026, 1, 4, tzinfo=UTC), 120, 120),
+            ],
+        )
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select availability_status from window_metrics where result_id = ?", [result_id]
+        ).fetchone() == ("AVAILABLE",)
+
+    before = (database.stat().st_size, sha256(database.read_bytes()).hexdigest())
+    _, payload = controller.strategies_performance_v2_export(panel_module.parse_performance_v2_export_query("retest=1"))
+    sheet = load_workbook(BytesIO(payload), data_only=False)["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+
+    metric_values = {column: sheet.cell(2, headers[column]).value for column in ("PnL/30", "W/R", "Trades/30", "PointsALL")}
+    assert all(value is not None for value in metric_values.values()), metric_values
+    assert before == (database.stat().st_size, sha256(database.read_bytes()).hexdigest())
+
+
+def test_performance_v2_export_rejects_rows_over_its_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies where strategy_name = 'alpha'").fetchone()[0]
+        connection.execute(
+            "insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc) values (?, 'RETEST', 'TEST', 'fixture', now())",
+            [strategy_id],
+        )
+    monkeypatch.setattr("mrs3.panel_performance_v2._EXPORT_MAX_ROWS", 0)
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller.strategies_performance_v2_export(panel_module.parse_performance_v2_export_query("retest=1"))
+
+    assert (raised.value.code, raised.value.status) == ("EXPORT_ROW_LIMIT_EXCEEDED", 413)
+
+
+def test_performance_v2_export_keeps_the_pareto_workbook_when_selection_is_empty(tmp_path: Path) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+
+    _, payload = controller.strategies_performance_v2_export(
+        panel_module.parse_performance_v2_export_query("status=FINALIST"),
+    )
+
+    workbook = load_workbook(BytesIO(payload), data_only=False)
+    assert workbook.sheetnames == ["All candidates", "Finalists", "_MRS_SELECTION_META"]
+    assert [cell.value for cell in workbook["All candidates"][1]][:9] == [
+        "ID", "Result ID", "Стратегия", "Пара", "Side", "ТФ", "Start", "End", "ORD",
+    ]
+    assert workbook["All candidates"].max_row == workbook["Finalists"].max_row == 1
+
+
+def test_performance_v2_export_uses_the_full_pareto_workbook_layout(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    pareto_path = write_selection_workbook(
+        pd.DataFrame(columns=["strategy_id"]), tmp_path / "pareto.xlsx", SelectionRequest("BTCUSDT", "LONG", ()),
+        {"workbook_schema_version": "1"}, {},
+    )
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies where strategy_name = 'alpha'").fetchone()[0]
+        connection.execute(
+            "insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc) values (?, 'RETEST', 'TEST', 'fixture', now())",
+            [strategy_id],
+        )
+    _, export_data = controller.strategies_performance_v2_export(panel_module.parse_performance_v2_export_query("retest=1"))
+
+    pareto = load_workbook(pareto_path, data_only=False)
+    exported = load_workbook(BytesIO(export_data), data_only=False)
+    assert exported.sheetnames == pareto.sheetnames
+    for sheet_name in ("All candidates", "Finalists"):
+        assert [cell.value for cell in exported[sheet_name][1]] == [cell.value for cell in pareto[sheet_name][1]]
+    assert exported["_MRS_SELECTION_META"].sheet_state == pareto["_MRS_SELECTION_META"].sheet_state == "veryHidden"
 
 
 def _http_json(connection: HTTPConnection, method: str, path: str, payload: object | None = None) -> tuple[int, dict]:
@@ -1081,11 +1213,13 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     controller._panel_jobs = Jobs("old-cohort")  # type: ignore[assignment]
     started: dict[str, object] = {}
     monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(start=lambda *_args, **kwargs: started.update(kwargs)))
-    assert controller.strategies_performance_v2_finalist_retest_start({"clear_reports": True})["job_id"] == "new"
+    assert controller.strategies_performance_v2_finalist_retest_start({"clear_reports": True, "initial_balance": "2500.5"})["job_id"] == "new"
     assert captured["runtime"]["cohort_members"] == [{"strategy_id": 1, "effective_start": "2026-01-01T00:00:00Z"}]
     captured["submit"]("new")
     assert captured["request"]["clear_reports"] is True
+    assert captured["request"]["initial_balance"] == 2500.5
     assert started["clear_reports"] is True
+    assert started["initial_balance"] == 2500.5
     controller._panel_jobs = Jobs("new-cohort")  # type: ignore[assignment]
     assert controller.strategies_performance_v2_finalist_retest_start({}) == {"job_id": "old", "replayed": True}
 
@@ -1111,8 +1245,20 @@ def test_finalist_retest_status_exposes_started_import_job(tmp_path: Path, monke
 
 
 def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_path: Path) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, result_id = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """update strategy_results
+               set effective_start_utc = '2026-02-11 23:30:00+00',
+                   effective_end_utc = '2026-09-03 00:00:00+00'
+               where result_id = ?""",
+            [result_id],
+        )
     controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+    with duckdb.connect(str(database), read_only=True) as connection:
+        fact_counts = connection.execute(
+            "select (select count(*) from strategy_results), (select count(*) from strategy_actions), (select count(*) from strategy_equity)"
+        ).fetchone()
     server, thread = _http_server(controller)
     try:
         connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
@@ -1131,6 +1277,7 @@ def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_pa
         workbook = load_workbook(BytesIO(body))
         sheet = workbook["All candidates"]
         headers = {cell.value: cell.column for cell in sheet[1]}
+        assert (sheet.cell(2, headers["Start"]).value, sheet.cell(2, headers["End"]).value) == ("11.02", "03.09")
         for row in range(2, sheet.max_row + 1):
             status = sheet.cell(row, headers["Auto Status"]).value
             sheet.cell(row, headers["User Status"]).value = status
@@ -1140,6 +1287,7 @@ def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_pa
             sheet.cell(row, headers["Analog Of ID"]).value = (
                 sheet.cell(row, headers["Auto Analog Of ID"]).value if status == "ANALOG" else None
             )
+            sheet.cell(row, headers["RETEST"]).value = "RETEST"
         completed = BytesIO()
         workbook.save(completed)
         body = completed.getvalue()
@@ -1154,6 +1302,21 @@ def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_pa
         assert response.status == 200
         assert imported["row_count"] == imported["finalist_count"] == 1
         connection.close()
+        workbook = load_workbook(BytesIO(body))
+        sheet = workbook["All candidates"]
+        headers = {cell.value: cell.column for cell in sheet[1]}
+        sheet.cell(2, headers["User Status"]).value = "not a status"
+        retest_only = BytesIO()
+        workbook.save(retest_only)
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST", "/api/v2/strategies/performance-v2/retest-tags-import", body=retest_only.getvalue(),
+            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read()) == {"row_count": 1, "retest_count": 1}
+        connection.close()
     finally:
         server.shutdown()
         server.server_close()
@@ -1164,6 +1327,9 @@ def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_pa
         )
         assert connection.execute("select count(*) from selection_results").fetchone() == (1,)
         assert connection.execute("select count(*) from selection_review_imports").fetchone() == (1,)
+        assert connection.execute("select (select count(*) from strategy_results), (select count(*) from strategy_actions), (select count(*) from strategy_equity)").fetchone() == fact_counts
+        assert connection.execute("select tag from strategy_tags").fetchone() == ("RETEST",)
+    assert controller._panel_jobs.list() == []
 
 
 def test_selection_http_missing_cache_returns_typed_json_without_xlsx(tmp_path: Path) -> None:

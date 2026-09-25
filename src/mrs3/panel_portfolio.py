@@ -9,16 +9,20 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import asyncio
 import base64
+import copy
+import gzip
 import hashlib
+import io
 import inspect
 import json
 import math
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -63,11 +67,18 @@ STAGES = (
 )
 STAGE2_STAGES = ("PREPARE", "FILL_PREBUILT", "START", "READBACK")
 _TERMINAL = frozenset({"COMMITTED", "CANCELLED", "FAILED"})
+_SNAPSHOT_SCHEMA = "portfolio-campaign-input-v1"
+_SNAPSHOT_NAME = "campaign-input.json.gz"
+_SNAPSHOT_MAX_UNCOMPRESSED = 512 * 1024 * 1024
+_SNAPSHOT_MIGRATION_BACKUP = ".panel-jobs.snapshot-migration.bak"
+_SNAPSHOT_MIGRATION_RESERVE = 64 * 1024 * 1024
+PORTFOLIO_SNAPSHOT_UNSERIALIZABLE = "PORTFOLIO_SNAPSHOT_UNSERIALIZABLE"
+_GEOMETRY_FIELDS = ("timeframe", "close_ma_len", "order_count", "strategy_orders")
 _SECRET = re.compile(r"(?:password|passwd|secret|token|credential|api[_-]?key|private[_-]?key)", re.I)
 _PATH = re.compile(
     r"(?<![\w])[A-Za-z]:[\\/][^\s,;)]*"
     r"|(?<![\w])\\\\[^\s,;)]*"
-    r"|(?<![\w/:])/(?!/)[^\s,;)]*"
+    r"|(?<![\w/:])/(?![/\s])(?=[A-Za-z0-9_.-])[^\s,;)]*"
     r"|(?<![\w])(?:[^\\/\s,;)]+[\\/])+\.\.(?:[\\/][^\s,;)]*)?"
     r"|(?<![\w])\.\.(?:[\\/][^\s,;)]*)+"
 )
@@ -105,6 +116,26 @@ PROFILE_STATUS_HEADERS = (
     "Campaign ID", "Profile", "Status", "Max Candidates", "Evaluations", "Evaluation Budget",
     "Pretest Period", "Coverage %", "Blockers", "Metric Basis", "Joint Metrics",
 )
+WEIGHTED_SUMMARY_HEADERS = ("Key", "Value")
+# Stage 1 workbook uses operator-facing columns; legacy sheets remain unchanged.
+WEIGHTED_VARIANT_HEADERS = (
+    "№", "ID", "Профиль", "Поз.", "Состав", "Банк\nнасыщ., USDT", "Целевой\nбанк, USDT",
+    "Мин. банк DD\nистории, USDT", "Банк DD P95\nстресса, USDT", "Банк\nлимитов, USDT", "PnL 30д,\nUSDT", "MaxDD SUM,\nUSDT", "DD истории,\n%",
+    "CDaR 20%\nUSDT · ц/н", "CDaR 10%\nUSDT · ц/н", "IM\nUSDT · ц/н", "MM\nUSDT · ц/н", "Номинал\nпортф., USDT",
+)
+WEIGHTED_MEMBER_HEADERS = (
+    "№ вар.", "ID", "Профиль", "Пара", "Сторона", "Strategy ID", "Result ID", "Позиция,\nUSDT",
+    "Множитель\nпары, %", "Max balance,\nUSDT", "X, %", "Y, %", "Z, %", "W, %", "Плечо", "Лимит ликв.,\nUSDT", "TF", "User Rank",
+    "Source PnL,\nUSDT", "Source MaxDD,\nUSDT", "Source MaxDD,\n%", "ORD_N", "Исп. ликв.\nx/C, %", "Инд. MaxDD,\nUSDT",
+)
+WEIGHTED_FINALIST_HEADERS = (
+    "Campaign\nID", "Strategy\nID", "Result\nID", "Пара", "Сторона",
+    "User\nstatus", "User\nrank", "Лимит", "Статус\nотбора", "Причина\nотбора",
+)
+WEIGHTED_EXCLUDED_HEADERS = (
+    "Campaign\nID", "Объект", "Object\nID", "Пара", "Сторона",
+    "Профиль", "Этап", "Результат", "Причина", "Сообщение",
+)
 
 
 class PortfolioPanelError(ValueError):
@@ -115,6 +146,115 @@ class PortfolioPanelError(ValueError):
         self.status = status
         self.field_errors = [dict(item) for item in field_errors]
         super().__init__(message or code)
+
+
+class _PortfolioProgressReporter:
+    """Small in-memory progress state; it deliberately stores no event history."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.RLock()
+        self._states: dict[str, dict[str, Any]] = {}
+
+    def start(self, job_id: str) -> None:
+        now = self._clock()
+        with self._lock:
+            self._states[job_id] = {
+                "started": now,
+                "last_emit": 0.0,
+                "last_update": now,
+                "last_heartbeat": now,
+                "last_persist": None,
+                "substage": None,
+                "unit": "",
+                "completed": 0,
+                "total": None,
+                "detail": "",
+                "inconsistent": False,
+            }
+
+    @staticmethod
+    def _event(event: Mapping[str, Any]) -> dict[str, Any]:
+        detail = str(event.get("detail", "")).encode("utf-8")[:160].decode("utf-8", "ignore")
+        total = event.get("total")
+        return {
+            "substage": str(event.get("substage", "")),
+            "unit": str(event.get("unit", "")),
+            "completed": max(0, int(event.get("completed", 0))),
+            "total": None if total is None else max(0, int(total)),
+            "detail": detail,
+        }
+
+    def _snapshot(self, state: Mapping[str, Any], now: float) -> dict[str, Any]:
+        elapsed = max(0.0, now - float(state["started"]))
+        completed = int(state["completed"])
+        total = state["total"]
+        reliable = not state["inconsistent"] and isinstance(total, int) and total > 0 and 2 <= completed <= total and elapsed >= 2.0
+        eta = (elapsed / completed) * (total - completed) if reliable else None
+        return {
+            "substage": state["substage"],
+            "unit": state["unit"],
+            "completed": completed,
+            "total": total if not state["inconsistent"] else None,
+            "detail": state["detail"],
+            "elapsed_seconds": elapsed,
+            "eta_seconds": max(0.0, eta) if eta is not None else None,
+            "heartbeat_age_seconds": max(0.0, now - float(state["last_heartbeat"])),
+            "last_update_age_seconds": max(0.0, now - float(state["last_update"])),
+            "indeterminate": bool(state["inconsistent"] or not (isinstance(total, int) and total > 0)),
+        }
+
+    def emit(self, job_id: str, event: Mapping[str, Any], *, force: bool = False) -> tuple[dict[str, Any], bool]:
+        now = self._clock()
+        parsed = self._event(event)
+        with self._lock:
+            state = self._states.get(job_id)
+            if state is None:
+                self.start(job_id)
+                state = self._states[job_id]
+            changed_substage = parsed["substage"] != state["substage"]
+            if not force and not changed_substage and now - float(state["last_emit"]) < 0.25:
+                return self._snapshot(state, now), False
+            previous_total = state["total"]
+            if previous_total is not None and parsed["total"] is not None and parsed["total"] != previous_total:
+                state["inconsistent"] = True
+            if parsed["total"] is not None and parsed["completed"] > parsed["total"]:
+                state["inconsistent"] = True
+            state.update(parsed)
+            state["last_emit"] = now
+            state["last_update"] = now
+            state["last_heartbeat"] = now
+            last_persist = state["last_persist"]
+            persist = bool(
+                force
+                or (changed_substage and (last_persist is None or now - float(last_persist) >= 2.0))
+            )
+            if persist:
+                state["last_persist"] = now
+            return self._snapshot(state, now), persist
+
+    def heartbeat(self, job_id: str) -> tuple[dict[str, Any] | None, bool]:
+        now = self._clock()
+        with self._lock:
+            state = self._states.get(job_id)
+            if state is None:
+                return None, False
+            state["last_heartbeat"] = now
+            last_persist = state["last_persist"]
+            persist = last_persist is not None and now - float(last_persist) >= 10.0
+            if persist:
+                state["last_persist"] = now
+            return self._snapshot(state, now), persist
+
+    def snapshot(self, job_id: str) -> dict[str, Any] | None:
+        now = self._clock()
+        with self._lock:
+            state = self._states.get(job_id)
+            return self._snapshot(state, now) if state is not None else None
+
+    def stop(self, job_id: str) -> None:
+        with self._lock:
+            self._states.pop(job_id, None)
 
 
 def _now() -> str:
@@ -195,7 +335,21 @@ def _validate_pretest_period(value: Any) -> None:
         raise ValueError("pretest period is too short")
 
 
-def _stage2_material(candidate: Mapping[str, Any], equity: Decimal) -> dict[str, Any]:
+def _candidate_required_bank(candidate: Mapping[str, Any]) -> Decimal:
+    metrics = candidate.get("metrics")
+    raw = metrics.get("required_bank_usdt") if isinstance(metrics, Mapping) else None
+    if isinstance(raw, bool) or raw is None:
+        raise ValueError("candidate required bank is invalid")
+    try:
+        bank = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("candidate required bank is invalid") from error
+    if not bank.is_finite() or bank <= 0:
+        raise ValueError("candidate required bank is invalid")
+    return bank
+
+
+def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
     """Render the exact tester inputs and receipt from one committed candidate."""
     candidate_id = candidate.get("candidate_id")
     if (
@@ -204,6 +358,7 @@ def _stage2_material(candidate: Mapping[str, Any], equity: Decimal) -> dict[str,
         or candidate.get("identity") != candidate_id
     ):
         raise ValueError("candidate id is unsafe")
+    required_bank = _candidate_required_bank(candidate)
     payloads = candidate.get("strategy_payloads")
     if isinstance(payloads, (str, bytes)) or not isinstance(payloads, Sequence) or len(payloads) < 2:
         raise ValueError("candidate strategies are invalid")
@@ -222,7 +377,7 @@ def _stage2_material(candidate: Mapping[str, Any], equity: Decimal) -> dict[str,
             numeric = {key: Decimal(str(facts[key])) for key in ("B", "C", "q", "x")}
         except (InvalidOperation, TypeError, ValueError) as error:
             raise ValueError("candidate sizing evidence is invalid") from error
-        if any(not value.is_finite() or value <= 0 for value in numeric.values()) or numeric["B"] != equity:
+        if any(not value.is_finite() or value <= 0 for value in numeric.values()) or numeric["B"] != required_bank:
             raise ValueError("candidate sizing evidence is invalid")
         strategy = payload.get("strategy")
         basic = strategy.get("basic") if isinstance(strategy, Mapping) else None
@@ -265,11 +420,11 @@ def _stage2_material(candidate: Mapping[str, Any], equity: Decimal) -> dict[str,
     ):
         raise ValueError("tester template is invalid")
     initial_balance: int | float
-    if equity == equity.to_integral_value():
-        initial_balance = int(equity)
+    if required_bank == required_bank.to_integral_value():
+        initial_balance = int(required_bank)
     else:
-        initial_balance = float(equity)
-        if not math.isfinite(initial_balance):
+        initial_balance = float(required_bank)
+        if not math.isfinite(initial_balance) or Decimal(str(initial_balance)) != required_bank:
             raise ValueError("tester balance is invalid")
     template.update({
         "name_comment": candidate_id,
@@ -315,6 +470,7 @@ def _stage2_material(candidate: Mapping[str, Any], equity: Decimal) -> dict[str,
         "tester_config_json": tester_config_json,
         "strategy_jsons": strategy_jsons,
         "receipt": receipt,
+        "required_bank_usdt": format(required_bank, "f"),
     }
 
 
@@ -333,6 +489,105 @@ def _load_weighted_template() -> tuple[dict[str, Any], str]:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _snapshot_normalize(value: Any, path: str = "$") -> Any:
+    """Normalize only values accepted by the snapshot wire contract."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise PortfolioPanelError(PORTFOLIO_SNAPSHOT_UNSERIALIZABLE, f"snapshot field {path} is not finite", status=422)
+        return format(value, "f")
+    if type(value) is int:
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise PortfolioPanelError(PORTFOLIO_SNAPSHOT_UNSERIALIZABLE, f"snapshot field {path} is not finite", status=422)
+        return value
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise PortfolioPanelError(PORTFOLIO_SNAPSHOT_UNSERIALIZABLE, f"snapshot field {path} has a non-string key", status=422)
+            result[key] = _snapshot_normalize(item, f"{path}.{key}")
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_normalize(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    raise PortfolioPanelError(PORTFOLIO_SNAPSHOT_UNSERIALIZABLE, f"snapshot field {path} has an unsupported value", status=422)
+
+
+def _snapshot_bytes(campaign: Mapping[str, Any]) -> tuple[bytes, bytes, str]:
+    """Return canonical JSON, deterministic gzip, and the raw digest."""
+    normalized = _snapshot_normalize(campaign)
+    raw = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=output, mode="wb", compresslevel=6, mtime=0) as stream:
+        stream.write(raw)
+    return raw, output.getvalue(), hashlib.sha256(raw).hexdigest()
+
+
+def _geometry_identity(row: Any) -> tuple[str, str, int, int] | None:
+    if not isinstance(row, Mapping):
+        return None
+    symbol, side = row.get("symbol"), row.get("side")
+    strategy_id, result_id = row.get("strategy_id"), row.get("result_id")
+    if (
+        not isinstance(symbol, str) or not symbol.strip()
+        or not isinstance(side, str) or side.strip().upper() not in {"LONG", "SHORT"}
+        or type(strategy_id) is not int or type(result_id) is not int
+    ):
+        return None
+    return symbol.strip().upper(), side.strip().upper(), strategy_id, result_id
+
+
+def _repair_legacy_geometry(campaign: Mapping[str, Any], *, strict: bool = False) -> dict[str, Any]:
+    """Copy only missing typed geometry from one exact finalist identity."""
+    repaired = copy.deepcopy(campaign)
+    rows = repaired.get("weighted_input_rows") if isinstance(repaired, Mapping) else None
+    finalists = repaired.get("finalists") if isinstance(repaired, Mapping) else None
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence) or isinstance(finalists, (str, bytes)) or not isinstance(finalists, Sequence):
+        return repaired
+    finalist_rows = tuple(row for row in finalists if isinstance(row, Mapping))
+    geometry_sensitive = any(any(field in row for field in _GEOMETRY_FIELDS) for row in finalist_rows)
+    if not strict and not geometry_sensitive:
+        return repaired
+    by_identity: dict[tuple[str, str, int, int], list[Mapping[str, Any]]] = {}
+    for finalist in finalist_rows:
+        identity = _geometry_identity(finalist)
+        if identity is not None:
+            by_identity.setdefault(identity, []).append(finalist)
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            continue
+        missing = [field for field in _GEOMETRY_FIELDS if field not in row]
+        identity = _geometry_identity(row)
+        if not missing:
+            continue
+        matches = by_identity.get(identity, []) if identity is not None else []
+        if len(matches) != 1:
+            raise PortfolioPanelError(
+                "PORTFOLIO_INPUT_GEOMETRY_INVALID",
+                f"weighted_input_rows[{index}] has {len(matches)} matching finalists",
+                status=422,
+            )
+        finalist = matches[0]
+        for field in _GEOMETRY_FIELDS:
+            if field in row and field in finalist and row[field] != finalist[field]:
+                raise PortfolioPanelError(
+                    "PORTFOLIO_INPUT_GEOMETRY_INVALID",
+                    f"weighted_input_rows[{index}].{field} conflicts with finalist geometry",
+                    status=422,
+                )
+            if field in missing:
+                if field not in finalist:
+                    raise PortfolioPanelError(
+                        "PORTFOLIO_INPUT_GEOMETRY_INVALID",
+                        f"finalist geometry is missing {field}",
+                        status=422,
+                    )
+                row[field] = copy.deepcopy(finalist[field])
+    return repaired
 
 
 def _plain(value: Any) -> Any:
@@ -464,23 +719,27 @@ def _weighted_payload_pairs(variant: Any) -> tuple[tuple[Any, Any], ...]:
     pairs = []
     for member in members:
         payload = None
+        symbol = _get(member, "symbol", _get(member, "pair"))
+        side = _get(member, "side", _get(member, "direction"))
+        identity = (
+            symbol.strip().upper(),
+            side.strip().upper(),
+        ) if isinstance(symbol, str) and isinstance(side, str) and side.strip().upper() in {"LONG", "SHORT"} else None
+        if identity is not None and member_identities.get(identity) == 1 and identity not in invalid_identities:
+            payload = payload_by_identity.get(identity)
+        if payload is None and isinstance(symbol, str) and isinstance(side, str):
+            symbol_key = symbol.strip().upper()
+            if side.strip().upper() == "LONG" and symbol_key not in tagged_symbols and member_identities.get(identity, 0) == 1 and sum(count for (candidate_symbol, _candidate_side), count in member_identities.items() if candidate_symbol == symbol_key) == 1 and symbol_key not in ambiguous_symbols:
+                payload = payload_by_symbol.get(symbol_key)
         try:
-            positive = Decimal(str(_get(member, "x_usdt"))) > 0
+            raw_x = _get(member, "x_usdt")
+            if raw_x is None and isinstance(payload, Mapping):
+                raw_x = _get(_get(payload, "facts", {}), "x")
+            positive = Decimal(str(raw_x)) > 0
         except (InvalidOperation, TypeError, ValueError):
             positive = False
-        if positive:
-            symbol = _get(member, "symbol", _get(member, "pair"))
-            side = _get(member, "side", _get(member, "direction"))
-            identity = (
-                symbol.strip().upper(),
-                side.strip().upper(),
-            ) if isinstance(symbol, str) and isinstance(side, str) and side.strip().upper() in {"LONG", "SHORT"} else None
-            if identity is not None and member_identities.get(identity) == 1 and identity not in invalid_identities:
-                payload = payload_by_identity.get(identity)
-            if payload is None and isinstance(symbol, str) and isinstance(side, str):
-                symbol_key = symbol.strip().upper()
-                if side.strip().upper() == "LONG" and symbol_key not in tagged_symbols and member_identities.get(identity, 0) == 1 and sum(count for (candidate_symbol, _candidate_side), count in member_identities.items() if candidate_symbol == symbol_key) == 1 and symbol_key not in ambiguous_symbols:
-                    payload = payload_by_symbol.get(symbol_key)
+        if not positive:
+            payload = None
         pairs.append((member, payload))
     return tuple(pairs)
 
@@ -502,6 +761,102 @@ def _weighted_number(item: Any, *keys: str) -> Any:
     except (ArithmeticError, TypeError, ValueError):
         return "UNKNOWN"
     return value if number.is_finite() and number > 0 else "UNKNOWN"
+
+
+def _weighted_identity(item: Any) -> tuple[Any, ...] | None:
+    if not isinstance(item, Mapping):
+        return None
+    symbol = _get(item, "symbol", _get(item, "pair"))
+    side = _get(item, "side", _get(item, "direction"))
+    strategy_id = _get(item, "strategy_id", _get(item, "strategyId"))
+    result_id = _get(item, "result_id", _get(item, "resultId"))
+    if not isinstance(symbol, str) or not isinstance(side, str) or strategy_id is None or result_id is None:
+        return None
+    return (symbol.strip().upper(), side.strip().upper(), strategy_id, result_id)
+
+
+def _weighted_entry_order_percentages(payload: Any, side: Any) -> tuple[Decimal, ...] | str:
+    strategy = _get(payload, "strategy", {})
+    mrs3 = _get(strategy, "mrs3", {})
+    normalized_side = str(side).upper()
+    if normalized_side not in {"LONG", "SHORT"}:
+        return "UNKNOWN"
+    order_key = "ma_long" if normalized_side == "LONG" else "ma_short"
+    orders = _get(mrs3, order_key, ())
+    if isinstance(orders, (str, bytes)) or not isinstance(orders, Sequence) or not orders:
+        return "UNKNOWN"
+    lots: list[Decimal] = []
+    for order in orders:
+        raw = _get(order, "lot_x")
+        try:
+            lot = Decimal(str(raw))
+        except (InvalidOperation, TypeError, ValueError):
+            return "UNKNOWN"
+        if not lot.is_finite() or lot <= 0:
+            return "UNKNOWN"
+        lots.append(lot)
+    total = sum(lots, Decimal(0))
+    return tuple(lot / total * Decimal(100) for lot in lots) if total > 0 else "UNKNOWN"
+
+
+def _weighted_source_evidence(campaign: Mapping[str, Any]) -> dict[tuple[Any, ...], dict[str, Any]]:
+    sources: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for key in ("finalists", "weighted_input_rows"):
+        rows = _get(campaign, key, ())
+        if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence):
+            continue
+        for row in rows:
+            identity = _weighted_identity(row)
+            if identity is None:
+                continue
+            merged = sources.setdefault(identity, {})
+            if isinstance(row, Mapping):
+                for name, value in row.items():
+                    if name in merged and merged[name] not in (None, value):
+                        merged["__invalid_source_evidence"] = True
+                    elif name not in merged or merged[name] is None:
+                        merged[name] = value
+    return sources
+
+
+def _weighted_source_maxdd_sum(campaign: Mapping[str, Any], members: Sequence[Mapping[str, Any]]) -> Decimal | str:
+    sources = _weighted_source_evidence(campaign)
+    total = Decimal(0)
+    included = False
+    for member in members:
+        try:
+            # position_usdt is copied from the executable payload's facts.x above.
+            x = Decimal(str(_get(member, "position_usdt")))
+        except (InvalidOperation, TypeError, ValueError):
+            return "UNKNOWN"
+        if not x.is_finite() or x <= 0:
+            return "UNKNOWN"
+        included = True
+        source = sources.get(_weighted_identity(member))
+        if source is None or source.get("__invalid_source_evidence"):
+            return "UNKNOWN"
+        metrics = _get(source, "metrics", {})
+        dd_raw = _weighted_value(source, "max_drawdown", "max_drawdown_usdt", "source_max_drawdown", default=_weighted_value(metrics, "max_drawdown", "max_drawdown_usdt", default=None))
+        initial_raw = _weighted_value(source, "source_initial_balance", "initial_balance", "result_initial_balance", default=_weighted_value(metrics, "source_initial_balance", "initial_balance", default=None))
+        try:
+            dd = Decimal(str(dd_raw))
+            initial = Decimal(str(initial_raw))
+        except (InvalidOperation, TypeError, ValueError):
+            return "UNKNOWN"
+        if not dd.is_finite() or dd < 0 or not initial.is_finite() or initial <= 0:
+            return "UNKNOWN"
+        total += dd * x / initial
+    return total if included else "UNKNOWN"
+
+
+def _weighted_decimal_or_unknown(value: Any, *, nonnegative: bool = False) -> Decimal | str:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return "UNKNOWN"
+    if not number.is_finite() or (number < 0 if nonnegative else number <= 0):
+        return "UNKNOWN"
+    return number
 
 
 def _validate_frozen_campaign(campaign: Any) -> None:
@@ -553,6 +908,10 @@ class PortfolioPanelService:
         self._threads: dict[str, threading.Thread] = {}
         self._results_root = self.root / ".portfolio-results"
         self._staging_root = self.root / ".portfolio-staging"
+        self._progress_reporter = _PortfolioProgressReporter()
+        self._progress_state_lock = threading.RLock()
+        self._progress_generations: dict[str, int] = {}
+        self._active_progress: dict[str, int] = {}
 
     def _settings_raw(self, *, strict: bool = False) -> tuple[str, dict[str, Any] | None, bytes | None]:
         try:
@@ -644,6 +1003,287 @@ class PortfolioPanelService:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _snapshot_link(path: Path) -> bool:
+        if path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)()):
+            return True
+        try:
+            return bool(os.stat(path, follow_symlinks=False).st_file_attributes & 0x400)
+        except (AttributeError, FileNotFoundError, OSError):
+            return False
+
+    def _snapshot_path(self, campaign_id: str, *, require_existing: bool = False) -> Path:
+        if not isinstance(campaign_id, str) or re.fullmatch(r"campaign-[0-9a-f]{32}", campaign_id) is None:
+            raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_UNAVAILABLE", "campaign snapshot is unavailable", status=500)
+        root = self._results_root
+        directory = root / campaign_id
+        path = directory / _SNAPSHOT_NAME
+        if root.exists() and self._snapshot_link(root):
+            raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_UNAVAILABLE", "campaign snapshot is unavailable", status=500)
+        for component in (directory, path):
+            if component.exists() and self._snapshot_link(component):
+                raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_UNAVAILABLE", "campaign snapshot is unavailable", status=500)
+        if require_existing and (not path.is_file() or not path.resolve(strict=True).is_file()):
+            raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_UNAVAILABLE", "campaign snapshot is unavailable", status=500)
+        try:
+            expected_root = root.resolve(strict=False)
+            resolved_parent = directory.resolve(strict=False)
+            if os.path.commonpath((str(expected_root), str(resolved_parent))) != str(expected_root):
+                raise ValueError
+        except (OSError, ValueError):
+            raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_UNAVAILABLE", "campaign snapshot is unavailable", status=500) from None
+        return path
+
+    def _write_campaign_snapshot(self, campaign: Mapping[str, Any]) -> dict[str, Any]:
+        campaign_id = campaign.get("campaign_id")
+        path = self._snapshot_path(campaign_id)
+        try:
+            raw, compressed, digest = _snapshot_bytes(campaign)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if self._snapshot_link(path.parent):
+                raise OSError("snapshot directory is not regular")
+            self._replace_bytes(path, compressed)
+            if path.read_bytes() != compressed:
+                raise OSError("snapshot readback mismatch")
+            timestamp = _now()
+            return {
+                "schema": _SNAPSHOT_SCHEMA,
+                "campaign_id": campaign_id,
+                "path": path.relative_to(self.root).as_posix(),
+                "sha256": digest,
+                "compressed_size": len(compressed),
+                "uncompressed_size": len(raw),
+                "state": "available",
+                "created_at_utc": timestamp,
+                "updated_at_utc": timestamp,
+            }
+        except PortfolioPanelError:
+            raise
+        except (OSError, TypeError, ValueError):
+            raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_UNAVAILABLE", "campaign snapshot is unavailable", status=500) from None
+
+    def _hydrate_campaign(self, saved: Mapping[str, Any], runtime: Mapping[str, Any], *, allow_terminal: bool = False, expected_campaign_id: str | None = None) -> dict[str, Any]:
+        if saved.get("state") in _TERMINAL and not allow_terminal:
+            raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_TERMINAL_STATE", "terminal Campaign cannot be retried", status=409)
+        if not isinstance(runtime, Mapping):
+            _validate_frozen_campaign(None)
+        embedded = runtime.get("campaign") if isinstance(runtime, Mapping) else None
+        descriptor = runtime.get("campaign_snapshot") if isinstance(runtime, Mapping) else None
+        if isinstance(embedded, Mapping):
+            campaign = _repair_legacy_geometry(_plain(dict(embedded)))
+            if expected_campaign_id is not None and campaign.get("campaign_id") != expected_campaign_id:
+                raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_UNAVAILABLE", "campaign snapshot is unavailable", status=500)
+            _validate_frozen_campaign(campaign)
+            return campaign
+        if isinstance(runtime, Mapping) and "campaign" in runtime:
+            _validate_frozen_campaign(embedded)
+        if not isinstance(descriptor, Mapping) or descriptor.get("schema") != _SNAPSHOT_SCHEMA:
+            raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_UNAVAILABLE", "campaign snapshot is unavailable", status=500)
+        campaign_id = descriptor.get("campaign_id")
+        if (
+            not isinstance(campaign_id, str)
+            or (expected_campaign_id is not None and campaign_id != expected_campaign_id)
+        ):
+            raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_UNAVAILABLE", "campaign snapshot is unavailable", status=500)
+        try:
+            path = self._snapshot_path(campaign_id, require_existing=True)
+            expected_relative = path.relative_to(self.root).as_posix()
+            if descriptor.get("path") != expected_relative:
+                raise ValueError("snapshot path mismatch")
+            compressed_size = descriptor.get("compressed_size")
+            uncompressed_size = descriptor.get("uncompressed_size")
+            digest = descriptor.get("sha256")
+            if (
+                type(compressed_size) is not int or compressed_size < 1
+                or type(uncompressed_size) is not int or uncompressed_size < 1 or uncompressed_size > _SNAPSHOT_MAX_UNCOMPRESSED
+                or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or path.stat().st_size != compressed_size
+            ):
+                raise ValueError("snapshot descriptor is invalid")
+            with path.open("rb") as handle, gzip.GzipFile(fileobj=handle, mode="rb") as stream:
+                raw = stream.read(uncompressed_size + 1)
+            if len(raw) != uncompressed_size or hashlib.sha256(raw).hexdigest() != digest:
+                raise ValueError("snapshot digest mismatch")
+            campaign = json.loads(raw.decode("utf-8"))
+            if not isinstance(campaign, dict) or campaign.get("campaign_id") != campaign_id:
+                raise ValueError("snapshot campaign mismatch")
+            campaign = _repair_legacy_geometry(campaign)
+            _validate_frozen_campaign(campaign)
+            return campaign
+        except PortfolioPanelError:
+            raise
+        except (OSError, EOFError, gzip.BadGzipFile, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            raise PortfolioPanelError("PORTFOLIO_SNAPSHOT_UNAVAILABLE", "campaign snapshot is unavailable", status=500) from None
+
+    @property
+    def _snapshot_migration_backup(self) -> Path:
+        return self.registry.journal.with_name(_SNAPSHOT_MIGRATION_BACKUP)
+
+    @staticmethod
+    def _compact_campaign_binding(campaign: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            key: campaign[key]
+            for key in ("campaign_id", "input_digest", "config_digest")
+            if isinstance(campaign.get(key), str)
+        }
+
+    @staticmethod
+    def _compact_runtime(runtime: Mapping[str, Any], campaign: Mapping[str, Any]) -> dict[str, Any]:
+        compact = copy.deepcopy(dict(runtime))
+        compact["campaign"] = PortfolioPanelService._compact_campaign_binding(campaign)
+        compact.pop("campaign_snapshot", None)
+        for key in ("weighted_input_rows", "finalists", "actions", "equity", "progress"):
+            compact.pop(key, None)
+        diagnostics = compact.get("diagnostics")
+        if isinstance(diagnostics, list):
+            compact["diagnostics"] = [
+                {
+                    "severity": str(item.get("severity", "ERROR")),
+                    "code": str(item.get("code", "PORTFOLIO_JOB_FAILED")),
+                    "message": _redact_text(item.get("message", ""))[:1024],
+                }
+                for item in diagnostics if isinstance(item, Mapping)
+            ]
+            while len(_json(compact["diagnostics"]).encode("utf-8")) > 8192 and compact["diagnostics"]:
+                compact["diagnostics"].pop()
+        return compact
+
+    def _ensure_snapshot_migration_backup(self, journal_bytes: bytes) -> Path:
+        backup = self._snapshot_migration_backup
+        if backup.exists():
+            if backup.is_file() and not backup.is_symlink():
+                return backup
+            raise PermissionError("snapshot migration backup is not a regular file")
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", dir=backup.parent, delete=False) as handle:
+                handle.write(journal_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temporary = Path(handle.name)
+            if backup.exists():
+                return backup
+            os.replace(temporary, backup)
+            temporary = None
+            return backup
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _migrate_legacy_campaigns_locked(self) -> bool | None:
+        """Move legacy embedded inputs out of the journal before recovery."""
+        candidates: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+        journal_bytes = self.registry.journal.read_bytes() if self.registry.journal.exists() else b""
+        compressed_total = 0
+        has_active_embedded = False
+        for job_id, job in self.registry.jobs.items():
+            if job.get("kind") != "portfolio.stage1":
+                continue
+            runtime = job.get("runtime")
+            if not isinstance(runtime, Mapping) or not isinstance(runtime.get("campaign"), Mapping):
+                continue
+            if isinstance(runtime.get("campaign_snapshot"), Mapping):
+                continue
+            campaign = dict(runtime["campaign"])
+            state = job.get("state")
+            if state in {"QUEUED", "RUNNING", "CANCELLING"}:
+                has_active_embedded = True
+            if state in {"FAILED", "CANCELLED"}:
+                candidates.append((job_id, job, campaign))
+                continue
+            if state not in {"QUEUED", "RUNNING", "CANCELLING", "COMMITTED"}:
+                continue
+            try:
+                repaired = _repair_legacy_geometry(campaign, strict=True)
+                _raw, compressed, _digest_value = _snapshot_bytes(repaired)
+            except (PortfolioPanelError, TypeError, ValueError, OverflowError):
+                continue
+            compressed_total += len(compressed)
+            candidates.append((job_id, job, repaired))
+        if not candidates and not has_active_embedded:
+            return False
+        try:
+            free = shutil.disk_usage(self.registry.journal.parent).free
+        except OSError:
+            return None
+        required = 2 * len(journal_bytes) + compressed_total + _SNAPSHOT_MIGRATION_RESERVE
+        if free < required:
+            return None
+        if not candidates:
+            return False
+        self._ensure_snapshot_migration_backup(journal_bytes)
+        migrated = False
+        for job_id, original_job, campaign in candidates:
+            runtime = original_job.get("runtime")
+            if not isinstance(runtime, Mapping):
+                continue
+            job_copy = copy.deepcopy(original_job)
+            try:
+                if original_job.get("state") in {"FAILED", "CANCELLED"}:
+                    job_copy["runtime"] = self._compact_runtime(runtime, campaign)
+                else:
+                    descriptor = self._write_campaign_snapshot(campaign)
+                    compact_runtime = copy.deepcopy(dict(runtime))
+                    compact_runtime.pop("campaign", None)
+                    compact_runtime["campaign_snapshot"] = descriptor
+                    for key in ("weighted_input_rows", "finalists", "actions", "equity", "progress"):
+                        compact_runtime.pop(key, None)
+                    job_copy["runtime"] = compact_runtime
+                self.registry.jobs[job_id] = job_copy
+                migrated = True
+            except (PortfolioPanelError, OSError, TypeError, ValueError, OverflowError):
+                continue
+        return migrated
+
+    def _verify_migrated_registry(self) -> None:
+        persisted = self.registry._load()
+        if set(persisted) != set(self.registry.jobs):
+            raise OSError("snapshot migration changed job IDs")
+        for job_id, job in persisted.items():
+            if not self.registry._valid_saved_job(job):
+                raise OSError("snapshot migration produced an invalid job")
+            runtime = job.get("runtime") if isinstance(job.get("runtime"), Mapping) else {}
+            descriptor = runtime.get("campaign_snapshot") if isinstance(runtime, Mapping) else None
+            if job.get("state") == "COMMITTED" and isinstance(descriptor, Mapping) and descriptor.get("state") == "available":
+                expected = job.get("campaign_id") if isinstance(job.get("campaign_id"), str) else descriptor.get("campaign_id")
+                self._hydrate_campaign(job, runtime, allow_terminal=True, expected_campaign_id=expected)
+
+    def startup_recover(self) -> None:
+        """Migrate legacy Campaigns, then perform one idempotent restart recovery."""
+        with self.registry.lock:
+            original_jobs = copy.deepcopy(self.registry.jobs)
+            backup = self._snapshot_migration_backup
+            try:
+                migrated = self._migrate_legacy_campaigns_locked()
+                if migrated is None:
+                    return
+                recovered = self.registry.recover_interrupted()
+                if recovered:
+                    retry = self._migrate_legacy_campaigns_locked()
+                    if retry is None:
+                        return
+                    migrated = migrated or retry
+                if migrated:
+                    self.registry._save()
+                for job_id in tuple(self.registry.jobs):
+                    self._cleanup_terminal_snapshot(job_id)
+                self._verify_migrated_registry()
+                if backup.exists():
+                    try:
+                        backup.unlink()
+                    except PermissionError:
+                        return
+            except PermissionError:
+                self.registry.jobs = original_jobs
+                return
+            except (OSError, PortfolioPanelError, TypeError, ValueError):
+                self.registry.jobs = original_jobs
+                try:
+                    self.registry._save()
+                except OSError:
+                    pass
 
     def settings_put(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -811,7 +1451,8 @@ class PortfolioPanelService:
             weighted_fields = (
                 "symbol", "side", "strategy_id", "result_id", "imported_at_utc",
                 "effective_start_utc", "effective_end_utc", "report_start_utc", "report_end_utc",
-                "initial_balance", "source_initial_balance", "optimizer_source_metadata", "source_provenance",
+                "initial_balance", "source_initial_balance", "total_pnl", "source_pnl", "max_drawdown", "max_drawdown_usdt", "max_drawdown_pct", "optimizer_source_metadata", "source_provenance",
+                "timeframe", "close_ma_len", "order_count", "strategy_orders",
             )
             for index, row in enumerate(loaded or ()):
                 if not isinstance(row, Mapping):
@@ -882,12 +1523,21 @@ class PortfolioPanelService:
             raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "portfolio finalists are unavailable", status=422) from error
         return finalists, tuple(weighted_input_rows)
 
-    def _package_variant_generator(self, selected: Sequence[Mapping[str, Any]], campaign: Mapping[str, Any], _profiles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    def _package_variant_generator(
+        self,
+        selected: Sequence[Mapping[str, Any]],
+        campaign: Mapping[str, Any],
+        _profiles: Sequence[Mapping[str, Any]],
+        progress_callback: Callable[[Mapping[str, Any]], Any] | None = None,
+    ) -> dict[str, Any]:
         """Run the package-owned current-facts adapter for one frozen Campaign."""
         from .portfolio.adapter import run_portfolio_adapter
 
         try:
-            result = run_portfolio_adapter(selected, campaign, workspace_root=self.root, workers=_portfolio_search_workers(self.root))
+            adapter_kwargs = {"workspace_root": self.root, "workers": _portfolio_search_workers(self.root)}
+            if progress_callback is not None:
+                adapter_kwargs["progress_callback"] = progress_callback
+            result = run_portfolio_adapter(selected, campaign, **adapter_kwargs)
         except Exception as error:
             raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "portfolio adapter failed", status=500) from error
         return {
@@ -947,17 +1597,27 @@ class PortfolioPanelService:
             if not isinstance(value, Mapping):
                 raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign fields are invalid", status=422)
             keys = set(value)
-            required = {"profile_id", "equity_usdt", "max_candidates"}
-            allowed = required | {"max_balance_usdt"}
+            legacy = keys & {"equity_usdt", "max_balance_usdt"}
+            if legacy:
+                raise PortfolioPanelError(
+                    "PORTFOLIO_CAMPAIGN_INVALID",
+                    "legacy profile fields are unsupported",
+                    status=422,
+                    field_errors=[{
+                        "field": f"profiles[{index}].{field}",
+                        "code": "LEGACY_PROFILE_FIELD_UNSUPPORTED",
+                        "message": "use bank_available_usdt instead",
+                    } for field in sorted(legacy)],
+                )
+            required = {"profile_id", "max_candidates"}
+            allowed = required | {"bank_available_usdt"}
             if not required.issubset(keys) or not keys.issubset(allowed):
                 raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign fields are invalid", status=422)
             profile_id = value.get("profile_id")
             if not isinstance(profile_id, str) or profile_id not in configured or profile_id in seen_profiles:
                 raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign profile is invalid", status=422, field_errors=[{"field": f"profiles[{index}].profile_id", "code": "UNKNOWN_PROFILE", "message": "profile is unknown"}])
             seen_profiles.add(profile_id)
-            max_balance = value.get("max_balance_usdt") if "max_balance_usdt" in value else None
-            if "max_balance_usdt" in value and max_balance is None:
-                raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign fields are invalid", status=422)
+            bank_available = value.get("bank_available_usdt") if "bank_available_usdt" in value else None
             max_candidates = value.get("max_candidates")
             if type(max_candidates) is not int or not 1 <= max_candidates <= 50:
                 raise PortfolioPanelError(
@@ -970,7 +1630,11 @@ class PortfolioPanelService:
                         "message": "max_candidates must be between 1 and 50",
                     }],
                 )
-            profiles.append({"profile_id": profile_id, "equity_usdt": _decimal(value.get("equity_usdt"), f"profiles[{index}].equity_usdt"), "max_balance_usdt": _decimal(max_balance, f"profiles[{index}].max_balance_usdt") if max_balance is not None else None, "max_candidates": max_candidates})
+            profiles.append({
+                "profile_id": profile_id,
+                "bank_available_usdt": _decimal(bank_available, f"profiles[{index}].bank_available_usdt") if bank_available is not None else None,
+                "max_candidates": max_candidates,
+            })
         launch = {"pairs": pairs, "profiles": profiles}
         launch["selected_pairs"] = [
             [pair["pair"], side]
@@ -1001,7 +1665,9 @@ class PortfolioPanelService:
             if not isinstance(runtime, Mapping):
                 raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500)
             campaign = runtime.get("campaign")
-            if isinstance(campaign, Mapping) and campaign.get("campaign_id") == campaign_id:
+            descriptor = runtime.get("campaign_snapshot")
+            binding = campaign if isinstance(campaign, Mapping) else descriptor
+            if isinstance(binding, Mapping) and binding.get("campaign_id") == campaign_id:
                 return saved, runtime
         raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_NOT_FOUND", "campaign is not available", status=404)
 
@@ -1042,6 +1708,8 @@ class PortfolioPanelService:
         runtime = runtime or {}
         stage2 = saved.get("kind") == "portfolio.stage2"
         campaign = runtime.get("campaign") if isinstance(runtime.get("campaign"), Mapping) else {}
+        if not campaign and isinstance(runtime.get("campaign_snapshot"), Mapping):
+            campaign = runtime["campaign_snapshot"]
         if stage2 and not campaign:
             binding = runtime.get("stage2") if isinstance(runtime.get("stage2"), Mapping) else {}
             campaign = {"campaign_id": binding.get("campaign_id"), "input_digest": binding.get("input_digest"), "config_digest": binding.get("config_digest")}
@@ -1084,7 +1752,10 @@ class PortfolioPanelService:
         except OSError:
             pass
         frozen_digest = campaign.get("config_digest")
-        result = {"job_id": saved.get("job_id"), "campaign_id": campaign.get("campaign_id"), "kind": "TESTER_SUBMISSION" if stage2 else "STAGE1_CALCULATION", "status": state, "stage": stage, "overall_percent": overall, "counters": _plain(runtime.get("counters", {})), "diagnostics": diagnostics, "journal": journal, "input_digest": campaign.get("input_digest"), "config_digest": frozen_digest, "settings_changed_since_freeze": bool(frozen_digest and current_digest != frozen_digest), "created_at": saved.get("created_at_utc"), "started_at": runtime.get("started_at"), "finished_at": runtime.get("finished_at")}
+        live_progress = self._progress_reporter.snapshot(str(saved.get("job_id")))
+        persisted_progress = runtime.get("optimizer_progress")
+        progress = live_progress or (dict(persisted_progress) if isinstance(persisted_progress, Mapping) else None)
+        result = {"job_id": saved.get("job_id"), "campaign_id": campaign.get("campaign_id"), "kind": "TESTER_SUBMISSION" if stage2 else "STAGE1_CALCULATION", "status": state, "stage": stage, "overall_percent": overall, "counters": _plain(runtime.get("counters", {})), "progress": _plain(progress) if progress is not None else None, "diagnostics": diagnostics, "journal": journal, "input_digest": campaign.get("input_digest"), "config_digest": frozen_digest, "settings_changed_since_freeze": bool(frozen_digest and current_digest != frozen_digest), "created_at": saved.get("created_at_utc"), "started_at": runtime.get("started_at"), "finished_at": runtime.get("finished_at")}
         if stage2 and state == "SUCCEEDED" and isinstance(runtime.get("stage2_result"), Mapping):
             result["result"] = _plain(runtime["stage2_result"])
         return result
@@ -1147,7 +1818,7 @@ class PortfolioPanelService:
                 if saved.get("state") in _TERMINAL:
                     continue
                 runtime = self.registry.runtime(saved["job_id"])
-                frozen = runtime.get("campaign") if isinstance(runtime.get("campaign"), Mapping) else {}
+                frozen = runtime.get("campaign") if isinstance(runtime.get("campaign"), Mapping) else runtime.get("campaign_snapshot", {})
                 active_jobs.append((saved, frozen))
                 if frozen.get("input_digest") == input_digest and frozen.get("config_digest") == config_digest:
                     raise PortfolioPanelError("PORTFOLIO_JOB_ACTIVE_DUPLICATE", "an identical campaign is active", status=409)
@@ -1158,7 +1829,7 @@ class PortfolioPanelService:
             campaign_id = f"campaign-{uuid4().hex}"
             frozen_raw = raw
             try:
-                if json.loads(raw.decode("utf-8")).get("schema_version") != SCHEMA_VERSION:
+                if json.loads(raw.decode("utf-8")) != _plain(document):
                     frozen_raw = self._encode_document(document)
             except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
                 raise PortfolioPanelError("CONFIG_INVALID", "portfolio settings are invalid", status=422) from None
@@ -1188,6 +1859,7 @@ class PortfolioPanelService:
                 },
             }
             _validate_frozen_campaign(campaign)
+            snapshot = self._write_campaign_snapshot(campaign)
             saved = None
             submission_key = f"portfolio:{campaign_id}"
 
@@ -1209,9 +1881,14 @@ class PortfolioPanelService:
                         self.registry.discard_queued(candidate)
                     except Exception:
                         pass
+                try:
+                    self._snapshot_path(campaign_id).unlink(missing_ok=True)
+                except (OSError, PortfolioPanelError):
+                    pass
 
             try:
                 saved = self.registry.submit("portfolio.stage1", {"campaign_id": campaign_id, "input_digest": input_digest, "config_digest": config_digest}, submission_key, ("portfolio_optimizer",))
+                self.registry.reserve_runtime(saved["job_id"], "campaign_snapshot", snapshot)
                 self.registry.reserve_runtime(saved["job_id"], "campaign", campaign)
             except PanelJobError as error:
                 discard_created_job()
@@ -1230,6 +1907,10 @@ class PortfolioPanelService:
                 self._threads.pop(saved["job_id"], None)
                 self._cancel_events.pop(saved["job_id"], None)
                 self.registry.discard_queued(saved["job_id"])
+                try:
+                    self._snapshot_path(campaign_id).unlink(missing_ok=True)
+                except (OSError, PortfolioPanelError):
+                    pass
                 raise PortfolioPanelError("PORTFOLIO_JOB_START_FAILED", "portfolio job could not start", status=503) from error
         return {"campaign_id": campaign_id, "job_id": saved["job_id"], "status": "QUEUED", "input_digest": input_digest, "config_digest": config_digest}
 
@@ -1237,6 +1918,76 @@ class PortfolioPanelService:
         runtime = self.registry.runtime(job_id)
         runtime.update(values)
         self.registry.sync(job_id, {"state": self.registry.get(job_id)["state"]}, runtime=runtime)
+
+    @staticmethod
+    def _progress_persisted(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            key: _plain(snapshot.get(key))
+            for key in (
+                "substage", "unit", "completed", "total", "detail",
+                "elapsed_seconds", "eta_seconds", "heartbeat_age_seconds",
+                "last_update_age_seconds", "indeterminate",
+            )
+        }
+
+    def _activate_progress(self, job_id: str) -> int:
+        with self._progress_state_lock:
+            generation = self._progress_generations.get(job_id, 0) + 1
+            self._progress_generations[job_id] = generation
+            self._active_progress[job_id] = generation
+            return generation
+
+    def _deactivate_progress(self, job_id: str) -> None:
+        with self._progress_state_lock:
+            self._active_progress.pop(job_id, None)
+
+    def _persist_progress(self, job_id: str, generation: int, snapshot: Mapping[str, Any]) -> None:
+        """Persist progress only while this generation is active and nonterminal."""
+        # Lock order is progress-state -> registry; registry-locked paths never acquire progress-state.
+        with self._progress_state_lock:
+            if self._active_progress.get(job_id) != generation:
+                return
+            with self.registry.lock:
+                job = self.registry.jobs.get(job_id)
+                if not isinstance(job, Mapping) or job.get("state") in _TERMINAL:
+                    return
+                runtime = job.get("runtime") if isinstance(job.get("runtime"), Mapping) else {}
+                self.registry.sync(
+                    job_id,
+                    {"state": job["state"]},
+                    runtime={**dict(runtime), "optimizer_progress": self._progress_persisted(snapshot)},
+                )
+
+    def _progress_callback(self, job_id: str, generation: int | None = None) -> Callable[[Mapping[str, Any]], None]:
+        if generation is None:
+            with self._progress_state_lock:
+                generation = self._active_progress.get(job_id)
+
+        def callback(event: Mapping[str, Any]) -> None:
+            total = event.get("total") if isinstance(event, Mapping) else None
+            completed = event.get("completed", 0) if isinstance(event, Mapping) else 0
+            force = isinstance(total, int) and total > 0 and isinstance(completed, int) and completed >= total
+            snapshot, persist = self._progress_reporter.emit(job_id, event, force=force)
+            if persist and generation is not None:
+                try:
+                    self._persist_progress(job_id, generation, snapshot)
+                except (PanelJobError, KeyError, OSError, TypeError, ValueError):
+                    pass
+        return callback
+
+    def _progress_heartbeat(self, job_id: str) -> None:
+        with self._progress_state_lock:
+            generation = self._active_progress.get(job_id)
+        snapshot, persist = self._progress_reporter.heartbeat(job_id)
+        if persist and snapshot is not None and generation is not None:
+            try:
+                self._persist_progress(job_id, generation, snapshot)
+            except (PanelJobError, KeyError, OSError, TypeError, ValueError):
+                pass
+
+    def _progress_heartbeat_loop(self, job_id: str, stop: threading.Event) -> None:
+        while not stop.wait(10.0):
+            self._progress_heartbeat(job_id)
 
     def _append_journal(self, job_id: str, *, stage: str, severity: str, code: str, text: Any) -> None:
         code = code if code.startswith("PORTFOLIO_JOB_") else f"PORTFOLIO_JOB_{code}"
@@ -1304,6 +2055,53 @@ class PortfolioPanelService:
         except PanelJobError:
             pass
         self._sync_runtime(job_id, finished_at=_now())
+
+    def _cleanup_terminal_snapshot(self, job_id: str) -> None:
+        """Delete only a terminal Campaign's private input file."""
+        if job_id in self._threads:
+            return
+        with self.registry.lock:
+            job = self.registry.jobs.get(job_id)
+            if not isinstance(job, Mapping) or job.get("state") not in {"CANCELLED", "FAILED"}:
+                return
+            runtime = job.get("runtime")
+            descriptor = runtime.get("campaign_snapshot") if isinstance(runtime, Mapping) else None
+            if not isinstance(descriptor, dict):
+                return
+            if descriptor.get("state") == "deleted":
+                return
+            path_name = descriptor.get("path")
+            for other_id, other in self.registry.jobs.items():
+                if other_id == job_id or other.get("state") in _TERMINAL:
+                    continue
+                other_runtime = other.get("runtime")
+                other_descriptor = other_runtime.get("campaign_snapshot") if isinstance(other_runtime, Mapping) else None
+                if isinstance(other_descriptor, Mapping) and other_descriptor.get("path") == path_name:
+                    return
+            descriptor["state"] = "deleting"
+            descriptor["updated_at_utc"] = _now()
+            try:
+                self.registry._save()
+            except OSError:
+                return
+            try:
+                campaign_id = descriptor.get("campaign_id")
+                path = self._snapshot_path(campaign_id)
+                path.unlink(missing_ok=True)
+            except PermissionError:
+                return
+            except (OSError, PortfolioPanelError):
+                return
+            descriptor["state"] = "deleted"
+            descriptor["updated_at_utc"] = _now()
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+            try:
+                self.registry._save()
+            except OSError:
+                pass
 
     def _staging_path(self, path: Path, campaign_id: str) -> Path:
         expected_parent = self._staging_root / campaign_id
@@ -1400,6 +2198,7 @@ class PortfolioPanelService:
         ):
             raise ValueError("candidate is not executable under the off-only policy")
         _validate_pretest_period(candidate.get("pretest_period"))
+        required_bank = _candidate_required_bank(candidate)
         metrics = candidate.get("metrics", {})
         if isinstance(metrics, Mapping) and "limiter_L" in metrics and (type(metrics["limiter_L"]) is not int or metrics["limiter_L"] != 0):
             raise ValueError("candidate metrics use a nonzero limiter")
@@ -1432,8 +2231,15 @@ class PortfolioPanelService:
                 or not isinstance(facts, Mapping)
             ):
                 raise ValueError("strategy payload violates the off-only executable contract")
-            x = Decimal(str(facts.get("x")))
-            if not x.is_finite() or x <= 0 or name in names or (symbol, side) in identities:
+            try:
+                bank = Decimal(str(facts.get("B")))
+                x = Decimal(str(facts.get("x")))
+            except (InvalidOperation, TypeError, ValueError) as error:
+                raise ValueError("strategy sizing evidence is invalid") from error
+            if (
+                not bank.is_finite() or bank <= 0 or bank != required_bank
+                or not x.is_finite() or x <= 0 or name in names or (symbol, side) in identities
+            ):
                 raise ValueError("strategy payload identity or positive size is invalid")
             names.add(name)
             identities.add((symbol, side))
@@ -1479,6 +2285,7 @@ class PortfolioPanelService:
                 "search_mode": variant.get("search_mode"),
                 "limiter_L": variant.get("limiter_L"),
                 "pretest_period": _plain(variant.get("pretest_period")),
+                "metrics": _plain(variant.get("metrics", {})),
                 "strategy_payloads": _plain(variant.get("strategy_payloads", ())),
             }
             try:
@@ -1531,7 +2338,7 @@ class PortfolioPanelService:
             path = self._stage1_executables_path(campaign_id)
             if require_committed:
                 saved, runtime = self._campaign_by_id(campaign_id)
-                campaign = runtime.get("campaign")
+                campaign = self._hydrate_campaign(saved, runtime, allow_terminal=True, expected_campaign_id=campaign_id)
                 if (
                     self._project_state(saved) != "SUCCEEDED"
                     or not isinstance(campaign, Mapping)
@@ -1564,7 +2371,7 @@ class PortfolioPanelService:
             seen_identities: set[str] = set()
             previous_order = -1
             for candidate in candidates:
-                fields = {"candidate_id", "identity", "profile", "order", "search_mode", "limiter_L", "pretest_period", "strategy_payloads", "members", "candidate_digest"}
+                fields = {"candidate_id", "identity", "profile", "order", "search_mode", "limiter_L", "pretest_period", "metrics", "strategy_payloads", "members", "candidate_digest"}
                 if not isinstance(candidate, dict) or set(candidate) != fields:
                     raise ValueError("artifact candidate shape is invalid")
                 candidate_body = {key: value for key, value in candidate.items() if key != "candidate_digest"}
@@ -1591,9 +2398,7 @@ class PortfolioPanelService:
         """Build one exact Stage 2 input package without running or mutating anything."""
         try:
             saved, runtime = self._campaign_by_id(campaign_id)
-            campaign = runtime.get("campaign")
-            if not isinstance(campaign, Mapping):
-                raise ValueError("campaign is invalid")
+            campaign = self._hydrate_campaign(saved, runtime, allow_terminal=True, expected_campaign_id=campaign_id)
             input_digest = campaign.get("input_digest")
             config_digest = campaign.get("config_digest")
             artifact_digest = runtime.get("executables_digest")
@@ -1609,26 +2414,7 @@ class PortfolioPanelService:
             artifact = self._load_stage1_executables(campaign_id, input_digest, config_digest, artifact_digest)
             candidate = artifact["candidates"][0]
 
-            launch = campaign.get("launch")
-            profiles = launch.get("profiles") if isinstance(launch, Mapping) else None
-            profile_id = candidate.get("profile")
-            matches = [
-                profile
-                for profile in profiles or ()
-                if isinstance(profile, Mapping) and profile.get("profile_id") == profile_id
-            ]
-            if len(matches) != 1:
-                raise ValueError("candidate profile is not unique")
-            equity_raw = matches[0].get("equity_usdt")
-            if isinstance(equity_raw, bool) or equity_raw is None:
-                raise ValueError("profile equity is invalid")
-            try:
-                equity = Decimal(str(equity_raw))
-            except (InvalidOperation, TypeError, ValueError) as error:
-                raise ValueError("profile equity is invalid") from error
-            if not equity.is_finite() or equity <= 0:
-                raise ValueError("profile equity is invalid")
-            material = _stage2_material(candidate, equity)
+            material = _stage2_material(candidate)
             return {
                 "campaign_id": campaign_id,
                 "input_digest": input_digest,
@@ -1667,10 +2453,7 @@ class PortfolioPanelService:
             payloads = candidate.get("strategy_payloads")
             first = payloads[0] if isinstance(payloads, Sequence) and payloads else None
             facts = first.get("facts") if isinstance(first, Mapping) else None
-            if not isinstance(facts, Mapping) or isinstance(facts.get("B"), bool) or facts.get("B") is None:
-                raise ValueError("stage 2 candidate bank is invalid")
-            equity = Decimal(str(facts["B"]))
-            material = _stage2_material(candidate, equity)
+            material = _stage2_material(candidate)
             if (
                 candidate.get("candidate_id") != prepared.get("candidate_id")
                 or candidate.get("candidate_digest") != prepared.get("candidate_digest")
@@ -1934,7 +2717,8 @@ class PortfolioPanelService:
         workbook = load_workbook(path, data_only=False)
         try:
             expected = ["Summary", "Finalists", "Portfolios", "Members", "Excluded", "Metadata"]
-            if workbook.sheetnames not in (expected, [*expected[:-1], "Metadata", "Profile Status"]):
+            weighted = ["Итог", "Варианты", "Состав", "Финалисты", "Исключено", "Metadata"]
+            if workbook.sheetnames not in (expected, [*expected[:-1], "Metadata", "Profile Status"], weighted):
                 raise ValueError("workbook sheets are invalid")
             if getattr(workbook, "_external_links", ()):
                 raise ValueError("workbook external links are not allowed")
@@ -1964,17 +2748,21 @@ class PortfolioPanelService:
         previous_executables: bytes | None = None
         staged_executables: Path | None = None
         executable_document: dict[str, Any] | None = None
+        heartbeat_stop: threading.Event | None = None
+        heartbeat_thread: threading.Thread | None = None
+        progress_generation: int | None = None
         saved = self.registry.get(job_id)
         if saved.get("state") in _TERMINAL:
             return
         try:
             runtime = self.registry.runtime(job_id)
-            campaign = runtime.get("campaign") if isinstance(runtime, Mapping) else None
-            _validate_frozen_campaign(campaign)
+            campaign = self._hydrate_campaign(
+                saved,
+                runtime,
+                expected_campaign_id=(saved.get("campaign_id") if isinstance(saved, Mapping) else None),
+            )
             self.registry.transition(job_id, "RUNNING", phase=STAGES[0])
             saved = self.registry.get(job_id)
-            runtime = self.registry.runtime(job_id)
-            campaign = runtime["campaign"]
             launch = campaign["launch"]
             try:
                 frozen_raw = base64.b64decode(campaign["config_bytes"], validate=True)
@@ -2027,7 +2815,16 @@ class PortfolioPanelService:
                         raise PortfolioPanelError("PORTFOLIO_JOB_NO_ELIGIBLE_CANDIDATES", "no eligible candidates", status=422)
                 elif stage == "GENERATE_VARIANTS":
                     generator = self.variant_generator or self._package_variant_generator
-                    generated = _invoke(generator, selected, campaign, launch["profiles"])
+                    progress_generation = self._activate_progress(job_id)
+                    self._progress_reporter.start(job_id)
+                    heartbeat_stop = threading.Event()
+                    heartbeat_thread = threading.Thread(
+                        target=lambda: self._progress_heartbeat_loop(job_id, heartbeat_stop),
+                        name="mrs3-portfolio-progress-heartbeat",
+                        daemon=True,
+                    )
+                    heartbeat_thread.start()
+                    generated = _invoke(generator, selected, campaign, launch["profiles"], self._progress_callback(job_id, progress_generation))
                     if isinstance(generated, Mapping) and "variants" in generated:
                         variants = tuple(generated.get("variants") or ())
                         optimizer_blockers = [str(item) for item in generated.get("blockers", ()) if isinstance(item, str)]
@@ -2089,7 +2886,7 @@ class PortfolioPanelService:
                         self._write_workbook(workbook, campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=optimizer_blockers, warnings=optimizer_warnings, optimizer_status=optimizer_status)
                     self._staging_path(workbook, campaign["campaign_id"])
                     summary = self._summary(campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=optimizer_blockers, warnings=optimizer_warnings, optimizer_status=optimizer_status)
-                    runtime_values = {"staged_workbook_path": str(workbook), "final_workbook_path": str(final_workbook), "summary": summary, "counters": {"finalists_read": len(finalists), "candidates_selected": len(selected), "variants_created": len(variants)}}
+                    runtime_values = {"staged_workbook_path": str(workbook), "final_workbook_path": str(final_workbook), "summary": _plain(summary), "counters": {"finalists_read": len(finalists), "candidates_selected": len(selected), "variants_created": len(variants)}}
                     self._sync_runtime(job_id, **runtime_values)
                 elif stage == "PUBLISH_RESULTS":
                     pass
@@ -2205,8 +3002,15 @@ class PortfolioPanelService:
             except PanelJobError:
                 pass
         finally:
+            self._deactivate_progress(job_id)
+            self._progress_reporter.stop(job_id)
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            if heartbeat_thread is not None and hasattr(heartbeat_thread, "join"):
+                heartbeat_thread.join(timeout=1.0)
             self._cancel_events.pop(job_id, None)
             self._threads.pop(job_id, None)
+            self._cleanup_terminal_snapshot(job_id)
 
     @staticmethod
     def _summary(campaign: Mapping[str, Any], finalists: Sequence[Mapping[str, Any]], selected: Sequence[Mapping[str, Any]], variants: Sequence[Any], excluded: Sequence[Mapping[str, Any]], *, optimizer_excluded: Sequence[Mapping[str, Any]] = (), blockers: Sequence[str] = (), warnings: Sequence[str] = (), optimizer_status: str | None = None) -> dict[str, Any]:
@@ -2255,13 +3059,20 @@ class PortfolioPanelService:
             if not isinstance(metrics, Mapping):
                 metrics = {}
             profile_id = _get(variant, "profile", _get(variant, "profile_id"))
+            config_profiles = _get(_get(campaign, "config_document", {}), "profiles", {})
+            profile_config = _get(config_profiles, profile_id, {}) if isinstance(config_profiles, Mapping) else {}
+            profile_dd_limit = _weighted_value(
+                profile_config,
+                "max_actual_equity_dd_pct", "maximum_actual_equity_dd_pct", "dd_limit_pct",
+                default=_weighted_value(variant, "maximum_individual_dd_pct", "max_actual_equity_dd_pct", default="UNKNOWN"),
+            )
             summary["Weighted candidate ID"] = _weighted_value(variant, "candidate_id", "strategy_id", "id")
             available = _weighted_value(metrics, "B_available_usdt", "bank_available_usdt", "available_bank_usdt")
             if available == "UNKNOWN":
                 profiles = _get(_get(campaign, "launch", {}), "profiles", ())
                 if isinstance(profiles, Sequence) and not isinstance(profiles, (str, bytes)):
                     profile = next((item for item in profiles if _get(item, "profile_id") == profile_id), None)
-                    available = _weighted_value(profile, "equity_usdt") if profile is not None else "UNKNOWN"
+                    available = _weighted_value(profile, "bank_available_usdt", default="UNCAPPED") if profile is not None else "UNKNOWN"
             payload_pairs = _weighted_payload_pairs(variant)
             max_balances = tuple(
                 _weighted_number(_get(_get(payload, "strategy", {}), "basic", {}), "max_balance")
@@ -2278,9 +3089,133 @@ class PortfolioPanelService:
             after_reserve = _weighted_value(metrics, "reserve_after_limiter_pct", "reserve_after_pct")
             release_status = _weighted_value(metrics, "limiter_release_status")
             reserve_reason = _weighted_value(metrics, "reserve_unknown_reason")
+            required_bank = _weighted_value(metrics, "B_required_usdt", "required_bank_usdt", "B_required_margin_usdt")
+            historical_bank = _weighted_value(metrics, "historical_bank_usdt", "bank_for_path_usdt")
+            stress_bank = _weighted_value(metrics, "B_risk_usdt", "stress_p95_bank_usdt", "stress_bank_p95_usdt")
+            margin_bank = _weighted_value(metrics, "B_margin_usdt")
+            if stress_bank == "UNKNOWN":
+                bootstrap_banks = _weighted_value(metrics, "bootstrap_p95_banks_usdt", default=())
+                flattened = []
+                def collect_bootstrap(value: Any) -> None:
+                    if isinstance(value, (str, bytes)):
+                        return
+                    if isinstance(value, Sequence):
+                        for item in value:
+                            collect_bootstrap(item)
+                        return
+                    try:
+                        number = Decimal(str(value))
+                    except (InvalidOperation, TypeError, ValueError):
+                        return
+                    if number.is_finite() and number > 0:
+                        flattened.append(number)
+                collect_bootstrap(bootstrap_banks)
+                if flattened:
+                    stress_bank = max(flattened)
+            source_evidence = _weighted_source_evidence(campaign)
+
+            def percentage_of_saturation(value: Any) -> Any:
+                if value == "UNKNOWN" or saturation == "UNKNOWN":
+                    return "UNKNOWN"
+                try:
+                    amount = Decimal(str(value))
+                    denominator = Decimal(str(saturation))
+                except (InvalidOperation, TypeError, ValueError):
+                    return "UNKNOWN"
+                return amount / denominator * Decimal(100) if amount.is_finite() and denominator.is_finite() and denominator > 0 else "UNKNOWN"
+
+            def percentage_of(value: Any, denominator: Any) -> Any:
+                if value == "UNKNOWN" or denominator in (None, "UNKNOWN", "UNCAPPED"):
+                    return "UNKNOWN"
+                try:
+                    amount = Decimal(str(value))
+                    base = Decimal(str(denominator))
+                except (InvalidOperation, TypeError, ValueError):
+                    return "UNKNOWN"
+                return amount / base * Decimal(100) if amount.is_finite() and base.is_finite() and base > 0 else "UNKNOWN"
+
+            def percentage_of_target(value: Any) -> Any:
+                return "—" if available == "UNCAPPED" else percentage_of(value, available)
+
+            weighted_members = []
+            total_notional = Decimal(0)
+            for member, payload in payload_pairs:
+                facts = _get(payload, "facts", {})
+                basic = _get(_get(payload, "strategy", {}), "basic", {})
+                raw_x = _get(member, "x_usdt")
+                if raw_x is None:
+                    raw_x = _get(facts, "x")
+                try:
+                    position = Decimal(str(raw_x))
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                if not position.is_finite() or position <= 0:
+                    continue
+                total_notional += position
+                q = _weighted_number(facts, "q")
+                try:
+                    bank_share = Decimal(str(q)) * Decimal(100)
+                    if not bank_share.is_finite() or bank_share <= 0:
+                        bank_share = None
+                except (InvalidOperation, TypeError, ValueError):
+                    bank_share = None
+                def known(value: Any) -> Any:
+                    return None if value == "UNKNOWN" else value
+                direction = known(_weighted_value(member, "side", "direction", default=_weighted_value(payload, "side")))
+                balance_percentage = _weighted_value(basic, f"balance_percentage_{str(direction).lower()}", default=bank_share if bank_share is not None else "UNKNOWN")
+                source = source_evidence.get(_weighted_identity(member), {})
+                if not isinstance(source, Mapping) or source.get("__invalid_source_evidence"):
+                    source = {}
+                source_metrics = _get(source, "metrics", {})
+                source_pnl = _weighted_value(source, "total_pnl", "source_pnl", "source_pnl_usdt", "pnl", default=_weighted_value(source_metrics, "total_pnl", "source_pnl", "pnl"))
+                source_maxdd = _weighted_value(source, "max_drawdown", "max_drawdown_usdt", "source_max_drawdown", default=_weighted_value(source_metrics, "max_drawdown", "max_drawdown_usdt"))
+                source_maxdd_pct = _weighted_value(source, "max_drawdown_pct", "source_max_drawdown_pct", default=_weighted_value(source_metrics, "max_drawdown_pct", "source_max_drawdown_pct"))
+                source_initial = _weighted_value(source, "source_initial_balance", "initial_balance", "result_initial_balance", default=_weighted_value(source_metrics, "source_initial_balance", "initial_balance"))
+                source_dd_number = _weighted_decimal_or_unknown(source_maxdd, nonnegative=True)
+                source_initial_number = _weighted_decimal_or_unknown(source_initial)
+                scaled_maxdd = (
+                    source_dd_number * position / source_initial_number
+                    if isinstance(source_dd_number, Decimal) and isinstance(source_initial_number, Decimal)
+                    else "UNKNOWN"
+                )
+                capacity = known(_weighted_value(member, "capacity_usdt", "capacity", default=_weighted_value(facts, "C", "capacity_usdt")))
+                liquidity_utilization = percentage_of(position, capacity)
+                mrs3 = _get(_get(payload, "strategy", {}), "mrs3", {})
+                order_key = "ma_long" if str(direction).upper() == "LONG" else "ma_short"
+                payload_orders = _get(mrs3, order_key, ())
+                order_count = len(payload_orders) if isinstance(payload_orders, Sequence) and not isinstance(payload_orders, (str, bytes)) and payload_orders else _weighted_value(source, "order_count", default=_weighted_value(source_metrics, "order_count"))
+                weighted_members.append({
+                    "pair": known(_weighted_value(member, "symbol", "pair", default=_weighted_value(basic, "symbol"))),
+                    "direction": direction,
+                    "strategy_id": known(_weighted_value(member, "strategy_id", "strategyId")),
+                    "result_id": known(_weighted_value(member, "result_id", "resultId")),
+                    "position_usdt": position,
+                    "bank_share_pct": bank_share,
+                    "balance_percentage": known(balance_percentage),
+                    "pair_multiplier_pct": known(balance_percentage),
+                    "max_balance": known(_weighted_number(basic, "max_balance")),
+                    "entry_order_percentages": _weighted_entry_order_percentages(payload, direction),
+                    "timeframe": known(_weighted_value(source, "timeframe", default=_weighted_value(source_metrics, "timeframe"))),
+                    "user_rank": known(_weighted_value(source, "user_rank", default=_weighted_value(source_metrics, "user_rank"))),
+                    "source_pnl": known(source_pnl),
+                    "source_max_drawdown_usdt": known(source_maxdd),
+                    "source_max_drawdown_pct": known(source_maxdd_pct),
+                    "order_count": known(order_count),
+                    "liquidity_utilization_pct": known(liquidity_utilization),
+                    "scaled_max_drawdown_usdt": known(scaled_maxdd),
+                    "leverage": known(_weighted_number(basic, "leverage", "planned_leverage", "max_leverage")),
+                    "capacity_usdt": capacity,
+                })
             summary.update({
-                "B required USDT": _weighted_value(metrics, "B_required_usdt", "required_bank_usdt", "B_required_margin_usdt"),
+                "weighted_result_schema": 1,
+                "B required USDT": required_bank,
+                "Required bank USDT": required_bank,
+                "Historical bank USDT": historical_bank,
+                "Stress bank P95 USDT": stress_bank,
+                "Margin-only bank USDT": margin_bank,
                 "B available USDT": available,
+                "Target bank USDT": available,
+                "Profile DD limit %": profile_dd_limit,
                 "B saturation USDT": saturation,
                 "B margin USDT": _weighted_value(metrics, "B_margin_usdt"),
                 "P30 common USDT/30d": _weighted_value(metrics, "p30_common_usdt_30d"),
@@ -2299,6 +3234,20 @@ class PortfolioPanelService:
                 "Joint status": _weighted_value(metrics, "joint_status", "joint_metrics", default="NOT_TESTED"),
                 "Search status": _weighted_value(variant, "status", default=_weighted_value(metrics, "status", default="NOT_TESTED")),
                 "Budget status": _weighted_value(metrics, "budget_status", "budget_limited"),
+                "IM all USDT": _weighted_value(metrics, "I_all_usdt"),
+                "CDaR peak80 %": percentage_of_saturation(_weighted_value(metrics, "cdar_peak80_usdt")),
+                "CDaR peak90 %": percentage_of_saturation(_weighted_value(metrics, "cdar_peak90_usdt")),
+                "CDaR peak80 target %": percentage_of_target(_weighted_value(metrics, "cdar_peak80_usdt")),
+                "CDaR peak90 target %": percentage_of_target(_weighted_value(metrics, "cdar_peak90_usdt")),
+                "CDaR peak80 saturation %": percentage_of_saturation(_weighted_value(metrics, "cdar_peak80_usdt")),
+                "CDaR peak90 saturation %": percentage_of_saturation(_weighted_value(metrics, "cdar_peak90_usdt")),
+                "IM target %": percentage_of_target(_weighted_value(metrics, "I_all_usdt")),
+                "IM saturation %": percentage_of_saturation(_weighted_value(metrics, "I_all_usdt")),
+                "MM target %": percentage_of_target(_weighted_value(metrics, "M_all_usdt")),
+                "MM saturation %": percentage_of_saturation(_weighted_value(metrics, "M_all_usdt")),
+                "MaxDD SUM USDT": _weighted_source_maxdd_sum(campaign, weighted_members),
+                "Total full notional USDT": total_notional,
+                "Weighted members": weighted_members,
             })
         return summary
 
@@ -2345,6 +3294,40 @@ class PortfolioPanelService:
             finalist_rows.append([campaign["campaign_id"], val(row, "strategy_id", "strategyId"), val(row, "result_id", "resultId"), val(row, "symbol", "pair"), val(row, "side", "direction"), val(row, "user_status", "status"), val(row, "user_rank"), val(row, "effective_maximum"), val(row, "selection_status"), val(row, "selection_reason")])
         portfolio_rows = []
         member_rows = []
+        weighted_mode = any(val(item, "search_mode") == CAMPAIGN_SEARCH_MODE for item in variants)
+        def display(value: Any) -> Any:
+            if value is None or value == "UNKNOWN":
+                return None
+            try:
+                number = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                return value
+            return format(number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f") if number.is_finite() else None
+
+        def display_ratio(value: Any) -> str:
+            if value in (None, "UNKNOWN", "NOT_TESTED"):
+                return "—"
+            try:
+                number = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                return str(value)
+            return format(number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f") + "%" if number.is_finite() else "—"
+
+        def display_amount_ratios(amount: Any, target: Any, saturation: Any) -> Any:
+            shown = display(amount)
+            if shown is None:
+                return None
+            return f"{shown} USDT · {display_ratio(target)} / {display_ratio(saturation)}"
+
+        def display_integer(value: Any) -> Any:
+            if value in (None, "UNKNOWN", "NOT_TESTED"):
+                return None
+            try:
+                number = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                return value
+            return str(int(number)) if number.is_finite() and number == number.to_integral_value() else str(value)
+
         for index, variant in enumerate(variants):
             candidate_id = val(variant, "candidate_id", "strategy_id", "id", default=f"candidate-{index + 1}")
             profile = val(variant, "profile", default="")
@@ -2373,6 +3356,68 @@ class PortfolioPanelService:
                 pair_count = len(symbols) if symbols else None
             metrics = val(variant, "metrics", default={})
             period = val(variant, "pretest_period", default={})
+            if val(variant, "search_mode") == CAMPAIGN_SEARCH_MODE:
+                variant_summary = self._summary(campaign, (), (), (variant,), ())
+                weighted_members = variant_summary.get("Weighted members", ())
+                member_names = "; ".join(
+                    f"{item.get('pair')} {item.get('direction')}"
+                    for item in weighted_members
+                    if isinstance(item, Mapping) and item.get("pair") and item.get("direction")
+                )
+                portfolio_rows.append([
+                    index + 1,
+                    candidate_id,
+                    profile,
+                    len(weighted_members),
+                    member_names,
+                    display(variant_summary.get("B saturation USDT")),
+                    display(variant_summary.get("Target bank USDT")),
+                    display(variant_summary.get("Historical bank USDT")),
+                    display(variant_summary.get("Stress bank P95 USDT")),
+                    display(variant_summary.get("Margin-only bank USDT")),
+                    display(_weighted_value(metrics, "p30_limiter_model_usdt_30d", "p30_common_usdt_30d")),
+                    display(variant_summary.get("MaxDD SUM USDT")) or "—",
+                    display(_weighted_value(metrics, "max_drawdown_pct")) or "—",
+                    display_amount_ratios(variant_summary.get("CDaR peak80 USDT"), variant_summary.get("CDaR peak80 target %"), variant_summary.get("CDaR peak80 saturation %")) or "—",
+                    display_amount_ratios(variant_summary.get("CDaR peak90 USDT"), variant_summary.get("CDaR peak90 target %"), variant_summary.get("CDaR peak90 saturation %")) or "—",
+                    display_amount_ratios(variant_summary.get("IM all USDT"), variant_summary.get("IM target %"), variant_summary.get("IM saturation %")) or "—",
+                    display_amount_ratios(variant_summary.get("MM all USDT"), variant_summary.get("MM target %"), variant_summary.get("MM saturation %")) or "—",
+                    display(variant_summary.get("Total full notional USDT")),
+                ])
+                for member in weighted_members:
+                    if not isinstance(member, Mapping):
+                        continue
+                    order_percentages = member.get("entry_order_percentages")
+                    order_columns = [
+                        display_ratio(order_percentages[ordinal])
+                        if isinstance(order_percentages, Sequence) and not isinstance(order_percentages, (str, bytes)) and ordinal < len(order_percentages)
+                        else None
+                        for ordinal in range(4)
+                    ]
+                    member_rows.append([
+                        index + 1,
+                        candidate_id,
+                        profile,
+                        member.get("pair"),
+                        member.get("direction"),
+                        member.get("strategy_id"),
+                        member.get("result_id"),
+                        display(member.get("position_usdt")),
+                        display(member.get("balance_percentage", member.get("bank_share_pct"))),
+                         display(member.get("max_balance")),
+                         *order_columns,
+                         display(member.get("leverage")),
+                         display(member.get("capacity_usdt")),
+                         member.get("timeframe"),
+                         display_integer(member.get("user_rank")),
+                         display(member.get("source_pnl")),
+                         display(member.get("source_max_drawdown_usdt")),
+                         display_ratio(member.get("source_max_drawdown_pct")),
+                         display_integer(member.get("order_count")),
+                         display_ratio(member.get("liquidity_utilization_pct")),
+                         display(member.get("scaled_max_drawdown_usdt")),
+                     ])
+                continue
             portfolio_rows.append([campaign["campaign_id"], candidate_id, profile, val(variant, "final_pretest_rank", default=index + 1), val(variant, "scheduling_key_id", default=val(val(variant, "scheduling_key", default={}), "identity")), val(variant, "scheduling_score", "score"), member_count, pair_count, val(variant, "limiter"), val(variant, "maximum_individual_dd_pct"), val(variant, "minimum_free_margin_reserve_pct"), val(variant, "maximum_account_mm_load_pct"), val(variant, "gate", "gate_result", default="UNKNOWN"), val(variant, "blocking_reasons", "reasons", default=""), "", None, "", val(variant, "search_mode", default=val(metrics, "metric_basis")), val(variant, "evaluations", default="UNKNOWN"), val(metrics, "proxy_pnl_usdt", default=val(metrics, "proxy_end_pnl_usdt")), val(metrics, "proxy_max_drawdown_usdt"), val(metrics, "proxy_max_drawdown_pct"), val(metrics, "proxy_recovery_factor"), val(metrics, "proxy_reserve_usdt"), val(metrics, "proxy_reserve_pct"), val(metrics, "k"), val(metrics, "tested_size_usdt"), val(metrics, "actual_size_usdt"), val(metrics, "tested_size_basis", default=val(metrics, "sizing_basis")), f"{val(period, 'start_utc')}..{val(period, 'end_utc')}" if val(period, 'start_utc') and val(period, 'end_utc') else "UNKNOWN", val(variant, "refinement", default=val(metrics, "refinement", default="DAILY")), val(metrics, "k1"), val(metrics, "corrective_reduction_applied", default=False), val(variant, "daily_pretest_rank"), val(variant, "final_pretest_rank")])
             if isinstance(directions, Mapping) and directions:
                 for ordinal, (direction, details) in enumerate(directions.items(), 1):
@@ -2442,22 +3487,64 @@ class PortfolioPanelService:
         def frame(rows: Sequence[Sequence[Any]], headers: Sequence[str]) -> pd.DataFrame:
             return pd.DataFrame([[ _safe_cell(value, key=header) for value, header in zip(row, headers)] for row in rows], columns=headers)
 
-        tables = {
-            "Summary": frame([[key, value] for key, value in summary.items()], SUMMARY_HEADERS),
-            "Finalists": frame(finalist_rows, FINALIST_HEADERS),
-            "Portfolios": frame(portfolio_rows, PORTFOLIO_HEADERS),
-            "Members": frame(member_rows, MEMBER_HEADERS),
-            "Excluded": frame(excluded_rows, EXCLUDED_HEADERS),
-            "Metadata": frame([[key, value] for key, value in metadata.items()], METADATA_HEADERS),
-        }
-        if pretest_mode:
-            tables["Profile Status"] = frame(profile_status_rows, PROFILE_STATUS_HEADERS)
+        if weighted_mode:
+            weighted_variant = next((item for item in variants if val(item, "search_mode") == CAMPAIGN_SEARCH_MODE), None)
+            weighted_summary = self._summary(campaign, finalists, selected, variants, excluded, optimizer_excluded=optimizer_excluded, blockers=blockers, warnings=warnings, optimizer_status=optimizer_status)
+            top_metrics = val(weighted_variant, "metrics", default={}) if weighted_variant is not None else {}
+            top_members = weighted_summary.get("Weighted members", ())
+            limit_text = display(weighted_summary.get("Profile DD limit %")) or "—"
+            summary_rows = [
+                ["ID варианта", weighted_summary.get("Weighted candidate ID")],
+                ["Профиль", val(weighted_variant, "profile") if weighted_variant is not None else None],
+                ["Целевой банк, USDT", display(weighted_summary.get("Target bank USDT")) or ("UNCAPPED" if weighted_summary.get("Target bank USDT") == "UNCAPPED" else None)],
+                [f"Минимальный банк для DD ≤ {limit_text}% на истории", display(weighted_summary.get("Historical bank USDT"))],
+                [f"Банк для DD ≤ {limit_text}% в 95% стресс-сценариев", display(weighted_summary.get("Stress bank P95 USDT"))],
+                ["Банк для профильных лимитов, USDT", display(weighted_summary.get("Margin-only bank USDT"))],
+                ["PnL, USDT", display(_weighted_value(top_metrics, "p30_limiter_model_usdt_30d", "p30_common_usdt_30d"))],
+                ["MaxDD SUM, USDT", display(weighted_summary.get("MaxDD SUM USDT")) or "—"],
+                ["Исторический рассчитанный DD, %", display(_weighted_value(top_metrics, "max_drawdown_pct")) or "—"],
+                ["CDaR худшие 20%, USDT · target/saturation", display_amount_ratios(weighted_summary.get("CDaR peak80 USDT"), weighted_summary.get("CDaR peak80 target %"), weighted_summary.get("CDaR peak80 saturation %")) or "—"],
+                ["CDaR худшие 10%, USDT · target/saturation", display_amount_ratios(weighted_summary.get("CDaR peak90 USDT"), weighted_summary.get("CDaR peak90 target %"), weighted_summary.get("CDaR peak90 saturation %")) or "—"],
+                ["IM", display_amount_ratios(weighted_summary.get("IM all USDT"), weighted_summary.get("IM target %"), weighted_summary.get("IM saturation %")) or "—"],
+                ["MM", display_amount_ratios(weighted_summary.get("MM all USDT"), weighted_summary.get("MM target %"), weighted_summary.get("MM saturation %")) or "—"],
+                ["Полный номинал портфеля, USDT", display(weighted_summary.get("Total full notional USDT"))],
+                ["Позиций", len(top_members) if isinstance(top_members, Sequence) else 0],
+            ]
+            tables = {
+                "Итог": frame(summary_rows, WEIGHTED_SUMMARY_HEADERS),
+                "Варианты": frame(portfolio_rows, WEIGHTED_VARIANT_HEADERS),
+                "Состав": frame(member_rows, WEIGHTED_MEMBER_HEADERS),
+                "Финалисты": frame(finalist_rows, WEIGHTED_FINALIST_HEADERS),
+                "Исключено": frame(excluded_rows, WEIGHTED_EXCLUDED_HEADERS),
+                "Metadata": frame([[key, value] for key, value in metadata.items()], METADATA_HEADERS),
+            }
+        else:
+            tables = {
+                "Summary": frame([[key, value] for key, value in summary.items()], SUMMARY_HEADERS),
+                "Finalists": frame(finalist_rows, FINALIST_HEADERS),
+                "Portfolios": frame(portfolio_rows, PORTFOLIO_HEADERS),
+                "Members": frame(member_rows, MEMBER_HEADERS),
+                "Excluded": frame(excluded_rows, EXCLUDED_HEADERS),
+                "Metadata": frame([[key, value] for key, value in metadata.items()], METADATA_HEADERS),
+            }
+            if pretest_mode:
+                tables["Profile Status"] = frame(profile_status_rows, PROFILE_STATUS_HEADERS)
         write_audit_workbook(tables, path)
         from openpyxl import load_workbook
+        from openpyxl.styles import Alignment
         workbook = load_workbook(path)
         temporary: Path | None = None
         try:
             workbook["Metadata"].sheet_state = "hidden"
+            if weighted_mode:
+                width_limits = {"Итог": 34, "Варианты": 20, "Состав": 18, "Финалисты": 18, "Исключено": 20}
+                for sheet_name, maximum_width in width_limits.items():
+                    worksheet = workbook[sheet_name]
+                    worksheet.row_dimensions[1].height = 48
+                    for cell in worksheet[1]:
+                        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                        dimension = worksheet.column_dimensions[cell.column_letter]
+                        dimension.width = min(maximum_width, max(12, float(dimension.width or 12)))
             with tempfile.NamedTemporaryFile(suffix=".xlsx", dir=path.parent, delete=False) as handle:
                 temporary = Path(handle.name)
             workbook.save(temporary)
@@ -2514,17 +3601,35 @@ class PortfolioPanelService:
                 raise PortfolioPanelError(code, "job is not available" if code == "PORTFOLIO_JOB_NOT_FOUND" else "portfolio job runtime is unavailable", status=404 if code == "PORTFOLIO_JOB_NOT_FOUND" else 500) from error
             except (OSError, TypeError, ValueError) as error:
                 raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500) from error
+        if saved.get("state") in {"CANCELLED", "FAILED"}:
+            self._cleanup_terminal_snapshot(job_id)
         return {"job_id": job_id, "status": self._project_state(saved)}
 
     def active_or_job(self) -> dict[str, Any] | None:
-        return self.active_job()
+        active = self.active_job()
+        if active is not None:
+            return active
+        try:
+            jobs = self.registry.list()
+        except (PanelJobError, KeyError, OSError, TypeError, ValueError) as error:
+            raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500) from error
+        portfolio_jobs = [saved for saved in jobs if saved.get("kind") in {"portfolio.stage1", "portfolio.stage2"} and saved.get("state") in _TERMINAL]
+        if portfolio_jobs:
+            latest = max(portfolio_jobs, key=lambda saved: str(saved.get("created_at_utc") or ""))
+            return self.job(latest["job_id"])
+        return None
 
     def results(self, campaign_id: str) -> dict[str, Any]:
         saved, runtime = self._campaign_by_id(campaign_id)
         if self._project_state(saved) != "SUCCEEDED":
             raise PortfolioPanelError("PORTFOLIO_JOB_RESULTS_UNAVAILABLE", "results are not available", status=409)
-        campaign = runtime.get("campaign")
-        if not isinstance(campaign, Mapping) or not isinstance(campaign.get("input_digest"), str) or not isinstance(campaign.get("config_digest"), str):
+        try:
+            campaign = self._hydrate_campaign(saved, runtime, allow_terminal=True, expected_campaign_id=campaign_id)
+        except PortfolioPanelError as error:
+            if error.code.startswith("CAMPAIGN_"):
+                raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500) from error
+            raise
+        if not isinstance(campaign.get("input_digest"), str) or not isinstance(campaign.get("config_digest"), str):
             raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500)
         summary = runtime.get("summary") if isinstance(runtime.get("summary"), Mapping) else {}
         try:
@@ -2534,6 +3639,37 @@ class PortfolioPanelService:
                 raise OSError
         except (OSError, TypeError, ValueError, FileNotFoundError):
             raise PortfolioPanelError("PORTFOLIO_JOB_RESULTS_UNAVAILABLE", "results are not available", status=409) from None
+        if not isinstance(summary, dict):
+            summary = dict(summary)
+        if summary.get("weighted_result_schema") != 1:
+            artifact_digest = runtime.get("executables_digest")
+            if isinstance(artifact_digest, str) and re.fullmatch(r"[0-9a-f]{64}", artifact_digest):
+                try:
+                    artifact = self._load_stage1_executables(
+                        campaign_id,
+                        campaign["input_digest"],
+                        campaign["config_digest"],
+                        artifact_digest,
+                    )
+                    candidates = artifact.get("candidates") if isinstance(artifact, Mapping) else None
+                    candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+                    if isinstance(candidate, Mapping):
+                        enriched = self._summary(campaign, (), (), (candidate,), ())
+                        for key in (
+                            "weighted_result_schema",
+                            "Weighted candidate ID", "B required USDT", "Required bank USDT", "Historical bank USDT",
+                            "Stress bank P95 USDT", "Margin-only bank USDT", "B saturation USDT", "B margin USDT",
+                            "P30 common USDT/30d", "P30 limiter USDT/30d", "MaxDD %", "CDaR peak80 USDT",
+                            "CDaR peak90 USDT", "IM all USDT", "MM all USDT", "Total full notional USDT", "Weighted members",
+                            "CDaR peak80 %", "CDaR peak90 %",
+                            "Target bank USDT", "Profile DD limit %", "MaxDD SUM USDT",
+                            "CDaR peak80 target %", "CDaR peak90 target %", "CDaR peak80 saturation %", "CDaR peak90 saturation %",
+                            "IM target %", "IM saturation %", "MM target %", "MM saturation %",
+                        ):
+                            if key in enriched:
+                                summary[key] = _plain(enriched[key])
+                except PortfolioPanelError:
+                    pass
         return {"campaign_id": campaign_id, "input_digest": campaign["input_digest"], "config_digest": campaign["config_digest"], "summary": summary, "blockers": summary.get("blockers", []), "workbook_available": workbook.is_file()}
 
     def workbook(self, campaign_id: str) -> bytes:

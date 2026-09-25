@@ -1,8 +1,10 @@
 import json
+from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import mrs3.portfolio.config as config_module
 
 from mrs3.portfolio.config import (
     INDIVIDUAL_DD_DEFAULTS,
@@ -89,34 +91,17 @@ def test_v1_migration_adds_weighted_search_defaults_and_rejects_invalid_value(tm
     assert migrated["search"]["weighted_search"] == {
         "history_step_minutes": 5,
         "lp_solutions_per_profile": 20,
-        "repair_attempts": 3,
-        "additional_passes": 1,
-        "base_vectors": 2_000_000,
-        "scenarios": 3_000_000,
-        "cdar_pct": 80,
-        "diagnostic_cdar_pct": 90,
-        "alternatives_per_profile": 2,
-        "p30_tolerance_pct": 5,
-        "bootstrap_block_days": [1, 3, 7],
+        "max_targets": 8,
         "bootstrap_scenarios_per_block": 1_000,
-        "bootstrap_p95": True,
         "bootstrap_diagnostic_scenarios": 100,
-        "bootstrap_low_block_common_days": 10,
-        "scale_warning_multiple": 10,
+        "wall_time_seconds": 900,
+        "solver_time_seconds": 30,
         "limiter_step": 1,
         "limiter_controls": 2,
         "limiter_stress_pct": 1.5,
         "priority_groups": 5,
         "priority_beta": 0.5,
         "priority_close_ratio": 2,
-        "wall_time_seconds": 900,
-        "solver_time_seconds": 30,
-        "max_targets": 8,
-        "api_requests_per_second": 2,
-        "api_concurrency": 1,
-        "api_retries": 3,
-        "reference_max_age_hours": 2,
-        "csv_download_concurrency": 2,
     }
 
     migrated["search"]["weighted_search"]["bootstrap_scenarios_per_block"] = 0
@@ -133,9 +118,59 @@ def test_v2_loader_adds_missing_weighted_search_defaults_in_memory(tmp_path):
     loaded = load_portfolio_config(path)
 
     expected = dict(WEIGHTED_SEARCH_DEFAULTS)
-    assert loaded.search["weighted_search"] == {**expected, "bootstrap_block_days": (1, 3, 7)}
+    assert loaded.search["weighted_search"] == expected
     assert "weighted_search" not in value["search"]
     assert path.read_bytes() == before
+
+
+def test_v2_migration_discards_only_retired_weighted_search_keys(tmp_path):
+    value = _v2_config()
+    retired = {
+        "repair_attempts": 3,
+        "additional_passes": 1,
+        "base_vectors": 2_000_000,
+        "scenarios": 3_000_000,
+        "cdar_pct": 80,
+        "diagnostic_cdar_pct": 90,
+        "alternatives_per_profile": 2,
+        "p30_tolerance_pct": 5,
+        "bootstrap_block_days": [1, 3, 7],
+        "bootstrap_p95": True,
+        "bootstrap_low_block_common_days": 10,
+        "scale_warning_multiple": 10,
+        "api_requests_per_second": 2,
+        "api_concurrency": 1,
+        "api_retries": 3,
+        "reference_max_age_hours": 2,
+        "csv_download_concurrency": 2,
+    }
+    value["search"]["weighted_search"].update(retired)
+
+    migrated, changed = migrate_portfolio_config_document(value)
+
+    assert not changed
+    assert not (retired.keys() & migrated["search"]["weighted_search"].keys())
+    loaded = load_portfolio_config(_write(tmp_path, value))
+    assert loaded.search["weighted_search"] == WEIGHTED_SEARCH_DEFAULTS
+
+
+def test_v2_migration_backfills_missing_retained_weighted_keys_and_preserves_values(tmp_path):
+    value = _v2_config()
+    value["search"]["weighted_search"] = {
+        "history_step_minutes": 9,
+        "repair_attempts": 3,
+    }
+
+    migrated, changed = migrate_portfolio_config_document(value)
+
+    assert not changed
+    assert migrated["search"]["weighted_search"] == {
+        **WEIGHTED_SEARCH_DEFAULTS,
+        "history_step_minutes": 9,
+    }
+    loaded = load_portfolio_config(_write(tmp_path, value))
+    assert loaded.search["weighted_search"]["history_step_minutes"] == 9
+    assert loaded.search["weighted_search"]["lp_solutions_per_profile"] == 20
 
 
 @pytest.mark.parametrize("malformed_search", ["missing", None, []])
@@ -180,24 +215,10 @@ def test_v1_migration_preserves_missing_or_nonmapping_search_for_parser_rejectio
         load_portfolio_config(_write(tmp_path, migrated))
 
 
-def test_weighted_search_rejects_boolean_bootstrap_block_day(tmp_path):
-    value = _v2_config()
-    value["search"]["weighted_search"]["bootstrap_block_days"] = [True, 3, 7]
-
-    with pytest.raises(PortfolioConfigError, match="bootstrap_block_days"):
-        load_portfolio_config(_write(tmp_path, value))
-
-
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("lp_solutions_per_profile", 21),
-        ("repair_attempts", 4),
-        ("additional_passes", 2),
-        ("alternatives_per_profile", -1),
-        ("cdar_pct", 100),
-        ("diagnostic_cdar_pct", 100),
-        ("p30_tolerance_pct", 100),
         ("limiter_stress_pct", 100),
         ("bootstrap_diagnostic_scenarios", 1001),
         ("limiter_controls", -1),
@@ -209,10 +230,6 @@ def test_weighted_search_rejects_boolean_bootstrap_block_day(tmp_path):
         ("priority_close_ratio", 1),
         ("max_targets", 0),
         ("max_targets", 9),
-        ("api_requests_per_second", 0),
-        ("api_concurrency", 0),
-        ("reference_max_age_hours", 0),
-        ("csv_download_concurrency", 0),
         ("limiter_stress_pct", -1),
     ],
 )
@@ -224,15 +241,31 @@ def test_weighted_search_plan_bounds_fail_closed(tmp_path, field, value):
         load_portfolio_config(_write(tmp_path, config))
 
 
+@pytest.mark.parametrize("value", [0, 21, 1.5, "1.5"])
+def test_weighted_search_solver_call_limit_rejects_out_of_range_or_non_integer(tmp_path, value):
+    config = _v2_config()
+    config["search"]["weighted_search"]["lp_solutions_per_profile"] = value
+
+    with pytest.raises(PortfolioConfigError, match="lp_solutions_per_profile"):
+        load_portfolio_config(_write(tmp_path, config))
+
+
+@pytest.mark.parametrize("value", [1, 20])
+def test_weighted_search_solver_call_limit_accepts_inclusive_boundaries(tmp_path, value):
+    config = _v2_config()
+    config["search"]["weighted_search"]["lp_solutions_per_profile"] = value
+
+    loaded = load_portfolio_config(_write(tmp_path, config))
+
+    assert loaded.search["weighted_search"]["lp_solutions_per_profile"] == value
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("alternatives_per_profile", 0),
-        ("p30_tolerance_pct", 0),
         ("limiter_stress_pct", 0),
         ("limiter_controls", 0),
         ("priority_beta", 0),
-        ("api_retries", 0),
     ],
 )
 def test_weighted_search_plan_zero_bounds_are_explicit(tmp_path, field, value):
@@ -242,6 +275,23 @@ def test_weighted_search_plan_zero_bounds_are_explicit(tmp_path, field, value):
     loaded = load_portfolio_config(_write(tmp_path, config))
 
     assert loaded.search["weighted_search"][field] == value
+
+
+def test_stage1_seed_is_required_and_history_window_has_no_backend_upper_bound(tmp_path):
+    missing_seed = _v2_config()
+    missing_seed["search"].pop("seed")
+    with pytest.raises(PortfolioConfigError, match="missing required field.*seed"):
+        load_portfolio_config(_write(tmp_path, missing_seed))
+
+    value = _v2_config()
+    large = 10**30
+    value["search"]["seed"] = large
+    value["search"]["composition"]["parameters"]["minimum_common_days"] = large
+
+    loaded = load_portfolio_config(_write(tmp_path, value))
+
+    assert loaded.search["seed"] == large
+    assert loaded.search["composition"]["parameters"]["minimum_common_days"] == large
 
 
 def _write(tmp_path: Path, value):
@@ -283,6 +333,9 @@ def test_v1_load_returns_v2_model_with_defaults(tmp_path):
     assert config.schema_version == 2
     assert not hasattr(config.scenarios["AGGRESSIVE"], "sizing_grid")
     assert config.search["sizing_mode"] == SIZING_MODE
+    assert config.liquidity["parameters"]["close_volume_participation_pct"] == 200
+    assert config.liquidity["round_down_usdt"] == Decimal("10")
+    assert config.liquidity["archive_publication_lag_hours"] == 6
     assert config.profiles["AGGRESSIVE"].individual_max_dd_pct == INDIVIDUAL_DD_DEFAULTS["AGGRESSIVE"]
     assert config.profiles["BALANCED"].individual_net_pnl_min_exclusive == Decimal("0")
 
@@ -300,6 +353,11 @@ def test_v2_unknown_keys_are_rejected(tmp_path):
 
     value = _v2_config()
     value["profiles"]["AGGRESSIVE"]["ranking"]["id"] = "operator_supplied_ranking_v1"
+    with pytest.raises(PortfolioConfigError, match="unknown"):
+        load_portfolio_config(_write(tmp_path, value))
+
+    value = _v2_config()
+    value["search"]["weighted_search"]["unexpected"] = 1
     with pytest.raises(PortfolioConfigError, match="unknown"):
         load_portfolio_config(_write(tmp_path, value))
 
@@ -427,3 +485,103 @@ def test_repository_v1_example_migrates():
     config = load_portfolio_config(Path(__file__).parents[1] / "portfolio_optimizer.local.json.example")
     assert config.schema_version == 2
     assert set(config.profiles) == {"AGGRESSIVE", "BALANCED", "CONSERVATIVE"}
+
+
+def test_effective_profile_risk_defaults_are_immutable_and_do_not_mutate_source():
+    source = {"individual_max_dd_pct": "20"}
+    before = deepcopy(source)
+
+    effective = config_module.effective_profile_risk(source, "BALANCED")
+
+    assert dict(effective) == {
+        "max_actual_equity_dd_pct": Decimal("10"),
+        "min_calculated_free_margin_reserve_pct": Decimal("40"),
+        "max_calculated_account_mm_load_pct": Decimal("35"),
+    }
+    assert source == before
+    with pytest.raises(TypeError):
+        effective["max_actual_equity_dd_pct"] = Decimal("1")
+
+
+def test_effective_profile_risk_preserves_custom_values_without_mutating_source():
+    source = {
+        "max_actual_equity_dd_pct": "10.000000000001",
+        "min_calculated_free_margin_reserve_pct": "40",
+        "max_calculated_account_mm_load_pct": 35,
+    }
+    before = deepcopy(source)
+
+    effective = config_module.effective_profile_risk(source, "BALANCED")
+
+    assert effective["max_actual_equity_dd_pct"] == Decimal("10.000000000001")
+    assert effective["min_calculated_free_margin_reserve_pct"] == Decimal("40")
+    assert effective["max_calculated_account_mm_load_pct"] == Decimal("35")
+    assert source == before
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("max_actual_equity_dd_pct", True),
+        ("min_calculated_free_margin_reserve_pct", "NaN"),
+        ("max_calculated_account_mm_load_pct", "-0.1"),
+        ("max_actual_equity_dd_pct", "100.000000000001"),
+        ("min_calculated_free_margin_reserve_pct", "123456789012345678901234567.0"),
+        ("max_calculated_account_mm_load_pct", "0.1234567890123"),
+    ],
+)
+def test_effective_profile_risk_rejects_invalid_present_values(field, value):
+    with pytest.raises(PortfolioConfigError, match=rf"profiles\.BALANCED\.{field}"):
+        config_module.effective_profile_risk({field: value}, "BALANCED")
+
+
+def test_v2_profile_risk_values_are_parsed_and_materialized(tmp_path):
+    value = _v2_config()
+    value["profiles"]["BALANCED"].update({
+        "max_actual_equity_dd_pct": "10.000000000001",
+        "min_calculated_free_margin_reserve_pct": "40.000000000001",
+        "max_calculated_account_mm_load_pct": "35.000000000001",
+    })
+
+    loaded = load_portfolio_config(_write(tmp_path, value))
+
+    assert loaded.profiles["BALANCED"].max_actual_equity_dd_pct == Decimal("10.000000000001")
+    assert loaded.profiles["BALANCED"].min_calculated_free_margin_reserve_pct == Decimal("40.000000000001")
+    assert loaded.profiles["BALANCED"].max_calculated_account_mm_load_pct == Decimal("35.000000000001")
+
+
+def test_schema_v2_migration_defaults_spread_history_pretest_bypass_off_and_materializes_it():
+    value = _v2_config()
+    value["liquidity"].pop("spread_history_bypass_pretest", None)
+
+    migrated, changed = migrate_portfolio_config_document(value)
+
+    assert changed is False
+    assert migrated["liquidity"]["spread_history_bypass_pretest"] is False
+
+
+def test_load_portfolio_config_materializes_absent_v2_spread_history_bypass_in_memory(tmp_path):
+    value = _v2_config()
+    value["liquidity"].pop("spread_history_bypass_pretest", None)
+
+    loaded = load_portfolio_config(_write(tmp_path, value))
+
+    assert loaded.liquidity["spread_history_bypass_pretest"] is False
+
+
+def test_spread_history_pretest_bypass_requires_strict_boolean(tmp_path):
+    value = _v2_config()
+    value["liquidity"]["spread_history_bypass_pretest"] = "false"
+
+    with pytest.raises(PortfolioConfigError, match="spread_history_bypass_pretest must be a boolean"):
+        load_portfolio_config(_write(tmp_path, value))
+
+
+def test_margin_fee_rates_preserve_exact_decimal_strings(tmp_path):
+    value = _v2_config()
+    value["margin"]["parameters"].update({"open_fee_rate": "0", "close_fee_rate": "0.0002"})
+
+    loaded = load_portfolio_config(_write(tmp_path, value))
+
+    assert loaded.margin["parameters"]["open_fee_rate"] == "0"
+    assert loaded.margin["parameters"]["close_fee_rate"] == "0.0002"

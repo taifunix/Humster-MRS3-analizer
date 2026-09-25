@@ -8,10 +8,13 @@ from decimal import Decimal, ROUND_HALF_UP, localcontext
 from pathlib import Path
 import re
 from threading import RLock, Thread
+import tempfile
 from typing import Callable, Mapping
 from uuid import uuid4
 
 import duckdb
+import pandas as pd
+from urllib.parse import parse_qsl
 
 from .performance_v2_import import (
     PerformanceV2ImportRequest,
@@ -30,6 +33,18 @@ from .performance_v2_windows import (
     calendar_window_days,
     compare_window_pair_geometrically,
     get_or_calculate_window_pair,
+)
+from .performance_v2_selection import (
+    SelectionConfig,
+    SelectionRequest,
+    load_selection_candidates,
+    retest_cohort_request,
+    write_selection_workbook,
+)
+from .performance_v2_selection_review import (
+    effective_selection_decisions,
+    latest_user_reviews_by_strategy,
+    new_run_metadata,
 )
 
 
@@ -87,6 +102,183 @@ def _canonical_utc(value: datetime) -> str:
 def _is_duckdb_lock_error(error: duckdb.IOException) -> bool:
     message = str(error).casefold()
     return "could not set lock on file" in message or "conflicting lock is held" in message
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceV2ExportSelection:
+    statuses: tuple[str, ...] = ()
+    retest: bool = False
+    all_active: bool = False
+
+
+def parse_performance_v2_export_query(query: str) -> PerformanceV2ExportSelection:
+    pairs = parse_qsl(query, keep_blank_values=True)
+    allowed = {"status", "retest", "all_active"}
+    for key, _ in pairs:
+        if key not in allowed:
+            raise PerformanceV2ApiError("unknown_query_parameter", status=400, message="Unknown query parameter.")
+
+    values: dict[str, list[str]] = {key: [] for key in allowed}
+    for key, value in pairs:
+        values[key].append(value)
+    if len(values["all_active"]) > 1:
+        raise PerformanceV2ApiError("duplicate_query_parameter", status=400, message="Query parameter may not be repeated.")
+    if not any(values.values()):
+        raise PerformanceV2ApiError("missing_export_selection", status=400, message="At least one export selection is required.")
+    if values["all_active"] and values["all_active"][0] != "true":
+        raise PerformanceV2ApiError("invalid_query_flag", status=400, message="Boolean flags must be exactly 'true'.")
+    if values["all_active"] and (values["status"] or values["retest"]):
+        raise PerformanceV2ApiError("all_active_mixed_with_status", status=400, message="'all_active' cannot be combined with 'status'.")
+
+    statuses = values["status"]
+    invalid = next((value for value in statuses if value not in {"FINALIST", "RESERVE"}), None)
+    if invalid is not None:
+        raise PerformanceV2ApiError("invalid_export_status", status=400, message="Status must be one of FINALIST, RESERVE.")
+    if len(statuses) != len(set(statuses)):
+        raise PerformanceV2ApiError("duplicate_export_status", status=400, message="Each status may be selected only once.")
+    if len(values["retest"]) > 1:
+        raise PerformanceV2ApiError("duplicate_query_parameter", status=400, message="Query parameter may not be repeated.")
+    retest = bool(values["retest"])
+    if retest and values["retest"][0] != "1":
+        raise PerformanceV2ApiError("invalid_query_flag", status=400, message="Boolean flags must be exactly 'true'.")
+    return PerformanceV2ExportSelection(tuple(statuses), retest, bool(values["all_active"]))
+
+
+_EXPORT_MAX_ROWS = 100_000
+
+
+def _export_xlsx(
+    rows: list[tuple[object, ...]],
+    metadata: Mapping[int, tuple[str | None, int | None, bool]],
+    review_metadata: Mapping[str, str],
+    user_reviews: Mapping[int, Mapping[str, object]],
+    cached_candidates: Mapping[int, Mapping[str, object]],
+) -> bytes:
+    """Reuse the agreed Pareto-and-filters workbook writer; filtering adds no XLSX schema."""
+    candidates: list[dict[str, object]] = []
+    for row in rows:
+        strategy_id = int(row[0])
+        status, rank, tagged = metadata.get(strategy_id, (None, None, False))
+        candidate = dict(cached_candidates.get(strategy_id, {}))
+        candidate.update({
+            "strategy_id": strategy_id, "strategy_name": row[1], "symbol": row[2], "side": row[3],
+            "timeframe": row[4], "close_ma_len": row[5], "order_count": row[6], "result_id": row[25],
+            "effective_start_utc": row[31], "effective_end_utc": row[32],
+            "max_drawdown_pct": row[40], "total_trades": row[42], "finalist": status in {"FINALIST", "RESERVE"},
+            "auto_status": status or "UNSELECTED", "auto_rank": rank, "final_rank": rank,
+            "prior_retest": tagged, "elimination_reason": None,
+        })
+        for number, offset in enumerate(range(7, 23, 4), start=1):
+            candidate.update({
+                f"order_{number}_open_ma_len": row[offset], f"order_{number}_lot_x": row[offset + 3],
+                f"order_{number}_shift_bp": row[offset + 2],
+            })
+        candidates.append(candidate)
+    request = SelectionRequest(str(rows[0][2]) if rows else "", str(rows[0][3]) if rows else "", ())
+    with tempfile.TemporaryDirectory() as directory:
+        path = write_selection_workbook(
+            pd.DataFrame(candidates), Path(directory) / "candidates.xlsx", request, review_metadata, user_reviews,
+        )
+        return path.read_bytes()
+
+
+def _export_cached_candidates(
+    connection: duckdb.DuckDBPyConnection,
+    rows: list[tuple[object, ...]],
+    config: SelectionConfig,
+) -> dict[int, Mapping[str, object]]:
+    cohorts: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    for row in rows:
+        cohorts.setdefault((str(row[2]), str(row[3])), []).append((int(row[0]), int(row[25])))
+    candidates: dict[int, Mapping[str, object]] = {}
+    for (symbol, side), members in cohorts.items():
+        request = retest_cohort_request(SelectionRequest(symbol, side, ()), "performance-db-export", members)
+        for candidate in load_selection_candidates(connection, request, config, cache_only=True).to_dict(orient="records"):
+            candidates[int(candidate["strategy_id"])] = candidate
+    return candidates
+
+
+def export_performance_v2(
+    database_path: Path,
+    selection: PerformanceV2ExportSelection,
+    *,
+    selection_config: SelectionConfig = SelectionConfig(),
+    now: datetime | None = None,
+) -> tuple[str, bytes]:
+    if not database_path.is_file():
+        raise PerformanceV2ApiError("PERFORMANCE_DB_UNAVAILABLE", status=503, message="PerformanceDB is unavailable.")
+    try:
+        with duckdb.connect(str(database_path), read_only=True) as connection:
+            decisions = effective_selection_decisions(connection)
+            retest_ids = {int(row[0]) for row in connection.execute("select strategy_id from strategy_tags where tag = 'RETEST'").fetchall()}
+            if selection.all_active:
+                selected_ids: set[int] | None = None
+            else:
+                selected_ids = {strategy_id for strategy_id, decision in decisions.items() if decision[0] in selection.statuses}
+                if selection.retest and selection.statuses:
+                    selected_ids.intersection_update(retest_ids)
+                elif selection.retest:
+                    selected_ids = set(retest_ids)
+            where = "where s.lifecycle_status = 'ACTIVE' and r.result_id = s.current_result_id and r.strategy_id = s.strategy_id"
+            params: list[object] = []
+            if selected_ids is not None:
+                if not selected_ids:
+                    return _export_filename(now), _export_xlsx([], {}, new_run_metadata(connection), {}, {})
+                where += " and s.strategy_id in (select unnest(?::bigint[]))"
+                params.append(sorted(selected_ids))
+            order_columns = ", ".join(
+                f"o{number}.open_ma_len, o{number}.open_multiplier, o{number}.shift_bp, o{number}.lot_x"
+                for number in range(1, 5)
+            )
+            rows = connection.execute(
+                f"""select s.strategy_id, s.strategy_name, s.symbol, s.side, s.timeframe, s.close_ma_len, s.order_count,
+                           {order_columns}, s.lifecycle_status, s.current_result_id, r.result_id,
+                           r.report_start_utc, r.report_end_utc, r.reported_start_utc, r.reported_end_utc,
+                           r.listing_date_utc, r.effective_start_utc, r.effective_end_utc, r.exchange,
+                           r.commission_rate, r.initial_balance, r.final_balance, r.total_pnl, r.total_pnl_pct,
+                           r.max_drawdown, r.max_drawdown_pct, r.total_fees, r.total_trades, r.warmup_hours,
+                           r.excluded_trade_count, r.exclusion_reason
+                      from strategies s
+                      join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
+                      left join strategy_orders o1 on o1.strategy_id = s.strategy_id and o1.order_id = 1
+                      left join strategy_orders o2 on o2.strategy_id = s.strategy_id and o2.order_id = 2
+                      left join strategy_orders o3 on o3.strategy_id = s.strategy_id and o3.order_id = 3
+                      left join strategy_orders o4 on o4.strategy_id = s.strategy_id and o4.order_id = 4
+                      {where}
+                     limit {_EXPORT_MAX_ROWS + 1}""", params,
+            ).fetchall()
+            if len(rows) > _EXPORT_MAX_ROWS:
+                raise PerformanceV2ApiError("EXPORT_ROW_LIMIT_EXCEEDED", status=413, message="Export exceeds 100000 rows.")
+            metadata = {
+                int(row[0]): (decisions.get(int(row[0]), (None, None, None))[0] if int(row[0]) in decisions else None,
+                              decisions.get(int(row[0]), (None, None, None))[1] if int(row[0]) in decisions else None,
+                              int(row[0]) in retest_ids)
+                for row in rows
+            }
+            review_metadata = new_run_metadata(connection)
+            user_reviews = latest_user_reviews_by_strategy(connection, [int(row[0]) for row in rows])
+            cached_candidates = _export_cached_candidates(connection, rows, selection_config)
+            decision_order = {"FINALIST": 1, "RESERVE": 2}
+            rows.sort(key=lambda row: (
+                decision_order.get(metadata[int(row[0])][0], 3),
+                row[1] is None, str(row[1]) if row[1] is not None else "",
+                row[2] is None, str(row[2]) if row[2] is not None else "",
+                row[4] is None, str(row[4]) if row[4] is not None else "",
+                row[25] is None, str(row[25]) if row[25] is not None else "",
+                int(row[0]),
+            ))
+            return _export_filename(now), _export_xlsx(rows, metadata, review_metadata, user_reviews, cached_candidates)
+    except PerformanceV2ApiError:
+        raise
+    except (duckdb.Error, OSError) as error:
+        if isinstance(error, duckdb.IOException) and _is_duckdb_lock_error(error):
+            raise PerformanceV2ApiError("PERFORMANCE_DB_BUSY", status=409, message="PerformanceDB is busy.") from error
+        raise PerformanceV2ApiError("PERFORMANCE_DB_UNAVAILABLE", status=503, message="PerformanceDB is unavailable.") from error
+
+
+def _export_filename(now: datetime | None = None) -> str:
+    instant = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return f"performance_v2_strategies_{instant.strftime('%Y%m%dT%H%M%SZ')}.xlsx"
 
 
 def _safe_cleanup_message(error: BaseException) -> str:

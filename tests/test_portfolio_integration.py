@@ -46,7 +46,7 @@ def capability() -> dict[str, object]:
     return {"dual_tf": True, "dedicated_close": True, "opposite_opening": True, "common_runtime_fields": ["mode"]}
 
 
-def campaign(*, budget: int = 10, policy: dict[str, object] | None = None, grid: tuple[str, ...] = ("10", "20"), upstream_periods=((0, 10),), hypothesis_values=("h1",), resume_from=None, selection_period=(0, 10)):
+def campaign(*, budget: int = 10, policy: dict[str, object] | None = None, grid: tuple[str, ...] = ("10", "20"), upstream_periods=((0, 10),), hypothesis_values=("h1",), resume_from=None, selection_period=(0, 10), search_facts: dict[str, object] | None = None):
     return freeze_campaign(
         (0, 10), (10, 20), upstream_selection={"surface": "selection-1", "period": selection_period},
         upstream_used_periods=upstream_periods, hypotheses=hypothesis_values, warmup={"seconds": 1},
@@ -57,7 +57,7 @@ def campaign(*, budget: int = 10, policy: dict[str, object] | None = None, grid:
         sizing_grid=grid, ranking_policy={"version": "rank-1", "metrics": [{"field": "net_pnl", "direction": "DESC"}], "tie_breaker": "candidate_id"},
         total_test_budget=budget, evaluation_clock=10, refinement_rounds=1, resume_from=resume_from,
         capability=capability(), current_equity={"amount": "100", "currency": "USDT", "timestamp_ms": 1, "expires_at_ms": 100},
-        dd_cap_pct="20", composition=None, priorities=None, opposite_policy="KEEP_OPPOSITE", limiter=0,
+        dd_cap_pct="20", composition=None, priorities=None, opposite_policy="KEEP_OPPOSITE", limiter=0, search_facts=search_facts,
     )
 
 
@@ -104,6 +104,41 @@ def test_unknown_risk_evidence_never_becomes_pass():
     result = evaluate_research_risk({"actual_equity_dd_pct": "1"}, profile="AGGRESSIVE")
     assert result.status == "UNKNOWN"
     assert all(check.status == "UNKNOWN" for check in result.checks)
+
+
+def test_explicit_profile_thresholds_use_exact_boundary_gates():
+    thresholds = {
+        "max_actual_equity_dd_pct": "10.000000000000",
+        "min_calculated_free_margin_reserve_pct": "40.000000000000",
+        "max_calculated_account_mm_load_pct": "35.000000000000",
+    }
+    exact = evaluate_research_risk(evidence(dd="10", im="60", mm="35"), profile="BALANCED", thresholds=thresholds, now_ms=10)
+    assert exact.status == PASS
+    assert tuple(check.threshold for check in exact.checks) == (
+        Decimal("10.000000000000"), Decimal("40.000000000000"), Decimal("35.000000000000")
+    )
+    for field, value in (
+        ("max_actual_equity_dd_pct", "9.999999999999"),
+        ("min_calculated_free_margin_reserve_pct", "40.000000000002"),
+        ("max_calculated_account_mm_load_pct", "34.999999999999"),
+    ):
+        stricter = dict(thresholds)
+        stricter[field] = value
+        result = evaluate_research_risk(evidence(dd="10", im="60", mm="35"), profile="BALANCED", thresholds=stricter, now_ms=10)
+        assert result.status == FAIL
+
+
+def test_integration_risk_gate_reads_frozen_profile_policy():
+    frozen = campaign(search_facts={"risk_policy": {"AGGRESSIVE": {
+        "max_actual_equity_dd_pct": "0",
+        "min_calculated_free_margin_reserve_pct": "100",
+        "max_calculated_account_mm_load_pct": "0",
+    }}})
+    result = run(frozen, [candidate()], import_result=lambda value: evidence())
+    risk = next(attempt.risk for attempt in result.attempts if attempt.risk is not None)
+    assert risk.checks[0].threshold == Decimal("0")
+    assert risk.checks[1].threshold == Decimal("100")
+    assert risk.checks[2].threshold == Decimal("0")
 
 
 def test_all_grid_points_are_tested_and_resume_does_not_repeat_callbacks():

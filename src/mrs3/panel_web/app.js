@@ -1,5 +1,11 @@
 const portfolioSettingsHelpers = (() => {
   const profiles = ['AGGRESSIVE', 'BALANCED', 'CONSERVATIVE'];
+  const riskFields = Object.freeze(['max_actual_equity_dd_pct', 'min_calculated_free_margin_reserve_pct', 'max_calculated_account_mm_load_pct']);
+  const riskDefaults = Object.freeze({
+    AGGRESSIVE: Object.freeze({ max_actual_equity_dd_pct: '20', min_calculated_free_margin_reserve_pct: '20', max_calculated_account_mm_load_pct: '50' }),
+    BALANCED: Object.freeze({ max_actual_equity_dd_pct: '10', min_calculated_free_margin_reserve_pct: '40', max_calculated_account_mm_load_pct: '35' }),
+    CONSERVATIVE: Object.freeze({ max_actual_equity_dd_pct: '5', min_calculated_free_margin_reserve_pct: '60', max_calculated_account_mm_load_pct: '20' }),
+  });
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const settingsMoneyParts = (value) => {
     if (typeof value === 'number' && (!Number.isSafeInteger(value) || value <= 0)) return null;
@@ -7,14 +13,6 @@ const portfolioSettingsHelpers = (() => {
     if (typeof text !== 'string' || !/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(text)) return null;
     const pieces = text.split('.'); const digits = `${pieces[0]}${pieces[1] || ''}`; const scaled = BigInt(digits || '0');
     return scaled > 0n ? { text, scale: (pieces[1] || '').length, scaled } : null;
-  };
-  const settingsMoneyValue = (raw, original) => {
-    const text = String(raw ?? '').trim();
-    if (!settingsMoneyParts(text)) throw new Error('money');
-    if (text === String(original)) return original;
-    if (typeof original === 'string' || text.includes('.')) return text;
-    const value = Number(text); if (!Number.isSafeInteger(value)) throw new Error('money');
-    return value;
   };
   const settingsIntegerValue = (raw, allowZero = false) => {
     const text = String(raw ?? '').trim();
@@ -36,38 +34,37 @@ const portfolioSettingsHelpers = (() => {
     const value = Number(text); if (!Number.isSafeInteger(value)) throw new Error('decimal');
     return value;
   };
+  const settingsFeeRateValue = (raw, original) => {
+    const text = String(raw ?? '').trim(); const parts = settingsDecimalParts(text);
+    if (!parts || parts.negative || parts.scale > 12 || parts.scaled >= 10n ** BigInt(parts.scale)) throw new Error('fee-rate');
+    return text === String(original) ? original : text;
+  };
+  const settingsRiskValue = (raw, original) => {
+    const text = String(raw ?? '').trim(); const parts = settingsDecimalParts(text);
+    const integerDigits = parts ? parts.text.replace('-', '').split('.')[0].length : 0;
+    const maximum = parts ? 100n * (10n ** BigInt(parts.scale)) : -1n;
+    if (!parts || parts.negative || parts.scale > 12 || integerDigits > 26 || parts.scaled > maximum) throw new Error('risk-decimal');
+    return text === String(original) ? original : text;
+  };
   const settingsWeekdayMinutes = (raw) => {
     if (typeof raw !== 'string') return null;
     const match = /^(MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY) ([0-9]{2}):([0-9]{2})$/.exec(raw);
     if (!match || Number(match[2]) > 23 || Number(match[3]) > 59) return null;
     return ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'].indexOf(match[1]) * 1440 + Number(match[2]) * 60 + Number(match[3]);
   };
-  const settingsCompareMoney = (left, right) => {
-    const a = settingsMoneyParts(left); const b = settingsMoneyParts(right); if (!a || !b) return NaN;
-    if (a.scale === b.scale) return a.scaled < b.scaled ? -1 : a.scaled > b.scaled ? 1 : 0;
-    const scale = Math.max(a.scale, b.scale); const av = a.scaled * 10n ** BigInt(scale - a.scale); const bv = b.scaled * 10n ** BigInt(scale - b.scale);
-    return av < bv ? -1 : av > bv ? 1 : 0;
-  };
   const weightedIntegerRules = Object.freeze({
-    history_step_minutes: { positive: true }, base_vectors: { positive: true }, scenarios: { positive: true },
+    history_step_minutes: { positive: true }, lp_solutions_per_profile: { positive: true, maximum: 20 },
+    max_targets: { positive: true, maximum: 8 },
     bootstrap_scenarios_per_block: { positive: true }, bootstrap_diagnostic_scenarios: { positive: true },
-    bootstrap_low_block_common_days: { positive: true }, limiter_step: { positive: true },
-    wall_time_seconds: { positive: true }, solver_time_seconds: { positive: true }, max_targets: { positive: true, maximum: 8 },
-    api_requests_per_second: { positive: true }, api_concurrency: { positive: true },
-    reference_max_age_hours: { positive: true }, csv_download_concurrency: { positive: true },
-    lp_solutions_per_profile: { positive: true, maximum: 20 }, repair_attempts: { positive: true, maximum: 3 },
-    additional_passes: { positive: true, maximum: 1 }, alternatives_per_profile: { maximum: 2 },
-    limiter_controls: { maximum: 2 }, priority_groups: { positive: true, maximum: 5 }, api_retries: {},
+    wall_time_seconds: { positive: true }, solver_time_seconds: { positive: true },
+    limiter_step: { positive: true }, limiter_controls: { maximum: 2 },
+    priority_groups: { positive: true, maximum: 5 },
   });
   const weightedNumberRules = Object.freeze({
-    cdar_pct: { positive: true, maximumExclusive: 100 }, diagnostic_cdar_pct: { positive: true, maximumExclusive: 100 },
-    p30_tolerance_pct: { minimum: 0, maximumExclusive: 100 }, scale_warning_multiple: { positive: true },
     limiter_stress_pct: { minimum: 0, maximumExclusive: 100 }, priority_beta: { minimum: 0, maximum: 1 },
     priority_close_ratio: { minimumExclusive: 1 },
   });
-  const weightedSearchKeys = Object.freeze([
-    ...Object.keys(weightedIntegerRules), ...Object.keys(weightedNumberRules), 'bootstrap_block_days', 'bootstrap_p95',
-  ]);
+  const weightedSearchKeys = Object.freeze([...Object.keys(weightedIntegerRules), ...Object.keys(weightedNumberRules)]);
   const weightedSearchValid = (weighted) => {
     if (!weighted || typeof weighted !== 'object' || Array.isArray(weighted) || Object.keys(weighted).sort().join(',') !== [...weightedSearchKeys].sort().join(',')) return false;
     for (const [name, rule] of Object.entries(weightedIntegerRules)) {
@@ -78,7 +75,7 @@ const portfolioSettingsHelpers = (() => {
       const value = weighted[name];
       if (typeof value !== 'number' || !Number.isFinite(value) || !settingsDecimalParts(String(value)) || (rule.positive && value <= 0) || (rule.minimum !== undefined && value < rule.minimum) || (rule.minimumExclusive !== undefined && value <= rule.minimumExclusive) || (rule.maximum !== undefined && value > rule.maximum) || (rule.maximumExclusive !== undefined && value >= rule.maximumExclusive)) return false;
     }
-    return Array.isArray(weighted.bootstrap_block_days) && JSON.stringify(weighted.bootstrap_block_days) === '[1,3,7]' && typeof weighted.bootstrap_p95 === 'boolean' && weighted.bootstrap_diagnostic_scenarios <= weighted.bootstrap_scenarios_per_block;
+    return weighted.bootstrap_diagnostic_scenarios <= weighted.bootstrap_scenarios_per_block;
   };
   const weightedIntegerValue = (raw, rule) => {
     const value = settingsIntegerValue(raw, !rule.positive);
@@ -103,12 +100,13 @@ const portfolioSettingsHelpers = (() => {
   const validSettingsDocument = (doc) => {
     const liquidity = doc?.liquidity; const parameters = liquidity?.parameters;
     const weighted = doc?.search?.weighted_search;
+    const compositionParameters = doc?.search?.composition?.parameters;
     const start = settingsWeekdayMinutes(liquidity?.weekend_start_utc); const end = settingsWeekdayMinutes(liquidity?.weekend_end_utc);
     const rounding = settingsDecimalParts(liquidity?.round_down_usdt);
-    if (!doc || typeof doc !== 'object' || Array.isArray(doc) || doc.schema_version !== 2 || !Number.isSafeInteger(doc.search?.total_test_budget) || doc.search.total_test_budget <= 0 || doc.search.sizing_mode !== 'liquidity_cap_single' || !Number.isSafeInteger(doc.search.max_enumerated_combinations) || doc.search.max_enumerated_combinations <= 0 || !weightedSearchValid(weighted) || !Number.isSafeInteger(parameters?.close_volume_participation_pct) || parameters.close_volume_participation_pct < 1 || parameters.close_volume_participation_pct > 200 || !rounding || rounding.negative || rounding.scaled === 0n || !Number.isSafeInteger(liquidity.minimum_coverage_pct) || liquidity.minimum_coverage_pct < 1 || liquidity.minimum_coverage_pct > 100 || !Number.isSafeInteger(liquidity.maximum_age_hours) || liquidity.maximum_age_hours <= 0 || start === null || end === null || start === end || !Number.isSafeInteger(liquidity.archive_publication_lag_hours) || liquidity.archive_publication_lag_hours < 0 || liquidity.archive_publication_lag_hours > 48 || typeof liquidity.backfill_write_enabled !== 'boolean') return false;
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc) || doc.schema_version !== 2 || !Number.isSafeInteger(doc.search?.seed) || doc.search.seed < 0 || !Number.isSafeInteger(compositionParameters?.minimum_common_days) || compositionParameters.minimum_common_days <= 0 || !Number.isSafeInteger(doc.search?.total_test_budget) || doc.search.total_test_budget <= 0 || doc.search.sizing_mode !== 'liquidity_cap_single' || !Number.isSafeInteger(doc.search.max_enumerated_combinations) || doc.search.max_enumerated_combinations <= 0 || !weightedSearchValid(weighted) || !Number.isSafeInteger(parameters?.close_volume_participation_pct) || parameters.close_volume_participation_pct < 1 || parameters.close_volume_participation_pct > 200 || !rounding || rounding.negative || rounding.scaled === 0n || !Number.isSafeInteger(liquidity.minimum_coverage_pct) || liquidity.minimum_coverage_pct < 1 || liquidity.minimum_coverage_pct > 100 || !Number.isSafeInteger(liquidity.maximum_age_hours) || liquidity.maximum_age_hours <= 0 || start === null || end === null || start === end || !Number.isSafeInteger(liquidity.archive_publication_lag_hours) || liquidity.archive_publication_lag_hours < 0 || liquidity.archive_publication_lag_hours > 48 || typeof liquidity.backfill_write_enabled !== 'boolean' || typeof liquidity.spread_history_bypass_pretest !== 'boolean') return false;
     for (const profile of profiles) {
       const scenario = doc.scenarios?.[profile]; const profileDocument = doc.profiles?.[profile]; const ranking = profileDocument?.ranking;
-      if (!scenario || !validMoney(scenario.deposit) || !validMoney(scenario.collateral) || !validMoney(scenario.max_balance) || !validMoney(scenario.sizing?.upper_bound) || scenario.sizing.grid !== undefined || !settingsDecimalParts(profileDocument?.individual_max_dd_pct) || settingsDecimalParts(profileDocument.individual_max_dd_pct).negative || settingsDecimalParts(profileDocument.individual_max_dd_pct).scaled === 0n || !settingsDecimalParts(profileDocument.individual_net_pnl_min_exclusive) || !Number.isSafeInteger(ranking?.top_n) || ranking.top_n <= 0) return false;
+      if (!scenario || !validMoney(scenario.deposit) || !validMoney(scenario.collateral) || !validMoney(scenario.max_balance) || !validMoney(scenario.sizing?.upper_bound) || scenario.sizing.grid !== undefined || !settingsDecimalParts(profileDocument?.individual_max_dd_pct) || settingsDecimalParts(profileDocument.individual_max_dd_pct).negative || settingsDecimalParts(profileDocument.individual_max_dd_pct).scaled === 0n || !settingsDecimalParts(profileDocument.individual_net_pnl_min_exclusive) || riskFields.some((field) => profileDocument[field] !== undefined && (() => { try { settingsRiskValue(profileDocument[field], profileDocument[field]); return false; } catch (_) { return true; } })()) || !Number.isSafeInteger(ranking?.top_n) || ranking.top_n <= 0) return false;
       if ([scenario.deposit, scenario.collateral, scenario.max_balance].some((money) => money.currency !== scenario.sizing.upper_bound.currency)) return false;
     }
     return true;
@@ -116,16 +114,24 @@ const portfolioSettingsHelpers = (() => {
   const settingsPatch = (document, values) => {
     if (!validSettingsDocument(document)) throw new Error('invalid-document');
     const payload = clone(document);
+    try { payload.search.seed = settingsIntegerValue(values.seed ?? document.search.seed, true); } catch (error) { error.field = 'seed'; throw error; }
+    try { payload.search.composition.parameters.minimum_common_days = settingsIntegerValue(values.minimum_common_days ?? document.search.composition.parameters.minimum_common_days); } catch (error) { error.field = 'minimum-common-days'; throw error; }
     try { payload.search.max_enumerated_combinations = settingsIntegerValue(values.max_enumerated_combinations ?? document.search.max_enumerated_combinations); } catch (error) { error.field = 'max-enumerated-combinations'; throw error; }
     try { payload.liquidity.parameters.close_volume_participation_pct = settingsIntegerValue(values.close_volume_participation_pct); if (payload.liquidity.parameters.close_volume_participation_pct > 200) throw new Error('integer'); } catch (error) { error.field = 'close-volume-participation-pct'; throw error; }
     try { payload.liquidity.round_down_usdt = settingsDecimalValue(values.round_down_usdt, document.liquidity.round_down_usdt, true); } catch (error) { error.field = 'round-down-usdt'; throw error; }
     try { payload.liquidity.minimum_coverage_pct = settingsIntegerValue(values.minimum_coverage_pct); if (payload.liquidity.minimum_coverage_pct > 100) throw new Error('integer'); } catch (error) { error.field = 'minimum-coverage-pct'; throw error; }
     try { payload.liquidity.maximum_age_hours = settingsIntegerValue(values.maximum_age_hours); } catch (error) { error.field = 'maximum-age-hours'; throw error; }
     try { payload.liquidity.archive_publication_lag_hours = settingsIntegerValue(values.archive_publication_lag_hours, true); if (payload.liquidity.archive_publication_lag_hours > 48) throw new Error('integer'); } catch (error) { error.field = 'archive-publication-lag-hours'; throw error; }
-    try { const start = settingsWeekdayMinutes(String(values.weekend_start_utc ?? '').trim()); if (start === null) throw new Error('time'); payload.liquidity.weekend_start_utc = String(values.weekend_start_utc).trim(); } catch (error) { error.field = 'weekend-start-utc'; throw error; }
-    try { const end = settingsWeekdayMinutes(String(values.weekend_end_utc ?? '').trim()); if (end === null || end === settingsWeekdayMinutes(payload.liquidity.weekend_start_utc)) throw new Error('time'); payload.liquidity.weekend_end_utc = String(values.weekend_end_utc).trim(); } catch (error) { error.field = 'weekend-end-utc'; throw error; }
     if (typeof values.backfill_write_enabled !== 'boolean') { const error = new Error('boolean'); error.field = 'backfill-write-enabled'; throw error; }
-    payload.liquidity.backfill_write_enabled = values.backfill_write_enabled;
+     payload.liquidity.backfill_write_enabled = values.backfill_write_enabled;
+     if (typeof values.spread_history_bypass_pretest !== 'boolean') { const error = new Error('boolean'); error.field = 'spread-history-bypass-pretest'; throw error; }
+     payload.liquidity.spread_history_bypass_pretest = values.spread_history_bypass_pretest;
+    if (values.open_fee_rate !== undefined || values.close_fee_rate !== undefined) {
+      const margin = payload.margin?.parameters;
+      if (!margin || typeof margin !== 'object' || Array.isArray(margin)) { const error = new Error('margin'); error.field = 'open-fee-rate'; throw error; }
+      if (values.open_fee_rate !== undefined) try { margin.open_fee_rate = settingsFeeRateValue(values.open_fee_rate, margin.open_fee_rate); } catch (error) { error.field = 'open-fee-rate'; throw error; }
+      if (values.close_fee_rate !== undefined) try { margin.close_fee_rate = settingsFeeRateValue(values.close_fee_rate, margin.close_fee_rate); } catch (error) { error.field = 'close-fee-rate'; throw error; }
+    }
     const weightedValues = values.weighted_search || {};
     for (const [name, rule] of Object.entries(weightedIntegerRules)) {
       try { payload.search.weighted_search[name] = weightedIntegerValue(weightedValues[name] ?? document.search.weighted_search[name], rule); } catch (error) { error.field = `weighted-${name.replaceAll('_', '-')}`; throw error; }
@@ -133,26 +139,22 @@ const portfolioSettingsHelpers = (() => {
     for (const [name, rule] of Object.entries(weightedNumberRules)) {
       try { payload.search.weighted_search[name] = weightedNumberValue(weightedValues[name] ?? document.search.weighted_search[name], rule); } catch (error) { error.field = `weighted-${name.replaceAll('_', '-')}`; throw error; }
     }
-    try {
-      const bootstrap = payload.search.weighted_search;
-      if (bootstrap.bootstrap_diagnostic_scenarios > bootstrap.bootstrap_scenarios_per_block) { const error = new Error('integer'); error.field = 'weighted-bootstrap-diagnostic-scenarios'; throw error; }
-      if (weightedValues.bootstrap_p95 !== undefined && typeof weightedValues.bootstrap_p95 !== 'boolean') { const error = new Error('boolean'); error.field = 'weighted-bootstrap-p95'; throw error; }
-      if (weightedValues.bootstrap_block_days !== undefined && weightedValues.bootstrap_block_days !== '1,3,7') { const error = new Error('integer'); error.field = 'weighted-bootstrap-block-days'; throw error; }
-      bootstrap.bootstrap_p95 = weightedValues.bootstrap_p95 ?? document.search.weighted_search.bootstrap_p95;
-    } catch (error) { error.field = error.field || 'weighted-bootstrap-p95'; throw error; }
-    for (const profile of profiles) {
-      const source = document.scenarios[profile]; const scenario = payload.scenarios[profile]; const value = values.profiles[profile];
-      for (const name of ['deposit', 'collateral', 'max_balance']) {
-        try { scenario[name].amount = settingsMoneyValue(value[name], source[name].amount); } catch (error) { error.field = `${profile.toLowerCase()}-${name.replace('_', '-')}`; throw error; }
+    const riskValues = values.risk_policy;
+    if (riskValues !== undefined) {
+      for (const profile of profiles) {
+        for (const field of riskFields) {
+          try {
+            payload.profiles[profile][field] = settingsRiskValue(riskValues?.[profile]?.[field], payload.profiles[profile][field] ?? riskDefaults[profile][field]);
+          } catch (error) { error.field = `risk-${profile.toLowerCase()}-${field.replaceAll('_', '-')}`; throw error; }
+        }
       }
-      try { scenario.sizing.upper_bound.amount = settingsMoneyValue(value.upper_bound, source.sizing.upper_bound.amount); } catch (error) { error.field = `${profile.toLowerCase()}-upper-bound`; throw error; }
-      try { payload.profiles[profile].individual_max_dd_pct = settingsDecimalValue(value.individual_max_dd_pct, document.profiles[profile].individual_max_dd_pct, true); } catch (error) { error.field = `${profile.toLowerCase()}-individual-max-dd-pct`; throw error; }
-      try { payload.profiles[profile].individual_net_pnl_min_exclusive = settingsDecimalValue(value.individual_net_pnl_min_exclusive, document.profiles[profile].individual_net_pnl_min_exclusive); } catch (error) { error.field = `${profile.toLowerCase()}-individual-net-pnl-min-exclusive`; throw error; }
-      try { payload.profiles[profile].ranking.top_n = settingsIntegerValue(value.top_n); } catch (error) { error.field = `${profile.toLowerCase()}-top-n`; throw error; }
+    }
+    if (payload.search.weighted_search.bootstrap_diagnostic_scenarios > payload.search.weighted_search.bootstrap_scenarios_per_block) {
+      const error = new Error('integer'); error.field = 'weighted-bootstrap-diagnostic-scenarios'; throw error;
     }
     return payload;
   };
-  return { profiles, clone, settingsMoneyParts, settingsMoneyValue, settingsIntegerValue, settingsDecimalParts, settingsDecimalValue, settingsWeekdayMinutes, settingsCompareMoney, revealInvalidField, settingsValidationFeedback, weightedSearchKeys, validSettingsDocument, settingsPatch };
+  return { clone, profiles, riskFields, riskDefaults, settingsIntegerValue, settingsDecimalValue, settingsFeeRateValue, settingsRiskValue, revealInvalidField, settingsValidationFeedback, weightedSearchKeys, validSettingsDocument, settingsPatch };
 })();
 if (typeof globalThis !== 'undefined') globalThis.portfolioSettingsHelpers = portfolioSettingsHelpers;
 
@@ -169,6 +171,31 @@ const portfolioReasonHelpers = (() => {
   return { humanize };
 })();
 if (typeof globalThis !== 'undefined') globalThis.portfolioReasonHelpers = portfolioReasonHelpers;
+
+const portfolioResultHelpers = (() => {
+  const missing = new Set(['', 'UNKNOWN', 'NOT_TESTED', 'NONE', 'NULL']);
+  const profiles = Object.freeze({ AGGRESSIVE: 'Агрессивный', BALANCED: 'Сбалансированный', CONSERVATIVE: 'Консервативный' });
+  const warnings = Object.freeze({
+    SPREAD_HISTORY_BYPASSED_PRETEST: 'История спреда временно не участвует в предварительном расчёте.',
+  });
+  const known = (value) => value !== null && value !== undefined && !missing.has(String(value).trim().toUpperCase());
+  const metric = (value, maximumFractionDigits = 2, suffix = '') => {
+    if (!known(value)) return '';
+    const number = Number(value);
+    const text = Number.isFinite(number)
+      ? new Intl.NumberFormat('ru-RU', { maximumFractionDigits }).format(number)
+      : String(value);
+    return `${text}${suffix}`;
+  };
+  const bank = (value) => String(value ?? '').trim().toUpperCase() === 'UNCAPPED' ? 'Без ограничения' : metric(value, 2, ' USDT');
+  const profile = (value) => profiles[String(value || '').toUpperCase()] || String(value || 'Без профиля');
+  const warning = (value) => warnings[String(value || '')] || portfolioReasonHelpers.humanize(value);
+  const ratio = (value) => known(value) && String(value) !== '—' ? metric(value, 2, '%') : '—';
+  const amountRatios = (amount, target, saturation) => known(amount) ? `${metric(amount, 2, ' USDT')} · ${ratio(target)} / ${ratio(saturation)}` : '';
+  const orderPercentages = (value) => Array.isArray(value) && value.length ? value.map((item) => ratio(item)).join(' / ') : '—';
+  return { known, metric, bank, ratio, amountRatios, orderPercentages, profile, warning };
+})();
+if (typeof globalThis !== 'undefined') globalThis.portfolioResultHelpers = portfolioResultHelpers;
 
 const screenerUiHelpers = (() => {
   const fallbackBigShiftHeading = 'Большой сдвиг';
@@ -199,6 +226,20 @@ const panelRequestErrorHelpers = (() => {
   return { allowsSafeString };
 })();
 if (typeof globalThis !== 'undefined') globalThis.panelRequestErrorHelpers = panelRequestErrorHelpers;
+
+const performanceV2ExportHelpers = (() => {
+  const query = (selected) => {
+    const chosen = new Set(Array.isArray(selected) ? selected : []);
+    if (chosen.has('ALL ACTIVE')) return '?all_active=true';
+    const params = [];
+    if (chosen.has('FINALIST')) params.push('status=FINALIST');
+    if (chosen.has('RESERVE')) params.push('status=RESERVE');
+    if (chosen.has('RETEST')) params.push('retest=1');
+    return params.length ? `?${params.join('&')}` : '';
+  };
+  return { query };
+})();
+if (typeof globalThis !== 'undefined') globalThis.performanceV2ExportHelpers = performanceV2ExportHelpers;
 
 const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const { selectCommittedRetestTester, selectRetestTester } = window.retestRecovery;
@@ -1632,11 +1673,16 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     const option = surfaceSource.querySelector('option');
     if (option) option.textContent = 'Select a newly committed Source DB';
   }
-  const v2CardOrder = ['performance-v2-window-card', 'performance-v2-retest-card', 'performance-v2-selection-card'];
-  const v2Cards = [...document.querySelectorAll('#strategies-dd5 > .panel-performance-v2')]
-    .sort((a, b) => v2CardOrder.indexOf(a.id) - v2CardOrder.indexOf(b.id));
   const strategyStack = document.querySelector('#strategies-dd5 .stack');
-  v2Cards.forEach((card) => strategyStack?.append(card));
+  const v2CardOrder = ['performance-v2-selection-card', 'performance-v2-window-card', 'performance-v2-finalist-retest-card', 'performance-v2-retest-card', 'performance-v2-export-card'];
+  const v2Cards = v2CardOrder
+    .map((id) => document.getElementById(id))
+    .filter((card) => card?.closest('#strategies-dd5'));
+  if (!strategyStack || v2Cards.length !== v2CardOrder.length) {
+    console.error('Performance v2 cards are not in the expected Strategies and DD5 layout.');
+  } else {
+    v2Cards.forEach((card) => strategyStack.append(card));
+  }
   const strategyCards = [...document.querySelectorAll('#strategies-dd5 .panel-card')].filter((card) => !card.classList.contains('panel-performance-v2'));
   ['1. Analysis of published surface', '2. Shortlist and READY JSON', '3. Test and Import to Performance DB'].forEach((label, index) => {
     const heading = strategyCards[index]?.querySelector('summary b');
@@ -1847,6 +1893,14 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     selectedScopeKeys.clear();
     renderShortlist();
   });
+  const addInitialBalanceField = (dateInput, id) => {
+    const grid = dateInput?.closest('.field-grid');
+    if (!grid || document.getElementById(id)) return;
+    grid.insertAdjacentHTML('beforeend', `<div class="field-group"><label for="${id}">Стартовый баланс теста</label><input id="${id}" type="number" min="0" step="any" inputmode="decimal" value="1000" required></div>`);
+  };
+  addInitialBalanceField(document.querySelector('#tester-start-date'), 'tester-initial-balance');
+  addInitialBalanceField(document.querySelector('#performance-v2-finalist-retest-start'), 'performance-v2-finalist-retest-initial-balance');
+  addInitialBalanceField(document.querySelector('#performance-v2-retest-start'), 'performance-v2-retest-initial-balance');
   const testerCard = strategyCards[2];
   const testerText = testerCard?.querySelector('.progress-block p');
   const testerStatus = testerCard?.querySelector('.card-status');
@@ -1856,8 +1910,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const testerRetry = document.querySelector('#tester-retry');
   const testerStartDate = document.querySelector('#tester-start-date');
   const testerEndDate = document.querySelector('#tester-end-date');
+  const testerInitialBalance = document.querySelector('#tester-initial-balance');
   const validIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
   const testerMaxDate = () => { const value = new Date(); value.setHours(0, 0, 0, 0); value.setDate(value.getDate() - 1); return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`; };
+  const validInitialBalance = (input) => input?.checkValidity() && Number.isFinite(Number(input.value)) && Number(input.value) > 0 ? Number(input.value) : null;
   if (testerEndDate) testerEndDate.max = testerMaxDate();
   const shiftDateMonths = (value, months) => {
     if (!validIsoDate(value)) return '';
@@ -1947,18 +2003,20 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     if (!currentAnalysisId) { strategyStatus('Generate READY JSON first.'); return; }
     const startDate = testerStartDate?.value || '';
     const endDate = testerEndDate?.value || '';
+    const initialBalance = validInitialBalance(testerInitialBalance);
     if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Enter valid tester start and end dates.'; return; }
     const maxDate = testerMaxDate();
     if (testerEndDate) testerEndDate.max = maxDate;
     if (endDate > maxDate) { if (testerStatus) testerStatus.textContent = 'Tester end date must not be later than yesterday.'; return; }
     if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Tester start date must not be after end date.'; return; }
+    if (initialBalance === null) { if (testerStatus) testerStatus.textContent = 'Enter a positive test initial balance.'; return; }
     normalImportAuthorized = false;
     authorizedTesterJobId = '';
     normalVerifyEpoch += 1;
     testerCommitted = false;
     setTesterControls(true);
     try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId, start_date: startDate, end_date: endDate } });
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId, start_date: startDate, end_date: endDate, initial_balance: initialBalance } });
       testerJobId = result.job?.job_id || '';
       if (!testerJobId) throw new Error('missing job');
       renderTester(result.job); await pollTester(); startTesterPolling(1000);
@@ -2173,6 +2231,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const retestCount = document.querySelector('#performance-v2-retest-count');
   const retestStartDate = document.querySelector('#performance-v2-retest-start');
   const retestEndDate = document.querySelector('#performance-v2-retest-end');
+  const retestInitialBalanceInput = document.querySelector('#performance-v2-retest-initial-balance');
   const retestStart = document.querySelector('#performance-v2-retest-check');
   const retestImport = document.querySelector('#performance-v2-retest-import');
   const retestProgress = document.querySelector('#performance-v2-retest-progress');
@@ -2181,6 +2240,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const retestInbox = document.querySelector('#performance-v2-retest-inbox');
   const retestFailure = document.querySelector('#performance-v2-retest-failure-report');
   const retestBadge = document.querySelector('#performance-v2-retest-badge');
+  if (retestEndDate) retestEndDate.max = testerMaxDate();
   let retestTesterJobId = '';
   let retestImportJobId = '';
   let retestInboxReady = false;
@@ -2256,6 +2316,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   retestStart?.addEventListener('click', async () => {
     const start = retestStartDate?.value || '';
     const end = retestEndDate?.value || '';
+    const retestInitialBalance = validInitialBalance(retestInitialBalanceInput);
     retestStart.disabled = true;
     if (retestImport) retestImport.disabled = true;
     retestTesterJobId = '';
@@ -2287,8 +2348,9 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
           }
         }
       }
-      if (!validIsoDate(start) || !validIsoDate(end) || start >= end) { if (retestStatus) retestStatus.textContent = 'Enter valid RETEST dates with start before end.'; retestStart.disabled = false; return; }
-      const result = await remoteRequest('/api/v2/strategies/performance-v2/retest/start', { test_start: start, test_end: end });
+      if (!validIsoDate(start) || !validIsoDate(end) || start >= end || end > testerMaxDate()) { if (retestStatus) retestStatus.textContent = 'Enter valid RETEST dates ending no later than yesterday.'; retestStart.disabled = false; return; }
+      if (retestInitialBalance === null) { if (retestStatus) retestStatus.textContent = 'Enter a positive test initial balance.'; retestStart.disabled = false; return; }
+      const result = await remoteRequest('/api/v2/strategies/performance-v2/retest/start', { test_start: start, test_end: end, initial_balance: retestInitialBalance });
       retestTesterJobId = result.job?.job_id || '';
       if (!retestTesterJobId) throw new Error('missing RETEST job');
       renderRetestTester(result.job); await pollRetestTester();
@@ -2329,6 +2391,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const finalistRetestClearReports = document.querySelector('#performance-v2-finalist-retest-clear-reports');
   const finalistRetestStartDate = document.querySelector('#performance-v2-finalist-retest-start');
   const finalistRetestEndDate = document.querySelector('#performance-v2-finalist-retest-end');
+  const finalistRetestInitialBalanceInput = document.querySelector('#performance-v2-finalist-retest-initial-balance');
   const finalistRetestStatus = document.querySelector('#performance-v2-finalist-retest-status');
   const finalistRetestCount = document.querySelector('#performance-v2-finalist-retest-count');
   const finalistRetestSuccesses = document.querySelector('#performance-v2-finalist-retest-successes');
@@ -2387,7 +2450,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   finalistRetestStart?.addEventListener('click', async () => {
     finalistRetestStart.disabled = true;
     try {
+      const finalistInitialBalance = validInitialBalance(finalistRetestInitialBalanceInput);
+      if (finalistInitialBalance === null) throw new Error('Enter a positive test initial balance');
       const payload = { include_reserve: Boolean(finalistRetestReserve?.checked), clear_reports: Boolean(finalistRetestClearReports?.checked) };
+      payload.initial_balance = finalistInitialBalance;
       finalistRetestImportJobId = '';
       finalistRetestHasSuccessfulExport = false;
       updateFinalistRetestExport();
@@ -2493,8 +2559,14 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const performanceV2SelectionCard = document.querySelector('#performance-v2-selection-card');
   const performanceV2SelectionTitle = performanceV2SelectionCard?.querySelector('summary b');
   const performanceV2WindowTitle = performanceV2WindowCard?.querySelector('summary b');
-  if (performanceV2SelectionTitle) performanceV2SelectionTitle.textContent = '6. Парето и фильтры';
-  if (performanceV2WindowTitle) performanceV2WindowTitle.textContent = '4. A/B анализ Performance';
+  const performanceV2FinalistRetestTitle = document.querySelector('#performance-v2-finalist-retest-card summary b');
+  const performanceV2RetestTitle = document.querySelector('#performance-v2-retest-card summary b');
+  const performanceV2ExportTitle = document.querySelector('#performance-v2-export-card summary b');
+  if (performanceV2SelectionTitle) performanceV2SelectionTitle.textContent = '4. Pareto and filters';
+  if (performanceV2WindowTitle) performanceV2WindowTitle.textContent = '5. A/B Performance analysis';
+  if (performanceV2FinalistRetestTitle) performanceV2FinalistRetestTitle.textContent = '6. Bulk RETEST current FINALIST';
+  if (performanceV2RetestTitle) performanceV2RetestTitle.textContent = '7. CHECK & RETEST';
+  if (performanceV2ExportTitle) performanceV2ExportTitle.textContent = '8. EXPORT FROM PERFORMANCEDB';
   const performanceV2WindowStrategyField = performanceV2WindowSelect?.closest('.field-group');
   if (performanceV2WindowStrategyField && !document.querySelector('#performance-v2-window-pair')) {
     const filters = document.createElement('div');
@@ -2908,6 +2980,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const selectionReviewFile = document.querySelector('#performance-v2-selection-review-file');
   const selectionReviewImportButton = document.querySelector('#performance-v2-selection-review-import');
   const selectionReviewImportResults = document.querySelector('#performance-v2-selection-review-results');
+  const selectionReviewImportStatus = document.querySelector('#performance-v2-retest-tag-import-status');
   let selectionCacheStatusRevision = 0;
   const refreshSelectionCacheStatus = async () => {
     const revision = ++selectionCacheStatusRevision;
@@ -3065,60 +3138,108 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       .filter((file) => file.name.toLowerCase().endsWith('.xlsx'))
       .sort((a, b) => a.lastModified - b.lastModified || a.name.localeCompare(b.name));
     if (!files.length) return;
+    if (selectionReviewImportButton) selectionReviewImportButton.disabled = true;
     const imported = [];
-    let unchanged = 0;
     let failed = 0;
     const importErrorText = {
-      SELECTION_REVIEW_INVALID_FILE: 'Некорректный XLSX-файл.',
-      SELECTION_REVIEW_SCHEMA_MISMATCH: 'Структура XLSX не соответствует шаблону.',
-      SELECTION_REVIEW_DATABASE_MISMATCH: 'Файл относится к другой базе результатов.',
-      SELECTION_REVIEW_INVALID_SELECTION: 'В файле указан некорректный отбор.',
-      SELECTION_REVIEW_INVALID_STATUS: 'Недопустимое значение в User Status.',
-      SELECTION_REVIEW_INVALID_RANK: 'Недопустимое значение в User Rank.',
-      SELECTION_REVIEW_INVALID_ANALOG: 'Недопустимое значение в Analog Of ID.',
-      SELECTION_REVIEW_INVALID_RETEST: 'Файл относится к недопустимому ретесту.',
-      SELECTION_REVIEW_ROWSET_MISMATCH: 'Состав строк XLSX не совпадает с отбором.',
-      SELECTION_REVIEW_NOT_LATEST_RUN: 'Файл не относится к последнему запуску отбора.',
-      SELECTION_REVIEW_STALE_RESULTS: 'Данные отбора успели измениться.',
-      SELECTION_REVIEW_AUTOMATIC_FIELDS_CHANGED: 'Изменены автоматические поля XLSX.',
+      RETEST_TAG_IMPORT_INVALID_FILE: 'Некорректный XLSX-файл.',
+      RETEST_TAG_IMPORT_DATABASE_MISMATCH: 'Файл относится к другой базе результатов.',
+      RETEST_TAG_IMPORT_STRATEGY_MISMATCH: 'В XLSX есть неизвестная стратегия.',
+      RETEST_TAG_IMPORT_INVALID_RETEST: 'В колонке RETEST допускается только RETEST или пустая ячейка.',
     };
     selectionReviewImportResults?.replaceChildren();
-    for (const [index, file] of files.entries()) {
-      const fileStatus = document.createElement('div');
-      fileStatus.className = 'selection-review-import-result state-badge state-running';
-      fileStatus.textContent = `… ${file.name} — импортируется (${index + 1}/${files.length})`;
-      selectionReviewImportResults?.append(fileStatus);
-      try {
-        if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Импорт XLSX ${index + 1}/${files.length}: ${file.name}`;
-        const response = await fetch('/api/v2/strategies/performance-v2/selection-review-import', {
-          method: 'POST', headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, body: file,
-        });
-        const result = await response.json().catch(() => ({}));
-        const code = result.error?.code || '';
-        if (response.ok) {
-          imported.push(result);
-          fileStatus.className = 'selection-review-import-result state-badge state-ready';
-          fileStatus.textContent = `✓ ${file.name} — импортировано.`;
-        } else if (code === 'SELECTION_REVIEW_ALREADY_IMPORTED') {
-          unchanged += 1;
-          fileStatus.className = 'selection-review-import-result state-badge state-ready';
-          fileStatus.textContent = `✓ ${file.name} — без изменений: уже импортирован.`;
-        } else {
+    try {
+      for (const [index, file] of files.entries()) {
+        const fileStatus = document.createElement('div');
+        fileStatus.className = 'selection-review-import-result state-badge state-running';
+        fileStatus.textContent = `… ${file.name} — импортируется (${index + 1}/${files.length})`;
+        selectionReviewImportResults?.append(fileStatus);
+        try {
+          if (selectionReviewImportStatus) selectionReviewImportStatus.textContent = `Импорт XLSX ${index + 1}/${files.length}: ${file.name}`;
+          const response = await fetch('/api/v2/strategies/performance-v2/retest-tags-import', {
+            method: 'POST', headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, body: file,
+          });
+          const result = await response.json().catch(() => ({}));
+          const code = result.error?.code || '';
+          if (response.ok) {
+            imported.push(result);
+            fileStatus.className = 'selection-review-import-result state-badge state-ready';
+            fileStatus.textContent = `✓ ${file.name} — импортировано.`;
+          } else {
+            failed += 1;
+            fileStatus.className = 'selection-review-import-result state-badge state-pending';
+            fileStatus.textContent = `✗ ${file.name} — ${importErrorText[code] || result.error?.message || 'Ошибка импорта.'} (${code || 'UNKNOWN'})`;
+          }
+        } catch (error) {
           failed += 1;
           fileStatus.className = 'selection-review-import-result state-badge state-pending';
-          fileStatus.textContent = `✗ ${file.name} — ${importErrorText[code] || result.error?.message || 'Ошибка импорта.'} (${code || 'UNKNOWN'})`;
+          fileStatus.textContent = `✗ ${file.name} — ошибка запроса: ${error.message || 'без описания'}.`;
         }
-      } catch (error) {
-        failed += 1;
-        fileStatus.className = 'selection-review-import-result state-badge state-pending';
-        fileStatus.textContent = `✗ ${file.name} — ошибка запроса: ${error.message || 'без описания'}.`;
       }
+      const catalogError = await loadPerformanceV2Catalog() || '';
+      if (selectionReviewImportStatus) selectionReviewImportStatus.textContent = `Импортировано ${imported.length}/${files.length}. Ошибок: ${failed}.${catalogError ? ` Каталог не обновлён: ${catalogError}.` : ''}`;
+    } finally {
+      await loadRetestStatus();
+      selectionReviewFile.value = '';
+      if (selectionReviewImportButton) selectionReviewImportButton.disabled = false;
     }
-    const catalogError = await loadPerformanceV2Catalog() || '';
-    if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Импортировано ${imported.length}/${files.length}. Без изменений: ${unchanged}. Ошибок: ${failed}.${catalogError ? ` Каталог не обновлён: ${catalogError}.` : ''}`;
-    selectionReviewFile.value = '';
   });
   renderSelectionPreviewOrder();
+
+  const performanceV2ExportButton = document.querySelector('#performance-v2-export-button');
+  const performanceV2ExportStatus = document.querySelector('#performance-v2-export-status');
+  const performanceV2ExportAllActive = document.querySelector('#performance-v2-export-all-active');
+  const performanceV2ExportStatusControls = [
+    ['FINALIST', document.querySelector('#performance-v2-export-finalist')],
+    ['RESERVE', document.querySelector('#performance-v2-export-reserve')],
+    ['RETEST', document.querySelector('#performance-v2-export-retest')],
+  ];
+  const selectedPerformanceV2ExportStatuses = () => performanceV2ExportAllActive?.checked
+    ? ['ALL ACTIVE']
+    : performanceV2ExportStatusControls.filter(([, control]) => control?.checked).map(([statusCode]) => statusCode);
+  const syncPerformanceV2ExportControls = () => {
+    for (const [, control] of performanceV2ExportStatusControls) {
+      if (control) {
+        control.disabled = performanceV2ExportAllActive?.checked === true;
+        if (performanceV2ExportAllActive?.checked) control.checked = false;
+      }
+    }
+    const selected = selectedPerformanceV2ExportStatuses();
+    if (performanceV2ExportButton) performanceV2ExportButton.disabled = !selected.length;
+  };
+  performanceV2ExportStatusControls.forEach(([, control]) => control?.addEventListener('change', () => {
+    if (control.checked && performanceV2ExportAllActive) performanceV2ExportAllActive.checked = false;
+    syncPerformanceV2ExportControls();
+  }));
+  performanceV2ExportAllActive?.addEventListener('change', syncPerformanceV2ExportControls);
+  syncPerformanceV2ExportControls();
+  performanceV2ExportButton?.addEventListener('click', async (event) => {
+    event.preventDefault();
+    const selected = selectedPerformanceV2ExportStatuses();
+    const query = performanceV2ExportHelpers.query(selected);
+    if (!query) return;
+    let url = '';
+    if (performanceV2ExportStatus) performanceV2ExportStatus.textContent = 'Подготовка XLSX…';
+    try {
+      const response = await fetch(`/api/v2/strategies/performance-v2/export${query}`, { method: 'GET' });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(result.error?.message || result.message || `HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const filenameMatch = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(disposition);
+      const filename = filenameMatch ? decodeURIComponent(filenameMatch[1] || filenameMatch[2]) : '';
+      if (!filename) throw new Error('Сервер не вернул имя XLSX-файла.');
+      url = URL.createObjectURL(blob);
+      Object.assign(document.createElement('a'), { href: url, download: filename }).click();
+      if (performanceV2ExportStatus) performanceV2ExportStatus.textContent = 'XLSX скачан.';
+    } catch (error) {
+      if (performanceV2ExportStatus) performanceV2ExportStatus.textContent = `Ошибка экспорта: ${error?.message || 'запрос не выполнен'}.`;
+    } finally {
+      if (url) URL.revokeObjectURL(url);
+    }
+  });
 
   const settingsStatus = document.querySelector('#settings-status');
   const settingsPayload = () => ({ panel: {
@@ -3195,7 +3316,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     }
   });
   function portfolioErrorMessage(error) {
-    return error?.code ? `${error.code}: ${portfolioReasonHelpers.humanize(error.message || '')}`.trim() : portfolioReasonHelpers.humanize(error?.message || 'request failed');
+    return error?.code ? `${error.code}: ${portfolioReasonHelpers.humanize(error.message || '')}`.trim() : portfolioReasonHelpers.humanize(error?.message || 'Не удалось выполнить запрос.');
   }
 
   function portfolioValues(value) {
@@ -3220,22 +3341,37 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const counts = row.finalist_counts || row.counts || {};
       const long = Number(row.current_finalist_long ?? row.finalist_long ?? row.finalistLong ?? counts.LONG ?? counts.long ?? 0);
       const short = Number(row.current_finalist_short ?? row.finalist_short ?? row.finalistShort ?? counts.SHORT ?? counts.short ?? 0);
-      return { pair: String(row.pair || row.symbol || row.name || ''), finalistLong: Number.isFinite(long) ? Math.max(0, long) : 0, finalistShort: Number.isFinite(short) ? Math.max(0, short) : 0, long: 1, short: 0, selected: row.selected === true };
-    }).filter((row) => row.pair);
+      const finalistLong = Number.isFinite(long) ? Math.max(0, long) : 0;
+      const finalistShort = Number.isFinite(short) ? Math.max(0, short) : 0;
+      return { pair: String(row.pair || row.symbol || row.name || ''), finalistLong, finalistShort, long: finalistLong > 0 ? 1 : 0, short: finalistLong <= 0 && finalistShort > 0 ? 1 : 0, selected: row.selected === true };
+    }).filter((row) => row.pair && (row.finalistLong > 0 || row.finalistShort > 0));
   }
 
   function loadPortfolioScreen() {
     if (!loadPortfolioScreen.state) {
-      const state = { pairRows: [], readiness: null, configDigest: null, activeJobId: '', job: null, poller: 0, initialized: true, locked: false, renderedJobId: '', renderedPercent: 0, settingsChanged: false, refreshPromise: null };
+      const state = { pairRows: [], readiness: null, configDigest: null, activeJobId: '', job: null, poller: 0, initialized: true, locked: false, renderedJobId: '', renderedPercent: 0, renderedSubstage: '', progressAnchor: 0, progressBaseElapsed: 0, heartbeatAnchor: 0, heartbeatBaseAge: 0, settingsChanged: false, refreshPromise: null };
       const portfolioJobEndpoint = '/api/v2/portfolio/jobs/';
       const query = (selector) => document.querySelector(selector);
       const runButton = query('#portfolio-run');
       const newButton = query('#portfolio-new-calculation');
       const cancelButton = query('#portfolio-cancel');
       const formStatus = query('#portfolio-form-status');
+      const portfolioStatusLabels = Object.freeze({
+        WAITING: 'ОЖИДАНИЕ', READY: 'ГОТОВО', BLOCKED: 'ЗАБЛОКИРОВАНО', EDITABLE: 'РЕДАКТИРУЕМО', FROZEN: 'ЗАФИКСИРОВАНО',
+        QUEUED: 'В ОЧЕРЕДИ', RUNNING: 'ВЫПОЛНЯЕТСЯ', SUCCEEDED: 'УСПЕШНО', FAILED: 'ОШИБКА', PARTIAL: 'ЧАСТИЧНО',
+        CANCEL_REQUESTED: 'ОТМЕНА ЗАПРОШЕНА', CANCELLING: 'ОТМЕНЯЕТСЯ', CANCELLED: 'ОТМЕНЕНО', INTERRUPTED: 'ПРЕРВАНО',
+        DISABLED: 'ОТКЛЮЧЕНО', 'NO JOB': 'НЕТ ЗАДАНИЯ',
+      });
+      const portfolioStatusLabel = (value) => portfolioStatusLabels[String(value ?? '').toUpperCase()] || String(value ?? '');
+      const portfolioStageLabels = Object.freeze({
+        VALIDATE_SNAPSHOT: 'Проверка снимка', LOAD_FINALISTS: 'Загрузка FINALIST', SELECT_CANDIDATES: 'Отбор кандидатов',
+        GENERATE_VARIANTS: 'Генерация вариантов', VALIDATE_VARIANTS: 'Проверка вариантов', BUILD_WORKBOOK: 'Сборка книги',
+        PUBLISH_RESULTS: 'Публикация результатов', PREPARE: 'Подготовка', FILL_PREBUILT: 'Заполнение тестера', START: 'Запуск', READBACK: 'Чтение результата',
+      });
+      const portfolioStageLabel = (value) => portfolioStageLabels[String(value ?? '').toUpperCase()] || (Number.isInteger(value) ? `Этап ${value}` : portfolioStatusLabel(value));
       const setBadge = (selector, value, kind = 'pending') => {
         const node = query(selector);
-        if (node) { node.className = `state-badge state-${kind}`; node.textContent = value; }
+        if (node) { node.className = `state-badge state-${kind}`; node.textContent = portfolioStatusLabel(value); }
       };
       const text = (selector, value) => { const node = query(selector); if (node) node.textContent = value == null || value === '' ? '—' : String(value); };
       const terminal = (job) => ['SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(String(job?.status || job?.state || '').toUpperCase());
@@ -3249,11 +3385,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         return digits !== '' && Math.max(scale, 0) <= 12 && Math.max(digits.length - scale, 0) <= 26;
       };
       const portfolioSafeInteger = (value, minimum = 0) => { const raw = String(value ?? '').trim(); const number = Number(raw); return raw !== '' && Number.isSafeInteger(number) && number >= minimum; };
-      const copyPortfolioMaximum = (selector) => {
-        const input = query(selector);
-        return portfolioSafeInteger(input?.value, 0) ? Number(input.value) : 0;
-      };
-      const freezeStatus = (status) => `${status}${state.settingsChanged ? ' · SETTINGS_CHANGED_SINCE_FREEZE' : ''}`;
+      const freezeStatusCode = 'SETTINGS_CHANGED_SINCE_FREEZE';
+      const freezeStatus = (status, campaignId = '') => `${portfolioStatusLabel(status)}${campaignId ? ` · Кампания ${campaignId}` : ''}${state.settingsChanged ? ' · НАСТРОЙКИ ИЗМЕНЕНЫ ПОСЛЕ ФИКСАЦИИ' : ''}`;
       const updateFreezeStatus = (job) => {
         const changed = job?.settings_changed_since_freeze === true || (state.configDigest && job?.config_digest && state.configDigest !== job.config_digest);
         if (changed) state.settingsChanged = true;
@@ -3270,63 +3403,54 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
           if (!portfolioSafeInteger(input.value, 0)) pairFieldsValid = false;
         }
         const selectedPairs = rows.filter((row) => row.selected);
-        const defaultsValid = ['#portfolio-default-long', '#portfolio-default-short'].every((selector) => portfolioSafeInteger(query(selector)?.value, 0));
         const activePair = selectedPairs.length > 0 && selectedPairs.every((row) => row.long > 0 || row.short > 0);
+        const invalidPairLimits = selectedPairs.filter((row) => row.long > row.finalistLong || row.short > row.finalistShort).map((row) => row.pair);
         const selectedProfiles = ['aggressive', 'balanced', 'conservative'].filter((profile) => query(`#portfolio-profile-${profile}`)?.checked);
         const profiles = selectedProfiles.map((profile) => {
-          const equity = query(`#portfolio-equity-${profile}`)?.value || '';
-          const maxBalance = query(`#portfolio-max-balance-${profile}`)?.value || '';
+          const bankAvailable = query(`#portfolio-bank-available-${profile}`)?.value || '';
           const candidates = query(`#portfolio-candidates-${profile}`)?.value || '';
-          return { profile, equity, maxBalance, candidates };
+          return { profile, bankAvailable, candidates };
         });
-        const profilesValid = profiles.length > 0 && profiles.every((profile) => portfolioDecimal(profile.equity) && (!String(profile.maxBalance).trim() || portfolioDecimal(profile.maxBalance)) && portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= 50);
-         return { rows, selectedPairs, activePair, selectedProfiles, profiles, valid: state.readiness?.stage1?.enabled === true && pairFieldsValid && defaultsValid && activePair && profilesValid };
+        const profilesValid = profiles.length > 0 && profiles.every((profile) => (!String(profile.bankAvailable).trim() || portfolioDecimal(profile.bankAvailable)) && portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= 50);
+         return { rows, selectedPairs, activePair, invalidPairLimits, selectedProfiles, profiles, valid: state.readiness?.stage1?.enabled === true && pairFieldsValid && activePair && invalidPairLimits.length === 0 && profilesValid };
       };
-      const blockerItems = (readiness) => [
-        ...portfolioValues(readiness?.stage1?.blockers || readiness?.blockers),
-        ...portfolioValues(readiness?.stage2?.blockers).map((value) => `Stage 2: ${value}`),
-      ].map((value) => portfolioReasonHelpers.humanize(typeof value === 'string' ? value : (value?.code ? `${value.code}: ${value.message || ''}` : JSON.stringify(value)))).filter(Boolean);
+      const blockerItems = (readiness) => portfolioValues(readiness?.stage1?.blockers || readiness?.blockers).map((value) => portfolioReasonHelpers.humanize(typeof value === 'string' ? value : (value?.code ? `${value.code}: ${value.message || ''}` : JSON.stringify(value)))).filter(Boolean);
       const renderReadiness = (readiness) => {
         state.readiness = readiness || {};
         state.configDigest = readiness?.config_digest ?? readiness?.settings?.digest ?? null;
         state.pairRows = portfolioPairRows(readiness);
-        text('#portfolio-schema-version', readiness?.schema_version ?? readiness?.settings?.schema_version);
-        text('#portfolio-policy-version', readiness?.policy_version ?? readiness?.settings?.policy_version);
-        text('#portfolio-config-digest', state.configDigest);
         const stage1 = readiness?.stage1 || {};
-        const stage2 = readiness?.stage2 || {};
         const stage1Ready = stage1.enabled === true;
         setBadge('#portfolio-readiness-state', stage1Ready ? 'READY' : 'BLOCKED', stage1Ready ? 'ready' : 'pending');
         setBadge('#portfolio-badge', stage1Ready ? 'READY' : 'BLOCKED', stage1Ready ? 'ready' : 'pending');
-        text('#portfolio-stage1-state', stage1Ready ? 'Stage 1 is available.' : 'Stage 1 is blocked by server readiness.');
+        text('#portfolio-stage1-state', stage1Ready ? 'Входные данные готовы.' : 'Расчёт заблокирован: проверьте входные данные.');
         const blockers = query('#portfolio-blockers');
-        if (blockers) { blockers.replaceChildren(); for (const reason of blockerItems(readiness)) { const item = document.createElement('li'); item.textContent = reason; blockers.append(item); } if (!blockers.children.length) { const item = document.createElement('li'); item.textContent = 'No readiness blockers reported.'; blockers.append(item); } }
-        const stage2Reasons = portfolioValues(stage2.blockers);
-        text('#portfolio-stage2-status', stage2.enabled === true ? 'Stage 2 capability is reported by the server.' : `Stage 2 disabled: ${stage2Reasons[0] || 'PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED'}`);
+        if (blockers) { const reasons = blockerItems(readiness); blockers.replaceChildren(); blockers.hidden = reasons.length === 0; for (const reason of reasons) { const item = document.createElement('li'); item.textContent = reason; blockers.append(item); } }
         renderPairs();
-        if (state.job) { updateFreezeStatus(state.job); text('#portfolio-job-status', freezeStatus(statusOf(state.job))); }
+        if (state.job) { updateFreezeStatus(state.job); text('#portfolio-job-status', freezeStatus(statusOf(state.job), state.job.campaign_id)); }
         updateControls();
       };
       const renderPairs = () => {
         const container = query('#portfolio-pairs');
         if (!container) return;
         container.replaceChildren();
-        if (!state.pairRows.length) { container.textContent = 'No current FINALIST pairs reported by the server.'; return; }
+        if (!state.pairRows.length) { const tableRow = document.createElement('tr'); const cell = document.createElement('td'); cell.colSpan = 3; cell.textContent = 'Нет пар с финалистами LONG или SHORT.'; tableRow.append(cell); container.append(tableRow); return; }
         for (const row of state.pairRows) {
-          const card = document.createElement('div'); card.className = 'portfolio-pair';
+          const tableRow = document.createElement('tr');
+          const pairCell = document.createElement('th'); pairCell.scope = 'row';
           const label = document.createElement('label'); label.className = 'check';
-          const selected = document.createElement('input'); selected.type = 'checkbox'; selected.checked = row.selected; selected.dataset.portfolioPair = row.pair; selected.setAttribute('aria-label', `Select ${row.pair}`);
-          selected.addEventListener('change', () => { row.selected = selected.checked; if (row.selected) { row.long = copyPortfolioMaximum('#portfolio-default-long'); row.short = copyPortfolioMaximum('#portfolio-default-short'); renderPairs(); } updateControls(); });
+          const selected = document.createElement('input'); selected.type = 'checkbox'; selected.checked = row.selected; selected.dataset.portfolioPair = row.pair; selected.setAttribute('aria-label', `Выбрать ${row.pair}`);
+          selected.addEventListener('change', () => { row.selected = selected.checked; updateControls(); });
           const name = document.createElement('span'); name.textContent = row.pair;
           const count = document.createElement('small'); count.className = 'portfolio-pair-count'; count.textContent = `FINALIST: LONG ${row.finalistLong} · SHORT ${row.finalistShort}`;
-          label.append(selected, name, count); card.append(label);
-          const grid = document.createElement('div'); grid.className = 'portfolio-pair-grid';
+          const pairInfo = document.createElement('div'); pairInfo.className = 'portfolio-pair-info';
+          label.append(selected, name); pairInfo.append(label, count); pairCell.append(pairInfo); tableRow.append(pairCell);
           for (const [side, countValue] of [['LONG', row.long], ['SHORT', row.short]]) {
-            const field = document.createElement('label'); field.className = 'field-group'; field.textContent = `Maximum ${side}`;
-            const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.step = '1'; input.value = String(countValue); input.dataset.portfolioPair = row.pair; input.dataset.portfolioSide = side; input.setAttribute('aria-label', `${row.pair} maximum ${side}`);
-            input.addEventListener('input', () => { row[side.toLowerCase()] = Number(input.value); updateControls(); }); field.append(input); grid.append(field);
+            const field = document.createElement('td');
+            const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.max = String(side === 'LONG' ? row.finalistLong : row.finalistShort); input.step = '1'; input.value = String(countValue); input.dataset.portfolioPair = row.pair; input.dataset.portfolioSide = side; input.setAttribute('aria-label', `${row.pair}: максимум ${side}`);
+            input.addEventListener('input', () => { row[side.toLowerCase()] = Number(input.value); updateControls(); }); field.append(input); tableRow.append(field);
           }
-          card.append(grid); container.append(card);
+          container.append(tableRow);
         }
       };
       const setLocked = (locked) => {
@@ -3340,7 +3464,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       };
       const updateControls = () => {
         const launch = portfolioLaunchForm();
-        if (formStatus && !state.locked) formStatus.textContent = launch.valid ? 'Ready to freeze this Campaign.' : 'Complete valid pair, direction, profile, and budget fields.';
+        if (formStatus && !state.locked) formStatus.textContent = launch.valid ? 'Кампания готова к фиксации.' : (launch.invalidPairLimits.length ? `Лимит превышает доступное число финалистов: ${launch.invalidPairLimits.join(', ')}.` : 'Заполните обязательные поля и исправьте недопустимые лимиты.');
         if (runButton) runButton.disabled = state.locked || !launch.valid;
         const jobTerminal = terminal(state.job);
         if (newButton) newButton.disabled = !state.locked || !jobTerminal;
@@ -3355,26 +3479,187 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         const summary = query('#portfolio-summary'); const exclusions = query('#portfolio-exclusions'); const portfolioXlsx = query('#portfolio-xlsx');
         if (portfolioXlsx) { portfolioXlsx.hidden = true; portfolioXlsx.removeAttribute('href'); }
         const succeeded = (job && job.status === 'SUCCEEDED') || statusOf(job) === 'SUCCEEDED';
-        if (!job?.campaign_id || !succeeded) { if (summary) summary.textContent = 'Results appear only after SUCCEEDED.'; if (exclusions) exclusions.replaceChildren(); return; }
+        if (!job?.campaign_id || !succeeded) { if (summary) summary.textContent = 'Результаты появятся только после успешного завершения.'; if (exclusions) exclusions.replaceChildren(); return; }
         try {
           const result = await requestJson(`/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/results`);
            const values = result.summary || result;
            const optimizerStatus = String(values?.optimizer_status || '').toUpperCase();
            if (optimizerStatus === 'PARTIAL') setBadge('#portfolio-result-state', 'PARTIAL', 'pending');
            else if (optimizerStatus === 'FAIL') setBadge('#portfolio-result-state', 'FAILED', 'pending');
-          if (summary) { summary.replaceChildren(); for (const [key, value] of Object.entries(values || {})) { const row = document.createElement('div'); const label = document.createElement('strong'); label.textContent = key; row.append(label, document.createTextNode(`: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`)); summary.append(row); } }
-           if (exclusions) { exclusions.replaceChildren(); for (const item of portfolioValues(result.exclusions || result.blockers)) { const row = document.createElement('div'); row.className = 'portfolio-exclusion'; row.textContent = portfolioReasonHelpers.humanize(typeof item === 'string' ? item : `${item.code || item.stage || 'Excluded'}: ${item.message || item.reason || ''}`); exclusions.append(row); } }
+          if (summary) {
+            summary.replaceChildren();
+            const membersKnown = Array.isArray(values['Weighted members']);
+            const members = membersKnown ? values['Weighted members'] : [];
+            const acceptedCount = Math.max(0, Number(values.candidates_selected) || 0);
+            const zeroWeightCount = Math.max(0, acceptedCount - members.length);
+            const accepted = document.createElement('p'); accepted.className = 'portfolio-result-accepted';
+            accepted.textContent = `Взято финалистов в расчёт: ${portfolioResultHelpers.metric(acceptedCount, 0)}`;
+            if (membersKnown) accepted.textContent += ` · В вариант №1 вошло: ${members.length}`;
+            if (membersKnown && zeroWeightCount) accepted.textContent += ` · Без позиции: ${zeroWeightCount}`;
+            summary.append(accepted);
+
+            const profileCounts = values.variants_by_profile && typeof values.variants_by_profile === 'object' ? values.variants_by_profile : {};
+            if (Object.keys(profileCounts).length) {
+              const profiles = document.createElement('div'); profiles.className = 'portfolio-result-profiles';
+              const heading = document.createElement('strong'); heading.textContent = 'Варианты по профилям'; profiles.append(heading);
+              for (const [profileName, count] of Object.entries(profileCounts)) {
+                const item = document.createElement('span'); item.textContent = `${portfolioResultHelpers.profile(profileName)}: ${portfolioResultHelpers.metric(count, 0)}`; profiles.append(item);
+              }
+              summary.append(profiles);
+            }
+
+            const candidateId = values['Weighted candidate ID'];
+            const limiterDefinitions = [
+              ['P30 limiter USDT/30d', 'PnL с ограничителем за 30 дней', (value) => portfolioResultHelpers.metric(value, 2, ' USDT')],
+              ['Reserve before limiter', 'Запас до ограничителя', (value) => portfolioResultHelpers.metric(value, 2, '%')],
+              ['Reserve after limiter', 'Запас после ограничителя', (value) => portfolioResultHelpers.metric(value, 2, '%')],
+              ['Bottleneck', 'Ограничивающий фактор', String],
+            ];
+            const ddLimit = portfolioResultHelpers.metric(values['Profile DD limit %'], 2, '%') || '—';
+            const targetBank = values['Target bank USDT'] ?? values['B available USDT'];
+            const metricGroups = [
+              {
+                className: 'portfolio-result-metric-group portfolio-result-bank-group',
+                title: 'Банки',
+                items: [
+                  ['B saturation USDT', 'Насыщение', (value) => portfolioResultHelpers.metric(value, 2, ' USDT')],
+                  ['Target bank USDT', 'Целевой банк', (value) => portfolioResultHelpers.bank(value ?? targetBank)],
+                  ['Historical bank USDT', `Минимальный банк для DD ≤ ${ddLimit} на истории`, (value) => portfolioResultHelpers.metric(value, 2, ' USDT')],
+                  ['Stress bank P95 USDT', `Банк для DD ≤ ${ddLimit} в 95% стресс-сценариев`, (value) => portfolioResultHelpers.metric(value, 2, ' USDT')],
+                  ['B margin USDT', 'Банк для профильных лимитов', (value) => portfolioResultHelpers.metric(value, 2, ' USDT')],
+                ],
+              },
+              {
+                className: 'portfolio-result-metric-group portfolio-result-drawdown-group',
+                title: 'Просадки',
+                items: [
+                  ['MaxDD SUM USDT', 'MaxDD SUM', (value) => portfolioResultHelpers.metric(value, 2, ' USDT')],
+                  ['MaxDD %', 'Исторический рассчитанный DD', (value) => portfolioResultHelpers.metric(value, 1, '%')],
+                  ['CDaR peak80 USDT', 'Средняя глубина худших 20% просадок', (value) => portfolioResultHelpers.amountRatios(value, values['CDaR peak80 target %'], values['CDaR peak80 saturation %'])],
+                  ['CDaR peak90 USDT', 'Средняя глубина худших 10% просадок', (value) => portfolioResultHelpers.amountRatios(value, values['CDaR peak90 target %'], values['CDaR peak90 saturation %'])],
+                ],
+              },
+              {
+                className: 'portfolio-result-metric-group portfolio-result-capital-group',
+                title: 'Капитал и результат',
+                items: [
+                  ['P30 common USDT/30d', 'PnL', (value) => portfolioResultHelpers.metric(value, 2, ' USDT')],
+                  ['IM all USDT', 'IM', (value) => portfolioResultHelpers.amountRatios(value, values['IM target %'], values['IM saturation %'])],
+                  ['MM all USDT', 'MM', (value) => portfolioResultHelpers.amountRatios(value, values['MM target %'], values['MM saturation %'])],
+                ],
+              },
+            ];
+            if (Number(values['Limiter L']) > 0) metricGroups.push({
+              className: 'portfolio-result-metric-group portfolio-result-limiter-group', title: 'Ограничитель', items: limiterDefinitions,
+            });
+            if (members.length || metricGroups.some(({ items }) => items.some(([key]) => portfolioResultHelpers.known(values[key])))) {
+              const candidate = document.createElement('section'); candidate.className = 'portfolio-result-candidate';
+              const heading = document.createElement('h3'); heading.textContent = 'Вариант №1'; candidate.append(heading);
+              const ratioLegend = document.createElement('p'); ratioLegend.className = 'portfolio-result-note'; ratioLegend.textContent = 'В парах с процентами порядок всегда один: целевой банк / банк насыщения.'; candidate.append(ratioLegend);
+              if (Number(values.variants_created) > 1) {
+                const hint = document.createElement('p'); hint.className = 'helper'; hint.textContent = 'Остальные варианты находятся в XLSX.'; candidate.append(hint);
+              }
+              const metrics = document.createElement('dl'); metrics.className = 'portfolio-result-metrics';
+              for (const groupDefinition of metricGroups) {
+                const group = document.createElement('section'); group.className = groupDefinition.className;
+                const groupTitle = document.createElement('h4'); groupTitle.textContent = groupDefinition.title; group.append(groupTitle);
+                 const groupMetrics = document.createElement('dl'); groupMetrics.className = 'portfolio-result-metric-group-grid';
+                 for (const [key, labelText, format] of groupDefinition.items) {
+                   const rawValue = key === 'Target bank USDT' ? targetBank : values[key];
+                   const item = document.createElement('div');
+                   const label = document.createElement('dt'); label.textContent = labelText;
+                   const value = document.createElement('dd'); value.textContent = format(rawValue) || '—';
+                  item.append(label, value); groupMetrics.append(item);
+                }
+                if (groupMetrics.children.length) { group.append(groupMetrics); metrics.append(group); }
+              }
+              candidate.append(metrics);
+              if (members.length) {
+                const membersHeading = document.createElement('h4'); membersHeading.textContent = 'Состав варианта'; candidate.append(membersHeading);
+                 const table = document.createElement('table'); table.className = 'portfolio-result-members';
+                 const head = document.createElement('thead'); const headRow = document.createElement('tr');
+                  for (const labelText of ['Пара / сторона', 'Стратегия / результат', 'Полный номинал позиции', 'Множитель пары', 'max_balance', 'Распределение входов', 'Плечо']) {
+                    const cell = document.createElement('th'); cell.scope = 'col'; cell.textContent = labelText; headRow.append(cell);
+                  }
+                  head.append(headRow); table.append(head);
+                const body = document.createElement('tbody');
+                for (const member of members) {
+                  const row = document.createElement('tr');
+                  const cells = [
+                    `${member.pair || '—'} / ${member.direction || '—'}`,
+                    `${member.strategy_id ?? '—'} / ${member.result_id ?? '—'}`,
+                    portfolioResultHelpers.metric(member.position_usdt, 2, ' USDT'),
+                    portfolioResultHelpers.metric(member.bank_share_pct, 2, '%'),
+                     portfolioResultHelpers.metric(member.leverage, 2),
+                   ];
+                   cells.splice(0, cells.length,
+                     cells[0], cells[1], cells[2],
+                     portfolioResultHelpers.metric(member.balance_percentage ?? member.pair_multiplier_pct ?? member.bank_share_pct, 2, '%'),
+                     portfolioResultHelpers.metric(member.max_balance, 2, ' USDT'),
+                     portfolioResultHelpers.orderPercentages(member.entry_order_percentages),
+                     cells[4],
+                   );
+                  for (const value of cells) { const cell = document.createElement('td'); cell.textContent = value || '—'; row.append(cell); }
+                  body.append(row);
+                }
+                table.append(body); candidate.append(table);
+              }
+              summary.append(candidate);
+            }
+            for (const warning of portfolioValues(values.warnings)) {
+              const notice = document.createElement('p'); notice.className = 'portfolio-result-warning'; notice.textContent = portfolioResultHelpers.warning(warning); summary.append(notice);
+            }
+            if (!portfolioResultHelpers.known(values['Joint status'])) {
+              const notice = document.createElement('p'); notice.className = 'portfolio-result-note'; notice.textContent = 'Совместный тест ещё не выполнялся.'; summary.append(notice);
+            }
+
+            const details = document.createElement('details'); details.className = 'portfolio-result-details';
+            const toggle = document.createElement('summary'); toggle.textContent = 'Технические данные'; details.append(toggle);
+            for (const [labelText, value] of [['Кампания', values.campaign_id || result.campaign_id], ['ID варианта', candidateId]]) {
+              if (!portfolioResultHelpers.known(value)) continue;
+              const row = document.createElement('div'); const label = document.createElement('strong'); const code = document.createElement('code');
+              label.textContent = labelText; code.textContent = String(value); row.append(label, code); details.append(row);
+            }
+            summary.append(details);
+          }
+            if (exclusions) { exclusions.replaceChildren(); for (const item of portfolioValues(result.exclusions || result.blockers)) { const row = document.createElement('div'); row.className = 'portfolio-exclusion'; row.textContent = portfolioReasonHelpers.humanize(typeof item === 'string' ? item : `${item.code || item.stage || 'Исключено'}: ${item.message || item.reason || ''}`); exclusions.append(row); } }
           if (portfolioXlsx && result.workbook_available === true) { portfolioXlsx.href = `/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/stage1.xlsx`; portfolioXlsx.hidden = false; }
-        } catch (error) { if (summary) summary.textContent = `Results unavailable: ${portfolioErrorMessage(error)}`; }
+        } catch (error) { if (summary) summary.textContent = `Результаты недоступны: ${portfolioErrorMessage(error)}`; }
       };
       const renderJob = (job) => {
         state.job = job || null;
         const statusName = statusOf(job); const stage = job?.stage || {}; const overallPercent = Number(job?.overall_percent); const stagePercent = Number(stage.percent); const overallKnown = Number.isFinite(overallPercent); const stageKnown = Number.isFinite(stagePercent) && stage.total !== undefined && Number.isFinite(Number(stage.total)); const stageIndeterminate = !!job && !stageKnown;
         if (state.renderedJobId !== job?.job_id) { state.renderedJobId = job?.job_id || ''; state.renderedPercent = 0; state.settingsChanged = false; }
         updateFreezeStatus(job);
-        text('#portfolio-job-status', job ? freezeStatus(`${statusName}${job.campaign_id ? ` · Campaign ${job.campaign_id}` : ''}`) : 'No calculation is active.');
-        text('#portfolio-progress-text', job ? `${stage.name || stage.index || statusName}${stageIndeterminate ? ' · indeterminate · elapsed time available' : ` · ${Math.max(0, Math.min(100, Math.round(stagePercent)))}%`}` : 'No calculation is active.');
+        text('#portfolio-job-status', job ? freezeStatus(statusName, job.campaign_id) : 'Нет активного расчёта.');
+        text('#portfolio-progress-text', job ? `${portfolioStageLabel(stage.name || stage.index || statusName)}${stageIndeterminate ? ' · точный прогресс неизвестен, доступно время выполнения' : ` · ${Math.max(0, Math.min(100, Math.round(stagePercent)))}%`}` : 'Нет активного расчёта.');
         const bar = query('#portfolio-progress-bar'); if (bar) { bar.classList.toggle('is-running', stageIndeterminate && !terminal(job)); if (overallKnown) { state.renderedPercent = Math.max(state.renderedPercent, Math.max(0, Math.min(100, overallPercent))); bar.style.width = `${Math.round(state.renderedPercent)}%`; } else if (stageKnown) { state.renderedPercent = Math.max(state.renderedPercent, Math.max(0, Math.min(100, stagePercent))); bar.style.width = `${Math.round(state.renderedPercent)}%`; } else if (!job || terminal(job)) bar.style.width = statusName === 'SUCCEEDED' ? '100%' : '0%'; }
+        const liveProgress = job?.progress || {};
+        const liveSubstage = String(liveProgress.substage || stage.name || stage.index || statusName || '');
+        const liveNow = performance.now();
+        const liveElapsedBase = Number(liveProgress.elapsed_seconds);
+        const liveHeartbeatBase = Number(liveProgress.heartbeat_age_seconds);
+        if (state.renderedJobId !== job?.job_id) { state.renderedJobId = job?.job_id || ''; state.renderedPercent = 0; state.renderedSubstage = ''; state.settingsChanged = false; }
+        if (state.renderedSubstage !== liveSubstage) { state.renderedSubstage = liveSubstage; state.renderedPercent = 0; state.progressAnchor = liveNow; state.progressBaseElapsed = Number.isFinite(liveElapsedBase) ? Math.max(0, liveElapsedBase) : 0; }
+        if (Number.isFinite(liveHeartbeatBase)) { state.heartbeatAnchor = liveNow; state.heartbeatBaseAge = Math.max(0, liveHeartbeatBase); }
+        const liveElapsed = state.progressBaseElapsed + Math.max(0, (liveNow - state.progressAnchor) / 1000);
+        const liveHeartbeatAge = state.heartbeatBaseAge + Math.max(0, (liveNow - state.heartbeatAnchor) / 1000);
+        const liveCompleted = Number(liveProgress.completed); const liveTotal = Number(liveProgress.total);
+        const liveDeterminate = Number.isFinite(liveCompleted) && Number.isFinite(liveTotal) && liveTotal > 0 && liveCompleted >= 0 && liveCompleted <= liveTotal && liveProgress.indeterminate !== true;
+        const livePercent = liveDeterminate ? Math.max(0, Math.min(100, liveCompleted * 100 / liveTotal)) : 0;
+        const liveEta = Number(liveProgress.eta_seconds); const liveStale = liveHeartbeatAge > 30; const liveEtaUnavailable = liveStale || terminal(job);
+        const liveDetail = liveProgress.detail ? ` · ${liveProgress.detail}` : '';
+        const liveCount = liveDeterminate ? ` · ${Math.round(liveCompleted)} / ${Math.round(liveTotal)} (${Math.round(livePercent)}%)` : ' · progress indeterminate';
+        const liveEtaText = !liveEtaUnavailable && Number.isFinite(liveEta) ? ` · ETA ${formatDuration(liveEta)}` : '';
+        const liveEtaUnknownText = liveEtaUnavailable ? ' · stalled / ETA unknown' : '';
+        const liveStaleText = liveStale ? ' · heartbeat stale (informational)' : '';
+        text('#portfolio-progress-text', job ? `${portfolioStageLabel(liveSubstage)}${liveCount} · elapsed ${formatDuration(liveElapsed)}${liveEtaText}${liveEtaUnknownText} · heartbeat ${formatDuration(liveHeartbeatAge)}${liveDetail}${liveStaleText}` : 'Нет активного расчёта.');
+        const liveBar = query('#portfolio-progress-bar'); if (liveBar) {
+          liveBar.classList.toggle('is-running', !!job && !liveDeterminate && !terminal(job));
+          liveBar.setAttribute('aria-busy', String(!!job && !liveDeterminate && !terminal(job)));
+          if (liveDeterminate) { liveBar.setAttribute('role', 'progressbar'); liveBar.setAttribute('aria-valuemin', '0'); liveBar.setAttribute('aria-valuemax', String(Math.round(liveTotal))); liveBar.setAttribute('aria-valuenow', String(Math.round(liveCompleted))); state.renderedPercent = livePercent; liveBar.style.width = `${Math.round(livePercent)}%`; }
+          else { liveBar.removeAttribute('role'); liveBar.removeAttribute('aria-valuemin'); liveBar.removeAttribute('aria-valuemax'); liveBar.removeAttribute('aria-valuenow'); liveBar.style.width = (!job || terminal(job)) && statusName === 'SUCCEEDED' ? '100%' : '0%'; }
+        }
         setBadge('#portfolio-job-state', job ? statusName : 'NO JOB', statusName === 'SUCCEEDED' ? 'ready' : (job && !terminal(job) ? 'running' : 'pending'));
         setBadge('#portfolio-result-state', statusName === 'SUCCEEDED' ? 'SUCCEEDED' : (job ? statusName : 'WAITING'), statusName === 'SUCCEEDED' ? 'ready' : 'pending');
         renderJournal(job); updateControls();
@@ -3401,24 +3686,26 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       };
       runButton?.addEventListener('click', async () => {
         const launch = portfolioLaunchForm();
-        if (!launch.valid) { if (formStatus) formStatus.textContent = 'Fix the server readiness and form blockers before calculating.'; updateControls(); return; }
+        if (!launch.valid) { if (formStatus) formStatus.textContent = 'Перед расчётом устраните блокировки входных данных и формы.'; updateControls(); return; }
         const selectedPairs = launch.selectedPairs.map((row) => ({ pair: row.pair, max_finalist_long: row.long, max_finalist_short: row.short }));
         const profiles = launch.profiles.map((profile) => {
-          const item = { profile_id: profile.profile.toUpperCase(), equity_usdt: profile.equity, max_candidates: Number(profile.candidates) };
-          if (String(profile.maxBalance).trim()) item.max_balance_usdt = profile.maxBalance;
-          return item;
+          return {
+            profile_id: profile.profile.toUpperCase(),
+            bank_available_usdt: String(profile.bankAvailable).trim() || null,
+            max_candidates: Number(profile.candidates),
+          };
         });
-        setLocked(true); if (formStatus) formStatus.textContent = 'Campaign frozen; creating server job…';
+        setLocked(true); if (formStatus) formStatus.textContent = 'Кампания зафиксирована, создаётся задание сервера…';
         try {
           const result = await requestJson('/api/v2/portfolio/campaigns', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairs: selectedPairs, profiles, expected_config_digest: state.configDigest }) });
           state.activeJobId = result.job_id || result.job?.job_id || ''; renderJob(result.job || { job_id: state.activeJobId, campaign_id: result.campaign_id, status: result.status || 'QUEUED', config_digest: result.config_digest }); if (state.activeJobId) startPortfolioPolling();
-          if (formStatus) formStatus.textContent = 'Campaign frozen and queued on the server.';
+          if (formStatus) formStatus.textContent = 'Кампания зафиксирована и поставлена в очередь на сервере.';
         } catch (error) {
           const activeConflict = ['PORTFOLIO_JOB_ACTIVE_DUPLICATE', 'PORTFOLIO_JOB_BUSY'].includes(error?.code);
           if (activeConflict) {
             setLocked(true);
             try { await recoverPortfolioJob(true); } catch (_) { /* retain the frozen form until the server job can be recovered. */ }
-            if (formStatus) formStatus.textContent = `${error.code}: an active calculation already exists.`;
+            if (formStatus) formStatus.textContent = `${error.code}: активный расчёт уже существует.`;
             return;
           }
           setLocked(false);
@@ -3431,9 +3718,11 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         try { const result = await requestJson(`${portfolioJobEndpoint}${encodeURIComponent(state.activeJobId)}/cancel`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); renderJob(result.job || { ...state.job, status: result.status || 'CANCEL_REQUESTED' }); }
         catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); await pollPortfolioJob(); }
       });
-      newButton?.addEventListener('click', async () => { if (!terminal(state.job)) return; state.activeJobId = ''; state.job = null; state.settingsChanged = false; renderJob(null); setLocked(false); try { renderReadiness(await requestJson('/api/v2/portfolio/readiness')); if (formStatus) formStatus.textContent = 'New Campaign ready.'; } catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); } });
+      newButton?.addEventListener('click', async () => { if (!terminal(state.job)) return; state.activeJobId = ''; state.job = null; state.settingsChanged = false; renderJob(null); setLocked(false); try { renderReadiness(await requestJson('/api/v2/portfolio/readiness')); if (formStatus) formStatus.textContent = 'Новая кампания готова.'; } catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); } });
       ['aggressive', 'balanced', 'conservative'].forEach((profile) => query(`#portfolio-profile-${profile}`)?.addEventListener('change', updateControls));
-      ['#portfolio-default-long', '#portfolio-default-short'].forEach((selector) => query(selector)?.addEventListener('input', updateControls));
+      query('#portfolio-select-all')?.addEventListener('click', () => { state.pairRows.forEach((row) => { row.selected = true; }); renderPairs(); updateControls(); });
+      query('#portfolio-select-maximum')?.addEventListener('click', () => { state.pairRows.forEach((row) => { row.long = Math.max(0, Number(row.finalistLong) || 0); row.short = Math.max(0, Number(row.finalistShort) || 0); row.selected = row.long > 0 || row.short > 0; }); renderPairs(); updateControls(); });
+      query('#portfolio-select-none')?.addEventListener('click', () => { state.pairRows.forEach((row) => { row.selected = false; }); renderPairs(); updateControls(); });
       query('#portfolio-profiles')?.querySelectorAll('input').forEach((input) => { input.addEventListener('input', updateControls); input.addEventListener('change', updateControls); });
       loadPortfolioScreen.state = state;
       state.refresh = refreshPortfolio;
@@ -3443,41 +3732,42 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
 
   function loadPortfolioSettings(force = false) {
     if (!loadPortfolioSettings.state) {
-      const { profiles, clone, settingsPatch, validSettingsDocument, weightedSearchKeys, revealInvalidField, settingsValidationFeedback } = portfolioSettingsHelpers;
+       const { clone, profiles, riskFields, riskDefaults, settingsPatch, validSettingsDocument, weightedSearchKeys, revealInvalidField, settingsValidationFeedback } = portfolioSettingsHelpers;
       const state = { digest: null, document: null, readOnly: true, dirty: false, loading: null, conflictMessage: '' };
       const readOnlyStates = ['MISSING', 'INVALID', 'UNSUPPORTED_SCHEMA'];
       const query = (selector) => document.querySelector(selector);
       const form = query('#portfolio-settings-form'); const save = query('#portfolio-settings-save'); const reload = query('#portfolio-settings-reload'); const meta = query('#portfolio-settings-meta');
+      const settingsStatusLabels = Object.freeze({ READY: 'ГОТОВО', INVALID: 'ОШИБКА', MISSING: 'ОТСУТСТВУЕТ', UNSUPPORTED_SCHEMA: 'НЕПОДДЕРЖИВАЕМАЯ СХЕМА' });
+      const settingsStatusLabel = (value) => settingsStatusLabels[String(value ?? '').toUpperCase()] || String(value ?? '');
       const controls = () => form ? [...form.querySelectorAll('input, textarea')] : [];
       const linkDescriptions = () => controls().forEach((control) => { const description = control.closest('.field-group')?.querySelector('small'); if (description) { description.id = `${control.id}-description`; control.setAttribute('aria-describedby', description.id); } });
       linkDescriptions();
       const setBadge = (value, kind) => { const node = query('#portfolio-settings-state'); if (node) { node.className = `state-badge state-${kind}`; node.textContent = value; } };
-       const displayMoney = (money) => String(money?.amount ?? '');
-       const input = (profile, name) => query(`#portfolio-settings-${profile.toLowerCase()}-${name}`);
-       const weightedInput = (name) => query(`#portfolio-settings-weighted-${name === 'csv_download_concurrency' ? 'archive-download-concurrency' : name.replaceAll('_', '-')}`);
+        const weightedInput = (name) => query(`#portfolio-settings-weighted-${name.replaceAll('_', '-')}`);
        const renderDocument = () => {
           const doc = state.document; if (!doc) { controls().forEach((control) => { if (control.type === 'checkbox') control.checked = false; else control.value = ''; }); return; }
+          const seed = query('#portfolio-settings-seed'); if (seed) seed.value = String(doc.search.seed);
+          const minimumCommonDays = query('#portfolio-settings-minimum-common-days'); if (minimumCommonDays) minimumCommonDays.value = String(doc.search.composition.parameters.minimum_common_days);
           const budget = query('#portfolio-settings-max-enumerated-combinations'); if (budget) budget.value = String(doc.search.max_enumerated_combinations);
-          for (const name of weightedSearchKeys) { const control = weightedInput(name); if (!control) continue; if (control.type === 'checkbox') control.checked = !!doc.search.weighted_search[name]; else control.value = name === 'bootstrap_block_days' ? doc.search.weighted_search[name].join(',') : String(doc.search.weighted_search[name]); }
+          for (const name of weightedSearchKeys) { const control = weightedInput(name); if (control) control.value = String(doc.search.weighted_search[name]); }
           const participation = query('#portfolio-settings-close-volume-participation-pct'); if (participation) participation.value = String(doc.liquidity.parameters.close_volume_participation_pct);
-         const rounding = query('#portfolio-settings-round-down-usdt'); if (rounding) rounding.value = String(doc.liquidity.round_down_usdt);
+           const rounding = query('#portfolio-settings-round-down-usdt'); if (rounding) rounding.value = String(doc.liquidity.round_down_usdt);
+          const openFee = query('#portfolio-settings-open-fee-rate'); if (openFee) openFee.value = String(doc.margin?.parameters?.open_fee_rate ?? '');
+          const closeFee = query('#portfolio-settings-close-fee-rate'); if (closeFee) closeFee.value = String(doc.margin?.parameters?.close_fee_rate ?? '');
          const coverage = query('#portfolio-settings-minimum-coverage-pct'); if (coverage) coverage.value = String(doc.liquidity.minimum_coverage_pct);
          const age = query('#portfolio-settings-maximum-age-hours'); if (age) age.value = String(doc.liquidity.maximum_age_hours);
          const lag = query('#portfolio-settings-archive-publication-lag-hours'); if (lag) lag.value = String(doc.liquidity.archive_publication_lag_hours);
          const weekendStart = query('#portfolio-settings-weekend-start-utc'); if (weekendStart) weekendStart.value = doc.liquidity.weekend_start_utc;
          const weekendEnd = query('#portfolio-settings-weekend-end-utc'); if (weekendEnd) weekendEnd.value = doc.liquidity.weekend_end_utc;
-         const backfill = query('#portfolio-settings-backfill-write-enabled'); if (backfill) backfill.checked = !!doc.liquidity.backfill_write_enabled;
-         for (const profile of profiles) {
-           const key = profile.toLowerCase(); const scenario = doc.scenarios[profile]; const ranking = doc.profiles[profile].ranking;
-           input(profile, 'deposit').value = displayMoney(scenario.deposit); input(profile, 'collateral').value = displayMoney(scenario.collateral); input(profile, 'max-balance').value = displayMoney(scenario.max_balance); input(profile, 'upper-bound').value = displayMoney(scenario.sizing.upper_bound); input(profile, 'individual-max-dd-pct').value = String(doc.profiles[profile].individual_max_dd_pct); input(profile, 'individual-net-pnl-min-exclusive').value = String(doc.profiles[profile].individual_net_pnl_min_exclusive); input(profile, 'top-n').value = String(ranking.top_n);
-          const currency = query(`#portfolio-settings-${key}-currency`); if (currency) currency.textContent = scenario.deposit.currency;
-        }
-      };
+          const backfill = query('#portfolio-settings-backfill-write-enabled'); if (backfill) backfill.checked = !!doc.liquidity.backfill_write_enabled;
+          const spreadBypass = query('#portfolio-settings-spread-history-bypass-pretest'); if (spreadBypass) spreadBypass.checked = !!doc.liquidity.spread_history_bypass_pretest;
+         for (const profile of profiles) for (const field of riskFields) { const control = query(`#portfolio-settings-risk-${profile.toLowerCase()}-${field.replaceAll('_', '-')}`); if (control) control.value = String(doc.profiles?.[profile]?.[field] ?? riskDefaults[profile][field]); }
+       };
       const setDisabled = (disabled) => { controls().forEach((control) => { control.disabled = disabled; }); if (save) save.disabled = disabled; };
       const show = (result) => {
          const stateName = result?.state || 'INVALID'; state.digest = stateName === 'READY' ? (result?.digest ?? null) : null; state.document = null; if (stateName === 'READY' && result?.document) { const candidate = clone(result.document); if (validSettingsDocument(candidate)) state.document = candidate; } state.dirty = false; state.readOnly = readOnlyStates.includes(stateName) || stateName !== 'READY' || !state.document;
-        renderDocument(); clearInvalid(); setDisabled(state.readOnly); setBadge(stateName, stateName === 'READY' && !state.readOnly ? 'ready' : 'pending');
-        if (meta) meta.textContent = state.readOnly ? (stateName === 'READY' ? 'Серверные настройки содержат недопустимые значения. Сохранение отключено.' : `${stateName}: настройки доступны только для чтения.`) : (state.conflictMessage || `READY · digest ${state.digest || '—'}`);
+        renderDocument(); clearInvalid(); setDisabled(state.readOnly); setBadge(settingsStatusLabel(stateName), stateName === 'READY' && !state.readOnly ? 'ready' : 'pending');
+        if (meta) meta.textContent = state.readOnly ? (stateName === 'READY' ? 'Серверные настройки содержат недопустимые значения. Сохранение отключено.' : `${settingsStatusLabel(stateName)}: настройки доступны только для чтения.`) : (state.conflictMessage || `ГОТОВО · digest ${state.digest || '—'}`);
       };
       const load = async (preserveConflict = false) => {
         if (state.loading) return state.loading;
@@ -3486,25 +3776,15 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         return state.loading;
       };
        const collect = () => {
-         const weighted_search = Object.fromEntries(weightedSearchKeys.map((name) => [name, weightedInput(name)?.type === 'checkbox' ? !!weightedInput(name)?.checked : weightedInput(name)?.value]));
-         const values = { max_enumerated_combinations: query('#portfolio-settings-max-enumerated-combinations')?.value, close_volume_participation_pct: query('#portfolio-settings-close-volume-participation-pct')?.value, round_down_usdt: query('#portfolio-settings-round-down-usdt')?.value, minimum_coverage_pct: query('#portfolio-settings-minimum-coverage-pct')?.value, maximum_age_hours: query('#portfolio-settings-maximum-age-hours')?.value, archive_publication_lag_hours: query('#portfolio-settings-archive-publication-lag-hours')?.value, weekend_start_utc: query('#portfolio-settings-weekend-start-utc')?.value, weekend_end_utc: query('#portfolio-settings-weekend-end-utc')?.value, backfill_write_enabled: !!query('#portfolio-settings-backfill-write-enabled')?.checked, weighted_search, profiles: {} };
-        for (const profile of profiles) {
-          values.profiles[profile] = {
-            deposit: input(profile, 'deposit')?.value,
-            collateral: input(profile, 'collateral')?.value,
-            max_balance: input(profile, 'max-balance')?.value,
-            upper_bound: input(profile, 'upper-bound')?.value,
-             individual_max_dd_pct: input(profile, 'individual-max-dd-pct')?.value,
-             individual_net_pnl_min_exclusive: input(profile, 'individual-net-pnl-min-exclusive')?.value,
-            top_n: input(profile, 'top-n')?.value,
-          };
-        }
+          const weighted_search = Object.fromEntries(weightedSearchKeys.filter((name) => weightedInput(name)).map((name) => [name, weightedInput(name).type === 'checkbox' ? !!weightedInput(name).checked : weightedInput(name).value]));
+          const risk_policy = Object.fromEntries(profiles.map((profile) => [profile, Object.fromEntries(riskFields.map((field) => [field, query(`#portfolio-settings-risk-${profile.toLowerCase()}-${field.replaceAll('_', '-')}`)?.value]))]));
+           const values = { seed: query('#portfolio-settings-seed')?.value, minimum_common_days: query('#portfolio-settings-minimum-common-days')?.value, max_enumerated_combinations: query('#portfolio-settings-max-enumerated-combinations')?.value, close_volume_participation_pct: query('#portfolio-settings-close-volume-participation-pct')?.value, round_down_usdt: query('#portfolio-settings-round-down-usdt')?.value, open_fee_rate: query('#portfolio-settings-open-fee-rate')?.value, close_fee_rate: query('#portfolio-settings-close-fee-rate')?.value, minimum_coverage_pct: query('#portfolio-settings-minimum-coverage-pct')?.value, maximum_age_hours: query('#portfolio-settings-maximum-age-hours')?.value, archive_publication_lag_hours: query('#portfolio-settings-archive-publication-lag-hours')?.value, backfill_write_enabled: !!query('#portfolio-settings-backfill-write-enabled')?.checked, spread_history_bypass_pretest: !!query('#portfolio-settings-spread-history-bypass-pretest')?.checked, weighted_search, risk_policy };
         return settingsPatch(state.document, values);
       };
       const clearInvalid = () => controls().forEach((control) => { control.removeAttribute('aria-invalid'); control.setCustomValidity(''); });
       const markDirty = () => { clearInvalid(); state.dirty = true; if (meta) meta.textContent = state.conflictMessage || 'Есть несохранённые изменения.'; };
       controls().forEach((control) => { control.addEventListener('input', markDirty); control.addEventListener('change', markDirty); });
-      reload?.addEventListener('click', async () => { if (state.dirty && !window.confirm('Отбросить несохранённые изменения настроек Portfolio Optimizer?')) return; await load(); });
+       reload?.addEventListener('click', async () => { if (state.dirty && !window.confirm('Отбросить несохранённые изменения настроек Оптимизатора портфеля?')) return; await load(); });
       save?.addEventListener('click', async () => {
         if (state.readOnly || !state.document) return;
         state.conflictMessage = '';

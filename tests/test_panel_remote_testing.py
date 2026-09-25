@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -265,7 +266,13 @@ def test_panel_controller_remote_fill_uses_side_templates_without_connection_lea
             "max_parallel_submissions": 7,
         },
     }), encoding="utf-8")
-    controller = PanelController(Path(__file__).parents[1], config)
+    repo_root = Path(__file__).parents[1]
+    for relative_path in panel_module._TEMPLATES["SHORT"]:
+        source = repo_root / relative_path
+        target = tmp_path / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    controller = PanelController(tmp_path, config)
 
     result = controller.remote_testing_fill({
         "symbols": "BTCUSDT", "side": "SHORT", "start": "2026-07-15", "end": "2026-08-06",
@@ -306,7 +313,7 @@ def test_panel_controller_remote_fill_fails_closed_when_worker_config_is_invalid
     }), encoding="utf-8")
 
     with pytest.raises(PanelTestingError, match="invalid tester configuration"):
-        PanelController(Path(__file__).parents[1], config).remote_testing_fill({
+        PanelController(tmp_path, config).remote_testing_fill({
             "symbols": "BTCUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06",
         })
 
@@ -324,7 +331,7 @@ def test_remote_start_is_rejected_until_this_controller_fills_the_config(tmp_pat
     config.write_text(json.dumps({"remote_runner": _config()}), encoding="utf-8")
 
     with pytest.raises(Exception, match="invalid testing request"):
-        PanelController(Path(__file__).parents[1], config).remote_testing_start()
+        PanelController(tmp_path, config).remote_testing_start()
 
 
 def test_check_paths_uses_one_injected_plink_argv_and_returns_only_labels() -> None:

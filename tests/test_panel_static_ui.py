@@ -39,7 +39,7 @@ def test_static_shell_has_approved_navigation_and_exclusions() -> None:
     for href in ("#testing", "#source-db", "#surfaces", "#strategies-dd5", "#settings"):
         assert f'href="{href}"' in html
     assert "Testing /" in html
-    assert ">Portfolio" in html
+    assert ">Оптимизатор портфеля" in html
     assert 'disabled' in html
     assert 'aria-disabled="true"' in html
     assert 'tabindex="-1"' in html
@@ -382,13 +382,116 @@ def test_normal_test_and_import_card_is_unified_and_numbered() -> None:
     assert html.count("performance-inbox-verify") == 1
     assert html.count("performance-import-start") == 1
     assert html.count("3. Test and Import to Performance DB") == 1
-    assert "4. A/B анализ Performance" in html
-    assert "5. CHECK &amp; RETEST" in html
+    assert "4. Pareto and filters" in js
+    assert "7. CHECK & RETEST" in js
     card = html.split("3. Test and Import to Performance DB", 1)[1].split("</details>", 1)[0]
     assert card.count('class="progress-block"') == 1
     assert card.count('role="status"') == 1
     assert "const v2CardOrder" in js
-    assert "performanceV2WindowTitle) performanceV2WindowTitle.textContent = '4. A/B" in js
+    assert "performanceV2WindowTitle) performanceV2WindowTitle.textContent = '5. A/B" in js
+
+
+def test_strategy_dd5_performance_cards_have_the_exact_final_order_and_titles() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
+    for card in ("performance-v2-selection-card", "performance-v2-window-card", "performance-v2-finalist-retest-card", "performance-v2-retest-card", "performance-v2-export-card"):
+        assert strategies.count(f'id="{card}"') == 1
+    for title in (
+        "4. Pareto and filters",
+        "5. A/B Performance analysis",
+        "6. Bulk RETEST current FINALIST",
+        "7. CHECK & RETEST",
+        "8. EXPORT FROM PERFORMANCEDB",
+    ):
+        assert js.count(f"textContent = '{title}'") == 1
+    assert "const v2CardOrder = ['performance-v2-selection-card', 'performance-v2-window-card', 'performance-v2-finalist-retest-card', 'performance-v2-retest-card', 'performance-v2-export-card'];" in js
+    assert ".map((id) => document.getElementById(id))" in js
+    assert "v2Cards.length !== v2CardOrder.length" in js
+    assert "Performance v2 cards are not in the expected Strategies and DD5 layout." in js
+    assert strategies.count("panel-performance-v2") == 5
+    for card, title in (
+        ("performance-v2-selection-card", "4. Pareto and filters"),
+        ("performance-v2-window-card", "5. A/B Performance analysis"),
+        ("performance-v2-finalist-retest-card", "6. Bulk RETEST current FINALIST"),
+        ("performance-v2-retest-card", "7. CHECK &amp; RETEST"),
+        ("performance-v2-export-card", "8. EXPORT FROM PERFORMANCEDB"),
+    ):
+        assert f'<details id="{card}"' in strategies
+        assert f'<b>{title}</b>' in strategies
+    assert "#strategies-dd5 > .panel-performance-v2" not in js
+
+
+def test_performance_v2_export_card_has_status_filters_and_accessible_status() -> None:
+    html = _read("index.html")
+    card = html.split('id="performance-v2-export-card"', 1)[1].split("</details>", 1)[0]
+
+    for control, label in (
+        ("performance-v2-export-finalist", "FINALIST"),
+        ("performance-v2-export-reserve", "RESERVE"),
+        ("performance-v2-export-retest", "RETEST"),
+        ("performance-v2-export-all-active", "ALL ACTIVE"),
+    ):
+        assert f'id="{control}"' in card
+        assert f">{label}</span>" in card
+    assert 'id="performance-v2-export-button"' in card
+    assert ">Скачать XLSX</button>" in card
+    assert 'id="performance-v2-export-status"' in card
+    assert 'role="status"' in card and 'aria-live="polite"' in card
+
+
+def test_performance_v2_export_query_uses_canonical_status_union_and_retest_modifier() -> None:
+    js = _read("app.js")
+    script = js.split("const ORDER_BUCKETS", 1)[0] + """
+const h = globalThis.performanceV2ExportHelpers;
+const checks = {
+  empty: h.query([]) === '',
+  finalist: h.query(['FINALIST']) === '?status=FINALIST',
+  reserve: h.query(['RESERVE']) === '?status=RESERVE',
+  union: h.query(['RESERVE', 'FINALIST']) === '?status=FINALIST&status=RESERVE',
+  retest: h.query(['RETEST']) === '?retest=1',
+  finalistRetest: h.query(['RETEST', 'FINALIST']) === '?status=FINALIST&retest=1',
+  reserveRetest: h.query(['RESERVE', 'RETEST']) === '?status=RESERVE&retest=1',
+  allActive: h.query(['ALL ACTIVE']) === '?all_active=true',
+  allActiveWins: h.query(['ALL ACTIVE', 'FINALIST', 'RETEST']) === '?all_active=true',
+};
+if (!h || Object.values(checks).some((value) => !value)) process.exit(1);
+"""
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_performance_v2_export_handler_is_get_only_and_server_named_blob_download() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    card = html.split('id="performance-v2-export-card"', 1)[1].split("</details>", 1)[0]
+    handler = js.split("performanceV2ExportButton?.addEventListener", 1)[1].split("const settingsStatus", 1)[0]
+
+    assert "/api/v2/strategies/performance-v2/export" in js
+    assert "method: 'GET'" in handler
+    assert "response.blob()" in handler
+    assert "response.headers.get('Content-Disposition')" in handler
+    assert "URL.revokeObjectURL(url)" in handler
+    assert "download: filename" in handler
+    assert "response.json()" in handler
+    assert "performanceV2ExportStatus.textContent" in handler
+    assert "POST" not in handler
+    assert "import" not in handler.lower()
+    assert "tester" not in handler.lower()
+    assert "strategy_id" not in card and "result_id" not in card
+    assert "strategy_ids" not in handler and "result_ids" not in handler
+    assert "input.name" not in handler and "file.name" not in handler
+
+
+def test_performance_v2_export_controls_enforce_all_active_mutual_exclusion() -> None:
+    js = _read("app.js")
+    handler = js.split("const performanceV2ExportButton", 1)[1].split("const settingsStatus", 1)[0]
+
+    assert "performanceV2ExportAllActive.checked = false" in handler
+    assert "performanceV2ExportAllActive.checked" in handler
+    assert "control.disabled = performanceV2ExportAllActive?.checked === true" in handler
+    assert "performanceV2ExportButton.disabled = !selected.length" in handler
 
 
 def test_performance_v2_retest_card_uses_server_mapping_and_committed_inbox_gate() -> None:
@@ -401,6 +504,11 @@ def test_performance_v2_retest_card_uses_server_mapping_and_committed_inbox_gate
     assert 'id="performance-v2-retest-count"' in card
     assert 'id="performance-v2-retest-start"' in card
     assert 'id="performance-v2-retest-end"' in card
+    assert 'id="performance-v2-selection-review-file"' in card
+    assert 'id="performance-v2-selection-review-import"' in card
+    assert 'id="performance-v2-selection-review-results"' in card
+    for control in ("performance-v2-selection-review-file", "performance-v2-selection-review-import", "performance-v2-selection-review-results"):
+        assert html.count(f'id="{control}"') == 1
     assert 'id="performance-v2-retest-import" class="button button-primary" disabled' in card
     assert "/api/v2/strategies/performance-v2/retest/status" in js
     assert "/api/v2/strategies/performance-v2/retest/start" in js
@@ -409,6 +517,10 @@ def test_performance_v2_retest_card_uses_server_mapping_and_committed_inbox_gate
     assert "selectRetestTester(jobs)" in js
     assert "job.inbox_ready === true" in js
     assert "tester_job_id: retestTesterJobId" in js
+    assert "retestEndDate.max = testerMaxDate();" in js
+    assert "end > testerMaxDate()" in js
+    assert "value.setHours(0, 0, 0, 0)" in js
+    assert "value.getFullYear()" in js and "value.getMonth() + 1" in js and "value.getDate()" in js
     retest_slice = js.split("const retestCard", 1)[1].split("const performanceV2WindowSelect", 1)[0]
     assert "replacement_strategy_ids" not in retest_slice
     assert "failure_report_available" in js
@@ -512,7 +624,7 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "if (!payload.symbol || !payload.side) return;" in js
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
     assert 'id="performance-v2-selection-card"' in strategies
-    assert "6. Парето и фильтры" in strategies
+    assert "4. Pareto and filters" in strategies
     expected_stage_order = [
         "filter_lot_variant_redundancy",
         "filter_holding_outlier",
@@ -806,8 +918,19 @@ def test_tester_dates_and_local_ranges_are_sent_only_on_tester_start() -> None:
     assert "testerEndDate?.value" in tester_handler
     assert "start_date: startDate" in tester_handler
     assert "end_date: endDate" in tester_handler
+    assert "tester-initial-balance" in js
+    assert "initial_balance: initialBalance" in tester_handler
     for marker in ("shortlist", "analyze", "generate"):
         assert f"tester-range-{marker}" not in js
+
+
+def test_each_single_mode_card_sends_its_initial_balance_only_to_its_start_route() -> None:
+    js = _read("app.js")
+
+    assert "performance-v2-finalist-retest-initial-balance" in js
+    assert "performance-v2-retest-initial-balance" in js
+    assert "payload.initial_balance = finalistInitialBalance" in js
+    assert "initial_balance: retestInitialBalance" in js
 
 
 def test_tester_card_exposes_single_mode_and_hides_fast_controls() -> None:
@@ -910,7 +1033,11 @@ def test_accordion_status_badges_align_to_the_right() -> None:
 def test_shortlist_bulk_handlers_preserve_non_selection_state() -> None:
     js = _read("app.js")
 
-    handlers = js.split("document.querySelector('#shortlist-select-all')", 1)[1].split("const testerCard", 1)[0]
+    handlers = "\n".join(
+        js.split(f"document.querySelector('{selector}')", 1)[1].split("});", 1)[0]
+        for selector in ("#shortlist-select-all", "#shortlist-select-active", "#shortlist-select-none")
+    )
+    assert all(selector in js for selector in ("#shortlist-select-all", "#shortlist-select-active", "#shortlist-select-none"))
     assert handlers.count("renderShortlist();") == 3
     assert "remoteRequest" not in handlers
     assert "expandedPairs.add" not in handlers
@@ -1252,9 +1379,24 @@ def test_performance_v2_window_analysis_uses_native_utc_controls() -> None:
     assert 'id="performance-v2-window-strategy-id"' in js
     assert 'id="performance-v2-window-finalists" type="checkbox" disabled' in js
     assert "const v2CardOrder" in js
-    assert "5. Парето и фильтры" not in js
-    assert "6. Парето и фильтры" in js
-    assert "4. A/B анализ Performance" in js
+    assert "4. Pareto and filters" in js
+    assert "5. A/B Performance analysis" in js
+    assert 'id="performance-v2-window-a-start" type="datetime-local" step="1"' in html
+    assert "/api/v2/strategies/performance-v2/windows" in js
+
+
+def test_performance_v2_window_analysis_includes_native_utc_controls() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert 'id="performance-v2-window-strategy"' in html
+    assert 'id="performance-v2-window-pair"' in js
+    assert 'id="performance-v2-window-strategy-id"' in js
+    assert 'id="performance-v2-window-finalists" type="checkbox" disabled' in js
+    assert "const v2CardOrder" in js
+    assert "4. Pareto and filters" in js
+    assert "6. Pareto and filters" not in js
+    assert "5. A/B Performance analysis" in js
     assert "strategy.symbol === performanceV2WindowPair.value" in js
     assert "String(strategy.strategy_id).includes(query)" in js
     assert "strategy.is_latest_finalist" in js
@@ -1273,35 +1415,39 @@ def test_performance_v2_window_analysis_uses_native_utc_controls() -> None:
     assert "Math.max(range[0].getTime(), range[1].getTime() - days * 86_400_000)" in js
 
 
-def test_performance_v2_review_import_uses_a_folder_picker_and_bounded_endpoint() -> None:
+def test_performance_v2_retest_tag_import_uses_a_folder_picker_and_bounded_endpoint() -> None:
     html = _read("index.html")
     js = _read("app.js")
 
     assert 'id="performance-v2-selection-review-file"' in html
     assert "multiple webkitdirectory hidden" in html
-    assert "Обратный импорт XLS" in html
-    assert "/api/v2/strategies/performance-v2/selection-review-import" in js
+    retest_card = html.split('id="performance-v2-retest-card"', 1)[1].split("</details>", 1)[0]
+    assert "Импортировать RETEST из XLS" in retest_card
+    assert "hidden" not in retest_card.split('id="performance-v2-selection-review-import"', 1)[1].split(">", 1)[0]
+    assert "Импортировать RETEST из XLS" in html
+    assert "/api/v2/strategies/performance-v2/retest-tags-import" in js
     assert ".filter((file) => file.name.toLowerCase().endsWith('.xlsx'))" in js
 
 
-def test_selection_review_batch_import_reports_one_clear_status_per_file() -> None:
+def test_retest_tag_batch_import_reports_one_clear_status_per_file() -> None:
     html = _read("index.html")
     js = _read("app.js")
     handler = js.split("selectionReviewFile?.addEventListener", 1)[1].split("renderSelectionPreviewOrder();", 1)[0]
 
     assert 'id="performance-v2-selection-review-results"' in html
     assert "selectionReviewImportResults" in handler
-    assert "SELECTION_REVIEW_ALREADY_IMPORTED" in handler
-    assert "SELECTION_REVIEW_INVALID_STATUS" in handler
-    assert "SELECTION_REVIEW_NOT_LATEST_RUN" in handler
-    assert "SELECTION_REVIEW_DATABASE_MISMATCH" in handler
-    assert "SELECTION_REVIEW_INVALID_SELECTION" in handler
-    assert "SELECTION_REVIEW_STALE_RESULTS" in handler
-    assert "SELECTION_REVIEW_ROWSET_MISMATCH" in handler
-    assert "SELECTION_REVIEW_INVALID_RANK" in handler
-    assert "SELECTION_REVIEW_INVALID_ANALOG" in handler
-    assert "SELECTION_REVIEW_INVALID_RETEST" in handler
+    assert "RETEST_TAG_IMPORT_INVALID_FILE" in handler
+    assert "RETEST_TAG_IMPORT_DATABASE_MISMATCH" in handler
+    assert "RETEST_TAG_IMPORT_STRATEGY_MISMATCH" in handler
+    assert "RETEST_TAG_IMPORT_INVALID_RETEST" in handler
+    assert "SELECTION_REVIEW_INVALID_STATUS" not in handler
+    assert "SELECTION_REVIEW_NOT_LATEST_RUN" not in handler
     assert "const catalogError = await loadPerformanceV2Catalog() || '';" in handler
+    assert "finally {" in handler
+    assert "await loadRetestStatus();" in handler
+    assert "selectionReviewImportButton.disabled = false;" in handler
+    assert js.count("selectionReviewImportButton?.addEventListener('click'") == 1
+    assert js.count("selectionReviewFile?.addEventListener('change'") == 1
     assert "failed.join('; ')" not in handler
 
 
@@ -1443,10 +1589,10 @@ def test_portfolio_screen_exposes_server_backed_launch_form() -> None:
     assert '<section id="portfolio"' in html
     for control in (
         'id="portfolio-readiness"', 'id="portfolio-pairs"',
-        'id="portfolio-default-long"', 'id="portfolio-default-short"',
+        'id="portfolio-select-all"', 'id="portfolio-select-none"',
         'id="portfolio-profile-aggressive"', 'id="portfolio-profile-balanced"',
-        'id="portfolio-profile-conservative"', 'id="portfolio-equity-aggressive"',
-        'id="portfolio-max-balance-aggressive"', 'id="portfolio-candidates-aggressive"',
+        'id="portfolio-profile-conservative"', 'id="portfolio-bank-available-aggressive"',
+        'id="portfolio-candidates-aggressive"',
         'id="portfolio-run"', 'id="portfolio-new-calculation"',
     ):
         assert control in html
@@ -1456,19 +1602,143 @@ def test_portfolio_screen_exposes_server_backed_launch_form() -> None:
     assert "'/api/v2/portfolio/campaigns'" in js
 
 
-def test_portfolio_pair_selection_copies_global_maxima_without_auto_selection() -> None:
+def test_portfolio_profiles_have_balanced_default_optional_bank_and_disabled_actions() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    css = _read("app.css")
+    profiles = html.split('class="portfolio-profile-table"', 1)[1].split("</table>", 1)[0]
+    launch_card = html.split('id="portfolio-launch-card"', 1)[1].split("</article>", 1)[0]
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert '<label class="check"><input id="portfolio-profile-aggressive"' in profiles
+    assert '<label class="check"><input id="portfolio-profile-balanced"' in profiles
+    assert '<label class="check"><input id="portfolio-profile-conservative"' in profiles
+    assert 'id="portfolio-profile-balanced" type="checkbox" checked' in profiles
+    for profile in ("aggressive", "conservative"):
+        assert f'id="portfolio-profile-{profile}" type="checkbox" checked' not in profiles
+    for profile in ("aggressive", "balanced", "conservative"):
+        assert f'id="portfolio-bank-available-{profile}" type="text"' in profiles
+        assert f'id="portfolio-bank-available-{profile}" type="text" inputmode="decimal" placeholder="Без ограничения" aria-describedby="portfolio-bank-available-hint"' in profiles
+    assert profiles.count("<tr>") == 4
+    for profile, dd, reserve, mm in (
+        ("AGGRESSIVE", "20%", "20%", "50%"),
+        ("BALANCED", "10%", "40%", "35%"),
+        ("CONSERVATIVE", "5%", "60%", "20%"),
+    ):
+        assert f'<th scope="row">{profile}</th><td>{dd}</td><td>{reserve}</td><td>{mm}</td>' in profiles
+
+    assert "Complete valid pair, direction, profile, and budget fields." not in js
+    assert "Complete valid pair, direction, profile, and candidate fields." not in js
+    assert "Заполните обязательные поля и исправьте недопустимые лимиты." in js
+    assert 'id="portfolio-bank-available-hint"' in launch_card
+    assert "Пусто — без ограничения." in launch_card
+    assert 'id="portfolio-run"' in launch_card
+    assert 'id="portfolio-new-calculation"' in launch_card
+    assert "const profilesValid = profiles.length > 0" in portfolio
+    assert "runButton.disabled = state.locked || !launch.valid;" in js
+    assert "#portfolio-launch-card .button:disabled {" in css
+
+
+def test_portfolio_readiness_is_compact_and_stage1_only() -> None:
     html = _read("index.html")
     js = _read("app.js")
     portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
 
-    assert 'id="portfolio-default-long"' in html
-    assert 'id="portfolio-default-short"' in html
+    assert 'id="portfolio-readiness" class="portfolio-readiness-strip"' in html
+    assert 'aria-labelledby="portfolio-readiness-label"' in html
+    assert 'id="portfolio-readiness-state" class="state-badge state-pending" role="status" aria-live="polite"' in html
+    assert 'id="portfolio-schema-version"' not in html
+    assert 'id="portfolio-policy-version"' not in html
+    assert 'id="portfolio-config-digest"' not in html
+    assert 'id="portfolio-stage2-status"' not in html
+    assert "...portfolioValues(readiness?.stage2?.blockers)" not in portfolio
+    assert "blockers.hidden = reasons.length === 0" in portfolio
+    assert "blockers.replaceChildren()" in portfolio
+
+
+def test_portfolio_settings_shows_editable_profile_risk_policy() -> None:
+    html = _read("index.html")
+    settings = html.split('id="portfolio-settings"', 1)[1].split("</details>", 1)[0]
+    policy = settings.split('class="portfolio-profile-policy-table"', 1)[1].split("</table>", 1)[0]
+
+    assert 'class="section-subtitle"' in settings
+    assert "Профиль" in policy
+    assert "Макс. DD" in policy
+    assert "Мин. запас свободной маржи" in policy
+    assert "Макс. MM-нагрузка" in policy
+    assert policy.count("<tr>") == 4
+
+
+def test_portfolio_screen_and_settings_card_use_russian_user_labels() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio_html = html.split('id="portfolio"', 1)[1].split('id="settings"', 1)[0]
+    settings_html = html.split('id="portfolio-settings"', 1)[1].split("</details>", 1)[0]
+    portfolio_js = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    for text in (
+        "Portfolio Optimizer", "Stage 1 calculation", "Pairs and directions", "Calculate variants", "New calculation",
+        "Calculation progress", "Cancel calculation", "Results appear only after SUCCEEDED", "Download Stage 1 XLSX",
+        "Tester handoff", "Submit to tester", "accepted v2 document", "Advanced controls used by the current adapter",
+    ):
+        assert text not in portfolio_html + settings_html
+    for text in (
+        "Ready to freeze this Campaign.", "Complete the required selections and fix invalid limits.",
+        "No calculation is active.", "Results appear only after SUCCEEDED.", "Campaign frozen; creating server job",
+        "Campaign frozen and queued on the server.", "New Campaign ready.", "Select ${row.pair}",
+    ):
+        assert text not in portfolio_js
+    assert "PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED" in portfolio_html
+    assert "profile_id: profile.profile.toUpperCase()" in portfolio_js
+
+
+def test_portfolio_pair_selection_preserves_per_row_limits() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert 'id="portfolio-default-long"' not in html
+    assert 'id="portfolio-default-short"' not in html
     assert "selected: row.selected === true" in js
-    assert "copyPortfolioMaximum" in portfolio
-    assert "label.append(selected, name, count)" in portfolio
-    assert "#portfolio-default-long" in portfolio
-    assert "#portfolio-default-short" in portfolio
+    assert ".filter((row) => row.pair && (row.finalistLong > 0 || row.finalistShort > 0))" in js
+    assert "Нет пар с финалистами LONG или SHORT." in portfolio
+    assert "copyPortfolioMaximum" not in portfolio
+    assert "pairInfo.append(label, count); pairCell.append(pairInfo)" in portfolio
+    assert "row.selected = selected.checked; updateControls();" in portfolio
     assert "portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= 50" in portfolio
+
+
+def test_portfolio_pair_picker_is_one_full_width_compact_table() -> None:
+    html = _read("index.html")
+    css = _read("app.css")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert '<table class="portfolio-pairs-table">' in html
+    assert '<caption class="sr-only">' in html
+    assert '<tbody id="portfolio-pairs">' in html
+    assert 'id="portfolio-select-all"' in html
+    assert 'id="portfolio-select-maximum"' in html
+    assert 'title="Перезаписать лимиты каждой пары максимально доступными значениями"' in html
+    assert 'id="portfolio-select-none"' in html
+    assert '<th scope="col">Пара / доступно</th>' in html
+    assert '<th scope="col">Финалистов LONG</th>' in html
+    assert '<th scope="col">Финалистов SHORT</th>' in html
+    assert "#portfolio-launch-card { grid-column: 1 / -1; }" in css
+    assert ".portfolio-pair-info { display: flex;" in css
+    assert ".portfolio-pairs-table tbody th { display: flex;" not in css
+    assert ".portfolio-pair-count { margin: 0;" in css
+    assert "const tableRow = document.createElement('tr')" in portfolio
+    assert "const pairCell = document.createElement('th'); pairCell.scope = 'row'" in portfolio
+    assert "state.pairRows.forEach((row) => { row.selected = true;" in portfolio
+    assert "row.long = Math.max(0, Number(row.finalistLong) || 0)" in portfolio
+    assert "row.short = Math.max(0, Number(row.finalistShort) || 0)" in portfolio
+    assert "row[side.toLowerCase()] = Number(input.value)" in portfolio
+    assert "input.max = String(side === 'LONG' ? row.finalistLong : row.finalistShort)" in portfolio
+    assert "invalidPairLimits" in portfolio
+    assert "state.pairRows.forEach((row) => { row.selected = false; })" in portfolio
+    assert "field.textContent = `Maximum ${side}`" not in portfolio
+    assert "portfolio-pair-grid" not in html + css + portfolio
 
 
 def test_portfolio_launch_exposes_directional_finalist_limits() -> None:
@@ -1476,8 +1746,8 @@ def test_portfolio_launch_exposes_directional_finalist_limits() -> None:
     js = _read("app.js")
     portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
 
-    assert 'id="portfolio-default-long" type="number" min="0" step="1" value="1"' in html
-    assert 'id="portfolio-default-short" type="number" min="0" step="1" value="1"' in html
+    assert "long: finalistLong > 0 ? 1 : 0" in js
+    assert "short: finalistLong <= 0 && finalistShort > 0 ? 1 : 0" in js
     assert "max_finalist_long: row.long" in portfolio
     assert "max_finalist_short: row.short" in portfolio
 
@@ -1541,25 +1811,50 @@ def test_portfolio_settings_uses_full_document_compare_and_swap() -> None:
     assert "INVALID" in js
 
 
-def test_portfolio_settings_uses_human_form_for_all_profiles_and_keeps_technical_document_hidden() -> None:
+def test_portfolio_progress_hides_stale_or_terminal_eta() -> None:
+    js = _read("app.js")
+    render = js.split("const renderJob = (job) =>", 1)[1].split("const pollPortfolioJob", 1)[0]
+
+    assert "const liveEtaUnavailable = liveStale || terminal(job);" in render
+    assert "const liveEtaText = !liveEtaUnavailable && Number.isFinite(liveEta)" in render
+    assert "stalled / ETA unknown" in render
+
+
+def test_portfolio_empty_job_progress_uses_utf8_russian_literal() -> None:
+    js = _read("app.js")
+    portfolio_js = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert portfolio_js.count("Нет активного расчёта.") == 3
+    assert "РќРµС‚ Р°РєС‚РёРІРЅРѕРіРѕ СЂР°СЃС‡С‘С‚Р°." not in portfolio_js
+    progress_assignments = [line.strip() for line in portfolio_js.splitlines() if "text('#portfolio-progress-text'," in line]
+    assert len(progress_assignments) == 2
+    assert progress_assignments[-1].endswith(": 'Нет активного расчёта.');")
+
+
+def test_portfolio_settings_shows_operational_controls_and_collapses_advanced_policy() -> None:
     html = _read("index.html")
     js = _read("app.js")
 
     assert 'id="portfolio-settings-document"' not in html
     assert 'id="portfolio-settings-form"' in html
     assert 'id="portfolio-settings-total-test-budget"' not in html
-    assert 'id="portfolio-settings-profile-aggressive"' in html
-    assert 'id="portfolio-settings-profile-balanced"' in html
-    assert 'id="portfolio-settings-profile-conservative"' in html
-    for profile in ("aggressive", "balanced", "conservative"):
-        for field in ("deposit", "collateral", "max-balance", "upper-bound", "individual-max-dd-pct", "individual-net-pnl-min-exclusive", "top-n"):
-            assert f'id="portfolio-settings-{profile}-{field}"' in html
-        assert f'id="portfolio-settings-{profile}-grid"' not in html
-    for field in ("close-volume-participation-pct", "round-down-usdt", "minimum-coverage-pct", "maximum-age-hours", "archive-publication-lag-hours", "weekend-start-utc", "weekend-end-utc", "backfill-write-enabled"):
+    assert 'id="portfolio-settings-profile-aggressive"' not in html
+    assert 'id="portfolio-settings-profile-balanced"' not in html
+    assert 'id="portfolio-settings-profile-conservative"' not in html
+    for field in ("close-volume-participation-pct", "round-down-usdt", "backfill-write-enabled"):
         assert f'id="portfolio-settings-{field}"' in html
-    assert "Доля минутного объёма для позиции" in html
-    assert "Шаг округления размера" in html
-    assert "Минимальное покрытие данных стакана" in html
+    assert 'id="portfolio-settings-advanced"' in html
+    assert 'id="portfolio-settings-history"' in html
+    assert 'id="portfolio-settings-phase13"' in html
+    assert "Текущий этап 1 принудительно использует L=0 и priority=1, поэтому эти поля не влияют на расчёт." in html
+    assert not re.search(r'<details id="portfolio-settings-(?:advanced|history|phase13)"[^>]*\bopen(?:\s|>)', html)
+    for field in ("seed", "minimum-common-days"):
+        assert f'id="portfolio-settings-{field}"' in html
+    for field in ("max-enumerated-combinations", "minimum-coverage-pct", "maximum-age-hours", "archive-publication-lag-hours", "weighted-history-step-minutes", "weighted-lp-solutions-per-profile", "weighted-max-targets", "weighted-bootstrap-scenarios-per-block", "weighted-bootstrap-diagnostic-scenarios", "weighted-wall-time-seconds", "weighted-solver-time-seconds", "weighted-limiter-step", "weighted-limiter-controls", "weighted-limiter-stress-pct", "weighted-priority-groups", "weighted-priority-beta", "weighted-priority-close-ratio"):
+        assert f'id="portfolio-settings-{field}"' in html
+    assert 'id="portfolio-settings-weighted-lp-solutions-per-profile" type="number" inputmode="numeric" min="1" max="20" step="1"' in html
+    for field in ("weekend-start-utc", "weekend-end-utc", "repair-attempts", "additional-passes", "base-vectors", "scenarios", "cdar-pct", "diagnostic-cdar-pct", "alternatives-per-profile", "p30-tolerance-pct", "bootstrap-block-days", "bootstrap-p95", "bootstrap-low-block-common-days", "scale-warning-multiple", "api-requests-per-second", "api-concurrency", "api-retries", "reference-max-age-hours", "archive-download-concurrency"):
+        assert f'id="portfolio-settings-{field}"' not in html
     assert "^[1-9][0-9]*$" in js
     assert "settingsDecimalValue" in js
     assert "settingsWeekdayMinutes" in js
@@ -1571,20 +1866,20 @@ def test_portfolio_settings_uses_human_form_for_all_profiles_and_keeps_technical
     assert "aria-invalid" in js
     assert "linkDescriptions" in js
     assert "Введите корректное значение для поля." in js
-    assert "const { profiles, clone, settingsPatch, validSettingsDocument, weightedSearchKeys, revealInvalidField, settingsValidationFeedback } = portfolioSettingsHelpers;" in js
+    assert "const { clone, profiles, riskFields, riskDefaults, settingsPatch, validSettingsDocument, weightedSearchKeys, revealInvalidField, settingsValidationFeedback } = portfolioSettingsHelpers;" in js
     assert "settingsValidationFeedback(error, query, meta, revealInvalidField)" in js
 
 
 def test_portfolio_settings_patches_only_exposed_leaves_and_preserves_money_lexemes() -> None:
     js = _read("app.js")
 
-    assert "settingsMoneyValue" in js
+    assert "settingsMoneyValue" not in js
     assert "settingsIntegerValue" in js
     assert "settingsDecimalValue" in js
-    assert "scenario[name].amount" in js
-    assert "scenario.sizing.upper_bound.amount" in js
+    assert "scenario[name].amount" not in js
+    assert "scenario.sizing.upper_bound.amount" not in js
     assert "scenario.sizing.grid !== undefined" in js
-    assert "payload.profiles[profile].ranking.top_n" in js
+    assert "payload.profiles[profile].ranking.top_n" not in js
     assert "const candidate = clone(result.document)" in js
     assert "if (validSettingsDocument(candidate)) state.document = candidate" in js
     assert "document: payload" in js
@@ -1614,47 +1909,36 @@ def test_portfolio_settings_helpers_patch_the_weighted_search_document_without_l
             "weekend_end_utc": "MONDAY 00:00",
             "archive_publication_lag_hours": 6,
             "backfill_write_enabled": False,
+            "spread_history_bypass_pretest": False,
         },
+        "margin": {"parameters": {"open_fee_rate": "0", "close_fee_rate": "0.0002"}},
         "search": {
+            "seed": 1,
             "total_test_budget": 9,
             "sizing_mode": "liquidity_cap_single",
             "max_enumerated_combinations": 100000,
+            "composition": {"policy_id": "operator_supplied_composition_v1", "parameters": {"operator_supplied": True, "minimum_common_days": 14, "minimum_daily_coverage_pct": 90, "maximum_forward_fill_gap_days": 3}},
             "weighted_search": {
                 "history_step_minutes": 5,
                 "lp_solutions_per_profile": 20,
-                "repair_attempts": 3,
-                "additional_passes": 1,
-                "base_vectors": 100,
-                "scenarios": 200,
-                "cdar_pct": 80,
-                "diagnostic_cdar_pct": 90,
-                "alternatives_per_profile": 2,
-                "p30_tolerance_pct": 5,
-                "bootstrap_block_days": [1, 3, 7],
+                "max_targets": 8,
                 "bootstrap_scenarios_per_block": 1000,
-                "bootstrap_p95": True,
                 "bootstrap_diagnostic_scenarios": 100,
-                "bootstrap_low_block_common_days": 10,
-                "scale_warning_multiple": 10,
+                "wall_time_seconds": 900,
+                "solver_time_seconds": 30,
                 "limiter_step": 1,
                 "limiter_controls": 2,
                 "limiter_stress_pct": 1.5,
                 "priority_groups": 5,
                 "priority_beta": 0.5,
                 "priority_close_ratio": 2,
-                "wall_time_seconds": 900,
-                "solver_time_seconds": 30,
-                "max_targets": 8,
-                "api_requests_per_second": 2,
-                "api_concurrency": 1,
-                "api_retries": 3,
-                "reference_max_age_hours": 2,
-                "csv_download_concurrency": 2,
             },
         },
         "runner": {"root": "hidden", "token": {"keep": True}},
     }
     values = {
+        "seed": "2",
+        "minimum_common_days": "21",
         "max_enumerated_combinations": "100000",
         "close_volume_participation_pct": "30",
         "round_down_usdt": "50",
@@ -1664,92 +1948,92 @@ def test_portfolio_settings_helpers_patch_the_weighted_search_document_without_l
         "weekend_start_utc": "SATURDAY 00:00",
         "weekend_end_utc": "MONDAY 00:00",
         "backfill_write_enabled": False,
+        "spread_history_bypass_pretest": False,
+        "open_fee_rate": "0",
+        "close_fee_rate": "0.0002",
         "profiles": {
             profile: {"deposit": "10", "collateral": "20", "max_balance": "30", "upper_bound": "30", "individual_max_dd_pct": "20", "individual_net_pnl_min_exclusive": "0", "top_n": "2"}
             for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
         },
-        "weighted_search": {
-            "history_step_minutes": "10",
-            "lp_solutions_per_profile": "10",
-            "repair_attempts": "2",
-            "additional_passes": "1",
-            "base_vectors": "101",
-            "scenarios": "201",
-            "cdar_pct": "70",
-            "diagnostic_cdar_pct": "80",
-            "alternatives_per_profile": "1",
-            "p30_tolerance_pct": "4.5",
-            "bootstrap_block_days": "1,3,7",
-            "bootstrap_scenarios_per_block": "900",
-            "bootstrap_p95": False,
-            "bootstrap_diagnostic_scenarios": "90",
-            "bootstrap_low_block_common_days": "9",
-            "scale_warning_multiple": "9",
-            "limiter_step": "2",
-            "limiter_controls": "1",
-            "limiter_stress_pct": "1.25",
-            "priority_groups": "4",
-            "priority_beta": "0.4",
-            "priority_close_ratio": "2.5",
-            "wall_time_seconds": "800",
-            "solver_time_seconds": "20",
-            "max_targets": "7",
-            "api_requests_per_second": "3",
-            "api_concurrency": "2",
-            "api_retries": "2",
-            "reference_max_age_hours": "3",
-            "csv_download_concurrency": "3",
-        }
+            "weighted_search": {
+                "history_step_minutes": "10",
+                "lp_solutions_per_profile": "10",
+                "max_targets": "7",
+                "bootstrap_scenarios_per_block": "900",
+                "bootstrap_diagnostic_scenarios": "90",
+                "wall_time_seconds": "800",
+                "solver_time_seconds": "20",
+                "limiter_step": "2",
+                "limiter_controls": "1",
+                "limiter_stress_pct": "1.25",
+                "priority_groups": "4",
+                "priority_beta": "0.4",
+                "priority_close_ratio": "2.5",
+            }
     }
-    script = _read("app.js").split("const ORDER_BUCKETS", 1)[0] + f"""
+    script = _read("app.js").split("const portfolioResultHelpers", 1)[0] + f"""
 const h = globalThis.portfolioSettingsHelpers;
 const document = {json.dumps(document)};
 const values = {json.dumps(values)};
+const sourceBefore = JSON.stringify(document);
 const errorField = (callback) => {{ try {{ callback(); return ''; }} catch (error) {{ return error.field || ''; }} }};
 const weightedWith = (name, value) => ({{...values, weighted_search: {{...values.weighted_search, [name]: value}}}});
 const patched = h.settingsPatch(document, values);
+const onlyOpenFee = {{...values}}; delete onlyOpenFee.close_fee_rate;
+const onlyCloseFee = {{...values}}; delete onlyCloseFee.open_fee_rate;
 const weighted = patched.search.weighted_search;
 const maximums = h.clone(values.weighted_search);
-Object.assign(maximums, {{ lp_solutions_per_profile: '20', repair_attempts: '3', additional_passes: '1', alternatives_per_profile: '2', cdar_pct: '99.9', diagnostic_cdar_pct: '99.9', p30_tolerance_pct: '99.9', bootstrap_scenarios_per_block: '900', bootstrap_diagnostic_scenarios: '900', limiter_controls: '2', limiter_stress_pct: '99.9', priority_groups: '5', priority_beta: '1' }});
+Object.assign(maximums, {{ lp_solutions_per_profile: '20', max_targets: '8', bootstrap_scenarios_per_block: '900', bootstrap_diagnostic_scenarios: '900', limiter_controls: '2', limiter_stress_pct: '99.9', priority_groups: '5', priority_beta: '1' }});
 const zeros = h.clone(values.weighted_search);
-Object.assign(zeros, {{ alternatives_per_profile: '0', p30_tolerance_pct: '0', limiter_controls: '0', limiter_stress_pct: '0', priority_beta: '0', api_retries: '0', bootstrap_scenarios_per_block: '1', bootstrap_diagnostic_scenarios: '1' }});
-const badDays = h.clone(document); badDays.search.weighted_search.bootstrap_block_days = [1, 3, 5];
-const shortDays = h.clone(document); shortDays.search.weighted_search.bootstrap_block_days = [1, 3];
-const stringDay = h.clone(document); stringDay.search.weighted_search.bootstrap_block_days = [1, '3', 7];
+Object.assign(zeros, {{ limiter_controls: '0', limiter_stress_pct: '0', priority_beta: '0' }});
 const extraKey = h.clone(document); extraKey.search.weighted_search.extra = 1;
-const missingKey = h.clone(document); delete missingKey.search.weighted_search.api_retries;
+const missingKey = h.clone(document); delete missingKey.search.weighted_search.max_targets;
 const invalidDiagnostic = h.clone(document); invalidDiagnostic.search.weighted_search.bootstrap_diagnostic_scenarios = 1001;
-const scientificNumber = h.clone(document); scientificNumber.search.weighted_search.scale_warning_multiple = 1e-7;
+const scientificNumber = h.clone(document); scientificNumber.search.weighted_search.priority_beta = 1e-7;
+const missingSeed = h.clone(document); delete missingSeed.search.seed;
+const missingMinimumCommonDays = h.clone(document); delete missingMinimumCommonDays.search.composition.parameters.minimum_common_days;
 const advancedDetails = {{ open: false }};
 const advancedState = {{ ariaInvalid: '', validity: '', focused: false }};
 const advancedLabel = {{ textContent: 'Advanced field' }};
 const advancedGroup = {{ querySelector: () => advancedLabel }};
 const advancedControl = {{ closest: (selector) => selector === 'details' ? advancedDetails : (selector === '.field-group' ? advancedGroup : null), setAttribute: (name, value) => {{ advancedState.ariaInvalid = value; }}, setCustomValidity: (value) => {{ advancedState.validity = value; }}, focus: () => {{ advancedState.focused = true; }} }};
 const advancedMeta = {{ textContent: '' }};
-const advancedQuery = (selector) => selector === '#portfolio-settings-weighted-bootstrap-p95' ? advancedControl : null;
+const advancedQuery = (selector) => selector === '#portfolio-settings-weighted-bootstrap-diagnostic-scenarios' ? advancedControl : null;
+const historyDetails = {{ open: false }};
+const historyState = {{ focused: false }};
+const historyControl = {{ closest: (selector) => selector === 'details' ? historyDetails : (selector === '.field-group' ? advancedGroup : null), setAttribute: () => {{}}, setCustomValidity: () => {{}}, focus: () => {{ historyState.focused = true; }} }};
+const historyQuery = (selector) => selector === '#portfolio-settings-seed' ? historyControl : null;
 const maxRuleField = (name, value) => errorField(() => h.settingsPatch(document, weightedWith(name, value)));
+const roundTrip = (name, value, expected) => h.settingsPatch(document, weightedWith(name, value)).search.weighted_search[name] === expected;
 const checks = {{
   hiddenPreserved: patched.runner.root === 'hidden' && patched.runner.token.keep === true,
-  weightedInteger: weighted.history_step_minutes === 10 && weighted.base_vectors === 101 && weighted.csv_download_concurrency === 3,
-  weightedFloat: weighted.p30_tolerance_pct === 4.5 && weighted.priority_close_ratio === 2.5,
-  weightedBoolean: weighted.bootstrap_p95 === false,
-  fixedBlockPreserved: JSON.stringify(weighted.bootstrap_block_days) === '[1,3,7]',
+  stage1InputsPatched: patched.search.seed === 2 && patched.search.composition.parameters.minimum_common_days === 21,
+  feeRatesPatched: patched.margin.parameters.open_fee_rate === '0' && patched.margin.parameters.close_fee_rate === '0.0002',
+  singleFeePatch: h.settingsPatch(document, onlyOpenFee).margin.parameters.close_fee_rate === '0.0002' && h.settingsPatch(document, onlyCloseFee).margin.parameters.open_fee_rate === '0',
+  sourceUnchanged: JSON.stringify(document) === sourceBefore,
+  exactWeightedKeys: JSON.stringify([...h.weightedSearchKeys].sort()) === JSON.stringify(['history_step_minutes', 'lp_solutions_per_profile', 'max_targets', 'bootstrap_scenarios_per_block', 'bootstrap_diagnostic_scenarios', 'wall_time_seconds', 'solver_time_seconds', 'limiter_step', 'limiter_controls', 'limiter_stress_pct', 'priority_groups', 'priority_beta', 'priority_close_ratio'].sort()),
+  weightedInteger: weighted.history_step_minutes === 10 && weighted.lp_solutions_per_profile === 10 && weighted.max_targets === 7 && weighted.bootstrap_scenarios_per_block === 900 && weighted.bootstrap_diagnostic_scenarios === 90 && weighted.wall_time_seconds === 800 && weighted.solver_time_seconds === 20 && weighted.limiter_step === 2 && weighted.limiter_controls === 1 && weighted.priority_groups === 4,
+  weightedFloat: weighted.limiter_stress_pct === 1.25 && weighted.priority_beta === 0.4 && weighted.priority_close_ratio === 2.5,
+  phase13Patched: weighted.limiter_step === 2 && weighted.limiter_controls === 1 && weighted.limiter_stress_pct === 1.25 && weighted.priority_groups === 4 && weighted.priority_beta === 0.4 && weighted.priority_close_ratio === 2.5,
   invalidWeightedInteger: (() => {{ const invalid = h.clone(document); invalid.search.weighted_search.history_step_minutes = 0; return h.validSettingsDocument(invalid) === false; }})(),
+  invalidSeed: errorField(() => h.settingsPatch(document, {{...values, seed: '-1'}})) === 'seed',
+  invalidMinimumCommonDays: errorField(() => h.settingsPatch(document, {{...values, minimum_common_days: '0'}})) === 'minimum-common-days',
+  missingRequiredInputsRejected: h.validSettingsDocument(missingSeed) === false && h.validSettingsDocument(missingMinimumCommonDays) === false,
+  safeIntegerBoundary: h.settingsPatch(document, {{...values, seed: String(Number.MAX_SAFE_INTEGER), minimum_common_days: String(Number.MAX_SAFE_INTEGER)}}).search.seed === Number.MAX_SAFE_INTEGER,
+  unsafeIntegerRejected: errorField(() => h.settingsPatch(document, {{...values, seed: '9007199254740992'}})) === 'seed',
+  invalidStage1Lexemes: ['', ' ', '1e3', '2.5', 'abc'].every((value) => errorField(() => h.settingsPatch(document, {{...values, seed: value}})) === 'seed' && errorField(() => h.settingsPatch(document, {{...values, minimum_common_days: value}})) === 'minimum-common-days'),
   invalidWeightedFloat: (() => {{ const invalid = h.clone(document); invalid.search.weighted_search.priority_close_ratio = 1; return h.validSettingsDocument(invalid) === false; }})(),
-  invalidWeightedBoolean: (() => {{ try {{ h.settingsPatch(document, {{...values, weighted_search: {{...values.weighted_search, bootstrap_p95: 'false'}}}}); return false; }} catch (_) {{ return true; }} }})(),
   diagnosticBound: h.validSettingsDocument(invalidDiagnostic) === false && errorField(() => h.settingsPatch(document, {{...values, weighted_search: {{...values.weighted_search, bootstrap_diagnostic_scenarios: '901'}}}})) === 'weighted-bootstrap-diagnostic-scenarios',
-  fixedDaysRejected: h.validSettingsDocument(badDays) === false && h.validSettingsDocument(shortDays) === false && h.validSettingsDocument(stringDay) === false,
-  fixedDaysError: errorField(() => h.settingsPatch(document, {{...values, weighted_search: {{...values.weighted_search, bootstrap_block_days: '1,3,5'}}}})) === 'weighted-bootstrap-block-days',
-  fixedDaysUiError: errorField(() => h.settingsPatch(document, {{...values, weighted_search: {{...values.weighted_search, bootstrap_block_days: '1,3,7,9'}}}})) === 'weighted-bootstrap-block-days',
-  p95Error: errorField(() => h.settingsPatch(document, {{...values, weighted_search: {{...values.weighted_search, bootstrap_p95: 'false'}}}})) === 'weighted-bootstrap-p95',
   representativeMaximums: h.settingsPatch(document, {{...values, weighted_search: maximums}}).search.weighted_search.priority_groups === 5,
-  zeroAllowed: (() => {{ const zero = h.settingsPatch(document, {{...values, weighted_search: zeros}}).search.weighted_search; return zero.alternatives_per_profile === 0 && zero.p30_tolerance_pct === 0 && zero.limiter_controls === 0 && zero.limiter_stress_pct === 0 && zero.priority_beta === 0 && zero.api_retries === 0; }})(),
+  zeroAllowed: (() => {{ const zero = h.settingsPatch(document, {{...values, weighted_search: zeros}}).search.weighted_search; return zero.limiter_controls === 0 && zero.limiter_stress_pct === 0 && zero.priority_beta === 0; }})(),
   strictWeightedKeys: h.validSettingsDocument(extraKey) === false && h.validSettingsDocument(missingKey) === false,
-  advancedReveal: (h.settingsValidationFeedback({{field: 'weighted-bootstrap-p95'}}, advancedQuery, advancedMeta), advancedDetails.open === true && advancedState.focused && advancedState.ariaInvalid === 'true' && advancedState.validity === 'Введите корректное значение для поля.' && advancedMeta.textContent.includes('Advanced field')),
+  advancedReveal: (h.settingsValidationFeedback({{field: 'weighted-bootstrap-diagnostic-scenarios'}}, advancedQuery, advancedMeta), advancedDetails.open === true && advancedState.focused && advancedState.ariaInvalid === 'true' && advancedState.validity === 'Введите корректное значение для поля.' && advancedMeta.textContent.includes('Advanced field')),
+  historyReveal: (h.settingsValidationFeedback({{field: 'seed'}}, historyQuery, advancedMeta), historyDetails.open === true && historyState.focused),
   scientificNotationRejected: h.validSettingsDocument(scientificNumber) === false,
-  roundTripP30Field: maxRuleField('p30_tolerance_pct', '0.0000001') === 'weighted-p30-tolerance-pct',
-  roundTripLimiterField: maxRuleField('limiter_stress_pct', '0.0000001') === 'weighted-limiter-stress-pct',
-  maxRuleFields: maxRuleField('lp_solutions_per_profile', '21') === 'weighted-lp-solutions-per-profile' && maxRuleField('repair_attempts', '4') === 'weighted-repair-attempts' && maxRuleField('additional_passes', '2') === 'weighted-additional-passes' && maxRuleField('alternatives_per_profile', '3') === 'weighted-alternatives-per-profile' && maxRuleField('limiter_controls', '3') === 'weighted-limiter-controls' && maxRuleField('priority_groups', '6') === 'weighted-priority-groups' && maxRuleField('max_targets', '9') === 'weighted-max-targets' && maxRuleField('cdar_pct', '100') === 'weighted-cdar-pct' && maxRuleField('p30_tolerance_pct', '100') === 'weighted-p30-tolerance-pct' && maxRuleField('priority_beta', '1.1') === 'weighted-priority-beta' && maxRuleField('priority_close_ratio', '1') === 'weighted-priority-close-ratio',
+  roundTripAll: roundTrip('history_step_minutes', '11', 11) && roundTrip('lp_solutions_per_profile', '11', 11) && roundTrip('max_targets', '7', 7) && roundTrip('bootstrap_scenarios_per_block', '901', 901) && roundTrip('bootstrap_diagnostic_scenarios', '90', 90) && roundTrip('wall_time_seconds', '801', 801) && roundTrip('solver_time_seconds', '21', 21) && roundTrip('limiter_step', '2', 2) && roundTrip('limiter_controls', '1', 1) && roundTrip('limiter_stress_pct', '1.25', 1.25) && roundTrip('priority_groups', '4', 4) && roundTrip('priority_beta', '0.4', 0.4) && roundTrip('priority_close_ratio', '2.5', 2.5),
+  positiveFieldsRejectZero: ['history_step_minutes', 'lp_solutions_per_profile', 'max_targets', 'bootstrap_scenarios_per_block', 'bootstrap_diagnostic_scenarios', 'wall_time_seconds', 'solver_time_seconds', 'limiter_step', 'priority_groups'].every((name) => !!maxRuleField(name, '0')),
+  maxRuleFields: maxRuleField('lp_solutions_per_profile', '21') === 'weighted-lp-solutions-per-profile' && maxRuleField('max_targets', '9') === 'weighted-max-targets' && maxRuleField('limiter_controls', '3') === 'weighted-limiter-controls' && maxRuleField('limiter_stress_pct', '100') === 'weighted-limiter-stress-pct' && maxRuleField('priority_groups', '6') === 'weighted-priority-groups' && maxRuleField('priority_beta', '1.1') === 'weighted-priority-beta' && maxRuleField('priority_close_ratio', '1') === 'weighted-priority-close-ratio',
+  invalidFeeRates: ['', '-0.1', '1', '1.0', '0.0000000000001'].every((value) => errorField(() => h.settingsPatch(document, {{...values, open_fee_rate: value}})) === 'open-fee-rate') && errorField(() => h.settingsPatch(document, {{...values, close_fee_rate: '1'}})) === 'close-fee-rate',
 }};
 if (Object.values(checks).some((value) => !value)) process.exit(1);
 """
@@ -1761,18 +2045,18 @@ def test_portfolio_settings_exposes_only_the_exact_weighted_search_schema() -> N
     html = _read("index.html")
     js = _read("app.js")
     weighted_fields = (
-        "history_step_minutes", "lp_solutions_per_profile", "repair_attempts", "additional_passes", "base_vectors", "scenarios",
-        "cdar_pct", "diagnostic_cdar_pct", "alternatives_per_profile", "p30_tolerance_pct", "bootstrap_block_days",
-        "bootstrap_scenarios_per_block", "bootstrap_p95", "bootstrap_diagnostic_scenarios", "bootstrap_low_block_common_days",
-        "scale_warning_multiple", "limiter_step", "limiter_controls", "limiter_stress_pct", "priority_groups", "priority_beta",
-        "priority_close_ratio", "wall_time_seconds", "solver_time_seconds", "max_targets", "api_requests_per_second",
-        "api_concurrency", "api_retries", "reference_max_age_hours", "csv_download_concurrency",
+        "history_step_minutes", "lp_solutions_per_profile", "max_targets",
+        "bootstrap_scenarios_per_block", "bootstrap_diagnostic_scenarios",
+        "wall_time_seconds", "solver_time_seconds", "limiter_step", "limiter_controls",
+        "limiter_stress_pct", "priority_groups", "priority_beta", "priority_close_ratio",
     )
     for field in weighted_fields:
-        field_id = "archive-download-concurrency" if field == "csv_download_concurrency" else field.replace("_", "-")
-        assert f'id="portfolio-settings-weighted-{field_id}"' in html
-    assert 'id="portfolio-settings-weighted-advanced"' in html
-    assert not re.search(r'<details id="portfolio-settings-weighted-advanced"[^>]*\bopen(?:\s|>)', html)
+        assert f'id="portfolio-settings-weighted-{field.replace("_", "-")}"' in html
+    assert 'id="portfolio-settings-advanced"' in html
+    assert 'id="portfolio-settings-phase13"' in html
+    assert not re.search(r'<details id="portfolio-settings-(?:advanced|phase13)"[^>]*\bopen(?:\s|>)', html)
+    for field in ("repair-attempts", "additional-passes", "base-vectors", "scenarios", "cdar-pct", "diagnostic-cdar-pct", "alternatives-per-profile", "p30-tolerance-pct", "bootstrap-block-days", "bootstrap-p95", "bootstrap-low-block-common-days", "scale-warning-multiple", "api-requests-per-second", "api-concurrency", "api-retries", "reference-max-age-hours", "archive-download-concurrency"):
+        assert f'id="portfolio-settings-weighted-{field}"' not in html
     assert 'id="portfolio-settings-document"' not in html
     assert "weightedSearchValid" in js
     assert "payload.search.weighted_search" in js
@@ -1801,26 +2085,27 @@ def test_portfolio_settings_helpers_validate_v2_lexemes_and_hidden_fields() -> N
             "weekend_end_utc": "MONDAY 00:00",
             "archive_publication_lag_hours": 6,
             "backfill_write_enabled": False,
+            "spread_history_bypass_pretest": False,
         },
         "search": {
+            "seed": 1,
             "total_test_budget": 9,
             "sizing_mode": "liquidity_cap_single",
             "max_enumerated_combinations": 100000,
+            "composition": {"policy_id": "operator_supplied_composition_v1", "parameters": {"operator_supplied": True, "minimum_common_days": 14, "minimum_daily_coverage_pct": 90, "maximum_forward_fill_gap_days": 3}},
             "weighted_search": {
-                "history_step_minutes": 5, "lp_solutions_per_profile": 20, "repair_attempts": 3, "additional_passes": 1,
-                "base_vectors": 100, "scenarios": 200, "cdar_pct": 80, "diagnostic_cdar_pct": 90,
-                "alternatives_per_profile": 2, "p30_tolerance_pct": 5, "bootstrap_block_days": [1, 3, 7],
-                "bootstrap_scenarios_per_block": 1000, "bootstrap_p95": True, "bootstrap_diagnostic_scenarios": 100,
-                "bootstrap_low_block_common_days": 10, "scale_warning_multiple": 10, "limiter_step": 1,
-                "limiter_controls": 2, "limiter_stress_pct": 1.5, "priority_groups": 5, "priority_beta": 0.5,
-                "priority_close_ratio": 2, "wall_time_seconds": 900, "solver_time_seconds": 30, "max_targets": 8,
-                "api_requests_per_second": 2, "api_concurrency": 1, "api_retries": 3, "reference_max_age_hours": 2,
-                "csv_download_concurrency": 2,
+                "history_step_minutes": 5, "lp_solutions_per_profile": 20, "max_targets": 8,
+                "bootstrap_scenarios_per_block": 1000, "bootstrap_diagnostic_scenarios": 100,
+                "wall_time_seconds": 900, "solver_time_seconds": 30, "limiter_step": 1,
+                "limiter_controls": 2, "limiter_stress_pct": 1.5, "priority_groups": 5,
+                "priority_beta": 0.5, "priority_close_ratio": 2,
             },
         },
         "runner": {"root": "hidden", "token": {"keep": True}},
     }
     values = {
+        "seed": "1",
+        "minimum_common_days": "14",
         "profiles": {
             profile: {"deposit": "10", "collateral": "20", "max_balance": "30", "upper_bound": "30", "individual_max_dd_pct": "20", "individual_net_pnl_min_exclusive": "0", "top_n": "2"}
             for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
@@ -1833,61 +2118,87 @@ def test_portfolio_settings_helpers_validate_v2_lexemes_and_hidden_fields() -> N
         "weekend_start_utc": "SATURDAY 00:00",
         "weekend_end_utc": "MONDAY 00:00",
         "backfill_write_enabled": False,
+        "spread_history_bypass_pretest": False,
         "weighted_search": {
-            "history_step_minutes": "5", "lp_solutions_per_profile": "20", "repair_attempts": "3", "additional_passes": "1",
-            "base_vectors": "100", "scenarios": "200", "cdar_pct": "80", "diagnostic_cdar_pct": "90",
-            "alternatives_per_profile": "2", "p30_tolerance_pct": "5", "bootstrap_block_days": "1,3,7",
-            "bootstrap_scenarios_per_block": "1000", "bootstrap_p95": True, "bootstrap_diagnostic_scenarios": "100",
-            "bootstrap_low_block_common_days": "10", "scale_warning_multiple": "10", "limiter_step": "1",
-            "limiter_controls": "2", "limiter_stress_pct": "1.5", "priority_groups": "5", "priority_beta": "0.5",
-            "priority_close_ratio": "2", "wall_time_seconds": "900", "solver_time_seconds": "30", "max_targets": "8",
-            "api_requests_per_second": "2", "api_concurrency": "1", "api_retries": "3", "reference_max_age_hours": "2",
-            "csv_download_concurrency": "2",
+            "history_step_minutes": "5", "lp_solutions_per_profile": "20", "max_targets": "8",
+            "bootstrap_scenarios_per_block": "1000", "bootstrap_diagnostic_scenarios": "100",
+            "wall_time_seconds": "900", "solver_time_seconds": "30", "limiter_step": "1",
+            "limiter_controls": "2", "limiter_stress_pct": "1.5", "priority_groups": "5",
+            "priority_beta": "0.5", "priority_close_ratio": "2",
         },
     }
     changed = json.loads(json.dumps(values))
     changed["round_down_usdt"] = "25"
-    changed["profiles"]["AGGRESSIVE"].update({"max_balance": "31.25", "upper_bound": "40", "individual_max_dd_pct": "25.5", "individual_net_pnl_min_exclusive": "-0.5", "top_n": "3"})
     script = _read("app.js").split("const ORDER_BUCKETS", 1)[0] + f"""
 const h = globalThis.portfolioSettingsHelpers;
 const document = {json.dumps(document)};
 const values = {json.dumps(values)};
 const changed = {json.dumps(changed)};
+const omitted = h.clone(values); delete omitted.weighted_search.limiter_step;
 const unchanged = h.settingsPatch(document, values);
 const edited = h.settingsPatch(document, changed);
-const scaleNumber = h.clone(document); scaleNumber.scenarios.AGGRESSIVE.sizing.upper_bound.amount = 100;
-const scaleNumberValues = h.clone(values); scaleNumberValues.profiles.AGGRESSIVE.upper_bound = '100.0';
-const scaleString = h.clone(document); scaleString.scenarios.AGGRESSIVE.sizing.upper_bound.amount = '100.00';
-const scaleStringValues = h.clone(values); scaleStringValues.profiles.AGGRESSIVE.upper_bound = '100.00';
+const omittedResult = h.settingsPatch(document, omitted);
 const floatDocument = h.clone(document); floatDocument.scenarios.AGGRESSIVE.deposit.amount = 1.5;
 const mixedCurrency = h.clone(document); mixedCurrency.scenarios.AGGRESSIVE.collateral.currency = 'EUR';
+const equalWeekendDocument = h.clone(document); equalWeekendDocument.liquidity.weekend_end_utc = 'SATURDAY 00:00';
 const mustThrow = (callback) => {{ try {{ callback(); return false; }} catch (_) {{ return true; }} }};
-const invalidMoney = ['0', '-1', '1e3', '1,5', ''];
 const checks = {{
   unchanged: JSON.stringify(unchanged) === JSON.stringify(document),
   hiddenPreserved: edited.runner.root === 'hidden' && edited.runner.token.keep === true,
-  stringDecimal: typeof edited.scenarios.AGGRESSIVE.max_balance.amount === 'string',
-  stringIntegerEdit: typeof h.settingsMoneyValue('11', '10.00') === 'string',
-  stringScalePreserved: h.settingsMoneyValue('10.00', '10.00') === '10.00',
-  changedDdString: typeof edited.profiles.AGGRESSIVE.individual_max_dd_pct === 'string',
-  changedPnlString: typeof edited.profiles.AGGRESSIVE.individual_net_pnl_min_exclusive === 'string',
+  scenariosPreserved: JSON.stringify(edited.scenarios) === JSON.stringify(document.scenarios),
+  profilesPreserved: JSON.stringify(edited.profiles) === JSON.stringify(document.profiles),
+  weekendPreserved: edited.liquidity.weekend_start_utc === document.liquidity.weekend_start_utc && edited.liquidity.weekend_end_utc === document.liquidity.weekend_end_utc,
+  omittedWeightedPreserved: omittedResult.search.weighted_search.limiter_step === document.search.weighted_search.limiter_step,
+  exposedChanged: edited.liquidity.round_down_usdt === 25,
   gridAbsent: edited.scenarios.AGGRESSIVE.sizing.grid === undefined,
   integerLexemes: ['1.0', '1e3', '0', '-1', ',', ''].every((value) => mustThrow(() => h.settingsIntegerValue(value))),
-  moneyLexemes: invalidMoney.every((value) => mustThrow(() => h.settingsMoneyValue(value, 1))),
-  unsafeIntegerRejected: mustThrow(() => h.settingsMoneyValue('9007199254740993', 1)),
-  mixedScaleNumberAccepted: h.settingsPatch(scaleNumber, scaleNumberValues).scenarios.AGGRESSIVE.sizing.upper_bound.amount === '100.0',
-  mixedScaleStringAccepted: h.settingsPatch(scaleString, scaleStringValues).scenarios.AGGRESSIVE.sizing.upper_bound.amount === '100.00',
   floatInboundRejected: h.validSettingsDocument(floatDocument) === false && mustThrow(() => h.settingsPatch(floatDocument, values)),
   mixedCurrencyRejected: h.validSettingsDocument(mixedCurrency) === false && mustThrow(() => h.settingsPatch(mixedCurrency, values)),
-  invalidDdRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, individual_max_dd_pct: '-1'}}}}}})),
-  invalidPnlRejected: mustThrow(() => h.settingsPatch(document, {{...values, profiles: {{...values.profiles, AGGRESSIVE: {{...values.profiles.AGGRESSIVE, individual_net_pnl_min_exclusive: '1e3'}}}}}})),
   invalidParticipationRejected: mustThrow(() => h.settingsPatch(document, {{...values, close_volume_participation_pct: '201'}})),
   invalidRoundingRejected: mustThrow(() => h.settingsPatch(document, {{...values, round_down_usdt: '0'}})),
   invalidCoverageRejected: mustThrow(() => h.settingsPatch(document, {{...values, minimum_coverage_pct: '101'}})),
   invalidAgeRejected: mustThrow(() => h.settingsPatch(document, {{...values, maximum_age_hours: '0'}})),
   zeroLagAccepted: h.settingsPatch(document, {{...values, archive_publication_lag_hours: '0'}}).liquidity.archive_publication_lag_hours === 0,
-  equalWeekendRejected: mustThrow(() => h.settingsPatch(document, {{...values, weekend_end_utc: 'SATURDAY 00:00'}})),
+  equalWeekendRejected: h.validSettingsDocument(equalWeekendDocument) === false,
 }};
+if (Object.values(checks).some((value) => !value)) process.exit(1);
+"""
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_portfolio_settings_helpers_patch_all_nine_risk_leaves_and_reject_bad_decimal() -> None:
+    js = _read("app.js")
+    script = js.split("const ORDER_BUCKETS", 1)[0] + """
+const h = globalThis.portfolioSettingsHelpers;
+const profiles = ['AGGRESSIVE', 'BALANCED', 'CONSERVATIVE'];
+const document = {
+  schema_version: 2,
+  scenarios: Object.fromEntries(profiles.map((profile) => [profile, {
+    deposit: { amount: 10, currency: 'USDT' }, collateral: { amount: 20, currency: 'USDT' },
+    max_balance: { amount: 30, currency: 'USDT' }, sizing: { upper_bound: { amount: 30, currency: 'USDT' } },
+  }])),
+  profiles: Object.fromEntries(profiles.map((profile) => [profile, {
+    max_actual_equity_dd_pct: '20', min_calculated_free_margin_reserve_pct: '20', max_calculated_account_mm_load_pct: '50',
+    individual_max_dd_pct: 20, individual_net_pnl_min_exclusive: 0, ranking: { top_n: 2 },
+  }])),
+  liquidity: { parameters: { close_volume_participation_pct: 30 }, round_down_usdt: 50, minimum_coverage_pct: 90, maximum_age_hours: 2, weekend_start_utc: 'SATURDAY 00:00', weekend_end_utc: 'MONDAY 00:00', archive_publication_lag_hours: 6, backfill_write_enabled: false, spread_history_bypass_pretest: false },
+  search: { total_test_budget: 9, sizing_mode: 'liquidity_cap_single', max_enumerated_combinations: 100000, weighted_search: {
+    history_step_minutes: 5, lp_solutions_per_profile: 20, max_targets: 8, bootstrap_scenarios_per_block: 1000, bootstrap_diagnostic_scenarios: 100, wall_time_seconds: 900, solver_time_seconds: 30, limiter_step: 1, limiter_controls: 2, limiter_stress_pct: 1.5, priority_groups: 5, priority_beta: 0.5, priority_close_ratio: 2,
+  }, seed: 1, composition: { policy_id: 'operator_supplied_composition_v1', parameters: { operator_supplied: true, minimum_common_days: 14, minimum_daily_coverage_pct: 90, maximum_forward_fill_gap_days: 3 } } },
+  runner: { root: 'hidden', token: { keep: true } },
+};
+const patchValues = (risk_policy) => ({ seed: '1', minimum_common_days: '14', max_enumerated_combinations: '100000', close_volume_participation_pct: '30', round_down_usdt: '50', minimum_coverage_pct: '90', maximum_age_hours: '2', archive_publication_lag_hours: '6', backfill_write_enabled: false, spread_history_bypass_pretest: false, weighted_search: { ...document.search.weighted_search }, risk_policy });
+const values = patchValues(Object.fromEntries(profiles.map((profile) => [profile, { max_actual_equity_dd_pct: '10.000000000001', min_calculated_free_margin_reserve_pct: '40.000000000001', max_calculated_account_mm_load_pct: '35.000000000001' }])));
+const before = JSON.stringify(document);
+const patched = h.settingsPatch(document, values);
+const bad = (field, value) => { try { const policy = Object.fromEntries(profiles.map((profile) => [profile, { max_actual_equity_dd_pct: '10', min_calculated_free_margin_reserve_pct: '40', max_calculated_account_mm_load_pct: '35' }])); policy.BALANCED[field] = value; h.settingsPatch(document, patchValues(policy)); return false; } catch (error) { return error.field === `risk-balanced-${field.replaceAll('_', '-')}`; } };
+const checks = {
+  sourceUnchanged: JSON.stringify(document) === before,
+  allProfilesPatched: profiles.every((profile) => patched.profiles[profile].max_actual_equity_dd_pct === '10.000000000001' && patched.profiles[profile].min_calculated_free_margin_reserve_pct === '40.000000000001' && patched.profiles[profile].max_calculated_account_mm_load_pct === '35.000000000001'),
+  precisionAccepted: h.settingsPatch(document, patchValues(Object.fromEntries(profiles.map((profile) => [profile, { max_actual_equity_dd_pct: '0.000000000001', min_calculated_free_margin_reserve_pct: '100', max_calculated_account_mm_load_pct: '0' }])))).profiles.AGGRESSIVE.max_actual_equity_dd_pct === '0.000000000001',
+  blankRejected: bad('max_actual_equity_dd_pct', ''), commaRejected: bad('max_actual_equity_dd_pct', '1,2'), tooPreciseRejected: bad('max_actual_equity_dd_pct', '0.1234567890123'), tooLargeRejected: bad('max_actual_equity_dd_pct', '100.000000000001'),
+};
 if (Object.values(checks).some((value) => !value)) process.exit(1);
 """
     completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
@@ -1901,6 +2212,92 @@ def test_portfolio_form_has_no_speculative_nullable_config_fields() -> None:
     assert 'name="max_balance_usdt"' not in portfolio
     assert 'name="default_max_balance"' not in portfolio
     assert 'schema_version="2"' not in portfolio
+
+
+def test_portfolio_settings_exposes_one_pretest_spread_history_bypass_checkbox() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    assert html.count('id="portfolio-settings-spread-history-bypass-pretest"') == 1
+    assert "Предварительный расчёт без истории стакана" in html
+    assert "liquidity.spread_history_bypass_pretest" in js
+    assert "spread-history-bypass-pretest" in js
+
+
+def test_portfolio_panel_keeps_unknown_spread_blocker_codes_visible_verbatim() -> None:
+    js = _read("app.js")
+    script = js.split("const ORDER_BUCKETS", 1)[0] + """
+const helper = globalThis.portfolioReasonHelpers;
+const unknown = 'SPREAD_HISTORY_UNAVAILABLE';
+if (helper.humanize(unknown) !== unknown) process.exit(1);
+"""
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    assert "portfolioReasonHelpers.humanize(typeof value === 'string' ? value" in js
+
+
+def test_portfolio_panel_renders_pretest_spread_warning_from_result_summary() -> None:
+    js = _read("app.js")
+    css = _read("app.css")
+    render_results = js.split("const renderResults = async (job) =>", 1)[1].split("const renderJob = (job) =>", 1)[0]
+
+    assert "const values = result.summary || result;" in render_results
+    assert "for (const [key, value] of Object.entries(values || {}))" not in render_results
+    for label in (
+        "Взято финалистов в расчёт", "В вариант №1 вошло", "Без позиции", "Вариант №1", "Остальные варианты находятся в XLSX.",
+        "Банки", "Насыщение", "Целевой банк", "Минимальный банк для DD ≤", "Банк для DD ≤", "Банк для профильных лимитов",
+        "Просадки", "MaxDD SUM", "Исторический рассчитанный DD", "Средняя глубина худших 20% просадок",
+        "Средняя глубина худших 10% просадок", "Капитал и результат", "PnL", "IM", "MM",
+        "Состав варианта", "Полный номинал позиции", "Множитель пары", "max_balance", "Распределение входов", "Технические данные",
+        "целевой банк / банк насыщения",
+    ):
+        assert label in render_results
+    for redundant in ("Прочитано финалистов", "Отобрано кандидатов", "USER_RANK_CUTOFF"):
+        assert redundant not in render_results
+    assert "values.finalists_read" not in render_results
+    assert "values.excluded" not in render_results
+    assert "values.optimizer_warnings" not in render_results
+    for unsafe_html_sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
+        assert unsafe_html_sink not in render_results
+    assert "label.textContent = labelText" in render_results
+    assert "value.textContent = format(rawValue) || '—'" in render_results
+    assert "if (!portfolioResultHelpers.known(rawValue)) continue" not in render_results
+    assert "code.textContent = String(value)" in render_results
+    assert "Number(values['Limiter L']) > 0" in render_results
+    assert "portfolio-result-accepted" in css
+    assert "portfolio-result-metrics" in css
+    assert "portfolio-result-members" in css
+    assert "portfolio-result-bank-group" in css
+    assert "portfolio-result-drawdown-group" in css
+    assert "portfolio-result-capital-group" in css
+
+
+def test_portfolio_result_formatting_is_compact_and_hides_unknown_values() -> None:
+    js = _read("app.js")
+    script = js.split("const ORDER_BUCKETS", 1)[0] + """
+const h = globalThis.portfolioResultHelpers;
+const payload = { zero: 0, textZero: '0', exponentZero: '0E-18', negative: '-12.3456', falseValue: false };
+const before = JSON.stringify(payload);
+const checks = {
+  longDecimal: h.metric('215.112765539596662941132816039291456392347838') === '215,11',
+  percent: h.metric('20.0', 1, '%') === '20%',
+  uncapped: h.bank('UNCAPPED') === 'Без ограничения',
+  unknownHidden: h.known('UNKNOWN') === false && h.known('NOT_TESTED') === false,
+  zeroKnown: h.known(payload.zero) && h.known(payload.textZero) && h.known(payload.exponentZero),
+  falseKnown: h.known(payload.falseValue),
+  negative: h.metric(payload.negative) === '-12,35',
+  exponent: ['1 000', '1 000'].includes(h.metric('1E+3')),
+  invalidPreserved: h.metric('not-a-number') === 'not-a-number',
+  profile: h.profile('AGGRESSIVE') === 'Агрессивный',
+  amountRatios: h.amountRatios('130.32', '26.064', '12.81') === '130,32 USDT · 26,06% / 12,81%',
+  uncappedRatio: h.amountRatios('130.32', '—', '12.81') === '130,32 USDT · — / 12,81%',
+  entryOrderPercentages: h.orderPercentages(['50', '50']) === '50% / 50%',
+  inputUnchanged: JSON.stringify(payload) === before,
+};
+if (Object.values(checks).some((value) => !value)) process.exit(1);
+"""
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def test_portfolio_launch_validates_decimal_and_profile_candidate_fields() -> None:
@@ -1935,7 +2332,7 @@ def test_portfolio_overall_progress_does_not_claim_unknown_stage_is_known() -> N
     portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
 
     assert "stageIndeterminate" in portfolio
-    assert "indeterminate" in portfolio
+    assert "точный прогресс неизвестен" in portfolio
     assert "overallPercent" in portfolio
 
 
@@ -1970,3 +2367,20 @@ if (!actual.includes('UNKNOWN:OTHER')) process.exit(1);
 """
     completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr or completed.stdout
+def test_portfolio_settings_has_editable_risk_controls_and_scoped_alignment() -> None:
+    html = _read("index.html")
+    css = _read("app.css")
+    settings = html.split('id="portfolio-settings"', 1)[1].split("</details>", 1)[0]
+    policy = settings.split('class="portfolio-profile-policy-table"', 1)[1].split("</table>", 1)[0]
+
+    assert 'class="section-subtitle"' in settings
+    assert "<strong>" in settings
+    assert policy.count("<tr>") == 4
+    assert policy.count('type="text"') == 9
+    for profile in ("aggressive", "balanced", "conservative"):
+        for field in ("max-actual-equity-dd-pct", "min-calculated-free-margin-reserve-pct", "max-calculated-account-mm-load-pct"):
+            assert f'id="portfolio-settings-risk-{profile}-{field}"' in policy
+    assert 'min="0" max="100" step="0.000000000001"' in policy
+    assert 'class="field-grid portfolio-settings-field-grid"' in html
+    assert ".portfolio-settings-field-grid { align-items: start; }" in css
+    assert ".portfolio-settings-field-grid .field-group > label" in css

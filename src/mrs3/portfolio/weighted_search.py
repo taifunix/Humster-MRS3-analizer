@@ -779,6 +779,48 @@ def _worker_exception_type(value: Any, fallback: str = "WorkerFailure") -> str:
     return value if isinstance(value, str) and value.isidentifier() and len(value) <= 128 else fallback
 
 
+def _progress_detail(value: Any) -> str:
+    """Return a bounded, valid UTF-8 progress detail without affecting search."""
+    raw = str(value).encode("utf-8")[:160]
+    return raw.decode("utf-8", "ignore")
+
+
+def _progress_sink(callback: Callable[[Mapping[str, Any]], Any] | None) -> Callable[..., None] | None:
+    """Make progress reporting best-effort and self-disabling after three errors."""
+    if callback is None:
+        return None
+    failures = 0
+    disabled = False
+    last_emit = 0.0
+    last_substage: str | None = None
+
+    def emit(*, substage: str, unit: str, completed: int, total: int | None, detail: Any = "") -> None:
+        nonlocal failures, disabled, last_emit, last_substage
+        if disabled:
+            return
+        event = {
+            "substage": str(substage),
+            "unit": str(unit),
+            "completed": max(0, int(completed)),
+            "total": None if total is None else max(0, int(total)),
+            "detail": _progress_detail(detail),
+        }
+        now = time.monotonic()
+        force = event["substage"] != last_substage or (event["total"] is not None and event["completed"] >= event["total"] > 0)
+        if not force and now - last_emit < 0.25:
+            return
+        last_emit = now
+        last_substage = event["substage"]
+        try:
+            callback(event)
+        except Exception:
+            failures += 1
+            if failures >= 3:
+                disabled = True
+
+    return emit
+
+
 def bootstrap_banks(
     normalized_delta: Sequence[Sequence[Any]],
     x_vectors: Sequence[Sequence[Any]],
@@ -795,6 +837,7 @@ def bootstrap_banks(
     wall_time_limit_seconds: Any | None = None,
     prefix_result: _BootstrapBankResult | None = None,
     model_identity: Any = WEIGHTED_V1,
+    progress_callback: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> _BootstrapBankResult:
     """Compute historical and stationary-bootstrap required banks in bounded batches.
 
@@ -895,6 +938,15 @@ def bootstrap_banks(
             })
     task_by_id = {int(task["task_id"]): task for task in tasks}
     task_count = len(tasks)
+    emit_progress = _progress_sink(progress_callback)
+    if emit_progress is not None:
+        emit_progress(
+            substage="BOOTSTRAP",
+            unit="batch",
+            completed=0,
+            total=task_count,
+            detail="bootstrap batches enumerated",
+        )
     new_scenario_count = sum(scenarios_per_family - count for count in prefix_counts)
     available_memory = max(1, int(psutil.virtual_memory().available))
     sampled_decimal_bytes = sys.getsizeof(increments[0][0]) if increments and increments[0] else 0
@@ -1039,6 +1091,14 @@ def bootstrap_banks(
                 worker_peak_rss = max(worker_peak_rss, parent_process.memory_info().rss + group_worker_rss)
             else:
                 worker_peak_rss = max(worker_peak_rss, group_worker_rss)
+            if emit_progress is not None and validated_results:
+                emit_progress(
+                    substage="BOOTSTRAP",
+                    unit="batch",
+                    completed=min(task_count, task_offset + len(validated_results)),
+                    total=task_count,
+                    detail="bootstrap batch completed",
+                )
             if batch_failed:
                 stopping_reason = "WORKER_FAILURE"
             if stopping_reason is not None:
@@ -3388,6 +3448,7 @@ def weighted_search(
     proposed_x: Sequence[Any] | None = None,
     proposal_validator: Callable[[tuple[Decimal, ...]], bool] | None = None,
     max_candidates: int = 20,
+    max_solver_calls: int = 20,
     seed: int = 731,
     bootstrap_scenarios: int = 1000,
     screening_scenarios: int = 100,
@@ -3395,11 +3456,14 @@ def weighted_search(
     wall_time: Any = Decimal("900"),
     solver_time: Any = Decimal("30"),
     cancel: Callable[[], bool] | None = None,
+    progress_callback: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> SearchResult:
     """Find a bounded weighted frontier and verify its base vectors with bootstrap risk."""
     max_targets = _validate_max_targets(max_targets)
     if type(max_candidates) is not int or not 1 <= max_candidates <= 50:
         raise ValueError("max_candidates must be an integer from 1 to 50")
+    if type(max_solver_calls) is not int or not 1 <= max_solver_calls <= 20:
+        raise ValueError("max_solver_calls must be an integer from 1 to 20")
     if type(bootstrap_scenarios) is not int or bootstrap_scenarios <= 0:
         raise ValueError("bootstrap_scenarios must be a positive integer")
     if type(screening_scenarios) is not int or screening_scenarios <= 0 or screening_scenarios > bootstrap_scenarios:
@@ -3411,6 +3475,7 @@ def weighted_search(
     _bootstrap_seed(seed, 0, 0)
     if cancel is not None and not callable(cancel):
         raise TypeError("cancel must be callable")
+    emit_progress = _progress_sink(progress_callback)
     normalized_delta = _validate_input(prepared)
     history_step_minutes = _decimal(prepared.history_step_minutes, "history_step_minutes", positive=True)
     n = len(prepared.strategy_ids)
@@ -3507,7 +3572,7 @@ def weighted_search(
         if reason is not None:
             budget_reason = reason
             return False
-        if calls >= 20:
+        if calls >= max_solver_calls:
             budget_reason = "SOLVER_CALL_LIMIT"
             return False
         calls += 1
@@ -3544,6 +3609,14 @@ def weighted_search(
         discovered.append((target_value, solution))
         if target_value is not None:
             solved[target_value] = solution
+        if emit_progress is not None:
+            emit_progress(
+                substage="SOLVER",
+                unit="solver_call",
+                completed=calls,
+                total=1 if target is not None or available is not None else None,
+                detail=f"solver call {calls}",
+            )
         return True
 
     if target is not None:
@@ -3606,17 +3679,22 @@ def weighted_search(
             if remaining is None:
                 budget_reason = "WALL_TIME_LIMIT"
             else:
+                bootstrap_kwargs = {
+                    "max_dd": drawdown,
+                    "common_days": days,
+                    "seed": seed,
+                    "history_step_minutes": history_step_minutes,
+                    "scenarios_per_family": screening_scenarios,
+                    "workers": workers,
+                    "cancel": cancel,
+                    "wall_time_limit_seconds": remaining,
+                }
+                if emit_progress is not None:
+                    bootstrap_kwargs["progress_callback"] = emit_progress
                 screening_result = bootstrap_banks(
                     normalized_delta,
                     tuple(solution.x for _target_value, solution in unique_entries),
-                    max_dd=drawdown,
-                    common_days=days,
-                    seed=seed,
-                    history_step_minutes=history_step_minutes,
-                    scenarios_per_family=screening_scenarios,
-                    workers=workers,
-                    cancel=cancel,
-                    wall_time_limit_seconds=remaining,
+                    **bootstrap_kwargs,
                 )
                 if not screening_result.complete:
                     budget_reason = screening_result.manifest.get("stopping_reason") or "BOOTSTRAP_INCOMPLETE"
@@ -3631,18 +3709,23 @@ def weighted_search(
                 if remaining is None:
                     budget_reason = "WALL_TIME_LIMIT"
                 else:
+                    bootstrap_kwargs = {
+                        "max_dd": drawdown,
+                        "common_days": days,
+                        "seed": seed,
+                        "history_step_minutes": history_step_minutes,
+                        "scenarios_per_family": bootstrap_scenarios,
+                        "workers": workers,
+                        "cancel": cancel,
+                        "wall_time_limit_seconds": remaining,
+                        "prefix_result": screening_result,
+                    }
+                    if emit_progress is not None:
+                        bootstrap_kwargs["progress_callback"] = emit_progress
                     bootstrap_result = bootstrap_banks(
                         normalized_delta,
                         tuple(solution.x for _target_value, solution in selected_entries),
-                        max_dd=drawdown,
-                        common_days=days,
-                        seed=seed,
-                        history_step_minutes=history_step_minutes,
-                        scenarios_per_family=bootstrap_scenarios,
-                        workers=workers,
-                        cancel=cancel,
-                        wall_time_limit_seconds=remaining,
-                        prefix_result=screening_result,
+                        **bootstrap_kwargs,
                     )
                     if not bootstrap_result.complete:
                         budget_reason = bootstrap_result.manifest.get("stopping_reason") or "BOOTSTRAP_INCOMPLETE"
@@ -3934,7 +4017,7 @@ def weighted_search(
                 additional_manifest["reason"] = "BANK_FIXED_UNAVAILABLE"
             elif not frozen_priorities:
                 additional_manifest["reason"] = "PRIORITY_UNKNOWN"
-            elif calls >= 20:
+            elif calls >= max_solver_calls:
                 budget_reason = "SOLVER_CALL_LIMIT"
                 additional_manifest["reason"] = "SOLVER_CALL_LIMIT"
             else:
@@ -4189,7 +4272,7 @@ def weighted_search(
                 budget_reason = reason
                 cdar_manifest["reasons"].append(reason)
                 break
-            if calls >= 20:
+            if calls >= max_solver_calls:
                 budget_reason = "SOLVER_CALL_LIMIT"
                 cdar_manifest["reasons"].append(budget_reason)
                 break
@@ -4428,7 +4511,7 @@ def weighted_search(
         if isinstance(manifest, Mapping)
     )
     remaining_work = {
-        "solver_call_slots": max(0, 20 - calls),
+        "solver_call_slots": max(0, max_solver_calls - calls),
         "base_x_slots": max(0, 2 * max_candidates - base_full_checked_count),
         "new_x_slots": max(0, max_candidates - len(new_x_digests)),
         "scenario_x_slots": max(0, 3 * max_candidates - (base_full_checked_count + len(new_x_digests))),
@@ -4439,6 +4522,7 @@ def weighted_search(
     manifest = {
         "parameters": {
             "max_candidates": max_candidates,
+            "max_solver_calls": max_solver_calls,
             "seed": seed,
             "bootstrap_scenarios": bootstrap_scenarios,
             "screening_scenarios": screening_scenarios,

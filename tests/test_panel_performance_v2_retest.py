@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from http.client import HTTPConnection
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import threading
 from types import SimpleNamespace
@@ -904,6 +905,57 @@ def test_committed_native_retest_verify_reports_missing_source_artifacts_for_fre
     assert "source artifacts" in str(error.value)
 
 
+@pytest.mark.parametrize("missing", ["inbox", "manifest", "root", "inbox_file"])
+def test_committed_native_retest_verify_reports_missing_inbox_for_fresh_run(tmp_path: Path, missing: str) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="verify-missing-inbox")
+    inbox = Path(controller._panel_jobs.runtime(tester_job_id)["inbox_path"])
+    if missing == "inbox":
+        shutil.rmtree(inbox)
+    elif missing == "manifest":
+        (inbox / "inbox_manifest.json").unlink()
+    elif missing == "root":
+        shutil.rmtree(inbox.parent)
+    else:
+        shutil.rmtree(inbox)
+        inbox.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(PerformanceV2ApiError) as error:
+        controller.strategies_tester_verify_inbox(tester_job_id)
+
+    assert error.value.code == "RETEST_SOURCE_ARTIFACTS_UNAVAILABLE"
+
+
+def test_committed_native_retest_verify_reports_moved_inbox_root_for_fresh_run(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="verify-moved-inbox")
+    config = json.loads(controller.default_config.read_text(encoding="utf-8"))
+    config["tester_runner"]["inbox_root"] = str(tmp_path / "moved-inbox")
+    controller.default_config.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2ApiError) as error:
+        controller.strategies_tester_verify_inbox(tester_job_id)
+
+    assert error.value.code == "RETEST_SOURCE_ARTIFACTS_UNAVAILABLE"
+    assert error.value.status == 409
+    assert (tmp_path / "inbox" / tester_job_id / "inbox_manifest.json").is_file()
+    assert controller._panel_jobs.get(tester_job_id)["state"] == "COMMITTED"
+
+
+def test_committed_native_retest_verify_reports_inbox_root_itself_for_fresh_run(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="verify-inbox-root")
+    config = json.loads(controller.default_config.read_text(encoding="utf-8"))
+    config["tester_runner"]["inbox_root"] = str(tmp_path / "inbox" / tester_job_id)
+    controller.default_config.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2ApiError) as error:
+        controller.strategies_tester_verify_inbox(tester_job_id)
+
+    assert error.value.code == "RETEST_SOURCE_ARTIFACTS_UNAVAILABLE"
+    assert error.value.status == 409
+
+
 def test_committed_native_retest_verify_rejects_same_size_foreign_manifest_without_capture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1121,7 +1173,7 @@ def test_retest_import_requires_committed_inbox_and_builds_mapping_on_server(tmp
     assert captured["replacement_strategy_ids"] == {"alpha": 1}
     assert captured["clear_retest_on_success"] is True
     assert captured["test_start"] == "2026-01-01"
-    assert captured["listing_dates_path"] == "input/dates.xlsx"
+    assert "listing_dates_path" not in captured
     assert controller._panel_jobs.runtime(job_id)["retest_import_job_id"] == "import"
     with pytest.raises(ValueError, match="already started"):
         controller.strategies_performance_v2_retest_import({"tester_job_id": job_id})
@@ -1132,6 +1184,27 @@ def test_retest_import_requires_committed_inbox_and_builds_mapping_on_server(tmp
     _committed_retest_job(controller, tmp_path / "not-ready", state="RUNNING", job_id="not-ready")
     with pytest.raises(ValueError, match="not committed"):
         controller.strategies_performance_v2_retest_import({"tester_job_id": "not-ready"})
+
+
+def test_retest_import_injects_current_server_listing_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = _controller(tmp_path)
+    tester_job_id = _committed_retest_job(controller, tmp_path, job_id="tester-server-listing")
+    runtime = controller._panel_jobs.runtime(tester_job_id)
+    monkeypatch.setattr(controller, "_retest_mapping", lambda _job_id: ({"alpha": 1}, runtime))
+    captured: dict[str, object] = {}
+
+    class StubJobs:
+        def start(self, request: object, *, job_id: str | None = None) -> dict[str, object]:
+            captured["request"] = request
+            return {"job_id": job_id, "state": "COMMITTED"}
+
+    controller._performance_v2_jobs = StubJobs()  # type: ignore[assignment]
+
+    controller.strategies_performance_v2_retest_import({"tester_job_id": tester_job_id})
+
+    request = captured["request"]
+    assert getattr(request, "listing_dates_root") == tmp_path.resolve()
+    assert getattr(request, "listing_dates_path") == Path("input/dates.xlsx")
 
 
 def test_retest_import_allows_retry_after_failed_inner_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1509,6 +1582,45 @@ def test_retest_http_start_and_import_return_job_envelopes(tmp_path: Path, monke
         {"kind": "strategies.performance.v2.retest.start", "request": requests[0][1]},
         {"kind": "strategies.performance.v2.retest.import", "request": requests[1][1]},
     ]
+
+
+@pytest.mark.parametrize("end", ("not-a-date", ""))
+def test_retest_http_rejects_invalid_or_late_end_date_before_creating_job(tmp_path: Path, end: str) -> None:
+    controller = _controller(tmp_path)
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            end = end or date.today().isoformat()
+            connection.request(
+                "POST", "/api/v2/strategies/performance-v2/retest/start",
+                body=json.dumps({"test_start": "2026-01-01", "test_end": end}),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            body = json.loads(response.read())
+        finally:
+            connection.close()
+        assert response.status == 422
+        assert body["error"]["code"] == "RETEST_END_DATE_INVALID"
+        assert controller._panel_jobs.list() == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_retest_range_accepts_yesterday_and_rejects_today_or_later(tmp_path: Path) -> None:
+    controller = _controller(tmp_path, seed=False)
+    start = "2026-01-01"
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    assert controller._retest_range({"test_start": start, "test_end": yesterday}, None) == (start, yesterday)
+    for end in (date.today().isoformat(), (date.today() + timedelta(days=1)).isoformat()):
+        with pytest.raises(PerformanceV2ApiError) as error:
+            controller._retest_range({"test_start": start, "test_end": end}, None)
+        assert error.value.code == "RETEST_END_DATE_INVALID"
 
 
 def test_retest_status_http_is_safe_without_database(tmp_path: Path) -> None:

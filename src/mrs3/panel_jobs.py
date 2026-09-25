@@ -28,15 +28,14 @@ class PanelJobError(ValueError):
 
 
 class PanelJobRegistry:
-    def __init__(self, journal: Path, *, capacity: int = 4) -> None:
+    def __init__(self, journal: Path, *, capacity: int = 4, recover_on_load: bool = True) -> None:
         if not isinstance(capacity, int) or capacity < 1:
             raise ValueError("capacity must be positive")
         self.journal, self.capacity, self.lock = journal, capacity, RLock()
+        self.recover_on_load = bool(recover_on_load)
         self.jobs: dict[str, dict] = self._load()
-        for job in self.jobs.values():
-            if job["state"] not in TERMINAL:
-                job.update(state="FAILED", error={"code": "INTERRUPTED"})
-        self._save()
+        if self.recover_on_load:
+            self.recover_interrupted()
 
     def _load(self) -> dict[str, dict]:
         try:
@@ -53,9 +52,17 @@ class PanelJobRegistry:
     def _save(self) -> None:
         self.journal.parent.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None
+        # Portfolio Campaign inputs live in their own verified gzip snapshot.
+        # Keep the in-process compatibility copy for old callers, but never
+        # write that payload into the shared journal.
+        persisted = json.loads(json.dumps(self.jobs))
+        for job in persisted.values():
+            runtime = job.get("runtime")
+            if isinstance(runtime, dict) and isinstance(runtime.get("campaign_snapshot"), dict):
+                runtime.pop("campaign", None)
         try:
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.journal.parent, delete=False) as handle:
-                json.dump(self.jobs, handle, sort_keys=True, separators=(",", ":"))
+                json.dump(persisted, handle, sort_keys=True, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
                 temporary = Path(handle.name)
@@ -127,6 +134,8 @@ class PanelJobRegistry:
             if not isinstance(job_id, str) or not job_id.strip() or len(job_id) > 128 or job_id in self.jobs:
                 raise PanelJobError("INVALID_REQUEST")
             job = {"job_id": job_id, "kind": kind, "idempotency_key": idempotency_key, "fingerprint": fingerprint, "resource_keys": list(resource_keys), "state": "QUEUED", "phase": "QUEUED", "progress": {"current": 0, "total": 0, "unit": "items"}, "artifacts": [], "error": None, "logs": [], "created_at_utc": datetime.now(timezone.utc).isoformat()}
+            if kind.startswith("portfolio.") and isinstance(request.get("campaign_id"), str):
+                job["campaign_id"] = request["campaign_id"]
             if request.get("retest") is True:
                 job["retest"] = True
             self.jobs[job["job_id"]] = job; self._save(); return self._copy(job)
@@ -261,6 +270,19 @@ class PanelJobRegistry:
                 raise PanelJobError("NOT_FOUND")
             value = job.get("runtime", {})
             return json.loads(json.dumps(value)) if isinstance(value, dict) else {}
+
+    def recover_interrupted(self) -> bool:
+        """Durably project every nonterminal job to the existing restart state."""
+        with self.lock:
+            changed = False
+            for job in self.jobs.values():
+                if job.get("state") not in TERMINAL:
+                    job.update(state="FAILED", error={"code": "INTERRUPTED"})
+                    changed = True
+            if changed:
+                self._save()
+            self.recover_on_load = True
+            return changed
 
     def reserve_runtime(self, job_id: str, key: str, value: object) -> None:
         """Atomically reserve one controller-only runtime marker."""

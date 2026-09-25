@@ -68,50 +68,42 @@ COMPOSITION_PARAMETER_DEFAULTS = MappingProxyType(
 _LEGACY_COMPOSITION_PARAMETERS = "legacy_parameters"
 LIQUIDITY_DEFAULTS = MappingProxyType(
     {
-        "close_volume_participation_pct": 30,
-        "round_down_usdt": 50,
+        "close_volume_participation_pct": 200,
+        "round_down_usdt": 10,
         "minimum_coverage_pct": 90,
         "maximum_age_hours": 2,
         "weekend_start_utc": "SATURDAY 00:00",
         "weekend_end_utc": "MONDAY 00:00",
         "archive_publication_lag_hours": 6,
         "backfill_write_enabled": False,
+        "spread_history_bypass_pretest": False,
     }
 )
 WEIGHTED_SEARCH_DEFAULTS = MappingProxyType(
     {
         "history_step_minutes": 5,
         "lp_solutions_per_profile": 20,
-        "repair_attempts": 3,
-        "additional_passes": 1,
-        "base_vectors": 2_000_000,
-        "scenarios": 3_000_000,
-        "cdar_pct": 80,
-        "diagnostic_cdar_pct": 90,
-        "alternatives_per_profile": 2,
-        "p30_tolerance_pct": 5,
-        "bootstrap_block_days": (1, 3, 7),
+        "max_targets": 8,
         "bootstrap_scenarios_per_block": 1_000,
-        "bootstrap_p95": True,
         "bootstrap_diagnostic_scenarios": 100,
-        "bootstrap_low_block_common_days": 10,
-        "scale_warning_multiple": 10,
+        "wall_time_seconds": 900,
+        "solver_time_seconds": 30,
         "limiter_step": 1,
         "limiter_controls": 2,
         "limiter_stress_pct": 1.5,
         "priority_groups": 5,
         "priority_beta": 0.5,
         "priority_close_ratio": 2,
-        "wall_time_seconds": 900,
-        "solver_time_seconds": 30,
-        "max_targets": 8,
-        "api_requests_per_second": 2,
-        "api_concurrency": 1,
-        "api_retries": 3,
-        "reference_max_age_hours": 2,
-        "csv_download_concurrency": 2,
     }
 )
+_RETIRED_WEIGHTED_SEARCH_KEYS = frozenset({
+    "repair_attempts", "additional_passes", "base_vectors", "scenarios",
+    "cdar_pct", "diagnostic_cdar_pct", "alternatives_per_profile",
+    "p30_tolerance_pct", "bootstrap_block_days", "bootstrap_p95",
+    "bootstrap_low_block_common_days", "scale_warning_multiple",
+    "api_requests_per_second", "api_concurrency", "api_retries",
+    "reference_max_age_hours", "csv_download_concurrency",
+})
 RESEARCH_RISK_POLICY = MappingProxyType(
     {
         "AGGRESSIVE": MappingProxyType(
@@ -137,12 +129,11 @@ RESEARCH_RISK_POLICY = MappingProxyType(
         ),
     }
 )
+RISK_POLICY_FIELDS = tuple(next(iter(RESEARCH_RISK_POLICY.values())))
 
 
 def _weighted_search_defaults() -> dict[str, Any]:
-    defaults = dict(WEIGHTED_SEARCH_DEFAULTS)
-    defaults["bootstrap_block_days"] = list(WEIGHTED_SEARCH_DEFAULTS["bootstrap_block_days"])
-    return defaults
+    return dict(WEIGHTED_SEARCH_DEFAULTS)
 
 
 class PortfolioConfigError(ValueError):
@@ -267,6 +258,33 @@ def _finite_decimal(value: Any, path: str, *, positive: bool = False) -> Decimal
     return number
 
 
+def _risk_decimal(value: Any, path: str) -> Decimal:
+    number = _finite_decimal(value, path)
+    _, digits, exponent = number.as_tuple()
+    fractional_digits = max(0, -exponent)
+    integer_digits = max(0, len(digits) + exponent)
+    if integer_digits > 26:
+        raise PortfolioConfigError(f"{path} must have at most 26 integer digits")
+    if fractional_digits > 12:
+        raise PortfolioConfigError(f"{path} must have at most 12 fractional digits")
+    if number < 0 or number > 100:
+        raise PortfolioConfigError(f"{path} must be between 0 and 100")
+    return number
+
+
+def effective_profile_risk(profile_mapping: Mapping[str, Any], profile_id: str) -> Mapping[str, Decimal]:
+    """Resolve one profile's optional risk fields without mutating its source."""
+    if profile_id not in RESEARCH_RISK_POLICY:
+        raise PortfolioConfigError(f"profiles.{profile_id} is unknown")
+    if not isinstance(profile_mapping, Mapping):
+        raise PortfolioConfigError(f"profiles.{profile_id} must be an object")
+    return MappingProxyType({
+        field: _risk_decimal(profile_mapping[field], f"profiles.{profile_id}.{field}")
+        if field in profile_mapping else RESEARCH_RISK_POLICY[profile_id][field]
+        for field in RISK_POLICY_FIELDS
+    })
+
+
 def _integer(value: Any, path: str, *, positive: bool = False, nonnegative: bool = False) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise PortfolioConfigError(f"{path} must be an integer")
@@ -371,6 +389,7 @@ def _parse_profiles(value: Any) -> Mapping[str, Profile]:
             value[name],
             f"profiles.{name}",
             ("pnl", "liquidity", "ranking", "individual_max_dd_pct", "individual_net_pnl_min_exclusive"),
+            RISK_POLICY_FIELDS,
         )
         pnl = _descriptor(raw["pnl"], f"profiles.{name}.pnl")
         liquidity = _descriptor(raw["liquidity"], f"profiles.{name}.liquidity")
@@ -383,7 +402,7 @@ def _parse_profiles(value: Any) -> Mapping[str, Profile]:
             raise PortfolioConfigError(f"profiles.{name}.ranking.parameters must be explicit")
         _ranking_metrics(parameters.get("metrics"), f"profiles.{name}.ranking.parameters", name)
         top_n = _integer(ranking["top_n"], f"profiles.{name}.ranking.top_n", positive=True)
-        risk = RESEARCH_RISK_POLICY[name]
+        risk = effective_profile_risk(raw, name)
         dd = risk["max_actual_equity_dd_pct"]
         reserve = risk["min_calculated_free_margin_reserve_pct"]
         mm = risk["max_calculated_account_mm_load_pct"]
@@ -411,6 +430,7 @@ def _parse_liquidity(value: Any) -> Mapping[str, Any]:
         (
             "policy_id", "parameters", "round_down_usdt", "minimum_coverage_pct", "maximum_age_hours",
             "weekend_start_utc", "weekend_end_utc", "archive_publication_lag_hours", "backfill_write_enabled",
+            "spread_history_bypass_pretest",
         ),
     )
     descriptor = _descriptor({"policy_id": raw["policy_id"], "parameters": raw["parameters"]}, "liquidity")
@@ -437,6 +457,9 @@ def _parse_liquidity(value: Any) -> Mapping[str, Any]:
     if not isinstance(raw["backfill_write_enabled"], bool):
         raise PortfolioConfigError("liquidity.backfill_write_enabled must be a boolean")
     result["backfill_write_enabled"] = raw["backfill_write_enabled"]
+    if not isinstance(raw["spread_history_bypass_pretest"], bool):
+        raise PortfolioConfigError("liquidity.spread_history_bypass_pretest must be a boolean")
+    result["spread_history_bypass_pretest"] = raw["spread_history_bypass_pretest"]
     return MappingProxyType(result)
 
 
@@ -444,47 +467,23 @@ def _parse_weighted_search(value: Any) -> Mapping[str, Any]:
     raw = _object(value, "search.weighted_search", tuple(WEIGHTED_SEARCH_DEFAULTS))
     result = {}
     integer_fields = (
-        "history_step_minutes", "base_vectors", "scenarios", "bootstrap_scenarios_per_block",
-        "bootstrap_diagnostic_scenarios", "bootstrap_low_block_common_days", "limiter_step",
-        "wall_time_seconds", "solver_time_seconds", "max_targets", "api_requests_per_second",
-        "api_concurrency", "reference_max_age_hours", "csv_download_concurrency",
+        "history_step_minutes", "lp_solutions_per_profile", "max_targets",
+        "bootstrap_scenarios_per_block", "bootstrap_diagnostic_scenarios",
+        "wall_time_seconds", "solver_time_seconds", "limiter_step",
+        "priority_groups",
     )
     for key in integer_fields:
         result[key] = _integer(raw[key], f"search.weighted_search.{key}", positive=True)
     if result["max_targets"] > 8:
         raise PortfolioConfigError("search.weighted_search.max_targets must be between 1 and 8")
-    for key, maximum in (("lp_solutions_per_profile", 20), ("repair_attempts", 3), ("additional_passes", 1)):
-        result[key] = _integer(raw[key], f"search.weighted_search.{key}", positive=True)
-        if result[key] > maximum:
-            raise PortfolioConfigError(f"search.weighted_search.{key} must be at most {maximum}")
-    result["alternatives_per_profile"] = _integer(raw["alternatives_per_profile"], "search.weighted_search.alternatives_per_profile", nonnegative=True)
-    if result["alternatives_per_profile"] > 2:
-        raise PortfolioConfigError("search.weighted_search.alternatives_per_profile must be at most 2")
-    for key in ("cdar_pct", "diagnostic_cdar_pct"):
-        result[key] = _finite_number(raw[key], f"search.weighted_search.{key}", positive=True)
-        if result[key] >= 100:
-            raise PortfolioConfigError(f"search.weighted_search.{key} must be less than 100")
-    tolerance = _finite_number(raw["p30_tolerance_pct"], "search.weighted_search.p30_tolerance_pct")
-    if tolerance < 0 or tolerance >= 100:
-        raise PortfolioConfigError("search.weighted_search.p30_tolerance_pct must be between 0 and 100")
-    result["p30_tolerance_pct"] = tolerance
-    block_days = raw["bootstrap_block_days"]
-    if not isinstance(block_days, list) or any(type(item) is not int for item in block_days) or block_days != [1, 3, 7]:
-        raise PortfolioConfigError("search.weighted_search.bootstrap_block_days must be [1, 3, 7]")
-    result["bootstrap_block_days"] = tuple(block_days)
-    if type(raw["bootstrap_p95"]) is not bool:
-        raise PortfolioConfigError("search.weighted_search.bootstrap_p95 must be a boolean")
-    result["bootstrap_p95"] = raw["bootstrap_p95"]
-    result["scale_warning_multiple"] = _finite_number(
-        raw["scale_warning_multiple"], "search.weighted_search.scale_warning_multiple", positive=True
-    )
+    if result["lp_solutions_per_profile"] > 20:
+        raise PortfolioConfigError("search.weighted_search.lp_solutions_per_profile must be at most 20")
     result["limiter_controls"] = _integer(raw["limiter_controls"], "search.weighted_search.limiter_controls", nonnegative=True)
     if result["limiter_controls"] > 2:
         raise PortfolioConfigError("search.weighted_search.limiter_controls must be at most 2")
     result["limiter_stress_pct"] = _finite_number(raw["limiter_stress_pct"], "search.weighted_search.limiter_stress_pct")
     if result["limiter_stress_pct"] < 0 or result["limiter_stress_pct"] >= 100:
         raise PortfolioConfigError("search.weighted_search.limiter_stress_pct must be between 0 and 100")
-    result["priority_groups"] = _integer(raw["priority_groups"], "search.weighted_search.priority_groups", positive=True)
     if result["priority_groups"] > 5:
         raise PortfolioConfigError("search.weighted_search.priority_groups must be between 1 and 5")
     result["priority_beta"] = _finite_number(raw["priority_beta"], "search.weighted_search.priority_beta")
@@ -495,10 +494,9 @@ def _parse_weighted_search(value: Any) -> Mapping[str, Any]:
     )
     if result["priority_close_ratio"] <= 1:
         raise PortfolioConfigError("search.weighted_search.priority_close_ratio must be greater than 1")
-    result["api_retries"] = _integer(raw["api_retries"], "search.weighted_search.api_retries", nonnegative=True)
     if result["bootstrap_diagnostic_scenarios"] > result["bootstrap_scenarios_per_block"]:
         raise PortfolioConfigError("search.weighted_search.bootstrap_diagnostic_scenarios must not exceed bootstrap_scenarios_per_block")
-    return MappingProxyType(result)
+    return MappingProxyType({key: result[key] for key in WEIGHTED_SEARCH_DEFAULTS})
 
 
 def _parse_groups(raw: dict[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
@@ -556,6 +554,12 @@ def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict
         search = active.get("search")
         if isinstance(search, dict):
             search.setdefault("weighted_search", _weighted_search_defaults())
+            weighted = search.get("weighted_search")
+            if isinstance(weighted, dict):
+                for key in _RETIRED_WEIGHTED_SEARCH_KEYS:
+                    weighted.pop(key, None)
+                for key, default in WEIGHTED_SEARCH_DEFAULTS.items():
+                    weighted.setdefault(key, default)
             active["search"] = search
             composition = search.get("composition") if isinstance(search.get("composition"), dict) else None
             if composition is not None:
@@ -565,6 +569,17 @@ def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict
                 composition["parameters"] = parameters
                 search["composition"] = composition
                 active["search"] = search
+        profiles = active.get("profiles")
+        if isinstance(profiles, dict):
+            for name in PROFILE_NAMES:
+                profile = profiles.get(name)
+                if isinstance(profile, dict):
+                    for field in RISK_POLICY_FIELDS:
+                        profile.setdefault(field, str(RESEARCH_RISK_POLICY[name][field]))
+        liquidity = active.get("liquidity")
+        if isinstance(liquidity, dict):
+            liquidity.setdefault("spread_history_bypass_pretest", False)
+            active["liquidity"] = liquidity
         return active, False
     if document.get("schema_version") != LEGACY_SCHEMA_VERSION:
         return deepcopy(dict(document)), False
@@ -619,6 +634,8 @@ def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict
             continue
         profile.setdefault("individual_max_dd_pct", str(INDIVIDUAL_DD_DEFAULTS[name]))
         profile.setdefault("individual_net_pnl_min_exclusive", "0")
+        for field in RISK_POLICY_FIELDS:
+            profile.setdefault(field, str(RESEARCH_RISK_POLICY[name][field]))
         ranking = profile.get("ranking") if isinstance(profile.get("ranking"), dict) else {}
         parameters = ranking.get("parameters") if isinstance(ranking.get("parameters"), dict) else {}
         parameters["metrics"] = [dict(item) for item in RANKING_METRICS[name]]

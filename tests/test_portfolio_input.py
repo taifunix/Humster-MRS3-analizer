@@ -1788,6 +1788,29 @@ def test_prepare_weighted_input_zeroes_partial_delta_when_later_segment_is_unkno
     assert "UNATTRIBUTABLE_EQUITY" in prepared.reasons[0][0]
 
 
+def test_prepare_weighted_input_excludes_unattributed_carry_in_before_first_recorded_open() -> None:
+    row = {
+        "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,
+        "report_start_utc": "2026-01-01T00:00:00Z", "report_end_utc": "2026-01-15T00:00:00Z",
+        "actions": (
+            {"action_index": 0, "timestamp_utc": "2026-01-01T00:05:00Z", "symbol": "A", "action": "opened", "post_size": "1", "post_side": "LONG", "balance": "110", "pnl": "0", "fee": "0"},
+        ),
+        "equity": (
+            {"timestamp_utc": "2026-01-01T00:00:00Z", "equity": "100"},
+            {"timestamp_utc": "2026-01-01T00:02:00Z", "equity": "110"},
+            {"timestamp_utc": "2026-01-01T00:05:00Z", "equity": "110"},
+        ),
+    }
+
+    prepared = prepare_weighted_input((row,))
+
+    assert prepared.timestamps_utc[0] == "2026-01-01T00:00:00Z"
+    assert prepared.normalized_delta[0][0] == Decimal("0")
+    assert all(prepared.valid[index][0] for index in range(len(prepared.valid)))
+    assert prepared.cycles["A:LONG:1:1"][0]["attribution_complete"] is False
+    assert prepared.diagnostics["rows"]["A:LONG:1:1"]["unattributed_prefix_equity_cells"] == 1
+
+
 def test_prepare_weighted_input_rejects_unrecognized_equity_point_shape() -> None:
     row = {
         "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,

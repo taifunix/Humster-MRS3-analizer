@@ -16,6 +16,7 @@ from mrs3.panel_fast_strategy_test import LocalFastStrategyTestService, LocalSin
 from mrs3.panel_fast_strategy_test import FastStrategyTestError
 from mrs3.panel_fast_strategy_test import _has_current_performance_v2_layout
 from mrs3.panel_fast_strategy_test import _write_fast_tester_config
+from mrs3.panel_fast_strategy_test import parse_initial_balance
 from mrs3.locking import TesterTargetLock
 from mrs3.performance_v2_html import parse_current_performance_v2_html
 from mrs3.performance_v2_store import PerformanceV2Config
@@ -214,6 +215,7 @@ def test_fast_writer_starts_from_template_and_preserves_unrelated_keys(tmp_path:
         "EndDate": "old",
         "use_runs": True,
         "single_mode": False,
+        "InitialBalance": 1000.0,
         "max_parallel_runs": 99,
         "include_chart_balance": False,
         "report": {"include_chart_balance": False, "include_position_stats": True},
@@ -225,6 +227,7 @@ def test_fast_writer_starts_from_template_and_preserves_unrelated_keys(tmp_path:
         "2026-08-01",
         "2026-08-31",
         single_mode=True,
+        initial_balance=2500.5,
         template_path=template,
     )
 
@@ -234,11 +237,57 @@ def test_fast_writer_starts_from_template_and_preserves_unrelated_keys(tmp_path:
     assert rendered["EndDate"] == "2026-08-31"
     assert rendered["use_runs"] is False
     assert rendered["single_mode"] is True
+    assert rendered["InitialBalance"] == 2500.5
+    assert isinstance(rendered["InitialBalance"], float)
     assert rendered["max_parallel_runs"] == config.max_parallel_submissions
     assert rendered["include_chart_balance"] is True
     assert rendered["report"]["include_chart_balance"] is True
     assert rendered["report"]["include_position_stats"] is False
     assert rendered["report"]["include_trades_table"] is True
+
+
+@pytest.mark.parametrize("value", ("", "abc", "1,5", "0", "-1", "NaN", True, 10 ** 1000))
+def test_initial_balance_rejects_non_positive_or_non_finite_values(value: object) -> None:
+    with pytest.raises(FastStrategyTestError, match="initial_balance"):
+        parse_initial_balance(value)
+
+
+def test_fast_writer_keeps_template_initial_balance_when_request_omits_it(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    template = tmp_path / "config-template.json"
+    template.write_text(json.dumps({"InitialBalance": 1000.0, "report": {}}), encoding="utf-8")
+
+    _write_fast_tester_config(config, "2026-08-01", "2026-08-31", template_path=template)
+
+    rendered = json.loads(config.tester_config.read_text(encoding="utf-8"))
+    assert rendered["InitialBalance"] == 1000.0
+    assert isinstance(rendered["InitialBalance"], float)
+
+
+def test_single_mode_retry_rerenders_original_initial_balance(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+
+    class FailAfterRender(LocalSingleModeStrategyTestService):
+        def _run_owned(self, job):
+            _write_fast_tester_config(
+                self.config, job.start_date, job.end_date, single_mode=True,
+                initial_balance=job.initial_balance,
+            )
+            raise FastStrategyTestError("forced failure")
+
+    service = FailAfterRender(config)
+    source = service.start(
+        manifest, analysis_run_id="a" * 64, start_date="2026-08-01", end_date="2026-08-31",
+        initial_balance=2500.5, job_id="balance-source",
+    )
+    assert _wait(service, str(source["job_id"]))["state"] == "FAILED"
+    config.tester_config.write_text(json.dumps({"InitialBalance": 1.0}), encoding="utf-8")
+
+    retry = service.retry(str(source["job_id"]), job_id="balance-retry")
+
+    assert _wait(service, str(retry["job_id"]))["state"] == "FAILED"
+    assert json.loads(config.tester_config.read_text(encoding="utf-8"))["InitialBalance"] == 2500.5
 
 
 @pytest.mark.parametrize("template_text", ["{", "[]"])
@@ -1009,6 +1058,7 @@ def test_single_mode_retry_recovers_interrupted_running_manifest(tmp_path: Path)
     assert loaded is not None
     assert loaded.state == "FAILED"
     assert loaded.phase == "FAILED"
+    assert loaded.initial_balance is None
 
 
 def test_fast_terminal_manifest_is_written_before_terminal_state(tmp_path: Path) -> None:

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from hashlib import sha256
 import json
 from io import BytesIO
 from pathlib import Path
@@ -14,6 +15,7 @@ from mrs3.performance_v2_selection_review import (
     SelectionReviewError,
     apply_prior_rejected,
     canonical_contract,
+    import_retest_tags,
     import_selection_review,
     latest_effective_finalists,
     latest_user_reviews_by_strategy,
@@ -298,6 +300,127 @@ def test_review_accepts_blank_trailing_headers(tmp_path: Path) -> None:
     workbook.save(padded)
 
     assert import_selection_review(connection, padded.read_bytes())["row_count"] == 2
+
+
+def test_review_import_ignores_informational_start_and_end_columns(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["Start"]).value = "11.02"
+    sheet.cell(2, headers["End"]).value = "03.09"
+    edited = tmp_path / "dated-review.xlsx"
+    workbook.save(edited)
+
+    assert import_selection_review(connection, edited.read_bytes())["row_count"] == 2
+
+
+def test_retest_tag_import_uses_only_marked_rows_from_an_old_review_workbook(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, _ = _export(connection, tmp_path)
+    facts_before = {
+        table: connection.execute(f"select * from {table} order by 1").fetchall()
+        for table in ("strategies", "strategy_results", "strategy_actions", "strategy_equity")
+    }
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["User Status"], "not a status")
+    sheet.cell(2, headers["User Rank"], 999)
+    sheet.cell(2, headers["Start"], "99.99")
+    sheet.cell(2, headers["End"], "")
+    sheet.cell(2, headers["RETEST"], "RETEST")
+    edited = BytesIO()
+    workbook.save(edited)
+    _export(connection, tmp_path)  # Make the edited export stale for full review import.
+
+    response = import_retest_tags(connection, edited.getvalue())
+
+    assert response == {"row_count": 1, "retest_count": 1}
+    assert connection.execute(
+        "select strategy_id, tag, source from strategy_tags order by strategy_id, tag"
+    ).fetchall() == [(1, "RETEST", "RETEST_WORKFLOW")]
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == (0,)
+    assert {
+        table: connection.execute(f"select * from {table} order by 1").fetchall()
+        for table in facts_before
+    } == facts_before
+
+
+def test_retest_tag_import_rejects_an_unknown_marked_strategy_without_writes(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["ID"], 999)
+    sheet.cell(2, headers["RETEST"], "RETEST")
+    edited = BytesIO()
+    workbook.save(edited)
+
+    with pytest.raises(SelectionReviewError, match="RETEST_TAG_IMPORT_STRATEGY_MISMATCH"):
+        import_retest_tags(connection, edited.getvalue())
+
+    assert connection.execute("select count(*) from strategy_tags").fetchone() == (0,)
+
+
+def test_retest_tag_import_rejects_an_invalid_retest_value_before_writes(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["RETEST"], "RETEST")
+    sheet.cell(3, headers["RETEST"], "YES")
+    edited = BytesIO()
+    workbook.save(edited)
+
+    with pytest.raises(SelectionReviewError, match="RETEST_TAG_IMPORT_INVALID_RETEST"):
+        import_retest_tags(connection, edited.getvalue())
+
+    assert connection.execute("select count(*) from strategy_tags").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("database_id", [None, "another-performance-db"])
+def test_retest_tag_import_rejects_missing_or_foreign_database_id(tmp_path: Path, database_id: str | None) -> None:
+    connection = _database(tmp_path)
+    path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(path)
+    for row in workbook[META_SHEET].iter_rows(min_row=1, max_col=2):
+        if row[0].value == "database_instance_id":
+            row[1].value = database_id
+    edited = BytesIO()
+    workbook.save(edited)
+
+    with pytest.raises(SelectionReviewError, match="RETEST_TAG_IMPORT_DATABASE_MISMATCH"):
+        import_retest_tags(connection, edited.getvalue())
+
+    assert connection.execute("select count(*) from strategy_tags").fetchone() == (0,)
+
+
+def test_retest_tag_import_keeps_blank_tags_and_is_idempotent(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    connection.execute(
+        "insert into strategy_tags values (1, 'RETEST', 'PERIOD_INTEGRITY_AUDIT', 'audit.xlsx', now())"
+    )
+    path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["RETEST"], None)
+    sheet.cell(3, headers["RETEST"], "RETEST")
+    edited = BytesIO()
+    workbook.save(edited)
+
+    assert import_retest_tags(connection, edited.getvalue()) == {"row_count": 1, "retest_count": 1}
+    assert import_retest_tags(connection, edited.getvalue()) == {"row_count": 1, "retest_count": 1}
+    assert connection.execute(
+        "select strategy_id, source, source_ref from strategy_tags where tag = 'RETEST' order by strategy_id"
+    ).fetchall() == [
+        (1, "PERIOD_INTEGRITY_AUDIT", "audit.xlsx"),
+        (2, "RETEST_WORKFLOW", sha256(edited.getvalue()).hexdigest()),
+    ]
 
 
 def test_review_import_is_atomic_and_syncs_rejected_and_retest_tags(tmp_path: Path) -> None:

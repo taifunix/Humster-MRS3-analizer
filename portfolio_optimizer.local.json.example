@@ -53,7 +53,22 @@
     "rounds": 1,
     "total_test_budget": 1,
     "sizing_mode": "liquidity_cap_single",
-    "max_enumerated_combinations": 100000
+    "max_enumerated_combinations": 100000,
+    "weighted_search": {
+      "history_step_minutes": 5,
+      "lp_solutions_per_profile": 20,
+      "max_targets": 8,
+      "bootstrap_scenarios_per_block": 1000,
+      "bootstrap_diagnostic_scenarios": 100,
+      "wall_time_seconds": 900,
+      "solver_time_seconds": 30,
+      "limiter_step": 1,
+      "limiter_controls": 2,
+      "limiter_stress_pct": 1.5,
+      "priority_groups": 5,
+      "priority_beta": 0.5,
+      "priority_close_ratio": 2
+    }
   },
   "research": {
     "development_window": {"value": 1, "unit": "days"},
@@ -64,18 +79,23 @@
   },
   "liquidity": {
     "policy_id": "operator_supplied_liquidity_v1",
-    "parameters": {"operator_supplied": true, "close_volume_participation_pct": 30},
-    "round_down_usdt": 50,
+    "parameters": {"operator_supplied": true, "close_volume_participation_pct": 200},
+    "round_down_usdt": 10,
     "minimum_coverage_pct": 90,
     "maximum_age_hours": 2,
     "weekend_start_utc": "SATURDAY 00:00",
     "weekend_end_utc": "MONDAY 00:00",
     "archive_publication_lag_hours": 6,
-    "backfill_write_enabled": false
+    "backfill_write_enabled": false,
+    "spread_history_bypass_pretest": false
   },
   "margin": {
     "policy_id": "operator_supplied_margin_v1",
-    "parameters": {"operator_supplied": true}
+    "parameters": {
+      "operator_supplied": true,
+      "open_fee_rate": "0",
+      "close_fee_rate": "0.0002"
+    }
   },
   "profiles": {
     "AGGRESSIVE": {

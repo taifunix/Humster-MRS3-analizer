@@ -472,11 +472,43 @@ def test_tester_job_uses_the_ui_recovery_kind(tmp_path: Path, monkeypatch) -> No
     controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
     captured: dict[str, object] = {}
     monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "strategy_manifest.json")
-    monkeypatch.setattr(controller, "_start_tracked_panel_job", lambda kind, *_args: captured.setdefault("kind", kind))
+    monkeypatch.setattr(controller, "_start_tracked_panel_job", lambda kind, request, _keys, submit, **_kwargs: captured.update(kind=kind, request=request, submit=submit))
+    started: dict[str, object] = {}
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(start=lambda *_args, **kwargs: started.update(kwargs)))
 
-    controller.strategies_tester_start({"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31"})
+    controller.strategies_tester_start({"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31", "initial_balance": "2500.5"})
 
     assert captured["kind"] == "strategies.tester.start"
+    assert captured["request"]["initial_balance"] == 2500.5
+    captured["submit"]("tester-job")
+    assert started["initial_balance"] == 2500.5
+
+
+def test_tester_start_http_rejects_invalid_initial_balance_before_creating_job(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request(
+            "POST", "/api/v2/jobs",
+            json.dumps({"kind": "strategies.tester.start", "request": {
+                "analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31", "initial_balance": "abc",
+            }}).encode("utf-8"),
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert 400 <= response.status < 500
+    assert body == {"error": "invalid settings"}
+    assert controller._panel_jobs.list() == []
 
 
 @pytest.mark.parametrize("kind", ("strategies.tester.fast.start", "strategies.tester.fast.retry"))

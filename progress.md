@@ -1,7 +1,96 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-22
+**Updated:** 2026-09-25
 **Current branch:** `main`
+
+## Performance v2 equity-quality proposal (2026-09-25)
+
+Added the [critical analysis/spec](docs/specs/2026-09-25-performance-v2-equity-quality.md)
+and [implementation plan](docs/superpowers/plans/2026-09-25-performance-v2-equity-quality.md),
+canonical R6.1, for independent stage-2 filtering and optional equity-quality
+Top N. The proposal uses 7/14/28-day horizons, admits a flat recent week on
+an otherwise growing curve, does not automatically exclude histories under
+28 days, reuses the existing cache worker/source load, and adds only four
+visible XLSX columns. Historical quartiles, peer rescue and all-history HWM
+were removed from the proposed first implementation.
+
+Configured Planner returned `PLAN_REVISION R5`. Advisor R3/R4 returned
+`PLAN_REVISE`; their documented findings were addressed, and independent
+Advisor R5 returned `PLAN_APPROVED` on 2026-09-25. This approves engineering
+coherence, not runtime implementation or empirical quality. M0 still requires
+representative coverage and ranking-demotion evidence, policy examples
+and acceptance of the proposed speed/memory budgets. No benchmark result or
+predictive improvement is claimed. Read-only source/data inspection and
+small Decimal formula probes were performed; no runtime code, tester run,
+live DB write, or Panel restart is part of this documentation task.
+
+User decision after R5: shorter-window decline must only lower equity-ranking
+priority while the main age-selected H remains UP. Planner `PLAN_REVISION R6`
+incorporates this as `equity-regime-v2`: GROWING and WEAKENING both pass ERF;
+ranking class order is unchanged. H-not-UP and nonpositive gates remain;
+no new correction threshold or cache recomputation is introduced. Advisor R6
+requested explicit robust-opt-in wording and adversarial class-order tests;
+Planner `PLAN_REVISION R6.1` and both documents incorporate these. Independent
+R6.1 re-review returned `PLAN_APPROVED`. An ephemeral `.venv` truth-table probe passed five
+policy cases; this is not a production implementation test.
+
+Documentation checks: scoped `git diff --check`, local Markdown link checks,
+fence balance and trailing-whitespace checks passed. Production tests were not
+run for this docs-only task. Next: user review, then assigned M0 diagnostics;
+implementation remains unstarted. Existing unrelated workspace edits are preserved.
+
+## RETEST XLSX entry point (2026-09-24)
+
+`CHECK & RETEST` now begins with a separate per-workbook RETEST-only XLSX
+folder import, so an operator can load marked rows before choosing dates or
+starting the tester. It checks workbook integrity/schema, the hidden current
+database ID and each marked Strategy ID, then writes only `RETEST` tags with
+source `RETEST_WORKFLOW`. `User Status`, ranks, selection-run age and current
+results are ignored; blank RETEST cells leave existing tags unchanged. It does
+not start a tester, write the review ledger, or replace Performance facts. The
+card reports every file separately and refreshes the tagged active-strategy
+count afterward.
+
+Recovery reuses only a persisted `strategies.tester.native.start` job marked
+`retest=true` after its own metadata manifest and source artifacts validate.
+If that exact inbox folder has disappeared, it is treated as unavailable and
+CHECK starts a fresh RETEST from the current tags; an unsafe or foreign manifest
+remains rejected rather than reused.
+
+The tag-driven start endpoint rejects an invalid, current-day, or future end
+date before a job is created; yesterday is accepted. Verification:
+selection-review suite `36 passed` (one existing pandas warning), RETEST suite
+`62 passed, 2 skipped` across non-overlapping groups (Windows symlink support),
+static UI `119 passed`, and focused HTTP route `3 passed` (two existing
+DataFrame fragmentation warnings). `node --check` and scoped `git diff --check`
+passed. The stale-inbox recovery regression and its valid/source-missing/
+foreign-manifest boundaries then passed `8 passed`. No Panel restart, tester
+run, or real PerformanceDB write occurred.
+
+## Portfolio weighted-search settings cleanup (2026-09-24)
+
+The active `search.weighted_search` document now contains only seven Stage 1
+controls plus the six deferred limiter/priority controls. Seventeen parser/UI-
+only fields were retired; existing schema-v2 files are normalized in memory by
+removing only those known legacy keys, while unknown keys remain fail-closed.
+The local file and example use the same meaning-based order. The retained
+`lp_solutions_per_profile` field now drives the real per-profile LP solver-call
+ceiling instead of being a display-only value. Limiter/priority remains in its
+separate default-closed Phase 13 Panel section and still does not affect Stage 1.
+
+Verification: config + adapter + weighted search + full static UI `747 passed`;
+Portfolio settings/service subset `16 passed, 226 deselected`; JavaScript
+syntax, Python compilation and scoped diff checks passed. The Panel was not
+restarted and no Campaign/tester run was started.
+
+## Portfolio result recovery after browser refresh (2026-09-23)
+
+The successful Stage 1 campaign `campaign-36524a03e3f3448ba673b5690b1afec0`
+remains persisted after F5. The Portfolio page now restores the active job, or
+the newest terminal Portfolio job by `created_at_utc` when none is active, so a
+refresh does not require another calculation. Focused service and static UI
+tests passed; a read-only check against the real journal selected that campaign
+with status `SUCCEEDED`.
 
 ## Analysis listing-date input and registry support (2026-09-22)
 
@@ -24,6 +113,8 @@ Independent review identified and verified fixes for three malformed-input
 edges: safe browser display of profile errors, corrupt XLSX normalization and
 strict rejection of an incomplete `Пары` schema. Final re-review returned
 `CODE_REVIEW_PASS`.
+
+Portfolio empty-job progress used one mojibake literal in the late `renderJob(null)` branch; replaced it with UTF-8 `Нет активного расчёта.` and added a static UI regression test. The full static UI suite passed (`118 passed`), and independent Opus high review returned `CODE_REVIEW_PASS`.
 
 ## Pair screener table readability and testing-screen layout (2026-09-21)
 
@@ -159,6 +250,38 @@ accounts, not real open positions: the balance goes negative on the last close
 and reads +10 in the same minute after the next open. That last observation is
 unexplained and should be put to whoever knows the tester.
 ## Portfolio Optimizer Phase 7 off-only boundary (2026-09-21)
+
+On 2026-09-22 the Stage 1 pair picker was compacted into a full-width table:
+one row per pair with a checkbox, pair name, availability summary, and LONG /
+SHORT finalist limits under a single shared header. Bulk actions select all,
+select the reported maximum, or clear selection. The obsolete global limit
+fields were removed, selected per-row limits are bounded by reported
+availability, and pairs without either LONG or SHORT finalists are hidden.
+
+The profile controls are now one compact table. Each profile has an optional
+`bank_available_usdt` ceiling and a candidate-count limit. Blank means uncapped;
+when filled, weighted search sizes within that ceiling. The candidate's own
+validated `required_bank_usdt` remains authoritative for wrapper `facts.B` and
+tester `InitialBalance`, so a 5000 USDT ceiling with an 1800 USDT requirement
+starts the tester at 1800, never 5000. Legacy launch fields `equity_usdt` and
+`max_balance_usdt` fail closed. Stage 1 binds the required bank into its
+digest-protected executable artifact, and Stage 2 rejects missing or mismatched
+bank evidence. No tester was run.
+
+Post-review verification passed: the complete affected Panel/adapter/UI/search
+suite reached `835 passed, 1 skipped` (the skip is the environment's unavailable
+symbolic-link support). The final decimal and blocker diagnostics added after
+that run passed their focused checks (`11 passed`); `node --check` and
+`git diff --check` pass. Independent Claude Opus 5 high review returned
+`CODE_REVIEW_PASS`.
+
+The profile table now defaults to `BALANCED` only; `AGGRESSIVE` and
+`CONSERVATIVE` remain opt-in. Blank bank fields persistently state that they are
+uncapped, profile checkboxes reuse the pair-table 16 px control, and disabled
+Campaign actions are visibly inactive. Client and server both reject an empty
+profile selection. Static UI verification passed (`109 passed`), the focused
+server boundary passed (`1 passed`), and independent Claude Opus 5 high review
+returned `CODE_REVIEW_PASS`.
 
 The current production weighted Stage 1 adapter uses
 `LIMITER_DISABLED_OFF_ONLY`: it calls weighted search with `L=0` and priority 1
@@ -1104,6 +1227,32 @@ SingleMode-evidence and Panel subset passed `136 passed`. Full repository suite
 completed with `3708 passed, 7 skipped` and one Windows HTTP timeout; the exact
 failed typed-envelope route then passed three independent reruns. Python
 `compileall`, JavaScript syntax, and `git diff --check` pass.
+
+The real Campaign `campaign-38b36d4644f94835bc7de3366d3f8308` completed
+weighted search but failed while hashing the executable package. All seven
+current finalists carry frozen nested `optimizer_source_metadata` as
+`mappingproxy`; the identity encoder passed that container directly to
+`json.dumps`, which rejects it. Executable identity now converts only nested
+JSON containers to their plain equivalents before canonical encoding. The
+focused identity slice passes (`6 passed`), and a read-only check against a
+current BABAUSDT finalist produced a 64-character digest from the real frozen
+metadata. The complete adapter and Stage 1 Panel contour then ran `563 passed,
+1 skipped, 1 failed`; the sole failure was the newly added legacy-digest test
+constant, corrected to include the fixture's Campaign digests, and its exact
+rerun passed. No Campaign or tester was launched by the agent; the next real
+run remains operator-controlled.
+
+The operator's next Campaign, `campaign-36524a03e3f3448ba673b5690b1afec0`,
+completed successfully and published the Stage 1 workbook. This closes the
+temporary post-search diagnostic loop. The raw result-summary mapping in Panel
+was then replaced with a compact operator view: four totals, counts by profile,
+rounded metrics for variant 1, humanized warnings, and collapsed technical IDs.
+Duplicate optimizer mirrors, empty collections, and inactive limiter UNKNOWN
+fields are no longer rendered; exact values and all ten variants remain in the
+XLSX. Static UI verification passes (`119 passed`), JavaScript syntax and diff
+checks pass, and the real completed Campaign was visually checked at 1280,
+760, and 375 px without horizontal overflow. No Campaign or tester was launched
+by the agent.
 
 ## Performance v2 global finalist retest control (2026-09-10)
 
@@ -3194,3 +3343,250 @@ missing in-page job ID instead of silently doing nothing. Recovery is
 read-only: it never starts a tester or import. Focused verification passed
 (`5 passed`) and `git diff --check` is clean. The external reviewer bridge is
 currently unavailable because its Claude authentication check fails.
+
+## Portfolio Optimizer Campaign runtime repair (2026-09-23)
+
+Корень проблемы: frozen weighted rows теряли `strategy_orders`, `order_count`,
+`close_ma_len` и `timeframe`. Теперь эти поля сохраняются и проверяются до
+weighted search; некорректная геометрия отклоняется с
+`PORTFOLIO_INPUT_GEOMETRY_INVALID`.
+
+Campaign inputs хранятся в детерминированных внешних gzip snapshots, а в
+журнале остаётся compact descriptor. Startup выполняет migration с backup,
+free-space preflight, repair и terminal cleanup. По явному operator sign-off
+от 2026-09-23 полный payload непочиняемого `FAILED` job удаляется навсегда;
+сохраняются только campaign IDs, digests и diagnostics, quarantine не
+создаётся.
+
+Progress telemetry теперь правдивая: сохраняются substage, counters, heartbeat
+и ETA; при stale heartbeat или terminal job числовой ETA подавляется. Норма
+персистентности — не более 360 journal writes/hour на active job плюс
+ограниченные transition/completion writes.
+
+Read-only измерения: `.panel-jobs.json` — 85,629,308 bytes; 14 portfolio jobs
+занимают 80,986,703 bytes. Проектируемый общий journal — 4,678,721 bytes,
+поскольку unrelated tester/retest jobs занимают около 4.63 MiB; вклад
+portfolio после compaction — десятки KiB.
+
+Проверки: affected contour — `885 passed, 1 skipped`; последний Panel+UI —
+`364 passed, 1 skipped`; полный suite — `4907 passed, 8 skipped, 25 warnings`.
+Remote isolation — `3 passed`, SHA-256 реального journal не изменился. Также
+успешны `node --check` и `git diff --check`. Финальный независимый Opus high
+review: `CODE_REVIEW_PASS`.
+
+Во время full-suite ранее три теста создавали `PanelController` с repository
+root и породили backup и четыре детерминированных snapshots. Hash backup
+совпал с journal; удалены только созданные backup/snapshots, существующий XLSX
+сохранён. После перевода этих тестов на `tmp_path` повторный запуск ничего в
+repository root не создал.
+
+## Weighted post-search failure diagnostics (2026-09-23)
+
+Campaign `campaign-3732e3ce2de84a66bdc88c74a63e7322` had 7 finalists and ran
+from 11:48:38 to 11:58:36 UTC before `GENERATE_VARIANTS` persisted only
+`PROFILE:AGGRESSIVE:WEIGHTED_SEARCH_CONFIG_INVALID`; terminal snapshot cleanup
+was contract-compliant. Post-search adapter failures now retain stable safe
+result, candidate-bank, candidate-shape, pretest-period, post-search-config,
+payload, or executable-identity codes
+in the normal blocker/diagnostic path without raw values or full payload.
+
+Evidence: focused TDD exposed the old generic classifications; the final adapter
+suite passed `315 passed`.
+
+## Weighted post-search taxonomy follow-up (2026-09-23)
+
+Review follow-up adds temporary diagnostic instrumentation for every reachable
+post-return validation boundary in the single-search path. Duplicate normalized
+symbol+side members persist as `PROFILE:WEIGHTED_CANDIDATE_SLOT_DUPLICATE`;
+malformed limiter values persist as
+`PROFILE:WEIGHTED_CANDIDATE_LIMITER_INVALID`; other candidate structure remains
+`PROFILE:WEIGHTED_CANDIDATE_SHAPE_INVALID`. Existing payload, snapshot, and
+executable-identity-specific codes remain unchanged. Blockers contain only
+safe allowlisted codes.
+
+The historical `campaign-3732e3ce2de84a66bdc88c74a63e7322` snapshot was already
+deleted under the accepted terminal-cleanup contract. Therefore its exact old
+emission site and root cause cannot be reconstructed or claimed fixed. The next
+user-run identifies the post-search stage; revisit/remove this temporary
+taxonomy after the root cause is fixed and one successful real Campaign is
+completed. The existing 900-second weighted-search wall-time bound is unchanged;
+no timeout behavior was added.
+
+Evidence: final adapter suite passed `315 passed`; the restarted Panel job
+persistence test passed `1 passed` after snapshot cleanup. No Panel, tester,
+campaign, database, network, or trading run was executed. The next step is a
+manual operator Campaign from Panel.
+
+## Portfolio Stage 1 human-readable results (2026-09-23)
+
+Weighted Stage 1 no longer exposes the raw technical summary as the operator
+result. Panel now uses one count line (`accepted / positive positions in
+variant 1 / without position`), separates the portfolio saturation bank,
+historical-path bank, P95 stress bank and minimum bank required by the selected
+risk profile, shows exchange-style aggregate IM/MM for all fully open
+positions, expresses CDaR 80/90 as percentages of the proven saturation bank,
+and lists the actual positive positions of variant 1.
+
+The weighted workbook now contains localized operator sheets `Итог`,
+`Варианты`, `Состав`, `Финалисты`, `Исключено` and hidden `Metadata`.
+Every variant carries bank/risk/PnL/IM/MM values, while every positive member
+carries Strategy/Result ID, pair/side, full notional, saturation-bank share,
+leverage and liquidity capacity. Legacy `PRETEST_PROXY` workbook behavior is
+unchanged. Old committed Campaign responses are enriched read-only from their
+digest-bound `stage1-executables.json`; the persisted summary and executable
+artifact are not rewritten.
+
+Campaign `campaign-36524a03e3f3448ba673b5690b1afec0` was checked from its
+frozen snapshot without rerunning the optimizer: saturation bank `1017 USDT`,
+historical-path bank `595.19 USDT`, P95 stress bank `1016.96 USDT`, minimum bank
+for the AGGRESSIVE profile limits `175.82 USDT`, aggregate IM `112.53 USDT`,
+aggregate MM `56.54 USDT`, full position notional `2799.14 USDT`, and three
+positive members from four accepted finalists. Its workbook was regenerated
+atomically with 10 variants and 31 composition rows; double generation was
+byte-identical (`sha256=3ab3bbee63b071cc69d1fe85fea6557fda875341928657f03a9f67b1fc28bd88`).
+
+Verification: `tests/test_panel_portfolio.py` — `240 passed, 1 skipped`;
+`tests/test_panel_static_ui.py` — `119 passed`; `node --check` and scoped
+`git diff --check` passed. Independent Opus high re-review returned
+`CODE_REVIEW_PASS`. The next step is operator inspection after restarting Panel;
+no new optimizer or tester run is required for the saved Campaign.
+
+## Portfolio Stage 1 metrics and compact weighted XLSX follow-up (2026-09-23)
+
+Panel result metrics are now grouped into banks, drawdowns and capital/result.
+The target bank is named explicitly; historical and P95 stress banks include
+the selected profile DD limit. CDaR 20/10, IM and MM show the amount followed
+by `target / saturation` percentages, with a dash for an absent target. Unknown
+risk evidence remains visibly fail-closed instead of disappearing.
+
+`MaxDD SUM` is the sum of each positive member's frozen source MaxDD scaled by
+the executable payload `facts.x / source_initial_balance`. Invalid or missing
+member evidence makes the complete aggregate unknown; partial sums are not
+reported. Read-only validation of
+`campaign-36524a03e3f3448ba673b5690b1afec0` produced
+`465.9045424901665413310370052 USDT`.
+
+The weighted workbook uses compact wrapped headers on all five operator sheets.
+`Состав` now includes frozen timeframe, User Rank, source PnL/MaxDD, `ORD_N`,
+X/Y/Z/W order percentages, liquidity utilization, scaled individual MaxDD,
+pair multiplier, max balance, leverage and capacity. The export performs no
+live PerformanceDB reads; the existing PRETEST_PROXY branch is unchanged.
+
+Verification after review fixes: `tests/test_panel_portfolio.py` —
+`241 passed, 1 skipped`; `tests/test_panel_static_ui.py` — `119 passed`;
+`node --check`, `py_compile` and scoped `git diff --check` passed. Independent
+Opus high re-review returned `CODE_REVIEW_PASS`. The running Panel and its
+active optimizer job were not restarted or mutated. Because that process had
+already loaded the previous code, its workbook can be regenerated later from
+the immutable snapshot/artifact after the job finishes, without rerunning the
+optimizer.
+
+## Weighted budget-limited adapter contract (2026-09-24)
+
+Campaign `campaign-986c34d1efea4761a7c1d56683fd61ab` failed after both
+AGGRESSIVE and BALANCED searches returned the generic
+`WEIGHTED_SEARCH_RESULT_INVALID`. Read-only journal/code tracing confirmed a
+contract mismatch: weighted search legitimately returns `budget_limited` when
+its wall/solver/call/bootstrap/new-vector budget is exhausted, including valid
+already-verified candidates, while the adapter accepted only `PASS` and `FAIL`.
+
+The adapter now validates the bounded budget reason and processes non-empty
+`budget_limited` candidates through the same bank/shape/payload checks as a
+normal PASS. Accepted partial frontiers publish with
+`PROFILE:<profile>:WEIGHTED_SEARCH_BUDGET_LIMITED:<reason>` as a warning; an
+empty partial frontier uses the same code as a blocker. Malformed reason or
+candidate content remains fail-closed as `WEIGHTED_SEARCH_RESULT_INVALID`.
+Only the audited resource-exhaustion reasons may publish validated partial
+candidates; cancellation, worker failure, and unknown future reasons remain
+blockers. When a target-bank ceiling removes every partial candidate,
+`BANK_UNAVAILABLE` remains the blocker and the exhausted-budget reason remains
+visible as a warning.
+
+Evidence: focused TDD first failed on the old status gate, then passed `3
+passed`; the complete adapter suite passed `342 passed`; weighted Panel
+integration coverage passed `30 passed`. No Panel restart, Campaign, tester,
+database, network, or trading run was executed. The exact old stopping reason
+cannot be recovered because accepted terminal cleanup deleted the Campaign
+snapshot; current configuration has a 900-second wall limit per profile.
+
+## Portfolio Settings Stage 1 controls (2026-09-24)
+
+The Panel Settings form now exposes the two remaining active weighted Stage 1
+inputs in a separate default-closed `Подготовка истории и воспроизводимость`
+block: non-negative `search.seed` and positive
+`search.composition.parameters.minimum_common_days`. They are loaded from and
+patched into the existing full v2 document; invalid values reveal and focus the
+corresponding control. Diagnostic-only composition coverage/gap values and the
+fixed weekend UTC boundaries remain config-only.
+
+Verification: static UI tests passed `119 passed`; portfolio config tests passed
+`73 passed`; focused Panel settings tests passed `15 passed`; `node --check`
+passed. The running Panel was not
+restarted and no Campaign or tester run was started.
+
+## Open: Campaign combination preflight (2026-09-24)
+
+Campaign `campaign-b26048e19e5d4b6b97b075129a2fa74d` read 33 finalists and
+then failed in `GENERATE_VARIANTS` with `COMBINATION_LIMIT_EXCEEDED` because the
+operator selected all available finalists while the temporary local technical
+limit was 100. The terminal snapshot cleanup removed the launch inputs, and the
+journal retained neither the exact Cartesian-product size nor its limit.
+
+Next implementation must show the exact live product and technical limit in
+the Campaign form, recalculate after every row edit and after `maximum
+available`, disable Calculate when the product exceeds the guard, repeat the
+same check server-side before job creation, and report both numbers. The limit
+remains a safety guard; the operator must not use an external calculator. Until
+then the operator is testing with one finalist per selected pair/direction.
+
+## PerformanceDB XLSX export (2026-09-24)
+
+Strategies and DD5 now provides card 8, `EXPORT FROM PERFORMANCEDB`, after
+cards 4-7 in their sequential order. It creates an in-memory, read-only XLSX
+for FINALIST, RESERVE, their union, RETEST alone, their RETEST intersection,
+or ALL ACTIVE. The route neither creates schema nor starts a tester, import,
+recalculation, or background job.
+
+Verification: export/static focused tests passed `136 passed`; all 80 nodes of
+`tests/test_panel_performance_v2.py` passed in four disjoint batches
+(`26 passed, 2 skipped; 20 passed; 17 passed; 15 passed`); JS syntax,
+compileall and scoped `git diff --check` passed. Independent re-review returned
+`CODE_REVIEW_PASS`. The running Panel was not restarted and no active import
+was touched; use the normal restart only after the active import reaches a
+terminal state.
+
+## Tester initial balance in Strategies and DD5 (2026-09-24)
+
+Cards 3, 6 and 7 now expose `Стартовый баланс теста`, defaulting to the
+canonical MRS3 template value `1000`. A positive finite operator value reaches
+only the existing native SINGLE_MODE renderer as numeric `InitialBalance` in
+`config_tester.json`; it does not change selection or PerformanceDB import.
+The job manifest retains the value for retry, while old requests and manifests
+without it preserve the template value. Invalid values fail before a job is
+created. Focused verification passed (`52 passed` and `11 passed` direct
+RETEST checks); JS syntax, Python compilation and `git diff --check` passed.
+Independent re-review returned `CODE_REVIEW_PASS`. No Panel restart, tester,
+job, database or import was started.
+
+## Effective dates in PerformanceDB XLSX (2026-09-24)
+
+The agreed Pareto workbook now also displays the existing effective research
+window as `Start` and `End`, formatted `DD.MM` without a year. The shared
+writer serves both the Pareto export and `EXPORT FROM PERFORMANCEDB`; no second
+XLSX schema was added. The columns are informational and remain ignored by
+round-trip review/RETEST import. Focused workbook/export checks passed (`5
+passed`), including a UTC-offset date and a full export-to-import round trip;
+the complete Pareto selection suite passed (`95 passed`) and the selection
+review/export-panel suites passed (`117 passed, 2 skipped`). Python compilation
+and `git diff --check` passed. The independent re-review bridge returned no
+result despite an available seat, so its final disposition remains pending. No Panel,
+tester, job, database or import was started.
+
+`EXPORT FROM PERFORMANCEDB` now also carries the already cached Pareto metrics
+for exactly its exported `(Strategy ID, Result ID)` cohort into that same
+workbook; the old DataFrame whitelist had discarded them before XLSX writing.
+The export remains read-only and does not recalculate a missing cache entry, so
+only genuinely unavailable metrics remain blank. Focused export/import checks
+passed (`6 passed`), including a byte-identical database assertion after export;
+Python compilation and `git diff --check` passed. The reviewer bridge was
+available but again returned no review result.

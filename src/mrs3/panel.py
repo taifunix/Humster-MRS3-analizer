@@ -28,6 +28,9 @@ import webbrowser
 
 _PANEL_WEB = Path(__file__).with_name("panel_web")
 _LOGGER = logging.getLogger(__name__)
+_RETEST_INBOX_PATH_UNAVAILABLE = "committed RETEST inbox path is unavailable"
+_RETEST_INBOX_MANIFEST_UNAVAILABLE = "committed RETEST inbox manifest is unavailable"
+_RETEST_INBOX_UNAVAILABLE = frozenset({_RETEST_INBOX_PATH_UNAVAILABLE, _RETEST_INBOX_MANIFEST_UNAVAILABLE})
 
 
 def _open_regular_artifact(path: Path) -> tuple[BinaryIO, int]:
@@ -196,12 +199,15 @@ from .panel_strategy_batch import LocalStrategyBatchService, StrategyBatchValida
 from .panel_tester_runs import LocalRunsBatchService
 from .panel_fast_strategy_test import (
     LocalSingleModeStrategyTestService,
+    parse_initial_balance,
 )
 from .panel_performance_v2 import (
     LocalPerformanceV2Jobs,
     PerformanceV2ApiError,
     PerformanceV2PanelRequest,
     calculate_performance_v2_windows,
+    export_performance_v2,
+    parse_performance_v2_export_query,
     performance_v2_catalog,
     _parse_window_payload,
 )
@@ -229,6 +235,7 @@ from .performance_v2_selection import (
 from .performance_v2_selection_review import (
     SelectionReviewError,
     apply_prior_rejected,
+    import_retest_tags,
     import_selection_review,
     latest_effective_finalists,
     latest_user_reviews_by_strategy,
@@ -1311,7 +1318,7 @@ class PanelController:
         self._performance_v2_writer_lock = threading.RLock()
         self._performance_v2_schema_ready: set[tuple[str, int, int, int, int, int]] = set()
         self._selection_candidate_cache: OrderedDict[tuple[object, ...], object] = OrderedDict()
-        self._panel_jobs = PanelJobRegistry(self.root / ".panel-jobs.json")
+        self._panel_jobs = PanelJobRegistry(self.root / ".panel-jobs.json", recover_on_load=False)
         self._portfolio_service = PortfolioPanelService(
             self.root,
             self.root / "portfolio_optimizer.local.json",
@@ -1319,6 +1326,7 @@ class PanelController:
             lock=self._lock,
             local_testing_service_provider=lambda: self._local_testing_service(),
         )
+        self._portfolio_service.startup_recover()
         self._local_testing_filled = False
         self._remote_testing_filled = False
         self._local_testing_service_instance: LocalTestingService | None = None
@@ -1839,7 +1847,7 @@ class PanelController:
         return self._portfolio_service.submit_campaign(payload)
 
     def portfolio_active_job(self) -> dict[str, object] | None:
-        return self._portfolio_service.active_job()
+        return self._portfolio_service.active_or_job()
 
     def portfolio_job(self, job_id: str) -> dict[str, object]:
         return self._portfolio_service.job(job_id)
@@ -3145,7 +3153,7 @@ class PanelController:
         return self._single_mode_strategy_test_service
 
     def strategies_tester_start(self, payload: Mapping[str, object]) -> dict[str, object]:
-        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end"})
+        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end", "initial_balance"})
         if unexpected:
             raise ValueError("tester start request contains unsupported fields")
         analysis_id = self._required(payload, "analysis_run_id")
@@ -3157,9 +3165,10 @@ class PanelController:
             raise ValueError("end_date and test_end disagree")
         if start_date is None or end_date is None:
             raise ValueError("start_date and end_date are required")
+        initial_balance = self._requested_initial_balance(payload)
         manifest = self._fresh_strategy_manifest(analysis_id)
         return self._start_tracked_panel_job(
-            "strategies.tester.start", {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "mode": "SINGLE_MODE"},
+            "strategies.tester.start", {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "initial_balance": initial_balance, "mode": "SINGLE_MODE"},
             ("strategies.tester",),
             lambda job_id: self._single_mode_strategy_test().start(
                 manifest,
@@ -3167,6 +3176,7 @@ class PanelController:
                 start_date=start_date,
                 end_date=end_date,
                 job_id=job_id,
+                **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ),
         )
 
@@ -3236,14 +3246,17 @@ class PanelController:
                 ):
                     raise ValueError("committed RETEST inbox is not ready")
                 if not isinstance(raw_inbox, str) or not raw_inbox.strip():
-                    raise ValueError("committed RETEST inbox path is unavailable")
+                    raise ValueError(_RETEST_INBOX_PATH_UNAVAILABLE)
                 inbox = Path(raw_inbox).resolve()
                 if inbox == inbox_root:
-                    raise ValueError("committed RETEST inbox path is unsafe")
-                inbox.relative_to(inbox_root)
+                    raise ValueError(_RETEST_INBOX_PATH_UNAVAILABLE)
+                try:
+                    inbox.relative_to(inbox_root)
+                except ValueError as error:
+                    raise ValueError(_RETEST_INBOX_PATH_UNAVAILABLE) from error
                 manifest_path = inbox / "inbox_manifest.json"
                 if not inbox.is_dir() or manifest_path.is_symlink() or not manifest_path.is_file():
-                    raise ValueError("committed RETEST inbox manifest is unavailable")
+                    raise ValueError(_RETEST_INBOX_MANIFEST_UNAVAILABLE)
                 if manifest_path.stat().st_size > 16 * 1024 * 1024:
                     raise ValueError("committed RETEST inbox manifest is too large")
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -3280,6 +3293,12 @@ class PanelController:
                 ):
                     raise ValueError("committed RETEST inbox manifest is invalid")
             except (OSError, RuntimeError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                if str(error) in _RETEST_INBOX_UNAVAILABLE:
+                    raise PerformanceV2ApiError(
+                        "RETEST_SOURCE_ARTIFACTS_UNAVAILABLE",
+                        status=409,
+                        message="committed RETEST inbox source artifacts are unavailable",
+                    ) from error
                 raise ValueError(str(error)) from None
             try:
                 self._validate_metadata_inbox(inbox)
@@ -3448,6 +3467,20 @@ class PanelController:
             raise ValueError(f"{field} must be an ISO date")
         return value
 
+    @staticmethod
+    def _requested_initial_balance(payload: Mapping[str, object]) -> float | None:
+        return None if "initial_balance" not in payload else parse_initial_balance(payload["initial_balance"])
+
+    @staticmethod
+    def _validate_retest_end_date(end: str) -> str:
+        if date.fromisoformat(end) > date.today() - timedelta(days=1):
+            raise PerformanceV2ApiError(
+                "RETEST_END_DATE_INVALID",
+                status=422,
+                message="RETEST test_end must not be later than yesterday",
+            )
+        return end
+
     def _retest_default_dates(self, connection: duckdb.DuckDBPyConnection) -> tuple[str, str]:
         rows = connection.execute(
             """
@@ -3489,16 +3522,16 @@ class PanelController:
     def _retest_range(self, payload: Mapping[str, object], connection: duckdb.DuckDBPyConnection) -> tuple[str, str]:
         explicit = self._retest_explicit_range(payload)
         if explicit is not None:
-            return explicit
+            return explicit[0], self._validate_retest_end_date(explicit[1])
         start, end = self._retest_default_dates(connection)
         if start >= end:
             raise ValueError("RETEST test_start must be before test_end")
-        return start, end
+        return start, self._validate_retest_end_date(end)
 
     def _retest_explicit_range(self, payload: Mapping[str, object]) -> tuple[str, str] | None:
         if not isinstance(payload, Mapping):
             raise ValueError("RETEST start request must be an object")
-        allowed = {"test_start", "test_end", "start_date", "end_date"}
+        allowed = {"test_start", "test_end", "start_date", "end_date", "initial_balance"}
         if set(payload).difference(allowed):
             raise ValueError("RETEST start request contains unsupported fields")
         pairs = [("test_start", "test_end"), ("start_date", "end_date")]
@@ -3508,10 +3541,15 @@ class PanelController:
         if not present:
             return None
         start_key, end_key = present[0]
-        if start_key not in payload or end_key not in payload:
+        if start_key not in payload:
             raise ValueError("RETEST test_start and test_end are required together")
+        if end_key not in payload:
+            raise PerformanceV2ApiError("RETEST_END_DATE_INVALID", status=422, message="RETEST test_end must be an ISO date")
         start = self._retest_date(payload[start_key], start_key)
-        end = self._retest_date(payload[end_key], end_key)
+        try:
+            end = self._retest_date(payload[end_key], end_key)
+        except ValueError:
+            raise PerformanceV2ApiError("RETEST_END_DATE_INVALID", status=422, message="RETEST test_end must be an ISO date") from None
         if start >= end:
             raise ValueError("RETEST test_start must be before test_end")
         return start, end
@@ -3743,7 +3781,10 @@ class PanelController:
         target = performance_v2_database_path(config)
         if not target.is_file():
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
-        self._retest_explicit_range(payload)
+        initial_balance = self._requested_initial_balance(payload)
+        explicit = self._retest_explicit_range(payload)
+        if explicit is not None:
+            self._validate_retest_end_date(explicit[1])
         reusable = self._reusable_retest_job()
         if reusable is not None:
             return reusable
@@ -3765,6 +3806,7 @@ class PanelController:
             "strategies_path": str(batch.strategies_path),
             "test_start": start,
             "test_end": end,
+            "initial_balance": initial_balance,
             "listing_dates_path": str(listing_relative),
         }
         request = {
@@ -3774,6 +3816,7 @@ class PanelController:
             "end_date": end,
             "mode": "SINGLE_MODE",
             "retest": True,
+            "initial_balance": initial_balance,
         }
         return self._start_tracked_panel_job(
             "strategies.tester.native.start",
@@ -3785,6 +3828,7 @@ class PanelController:
                 start_date=start,
                 end_date=end,
                 job_id=job_id,
+                **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ),
             runtime=runtime,
         )
@@ -3875,7 +3919,6 @@ class PanelController:
                 "clear_retest_on_success": True,
                 "test_start": start,
                 "test_end": end,
-                "listing_dates_path": listing_path,
                 "_retest": True,
             }, _internal=True)
             if not isinstance(import_job, Mapping):
@@ -4079,6 +4122,19 @@ class PanelController:
     def strategies_performance_v2_catalog(self) -> dict[str, object]:
         return self.performance_v2_catalog()
 
+    def strategies_performance_v2_export(self, selection: object, *, now: datetime | None = None) -> tuple[str, bytes]:
+        try:
+            config = self._performance_v2_config()
+            target = performance_v2_database_path(config)
+        except (OSError, TypeError, ValueError) as error:
+            raise PerformanceV2ApiError("PERFORMANCE_DB_UNAVAILABLE", status=503, message="PerformanceDB is unavailable.") from error
+        return export_performance_v2(
+            target,
+            selection,
+            selection_config=load_selection_config(self.default_config.with_name("config.performance.json")),
+            now=now,
+        )
+
     def performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(payload, Mapping):
             raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="request must be an object")
@@ -4138,7 +4194,7 @@ class PanelController:
 
     @staticmethod
     def _bulk_retest_range(payload: Mapping[str, object], listing_dates: Mapping[str, object], connection: duckdb.DuckDBPyConnection, include_reserve: bool) -> tuple[str, str]:
-        allowed = {"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date"}
+        allowed = {"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date", "initial_balance"}
         if set(payload).difference(allowed):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
         if type(include_reserve) is not bool:
@@ -4167,12 +4223,13 @@ class PanelController:
     def strategies_performance_v2_finalist_retest_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(payload, Mapping):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request must be an object")
-        if set(payload).difference({"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date"}):
+        if set(payload).difference({"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date", "initial_balance"}):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
         include_reserve = payload.get("include_reserve", False)
         clear_reports = payload.get("clear_reports", False)
         if type(clear_reports) is not bool:
             raise FinalistRetestError("INVALID_REQUEST", "clear_reports must be a boolean")
+        initial_balance = self._requested_initial_balance(payload)
         listing_path, listing_relative = self._retest_listing_context()
         try:
             listing_dates = load_listing_dates(listing_path)
@@ -4207,6 +4264,7 @@ class PanelController:
                 and old_runtime.get("test_end") == end
                 and old_runtime.get("cohort_sha256") == current_cohort.cohort_sha256
                 and old_runtime.get("config_sha256") == current_config_sha256
+                and old_runtime.get("initial_balance") == initial_balance
             )
             if not same_request:
                 continue
@@ -4228,17 +4286,19 @@ class PanelController:
             "bulk_retest": True, "scope": batch.cohort.scope, "cohort_sha256": batch.cohort.cohort_sha256,
             "config_sha256": batch.config_sha256, "manifest_sha256": sha256(batch.manifest_path.read_bytes()).hexdigest(),
             "test_start": start, "test_end": end, "listing_dates_path": str(listing_relative),
+            "initial_balance": initial_balance,
             "manifest_path": str(batch.manifest_path), "cohort_members": _json_value([dict(member) for member in batch.cohort.members]),
             "exclusions": [item.as_dict() for item in batch.cohort.exclusions],
             "successful_replacements": [], "failures": [item.as_dict() for item in batch.cohort.exclusions],
         }
-        request = {"scope": batch.cohort.scope, "test_start": start, "test_end": end, "retest": True, "clear_reports": clear_reports}
+        request = {"scope": batch.cohort.scope, "test_start": start, "test_end": end, "retest": True, "clear_reports": clear_reports, "initial_balance": initial_balance}
         return self._start_tracked_panel_job(
             "strategies.performance.v2.finalist-retest", request,
             ("strategies.tester", "performance-v2-finalist-retest"),
             lambda job_id: self._single_mode_strategy_test().start(
                 batch.manifest_path, analysis_run_id=batch.run_id, start_date=start, end_date=end, job_id=job_id,
                 clear_reports=clear_reports,
+                **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ), runtime=runtime,
         )
 
@@ -4962,6 +5022,22 @@ class PanelController:
             } else 400
             details = f": {error.details}" if error.details else ""
             raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
+        except PerformanceV2StoreError as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
+        except duckdb.Error as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
+
+    def strategies_performance_v2_retest_tags_import(self, data: bytes) -> dict[str, object]:
+        target = performance_v2_database_path(self._performance_v2_config())
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
+        self._ensure_performance_v2_schema(target)
+        try:
+            with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+                return import_retest_tags(connection, data)
+        except SelectionReviewError as error:
+            details = f": {error.details}" if error.details else ""
+            raise PerformanceV2ApiError(error.code, status=400, message=f"{error}{details}") from error
         except PerformanceV2StoreError as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
         except duckdb.Error as error:
@@ -7552,6 +7628,8 @@ class _PanelServer(ThreadingHTTPServer):
 
 class _PanelHandler(BaseHTTPRequestHandler):
     server: _PanelServer
+    _PERFORMANCE_V2_EXPORT = "/api/v2/strategies/performance-v2/export"
+    _PERFORMANCE_V2_EXPORT_ALLOW = "GET, HEAD, OPTIONS"
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -7574,6 +7652,54 @@ class _PanelHandler(BaseHTTPRequestHandler):
         self._headers(status, "application/json; charset=utf-8", len(payload))
         self.wfile.write(payload)
 
+    def _export_json(self, status: int, value: object, *, body: bool = True) -> None:
+        payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Allow", self._PERFORMANCE_V2_EXPORT_ALLOW)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.end_headers()
+        if body:
+            self.wfile.write(payload)
+
+    def _export_method_not_allowed(self) -> None:
+        self.send_response(405)
+        self.send_header("Allow", self._PERFORMANCE_V2_EXPORT_ALLOW)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _handle_performance_v2_export(self, query: str, *, body: bool) -> None:
+        try:
+            selection = parse_performance_v2_export_query(query)
+            filename, data = self.server.controller.strategies_performance_v2_export(selection)
+        except PerformanceV2ApiError as error:
+            if error.code in {
+                "unknown_query_parameter", "duplicate_query_parameter", "missing_export_selection",
+                "invalid_query_flag", "all_active_mixed_with_status", "invalid_export_status", "duplicate_export_status",
+            }:
+                self._export_json(error.status, {"error": error.code, "message": str(error)}, body=body)
+            else:
+                self._export_json(error.status, {"error": {"code": error.code, "message": str(error)}}, body=body)
+            return
+        except Exception:
+            _LOGGER.exception("Performance v2 export failed")
+            self._export_json(503, {"error": {"code": "PERFORMANCE_DB_UNAVAILABLE", "message": "PerformanceDB is unavailable."}}, body=body)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Allow", self._PERFORMANCE_V2_EXPORT_ALLOW)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.end_headers()
+        if body:
+            self.wfile.write(data)
+
     def _portfolio_error(self, error: PortfolioPanelError) -> None:
         self._json(error.status, {"error": {"code": error.code, "message": str(error), "field_errors": error.field_errors}})
 
@@ -7594,6 +7720,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         parsed = urlparse(self.path)
+        if parsed.path == self._PERFORMANCE_V2_EXPORT:
+            self._handle_performance_v2_export(parsed.query, body=True)
+            return
         if parsed.path == "/legacy":
             payload = PANEL_HTML.encode("utf-8")
             self._headers(200, "text/html; charset=utf-8", len(payload))
@@ -7947,9 +8076,34 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         self._json(404, {"error": "not found"})
 
+    def do_HEAD(self) -> None:
+        if not self._has_local_host():
+            self._export_json(403, {"error": "local Host header required"}, body=False)
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == self._PERFORMANCE_V2_EXPORT:
+            self._handle_performance_v2_export(parsed.query, body=False)
+            return
+        self._export_json(404, {"error": "not found"}, body=False)
+
+    def do_OPTIONS(self) -> None:
+        if not self._has_local_host():
+            self._export_json(403, {"error": "local Host header required"}, body=False)
+            return
+        if urlparse(self.path).path != self._PERFORMANCE_V2_EXPORT:
+            self._export_json(404, {"error": "not found"}, body=False)
+            return
+        self.send_response(204)
+        self.send_header("Allow", self._PERFORMANCE_V2_EXPORT_ALLOW)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_PUT(self) -> None:
         if not self._has_local_host():
             self._json(403, {"error": "local Host header required"})
+            return
+        if urlparse(self.path).path == self._PERFORMANCE_V2_EXPORT:
+            self._export_method_not_allowed()
             return
         if urlparse(self.path).path != "/api/v2/portfolio/settings":
             self._json(404, {"error": "not found"})
@@ -7982,6 +8136,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
+        if endpoint == self._PERFORMANCE_V2_EXPORT:
+            self._export_method_not_allowed()
+            return
         direct_retest_endpoint = endpoint if endpoint in {
             "/api/v2/strategies/performance-v2/retest/start",
             "/api/v2/strategies/performance-v2/retest/import",
@@ -8008,23 +8165,26 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_route = endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         portfolio_cancel_route = bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint))
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
-        if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
+        if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
             self._json(404, {"error": "not found"})
             return
-        if endpoint == "/api/v2/strategies/performance-v2/selection-review-import":
+        if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import"}:
+            error_code = "RETEST_TAG_IMPORT_INVALID_FILE" if endpoint.endswith("retest-tags-import") else "SELECTION_REVIEW_INVALID_FILE"
             if self.headers.get("Content-Type", "").partition(";")[0].strip().casefold() != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
-                self._json(415, {"error": {"code": "SELECTION_REVIEW_INVALID_FILE", "message": "XLSX Content-Type required"}})
+                self._json(415, {"error": {"code": error_code, "message": "XLSX Content-Type required"}})
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 length = 0
             if length <= 0 or length > 20 * 1024 * 1024:
-                self._json(400, {"error": {"code": "SELECTION_REVIEW_INVALID_FILE", "message": "XLSX must be between 1 byte and 20 MiB"}})
+                self._json(400, {"error": {"code": error_code, "message": "XLSX must be between 1 byte and 20 MiB"}})
                 return
             try:
                 if bulk_control_import_endpoint:
                     result = self.server.controller.strategies_performance_v2_finalist_retest_control_import(self.rfile.read(length))
+                elif endpoint.endswith("retest-tags-import"):
+                    result = self.server.controller.strategies_performance_v2_retest_tags_import(self.rfile.read(length))
                 else:
                     result = self.server.controller.strategies_performance_v2_selection_review_import(self.rfile.read(length))
             except PerformanceV2ApiError as error:
@@ -8325,6 +8485,24 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         accepted = portfolio_cancel_route or portfolio_submission_route or endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
         self._json(202 if accepted else 200, result)
+
+    def do_PATCH(self) -> None:
+        if not self._has_local_host():
+            self._json(403, {"error": "local Host header required"})
+            return
+        if urlparse(self.path).path == self._PERFORMANCE_V2_EXPORT:
+            self._export_method_not_allowed()
+            return
+        self._json(404, {"error": "not found"})
+
+    def do_DELETE(self) -> None:
+        if not self._has_local_host():
+            self._json(403, {"error": "local Host header required"})
+            return
+        if urlparse(self.path).path == self._PERFORMANCE_V2_EXPORT:
+            self._export_method_not_allowed()
+            return
+        self._json(404, {"error": "not found"})
 
 
 def create_panel_server(

@@ -748,6 +748,54 @@ def _lot_variant_row(
     }
 
 
+def test_selection_workbook_shows_effective_dates_as_day_and_month(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    path = write_selection_workbook(
+        pd.DataFrame([_lot_variant_row(
+            "dated", 1,
+            interval=(datetime(2026, 2, 11, 23, 30, tzinfo=UTC), datetime(2026, 9, 3, tzinfo=UTC)),
+            finalist=True,
+        )]),
+        tmp_path / "dated.xlsx", request,
+    )
+
+    sheet = load_workbook(path, data_only=True)["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    assert headers[headers.index("Start")] == "Start"
+    assert headers[headers.index("End")] == "End"
+    assert sheet.cell(2, headers.index("Start") + 1).value == "11.02"
+    assert sheet.cell(2, headers.index("End") + 1).value == "03.09"
+
+
+def test_selection_workbook_keeps_missing_effective_dates_blank_for_sparse_rows(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    result = pd.DataFrame([{"strategy_id": 1, "finalist": True, "effective_start_utc": None, "effective_end_utc": pd.NaT}])
+    sheet = load_workbook(
+        write_selection_workbook(result, tmp_path / "blank-dates.xlsx", request), data_only=True
+    )["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+
+    assert sheet.cell(2, headers.index("Start") + 1).value is None
+    assert sheet.cell(2, headers.index("End") + 1).value is None
+
+    empty_headers = [cell.value for cell in load_workbook(
+        write_selection_workbook(pd.DataFrame(), tmp_path / "empty.xlsx", request), data_only=True
+    )["All candidates"][1]]
+    assert {"Start", "End"}.issubset(empty_headers)
+
+
+def test_selection_workbook_keeps_malformed_effective_dates_blank(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    sheet = load_workbook(write_selection_workbook(
+        pd.DataFrame([{"strategy_id": 1, "finalist": False, "effective_start_utc": "not-a-date", "effective_end_utc": ""}]),
+        tmp_path / "malformed-dates.xlsx", request,
+    ), data_only=True)["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+
+    assert sheet.cell(2, headers.index("Start") + 1).value is None
+    assert sheet.cell(2, headers.index("End") + 1).value is None
+
+
 def test_lot_variant_filter_is_default_on_first_and_keeps_loser_auditable() -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_best_trade_dependency", "enabled": True, "scope": "pair_side_timeframe"},
@@ -1225,8 +1273,8 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     strategy_column = headers.index("Стратегия") + 1
     winner_row = next(row for row in range(2, book["All candidates"].max_row + 1) if book["All candidates"].cell(row, strategy_column).value == "winner")
     assert book["All candidates"].cell(winner_row, headers.index("PnL/30") + 1).value == 9
-    assert headers[:25] == [
-        "ID", "Стратегия", "Пара", "Side", "ТФ", "ORD", "Close", "PnL/30", "PnL DD5/30",
+    assert headers[:27] == [
+        "ID", "Стратегия", "Пара", "Side", "ТФ", "Start", "End", "ORD", "Close", "PnL/30", "PnL DD5/30",
         "∆ PnL A/B", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "Positive windows", "CE", "PF", "DD", "W/R", "Trades", "Trades/30", "Lot DD5", "Hold p95", "Hold M", "PointsALL",
     ]
     assert "Shift 1" not in headers
