@@ -20,7 +20,11 @@ from openpyxl import load_workbook
 
 from .config import AlgorithmConfig
 from .lots import LotMethod
-from .performance_v2_store import PerformanceV2StoreError, require_performance_v2
+from .performance_v2_store import (
+    PerformanceV2StoreError,
+    require_performance_v2,
+    require_performance_v2_readable,
+)
 from .performance_v2_selection import SELECTION_REASON_ALIASES
 from .performance_v2_selection_review import effective_selection_decisions
 from .strategy_json import generate_strategy
@@ -1207,7 +1211,7 @@ def freeze_finalist_cohort(
     warmup_hours: int = LISTING_WARMUP_HOURS,
 ) -> FinalistRetestCohort:
     """Read and freeze the current effective finalist/reserve population."""
-    require_performance_v2(connection)
+    require_performance_v2_readable(connection)
     if type(include_reserve) is not bool or isinstance(warmup_hours, bool) or not isinstance(warmup_hours, int) or warmup_hours < 0:
         raise FinalistRetestError("INVALID_REQUEST", "bulk retest options are invalid")
     requested_start_dt, requested_start = _boundary(test_start, "test_start")

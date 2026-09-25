@@ -217,9 +217,13 @@ from .performance_v2_store import (
     load_performance_v2_config,
     performance_v2_database_path,
     require_performance_v2,
+    require_performance_v2_readable,
 )
+from .performance_v2_equity_cache import EquitySourceChangedError
 from .performance_v2_optimizer import prepare_current_optimizer_inputs
 from .performance_v2_selection import (
+    EquityCacheSchemaInvalidError,
+    EquitySchemaUpgradeRequiredError,
     PerformanceV2SelectionError,
     SelectionRequest,
     load_selection_candidates,
@@ -229,6 +233,7 @@ from .performance_v2_selection import (
     run_selection,
     selection_cache_missing_strategy_ids,
     selection_cache_status,
+    selection_equity_facts_token,
     write_selection_workbook,
     retest_cohort_request,
 )
@@ -4101,8 +4106,8 @@ class PanelController:
         if not target.is_file():
             return {"strategies": []}
         try:
-            self._ensure_performance_v2_schema(target)
             with duckdb.connect(str(target), read_only=True) as connection:
+                require_performance_v2_readable(connection)
                 catalog = performance_v2_catalog(connection)
                 pairs_with_runs: list[str] = []
                 for symbol in sorted({str(row["symbol"]) for row in catalog["strategies"]}):
@@ -4116,6 +4121,8 @@ class PanelController:
                 return catalog
         except PerformanceV2ApiError:
             raise
+        except PerformanceV2StoreError as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
         except (duckdb.Error, OSError) as error:
             raise ValueError("Performance v2 database is unavailable") from error
 
@@ -4918,11 +4925,10 @@ class PanelController:
         target = performance_v2_database_path(performance_config)
         if not target.is_file():
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
-        self._ensure_performance_v2_schema(target)
         try:
             with duckdb.connect(str(target), read_only=True) as connection:
                 connection.execute(f"set threads to {performance_config.workers}")
-                require_performance_v2(connection)
+                schema_version = require_performance_v2_readable(connection)
                 if not selection_cache_status(connection, request, selection_config)["ready"]:
                     raise PerformanceV2ApiError(
                         "SELECTION_CACHE_INCOMPLETE", status=409,
@@ -4954,6 +4960,9 @@ class PanelController:
                         + (" and s.strategy_id in (" + ",".join("?" for _ in request.cohort_members) + ")" if request.ranking_scope == "RETEST_COHORT" else ""),
                     [request.symbol, request.side, *(strategy_id for strategy_id, _ in request.cohort_members)] if request.ranking_scope == "RETEST_COHORT" else [request.symbol, request.side],
                 ).fetchone()
+                equity_facts_token = selection_equity_facts_token(
+                    connection, request, schema_version=schema_version
+                )
                 cache_key = (
                     request.symbol,
                     request.side,
@@ -4963,6 +4972,7 @@ class PanelController:
                     tuple(asdict(selection_config).items()),
                     result_token,
                     facts_token,
+                    equity_facts_token,
                 )
                 with self._selection_candidate_cache_lock:
                     candidates = self._selection_candidate_cache.get(cache_key)
@@ -4977,6 +4987,8 @@ class PanelController:
                             self._selection_candidate_cache.popitem(last=False)
                 result = run_selection(apply_prior_rejected(connection, candidates), request, selection_config)
             return request, result
+        except PerformanceV2StoreError as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
         except duckdb.Error as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
 
@@ -5056,10 +5068,11 @@ class PanelController:
         request = self._selection_request(selection_payload)
         config = load_selection_config(self.default_config.with_name("config.performance.json"))
         target = performance_v2_database_path(self._performance_v2_config())
-        self._ensure_performance_v2_schema(target)
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
         try:
             with duckdb.connect(str(target), read_only=True) as connection:
-                require_performance_v2(connection)
+                require_performance_v2_readable(connection)
                 return selection_cache_status(connection, request, config)
         except PerformanceV2StoreError as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
@@ -5080,11 +5093,22 @@ class PanelController:
             self._ensure_performance_v2_schema(target)
             with self._performance_v2_writer_lock:
                 with duckdb.connect(str(target), read_only=True) as connection:
-                    missing_strategy_ids = selection_cache_missing_strategy_ids(connection, request, config)
-                prepare_selection_window_cache(target, request, config, performance_config.workers, missing_strategy_ids)
+                    missing_strategy_ids = selection_cache_missing_strategy_ids(
+                        connection, request, config, include_equity=True
+                    )
+                prepare_selection_window_cache(
+                    target, request, config, performance_config.workers, missing_strategy_ids,
+                    include_equity=True,
+                )
             with self._selection_candidate_cache_lock:
                 self._selection_candidate_cache.clear()
             return {"status": "READY"}
+        except EquitySourceChangedError as error:
+            raise PerformanceV2ApiError("EQUITY_SOURCE_CHANGED", status=409, message=str(error)) from error
+        except EquitySchemaUpgradeRequiredError as error:
+            raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
+        except EquityCacheSchemaInvalidError as error:
+            raise PerformanceV2ApiError(error.code, status=500, message=str(error)) from error
         except (PerformanceV2SelectionError, OSError, duckdb.Error) as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_RECALCULATE_FAILED", status=400, message=str(error)) from error
 
@@ -5105,12 +5129,17 @@ class PanelController:
                 pending = []
                 for symbol, side in pairs:
                     request = SelectionRequest(str(symbol), str(side), ())
-                    missing_strategy_ids = selection_cache_missing_strategy_ids(connection, request, config)
+                    missing_strategy_ids = selection_cache_missing_strategy_ids(
+                        connection, request, config, include_equity=True
+                    )
                     if missing_strategy_ids:
                         pending.append((request, missing_strategy_ids))
             with self._performance_v2_writer_lock:
                 for request, missing_strategy_ids in pending:
-                    prepare_selection_window_cache(target, request, config, performance_config.workers, missing_strategy_ids)
+                    prepare_selection_window_cache(
+                        target, request, config, performance_config.workers, missing_strategy_ids,
+                        include_equity=True,
+                    )
             if pending:
                 with self._selection_candidate_cache_lock:
                     self._selection_candidate_cache.clear()
@@ -5118,6 +5147,12 @@ class PanelController:
                 "status": "READY", "total_pairs": len(pairs), "recalculated_pairs": len(pending),
                 "ready_pairs": len(pairs) - len(pending),
             }
+        except EquitySourceChangedError as error:
+            raise PerformanceV2ApiError("EQUITY_SOURCE_CHANGED", status=409, message=str(error)) from error
+        except EquitySchemaUpgradeRequiredError as error:
+            raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
+        except EquityCacheSchemaInvalidError as error:
+            raise PerformanceV2ApiError(error.code, status=500, message=str(error)) from error
         except (PerformanceV2SelectionError, OSError, duckdb.Error) as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_RECALCULATE_FAILED", status=400, message=str(error)) from error
 

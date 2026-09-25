@@ -18,6 +18,7 @@ from .performance_v2_store import (
 
 DEFAULT_CUTOFF = "2026-09-06"
 _CHILD_TABLES = (
+    "equity_quality_metrics",
     "window_metrics",
     "strategy_actions",
     "strategy_equity",
@@ -124,7 +125,7 @@ def _plan(connection: duckdb.DuckDBPyConnection, cutoff: datetime) -> tuple[list
                 [stale_ids],
             ).fetchone()[0]
         )
-    for table in ("window_metrics", "strategy_actions", "strategy_equity"):
+    for table in ("equity_quality_metrics", "window_metrics", "strategy_actions", "strategy_equity"):
         counts[table] = int(
             connection.execute(
                 f"""
@@ -150,7 +151,7 @@ def _delete(connection: duckdb.DuckDBPyConnection, stale_ids: list[int]) -> None
             [stale_ids],
         ).fetchall()
     ]
-    for table in ("window_metrics", "strategy_actions", "strategy_equity"):
+    for table in ("equity_quality_metrics", "window_metrics", "strategy_actions", "strategy_equity"):
         if result_ids:
             connection.execute(
                 f"delete from {table} where result_id in (select unnest(?::BIGINT[]))",

@@ -748,6 +748,10 @@ def test_replace_switches_current_result_and_replaces_only_scoped_children(tmp_p
                 Decimal("0"), Decimal("1"), 1, Decimal("100"), Decimal("0"), Decimal("0"), window_end,
             ],
         )
+        connection.execute(
+            "insert into equity_quality_metrics values (?, 'old-source', 'equity-quality-r7.3-v1', '{}', 'old-digest', now())",
+            [old_result],
+        )
     changed = FIXTURE.read_bytes().replace(
         b"2026-01-01 - 2026-01-09", b"2026-01-01 - 2026-01-10"
     ).replace(b"1009.9", b"1019.9")
@@ -771,6 +775,7 @@ def test_replace_switches_current_result_and_replaces_only_scoped_children(tmp_p
         assert len(connection.execute("select * from strategy_actions where result_id = ?", [old_result]).fetchall()) == len(old_actions)
         assert len(connection.execute("select * from strategy_equity where result_id = ?", [old_result]).fetchall()) == len(old_equity)
         assert connection.execute("select count(*) from window_metrics where result_id = ?", [old_result]).fetchone() == (0,)
+        assert connection.execute("select count(*) from equity_quality_metrics where result_id = ?", [old_result]).fetchone() == (0,)
         assert connection.execute("select report_end_utc from strategy_results where result_id = ?", [old_result]).fetchone()[0].date().isoformat() == "2026-01-10"
     assert (request.inbox / "strategies" / "alpha.json").read_bytes()
     assert (request.inbox / "inbox_manifest.json").read_bytes()
@@ -788,6 +793,10 @@ def test_replace_rollback_restores_old_result_after_publish_failure(tmp_path: Pa
         connection.execute(
             "insert into strategy_tags values (?, 'RETEST', 'RETEST_WORKFLOW', 'test', now())",
             [strategy_id],
+        )
+        connection.execute(
+            "insert into equity_quality_metrics values (?, 'old-source', 'equity-quality-r7.3-v1', '{\"state\":\"GROWING\"}', 'old-digest', now())",
+            [old_result],
         )
     _rewrite_report(request, FIXTURE.read_bytes().replace(b"1009.9", b"1019.9"))
     original_inbox = {path.relative_to(request.inbox): path.read_bytes() for path in request.inbox.rglob("*") if path.is_file()}
@@ -819,6 +828,10 @@ def test_replace_rollback_restores_old_result_after_publish_failure(tmp_path: Pa
         assert connection.execute(
             "select count(*) from strategy_tags where strategy_id = ? and tag = 'RETEST'", [strategy_id]
         ).fetchone() == (1,)
+        assert connection.execute(
+            "select source_revision, facts_json, facts_sha256 from equity_quality_metrics where result_id = ?",
+            [old_result],
+        ).fetchone() == ("old-source", '{"state":"GROWING"}', "old-digest")
     assert list(request.config.database_root.glob("performance_v2_failures_*.csv"))
     assert {path.relative_to(request.inbox): path.read_bytes() for path in request.inbox.rglob("*") if path.is_file()} == original_inbox
 
@@ -956,7 +969,7 @@ def test_import_migrates_existing_v4_target_before_current_schema_gate(tmp_path:
     with duckdb.connect(str(target), read_only=True) as connection:
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("5",)
+        ).fetchone() == ("6",)
 
 
 def test_bare_duckdb_target_is_not_initialized_by_import(tmp_path: Path) -> None:

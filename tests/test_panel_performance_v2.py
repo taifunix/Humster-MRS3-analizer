@@ -1408,28 +1408,41 @@ def test_selection_preview_reuses_candidates_until_recalculation(tmp_path: Path,
     assert calls == 4
 
 
-def test_performance_v2_schema_initialization_is_memoized(tmp_path: Path, monkeypatch) -> None:
+def test_performance_v2_catalog_and_cache_status_do_not_upgrade_v5_on_read(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
-    import mrs3.panel as panel_module
-    original = panel_module.initialize_performance_v2
-    calls = 0
+    payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+    controller.strategies_performance_v2_recalculate(payload)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("drop table equity_quality_metrics")
+        connection.execute("update schema_info set value = '5' where key = 'schema_version'")
 
-    def counted(connection):
-        nonlocal calls
-        calls += 1
-        return original(connection)
-
-    monkeypatch.setattr(panel_module, "initialize_performance_v2", counted)
     controller.performance_v2_catalog()
-    controller.performance_v2_catalog()
+    assert controller.strategies_performance_v2_selection_preview(payload) == {"stages": {}}
+    assert controller.strategies_performance_v2_selection_cache_status(payload) == {
+        "total": 1, "missing": 0, "ready": True,
+    }
 
-    assert calls == 1
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("5",)
+        assert connection.execute(
+            "select count(*) from information_schema.tables where table_name = 'equity_quality_metrics'"
+        ).fetchone() == (0,)
 
+
+def test_performance_v2_catalog_rejects_existing_bare_database_without_initializing_it(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
     database.unlink()
     with duckdb.connect(str(database)):
         pass
-    controller.performance_v2_catalog()
-    assert calls == 2
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller.performance_v2_catalog()
+
+    assert raised.value.code == "PERFORMANCE_V2_SCHEMA_INVALID"
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute(
+            "select count(*) from information_schema.tables where table_name = 'schema_info'"
+        ).fetchone() == (0,)
 
 
 def test_selection_xlsx_maps_stale_snapshot_to_api_error(tmp_path: Path, monkeypatch) -> None:
@@ -1513,11 +1526,36 @@ def test_selection_recalculate_passes_only_missing_strategy_ids(tmp_path: Path, 
         "prepare_current_optimizer_inputs",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("optimizer preparation is not part of selection recalculation")),
     )
-    monkeypatch.setattr(panel_module, "selection_cache_missing_strategy_ids", lambda *_args: (17, 23))
-    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *args: calls.append(args))
+    monkeypatch.setattr(panel_module, "selection_cache_missing_strategy_ids", lambda *_args, **_kwargs: (17, 23))
+    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *args, **kwargs: calls.append((args, kwargs)))
 
     assert controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"}) == {"status": "READY"}
-    assert calls and calls[0][-1] == (17, 23)
+    assert calls and calls[0][0][-1] == (17, 23) and calls[0][1] == {"include_equity": True}
+
+
+@pytest.mark.parametrize(
+    ("schema", "code", "status"),
+    [("v5", "EQUITY_SCHEMA_UPGRADE_REQUIRED", 409), ("invalid_v6", "PERFORMANCE_V2_SCHEMA_INVALID", 500)],
+)
+def test_selection_recalculate_maps_equity_cache_errors_to_typed_api_errors(
+    tmp_path: Path, monkeypatch, schema: str, code: str, status: int,
+) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    if schema == "v5":
+        controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+        with duckdb.connect(str(database)) as connection:
+            connection.execute("drop table equity_quality_metrics")
+            connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+    else:
+        with duckdb.connect(str(database)) as connection:
+            connection.execute("drop table equity_quality_metrics")
+    monkeypatch.setattr(controller, "_ensure_performance_v2_schema", lambda _target: None)
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+
+    assert raised.value.code == code
+    assert raised.value.status == status
 
 
 def test_selection_recalculate_all_does_not_prepare_optimizer_inputs(tmp_path: Path, monkeypatch) -> None:
@@ -1607,9 +1645,9 @@ def test_selection_recalculate_tracks_only_new_current_results_for_add_replace_a
 
     import mrs3.panel as panel_module
     calls: list[tuple[object, ...]] = []
-    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *args: calls.append(args))
+    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *args, **kwargs: calls.append((args, kwargs)))
     assert controller.strategies_performance_v2_recalculate(payload) == {"status": "READY"}
-    assert calls and calls[0][-1] == ()
+    assert calls and calls[0][0][-1] == () and calls[0][1] == {"include_equity": True}
     calls.clear()
     assert controller.strategies_performance_v2_recalculate_all() == {
         "status": "READY", "total_pairs": 1, "recalculated_pairs": 0, "ready_pairs": 1,
@@ -1682,7 +1720,7 @@ def test_selection_still_exports_when_parallel_cache_warmup_fails(tmp_path: Path
     controller, _, _ = _controller_for_windows(tmp_path)
     controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
     import mrs3.panel as panel_module
-    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *_args: (_ for _ in ()).throw(OSError("warmup unavailable")))
+    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("warmup unavailable")))
 
     filename, workbook = controller.strategies_performance_v2_selection(
         {"symbol": "BTCUSDT", "side": "LONG", "stages": []}

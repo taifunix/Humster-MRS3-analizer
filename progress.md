@@ -3,7 +3,41 @@
 **Updated:** 2026-09-25
 **Current branch:** `main`
 
-## Performance v2 equity-quality proposal (2026-09-25)
+## Performance v2 equity-quality R7.3 M1 accepted (2026-09-25)
+
+The canonical contract is now R7.3. Authoritative equity is evaluated as a
+right-continuous step series on a T-anchored six-hour grid: quiet periods and
+final inactivity are horizontal curve segments and never become a data-quality
+failure. Actions, positions, candle timeframe and trade frequency are not
+inputs. H is the longest 28/14/7-day window with an in-report baseline; mixed
+report ends are supported. A growing H passes ERF even with a flat or declining
+shorter window; only the optional equity ranking demotes WEAKENING. A genuinely
+flat H remains an ERF-only block. R7.3 received independent `PLAN_APPROVED`.
+
+The read-only [M0 evidence](docs/superpowers/plans/2026-09-25-performance-v2-equity-quality-evidence.md)
+and diagnostic script were implemented by GPT-6 Luna xhigh and independently
+reviewed by Opus 5; final disposition was `CODE_REVIEW_PASS`. The post-review
+deterministic bounded scan covered 190/14,463 ACTIVE results from all 25
+Pair+Side groups and 988,120/74,333,934 equity rows. All 190 had H=28:
+GROWING=80, WEAKENING=52, FLAT=3 and DECLINING_OR_MIXED=55. No sampled result
+was invalid, nonpositive, under seven days or missing a baseline. Quiet tails
+reached 1,277.98 hours and did not invalidate any result. The equity calculation
+issued one equity query and zero action queries/rows; DB size, mtime, schema,
+catalog and row counts were unchanged.
+
+This is a 1.314% deterministic sample, not a representative population result.
+The 60-result repeat median was 29.2023 seconds with peak RSS about 487.4 MB,
+but it is not comparable to the existing cache benchmark; cold/warm/RSS budgets
+remain unaccepted. The user subsequently authorized implementation. M1 pure
+facts, schema/cache lifecycle, v5 read compatibility and bounded worker
+integration all received independent Opus 5 `CODE_REVIEW_PASS`. Final relevant
+suite: 429 passed, 2 platform symlink skips. A synthetic warm worker fixture
+reduced seven per-window cache SELECTs to one result-scoped SELECT without
+changing metrics; this is not a full-corpus wall-time benchmark. M2–M5 remain
+pending. No live Performance DB was migrated or backfilled. Next: implement
+optional filter #2, then equity Top N, without changing legacy defaults.
+
+### Superseded proposal history
 
 Added the [critical analysis/spec](docs/specs/2026-09-25-performance-v2-equity-quality.md)
 and [implementation plan](docs/superpowers/plans/2026-09-25-performance-v2-equity-quality.md),
@@ -36,8 +70,9 @@ policy cases; this is not a production implementation test.
 
 Documentation checks: scoped `git diff --check`, local Markdown link checks,
 fence balance and trailing-whitespace checks passed. Production tests were not
-run for this docs-only task. Next: user review, then assigned M0 diagnostics;
-implementation remains unstarted. Existing unrelated workspace edits are preserved.
+run for this docs-only task. This paragraph describes the superseded R6.1
+planning state; current R7.3 M0 status is recorded above. Existing unrelated
+workspace edits are preserved.
 
 ## RETEST XLSX entry point (2026-09-24)
 

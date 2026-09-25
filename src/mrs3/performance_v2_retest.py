@@ -19,7 +19,11 @@ from openpyxl import load_workbook
 from .config import AlgorithmConfig
 from .lots import LotMethod
 from .panel_strategy_batch import validate_strategy_manifest
-from .performance_v2_store import PerformanceV2StoreError, require_performance_v2
+from .performance_v2_store import (
+    PerformanceV2StoreError,
+    require_performance_v2,
+    require_performance_v2_readable,
+)
 from .pipeline import _publication_staging_dir, _publish_strategies, _write_json_atomic
 from .strategy_json import generate_strategy
 from .performance_v2_input import adapt_strategy_identity
@@ -112,7 +116,7 @@ class RetestBatch:
 
 
 def retest_status(connection: duckdb.DuckDBPyConnection) -> RetestStatus:
-    require_performance_v2(connection)
+    require_performance_v2_readable(connection)
     count = connection.execute(
         """
         select count(*)
@@ -498,7 +502,7 @@ def build_retest_manifest(
     output_dir: Path,
 ) -> RetestBatch:
     """Render active RETEST strategies from typed Performance v2 rows."""
-    require_performance_v2(connection)
+    require_performance_v2_readable(connection)
     if not isinstance(templates, Mapping):
         raise PerformanceV2StoreError("RETEST templates must be a side mapping")
     rows = _read_retest_rows(connection)

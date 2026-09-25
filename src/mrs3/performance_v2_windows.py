@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import duckdb
+
+from .performance_v2_equity_quality import EquitySample
 
 
 METRICS_VERSION = "performance-window-v2.2"
@@ -143,6 +145,15 @@ class _RoundTrip:
     realisations: list[_Action]
 
 
+@dataclass(frozen=True, slots=True)
+class _EquityQualitySourceSummary:
+    raw_sample_count: int
+    in_report_sample_count: int
+    nonpositive_in_report_rows: int
+    duplicate_timestamp_count: int
+    invalid_reasons: tuple[str, ...]
+
+
 _METRIC_COLUMNS = (
     "result_id",
     "requested_start_utc",
@@ -263,6 +274,70 @@ def _load_source(
         ).fetchall()
     )
     return report_start, report_end, actions, equity
+
+
+def _load_equity_samples_for_quality(
+    connection: duckdb.DuckDBPyConnection,
+    result_id: int,
+    report_start: datetime,
+    report_end: datetime,
+) -> tuple[tuple[EquitySample, ...], _EquityQualitySourceSummary]:
+    """Read only the 28-day calculation path and source sentinels for equity facts."""
+    start, end = _utc(report_start), _utc(report_end)
+    left = end - timedelta(days=28)
+    bounded_start = max(start, left)
+    summary_row = connection.execute(
+        """select count(*),
+                  count(*) filter (where timestamp_utc >= ? and timestamp_utc <= ?),
+                  count(*) filter (where timestamp_utc >= ? and timestamp_utc <= ? and equity <= 0),
+                  count(*) filter (where timestamp_utc >= ? and timestamp_utc <= ?) -
+                    count(distinct timestamp_utc) filter (where timestamp_utc >= ? and timestamp_utc <= ?),
+                  count(*) filter (where timestamp_utc < ? or timestamp_utc > ?)
+             from strategy_equity where result_id = ?""",
+        [start, end, start, end, start, end, start, end, start, end, result_id],
+    ).fetchone()
+    raw_count, in_report_count, nonpositive_count, duplicate_count, outside_count = map(int, summary_row)
+    selected_rows = connection.execute(
+        """with bounded as (
+                 select sample_index, timestamp_utc, equity from strategy_equity
+                  where result_id = ? and timestamp_utc >= ? and timestamp_utc <= ?
+             ), predecessor as (
+                 select sample_index, timestamp_utc, equity from strategy_equity
+                  where result_id = ? and timestamp_utc >= ? and timestamp_utc < ?
+                    and not exists (
+                        select 1 from strategy_equity edge
+                         where edge.result_id = ? and edge.timestamp_utc = ?
+                    )
+                  order by timestamp_utc desc, sample_index desc limit 1
+             ), prior_nonpositive as (
+                 select sample_index, timestamp_utc, equity from strategy_equity
+                  where result_id = ? and timestamp_utc >= ? and timestamp_utc < ? and equity <= 0
+                  order by timestamp_utc, sample_index limit 1
+             ), outside_report as (
+                 select sample_index, timestamp_utc, equity from strategy_equity
+                  where result_id = ? and (timestamp_utc < ? or timestamp_utc > ?)
+                  order by timestamp_utc, sample_index limit 1
+             )
+             select sample_index, timestamp_utc, equity from bounded
+             union select sample_index, timestamp_utc, equity from predecessor
+             union select sample_index, timestamp_utc, equity from prior_nonpositive
+             union select sample_index, timestamp_utc, equity from outside_report
+             order by timestamp_utc, sample_index""",
+        [
+            result_id, bounded_start, end,
+            result_id, start, bounded_start, result_id, bounded_start,
+            result_id, start, bounded_start,
+            result_id, start, end,
+        ],
+    ).fetchall()
+    samples = tuple(
+        EquitySample(int(result_id), int(index), _utc(timestamp), equity)
+        for index, timestamp, equity in selected_rows
+    )
+    invalid_reasons = ("EQUITY_OUTSIDE_REPORT_INTERVAL",) if outside_count else ()
+    return samples, _EquityQualitySourceSummary(
+        raw_count, in_report_count, nonpositive_count, duplicate_count, invalid_reasons
+    )
 
 
 def _flat_samples(equity: tuple[_Equity, ...], actions: tuple[_Action, ...]) -> tuple[datetime, ...]:

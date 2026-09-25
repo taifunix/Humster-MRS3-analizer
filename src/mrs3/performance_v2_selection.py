@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from colorsys import hls_to_rgb
 import json
 from pathlib import Path
@@ -19,8 +19,16 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 from .performance_v2_windows import (
     METRICS_VERSION, WindowMetrics, _METRIC_COLUMNS, _cached, _calculate,
-    _load_source, _metric_from_row, _persist, calendar_window_days, get_or_calculate_window, get_or_calculate_window_pair,
+    _load_equity_samples_for_quality, _load_source, _metric_from_row, _persist,
+    calendar_window_days, get_or_calculate_window, get_or_calculate_window_pair,
 )
+from .performance_v2_equity_cache import (
+    ALGORITHM_VERSION, EquityQualityCacheError, EquitySourceChangedError,
+    current_equity_source_metadata, decode_equity_facts, equity_source_revision,
+    upsert_equity_quality_facts_checked,
+)
+from .performance_v2_equity_quality import EquityQualityFacts, EquitySample, calculate_equity_quality_facts
+from .performance_v2_store import PerformanceV2StoreError, require_performance_v2_readable
 from .audit import _normalize_xlsx_archive, write_audit_workbook
 
 StageScope = Literal["pair_side", "pair_side_timeframe"]
@@ -79,6 +87,14 @@ _CANDIDATE_COLUMNS = (
 
 class PerformanceV2SelectionError(ValueError):
     """Stable error code for an invalid finalist-selection request/config."""
+
+
+class EquitySchemaUpgradeRequiredError(EquityQualityCacheError):
+    code = "EQUITY_SCHEMA_UPGRADE_REQUIRED"
+
+
+class EquityCacheSchemaInvalidError(EquityQualityCacheError):
+    code = "PERFORMANCE_V2_SCHEMA_INVALID"
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,6 +537,32 @@ def _selection_windows(report_start: datetime, report_end: datetime, config: Sel
     return tuple(dict.fromkeys(windows))
 
 
+def _cached_many(
+    connection: duckdb.DuckDBPyConnection,
+    result_id: int,
+    windows: Sequence[tuple[datetime, datetime]],
+    version: str,
+) -> tuple[WindowMetrics | None, ...]:
+    if not windows:
+        return ()
+    pairs = tuple(dict.fromkeys(windows))
+    predicates = " or ".join(
+        "(requested_start_utc = ? and requested_end_utc = ?)" for _ in pairs
+    )
+    parameters: list[object] = [result_id, version]
+    parameters.extend(value for pair in pairs for value in pair)
+    rows = connection.execute(
+        "select " + ", ".join(_METRIC_COLUMNS) + " from window_metrics "
+        "where result_id = ? and metrics_version = ? and (" + predicates + ")",
+        parameters,
+    ).fetchall()
+    by_window = {
+        (metric.requested_start_utc, metric.requested_end_utc): metric
+        for metric in (_metric_from_row(row) for row in rows)
+    }
+    return tuple(by_window.get(window) for window in windows)
+
+
 def _empty_ab_metrics() -> dict[str, Decimal | None]:
     return {key: None for key in (
         "ab_pnl_change_30d_pct", "ab_return_b_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_calendar_days_b", "ab_return_b_30d_pct",
@@ -602,62 +644,270 @@ def _cached_positive_quarters(
     return _consistency_summary(metrics, windows)
 
 
-def _selection_window_job(database: str, result_id: int, report_start: datetime, report_end: datetime, final_days: int) -> tuple[WindowMetrics, ...]:
-    """Compute default selection windows through a read-only worker connection."""
+@dataclass(frozen=True, slots=True)
+class _SelectionWindowJobResult:
+    metrics: tuple[WindowMetrics, ...]
+    equity_publication: tuple[Mapping[str, object], EquityQualityFacts] | None
+    source_recheck: Mapping[str, object] | None = None
+
+
+def _facts_from_full_source(
+    result_id: int, source: tuple[datetime, datetime, tuple[object, ...], tuple[object, ...]]
+) -> EquityQualityFacts:
+    report_start, report_end, _actions, equity = source
+    samples = tuple(
+        EquitySample(result_id, item.index, item.timestamp, item.equity)
+        for item in equity
+    )
+    return calculate_equity_quality_facts(result_id, report_start, report_end, samples)
+
+
+def _selection_window_job(
+    database: str, result_id: int, report_start: datetime, report_end: datetime, final_days: int,
+    include_equity: bool = False,
+) -> _SelectionWindowJobResult:
+    """Compute missing windows/facts in one bounded read-only worker."""
     windows = _selection_windows(report_start, report_end, SelectionConfig(ab_final_days=final_days))
     with duckdb.connect(database, read_only=True) as connection:
         connection.execute("set threads to 1")
-        cached = [_cached(connection, result_id, start, end, METRICS_VERSION) for start, end in windows]
-        if all(cached):
-            return tuple(cached)
-        source = _load_source(connection, result_id)
-        return tuple(
-            metric if metric is not None else _calculate(result_id, start, end, METRICS_VERSION, *source)
-            for metric, (start, end) in zip(cached, windows)
-        )
+        cached = _cached_many(connection, result_id, windows, METRICS_VERSION)
+        missing_windows = any(metric is None for metric in cached)
+        metadata: Mapping[str, object] | None = None
+        equity_missing = False
+        if include_equity:
+            metadata = current_equity_source_metadata(connection, result_id)
+            revision = equity_source_revision(metadata)
+            equity_facts = _read_selection_equity_facts(connection, result_id, revision)
+            equity_missing = equity_facts is None
+        else:
+            equity_facts = None
+        if not missing_windows and not equity_missing:
+            return _SelectionWindowJobResult(() if include_equity else tuple(cached), None)
+
+        publication: tuple[Mapping[str, object], EquityQualityFacts] | None = None
+        source_recheck: Mapping[str, object] | None = None
+        if missing_windows:
+            source = _load_source(connection, result_id)
+            if include_equity:
+                source_recheck = metadata
+            calculated = tuple(
+                metric if metric is not None else _calculate(result_id, start, end, METRICS_VERSION, *source)
+                for metric, (start, end) in zip(cached, windows)
+            )
+            if equity_missing:
+                if metadata is None:
+                    raise PerformanceV2SelectionError("EQUITY_SOURCE_METADATA_MISSING")
+                publication = (metadata, _facts_from_full_source(result_id, source))
+            # Preserve the old no-flag write path, while a new opt-in warm branch
+            # never rewrites already-cached window rows.
+            metrics_to_write = calculated if not include_equity else tuple(
+                metric for metric, cached_metric in zip(calculated, cached) if cached_metric is None
+            )
+        else:
+            if not include_equity or metadata is None:
+                raise PerformanceV2SelectionError("EQUITY_SOURCE_METADATA_MISSING")
+            samples, summary = _load_equity_samples_for_quality(
+                connection, result_id,
+                metadata["report_start_utc"], metadata["report_end_utc"],
+            )
+            facts = calculate_equity_quality_facts(
+                result_id, metadata["report_start_utc"], metadata["report_end_utc"], samples
+            )
+            source_recheck = metadata
+            invalid_reasons = tuple(sorted(set(facts.invalid_reasons).union(summary.invalid_reasons)))
+            publication = (
+                metadata,
+                replace(
+                    facts,
+                    raw_sample_count=summary.raw_sample_count,
+                    in_report_sample_count=summary.in_report_sample_count,
+                    nonpositive_in_report_rows=summary.nonpositive_in_report_rows,
+                    duplicate_timestamp_count=summary.duplicate_timestamp_count,
+                    invalid_reasons=invalid_reasons,
+                ),
+            )
+            metrics_to_write = ()
+    return _SelectionWindowJobResult(tuple(metrics_to_write), publication, source_recheck)
 
 
-def _selection_window_job_from_args(args: tuple[str, int, datetime, datetime, int]) -> tuple[WindowMetrics, ...]:
+def _selection_window_job_from_args(
+    args: tuple[str, int, datetime, datetime, int] | tuple[str, int, datetime, datetime, int, bool],
+) -> _SelectionWindowJobResult:
     return _selection_window_job(*args)
+
+
+def _equity_metadata_from_selection_row(row: Sequence[object]) -> dict[str, object]:
+    names = (
+        "result_id", "report_start_utc", "report_end_utc", "imported_at_utc",
+        "effective_start_utc", "effective_end_utc", "optimizer_source_metadata_json",
+    )
+    metadata = dict(zip(names, (row[1], row[2], row[3], row[4], row[5], row[6], row[7])))
+    for name in ("report_start_utc", "report_end_utc", "imported_at_utc", "effective_start_utc", "effective_end_utc"):
+        value = metadata[name]
+        if value is not None:
+            metadata[name] = value.astimezone(timezone.utc)
+    return metadata
+
+
+def _require_equity_read_schema(connection: duckdb.DuckDBPyConnection) -> int:
+    try:
+        version = require_performance_v2_readable(connection)
+    except PerformanceV2StoreError as error:
+        raise EquityCacheSchemaInvalidError("Performance database schema is invalid") from error
+    if version == 5:
+        raise EquitySchemaUpgradeRequiredError("EQUITY_SCHEMA_UPGRADE_REQUIRED")
+    return version
+
+
+def _read_selection_equity_facts(
+    connection: duckdb.DuckDBPyConnection, result_id: int, source_revision: str,
+) -> EquityQualityFacts | None:
+    _require_equity_read_schema(connection)
+    row = connection.execute(
+        """select source_revision, algo_version, facts_json, facts_sha256
+             from equity_quality_metrics where result_id = ? and algo_version = ?""",
+        [result_id, ALGORITHM_VERSION],
+    ).fetchone()
+    if row is None or row[0] != source_revision:
+        return None
+    try:
+        facts = decode_equity_facts(row[2], row[3])
+    except EquityQualityCacheError:
+        return None
+    if row[1] != ALGORITHM_VERSION or facts.result_id != result_id:
+        return None
+    return facts
+
+
+def _equity_cache_ready_by_result(
+    connection: duckdb.DuckDBPyConnection,
+    rows: Sequence[Sequence[object]],
+) -> dict[int, bool]:
+    """Validate a scoped facts batch after one catalog check for this connection."""
+    _require_equity_read_schema(connection)
+    result_ids = tuple(dict.fromkeys(int(row[1]) for row in rows))
+    if not result_ids:
+        return {}
+    raw = connection.execute(
+        """select result_id, source_revision, algo_version, facts_json, facts_sha256
+             from equity_quality_metrics where algo_version = ? and result_id in ("""
+        + ",".join("?" for _ in result_ids) + ")",
+        [ALGORITHM_VERSION, *result_ids],
+    ).fetchall()
+    cache_rows = {int(row[0]): row for row in raw}
+    ready: dict[int, bool] = {}
+    for row in rows:
+        result_id = int(row[1])
+        cached = cache_rows.get(result_id)
+        if cached is None:
+            ready[result_id] = False
+            continue
+        try:
+            metadata = _equity_metadata_from_selection_row(row)
+            if cached[1] != equity_source_revision(metadata) or cached[2] != ALGORITHM_VERSION:
+                ready[result_id] = False
+                continue
+            facts = decode_equity_facts(cached[3], cached[4])
+            ready[result_id] = facts.result_id == result_id
+        except (EquityQualityCacheError, AttributeError, TypeError, ValueError):
+            ready[result_id] = False
+    return ready
+
+
+def selection_equity_facts_token(
+    connection: duckdb.DuckDBPyConnection, request: SelectionRequest,
+    *, schema_version: int | None = None,
+) -> tuple[object, ...]:
+    """Current scoped source revisions and fact digests for Panel memoization."""
+    cohort_sql, cohort_params = _cohort_clause(request)
+    rows = connection.execute(
+        """select s.strategy_id, r.result_id, r.report_start_utc, r.report_end_utc,
+                  r.imported_at_utc, r.effective_start_utc, r.effective_end_utc,
+                  r.optimizer_source_metadata_json
+             from strategies s join strategy_results r
+               on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
+            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + cohort_sql + " order by s.strategy_id",
+        [request.symbol, request.side, *cohort_params],
+    ).fetchall()
+    if schema_version is not None:
+        version = schema_version
+    else:
+        try:
+            version = require_performance_v2_readable(connection)
+        except PerformanceV2StoreError as error:
+            raise EquityQualityCacheError("Performance database schema is invalid") from error
+    cache_rows: dict[int, tuple[object, object]] = {}
+    if version == 6 and rows:
+        ids = tuple(int(row[1]) for row in rows)
+        raw = connection.execute(
+            """select result_id, source_revision, facts_sha256 from equity_quality_metrics
+                 where algo_version = ? and result_id in (""" + ",".join("?" for _ in ids) + ")",
+            [ALGORITHM_VERSION, *ids],
+        ).fetchall()
+        cache_rows = {int(row[0]): (row[1], row[2]) for row in raw}
+    token: list[object] = [ALGORITHM_VERSION]
+    for row in rows:
+        result_id = int(row[1])
+        metadata = _equity_metadata_from_selection_row(row)
+        revision = equity_source_revision(metadata)
+        cached = cache_rows.get(result_id)
+        digest = cached[1] if cached is not None and cached[0] == revision else None
+        token.append((result_id, revision, digest))
+    return tuple(token)
 
 
 def _selection_cache_missing_strategy_ids(
     connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig,
+    *, include_equity: bool = False,
 ) -> tuple[int, ...]:
     _verify_retest_cohort(connection, request)
     cohort_sql, cohort_params = _cohort_clause(request)
     rows = connection.execute(
-        """select s.strategy_id, r.result_id, r.report_start_utc, r.report_end_utc from strategies s
+        """select s.strategy_id, r.result_id, r.report_start_utc, r.report_end_utc,
+                  r.imported_at_utc, r.effective_start_utc, r.effective_end_utc,
+                  r.optimizer_source_metadata_json from strategies s
              join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
             where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + cohort_sql + """
             order by s.strategy_id""",
         [request.symbol, request.side, *cohort_params],
     ).fetchall()
     cached_metrics = _selection_cached_metrics(connection, request)
+    equity_ready = _equity_cache_ready_by_result(connection, rows) if include_equity else {}
     missing: list[int] = []
-    for strategy_id, result_id, report_start, report_end in rows:
+    for row in rows:
+        strategy_id, result_id, report_start, report_end = row[:4]
         windows = _selection_windows(report_start, report_end, config)
-        if any(cached_metrics.get((int(result_id), window_start, window_end)) is None for window_start, window_end in windows):
+        old_missing = any(
+            cached_metrics.get((int(result_id), window_start, window_end)) is None
+            for window_start, window_end in windows
+        )
+        if old_missing or (include_equity and not equity_ready.get(int(result_id), False)):
             missing.append(int(strategy_id))
     return tuple(missing)
 
 
 def selection_cache_missing_strategy_ids(
     connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig,
+    *, include_equity: bool = False,
 ) -> tuple[int, ...]:
     """Return active strategies whose current result lacks a required cache window."""
-    return _selection_cache_missing_strategy_ids(connection, request, config)
+    return _selection_cache_missing_strategy_ids(connection, request, config, include_equity=include_equity)
 
 
 def prepare_selection_window_cache(
     database: Path, request: SelectionRequest, config: SelectionConfig, workers: int,
-    strategy_ids: Sequence[int] | None = None,
+    strategy_ids: Sequence[int] | None = None, *, include_equity: bool = False,
 ) -> None:
-    """Warm default windows in independent readers, then persist them through one writer."""
+    """Warm bounded result batches in independent readers and one checked writer."""
     selected_ids = None if strategy_ids is None else tuple(dict.fromkeys(int(strategy_id) for strategy_id in strategy_ids))
-    if selected_ids is None and request.ranking_scope == "RETEST_COHORT":
+    if request.ranking_scope == "RETEST_COHORT":
         _verify_retest_cohort_for_database(database, request)
-        selected_ids = tuple(strategy_id for strategy_id, _ in request.cohort_members)
+        allowed_ids = tuple(strategy_id for strategy_id, _ in request.cohort_members)
+        if selected_ids is None:
+            selected_ids = allowed_ids
+        else:
+            allowed = set(allowed_ids)
+            selected_ids = tuple(strategy_id for strategy_id in selected_ids if strategy_id in allowed)
     if selected_ids == ():
         return
     with duckdb.connect(str(database), read_only=True) as connection:
@@ -674,28 +924,85 @@ def prepare_selection_window_cache(
         ).fetchall()
     if not rows:
         return
-    jobs = [(str(database), int(result_id), report_start, report_end, config.ab_final_days) for result_id, report_start, report_end in rows]
-    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as executor:
-        metrics = [metric for result in executor.map(_selection_window_job_from_args, jobs) for metric in result]
-    with duckdb.connect(str(database)) as connection:
-        for metric in metrics:
-            _persist(connection, metric)
+    worker_count = max(1, min(int(workers), len(rows)))
+    batch_size = 2 * worker_count
+    jobs = [
+        (str(database), int(result_id), report_start, report_end, config.ab_final_days, include_equity)
+        for result_id, report_start, report_end in rows
+    ]
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for offset in range(0, len(jobs), batch_size):
+            pending = {
+                executor.submit(_selection_window_job_from_args, job): job
+                for job in jobs[offset : offset + batch_size]
+            }
+            completed: list[_SelectionWindowJobResult] = []
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    pending.pop(future)
+                    completed.append(future.result())
+            metrics = [metric for result in completed for metric in result.metrics]
+            publications = [
+                result.equity_publication for result in completed
+                if result.equity_publication is not None
+            ]
+            source_rechecks = [
+                result.source_recheck for result in completed
+                if result.source_recheck is not None
+            ]
+            publication_ids = {int(metadata["result_id"]) for metadata, _ in publications}
+            source_rechecks = [
+                metadata for metadata in source_rechecks
+                if int(metadata["result_id"]) not in publication_ids
+            ]
+            if not metrics and not publications:
+                continue
+            with duckdb.connect(str(database)) as writer:
+                writer.execute("begin transaction")
+                try:
+                    for metadata in source_rechecks:
+                        result_id = int(metadata["result_id"])
+                        current = current_equity_source_metadata(writer, result_id)
+                        if equity_source_revision(current) != equity_source_revision(metadata):
+                            raise EquitySourceChangedError("EQUITY_SOURCE_CHANGED")
+                    for metric in metrics:
+                        _persist(writer, metric)
+                    if publications:
+                        upsert_equity_quality_facts_checked(
+                            writer, publications, calculated_at_utc=datetime.now(timezone.utc)
+                        )
+                    writer.execute("commit")
+                except BaseException:
+                    writer.execute("rollback")
+                    raise
 
 
-def selection_cache_status(connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig) -> dict[str, int | bool]:
+def selection_cache_status(
+    connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig,
+    *, include_equity: bool = False,
+) -> dict[str, int | bool]:
     _verify_retest_cohort(connection, request)
     cohort_sql, cohort_params = _cohort_clause(request)
     rows = connection.execute(
-        """select r.result_id, r.report_start_utc, r.report_end_utc from strategies s
+        """select s.strategy_id, r.result_id, r.report_start_utc, r.report_end_utc,
+                  r.imported_at_utc, r.effective_start_utc, r.effective_end_utc,
+                  r.optimizer_source_metadata_json from strategies s
              join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
             where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + cohort_sql,
         [request.symbol, request.side, *cohort_params],
     ).fetchall()
     cached_metrics = _selection_cached_metrics(connection, request)
+    equity_ready = _equity_cache_ready_by_result(connection, rows) if include_equity else {}
     missing = 0
-    for result_id, start, end in rows:
+    for row in rows:
+        result_id, start, end = row[1], row[2], row[3]
         windows = _selection_windows(start, end, config)
-        if any(cached_metrics.get((int(result_id), window_start, window_end)) is None for window_start, window_end in windows):
+        old_missing = any(
+            cached_metrics.get((int(result_id), window_start, window_end)) is None
+            for window_start, window_end in windows
+        )
+        if old_missing or (include_equity and not equity_ready.get(int(result_id), False)):
             missing += 1
     return {"total": len(rows), "missing": missing, "ready": bool(rows) and missing == 0}
 

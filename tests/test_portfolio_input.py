@@ -699,7 +699,7 @@ def test_snapshot_assembly_wraps_generic_errors_and_preserves_coded_errors(tmp_p
 def test_snapshot_contains_full_candidate_source_and_digest(tmp_path: Path) -> None:
     snapshot = _snapshot(_database(tmp_path), [REQUEST])
 
-    assert snapshot.source_schema_version == "5"
+    assert snapshot.source_schema_version == "6"
     assert snapshot.database_kind == "unified_performance_v2"
     assert snapshot.database_instance_id
     assert snapshot.candidates[0]["result_id"]

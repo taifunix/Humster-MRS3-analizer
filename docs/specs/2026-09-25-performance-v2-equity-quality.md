@@ -1,14 +1,133 @@
 # Performance v2: качество роста equity — анализ и проект
 
-**Статус:** PROPOSED, архитектурное предложение; реализация не начата.
-**Версия:** R6.1, 2026-09-25.
+**Статус:** R7.3 утверждена; M0–M1 приняты, M2–M5 ожидают выполнения.
+**Версия:** R7.3, 2026-09-25.
 **Назначение:** спецификация для обсуждения и независимой проверки плана.
 
-**Engineering review:** R5 получил независимое `PLAN_APPROVED` 2026-09-25;
-R6.1 учитывает решение пользователя «только понижать место» и уточнения
-review R6; получил отдельное `PLAN_APPROVED` 2026-09-25. Это не результат benchmark и не разрешение
-на runtime implementation. Findings и этапы — в
+**Engineering review:** canonical R7.3 получил независимое `PLAN_APPROVED`
+2026-09-25 (Opus 5). R7.3 заменяет конфликтующие правила R6.1 ниже; это не
+результат benchmark; разрешение на внедрение дано пользователем отдельно. Findings и этапы — в
 [плане внедрения](../superpowers/plans/2026-09-25-performance-v2-equity-quality.md).
+
+## 0. Canonical R7.3 contract (normative; supersedes R6.1)
+
+The following is the accepted contract. Older sections below preserve design
+history; where they mention action/position-based gap proof, age-selected
+edge-anchor availability, a common-T preflight, a <=5% coverage-unrankable
+release gate, `CONTINUATION_UNASSESSED`, or a short-window ERF block, those
+statements are **SUPERSEDED** and must not guide implementation.
+Defaults remain OFF and the existing robust method remains the default. Four
+existing XLSX columns remain unchanged. Implementation proceeds under the
+user's separate authorization, not by this specification or its approval alone.
+
+### Source, validity, and windows
+
+- Facts are equity-only. The engine receives the current result's stored
+  `[report_start_utc, T=report_end_utc]` and raw equity rows. It must not read
+  actions, positions, timeframes, trade counts, or frequencies. Optional M0
+  trip-rate labels are outside the equity calculation and must have separate
+  query/row counters. A diagnostic with no trip-rate labels performs zero
+  action-fact queries and reads zero action rows.
+- All timestamps are native timezone-aware UTC values (DuckDB `TIMESTAMPTZ`);
+  check type, UTC offset, and decoded datetime values. Do not interpret them as
+  epoch numbers or silently guess units. Convert numeric equity directly to
+  Decimal: preserve Decimal inputs; otherwise parse `Decimal(str(value))`,
+  with no float round-trip. Malformed or non-finite conversions are structural
+  source invalidity.
+- Apply outcome precedence exactly: structural source validation (report
+  interval/range, ownership, conversion/finite values, and sample-index
+  ordering) -> in-report raw Decimal <= 0 -> age/window availability ->
+  metrics/class/score. Structurally invalid source is
+  `UNKNOWN_INVALID_SOURCE` / NOT_EVALUATED even if it also contains an
+  in-report nonpositive value. Only structurally valid source with an
+  in-report raw equity <= 0 is `NONPOSITIVE_EQUITY` / BLOCK, before age,
+  baseline, or logarithms; this includes under-seven-day histories and points
+  outside selected H. Neither invalid nor nonpositive rows supply a metric.
+- On valid source rows, right-continuous `E(t)` is the greatest ordered
+  in-report observation at or before `t`. For duplicate timestamps, greatest
+  `sample_index` is effective for `E(t)`; earlier duplicates remain raw risk
+  observations. Carry `E(t)` unconditionally until the next observation and
+  through T. Internal gaps and quiet terminal tails never invalidate facts.
+- A W-day baseline is available iff `report_start_utc <= T-W` and there is an
+  in-report equity observation at or before `T-W`. No pre-report/future
+  backfill. H is the longest available of 28/14/7; a shorter H is normal when
+  the longer baseline is unavailable. Invalid/corrupt source never falls back.
+  With no baseline, age under 7 days is `INSUFFICIENT_HISTORY`, otherwise
+  `MISSING_BASELINE`; both are NOT_EVALUATED.
+
+### Metrics, risk path, and decisions
+
+- For every available W, use the fixed T-anchored 6-hour grid from `T-W`
+  through T, including both endpoints. One baseline observation can fill a
+  whole window and yield valid FLAT facts. There are no endpoint, occupancy,
+  update-count, gap-duration, position-state, or activity thresholds.
+- At Decimal precision 38, with grid x in days from `T-W` and
+  `y=ln(E(t)/E_start)`: `trend30=3000*OLS_slope`,
+  `endpoint30=3000*ln(E_T/E_start)/W`, and
+  `return_pct=100*(E_T/E_start-1)`. `ER=net_log/sum(abs(grid_log_step))`,
+  with zero denominator giving zero. `eps=1e-8` log-pp/30d.
+- Raw H risk path covers `[L=T-H,T]`. If no raw row is exactly L, prepend
+  `E(L)`; otherwise include every raw L duplicate once in sample-index order
+  and do not prepend. Append `E(T)` only when no raw row is exactly T. Each
+  raw observation is included once. `D=max(1-equity/peak)` and
+  `P=1-E(T)/max_equity` use this raw path. Grid ER and raw D/P intentionally
+  describe different samplings.
+- Let `G=min(trend30,endpoint30)`, `Q=max(0,ER)`. Score is
+  `G*Q*(1-D)*(1-P)` for G>eps, zero for `abs(G)<=eps`, and
+  `G*(1+D+P)` for G<-eps; quantize HALF_EVEN to 12 decimals.
+- A window is UP iff both trend and endpoint > eps, NONDECLINING iff both are
+  >= -eps, FLAT iff both absolute values <= eps. For H28 inspect shorts 7/14;
+  H14 inspect 7; H7 inspect none. H-UP plus all shorts NONDECLINING is
+  GROWING class 0 / PASS. H-UP plus any short decline is WEAKENING class 1 /
+  PASS. FLAT H is class 2 / BLOCK only when ERF is enabled. Other valid
+  non-UP is DECLINING_OR_MIXED class 2 or 3 / BLOCK. Invalid, under-seven-day,
+  and missing-baseline rows are NOT_EVALUATED; nonpositive is BLOCK and
+  unscoreable. Short decline alone never blocks. A quiet multi-day tail with
+  H still UP and flat shorts remains GROWING / PASS.
+- `CONTINUATION_UNASSESSED` is deleted. Optional equity ranking uses the exact
+  ascending tuple `(class,-score12,D,P,-H,strategy_id)`. Unscoreable rows have
+  null score and are RESERVE, consuming no N slot. Different candidates may
+  use different T; mixed report ends are valid. There is no common-T gate,
+  freshness rule, or report-date tie-break. T is part of revision/digest; a
+  T-only change recomputes facts.
+
+### R7.3 M0 acceptance evidence
+
+M0 must check the contract with deterministic self-tests: 5m/4h label
+invariance; quiet multi-day tails; H-UP short decline; H-flat; one-baseline
+windows; arbitrary internal/final gaps; in-report predecessor; exact L/T and
+duplicate raw paths; invalid pre-report/future-only inputs; H availability
+transitions; malformed/non-finite/duplicate-index/out-of-interval collisions
+with an in-report nonpositive value; Decimal values below binary64 precision
+and negative zero; duplicate-driven raw D/P deltas; grid/logging invariance;
+mixed T; and zero short-only blocks. Structural invalidity must win each
+collision. Verify streamed per-result row accounting covers each selected
+result exactly once, including empty and final groups, and that per-result raw
+row counts sum to the query's scanned-row count. Ordered streaming is by
+`result_id,sample_index`, so groups stay contiguous across fetch chunks.
+Self-check output must repeat byte-identically.
+
+The read-only live diagnostic reports overall/by-age availability, invalid,
+out-of-interval and nonpositive source rows, H/baseline distribution, raw/grid
+counts, max gaps, elapsed time since last sample to T (a carry duration, not
+proof equity was economically flat), classes, scores, ranking/Top-N effects,
+and timeframe/inactivity cross-tabs when those metadata exist. Action-derived
+`r=0`, `0<r<=3`, `r>3` strata are optional and separately counted; omitting
+them is valid and requires zero action queries/rows for equity calculation.
+Report duplicate-driven raw D/P delta statistics; compare 1/3/6h grid ER and
+raw-versus-grid ER when feasible without changing canonical 6h facts.
+
+M0 preserves the earlier warm-cache baseline and, when feasible, measures the
+R7.3 diagnostic with one code warmup plus three measured repeats, recording
+wall/RSS/query/rows/writes and before/after database identity. No budgets pass
+without comparable measurements. Proposed gates: cold median <= baseline +
+max(20%, 0.5s), warm <= baseline + max(10%, 0.05s), RSS <= baseline +
+max(25%, 64MiB). No live writes, migration, cache backfill, tester, Panel, or
+service restart is allowed for M0.
+
+> **Historical R6.1 material follows.** Sections 1 onward preserve context and
+> older analysis. Treat them as non-normative wherever they differ from §0;
+> revise any needed implementation detail to R7.3 before M1.
 
 ## 1. Запрос и границы
 

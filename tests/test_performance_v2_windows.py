@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import duckdb
 import pytest
+import mrs3.performance_v2_windows as windows_module
 
 from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_windows import (
@@ -124,6 +125,38 @@ def test_overlapping_nested_and_disjoint_pair_is_independently_cached(tmp_path) 
         )
         assert disjoint[0].availability_status == "UNAVAILABLE"
         assert disjoint[1].availability_status == "UNAVAILABLE"
+    finally:
+        connection.close()
+
+
+def test_equity_quality_source_read_is_bounded_and_keeps_exact_source_counts(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 1, 31, tzinfo=UTC)
+    connection.execute("update strategy_results set report_end_utc = ? where result_id = ?", [end, result_id])
+    connection.execute(
+        "update strategy_equity set equity = -1 where result_id = ? and sample_index = 0", [result_id]
+    )
+    connection.execute(
+        "insert into strategy_equity values (?, 5, ?, 100, 100)",
+        [result_id, datetime(2025, 12, 31, tzinfo=UTC)],
+    )
+    connection.execute(
+        "insert into strategy_equity values (?, 6, ?, 100, 100)",
+        [result_id, datetime(2026, 1, 3, tzinfo=UTC)],
+    )
+    try:
+        loader = getattr(windows_module, "_load_equity_samples_for_quality", None)
+        assert callable(loader), "bounded equity-only source loader is missing"
+
+        samples, summary = loader(connection, result_id, start, end)
+
+        assert [sample.sample_index for sample in samples] == [5, 0, 2, 6, 3, 4]
+        assert summary.raw_sample_count == 7
+        assert summary.in_report_sample_count == 6
+        assert summary.nonpositive_in_report_rows == 1
+        assert summary.duplicate_timestamp_count == 1
+        assert summary.invalid_reasons == ("EQUITY_OUTSIDE_REPORT_INTERVAL",)
     finally:
         connection.close()
 

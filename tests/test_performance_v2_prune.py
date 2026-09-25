@@ -78,6 +78,10 @@ def _database(tmp_path: Path) -> Path:
                 "insert into strategy_equity values (?, 0, ?, 100, 100)", [result_id, report_end]
             )
             connection.execute(
+                "insert into equity_quality_metrics values (?, ?, 'equity-quality-r7.3-v1', '{}', ?, now())",
+                [result_id, name, f"digest-{name}"],
+            )
+            connection.execute(
                 "insert into window_metrics (result_id, requested_start_utc, requested_end_utc, metrics_version, availability_status, calculated_at_utc) values (?, ?, ?, 'v1', 'AVAILABLE', now())",
                 [result_id, "2026-01-01", report_end],
             )
@@ -147,6 +151,7 @@ def test_apply_backups_and_deletes_only_old_unprotected_strategy(tmp_path: Path)
     with duckdb.connect(str(backup), read_only=True) as connection:
         assert connection.execute("select count(*) from strategies").fetchone() == (4,)
     assert result["counts"] == {
+        "equity_quality_metrics": 2,
         "window_metrics": 2,
         "strategy_actions": 2,
         "strategy_equity": 2,
@@ -163,8 +168,12 @@ def test_apply_backups_and_deletes_only_old_unprotected_strategy(tmp_path: Path)
         assert connection.execute("select count(*) from selection_runs").fetchone() == (2,)
         assert connection.execute("select count(*) from selection_results").fetchone() == (4,)
         assert connection.execute("select count(*) from selection_review_rows").fetchone() == (4,)
-        for table in ("window_metrics", "strategy_actions", "strategy_equity", "strategy_results", "strategy_tags", "strategy_orders"):
+        for table in ("equity_quality_metrics", "window_metrics", "strategy_actions", "strategy_equity", "strategy_results", "strategy_tags", "strategy_orders"):
             assert connection.execute(f"select count(*) from {table}").fetchone() == (2,)
+        assert connection.execute(
+            "select count(*) from equity_quality_metrics cache left join strategy_results results "
+            "using (result_id) where results.result_id is null"
+        ).fetchone() == (0,)
 
 
 def test_apply_holds_the_writer_lock_through_delete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -211,6 +220,7 @@ def test_apply_restores_backup_after_partial_delete(tmp_path: Path, monkeypatch:
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute("select count(*) from strategies").fetchone() == (4,)
         assert connection.execute("select count(*) from strategy_actions").fetchone() == (4,)
+        assert connection.execute("select count(*) from equity_quality_metrics").fetchone() == (4,)
 
 
 def test_restore_removes_a_stale_wal_before_replacing_database(tmp_path: Path) -> None:

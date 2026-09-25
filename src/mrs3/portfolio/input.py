@@ -28,7 +28,7 @@ from ..performance_v2_selection import (
     load_selection_candidates,
     parse_selection_request,
 )
-from ..performance_v2_store import require_performance_v2
+from ..performance_v2_store import require_performance_v2_readable
 from ..performance_v2_store import decode_optimizer_source_metadata
 from ..performance_v2_selection_review import STATUSES as USER_STATUSES
 from ..performance_v2_optimizer import (
@@ -818,7 +818,7 @@ def read_performance_snapshot(
     try:
         with duckdb.connect(str(path), read_only=True) as connection:
             connection.execute("begin transaction")
-            require_performance_v2(connection)
+            require_performance_v2_readable(connection)
             schema_markers = dict(connection.execute("select key, value from schema_info").fetchall())
             for request in parsed:
                 # This is intentionally the only selection API call and is always cache-only.
@@ -1273,7 +1273,7 @@ def read_current_finalists(
     try:
         with duckdb.connect(str(path), read_only=True) as connection:
             connection.execute("begin transaction")
-            require_performance_v2(connection)
+            require_performance_v2_readable(connection)
             facts, _selected, _lineage = _current_review_facts(connection, requests, allow_missing_pair=True)
             finalist_keys = [
                 key for key, fact in facts.items()

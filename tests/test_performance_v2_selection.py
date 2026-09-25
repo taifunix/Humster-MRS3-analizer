@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -10,6 +12,7 @@ import pandas as pd
 import pytest
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+import mrs3.performance_v2_equity_cache as equity_cache_module
 import mrs3.performance_v2_selection as selection_module
 
 from mrs3.performance_v2_selection import (
@@ -33,7 +36,15 @@ from mrs3.performance_v2_selection import (
     retest_cohort_request,
 )
 from mrs3.performance_v2_store import initialize_performance_v2
-from mrs3.performance_v2_windows import METRICS_VERSION, WindowMetrics
+from mrs3.performance_v2_windows import METRICS_VERSION, WindowMetrics, _cached
+from mrs3.performance_v2_equity_cache import (
+    EquityQualityCacheError,
+    EquitySourceChangedError,
+    current_equity_source_metadata,
+    decode_equity_facts,
+    equity_source_revision,
+    read_equity_quality_facts,
+)
 
 
 def test_retest_cohort_request_is_explicit_and_rejects_empty_members():
@@ -450,6 +461,601 @@ def _candidate_db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
         ],
     )
     return connection
+
+
+def _clone_current_candidate(connection: duckdb.DuckDBPyConnection, name: str) -> tuple[int, int]:
+    source_strategy_id, source_result_id = connection.execute(
+        "select strategy_id, result_id from strategy_results order by result_id limit 1"
+    ).fetchone()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    strategy_id = int(connection.execute(
+        """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+               order_count, analysis_run_id, candidate_identity, lifecycle_status,
+               created_at_utc, updated_at_utc) values (?, 'BTCUSDT', 'LONG', '1h',
+               3, 1, 'run', ?, 'ACTIVE', ?, ?) returning strategy_id""",
+        [name, name, now, now],
+    ).fetchone()[0])
+    result_columns = [row[0] for row in connection.execute(
+        "select column_name from information_schema.columns where table_name = 'strategy_results' order by ordinal_position"
+    ).fetchall()]
+    source_result = connection.execute(
+        "select * from strategy_results where result_id = ?", [source_result_id]
+    ).fetchone()
+    result_values = [
+        strategy_id if column == "strategy_id" else value
+        for column, value in zip(result_columns, source_result)
+        if column != "result_id"
+    ]
+    result_insert_columns = [column for column in result_columns if column != "result_id"]
+    result_id = int(connection.execute(
+        f"insert into strategy_results ({', '.join(result_insert_columns)}) values ({', '.join('?' for _ in result_values)}) returning result_id",
+        result_values,
+    ).fetchone()[0])
+    connection.execute(
+        "update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id]
+    )
+    for table in ("strategy_actions", "strategy_equity"):
+        columns = [row[0] for row in connection.execute(
+            "select column_name from information_schema.columns where table_name = ? order by ordinal_position", [table]
+        ).fetchall()]
+        rows = connection.execute(f"select * from {table} where result_id = ?", [source_result_id]).fetchall()
+        connection.executemany(
+            f"insert into {table} ({', '.join(columns)}) values ({', '.join('?' for _ in columns)})",
+            [[result_id if column == "result_id" else value for column, value in zip(columns, row)] for row in rows],
+        )
+    return strategy_id, result_id
+
+
+def test_equity_warmup_shares_the_cold_selection_source_load(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id, strategy_id = connection.execute(
+        "select result_id, strategy_id from strategy_results"
+    ).fetchone()
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    calls = 0
+    original = selection_module._load_source
+
+    def counted(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(selection_module, "_load_source", counted)
+
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    assert calls == 1
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select count(*) from window_metrics").fetchone() == (7,)
+        assert check.execute("select count(*) from equity_quality_metrics").fetchone() == (1,)
+        assert selection_cache_status(check, request, SelectionConfig()) == {
+            "total": 1, "missing": 0, "ready": True,
+        }
+        assert selection_cache_status(check, request, SelectionConfig(), include_equity=True)["ready"]
+        metadata = current_equity_source_metadata(check, result_id)
+        facts = read_equity_quality_facts(
+            check, result_id, equity_source_revision(metadata)
+        )
+        assert facts is not None
+        assert facts.raw_sample_count == 4
+
+
+def test_serial_and_parallel_equity_preparation_publish_identical_canonical_bytes(tmp_path: Path) -> None:
+    serial_dir = tmp_path / "serial"
+    serial_dir.mkdir()
+    connection = _candidate_db(serial_dir)
+    _clone_current_candidate(connection, "beta")
+    serial_database = serial_dir / "strategy_performance.duckdb"
+    connection.close()
+    parallel_database = tmp_path / "parallel.duckdb"
+    shutil.copyfile(serial_database, parallel_database)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    prepare_selection_window_cache(serial_database, request, SelectionConfig(), workers=1, include_equity=True)
+    prepare_selection_window_cache(parallel_database, request, SelectionConfig(), workers=2, include_equity=True)
+
+    with duckdb.connect(str(serial_database), read_only=True) as serial, duckdb.connect(
+        str(parallel_database), read_only=True
+    ) as parallel:
+        serial_bytes = serial.execute(
+            "select facts_json, facts_sha256 from equity_quality_metrics order by result_id"
+        ).fetchall()
+        parallel_bytes = parallel.execute(
+            "select facts_json, facts_sha256 from equity_quality_metrics order by result_id"
+        ).fetchall()
+    assert serial_bytes == parallel_bytes
+
+
+def test_retest_equity_warmup_is_limited_to_the_exact_cohort(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    first_id = int(connection.execute("select strategy_id from strategies").fetchone()[0])
+    second_id, _ = _clone_current_candidate(connection, "beta")
+    first_result = int(connection.execute(
+        "select current_result_id from strategies where strategy_id = ?", [first_id]
+    ).fetchone()[0])
+    connection.close()
+    ordinary = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    scoped = retest_cohort_request(ordinary, "bulk-equity", {first_id: first_result})
+
+    prepare_selection_window_cache(
+        database, scoped, SelectionConfig(), workers=2,
+        strategy_ids=(first_id, second_id), include_equity=True,
+    )
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select result_id from equity_quality_metrics").fetchall() == [(first_result,)]
+        assert check.execute("select distinct result_id from window_metrics").fetchall() == [(first_result,)]
+
+
+def test_equity_readiness_requires_v6_only_when_opted_in(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    connection.execute("drop table equity_quality_metrics")
+    connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+    try:
+        assert selection_cache_status(connection, request, SelectionConfig()) == {
+            "total": 1, "missing": 1, "ready": False,
+        }
+        with pytest.raises(EquityQualityCacheError, match="EQUITY_SCHEMA_UPGRADE_REQUIRED"):
+            selection_cache_status(connection, request, SelectionConfig(), include_equity=True)
+    finally:
+        connection.close()
+
+
+def test_cold_full_and_warm_bounded_sources_publish_identical_canonical_facts(tmp_path: Path) -> None:
+    full_dir = tmp_path / "full"
+    full_dir.mkdir()
+    connection = _candidate_db(full_dir)
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    connection.execute("update strategy_results set report_end_utc = ? where result_id = ?", [datetime(2026, 1, 31, tzinfo=UTC), result_id])
+    connection.execute("update strategy_equity set equity = -1 where result_id = ? and sample_index = 0", [result_id])
+    connection.execute("insert into strategy_equity values (?, 4, ?, 100, 100)", [result_id, datetime(2026, 1, 2, tzinfo=UTC)])
+    connection.execute("insert into strategy_equity values (?, 5, ?, 100, 100)", [result_id, datetime(2026, 2, 1, tzinfo=UTC)])
+    full_database = full_dir / "strategy_performance.duckdb"
+    connection.close()
+    bounded_database = tmp_path / "bounded.duckdb"
+    shutil.copyfile(full_database, bounded_database)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    prepare_selection_window_cache(full_database, request, SelectionConfig(), workers=1, include_equity=True)
+    prepare_selection_window_cache(bounded_database, request, SelectionConfig(), workers=1)
+    prepare_selection_window_cache(bounded_database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    with duckdb.connect(str(full_database), read_only=True) as full, duckdb.connect(
+        str(bounded_database), read_only=True
+    ) as bounded:
+        full_fact = full.execute("select facts_json, facts_sha256 from equity_quality_metrics").fetchone()
+        bounded_fact = bounded.execute("select facts_json, facts_sha256 from equity_quality_metrics").fetchone()
+    assert full_fact == bounded_fact
+    facts = decode_equity_facts(*full_fact)
+    assert facts.raw_sample_count == 6
+    assert facts.in_report_sample_count == 5
+    assert facts.nonpositive_in_report_rows == 1
+    assert facts.duplicate_timestamp_count == 1
+    assert facts.invalid_reasons == ("EQUITY_OUTSIDE_REPORT_INTERVAL",)
+
+
+def test_bounded_source_uses_greatest_sample_index_at_duplicate_timestamp(tmp_path: Path) -> None:
+    full_dir = tmp_path / "full"
+    full_dir.mkdir()
+    connection = _candidate_db(full_dir)
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    connection.execute(
+        "update strategy_results set report_end_utc = ? where result_id = ?",
+        [datetime(2026, 1, 31, tzinfo=UTC), result_id],
+    )
+    connection.execute(
+        "update strategy_equity set timestamp_utc = ? where result_id = ? and sample_index = 2",
+        [datetime(2026, 1, 4, tzinfo=UTC), result_id],
+    )
+    connection.execute(
+        "insert into strategy_equity values (?, 4, ?, 150, 150)",
+        [result_id, datetime(2026, 1, 2, tzinfo=UTC)],
+    )
+    full_database = full_dir / "strategy_performance.duckdb"
+    connection.close()
+    bounded_database = tmp_path / "bounded.duckdb"
+    shutil.copyfile(full_database, bounded_database)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    prepare_selection_window_cache(full_database, request, SelectionConfig(), workers=1, include_equity=True)
+    prepare_selection_window_cache(bounded_database, request, SelectionConfig(), workers=1)
+    prepare_selection_window_cache(bounded_database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    with duckdb.connect(str(full_database), read_only=True) as full, duckdb.connect(
+        str(bounded_database), read_only=True
+    ) as bounded:
+        full_fact = full.execute("select facts_json, facts_sha256 from equity_quality_metrics").fetchone()
+        bounded_fact = bounded.execute("select facts_json, facts_sha256 from equity_quality_metrics").fetchone()
+    assert full_fact == bounded_fact
+    facts = decode_equity_facts(*full_fact)
+    horizon = next(window for window in facts.windows if window.days == 28)
+
+    assert facts.duplicate_timestamp_count == 1
+    assert facts.horizon_days == 28
+    assert facts.state == "DECLINING_OR_MIXED"
+    assert facts.drawdown is not None
+    assert Decimal("-27") < horizon.return_pct < Decimal("-26")
+    assert Decimal("0.26") < facts.drawdown < Decimal("0.27")
+
+
+def test_pre_h_duplicate_timestamp_is_valid_and_counted(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    connection.execute("update strategy_results set report_end_utc = ? where result_id = ?", [datetime(2026, 1, 31, tzinfo=UTC), result_id])
+    connection.execute("insert into strategy_equity values (?, 4, ?, 100, 100)", [result_id, datetime(2026, 1, 2, tzinfo=UTC)])
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+
+    prepare_selection_window_cache(
+        database, request, SelectionConfig(), workers=1, include_equity=True
+    )
+    with duckdb.connect(str(database), read_only=True) as reader:
+        metadata = current_equity_source_metadata(reader, result_id)
+        facts = read_equity_quality_facts(reader, result_id, equity_source_revision(metadata))
+
+    assert facts is not None
+    assert facts.state == "FLAT"
+    assert facts.duplicate_timestamp_count == 1
+    assert facts.invalid_reasons == ()
+
+
+def test_selection_window_job_fetches_cached_windows_in_one_query(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id, report_start, report_end = connection.execute(
+        "select result_id, report_start_utc, report_end_utc from strategy_results"
+    ).fetchone()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    windows = _selection_windows(report_start, report_end, SelectionConfig())
+    connection.close()
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1)
+
+    helper = getattr(selection_module, "_cached_many", None)
+    assert callable(helper), "result-scoped cached-window loader is missing"
+
+    class CountingConnection:
+        def __init__(self, target):
+            self.target = target
+            self.queries = 0
+
+        def execute(self, *args):
+            self.queries += 1
+            return self.target.execute(*args)
+
+    with duckdb.connect(str(database), read_only=True) as reader:
+        legacy = CountingConnection(reader)
+        legacy_cached = tuple(
+            _cached(legacy, int(result_id), start, end, METRICS_VERSION)
+            for start, end in windows
+        )
+        counted = CountingConnection(reader)
+        cached = helper(counted, int(result_id), windows, METRICS_VERSION)
+
+    assert len(cached) == len(windows) == 7
+    assert all(metric is not None for metric in cached)
+    assert cached == legacy_cached
+    assert legacy.queries == 7
+    assert counted.queries == 1
+    assert cached[-1].requested_end_utc == windows[-1][1]
+
+
+def test_selection_preparation_caps_queued_jobs_at_twice_worker_count(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    for name in ("beta", "gamma", "delta", "epsilon"):
+        _clone_current_candidate(connection, name)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    submitted: list[tuple[object, ...]] = []
+    pending_count = 0
+    max_pending = 0
+
+    class ObservedFuture(Future):
+        def __init__(self):
+            super().__init__()
+            self.consumed = False
+
+        def result(self, *args, **kwargs):
+            nonlocal pending_count
+            result = super().result(*args, **kwargs)
+            if not self.consumed:
+                self.consumed = True
+                pending_count -= 1
+            return result
+
+    class DeterministicExecutor:
+        def __init__(self, max_workers):
+            assert max_workers == 2
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, function, args):
+            nonlocal pending_count, max_pending
+            submitted.append(args)
+            pending_count += 1
+            max_pending = max(max_pending, pending_count)
+            future = ObservedFuture()
+            future.set_result(function(args))
+            return future
+
+    monkeypatch.setattr(selection_module, "ThreadPoolExecutor", DeterministicExecutor)
+    monkeypatch.setattr(
+        selection_module,
+        "_selection_window_job_from_args",
+        lambda _args: selection_module._SelectionWindowJobResult((), None),
+    )
+
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=2)
+
+    assert len(submitted) == 5
+    assert max_pending == 4
+    assert pending_count == 0
+
+
+def test_earlier_preparation_batch_remains_committed_after_later_batch_fails(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    for name in ("beta", "gamma"):
+        _clone_current_candidate(connection, name)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    original = selection_module._selection_window_job_from_args
+    seen: list[int] = []
+
+    def fail_on_third_result(args):
+        seen.append(int(args[1]))
+        if len(seen) == 3:
+            raise RuntimeError("later preparation batch failed")
+        return original(args)
+
+    monkeypatch.setattr(selection_module, "_selection_window_job_from_args", fail_on_third_result)
+
+    with pytest.raises(RuntimeError, match="later preparation batch failed"):
+        prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    assert len(seen) == 3
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert set(row[0] for row in check.execute("select distinct result_id from window_metrics").fetchall()) == set(seen[:2])
+        assert set(row[0] for row in check.execute("select result_id from equity_quality_metrics").fetchall()) == set(seen[:2])
+
+
+def test_equity_only_cold_warmup_uses_bounded_equity_without_legacy_source_or_actions(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id, strategy_id = connection.execute(
+        "select result_id, strategy_id from strategy_results"
+    ).fetchone()
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    config = SelectionConfig()
+    prepare_selection_window_cache(database, request, config, workers=1)
+    with duckdb.connect(str(database)) as writer:
+        writer.execute(
+            "update strategy_equity set equity = -1 where result_id = ? and sample_index = 0",
+            [result_id],
+        )
+    bounded_counts: list[int] = []
+    original_loader = selection_module._load_equity_samples_for_quality
+
+    def counted_loader(*args):
+        samples, summary = original_loader(*args)
+        bounded_counts.append(len(samples))
+        return samples, summary
+
+    def legacy_load_forbidden(*_args):
+        raise AssertionError("equity-only cold preparation read actions through legacy source loading")
+
+    monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", counted_loader)
+    monkeypatch.setattr(selection_module, "_load_source", legacy_load_forbidden)
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert selection_cache_missing_strategy_ids(
+            check, request, config, include_equity=True
+        ) == (strategy_id,)
+    prepare_selection_window_cache(
+        database, request, config, workers=1, strategy_ids=(strategy_id,), include_equity=True
+    )
+
+    assert bounded_counts == [3]
+    with duckdb.connect(str(database), read_only=True) as check:
+        metadata = current_equity_source_metadata(check, result_id)
+        facts = read_equity_quality_facts(check, result_id, equity_source_revision(metadata))
+        assert facts is not None
+        assert facts.state == "NONPOSITIVE_EQUITY"
+        assert facts.raw_sample_count == 4
+        assert facts.in_report_sample_count == 4
+        assert facts.nonpositive_in_report_rows == 1
+
+
+def test_warm_equity_preparation_has_no_source_load_or_cache_write(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    _result_id, strategy_id = connection.execute(
+        "select result_id, strategy_id from strategy_results"
+    ).fetchone()
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    config = SelectionConfig()
+    prepare_selection_window_cache(database, request, config, workers=1, include_equity=True)
+    with duckdb.connect(str(database), read_only=True) as check:
+        before = check.execute(
+            "select source_revision, facts_json, facts_sha256, calculated_at_utc from equity_quality_metrics"
+        ).fetchall()
+        window_times = check.execute(
+            "select calculated_at_utc from window_metrics order by requested_start_utc, requested_end_utc"
+        ).fetchall()
+
+    def raw_load_forbidden(*_args):
+        raise AssertionError("warm preparation read raw source rows")
+
+    monkeypatch.setattr(selection_module, "_load_source", raw_load_forbidden)
+    monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", raw_load_forbidden)
+    monkeypatch.setattr(selection_module, "_persist", raw_load_forbidden)
+    prepare_selection_window_cache(
+        database, request, config, workers=1, strategy_ids=(strategy_id,), include_equity=True
+    )
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute(
+            "select source_revision, facts_json, facts_sha256, calculated_at_utc from equity_quality_metrics"
+        ).fetchall() == before
+        assert check.execute(
+            "select calculated_at_utc from window_metrics order by requested_start_utc, requested_end_utc"
+        ).fetchall() == window_times
+
+
+def test_equity_readiness_is_opt_in_and_rechecks_source_revision_and_digest(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id, strategy_id = connection.execute(
+        "select result_id, strategy_id from strategy_results"
+    ).fetchone()
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    config = SelectionConfig()
+    prepare_selection_window_cache(database, request, config, workers=1, include_equity=True)
+
+    with duckdb.connect(str(database)) as writer:
+        writer.execute(
+            "update strategy_results set imported_at_utc = imported_at_utc + interval '1 second' where result_id = ?",
+            [result_id],
+        )
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert selection_cache_status(check, request, config) == {"total": 1, "missing": 0, "ready": True}
+        assert selection_cache_status(check, request, config, include_equity=True)["ready"] is False
+        assert selection_cache_missing_strategy_ids(check, request, config, include_equity=True) == (strategy_id,)
+    prepare_selection_window_cache(
+        database, request, config, workers=1, strategy_ids=(strategy_id,), include_equity=True
+    )
+    with duckdb.connect(str(database)) as writer:
+        writer.execute("update equity_quality_metrics set facts_sha256 = ?", ["0" * 64])
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert selection_cache_status(check, request, config, include_equity=True)["ready"] is False
+        assert selection_cache_missing_strategy_ids(check, request, config, include_equity=True) == (strategy_id,)
+
+
+def test_equity_publication_rechecks_source_revision_and_rolls_back_current_batch(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    original = selection_module._selection_window_job_from_args
+    changed = False
+
+    def mutate_after_source_read(args):
+        nonlocal changed
+        result = original(args)
+        if not changed:
+            changed = True
+            with duckdb.connect(str(database)) as writer:
+                writer.execute(
+                    "update strategy_results set imported_at_utc = imported_at_utc + interval '1 second' where result_id = ?",
+                    [result_id],
+                )
+        return result
+
+    monkeypatch.setattr(selection_module, "_selection_window_job_from_args", mutate_after_source_read)
+
+    with pytest.raises(EquitySourceChangedError, match="EQUITY_SOURCE_CHANGED"):
+        prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select count(*) from window_metrics").fetchone() == (0,)
+        assert check.execute("select count(*) from equity_quality_metrics").fetchone() == (0,)
+
+
+def test_equity_publication_uses_single_writer_source_revision_check(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    selection_checks = 0
+    publication_checks = 0
+    read_metadata = selection_module.current_equity_source_metadata
+    write_metadata = equity_cache_module.current_equity_source_metadata
+
+    def count_selection_check(connection, result_id):
+        nonlocal selection_checks
+        selection_checks += 1
+        return read_metadata(connection, result_id)
+
+    def count_publication_check(connection, result_id):
+        nonlocal publication_checks
+        publication_checks += 1
+        return write_metadata(connection, result_id)
+
+    monkeypatch.setattr(selection_module, "current_equity_source_metadata", count_selection_check)
+    monkeypatch.setattr(equity_cache_module, "current_equity_source_metadata", count_publication_check)
+
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    assert selection_checks == 1
+    assert publication_checks == 1
+
+
+def test_same_id_replace_race_rechecks_revision_for_old_windows_when_equity_is_warm(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    config = SelectionConfig()
+    prepare_selection_window_cache(database, request, config, workers=1, include_equity=True)
+    with duckdb.connect(str(database)) as writer:
+        missing_window = writer.execute(
+            "select requested_start_utc, requested_end_utc from window_metrics where result_id = ? order by requested_start_utc, requested_end_utc limit 1",
+            [result_id],
+        ).fetchone()
+        writer.execute(
+            "delete from window_metrics where result_id = ? and requested_start_utc = ? and requested_end_utc = ?",
+            [result_id, *missing_window],
+        )
+        before_equity = writer.execute(
+            "select source_revision, facts_json, facts_sha256, calculated_at_utc from equity_quality_metrics"
+        ).fetchall()
+    original = selection_module._selection_window_job_from_args
+    changed = False
+
+    def replace_after_read(args):
+        nonlocal changed
+        result = original(args)
+        if not changed:
+            changed = True
+            with duckdb.connect(str(database)) as writer:
+                writer.execute(
+                    "update strategy_results set imported_at_utc = imported_at_utc + interval '1 second' where result_id = ?",
+                    [result_id],
+                )
+        return result
+
+    monkeypatch.setattr(selection_module, "_selection_window_job_from_args", replace_after_read)
+
+    with pytest.raises(EquitySourceChangedError, match="EQUITY_SOURCE_CHANGED"):
+        prepare_selection_window_cache(database, request, config, workers=1, include_equity=True)
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select count(*) from window_metrics where result_id = ?", [result_id]).fetchone() == (6,)
+        assert check.execute(
+            "select source_revision, facts_json, facts_sha256, calculated_at_utc from equity_quality_metrics"
+        ).fetchall() == before_equity
 
 
 def test_loader_derives_proxy_holding_and_order_plateau_counts(tmp_path: Path) -> None:

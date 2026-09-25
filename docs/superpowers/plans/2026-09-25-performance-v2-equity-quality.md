@@ -14,24 +14,69 @@
 
 **Spec:** [Performance v2 equity quality](../../specs/2026-09-25-performance-v2-equity-quality.md).
 
-**Version:** canonical R6.1, 2026-09-25. Основание: Planner `PLAN_REVISION R6.1`, source R6.
-R5 получил independent `PLAN_APPROVED`; RV3/RV4 findings closed. R6 меняет
-policy по решению пользователя «только понижать место»; review R6 запросил
-два уточнения ниже; re-review R6.1: **`PLAN_APPROVED`**, 2026-09-25.
-Engineering review не заменяет acceptance покрытия/скорости и не разрешает runtime.
-Все implementation checkboxes ниже открыты. Реализация не начата.
+**Version:** canonical R7.3, 2026-09-25. Independent Opus 5
+`PLAN_APPROVED`, 2026-09-25. R7.3 replaces conflicting R6.1 rules below;
+the R6.1 findings ledger is historical only. Approval does not accept M0
+coverage/performance evidence and does not authorize runtime implementation.
+Implementation was separately authorized by the user. M0–M1 are accepted;
+M2–M5 remain open. Checkboxes close only after verified evidence and
+independent review.
+
+## R7.3 canonical override (normative)
+
+Follow the [R7.3 contract in the spec](../../specs/2026-09-25-performance-v2-equity-quality.md#0-canonical-r73-contract-normative-supersedes-r61).
+This block supersedes any contradictory lower checklist text; revise that text
+before starting M1. In particular, the old common-T preflight, action/position
+gap proofs, age-based H selection, <=5% gap-unrankable gate, and
+`CONTINUATION_UNASSESSED` are deleted.
+
+- Pure facts depend only on stored report `[start,T]` and owned equity rows.
+  No actions/positions/trade counts/timeframes are inputs; zero action-fact
+  queries/rows are attributable to equity computation. Optional trip strata
+  are separate and may be omitted.
+- Enforce aware UTC `TIMESTAMPTZ`, numeric Decimal finite values and inclusive
+  source ownership. Convert Decimal inputs directly, otherwise parse
+  `Decimal(str(value))` with no float round-trip. Precedence is structural
+  source validation -> in-report nonpositive Decimal -> age/window availability
+  -> metrics/class/score. Malformed/nonfinite/out-of-interval/invalid-index
+  input is UNKNOWN_INVALID_SOURCE/NOT_EVALUATED even if an in-report value is
+  nonpositive; only structurally valid source can be NONPOSITIVE_EQUITY/BLOCK.
+- `E(t)` is right-continuous, duplicate timestamps use greatest sample_index,
+  and all raw duplicates remain in raw risk. Carry unconditionally to the next
+  update and T; gaps and quiet tails never invalidate. No future/pre-report
+  baseline or fallback from corrupt input.
+- W baseline exists iff start<=T-W and an in-report sample exists at/before
+  T-W. Select longest available H in 28/14/7; no baseline => under7
+  INSUFFICIENT_HISTORY, otherwise MISSING_BASELINE. Compute each available
+  window on the exact T-anchored 6h grid with Decimal38 formulas and eps
+  `1e-8`; raw H D/P uses `[T-H,T]` and the exact no-double-anchor rules from
+  spec §0.
+- Decision policy: H-UP + all shorts NONDECLINING => GROWING class0/PASS;
+  H-UP + any short decline => WEAKENING class1/PASS; H-flat => FLAT class2,
+  blocked only by enabled ERF; other valid non-UP => DECLINING_OR_MIXED
+  class2/3 BLOCK. Short decline alone never blocks. Remove
+  `CONTINUATION_UNASSESSED`.
+- Ranking is exactly `(class,-score12,D,P,-H,strategy_id)`; unscoreable nulls
+  are RESERVE outside N. Each candidate uses its own stored T; mixed report
+  ends are valid, with no common-T gate/freshness/date tie. Include T in
+  revision/digest so T-only changes recompute facts.
+- Any later worker/cache source contract is equity-only. UI defaults remain
+  OFF/robust, and four XLSX columns do not change. Production work follows
+  the user's separate implementation authorization.
 
 ## Global constraints
 
 - Только Performance v2 card «4. Pareto and filters» и её существующие consumers.
 - `filter_equity_regime` OFF по умолчанию; optional `rank_robust_top_n`,
   `method=robust_v1|equity_quality_v1`; omitted method = robust; N default 20.
-- Окна 7/14/28d, UTC `T=report_end`, H по возрасту 28/14/7; нет 3d gate.
+- Окна 7/14/28d, UTC `T=report_end`, H по baseline availability 28/14/7;
+  report age gates only under-7 insufficient history, not H selection.
 - При UP H и валидных facts flat/declining короткие окна не вызывают ERF BLOCK;
   WEAKENING только понижает приоритет enabled equity-ranking.
   Нет minimum trades/week и hard-exclusion только за возраст <28d.
 - Decimal precision 38; eps `1e-8` log-pp/30d; score HALF_EVEN 12 знаков.
-- Одна сетка <=113 points; raw DD/P только H. Нет historical blocks/HWM age.
+- Fixed T-anchored 6h grids; raw DD/P only on exact H path. No gap/position
+  invalidation, historical blocks, HWM age, or common-T grouping.
 - Старый wallet/A/B расчёт не менять; новый путь MTM не snap к flat boundary.
 - Missing required cache = request error; cached unknown = ready/unassessed.
 - Legacy hashes/columns/robust decisions не меняются при отсутствии новых полей.
@@ -43,8 +88,8 @@ Engineering review не заменяет acceptance покрытия/скоро�
 
 ## Review focus
 
-1. Редкие сделки: flat неделя не превращается в отрицательную оценку;
-   длительный разрыв при открытой позиции не считается доказанным flat (M1/M2).
+1. Sparse updates/quiet tails use equity-only right-continuous carry; gaps never
+   need action/position-state proof and do not invalidate metrics (R7.3).
 2. REPLACE переиспользует result_id: stale source нельзя публиковать ни в
    facts, ни в selection snapshot, даже если список IDs не изменился (M1/M3).
 3. Legacy asdict/hash, boolean trace и protected XLSX headers сохраняются;
@@ -63,19 +108,19 @@ Engineering review не заменяет acceptance покрытия/скоро�
 | R-03 | Planner R2: FK/new revision column/raw hash | Accepted R3: existing metadata revision, no FK, transactional invalidation |
 | R-04 | Planner R2: float и незаданный epsilon | Accepted R3: Decimal grid, fixed epsilon/rounding |
 | R-05 | Planner R2: весь preview без raw | Accepted R3: только новая equity ветка; legacy actions reads остаются |
-| R-06 | Planner R2: лишние DD windows/неявный fallback | Accepted R3: DD/P только H, H только по report age |
+| R-06 | Planner R2: лишние DD windows/неявный fallback | H-only DD/P retained; R6.1 age-selected H superseded by R7.3 baseline-availability H |
 | R-07 | Planner R2: незаданные benchmark floors | Accepted R3: конкретные proposed бюджеты/повторы/сценарии |
 | RV3-01 | Advisor: одинаковые strategy_id у lot variants | Premise rejected / resolved: loader dictionary keyed strategy_id, variants distinct; uniqueness invariant и permutation tests |
 | RV3-02 | Advisor: passthrough можно спутать с PASS | Accepted R4: только decisive PASS; разные skip reasons для unassessed/blocked |
 | RV3-03 | Advisor: readiness нового cache неявна | Accepted R4: old-ready AND presence/revision/algo/canonical digest для enabled consumers |
 | RV3-04 | Advisor: неоднозначный batch bound | Accepted R4: <=w active sources, <=2*w metadata jobs/compact results |
 | RV3-05 | Advisor: lifecycle deletion неполон | Accepted R4 с проверкой кода: REPLACE transaction; prune verified backup/restore, других parent-delete APIs не найдено |
-| RV3-06 | Advisor: sparse quality не имеет release gate | Accepted R4: proposed <=5% coverage-unrankable, 0 false unknown на verified flat paths; predecessor action proof |
-| RV3-07 | Advisor: mixed T обнаруживается поздно | Accepted R4: cheap all-input metadata preflight до compute/writes, payload и remediation |
+| RV3-06 | Advisor: sparse quality не имеет release gate | R6.1 coverage/action-proof disposition superseded by R7.3 unconditional carry and baseline availability; reassess only with R7.3 M0 evidence |
+| RV3-07 | Advisor: mixed T обнаруживается поздно | R6.1 common-T gate superseded: each current candidate uses its own T |
 | RV3-08 | Advisor: LRU может вернуть старые решения | Accepted R4: settings-independent facts only; fresh policy outside LRU |
 | RV4-01 | Advisor: read-only schema v5 после миграции | Accepted R5: strict readable v5/v6, no DDL; damaged v6 fail-closed; explicit writable initialization |
 | RV4-02 | Advisor: toggle-dependent facts и single LRU entry | Accepted R5: toggle-independent cached reads; explicit sentinels; cold publish legitimate miss |
-| RV4-03 | Advisor: нет оценки sparse correction-block rate | Accepted R5: M0 distributions и explicit user acceptance, не скрытая смена tolerance |
+| RV4-03 | Advisor: нет оценки sparse correction-block rate | Historical R5/R6.1 <=5% gap-unrankable gate superseded by R7.3 unconditional carry; M0 reports availability/invalidity evidence only |
 | U6 | Пользователь: «только понижать место» | Accepted R6: H-UP GROWING/WEAKENING оба PASS; ranking class priority прежний; RV4-03 M0 теперь проверяет zero short-only BLOCK и ranking demotion |
 | R6-01 | Advisor: комбинация ERF ON + robust | Clarified R6.1: намеренно без equity-штрафа; понижение только new method; controlled robust-equivalence fixture |
 | R6-02 | Advisor: недостаточно adversarial rank tests | Accepted R6.1: class1 score10 ниже class0 score1; within-class tie-chain; оба коротких окна отрицательны; policy/hash assertions |
@@ -84,12 +129,11 @@ Engineering review не заменяет acceptance покрытия/скоро�
 
 Новые production files — только:
 
-- `src/mrs3/performance_v2_equity_quality.py`: pure geometry и typed facts;
-  `EquitySample(sample_index, timestamp_utc, equity)` и
-  `PositionSample(action_index, timestamp_utc, post_size)` — frozen dataclasses.
-  Inputs sorted by UTC/index; adapter нормализует порядок, engine валидирует.
-  `calculate_equity_facts(*, report_start: datetime, report_end: datetime,
-  equity: Iterable[EquitySample], actions: Iterable[PositionSample]) -> EquityFacts`.
+- `src/mrs3/performance_v2_equity_quality.py`: pure equity-only geometry and
+  typed facts; frozen `EquitySample(sample_index,timestamp_utc,equity)` only.
+  Inputs include stored report start and report-end T; no action/position input.
+  UTC, ownership, duplicate timestamps, baseline availability, finite Decimal,
+  and window/risk semantics follow canonical R7.3 spec §0.
   `EquityFacts` содержит H, version, quality, window facts keyed 7/14/28,
   D/P H и structured reasons; точные поля/диапазоны из spec §§4–6.
 - `src/mrs3/performance_v2_equity_cache.py`: revision, strict canonical
@@ -110,63 +154,73 @@ Existing edits: `performance_v2_selection.py`, `performance_v2_windows.py`
 `performance_v2_selection_review.py`, `panel.py`, `panel_performance_v2.py`,
 `panel_web/app.js`, `panel_web/index.html`. Не выделять общий framework.
 
-## M0 — проверка идеи и критериев до implementation
+## M0 — проверка идеи и критериев до implementation (R7.3)
 
 **Files:** spec/this plan; future `scripts/benchmark_equity_quality.py` и
 `docs/superpowers/plans/2026-09-25-performance-v2-equity-quality-evidence.md`
 только при назначении этапа. Новый ADR создаётся после принятия контракта,
 со следующим свободным номером; не резервировать занятый номер заранее.
 
-- [ ] Зафиксировать frozen cohort и ревизии, распределение возраста, дат T,
-  количества samples/actions и gaps. Read-only live scan либо DB copy;
-  ни finalists, ни производственный кэш не менять.
-  Live gap distribution показать рядом с denominators; восемь ранее
-  просмотренных результатов с95–265h gaps не выдавать за весь корпус.
-- [ ] Воспроизвести monotone, ступени 2–3 trades/week, flat last7, last7 loss,
-  late jump, recovery при отрицательном28, intragrid DD, sparse-flat/open.
-  Сравнить сетки 1/3/6h и возрастные переходы около7/14/28; показать пользователю
-  различия класса/score, а не выбирать настройки по количеству прошедших.
-- [ ] Зафиксировать ограничения event-based equity: missing MTM и неизвестные
-  cashflows не восстанавливаются математикой. Проверить, есть ли достаточное
-  число оценимых стратегий при контракте coverage.
-- [ ] Проверить spec §11 coverage gate по strata r=0/0<r<=3/r>3 trips/week,
-  где r=completed trips within H *7/H (дробные частоты не теряются):
-  <=5% coverage-unrankable overall и в каждом sparse stratum; 0 ложных unknown
-  на вручную подтверждённых complete flat paths. Missing boundary/initial
-  unknown/open gaps/invalid показывать раздельно с denominator и размером
-  strata. Пустая stratum не PASS. Не достигнуто — решение по источнику/дизайну,
-  не молчаливое ослабление coverage. Бюджет согласовать до runtime coding.
-- [ ] Измерить старый код: one warmup +3 repeats на одинаковой DB copy,
-  hardware/settings. Записать baseline wall/RSS/SQL/rows/writes.
-- [ ] Принять с пользователем policy примеры и performance targets из spec §9.
-  До этого M1–M5 — план, не разрешение менять runtime.
-- [ ] Для тех же strata проверить ноль ERF BLOCK solely-by-short-decline
-  при валидном H UP. Показать доли WEAKENING от всех и от H-UP, magnitude
-  p50/p90/max и примеры понижения порядка. Отдельно отметить действия других
-  фильтров/lot/analog/Top N. Решение пользователя уже принято: новый tolerance
-  и повторное согласование short-window отсева не нужны.
+- [ ] Freeze ACTIVE/current-result metadata identity incl. each candidate's T;
+  read source/report/action/equity timestamp types and enforce native UTC
+  `TIMESTAMPTZ`/aware offset +00:00. Report exact SQL queries by purpose.
+- [ ] Run the canonical equity-only self-check matrix from spec §0, including
+  5m/4h invariance, quiet tails, arbitrary gaps, exact baseline/L/T and duplicate
+  paths, invalid/non-finite/nonpositive precedence and collisions, H availability boundaries,
+  mixed T, score/class behavior, and duplicate raw D/P deltas. Repeat output and
+  verify byte-identical self-check output.
+- [ ] Read-only scan largest feasible deterministic scope (default bounded
+  per Pair+Side sample; `--full` only if resource/time budget permits). Make
+  sample selection counts/reasons auditable and assert no duplicate/drop.
+  Report overall/by-age baseline availability, invalid/outside/nonpositive,
+  H/classes/score/rank/Top-N, raw/grid rows, max internal gap, last-sample-to-T
+  carry duration, duplicate raw risk deltas, and timeframe/inactivity cross-tabs
+  only for available fields. Assert ordered streamed groups and per-result row
+  counts reconcile exactly to scanned rows, including empty results and final
+  group flush. Explain limits; no unsupported representativeness.
+- [ ] Optional action trip strata may be omitted. If retained, isolate and count
+  their action query/rows separately; equity calculation must issue zero action
+  queries and read zero action rows.
+- [ ] Compare diagnostic ER under 1/3/6h grids and raw-vs-grid ER when feasible;
+  canonical facts remain fixed at 6h. Preserve the previous warm-cache baseline.
+- [ ] If feasible, measure R7.3 diagnostic with one code warmup and three
+  measured repeats; record wall/RSS/query/rows/writes and exact DB size/mtime/
+  schema/catalog/table-count invariants before and after. No copy, backfill,
+  migration, DB write, Panel, tester, or service restart. Do not claim budgets
+  pass absent comparable old/new measures; proposed cold/warm/RSS budgets are
+  spec §0.
+- [ ] M0 has no common-T blocker and no action-proven-gap or <=5%
+  coverage-unrankable gate under R7.3. Record M0 limits and unresolved user decisions only from
+  observed R7.3 evidence. Approval is not M1 authorization.
 
-**Exit:** evidence объясняет flat-week admission, возможный отказ recovery,
-риск сравнения разных H и реальную оценимость данных; предиктивность не заявлена.
+**Exit:** reproducible R7.3 evidence and exact limitations; no claim of
+predictive validity, accepted speed budgets, or implementation readiness.
 
 ## M1 — pure engine, lifecycle и быстрая единая подготовка
+
+**Accepted:** 2026-09-25, independent Opus 5 `CODE_REVIEW_PASS` for pure facts,
+schema/cache lifecycle, v5 reads and worker integration. Final relevant suite:
+429 passed, 2 platform skips. The synthetic seven-window worker fetch fell
+from seven SELECTs to one with identical cached metrics. Comparable full-corpus
+wall/RSS budgets remain an M5 gate, not an M1 claim.
 
 **Files:** оба новых модуля; existing store/import/prune/windows/selection;
 `tests/test_performance_v2_equity_quality.py`,
 `tests/test_performance_v2_equity_cache.py`, existing store/import/prune/windows tests.
 
-- [ ] Сначала добавить failing parameterized pure checks на eps, scale
-  invariance, nonpositive priority, Decimal values, equal timestamp spikes,
-  left boundary, age6.99/7/13.99/14/27.99/28, no fallback при broken H.
-  Минимальный fixture для flat tail: equity `1000 + 10*count(day>=d)` при
-  `d=[3,6,10,13,17,20]`, sample каждые6h до28d, непрерывно flat position.
-  Ожидание: H28 UP, 14 NONDECLINING, 7 slope=endpoint=ER=0.
-- [ ] Запустить новый тест, получить ожидаемый FAIL, затем реализовать один
-  merge-проход equity/actions, causal grid, до113 ln, slices OLS/ER, raw DD/P H.
-  Не добавлять historical scan или float conversion.
-- [ ] Добавить boundary tests open/unknown gap6h vs >6h, unknown gap между
-  grid nodes, continuous flat gap, закрытие без нового equity, неизвестное
-  состояние до первого action. Unknown не подменяет ноль и не скрывает E<=0.
+- [ ] Сначала добавить failing pure checks на R7.3 §0: timezone/source
+  ownership, baseline availability (not age-selected H), finite Decimal,
+  structural validation before nonpositive classification, duplicate timestamp sample_index, exact L/T anchors,
+  scale/log-grid invariance, classification and ranking score.
+  Flat-tail fixture uses equity only: expected H-UP, flat short windows and
+  GROWING/PASS despite a quiet multi-day tail.
+- [ ] Implement one ordered equity-only pass, right-continuous 6h grids,
+  Decimal38 OLS/ER and exact raw H D/P. The engine API must not accept/read
+  actions or positions. No historical scan or float conversion.
+- [ ] Replace old open/unknown gap/action-proof tests with arbitrary internal,
+  leading and terminal carry tests, in-report predecessor, missing baseline,
+  pre-report/future invalidity, nonpositive inside/outside H, and duplicate raw
+  risk-path tests. Gaps never turn otherwise valid equity facts unknown.
 - [ ] Red/green schema v6: fresh DB, поддержанные old migrations, exact catalog,
   round-trip strict facts JSON/digest. Table `equity_quality_metrics` с
   PK(result_id,algo_version), без FK и без изменения source schema columns.
@@ -184,12 +238,11 @@ Existing edits: `performance_v2_selection.py`, `performance_v2_windows.py`
   transaction: текущий DuckDB FK-контур использует backup boundary.
   Проверить single/multiple prune и failure restore вместе с новой таблицей,
   zero orphans; повторить поиск всех source parent-delete/cache-delete sites.
-- [ ] Расширить существующий worker: union missing jobs; один full `_load_source`
-  когда нужны old windows, иначе H-tail query с predecessor equity/position.
-  Метаданные revision и raw source читать в одной read transaction.
-  Position predecessor нужен на/до predecessor equity sample; все actions
-  от этого sample до T. Last action только на H start недостаточен для
-  доказательства, что старое equity наблюдалось уже в flat-состоянии.
+- [ ] Расширить существующий worker: union missing jobs; один source query
+  который выбирает только owned equity rows needed for available windows,
+  retaining rows required for raw H D/P. Metadata revision (including stored
+  report T) and equity source are read in one read transaction. No actions or
+  position predecessor are loaded for equity facts.
 - [ ] Spy tests: old+new cold = один source load; new-only cold не читает
   историю до predecessor; warm new branch = ноль raw reads/writes;
   change N/method/order/ab_final_days не инвалидирует equity facts.
@@ -212,10 +265,14 @@ Run: `.venv\Scripts\python.exe -m pytest tests/test_performance_v2_equity_qualit
 
 - [ ] Red/green parser `filter_equity_regime`, fixed pair_side, default OFF;
   submitted/effective order, explicit/implicit lot first, rank last.
-- [ ] Табличные policy tests: flat7 + UP14/28 PASS; negative7 + UP H14/28
-  PASS/WEAKENING; negative14 + UP H28 PASS/WEAKENING; H7 negative BLOCK;
-  positive7/14 + negative28 BLOCK; validshort10d UP PASS; under7 unassessed;
-  malformed/gap unassessed; nonpositive BLOCK даже при другом unknown.
+- [ ] Табличные policy tests use baseline availability: H28 with short
+  nondeclining => GROWING/PASS; H28 plus any short decline => WEAKENING/PASS;
+  H14/H7 use only available shorts; H-flat => FLAT/class2 (ERF-only block);
+  other valid non-UP => DECLINING_OR_MIXED/BLOCK; under7 and missing baseline
+  unassessed; structural malformed/out-of-interval/invalid-index input is
+  UNKNOWN_INVALID_SOURCE even when an in-report nonpositive value also exists;
+  only structurally valid in-report nonpositive is BLOCK. Gaps/tails do not
+  invalidate otherwise valid facts.
 - [ ] Реализовать self-only gate из готовых facts. Stage counts оставляют
   стандартную семантику; отдельный unassessed count и reason, не ложный PASS.
 - [ ] Red/green mixed lot group: old winner BLOCK, sibling PASS -> не
@@ -259,17 +316,15 @@ Run: `.venv\Scripts\python.exe -m pytest tests/test_performance_v2_selection.py`
   одинаковыми метриками сохраняют порядок при permutations/worker counts;
   duplicate IDs дают typed invalid input. Не менять tie-key из-за неверного
   предположения, что order rows являются отдельными candidate rows.
-- [ ] Проверить missing-score RESERVE, rank-only отрицательные rankable,
-  Top N по analog representatives, prior REJECTED, одинаковые T у input cohort,
-  typed mismatch и отсутствие влияния чужого RETEST cohort.
-  Общий T проверяется по всем ACTIVE input results до фильтров, до heavy
-  source reads/cache publication. Error payload result_id/date; mixed-T
-  rank request = zero heavy reads/writes, но facts-only warming разрешён.
+- [ ] Проверить missing-score RESERVE (не занимает N), rankable non-UP,
+  Top N по analog representatives, prior REJECTED, candidate-specific T in
+  facts revision/digest, T-only recompute, and отсутствие влияния чужого
+  RETEST cohort. Mixed-T is valid; no common-T preflight or date tie-break.
 - [ ] Version-aware canonical projection: old request не получает новые null
   fields от asdict. Новый contract v2 сохраняет method/policy/effective order,
   revisions/digests/decision facts в существующих JSON-полях, не новой таблице.
-  Filter policy R6 = `equity-regime-v2`; facts version/ranking method прежние.
-  Policy-only изменение не инвалидирует facts и само не требует DB migration.
+  R7.3 contract/T must be represented in source revision/digest; policy-only
+  changes do not invalidate otherwise current facts or silently change scoring.
   Assert snapshot policy ID и byte-identical прежний legacy-v1 canonical hash.
 - [ ] Red/green v1/v2 review round-trip, snapshot recheck при same-ID REPLACE,
   old snapshot после удаления cache, equivalent-run checks и rollback при race.

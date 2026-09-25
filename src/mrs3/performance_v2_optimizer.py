@@ -703,13 +703,13 @@ def _read_prepared_optimizer_inputs(
 def read_prepared_optimizer_inputs(database: str, result_ids: Sequence[int]) -> tuple[PreparedCurrentResult, ...]:
     """Strictly read revision-bound prepared rows; never consult compatibility JSON."""
     import duckdb
-    from .performance_v2_store import require_performance_v2
+    from .performance_v2_store import require_performance_v2_readable
 
     requested = tuple(dict.fromkeys(int(item) for item in result_ids))
     if not requested:
         return ()
     with duckdb.connect(str(database), read_only=True) as connection:
-        require_performance_v2(connection)
+        require_performance_v2_readable(connection)
         return _read_prepared_optimizer_inputs(connection, requested)
 
 

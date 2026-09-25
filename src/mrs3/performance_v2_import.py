@@ -1591,7 +1591,10 @@ def _publish(
                 result_id = int(old[10])  # type: ignore[index]
                 # Keep the existing result identity for v4 databases, whose
                 # strategy_id uniqueness permits one current result per strategy.
-                for table in ("strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs"):
+                for table in (
+                    "strategy_actions", "strategy_equity", "window_metrics",
+                    "equity_quality_metrics", "optimizer_prepared_inputs",
+                ):
                     connection.execute(f"delete from {table} where result_id = ?", [result_id])
             values = _result_values(entry, report, prepared.commission_contract, now)
             ordered_values = tuple(values[field] for field in _RESULT_VALUE_FIELDS)
