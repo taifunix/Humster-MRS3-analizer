@@ -4921,6 +4921,9 @@ class PanelController:
             selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
         except PerformanceV2SelectionError as error:
             raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=str(error)) from error
+        equity_filter_enabled = any(
+            stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages
+        )
         performance_config = self._performance_v2_config()
         target = performance_v2_database_path(performance_config)
         if not target.is_file():
@@ -4929,10 +4932,21 @@ class PanelController:
             with duckdb.connect(str(target), read_only=True) as connection:
                 connection.execute(f"set threads to {performance_config.workers}")
                 schema_version = require_performance_v2_readable(connection)
-                if not selection_cache_status(connection, request, selection_config)["ready"]:
+                cache_status = selection_cache_status(
+                    connection, request, selection_config, include_equity=equity_filter_enabled,
+                    include_readiness_breakdown=equity_filter_enabled,
+                )
+                if not cache_status["ready"]:
+                    equity_only_missing = (
+                        equity_filter_enabled
+                        and int(cache_status["total"]) > 0
+                        and int(cache_status["window_missing"]) == 0
+                        and int(cache_status["equity_missing"]) > 0
+                    )
+                    code = "EQUITY_CACHE_INCOMPLETE" if equity_only_missing else "SELECTION_CACHE_INCOMPLETE"
                     raise PerformanceV2ApiError(
-                        "SELECTION_CACHE_INCOMPLETE", status=409,
-                        message="Selection cache is not ready; prepare or recalculate it before exporting XLSX",
+                        code, status=409,
+                        message="Required selection caches are incomplete; prepare or recalculate them before continuing",
                     )
                 result_token = tuple(connection.execute(
                     """select s.strategy_id, s.current_result_id from strategies s
@@ -4969,6 +4983,7 @@ class PanelController:
                     request.ranking_scope,
                     request.bulk_retest_job_id,
                     request.cohort_members,
+                    equity_filter_enabled,
                     tuple(asdict(selection_config).items()),
                     result_token,
                     facts_token,
@@ -4987,6 +5002,14 @@ class PanelController:
                             self._selection_candidate_cache.popitem(last=False)
                 result = run_selection(apply_prior_rejected(connection, candidates), request, selection_config)
             return request, result
+        except EquitySchemaUpgradeRequiredError as error:
+            raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
+        except EquityCacheSchemaInvalidError as error:
+            raise PerformanceV2ApiError(error.code, status=500, message=str(error)) from error
+        except PerformanceV2SelectionError as error:
+            if str(error) == "EQUITY_CACHE_INCOMPLETE":
+                raise PerformanceV2ApiError(str(error), status=409, message=str(error)) from error
+            raise
         except PerformanceV2StoreError as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
         except duckdb.Error as error:

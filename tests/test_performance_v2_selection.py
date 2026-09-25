@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
+from dataclasses import asdict
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -286,6 +288,209 @@ def test_parse_selection_request_accepts_new_stages_and_requires_last_fixed_rank
         ]})
 
 
+def test_equity_regime_stage_has_fixed_pair_side_scope_and_legacy_absence_is_unchanged() -> None:
+    legacy = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    encoded = json.dumps(asdict(legacy), sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(encoded.encode()).hexdigest() == "40080afb14245d0729d4124794ce647e089521725624767bdfb94de87cc6edb4"
+
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    assert [(stage.id, stage.scope, stage.enabled) for stage in request.stages] == [
+        ("filter_equity_regime", "pair_side", True),
+    ]
+    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_REGIME_STAGE_SCOPE"):
+        parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side_timeframe"},
+        ]})
+
+
+@pytest.mark.parametrize(
+    ("state", "disposition", "reason", "finalist", "unassessed"),
+    [
+        ("GROWING", "PASS", "H_UP_SHORTS_NONDECLINING", True, 0),
+        ("WEAKENING", "PASS", "SHORT_WINDOW_DECLINE", True, 0),
+        ("FLAT", "BLOCK_IF_ERF_ENABLED", "H_FLAT", False, 0),
+        ("DECLINING_OR_MIXED", "BLOCK", "H_DECLINING_OR_MIXED", False, 0),
+        ("NONPOSITIVE_EQUITY", "BLOCK", "NONPOSITIVE_EQUITY", False, 0),
+        ("INSUFFICIENT_HISTORY", "NOT_EVALUATED", "INSUFFICIENT_HISTORY", True, 1),
+        ("MISSING_BASELINE", "NOT_EVALUATED", "MISSING_BASELINE", True, 1),
+        ("UNKNOWN_INVALID_SOURCE", "NOT_EVALUATED", "UNKNOWN_INVALID_SOURCE", True, 1),
+    ],
+)
+def test_equity_regime_filter_uses_cached_disposition_without_false_pass(
+    state: str, disposition: str, reason: str, finalist: bool, unassessed: int,
+) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row(
+        "candidate", _equity_state=state, _equity_disposition=disposition,
+        _equity_reason=reason,
+    )]), request)
+
+    assert bool(result.loc[0, "finalist"]) is finalist
+    assert result.loc[0, "equity_regime_state"] == state
+    assert result.loc[0, "equity_regime_reason"] == reason
+    assert result.attrs["stage_counts"]["filter_equity_regime"]["not_evaluated"] == unassessed
+    if not finalist:
+        assert result.loc[0, "elimination_reason"] == "FILTER_EQUITY_REGIME"
+    if unassessed:
+        assert result.loc[0, "elimination_reason"] == reason
+
+
+@pytest.mark.parametrize("missing_column", ["_equity_state", "_equity_disposition", "_equity_reason"])
+def test_equity_regime_rejects_missing_cached_fact_columns(missing_column: str) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    row = _selection_row(
+        "candidate", _equity_state="UNKNOWN_INVALID_SOURCE",
+        _equity_disposition="NOT_EVALUATED", _equity_reason="UNKNOWN_INVALID_SOURCE",
+    )
+    frame = pd.DataFrame([row]).drop(columns=[missing_column])
+
+    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
+        run_selection(frame, request)
+
+
+@pytest.mark.parametrize("disposition", [None, "UNKNOWN", "PASS "])
+def test_equity_regime_rejects_missing_or_invalid_cached_disposition(disposition: object) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    frame = pd.DataFrame([_selection_row(
+        "candidate", _equity_state="UNKNOWN_INVALID_SOURCE", _equity_disposition=disposition,
+        _equity_reason="UNKNOWN_INVALID_SOURCE",
+    )])
+
+    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
+        run_selection(frame, request)
+
+
+def test_equity_regime_runs_after_lot_and_before_submitted_filters_and_rank() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pareto_primary", "enabled": True, "scope": "pair_side"},
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 10},
+    ]})
+    result = run_selection(pd.DataFrame([_lot_variant_row(
+        "candidate", 1, _equity_state="GROWING", _equity_disposition="PASS",
+        _equity_reason="H_UP_SHORTS_NONDECLINING",
+    )]), request)
+
+    assert list(result.attrs["stage_counts"]) == [
+        "filter_lot_variant_redundancy", "filter_equity_regime", "pareto_primary", "rank_robust_top_n",
+    ]
+
+
+def test_equity_regime_preserves_mixed_lot_group_until_blocked_variant_is_removed() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _lot_variant_row("old-lot-winner", 1, lots=("1", "2"), dd5_proxy=Decimal("11"),
+                         _equity_state="FLAT", _equity_disposition="BLOCK_IF_ERF_ENABLED",
+                         _equity_reason="H_FLAT"),
+        _lot_variant_row("passing-sibling", 2, lots=("3", "4"), dd5_proxy=Decimal("10"),
+                         _equity_state="GROWING", _equity_disposition="PASS",
+                         _equity_reason="H_UP_SHORTS_NONDECLINING"),
+    ]), request).set_index("strategy_name")
+
+    assert not result.loc["old-lot-winner", "finalist"]
+    assert result.loc["passing-sibling", "finalist"]
+    assert result.loc["passing-sibling", "elimination_reason"] == "LOT_GROUP_EQUITY_BLOCKED"
+    assert not result["eliminated_by_filter_lot_variant_redundancy"].any()
+    assert result.loc["old-lot-winner", "elimination_reason"] == "FILTER_EQUITY_REGIME"
+
+
+def test_equity_regime_skips_whole_three_member_lot_group_if_any_member_is_blocked() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _lot_variant_row("pass-a", 1, lots=("1", "2"), dd5_proxy=Decimal("11"),
+                         _equity_state="GROWING", _equity_disposition="PASS",
+                         _equity_reason="H_UP_SHORTS_NONDECLINING"),
+        _lot_variant_row("pass-b", 2, lots=("3", "4"), dd5_proxy=Decimal("10"),
+                         _equity_state="WEAKENING", _equity_disposition="PASS",
+                         _equity_reason="H_UP_SHORTS_NONDECLINING"),
+        _lot_variant_row("blocked-c", 3, lots=("5", "6"), dd5_proxy=Decimal("9"),
+                         _equity_state="FLAT", _equity_disposition="BLOCK_IF_ERF_ENABLED",
+                         _equity_reason="H_FLAT"),
+    ]), request).set_index("strategy_name")
+
+    assert result.loc["pass-a", "finalist"]
+    assert result.loc["pass-b", "finalist"]
+    assert not result.loc["blocked-c", "finalist"]
+    assert result.loc["pass-a", "elimination_reason"] == "LOT_GROUP_EQUITY_BLOCKED"
+    assert result.loc["pass-b", "elimination_reason"] == "LOT_GROUP_EQUITY_BLOCKED"
+    assert result.loc["blocked-c", "elimination_reason"] == "FILTER_EQUITY_REGIME"
+    assert not result["eliminated_by_filter_lot_variant_redundancy"].any()
+    assert result["eliminated_by_filter_equity_regime"].to_dict() == {
+        "pass-a": False, "pass-b": False, "blocked-c": True,
+    }
+
+
+def test_equity_regime_all_pass_lot_group_keeps_existing_winner_and_precedence_for_unassessed() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    all_pass = run_selection(pd.DataFrame([
+        _lot_variant_row("a", 1, lots=("1", "2"), dd5_proxy=Decimal("11"),
+                         _equity_state="GROWING", _equity_disposition="PASS",
+                         _equity_reason="H_UP_SHORTS_NONDECLINING"),
+        _lot_variant_row("b", 2, lots=("3", "4"), dd5_proxy=Decimal("10"),
+                         _equity_state="WEAKENING", _equity_disposition="PASS",
+                         _equity_reason="SHORT_WINDOW_DECLINE"),
+    ]), request).set_index("strategy_name")
+    assert all_pass.loc["a", "finalist"] and not all_pass.loc["b", "finalist"]
+    assert all_pass.loc["b", "eliminated_by_filter_lot_variant_redundancy"]
+    assert not all_pass.loc["b", "eliminated_by_filter_equity_regime"]
+
+    unknown = run_selection(pd.DataFrame([
+        _lot_variant_row("blocked", 1, lots=("1", "2"), dd5_proxy=Decimal("11"),
+                         _equity_state="FLAT", _equity_disposition="BLOCK_IF_ERF_ENABLED",
+                         _equity_reason="H_FLAT"),
+        _lot_variant_row("unassessed", 2, lots=("3", "4"), dd5_proxy=Decimal("10"),
+                         _equity_state="MISSING_BASELINE", _equity_disposition="NOT_EVALUATED",
+                         _equity_reason="MISSING_BASELINE"),
+    ]), request).set_index("strategy_name")
+    assert not unknown.loc["blocked", "finalist"] and unknown.loc["unassessed", "finalist"]
+    assert unknown.loc["unassessed", "elimination_reason"] == "LOT_GROUP_EQUITY_UNASSESSED"
+    assert not unknown["eliminated_by_filter_lot_variant_redundancy"].any()
+
+
+def test_lot_unassessed_advisory_is_replaced_when_later_pareto_eliminates_survivor() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+        {"id": "pareto_primary", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _lot_variant_row("unassessed-winner", 1, lots=("1", "2"), dd5_proxy=Decimal("10"),
+                         capital_proxy=Decimal("5"), _equity_state="MISSING_BASELINE",
+                         _equity_disposition="NOT_EVALUATED", _equity_reason="MISSING_BASELINE"),
+        _lot_variant_row("unassessed-loser", 2, lots=("3", "4"), dd5_proxy=Decimal("5"),
+                         capital_proxy=Decimal("10"), _equity_state="MISSING_BASELINE",
+                         _equity_disposition="NOT_EVALUATED", _equity_reason="MISSING_BASELINE"),
+    ]), request).set_index("strategy_name")
+
+    assert result.loc["unassessed-winner", "finalist"]
+    assert result.loc["unassessed-winner", "elimination_reason"] == "LOT_GROUP_EQUITY_UNASSESSED"
+    assert not result.loc["unassessed-loser", "finalist"]
+    assert result.loc["unassessed-loser", "elimination_reason"] == "PARETO_PRIMARY"
+
+
+def test_equity_regime_off_keeps_legacy_selection_frame_without_equity_columns() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    result = run_selection(pd.DataFrame([_selection_row("candidate")]), request)
+
+    assert "eliminated_by_filter_equity_regime" not in result
+    assert "equity_regime_state" not in result
+    assert "equity_regime_reason" not in result
+
+
 @pytest.mark.parametrize(
     ("payload", "code"),
     [
@@ -540,6 +745,239 @@ def test_equity_warmup_shares_the_cold_selection_source_load(tmp_path: Path, mon
         )
         assert facts is not None
         assert facts.raw_sample_count == 4
+
+
+def test_enabled_equity_selection_batch_reads_only_fresh_facts_for_exact_retest_cohort(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    first_id = int(connection.execute("select strategy_id from strategies").fetchone()[0])
+    first_result = int(connection.execute("select current_result_id from strategies where strategy_id = ?", [first_id]).fetchone()[0])
+    second_id, second_result = _clone_current_candidate(connection, "beta")
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+    with duckdb.connect(str(database)) as writer:
+        writer.execute("update equity_quality_metrics set source_revision = 'stale' where result_id = ?", [first_result])
+    with duckdb.connect(str(database), read_only=True) as check:
+        before = check.execute("select result_id, facts_json, facts_sha256 from equity_quality_metrics order by result_id").fetchall()
+        scoped = retest_cohort_request(request, "one-result", {second_id: second_result})
+        equity_queries: list[tuple[str, object]] = []
+
+        class CountingConnection:
+            def execute(self, sql: str, parameters: object = None):
+                if sql.lower().lstrip().startswith("select result_id, source_revision, algo_version, facts_json, facts_sha256"):
+                    equity_queries.append((sql, parameters))
+                return check.execute(sql) if parameters is None else check.execute(sql, parameters)
+
+        monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
+        monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
+        monkeypatch.setattr(selection_module, "_persist", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
+        candidates = load_selection_candidates(CountingConnection(), scoped, SelectionConfig(), cache_only=True)
+        assert candidates["strategy_id"].tolist() == [second_id]
+        assert candidates.loc[0, "_equity_state"] == "FLAT"
+        assert candidates.loc[0, "_equity_disposition"] == "BLOCK_IF_ERF_ENABLED"
+        assert len(equity_queries) == 1
+        assert "result_id in (?)" in equity_queries[0][0].lower()
+        assert equity_queries[0][1][-1] == second_result
+
+        equity_queries.clear()
+        with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
+            load_selection_candidates(CountingConnection(), request, SelectionConfig(), cache_only=True)
+        assert len(equity_queries) == 1
+        assert "result_id in (?,?)" in equity_queries[0][0].lower()
+        after = check.execute("select result_id, facts_json, facts_sha256 from equity_quality_metrics order by result_id").fetchall()
+
+    assert before == after
+
+
+@pytest.mark.parametrize("corruption", ["missing", "stale", "wrong-algorithm", "bad-digest"])
+def test_enabled_equity_selection_rejects_unverified_cache_facts(
+    tmp_path: Path, monkeypatch, corruption: str,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+    with duckdb.connect(str(database)) as writer:
+        if corruption == "missing":
+            writer.execute("delete from equity_quality_metrics where result_id = ?", [result_id])
+        elif corruption == "stale":
+            writer.execute("update equity_quality_metrics set source_revision = 'stale' where result_id = ?", [result_id])
+        elif corruption == "wrong-algorithm":
+            writer.execute("update equity_quality_metrics set algo_version = 'old' where result_id = ?", [result_id])
+        else:
+            writer.execute("update equity_quality_metrics set facts_sha256 = ? where result_id = ?", ["0" * 64, result_id])
+
+    monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
+    monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
+    monkeypatch.setattr(selection_module, "_persist", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
+    with duckdb.connect(str(database), read_only=True) as check:
+        with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
+            load_selection_candidates(check, request, SelectionConfig(), cache_only=True)
+
+
+def test_equity_fact_batch_does_not_mask_malformed_candidate_source_fields(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        with pytest.raises(IndexError):
+            selection_module._selection_equity_facts_by_result(check, ((1, result_id),))
+        malformed_row = (1, result_id, None, None, "not-a-datetime", None, None, None)
+        with pytest.raises(AttributeError):
+            selection_module._selection_equity_facts_by_result(check, (malformed_row,))
+
+
+def test_equity_selection_accepts_cached_no_sample_not_evaluated_fact(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.execute("delete from strategy_equity")
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert selection_cache_status(check, request, SelectionConfig(), include_equity=True) == {
+            "total": 1, "missing": 0, "ready": True,
+        }
+        candidates = load_selection_candidates(check, request, SelectionConfig(), cache_only=True)
+    result = run_selection(candidates, request)
+
+    assert result.loc[0, "finalist"]
+    assert result.loc[0, "equity_regime_state"] == "MISSING_BASELINE"
+    assert result.loc[0, "equity_regime_disposition"] == "NOT_EVALUATED"
+    assert result.loc[0, "equity_regime_reason"] == "MISSING_BASELINE"
+    assert result.attrs["stage_counts"]["filter_equity_regime"]["not_evaluated"] == 1
+
+
+def test_equity_selection_reads_cached_growing_pass_fact(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id, report_end = connection.execute(
+        "select result_id, report_end_utc from strategy_results"
+    ).fetchone()
+    connection.execute("delete from strategy_equity where result_id = ?", [result_id])
+    first = report_end - timedelta(days=28)
+    connection.executemany(
+        "insert into strategy_equity values (?, ?, ?, ?, ?)",
+        [
+            (result_id, day, first + timedelta(days=day), Decimal(100 + day), Decimal(100 + day))
+            for day in range(29)
+        ],
+    )
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        candidates = load_selection_candidates(check, request, SelectionConfig(), cache_only=True)
+    result = run_selection(candidates, request)
+
+    assert candidates.loc[0, "_equity_state"] == "GROWING"
+    assert candidates.loc[0, "_equity_disposition"] == "PASS"
+    assert result.loc[0, "equity_regime_state"] == "GROWING"
+    assert result.loc[0, "equity_regime_disposition"] == "PASS"
+    assert result.loc[0, "equity_regime_reason"] == "H_UP_SHORTS_NONDECLINING"
+    assert result.loc[0, "finalist"]
+
+
+def test_equity_selection_reads_verified_facts_when_optional_optimizer_metadata_is_unparseable(
+    tmp_path: Path,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    connection.execute(
+        "update strategy_results set optimizer_source_metadata_json = ? where result_id = ?",
+        ["not-json", result_id],
+    )
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        metadata = current_equity_source_metadata(check, result_id)
+        revision = equity_source_revision(metadata)
+        assert revision == equity_source_revision({**metadata, "optimizer_source_metadata_json": None})
+        facts = read_equity_quality_facts(check, result_id, revision)
+        assert facts is not None
+        candidates = load_selection_candidates(check, request, SelectionConfig(), cache_only=True)
+    result = run_selection(candidates, request)
+
+    assert facts.state == "FLAT"
+    assert facts.erf_disposition == "BLOCK_IF_ERF_ENABLED"
+    assert candidates.loc[0, "_equity_state"] == facts.state
+    assert candidates.loc[0, "_equity_disposition"] == facts.erf_disposition
+    assert result.loc[0, "equity_regime_reason"] == facts.reason
+    assert not result.loc[0, "finalist"]
+
+
+def test_enabled_equity_selection_handles_empty_candidate_frame_without_empty_in_query(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    request = parse_selection_request({"symbol": "ETHUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    status = selection_cache_status(connection, request, SelectionConfig(), include_equity=True)
+    candidates = load_selection_candidates(connection, request, SelectionConfig(), cache_only=True)
+    connection.close()
+    result = run_selection(candidates, request)
+
+    assert status == {"total": 0, "missing": 0, "ready": False}
+    assert candidates.empty
+    assert {"_equity_state", "_equity_disposition", "_equity_reason"}.issubset(candidates.columns)
+    assert result.empty
+    assert result.attrs["stage_counts"]["filter_equity_regime"] == {
+        "enabled": True, "eliminated": 0, "remaining": 0, "not_evaluated": 0,
+    }
+
+
+def test_equity_selection_off_adds_no_cache_columns_or_equity_queries(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    absent = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    disabled = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": False, "scope": "pair_side"},
+    ]})
+    prepare_selection_window_cache(database, absent, SelectionConfig(), workers=1)
+    with duckdb.connect(str(database), read_only=True) as check:
+        calls: list[str] = []
+
+        class CountingConnection:
+            def execute(self, sql: str, parameters: object = None):
+                if "equity_quality_metrics" in sql.lower():
+                    calls.append(sql)
+                return check.execute(sql) if parameters is None else check.execute(sql, parameters)
+
+        legacy_candidates = load_selection_candidates(CountingConnection(), absent, SelectionConfig(), cache_only=True)
+        disabled_candidates = load_selection_candidates(CountingConnection(), disabled, SelectionConfig(), cache_only=True)
+    assert legacy_candidates.columns.tolist() == disabled_candidates.columns.tolist()
+    assert not any(column.startswith("_equity_") for column in disabled_candidates.columns)
+    assert calls == []
+    assert run_selection(legacy_candidates, absent).equals(run_selection(disabled_candidates, disabled))
+    disabled_result = run_selection(disabled_candidates, disabled)
+    assert "eliminated_by_filter_equity_regime" not in disabled_result
+    assert disabled_result.attrs["stage_counts"]["filter_equity_regime"] == {
+        "enabled": False, "eliminated": 0, "remaining": 1,
+    }
 
 
 def test_serial_and_parallel_equity_preparation_publish_identical_canonical_bytes(tmp_path: Path) -> None:
@@ -1994,6 +2432,46 @@ def test_workbook_prefixes_applied_filter_reason_and_fills_rows(tmp_path: Path) 
     assert book["All candidates"].cell(2, 1).fill.fgColor.rgb == "00FAEFEF"
     assert book["All candidates"].cell(3, 1).fill.fgColor.rgb == "00D9EAD3"
     assert book["Finalists"].cell(2, 1).fill.fgColor.rgb == "00D9EAD3"
+
+
+def test_workbook_keeps_advisory_reasons_visible_on_legacy_and_equity_finalists(tmp_path: Path) -> None:
+    legacy_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
+    ]})
+    legacy = run_selection(pd.DataFrame([_selection_row("legacy-finalist")]), legacy_request)
+    equity_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    equity = run_selection(pd.DataFrame([
+        _lot_variant_row("blocked-old-winner", 1, lots=("1", "2"),
+                         _equity_state="FLAT", _equity_disposition="BLOCK_IF_ERF_ENABLED",
+                         _equity_reason="H_FLAT"),
+        _lot_variant_row("equity-finalist", 2, lots=("3", "4"),
+                         _equity_state="GROWING", _equity_disposition="PASS",
+                         _equity_reason="H_UP_SHORTS_NONDECLINING"),
+    ]), equity_request)
+
+    legacy_book = load_workbook(
+        write_selection_workbook(legacy, tmp_path / "legacy.xlsx", legacy_request), data_only=True,
+    )
+    equity_book = load_workbook(
+        write_selection_workbook(equity, tmp_path / "equity.xlsx", equity_request), data_only=True,
+    )
+    for book, sheet_name, strategy_name, expected_reason in (
+        (legacy_book, "All candidates", "legacy-finalist", "AB_NOT_EVALUATED_INSUFFICIENT_DATA"),
+        (equity_book, "All candidates", "equity-finalist", "LOT_GROUP_EQUITY_BLOCKED"),
+    ):
+        sheet = book[sheet_name]
+        headers = [cell.value for cell in sheet[1]]
+        strategy_column, finalist_column = headers.index("Стратегия") + 1, headers.index("Final") + 1
+        reason_column = headers.index("Причина") + 1
+        row = next(
+            row for row in range(2, sheet.max_row + 1)
+            if sheet.cell(row, strategy_column).value == strategy_name
+        )
+        assert sheet.cell(row, finalist_column).value is True
+        assert sheet.cell(row, reason_column).value == expected_reason
+        assert sheet.cell(row, 1).fill.fgColor.rgb == "00D9EAD3"
 
 
 def test_workbook_keeps_only_enabled_filter_columns_in_request_order(tmp_path: Path) -> None:

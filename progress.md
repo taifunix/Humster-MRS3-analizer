@@ -3,7 +3,7 @@
 **Updated:** 2026-09-25
 **Current branch:** `main`
 
-## Performance v2 equity-quality R7.3 M1 accepted (2026-09-25)
+## Performance v2 equity-quality R7.3 M2 accepted (2026-09-25)
 
 The canonical contract is now R7.3. Authoritative equity is evaluated as a
 right-continuous step series on a T-anchored six-hour grid: quiet periods and
@@ -33,9 +33,15 @@ facts, schema/cache lifecycle, v5 read compatibility and bounded worker
 integration all received independent Opus 5 `CODE_REVIEW_PASS`. Final relevant
 suite: 429 passed, 2 platform symlink skips. A synthetic warm worker fixture
 reduced seven per-window cache SELECTs to one result-scoped SELECT without
-changing metrics; this is not a full-corpus wall-time benchmark. M2–M5 remain
-pending. No live Performance DB was migrated or backfilled. Next: implement
-optional filter #2, then equity Top N, without changing legacy defaults.
+changing metrics; this is not a full-corpus wall-time benchmark. M2 adds the
+optional filter #2 after lot protection and before submitted filters. It reads
+verified cached facts only, preserves quiet/short-history passthrough, protects
+mixed lot groups, and maps incomplete cache to typed Panel errors without
+preview-time backfill. Independent Opus 5 `CODE_REVIEW_PASS` followed race,
+lot-group, malformed optional metadata, and XLSX regressions; the final M2
+selection/Panel/review suite passed 273 tests with 2 platform skips. M3–M5
+remain pending. No live Performance DB was migrated or backfilled. Next:
+implement optional equity Top N without changing the robust default.
 
 ### Superseded proposal history
 

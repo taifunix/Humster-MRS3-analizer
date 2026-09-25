@@ -18,8 +18,8 @@
 `PLAN_APPROVED`, 2026-09-25. R7.3 replaces conflicting R6.1 rules below;
 the R6.1 findings ledger is historical only. Approval does not accept M0
 coverage/performance evidence and does not authorize runtime implementation.
-Implementation was separately authorized by the user. M0–M1 are accepted;
-M2–M5 remain open. Checkboxes close only after verified evidence and
+Implementation was separately authorized by the user. M0–M2 are accepted;
+M3–M5 remain open. Checkboxes close only after verified evidence and
 independent review.
 
 ## R7.3 canonical override (normative)
@@ -263,9 +263,9 @@ Run: `.venv\Scripts\python.exe -m pytest tests/test_performance_v2_equity_qualit
 
 **Files:** `performance_v2_selection.py`, `tests/test_performance_v2_selection.py`.
 
-- [ ] Red/green parser `filter_equity_regime`, fixed pair_side, default OFF;
+- [x] Red/green parser `filter_equity_regime`, fixed pair_side, default OFF;
   submitted/effective order, explicit/implicit lot first, rank last.
-- [ ] Табличные policy tests use baseline availability: H28 with short
+- [x] Табличные policy tests use baseline availability: H28 with short
   nondeclining => GROWING/PASS; H28 plus any short decline => WEAKENING/PASS;
   H14/H7 use only available shorts; H-flat => FLAT/class2 (ERF-only block);
   other valid non-UP => DECLINING_OR_MIXED/BLOCK; under7 and missing baseline
@@ -273,9 +273,9 @@ Run: `.venv\Scripts\python.exe -m pytest tests/test_performance_v2_equity_qualit
   UNKNOWN_INVALID_SOURCE even when an in-report nonpositive value also exists;
   only structurally valid in-report nonpositive is BLOCK. Gaps/tails do not
   invalidate otherwise valid facts.
-- [ ] Реализовать self-only gate из готовых facts. Stage counts оставляют
+- [x] Реализовать self-only gate из готовых facts. Stage counts оставляют
   стандартную семантику; отдельный unassessed count и reason, не ложный PASS.
-- [ ] Red/green mixed lot group: old winner BLOCK, sibling PASS -> не
+- [x] Red/green mixed lot group: old winner BLOCK, sibling PASS -> не
   схлопывать group перед ERF. All PASS -> прежний lot winner; unknown member
   -> skip collapse. Filter OFF -> byte-equivalent legacy result frame.
   All-unassessed тоже skip; any unassessed reason
@@ -283,12 +283,15 @@ Run: `.venv\Scripts\python.exe -m pytest tests/test_performance_v2_equity_qualit
   Passthrough != decisive PASS.
   Mixed GROWING/WEAKENING с валидными facts — all-PASS, обычный lot collapse;
   class1 не должен остаться BLOCK по старому контракту.
-- [ ] Проверить prior elimination, отсутствие resurrection и отсутствие
+- [x] Проверить prior elimination, отсутствие resurrection и отсутствие
   raw compute при selection/preview.
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_performance_v2_selection.py`.
 
 **Exit:** отдельный filter-only режим работает без включённого ranking.
+M2 independently reviewed by Opus 5: `CODE_REVIEW_PASS` after focused race,
+cache-integrity, lot-group and XLSX regressions. Final M2 suite:
+`273 passed, 2 existing platform skips`; no live DB mutation or backfill.
 
 ## M3 — альтернативный ranking и воспроизводимый review
 
@@ -384,6 +387,16 @@ Run: `node --check src/mrs3/panel_web/app.js`.
 ## M5 — performance, интеграция и приёмка
 
 **Files:** benchmark/evidence из M0; spec/plan/progress/PRD по verified facts.
+
+**Cache-path audit to measure:** M1 removed the proven per-result window-cache
+read duplication (seven SELECTs to one in the synthetic seven-window case) and
+one duplicate publication revision check. M4/M5 must separately measure warm
+preview's repeated scoped `window_metrics` scans and source/equity token reads,
+and recalculate-all's per-pair canonical facts decoding. Preserve full-payload
+validation for enabled consumers until a safe equivalent is demonstrated. The
+equity-only cold path still performs an SQL full-history aggregate for exact
+raw/invalid counts but transfers only bounded rows; do not call that a bounded
+database scan or remove it without a replacement validity source.
 
 - [ ] Прогнать один frozen corpus в четырёх режимах: legacy/filter-only/rank-only/
   both. Проверить повторяемость, список изменившихся решений и причины.
