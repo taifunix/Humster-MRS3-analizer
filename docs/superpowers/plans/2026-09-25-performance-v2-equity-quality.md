@@ -391,6 +391,13 @@ Run: `node --check src/mrs3/panel_web/app.js`.
 
 ## M5 — performance, интеграция и приёмка
 
+Partial tooling evidence (2026-09-25): the copy-only benchmark harness
+`scripts/benchmark_performance_v2_equity_selection.py` received independent
+Opus 5 `CODE_REVIEW_PASS` after 13 fixture tests. It measures four all-warm
+consumer modes and cold/backfill recalculation on isolated v6 copies, with
+explicit partial SQL/fetched-row and parent-RSS scope. Prior-runtime baseline,
+one-REPLACE, full-corpus wall/RSS budgets and M5 acceptance remain open.
+
 **Files:** benchmark/evidence из M0; spec/plan/progress/PRD по verified facts.
 
 **Cache-path audit to measure:** M1 removed the proven per-result window-cache

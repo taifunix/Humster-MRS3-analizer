@@ -52,6 +52,13 @@ the selected method before acceptance. No live Performance DB was migrated or
 backfilled. Next: M4 shared XLSX/facts loader, Panel/UI integration, then
 comparable cache-performance evidence.
 
+The copy-only M5 measurement harness is implemented and independently reviewed
+(`CODE_REVIEW_PASS`, 13 fixture tests). It requires an explicit offline v6 DB
+copy, refuses the configured live DB and WAL/hardlink aliases, and records
+all-warm four-mode previews plus cold/backfill recalculation on temporary
+copies. No live/full-corpus run or comparable old-runtime/REPLACE measurement
+has been performed; M5 speed/RSS budgets are not accepted.
+
 ### Superseded proposal history
 
 Added the [critical analysis/spec](docs/specs/2026-09-25-performance-v2-equity-quality.md)
