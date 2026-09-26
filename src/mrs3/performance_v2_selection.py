@@ -16,6 +16,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.comments import Comment
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from .performance_v2_windows import (
@@ -797,33 +798,58 @@ def _decode_selection_equity_cache_row(
 
 def _selection_equity_facts_by_result(
     connection: duckdb.DuckDBPyConnection, rows: Sequence[Sequence[object]],
-) -> dict[int, tuple[EquityQualityFacts, str, str]]:
-    """Decode fresh facts for a scoped selection with one cache read."""
+) -> dict[int, dict[str, object]]:
+    """Hydrate fresh facts or an explicit cache sentinel with one scoped read."""
+    try:
+        schema_version = require_performance_v2_readable(connection)
+    except PerformanceV2StoreError as error:
+        raise EquityCacheSchemaInvalidError("Performance database schema is invalid") from error
     if not rows:
         return {}
-    _require_equity_read_schema(connection)
     result_ids = tuple(dict.fromkeys(int(row[1]) for row in rows))
+    if schema_version == 5:
+        return {result_id: {"status": "SCHEMA5"} for result_id in result_ids}
     cached_rows = connection.execute(
         """select result_id, source_revision, algo_version, facts_json, facts_sha256
-             from equity_quality_metrics where algo_version = ? and result_id in ("""
+             from equity_quality_metrics where result_id in ("""
         + ",".join("?" for _ in result_ids) + ")",
-        [ALGORITHM_VERSION, *result_ids],
+        list(result_ids),
     ).fetchall()
-    cached_by_result = {int(row[0]): row for row in cached_rows}
-    facts_by_result: dict[int, tuple[EquityQualityFacts, str, str]] = {}
+    cached_by_result: dict[int, Sequence[object]] = {}
+    for cached_row in cached_rows:
+        result_id = int(cached_row[0])
+        previous = cached_by_result.get(result_id)
+        if previous is None or (
+            previous[2] != ALGORITHM_VERSION and cached_row[2] == ALGORITHM_VERSION
+        ):
+            cached_by_result[result_id] = cached_row
+    facts_by_result: dict[int, dict[str, object]] = {}
     for row in rows:
         result_id = int(row[1])
         cached = cached_by_result.get(result_id)
         if cached is None:
+            facts_by_result[result_id] = {"status": "ABSENT"}
             continue
         try:
             metadata = _equity_metadata_from_selection_row(row)
             source_revision = equity_source_revision(metadata)
         except EquityQualityCacheError:
+            facts_by_result[result_id] = {"status": "INVALID"}
             continue
-        facts = _decode_selection_equity_cache_row(cached[1:], result_id, source_revision)
-        if facts is not None:
-            facts_by_result[result_id] = (facts, source_revision, str(cached[4]))
+        if cached[1] != source_revision or cached[2] != ALGORITHM_VERSION:
+            facts_by_result[result_id] = {"status": "STALE"}
+            continue
+        try:
+            facts = decode_equity_facts(cached[3], cached[4])
+            if facts.result_id != result_id:
+                raise EquityQualityCacheError("cached result id does not match candidate")
+        except EquityQualityCacheError:
+            facts_by_result[result_id] = {"status": "INVALID"}
+            continue
+        facts_by_result[result_id] = {
+            "status": "FRESH", "facts": facts,
+            "source_revision": source_revision, "facts_sha256": str(cached[4]),
+        }
     return facts_by_result
 
 
@@ -1073,13 +1099,7 @@ def load_selection_candidates(
     """Load all current ACTIVE candidates for one Pair + Side without filtering them."""
     _verify_retest_cohort(connection, request)
     cohort_sql, cohort_params = _cohort_clause(request)
-    equity_enabled = any(stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages)
-    equity_rank_enabled = any(
-        stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1"
-        for stage in request.stages
-    )
-    equity_data_enabled = equity_enabled or equity_rank_enabled
-    equity_source_columns = " r.imported_at_utc, r.optimizer_source_metadata_json," if equity_data_enabled else ""
+    equity_source_columns = " r.imported_at_utc, r.optimizer_source_metadata_json,"
     holding_minutes = _holding_quantiles_minutes(connection, request)
     b_holding_minutes = _window_b_holding_p95_minutes(connection, request, config)
     best_trade_facts = _best_trade_facts(connection, request)
@@ -1114,11 +1134,10 @@ def load_selection_candidates(
         candidate = candidates.get(int(strategy_id))
         if candidate is None:
             result_id = int(result_id)
-            if equity_data_enabled:
-                equity_source_rows[result_id] = (
-                    int(strategy_id), result_id, report_start, report_end,
-                    equity_source[0], effective_start, effective_end, equity_source[1],
-                )
+            equity_source_rows[result_id] = (
+                int(strategy_id), result_id, report_start, report_end,
+                equity_source[0], effective_start, effective_end, equity_source[1],
+            )
             if cache_only:
                 full_metrics, ab_metrics = _cached_selection_metrics(
                     connection, result_id, report_start, report_end, config, cached_metrics
@@ -1221,26 +1240,28 @@ def load_selection_candidates(
         full_hold, b_hold = candidate["holding_p95_minutes"], candidate["ab_holding_p95_minutes"]
         if full_hold is not None and b_hold is not None:
             candidate["worst_holding_p95_minutes"] = max(full_hold, b_hold)
-    if equity_data_enabled:
+    equity_consumer_enabled = any(
+        stage.enabled and (
+            stage.id == "filter_equity_regime"
+            or (stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1")
+        )
+        for stage in request.stages
+    )
+    if equity_consumer_enabled and not equity_source_rows:
+        _require_equity_read_schema(connection)
+        facts_by_result = {}
+    else:
         facts_by_result = _selection_equity_facts_by_result(connection, tuple(equity_source_rows.values()))
-        if set(equity_source_rows).difference(facts_by_result):
+    for candidate in candidates.values():
+        cached = facts_by_result.get(
+            int(candidate["result_id"]), {"status": "ABSENT"}
+        )
+        if equity_consumer_enabled and cached.get("status") != "FRESH":
+            if cached.get("status") == "SCHEMA5":
+                raise EquitySchemaUpgradeRequiredError("EQUITY_SCHEMA_UPGRADE_REQUIRED")
             raise _error("EQUITY_CACHE_INCOMPLETE")
-        for candidate in candidates.values():
-            cached = facts_by_result.get(int(candidate["result_id"]))
-            facts = None if cached is None else cached[0]
-            if equity_enabled:
-                candidate["_equity_state"] = None if facts is None else facts.state
-                candidate["_equity_disposition"] = "NOT_EVALUATED" if facts is None else facts.erf_disposition
-                candidate["_equity_reason"] = "EQUITY_FACTS_UNAVAILABLE" if facts is None else facts.reason
-            if equity_rank_enabled:
-                candidate["_equity_quality"] = None if cached is None else {
-                    "facts": facts, "source_revision": cached[1], "facts_sha256": cached[2],
-                }
-    columns = _CANDIDATE_COLUMNS
-    if equity_enabled:
-        columns += ("_equity_state", "_equity_disposition", "_equity_reason")
-    if equity_rank_enabled:
-        columns += ("_equity_quality",)
+        candidate["_equity_cache"] = cached
+    columns = (*_CANDIDATE_COLUMNS, "_equity_cache")
     return pd.DataFrame.from_records(list(candidates.values())).reindex(columns=columns)
 
 
@@ -1538,6 +1559,33 @@ def _validate_equity_quality_evidence(cached: object, result_id: object) -> None
         raise _error("EQUITY_CACHE_INCOMPLETE")
 
 
+def _equity_workbook_values(cached: object) -> dict[str, object]:
+    """Map one optional facts-cache entry to the four compact workbook fields."""
+    if not isinstance(cached, Mapping):
+        return {"equity_state": None, "equity_basis": "INVALID", "equity_dd_pct": None, "equity_smoothness": None}
+    if cached.get("status") != "FRESH":
+        return {
+            "equity_state": None, "equity_basis": str(cached.get("status", "INVALID")),
+            "equity_dd_pct": None, "equity_smoothness": None,
+        }
+    facts = cached.get("facts")
+    if not isinstance(facts, EquityQualityFacts):
+        return {"equity_state": None, "equity_basis": "INVALID", "equity_dd_pct": None, "equity_smoothness": None}
+    horizon = facts.horizon_days
+    horizon_label = {28: "OK", 14: "PARTIAL", 7: "PROVISIONAL"}.get(horizon, "UNKNOWN")
+    basis = facts.reason if horizon is None else f"{horizon}d / {horizon_label}"
+    drawdown = facts.drawdown
+    window = next((item for item in facts.windows if item.days == horizon), None) if horizon is not None else None
+    if horizon is not None and window is None:
+        return {"equity_state": None, "equity_basis": "INVALID", "equity_dd_pct": None, "equity_smoothness": None}
+    return {
+        "equity_state": facts.state,
+        "equity_basis": basis,
+        "equity_dd_pct": drawdown * 100 if isinstance(drawdown, Decimal) else None,
+        "equity_smoothness": None if window is None else window.er,
+    }
+
+
 def effective_selection_stages(
     request: SelectionRequest, config: SelectionConfig = SelectionConfig(),
 ) -> tuple[SelectionStage, ...]:
@@ -1733,6 +1781,39 @@ def run_selection(
     if "prior_rejected" not in result:
         result["prior_rejected"] = False
     result["prior_rejected"] = result["prior_rejected"].fillna(False).astype(bool)
+    equity_filter_enabled = any(
+        stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages
+    )
+    equity_consumer_enabled = equity_rank_enabled or equity_filter_enabled
+    if equity_consumer_enabled and "_equity_cache" not in result:
+        raise _error("EQUITY_CACHE_INCOMPLETE")
+    if equity_consumer_enabled:
+        projected_quality: list[object] = []
+        projected_state: list[object] = []
+        projected_disposition: list[object] = []
+        projected_reason: list[object] = []
+        for index in result.index:
+            entry = result.at[index, "_equity_cache"]
+            if not isinstance(entry, Mapping) or entry.get("status") != "FRESH":
+                if isinstance(entry, Mapping) and entry.get("status") == "SCHEMA5":
+                    raise EquitySchemaUpgradeRequiredError("EQUITY_SCHEMA_UPGRADE_REQUIRED")
+                raise _error("EQUITY_CACHE_INCOMPLETE")
+            facts = entry.get("facts")
+            cached = {
+                "facts": facts,
+                "source_revision": entry.get("source_revision"),
+                "facts_sha256": entry.get("facts_sha256"),
+            }
+            _validate_equity_quality_evidence(cached, result.at[index, "result_id"])
+            projected_quality.append(cached)
+            projected_state.append(facts.state)
+            projected_disposition.append(facts.erf_disposition)
+            projected_reason.append(facts.reason)
+        result["_equity_quality"] = projected_quality
+        if equity_filter_enabled:
+            result["_equity_state"] = projected_state
+            result["_equity_disposition"] = projected_disposition
+            result["_equity_reason"] = projected_reason
     if equity_rank_enabled:
         if "result_id" not in result or "_equity_quality" not in result:
             raise _error("EQUITY_CACHE_INCOMPLETE")
@@ -1746,9 +1827,6 @@ def run_selection(
     result["lot_variant_group_key"] = None
     result["lot_variant_representative_strategy_id"] = pd.NA
     stage_counts: dict[str, dict[str, int | bool]] = {}
-    equity_filter_enabled = any(
-        stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages
-    )
     if equity_filter_enabled:
         equity_columns = ("_equity_state", "_equity_disposition", "_equity_reason")
         if any(column not in result for column in equity_columns):
@@ -1936,6 +2014,14 @@ def run_selection(
             stage_counts[stage.id] = {"enabled": True, "eliminated": int(result[column].sum()), "remaining": int(result["finalist"].sum())}
     result.loc[result["auto_status"].isna() & result["finalist"], "auto_status"] = "FINALIST"
     result.loc[result["auto_status"].isna() & ~result["finalist"], "auto_status"] = "FILTERED"
+    equity_consumer_enabled = equity_rank_enabled or equity_filter_enabled
+    if equity_consumer_enabled and "_equity_cache" in result:
+        equity_columns = [
+            _equity_workbook_values(result.at[index, "_equity_cache"])
+            for index in result.index
+        ]
+        for column in ("equity_state", "equity_basis", "equity_dd_pct", "equity_smoothness"):
+            result[column] = [values[column] for values in equity_columns]
     if equity_rank_enabled:
         result.attrs["equity_quality_facts"] = {
             str(int(row["strategy_id"])): {
@@ -1947,7 +2033,7 @@ def run_selection(
             for _, row in result.iterrows()
         }
     result = result.drop(columns=[
-        "_source_order", "_equity_state", "_equity_disposition", "_equity_reason", "_equity_quality",
+        "_source_order", "_equity_state", "_equity_disposition", "_equity_reason", "_equity_quality", "_equity_cache",
     ], errors="ignore")
     result.attrs["stage_counts"] = stage_counts
     return result
@@ -1961,12 +2047,38 @@ def write_selection_workbook(
     user_review_rows: Mapping[int, Mapping[str, object]] | None = None,
 ) -> Path:
     """Write the one disposable selection workbook; internal A/B facts stay internal."""
+    equity_rank = next((
+        stage for stage in request.stages
+        if stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1"
+    ), None)
+    selection_method = None if equity_rank is None else "equity_quality_v1"
+    equity_request_enabled = selection_method is not None or any(
+        stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages
+    )
+    equity_columns = ("equity_state", "equity_basis", "equity_dd_pct", "equity_smoothness")
+    cached_equity_values = result.get("_equity_cache")
+    fresh_equity_present = cached_equity_values is not None and any(
+        isinstance(value, Mapping) and value.get("status") == "FRESH"
+        for value in cached_equity_values
+    )
+    if "_equity_cache" in result and (equity_request_enabled or fresh_equity_present):
+        values = [_equity_workbook_values(value) for value in result["_equity_cache"]]
+        missing_equity_columns = [column for column in equity_columns if column not in result]
+        if missing_equity_columns:
+            result = result.copy()
+            for column in missing_equity_columns:
+                result[column] = [item[column] for item in values]
     display = result.drop(columns=[
         column for column in result.columns
         if column.startswith("ab_") and column not in {
             "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "ab_stability_ratio",
         }
-    ] + ["total_pnl", "total_pnl_pct", "max_drawdown", "total_fees", "risk_scale", "scaled_lot_sum", "daily_log_return"], errors="ignore").copy()
+    ] + ["total_pnl", "total_pnl_pct", "max_drawdown", "total_fees", "risk_scale", "scaled_lot_sum", "daily_log_return", "_equity_cache"], errors="ignore").copy()
+    equity_block_enabled = equity_request_enabled or any(column in display for column in equity_columns)
+    if equity_block_enabled:
+        for column in equity_columns:
+            if column not in display:
+                display[column] = None
     if "ab_pnl_change_30d_pct" not in display:
         display["ab_pnl_change_30d_pct"] = None
     enabled_stages = [stage for stage in request.stages if stage.enabled]
@@ -2008,7 +2120,7 @@ def write_selection_workbook(
             axis=1,
         )
     for column in display.columns:
-        if column.endswith("_id") or "count" in column or column.endswith("_bp"):
+        if column.endswith("_id") or "count" in column or column.endswith("_bp") or column in {"equity_dd_pct", "equity_smoothness"}:
             continue
         display[column] = display[column].map(
             lambda value: value.quantize(Decimal(".01")) if isinstance(value, Decimal) else value
@@ -2136,6 +2248,7 @@ def write_selection_workbook(
         "open_ma",
         "final_rank", "finalist", "elimination_reason", "lot_variant_group_key", "lot_variant_representative_strategy_id",
         *enabled_filter_columns, *review_columns,
+        *(equity_columns if equity_block_enabled else ()),
     ]
     display = display.reindex(columns=column_order)
     display = display.rename(columns={
@@ -2166,6 +2279,8 @@ def write_selection_workbook(
         "auto_status": "Auto Status", "user_status": "User Status", "retest": "RETEST", "auto_rank": "Auto Rank",
         "user_rank": "User Rank", "auto_analog_of_strategy_id": "Auto Analog Of ID",
         "user_analog_of_strategy_id": "Analog Of ID", "comment": "Comment",
+        "equity_state": "Equity state", "equity_basis": "Equity basis",
+        "equity_dd_pct": "Equity DD, %", "equity_smoothness": "Equity smoothness",
     })
     finalists = display.loc[display["Final"]].copy()
     finalist_fills = [color for color, finalist in zip(row_fills, display["Final"]) if finalist]
@@ -2187,6 +2302,7 @@ def write_selection_workbook(
                 "PnL/30", "PnL DD5/30", "PF", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "PnL without best, %",
             )},
             "Final rank": "0",
+            "Equity DD, %": "0.0000", "Equity smoothness": "0.000000",
         },
         center_from_column=5,
         font_colors={"Дней A": "FF0000FF", "Дней B": "FF0000FF"},
@@ -2203,16 +2319,33 @@ def write_selection_workbook(
             "Close": ("left", "right"),
         },
     )
-    if review_metadata is None:
+    if review_metadata is None and selection_method is None:
         return workbook_path
     workbook = load_workbook(workbook_path)
-    metadata_sheet = workbook.create_sheet("_MRS_SELECTION_META")
-    for row in review_metadata.items():
-        metadata_sheet.append(row)
-    metadata_sheet.sheet_state = "veryHidden"
+    metadata_values = dict(review_metadata or {})
+    if selection_method is not None:
+        metadata_values["selection_method"] = selection_method
+    if metadata_values:
+        metadata_sheet = workbook.create_sheet("_MRS_SELECTION_META")
+        for row in metadata_values.items():
+            metadata_sheet.append(row)
+        metadata_sheet.sheet_state = "veryHidden"
     for sheet_name in ("All candidates", "Finalists"):
         worksheet = workbook[sheet_name]
         headers = {cell.value: cell.column_letter for cell in worksheet[1]}
+        if selection_method is not None and "Final score (Pair+Side)" in headers:
+            score_header = worksheet[f'{headers["Final score (Pair+Side)"]}1']
+            method_note = f"Selection method: {selection_method}"
+            existing_comment = score_header.comment
+            if existing_comment is None:
+                score_header.comment = Comment(method_note, "MRS3")
+            elif method_note not in existing_comment.text:
+                comment = Comment(
+                    f"{existing_comment.text}\n{method_note}", existing_comment.author or "MRS3",
+                )
+                comment.width = existing_comment.width
+                comment.height = existing_comment.height
+                score_header.comment = comment
         if "User Status" in headers:
             validation = DataValidation(
                 type="list", formula1='"FINALIST,RESERVE,ANALOG,FILTERED,REJECTED"', allow_blank=False

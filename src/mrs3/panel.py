@@ -4200,6 +4200,14 @@ class PanelController:
         return retest_cohort_request(request, raw_job.strip(), pairs)
 
     @staticmethod
+    def _selection_requires_equity(request: SelectionRequest) -> bool:
+        return any(
+            (stage.id == "filter_equity_regime" and stage.enabled)
+            or (stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1")
+            for stage in request.stages
+        )
+
+    @staticmethod
     def _bulk_retest_range(payload: Mapping[str, object], listing_dates: Mapping[str, object], connection: duckdb.DuckDBPyConnection, include_reserve: bool) -> tuple[str, str]:
         allowed = {"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date", "initial_balance"}
         if set(payload).difference(allowed):
@@ -4921,9 +4929,7 @@ class PanelController:
             selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
         except PerformanceV2SelectionError as error:
             raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=str(error)) from error
-        equity_filter_enabled = any(
-            stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages
-        )
+        equity_consumer_enabled = self._selection_requires_equity(request)
         performance_config = self._performance_v2_config()
         target = performance_v2_database_path(performance_config)
         if not target.is_file():
@@ -4933,12 +4939,12 @@ class PanelController:
                 connection.execute(f"set threads to {performance_config.workers}")
                 schema_version = require_performance_v2_readable(connection)
                 cache_status = selection_cache_status(
-                    connection, request, selection_config, include_equity=equity_filter_enabled,
-                    include_readiness_breakdown=equity_filter_enabled,
+                    connection, request, selection_config, include_equity=equity_consumer_enabled,
+                    include_readiness_breakdown=equity_consumer_enabled,
                 )
                 if not cache_status["ready"]:
                     equity_only_missing = (
-                        equity_filter_enabled
+                        equity_consumer_enabled
                         and int(cache_status["total"]) > 0
                         and int(cache_status["window_missing"]) == 0
                         and int(cache_status["equity_missing"]) > 0
@@ -4983,7 +4989,6 @@ class PanelController:
                     request.ranking_scope,
                     request.bulk_retest_job_id,
                     request.cohort_members,
-                    equity_filter_enabled,
                     tuple(asdict(selection_config).items()),
                     result_token,
                     facts_token,
@@ -5023,7 +5028,7 @@ class PanelController:
         try:
             with tempfile.TemporaryDirectory() as directory:
                 with duckdb.connect(str(target), read_only=True) as connection:
-                    metadata = new_run_metadata(connection)
+                    metadata = new_run_metadata(connection, request=request)
                     user_review_rows = latest_user_reviews_by_strategy(
                         connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
                     )
@@ -5085,10 +5090,14 @@ class PanelController:
     def strategies_performance_v2_selection_cache_status(self, payload: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(payload, Mapping) or set(payload).difference({"symbol", "side", "stages", "bulk_retest_job_id"}):
             raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="unsupported selection cache fields")
-        selection_payload = {"symbol": payload.get("symbol"), "side": payload.get("side"), "stages": payload.get("stages", [])}
+        selection_payload = {
+            "symbol": payload.get("symbol"), "side": payload.get("side"),
+            "stages": payload.get("stages", []),
+        }
         if "bulk_retest_job_id" in payload:
             selection_payload["bulk_retest_job_id"] = payload.get("bulk_retest_job_id")
         request = self._selection_request(selection_payload)
+        equity_consumer_enabled = self._selection_requires_equity(request)
         config = load_selection_config(self.default_config.with_name("config.performance.json"))
         target = performance_v2_database_path(self._performance_v2_config())
         if not target.is_file():
@@ -5096,7 +5105,14 @@ class PanelController:
         try:
             with duckdb.connect(str(target), read_only=True) as connection:
                 require_performance_v2_readable(connection)
-                return selection_cache_status(connection, request, config)
+                # Cache-status reports aggregate readiness; preview alone needs the breakdown.
+                return selection_cache_status(
+                    connection, request, config, include_equity=equity_consumer_enabled,
+                )
+        except EquitySchemaUpgradeRequiredError as error:
+            raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
+        except EquityCacheSchemaInvalidError as error:
+            raise PerformanceV2ApiError(error.code, status=500, message=str(error)) from error
         except PerformanceV2StoreError as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
         except duckdb.Error as error:

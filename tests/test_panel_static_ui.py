@@ -627,6 +627,7 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "4. Pareto and filters" in strategies
     expected_stage_order = [
         "filter_lot_variant_redundancy",
+        "filter_equity_regime",
         "filter_holding_outlier",
         "filter_low_trades",
         "filter_min_shift",
@@ -672,7 +673,7 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     default_order = re.search(r"const defaultSelectionStageOrder = \[(.*?)\];", js, re.S)
     assert default_order
     assert re.findall(r"'([^']+)'", default_order.group(1)) == [
-        "filter_lot_variant_redundancy", "filter_holding_outlier", "filter_low_trades", "filter_min_shift", "ab_deterioration",
+        "filter_lot_variant_redundancy", "filter_equity_regime", "filter_holding_outlier", "filter_low_trades", "filter_min_shift", "ab_deterioration",
         "filter_best_trade_dependency", "filter_time_consistency", "pareto_dd5_balanced",
         "pareto_robust", "pareto_shift_near_tie", "pareto_close_ma_near_tie",
     ]
@@ -691,12 +692,12 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert 'value="0.3"' in min_shift_stage.group(1)
     lot_stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_lot_variant_redundancy">(.*?)</li>', strategies, re.S)
     assert lot_stage and 'data-selection-scope="pair_side_timeframe"' in lot_stage.group(1)
-    assert "fixedFirst" in js
+    assert "fixedSelectionPrefix" in js
     pair_side_stages = {"filter_holding_outlier", "filter_low_trades", "filter_min_shift", "ab_deterioration", "pareto_dd5_balanced"}
     for stage_id in pair_side_stages:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and 'data-selection-scope="pair_side"' in stage.group(1)
-    for stage_id in set(expected_stage_order) - pair_side_stages:
+    for stage_id in set(expected_stage_order) - pair_side_stages - {"filter_equity_regime"}:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and 'data-selection-scope="pair_side_timeframe"' in stage.group(1)
     assert '<select id="performance-v2-selection-pair">' in strategies
@@ -725,11 +726,20 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert re.search(r"\.selection-stage-kind \{[^}]*justify-self: start;[^}]*text-align: left", css)
     assert re.search(r"\.selection-stage-kind \{[^}]*width: max-content", css)
     assert ".selection-stage:has(.selection-stage-threshold) .selection-stage-scope > :last-child { margin-top: 14px; }" in css
-    rank_stage = re.search(r'<div class="selection-stage selection-stage-fixed" data-selection-rank>(.*?)</div>', strategies, re.S)
+    rank_stage = re.search(r'<div class="selection-stage selection-stage-fixed" data-selection-rank>(.*?)</div>\s*<p id="performance-v2-selection-method-help"', strategies, re.S)
     assert rank_stage and 'class="selection-stage-threshold"' in rank_stage.group(1)
     assert rank_stage and 'data-selection-top-n' in rank_stage.group(1)
     assert ".selection-stage-fixed .selection-stage-scope > span:last-child {" in css
+    assert ".selection-stage-fixed .selection-stage-threshold { grid-column: 5 / 7; }" in css
+    assert ".selection-stage-fixed .selection-stage-scope { grid-column: 7 / 9; }" in css
+    assert ".selection-stage-fixed .selection-stage-threshold select { min-width: 0; width: 100%;" in css
+    assert ".selection-stage-summary { display: grid; grid-column: 7;" in css
+    assert "@media (max-width: 1279px)" in css
+    mobile = css.split("@media (max-width: 1279px)", 1)[1]
+    assert ".selection-stage-fixed .selection-stage-threshold { grid-column: 2; }" in mobile
+    assert ".selection-stage-fixed .selection-stage-scope { grid-column: 2; }" in mobile
     assert "line('Осталось', count.remaining, 'remaining')" in js
+    assert ".selection-stage-summary-unassessed { color: var(--muted); }" in css
     assert "selectionPreviewRevision" in js
     assert "revision !== selectionPreviewRevision" in js
     assert "performanceV2SelectionCard?.addEventListener('toggle'" in js
@@ -745,6 +755,100 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "selectionCacheStatusRevision" in js
     assert "revision !== selectionCacheStatusRevision" in js
     assert "fetch(" not in dirty_handler
+
+
+def test_equity_regime_filter_is_second_fixed_prefix_without_scope_or_move_controls() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
+    stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_equity_regime">(.*?)</li>', strategies, re.S)
+
+    assert stage
+    assert re.search(r'data-selection-stage="filter_equity_regime">\s*<span[^>]*>2</span>', stage.group(0))
+    assert '<input type="checkbox"' in stage.group(1)
+    assert not re.search(r'<input type="checkbox" checked', stage.group(1))
+    assert "data-selection-scope" not in stage.group(1)
+    assert "data-selection-move" not in stage.group(1)
+    assert "Тихие периоды и редкие сделки не делают данные невалидными" in stage.group(1)
+    assert "основной горизонт H" in stage.group(1)
+    assert 'id="performance-v2-equity-regime-help"' not in html
+    assert 'aria-describedby="performance-v2-equity-regime-help"' not in stage.group(1)
+    assert "filter_equity_regime' ? 'pair_side'" in js
+    assert re.search(
+        r"const fixedSelectionPrefix = new Set\(\[\s*'filter_lot_variant_redundancy',\s*'filter_equity_regime'\s*\]\)",
+        js,
+    )
+    assert "fixedSelectionPrefix.has(target.dataset.selectionStage)" in js
+    assert "fixedSelectionPrefix.has(stage.previousElementSibling?.dataset.selectionStage)" in js
+
+
+def test_equity_quality_rank_method_is_native_and_preserves_legacy_default_payload() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
+    rank_stage = re.search(r'<div class="selection-stage selection-stage-fixed" data-selection-rank>(.*?)</div>\s*<p id="performance-v2-selection-method-help"', strategies, re.S)
+    assert rank_stage
+    assert 'class="selection-stage-scope"' in rank_stage.group(1)
+    assert "ПАРА + сторона" in rank_stage.group(1)
+
+    assert '<select id="performance-v2-selection-method" data-selection-method' in rank_stage.group(1)
+    assert '<option value="robust_v1" selected>' in rank_stage.group(1)
+    assert '<option value="equity_quality_v1">' in rank_stage.group(1)
+    assert '<label for="performance-v2-selection-method">Метод</label>' in strategies
+    assert "Метод изменения порядка" not in strategies
+    assert "При robust_v1 короткая коррекция не меняет порядок" in strategies
+    assert "equity_quality_v1 понижает WEAKENING" in strategies
+    selection_stages = js.split("const selectionStages = () =>", 1)[1].split("const selectionPayload =", 1)[0]
+    assert "stage.dataset.selectionStage !== 'filter_equity_regime'" in selection_stages
+    assert "|| !!stage.querySelector('input[type=\"checkbox\"]')?.checked" in selection_stages
+    assert "method: selectionMethod" in selection_stages
+    assert "selectionMethod !== 'robust_v1'" in selection_stages
+    assert "body: JSON.stringify(selectionPayload())" in js
+    assert "selectionRankStage?.querySelector('[data-selection-method]')?.addEventListener('change'" in js
+    assert "[hidden] { display: none !important; }" in _read("app.css")
+
+
+def test_equity_preview_shows_unassessed_count_warning_and_keeps_stale_response_guard() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+
+    warning = re.search(r'<p\b(?=[^>]*\bid="performance-v2-selection-equity-warning")[^>]*>', html)
+    assert warning and re.search(r"\bhidden\b", warning.group(0))
+    equity_stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_equity_regime">(.*?)</li>', html, re.S)
+    assert equity_stage and not re.search(r'<input type="checkbox" checked', equity_stage.group(1))
+    assert "[hidden] { display: none !important; }" in _read("app.css")
+    assert 'role="status" aria-live="polite"' in html
+    assert "const updateSelectionEquityWarning" in js
+    assert "rankEnabled && equityMethod && lotEnabled && !equityEnabled" in js
+    assert "скрыть более сильный equity-вариант" in js
+    assert "count.not_evaluated" in js
+    assert "Не оценено" in js
+    assert "revision !== selectionPreviewRevision" in js
+    cache_status = js.split("const refreshSelectionCacheStatus = async", 1)[1].split("const renderSelectionCounts", 1)[0]
+    assert cache_status.index("try {") < cache_status.index("const payload = selectionPayload();")
+    assert "body: JSON.stringify(payload)" in cache_status
+    assert "if (selectionXlsButton) selectionXlsButton.disabled = true;" in cache_status.split("} catch (error) {", 1)[1]
+    assert "failure.error?.code || 'CACHE_STATUS_UNAVAILABLE'" in cache_status
+    assert "selectionPreviewStatus.textContent = `Статус кэша недоступен: ${error.message}`" in cache_status
+    assert "let selectionCacheStatusRevision" in js
+    preview_handler = js.split("const refreshSelectionPreview = async", 1)[1].split("const scheduleSelectionPreview", 1)[0]
+    assert preview_handler.index("try {") < preview_handler.index("const payload = selectionPayload();")
+    assert "selectionRankStage?.querySelector('[data-selection-top-n]')?.addEventListener('input', () => markSelectionPreviewDirty" in js
+    stage_toggle = js.split("selectionPreviewStages.forEach", 1)[1].split("document.querySelectorAll('[data-selection-scope]')", 1)[0]
+    assert "if (stage === selectionEquityStage) refreshSelectionCacheStatus();" in stage_toggle
+    method_change = js.split("selectionRankStage?.querySelector('[data-selection-method]')?.addEventListener('change'", 1)[1].split("});", 1)[0]
+    assert "if (selectionRankStage.querySelector('input[type=\"checkbox\"]')?.checked) refreshSelectionCacheStatus();" in method_change
+    top_n_change = js.split("selectionRankStage?.querySelector('[data-selection-top-n]')", 1)[1].split("selectionRankStage?.querySelector('[data-selection-method]')", 1)[0]
+    assert "refreshSelectionCacheStatus" not in top_n_change
+    render_counts = js.split("const renderSelectionCounts = (counts) =>", 1)[1].split("selectionPreviewOrder?.addEventListener", 1)[0]
+    assert "stage.dataset.selectionStage === 'filter_equity_regime'" in render_counts
+    assert "!stage.querySelector('input[type=\"checkbox\"]')?.checked" in render_counts
+
+
+def test_selection_responsive_breakpoint_does_not_change_portfolio_breakpoint() -> None:
+    css = _read("app.css")
+    assert "@media (max-width: 760px) {\n  .portfolio-result-metrics" in css
+    assert "@media (max-width: 1279px) {\n  .selection-preview-layout" in css
 
 
 def test_analysis_start_immediately_shows_running_phase_and_elapsed_time() -> None:

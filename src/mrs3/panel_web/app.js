@@ -2902,8 +2902,24 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const selectionPreviewStatus = document.querySelector('#performance-v2-selection-status');
   const selectionPreviewBadge = document.querySelector('#performance-v2-selection-badge');
   const selectionRankStage = document.querySelector('[data-selection-rank]');
+  const selectionEquityStage = document.querySelector('[data-selection-stage="filter_equity_regime"]');
+  const selectionLotStage = document.querySelector('[data-selection-stage="filter_lot_variant_redundancy"]');
+  const selectionEquityWarning = document.querySelector('#performance-v2-selection-equity-warning');
+  const updateSelectionEquityWarning = () => {
+    const rankEnabled = !!selectionRankStage?.querySelector('input[type="checkbox"]')?.checked;
+    const equityMethod = selectionRankStage?.querySelector('[data-selection-method]')?.value === 'equity_quality_v1';
+    const lotEnabled = !!selectionLotStage?.querySelector('input[type="checkbox"]')?.checked;
+    const equityEnabled = !!selectionEquityStage?.querySelector('input[type="checkbox"]')?.checked;
+    const showWarning = rankEnabled && equityMethod && lotEnabled && !equityEnabled;
+    if (!selectionEquityWarning) return;
+    selectionEquityWarning.hidden = !showWarning;
+    selectionEquityWarning.textContent = showWarning
+      ? 'Внимание: фильтр лотов может скрыть более сильный equity-вариант до equity_quality_v1.'
+      : '';
+  };
+  const fixedSelectionPrefix = new Set(['filter_lot_variant_redundancy', 'filter_equity_regime']);
   const defaultSelectionStageOrder = [
-    'filter_lot_variant_redundancy', 'filter_holding_outlier', 'filter_low_trades', 'filter_min_shift', 'ab_deterioration',
+    'filter_lot_variant_redundancy', 'filter_equity_regime', 'filter_holding_outlier', 'filter_low_trades', 'filter_min_shift', 'ab_deterioration',
     'filter_best_trade_dependency', 'filter_time_consistency', 'pareto_dd5_balanced',
     'pareto_robust', 'pareto_shift_near_tie', 'pareto_close_ma_near_tie',
   ];
@@ -2937,10 +2953,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const position = stage.querySelector('[data-selection-position]');
       const up = stage.querySelector('[data-selection-move="up"]');
       const down = stage.querySelector('[data-selection-move="down"]');
+      const fixed = fixedSelectionPrefix.has(stage.dataset.selectionStage);
       if (position) position.textContent = String(index + 1);
-      const fixedFirst = stage.dataset.selectionStage === 'filter_lot_variant_redundancy';
-      if (up) up.disabled = fixedFirst || index === 0;
-      if (down) down.disabled = fixedFirst || index === stages.length - 1;
+      if (up) up.disabled = fixed || fixedSelectionPrefix.has(stage.previousElementSibling?.dataset.selectionStage) || index === 0;
+      if (down) down.disabled = fixed || fixedSelectionPrefix.has(stage.nextElementSibling?.dataset.selectionStage) || index === stages.length - 1;
     });
   };
 
@@ -2963,16 +2979,21 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
 
   const selectionStages = () => {
     if (!selectionRankStage) throw new Error('Final rank stage is unavailable.');
-    return [...orderedSelectionStages().map((stage) => ({
+    const selectionMethod = selectionRankStage.querySelector('[data-selection-method]')?.value || 'robust_v1';
+    return [...orderedSelectionStages()
+      .filter((stage) => stage.dataset.selectionStage !== 'filter_equity_regime'
+        || !!stage.querySelector('input[type="checkbox"]')?.checked)
+      .map((stage) => ({
     id: stage.dataset.selectionStage,
     enabled: !!stage.querySelector('input[type="checkbox"]')?.checked,
-    scope: stage.querySelector('[data-selection-scope]')?.value,
+    scope: stage.querySelector('[data-selection-scope]')?.value || (stage.dataset.selectionStage === 'filter_equity_regime' ? 'pair_side' : undefined),
     ...(stage.querySelector('[data-selection-min-shift]') ? { min_shift_pct: stage.querySelector('[data-selection-min-shift]').value } : {}),
     ...(stage.querySelector('[data-selection-pnl-tolerance]') ? { pnl_tolerance_pct: stage.querySelector('[data-selection-pnl-tolerance]').value } : {}),
   })), {
     id: 'rank_robust_top_n',
     enabled: !!selectionRankStage.querySelector('input[type="checkbox"]')?.checked,
     scope: 'pair_side', top_n: Number(selectionRankStage.querySelector('[data-selection-top-n]')?.value || 20),
+    ...(selectionMethod !== 'robust_v1' ? { method: selectionMethod } : {}),
   }];
   };
   const selectionPayload = () => ({ symbol: performanceV2SelectionPair?.value || '', side: performanceV2SelectionSide?.value || '', stages: selectionStages() });
@@ -2984,14 +3005,17 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   let selectionCacheStatusRevision = 0;
   const refreshSelectionCacheStatus = async () => {
     const revision = ++selectionCacheStatusRevision;
-    const symbol = performanceV2SelectionPair?.value || '';
-    const side = performanceV2SelectionSide?.value || '';
-    if (!symbol || !side) { if (selectionXlsButton) selectionXlsButton.disabled = true; return; }
     try {
+      const payload = selectionPayload();
+      const { symbol, side } = payload;
+      if (!symbol || !side) { if (selectionXlsButton) selectionXlsButton.disabled = true; return; }
       const response = await fetch('/api/v2/strategies/performance-v2/selection-cache-status', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol, side }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       });
-      if (!response.ok) throw new Error('cache status failed');
+      if (!response.ok) {
+        const failure = await response.json().catch(() => ({}));
+        throw new Error(failure.error?.code || 'CACHE_STATUS_UNAVAILABLE');
+      }
       const cache = await response.json();
       if (revision !== selectionCacheStatusRevision || symbol !== performanceV2SelectionPair?.value || side !== performanceV2SelectionSide?.value) return;
       if (selectionXlsButton) selectionXlsButton.disabled = !cache.ready;
@@ -3001,14 +3025,24 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     } catch (error) {
       if (revision !== selectionCacheStatusRevision) return;
       if (selectionXlsButton) selectionXlsButton.disabled = true;
+      if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Статус кэша недоступен: ${error.message}`;
     }
   };
   const renderSelectionCounts = (counts) => {
     selectionPreviewStages.forEach((stage) => {
       let summary = stage.querySelector('.selection-stage-summary');
-      if (!summary) { summary = document.createElement('span'); summary.className = 'selection-stage-summary'; stage.querySelector('.selection-stage-controls')?.before(summary); }
+      if (!summary) {
+        summary = document.createElement('span'); summary.className = 'selection-stage-summary';
+        const controls = stage.querySelector('.selection-stage-controls');
+        if (controls) controls.before(summary); else stage.append(summary);
+      }
       const count = counts[stage.dataset.selectionStage];
-      if (!count || !count.enabled) { summary.textContent = count ? 'Не применялся' : '—'; return; }
+      if (!count || !count.enabled) {
+        const equityFilterOff = stage.dataset.selectionStage === 'filter_equity_regime'
+          && !stage.querySelector('input[type="checkbox"]')?.checked;
+        summary.textContent = count || equityFilterOff ? 'Не применялся' : '—';
+        return;
+      }
       const line = (label, value, className) => {
         const item = document.createElement('span'); item.className = `selection-stage-summary-${className}`;
         item.textContent = `${label} ${value}`;
@@ -3017,6 +3051,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       summary.replaceChildren(
         line('Исключено', count.eliminated, count.eliminated ? 'eliminated' : 'zero'),
         line('Осталось', count.remaining, 'remaining'),
+        ...(count.not_evaluated == null ? [] : [line('Не оценено', count.not_evaluated, 'unassessed')]),
       );
     });
   };
@@ -3028,7 +3063,9 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     const target = button.dataset.selectionMove === 'up'
       ? stage.previousElementSibling
       : stage.nextElementSibling;
-    if (!target?.matches('[data-selection-stage]')) return;
+    if (!target?.matches('[data-selection-stage]')
+      || fixedSelectionPrefix.has(stage.dataset.selectionStage)
+      || fixedSelectionPrefix.has(target.dataset.selectionStage)) return;
     const oldIndex = orderedSelectionStages().indexOf(stage);
     selectionPreviewOrder.insertBefore(stage, button.dataset.selectionMove === 'up' ? target : target.nextElementSibling);
     renderSelectionPreviewOrder();
@@ -3036,7 +3073,11 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   });
 
   selectionPreviewStages.forEach((stage) => {
-    stage.querySelector('input[type="checkbox"]')?.addEventListener('change', () => markSelectionPreviewDirty(orderedSelectionStages().indexOf(stage)));
+    stage.querySelector('input[type="checkbox"]')?.addEventListener('change', () => {
+      updateSelectionEquityWarning();
+      markSelectionPreviewDirty(orderedSelectionStages().indexOf(stage));
+      if (stage === selectionEquityStage) refreshSelectionCacheStatus();
+    });
   });
   document.querySelectorAll('[data-selection-scope]').forEach((input) => {
     input.addEventListener('change', () => markSelectionPreviewDirty(orderedSelectionStages().indexOf(input.closest('[data-selection-stage]'))));
@@ -3047,8 +3088,18 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   document.querySelectorAll('[data-selection-pnl-tolerance]').forEach((input) => {
     input.addEventListener('input', () => markSelectionPreviewDirty(orderedSelectionStages().indexOf(input.closest('[data-selection-stage]'))));
   });
-  selectionRankStage?.querySelector('input[type="checkbox"]')?.addEventListener('change', () => markSelectionPreviewDirty(orderedSelectionStages().length));
+  selectionRankStage?.querySelector('input[type="checkbox"]')?.addEventListener('change', () => {
+    updateSelectionEquityWarning();
+    markSelectionPreviewDirty(orderedSelectionStages().length);
+    refreshSelectionCacheStatus();
+  });
   selectionRankStage?.querySelector('[data-selection-top-n]')?.addEventListener('input', () => markSelectionPreviewDirty(orderedSelectionStages().length));
+  selectionRankStage?.querySelector('[data-selection-method]')?.addEventListener('change', () => {
+    updateSelectionEquityWarning();
+    markSelectionPreviewDirty(orderedSelectionStages().length);
+    if (selectionRankStage.querySelector('input[type="checkbox"]')?.checked) refreshSelectionCacheStatus();
+  });
+  updateSelectionEquityWarning();
   performanceV2SelectionPair?.addEventListener('change', () => {
     syncPerformanceV2SelectionScope();
     markSelectionPreviewDirty();
@@ -3060,10 +3111,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   });
   let selectionPreviewTimer = 0;
   const refreshSelectionPreview = async () => {
-    const payload = selectionPayload();
-    if (!payload.symbol || !payload.side) return;
     const revision = selectionPreviewRevision;
     try {
+      const payload = selectionPayload();
+      if (!payload.symbol || !payload.side) return;
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Обновляем счётчики…';
       const response = await fetch('/api/v2/strategies/performance-v2/selection-preview', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),

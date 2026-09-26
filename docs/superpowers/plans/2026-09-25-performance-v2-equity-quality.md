@@ -18,8 +18,8 @@
 `PLAN_APPROVED`, 2026-09-25. R7.3 replaces conflicting R6.1 rules below;
 the R6.1 findings ledger is historical only. Approval does not accept M0
 coverage/performance evidence and does not authorize runtime implementation.
-Implementation was separately authorized by the user. M0–M3 are accepted;
-M4–M5 remain open. Checkboxes close only after verified evidence and
+Implementation was separately authorized by the user. M0–M4 are accepted;
+M5 remains open. Checkboxes close only after verified evidence and
 independent review.
 
 ## R7.3 canonical override (normative)
@@ -337,7 +337,8 @@ Run: `.venv\Scripts\python.exe -m pytest tests/test_performance_v2_selection.py 
 Accepted M3 evidence (2026-09-25): 209 passed, 6 pandas warnings; `git diff --check`
 passed. Opus 5 final `CODE_REVIEW_PASS` after v1 disabled-method, v2 stage-order,
 source-revision/timezone, mixed RETEST reserve/Decimal and decision-facts checks.
-M4 candidate-LRU hydration, XLSX columns and Panel integration remain open.
+M4 candidate-LRU hydration, XLSX columns and Panel integration are accepted
+after independent Opus 5 `CODE_REVIEW_PASS`; M5 remains open.
 
 **Exit:** filter-only/rank-only/both/legacy воспроизводимы; review не доверяет Excel precision.
 
@@ -348,7 +349,7 @@ shared writer в selection.py; tests/test_panel_performance_v2.py,
 test_panel_performance_v2_export.py, test_panel_performance_v2_retest.py,
 test_panel_static_ui.py, selection/review tests.
 
-- [ ] Red/green service readiness учитывает только enabled equity consumers;
+- [x] Red/green service readiness учитывает только enabled equity consumers;
   explicit recalc может прогреть facts при выключенном consumer. Добавить
   source/digest/version/cohort в candidate LRU identity.
   Проверить missing/stale revision/wrong algo/corrupt JSON/digest => not-ready;
@@ -360,32 +361,41 @@ test_panel_static_ui.py, selection/review tests.
   cached reads toggle-independent. После ON/method/N — hit. Отдельно cold
   ABSENT sentinel -> ON not-ready -> explicit publish -> новый key/miss.
   SCHEMA5/STALE/INVALID sentinels и zero new raw/write проверяются отдельно.
-- [ ] Добавить checkbox №2 и native method select у текущего Top N, не новую
+- [x] Добавить checkbox №2 и native method select у текущего Top N, не новую
   панель. Fixed-prefix barrier действует также при перемещении соседнего ряда.
   Disabled rank не требует кэш; stale HTTP responses не перетирают новый выбор.
-- [ ] Показать предупреждение rank-only+lot и unassessed count. Labels,
+- [x] Показать предупреждение rank-only+lot и unassessed count. Labels,
   keyboard/aria-live сохраняют доступность; CSS framework не нужен.
   Help явно различает short-window WEAKENING (понижение equity-rank) и ERF
   BLOCK (основной H не UP либо nonpositive); другие filters не отключаются.
   Для ERF ON + robust явно писать: PASS без нового equity-штрафа; понижение
   только при equity_quality_v1. Никакого автоматического переключения метода.
-- [ ] Shared writer добавляет только четыре equity columns для нового request.
+- [x] Shared writer добавляет только четыре equity columns для нового request.
   Existing Final score/rank переиспользуются, метод явно подписан без изменения
   protected headers: cell comment и workbook metadata, без header rename.
   State/basis объясняют short/unknown/invalid; null blank.
-- [ ] XLSX tests: legacy columns неизменны, new block справа, исключённые
+- [x] XLSX tests: legacy columns неизменны, new block справа, исключённые
   строки сохраняются; нет generic .01 rounding для equity metrics и нет
   полной диагностики в hidden columns. Full facts находятся в snapshot JSON.
-- [ ] Read-only Performance export показывает только свежие имеющиеся facts,
+- [x] Read-only Performance export показывает только свежие имеющиеся facts,
   не compute/migrate/write и не меняет manual FINALIST/RETEST.
   Valid v5 fixture экспортируется прежними колонками с неизменным catalog;
   review-read работает. Snapshot/review-import writers требуют explicit
   initialized v6. Test той же копии после normal writable initialize v5->v6.
-- [ ] Проверить recovery/bulk retest/control export: method не теряется,
+- [x] Проверить recovery/bulk retest/control export: method не теряется,
   exact successful cohort и существующие snapshot/review guarantees сохранены.
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_panel_performance_v2.py tests/test_panel_performance_v2_export.py tests/test_panel_performance_v2_retest.py tests/test_panel_static_ui.py tests/test_performance_v2_selection_review.py`.
 Run: `node --check src/mrs3/panel_web/app.js`.
+
+Accepted M4 evidence (2026-09-26): 524 passed, 4 Windows symlink skips across
+selection/review/Panel/export/RETEST/static UI; 132 passed in the separate
+equity-quality/cache/store/benchmark slice. `node --check` and scoped
+`git diff --check` passed. Independent Opus 5 selection/writer, Panel/UI/export
+and final integration reviews returned `CODE_REVIEW_PASS`. Local headless Chrome
+QA at 820/901/1100/1279/1280px found no selection overflow or clipped inputs;
+portfolio breakpoint remained 760px. No live DB migration/backfill or tester
+run was performed. M5 comparable full-corpus speed/RSS evidence remains open.
 
 **Exit:** минимальный UI и четыре новых колонки, без скрытой новой вычислительной ветки.
 

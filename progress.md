@@ -1,9 +1,9 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-25
+**Updated:** 2026-09-26
 **Current branch:** `main`
 
-## Performance v2 equity-quality R7.3 M3 accepted (2026-09-25)
+## Performance v2 equity-quality R7.3 M4 accepted (2026-09-26)
 
 The canonical contract is now R7.3. Authoritative equity is evaluated as a
 right-continuous step series on a T-anchored six-hour grid: quiet periods and
@@ -45,12 +45,20 @@ request JSON and hash, and persists full cached facts/source evidence in a v2
 selection snapshot. Mixed RETEST and reserve candidates round-trip through
 Excel review without trusting workbook precision. Independent Opus 5
 `CODE_REVIEW_PASS`; the M3 selection/review suites passed 209 tests with six
-pandas warnings. M4–M5 remain pending. The M4 candidate-LRU switch from
-filter+robust to equity rank currently has a failing integration regression
-(`EQUITY_CACHE_INCOMPLETE`); M4 must hydrate optional facts independently of
-the selected method before acceptance. No live Performance DB was migrated or
-backfilled. Next: M4 shared XLSX/facts loader, Panel/UI integration, then
-comparable cache-performance evidence.
+pandas warnings. M4 adds toggle-independent cached-facts hydration to one
+candidate LRU entry: OFF/filter/rank/both requests reapply policy after lookup,
+without raw reads or preview-time writes. The Panel has optional ERF checkbox
+at fixed position #2 and a native robust/equity method selector on the existing
+Top N, with legacy defaults OFF/robust. The shared writer adds at most four
+equity columns; read-only Performance export includes only fresh existing facts
+and preserves valid v5 legacy output. Independent Opus 5 selection/writer,
+Panel/UI/export and final integration reviews each returned `CODE_REVIEW_PASS`.
+The combined selection/review/Panel/export/RETEST/static suite passed 524 tests
+with four Windows symlink skips; pure equity/cache/store/benchmark passed 132
+tests. JavaScript syntax and `git diff --check` passed. Responsive Chrome QA
+found no clipping at 820/901/1100/1279/1280px. No live Performance DB was
+migrated or backfilled. Next: M5 comparable full-corpus cache-performance
+evidence on an explicit frozen offline v6 copy; speed/RSS budgets remain open.
 
 The copy-only M5 measurement harness is implemented and independently reviewed
 (`CODE_REVIEW_PASS`, 13 fixture tests). It requires an explicit offline v6 DB

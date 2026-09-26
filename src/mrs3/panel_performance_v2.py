@@ -23,8 +23,10 @@ from .performance_v2_import import (
 )
 from .performance_v2_store import (
     PerformanceV2Config,
+    PerformanceV2StoreError,
     performance_v2_database_path,
     require_performance_v2,
+    require_performance_v2_readable,
 )
 from .performance_v2_windows import (
     METRICS_VERSION,
@@ -209,6 +211,7 @@ def export_performance_v2(
         raise PerformanceV2ApiError("PERFORMANCE_DB_UNAVAILABLE", status=503, message="PerformanceDB is unavailable.")
     try:
         with duckdb.connect(str(database_path), read_only=True) as connection:
+            require_performance_v2_readable(connection)
             decisions = effective_selection_decisions(connection)
             retest_ids = {int(row[0]) for row in connection.execute("select strategy_id from strategy_tags where tag = 'RETEST'").fetchall()}
             if selection.all_active:
@@ -270,6 +273,10 @@ def export_performance_v2(
             return _export_filename(now), _export_xlsx(rows, metadata, review_metadata, user_reviews, cached_candidates)
     except PerformanceV2ApiError:
         raise
+    except PerformanceV2StoreError as error:
+        raise PerformanceV2ApiError(
+            "PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error),
+        ) from error
     except (duckdb.Error, OSError) as error:
         if isinstance(error, duckdb.IOException) and _is_duckdb_lock_error(error):
             raise PerformanceV2ApiError("PERFORMANCE_DB_BUSY", status=409, message="PerformanceDB is busy.") from error

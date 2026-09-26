@@ -99,7 +99,7 @@ def _equity_ranked_result(connection: duckdb.DuckDBPyConnection) -> tuple[object
          "method": "equity_quality_v1"},
     ]})
     result = _result().copy()
-    result["_equity_quality"] = None
+    result["_equity_cache"] = None
     for row_index in result.index:
         result_id = int(result.at[row_index, "result_id"])
         source = current_equity_source_metadata(connection, result_id)
@@ -107,7 +107,8 @@ def _equity_ranked_result(connection: duckdb.DuckDBPyConnection) -> tuple[object
             result_id, source["report_start_utc"], source["report_end_utc"], (),
         )
         facts_json = encode_equity_facts(facts)
-        result.at[row_index, "_equity_quality"] = {
+        result.at[row_index, "_equity_cache"] = {
+            "status": "FRESH",
             "facts": facts,
             "source_revision": equity_source_revision(source),
             "facts_sha256": sha256(facts_json.encode()).hexdigest(),
@@ -329,7 +330,7 @@ def test_mixed_equity_retest_cohort_round_trips_unscoreable_reserve_evidence(tmp
     result["result_id"] = [101, 102, 103]
     result["strategy_name"] = ["strategy-1", "strategy-2", "strategy-3"]
     result["auto_analog_of_strategy_id"] = None
-    result["_equity_quality"] = None
+    result["_equity_cache"] = None
     for row_index in result.index:
         result_id = int(result.at[row_index, "result_id"])
         source = current_equity_source_metadata(connection, result_id)
@@ -340,7 +341,8 @@ def test_mixed_equity_retest_cohort_round_trips_unscoreable_reserve_evidence(tmp
         )
         facts = calculate_equity_quality_facts(result_id, source["report_start_utc"], source["report_end_utc"], samples)
         facts_json = encode_equity_facts(facts)
-        result.at[row_index, "_equity_quality"] = {
+        result.at[row_index, "_equity_cache"] = {
+            "status": "FRESH",
             "facts": facts,
             "source_revision": equity_source_revision(source),
             "facts_sha256": sha256(facts_json.encode()).hexdigest(),

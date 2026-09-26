@@ -272,9 +272,14 @@ tbody th { font-weight: 750; }
 .selection-stage-summary-eliminated { color: #b42318; }
 .selection-stage-summary-zero { color: var(--muted); }
 .selection-stage-summary-remaining { color: #067647; }
+.selection-stage-summary-unassessed { color: var(--muted); }
 .selection-stage-controls { grid-column: 8; display: flex; gap: 4px; }
 .selection-stage-controls .button { min-width: 31px; min-height: 30px; padding: 4px 7px; }
 .selection-stage-fixed { margin-top: 7px; }
+.selection-stage-fixed .selection-stage-threshold { grid-column: 5 / 7; }
+.selection-stage-fixed .selection-stage-threshold input[data-selection-top-n] { max-width: 78px; }
+.selection-stage-fixed .selection-stage-threshold select { min-width: 0; width: 100%; min-height: 30px; padding: 4px 6px; font: inherit; font-size: .7rem; color: var(--text); }
+.selection-stage-fixed .selection-stage-scope { grid-column: 7 / 9; }
 .selection-stage-fixed .selection-stage-scope > span:last-child { color: var(--text); min-height: 30px; display: flex; align-items: center; padding: 4px 6px; border: 1px solid #cbd7e4; border-radius: 7px; background: #fff; font-size: .7rem; }
 .selection-objectives { display: grid; gap: 10px; margin-top: 16px; }
 .selection-objectives .table-wrap { margin-top: 0; }
@@ -371,12 +376,16 @@ textarea { width: 100%; padding: 10px; border: 1px solid #cbd7e4; border-radius:
   .portfolio-result-drawdown-group .portfolio-result-metric-group-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .portfolio-result-capital-group .portfolio-result-metric-group-grid { grid-template-columns: 1fr; }
   .portfolio-result-candidate { overflow-x: auto; }
+}
+@media (max-width: 1279px) {
   .selection-preview-layout { grid-template-columns: 1fr; }
   .selection-stage { grid-template-columns: 24px minmax(0, 1fr); }
   .selection-stage .check { grid-column: 2; }
   .selection-stage-kind { grid-column: 2; justify-self: start; }
   .selection-stage-threshold { grid-column: 2; }
+  .selection-stage-fixed .selection-stage-threshold { grid-column: 2; }
   .selection-stage-scope { grid-column: 2; }
+  .selection-stage-fixed .selection-stage-scope { grid-column: 2; }
   .selection-stage-summary { grid-column: 2; text-align: left; }
   .selection-stage-controls { grid-column: 2; justify-self: end; }
 }
