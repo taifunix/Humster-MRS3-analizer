@@ -1,6 +1,6 @@
 # Performance v2: качество роста equity — анализ и проект
 
-**Статус:** R7.3 утверждена; M0–M2 приняты, M3–M5 ожидают выполнения.
+**Статус:** R7.3 утверждена; M0–M4 приняты, M5 измеряется.
 **Версия:** R7.3, 2026-09-25.
 **Назначение:** спецификация для обсуждения и независимой проверки плана.
 
@@ -91,7 +91,7 @@ user's separate authorization, not by this specification or its approval alone.
   freshness rule, or report-date tie-break. T is part of revision/digest; a
   T-only change recomputes facts.
 
-### R7.3 M0 acceptance evidence
+### R7.3 M0 acceptance evidence (historical timing targets; M5 amendment below)
 
 M0 must check the contract with deterministic self-tests: 5m/4h label
 invariance; quiet multi-day tails; H-UP short decline; H-flat; one-baseline
@@ -124,6 +124,24 @@ without comparable measurements. Proposed gates: cold median <= baseline +
 max(20%, 0.5s), warm <= baseline + max(10%, 0.05s), RSS <= baseline +
 max(25%, 64MiB). No live writes, migration, cache backfill, tester, Panel, or
 service restart is allowed for M0.
+
+### M5 measurement amendment (2026-09-26)
+
+At the user's direction, M5 evaluates only the current runtime. Prior-runtime
+timing comparison and the percentage-over-baseline targets above and in the
+historical sections below are withdrawn as M5 acceptance gates. Measure cold
+derived caches, warm-window/cold-equity backfill, and all-warm behavior on
+frozen offline v6 copies with one warmup and three measured runs, including
+worker profiles 1/4/8/16 for the two recalculation states. All-warm preview
+has no worker-parallel recalculation in its measured call; prepare it once and
+measure the four consumer modes separately. Record median and maximum wall time,
+peak process RSS (including worker threads), queries/fetched rows/cache writes,
+stable decisions, and source invariance. A partial-corpus result is labelled as
+such and cannot establish
+full-corpus speed. No unagreed wall-time or RSS threshold is inferred from a
+measurement; user acceptance of the observed current-runtime cost remains the
+M5 performance gate. This amendment changes measurement acceptance only, not
+equity facts, UI defaults, or cache correctness.
 
 > **Historical R6.1 material follows.** Sections 1 onward preserve context and
 > older analysis. Treat them as non-normative wherever they differ from §0;

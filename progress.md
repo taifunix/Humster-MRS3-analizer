@@ -27,8 +27,9 @@ catalog and row counts were unchanged.
 
 This is a 1.314% deterministic sample, not a representative population result.
 The 60-result repeat median was 29.2023 seconds with peak RSS about 487.4 MB,
-but it is not comparable to the existing cache benchmark; cold/warm/RSS budgets
-remain unaccepted. The user subsequently authorized implementation. M1 pure
+but it is not comparable to the existing cache benchmark; the then-proposed
+cold/warm/RSS budgets were not accepted. The user subsequently authorized
+implementation. M1 pure
 facts, schema/cache lifecycle, v5 read compatibility and bounded worker
 integration all received independent Opus 5 `CODE_REVIEW_PASS`. Final relevant
 suite: 429 passed, 2 platform symlink skips. A synthetic warm worker fixture
@@ -57,16 +58,18 @@ The combined selection/review/Panel/export/RETEST/static suite passed 524 tests
 with four Windows symlink skips; pure equity/cache/store/benchmark passed 132
 tests. JavaScript syntax and `git diff --check` passed. Responsive Chrome QA
 found no clipping at 820/901/1100/1279/1280px. No live Performance DB was
-migrated or backfilled. Next: M5 comparable full-corpus cache-performance
-evidence on an explicit frozen offline v6 copy; speed/RSS budgets remain open.
+migrated or backfilled. Next: M5 current-runtime cache-performance evidence
+on explicit frozen offline v6 copies; full-corpus scale and speed acceptance
+remain open.
 
 The copy-only M5 measurement harness is implemented and independently reviewed
 (`CODE_REVIEW_PASS`, 13 fixture tests). It requires an explicit offline v6 DB
 copy, refuses the configured live DB and WAL/hardlink aliases, and records
 all-warm four-mode previews plus cold/backfill recalculation on temporary
 copies. No benchmark or mutation of the live DB, full-corpus run, or comparable
-old-runtime/REPLACE measurement has been performed; M5 speed/RSS budgets are
-not accepted.
+REPLACE measurement has been performed. On 2026-09-26 the user withdrew the
+old-runtime comparison and percentage-over-baseline speed/RSS targets; only
+current-runtime measurements and explicit acceptance remain M5 gates.
 
 A bounded [M5 real-data slice and measurement](docs/superpowers/plans/2026-09-26-performance-v2-equity-quality-m5-slice-evidence.md)
 were added after independent Opus 5 `CODE_REVIEW_PASS` for the slice creator.
@@ -75,8 +78,26 @@ FWDIUSDT/LONG v6 slice holds 2,348,395 equity points and 288,464 actions;
 four new-runtime all-warm modes gave stable signatures and zero cache writes.
 Their median previews were 2.295s legacy-controls, 1.952s filter-only,
 3.139s equity-rank-only and 2.036s both. Creator plus benchmark tests passed
-30 tests. This is a partial one-group sample: old-runtime comparison,
-cold/backfill/REPLACE and full-corpus performance gates remain open.
+30 tests. This is a partial one-group sample: cold/backfill/REPLACE and
+full-corpus performance gates remained open at that point. Follow-up on a
+64-strategy, 294,397-equity-point frozen slice measured
+one warmup and three current-runtime runs for cold and window-warm/equity-cold
+backfill at 1/4/8/16 workers, plus four all-warm modes. The 4-worker medians
+were 28.749s cold and 8.363s backfill; 16 workers gave 29.612s and 9.519s
+with more peak parent RSS (348.5 versus 236.7 MiB cold). The 64-result
+all-warm medians were 0.415/0.455/0.485/0.393s for legacy-controls/filter/
+equity-rank/both, with stable decisions and zero cache writes/raw-equity reads.
+Source file size and mtime stayed unchanged; the 14 GB source was not
+content-hashed. Neither the 64-result worker profile nor the 512-result warm
+preview is a full-corpus result; no shared worker default was
+changed. One-REPLACE timing remains open because no exact replacement
+report/inbox was available; user acceptance of the observed speed is also
+open. See the linked M5 evidence for cohort hashes, SQL counters and decision
+changes. The current M5 relevant regression suite passed 844 tests with four
+Windows symlink skips; 44 existing pandas DataFrame-fragmentation warnings
+were reported by selection/review display tests. The bounded measurement/docs
+update received independent Opus 5 `CODE_REVIEW_PASS` on round two; this does
+not accept full-corpus M5 performance.
 
 ### Superseded proposal history
 

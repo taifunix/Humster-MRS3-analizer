@@ -201,8 +201,8 @@ predictive validity, accepted speed budgets, or implementation readiness.
 **Accepted:** 2026-09-25, independent Opus 5 `CODE_REVIEW_PASS` for pure facts,
 schema/cache lifecycle, v5 reads and worker integration. Final relevant suite:
 429 passed, 2 platform skips. The synthetic seven-window worker fetch fell
-from seven SELECTs to one with identical cached metrics. Comparable full-corpus
-wall/RSS budgets remain an M5 gate, not an M1 claim.
+from seven SELECTs to one with identical cached metrics. Current-runtime
+full-corpus wall/RSS evidence remains an M5 gate, not an M1 claim.
 
 **Files:** оба новых модуля; existing store/import/prune/windows/selection;
 `tests/test_performance_v2_equity_quality.py`,
@@ -395,7 +395,7 @@ equity-quality/cache/store/benchmark slice. `node --check` and scoped
 and final integration reviews returned `CODE_REVIEW_PASS`. Local headless Chrome
 QA at 820/901/1100/1279/1280px found no selection overflow or clipped inputs;
 portfolio breakpoint remained 760px. No live DB migration/backfill or tester
-run was performed. M5 comparable full-corpus speed/RSS evidence remains open.
+run was performed. M5 current-runtime full-corpus speed/RSS evidence remains open.
 
 **Exit:** минимальный UI и четыре новых колонки, без скрытой новой вычислительной ветки.
 
@@ -405,16 +405,27 @@ Partial tooling evidence (2026-09-25): the copy-only benchmark harness
 `scripts/benchmark_performance_v2_equity_selection.py` received independent
 Opus 5 `CODE_REVIEW_PASS` after 13 fixture tests. It measures four all-warm
 consumer modes and cold/backfill recalculation on isolated v6 copies, with
-explicit partial SQL/fetched-row and parent-RSS scope. Prior-runtime baseline,
-one-REPLACE, full-corpus wall/RSS budgets and M5 acceptance remain open.
+explicit partial SQL/fetched-row and parent-RSS scope. One-REPLACE,
+full-corpus measurement and M5 acceptance remain open. The user withdrew
+prior-runtime timing comparison and percentage-over-baseline budgets on
+2026-09-26; only current-runtime timing is required.
 
 Bounded real-data evidence (2026-09-26): the independently reviewed
 `scripts/create_performance_v2_equity_benchmark_slice.py` safely derived a
 512-strategy v6 slice from the existing v5 source using read-only access. The
 [M5 slice evidence](2026-09-26-performance-v2-equity-quality-m5-slice-evidence.md)
 records source invariance, row counts, stable four-mode all-warm signatures and
-medians. This closes only the partial-corpus all-warm measurement, not the
-full-corpus, prior-runtime, cold/backfill, REPLACE or budget gates below.
+medians. At that point it closed only the partial-corpus all-warm measurement.
+
+Further bounded current-runtime evidence on 2026-09-26: the same evidence
+file now records 64-result cold/backfill profiles for 1/4/8/16 workers and
+all-warm previews on that same cohort. Three measured repeats per profile
+were source-stat-invariant. Worker 4 had the lowest sample median; no shared
+default was changed. The checklist below stays open for full-corpus scale, one-REPLACE
+timing (no exact replacement report/inbox available) and explicit speed
+acceptance. The bounded evidence/docs update passed independent Opus 5
+`CODE_REVIEW_PASS` on review round two; 844 relevant
+tests passed with four Windows symlink skips.
 
 **Files:** benchmark/evidence из M0; spec/plan/progress/PRD по verified facts.
 
@@ -430,18 +441,18 @@ database scan or remove it without a replacement validity source.
 
 - [ ] Прогнать один frozen corpus в четырёх режимах: legacy/filter-only/rank-only/
   both. Проверить повторяемость, список изменившихся решений и причины.
-  Отдельно сравнить legacy baseline с новым v6 при обоих controls OFF:
-  optional cached-facts read имеет измеряемую цену, её не считать бесплатной.
+  Сравнить только режимы текущего runtime; legacy-controls — не старый runtime.
+  Partial-corpus и full-corpus evidence не смешивать.
 - [ ] На DB copies сравнить old-cold+new-cold, old-warm+new-cold backfill,
   all-warm, one REPLACE. One warmup+3 measured repeats, тот же cohort/settings.
+  Здесь old/new — состояния window/equity-кэша, не версии runtime.
   Профиль 1/4/8/16 workers; timestamped evidence с версиями и SQL counters.
-- [ ] Проверить согласованные в M0 budgets: cold median <= baseline+
-  max(20%,0.5s); warm <= baseline+max(10%,0.05s); RSS <= baseline+
-  max(25%,64MiB). Проценты берутся от соответствующего baseline; absolute
-  floors не складываются с процентами. Backfill показывается отдельно.
-- [ ] При превышении измерить load/compute/publish, устранить bottleneck либо
-  получить явное принятие нового бюджета. Не менять Decimal/version молча.
-- [ ] Повторить все focused commands M1–M4 и relevant broader suites после
+- [ ] Зафиксировать median/max wall, peak parent RSS, SQL/fetched rows и writes
+  только нового runtime по состояниям кэша и worker profiles. M0 relative
+  budgets отменены; без согласованного абсолютного порога нельзя заявлять
+  speed PASS. Backfill показывать отдельно; при заметном bottleneck измерить
+  load/compute/publish и оптимизировать без изменения Decimal/version.
+- [x] Повторить все focused commands M1–M4 и relevant broader suites после
   интеграции. `git diff --check`, осмотр scoped/staged diff; independent
   `CODE_REVIEW_PASS`, подтверждённые fixes и re-review.
 - [ ] Обновить evidence/progress/PRD только проверенными результатами. Scoped
