@@ -64,8 +64,19 @@ The copy-only M5 measurement harness is implemented and independently reviewed
 (`CODE_REVIEW_PASS`, 13 fixture tests). It requires an explicit offline v6 DB
 copy, refuses the configured live DB and WAL/hardlink aliases, and records
 all-warm four-mode previews plus cold/backfill recalculation on temporary
-copies. No live/full-corpus run or comparable old-runtime/REPLACE measurement
-has been performed; M5 speed/RSS budgets are not accepted.
+copies. No benchmark or mutation of the live DB, full-corpus run, or comparable
+old-runtime/REPLACE measurement has been performed; M5 speed/RSS budgets are
+not accepted.
+
+A bounded [M5 real-data slice and measurement](docs/superpowers/plans/2026-09-26-performance-v2-equity-quality-m5-slice-evidence.md)
+were added after independent Opus 5 `CODE_REVIEW_PASS` for the slice creator.
+The original schema-v5 source was read-only and unchanged. A 512-strategy
+FWDIUSDT/LONG v6 slice holds 2,348,395 equity points and 288,464 actions;
+four new-runtime all-warm modes gave stable signatures and zero cache writes.
+Their median previews were 2.295s legacy-controls, 1.952s filter-only,
+3.139s equity-rank-only and 2.036s both. Creator plus benchmark tests passed
+30 tests. This is a partial one-group sample: old-runtime comparison,
+cold/backfill/REPLACE and full-corpus performance gates remain open.
 
 ### Superseded proposal history
 

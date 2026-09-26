@@ -408,6 +408,14 @@ consumer modes and cold/backfill recalculation on isolated v6 copies, with
 explicit partial SQL/fetched-row and parent-RSS scope. Prior-runtime baseline,
 one-REPLACE, full-corpus wall/RSS budgets and M5 acceptance remain open.
 
+Bounded real-data evidence (2026-09-26): the independently reviewed
+`scripts/create_performance_v2_equity_benchmark_slice.py` safely derived a
+512-strategy v6 slice from the existing v5 source using read-only access. The
+[M5 slice evidence](2026-09-26-performance-v2-equity-quality-m5-slice-evidence.md)
+records source invariance, row counts, stable four-mode all-warm signatures and
+medians. This closes only the partial-corpus all-warm measurement, not the
+full-corpus, prior-runtime, cold/backfill, REPLACE or budget gates below.
+
 **Files:** benchmark/evidence из M0; spec/plan/progress/PRD по verified facts.
 
 **Cache-path audit to measure:** M1 removed the proven per-result window-cache
