@@ -151,7 +151,7 @@ def test_low_trades_filter_uses_calendar_rate_and_excludes_missing_rates() -> No
     assert result.loc["missing", "finalist"]
 
 
-def test_unavailable_time_consistency_survives_and_exports_na(tmp_path: Path) -> None:
+def test_unavailable_time_consistency_survives_and_exports_na_in_positive_windows(tmp_path: Path) -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_time_consistency", "enabled": True, "scope": "pair_side_timeframe"},
     ]})
@@ -172,7 +172,7 @@ def test_unavailable_time_consistency_survives_and_exports_na(tmp_path: Path) ->
     }
     unavailable_row = data_rows["unavailable"]
     assert book["All candidates"].cell(unavailable_row, headers.index("Positive windows") + 1).value == "N/A"
-    assert book["All candidates"].cell(unavailable_row, headers.index("eliminated_by_filter_time_consistency") + 1).value == "N/A"
+    assert "eliminated_by_filter_time_consistency" not in headers
 
 
 def test_unavailable_status_exports_na_without_count_fields(tmp_path: Path) -> None:
@@ -1825,6 +1825,12 @@ def test_earlier_preparation_batch_remains_committed_after_later_batch_fails(
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
     original = selection_module._selection_window_job_from_args
     seen: list[int] = []
+    published_batches: list[int] = []
+
+    def after_batch(count: int) -> None:
+        with duckdb.connect(str(database), read_only=True) as check:
+            assert check.execute("select count(distinct result_id) from equity_quality_metrics").fetchone()[0] == sum(published_batches) + count
+        published_batches.append(count)
 
     def fail_on_third_result(args):
         seen.append(int(args[1]))
@@ -1835,12 +1841,32 @@ def test_earlier_preparation_batch_remains_committed_after_later_batch_fails(
     monkeypatch.setattr(selection_module, "_selection_window_job_from_args", fail_on_third_result)
 
     with pytest.raises(RuntimeError, match="later preparation batch failed"):
-        prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+        prepare_selection_window_cache(
+            database, request, SelectionConfig(), workers=1, include_equity=True,
+            on_batch_complete=after_batch,
+        )
 
     assert len(seen) == 3
+    assert published_batches == [2]
     with duckdb.connect(str(database), read_only=True) as check:
         assert set(row[0] for row in check.execute("select distinct result_id from window_metrics").fetchall()) == set(seen[:2])
         assert set(row[0] for row in check.execute("select result_id from equity_quality_metrics").fetchall()) == set(seen[:2])
+
+
+def test_warm_noop_preparation_reports_completed_batch(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+    completed: list[int] = []
+
+    prepare_selection_window_cache(
+        database, request, SelectionConfig(), workers=1, include_equity=True,
+        on_batch_complete=completed.append,
+    )
+
+    assert completed == [1]
 
 
 def test_equity_only_cold_warmup_uses_bounded_equity_without_legacy_source_or_actions(
@@ -2881,9 +2907,9 @@ def test_workbook_keeps_rank_eliminated_rows_with_rank_diagnostics(tmp_path: Pat
     headers = [cell.value for cell in sheet[1]]
 
     assert sheet.max_row == 3
-    assert "Final rank" in headers and "Rank coverage, %" in headers
-    assert headers[-1] == "eliminated_by_rank_robust_top_n"
-    assert {sheet.cell(row, headers.index("Final rank") + 1).value for row in (2, 3)} == {1, 2}
+    assert "Auto Rank" in headers and "Rank coverage, %" in headers
+    assert headers[-1] == "Причина"
+    assert {sheet.cell(row, headers.index("Auto Rank") + 1).value for row in (2, 3)} == {1, 2}
 
 
 def test_equity_workbook_appends_four_precise_columns_and_labels_method(tmp_path: Path) -> None:
@@ -2905,7 +2931,8 @@ def test_equity_workbook_appends_four_precise_columns_and_labels_method(tmp_path
     sheet = workbook["All candidates"]
     headers = [cell.value for cell in sheet[1]]
 
-    assert headers[-4:] == ["Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"]
+    equity_start = headers.index("MA") + 1
+    assert headers[equity_start:equity_start + 4] == ["Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"]
     assert sheet.max_row == 3
     assert sheet.cell(2, headers.index("Equity DD, %") + 1).value == 12.3456789
     assert sheet.cell(3, headers.index("Equity smoothness") + 1).value == 0.1234567
@@ -2925,13 +2952,16 @@ def test_equity_method_metadata_without_review_preserves_existing_score_comment(
     original_writer = selection_module.write_audit_workbook
 
     def write_with_existing_comment(*args, **kwargs):
-        path = original_writer(*args, **kwargs)
-        workbook = load_workbook(path)
-        sheet = workbook["All candidates"]
-        headers = {cell.value: cell.column for cell in sheet[1]}
-        sheet.cell(1, headers["Final score (Pair+Side)"]).comment = Comment("Existing score note", "Analyst")
-        workbook.save(path)
-        return path
+        finalizer = kwargs["finalize_workbook"]
+
+        def add_existing_comment(workbook):
+            sheet = workbook["All candidates"]
+            headers = {cell.value: cell.column for cell in sheet[1]}
+            sheet.cell(1, headers["Final score (Pair+Side)"]).comment = Comment("Existing score note", "Analyst")
+            finalizer(workbook)
+
+        kwargs["finalize_workbook"] = add_existing_comment
+        return original_writer(*args, **kwargs)
 
     monkeypatch.setattr(selection_module, "write_audit_workbook", write_with_existing_comment)
     path = write_selection_workbook(pd.DataFrame([{
@@ -3042,14 +3072,14 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     assert "PnL" not in headers
     assert "total_pnl_pct" not in headers
     assert "PnL/30" in headers and "Trades/30" in headers
-    assert "eliminated_by_filter_lot_variant_redundancy" in headers
+    assert not any(header.startswith("eliminated_by_") for header in headers)
     assert "positive_quarter_status" not in headers
     strategy_column = headers.index("Стратегия") + 1
     winner_row = next(row for row in range(2, book["All candidates"].max_row + 1) if book["All candidates"].cell(row, strategy_column).value == "winner")
     assert book["All candidates"].cell(winner_row, headers.index("PnL/30") + 1).value == 9
-    assert headers[:27] == [
+    assert headers[:26] == [
         "ID", "Стратегия", "Пара", "Side", "ТФ", "Start", "End", "ORD", "Close", "PnL/30", "PnL DD5/30",
-        "∆ PnL A/B", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "Positive windows", "CE", "PF", "DD", "W/R", "Trades", "Trades/30", "Lot DD5", "Hold p95", "Hold M", "PointsALL",
+        "∆ PnL A/B", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "Positive windows", "CE", "PF", "DD", "W/R", "Trades", "Trades/30", "Lot DD5", "Hold p95", "Hold M",
     ]
     assert "Shift 1" not in headers
     strategy_column = headers.index("Стратегия") + 1
@@ -3091,9 +3121,9 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
         "Rank q Close MA", "Final score (Pair+Side)", "Best trade, %", "PnL without best, %",
     ):
         assert book["All candidates"].column_dimensions[get_column_letter(headers.index(header) + 1)].hidden
-    assert not book["All candidates"].column_dimensions[get_column_letter(headers.index("Final rank") + 1)].hidden
-    assert headers.index("Final rank") + 1 == headers.index("Final")
-    for header in ("Close", "DD", "Hold p95", "1 Shift", "Final rank"):
+    assert not book["All candidates"].column_dimensions[get_column_letter(headers.index("Auto Rank") + 1)].hidden
+    assert "Final rank" not in headers and "Final" not in headers
+    for header in ("Close", "DD", "Hold p95", "1 Shift", "Auto Rank"):
         assert book["All candidates"].cell(2, headers.index(header) + 1).font.bold
     assert headers.index("ORD") + 1 == headers.index("Close")
     for header, edge in (
@@ -3101,27 +3131,27 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
         ("Hold p95", "left"),
         ("Hold M", "right"),
         ("1 Shift", "left"),
-        ("4 Shift", "right"),
+        ("3 Shift", "right"),
         ("Points", "left"),
         ("Points", "right"),
         ("MA", "left"),
         ("MA", "right"),
-        ("Final rank", "left"),
-        ("Final rank", "right"),
+        ("Auto Rank", "left"),
+        ("Auto Rank", "right"),
         ("Close", "left"),
         ("Close", "right"),
     ):
         assert getattr(book["All candidates"].cell(1, headers.index(header) + 1).border, edge).style == "double"
-    assert headers.index("PointsALL") + 1 == headers.index("PointsMin")
+    assert "PointsALL" not in headers and "PointsMin" not in headers
     assert headers.index("CE") + 1 == headers.index("PF")
     shifts_start = headers.index("1 Shift")
-    assert headers[shifts_start:shifts_start + 7] == [
-        "1 Shift", "2 Shift", "3 Shift", "4 Shift", "Lots", "Points", "MA",
+    assert headers[shifts_start:shifts_start + 6] == [
+        "1 Shift", "2 Shift", "3 Shift", "Lots", "Points", "MA",
     ]
     first_order_shift = headers.index("1 Shift") + 1
     assert {book["All candidates"].cell(row, first_order_shift).value for row in (2, 3)} == {0.3, 2.7}
     assert book["All candidates"].cell(2, first_order_shift).number_format == "0.0"
-    assert book["All candidates"].cell(2, headers.index("Final rank") + 1).number_format == "0"
+    assert book["All candidates"].cell(2, headers.index("Auto Rank") + 1).number_format == "0"
     assert book["All candidates"].cell(winner_row, headers.index("∆ PnL A/B") + 1).value == 2
     assert "1 Points" not in headers
     assert {book["All candidates"].cell(row, headers.index("Points") + 1).value for row in (2, 3)} == {
@@ -3138,8 +3168,7 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     assert book["Finalists"].cell(2, 5).alignment.horizontal == "center"
 
     assert book.sheetnames == ["All candidates", "Finalists"]
-    assert headers[-1] == "eliminated_by_pareto_dd5_capital"
-    assert {book["All candidates"].cell(row, len(headers)).value for row in (2, 3)} == {"BLOCK", "PASS"}
+    assert headers[-1] == "Причина"
     assert "result_id" not in headers
     assert "total_pnl" not in headers
     assert book["All candidates"].max_row == 3
@@ -3193,18 +3222,21 @@ def test_workbook_keeps_advisory_reasons_visible_on_legacy_and_equity_finalists(
     ):
         sheet = book[sheet_name]
         headers = [cell.value for cell in sheet[1]]
-        strategy_column, finalist_column = headers.index("Стратегия") + 1, headers.index("Final") + 1
+        strategy_column = headers.index("Стратегия") + 1
         reason_column = headers.index("Причина") + 1
         row = next(
             row for row in range(2, sheet.max_row + 1)
             if sheet.cell(row, strategy_column).value == strategy_name
         )
-        assert sheet.cell(row, finalist_column).value is True
+        assert any(
+            finalist_row[headers.index("Стратегия")].value == strategy_name
+            for finalist_row in book["Finalists"].iter_rows(min_row=2)
+        )
         assert sheet.cell(row, reason_column).value == expected_reason
         assert sheet.cell(row, 1).fill.fgColor.rgb == "00D9EAD3"
 
 
-def test_workbook_keeps_only_enabled_filter_columns_in_request_order(tmp_path: Path) -> None:
+def test_workbook_omits_stage_trace_columns_without_changing_selection_result(tmp_path: Path) -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_low_trades", "enabled": False, "scope": "pair_side"},
         {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side"},
@@ -3216,9 +3248,9 @@ def test_workbook_keeps_only_enabled_filter_columns_in_request_order(tmp_path: P
     path = write_selection_workbook(result, tmp_path / "finalists.xlsx", request)
     headers = [cell.value for cell in load_workbook(path, data_only=True)["All candidates"][1]]
 
-    assert headers[-2:] == ["eliminated_by_pareto_dd5_capital", "eliminated_by_pareto_dd5_balanced"]
-    assert "eliminated_by_filter_low_trades" not in headers
-    assert "eliminated_by_ab_deterioration" not in headers
+    assert headers[-1] == "Причина"
+    assert not any(header.startswith("eliminated_by_") for header in headers)
+    assert {"eliminated_by_pareto_dd5_capital", "eliminated_by_pareto_dd5_balanced"}.issubset(result.columns)
 
 
 def test_workbook_consolidated_ma_never_shows_decimal_places(tmp_path: Path) -> None:

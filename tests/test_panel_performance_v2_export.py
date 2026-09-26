@@ -197,7 +197,8 @@ def test_read_only_export_includes_only_fresh_cached_equity_facts_without_writes
 
     sheet = load_workbook(BytesIO(payload), data_only=True)["All candidates"]
     headers = [cell.value for cell in sheet[1]]
-    assert headers[-4:] == ["Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"]
+    equity_start = headers.index("MA") + 1
+    assert headers[equity_start:equity_start + 4] == ["Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"]
     assert sheet.cell(2, headers.index("Equity state") + 1).value == facts.state
     assert sheet.cell(2, headers.index("Equity basis") + 1).value == "7d / PROVISIONAL"
     drawdown_cell = sheet.cell(2, headers.index("Equity DD, %") + 1)

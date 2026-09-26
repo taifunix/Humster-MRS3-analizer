@@ -501,7 +501,7 @@ def _parse_workbook(data: bytes) -> tuple[dict[str, str], list[dict[str, object]
         positions = {header: position for position, header in header_pairs}
         required = {"ID", "Result ID", "Стратегия", "Auto Status", "User Status", "RETEST", "Auto Rank", "User Rank", "Auto Analog Of ID", "Analog Of ID", "Comment"}
         if (len(headers) != len(set(headers)) or not required.issubset(headers)
-                or positions["RETEST"] != positions["User Status"] + 1):
+                or positions["RETEST"] not in {positions["User Status"] + 1, positions["User Rank"] + 1}):
             raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
         index = {header: position for position, header in header_pairs}
         rows: list[dict[str, object]] = []

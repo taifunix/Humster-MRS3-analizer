@@ -3147,7 +3147,60 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Пересчёт не выполнен: ${error.message || 'ошибка запроса'}`;
     }
   });
-  document.querySelector('#performance-v2-selection-recalculate-all')?.addEventListener('click', async () => {
+  const recalculateAllButton = document.querySelector('#performance-v2-selection-recalculate-all');
+  const recalculateProgress = document.querySelector('#performance-v2-recalculate-progress');
+  let recalculatePollTimer = 0;
+  let recalculatePollBusy = false;
+  let recalculatePostPending = false;
+  let recalculateGeneration = 0;
+  const setRecalculateMessage = (message) => {
+    if (recalculateProgress && recalculateProgress.textContent !== message) recalculateProgress.textContent = message;
+  };
+  const showRecalculateProgress = (result) => {
+    if (!recalculateProgress) return;
+    recalculateProgress.hidden = result.status === 'IDLE';
+    if (recalculateAllButton) recalculateAllButton.disabled = result.status === 'SCANNING' || result.status === 'RUNNING';
+    if (result.status === 'SCANNING') setRecalculateMessage('Проверяем кэш всех пар…');
+    else if (result.status === 'RUNNING') {
+      const percent = result.total_strategies ? (100 * result.completed_strategies / result.total_strategies).toLocaleString('ru-RU', { maximumFractionDigits: 1 }) : '0';
+      setRecalculateMessage(`Обработано стратегий ${result.completed_strategies} / ${result.total_strategies} (${percent}%); пар к пересчёту ${result.completed_pairs} / ${result.planned_pairs}; сейчас ${result.current_pair || '—'}.`);
+    } else if (result.status === 'READY') {
+      setRecalculateMessage(`Готово: всего ${result.total_pairs} пар; обновлено ${result.planned_pairs}; без пересчёта ${result.ready_pairs}.`);
+    } else if (result.status === 'FAILED') {
+      setRecalculateMessage(`Пересчёт прерван: обработано ${result.completed_strategies} из ${result.total_strategies} стратегий; ${result.error || 'ошибка'}.`);
+    }
+  };
+  const pollRecalculateProgress = async () => {
+    if (recalculatePollBusy) return;
+    recalculatePollBusy = true;
+    const generation = recalculateGeneration;
+    let running = false;
+    try {
+      const response = await fetch('/api/v2/strategies/performance-v2/recalculate-all/progress', { cache: 'no-store' });
+      if (!response.ok) throw new Error('status unavailable');
+      const result = await response.json();
+      if (generation !== recalculateGeneration) return;
+      showRecalculateProgress(result);
+      running = result.status === 'SCANNING' || result.status === 'RUNNING';
+    } catch (error) {
+      if (generation === recalculateGeneration && recalculateProgress) {
+        recalculateProgress.hidden = false;
+        setRecalculateMessage('Статус пересчёта временно недоступен.');
+      }
+    } finally {
+      recalculatePollBusy = false;
+      if (generation === recalculateGeneration && (running || recalculatePostPending)) {
+        recalculatePollTimer = window.setTimeout(() => { recalculatePollTimer = 0; void pollRecalculateProgress(); }, 1500);
+      }
+    }
+  };
+  if (recalculateAllButton) void pollRecalculateProgress();
+  recalculateAllButton?.addEventListener('click', async () => {
+    recalculatePostPending = true;
+    window.clearTimeout(recalculatePollTimer);
+    recalculatePollTimer = 0;
+    showRecalculateProgress({ status: 'SCANNING' });
+    void pollRecalculateProgress();
     try {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Пересчитываем все пары…';
       const response = await fetch('/api/v2/strategies/performance-v2/recalculate-all', {
@@ -3155,10 +3208,18 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       });
       if (!response.ok) throw new Error((await response.json()).error?.message || 'recalculation failed');
       const result = await response.json();
-      if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Готово: пересчитано пар ${result.recalculated_pairs}, уже готово ${result.ready_pairs}.`;
+      recalculateGeneration++;
+      showRecalculateProgress({ status: 'READY', ...result, planned_pairs: result.recalculated_pairs });
       refreshSelectionCacheStatus();
     } catch (error) {
+      recalculateGeneration++;
+      if (recalculateProgress) { recalculateProgress.hidden = false; setRecalculateMessage(`Пересчёт не выполнен: ${error.message || 'ошибка запроса'}`); }
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Пересчёт не выполнен: ${error.message || 'ошибка запроса'}`;
+    } finally {
+      recalculatePostPending = false;
+      window.clearTimeout(recalculatePollTimer);
+      recalculatePollTimer = 0;
+      if (recalculateAllButton) recalculateAllButton.disabled = false;
     }
   });
   selectionXlsButton?.addEventListener('click', async () => {

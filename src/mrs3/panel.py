@@ -1321,6 +1321,12 @@ class PanelController:
         self._lock = threading.RLock()
         self._selection_candidate_cache_lock = threading.RLock()
         self._performance_v2_writer_lock = threading.RLock()
+        self._performance_v2_recalculate_progress: dict[str, object] = {
+            "status": "IDLE", "total_pairs": 0, "ready_pairs": 0,
+            "planned_pairs": 0, "completed_pairs": 0,
+            "total_strategies": 0, "completed_strategies": 0,
+            "current_pair": None, "error": None,
+        }
         self._performance_v2_schema_ready: set[tuple[str, int, int, int, int, int]] = set()
         self._selection_candidate_cache: OrderedDict[tuple[object, ...], object] = OrderedDict()
         self._panel_jobs = PanelJobRegistry(self.root / ".panel-jobs.json", recover_on_load=False)
@@ -5152,48 +5158,86 @@ class PanelController:
             raise PerformanceV2ApiError("PERFORMANCE_V2_RECALCULATE_FAILED", status=400, message=str(error)) from error
 
     def strategies_performance_v2_recalculate_all(self) -> dict[str, object]:
+        with self._lock:
+            if self._performance_v2_recalculate_progress["status"] in {"SCANNING", "RUNNING"}:
+                raise PerformanceV2ApiError(
+                    "PERFORMANCE_V2_RECALCULATE_IN_PROGRESS", status=409,
+                    message="Performance v2 recalculation is already running",
+                )
+            self._performance_v2_recalculate_progress = {
+                "status": "SCANNING", "total_pairs": 0, "ready_pairs": 0,
+                "planned_pairs": 0, "completed_pairs": 0,
+                "total_strategies": 0, "completed_strategies": 0,
+                "current_pair": None, "error": None,
+            }
         try:
             config = load_selection_config(self.default_config.with_name("config.performance.json"))
             performance_config = self._performance_v2_config()
             target = performance_v2_database_path(performance_config)
             self._ensure_performance_v2_schema(target)
-            with duckdb.connect(str(target), read_only=True) as connection:
-                require_performance_v2(connection)
-                pairs = connection.execute(
-                    """select s.symbol, s.side from strategies s
-                         join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
-                        where s.lifecycle_status = 'ACTIVE'
-                        group by s.symbol, s.side order by s.symbol, s.side"""
-                ).fetchall()
-                pending = []
-                for symbol, side in pairs:
-                    request = SelectionRequest(str(symbol), str(side), ())
-                    missing_strategy_ids = selection_cache_missing_strategy_ids(
-                        connection, request, config, include_equity=True
-                    )
-                    if missing_strategy_ids:
-                        pending.append((request, missing_strategy_ids))
             with self._performance_v2_writer_lock:
+                with duckdb.connect(str(target), read_only=True) as connection:
+                    require_performance_v2(connection)
+                    pairs = connection.execute(
+                        """select s.symbol, s.side from strategies s
+                             join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
+                            where s.lifecycle_status = 'ACTIVE'
+                            group by s.symbol, s.side order by s.symbol, s.side"""
+                    ).fetchall()
+                    pending = []
+                    for symbol, side in pairs:
+                        request = SelectionRequest(str(symbol), str(side), ())
+                        missing_strategy_ids = selection_cache_missing_strategy_ids(
+                            connection, request, config, include_equity=True
+                        )
+                        if missing_strategy_ids:
+                            pending.append((request, missing_strategy_ids))
+                with self._lock:
+                    self._performance_v2_recalculate_progress.update({
+                        "status": "RUNNING", "total_pairs": len(pairs),
+                        "ready_pairs": len(pairs) - len(pending),
+                        "planned_pairs": len(pending),
+                        "total_strategies": sum(len(ids) for _, ids in pending),
+                    })
+
+                def after_batch(count: int) -> None:
+                    with self._lock:
+                        self._performance_v2_recalculate_progress["completed_strategies"] += count
+
                 for request, missing_strategy_ids in pending:
+                    with self._lock:
+                        self._performance_v2_recalculate_progress["current_pair"] = f"{request.symbol}/{request.side}"
                     prepare_selection_window_cache(
                         target, request, config, performance_config.workers, missing_strategy_ids,
-                        include_equity=True,
+                        include_equity=True, on_batch_complete=after_batch,
                     )
+                    with self._lock:
+                        self._performance_v2_recalculate_progress["completed_pairs"] += 1
             if pending:
                 with self._selection_candidate_cache_lock:
                     self._selection_candidate_cache.clear()
+            with self._lock:
+                self._performance_v2_recalculate_progress.update({"status": "READY", "current_pair": None})
             return {
                 "status": "READY", "total_pairs": len(pairs), "recalculated_pairs": len(pending),
                 "ready_pairs": len(pairs) - len(pending),
             }
-        except EquitySourceChangedError as error:
-            raise PerformanceV2ApiError("EQUITY_SOURCE_CHANGED", status=409, message=str(error)) from error
-        except EquitySchemaUpgradeRequiredError as error:
-            raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
-        except EquityCacheSchemaInvalidError as error:
-            raise PerformanceV2ApiError(error.code, status=500, message=str(error)) from error
-        except (PerformanceV2SelectionError, OSError, duckdb.Error) as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_RECALCULATE_FAILED", status=400, message=str(error)) from error
+        except Exception as error:
+            with self._lock:
+                self._performance_v2_recalculate_progress.update({"status": "FAILED", "error": str(error)})
+            if isinstance(error, EquitySourceChangedError):
+                raise PerformanceV2ApiError("EQUITY_SOURCE_CHANGED", status=409, message=str(error)) from error
+            if isinstance(error, EquitySchemaUpgradeRequiredError):
+                raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
+            if isinstance(error, EquityCacheSchemaInvalidError):
+                raise PerformanceV2ApiError(error.code, status=500, message=str(error)) from error
+            if isinstance(error, (PerformanceV2SelectionError, OSError, duckdb.Error)):
+                raise PerformanceV2ApiError("PERFORMANCE_V2_RECALCULATE_FAILED", status=400, message=str(error)) from error
+            raise
+
+    def strategies_performance_v2_recalculate_all_progress(self) -> dict[str, object]:
+        with self._lock:
+            return dict(self._performance_v2_recalculate_progress)
 
     def _import_settings(self, payload: Mapping[str, object] | None = None) -> DuckDBImportSettings:
         if payload is None:
@@ -8009,6 +8053,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(200, self.server.controller.strategies_performance_v2_retest_status())
             except ValueError:
                 self._json(200, {"count": 0, "retest_count": 0, "active_count": 0, "phase": "UNAVAILABLE"})
+            return
+        if parsed.path == "/api/v2/strategies/performance-v2/recalculate-all/progress":
+            self._json(200, self.server.controller.strategies_performance_v2_recalculate_all_progress())
             return
         if parsed.path == "/api/v2/strategies/performance-v2/finalist-retest/status":
             try:

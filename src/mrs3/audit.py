@@ -9,7 +9,7 @@ import re
 import shutil
 import tempfile
 import zipfile
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import pandas as pd
 from openpyxl import Workbook
@@ -96,6 +96,7 @@ def write_audit_workbook(
     bold_columns: frozenset[str] = frozenset(), column_edge_borders: Mapping[str, tuple[str, ...]] | None = None,
     center_from_column: int | None = None, left_aligned_columns: frozenset[str] = frozenset(),
     row_fill_colors: Mapping[str, Sequence[str | None]] | None = None, font_colors: Mapping[str, str] | None = None,
+    finalize_workbook: Callable[[Workbook], None] | None = None,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
@@ -105,6 +106,10 @@ def write_audit_workbook(
     workbook.properties.modified = FIXED_EXCEL_TIME
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
+    center_alignment = Alignment(horizontal="center")
+    left_alignment = Alignment(horizontal="left")
+    bold_font = Font(bold=True)
+    fill_styles: dict[str, PatternFill] = {}
 
     for sheet_name, raw_frame in tables.items():
         worksheet = workbook.create_sheet(sheet_name)
@@ -126,12 +131,12 @@ def write_audit_workbook(
         if center_from_column is not None:
             for row in worksheet.iter_rows(min_col=center_from_column):
                 for cell in row:
-                    cell.alignment = Alignment(horizontal="center")
+                    cell.alignment = center_alignment
         for index, column in enumerate(frame.columns, start=1):
             if str(column) in left_aligned_columns:
                 for cell in worksheet.iter_cols(min_col=index, max_col=index, min_row=2):
                     for value_cell in cell:
-                        value_cell.alignment = Alignment(horizontal="left")
+                        value_cell.alignment = left_alignment
         if numeric_decimals:
             for row in worksheet.iter_rows(min_row=2):
                 for cell in row:
@@ -150,7 +155,7 @@ def write_audit_workbook(
                 cells = list(worksheet.iter_cols(min_col=index, max_col=index, min_row=1, max_row=worksheet.max_row))[0]
                 if str(column) in bold_columns:
                     for value_cell in cells[1:]:
-                        value_cell.font = Font(bold=True)
+                        value_cell.font = bold_font
                 if color := (font_colors or {}).get(str(column)):
                     for value_cell in cells[1:]:
                         font = copy(value_cell.font)
@@ -162,13 +167,14 @@ def write_audit_workbook(
                         value_cell.border += border
         for row, color in zip(worksheet.iter_rows(min_row=2), (row_fill_colors or {}).get(sheet_name, ())):
             if color:
+                fill = fill_styles.setdefault(color, PatternFill("solid", fgColor=color))
                 for cell in row:
-                    cell.fill = PatternFill("solid", fgColor=color)
+                    cell.fill = fill
         if len(frame.columns):
             for cell in worksheet[1]:
                 cell.fill = header_fill
                 cell.font = header_font
-                cell.alignment = Alignment(horizontal="center")
+                cell.alignment = center_alignment
             worksheet.freeze_panes = "A2"
             worksheet.auto_filter.ref = worksheet.dimensions
             for index, column in enumerate(frame.columns, start=1):
@@ -182,6 +188,8 @@ def write_audit_workbook(
                 dimension = worksheet.column_dimensions[get_column_letter(index)]
                 dimension.width = width
                 dimension.hidden = str(column) in hidden_columns
+    if finalize_workbook is not None:
+        finalize_workbook(workbook)
     with tempfile.NamedTemporaryFile(
         prefix=f".{path.stem}.", suffix=".xlsx", dir=path.parent, delete=False
     ) as handle:

@@ -621,6 +621,10 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "/api/v2/strategies/performance-v2/recalculate-all" in js
     assert "recalculate-all', {" in js
     assert "body: '{}'" in js
+    assert 'id="performance-v2-recalculate-progress"' in html
+    assert "/api/v2/strategies/performance-v2/recalculate-all/progress" in js
+    assert "всего ${result.total_pairs} пар" in js
+    assert "обновлено ${result.planned_pairs}; без пересчёта ${result.ready_pairs}" in js
     assert "if (!payload.symbol || !payload.side) return;" in js
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
     assert 'id="performance-v2-selection-card"' in strategies
@@ -725,18 +729,19 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert ".selection-stage-scope > span:first-child { display: none; }" in css
     assert re.search(r"\.selection-stage-kind \{[^}]*justify-self: start;[^}]*text-align: left", css)
     assert re.search(r"\.selection-stage-kind \{[^}]*width: max-content", css)
-    assert ".selection-stage:has(.selection-stage-threshold) .selection-stage-scope > :last-child { margin-top: 14px; }" in css
+    assert ".selection-stage:has(> .selection-stage-threshold) .selection-stage-scope > :last-child { margin-top: 14px; }" in css
     rank_stage = re.search(r'<div class="selection-stage selection-stage-fixed" data-selection-rank>(.*?)</div>\s*<p id="performance-v2-selection-method-help"', strategies, re.S)
     assert rank_stage and 'class="selection-stage-threshold"' in rank_stage.group(1)
     assert rank_stage and 'data-selection-top-n' in rank_stage.group(1)
+    assert re.search(r'<div class="selection-rank-main">\s*<label class="check">.*?</label>\s*<div class="selection-stage-threshold">', rank_stage.group(1), re.S)
     assert ".selection-stage-fixed .selection-stage-scope > span:last-child {" in css
-    assert ".selection-stage-fixed .selection-stage-threshold { grid-column: 5 / 7; }" in css
-    assert ".selection-stage-fixed .selection-stage-scope { grid-column: 7 / 9; }" in css
+    assert ".selection-stage-fixed .selection-rank-main { grid-column: 2 / 4;" in css
+    assert ".selection-stage-fixed .selection-stage-scope { grid-column: 6; }" in css
     assert ".selection-stage-fixed .selection-stage-threshold select { min-width: 0; width: 100%;" in css
     assert ".selection-stage-summary { display: grid; grid-column: 7;" in css
     assert "@media (max-width: 1279px)" in css
     mobile = css.split("@media (max-width: 1279px)", 1)[1]
-    assert ".selection-stage-fixed .selection-stage-threshold { grid-column: 2; }" in mobile
+    assert ".selection-stage-fixed .selection-rank-main { grid-column: 2; }" in mobile
     assert ".selection-stage-fixed .selection-stage-scope { grid-column: 2; }" in mobile
     assert "line('Осталось', count.remaining, 'remaining')" in js
     assert ".selection-stage-summary-unassessed { color: var(--muted); }" in css

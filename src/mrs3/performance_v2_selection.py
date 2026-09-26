@@ -15,7 +15,7 @@ from typing import Callable, Literal, Mapping, Sequence
 import duckdb
 import numpy as np
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook
 from openpyxl.comments import Comment
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -31,7 +31,7 @@ from .performance_v2_equity_cache import (
 )
 from .performance_v2_equity_quality import EquityQualityFacts, EquitySample, calculate_equity_quality_facts
 from .performance_v2_store import PerformanceV2StoreError, require_performance_v2_readable
-from .audit import _normalize_xlsx_archive, write_audit_workbook
+from .audit import write_audit_workbook
 
 StageScope = Literal["pair_side", "pair_side_timeframe"]
 
@@ -971,6 +971,7 @@ def selection_cache_missing_strategy_ids(
 def prepare_selection_window_cache(
     database: Path, request: SelectionRequest, config: SelectionConfig, workers: int,
     strategy_ids: Sequence[int] | None = None, *, include_equity: bool = False,
+    on_batch_complete: Callable[[int], None] | None = None,
 ) -> None:
     """Warm bounded result batches in independent readers and one checked writer."""
     selected_ids = None if strategy_ids is None else tuple(dict.fromkeys(int(strategy_id) for strategy_id in strategy_ids))
@@ -1031,6 +1032,8 @@ def prepare_selection_window_cache(
                 if int(metadata["result_id"]) not in publication_ids
             ]
             if not metrics and not publications:
+                if on_batch_complete is not None:
+                    on_batch_complete(len(completed))
                 continue
             with duckdb.connect(str(database)) as writer:
                 writer.execute("begin transaction")
@@ -1050,6 +1053,8 @@ def prepare_selection_window_cache(
                 except BaseException:
                     writer.execute("rollback")
                     raise
+            if on_batch_complete is not None:
+                on_batch_complete(len(completed))
 
 
 def selection_cache_status(
@@ -2125,7 +2130,7 @@ def write_selection_workbook(
         display[column] = display[column].map(
             lambda value: value.quantize(Decimal(".01")) if isinstance(value, Decimal) else value
         )
-    for column in ("first_shift_bp", *(f"order_{order}_shift_bp" for order in range(1, 5))):
+    for column in ("first_shift_bp", *(f"order_{order}_shift_bp" for order in range(1, 4))):
         if column in display:
             display[column] = display[column].map(
                 lambda value: (Decimal(str(value)) / Decimal("100")).quantize(
@@ -2136,7 +2141,7 @@ def write_selection_workbook(
         "pnl_30d_pct", "dd5_proxy", "profit_factor", "ab_pnl_change_30d_pct",
         "ab_return_a_30d_pct", "ab_return_b_30d_pct", "pnl_without_best_trade_pct",
         "capital_efficiency", "win_rate_pct", "holding_p95_minutes",
-        "holding_median_minutes", "total_plateau_point_count", "minimum_plateau_point_count", "final_rank",
+        "holding_median_minutes", "final_rank",
         *(f"order_{order}_plateau_point_count" for order in range(1, 5)),
         *(f"order_{order}_open_ma_len" for order in range(1, 5)),
     ):
@@ -2145,27 +2150,6 @@ def write_selection_workbook(
                 lambda value: int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
                 if value is not None and not pd.isna(value) else value
             )
-    enabled_filter_columns = [f"eliminated_by_{stage.id}" for stage in request.stages if stage.enabled]
-    implicit_lot_column = "eliminated_by_filter_lot_variant_redundancy"
-    if implicit_lot_column in display and implicit_lot_column not in enabled_filter_columns and not any(
-        stage.id == _LOT_VARIANT_STAGE_ID for stage in request.stages
-    ):
-        enabled_filter_columns.insert(0, implicit_lot_column)
-    display = display.drop(columns=[
-        column for column in display if column.startswith("eliminated_by_") and column not in enabled_filter_columns
-    ], errors="ignore")
-    for column in enabled_filter_columns:
-        if column in display:
-            if column == "eliminated_by_filter_time_consistency" and "positive_quarter_status" in display:
-                display[column] = display.apply(
-                    lambda row: "N/A" if row.get("positive_quarter_status") == "UNAVAILABLE"
-                    else ("BLOCK" if bool(row[column]) else "PASS") if pd.notna(row[column]) else row[column],
-                    axis=1,
-                )
-            else:
-                display[column] = display[column].map(
-                    lambda value: ("BLOCK" if bool(value) else "PASS") if pd.notna(value) else value
-                )
     def order_values(columns: list[str], render: Callable[[object], str]) -> pd.Series:
         values = display.reindex(columns=columns)
         return values.apply(
@@ -2187,6 +2171,7 @@ def write_selection_workbook(
     display["points"] = order_values(
         point_columns, lambda value: str(int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))),
     )
+    display["auto_rank"] = display.get("final_rank")
     if review_metadata is not None:
         def review_value(row: pd.Series, key: str) -> object:
             review = (user_review_rows or {}).get(int(row["strategy_id"]))
@@ -2208,7 +2193,6 @@ def write_selection_workbook(
                 lambda row: "RETEST" if bool(row.get("prior_retest", False)) else None, axis=1
             )
             display["comment"] = display.apply(lambda row: review_value(row, "comment"), axis=1)
-        display["auto_rank"] = display.get("final_rank")
     def effective_date(value: object) -> str | None:
         if not _present(value):
             return None
@@ -2229,26 +2213,26 @@ def write_selection_workbook(
             display[column] = display[column].map(effective_date)
     review_identity_columns = ["result_id"] if review_metadata is not None else []
     review_columns = [
-        "auto_status", "user_status", "retest", "auto_rank", "user_rank", "auto_analog_of_strategy_id",
-        "user_analog_of_strategy_id", "comment",
+        "user_status", "user_rank", "retest", "comment", "auto_analog_of_strategy_id",
+        "user_analog_of_strategy_id",
     ] if review_metadata is not None else []
+    finalist_flags = display["finalist"] if not display.empty else pd.Series(False, index=display.index, dtype=bool)
     column_order = [
         "strategy_id", *review_identity_columns, "strategy_name", "symbol", "side", "timeframe", "effective_start_utc", "effective_end_utc", "order_count", "close_ma_len",
         "pnl_30d_pct", "dd5_proxy", "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "positive_quarter_count",
         "capital_efficiency", "profit_factor", "max_drawdown_pct", "win_rate_pct", "total_trades", "trades_30d", "capital_proxy",
-        "holding_p95_minutes", "holding_median_minutes", "total_plateau_point_count", "minimum_plateau_point_count",
+        "holding_p95_minutes", "holding_median_minutes",
         "best_trade_profit_share_pct", "pnl_without_best_trade_pct", "completed_profitable_trade_count",
         "robust_pnl_30d_pct", "worst_drawdown_pct", "worst_holding_p95_minutes", "ab_stability_ratio",
         "rank_quality_robust_pnl", "rank_quality_worst_drawdown", "rank_quality_ab_stability", "rank_quality_first_shift", "rank_quality_minimum_plateau_points", "rank_quality_close_ma",
         "rank_weight_coverage_pct", "rank_weight_robust_pnl", "rank_weight_worst_drawdown", "rank_weight_ab_stability", "rank_weight_first_shift", "rank_weight_minimum_plateau_points", "rank_weight_close_ma",
         "final_score",
-        *(f"order_{order}_shift_bp" for order in range(1, 5)),
+        *(f"order_{order}_shift_bp" for order in range(1, 4)),
         "lots",
         "points",
         "open_ma",
-        "final_rank", "finalist", "elimination_reason", "lot_variant_group_key", "lot_variant_representative_strategy_id",
-        *enabled_filter_columns, *review_columns,
         *(equity_columns if equity_block_enabled else ()),
+        "auto_status", "auto_rank", *review_columns, "elimination_reason",
     ]
     display = display.reindex(columns=column_order)
     display = display.rename(columns={
@@ -2258,11 +2242,11 @@ def write_selection_workbook(
         "ab_pnl_change_30d_pct": "∆ PnL A/B", "ab_return_a_30d_pct": "PnL A/30д, %", "ab_calendar_days_a": "Дней A", "ab_return_b_30d_pct": "PnL B/30д, %", "ab_calendar_days_b": "Дней B", "capital_efficiency": "CE",
         "max_drawdown_pct": "DD", "win_rate_pct": "W/R", "total_trades": "Trades", "capital_proxy": "Lot DD5",
         "holding_p95_minutes": "Hold p95", "holding_median_minutes": "Hold M",
-        "total_plateau_point_count": "PointsALL", "finalist": "Final", "elimination_reason": "Причина",
+        "elimination_reason": "Причина",
         "best_trade_profit_share_pct": "Best trade, %", "pnl_without_best_trade_pct": "PnL without best, %",
         "completed_profitable_trade_count": "Positive trades", "positive_quarter_count": "Positive windows", "trades_30d": "Trades/30",
         "robust_pnl_30d_pct": "Robust PnL/30", "worst_drawdown_pct": "Worst DD", "worst_holding_p95_minutes": "Worst Hold p95",
-        "ab_stability_ratio": "A/B stability", "minimum_plateau_point_count": "PointsMin",
+        "ab_stability_ratio": "A/B stability",
         "rank_quality_robust_pnl": "Rank q PnL", "rank_quality_worst_drawdown": "Rank q DD",
         "rank_quality_ab_stability": "Rank q A/B", "rank_quality_first_shift": "Rank q Shift", "rank_quality_minimum_plateau_points": "Rank q Points",
         "rank_quality_close_ma": "Rank q Close MA",
@@ -2270,10 +2254,9 @@ def write_selection_workbook(
         "rank_weight_worst_drawdown": "Rank w DD", "rank_weight_ab_stability": "Rank w A/B",
         "rank_weight_first_shift": "Rank w Shift", "rank_weight_minimum_plateau_points": "Rank w Points",
         "rank_weight_close_ma": "Rank w Close MA",
-        "final_score": "Final score (Pair+Side)", "final_rank": "Final rank",
-        "lot_variant_group_key": "Lot variant group key", "lot_variant_representative_strategy_id": "Lot variant representative ID",
+        "final_score": "Final score (Pair+Side)",
         "open_ma": "MA",
-        **{f"order_{order}_shift_bp": f"{order} Shift" for order in range(1, 5)},
+        **{f"order_{order}_shift_bp": f"{order} Shift" for order in range(1, 4)},
         "lots": "Lots",
         "points": "Points",
         "auto_status": "Auto Status", "user_status": "User Status", "retest": "RETEST", "auto_rank": "Auto Rank",
@@ -2282,12 +2265,54 @@ def write_selection_workbook(
         "equity_state": "Equity state", "equity_basis": "Equity basis",
         "equity_dd_pct": "Equity DD, %", "equity_smoothness": "Equity smoothness",
     })
-    finalists = display.loc[display["Final"]].copy()
-    finalist_fills = [color for color, finalist in zip(row_fills, display["Final"]) if finalist]
+    finalists = display.loc[finalist_flags].copy()
+    finalist_fills = [color for color, finalist in zip(row_fills, finalist_flags) if finalist]
+    compact_widths = {
+        header: min(255, max(len(header), max((len(str(value)) for value in display[header] if value is not None), default=0)) + 2)
+        for header in ("Lots", "Points", "MA")
+    }
+    def finalize_workbook(workbook: Workbook) -> None:
+        metadata_values = dict(review_metadata or {})
+        if selection_method is not None:
+            metadata_values["selection_method"] = selection_method
+        if metadata_values:
+            metadata_sheet = workbook.create_sheet("_MRS_SELECTION_META")
+            for row in metadata_values.items():
+                metadata_sheet.append(row)
+            metadata_sheet.sheet_state = "veryHidden"
+        for sheet_name in ("All candidates", "Finalists"):
+            worksheet = workbook[sheet_name]
+            headers = {cell.value: cell.column_letter for cell in worksheet[1]}
+            for header, width in compact_widths.items():
+                worksheet.column_dimensions[headers[header]].width = width
+            if selection_method is not None and "Final score (Pair+Side)" in headers:
+                score_header = worksheet[f'{headers["Final score (Pair+Side)"]}1']
+                method_note = f"Selection method: {selection_method}"
+                existing_comment = score_header.comment
+                if existing_comment is None:
+                    score_header.comment = Comment(method_note, "MRS3")
+                elif method_note not in existing_comment.text:
+                    comment = Comment(
+                        f"{existing_comment.text}\n{method_note}", existing_comment.author or "MRS3",
+                    )
+                    comment.width = existing_comment.width
+                    comment.height = existing_comment.height
+                    score_header.comment = comment
+            if "User Status" in headers:
+                validation = DataValidation(
+                    type="list", formula1='"FINALIST,RESERVE,ANALOG,FILTERED,REJECTED"', allow_blank=False
+                )
+                worksheet.add_data_validation(validation)
+                validation.add(f'{headers["User Status"]}2:{headers["User Status"]}{max(2, worksheet.max_row)}')
+            if "RETEST" in headers:
+                validation = DataValidation(type="list", formula1='"RETEST"', allow_blank=True)
+                worksheet.add_data_validation(validation)
+                validation.add(f'{headers["RETEST"]}2:{headers["RETEST"]}{max(2, worksheet.max_row)}')
+
     workbook_path = write_audit_workbook(
         {"All candidates": display, "Finalists": finalists}, Path(path), data_widths_only=True,
         minimum_width=3, hidden_columns=frozenset({
-            "Result ID", "Стратегия", "Auto Analog Of ID", "Positive trades", "Rank coverage, %", "Rank w PnL", "Rank w DD",
+            "Result ID", "Стратегия", "Auto Analog Of ID", "Analog Of ID", "Positive trades", "Rank coverage, %", "Rank w PnL", "Rank w DD",
             "Rank w A/B", "Rank w Shift", "Rank w Points", "Rank w Close MA",
             "Robust PnL/30", "Worst Hold p95", "Rank q PnL", "Rank q DD", "Rank q A/B",
             "Rank q Shift", "Rank q Points", "Rank q Close MA", "Final score (Pair+Side)",
@@ -2297,65 +2322,27 @@ def write_selection_workbook(
             "Finalists": finalist_fills,
         },
         number_formats={
-            **{f"{order} Shift": "0.0" for order in range(1, 5)},
+            **{f"{order} Shift": "0.0" for order in range(1, 4)},
             **{header: "0" for header in (
                 "PnL/30", "PnL DD5/30", "PF", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "PnL without best, %",
             )},
-            "Final rank": "0",
+            "Auto Rank": "0",
             "Equity DD, %": "0.0000", "Equity smoothness": "0.000000",
         },
         center_from_column=5,
         font_colors={"Дней A": "FF0000FF", "Дней B": "FF0000FF"},
-        bold_columns=frozenset({"Close", "DD", "Hold p95", "1 Shift", "Final rank"}),
+        bold_columns=frozenset({"Close", "DD", "Hold p95", "1 Shift", "Auto Rank"}),
         column_edge_borders={
                 "Positive windows": ("right",),
             "Hold p95": ("left",),
             "Hold M": ("right",),
             "1 Shift": ("left",),
-            "4 Shift": ("right",),
+            "3 Shift": ("right",),
                 "Points": ("left", "right"),
             "MA": ("left", "right"),
-            "Final rank": ("left", "right"),
+            "Auto Rank": ("left", "right"),
             "Close": ("left", "right"),
         },
+        finalize_workbook=finalize_workbook,
     )
-    if review_metadata is None and selection_method is None:
-        return workbook_path
-    workbook = load_workbook(workbook_path)
-    metadata_values = dict(review_metadata or {})
-    if selection_method is not None:
-        metadata_values["selection_method"] = selection_method
-    if metadata_values:
-        metadata_sheet = workbook.create_sheet("_MRS_SELECTION_META")
-        for row in metadata_values.items():
-            metadata_sheet.append(row)
-        metadata_sheet.sheet_state = "veryHidden"
-    for sheet_name in ("All candidates", "Finalists"):
-        worksheet = workbook[sheet_name]
-        headers = {cell.value: cell.column_letter for cell in worksheet[1]}
-        if selection_method is not None and "Final score (Pair+Side)" in headers:
-            score_header = worksheet[f'{headers["Final score (Pair+Side)"]}1']
-            method_note = f"Selection method: {selection_method}"
-            existing_comment = score_header.comment
-            if existing_comment is None:
-                score_header.comment = Comment(method_note, "MRS3")
-            elif method_note not in existing_comment.text:
-                comment = Comment(
-                    f"{existing_comment.text}\n{method_note}", existing_comment.author or "MRS3",
-                )
-                comment.width = existing_comment.width
-                comment.height = existing_comment.height
-                score_header.comment = comment
-        if "User Status" in headers:
-            validation = DataValidation(
-                type="list", formula1='"FINALIST,RESERVE,ANALOG,FILTERED,REJECTED"', allow_blank=False
-            )
-            worksheet.add_data_validation(validation)
-            validation.add(f'{headers["User Status"]}2:{headers["User Status"]}{max(2, worksheet.max_row)}')
-        if "RETEST" in headers:
-            validation = DataValidation(type="list", formula1='"RETEST"', allow_blank=True)
-            worksheet.add_data_validation(validation)
-            validation.add(f'{headers["RETEST"]}2:{headers["RETEST"]}{max(2, worksheet.max_row)}')
-    workbook.save(workbook_path)
-    _normalize_xlsx_archive(workbook_path)
     return workbook_path

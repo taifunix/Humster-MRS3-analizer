@@ -5,6 +5,7 @@ from zipfile import ZipFile
 
 import pandas as pd
 import pytest
+from openpyxl import load_workbook
 
 from mrs3.audit import write_audit_csvs, write_audit_workbook
 
@@ -19,6 +20,23 @@ def test_workbook_core_timestamps_are_fixed(tmp_path: Path) -> None:
     assert "2000-01-01T00:00:00Z" in core
     assert "dcterms:modified" in core
     assert core.count("2000-01-01T00:00:00Z") == 2
+
+
+def test_workbook_reused_styles_keep_visible_formatting(tmp_path: Path) -> None:
+    target = tmp_path / "styled.xlsx"
+    write_audit_workbook(
+        {"Sheet": pd.DataFrame({"Name": ["first", "second"], "Amount": [1.25, 2.5]})},
+        target, center_from_column=2, row_fill_colors={"Sheet": ["D9EAD3", "D9EAD3"]},
+        number_formats={"Amount": "0.00"}, bold_columns=frozenset({"Amount"}),
+        column_edge_borders={"Amount": ("left", "right")},
+    )
+
+    sheet = load_workbook(target)["Sheet"]
+    assert sheet["B2"].alignment.horizontal == sheet["B3"].alignment.horizontal == "center"
+    assert sheet["B2"].fill.fgColor.rgb == sheet["B3"].fill.fgColor.rgb == "00D9EAD3"
+    assert sheet["B2"].font.bold and sheet["B3"].font.bold
+    assert sheet["B2"].number_format == sheet["B3"].number_format == "0.00"
+    assert sheet["B2"].border.left.style == sheet["B2"].border.right.style == "double"
 
 
 def test_csv_export_keeps_previous_file_if_serialization_fails(

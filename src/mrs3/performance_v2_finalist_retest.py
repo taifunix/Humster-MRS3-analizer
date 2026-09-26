@@ -318,7 +318,7 @@ CONTROL_GROUP_HEADERS = (
 CONTROL_FAILURE_HEADERS = ("Pair", "Direction", "Strategy ID", "Strategy", "Result ID", "Reason")
 CONTROL_CANDIDATE_REQUIRED_HEADERS = frozenset({
     "ID", "Result ID", "Стратегия", "Пара", "Side", "ТФ", "ORD", "Close", "PnL/30", "PnL DD5/30",
-    "Lots", "Points", "MA", "Final", "Auto Status", "User Status", "RETEST", "Analog Of ID", "Comment",
+    "Lots", "Points", "MA", "Auto Status", "User Status", "RETEST", "Analog Of ID", "Comment",
 })
 _CONTROL_CANDIDATE_ALIASES = {
     "Pair": ("Пара", "Pair"),

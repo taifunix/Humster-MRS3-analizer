@@ -3,6 +3,52 @@
 **Updated:** 2026-09-26
 **Current branch:** `main`
 
+## Compact selection XLSX accepted (2026-09-26)
+
+The selection workbook now omits the requested duplicate and diagnostic
+columns, orders the equity and review fields for manual work, and sizes
+`Lots`, `Points`, and `MA` to their contents. `Auto Analog Of ID` and
+`Analog Of ID` remain in both sheets but are hidden so review import and
+manual analog reassignment still work after unhiding. The old and new
+`RETEST` positions are both accepted by the importer; finalist-control
+validation no longer requires the unused `Final` display header. Selection
+facts and immutable snapshots are unchanged. See ADR-0045.
+
+The full local suite passed before review follow-ups: `5222 passed, 8 skipped`
+(30 warnings, mostly existing pandas warnings). Review exposed the need to
+distinguish an empty export from a non-empty result missing the required
+`finalist` decision; a failing regression test led to an explicit error only
+for the latter. The final relevant audit/selection/review/Panel/control suite
+passed: `558 passed, 4 skipped`. Two independent fixed-input workbook exports,
+including equity fields, hidden analogs and non-empty finalists, had the same
+SHA-256. Current 512-row synthetic workbook generation took 2.318, 2.056 and
+2.300 seconds (median 2.300); this fixture is not directly comparable to the
+earlier benchmark. `git diff --check` passed. No live PerformanceDB was opened.
+Independent Opus 5 re-review returned `CODE_REVIEW_PASS` after a twelve-item
+findings ledger; no material finding remains.
+
+## Panel recalc progress and selection XLSX/UI accepted (2026-09-26)
+
+The preceding increment clarified recalculate-all totals and exposed
+in-memory per-batch progress without opening PerformanceDB for status polling.
+The final Top N controls now sit beneath their heading, with type and scope in
+the same columns as other stages. Selection XLSX generation uses one workbook
+save/normalization instead of reopening and saving the workbook again; the
+shared audit writer reuses cell styles. At that stage, reverse import and
+selection snapshot persistence were not changed; the compact XLSX increment
+above later updated the importer's RETEST-header position only. The live
+PerformanceDB was not opened for these changes.
+
+The same 512-row synthetic selection workbook took median 8.781 seconds before
+style reuse and 4.788 seconds after it (three runs each, both with the
+single-save change). The fixed two-row normalized workbook SHA-256 stayed
+unchanged across style reuse. Relevant audit/export/selection/review/panel/UI
+tests passed: `613 passed, 4 skipped` (44 existing pandas warnings). `node
+--check` and `git diff --check` passed. The initial Opus 5 review could not
+start because the Claude Code authentication check exited with 1; the
+subsequent combined review/re-review completed with `CODE_REVIEW_PASS` as
+recorded above.
+
 ## Performance v2 equity-quality R7.3 M4 accepted (2026-09-26)
 
 The canonical contract is now R7.3. Authoritative equity is evaluated as a

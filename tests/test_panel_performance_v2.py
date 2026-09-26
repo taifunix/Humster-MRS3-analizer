@@ -782,7 +782,7 @@ def test_performance_v2_export_uses_cached_metrics_for_selected_rows(tmp_path: P
     sheet = load_workbook(BytesIO(payload), data_only=False)["All candidates"]
     headers = {cell.value: cell.column for cell in sheet[1]}
 
-    metric_values = {column: sheet.cell(2, headers[column]).value for column in ("PnL/30", "W/R", "Trades/30", "PointsALL")}
+    metric_values = {column: sheet.cell(2, headers[column]).value for column in ("PnL/30", "W/R", "Trades/30", "Points")}
     assert all(value is not None for value in metric_values.values()), metric_values
     assert before == (database.stat().st_size, sha256(database.read_bytes()).hexdigest())
 
@@ -1070,7 +1070,7 @@ def test_job_id_finalist_export_uses_stage_free_rich_control_schema(tmp_path: Pa
     }
     _, stageful_data = controller.strategies_performance_v2_selection(stageful_payload)
     stageful_headers = [cell.value for cell in load_workbook(BytesIO(stageful_data))["All candidates"][1]]
-    assert "eliminated_by_filter_min_shift" in stageful_headers
+    assert "eliminated_by_filter_min_shift" not in stageful_headers
     stageful_request = parse_selection_request(stageful_payload)
     runtime = {
         "bulk_retest": True, "scope": "FINALIST", "cohort_sha256": "c" * 64,
@@ -1091,7 +1091,7 @@ def test_job_id_finalist_export_uses_stage_free_rich_control_schema(tmp_path: Pa
     sheet = workbook["Candidates"]
     headers = [cell.value for cell in sheet[1]]
     assert headers == ordinary_headers
-    assert headers != stageful_headers
+    assert headers == stageful_headers
     assert "eliminated_by_filter_min_shift" not in headers
     columns = {header: index + 1 for index, header in enumerate(headers)}
     assert sheet.cell(2, columns["PnL/30"]).value is not None
@@ -1803,7 +1803,8 @@ def test_selection_workbook_handles_equity_stage_only_when_enabled_column_is_pre
 
     if enabled:
         assert result.loc[0, "equity_regime_disposition"] == "PASS"
-    assert ("eliminated_by_filter_equity_regime" in headers) is enabled
+    assert "eliminated_by_filter_equity_regime" not in headers
+    assert ("Equity state" in headers) is enabled
 
 
 def test_performance_v2_catalog_rejects_existing_bare_database_without_initializing_it(tmp_path: Path) -> None:
@@ -2081,6 +2082,74 @@ def test_selection_recalculate_all_skips_pairs_with_ready_facts(tmp_path: Path) 
 
     assert first == {"status": "READY", "total_pairs": 1, "recalculated_pairs": 1, "ready_pairs": 0}
     assert second == {"status": "READY", "total_pairs": 1, "recalculated_pairs": 0, "ready_pairs": 1}
+
+
+def test_recalculate_all_progress_is_visible_and_rejects_duplicate_run(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    responses: list[dict[str, object]] = []
+
+    def paused_prepare(*_args, on_batch_complete, **_kwargs) -> None:
+        on_batch_complete(1)
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", paused_prepare)
+    worker = threading.Thread(target=lambda: responses.append(controller.strategies_performance_v2_recalculate_all()))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert controller.strategies_performance_v2_recalculate_all_progress() == {
+            "status": "RUNNING", "total_pairs": 1, "ready_pairs": 0,
+            "planned_pairs": 1, "completed_pairs": 0,
+            "total_strategies": 1, "completed_strategies": 1,
+            "current_pair": "BTCUSDT/LONG", "error": None,
+        }
+        with pytest.raises(PerformanceV2ApiError) as raised:
+            controller.strategies_performance_v2_recalculate_all()
+        assert raised.value.status == 409
+        assert raised.value.code == "PERFORMANCE_V2_RECALCULATE_IN_PROGRESS"
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert responses == [{"status": "READY", "total_pairs": 1, "recalculated_pairs": 1, "ready_pairs": 0}]
+    assert controller.strategies_performance_v2_recalculate_all_progress()["status"] == "READY"
+    assert controller.strategies_performance_v2_recalculate_all_progress()["completed_pairs"] == 1
+
+
+def test_recalculate_all_progress_retains_committed_count_on_error(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+
+    def failing_prepare(*_args, on_batch_complete, **_kwargs) -> None:
+        on_batch_complete(1)
+        raise OSError("later batch failed")
+
+    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", failing_prepare)
+    with pytest.raises(PerformanceV2ApiError, match="later batch failed"):
+        controller.strategies_performance_v2_recalculate_all()
+    status = controller.strategies_performance_v2_recalculate_all_progress()
+    assert status["status"] == "FAILED"
+    assert status["completed_strategies"] == 1
+    assert status["completed_pairs"] == 0
+    assert status["error"] == "later batch failed"
+
+
+def test_recalculate_all_progress_http_reads_memory_only(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    server, thread = _http_server(controller)
+    monkeypatch.setattr(panel_module.duckdb, "connect", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("DB opened")))
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        status, body = _http_json(connection, "GET", "/api/v2/strategies/performance-v2/recalculate-all/progress")
+        connection.close()
+        assert status == 200
+        assert body["status"] == "IDLE"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_selection_xlsx_rejects_incomplete_cache(tmp_path: Path) -> None:

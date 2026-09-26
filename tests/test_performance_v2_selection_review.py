@@ -7,6 +7,7 @@ from pathlib import Path
 
 import duckdb
 from openpyxl import load_workbook
+from openpyxl.workbook.workbook import Workbook
 import pandas as pd
 import pytest
 
@@ -126,6 +127,28 @@ def _review_rows(result: pd.DataFrame) -> dict[int, dict[str, object]]:
         }
         for row in result.itertuples()
     }
+
+
+def test_review_export_serializes_workbook_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    saves = 0
+    original_save = Workbook.save
+
+    def counted_save(self: Workbook, filename: object) -> None:
+        nonlocal saves
+        saves += 1
+        original_save(self, filename)
+
+    monkeypatch.setattr(Workbook, "save", counted_save)
+    path = write_selection_workbook(
+        _result(), tmp_path / "single-pass.xlsx", _request(),
+        {"selection_run_id": "fixed-run"}, _review_rows(_result()),
+    )
+
+    workbook = load_workbook(path)
+    assert saves == 1
+    assert workbook["_MRS_SELECTION_META"].sheet_state == "veryHidden"
+    assert workbook["All candidates"].data_validations.count == 2
+    assert workbook["Finalists"].data_validations.count == 2
 
 
 def test_contract_hashes_are_canonical() -> None:
@@ -382,6 +405,94 @@ def test_export_persists_exact_snapshot_and_review_contract(tmp_path: Path) -> N
     assert connection.execute("select count(*) from selection_results").fetchone() == (2,)
 
 
+def test_selection_workbook_has_compact_visible_order_and_hidden_analog_fields(tmp_path: Path) -> None:
+    result = _result().copy()
+    result.index = [17, 3]
+    result["order_1_lot_x"] = Decimal("0.01")
+    result["order_1_plateau_point_count"] = 2
+    result["order_1_open_ma_len"] = 5
+    result["equity_state"] = "GROWING"
+    result["equity_basis"] = "28d / OK"
+    result["equity_dd_pct"] = Decimal("2.5")
+    result["equity_smoothness"] = Decimal("0.5")
+    path = write_selection_workbook(
+        result, tmp_path / "compact.xlsx", _request(),
+        {"selection_run_id": "fixed-run"}, _review_rows(result),
+    )
+    workbook = load_workbook(path)
+    repeat = write_selection_workbook(
+        result, tmp_path / "compact-repeat.xlsx", _request(),
+        {"selection_run_id": "fixed-run"}, _review_rows(result),
+    )
+    assert sha256(path.read_bytes()).digest() == sha256(repeat.read_bytes()).digest()
+    assert workbook["Finalists"].max_row == 2
+    assert workbook["Finalists"]["A2"].value == 1
+
+    for sheet_name in ("All candidates", "Finalists"):
+        sheet = workbook[sheet_name]
+        headers = [cell.value for cell in sheet[1]]
+        assert headers[-1] == "Причина"
+        assert not any(str(header).startswith("eliminated_by_") for header in headers)
+        assert not {"Final rank", "Final", "Lot variant group key", "Lot variant representative ID",
+                    "4 Shift", "PointsALL", "PointsMin"}.intersection(headers)
+        assert all(sheet.column_dimensions[sheet.cell(1, headers.index(header) + 1).column_letter].hidden
+                   for header in ("Auto Analog Of ID", "Analog Of ID"))
+        if sheet_name == "All candidates":
+            assert sheet.cell(3, headers.index("Auto Analog Of ID") + 1).value == 1
+            assert sheet.cell(3, headers.index("Analog Of ID") + 1).value == 1
+        assert sheet.protection.sheet is False
+        assert sheet.data_validations.count == 2
+        visible = [header for cell, header in zip(sheet[1], headers)
+                   if not sheet.column_dimensions[cell.column_letter].hidden]
+        assert visible[-14:] == [
+            "Lots", "Points", "MA", "Equity state", "Equity basis", "Equity DD, %",
+            "Equity smoothness", "Auto Status", "Auto Rank", "User Status", "User Rank",
+            "RETEST", "Comment", "Причина",
+        ]
+        for header in ("Lots", "Points", "MA"):
+            column = headers.index(header) + 1
+            value = sheet.cell(2, column).value
+            assert sheet.column_dimensions[sheet.cell(1, column).column_letter].width >= max(
+                len(header), len(str(value)) if value is not None else 0
+            ) + 2
+
+
+def test_review_import_still_accepts_legacy_retest_position(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    for row in sheet.iter_rows():
+        rank_cell = row[headers["User Rank"] - 1]
+        retest_cell = row[headers["RETEST"] - 1]
+        rank_cell.value, retest_cell.value = retest_cell.value, rank_cell.value
+    legacy = tmp_path / "legacy-retest-position.xlsx"
+    workbook.save(legacy)
+
+    assert import_selection_review(connection, legacy.read_bytes())["row_count"] == 2
+
+
+def test_lots_width_fits_long_composite_value(tmp_path: Path) -> None:
+    result = _result().iloc[[0]].copy()
+    for order in range(1, 5):
+        result[f"order_{order}_lot_x"] = Decimal("12345678901234567890")
+    path = write_selection_workbook(result, tmp_path / "wide-lots.xlsx", _request())
+    sheet = load_workbook(path)["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    column = sheet.cell(1, headers.index("Lots") + 1).column_letter
+
+    assert len(sheet[f"{column}2"].value) > 70
+    assert sheet.column_dimensions[column].width >= len(sheet[f"{column}2"].value) + 2
+
+
+def test_workbook_rejects_result_without_finalist_decision(tmp_path: Path) -> None:
+    result = _result().drop(columns=["finalist"])
+
+    with pytest.raises(KeyError, match="finalist"):
+        write_selection_workbook(result, tmp_path / "missing-finalist.xlsx", _request())
+
+
 def test_auto_only_snapshot_has_no_effective_user_decision_or_review_rows(tmp_path: Path) -> None:
     connection = _database(tmp_path)
     request = _request()
@@ -446,7 +557,7 @@ def test_export_includes_current_retest_tag_and_editable_validation(tmp_path: Pa
     headers = [cell.value for cell in sheet[1]]
     values = {sheet.cell(row, headers.index("ID") + 1).value: sheet.cell(row, headers.index("RETEST") + 1).value for row in range(2, sheet.max_row + 1)}
 
-    assert headers[headers.index("User Status") + 1] == "RETEST"
+    assert headers[headers.index("User Rank") + 1] == "RETEST"
     assert values == {1: "RETEST", 2: None}
     retest_validation = next(validation for validation in sheet.data_validations.dataValidation if validation.formula1 == '"RETEST"')
     assert retest_validation.allow_blank
@@ -831,6 +942,23 @@ def test_changed_automatic_status_is_rejected_without_writes(tmp_path: Path) -> 
     headers = {cell.value: cell.column for cell in sheet[1]}
     sheet.cell(2, headers["Auto Status"], "FILTERED")
     changed = tmp_path / "changed.xlsx"
+    workbook.save(changed)
+
+    with pytest.raises(SelectionReviewError, match="SELECTION_REVIEW_AUTOMATIC_FIELDS_CHANGED"):
+        import_selection_review(connection, changed.read_bytes())
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == (0,)
+
+
+def test_changed_automatic_rank_is_rejected_without_writes(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    assert sheet.cell(2, headers["Auto Rank"]).value == 1
+    assert sheet.cell(3, headers["Auto Rank"]).value is None
+    sheet.cell(2, headers["Auto Rank"], 2)
+    changed = tmp_path / "changed-auto-rank.xlsx"
     workbook.save(changed)
 
     with pytest.raises(SelectionReviewError, match="SELECTION_REVIEW_AUTOMATIC_FIELDS_CHANGED"):
