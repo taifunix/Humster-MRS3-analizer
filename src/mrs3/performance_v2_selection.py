@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from colorsys import hls_to_rgb
+from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Sequence
@@ -106,6 +107,7 @@ class SelectionStage:
     min_shift_pct: Decimal | None = None
     pnl_tolerance_pct: Decimal | None = None
     top_n: int | None = None
+    method: Literal["robust_v1", "equity_quality_v1"] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +164,8 @@ def parse_selection_request(payload: Mapping[str, object]) -> SelectionRequest:
             expected.add("pnl_tolerance_pct")
         if stage_id == "rank_robust_top_n":
             expected.add("top_n")
+            if "method" in raw:
+                expected.add("method")
         if set(raw) != expected:
             raise _error("INVALID_STAGE")
         enabled, scope = raw["enabled"], raw["scope"]
@@ -176,6 +180,9 @@ def parse_selection_request(payload: Mapping[str, object]) -> SelectionRequest:
         min_shift_pct = _positive_decimal(raw["min_shift_pct"], "min_shift_pct") if stage_id == "filter_min_shift" and enabled else None
         pnl_tolerance_pct = _bounded_decimal(raw["pnl_tolerance_pct"], "pnl_tolerance_pct", Decimal(0), Decimal(100)) if stage_id in {"pareto_shift_near_tie", "pareto_close_ma_near_tie"} and enabled else None
         top_n = _positive_int(raw["top_n"], "top_n") if stage_id == "rank_robust_top_n" else None
+        method = raw.get("method") if stage_id == "rank_robust_top_n" else None
+        if "method" in raw and method not in ("robust_v1", "equity_quality_v1"):
+            raise _error("INVALID_RANK_METHOD")
         if stage_id == "rank_robust_top_n" and scope != "pair_side":
             raise _error("RANK_STAGE_SCOPE")
         if stage_id == "filter_lot_variant_redundancy" and scope != "pair_side_timeframe":
@@ -183,7 +190,7 @@ def parse_selection_request(payload: Mapping[str, object]) -> SelectionRequest:
         if stage_id == "filter_equity_regime" and scope != "pair_side":
             raise _error("EQUITY_REGIME_STAGE_SCOPE")
         seen.add(stage_id)
-        parsed.append(SelectionStage(stage_id, enabled, scope, min_shift_pct, pnl_tolerance_pct, top_n))
+        parsed.append(SelectionStage(stage_id, enabled, scope, min_shift_pct, pnl_tolerance_pct, top_n, method))
     if any(stage.id == "rank_robust_top_n" for stage in parsed) and parsed[-1].id != "rank_robust_top_n":
         raise _error("RANK_STAGE_MUST_BE_LAST")
     return SelectionRequest(symbol.strip(), side, tuple(parsed))
@@ -790,7 +797,7 @@ def _decode_selection_equity_cache_row(
 
 def _selection_equity_facts_by_result(
     connection: duckdb.DuckDBPyConnection, rows: Sequence[Sequence[object]],
-) -> dict[int, EquityQualityFacts]:
+) -> dict[int, tuple[EquityQualityFacts, str, str]]:
     """Decode fresh facts for a scoped selection with one cache read."""
     if not rows:
         return {}
@@ -803,7 +810,7 @@ def _selection_equity_facts_by_result(
         [ALGORITHM_VERSION, *result_ids],
     ).fetchall()
     cached_by_result = {int(row[0]): row for row in cached_rows}
-    facts_by_result: dict[int, EquityQualityFacts] = {}
+    facts_by_result: dict[int, tuple[EquityQualityFacts, str, str]] = {}
     for row in rows:
         result_id = int(row[1])
         cached = cached_by_result.get(result_id)
@@ -816,7 +823,7 @@ def _selection_equity_facts_by_result(
             continue
         facts = _decode_selection_equity_cache_row(cached[1:], result_id, source_revision)
         if facts is not None:
-            facts_by_result[result_id] = facts
+            facts_by_result[result_id] = (facts, source_revision, str(cached[4]))
     return facts_by_result
 
 
@@ -1067,7 +1074,12 @@ def load_selection_candidates(
     _verify_retest_cohort(connection, request)
     cohort_sql, cohort_params = _cohort_clause(request)
     equity_enabled = any(stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages)
-    equity_source_columns = " r.imported_at_utc, r.optimizer_source_metadata_json," if equity_enabled else ""
+    equity_rank_enabled = any(
+        stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1"
+        for stage in request.stages
+    )
+    equity_data_enabled = equity_enabled or equity_rank_enabled
+    equity_source_columns = " r.imported_at_utc, r.optimizer_source_metadata_json," if equity_data_enabled else ""
     holding_minutes = _holding_quantiles_minutes(connection, request)
     b_holding_minutes = _window_b_holding_p95_minutes(connection, request, config)
     best_trade_facts = _best_trade_facts(connection, request)
@@ -1102,7 +1114,7 @@ def load_selection_candidates(
         candidate = candidates.get(int(strategy_id))
         if candidate is None:
             result_id = int(result_id)
-            if equity_enabled:
+            if equity_data_enabled:
                 equity_source_rows[result_id] = (
                     int(strategy_id), result_id, report_start, report_end,
                     equity_source[0], effective_start, effective_end, equity_source[1],
@@ -1209,16 +1221,26 @@ def load_selection_candidates(
         full_hold, b_hold = candidate["holding_p95_minutes"], candidate["ab_holding_p95_minutes"]
         if full_hold is not None and b_hold is not None:
             candidate["worst_holding_p95_minutes"] = max(full_hold, b_hold)
-    if equity_enabled:
+    if equity_data_enabled:
         facts_by_result = _selection_equity_facts_by_result(connection, tuple(equity_source_rows.values()))
         if set(equity_source_rows).difference(facts_by_result):
             raise _error("EQUITY_CACHE_INCOMPLETE")
         for candidate in candidates.values():
-            facts = facts_by_result.get(int(candidate["result_id"]))
-            candidate["_equity_state"] = None if facts is None else facts.state
-            candidate["_equity_disposition"] = "NOT_EVALUATED" if facts is None else facts.erf_disposition
-            candidate["_equity_reason"] = "EQUITY_FACTS_UNAVAILABLE" if facts is None else facts.reason
-    columns = (*_CANDIDATE_COLUMNS, "_equity_state", "_equity_disposition", "_equity_reason") if equity_enabled else _CANDIDATE_COLUMNS
+            cached = facts_by_result.get(int(candidate["result_id"]))
+            facts = None if cached is None else cached[0]
+            if equity_enabled:
+                candidate["_equity_state"] = None if facts is None else facts.state
+                candidate["_equity_disposition"] = "NOT_EVALUATED" if facts is None else facts.erf_disposition
+                candidate["_equity_reason"] = "EQUITY_FACTS_UNAVAILABLE" if facts is None else facts.reason
+            if equity_rank_enabled:
+                candidate["_equity_quality"] = None if cached is None else {
+                    "facts": facts, "source_revision": cached[1], "facts_sha256": cached[2],
+                }
+    columns = _CANDIDATE_COLUMNS
+    if equity_enabled:
+        columns += ("_equity_state", "_equity_disposition", "_equity_reason")
+    if equity_rank_enabled:
+        columns += ("_equity_quality",)
     return pd.DataFrame.from_records(list(candidates.values())).reindex(columns=columns)
 
 
@@ -1427,6 +1449,112 @@ def _rank_robust(group: pd.DataFrame) -> tuple[pd.DataFrame, list[object]]:
     return ranked, ordered.index.tolist()
 
 
+def _equity_rank_strategy_id(group: pd.DataFrame, index: object) -> int:
+    strategy_id = group.at[index, "strategy_id"]
+    if isinstance(strategy_id, bool) or not isinstance(strategy_id, (int, np.integer)) or int(strategy_id) < 1:
+        raise _error("EQUITY_RANK_INVALID_STRATEGY_ID")
+    return int(strategy_id)
+
+
+def _rank_equity_quality(group: pd.DataFrame) -> tuple[pd.DataFrame, list[object]]:
+    if "_equity_quality" not in group:
+        raise _error("EQUITY_CACHE_INCOMPLETE")
+    seen_strategy_ids: set[int] = set()
+    keys: dict[object, tuple[int, Decimal, Decimal, Decimal, int, int]] = {}
+    for index, row in group.iterrows():
+        strategy_id = _equity_rank_strategy_id(group, index)
+        if strategy_id in seen_strategy_ids:
+            raise _error("EQUITY_RANK_DUPLICATE_STRATEGY_ID")
+        seen_strategy_ids.add(strategy_id)
+        cached = row.get("_equity_quality")
+        if not isinstance(cached, Mapping) or not isinstance(cached.get("facts"), EquityQualityFacts):
+            raise _error("EQUITY_CACHE_INCOMPLETE")
+        facts = cached["facts"]
+        if facts.result_id != int(row.get("result_id", -1)):
+            raise _error("EQUITY_CACHE_INCOMPLETE")
+        if facts.score12 is None:
+            if any(value is not None for value in (
+                facts.equity_class, facts.drawdown, facts.peak_gap, facts.horizon_days,
+            )):
+                raise _error("EQUITY_CACHE_INCOMPLETE")
+            continue
+        if (
+            facts.equity_class not in {0, 1, 2, 3}
+            or facts.drawdown is None or facts.peak_gap is None
+            or facts.horizon_days not in {7, 14, 28}
+        ):
+            raise _error("EQUITY_CACHE_INCOMPLETE")
+        keys[index] = (
+            facts.equity_class, -facts.score12, facts.drawdown, facts.peak_gap,
+            -facts.horizon_days, strategy_id,
+        )
+    ranked = group.copy()
+    ranked["final_score"] = pd.Series(
+        {index: value["facts"].score12 for index, value in group["_equity_quality"].items()},
+        dtype=object,
+    ).reindex(group.index)
+    ordered = sorted(keys, key=keys.__getitem__)
+    ranked["final_rank"] = np.nan
+    ranked.loc[ordered, "final_rank"] = range(1, len(ordered) + 1)
+    return ranked, ordered
+
+
+def _validate_equity_quality_evidence(cached: object, result_id: object) -> None:
+    if (
+        isinstance(result_id, bool) or not isinstance(result_id, (int, np.integer)) or int(result_id) < 1
+        or not isinstance(cached, Mapping)
+    ):
+        raise _error("EQUITY_CACHE_INCOMPLETE")
+    facts = cached.get("facts")
+    source_revision = cached.get("source_revision")
+    facts_sha256 = cached.get("facts_sha256")
+    if (
+        not isinstance(facts, EquityQualityFacts) or facts.result_id != int(result_id)
+        or not isinstance(source_revision, str) or len(source_revision) != 64
+        or not isinstance(facts_sha256, str) or len(facts_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in source_revision + facts_sha256)
+    ):
+        raise _error("EQUITY_CACHE_INCOMPLETE")
+    try:
+        encoded_facts = json.dumps(
+            facts.to_canonical_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+    except (AttributeError, TypeError, ValueError, UnicodeEncodeError):
+        raise _error("EQUITY_CACHE_INCOMPLETE") from None
+    if sha256(encoded_facts).hexdigest() != facts_sha256:
+        raise _error("EQUITY_CACHE_INCOMPLETE")
+    if facts.score12 is None:
+        if any(value is not None for value in (
+            facts.equity_class, facts.drawdown, facts.peak_gap, facts.horizon_days,
+        )):
+            raise _error("EQUITY_CACHE_INCOMPLETE")
+    elif (
+        type(facts.equity_class) is not int or facts.equity_class not in {0, 1, 2, 3}
+        or not isinstance(facts.score12, Decimal) or not facts.score12.is_finite()
+        or not isinstance(facts.drawdown, Decimal) or not facts.drawdown.is_finite()
+        or not isinstance(facts.peak_gap, Decimal) or not facts.peak_gap.is_finite()
+        or facts.horizon_days not in {7, 14, 28}
+    ):
+        raise _error("EQUITY_CACHE_INCOMPLETE")
+
+
+def effective_selection_stages(
+    request: SelectionRequest, config: SelectionConfig = SelectionConfig(),
+) -> tuple[SelectionStage, ...]:
+    explicit_ids = {stage.id for stage in request.stages}
+    stages = list(request.stages)
+    if _LOT_VARIANT_STAGE_ID not in explicit_ids and config.lot_variant_redundancy_enabled:
+        stages.insert(0, SelectionStage(_LOT_VARIANT_STAGE_ID, True, "pair_side_timeframe"))
+    elif _LOT_VARIANT_STAGE_ID in explicit_ids:
+        lot_stage = next(stage for stage in stages if stage.id == _LOT_VARIANT_STAGE_ID)
+        stages = [lot_stage, *(stage for stage in stages if stage.id != _LOT_VARIANT_STAGE_ID)]
+    if "filter_equity_regime" in explicit_ids:
+        equity_stage = next(stage for stage in stages if stage.id == "filter_equity_regime")
+        stages = [stage for stage in stages if stage.id != "filter_equity_regime"]
+        stages.insert(1 if stages and stages[0].id == _LOT_VARIANT_STAGE_ID else 0, equity_stage)
+    return tuple(stages)
+
+
 def _scope_groups(frame: pd.DataFrame, scope: StageScope):
     return frame.groupby([] if scope == "pair_side" else ["timeframe"], dropna=False, sort=False) if scope != "pair_side" else [(None, frame)]
 
@@ -1583,6 +1711,18 @@ def run_selection(
     candidates: pd.DataFrame, request: SelectionRequest, config: SelectionConfig = SelectionConfig()
 ) -> pd.DataFrame:
     """Apply the submitted stages in order; input candidates remain fully represented."""
+    equity_rank_enabled = any(
+        stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1"
+        for stage in request.stages
+    )
+    if equity_rank_enabled:
+        if "strategy_id" not in candidates:
+            raise _error("EQUITY_RANK_INVALID_STRATEGY_ID")
+        ids = candidates["strategy_id"].tolist()
+        if any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) < 1 for value in ids):
+            raise _error("EQUITY_RANK_INVALID_STRATEGY_ID")
+        if len({int(value) for value in ids}) != len(ids):
+            raise _error("EQUITY_RANK_DUPLICATE_STRATEGY_ID")
     result = candidates.copy()
     result["_source_order"] = np.arange(len(result))
     result = result.sort_values(["strategy_name", "strategy_id"], kind="stable").reset_index(drop=True)
@@ -1593,6 +1733,11 @@ def run_selection(
     if "prior_rejected" not in result:
         result["prior_rejected"] = False
     result["prior_rejected"] = result["prior_rejected"].fillna(False).astype(bool)
+    if equity_rank_enabled:
+        if "result_id" not in result or "_equity_quality" not in result:
+            raise _error("EQUITY_CACHE_INCOMPLETE")
+        for index in result.index:
+            _validate_equity_quality_evidence(result.at[index, "_equity_quality"], result.at[index, "result_id"])
     result["finalist"] = True
     result["elimination_reason"] = None
     result["auto_status"] = None
@@ -1616,16 +1761,7 @@ def run_selection(
         result["equity_regime_disposition"] = result["_equity_disposition"]
         result["equity_regime_reason"] = result["_equity_reason"]
     explicit_stage_ids = {stage.id for stage in request.stages}
-    stages = list(request.stages)
-    if _LOT_VARIANT_STAGE_ID not in explicit_stage_ids and config.lot_variant_redundancy_enabled:
-        stages.insert(0, SelectionStage(_LOT_VARIANT_STAGE_ID, True, "pair_side_timeframe"))
-    elif _LOT_VARIANT_STAGE_ID in explicit_stage_ids:
-        lot_stage = next(stage for stage in stages if stage.id == _LOT_VARIANT_STAGE_ID)
-        stages = [lot_stage, *(stage for stage in stages if stage.id != _LOT_VARIANT_STAGE_ID)]
-    if "filter_equity_regime" in explicit_stage_ids:
-        equity_stage = next(stage for stage in stages if stage.id == "filter_equity_regime")
-        stages = [stage for stage in stages if stage.id != "filter_equity_regime"]
-        stages.insert(1 if stages and stages[0].id == _LOT_VARIANT_STAGE_ID else 0, equity_stage)
+    stages = list(effective_selection_stages(request, config))
     implicit_lot_variant_stage = _LOT_VARIANT_STAGE_ID not in explicit_stage_ids
     for stage in stages:
         if stage.id == "filter_equity_regime" and not stage.enabled:
@@ -1651,7 +1787,13 @@ def run_selection(
             continue
         if stage.id == "rank_robust_top_n":
             survivors = result.loc[result["finalist"]]
-            ranked, ordered = _rank_robust(survivors)
+            if stage.enabled and stage.method == "equity_quality_v1" and "final_score" in result:
+                result["final_score"] = result["final_score"].astype(object)
+            ranked, ordered = (
+                _rank_equity_quality(survivors)
+                if stage.enabled and stage.method == "equity_quality_v1"
+                else _rank_robust(survivors)
+            )
             rank_columns = [column for column in ranked.columns if column.startswith("rank_") or column in {"final_score", "final_rank"}]
             result.loc[ranked.index, rank_columns] = ranked.loc[:, rank_columns]
             order_position = {index: position for position, index in enumerate(ordered)}
@@ -1794,7 +1936,19 @@ def run_selection(
             stage_counts[stage.id] = {"enabled": True, "eliminated": int(result[column].sum()), "remaining": int(result["finalist"].sum())}
     result.loc[result["auto_status"].isna() & result["finalist"], "auto_status"] = "FINALIST"
     result.loc[result["auto_status"].isna() & ~result["finalist"], "auto_status"] = "FILTERED"
-    result = result.drop(columns=["_source_order", "_equity_state", "_equity_disposition", "_equity_reason"], errors="ignore")
+    if equity_rank_enabled:
+        result.attrs["equity_quality_facts"] = {
+            str(int(row["strategy_id"])): {
+                "result_id": int(row["result_id"]),
+                "source_revision": row["_equity_quality"]["source_revision"],
+                "facts_sha256": row["_equity_quality"]["facts_sha256"],
+                "facts": row["_equity_quality"]["facts"].to_canonical_dict(),
+            }
+            for _, row in result.iterrows()
+        }
+    result = result.drop(columns=[
+        "_source_order", "_equity_state", "_equity_disposition", "_equity_reason", "_equity_quality",
+    ], errors="ignore")
     result.attrs["stage_counts"] = stage_counts
     return result
 

@@ -16,16 +16,31 @@ import duckdb
 from openpyxl import load_workbook
 import pandas as pd
 
-from .performance_v2_selection import SelectionConfig, SelectionRequest
+from .performance_v2_equity_cache import equity_source_revision
+from .performance_v2_equity_quality import ALGORITHM_VERSION
+from .performance_v2_selection import (
+    SelectionConfig, SelectionRequest, effective_selection_stages, parse_selection_request,
+)
 
 
-SELECTION_CONTRACT_VERSION = "performance-v2-selection-review-v1"
+SELECTION_CONTRACT_VERSION_V1 = "performance-v2-selection-review-v1"
+SELECTION_CONTRACT_VERSION_V2 = "performance-v2-selection-review-v2"
+SELECTION_CONTRACT_VERSION = SELECTION_CONTRACT_VERSION_V1
+EQUITY_QUALITY_RANK_POLICY_VERSION = "equity-quality-rank-v1"
 WORKBOOK_SCHEMA_VERSION = "1"
 META_SHEET = "_MRS_SELECTION_META"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_ZIP_ENTRIES = 256
 MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 STATUSES = frozenset({"FINALIST", "RESERVE", "ANALOG", "FILTERED", "REJECTED"})
+_EQUITY_DECISION_FACT_FIELDS = (
+    "state", "reason", "erf_disposition", "horizon_days", "equity_class",
+    "score12", "drawdown", "peak_gap", "windows",
+)
+
+
+def _equity_decision_facts(facts: Mapping[str, object]) -> dict[str, object]:
+    return {key: facts.get(key) for key in _EQUITY_DECISION_FACT_FIELDS}
 
 
 class SelectionReviewError(ValueError):
@@ -59,7 +74,11 @@ def canonical_json(value: object) -> str:
 
 
 def canonical_contract(request: SelectionRequest, config: SelectionConfig) -> tuple[str, str, str, str]:
-    request_json = canonical_json(asdict(request))
+    request_data = asdict(request)
+    for stage in request_data["stages"]:
+        if stage["method"] in (None, "robust_v1") or not stage["enabled"]:
+            stage.pop("method")
+    request_json = canonical_json(request_data)
     config_json = canonical_json(asdict(config))
     return request_json, sha256(request_json.encode()).hexdigest(), config_json, sha256(config_json.encode()).hexdigest()
 
@@ -71,14 +90,120 @@ def database_instance_id(connection: duckdb.DuckDBPyConnection) -> str:
     return str(row[0])
 
 
-def new_run_metadata(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
+def _equity_quality_rank_enabled(request: SelectionRequest | None) -> bool:
+    return bool(request and any(
+        stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1"
+        for stage in request.stages
+    ))
+
+
+def new_run_metadata(
+    connection: duckdb.DuckDBPyConnection, request: SelectionRequest | None = None,
+) -> dict[str, str]:
     return {
         "workbook_schema_version": WORKBOOK_SCHEMA_VERSION,
         "selection_run_id": str(uuid4()),
         "database_instance_id": database_instance_id(connection),
-        "selection_contract_version": SELECTION_CONTRACT_VERSION,
+        "selection_contract_version": (
+            SELECTION_CONTRACT_VERSION_V2 if _equity_quality_rank_enabled(request)
+            else SELECTION_CONTRACT_VERSION_V1
+        ),
         "exported_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def equity_quality_snapshot_metadata(
+    request: SelectionRequest, config: SelectionConfig, result: pd.DataFrame,
+) -> dict[str, object] | None:
+    """Build reproducible policy/source evidence from the cached facts used by ranking."""
+    if not _equity_quality_rank_enabled(request):
+        return None
+    sources = result.attrs.get("equity_quality_facts")
+    if not isinstance(sources, Mapping) or set(sources) != {str(int(value)) for value in result["strategy_id"]}:
+        raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+    checked_sources: dict[str, object] = {}
+    for strategy_id, raw in sources.items():
+        if not isinstance(raw, Mapping):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        result_id = _whole_number(raw.get("result_id"), "SELECTION_REVIEW_INVALID_SELECTION", optional=False)
+        source_revision = raw.get("source_revision")
+        facts_sha256 = raw.get("facts_sha256")
+        facts = raw.get("facts")
+        if (
+            not isinstance(source_revision, str) or len(source_revision) != 64
+            or not isinstance(facts_sha256, str) or len(facts_sha256) != 64
+            or not isinstance(facts, Mapping) or facts.get("result_id") != result_id
+            or sha256(canonical_json(facts).encode()).hexdigest() != facts_sha256
+        ):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        checked_sources[str(strategy_id)] = {
+            "result_id": result_id,
+            "source_revision": source_revision,
+            "facts_sha256": facts_sha256,
+            "decision_facts": _equity_decision_facts(facts),
+            "facts": facts,
+        }
+    return {
+        "policy_id": "equity_quality_rank",
+        "policy_version": EQUITY_QUALITY_RANK_POLICY_VERSION,
+        "method": "equity_quality_v1",
+        "algorithm_version": ALGORITHM_VERSION,
+        "effective_stage_order": [stage.id for stage in effective_selection_stages(request, config)],
+        "sources": checked_sources,
+    }
+
+
+def _current_equity_revisions(
+    connection: duckdb.DuckDBPyConnection, strategy_ids: Sequence[int],
+) -> dict[int, tuple[int, str]]:
+    if not strategy_ids:
+        return {}
+    rows = connection.execute(
+        """select s.strategy_id, r.result_id, r.imported_at_utc, r.report_start_utc,
+                  r.report_end_utc, r.effective_start_utc, r.effective_end_utc,
+                  r.optimizer_source_metadata_json
+             from strategies s join strategy_results r on r.result_id = s.current_result_id
+            where s.strategy_id in (select unnest(?::bigint[]))""",
+        [list(strategy_ids)],
+    ).fetchall()
+    current: dict[int, tuple[int, str]] = {}
+    for row in rows:
+        metadata = dict(zip((
+            "strategy_id", "result_id", "imported_at_utc", "report_start_utc", "report_end_utc",
+            "effective_start_utc", "effective_end_utc", "optimizer_source_metadata_json",
+        ), row))
+        for name in (
+            "imported_at_utc", "report_start_utc", "report_end_utc",
+            "effective_start_utc", "effective_end_utc",
+        ):
+            if metadata[name] is not None:
+                value = metadata[name]
+                if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+                    raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+                metadata[name] = metadata[name].astimezone(timezone.utc)
+        current[int(row[0])] = (int(row[1]), equity_source_revision(metadata))
+    return current
+
+
+def _equity_snapshot_stale_ids(
+    connection: duckdb.DuckDBPyConnection, snapshot: Mapping[str, object],
+) -> list[int]:
+    sources = snapshot.get("sources")
+    if not isinstance(sources, Mapping):
+        raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+    ids = [int(strategy_id) for strategy_id in sources]
+    current = _current_equity_revisions(connection, ids)
+    stale: list[int] = []
+    for strategy_id, source in sources.items():
+        if not isinstance(source, Mapping):
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+        pair = current.get(int(strategy_id))
+        if (
+            pair is None or pair[0] != source.get("result_id")
+            or pair[1] != source.get("source_revision")
+        ):
+            stale.append(int(strategy_id))
+    return sorted(stale)
 
 
 def apply_prior_rejected(connection: duckdb.DuckDBPyConnection, candidates: pd.DataFrame) -> pd.DataFrame:
@@ -183,13 +308,32 @@ def persist_selection_snapshots(
         if not run_id or run_id in seen_run_ids:
             raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
         seen_run_ids.add(run_id)
+        expected_contract_version = (
+            SELECTION_CONTRACT_VERSION_V2 if _equity_quality_rank_enabled(request)
+            else SELECTION_CONTRACT_VERSION_V1
+        )
+        if metadata.get("selection_contract_version") != expected_contract_version:
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
         request_json, request_hash, config_json, config_hash = canonical_contract(request, config)
         request_extra = item.get("request_json_extra")
         if request_extra is not None:
             if not isinstance(request_extra, Mapping):
                 raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        equity_snapshot = equity_quality_snapshot_metadata(request, config, result)
+        if equity_snapshot is not None:
+            stale = _equity_snapshot_stale_ids(connection, equity_snapshot)
+            if stale:
+                raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
+        request_extra_json = {} if request_extra is None else _json_value(request_extra)
+        if not isinstance(request_extra_json, dict):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        if equity_snapshot is not None:
+            if "equity_quality_snapshot" in request_extra_json and request_extra_json["equity_quality_snapshot"] != equity_snapshot:
+                raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+            request_extra_json["equity_quality_snapshot"] = equity_snapshot
+        if request_extra_json:
             parsed_request = json.loads(request_json)
-            parsed_request.update(_json_value(request_extra))
+            parsed_request.update(request_extra_json)
             request_json = canonical_json(parsed_request)
             request_hash = sha256(request_json.encode()).hexdigest()
         expected = {int(row.strategy_id): int(row.result_id) for row in result.itertuples()}
@@ -207,6 +351,7 @@ def persist_selection_snapshots(
         prepared.append({
             "request": request, "config": config, "result": result, "metadata": metadata,
             "request_json_extra": request_extra,
+            "equity_snapshot": equity_snapshot,
             "run_id": run_id, "request_json": request_json, "request_hash": request_hash,
             "config_json": config_json, "config_hash": config_hash, "expected": expected,
             "top_n": top_n, "representative_count": representative_count, "run_hash": run_hash,
@@ -220,6 +365,10 @@ def persist_selection_snapshots(
             config = item["config"]
             result = item["result"]
             metadata = item["metadata"]
+            if item["equity_snapshot"] is not None:
+                stale = _equity_snapshot_stale_ids(connection, item["equity_snapshot"])
+                if stale:
+                    raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
             connection.execute(
                 """insert into selection_runs (
                     selection_run_id, database_instance_id, symbol, side, selection_contract_version,
@@ -336,7 +485,9 @@ def _parse_workbook(data: bytes) -> tuple[dict[str, str], list[dict[str, object]
             raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
         meta_sheet = workbook[META_SHEET]
         metadata = {str(key): str(value) for key, value in meta_sheet.iter_rows(min_row=1, max_col=2, values_only=True) if key and value is not None}
-        if metadata.get("workbook_schema_version") != WORKBOOK_SCHEMA_VERSION or metadata.get("selection_contract_version") != SELECTION_CONTRACT_VERSION:
+        if metadata.get("workbook_schema_version") != WORKBOOK_SCHEMA_VERSION or metadata.get("selection_contract_version") not in {
+            SELECTION_CONTRACT_VERSION_V1, SELECTION_CONTRACT_VERSION_V2,
+        }:
             raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
         sheet = workbook["All candidates"]
         header_cells = next(sheet.iter_rows(min_row=1, max_row=1), ())
@@ -422,12 +573,111 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
     if metadata.get("database_instance_id") != database_instance_id(connection):
         raise SelectionReviewError("SELECTION_REVIEW_DATABASE_MISMATCH")
     run_id = metadata.get("selection_run_id", "")
-    run = connection.execute("select symbol, side from selection_runs where selection_run_id = ?", [run_id]).fetchone()
+    run = connection.execute(
+        "select symbol, side, selection_contract_version, request_json, config_json from selection_runs where selection_run_id = ?",
+        [run_id],
+    ).fetchone()
     if not run:
         raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+    if metadata.get("selection_contract_version") != run[2]:
+        raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+    equity_snapshot: Mapping[str, object] | None = None
+    if run[2] == SELECTION_CONTRACT_VERSION_V2:
+        try:
+            request_document = json.loads(run[3])
+            if not isinstance(request_document, Mapping):
+                raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+            stages = request_document.get("stages")
+            if not isinstance(stages, list) or any(not isinstance(stage, Mapping) for stage in stages):
+                raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+            rank_stage = next(
+                stage for stage in stages
+                if stage.get("id") == "rank_robust_top_n"
+            )
+            snapshot_value = request_document["equity_quality_snapshot"]
+            parsed_stages: list[dict[str, object]] = []
+            canonical_stage_keys = {
+                "id", "enabled", "scope", "min_shift_pct", "pnl_tolerance_pct", "top_n",
+            }
+            for stage in stages:
+                stage_keys = set(stage)
+                if stage_keys not in (canonical_stage_keys, canonical_stage_keys | {"method"}):
+                    raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+                stage_id = stage.get("id")
+                payload = {key: stage[key] for key in ("id", "enabled", "scope")}
+                relevant = {"id", "enabled", "scope"}
+                if stage_id == "filter_min_shift":
+                    relevant.add("min_shift_pct")
+                    payload["min_shift_pct"] = stage["min_shift_pct"]
+                elif stage_id in {"pareto_shift_near_tie", "pareto_close_ma_near_tie"}:
+                    relevant.add("pnl_tolerance_pct")
+                    payload["pnl_tolerance_pct"] = stage["pnl_tolerance_pct"]
+                elif stage_id == "rank_robust_top_n":
+                    relevant.add("top_n")
+                    payload["top_n"] = stage["top_n"]
+                    if "method" in stage:
+                        payload["method"] = stage["method"]
+                if any(stage[key] is not None for key in canonical_stage_keys - relevant):
+                    raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+                if "method" in stage and stage_id != "rank_robust_top_n":
+                    raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+                parsed_stages.append(payload)
+            saved_request = parse_selection_request({
+                "symbol": request_document.get("symbol"),
+                "side": request_document.get("side"),
+                "stages": parsed_stages,
+            })
+            config_document = json.loads(run[4])
+            if not isinstance(config_document, Mapping) or type(
+                config_document.get("lot_variant_redundancy_enabled")
+            ) is not bool:
+                raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+            expected_stage_order = [
+                stage.id for stage in effective_selection_stages(
+                    saved_request,
+                    SelectionConfig(lot_variant_redundancy_enabled=config_document["lot_variant_redundancy_enabled"]),
+                )
+            ]
+        except (AttributeError, KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH") from None
+        if (
+            rank_stage.get("enabled") is not True
+            or rank_stage.get("method") != "equity_quality_v1"
+            or not isinstance(snapshot_value, Mapping)
+            or snapshot_value.get("policy_id") != "equity_quality_rank"
+            or snapshot_value.get("policy_version") != EQUITY_QUALITY_RANK_POLICY_VERSION
+            or snapshot_value.get("method") != "equity_quality_v1"
+            or snapshot_value.get("algorithm_version") != ALGORITHM_VERSION
+            or not isinstance(snapshot_value.get("effective_stage_order"), list)
+            or snapshot_value.get("effective_stage_order") != expected_stage_order
+            or not isinstance(snapshot_value.get("sources"), Mapping)
+        ):
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+        for strategy_id, source in snapshot_value["sources"].items():
+            try:
+                parsed_id = int(strategy_id)
+                result_id = int(source["result_id"])
+                source_revision = source["source_revision"]
+                facts_sha256 = source["facts_sha256"]
+                facts = source["facts"]
+                decision_facts = source["decision_facts"]
+            except (KeyError, TypeError, ValueError):
+                raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH") from None
+            if (
+                str(parsed_id) != strategy_id or parsed_id <= 0 or result_id <= 0
+                or not isinstance(source_revision, str) or len(source_revision) != 64
+                or not isinstance(facts_sha256, str) or len(facts_sha256) != 64
+                or not isinstance(facts, Mapping) or facts.get("result_id") != result_id
+                or sha256(canonical_json(facts).encode()).hexdigest() != facts_sha256
+                or not isinstance(decision_facts, Mapping)
+                or set(decision_facts) != set(_EQUITY_DECISION_FACT_FIELDS)
+                or decision_facts != _equity_decision_facts(facts)
+            ):
+                raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+        equity_snapshot = snapshot_value
     latest = connection.execute(
         "select selection_run_id from selection_runs where symbol = ? and side = ? order by created_at_utc desc, selection_run_id desc limit 1",
-        list(run),
+        list(run[:2]),
     ).fetchone()
     latest_run_id = latest[0] if latest else ""
     if latest_run_id != run_id and not _equivalent_selection_runs(connection, run_id, latest_run_id):
@@ -440,6 +690,8 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
              from selection_results where selection_run_id = ?""", [run_id]
     ).fetchall()
     snapshot = {int(row[0]): row[1:] for row in snapshot_rows}
+    if equity_snapshot is not None and set(equity_snapshot["sources"]) != {str(strategy_id) for strategy_id in snapshot}:
+        raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
     names = dict(connection.execute(
         "select strategy_id, strategy_name from strategies where strategy_id in (select unnest(?::bigint[]))", [list(snapshot)]
     ).fetchall()) if snapshot else {}
@@ -493,12 +745,16 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
     stale = sorted(strategy_id for strategy_id, values in snapshot.items() if current.get(strategy_id) != values[0])
     if stale:
         raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
+    if equity_snapshot is not None:
+        stale = _equity_snapshot_stale_ids(connection, equity_snapshot)
+        if stale:
+            raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
     review_id = str(uuid4())
     now = datetime.now(timezone.utc)
     connection.execute("begin transaction")
     try:
         latest_again = connection.execute(
-            "select selection_run_id from selection_runs where symbol = ? and side = ? order by created_at_utc desc, selection_run_id desc limit 1", list(run)
+            "select selection_run_id from selection_runs where symbol = ? and side = ? order by created_at_utc desc, selection_run_id desc limit 1", list(run[:2])
         ).fetchone()
         latest_again_id = latest_again[0] if latest_again else ""
         if latest_again_id != run_id and not _equivalent_selection_runs(connection, run_id, latest_again_id):
@@ -509,6 +765,10 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
         stale = sorted(strategy_id for strategy_id, values in snapshot.items() if current_again.get(strategy_id) != values[0])
         if stale:
             raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
+        if equity_snapshot is not None:
+            stale = _equity_snapshot_stale_ids(connection, equity_snapshot)
+            if stale:
+                raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
         connection.execute(
             """insert into selection_review_imports (
                 review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count

@@ -3,7 +3,7 @@
 **Updated:** 2026-09-25
 **Current branch:** `main`
 
-## Performance v2 equity-quality R7.3 M2 accepted (2026-09-25)
+## Performance v2 equity-quality R7.3 M3 accepted (2026-09-25)
 
 The canonical contract is now R7.3. Authoritative equity is evaluated as a
 right-continuous step series on a T-anchored six-hour grid: quiet periods and
@@ -39,9 +39,18 @@ verified cached facts only, preserves quiet/short-history passthrough, protects
 mixed lot groups, and maps incomplete cache to typed Panel errors without
 preview-time backfill. Independent Opus 5 `CODE_REVIEW_PASS` followed race,
 lot-group, malformed optional metadata, and XLSX regressions; the final M2
-selection/Panel/review suite passed 273 tests with 2 platform skips. M3–M5
-remain pending. No live Performance DB was migrated or backfilled. Next:
-implement optional equity Top N without changing the robust default.
+selection/Panel/review suite passed 273 tests with 2 platform skips. M3 adds
+optional equity Top N to the existing rank stage, preserving v1 robust/disabled
+request JSON and hash, and persists full cached facts/source evidence in a v2
+selection snapshot. Mixed RETEST and reserve candidates round-trip through
+Excel review without trusting workbook precision. Independent Opus 5
+`CODE_REVIEW_PASS`; the M3 selection/review suites passed 209 tests with six
+pandas warnings. M4–M5 remain pending. The M4 candidate-LRU switch from
+filter+robust to equity rank currently has a failing integration regression
+(`EQUITY_CACHE_INCOMPLETE`); M4 must hydrate optional facts independently of
+the selected method before acceptance. No live Performance DB was migrated or
+backfilled. Next: M4 shared XLSX/facts loader, Panel/UI integration, then
+comparable cache-performance evidence.
 
 ### Superseded proposal history
 

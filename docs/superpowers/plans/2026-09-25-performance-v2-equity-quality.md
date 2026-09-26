@@ -18,8 +18,8 @@
 `PLAN_APPROVED`, 2026-09-25. R7.3 replaces conflicting R6.1 rules below;
 the R6.1 findings ledger is historical only. Approval does not accept M0
 coverage/performance evidence and does not authorize runtime implementation.
-Implementation was separately authorized by the user. M0–M2 are accepted;
-M3–M5 remain open. Checkboxes close only after verified evidence and
+Implementation was separately authorized by the user. M0–M3 are accepted;
+M4–M5 remain open. Checkboxes close only after verified evidence and
 independent review.
 
 ## R7.3 canonical override (normative)
@@ -297,9 +297,9 @@ cache-integrity, lot-group and XLSX regressions. Final M2 suite:
 
 **Files:** selection/selection_review и matching tests.
 
-- [ ] Сначала golden tests legacy request JSON/hash/results. Optional method
+- [x] Сначала golden tests legacy request JSON/hash/results. Optional method
   только у rank stage; отсутствующий/disabled rank инертен; robust untouched.
-- [ ] Реализовать `_rank_equity_quality` и общий dispatch, не копировать analog
+- [x] Реализовать `_rank_equity_quality` и общий dispatch, не копировать analog
   grouping. Exact key `(class,-score12,D,P,-H,strategy_id)`; все формулы spec §8.
   В combined режиме ERF сохраняет WEAKENING eligible, equity-ranking ставит
   class0 выше class1; rank-only использует тот же порядок. Robust без изменений,
@@ -311,28 +311,33 @@ cache-integrity, lot-group and XLSX regressions. Final M2 suite:
   lot и прочие фильтры OFF, одинаковый input/N. ERF ON/OFF + robust даёт
   одинаковый порядок, без нового equity-штрафа. Не переносить эту эквивалентность
   на произвольный cohort, где ERF действительно исключает другие строки.
-- [ ] Red/green score cases: при G>0 рост D/P или снижение Q понижает score;
+- [x] Red/green score cases: при G>0 рост D/P или снижение Q понижает score;
   G<0 большая DD делает score хуже, не ближе к0; near-eps score0; deterministic
   ties; flat7 не обнуляет положительный G28; young growing может быть выше old
   weakening; H — только поздний tie-break.
-- [ ] Assert candidate strategy_id unique; different lot-strategy IDs с
+- [x] Assert candidate strategy_id unique; different lot-strategy IDs с
   одинаковыми метриками сохраняют порядок при permutations/worker counts;
   duplicate IDs дают typed invalid input. Не менять tie-key из-за неверного
   предположения, что order rows являются отдельными candidate rows.
-- [ ] Проверить missing-score RESERVE (не занимает N), rankable non-UP,
+- [x] Проверить missing-score RESERVE (не занимает N), rankable non-UP,
   Top N по analog representatives, prior REJECTED, candidate-specific T in
   facts revision/digest, T-only recompute, and отсутствие влияния чужого
   RETEST cohort. Mixed-T is valid; no common-T preflight or date tie-break.
-- [ ] Version-aware canonical projection: old request не получает новые null
+- [x] Version-aware canonical projection: old request не получает новые null
   fields от asdict. Новый contract v2 сохраняет method/policy/effective order,
   revisions/digests/decision facts в существующих JSON-полях, не новой таблице.
   R7.3 contract/T must be represented in source revision/digest; policy-only
   changes do not invalidate otherwise current facts or silently change scoring.
   Assert snapshot policy ID и byte-identical прежний legacy-v1 canonical hash.
-- [ ] Red/green v1/v2 review round-trip, snapshot recheck при same-ID REPLACE,
+- [x] Red/green v1/v2 review round-trip, snapshot recheck при same-ID REPLACE,
   old snapshot после удаления cache, equivalent-run checks и rollback при race.
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_performance_v2_selection.py tests/test_performance_v2_selection_review.py`.
+
+Accepted M3 evidence (2026-09-25): 209 passed, 6 pandas warnings; `git diff --check`
+passed. Opus 5 final `CODE_REVIEW_PASS` after v1 disabled-method, v2 stage-order,
+source-revision/timezone, mixed RETEST reserve/Decimal and decision-facts checks.
+M4 candidate-LRU hydration, XLSX columns and Panel integration remain open.
 
 **Exit:** filter-only/rank-only/both/legacy воспроизводимы; review не доверяет Excel precision.
 

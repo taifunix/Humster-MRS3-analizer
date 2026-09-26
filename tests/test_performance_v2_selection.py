@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -47,6 +47,7 @@ from mrs3.performance_v2_equity_cache import (
     equity_source_revision,
     read_equity_quality_facts,
 )
+from mrs3.performance_v2_equity_quality import EquitySample, calculate_equity_quality_facts
 
 
 def test_retest_cohort_request_is_explicit_and_rejects_empty_members():
@@ -288,6 +289,263 @@ def test_parse_selection_request_accepts_new_stages_and_requires_last_fixed_rank
         ]})
 
 
+def test_equity_quality_method_is_optional_only_on_the_existing_rank_stage() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 20,
+         "method": "equity_quality_v1"},
+    ]})
+
+    assert request.stages[0].method == "equity_quality_v1"
+    legacy = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 20},
+    ]})
+    assert legacy.stages[0].method is None
+    with pytest.raises(PerformanceV2SelectionError, match="INVALID_RANK_METHOD"):
+        parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 20,
+             "method": "equity_quality_v2"},
+        ]})
+    with pytest.raises(PerformanceV2SelectionError, match="INVALID_STAGE"):
+        parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "pareto_robust", "enabled": True, "scope": "pair_side_timeframe",
+             "method": "equity_quality_v1"},
+        ]})
+
+
+def test_equity_quality_rank_orders_class_then_exact_score_tie_chain() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 20,
+         "method": "equity_quality_v1"},
+    ]})
+    rows = [
+        _selection_row("class1-high", strategy_id=1, result_id=101, close_ma_len=2,
+                       _equity_quality=_equity_rank_facts(101, 1, "10", "0", "0", 28)),
+        _selection_row("class0-low", strategy_id=2, result_id=102, close_ma_len=3,
+                       _equity_quality=_equity_rank_facts(102, 0, "1", "0.2", "0.2", 7)),
+        _selection_row("dd-tie", strategy_id=8, result_id=108, close_ma_len=4,
+                       _equity_quality=_equity_rank_facts(108, 0, "1", "0.05", "0.1", 7)),
+        _selection_row("p-tie", strategy_id=9, result_id=109, close_ma_len=5,
+                       _equity_quality=_equity_rank_facts(109, 0, "1", "0.05", "0.05", 7)),
+        _selection_row("h-tie", strategy_id=10, result_id=110, close_ma_len=6,
+                       _equity_quality=_equity_rank_facts(110, 0, "1", "0.05", "0.05", 14)),
+        _selection_row("id-tie", strategy_id=3, result_id=103, close_ma_len=7,
+                       _equity_quality=_equity_rank_facts(103, 0, "1", "0.05", "0.05", 14)),
+    ]
+
+    result = run_selection(pd.DataFrame(rows), request).set_index("strategy_name")
+
+    assert result.sort_values("final_rank").index.tolist() == [
+        "id-tie", "h-tie", "p-tie", "dd-tie", "class0-low", "class1-high",
+    ]
+    assert result.loc["class0-low", "final_rank"] < result.loc["class1-high", "final_rank"]
+
+
+def test_equity_quality_unscoreable_is_reserve_and_non_up_can_rank() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _selection_row("unscoreable", strategy_id=1, result_id=101, close_ma_len=2,
+                       _equity_quality=_equity_rank_facts(101, None, None, None, None, None)),
+        _selection_row("declining", strategy_id=2, result_id=102, close_ma_len=3,
+                       _equity_quality=_equity_rank_facts(102, 3, "-2", "0.1", "0.1", 28,
+                                                          state="DECLINING_OR_MIXED")),
+    ]), request).set_index("strategy_name")
+
+    assert result.loc["declining", "auto_status"] == "FINALIST"
+    assert result.loc["unscoreable", "auto_status"] == "RESERVE"
+    assert result.loc["unscoreable", "elimination_reason"] == "RANK_NOT_EVALUATED_INSUFFICIENT_DATA"
+
+
+def test_robust_rank_is_equivalent_with_equity_filter_when_every_fact_passes() -> None:
+    robust = {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 2}
+    base = [
+        _selection_row("growing", strategy_id=1, close_ma_len=3, robust_pnl_30d_pct=Decimal("20"),
+                       worst_drawdown_pct=Decimal("2"), worst_holding_p95_minutes=Decimal("20"),
+                       ab_stability_ratio=Decimal(".8"), minimum_plateau_point_count=20, first_shift_bp=200,
+                       _equity_state="GROWING", _equity_disposition="PASS", _equity_reason="H_UP_SHORTS_NONDECLINING"),
+        _selection_row("weakening", strategy_id=2, close_ma_len=5, robust_pnl_30d_pct=Decimal("10"),
+                       worst_drawdown_pct=Decimal("4"), worst_holding_p95_minutes=Decimal("40"),
+                       ab_stability_ratio=Decimal(".7"), minimum_plateau_point_count=10, first_shift_bp=100,
+                       _equity_state="WEAKENING", _equity_disposition="PASS", _equity_reason="SHORT_WINDOW_DECLINE"),
+    ]
+    without_filter = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [robust]})
+    with_filter = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"}, robust,
+    ]})
+
+    first = run_selection(pd.DataFrame(base), without_filter).set_index("strategy_name")
+    second = run_selection(pd.DataFrame(base), with_filter).set_index("strategy_name")
+
+    assert first["final_rank"].to_dict() == second["final_rank"].to_dict()
+    assert first["final_score"].to_dict() == second["final_score"].to_dict()
+    assert second.loc["weakening", "auto_status"] == "FINALIST"
+
+
+def test_equity_quality_rank_rejects_duplicate_strategy_ids() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    rows = [
+        _selection_row("a", strategy_id=1, result_id=101, _equity_quality=_equity_rank_facts(101, 0, "1", "0", "0", 28)),
+        _selection_row("b", strategy_id=1, result_id=102, _equity_quality=_equity_rank_facts(102, 0, "1", "0", "0", 28)),
+    ]
+
+    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_RANK_DUPLICATE_STRATEGY_ID"):
+        run_selection(pd.DataFrame(rows), request)
+
+
+def test_equity_quality_rank_validates_all_candidates_before_prior_filters() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_min_shift", "enabled": True, "scope": "pair_side_timeframe", "min_shift_pct": "1"},
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    rows = [
+        _selection_row("filtered-duplicate", strategy_id=1, result_id=101, order_1_shift_bp=1,
+                       _equity_quality=_equity_rank_facts(101, 0, "1", "0", "0", 28)),
+        _selection_row("survivor-duplicate", strategy_id=1, result_id=102, order_1_shift_bp=100,
+                       _equity_quality=_equity_rank_facts(102, 0, "1", "0", "0", 28)),
+    ]
+
+    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_RANK_DUPLICATE_STRATEGY_ID"):
+        run_selection(pd.DataFrame(rows), request)
+
+
+def test_equity_rank_review_metadata_survives_panel_candidate_preparation(tmp_path: Path) -> None:
+    from mrs3.performance_v2_selection_review import apply_prior_rejected, equity_quality_snapshot_metadata
+
+    connection = _candidate_db(tmp_path)
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    prepare_selection_window_cache(
+        tmp_path / "strategy_performance.duckdb", request, SelectionConfig(), workers=1, include_equity=True,
+    )
+    connection = duckdb.connect(str(tmp_path / "strategy_performance.duckdb"))
+    candidates = load_selection_candidates(connection, request, SelectionConfig(), cache_only=True)
+    selected = run_selection(apply_prior_rejected(connection, candidates), request)
+
+    assert "_equity_quality" not in selected.columns
+    assert set(selected.attrs["equity_quality_facts"]) == {str(int(candidates.iloc[0]["strategy_id"]))}
+    snapshot = equity_quality_snapshot_metadata(request, SelectionConfig(), selected)
+    assert snapshot is not None
+    assert snapshot["sources"][str(int(candidates.iloc[0]["strategy_id"]))]["result_id"] == int(candidates.iloc[0]["result_id"])
+
+
+def _equity_review_roundtrip(connection, request, config, workbook_path: Path):
+    from mrs3.performance_v2_selection_review import (
+        apply_prior_rejected, import_selection_review, new_run_metadata, persist_selection_snapshot,
+    )
+
+    candidates = load_selection_candidates(connection, request, config, cache_only=True)
+    result = run_selection(apply_prior_rejected(connection, candidates), request, config)
+    review_rows = {
+        int(row.strategy_id): {
+            "user_status": str(row.auto_status),
+            "user_rank": row.final_rank if row.auto_status in {"FINALIST", "RESERVE"} else None,
+            "user_analog_of_strategy_id": row.auto_analog_of_strategy_id if row.auto_status == "ANALOG" else None,
+            "comment": None,
+        }
+        for row in result.itertuples()
+    }
+    metadata = new_run_metadata(connection, request)
+    workbook = write_selection_workbook(result, workbook_path, request, metadata, review_rows)
+    persist_selection_snapshot(connection, request, config, result, metadata, workbook.read_bytes())
+    imported = import_selection_review(connection, workbook.read_bytes())
+    return candidates, result, imported
+
+
+def test_equity_cache_evidence_round_trips_from_candidate_loader(tmp_path: Path) -> None:
+    from mrs3.performance_v2_selection_review import canonical_json
+
+    database = tmp_path / "strategy_performance.duckdb"
+    connection = _candidate_db(tmp_path)
+    strategy_id, result_id = connection.execute(
+        "select strategy_id, current_result_id from strategies"
+    ).fetchone()
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    config = SelectionConfig(lot_variant_redundancy_enabled=False)
+    prepare_selection_window_cache(database, request, config, workers=1, include_equity=True)
+
+    connection = duckdb.connect(str(database))
+    candidates, result, imported = _equity_review_roundtrip(
+        connection, request, config, tmp_path / "equity-cache-review.xlsx",
+    )
+    cached = connection.execute(
+        "select source_revision, facts_json, facts_sha256 from equity_quality_metrics where result_id = ?",
+        [result_id],
+    ).fetchone()
+    current_revision = equity_source_revision(current_equity_source_metadata(connection, result_id))
+    source = result.attrs["equity_quality_facts"][str(strategy_id)]
+
+    assert len(candidates) == 1
+    assert imported["row_count"] == 1
+    assert source["facts_sha256"] == cached[2]
+    assert source["source_revision"] == cached[0] == current_revision
+    assert cached[1] == canonical_json(source["facts"])
+    assert hashlib.sha256(canonical_json(source["facts"]).encode()).hexdigest() == cached[2]
+
+
+def test_equity_quality_retest_cohort_persists_and_imports_review(tmp_path: Path) -> None:
+    database = tmp_path / "strategy_performance.duckdb"
+    connection = _candidate_db(tmp_path)
+    first_strategy_id, first_result_id = connection.execute(
+        "select strategy_id, current_result_id from strategies order by strategy_id"
+    ).fetchone()
+    second_strategy_id, second_result_id = _clone_current_candidate(connection, "beta")
+    base_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 2,
+         "method": "equity_quality_v1"},
+    ]})
+    request = retest_cohort_request(base_request, "review-cohort", {
+        int(first_strategy_id): int(first_result_id),
+        int(second_strategy_id): int(second_result_id),
+    })
+    config = SelectionConfig(lot_variant_redundancy_enabled=False)
+    connection.close()
+    prepare_selection_window_cache(database, request, config, workers=1, include_equity=True)
+
+    connection = duckdb.connect(str(database))
+    _, _, imported = _equity_review_roundtrip(
+        connection, request, config, tmp_path / "equity-retest-review.xlsx",
+    )
+    request_json = connection.execute(
+        "select request_json from selection_runs where selection_run_id = ?", [imported["selection_run_id"]],
+    ).fetchone()[0]
+    stored_request = json.loads(request_json)
+
+    assert imported["row_count"] == 2
+    assert stored_request["ranking_scope"] == "RETEST_COHORT"
+    assert stored_request["bulk_retest_job_id"] == "review-cohort"
+    assert stored_request["cohort_members"] == [
+        [int(first_strategy_id), int(first_result_id)], [int(second_strategy_id), int(second_result_id)],
+    ]
+
+
+def test_equity_rank_disabled_method_does_not_require_facts_or_change_result() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": False, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    candidates = pd.DataFrame([_selection_row("candidate", strategy_id=1)])
+
+    result = run_selection(candidates, request)
+
+    assert result.loc[0, "finalist"]
+    assert "final_rank" not in result
+    assert not result.loc[0, "eliminated_by_rank_robust_top_n"]
+    assert "_equity_quality" not in result
+
+
 def test_equity_regime_stage_has_fixed_pair_side_scope_and_legacy_absence_is_unchanged() -> None:
     legacy = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
     encoded = json.dumps(asdict(legacy), sort_keys=True, separators=(",", ":"))
@@ -303,6 +561,88 @@ def test_equity_regime_stage_has_fixed_pair_side_scope_and_legacy_absence_is_unc
         parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
             {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side_timeframe"},
         ]})
+
+
+def test_legacy_robust_request_json_stays_byte_identical() -> None:
+    from mrs3.performance_v2_selection_review import canonical_contract
+
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1},
+    ]})
+    expected = (
+        '{"bulk_retest_job_id":null,"cohort_members":[],"ranking_scope":"ORDINARY",'
+        '"side":"LONG","stages":[{"enabled":true,"id":"rank_robust_top_n",'
+        '"min_shift_pct":null,"pnl_tolerance_pct":null,"scope":"pair_side","top_n":1}],'
+        '"symbol":"BTCUSDT"}'
+    )
+
+    assert canonical_contract(request, SelectionConfig())[0] == expected
+
+
+def test_legacy_filter_and_rank_contract_keeps_pre_m3_json_and_hash() -> None:
+    from mrs3.performance_v2_selection_review import canonical_contract
+
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "2.5"},
+        {"id": "pareto_shift_near_tie", "enabled": True, "scope": "pair_side_timeframe", "pnl_tolerance_pct": "3"},
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 5},
+    ]})
+    expected = (
+        '{"bulk_retest_job_id":null,"cohort_members":[],"ranking_scope":"ORDINARY",'
+        '"side":"LONG","stages":[{"enabled":true,"id":"filter_min_shift",'
+        '"min_shift_pct":"2.5","pnl_tolerance_pct":null,"scope":"pair_side","top_n":null},'
+        '{"enabled":true,"id":"pareto_shift_near_tie","min_shift_pct":null,'
+        '"pnl_tolerance_pct":"3","scope":"pair_side_timeframe","top_n":null},'
+        '{"enabled":true,"id":"rank_robust_top_n","min_shift_pct":null,'
+        '"pnl_tolerance_pct":null,"scope":"pair_side","top_n":5}],"symbol":"BTCUSDT"}'
+    )
+
+    request_json, request_hash, *_ = canonical_contract(request, SelectionConfig())
+    assert request_json == expected
+    assert request_hash == "b5fd67f1a42c9f1286df804cb813cbba6b9ceb3acda2b436e41f395fa4a3481e"
+
+    explicit_default = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 5,
+         "method": "robust_v1"},
+    ]})
+    legacy_default = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 5},
+    ]})
+    assert canonical_contract(explicit_default, SelectionConfig()) == canonical_contract(legacy_default, SelectionConfig())
+
+    active_equity_method = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 5,
+         "method": "equity_quality_v1"},
+    ]})
+    active_json = canonical_contract(active_equity_method, SelectionConfig())[0]
+    assert json.loads(active_json)["stages"][0]["method"] == "equity_quality_v1"
+
+
+def test_disabled_rank_method_variants_share_v1_golden_json_and_hash() -> None:
+    from mrs3.performance_v2_selection_review import canonical_contract
+
+    expected_json = (
+        '{"bulk_retest_job_id":null,"cohort_members":[],"ranking_scope":"ORDINARY",'
+        '"side":"LONG","stages":[{"enabled":true,"id":"filter_min_shift",'
+        '"min_shift_pct":"2.5","pnl_tolerance_pct":null,"scope":"pair_side","top_n":null},'
+        '{"enabled":false,"id":"rank_robust_top_n","min_shift_pct":null,'
+        '"pnl_tolerance_pct":null,"scope":"pair_side","top_n":5}],"symbol":"BTCUSDT"}'
+    )
+    expected_hash = "ebd8f3b43e3b7194d9edb10e21056f749479b2d1dffbaedff9a76897212ff45e"
+    method_variants = (None, "robust_v1", "equity_quality_v1")
+
+    for method in method_variants:
+        rank_stage = {"id": "rank_robust_top_n", "enabled": False, "scope": "pair_side", "top_n": 5}
+        if method is not None:
+            rank_stage["method"] = method
+        request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "2.5"},
+            rank_stage,
+        ]})
+
+        request_json, request_hash, *_ = canonical_contract(request, SelectionConfig())
+        assert request_json == expected_json
+        assert request_hash == expected_hash
 
 
 @pytest.mark.parametrize(
@@ -792,6 +1132,106 @@ def test_enabled_equity_selection_batch_reads_only_fresh_facts_for_exact_retest_
         after = check.execute("select result_id, facts_json, facts_sha256 from equity_quality_metrics order by result_id").fetchall()
 
     assert before == after
+
+
+def test_equity_rank_only_reads_verified_cached_facts_in_one_batch(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+    with duckdb.connect(str(database), read_only=True) as check:
+        queries: list[str] = []
+
+        class CountingConnection:
+            def execute(self, sql: str, parameters: object = None):
+                if "from equity_quality_metrics" in sql.lower():
+                    queries.append(sql)
+                return check.execute(sql) if parameters is None else check.execute(sql, parameters)
+
+        monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
+        monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
+        candidates = load_selection_candidates(CountingConnection(), request, SelectionConfig(), cache_only=True)
+
+    assert len(queries) == 1
+    cached = candidates.loc[0, "_equity_quality"]
+    assert cached["facts"].state == "FLAT"
+    assert cached["facts"].equity_class == 2
+    assert cached["facts"].score12 == Decimal("0E-12")
+    assert cached["facts"].horizon_days == 28
+    assert len(cached["source_revision"]) == 64
+    assert len(cached["facts_sha256"]) == 64
+
+
+def test_equity_rank_allows_mixed_report_ends_in_exact_retest_cohort(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    first_strategy, first_result = connection.execute(
+        "select strategy_id, current_result_id from strategies"
+    ).fetchone()
+    second_strategy, second_result = _clone_current_candidate(connection, "beta")
+    second_end = datetime(2026, 2, 1, tzinfo=UTC)
+    connection.execute("update strategy_results set report_end_utc = ? where result_id = ?", [second_end, second_result])
+    connection.close()
+    base = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 2,
+         "method": "equity_quality_v1"},
+    ]})
+    request = retest_cohort_request(base, "mixed-t", {
+        int(first_strategy): int(first_result), int(second_strategy): int(second_result),
+    })
+    database = tmp_path / "strategy_performance.duckdb"
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+    with duckdb.connect(str(database), read_only=True) as check:
+        fact_queries: list[str] = []
+
+        class CountingConnection:
+            def execute(self, sql: str, parameters: object = None):
+                if "from equity_quality_metrics" in sql.lower():
+                    fact_queries.append(sql)
+                return check.execute(sql) if parameters is None else check.execute(sql, parameters)
+
+        monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
+        monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
+        candidates = load_selection_candidates(CountingConnection(), request, SelectionConfig(), cache_only=True)
+
+    assert len(candidates) == 2
+    assert len(fact_queries) == 1
+    assert {row["report_end_utc"] for _, row in candidates.iterrows()} == {
+        datetime(2026, 1, 31, tzinfo=UTC), second_end,
+    }
+    assert {
+        row["_equity_quality"]["facts"].report_end_utc for _, row in candidates.iterrows()
+    } == {datetime(2026, 1, 31, tzinfo=UTC), second_end}
+    assert f"result_id in (?,?)" in fact_queries[0].lower()
+
+
+def test_equity_rank_rejects_malformed_facts_on_previously_eliminated_candidate() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_min_shift", "enabled": True, "scope": "pair_side_timeframe", "min_shift_pct": "1"},
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    rows = [
+        _selection_row("filtered-bad-facts", strategy_id=1, result_id=101, order_1_shift_bp=1,
+                       _equity_quality={**_equity_rank_facts(101, 0, "1", "0", "0", 28), "source_revision": None}),
+        _selection_row("rankable", strategy_id=2, result_id=102, order_1_shift_bp=100,
+                       _equity_quality=_equity_rank_facts(102, 0, "1", "0", "0", 28)),
+    ]
+
+    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
+        run_selection(pd.DataFrame(rows), request)
+
+
+def test_equity_rank_id_lookup_avoids_iterrows_numeric_upcast() -> None:
+    numeric_rows = pd.DataFrame({"strategy_id": [7], "result_id": [17], "metric": [1.25]})
+
+    iterated_id = next(numeric_rows.iterrows())[1]["strategy_id"]
+
+    assert not isinstance(iterated_id, int)
+    assert selection_module._equity_rank_strategy_id(numeric_rows, 0) == 7
 
 
 @pytest.mark.parametrize("corruption", ["missing", "stale", "wrong-algorithm", "bad-digest"])
@@ -1754,6 +2194,33 @@ def _selection_row(name: str, **values: object) -> dict[str, object]:
         "order_1_plateau_point_count": 20 if name == "winner" else 10,
         "total_plateau_point_count": 20 if name == "winner" else 10,
         **values,
+    }
+
+
+def _equity_rank_facts(
+    result_id: int, growth_class: int | None, score: str | None, drawdown: str | None,
+    peak_gap: str | None, horizon: int | None, *, state: str | None = None,
+) -> dict[str, object]:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    facts = calculate_equity_quality_facts(
+        result_id, start, start + timedelta(days=30),
+        (EquitySample(result_id, 0, start, Decimal("100")),
+         EquitySample(result_id, 1, start + timedelta(days=30), Decimal("101"))),
+    )
+    canonical_facts = replace(
+            facts,
+            state=state or ("GROWING" if growth_class == 0 else "WEAKENING" if growth_class == 1 else "DECLINING_OR_MIXED"),
+            equity_class=growth_class,
+            score12=None if score is None else Decimal(score),
+            drawdown=None if drawdown is None else Decimal(drawdown),
+            peak_gap=None if peak_gap is None else Decimal(peak_gap),
+            horizon_days=horizon,
+        )
+    encoded_facts = json.dumps(canonical_facts.to_canonical_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return {
+        "facts": canonical_facts,
+        "source_revision": "0" * 64,
+        "facts_sha256": hashlib.sha256(encoded_facts.encode()).hexdigest(),
     }
 
 
