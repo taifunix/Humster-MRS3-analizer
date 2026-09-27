@@ -1,7 +1,69 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-26
+**Updated:** 2026-09-27
 **Current branch:** `main`
+
+## Liquidity model agreed (2026-09-27)
+
+The user approved the simple replacement curve and EQUAL/INCOME examples.
+Canonical contract: `docs/specs/2026-09-27-liquidity-lot-model.md`.
+`M(s)=1+1.1*(max(0,s-0.6)/4.9)^2`,
+`N_max=K*V25*A15*min_i(M(s_i)/W_i)` with cumulative normalized shares.
+No additional discount on multiorder capacity. The ceiling is 1x up to 0.6%
+and 2.1x for a single 5.5% order. Risk/margin/DD/leverage are unchanged.
+This is approval of the mathematical model, not empirical calibration or a
+runtime integration. Further exploratory research was curtailed at the user's
+request. SMA OHLC4 on closed candles is the final user-confirmed MA definition.
+
+The implementation design is recorded in
+`docs/superpowers/plans/2026-09-27-liquidity-lot-optimizer-integration.md`
+and received independent `PLAN_APPROVED` on 2026-09-27. It keeps the current
+shared symbol cap and adds a separate per-candidate model cap, with two
+proposed Panel/config settings: base K (default 9) and deep-shift bonus
+(default 1.1). Runtime, config and Panel behavior are not changed by this
+design step. Before implementation, extend
+the model spec's runtime contract and add ADR-0046; then use focused TDD and
+independent code review.
+
+## Liquidity lot-model research audit (2026-09-26)
+
+Read-only research artifacts are in the ignored
+`Output/liquidity-model-audit-2026-09-26/` directory (`audit-report.md` and
+`model-v1.1-proposal.md`). All 1,491 workbook runs matched their HTML reports;
+all 870 workbook formulas and 76 minute-feature groups reproduced. The 1,516
+HTML source scan and minute reconstruction were deterministic at 1/16 workers;
+source hashes were unchanged. Existing minute-capacity tests: `22 passed`.
+
+The published K=9 formula was also checked descriptively after clipping saved
+position/equity points and volume features to the same post-warmup six-day
+interval, without refitting: 74/74 original-HIGH curves with sizes inside the
+tested ladder retained at least 80% of their recalculated small-lot baseline.
+This point-sampled sensitivity check retains prior strategy state and is not
+a fresh retest or OOS validation. Entry-minute volume was higher for the deeper
+strategy in 4/6 comparisons with at least ten entry minutes on both sides
+(20/24 including sparse comparisons); timeframe/MA and fill-selection
+confounding remain. Multiorder uplift is not yet calibrated.
+
+The user restricted this work to the liquidity ceiling of the full strategy
+lot. Risk, margin, DD and leverage policies remain unchanged. No runtime code,
+production database, original workbook or tester run was changed/started.
+PerformanceDB feasibility was checked read-only on 12 current 2-4ORD results.
+All 4,736 distinct execution-order IDs were joined by first observed event to
+214 available daily volume files. Added-position entries had higher Q25 volume
+than initial entries in 8/11 sufficiently populated comparisons (median ratio
+1.393); first-event labels are window-relative and subject to left censoring,
+so this is descriptive, not a calibrated lot multiplier. IDs do not map
+directly to grid levels. Further mapping research is optional, not a
+prerequisite for this model. Independent review: `CODE_REVIEW_PASS` for
+descriptive publication only; this does not validate a multiorder multiplier.
+
+User-directed wide-shift filter (<1%, 2-3%, >=3.5%; current LONG 3ORD) found
+1,613 strategies on 9 symbols, 66 with equal opening MA lengths. A subsequent
+exploratory price-mapping probe used three price-complete results. Earlier
+SMA/open figures were superseded by the user's correction to SMA OHLC4 on
+closed candles. The price-mapping supplement has unresolved review findings
+and is not accepted calibration evidence. It is not a prerequisite for the
+user-approved simple model above.
 
 ## Compact selection XLSX accepted (2026-09-26)
 
