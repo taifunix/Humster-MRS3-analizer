@@ -11,6 +11,7 @@ from mrs3.portfolio.minute_capacity import (
     backfill_missing_days,
     calculate_minute_capacity,
     fetch_bybit_trade_archive,
+    resolve_liquidity_window,
 )
 
 
@@ -229,3 +230,81 @@ def test_public_archive_fetch_uses_exact_bybit_daily_path(monkeypatch: pytest.Mo
     data = fetch_bybit_trade_archive("BTCUSDT", date(2026, 9, 8))
     assert data == b"archive"
     assert calls == [("https://public.bybit.com/trading/BTCUSDT/BTCUSDT2026-09-08.csv.gz", 30.0, True)]
+
+
+def test_lot_model_freezes_seven_days_and_computes_type7_q25_and_a15(tmp_path: Path):
+    anchor = datetime(2026, 9, 8, 8, tzinfo=timezone.utc)
+    days = resolve_liquidity_window(anchor, 6)
+    assert days == tuple(date(2026, 9, day) for day in range(1, 8))
+    for day in days:
+        rows = []
+        if day == days[0]:
+            rows = [
+                minute(day, 0, close="1", volume="10", buy="5", sell="5"),
+                minute(day, 1, close="1", volume="20", buy="10", sell="10"),
+                minute(day, 16, close="1", volume="30", buy="15", sell="15"),
+                minute(day, 31, close="1", volume="40", buy="20", sell="20"),
+            ]
+        write_day(tmp_path, "BTCUSDT", day, rows)
+
+    result = calculate_minute_capacity(
+        tmp_path, "BTCUSDT", lot_model=True, anchor_created_at=anchor,
+        publication_lag_hours=6,
+    )
+
+    assert result.status == "READY"
+    assert result.window_start == days[0] and result.window_end == days[-1]
+    assert result.position_cap_usdt == 0
+    assert result.lot_features.v25 == Decimal("17.5")
+    assert result.lot_features.active_15m_bins == 3
+    assert result.lot_features.a15 == Decimal(3) / Decimal(672)
+    assert result.lot_features.window_dates == days
+    assert result.lot_features.publication_lag_hours == 6
+    assert result.lot_features.anchor_created_at_utc == anchor.isoformat()
+    assert len(result.lot_features.file_hashes) == 7
+    assert all(len(digest) == 64 for _name, digest in result.lot_features.file_hashes)
+    assert all("tmp" not in name.lower() for name, _digest in result.lot_features.file_hashes)
+    assert result.lot_features.content_digest
+    assert result.content_digest
+    changed_lag = calculate_minute_capacity(
+        tmp_path, "BTCUSDT", lot_model=True, anchor_created_at=anchor,
+        publication_lag_hours=7,
+    )
+    assert changed_lag.lot_features.window_dates == days
+    assert changed_lag.lot_features.content_digest != result.lot_features.content_digest
+
+
+def test_lot_model_requires_every_valid_file_and_positive_turnover(tmp_path: Path):
+    anchor = datetime(2026, 9, 8, 6, tzinfo=timezone.utc)
+    days = resolve_liquidity_window(anchor, 6)
+    for day in days[:-1]:
+        write_day(tmp_path, "BTCUSDT", day, [minute(day, 0)])
+    with pytest.raises(MinuteCapacityError, match="LIQUIDITY_MODEL_WINDOW_UNAVAILABLE"):
+        calculate_minute_capacity(tmp_path, "BTCUSDT", lot_model=True, anchor_created_at=anchor)
+
+    for day in days:
+        write_day(tmp_path, "ETHUSDT", day, [])
+    with pytest.raises(MinuteCapacityError, match="LIQUIDITY_MODEL_WINDOW_UNAVAILABLE"):
+        calculate_minute_capacity(tmp_path, "ETHUSDT", lot_model=True, anchor_created_at=anchor)
+
+    for day in days:
+        write_day(tmp_path, "XRPUSDT", day, [minute(day, 0)])
+    (tmp_path / "XRPUSDT" / f"XRPUSDT{days[3].isoformat()}_1m.csv").write_text("bad header\n", encoding="utf-8")
+    with pytest.raises(MinuteCapacityError, match="LIQUIDITY_MODEL_WINDOW_UNAVAILABLE"):
+        calculate_minute_capacity(tmp_path, "XRPUSDT", lot_model=True, anchor_created_at=anchor)
+
+
+def test_lot_model_requires_a_frozen_aware_campaign_anchor(tmp_path: Path):
+    with pytest.raises(MinuteCapacityError, match="LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE"):
+        calculate_minute_capacity(
+            tmp_path, "BTCUSDT", lot_model=True,
+            anchor_created_at=datetime(2026, 9, 8, 6),
+        )
+
+
+def test_liquidity_window_uses_publication_lag_at_campaign_creation_boundary():
+    assert resolve_liquidity_window(datetime(2026, 9, 8, 5, 59, tzinfo=timezone.utc), 6)[-1] == date(2026, 9, 6)
+    assert resolve_liquidity_window(datetime(2026, 9, 8, 6, tzinfo=timezone.utc), 6)[-1] == date(2026, 9, 7)
+    anchor = datetime(2026, 9, 8, 6, 30, tzinfo=timezone.utc)
+    assert resolve_liquidity_window(anchor, 6)[-1] == date(2026, 9, 7)
+    assert resolve_liquidity_window(anchor, 7)[-1] == date(2026, 9, 6)

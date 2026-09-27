@@ -1,55 +1,91 @@
-# Liquidity lot ceiling in Portfolio Optimizer
+# Unified liquidity and one-way history implementation plan
 
-Status: implementation plan; `PLAN_APPROVED` by independent Advisor on 2026-09-27. No optimizer behavior or Panel setting is implemented by this document. The user-approved default mathematics is in [the model specification](../../specs/2026-09-27-liquidity-lot-model.md). `K=9` and deep-shift bonus `1.1` are proposed defaults, not validation of the replacement curve.
+Status: implemented and independently reviewed. PLAN_REVISION v3 received independent PLAN_APPROVED; implementation received sequential Opus 5/high CODE_REVIEW_PASS on 2026-09-27 after two finding rounds. The previous two-cap design is superseded by explicit user corrections.
 
-## Decision
+Goal: one approved liquidity ceiling per strategy and one active position direction per symbol. Both LONG and SHORT remain selectable. Spec: [liquidity model](../../specs/2026-09-27-liquidity-lot-model.md).
 
-Keep two separate liquidity limits for each weighted candidate:
+## Agreed contract
 
-- `C_symbol`: today's exchange-rounded shared symbol cap, derived from calendar mean minute turnover and `liquidity.parameters.close_volume_participation_pct` (currently 200%). All members on a symbol still share `sum(x_i) <= C_symbol`, including LONG and SHORT.
-- `C_model`: the candidate's full-strategy lot ceiling, `K * V25 * A15 * min_i(M(s_i) / W_i)`. `M(s) = 1 + bonus * (max(0, s - 0.6) / 4.9)^2`, with default `bonus=1.1`; `W_i` is the cumulative share of the existing `lot_x` through order `i`.
-- `C_effective = min(C_symbol, C_model)`: the individual LP and executable ceiling, `x_i <= C_effective`.
+- One strategy per canonical (symbol, side), already enforced in input/adapter.
+- Replace the old mean-turnover participation cap; no minimum of two formulas.
+- LONG and SHORT have independent caps, no aggregate liquidity constraint.
+- No hedge. Assume dedicated close before opposite entry; ignore opposite-fill reduction/reversal. No account-mode confirmation gate.
+- Independent portfolio calculations, no prior-run positions or reservations.
+- Retain existing rounding setting, default 10 USDT, always floor.
+- K default9 and deep-shift bonus default1.1 are the only new model controls.
+- Risk thresholds and conservative additive margin formulas stay unchanged.
 
-Keep the current `position_size_usdt` on the enriched source member and `capacity_usdt` on the weighted candidate equal to `C_symbol`. Add explicit model and effective-cap fields; do not silently change the meaning of existing fields. The JSON strategy payload's `facts.C` and `basic.max_balance` will use `C_effective` under the new weighted algorithm version. Risk, DD, margin, leverage, and allocation policy remain unchanged. EQUAL and INCOME need no branch: the already frozen `lot_x` determines order shares.
+## Tasks
 
-The shared cap can bind before the shift bonus, so a candidate is never promised the entire formula result. In the historical workbook's 76 descriptive feature groups, `9*V25*A15` was below the current raw `2*calendar_mean` cap in 71 groups; even `2.1*9*V25*A15` was below it in 59. These different-window observations show that preserving the shared cap does not automatically erase the bonus, but they do not calibrate the new curve.
+### 1. Consistent one-way history
 
-## Model input and evidence contract
+- [x] Update runtime spec and add ADR before code changes.
+- [x] Reuse input.py prepare_weighted_input and existing segmented equity attribution in a two-pass flow: collect/validate cycles, then determine per-symbol admission before contributing to normalized_delta.
+- [x] Compute liquidity/exchange bounds and apply invalid-source/geometry/capacity exclusions BEFORE freezing the composition and its admission mask. Rebuild preparation if that source membership changes. Post-LP zero/minimum-size omission is the explicit frozen-mask approximation below, not a source exclusion.
+- [x] Use [first_fill, final_flat) intervals; closes precede opens at the same timestamp. Simultaneous opens use original opening time, strategy ID, source ordinal, cycle ID. A symbol remains occupied until its admitted cycle is flat. Reject a whole overlapping opposite cycle; do not queue or admit its tail.
+- [x] Preserve source-run boundary cycles; their clipped history is not cross-run position state.
+- [x] Same-side source cycles must not overlap; fail ONE_WAY_SOURCE_CYCLE_OVERLAP if they do. For boundary cycles from either selected direction, use original opening time and deterministic ties to select the occupying cycle.
+- [x] Validate source deltas and source_basis even for rejected cycles. Exclude the whole rejected cycle's contributions, including closing/cost deltas, from effective PnL/equity/DD. Downstream occupancy and replay use admitted cycles. Retain rejection/conflict witnesses and source diagnostics.
+- [x] Preserve each admitted cycle's own source_basis normalization denominator; it is not a sum over active positions and must not be recomputed from the admission count.
+- [x] Fail mixed-symbol history without complete attribution with ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE. Do not fall back to independent curves. Include policy/mask/participants in cache and preparation identity.
+- [x] Verify that coefficients, DD, bootstrap and replay consume the same effective aligned path, without a second simulator.
 
-For each Campaign, derive one frozen seven-day UTC window from its immutable `created_at_utc` and its frozen `config_document.liquidity.archive_publication_lag_hours` (existing default 6, allowed 0..48). Its end date is the latest UTC date before the creation date whose following midnight plus publication lag is no later than Campaign creation; the start date is six days earlier. Both caps use that window. An immediate run keeps the current archive-lag choice; a delayed run cannot move it. Backfill, when enabled, may fetch only these seven dates. An absent minute row in a valid daily CSV means no trades. A missing or invalid daily file, or no positive turnover from which to compute the model, fails the run before search with `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE` and symbol/date evidence; it must not silently fall back to `C_symbol` or yield an empty successful run.
+The admission mask is frozen per composition before LP. A member later sized to zero does not reactivate suppressed cycles. This is a deterministic approximation, NOT a conservative PnL guarantee: suppressing a cycle may remove profit or loss. Source-recorded normalization bases remain; no counterfactual compounding or tick reconstruction. Document and test this boundary.
 
-Compute `V25` as the Type-7 linear Q25 of positive minute `close * volume` values. Compute `A15` as the number of UTC 15-minute bins with positive turnover divided by `672`. Use the same validated minute rows for the old shared mean. Record the resolved lag, dates, file hashes, V25, A15, K, both raw caps, rounding steps, and model version in deterministic evidence and digests. Changing current Panel settings after Campaign creation must not change its window or identity.
+### 2. Features and liquidity formula
 
-Evaluate the model inside one `Decimal` local context with precision 28 and `ROUND_HALF_EVEN`. Parse numeric inputs exactly; compute `L=V25*A15`, `base=K*L`, then for each existing canonical `order_id` sequence compute `s_i=Decimal(shift_bp)/100` percentage points, `M_i`, `W_i=(sum of lot_x through i)/(sum of all lot_x)`, `B=min_i(M_i/W_i)`, and `raw=base*B`. Do not quantize intermediate values, sort by shift, or convert to binary float. In an exact tie, the first configured order binds. Accept 1–4 unique valid order IDs with finite positive `lot_x`; allow `shift_bp=0` as an explicit no-premium base level, and other shifts only in `30..550` bp. Reject 10 or 600 bp as unsupported rather than extrapolating. The model cap and exchange quantity are rounded down with `ROUND_FLOOR`, first to the configured USDT step, then to the instrument quantity step. Zero or below-minimum results exclude the candidate before the LP. Include both K and bonus as canonical fixed-point Decimal strings in evidence and identity; changing bonus affects the deep premium but leaves shifts through 0.6% at `M=1`.
+- [x] minute_capacity.py: resolve seven UTC dates from frozen Campaign creation and publication lag (latest completed date whose next midnight plus lag <= creation, plus six preceding days). Backfill only those dates. Require all seven valid files and positive turnover; fail before search on missing/invalid data.
+- [x] Missing/invalid Campaign creation anchor fails LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE; previews do not silently use the current clock.
+- [x] Compute Type-7 Q25 of positive minute close*volume as V25; A15=positive UTC 15-minute bins/672. Absent minute rows in valid files mean zero trades. Record lag/window/file hashes/features.
+- [x] position_sizing.py: compute L=V25*A15, M_i=1+bonus*(max(0,s_i-0.6)/4.9)^2, W_i=cumulative lot_x/total lot_x, B=min(M_i/W_i), C_raw=K*L*B. Use configured order IDs, never shift sorting. Require 1-4 unique valid IDs, finite positive lots, shift_bp exactly0 or30..550. First configured binding tie wins. EQUAL/INCOME retain existing lots.
+- [x] Decimal precision28 HALF_EVEN arithmetic; FLOOR USDT/quantity steps. Floor C_raw to configured USDT step, cap with exchange maxQty/mark, floor qtyStep, validate minima. Result U is the individual upper bound. Malformed geometry/minimum failures exclude only that candidate; no survivors -> LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE. No old-formula fallback.
 
-Golden examples with `K*V25*A15=1000 USDT` and a 10-USDT floor:
+Goldens at K*L=1000: shifts .5/3 and lots50/50 -> raw1263.890045814244064972927947, floor1260; shifts .5/3/5.5 and lots80/15/5 ->1250.00, first order binds. Final cumulative W exactly1.
 
-| Shifts (%) | `lot_x` | Raw cap (USDT) | Binding order | Floored cap (USDT) |
-| --- | --- | ---: | ---: | ---: |
-| 0.5 / 3 | 50 / 50 | 1263.890045814244064972927947 | 2 | 1260 |
-| 0.5 / 3 / 5.5 | 80 / 15 / 5 | 1250.00 | 1 | 1250 |
+### 3. Search and payloads
 
-If an individual candidate has malformed geometry, unsupported shift, or a cap below the exchange minimum, exclude only it with a stable counted reason. Solve surviving candidates normally. If none remain, return terminal `LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE` with reason counts; never report `PASS` with no candidates.
+- [x] weighted_search.py: remove same-symbol capacity equality/aggregate LP rows and checks. Enforce heterogeneous member bounds0<=x_j<=U_j in LP, proposals, residual checks, rescue, conversion and final validation. Upper target=sum(max(0,coefficient_j)*U_j).
+- [x] size_composition_vector: per-strategy capacities, per-symbol instruments/marks; check each rounded actual<=U without aggregate L/S cap or redistribution.
+- [x] adapter.py: source position_size_usdt=U, candidate capacity_usdt=U, x_usdt=solver allocation; executable position_size_usdt=rounded actual. facts.C=U, max_balance=U*bank/actual. Do not arm U when solver selected less. Preserve both directional payloads; no account-mode field or gate.
+- [x] Per explicit user correction, do not rerun bootstrap or historical search after exchange rounding. Verify each actual size is nonnegative and no greater than its LP allocation and U. Label historical/DD/bootstrap metrics as pre-rounding estimates; unequal rounding can alter portfolio DD despite smaller individual orders.
+- [x] Omit zero or exchange-below-minimum rounded allocations from payloads with a recorded reason; guard the actual>0 division explicitly. Do not reactivate suppressed cycles after this omission. No positive payload members is an explicit terminal no-candidate outcome.
+- [x] Include geometry/features/settings/binding/raw/floored cap/reference and one-way evidence in appropriate identities. Active WS1.3 and portfolio_optimizer_sizing_v3. The operator confirmed no old WS1.2 result artifacts exist; add no compatibility path for them.
 
-## Integration points
+### 4. Config and Panel
 
-1. Extend `src/mrs3/portfolio/minute_capacity.py` to calculate V25/A15 while reading the existing seven daily files and expose frozen window/model evidence. Anchor both caps to the Campaign snapshot in `src/mrs3/portfolio/adapter.py` instead of the wall clock; retain the current shared-cap formula.
-2. Calculate each candidate's model cap from its frozen `strategy_orders` in `src/mrs3/portfolio/position_sizing.py` or the adjacent enrichment seam. Carry `C_symbol`, `C_model`, `C_effective`, the binding order, and the reason if excluded. Existing `lot_x` supports both EQUAL and INCOME.
-3. Keep `weighted_search.py`'s `capacities` as identical same-symbol shared caps. Pass heterogeneous individual caps separately. The LP must enforce both `0 <= x_i <= C_effective_i` and `sum(x_i for symbol=s) <= C_symbol_s`; repeat these checks in solver output, proposed vectors, rescue, candidate conversion, bootstrap/replay, and final validation. The existing `upper_target = sum_s C_symbol_s * max(0, max coefficient on s)` is still a safe upper bound because individual caps only shrink the feasible set; final rounded bounds remain the acceptance gate.
-4. In `size_composition_vector`, reject any rounded member above its effective cap or rounded symbol total above the shared cap; do not clamp or redistribute. Keep margin coefficients validated over the existing `C_symbol` domain, of which the effective bounds are a subset.
-5. Change `build_weighted_strategy_payload` to receive `C_effective` as its executable capacity. For the new version, emit `facts.C = C_effective` plus `C_symbol`, `C_model`, and `C_effective`; read back `C == C_effective <= C_symbol`, `C_effective <= C_model`, actual size `<= C_effective`, and the symbol aggregate `<= C_symbol`. Preserve the existing equality between weighted candidate `capacity_usdt` and enriched source `position_size_usdt`, both of which remain `C_symbol`.
-6. Bump the sizing algorithm ID to `portfolio_optimizer_sizing_v3` and Campaign weighted algorithm to `WS1.3`, and include ordered geometry, K, frozen lag/window/source hashes, features, binding order, and all caps in the sizing/executable identities. Reject old WS1.2 Campaigns for new execution; retain existing stored results as read-only artifacts without recomputation.
+- [x] Schema3: liquidity.parameters.lot_model_base_coefficient exactDecimal1..20 default9; lot_model_max_shift_bonus exactDecimal0..2 default1.1. Keep round_down_usdt default10.
+- [x] K/bonus are global settings frozen per Campaign. Geometry belongs to individual candidate inputs, not the config document: reject invalid geometry at enrichment, not by rewriting historic payloads or invalidating unrelated config.
+- [x] Migrate v1/v2 in memory, remove close_volume_participation_pct without translating it into K. Explicit CAS Save persists v3; frozen Campaign bytes/digests unchanged. Reject retired keys in strict v3.
+- [x] Replace participation with K/bonus in existing panel_web/index.html and app.js Settings card, retain rounding. Existing API/CAS only, no new screen or shape controls.
 
-Before changing behavior, expand the model spec into the exact runtime contract and add ADR-0046 for the separate shared/candidate ceilings. Amend the weighted-search and Panel specs only where the new version and setting alter their contracts. No new tester, live DB, portfolio-risk, or curve-fitting work is required.
+### 5. Checks and delivery
 
-## Configuration and Panel
+- [x] Failing focused tests before implementation: minute quantile/activity/sparse files/frozen window; formula goldens/bounds/ties/lots/exchange minima; whole-cycle exclusion including fees/close; sequential sides/close-before-open/ties/boundaries/independent symbols/rejected validation; consistent effective metrics and frozen-mask zero-size approximation.
+- [x] Independent heterogeneous L/S caps with known optimum, duplicate pair-side rejection, overflow, payload actual/U readback, identity sensitivity, config migration/CAS and strict WS1.3 reads.
+- [x] Test exclusions before admission, mask idempotence, same-side source overlap, boundary conflicts, preservation of different source bases, missing anchor, x=0 and positive x rounding to zero, all-candidate exclusions, endpoint M(0.6)=1 and M(5.5)=1+bonus, independent caps with additive margin. The USDT rounding step is not an invented minimum-notional constraint.
+- [x] Run .venv\Scripts\python.exe -m pytest focused then relevant broader suites, JS syntax, compilation, git diff --check, independent CODE_REVIEW_PASS. Update this task's docs/progress only, preserve concurrent shortlist edits. Scoped conventional commit after review.
 
-Expose exactly two settings in the existing Portfolio Optimizer Settings card: `liquidity.parameters.lot_model_base_coefficient`, exact Decimal `1..20` with proposed default `9`, and `liquidity.parameters.lot_model_max_shift_bonus`, exact Decimal `0..2` with default `1.1`. K changes the whole ceiling; bonus changes only the deep-shift premium. At 5.5% the multiplier is `1+bonus`, so the default gives `2.1`; through 0.6% the multiplier remains `1`. Relabel the existing participation input so it clearly says **shared symbol cap**; keep its config key and default unchanged. The curve onset `0.6`, endpoint `5.5`, exponent `2`, V25 quantile, A15 bin width, and seven-day window stay in the versioned algorithm.
+## Findings ledger
 
-Keep config `schema_version=2`: `liquidity.parameters` already admits additive leaves. Existing v2 files lacking the two values receive `9` and `1.1` in memory; only an explicit full-document compare-and-swap save writes them to disk. A save cannot modify an already frozen Campaign. Reuse the current Settings API; add no new endpoint, screen, or workbook sheet. Existing member output may show a compact shared/model/effective/binding evidence block. A front-weighted strategy may bind at its shallow first order, in which case changing the deep bonus correctly has no effect on its ceiling.
+F1 remove mixed-member/account gate; F2 preserve source boundary cycles, no cross-run state; F3 retain rounding; F4 schema3 migration; F5 accept zero shift; F6 independent caps; F7 reuse attribution; F8 frozen mask is approximation, not conservative; F9 coherent effective metrics; F10 additive margin; F11 no external execution.
 
-## Implementation checks
+User correction after PLAN_APPROVED: exchange flooring must not trigger a second
+bootstrap or historical search. Preserve the cheap `actual<=x<=U` check and
+distinguish pre-rounding risk evidence from executable sizes.
 
-Write focused failing tests before implementation. Required cases are the two exact Decimal goldens plus one non-default bonus case; shift 0 accepted and 10/600 rejected; missing daily file as run failure; sparse minutes; frozen lag/window despite later settings changes; partial and all-candidate exclusions; heterogeneous same-symbol caps with a known feasible optimum; safe loose upper target; floor/quantity minimum; unchanged risk/DD/margin when the model does not bind; old stored WS1.2 result remaining readable; and one binding `C_model < C_symbol` path through proposal, LP, rounding, sizing, payload, readback, and replay without repair. Test K and bonus validation (including bonus 0 and 2), their independent effects, identity stability for identical frozen inputs, and sensitivity to geometry, both settings, window, and file bytes.
+Advisor first round PLAN_REVISE. F12 accepted exclusion-before-mask with explicit distinction for later zero-size omission. F13 accepted positive denominator/zero-payload guard. F14 accepted per-symbol occupancy and same-side/source-boundary checks. F15 rejected aggregate-denominator recomputation: existing attribution uses each cycle's own source_basis. F16 accepted units/pairing/endpoint tests. F17 partially accepted: stable below-minimum/all-excluded outcomes, but retain approved USDT-then-quantity floor order; step10 is not a minimum notional. F18 accepted named missing-anchor failure. F19 partially accepted: global settings; geometry is candidate data validated at enrichment, not config-load fields. F20 accepted corresponding focused tests. Independent re-review accepted all dispositions and returned PLAN_APPROVED; no material findings remain.
 
-Run focused and relevant broader tests only with `.venv\\Scripts\\python.exe -m pytest`, then JS syntax, Python compilation, and `git diff --check`. Obtain independent `CODE_REVIEW_PASS`, address confirmed findings, update `progress.md` and PRD if scope/status changed, and make a scoped conventional implementation commit containing the runtime spec amendment, ADR, code, tests, and evidence. Do not present either proposed default or the new curve as empirically calibrated.
+## Implementation acceptance evidence (2026-09-27)
+
+The GPT-6 Luna slices implemented feature extraction, settings/UI,
+input/search and adapter integration. The operator confirmed there are no old
+WS1.2 result artifacts; the temporary historical-read exception was removed.
+Ten-USDT downward exchange rounding is checked against `actual<=LP x<=U`
+without a second bootstrap, per the operator's instruction.
+
+The final eight-suite run passed 1224 tests with one Windows symlink skip.
+After the last narrow review fixes, the affected input/search/adapter suite
+passed 713 tests. `node --check`, Python compilation and `git diff --check`
+passed. Independent Opus 5/high review returned `CODE_REVIEW_FINDINGS` in two
+sequential rounds, then `CODE_REVIEW_PASS` after the missing proofs and narrow
+guards were added. No tester, live account or exchange action was performed.

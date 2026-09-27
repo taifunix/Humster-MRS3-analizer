@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from itertools import product
@@ -20,17 +20,25 @@ from .canonical import CanonicalEnvelope, canonical_digest_v1, typed_value
 from .liquidity import ReferenceSnapshot
 from .margin import derive_reference_margin_coefficients
 from .market_snapshot import ApiRateLimiter, MarketSnapshotError, load_market_snapshot
-from .minute_capacity import MinuteCapacityError, MinuteCapacityResult, backfill_missing_days, calculate_minute_capacity
+from .minute_capacity import MinuteCapacityError, MinuteCapacityResult, backfill_missing_days, calculate_minute_capacity, resolve_liquidity_window
 from .spread_screen import read_spread_history
 
 
 CAMPAIGN_CONTRACT_VERSION = "PORTFOLIO_WEIGHTED_CAMPAIGN_V1"
 CAMPAIGN_SEARCH_MODE = "WEIGHTED_V1"
 CAMPAIGN_LEGACY_SEARCH_MODE = "PRETEST_PROXY"
-CAMPAIGN_WEIGHTED_ALGO_VERSION = "WS1.2"
+CAMPAIGN_WEIGHTED_ALGO_VERSION = "WS1.3"
 WEIGHTED_SEARCH_NOT_IMPLEMENTED = "WEIGHTED_SEARCH_NOT_IMPLEMENTED"
 WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE = "WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE"
 WEIGHTED_INPUT_PREPARATION_FAILED = "WEIGHTED_INPUT_PREPARATION_FAILED"
+_PROMOTED_WEIGHTED_PREPARATION_CODES = frozenset({
+    "COMMON_PERIOD_UNAVAILABLE",
+    "COMMON_PERIOD_UNIVERSE_CHANGED",
+    "INVALID_SOURCE_VALUE",
+    "ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE",
+    "ONE_WAY_SOURCE_CYCLE_OVERLAP",
+    "SOURCE_SNAPSHOT_UNAVAILABLE",
+})
 MARGIN_BOUND_UNAVAILABLE = "MARGIN_BOUND_UNAVAILABLE"
 MINUTE_CAPACITY_UNAVAILABLE = "MINUTE_CAPACITY_UNAVAILABLE"
 MARKET_SNAPSHOT_UNAVAILABLE = "MARKET_SNAPSHOT_UNAVAILABLE"
@@ -87,6 +95,13 @@ def weighted_search(*args: Any, **kwargs: Any) -> Any:
 def enrich_finalist_rows(*args: Any, **kwargs: Any) -> Any:
     """Lazy adapter seam for finalist enrichment."""
     from .position_sizing import enrich_finalist_rows as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def size_composition_vector(*args: Any, **kwargs: Any) -> Any:
+    """Lazy adapter seam for exchange-rounded weighted allocations."""
+    from .position_sizing import size_composition_vector as implementation
 
     return implementation(*args, **kwargs)
 
@@ -276,7 +291,7 @@ def build_weighted_strategy_payload(
         for key in ("use_long", "use_short")
     ):
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
-    if basic.get("use_long") is not True or basic.get("use_short") is not False:
+    if (basic.get("use_long"), basic.get("use_short")) not in {(True, False), (False, True)}:
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
     balance_field = f"balance_percentage_{side.lower()}"
     risk_field = f"risk_{side.lower()}"
@@ -293,10 +308,11 @@ def build_weighted_strategy_payload(
     if type(open_positions_limiter) is not int or open_positions_limiter < 0:
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
 
-    x = _weighted_decimal(member.get("x_usdt"))
+    solver_x = _weighted_decimal(member.get("solver_x_usdt", member.get("x_usdt")))
+    x = _weighted_decimal(member.get("actual_size_usdt", solver_x))
     bank = _weighted_decimal(bank_usdt)
     capacity = _weighted_decimal(capacity_usdt)
-    if x <= 0 or bank <= 0 or capacity <= 0:
+    if x <= 0 or bank <= 0 or capacity <= 0 or x > solver_x or solver_x > capacity:
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
     try:
         q = x / bank
@@ -611,6 +627,9 @@ def _prepare_frozen_weighted_input(
             minimum_common_days=minimum_common_days,
         )
     except Exception as error:
+        code = getattr(error, "code", None)
+        if isinstance(code, str) and code in _PROMOTED_WEIGHTED_PREPARATION_CODES:
+            raise CampaignContractError(code) from error
         raise CampaignContractError(WEIGHTED_INPUT_PREPARATION_FAILED) from error
 
 
@@ -668,6 +687,14 @@ def _plain_json_containers(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_plain_json_containers(item) for item in value]
     return value
+
+
+def _plain_json_executable_member(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Encode exact sizing decimals without normalizing unrelated evidence."""
+    return {
+        key: _weighted_decimal_text(item) if isinstance(item, Decimal) else _plain_json_containers(item)
+        for key, item in value.items()
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -997,6 +1024,7 @@ def _build_strategy_payloads(
     enriched_rows: Sequence[Mapping[str, Any]],
     bank_usdt: Any,
     open_positions_limiter: Any,
+    executable_members: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[Mapping[str, Any], ...]:
     if not isinstance(template, Mapping):
         raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
@@ -1015,8 +1043,8 @@ def _build_strategy_payloads(
 
     payloads: list[Mapping[str, Any]] = []
     positive_identities: set[tuple[str, str, int, int]] = set()
-    for member in candidate_members:
-        x = _weighted_decimal(member.get("x_usdt"))
+    for member in executable_members if executable_members is not None else candidate_members:
+        x = _weighted_decimal(member.get("actual_size_usdt", member.get("x_usdt")))
         if x == 0:
             continue
         if x < 0:
@@ -1107,6 +1135,87 @@ def _build_strategy_payloads(
     return tuple(payloads)
 
 
+def _round_weighted_candidate_members(
+    candidate_members: Sequence[Mapping[str, Any]],
+    enriched_rows: Sequence[Mapping[str, Any]],
+    reference: Any,
+    mark_prices: Mapping[str, Any],
+) -> tuple[tuple[Mapping[str, Any], ...], tuple[Mapping[str, Any], ...]]:
+    """Round LP targets down per member, retaining source U as its capacity."""
+    from .position_sizing import PASS as SIZING_PASS
+
+    enriched_by_identity = {_weighted_input_identity(row): row for row in enriched_rows}
+    member_by_identity: dict[tuple[str, str, int, int], Mapping[str, Any]] = {}
+    sizing_rows: list[Mapping[str, Any]] = []
+    for member in candidate_members:
+        identity = _weighted_input_identity(member)
+        if identity in member_by_identity:
+            raise CampaignContractError(WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE)
+        member_by_identity[identity] = member
+        enriched = enriched_by_identity.get(identity)
+        if not isinstance(enriched, Mapping):
+            raise CampaignContractError(WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE)
+        target = _weighted_decimal(member.get("x_usdt"))
+        capacity = _weighted_decimal(member.get("capacity_usdt"))
+        enriched_capacity = _weighted_decimal(enriched.get("position_size_usdt"))
+        if target < 0:
+            raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
+        if capacity <= 0 or not _weighted_close(capacity, enriched_capacity) or target > capacity:
+            raise CampaignContractError(WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE)
+        sizing_rows.append({**dict(enriched), "x_usdt": target, "capacity_usdt": capacity})
+
+    result = size_composition_vector(
+        tuple(sizing_rows),
+        {},
+        reference,
+        mark_prices,
+        independent_capacities=True,
+    )
+    raw_exclusions: list[Mapping[str, Any]] = []
+    for exclusion in getattr(result, "exclusions", ()):
+        reason = getattr(exclusion, "reason", None) or "SIZE_EXCLUDED"
+        for row in getattr(exclusion, "members", ()):
+            if not isinstance(row, Mapping):
+                continue
+            identity = _weighted_input_identity(row)
+            member = member_by_identity.get(identity)
+            raw_exclusions.append({
+                **dict(_normalise_scalar_exclusion(row)),
+                "reason": reason,
+                "solver_x_usdt": _weighted_decimal_text(_weighted_decimal(member.get("x_usdt"))) if member is not None else "0",
+            })
+    if getattr(result, "status", None) != SIZING_PASS:
+        if getattr(result, "reason", None) == "NO_NONZERO_TARGET" and raw_exclusions:
+            return (), tuple(raw_exclusions)
+        raise CampaignContractError(getattr(result, "reason", None) or "EXCHANGE_ROUNDING_FAILED")
+
+    executable: list[Mapping[str, Any]] = []
+    for sized in getattr(result, "rows", ()):
+        identity = _weighted_input_identity(sized)
+        member = member_by_identity.get(identity)
+        if member is None:
+            raise CampaignContractError(WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE)
+        solver_x = _weighted_decimal(member.get("x_usdt"))
+        capacity = _weighted_decimal(member.get("capacity_usdt"))
+        actual = _weighted_decimal(sized.get("actual_size_usdt"))
+        if actual <= 0 or actual > solver_x or solver_x > capacity:
+            raise CampaignContractError(_WEIGHTED_PAYLOAD_ERROR)
+        executable.append({
+            "symbol": identity[0],
+            "side": identity[1],
+            "strategy_id": identity[2],
+            "result_id": identity[3],
+            "x_usdt": actual,
+            "solver_x_usdt": solver_x,
+            "actual_size_usdt": actual,
+            "capacity_usdt": capacity,
+            "priority": member.get("priority"),
+            "quantity": sized.get("quantity"),
+            "sizing_digest": sized.get("sizing_digest"),
+        })
+    return tuple(executable), tuple(raw_exclusions)
+
+
 def _weighted_executable_identity(
     campaign: Mapping[str, Any],
     profile_id: str,
@@ -1117,6 +1226,7 @@ def _weighted_executable_identity(
     payloads: Sequence[Mapping[str, Any]],
     *,
     source_rows: Sequence[Mapping[str, Any]] = (),
+    executable_members: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     """Digest only the frozen inputs and executable weighted package."""
     try:
@@ -1134,6 +1244,7 @@ def _weighted_executable_identity(
             or not isinstance(payloads, Sequence)
             or isinstance(source_rows, (str, bytes))
             or not isinstance(source_rows, Sequence)
+            or (executable_members is not None and (isinstance(executable_members, (str, bytes)) or not isinstance(executable_members, Sequence)))
         ):
             raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
         positive_members = []
@@ -1142,15 +1253,41 @@ def _weighted_executable_identity(
                 raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
             if _weighted_decimal(member.get("x_usdt")) > 0:
                 positive_members.append((_weighted_input_identity(member), member))
-        if len(positive_members) != len(payloads):
+        by_solver_identity = {identity: member for identity, member in positive_members}
+        if len(by_solver_identity) != len(positive_members):
+            raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
+        explicit_executables = executable_members is not None
+        if executable_members is None:
+            actual_members = tuple(member for _identity, member in positive_members)
+        else:
+            actual_members = tuple(executable_members)
+        executable_by_identity: dict[tuple[str, str, int, int], Mapping[str, Any]] = {}
+        for member in actual_members:
+            if not isinstance(member, Mapping):
+                raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
+            identity = _weighted_input_identity(member)
+            solver = by_solver_identity.get(identity)
+            if explicit_executables:
+                actual = _weighted_decimal(member.get("actual_size_usdt", member.get("x_usdt")))
+                capacity = _weighted_decimal(member.get("capacity_usdt"))
+                solver_x = _weighted_decimal(solver.get("x_usdt")) if solver is not None else Decimal(0)
+                invalid_size = solver is None or actual <= 0 or actual > solver_x or solver_x > capacity
+            else:
+                invalid_size = solver is None
+            if identity in executable_by_identity or invalid_size:
+                raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
+            executable_by_identity[identity] = member
+        if len(executable_by_identity) != len(payloads):
             raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
         evidence_by_identity: dict[tuple[str, str, int, int], dict[str, Any]] = {}
         evidence_fields = (
             "reference_digest", "sizing_digest", "capacity_digest",
             "report_start_utc", "report_end_utc", "effective_start_utc", "effective_end_utc",
-            "optimizer_source_metadata", "source_provenance",
+            "optimizer_source_metadata", "source_provenance", "lot_model_digest",
+            "liquidity_v25_usdt", "liquidity_a15", "binding_order_id",
+            "one_way_policy", "one_way_mask_digest",
         )
-        for rows in (source_rows, enriched_rows):
+        for rows in (source_rows, enriched_rows, members):
             seen: set[tuple[str, str, int, int]] = set()
             for row in rows:
                 identity = _weighted_input_identity(row)
@@ -1166,19 +1303,51 @@ def _weighted_executable_identity(
                     evidence[field] = row[field]
 
         ordered_members = []
-        for (identity, _member), payload in sorted(zip(positive_members, payloads), key=lambda item: item[0][0]):
+        expected_identity_by_name: dict[str, tuple[str, str, int, int]] = {}
+        for executable in actual_members:
+            identity = _weighted_input_identity(executable)
+            name = f"PORTFOLIO_{identity[0]}_{identity[2]}_{identity[3]}"
+            if name in expected_identity_by_name:
+                raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
+            expected_identity_by_name[name] = identity
+        payload_by_identity: dict[tuple[str, str, int, int], Mapping[str, Any]] = {}
+        for payload in payloads:
             if not isinstance(payload, Mapping):
                 raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
             strategy = payload.get("strategy")
             basic = strategy.get("basic") if isinstance(strategy, Mapping) else None
-            expected_name = f"PORTFOLIO_{identity[0]}_{identity[2]}_{identity[3]}"
+            name = strategy.get("name") if isinstance(strategy, Mapping) else None
+            identity = expected_identity_by_name.get(name) if isinstance(name, str) else None
             if (
                 not isinstance(strategy, Mapping)
                 or not isinstance(basic, Mapping)
+                or identity is None
                 or basic.get("symbol") != identity[0]
-                or strategy.get("name") != expected_name
+                or ("side" in payload and payload.get("side") != identity[1])
+                or identity in payload_by_identity
             ):
                 raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
+            executable = executable_by_identity[identity]
+            facts = payload.get("facts")
+            if explicit_executables:
+                if not isinstance(facts, Mapping):
+                    raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
+                try:
+                    if (
+                        _weighted_decimal(facts.get("x")) != _weighted_decimal(executable.get("actual_size_usdt", executable.get("x_usdt")))
+                        or _weighted_decimal(facts.get("C")) != _weighted_decimal(executable.get("capacity_usdt"))
+                    ):
+                        raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
+                except CampaignContractError as error:
+                    raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID) from error
+            payload_by_identity[identity] = payload
+        if len(payload_by_identity) != len(actual_members):
+            raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
+        for identity, solver_member in sorted(positive_members, key=lambda item: item[0]):
+            payload = payload_by_identity.get(identity)
+            if payload is None:
+                continue
+            executable = executable_by_identity[identity]
             evidence = evidence_by_identity.get(identity)
             if evidence is None:
                 raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
@@ -1192,6 +1361,8 @@ def _weighted_executable_identity(
                     "strategy_id": identity[2],
                     "result_id": identity[3],
                 },
+                "solver_x_usdt": _weighted_decimal_text(_weighted_decimal(solver_member.get("x_usdt"))),
+                "executable_member": _plain_json_executable_member(executable),
                 "evidence": {field: evidence[field] for field in evidence_fields if field in evidence},
                 "payload": payload,
             })
@@ -1326,23 +1497,47 @@ def _build_portfolio_candidates_single(
                 continue
             if identity in selected_ids and any(key in row for key in ("timeframe", "close_ma_len", "order_count", "strategy_orders")):
                 geometry_rows.append(row)
-    try:
-        if geometry_rows:
-            _validate_input_geometry(tuple(geometry_rows))
-    except CampaignContractError as error:
-        return AdapterResult("FAIL", excluded=spread_excluded, blockers=(error.code,))
-
-    try:
-        prepared = _prepare_frozen_weighted_input(selected_for_adapter, campaign)
-    except CampaignContractError as error:
-        return AdapterResult("FAIL", blockers=(error.code,))
+    geometry_excluded: list[Mapping[str, Any]] = []
+    geometry_survivors: list[Mapping[str, Any]] = []
+    if geometry_rows:
+        for row in geometry_rows:
+            try:
+                _validate_input_geometry((row,))
+            except CampaignContractError as error:
+                item = dict(_normalise_scalar_exclusion(row))
+                item["reason"] = error.code
+                geometry_excluded.append(item)
+            else:
+                geometry_survivors.append(row)
+        if geometry_excluded:
+            selected_for_adapter = tuple(
+                row for row in selected_for_adapter
+                if _weighted_input_identity(row) not in {_weighted_input_identity(item) for item in geometry_excluded}
+            )
+            if not selected_for_adapter:
+                return AdapterResult("FAIL", excluded=tuple((*spread_excluded, *geometry_excluded)), blockers=("LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE",))
+        try:
+            _validate_input_geometry(geometry_survivors)
+        except CampaignContractError as error:
+            return AdapterResult(
+                "FAIL",
+                excluded=tuple((*spread_excluded, *geometry_excluded)),
+                blockers=(error.code,),
+            )
 
     try:
         if not isinstance(campaign, Mapping):
             raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
         config_document = campaign.get("config_document")
         liquidity = config_document.get("liquidity") if isinstance(config_document, Mapping) else None
+        liquidity_parameters = liquidity.get("parameters") if isinstance(liquidity, Mapping) else None
         maximum_age_hours = liquidity.get("maximum_age_hours") if isinstance(liquidity, Mapping) else None
+        if not isinstance(liquidity_parameters, Mapping):
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        lot_model_settings = {
+            "lot_model_base_coefficient": liquidity_parameters.get("lot_model_base_coefficient"),
+            "lot_model_max_shift_bonus": liquidity_parameters.get("lot_model_max_shift_bonus"),
+        }
         launch = campaign.get("launch")
         profiles = launch.get("profiles") if isinstance(launch, Mapping) else None
         if (
@@ -1376,11 +1571,12 @@ def _build_portfolio_candidates_single(
             mark_prices,
             now_ms=now_ms,
             maximum_age_hours=maximum_age_hours,
+            lot_model_settings=lot_model_settings,
         )
     except CampaignContractError as error:
         return AdapterResult("FAIL", excluded=spread_excluded, blockers=(error.code,))
     except (KeyError, TypeError, ValueError, ArithmeticError):
-        return AdapterResult("FAIL", excluded=spread_excluded, blockers=(_WEIGHTED_SEARCH_CONFIG_INVALID,))
+        return AdapterResult("FAIL", excluded=spread_excluded + tuple(geometry_excluded), blockers=(_WEIGHTED_SEARCH_CONFIG_INVALID,))
     except Exception:
         return AdapterResult(
             "FAIL",
@@ -1392,10 +1588,44 @@ def _build_portfolio_candidates_single(
     sizing_excluded = tuple(_normalise_scalar_exclusion(item) for item in getattr(sizing, "exclusions", ()))
     if sizing_status != "PASS":
         reason = getattr(sizing, "reason", None) or "POSITION_SIZING_FAILED"
+        if reason in {"NO_ENRICHED_ROWS", "NO_ELIGIBLE_ROWS", "NO_ENRICHED_FINALISTS"}:
+            reason = "LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE"
         return AdapterResult("FAIL", excluded=spread_excluded + sizing_excluded, blockers=(reason,))
     members = getattr(sizing, "rows", None)
     if isinstance(members, (str, bytes)) or not isinstance(members, Sequence) or not members:
-        return AdapterResult("FAIL", excluded=spread_excluded + sizing_excluded, blockers=("POSITION_SIZING_FAILED",))
+        return AdapterResult("FAIL", excluded=spread_excluded + sizing_excluded, blockers=("LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE",))
+
+    try:
+        prepared = _prepare_frozen_weighted_input(members, campaign)
+        one_way = prepared.diagnostics.get("one_way") if isinstance(prepared.diagnostics, Mapping) else None
+        if not isinstance(one_way, Mapping):
+            raise CampaignContractError(WEIGHTED_INPUT_PREPARATION_FAILED)
+        one_way_policy = one_way.get("policy")
+        one_way_mask_digest = one_way.get("mask_digest")
+        one_way_rejections = tuple(one_way.get("rejections", ()))
+        if not isinstance(one_way_policy, str) or not one_way_policy or not isinstance(one_way_mask_digest, str) or not one_way_mask_digest:
+            raise CampaignContractError(WEIGHTED_INPUT_PREPARATION_FAILED)
+        with_cycles: list[Mapping[str, Any]] = []
+        for member in members:
+            key = f"{member['symbol']}:{member['side']}:{member['strategy_id']}:{member['result_id']}"
+            cycles = prepared.cycles.get(key)
+            if isinstance(cycles, (str, bytes)) or not isinstance(cycles, Sequence):
+                raise CampaignContractError(WEIGHTED_INPUT_PREPARATION_FAILED)
+            admitted_cycles = tuple(
+                cycle for cycle in cycles
+                if isinstance(cycle, Mapping) and cycle.get("one_way_admitted", True) is True
+            )
+            with_cycles.append({
+                **dict(member),
+                "cycles": admitted_cycles,
+                "one_way_policy": one_way_policy,
+                "one_way_mask_digest": one_way_mask_digest,
+            })
+        members = tuple(with_cycles)
+    except CampaignContractError as error:
+        return AdapterResult("FAIL", excluded=spread_excluded + sizing_excluded + tuple(geometry_excluded), blockers=(error.code,))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return AdapterResult("FAIL", excluded=spread_excluded + sizing_excluded + tuple(geometry_excluded), blockers=(WEIGHTED_INPUT_PREPARATION_FAILED,))
 
     if margin_coefficients is None:
         try:
@@ -1614,6 +1844,17 @@ def _build_portfolio_candidates_single(
                     limiter = variant.get("limiter_L")
                     if type(limiter) is not int or limiter < 0:
                         raise CampaignContractError(WEIGHTED_CANDIDATE_LIMITER_INVALID)
+                    executable_members, rounding_exclusions = _round_weighted_candidate_members(
+                        variant["members"], members, reference, mark_prices,
+                    )
+                    for item in rounding_exclusions:
+                        excluded.append({
+                            **dict(item),
+                            "stage": "EXCHANGE_ROUNDING",
+                            "candidate_id": variant["identity"],
+                        })
+                    if not executable_members:
+                        continue
                     variant["strategy_payloads"] = _build_strategy_payloads(
                         strategy_template,
                         variant["members"],
@@ -1621,7 +1862,20 @@ def _build_portfolio_candidates_single(
                         members,
                         required_bank,
                         limiter,
+                        executable_members=executable_members,
                     )
+                    variant["executable_members"] = executable_members
+                    variant["member_exclusions"] = rounding_exclusions
+                    variant["allocation_rounding"] = {
+                        "basis": "INDEPENDENT_EXCHANGE_ROUND_DOWN_V1",
+                        "risk_metrics_basis": "LP_SOLVER_TARGET_BEFORE_EXCHANGE_ROUNDING",
+                        "per_member_flooring_can_change_portfolio_drawdown": True,
+                    }
+                    variant["one_way_admission"] = {
+                        "policy": one_way_policy,
+                        "mask_digest": one_way_mask_digest,
+                        "rejections": one_way_rejections,
+                    }
                     variant["search_identity"] = variant["identity"]
                     variant["candidate_id"] = variant["identity"] = _weighted_executable_identity(
                         campaign,
@@ -1632,6 +1886,7 @@ def _build_portfolio_candidates_single(
                         members,
                         variant["strategy_payloads"],
                         source_rows=selected_for_adapter,
+                        executable_members=executable_members,
                     )
                     variant["pretest_period"] = _prepared_pretest_period(prepared)
                 profile_variants.append(variant)
@@ -1643,6 +1898,8 @@ def _build_portfolio_candidates_single(
             )
             blockers.append(profile_blocker(profile_id, code))
         else:
+            if strategy_template is not None and not profile_variants:
+                blockers.append(profile_blocker(profile_id, "LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE"))
             if budget_notice is not None:
                 warnings.append(budget_notice)
             variants.extend(profile_variants)
@@ -1943,10 +2200,20 @@ def run_portfolio_adapter(
             return AdapterResult("FAIL", blockers=("NO_SELECTED_SYMBOLS",))
 
         lag = liquidity["archive_publication_lag_hours"]
-        end_date = now.date() - timedelta(days=1)
-        if now < datetime.combine(now.date(), time(), timezone.utc) + timedelta(hours=lag):
-            end_date -= timedelta(days=1)
-        days = tuple(end_date - timedelta(days=offset) for offset in range(6, -1, -1))
+        raw_anchor = campaign.get("created_at_utc")
+        if isinstance(raw_anchor, datetime):
+            anchor = raw_anchor
+        elif isinstance(raw_anchor, str) and raw_anchor.strip():
+            try:
+                anchor = datetime.fromisoformat(raw_anchor.strip().replace("Z", "+00:00"))
+            except (TypeError, ValueError, OverflowError) as error:
+                raise MinuteCapacityError("LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE") from error
+        else:
+            raise MinuteCapacityError("LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE")
+        if anchor.tzinfo is None or anchor.utcoffset() is None:
+            raise MinuteCapacityError("LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE")
+        anchor = anchor.astimezone(timezone.utc)
+        days = resolve_liquidity_window(anchor, lag)
         minute_root = Path(workspace_root) / Path(str(inputs["bybit_minute_data_root"]))
         backfill_enabled = liquidity["backfill_write_enabled"]
         archive_fetch_day = archive_fetcher if callable(archive_fetcher) else minute_capacity.fetch_bybit_trade_archive
@@ -1961,18 +2228,14 @@ def run_portfolio_adapter(
                 enabled=backfill_enabled,
             )
             if backfill_enabled and backfill.failed:
-                failed_days = ", ".join(day.isoformat() for day in sorted(backfill.failed))
-                raise MinuteCapacityError(f"Bybit archive backfill failed for {symbol}: {failed_days}")
+                raise MinuteCapacityError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE")
             capacities[symbol] = calculate_minute_capacity(
                 minute_root,
                 symbol,
-                end_date=end_date,
-                participation_pct=parameters["close_volume_participation_pct"],
+                lot_model=True,
+                anchor_created_at=anchor,
                 round_down_usdt=liquidity["round_down_usdt"],
-                weekend_start_utc=liquidity["weekend_start_utc"],
-                weekend_end_utc=liquidity["weekend_end_utc"],
                 publication_lag_hours=lag,
-                now=now,
             )
 
         market_kwargs = {
@@ -2014,8 +2277,11 @@ def run_portfolio_adapter(
             ):
                 return AdapterResult("FAIL", blockers=(SPREAD_HISTORY_UNAVAILABLE,))
 
-    except MinuteCapacityError:
-        return AdapterResult("FAIL", blockers=(MINUTE_CAPACITY_UNAVAILABLE,))
+    except MinuteCapacityError as error:
+        code = str(error)
+        if code not in {"LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE", "LIQUIDITY_MODEL_WINDOW_UNAVAILABLE"}:
+            code = MINUTE_CAPACITY_UNAVAILABLE
+        return AdapterResult("FAIL", blockers=(code,))
     except MarketSnapshotError:
         return AdapterResult("FAIL", blockers=(MARKET_SNAPSHOT_UNAVAILABLE,))
     except CampaignContractError as error:

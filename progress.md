@@ -16,14 +16,31 @@ runtime integration. Further exploratory research was curtailed at the user's
 request. SMA OHLC4 on closed candles is the final user-confirmed MA definition.
 
 The implementation design is recorded in
-`docs/superpowers/plans/2026-09-27-liquidity-lot-optimizer-integration.md`
-and received independent `PLAN_APPROVED` on 2026-09-27. It keeps the current
-shared symbol cap and adds a separate per-candidate model cap, with two
-proposed Panel/config settings: base K (default 9) and deep-shift bonus
-(default 1.1). Runtime, config and Panel behavior are not changed by this
-design step. Before implementation, extend
-the model spec's runtime contract and add ADR-0046; then use focused TDD and
-independent code review.
+`docs/superpowers/plans/2026-09-27-liquidity-lot-optimizer-integration.md`.
+The prior two-cap `PLAN_APPROVED` is superseded by the user's corrections:
+replace the old mean-turnover cap with one per-strategy model; do not share
+liquidity between LONG and SHORT; retain rounding down to 10 USDT. The user
+also fixed the model to no hedge: one active direction per symbol, with the
+dedicated close assumed to precede opposite entry. Opposite-fill reduction
+and reversal are ignored; no account-mode proof gate is requested.
+The GPT-6 Luna implementation is complete: eligible strategies receive the
+single geometry-dependent cap, LONG/SHORT caps are independent, and accepted
+historical cycles obey one active direction per symbol. The Panel exposes K
+(default 9) and the deep-shift bonus (default 1.1) in config schema 3. The
+operator confirmed no old WS1.2 result artifacts exist, so Campaign reads and
+execution remain strict WS1.3; v1/v2 config migration is still supported.
+Exchange-rounded actual sizes are bounded by LP x and U, with no second
+bootstrap after 10-USDT flooring per the operator's correction. Risk/margin
+thresholds and cross-run independence are unchanged. The frozen admission
+schedule and pre-rounding risk metrics remain model approximations.
+
+Pre-change baseline was 805 passed. Final eight-suite verification: 1224
+passed, one Windows symlink skip; after narrow review fixes, input/search/
+adapter verification: 713 passed. JavaScript syntax, Python compilation and
+`git diff --check` passed. Independent Opus 5/high review returned
+`CODE_REVIEW_PASS` after two sequential findings rounds. No tester, live
+account or exchange action was performed. See ADR-0046 and the
+implementation plan's acceptance evidence.
 
 ## Liquidity lot-model research audit (2026-09-26)
 

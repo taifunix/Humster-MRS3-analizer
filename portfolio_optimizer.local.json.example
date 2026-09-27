@@ -1,8 +1,8 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "policy_version": "portfolio_optimizer_research_risk_v1",
   "algorithm_versions": {
-    "sizing": "portfolio_optimizer_sizing_v2",
+    "sizing": "portfolio_optimizer_sizing_v3",
     "ranking": "portfolio_optimizer_ranking_v2"
   },
   "inputs": {
@@ -79,7 +79,7 @@
   },
   "liquidity": {
     "policy_id": "operator_supplied_liquidity_v1",
-    "parameters": {"operator_supplied": true, "close_volume_participation_pct": 200},
+    "parameters": {"lot_model_base_coefficient": "9", "lot_model_max_shift_bonus": "1.1"},
     "round_down_usdt": 10,
     "minimum_coverage_pct": 90,
     "maximum_age_hours": 2,

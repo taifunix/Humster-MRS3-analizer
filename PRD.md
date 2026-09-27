@@ -142,6 +142,18 @@ compositions are ranked on equal terms, and same-symbol LONG+SHORT share one
 liquidity cap while retaining additive margin and distinct limiter slots.
 See [ADR-0039](docs/decisions/0039-portfolio-optimizer-ws12-directional-shared-cap.md)
 and [Phase 9 evidence](docs/superpowers/plans/2026-09-18-portfolio-optimizer-weighted-search-phase-9-evidence.md).
+WS1.3 is implemented and independently reviewed under the user-approved
+[unified liquidity model](docs/specs/2026-09-27-liquidity-lot-model.md) and
+[ADR-0046](docs/decisions/0046-portfolio-unified-liquidity-and-one-way-model.md).
+It replaces the shared mean-turnover cap with one geometry-dependent cap per
+directional strategy, default 10-USDT flooring, and K/bonus settings. Both
+directions remain selectable; effective historical cycles obey one active
+direction per symbol under the explicit dedicated-close-first assumption.
+The frozen cycle schedule is an approximation, not a joint tick-test or a
+conservative profitability bound. Additive margin and risk thresholds remain
+unchanged. Eight affected suites passed (1224 tests, one environment skip),
+and independent Opus 5/high returned `CODE_REVIEW_PASS`. This is not empirical
+calibration or permission to run a tester or use live trading.
 Current production weighted Stage 1 follows `LIMITER_DISABLED_OFF_ONLY` because
 the bot's `open_positions_limiter` is not operational. The adapter passes `L=0`
 and priority 1 for every member; the executable strategy keeps

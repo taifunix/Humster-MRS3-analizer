@@ -20,9 +20,13 @@ from mrs3.portfolio.weighted_search import (
     _Solution,
     _candidate_for_solution,
     _candidates_for_solution,
+    _compact_additional_inputs,
     _select_cdar_families,
+    _symbol_cap_groups,
     _cdar_p30_floor,
     _margin_variant,
+    _hold_metrics,
+    _priority_unit,
     _ordered_margin_variants,
     _limiter_model_coefficients,
     _precision_for,
@@ -1714,65 +1718,51 @@ def test_limiter_replay_releases_before_equal_timestamp_starts_and_skips_without
     assert result.p30_limiter == Decimal("1200")
 
 
-def test_same_symbol_opposite_sides_share_one_lp_capacity_and_candidate_cap() -> None:
+def test_same_symbol_opposite_sides_have_independent_member_caps() -> None:
     module = importlib.import_module("mrs3.portfolio.weighted_search")
     prepared = _prepared((("1", "1"),), strategy_ids=(1, 2))
     members = (
         {"symbol": " btcusdt ", "side": "LONG", "strategy_id": 1, "result_id": 101},
         {"symbol": "BTCUSDT", "side": "SHORT", "strategy_id": 2, "result_id": 102},
     )
-
-    with pytest.raises(ValueError, match=r"SYMBOL_CAPACITY_MISMATCH:BTCUSDT"):
-        weighted_search(
-            prepared,
-            (Decimal("100"), Decimal("101")),
-            members=members,
-            max_dd=Decimal("0.2"),
-            common_days=Decimal("1"),
-            max_targets=1,
-        )
-
-    with pytest.raises(ValueError, match=r"MISSING_SYMBOL"):
-        module._symbol_cap_groups(({"strategy_id": 1},), (Decimal("100"),))
-    with pytest.raises(ValueError, match=r"MISSING_SYMBOL"):
-        module._symbol_cap_groups(({"strategy_id": 1, "symbol": None},), (Decimal("100"),))
-    with pytest.raises(ValueError, match=r"MISSING_SYMBOL"):
-        module._symbol_cap_groups(({"strategy_id": 1, "pair": "BTCUSDT"},), (Decimal("100"),))
-
-    with pytest.raises(ValueError, match=r"SYMBOL_CAPACITY_EXCEEDED:BTCUSDT"):
-        module._validate_symbol_cap_vector(
-            (Decimal("60"), Decimal("50")), members, (Decimal("100"), Decimal("100"))
-        )
-    module._validate_symbol_cap_vector(
-        (Decimal("60"), Decimal("40")), members, (Decimal("100"), Decimal("100"))
-    )
-
-    failure_reason: list[str] = []
-    assert module._candidates_for_solution(
-        _Solution(Decimal("1000"), (Decimal("60"), Decimal("50"))),
-        prepared.normalized_delta,
-        members,
-        (Decimal("100"), Decimal("100")),
+    result = weighted_search(
+        prepared,
+        (Decimal("100"), Decimal("150")),
+        members=members,
         max_dd=Decimal("0.2"),
         common_days=Decimal("1"),
-        target=None,
-        profile_id="P",
-        scenario_id="S",
-        failure_reason=failure_reason,
-    ) == ()
-    assert failure_reason == ["SYMBOL_CAPACITY_EXCEEDED:BTCUSDT"]
-
-    outcome = _solve_lp_unchecked(
-        ((Decimal("1"), Decimal("1")),),
-        (Decimal("100"), Decimal("100")),
-        (Decimal("1"), Decimal("1")),
-        max_dd=Decimal("0.2"),
-        target=Decimal("150"),
-        bank_available=None,
-        maximize=False,
-        symbol_cap_groups={"BTCUSDT": (0, 1)},
+        target_p30=Decimal("7500"),
+        bootstrap_scenarios=4,
+        screening_scenarios=4,
     )
-    assert outcome.status == "INFEASIBLE" and outcome.reason == "LP_INFEASIBLE"
+
+    assert result.status == "PASS"
+    assert tuple(member["x_usdt"] for member in result.candidates[0].members) == (Decimal("100"), Decimal("150"))
+    assert tuple(member["capacity_usdt"] for member in result.candidates[0].members) == (Decimal("100"), Decimal("150"))
+
+
+def test_weighted_search_rejects_duplicate_symbol_side_even_with_independent_caps() -> None:
+    prepared = _prepared((("1", "1"),), strategy_ids=(1, 2))
+    members = (
+        {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 101},
+        {"symbol": " btcusdt ", "side": " long ", "strategy_id": 2, "result_id": 102},
+    )
+    with pytest.raises(ValueError, match="DUPLICATE_PARTICIPANT_PAIR_SIDE"):
+        weighted_search(prepared, (Decimal("100"), Decimal("200")), members=members)
+
+
+def test_symbol_side_guard_normalizes_explicit_case_and_public_search_requires_side() -> None:
+    with pytest.raises(ValueError, match="DUPLICATE_PARTICIPANT_PAIR_SIDE"):
+        _symbol_cap_groups((
+            {"symbol": " btcusdt ", "side": "long", "strategy_id": 1},
+            {"symbol": "BTCUSDT", "side": " LONG ", "strategy_id": 2},
+        ), (Decimal("100"), Decimal("200")))
+    with pytest.raises(ValueError, match="INVALID_PARTICIPANT_SIDE"):
+        weighted_search(
+            _prepared((("1",),), strategy_ids=(1,)),
+            (Decimal("100"),),
+            members=({"symbol": "BTCUSDT", "strategy_id": 1},),
+        )
 
 
 def test_replay_same_symbol_opposite_sides_use_distinct_slots() -> None:
@@ -2135,6 +2125,91 @@ def test_margin_replay_is_compact_and_model_order_uses_replayed_p30() -> None:
     assert variants[10].p30 == Decimal("450")
     compact = {"L": variants[10].L, "p30": variants[10].p30, "mask": variants[10].replay.accepted_mask}
     assert "cycle_id" not in compact and "cycles" not in compact
+
+
+def test_margin_replay_uses_only_one_way_admitted_cycles_for_off_and_limiter() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    accepted = {
+        "cycle_id": "accepted", "strategy_id": 1,
+        "first_fill": start.isoformat(), "final_flat": end.isoformat(),
+        "carry_in_count": 0, "attribution_complete": True,
+        "common_window_normalized_return": Decimal("10"), "one_way_admitted": True,
+    }
+    rejected = {
+        "cycle_id": "rejected", "strategy_id": 1,
+        "first_fill": start.isoformat(), "final_flat": end.isoformat(),
+        "carry_in_count": 0, "attribution_complete": True,
+        "common_window_normalized_return": Decimal("1000"), "one_way_admitted": False,
+    }
+    member = {"strategy_id": 1, "symbol": "BTCUSDT", "side": "LONG", "cycles": (accepted, rejected)}
+    second_member = {"strategy_id": 2, "symbol": "ETHUSDT", "side": "LONG", "cycles": ()}
+    coefficients = _evidence_coefficients(
+        ((Decimal("0.1"), Decimal("0.01")), (Decimal("0.1"), Decimal("0.01"))),
+        (1, 2), max_notional=Decimal("100"),
+    )
+    common = {
+        "max_dd": Decimal("0.2"), "reserve": Decimal("0.4"), "max_mm_load": Decimal("0.35"),
+        "priorities": {1: 1, 2: 1}, "strategy_ids": (1, 2), "cycles": (accepted, rejected),
+        "common_days": Decimal("30"), "common_p30": Decimal("10"),
+        "period_start": start, "period_end": end,
+    }
+
+    x = (Decimal("1"), Decimal("1"))
+    members = (member, second_member)
+    _off, off_variants = _margin_variant(x, members, coefficients, options={**common, "L": 0}, bank_available=Decimal("100"))
+    _limited, limited_variants = _margin_variant(x, members, coefficients, options={**common, "L": 1}, bank_available=Decimal("100"))
+
+    assert off_variants[0].p30_status == limited_variants[0].p30_status == "MODEL"
+    assert off_variants[0].p30 == limited_variants[0].p30 == Decimal("10")
+    assert off_variants[0].replay.accepted_cycle_ids == ("accepted",)
+    assert limited_variants[0].replay.accepted_cycle_ids == ("accepted",)
+
+    _rows, _x, _active, _caps, _coefficients, compact_options = _compact_additional_inputs(
+        x,
+        ((Decimal("0"), Decimal("0")),),
+        members,
+        (Decimal("100"), Decimal("100")),
+        coefficients,
+        common,
+        strategy_ids=(1, 2),
+        limiter=0,
+        common_days=Decimal("30"),
+        max_dd=Decimal("0.2"),
+    )
+    assert compact_options["cycles"] == (accepted,)
+    status, reconstructed = _limiter_model_coefficients(
+        compact_options["cycles"], (1, 2), off_variants[0].replay, common_days=Decimal("30")
+    )
+    assert status == "MODEL" and reconstructed == (Decimal("10"), Decimal("0"))
+
+
+def test_priority_cycle_metrics_ignore_rejected_one_way_cycles() -> None:
+    member = {
+        "strategy_id": 1,
+        "cycles": (
+            {"duration_seconds": 3600, "normalized_pnl": Decimal("2"), "one_way_admitted": True},
+            {"duration_seconds": 360000, "net_pnl": Decimal("500"), "one_way_admitted": False},
+        ),
+    }
+
+    assert _hold_metrics(member) == (Decimal("1"), Decimal("1"))
+    assert _priority_unit(member) == "normalized"
+
+
+def test_weighted_search_requires_cycle_mask_on_one_way_members() -> None:
+    prepared = _prepared((("1",),), strategy_ids=(1,))
+    member = {
+        "strategy_id": 1,
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "one_way_policy": "ONE_ACTIVE_DIRECTION_PER_SYMBOL_V1",
+        "one_way_mask_digest": "mask-digest",
+        "cycles": ({"cycle_id": "unmasked", "strategy_id": 1, "common_window_normalized_return": Decimal("10")},),
+    }
+
+    with pytest.raises(ValueError, match="ONE_WAY_MASK_INCOMPLETE"):
+        weighted_search(prepared, (Decimal("100"),), members=(member,))
 
 
 def test_unknown_fixed_bank_order_is_off_then_strict_l_descending() -> None:

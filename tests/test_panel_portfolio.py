@@ -650,7 +650,7 @@ def test_valid_frozen_campaign_reaches_adapter_fact_blocker(monkeypatch: pytest.
     campaign = service.registry.runtime(result["job_id"])["campaign"]
     generated = service._package_variant_generator(finalists, campaign, campaign["launch"]["profiles"])
     assert generated["variants"] == ()
-    assert generated["blockers"] == [MINUTE_CAPACITY_UNAVAILABLE]
+    assert generated["blockers"] == ["LIQUIDITY_MODEL_WINDOW_UNAVAILABLE"]
 
 
 def test_settings_get_put_uses_exact_byte_digest_and_cas(tmp_path: Path) -> None:
@@ -730,7 +730,7 @@ def test_old_v2_campaign_freezes_effective_document_pair(monkeypatch: pytest.Mon
     assert json.loads(frozen.decode()) == campaign["config_document"]
 
 
-def test_settings_save_migrates_legacy_v1_document_to_v2(tmp_path: Path) -> None:
+def test_settings_save_persists_schema3_example(tmp_path: Path) -> None:
     source = Path(__file__).parents[1] / "portfolio_optimizer.local.json.example"
     path = tmp_path / "portfolio_optimizer.local.json"
     path.write_bytes(source.read_bytes())
@@ -738,13 +738,46 @@ def test_settings_save_migrates_legacy_v1_document_to_v2(tmp_path: Path) -> None
 
     loaded = service.settings_get()
     assert loaded["state"] == "READY"
-    assert loaded["schema_version"] == 2
+    assert loaded["schema_version"] == 3
     saved = service.settings_put({"expected_digest": loaded["digest"], "document": loaded["document"]})
 
     document = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema_version"] == 2
-    assert document["schema_version"] == 2
+    assert saved["schema_version"] == 3
+    assert document["schema_version"] == 3
     assert all("grid" not in scenario["sizing"] for scenario in document["scenarios"].values())
+
+
+def test_settings_get_migrates_v2_in_memory_and_cas_save_persists_v3(tmp_path: Path) -> None:
+    source = Path(__file__).parents[1] / "portfolio_optimizer.local.json.example"
+    document = json.loads(source.read_text(encoding="utf-8"))
+    document["schema_version"] = 2
+    document["algorithm_versions"]["sizing"] = "portfolio_optimizer_sizing_v2"
+    parameters = document["liquidity"]["parameters"]
+    parameters.pop("lot_model_base_coefficient")
+    parameters.pop("lot_model_max_shift_bonus")
+    parameters["close_volume_participation_pct"] = 200
+    path = tmp_path / "portfolio_optimizer.local.json"
+    original = json.dumps(document, ensure_ascii=False, indent=2).encode()
+    path.write_bytes(original)
+    service = PortfolioPanelService(tmp_path, path)
+
+    loaded = service.settings_get()
+
+    assert loaded["state"] == "READY"
+    assert loaded["schema_version"] == 3
+    assert loaded["document"]["algorithm_versions"]["sizing"] == "portfolio_optimizer_sizing_v3"
+    assert loaded["document"]["liquidity"]["parameters"] == {
+        "lot_model_base_coefficient": "9",
+        "lot_model_max_shift_bonus": "1.1",
+    }
+    assert loaded["digest"] == hashlib.sha256(original).hexdigest()
+    assert path.read_bytes() == original
+
+    saved = service.settings_put({"expected_digest": loaded["digest"], "document": loaded["document"]})
+    stored = json.loads(path.read_text(encoding="utf-8"))
+
+    assert saved["schema_version"] == stored["schema_version"] == 3
+    assert stored["liquidity"]["parameters"] == loaded["document"]["liquidity"]["parameters"]
 
 
 def test_settings_save_materializes_absent_v2_spread_history_bypass(tmp_path: Path) -> None:
@@ -767,6 +800,7 @@ def test_settings_save_materializes_absent_v2_spread_history_bypass(tmp_path: Pa
 def test_v2_legacy_algorithm_versions_are_resolved_for_panel_and_save(tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     document = _config()
+    document["schema_version"] = 2
     document["algorithm_versions"] = {
         "sizing": "portfolio_optimizer_sizing_v1",
         "ranking": "portfolio_optimizer_ranking_v1",
@@ -778,7 +812,7 @@ def test_v2_legacy_algorithm_versions_are_resolved_for_panel_and_save(tmp_path: 
 
     settings = service.settings_get()
     assert settings["document"]["algorithm_versions"] == {
-        "sizing": "portfolio_optimizer_sizing_v2",
+        "sizing": "portfolio_optimizer_sizing_v3",
         "ranking": "portfolio_optimizer_ranking_v2",
     }
     assert settings["digest"] == digest
@@ -837,7 +871,7 @@ def test_settings_put_does_not_relock_plain_lock(tmp_path: Path) -> None:
 def test_unsupported_settings_are_read_only(tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     document = _config()
-    document["schema_version"] = 3
+    document["schema_version"] = 4
     path.write_text(json.dumps(document), encoding="utf-8")
     service = PortfolioPanelService(tmp_path, path)
     assert service.settings_get()["state"] == "UNSUPPORTED_SCHEMA"
@@ -854,7 +888,7 @@ def test_readiness_reports_exact_config_digest(tmp_path: Path) -> None:
     readiness = service.readiness()
 
     assert readiness["config_digest"] == digest
-    assert readiness["schema_version"] == 2
+    assert readiness["schema_version"] == 3
     assert readiness["policy_version"] == "portfolio_optimizer_research_risk_v1"
     assert "search" not in readiness
 
@@ -3227,7 +3261,6 @@ def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_pa
     assert config["use_runs"] is False
     assert config["parameter_mining"] == []
     assert prepared["tester_config_json"].endswith("\n")
-
     for payload in payloads:
         name = payload["strategy"]["name"]
         expected = json.dumps(payload["strategy"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
@@ -3999,6 +4032,74 @@ def test_weighted_summary_enriches_identity_only_members_from_payload_facts() ->
         campaign, (), (), ({**variant, "metrics": {**variant["metrics"], "B_available_usdt": "0"}},), (),
     )
     assert zero_target["CDaR peak80 target %"] == "UNKNOWN"
+
+
+def test_weighted_summary_and_export_allow_missing_capacity(tmp_path: Path) -> None:
+    campaign = {
+        "campaign_id": "campaign-no-capacity",
+        "input_digest": "i",
+        "config_digest": "c",
+        "versions": {"policy_version": "p"},
+        "launch": {"profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "5000", "max_candidates": 1}]},
+    }
+    variant = {
+        "candidate_id": "candidate-no-capacity",
+        "profile": "BALANCED",
+        "search_mode": CAMPAIGN_SEARCH_MODE,
+        "members": ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 7, "result_id": 11},),
+        "strategy_payloads": ({
+            "side": "LONG",
+            "facts": {"B": "200", "q": "0.25", "x": "100"},
+            "strategy": {"basic": {"symbol": "BTCUSDT", "leverage": "3"}},
+        },),
+        "metrics": {"B_sat_settings_usdt": Decimal("400")},
+    }
+
+    summary = PortfolioPanelService._summary(campaign, (), (), (variant,), ())
+
+    assert summary["Weighted members"][0]["capacity_usdt"] is None
+    assert summary["Weighted members"][0]["liquidity_utilization_pct"] is None
+
+    path = tmp_path / "no-capacity.xlsx"
+    PortfolioPanelService(tmp_path)._write_workbook(path, campaign, (), (), (variant,), ())
+    workbook = load_workbook(path, data_only=False)
+    try:
+        member_row = workbook.worksheets[2][2]
+        assert member_row[15].value is None
+        assert isinstance(member_row[22].value, str)
+        assert "UNKNOWN" not in member_row[22].value
+    finally:
+        workbook.close()
+
+
+def test_nonweighted_workbook_allows_explicitly_missing_capacity_details(tmp_path: Path) -> None:
+    campaign = {
+        "campaign_id": "campaign-missing-capacity-details",
+        "input_digest": "i",
+        "config_digest": "c",
+        "versions": {"policy_version": "p"},
+    }
+    variant = {
+        "candidate_id": "candidate-missing-capacity-details",
+        "profile": "BALANCED",
+        "members": ({
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "calendar_7d": None,
+            "weekday_5d": None,
+            "capacity_status": None,
+            "spread_status": None,
+        },),
+    }
+
+    path = tmp_path / "missing-capacity-details.xlsx"
+    PortfolioPanelService(tmp_path)._write_workbook(path, campaign, (), (), (variant,), ())
+    workbook = load_workbook(path, data_only=False)
+    try:
+        member_row = workbook["Members"][2]
+        assert all(member_row[index].value is None for index in range(19, 27))
+    finally:
+        workbook.close()
 
 
 def test_weighted_summary_adds_source_maxdd_and_payload_composition_facts() -> None:

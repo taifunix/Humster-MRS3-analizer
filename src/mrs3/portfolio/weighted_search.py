@@ -157,6 +157,13 @@ def _sequence(value: Any) -> tuple[Any, ...]:
     return tuple(value)
 
 
+def _member_cycles(member: Any) -> tuple[Any, ...]:
+    return tuple(
+        cycle for cycle in _sequence(_member_value(member, "cycles", "position_cycles", default=None))
+        if _member_value(cycle, "one_way_admitted", default=True) is not False
+    )
+
+
 def _cycle_metric(cycles: Sequence[Any], names: tuple[str, ...]) -> Decimal | None:
     values: list[Decimal] = []
     for cycle in cycles:
@@ -231,7 +238,7 @@ def _ordinal_key(value: Any) -> tuple[int, Any]:
 def _hold_metrics(member: Any) -> tuple[Decimal | None, Decimal | None]:
     mean = _member_value(member, "mean_hold", "mean_hold_hours", "hold_mean", default=None)
     hold90 = _member_value(member, "hold90", "hold90_hours", "hold_90", "p90_hold", default=None)
-    cycles = _sequence(_member_value(member, "cycles", "position_cycles", default=None))
+    cycles = _member_cycles(member)
     if not cycles:
         duration_seconds = _member_value(member, "duration_seconds", default=None)
         if duration_seconds is not None:
@@ -261,7 +268,7 @@ def _priority_unit(member: Any) -> str | None:
         return "normalized"
     absolute = _member_value(member, "mean_net_pnl", "mean_net_pnl_usdt", "mean_pnl", "net_pnl", default=None) is not None
     normalized = _member_value(member, "mean_normalized_pnl", "normalized_pnl", default=None) is not None
-    cycles = _sequence(_member_value(member, "cycles", "position_cycles", default=None))
+    cycles = _member_cycles(member)
     if cycles:
         cycle_normalized = tuple(_member_value(cycle, "normalized_pnl", "normalized_net_pnl", default=None) for cycle in cycles)
         cycle_absolute = tuple(_member_value(cycle, "net_pnl", "net_pnl_usdt", "pnl", default=None) for cycle in cycles)
@@ -307,7 +314,7 @@ def priority_details(
             context.prec = _precision_for(mean_hold, hold90)
             t_eff = None if mean_hold is None or hold90 is None else mean_hold + Decimal("0.5") * max(Decimal(0), hold90 - mean_hold)
         pnl = _member_value(member, "mean_net_pnl", "mean_net_pnl_usdt", "mean_pnl", "net_pnl", default=None)
-        cycles = _sequence(_member_value(member, "cycles", "position_cycles", default=None))
+        cycles = _member_cycles(member)
         normalized = False
         if pnl is None:
             pnl = _member_value(member, "mean_normalized_pnl", "normalized_pnl", default=None)
@@ -677,21 +684,31 @@ def _symbol_cap_groups(
     source_members: Sequence[Mapping[str, Any]],
     capacities: Sequence[Any],
 ) -> dict[str, tuple[int, ...]]:
-    """Group member indices by canonical symbol and validate shared caps."""
+    """Group for diagnostics while enforcing unique canonical symbol-side slots."""
     if len(source_members) != len(capacities):
         raise ValueError("CAPACITY_SHAPE_MISMATCH")
     groups: dict[str, list[int]] = {}
     caps = tuple(_decimal(value, "capacity", nonnegative=True) for value in capacities)
+    seen_pairs: set[tuple[str, str]] = set()
     for index, member in enumerate(source_members):
         raw_symbol = member.get("symbol")
         if not isinstance(raw_symbol, str) or not raw_symbol.strip():
             raise ValueError("MISSING_SYMBOL")
         symbol = raw_symbol.strip().upper()
+        raw_side = member.get("side")
+        if raw_side is None:
+            # Standalone candidate helpers retain their identity-only fixture seam;
+            # weighted_search validates real members before reaching this helper.
+            side = f"UNSPECIFIED:{member.get('strategy_id', index)}"
+        else:
+            side = raw_side.strip().upper() if isinstance(raw_side, str) else ""
+        if raw_side is not None and side not in {"LONG", "SHORT"}:
+            raise ValueError("INVALID_PARTICIPANT_SIDE")
+        pair = (symbol, side)
+        if pair in seen_pairs:
+            raise ValueError("DUPLICATE_PARTICIPANT_PAIR_SIDE")
+        seen_pairs.add(pair)
         groups.setdefault(symbol, []).append(index)
-    for symbol, indexes in groups.items():
-        first = caps[indexes[0]]
-        if any(abs(caps[index] - first) > _solver_tolerance(first, caps[index]) for index in indexes[1:]):
-            raise ValueError(f"SYMBOL_CAPACITY_MISMATCH:{symbol}")
     return {symbol: tuple(indexes) for symbol, indexes in groups.items()}
 
 
@@ -700,17 +717,14 @@ def _validate_symbol_cap_vector(
     source_members: Sequence[Mapping[str, Any]],
     capacities: Sequence[Any],
 ) -> None:
-    """Reject a vector whose combined same-symbol allocation exceeds its cap."""
+    """Enforce per-member bounds and retain the one member per symbol-side guard."""
     values = tuple(_decimal(value, "x", nonnegative=True) for value in x)
     caps = tuple(_decimal(value, "capacity", nonnegative=True) for value in capacities)
-    groups = _symbol_cap_groups(source_members, caps)
     if len(values) != len(caps):
         raise ValueError("VECTOR_SHAPE_MISMATCH")
-    for symbol, indexes in groups.items():
-        total = sum((values[index] for index in indexes), Decimal(0))
-        cap = caps[indexes[0]]
-        if total > cap + _solver_tolerance(total, cap):
-            raise ValueError(f"SYMBOL_CAPACITY_EXCEEDED:{symbol}")
+    _symbol_cap_groups(source_members, caps)
+    if any(value > capacity + _solver_tolerance(value, capacity) for value, capacity in zip(values, caps)):
+        raise ValueError("MEMBER_CAPACITY_EXCEEDED")
 
 
 def stationary_bootstrap_indices(
@@ -1494,18 +1508,6 @@ def _solve_lp_unchecked(
             tuple((x_start + index, -float(value)) for index, value in enumerate(coefficients)),
             -float(target),
         )
-    if symbol_cap_groups is not None:
-        for indexes in symbol_cap_groups.values():
-            if len(indexes) >= 2:
-                cap = capacities[indexes[0]]
-                _append_sparse_constraint(
-                    a_rows,
-                    a_columns,
-                    a_values,
-                    b_ub,
-                    tuple((x_start + index, 1.0) for index in indexes),
-                    float(cap),
-                )
     a_ub = coo_matrix((a_values, (a_rows, a_columns)), shape=(len(b_ub), size), dtype=float).tocsr()
     upper_bank = None if bank_available is None else float(bank_available)
     bounds = [(1.0, upper_bank)] + [(0.0, float(value)) for value in capacities] + [(0.0, None)] * t
@@ -1586,13 +1588,6 @@ def _solve_lp_unchecked(
                 reason="LP_SOLUTION_INVALID",
                 **metadata,
             )
-        if symbol_cap_groups is not None:
-            for indexes in symbol_cap_groups.values():
-                if len(indexes) >= 2:
-                    total = sum((raw_x[index] for index in indexes), Decimal(0))
-                    cap = capacities[indexes[0]]
-                    if total > cap + _solver_tolerance(total, cap):
-                        return _SolveOutcome("ERROR", reason="LP_SOLUTION_INVALID", **metadata)
         if bank_available is not None and raw_bank > bank_available + _solver_tolerance(raw_bank, bank_available):
             return _SolveOutcome(
                 "ERROR",
@@ -1878,18 +1873,6 @@ def _solve_additional_lp(
                 0.0,
             )
 
-    if symbol_cap_groups is not None:
-        for indexes in symbol_cap_groups.values():
-            if len(indexes) >= 2:
-                _append_sparse_constraint(
-                    a_rows,
-                    a_columns,
-                    a_values,
-                    b_ub,
-                    tuple((x_start + index, 1.0) for index in indexes),
-                    float(caps[indexes[0]]),
-                )
-
     _append_sparse_constraint(
         a_rows,
         a_columns,
@@ -2057,12 +2040,6 @@ def _solve_additional_lp(
         return _SolveOutcome("ERROR", reason="LP_SOLUTION_INVALID", **metadata)
     if any(value < -tolerance or value > cap + tolerance for value, cap in zip(raw_x, caps)) or raw_le < -tolerance:
         return _SolveOutcome("ERROR", reason="LP_SOLUTION_INVALID", **metadata)
-    if symbol_cap_groups is not None:
-        for indexes in symbol_cap_groups.values():
-            if len(indexes) >= 2:
-                total = sum((raw_x[index] for index in indexes), Decimal(0))
-                if total > caps[indexes[0]] + tolerance:
-                    return _SolveOutcome("ERROR", reason="LP_SOLUTION_INVALID", **metadata)
     path_required_banks = tuple(bank_for_path(_path(path, raw_x), drawdown) for path in paths)
     if any(required > bank + tolerance for required in path_required_banks):
         return _SolveOutcome("ERROR", reason="BANK_UNAVAILABLE", **metadata)
@@ -2106,7 +2083,7 @@ def _safe_member(member: Mapping[str, Any], x: Decimal, capacity: Decimal, *, pr
     result = {
         key: value
         for key, value in member.items()
-        if key not in _RAW_KEYS and key in {"symbol", "side", "strategy_id", "result_id", "user_rank", "user_status", "priority", "position_priority", "open_positions_limiter"}
+        if key not in _RAW_KEYS and key in {"symbol", "side", "strategy_id", "result_id", "user_rank", "user_status", "priority", "position_priority", "open_positions_limiter", "one_way_policy", "one_way_mask_digest"}
     }
     result["capacity_usdt"] = capacity
     result["x_usdt"] = x
@@ -2171,6 +2148,10 @@ def _margin_variant(
             for member in source_members
             for cycle in _sequence(_member_value(member, "cycles", "position_cycles", default=None))
         )
+    cycles = tuple(
+        cycle for cycle in cycles
+        if _member_value(cycle, "one_way_admitted", default=True) is not False
+    )
     # Replay is the only source of limiter P30 evidence. Arbitrary status/value
     # kwargs remain diagnostics and cannot manufacture MODEL evidence.
     replay_by_l = {
@@ -2458,7 +2439,6 @@ def _candidates_for_solution(
 ) -> tuple[PortfolioCandidate, ...]:
     try:
         _validate_symbol_cap_vector(solution.x, source_members, capacities)
-        symbol_cap_groups = _symbol_cap_groups(source_members, capacities)
     except ValueError as error:
         if failure_reason is not None:
             failure_reason.append(str(error))
@@ -2559,19 +2539,8 @@ def _candidates_for_solution(
                         with localcontext() as context:
                             context.prec = _precision_for(bank_available, denominator, capacities, solution.x)
                             cap_scale = min(
-                                (
-                                    capacities[indexes[0]] / sum((solution.x[index] for index in indexes), Decimal(0))
-                                    for indexes in symbol_cap_groups.values()
-                                    if len(indexes) >= 2 and sum((solution.x[index] for index in indexes), Decimal(0)) > 0
-                                ),
+                                (capacity / value for capacity, value in zip(capacities, solution.x) if value > 0),
                                 default=Decimal("Infinity"),
-                            )
-                            cap_scale = min(
-                                cap_scale,
-                                min(
-                                    (capacity / value for capacity, value in zip(capacities, solution.x) if value > 0),
-                                    default=Decimal("Infinity"),
-                                ),
                             )
                             scale = min(bank_available / denominator, cap_scale)
                         if scale.is_finite() and Decimal(0) < scale < Decimal(1):
@@ -2848,6 +2817,10 @@ def _compact_additional_inputs(
         )
     else:
         cycles = tuple(cycles)
+    cycles = tuple(
+        cycle for cycle in cycles
+        if _member_value(cycle, "one_way_admitted", default=True) is not False
+    )
     options.update({
         "L": limiter,
         "priorities": tuple(priorities.get(strategy_id) for strategy_id in active_ids),
@@ -3492,6 +3465,27 @@ def weighted_search(
             raise ValueError("MEMBER_STRATEGY_SHAPE_MISMATCH")
         by_id = {member["strategy_id"]: member for member in source_members}
         source_members = tuple(by_id[strategy_id] for strategy_id in prepared.strategy_ids)
+        source_members = tuple({
+            **member,
+            "symbol": member.get("symbol").strip().upper() if isinstance(member.get("symbol"), str) else member.get("symbol"),
+            "side": member.get("side").strip().upper() if isinstance(member.get("side"), str) else member.get("side"),
+        } for member in source_members)
+    if any(member.get("side") not in {"LONG", "SHORT"} for member in source_members):
+        raise ValueError("INVALID_PARTICIPANT_SIDE")
+    for member in source_members:
+        if "one_way_policy" not in member and "one_way_mask_digest" not in member:
+            continue
+        if (
+            member.get("one_way_policy") != "ONE_ACTIVE_DIRECTION_PER_SYMBOL_V1"
+            or not isinstance(member.get("one_way_mask_digest"), str)
+            or not member["one_way_mask_digest"]
+        ):
+            raise ValueError("ONE_WAY_MASK_INCOMPLETE")
+        if any(
+            not isinstance(cycle, Mapping) or type(cycle.get("one_way_admitted")) is not bool
+            for cycle in _sequence(_member_value(member, "cycles", "position_cycles", default=None))
+        ):
+            raise ValueError("ONE_WAY_MASK_INCOMPLETE")
     days = _common_days(prepared, common_days)
     drawdown = _decimal(max_dd, "max_dd")
     if not Decimal(0) < drawdown < Decimal(1):
@@ -3543,10 +3537,7 @@ def weighted_search(
     target = None if target_p30 is None else _decimal(target_p30, "target_p30", positive=True)
     available = None if bank_available is None else _decimal(bank_available, "bank_available", positive=True)
     upper_target = sum(
-        (
-            caps[indexes[0]] * max((max(coefficients[index], Decimal(0)) for index in indexes), default=Decimal(0))
-            for indexes in symbol_cap_groups.values()
-        ),
+        (capacity * max(coefficient, Decimal(0)) for capacity, coefficient in zip(caps, coefficients)),
         Decimal(0),
     )
     if target is None and upper_target <= 0:
@@ -3944,6 +3935,10 @@ def weighted_search(
                 )
             else:
                 cycles = tuple(cycles_value)
+            cycles = tuple(
+                cycle for cycle in cycles
+                if _member_value(cycle, "one_way_admitted", default=True) is not False
+            )
             try:
                 _primary, frozen_variants = _margin_variant(
                     seed_solution.x,

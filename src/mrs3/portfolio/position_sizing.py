@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass, replace
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
+from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_EVEN, localcontext
 import hashlib
 import json
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from .liquidity import Instrument, LiquidityError, ReferenceSnapshot
-from .minute_capacity import CapacityWindow, MinuteCapacityResult
+from .minute_capacity import CapacityWindow, MinuteCapacityResult, MinuteLiquidityFeatures, resolve_liquidity_window
 from .pretest_proxy import ProxyMetrics, compute_proxy_metrics
 from .weighted_search import _precision_for
 
@@ -21,7 +23,11 @@ _CAPACITY_STATUSES = frozenset({"READY", "PRELIMINARY"})
 _RUNTIME_FIELDS = frozenset({
     "position_size_usdt", "maximum_closing_quantity", "maximum_closing_notional_usdt",
     "planned_leverage", "sizing_digest", "reference_digest", "capacity_digest",
-    "capacity_status", "calendar_7d", "weekday_5d", "opening_allocations",
+    "capacity_status", "calendar_7d", "weekday_5d", "opening_allocations", "capacity_usdt",
+    "raw_capacity_usdt", "binding_order_id", "liquidity_v25_usdt", "liquidity_a15",
+    "liquidity_factor", "lot_model_digest", "liquidity_window_dates",
+    "liquidity_publication_lag_hours", "liquidity_anchor_created_at_utc",
+    "liquidity_file_hashes", "liquidity_feature_digest",
 })
 
 
@@ -166,6 +172,66 @@ def _exclude(row: Any, reason: str) -> PositionSizingExclusion:
     return PositionSizingExclusion(dict(row) if isinstance(row, Mapping) else {}, reason)
 
 
+@dataclass(frozen=True, slots=True)
+class LotCapacityFormula:
+    raw_cap_usdt: Decimal
+    liquidity_usdt: Decimal
+    liquidity_factor: Decimal
+    binding_order_id: int
+
+
+def calculate_lot_capacity(
+    v25: Any,
+    a15: Any,
+    strategy_orders: Sequence[Mapping[str, Any]],
+    *,
+    base_coefficient: Any = "9",
+    max_shift_bonus: Any = "1.1",
+) -> LotCapacityFormula:
+    """Apply the frozen formula in the supplied configured order sequence."""
+    turnover = _decimal(v25, "v25", positive=True)
+    activity = _decimal(a15, "a15", positive=True)
+    coefficient = _decimal(base_coefficient, "base_coefficient", positive=True)
+    bonus = _decimal(max_shift_bonus, "max_shift_bonus", nonnegative=True)
+    if activity > 1 or not Decimal(1) <= coefficient <= Decimal(20) or bonus > 2:
+        raise ValueError("INVALID_LOT_MODEL_SETTINGS")
+    if isinstance(strategy_orders, (str, bytes)) or not isinstance(strategy_orders, Sequence) or not 1 <= len(strategy_orders) <= 4:
+        raise ValueError("INVALID_ORDER_GEOMETRY")
+    ids: set[int] = set()
+    parsed: list[tuple[int, Decimal, int]] = []
+    for order in strategy_orders:
+        if not isinstance(order, Mapping):
+            raise ValueError("INVALID_ORDER_GEOMETRY")
+        order_id, shift = order.get("order_id"), order.get("shift_bp")
+        if type(order_id) is not int or order_id <= 0 or order_id in ids:
+            raise ValueError("INVALID_ORDER_GEOMETRY")
+        if type(shift) is not int or not (shift == 0 or 30 <= shift <= 550):
+            raise ValueError("INVALID_ORDER_GEOMETRY")
+        ids.add(order_id)
+        parsed.append((order_id, _decimal(order.get("lot_x"), "lot_x", positive=True), shift))
+    parsed.sort(key=lambda item: item[0])
+    with localcontext() as context:
+        context.prec = 28
+        context.rounding = ROUND_HALF_EVEN
+        lot_total = sum((lot for _order_id, lot, _shift in parsed), Decimal(0))
+        cumulative = Decimal(0)
+        binding_order_id = parsed[0][0]
+        factor: Decimal | None = None
+        for index, (order_id, lot, shift_bp) in enumerate(parsed):
+            cumulative += lot
+            share = Decimal(1) if index == len(parsed) - 1 else cumulative / lot_total
+            shift = Decimal(shift_bp) / Decimal(100)
+            premium = max(Decimal(0), shift - Decimal("0.6")) / Decimal("4.9")
+            multiple = Decimal(1) + bonus * premium * premium
+            current = multiple / share
+            if factor is None or current < factor:
+                factor = current
+                binding_order_id = order_id
+        liquidity = turnover * activity
+        raw = coefficient * liquidity * factor
+    return LotCapacityFormula(raw, liquidity, factor, binding_order_id)
+
+
 def enrich_finalist_rows(
     rows: Sequence[Mapping[str, Any]],
     capacities: Mapping[str, MinuteCapacityResult],
@@ -174,9 +240,21 @@ def enrich_finalist_rows(
     *,
     now_ms: int,
     maximum_age_hours: Any,
+    lot_model_settings: Mapping[str, Any] | None = None,
 ) -> PositionSizingResult:
     """Enrich exact finalist rows with one exchange-rounded full position."""
     raw_rows = tuple(rows)
+    model_settings: tuple[Decimal, Decimal] | None = None
+    if lot_model_settings is not None:
+        try:
+            coefficient = _decimal(lot_model_settings["lot_model_base_coefficient"], "lot_model_base_coefficient", positive=True)
+            bonus = _decimal(lot_model_settings["lot_model_max_shift_bonus"], "lot_model_max_shift_bonus", nonnegative=True)
+            if not Decimal(1) <= coefficient <= Decimal(20) or bonus > 2:
+                raise ValueError("INVALID_LOT_MODEL_SETTINGS")
+            model_settings = coefficient, bonus
+        except (KeyError, TypeError, ValueError):
+            exclusions = tuple(sorted((_exclude(row, "INVALID_LOT_MODEL_SETTINGS") for row in raw_rows), key=lambda item: _row_key(item.row)))
+            return PositionSizingResult(FAIL, (), exclusions, "INVALID_LOT_MODEL_SETTINGS")
     global_reason = _global_reference_reason(reference, now_ms=now_ms, maximum_age_hours=maximum_age_hours)
     if global_reason is not None:
         exclusions = tuple(sorted((_exclude(row, global_reason) for row in raw_rows), key=lambda item: _row_key(item.row)))
@@ -213,44 +291,113 @@ def enrich_finalist_rows(
                 lot_x = _decimal(order.get("lot_x"), "lot_x", positive=True)
                 seen_ids.add(order_key)
                 parsed_orders.append({**dict(order), "order_id": order_id, "lot_x": lot_x})
-            parsed_orders.sort(key=lambda item: json.dumps(_canonical(item["order_id"]), sort_keys=True, separators=(",", ":"), ensure_ascii=True))
+            if model_settings is None:
+                parsed_orders.sort(key=lambda item: json.dumps(_canonical(item["order_id"]), sort_keys=True, separators=(",", ":"), ensure_ascii=True))
+            else:
+                if any(type(item["order_id"]) is not int or item["order_id"] <= 0 for item in parsed_orders):
+                    raise ValueError("INVALID_ORDER_GEOMETRY")
+                parsed_orders.sort(key=lambda item: item["order_id"])
             geometry = tuple(parsed_orders)
             capacity = capacities.get(symbol) if isinstance(capacities, Mapping) else None
             if not isinstance(capacity, MinuteCapacityResult) or capacity.symbol != symbol:
                 raise ValueError("MISSING_CAPACITY")
-            if capacity.status not in _CAPACITY_STATUSES or not isinstance(capacity.calendar_7d, CapacityWindow) or not isinstance(capacity.weekday_5d, CapacityWindow):
+            if capacity.status not in _CAPACITY_STATUSES:
                 raise ValueError("INVALID_CAPACITY")
+            if model_settings is not None and capacity.status != "READY":
+                raise ValueError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE")
             capacity_digest = _text(capacity.content_digest, "capacity.content_digest")
             round_down = _decimal(capacity.round_down_usdt, "round_down_usdt", positive=True)
-            position_cap = _decimal(capacity.position_cap_usdt, "position_cap_usdt", nonnegative=True)
+            if model_settings is None and (not isinstance(capacity.calendar_7d, CapacityWindow) or not isinstance(capacity.weekday_5d, CapacityWindow)):
+                raise ValueError("INVALID_CAPACITY")
             mark = _decimal(mark_prices.get(symbol), "mark_price", positive=True)
             instrument = reference.instrument(symbol)
             if instrument.status != "Trading" or instrument.contract_type != "LinearPerpetual":
                 raise ValueError("INACTIVE_INSTRUMENT")
-            raw_cap = min(position_cap, instrument.max_qty * mark)
+            formula: LotCapacityFormula | None = None
+            features = capacity.lot_features
+            if model_settings is not None:
+                if not isinstance(features, MinuteLiquidityFeatures):
+                    raise ValueError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE")
+                try:
+                    v25 = _decimal(features.v25, "v25", positive=True)
+                    a15 = _decimal(features.a15, "a15", positive=True)
+                    anchor = features.anchor_created_at_utc
+                    frozen_dates = resolve_liquidity_window(
+                        datetime.fromisoformat(anchor), features.publication_lag_hours,
+                    ) if isinstance(anchor, str) and type(features.publication_lag_hours) is int else ()
+                    if (
+                        a15 > 1
+                        or type(features.active_15m_bins) is not int
+                        or not 1 <= features.active_15m_bins <= 672
+                        or len(features.file_hashes) != 7
+                        or len(features.window_dates) != 7
+                        or not isinstance(features.content_digest, str)
+                        or not features.content_digest
+                        or tuple(features.window_dates) != frozen_dates
+                        or frozen_dates[0] != capacity.window_start
+                        or frozen_dates[-1] != capacity.window_end
+                        or any(not isinstance(name, str) or Path(name).name != name or not isinstance(digest, str) or len(digest) != 64 for name, digest in features.file_hashes)
+                    ):
+                        raise ValueError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE")
+                except (ArithmeticError, TypeError, ValueError, AttributeError) as error:
+                    raise ValueError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE") from error
+                formula = calculate_lot_capacity(
+                    v25,
+                    a15,
+                    geometry,
+                    base_coefficient=model_settings[0],
+                    max_shift_bonus=model_settings[1],
+                )
+                raw_cap = formula.raw_cap_usdt
+            else:
+                position_cap = _decimal(capacity.position_cap_usdt, "position_cap_usdt", nonnegative=True)
+                with localcontext() as context:
+                    context.prec = 28
+                    context.rounding = ROUND_HALF_EVEN
+                    exchange_cap = instrument.max_qty * mark
+                raw_cap = min(position_cap, exchange_cap)
             rounded_cap = _floor_step(raw_cap, round_down)
             if rounded_cap == 0:
-                raise ValueError("SIZE_ROUNDED_TO_ZERO")
-            closing_quantity = _floor_step(rounded_cap / mark, instrument.qty_step)
+                raise ValueError("SIZE_ROUNDED_TO_ZERO" if formula is None else "LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE")
+            with localcontext() as context:
+                context.prec = 28
+                context.rounding = ROUND_HALF_EVEN
+                closing_quantity = _floor_step(min(_floor_step(rounded_cap / mark, instrument.qty_step), instrument.max_qty), instrument.qty_step)
             if closing_quantity < instrument.min_qty:
                 raise ValueError("SIZE_BELOW_MINIMUM_QTY")
-            final_notional = closing_quantity * mark
+            with localcontext() as context:
+                context.prec = 28
+                context.rounding = ROUND_HALF_EVEN
+                final_notional = closing_quantity * mark
             if final_notional > rounded_cap:
                 raise ValueError("SIZE_EXCEEDS_ROUNDED_CAP")
             if instrument.min_notional is not None and final_notional < instrument.min_notional:
                 raise ValueError("SIZE_BELOW_MINIMUM_NOTIONAL")
             leverage = reference.maximum_symbol_leverage(symbol, final_notional, 0)
             leverage = _decimal(leverage, "planned_leverage", positive=True)
-            total_lot = sum((item["lot_x"] for item in geometry), Decimal(0))
             with localcontext() as context:
                 context.prec = 28
+                context.rounding = ROUND_HALF_EVEN
+                total_lot = sum((item["lot_x"] for item in geometry), Decimal(0))
                 allocations = tuple(
                     {"order_id": item["order_id"], "lot_x": item["lot_x"], "target_notional_usdt": final_notional * item["lot_x"] / total_lot}
                     for item in geometry
                 )
+            model_digest = _digest({
+                "schema": "liquidity_lot_model_v1",
+                "features": features,
+                "settings": {"base_coefficient": model_settings[0], "max_shift_bonus": model_settings[1]} if model_settings is not None else None,
+                "formula": formula,
+                "round_down_usdt": round_down,
+                "mark_price": mark,
+                "instrument": instrument,
+                "raw_capacity_usdt": raw_cap,
+                "rounded_capacity_usdt": rounded_cap,
+                "capacity_usdt": final_notional,
+            }) if model_settings is not None else None
             reference_digest = reference.content_digest
             sizing_digest = _digest({
-                "schema": "portfolio_position_sizing_v1",
+                "schema": "portfolio_position_sizing_v2" if model_settings is not None else "portfolio_position_sizing_v1",
                 "source_row": _source_row(row, geometry),
                 "mark_price": mark,
                 "raw_cap_usdt": raw_cap,
@@ -263,6 +410,7 @@ def enrich_finalist_rows(
                 "reference_digest": reference_digest,
                 "capacity_digest": capacity_digest,
                 "capacity_status": capacity.status,
+                "lot_model_digest": model_digest,
                 "policy": {"now_ms": now_ms, "maximum_age_hours": _decimal(maximum_age_hours, "maximum_age_hours", nonnegative=True)},
             })
             enriched_row = dict(row)
@@ -279,6 +427,21 @@ def enrich_finalist_rows(
                 "weekday_5d": capacity.weekday_5d,
                 "opening_allocations": allocations,
             })
+            if model_settings is not None and formula is not None and features is not None:
+                enriched_row.update({
+                    "capacity_usdt": final_notional,
+                    "raw_capacity_usdt": raw_cap,
+                    "binding_order_id": formula.binding_order_id,
+                    "liquidity_v25_usdt": features.v25,
+                    "liquidity_a15": features.a15,
+                    "liquidity_factor": formula.liquidity_factor,
+                    "lot_model_digest": model_digest,
+                    "liquidity_window_dates": features.window_dates,
+                    "liquidity_publication_lag_hours": features.publication_lag_hours,
+                    "liquidity_anchor_created_at_utc": features.anchor_created_at_utc,
+                    "liquidity_file_hashes": features.file_hashes,
+                    "liquidity_feature_digest": features.content_digest,
+                })
             enriched.append(_freeze(enriched_row))
         except LiquidityError:
             exclusions.append(_exclude(row, "REFERENCE_FACTS_UNAVAILABLE"))
@@ -289,7 +452,8 @@ def enrich_finalist_rows(
     enriched.sort(key=_row_key)
     exclusions.sort(key=lambda item: _row_key(item.row) + (item.reason,))
     if not enriched:
-        return PositionSizingResult(FAIL, (), tuple(exclusions), "NO_ENRICHED_ROWS")
+        reason = "LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE" if model_settings is not None else "NO_ENRICHED_ROWS"
+        return PositionSizingResult(FAIL, (), tuple(exclusions), reason)
     return PositionSizingResult(PASS, tuple(enriched), tuple(exclusions))
 
 
@@ -386,12 +550,15 @@ def _qty_round(notional: Decimal, mark: Decimal, instrument: Any, *, cap: Decima
     qty_step = _map_decimal(instrument, "qty_step", "quantity_step", positive=True)
     min_qty = _map_decimal(instrument, "min_qty", "min_order_qty", nonnegative=True)
     max_qty = _map_decimal(instrument, "max_qty", nonnegative=True)
-    qty = _floor_step(notional / mark, qty_step)
-    qty = min(qty, max_qty)
-    actual = qty * mark
-    while actual > cap + MONEY_EPS:
-        qty = _floor_step(qty - qty_step, qty_step)
+    with localcontext() as context:
+        context.prec = 28
+        context.rounding = ROUND_HALF_EVEN
+        qty = _floor_step(notional / mark, qty_step)
+        qty = min(qty, max_qty)
         actual = qty * mark
+        while actual > cap + MONEY_EPS:
+            qty = _floor_step(qty - qty_step, qty_step)
+            actual = qty * mark
     if qty < min_qty:
         return Decimal(0), Decimal(0)
     return qty, actual
@@ -621,6 +788,7 @@ def size_composition_vector(
     mark_prices: Mapping[str, Any],
     *,
     targets: Sequence[Any] | Mapping[Any, Any] | None = None,
+    independent_capacities: bool = False,
 ) -> CompositionSizingResult:
     """Apply per-member weighted targets while reusing exchange geometry.
 
@@ -691,6 +859,8 @@ def size_composition_vector(
                 result[symbol] = value
             return result
 
+        if type(independent_capacities) is not bool:
+            raise ValueError("INVALID_VECTOR")
         capacity_values = canonical_map(capacities, "capacity")
         mark_values = canonical_map(mark_prices, "mark_price")
         if isinstance(targets, Mapping) and any(key not in consumed_target_keys for key in targets):
@@ -706,26 +876,43 @@ def size_composition_vector(
         for symbol, symbol_rows in sorted(by_symbol.items()):
             if not symbol:
                 raise ValueError("MISSING_SYMBOL")
-            if symbol not in capacity_values or symbol not in mark_values:
+            if symbol not in mark_values or (not independent_capacities and symbol not in capacity_values):
                 raise ValueError(f"MISSING_{symbol}")
-            capacity, round_down = _composition_capacity(capacity_values[symbol])
             mark = _decimal(mark_values[symbol], f"mark_prices.{symbol}", positive=True)
             instrument = _instrument_for(reference, symbol)
-            if instrument is None:
+            if instrument is None and symbol in capacity_values:
                 instrument = capacity_values[symbol] if isinstance(capacity_values[symbol], Mapping) else None
             if instrument is None:
                 raise ValueError("MISSING_REFERENCE")
             max_qty = _map_decimal(instrument, "max_qty", nonnegative=True)
-            cap = _floor_step(min(capacity, max_qty * mark), round_down)
-            combined_target = sum((target for _row, target in symbol_rows), Decimal(0))
-            if combined_target > cap + MONEY_EPS:
-                return CompositionSizingResult(
-                    FAIL,
-                    (),
-                    f"CAPACITY_EXCEEDED_{symbol}",
-                    exclusions=tuple(exclusions),
-                )
+            if independent_capacities:
+                common_cap = None
+            else:
+                capacity, round_down = _composition_capacity(capacity_values[symbol])
+                with localcontext() as context:
+                    context.prec = 28
+                    context.rounding = ROUND_HALF_EVEN
+                    exchange_cap = max_qty * mark
+                common_cap = _floor_step(min(capacity, exchange_cap), round_down)
+                combined_target = sum((target for _row, target in symbol_rows), Decimal(0))
+                if combined_target > common_cap + MONEY_EPS:
+                    return CompositionSizingResult(
+                        FAIL,
+                        (),
+                        f"CAPACITY_EXCEEDED_{symbol}",
+                        exclusions=tuple(exclusions),
+                    )
             for row, target in sorted(symbol_rows, key=lambda item: _member_sort_key(item[0])):
+                if independent_capacities:
+                    member_cap = _decimal(row.get("capacity_usdt"), "capacity_usdt", positive=True)
+                    with localcontext() as context:
+                        context.prec = 28
+                        context.rounding = ROUND_HALF_EVEN
+                        cap = min(member_cap, max_qty * mark)
+                    if target > cap:
+                        return CompositionSizingResult(FAIL, (), f"CAPACITY_EXCEEDED_{symbol}", exclusions=tuple(exclusions))
+                else:
+                    cap = common_cap
                 if target == 0:
                     exclusions.append(CompositionSizingExclusion((row,), "SIZE_ZERO"))
                     continue
@@ -735,10 +922,12 @@ def size_composition_vector(
                 if rounded_quantity > 0 and rounded_quantity < min_qty:
                     exclusions.append(CompositionSizingExclusion((row,), "SIZE_BELOW_MINIMUM_QTY"))
                     continue
-                quantity, actual = _qty_round(target, mark, instrument, cap=target)
+                quantity, actual = _qty_round(target, mark, instrument, cap=min(target, cap))
                 if quantity == 0 or actual == 0:
                     exclusions.append(CompositionSizingExclusion((row,), "SIZE_ROUNDED_TO_ZERO"))
                     continue
+                if independent_capacities and (actual > cap or actual > target):
+                    return CompositionSizingResult(FAIL, (), f"CAPACITY_EXCEEDED_{symbol}", exclusions=tuple(exclusions))
                 min_notional = _field(instrument, "min_notional", default=None)
                 if min_notional is not None and actual < _decimal(min_notional, "min_notional", positive=True):
                     exclusions.append(CompositionSizingExclusion((row,), "SIZE_BELOW_MINIMUM_NOTIONAL"))
@@ -782,7 +971,7 @@ def size_composition_vector(
                     "sizing_digest": _digest({"basis": "WEIGHTED_VECTOR_V1", "row": row, "target_x_usdt": target, "capacity_usdt": cap, "quantity": quantity, "actual_size_usdt": actual, "mark": mark}),
                 })
                 sized.append(_freeze(enriched))
-            if actual_totals.get(symbol, Decimal(0)) > cap + MONEY_EPS:
+            if not independent_capacities and actual_totals.get(symbol, Decimal(0)) > common_cap + MONEY_EPS:
                 return CompositionSizingResult(FAIL, (), f"CAPACITY_EXCEEDED_{symbol}", exclusions=tuple(exclusions))
         sized.sort(key=_member_sort_key)
         if not sized:
@@ -796,6 +985,7 @@ def size_composition_vector(
 
 __all__ = [
     "FAIL", "PASS", "FLOAT_ABS_EPS", "FLOAT_REL_EPS", "MONEY_EPS", "PositionSizingExclusion", "PositionSizingResult",
-    "CompositionSizingExclusion", "CompositionSizingResult", "enrich_finalist_rows", "size_finalist_rows",
+    "CompositionSizingExclusion", "CompositionSizingResult", "LotCapacityFormula", "calculate_lot_capacity",
+    "enrich_finalist_rows", "size_finalist_rows",
     "size_composition", "size_portfolio_composition", "size_candidate_composition", "calculate_composition_sizing", "size_composition_vector",
 ]

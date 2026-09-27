@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_EVEN, localcontext
 import csv
 import gzip
 import hashlib
@@ -45,20 +45,33 @@ class CapacityWindow:
 
 
 @dataclass(frozen=True, slots=True)
+class MinuteLiquidityFeatures:
+    v25: Decimal
+    active_15m_bins: int
+    a15: Decimal
+    file_hashes: tuple[tuple[str, str], ...]
+    content_digest: str
+    window_dates: tuple[date, ...] = ()
+    publication_lag_hours: int | None = None
+    anchor_created_at_utc: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class MinuteCapacityResult:
     status: str
     symbol: str
     window_start: date
     window_end: date
-    participation_pct: int
+    participation_pct: int | None
     round_down_usdt: Decimal
-    calendar_7d: CapacityWindow
-    weekday_5d: CapacityWindow
+    calendar_7d: CapacityWindow | None
+    weekday_5d: CapacityWindow | None
     position_cap_usdt: Decimal
     selected_basis: str
     missing_days: tuple[date, ...]
     source_files: tuple[str, ...]
     content_digest: str
+    lot_features: MinuteLiquidityFeatures | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,39 +108,51 @@ def _day_start_ms(day: date) -> int:
     return int(datetime.combine(day, time(), timezone.utc).timestamp() * 1000)
 
 
-def _read_day(path: Path, symbol: str, day: date) -> tuple[tuple[int, Decimal], ...]:
+def _read_day_bytes(data: bytes, path: Path, day: date) -> tuple[tuple[int, Decimal], ...]:
     try:
-        with path.open("r", encoding="utf-8-sig", newline="") as source:
-            reader = csv.DictReader(source)
-            if tuple(reader.fieldnames or ()) != HEADER:
-                raise MinuteCapacityError(f"invalid minute CSV header: {path}")
-            values: list[tuple[int, Decimal]] = []
-            previous = -1
-            start = _day_start_ms(day)
-            for number, row in enumerate(reader, 2):
-                if set(row) != set(HEADER) or None in row or any(value is None for value in row.values()):
-                    raise MinuteCapacityError(f"invalid minute CSV row {number}: {path}")
-                try:
-                    stamp = int(row["timestamp"])
-                    trades = int(row["trades"])
-                except (TypeError, ValueError) as error:
-                    raise MinuteCapacityError(f"invalid minute CSV integer row {number}: {path}") from error
-                if str(stamp) != row["timestamp"] or str(trades) != row["trades"] or trades <= 0:
-                    raise MinuteCapacityError(f"invalid minute CSV integer row {number}: {path}")
-                if stamp % 60_000 or not start <= stamp < start + DAY_MS or stamp <= previous:
-                    raise MinuteCapacityError(f"minute timestamps are not unique, ordered, aligned and in-day: {path}")
-                previous = stamp
-                prices = [_decimal(row[key], key, positive=True) for key in ("open", "high", "low", "close")]
-                volume = _decimal(row["volume"], "volume", nonnegative=True)
-                buy = _decimal(row["buy_volume"], "buy_volume", nonnegative=True)
-                sell = _decimal(row["sell_volume"], "sell_volume", nonnegative=True)
-                if volume != buy + sell or prices[1] < max(prices[0], prices[2], prices[3]) or prices[2] > min(prices[0], prices[1], prices[3]):
-                    raise MinuteCapacityError(f"inconsistent minute CSV row {number}: {path}")
-                values.append((stamp, prices[3] * volume))
-            return tuple(values)
+        reader = csv.DictReader(StringIO(data.decode("utf-8-sig"), newline=""))
+        if tuple(reader.fieldnames or ()) != HEADER:
+            raise MinuteCapacityError(f"invalid minute CSV header: {path}")
+        values: list[tuple[int, Decimal]] = []
+        previous = -1
+        start = _day_start_ms(day)
+        for number, row in enumerate(reader, 2):
+            if set(row) != set(HEADER) or None in row or any(value is None for value in row.values()):
+                raise MinuteCapacityError(f"invalid minute CSV row {number}: {path}")
+            try:
+                stamp = int(row["timestamp"])
+                trades = int(row["trades"])
+            except (TypeError, ValueError) as error:
+                raise MinuteCapacityError(f"invalid minute CSV integer row {number}: {path}") from error
+            if str(stamp) != row["timestamp"] or str(trades) != row["trades"] or trades <= 0:
+                raise MinuteCapacityError(f"invalid minute CSV integer row {number}: {path}")
+            if stamp % 60_000 or not start <= stamp < start + DAY_MS or stamp <= previous:
+                raise MinuteCapacityError(f"minute timestamps are not unique, ordered, aligned and in-day: {path}")
+            previous = stamp
+            prices = [_decimal(row[key], key, positive=True) for key in ("open", "high", "low", "close")]
+            volume = _decimal(row["volume"], "volume", nonnegative=True)
+            buy = _decimal(row["buy_volume"], "buy_volume", nonnegative=True)
+            sell = _decimal(row["sell_volume"], "sell_volume", nonnegative=True)
+            if volume != buy + sell or prices[1] < max(prices[0], prices[2], prices[3]) or prices[2] > min(prices[0], prices[1], prices[3]):
+                raise MinuteCapacityError(f"inconsistent minute CSV row {number}: {path}")
+            with localcontext() as context:
+                context.prec = 28
+                context.rounding = ROUND_HALF_EVEN
+                turnover = prices[3] * volume
+            values.append((stamp, turnover))
+        return tuple(values)
     except MinuteCapacityError:
         raise
-    except (OSError, UnicodeError, csv.Error) as error:
+    except (UnicodeError, csv.Error) as error:
+        raise MinuteCapacityError(f"cannot read minute CSV: {path}") from error
+
+
+def _read_day(path: Path, symbol: str, day: date) -> tuple[tuple[int, Decimal], ...]:
+    try:
+        return _read_day_bytes(path.read_bytes(), path, day)
+    except MinuteCapacityError:
+        raise
+    except OSError as error:
         raise MinuteCapacityError(f"cannot read minute CSV: {path}") from error
 
 
@@ -174,19 +199,125 @@ def _window(days: list[tuple[date, tuple[tuple[int, Decimal], ...]]], participat
     return CapacityWindow(available_days, clock, observed, clock - observed, traded_ratio, turnover, mean, raw, rounded)
 
 
+def resolve_liquidity_window(anchor_created_at: datetime, publication_lag_hours: int = 6) -> tuple[date, ...]:
+    """Return the seven complete UTC dates available at the frozen Campaign time."""
+    if not isinstance(anchor_created_at, datetime) or anchor_created_at.tzinfo is None or anchor_created_at.utcoffset() is None:
+        raise MinuteCapacityError("LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE")
+    if type(publication_lag_hours) is not int or not 0 <= publication_lag_hours <= 48:
+        raise MinuteCapacityError("LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE")
+    anchor = anchor_created_at.astimezone(timezone.utc)
+    end_date = anchor.date()
+    while datetime.combine(end_date + timedelta(days=1), time(), timezone.utc) + timedelta(hours=publication_lag_hours) > anchor:
+        end_date -= timedelta(days=1)
+    return tuple(end_date - timedelta(days=offset) for offset in range(WEEK_DAYS - 1, -1, -1))
+
+
+def _type7_q25(values: list[Decimal]) -> Decimal:
+    if not values:
+        raise MinuteCapacityError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE")
+    ordered = sorted(values)
+    with localcontext() as context:
+        context.prec = 28
+        context.rounding = ROUND_HALF_EVEN
+        position = Decimal(len(ordered) - 1) * Decimal("0.25")
+        lower = int(position)
+        fraction = position - lower
+        return ordered[lower] + (ordered[min(lower + 1, len(ordered) - 1)] - ordered[lower]) * fraction
+
+
+def _lot_model_capacity(
+    root: str | Path,
+    symbol: str,
+    *,
+    anchor_created_at: datetime,
+    round_down_usdt: Decimal | int | str,
+    publication_lag_hours: int,
+) -> MinuteCapacityResult:
+    days = resolve_liquidity_window(anchor_created_at, publication_lag_hours)
+    step = _decimal(round_down_usdt, "round_down_usdt", positive=True)
+    root = Path(root)
+    positive_turnover: list[Decimal] = []
+    active_bins: set[int] = set()
+    file_hashes: list[tuple[str, str]] = []
+    source_files: list[str] = []
+    try:
+        for day_offset, day in enumerate(days):
+            path = _day_path(root, symbol, day)
+            data = path.read_bytes()
+            rows = _read_day_bytes(data, path, day)
+            name = path.name
+            file_hashes.append((name, hashlib.sha256(data).hexdigest()))
+            source_files.append(name)
+            for stamp, turnover in rows:
+                if turnover > 0:
+                    positive_turnover.append(turnover)
+                    minute_in_day = (stamp - _day_start_ms(day)) // 60_000
+                    active_bins.add(day_offset * 96 + minute_in_day // 15)
+    except (OSError, MinuteCapacityError) as error:
+        raise MinuteCapacityError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE") from error
+    if not positive_turnover:
+        raise MinuteCapacityError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE")
+    v25 = _type7_q25(positive_turnover)
+    with localcontext() as context:
+        context.prec = 28
+        context.rounding = ROUND_HALF_EVEN
+        a15 = Decimal(len(active_bins)) / Decimal(WEEK_DAYS * 96)
+    hash_evidence = tuple(file_hashes)
+    anchor_utc = anchor_created_at.astimezone(timezone.utc).isoformat()
+    feature_payload = {
+        "model": "LOT_MODEL_V1",
+        "window": [day.isoformat() for day in days],
+        "publication_lag_hours": publication_lag_hours,
+        "anchor_created_at_utc": anchor_utc,
+        "file_hashes": hash_evidence,
+        "positive_minute_count": len(positive_turnover),
+        "v25": format(v25, "f"),
+        "active_15m_bins": len(active_bins),
+        "a15": format(a15, "f"),
+    }
+    feature_digest = hashlib.sha256(json.dumps(feature_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    features = MinuteLiquidityFeatures(
+        v25, len(active_bins), a15, hash_evidence, feature_digest,
+        days, publication_lag_hours, anchor_utc,
+    )
+    payload = {**feature_payload, "symbol": symbol, "round_down_usdt": format(step, "f")}
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return MinuteCapacityResult(
+        "READY", symbol, days[0], days[-1], None, step, None, None, Decimal(0),
+        "LOT_MODEL_V1", (), tuple(source_files), digest, features,
+    )
+
+
 def calculate_minute_capacity(
     root: str | Path,
     symbol: str,
     *,
-    end_date: date,
-    participation_pct: int,
-    round_down_usdt: Decimal | int | str = "50",
+    end_date: date | None = None,
+    participation_pct: int | None = None,
+    round_down_usdt: Decimal | int | str = "10",
     weekend_start_utc: str = "SATURDAY 00:00",
     weekend_end_utc: str = "MONDAY 00:00",
     publication_lag_hours: int = 6,
     now: datetime | None = None,
+    lot_model: bool = False,
+    anchor_created_at: datetime | None = None,
 ) -> MinuteCapacityResult:
     symbol = _symbol(symbol)
+    if type(lot_model) is not bool:
+        raise ValueError("lot_model must be a boolean")
+    if lot_model:
+        if anchor_created_at is None:
+            raise MinuteCapacityError("LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE")
+        days = resolve_liquidity_window(anchor_created_at, publication_lag_hours)
+        if end_date is not None and end_date != days[-1]:
+            raise MinuteCapacityError("LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE")
+        return _lot_model_capacity(
+            root,
+            symbol,
+            anchor_created_at=anchor_created_at,
+            round_down_usdt=round_down_usdt,
+            publication_lag_hours=publication_lag_hours,
+        )
     if isinstance(end_date, datetime) or not isinstance(end_date, date):
         raise MinuteCapacityError("end_date must be a date")
     if type(participation_pct) is not int or not 1 <= participation_pct <= 200:
@@ -370,4 +501,7 @@ def backfill_missing_days(
     )
 
 
-__all__ = ["BackfillResult", "CapacityWindow", "MinuteCapacityError", "MinuteCapacityResult", "backfill_missing_days", "calculate_minute_capacity", "fetch_bybit_trade_archive"]
+__all__ = [
+    "BackfillResult", "CapacityWindow", "MinuteCapacityError", "MinuteCapacityResult", "MinuteLiquidityFeatures",
+    "backfill_missing_days", "calculate_minute_capacity", "fetch_bybit_trade_archive", "resolve_liquidity_window",
+]

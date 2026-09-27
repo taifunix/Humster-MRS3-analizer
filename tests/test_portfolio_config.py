@@ -84,6 +84,107 @@ def _v2_config():
     return migrate_portfolio_config_document(_v1_config())[0]
 
 
+def _legacy_v2_config():
+    value = _v2_config()
+    value["schema_version"] = 2
+    value["algorithm_versions"] = {
+        "sizing": "portfolio_optimizer_sizing_v2",
+        "ranking": "portfolio_optimizer_ranking_v2",
+    }
+    parameters = value["liquidity"]["parameters"]
+    parameters.pop("lot_model_base_coefficient", None)
+    parameters.pop("lot_model_max_shift_bonus", None)
+    parameters["close_volume_participation_pct"] = 200
+    return value
+
+
+def test_schema2_migrates_to_v3_in_memory_without_translating_participation(tmp_path):
+    value = _legacy_v2_config()
+    original = deepcopy(value)
+    path = _write(tmp_path, value)
+    before = path.read_bytes()
+
+    migrated, changed = migrate_portfolio_config_document(value)
+    loaded = load_portfolio_config(path)
+
+    assert changed
+    assert value == original
+    assert migrated["schema_version"] == SCHEMA_VERSION == 3
+    assert migrated["algorithm_versions"]["sizing"] == "portfolio_optimizer_sizing_v3"
+    assert migrated["liquidity"]["parameters"] == {
+        "lot_model_base_coefficient": "9",
+        "lot_model_max_shift_bonus": "1.1",
+    }
+    assert loaded.schema_version == 3
+    assert dict(loaded.liquidity["parameters"]) == {
+        key: Decimal(value) for key, value in migrated["liquidity"]["parameters"].items()
+    }
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("source", ["v1", "v2"])
+def test_v1_and_v2_migrations_parse_with_v3_lot_model_defaults(tmp_path, source):
+    document = _v1_config() if source == "v1" else _legacy_v2_config()
+
+    loaded = load_portfolio_config(_write(tmp_path, document))
+
+    assert loaded.schema_version == 3
+    assert loaded.algorithm_versions["sizing"] == "portfolio_optimizer_sizing_v3"
+    assert loaded.liquidity["parameters"] == {
+        "lot_model_base_coefficient": Decimal("9"),
+        "lot_model_max_shift_bonus": Decimal("1.1"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lot_model_base_coefficient", "0"),
+        ("lot_model_base_coefficient", "20.01"),
+        ("lot_model_max_shift_bonus", "-0.01"),
+        ("lot_model_max_shift_bonus", "2.01"),
+        ("lot_model_base_coefficient", True),
+        ("lot_model_max_shift_bonus", 1.1),
+        ("lot_model_base_coefficient", "01"),
+        ("lot_model_max_shift_bonus", "1e0"),
+        ("lot_model_base_coefficient", "NaN"),
+    ],
+)
+def test_v3_lot_model_settings_reject_invalid_exact_decimal_values(tmp_path, field, value):
+    config = _v2_config()
+    config["liquidity"]["parameters"][field] = value
+
+    with pytest.raises(PortfolioConfigError, match=field):
+        load_portfolio_config(_write(tmp_path, config))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lot_model_base_coefficient", "1"),
+        ("lot_model_base_coefficient", "20"),
+        ("lot_model_max_shift_bonus", "0"),
+        ("lot_model_max_shift_bonus", "2"),
+    ],
+)
+def test_v3_lot_model_settings_accept_inclusive_bounds(tmp_path, field, value):
+    config = _v2_config()
+    config["liquidity"]["parameters"][field] = value
+
+    loaded = load_portfolio_config(_write(tmp_path, config))
+
+    assert loaded.liquidity["parameters"][field] == Decimal(value)
+
+
+@pytest.mark.parametrize("field", ["close_volume_participation_pct", "future_liquidity_model_key"])
+def test_v3_liquidity_model_parameters_reject_retired_and_unknown_keys(tmp_path, field):
+    config = _v2_config()
+    config["liquidity"]["parameters"][field] = 10
+
+    with pytest.raises(PortfolioConfigError, match=field):
+        load_portfolio_config(_write(tmp_path, config))
+
+
 def test_v1_migration_adds_weighted_search_defaults_and_rejects_invalid_value(tmp_path):
     migrated, changed = migrate_portfolio_config_document(_v1_config())
 
@@ -308,7 +409,7 @@ def test_v1_migration_is_deterministic_and_drops_legacy_grid():
     assert migrated and migrated_again
     assert first == second
     assert original["schema_version"] == 1
-    assert first["schema_version"] == SCHEMA_VERSION == 2
+    assert first["schema_version"] == SCHEMA_VERSION == 3
     assert all("grid" not in item["sizing"] for item in first["scenarios"].values())
     assert first["search"]["sizing_mode"] == SIZING_MODE
     assert first["search"]["max_enumerated_combinations"] == 100000
@@ -327,13 +428,14 @@ def test_v1_migration_preserves_opaque_composition_parameters_under_compatibilit
     assert load_portfolio_config(_write(tmp_path, migrated)).search["composition"]["parameters"]["legacy_parameters"] == {"operator_knob": {"value": 7}}
 
 
-def test_v1_load_returns_v2_model_with_defaults(tmp_path):
+def test_v1_load_returns_v3_model_with_defaults(tmp_path):
     config = load_portfolio_config(_write(tmp_path, _v1_config()))
 
-    assert config.schema_version == 2
+    assert config.schema_version == 3
     assert not hasattr(config.scenarios["AGGRESSIVE"], "sizing_grid")
     assert config.search["sizing_mode"] == SIZING_MODE
-    assert config.liquidity["parameters"]["close_volume_participation_pct"] == 200
+    assert config.liquidity["parameters"]["lot_model_base_coefficient"] == Decimal("9")
+    assert config.liquidity["parameters"]["lot_model_max_shift_bonus"] == Decimal("1.1")
     assert config.liquidity["round_down_usdt"] == Decimal("10")
     assert config.liquidity["archive_publication_lag_hours"] == 6
     assert config.profiles["AGGRESSIVE"].individual_max_dd_pct == INDIVIDUAL_DD_DEFAULTS["AGGRESSIVE"]
@@ -360,22 +462,6 @@ def test_v2_unknown_keys_are_rejected(tmp_path):
     value["search"]["weighted_search"]["unexpected"] = 1
     with pytest.raises(PortfolioConfigError, match="unknown"):
         load_portfolio_config(_write(tmp_path, value))
-
-
-@pytest.mark.parametrize("value", [1, 30, 200])
-def test_close_volume_participation_bounds_are_inclusive(tmp_path, value):
-    config = _v2_config()
-    config["liquidity"]["parameters"]["close_volume_participation_pct"] = value
-    loaded = load_portfolio_config(_write(tmp_path, config))
-    assert loaded.liquidity["parameters"]["close_volume_participation_pct"] == value
-
-
-@pytest.mark.parametrize("value", [0, 201, 1.0, "30"])
-def test_close_volume_participation_invalid_values_fail(tmp_path, value):
-    config = _v2_config()
-    config["liquidity"]["parameters"]["close_volume_participation_pct"] = value
-    with pytest.raises(PortfolioConfigError):
-        load_portfolio_config(_write(tmp_path, config))
 
 
 @pytest.mark.parametrize("value", [0, 6, 48])
@@ -435,7 +521,7 @@ def test_v2_values_are_preserved_and_money_stays_decimal(tmp_path):
 
 
 def test_existing_v2_v1_algorithm_versions_resolve_in_memory_without_rewrite(tmp_path):
-    value = _v2_config()
+    value = _legacy_v2_config()
     value["algorithm_versions"] = {
         "sizing": "portfolio_optimizer_sizing_v1",
         "ranking": "portfolio_optimizer_ranking_v1",
@@ -446,14 +532,14 @@ def test_existing_v2_v1_algorithm_versions_resolve_in_memory_without_rewrite(tmp
     loaded = load_portfolio_config(path)
 
     assert dict(loaded.algorithm_versions) == {
-        "sizing": "portfolio_optimizer_sizing_v2",
+        "sizing": "portfolio_optimizer_sizing_v3",
         "ranking": "portfolio_optimizer_ranking_v2",
     }
     assert path.read_bytes() == before
 
 
 def test_v2_migration_resolves_legacy_algorithm_versions_in_document_without_rewrite():
-    value = _v2_config()
+    value = _legacy_v2_config()
     value["algorithm_versions"] = {
         "sizing": "portfolio_optimizer_sizing_v1",
         "ranking": "portfolio_optimizer_ranking_v1",
@@ -461,11 +547,12 @@ def test_v2_migration_resolves_legacy_algorithm_versions_in_document_without_rew
 
     resolved, changed = migrate_portfolio_config_document(value)
 
-    assert not changed
+    assert changed
     assert resolved["algorithm_versions"] == {
-        "sizing": "portfolio_optimizer_sizing_v2",
+        "sizing": "portfolio_optimizer_sizing_v3",
         "ranking": "portfolio_optimizer_ranking_v2",
     }
+    assert resolved["schema_version"] == 3
     assert value["algorithm_versions"]["sizing"].endswith("_v1")
 
 
@@ -483,7 +570,7 @@ def test_nonfinite_and_binary_float_money_fail(tmp_path):
 
 def test_repository_v1_example_migrates():
     config = load_portfolio_config(Path(__file__).parents[1] / "portfolio_optimizer.local.json.example")
-    assert config.schema_version == 2
+    assert config.schema_version == 3
     assert set(config.profiles) == {"AGGRESSIVE", "BALANCED", "CONSERVATIVE"}
 
 

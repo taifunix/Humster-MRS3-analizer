@@ -2080,6 +2080,203 @@ def test_prepare_weighted_input_attributes_equal_endpoint_intra_cell_changes() -
     assert cycles[1]["normalized_pnl"] == Decimal("-0.05")
 
 
+def _one_way_fixture_row(strategy_id: int, side: str, cycles: tuple[dict, ...], changes: tuple[tuple[int, str], ...]):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 16, tzinfo=timezone.utc)
+    basis = Decimal(str(next((cycle["source_basis"] for cycle in cycles if cycle.get("source_basis") is not None), 100)))
+    equity = [{"timestamp_utc": start, "equity": basis}]
+    value = basis
+    for minute, delta in changes:
+        value += Decimal(delta)
+        equity.append({"timestamp_utc": start + timedelta(minutes=minute), "equity": value})
+    equity.append({"timestamp_utc": end, "equity": value})
+    return {
+        "symbol": "BTCUSDT", "side": side, "strategy_id": strategy_id, "result_id": strategy_id,
+        "report_start_utc": start, "report_end_utc": end, "initial_balance": basis,
+        "equity": tuple(equity), "_prepared_cycles": cycles,
+    }
+
+
+def test_prepare_weighted_input_rejects_duplicate_symbol_side_pair() -> None:
+    rows = (
+        {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 1},
+        {"symbol": " btcusdt ", "side": " long ", "strategy_id": 2, "result_id": 2},
+    )
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input(rows)
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def test_prepare_weighted_input_rejects_strategy_id_reused_for_opposite_sides() -> None:
+    rows = (
+        {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 1},
+        {"symbol": "BTCUSDT", "side": "SHORT", "strategy_id": 1, "result_id": 2},
+    )
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input(rows)
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def _one_way_cycle(cycle_id: str, side: str, opened: int, closed: int, basis: str = "100") -> dict:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return {
+        "cycle_id": cycle_id, "side": side,
+        "opened_at": (start + timedelta(minutes=opened)).isoformat().replace("+00:00", "Z"),
+        "closed_at": (start + timedelta(minutes=closed)).isoformat().replace("+00:00", "Z"),
+        "duration_seconds": Decimal((closed - opened) * 60), "carry_in": False,
+        "source_basis": Decimal(basis), "source_ordinal": opened,
+        "normalized_pnl": None, "realized_pnl": Decimal("0"), "fees": Decimal("0"),
+    }
+
+
+def test_one_way_mask_excludes_whole_overlapping_opposite_cycle_from_effective_path() -> None:
+    long = _one_way_cycle("long-1", "LONG", 0, 10)
+    short = _one_way_cycle("short-1", "SHORT", 5, 15, "200")
+    short["normalized_pnl"] = Decimal("0.2")
+    short["realized_pnl"] = Decimal("42")
+    short["fees"] = Decimal("2")
+    rows = (
+        _one_way_fixture_row(1, "LONG", (long,), ((5, "10"), (10, "10"))),
+        _one_way_fixture_row(2, "SHORT", (short,), ((10, "20"), (15, "20"))),
+    )
+
+    prepared = prepare_weighted_input(rows)
+
+    assert tuple(row[0] for row in prepared.normalized_delta[:3]) == (Decimal("0.1"), Decimal("0.1"), Decimal("0"))
+    assert all(row[1] == 0 for row in prepared.normalized_delta)
+    assert prepared.cycles["BTCUSDT:LONG:1:1"][0]["one_way_admitted"] is True
+    rejected = prepared.cycles["BTCUSDT:SHORT:2:2"][0]
+    assert rejected["one_way_admitted"] is False
+    assert rejected["one_way_rejection_reason"] == "ONE_WAY_OPPOSITE_CYCLE_OVERLAP"
+    assert rejected["realized_pnl"] == Decimal("42") and rejected["fees"] == Decimal("2")
+    assert rejected["common_window_normalized_return"] is None
+    assert rejected["attribution_complete"] is True
+    assert prepared.diagnostics["one_way"]["mask_digest"]
+
+
+def test_one_way_close_at_open_boundary_admits_next_direction() -> None:
+    rows = (
+        _one_way_fixture_row(1, "LONG", (_one_way_cycle("long-1", "LONG", 0, 10),), ((10, "10"),)),
+        _one_way_fixture_row(2, "SHORT", (_one_way_cycle("short-1", "SHORT", 10, 20),), ((20, "20"),)),
+    )
+    prepared = prepare_weighted_input(rows)
+    assert prepared.cycles["BTCUSDT:LONG:1:1"][0]["one_way_admitted"] is True
+    assert prepared.cycles["BTCUSDT:SHORT:2:2"][0]["one_way_admitted"] is True
+
+
+def test_one_way_out_of_window_cycle_is_not_counted_as_direction_conflict() -> None:
+    outside = _one_way_cycle("outside", "LONG", -20, -10)
+    inside = _one_way_cycle("inside", "SHORT", 0, 10)
+    rows = (
+        _one_way_fixture_row(1, "LONG", (outside,), ()),
+        _one_way_fixture_row(2, "SHORT", (inside,), ((10, "10"),)),
+    )
+
+    prepared = prepare_weighted_input(rows)
+
+    excluded = prepared.cycles["BTCUSDT:LONG:1:1"][0]
+    assert excluded["one_way_admitted"] is False
+    assert excluded["one_way_rejection_reason"] == "ONE_WAY_CYCLE_OUTSIDE_COMMON_WINDOW"
+    assert prepared.diagnostics["one_way"]["rejections"] == ()
+    row_diagnostics = prepared.diagnostics["rows"]["BTCUSDT:LONG:1:1"]
+    assert row_diagnostics["one_way_rejected_cycle_count"] == 0
+    assert row_diagnostics["one_way_out_of_window_cycle_count"] == 1
+
+
+def test_one_way_same_timestamp_tie_is_deterministic_by_strategy_identity() -> None:
+    long = _one_way_cycle("long-1", "LONG", 0, 10)
+    short = _one_way_cycle("short-1", "SHORT", 0, 10)
+    rows = (
+        _one_way_fixture_row(2, "SHORT", (short,), ((5, "10"),)),
+        _one_way_fixture_row(1, "LONG", (long,), ((5, "10"),)),
+    )
+    first = prepare_weighted_input(rows)
+    second = prepare_weighted_input(tuple(reversed(rows)))
+
+    assert first.cycles["BTCUSDT:LONG:1:1"][0]["one_way_admitted"] is True
+    assert first.cycles["BTCUSDT:SHORT:2:2"][0]["one_way_admitted"] is False
+    assert first.diagnostics["one_way"]["mask_digest"] == second.diagnostics["one_way"]["mask_digest"]
+
+
+def test_one_way_mask_digest_is_stable_when_source_cycle_rows_are_reordered() -> None:
+    first_cycle = _one_way_cycle("first", "LONG", 0, 10)
+    second_cycle = _one_way_cycle("second", "LONG", 10, 20)
+    first = prepare_weighted_input((
+        _one_way_fixture_row(1, "LONG", (first_cycle, second_cycle), ((10, "10"), (20, "10"))),
+    ))
+    second = prepare_weighted_input((
+        _one_way_fixture_row(1, "LONG", (second_cycle, first_cycle), ((10, "10"), (20, "10"))),
+    ))
+
+    assert first.diagnostics["one_way"]["mask_digest"] == second.diagnostics["one_way"]["mask_digest"]
+
+
+def test_one_way_carry_in_uses_common_start_when_original_open_is_unknown() -> None:
+    carry = _one_way_cycle("carry", "LONG", 0, 10)
+    carry.pop("opened_at")
+    carry["carry_in"] = True
+    row = _one_way_fixture_row(1, "LONG", (carry,), ((5, "10"),))
+
+    prepared = prepare_weighted_input((row,))
+
+    admitted = prepared.cycles["BTCUSDT:LONG:1:1"][0]
+    assert admitted["one_way_admitted"] is True
+    assert admitted["one_way_open_time_fallback"] is True
+
+
+def test_one_way_mixed_direction_unknown_carry_in_order_fails_closed() -> None:
+    long = _one_way_cycle("carry-long", "LONG", 0, 10)
+    short = _one_way_cycle("carry-short", "SHORT", 0, 10)
+    for cycle in (long, short):
+        cycle.pop("opened_at")
+        cycle["carry_in"] = True
+    rows = (
+        _one_way_fixture_row(1, "LONG", (long,), ((5, "10"),)),
+        _one_way_fixture_row(2, "SHORT", (short,), ((5, "20"),)),
+    )
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input(rows)
+    assert error.value.code == "ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE"
+
+
+def test_one_way_same_side_overlap_fails_source_history() -> None:
+    cycles = (
+        _one_way_cycle("long-1", "LONG", 0, 10),
+        _one_way_cycle("long-2", "LONG", 5, 15),
+    )
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input((_one_way_fixture_row(1, "LONG", cycles, ((5, "10"), (10, "10"), (15, "10"))),))
+    assert error.value.code == "ONE_WAY_SOURCE_CYCLE_OVERLAP"
+
+
+def test_one_way_rejects_explicit_invalid_cycle_side_instead_of_defaulting() -> None:
+    invalid = _one_way_cycle("invalid-side", "LONG", 0, 10)
+    invalid["side"] = ""
+
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input((_one_way_fixture_row(1, "LONG", (invalid,), ((5, "10"),)),))
+
+    assert error.value.code == "INVALID_SOURCE_VALUE"
+
+
+def test_one_way_mixed_side_requires_complete_cycle_attribution() -> None:
+    long = _one_way_cycle("long-1", "LONG", 0, 10)
+    short = _one_way_cycle("short-1", "SHORT", 5, 15)
+    short["source_basis"] = None
+    rows = (
+        _one_way_fixture_row(1, "LONG", (long,), ((5, "10"), (10, "10"))),
+        _one_way_fixture_row(2, "SHORT", (short,), ((10, "20"), (15, "20"))),
+    )
+    with pytest.raises(PortfolioInputError) as error:
+        prepare_weighted_input(rows)
+    assert error.value.code == "ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE"
+
+
 def test_prepare_weighted_input_rolls_back_partial_cell_attribution_on_unknown_owner() -> None:
     row = {
         "symbol": "A", "side": "LONG", "strategy_id": 1, "result_id": 1,

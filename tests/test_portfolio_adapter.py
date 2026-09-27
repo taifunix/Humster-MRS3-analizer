@@ -1,4 +1,5 @@
 import json
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -75,6 +76,28 @@ def test_geometry_preflight_rejects_partial_frozen_geometry_before_search(monkey
         now_ms=0,
         margin_coefficients={11: {"status": "PASS"}},
     )
+    assert result.blockers == ("LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE",)
+
+
+def test_geometry_preflight_checks_duplicate_identity_across_surviving_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign = _weighted_build_campaign()
+    geometry = {
+        **campaign["weighted_input_rows"][0],
+        "timeframe": "3h",
+        "close_ma_len": 55,
+        "order_count": 1,
+        "strategy_orders": ({"order_id": 1, "open_ma_len": 34, "shift_bp": 50, "lot_x": Decimal("1")},),
+    }
+    campaign["weighted_input_rows"] = (geometry, dict(geometry))
+    selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
+    monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: pytest.fail("enrichment reached"))
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={}, spread_observations={},
+        spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients={11: {"status": "PASS"}},
+    )
+
     assert result.blockers == (PORTFOLIO_INPUT_GEOMETRY_INVALID,)
 
 
@@ -218,10 +241,7 @@ def test_build_adapter_keeps_distinct_compositions_that_only_change_zero_member(
         identity="same-search-identity", members=(positive,),
         metrics={"limiter_L": 2, "p30_common_usdt_30d": Decimal("10"), "cdar_peak80_usdt": Decimal("1"), "required_bank_usdt": Decimal("1")},
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
-        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
-    ))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -244,8 +264,8 @@ def test_build_adapter_keeps_distinct_compositions_that_only_change_zero_member(
         source_rows,
         campaign,
         capacities={},
-        reference=None,
-        mark_prices={},
+        reference=_payload_reference(("A", "B")),
+        mark_prices={"A": Decimal("100"), "B": Decimal("100")},
         spread_observations={},
         spread_history_statuses={"A": "READY", "B": "READY"},
         now_ms=0,
@@ -802,11 +822,45 @@ def weighted_campaign():
     }
 
 
-def test_ws12_is_the_only_supported_weighted_revision() -> None:
-    assert CAMPAIGN_WEIGHTED_ALGO_VERSION == "WS1.2"
+_PREPARED_DEFAULT = object()
+
+
+def _prepared_stub(*args, period_start_utc=_PREPARED_DEFAULT, period_end_utc=_PREPARED_DEFAULT):
+    rows = args[0] if args and isinstance(args[0], (tuple, list)) else ()
+    cycles = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        key = f"{row.get('symbol')}:{row.get('side')}:{row.get('strategy_id')}:{row.get('result_id')}"
+        cycles[key] = tuple(row.get("_prepared_cycles", row.get("cycles", ())))
+    return SimpleNamespace(
+        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc) if period_start_utc is _PREPARED_DEFAULT else period_start_utc,
+        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc) if period_end_utc is _PREPARED_DEFAULT else period_end_utc,
+        diagnostics={"one_way": {"policy": "ONE_ACTIVE_DIRECTION_PER_SYMBOL_V1", "mask_digest": "fixture-mask", "rejections": ()}},
+        cycles=cycles,
+    )
+
+
+def _payload_reference(symbols=("BTCUSDT",), *, captured_at_ms=0, qty_step="0.1", min_qty="0.1"):
+    return ReferenceReader.from_records(
+        instruments=[{
+            "symbol": symbol, "status": "Trading", "contract_type": "LinearPerpetual",
+            "tick_size": "0.1", "qty_step": qty_step, "min_qty": min_qty,
+            "max_qty": "100000", "leverage_step": "1", "max_leverage": "50",
+            "min_notional": "1",
+        } for symbol in symbols],
+        risk_tiers=[{
+            "symbol": symbol, "risk_limit_value": "10000000", "max_leverage": "50",
+        } for symbol in symbols],
+        captured_at_ms=captured_at_ms,
+    )
+
+
+def test_ws13_is_the_only_supported_weighted_revision() -> None:
+    assert CAMPAIGN_WEIGHTED_ALGO_VERSION == "WS1.3"
     request = weighted_campaign()
-    request["weighted_algo_version"] = "WS1.1"
-    request["versions"]["weighted_algo_version"] = "WS1.1"
+    request["weighted_algo_version"] = "WS1.2"
+    request["versions"]["weighted_algo_version"] = "WS1.2"
     with pytest.raises(CampaignContractError) as error:
         validate_campaign_contract(request)
     assert error.value.code == "CAMPAIGN_WEIGHTED_ALGO_VERSION_UNSUPPORTED"
@@ -820,7 +874,13 @@ def _weighted_build_campaign():
             "actions": (), "equity": (),
         },),
         "config_document": {
-            "liquidity": {"maximum_age_hours": 2},
+            "liquidity": {
+                "maximum_age_hours": 2,
+                "parameters": {
+                    "lot_model_base_coefficient": Decimal("9"),
+                    "lot_model_max_shift_bonus": Decimal("1.1"),
+                },
+            },
             "search": {
                 "seed": 17,
                 "weighted_search": {
@@ -871,7 +931,10 @@ def _runtime_weighted_campaign():
                 "collector_root": "collector",
             },
             "liquidity": {
-                "parameters": {"close_volume_participation_pct": 30},
+                "parameters": {
+                    "lot_model_base_coefficient": Decimal("9"),
+                    "lot_model_max_shift_bonus": Decimal("1.1"),
+                },
                 "round_down_usdt": Decimal("50"),
                 "minimum_coverage_pct": 90,
                 "maximum_age_hours": 2,
@@ -899,7 +962,7 @@ def test_build_adapter_derives_margin_coefficients_from_frozen_reference(monkeyp
         captured_at_ms=123,
     )
     seen = []
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=()))
     monkeypatch.setattr(adapter_module, "_run_weighted_search", lambda _prepared, _members, _campaign, _profile, margin, *, workers: seen.append(margin) or SimpleNamespace(status="PASS", mode=CAMPAIGN_SEARCH_MODE, candidates=(_weighted_candidate(members=enriched),), warnings=()))
     result = build_portfolio_candidates(
@@ -919,7 +982,7 @@ def test_build_adapter_keeps_margin_blocker_without_explicit_reference_policy(mo
         risk_tiers=[{"symbol": "BTCUSDT", "risk_limit_value": "500", "max_leverage": "20", "initial_margin": "0.05", "maintenance_margin": "0.025"}],
         captured_at_ms=123,
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=()))
     result = build_portfolio_candidates(
         selected, campaign, capacities={}, reference=reference, mark_prices={}, spread_observations={},
@@ -935,7 +998,7 @@ def _adapter_margin_failure_case(monkeypatch, reference, members, expected):
         "parameters": {"open_fee_rate": "0.001", "close_fee_rate": "0.002"},
     }
     selected = tuple({"symbol": row["symbol"], "side": "LONG", "strategy_id": row["strategy_id"], "result_id": row["result_id"]} for row in members)
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=members, exclusions=()))
     result = build_portfolio_candidates(
         selected, campaign, capacities={}, reference=reference, mark_prices={}, spread_observations={},
@@ -974,7 +1037,7 @@ def test_build_adapter_malformed_margin_policy_stays_generic_blocker(monkeypatch
         risk_tiers=[{"symbol": "BTCUSDT", "risk_limit_value": "500", "max_leverage": "20", "initial_margin": "0.05", "maintenance_margin": "0.025"}],
         captured_at_ms=123,
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=members, exclusions=()))
     result = build_portfolio_candidates(
         selected, campaign, capacities={}, reference=reference, mark_prices={}, spread_observations={},
@@ -1012,8 +1075,11 @@ def _weighted_candidate(profile_id="BALANCED", *, members=None, scenario_id=None
 
 def _patch_post_search_setup(monkeypatch, search_result, *, members=None):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
-    enriched = tuple(members or (dict(selected[0], position_size_usdt=Decimal("123")),))
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    enriched = tuple(members or (dict(
+        selected[0], position_size_usdt=Decimal("123"), planned_leverage=Decimal("9"),
+        strategy_orders=({"order_id": 1, "lot_x": Decimal("1")},),
+    ),))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1353,7 +1419,10 @@ def test_build_adapter_remaps_downstream_config_error_to_postsearch_config(monke
     selected, campaign, members = _patch_post_search_setup(monkeypatch, None)
     candidate = SimpleNamespace(
         profile_id="BALANCED", scenario_id="BALANCED", identity="candidate-BALANCED",
-        schema_version="portfolio_candidate_v1", members=tuple(members),
+        schema_version="portfolio_candidate_v1", members=({
+            **selected[0], "x_usdt": Decimal("100"), "capacity_usdt": Decimal("123"), "priority": 3,
+            "strategy_orders": ({"order_id": 1, "lot_x": Decimal("1")},),
+        },),
         metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
     monkeypatch.setattr(
@@ -1369,7 +1438,7 @@ def test_build_adapter_remaps_downstream_config_error_to_postsearch_config(monke
 
     monkeypatch.setattr(adapter_module, "_build_strategy_payloads", fail_payload)
     result = build_portfolio_candidates(
-        selected, campaign, capacities={}, reference=None, mark_prices={},
+        selected, campaign, capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
         margin_coefficients=_margin_evidence(11), strategy_template={},
     )
@@ -1381,7 +1450,10 @@ def test_build_adapter_maps_invalid_postsearch_period_to_pretest_period_blocker(
     selected, campaign, members = _patch_post_search_setup(monkeypatch, None)
     candidate = SimpleNamespace(
         profile_id="BALANCED", scenario_id="BALANCED", identity="candidate-BALANCED",
-        schema_version="portfolio_candidate_v1", members=tuple(members),
+        schema_version="portfolio_candidate_v1", members=({
+            **selected[0], "x_usdt": Decimal("100"), "capacity_usdt": Decimal("123"), "priority": 3,
+            "strategy_orders": ({"order_id": 1, "lot_x": Decimal("1")},),
+        },),
         metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
     monkeypatch.setattr(
@@ -1391,14 +1463,12 @@ def test_build_adapter_maps_invalid_postsearch_period_to_pretest_period_blocker(
             status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
         ),
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
-        period_start_utc=None, period_end_utc=None,
-    ))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args, period_start_utc=None, period_end_utc=None))
     monkeypatch.setattr(adapter_module, "_build_strategy_payloads", lambda *_args, **_kwargs: ({},))
     monkeypatch.setattr(adapter_module, "_weighted_executable_identity", lambda *_args, **_kwargs: "identity")
 
     result = build_portfolio_candidates(
-        selected, campaign, capacities={}, reference=None, mark_prices={},
+        selected, campaign, capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
         margin_coefficients=_margin_evidence(11), strategy_template={},
     )
@@ -1510,7 +1580,7 @@ def test_build_adapter_does_not_publish_partial_profile_variants_when_later_cand
         metrics={},
     )
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1543,7 +1613,7 @@ def test_build_adapter_validates_profile_id_before_search_call(monkeypatch, prof
     campaign["launch"] = {"profiles": (profile,)}
     calls = []
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1576,7 +1646,7 @@ def test_build_adapter_publishes_only_weighted_candidates_for_requested_profile(
     campaign = _weighted_build_campaign()
     candidate = _weighted_candidate(candidate_profile, members=members)
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1613,7 +1683,7 @@ def test_build_adapter_requires_candidate_profile_and_scenario_to_match_request(
         candidate_profile, members=members, scenario_id=candidate_scenario,
     )
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1648,7 +1718,7 @@ def test_build_adapter_rejects_duplicate_launch_profiles_before_enrichment_or_se
     )}
     calls = []
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: calls.append("prepare") or object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: calls.append("prepare") or _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1665,7 +1735,7 @@ def test_build_adapter_rejects_duplicate_launch_profiles_before_enrichment_or_se
     )
 
     assert (result.status, result.blockers, result.variants, calls) == (
-        "FAIL", ("PROFILE:WEIGHTED_SEARCH_CONFIG_INVALID",), (), ["prepare"],
+        "FAIL", ("PROFILE:WEIGHTED_SEARCH_CONFIG_INVALID",), (), [],
     )
 
 
@@ -1682,7 +1752,7 @@ def test_build_adapter_reports_typed_candidate_identity_collision(monkeypatch):
         "AGGRESSIVE": _weighted_candidate("AGGRESSIVE", members=members, identity="duplicate"),
     }
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1712,7 +1782,7 @@ def test_build_adapter_rejects_invalid_search_warning_without_coercion(monkeypat
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
     candidate = _weighted_candidate(members=members)
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1741,7 +1811,7 @@ def test_build_adapter_rejects_pass_search_with_no_candidates(monkeypatch):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1770,7 +1840,7 @@ def test_build_adapter_maps_capped_lp_infeasible_to_bank_unavailable(monkeypatch
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1801,7 +1871,7 @@ def test_build_adapter_excludes_candidate_above_bank_ceiling(monkeypatch):
     campaign = _weighted_build_campaign()
     campaign["launch"]["profiles"][0]["bank_available_usdt"] = Decimal("50")
     candidate = _weighted_candidate(members=members)
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1833,7 +1903,7 @@ def test_build_adapter_scenario_injection_does_not_mutate_campaign_profile(monke
     campaign["launch"] = {"profiles": (profile,)}
     captured = []
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -1868,7 +1938,7 @@ def test_build_adapter_runs_all_profiles_and_keeps_only_failed_profile_blocker(m
     calls = []
     candidate = _weighted_candidate(members=members)
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -2119,7 +2189,7 @@ def test_outer_builder_accepts_empty_preliminary_spread_facts_for_all_symbols(mo
         members=tuple(dict(row, position_size_usdt=Decimal("123"), planned_leverage=Decimal("1")) for row in selected),
         metrics={"limiter_L": Decimal("2"), "required_bank_usdt": Decimal("100"), "p30_common_usdt_30d": Decimal("10"), "cdar_peak80_usdt": Decimal("1")},
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -2286,9 +2356,27 @@ def test_runtime_adapter_maps_official_archive_failure_before_market(monkeypatch
     )
 
     assert len(archive_days) == 21
-    failed_days = ", ".join(day.isoformat() for day in sorted(set(archive_days)))
-    assert errors == [f"Bybit archive backfill failed for BTCUSDT: {failed_days}"]
-    assert (result.status, result.blockers, fact_calls) == ("FAIL", ("MINUTE_CAPACITY_UNAVAILABLE",), [])
+    assert errors == ["LIQUIDITY_MODEL_WINDOW_UNAVAILABLE"]
+    assert (result.status, result.blockers, fact_calls) == ("FAIL", ("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE",), [])
+
+
+def test_runtime_adapter_rejects_missing_frozen_anchor_before_fact_work(monkeypatch, tmp_path):
+    campaign = _runtime_weighted_campaign()
+    campaign.pop("created_at_utc")
+    calls = []
+    monkeypatch.setattr(adapter_module, "backfill_missing_days", lambda *_args, **_kwargs: calls.append("backfill"))
+    monkeypatch.setattr(adapter_module, "calculate_minute_capacity", lambda *_args, **_kwargs: calls.append("capacity"))
+    monkeypatch.setattr(adapter_module, "load_market_snapshot", lambda *_args, **_kwargs: calls.append("market"))
+
+    result = run_portfolio_adapter(
+        ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},),
+        campaign,
+        workspace_root=tmp_path,
+    )
+
+    assert (result.status, result.blockers, calls) == (
+        "FAIL", ("LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE",), [],
+    )
 
 
 def test_runtime_adapter_maps_unexpected_builder_failure_separately(monkeypatch, tmp_path):
@@ -2479,16 +2567,24 @@ def test_runtime_adapter_keeps_legacy_campaign_gate_failure(tmp_path):
 
 
 def test_build_adapter_blocks_valid_weighted_campaign_before_legacy_search(monkeypatch):
+    selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
+    campaign = _weighted_build_campaign()
+    campaign.pop("weighted_input_rows")
     calls = []
     monkeypatch.setattr(candidate_search, "search_portfolio_candidates", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy search reached")))
-    monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: calls.append("enrich"))
+    monkeypatch.setattr(
+        adapter_module, "enrich_finalist_rows",
+        lambda rows, *_args, **_kwargs: calls.append("enrich") or SimpleNamespace(
+            status="PASS", rows=rows, exclusions=(), reason=None,
+        ),
+    )
     monkeypatch.setattr(adapter_module, "_run_weighted_search", lambda *_args, **_kwargs: calls.append("search"))
     result = build_portfolio_candidates(
-        (), weighted_campaign(), capacities={}, reference=None, mark_prices={},
+        selected, campaign, capacities={}, reference=None, mark_prices={},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
     )
     assert (result.status, result.blockers) == ("FAIL", (WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE,))
-    assert calls == []
+    assert calls == ["enrich"]
 
 
 def test_build_adapter_bridges_frozen_weighted_search_result(monkeypatch):
@@ -2499,16 +2595,18 @@ def test_build_adapter_bridges_frozen_weighted_search_result(monkeypatch):
         k=9,
         size_composition_vector=(Decimal("0.5"),),
     ),)
-    prepared = SimpleNamespace(
-        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
-    )
     margin = _margin_evidence(11)
     campaign = weighted_campaign()
     campaign.update({
         "weighted_input_rows": (dict(selected[0], actions=(), equity=()),),
         "config_document": {
-            "liquidity": {"maximum_age_hours": 2},
+            "liquidity": {
+                "maximum_age_hours": 2,
+                "parameters": {
+                    "lot_model_base_coefficient": Decimal("9"),
+                    "lot_model_max_shift_bonus": Decimal("1.1"),
+                },
+            },
             "search": {
                 "seed": 17,
                 "weighted_search": {
@@ -2549,7 +2647,7 @@ def test_build_adapter_bridges_frozen_weighted_search_result(monkeypatch):
 
     def capture_prepare(*args):
         calls["prepare"] = args
-        return prepared
+        return _prepared_stub(*args)
 
     def capture_search(*args, **kwargs):
         calls["search"] = (args, kwargs)
@@ -2578,12 +2676,22 @@ def test_build_adapter_bridges_frozen_weighted_search_result(monkeypatch):
     assert result.status == "PASS"
     assert calls["enrich"] == (
         (selected, {}, None, {}),
-        {"now_ms": 0, "maximum_age_hours": 2},
+        {
+            "now_ms": 0,
+            "maximum_age_hours": 2,
+            "lot_model_settings": {
+                "lot_model_base_coefficient": Decimal("9"),
+                "lot_model_max_shift_bonus": Decimal("1.1"),
+            },
+        },
     )
-    assert calls["prepare"] == (selected, campaign)
+    assert calls["prepare"] == (members, campaign)
     search_args, search_kwargs = calls["search"]
-    assert search_args[0] is prepared
-    assert search_args[1] is members
+    assert search_args[0].diagnostics["one_way"]["policy"] == "ONE_ACTIVE_DIRECTION_PER_SYMBOL_V1"
+    assert len(search_args[1]) == 1
+    assert search_args[1][0]["position_size_usdt"] == Decimal("123")
+    assert search_args[1][0]["cycles"] == ()
+    assert search_args[1][0]["one_way_policy"] == "ONE_ACTIVE_DIRECTION_PER_SYMBOL_V1"
     assert search_args[2] is campaign
     assert search_args[3] == {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "scenario_id": "BALANCED"}
     assert search_args[4] is margin
@@ -2609,6 +2717,58 @@ def test_build_adapter_bridges_frozen_weighted_search_result(monkeypatch):
         result.variants[0]["members"][0]["symbol"] = "ETHUSDT"
     with pytest.raises(TypeError):
         result.variants[0]["metrics"]["limiter_L"] = Decimal("9")
+
+
+def test_build_adapter_payloads_keep_rounded_long_short_sizes_below_lp_and_independent_caps(monkeypatch):
+    selected = tuple({
+        "symbol": "BTCUSDT", "side": side, "strategy_id": strategy_id, "result_id": result_id,
+        "timeframe": "3h", "close_ma_len": 55, "order_count": 1,
+        "strategy_orders": ({"order_id": 1, "open_ma_len": 34, "shift_bp": 50, "lot_x": Decimal("1")},),
+        "actions": (), "equity": (),
+    } for side, strategy_id, result_id in (("LONG", 11, 101), ("SHORT", 22, 202)))
+    enriched = tuple(_weighted_required_evidence(dict(
+        row, position_size_usdt=capacity, planned_leverage=Decimal("9"),
+    )) for row, capacity in zip(selected, (Decimal("400"), Decimal("300"))))
+    solver_members = tuple({
+        "symbol": "BTCUSDT", "side": side, "strategy_id": strategy_id, "result_id": result_id,
+        "x_usdt": target, "capacity_usdt": upper, "priority": 3,
+    } for side, strategy_id, result_id, target, upper in (
+        ("LONG", 11, 101, Decimal("357"), Decimal("400")),
+        ("SHORT", 22, 202, Decimal("257"), Decimal("300")),
+    ))
+    candidate = candidate_search.PortfolioCandidate(
+        schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
+        identity="solver-candidate", members=solver_members,
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
+    )
+    campaign = _weighted_build_campaign()
+    campaign["weighted_input_rows"] = tuple(dict(row, actions=(), equity=()) for row in selected)
+    monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: SimpleNamespace(
+        status="PASS", rows=enriched, exclusions=(), reason=None,
+    ))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *args: _prepared_stub(*args))
+    monkeypatch.setattr(adapter_module, "_run_weighted_search", lambda *_args, **_kwargs: candidate_search.SearchResult(
+        status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+    ))
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11, 22), strategy_template=_weighted_strategy_template_fixture(),
+    )
+
+    assert result.status == "PASS", (result.blockers, result.excluded)
+    variant = result.variants[0]
+    executable = {row["side"]: row for row in variant["executable_members"]}
+    payloads = {payload["side"]: payload for payload in variant["strategy_payloads"]}
+    expected = {"LONG": (Decimal("350"), Decimal("357"), Decimal("400")),
+                "SHORT": (Decimal("250"), Decimal("257"), Decimal("300"))}
+    for side, (actual, solver_x, upper) in expected.items():
+        row = executable[side]
+        assert (row["actual_size_usdt"], row["solver_x_usdt"], row["capacity_usdt"]) == (actual, solver_x, upper)
+        assert row["actual_size_usdt"] <= row["solver_x_usdt"] <= row["capacity_usdt"]
+        assert Decimal(payloads[side]["facts"]["x"]) == actual
+        assert Decimal(payloads[side]["facts"]["C"]) == upper
 
 
 def _weighted_strategy_template_fixture():
@@ -2689,10 +2849,7 @@ def test_build_adapter_attaches_real_source_geometry_payloads_by_member_identity
     template = _weighted_strategy_template_fixture()
     template_before = deepcopy(template)
     source_before = deepcopy(source_rows)
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
-        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
-    ))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),
@@ -2706,7 +2863,9 @@ def test_build_adapter_attaches_real_source_geometry_payloads_by_member_identity
     monkeypatch.setattr(adapter_module, "weighted_search", capture_weighted_search)
 
     result = build_portfolio_candidates(
-        selected, campaign, capacities={}, reference=None, mark_prices={},
+        selected, campaign, capacities={}, reference=_payload_reference(("BTCUSDT", "ETHUSDT", "SOLUSDT")), mark_prices={
+            "BTCUSDT": Decimal("100"), "ETHUSDT": Decimal("100"), "SOLUSDT": Decimal("100"),
+        },
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY", "ETHUSDT": "READY", "SOLUSDT": "READY"},
         now_ms=0, margin_coefficients=_margin_evidence(11, 22, 33), strategy_template=template,
     )
@@ -2790,10 +2949,7 @@ def test_build_adapter_rebinds_identity_after_executable_payload_assembly(monkey
     )
     campaign = _weighted_build_campaign()
     template = _weighted_strategy_template_fixture()
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
-        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
-    ))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),
@@ -2806,7 +2962,7 @@ def test_build_adapter_rebinds_identity_after_executable_payload_assembly(monkey
     )
 
     result = build_portfolio_candidates(
-        source_rows, campaign, capacities={}, reference=None, mark_prices={},
+        source_rows, campaign, capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
         margin_coefficients=_margin_evidence(11), strategy_template=template,
     )
@@ -2834,10 +2990,7 @@ def test_build_adapter_maps_identity_evidence_conflict_to_profile_blocker(monkey
              "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3},
         )), metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
-        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
-    ))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),
@@ -2850,7 +3003,7 @@ def test_build_adapter_maps_identity_evidence_conflict_to_profile_blocker(monkey
     )
 
     result = build_portfolio_candidates(
-        selected, _weighted_build_campaign(), capacities={}, reference=None, mark_prices={},
+        selected, _weighted_build_campaign(), capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
         margin_coefficients=_margin_evidence(11), strategy_template=_weighted_strategy_template_fixture(),
     )
@@ -2882,10 +3035,7 @@ def test_build_adapter_reports_true_executable_identity_collision(monkeypatch):
         )
         for identity in ("search-a", "search-b")
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: SimpleNamespace(
-        period_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        period_end_utc=datetime(2026, 1, 15, tzinfo=timezone.utc),
-    ))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),
@@ -2898,7 +3048,7 @@ def test_build_adapter_reports_true_executable_identity_collision(monkeypatch):
     )
 
     result = build_portfolio_candidates(
-        source_rows, _weighted_build_campaign(), capacities={}, reference=None, mark_prices={},
+        source_rows, _weighted_build_campaign(), capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
         margin_coefficients=_margin_evidence(11), strategy_template=_weighted_strategy_template_fixture(),
     )
@@ -3008,7 +3158,7 @@ def test_weighted_executable_identity_is_stable_and_binds_mutable_inputs():
     identity = adapter_module._weighted_executable_identity(
         campaign, "BALANCED", "BALANCED", Decimal("1000"), (member,), (enriched,), (payload,)
     )
-    assert identity == "f90b129e76301eb7d259282eae9fbafc296dcf36e3d74164428294eb43201dbf"
+    assert identity == "b2d1fc2bfa2724fa8b7e139342e7e92df554ff4babb619f7d14af08de4996684"
     assert identity == adapter_module._weighted_executable_identity(
         campaign, "BALANCED", "BALANCED", Decimal("1000"), (member,), (enriched,), (payload,)
     )
@@ -3144,7 +3294,40 @@ def test_weighted_executable_identity_binds_ordered_zero_member_source_rows():
     assert first != second
 
 
-def test_weighted_executable_identity_rejects_reversed_payload_association():
+def test_weighted_executable_identity_binds_provenance_sizing_and_mask_evidence():
+    campaign = weighted_campaign()
+    member = {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101, "x_usdt": "100"}
+    enriched = dict(_weighted_required_evidence(member), source_provenance={"sha256": "a" * 64})
+    solver_member = dict(
+        member,
+        sizing_digest=enriched["sizing_digest"],
+        one_way_policy="ONE_ACTIVE_DIRECTION_PER_SYMBOL_V1",
+        one_way_mask_digest="mask-a",
+    )
+    payload = {
+        "strategy": {"name": "PORTFOLIO_BTCUSDT_11_101", "basic": {"symbol": "BTCUSDT"}},
+        "account": {}, "facts": {},
+    }
+    identity = adapter_module._weighted_executable_identity(
+        campaign, "BALANCED", "BALANCED", Decimal("1000"), (solver_member,), (enriched,), (payload,),
+    )
+
+    changed_provenance = dict(enriched, source_provenance={"sha256": "b" * 64})
+    assert identity != adapter_module._weighted_executable_identity(
+        campaign, "BALANCED", "BALANCED", Decimal("1000"), (solver_member,), (changed_provenance,), (payload,),
+    )
+    changed_enriched = dict(enriched, sizing_digest="sizing-b")
+    changed_member = dict(solver_member, sizing_digest="sizing-b")
+    assert identity != adapter_module._weighted_executable_identity(
+        campaign, "BALANCED", "BALANCED", Decimal("1000"), (changed_member,), (changed_enriched,), (payload,),
+    )
+    changed_mask = dict(solver_member, one_way_mask_digest="mask-b")
+    assert identity != adapter_module._weighted_executable_identity(
+        campaign, "BALANCED", "BALANCED", Decimal("1000"), (changed_mask,), (enriched,), (payload,),
+    )
+
+
+def test_weighted_executable_identity_canonicalizes_payload_order_by_member_identity():
     campaign = weighted_campaign()
     first = {
         "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101, "x_usdt": "100",
@@ -3161,13 +3344,20 @@ def test_weighted_executable_identity_rejects_reversed_payload_association():
         for row in (first, second)
     )
 
-    with pytest.raises(CampaignContractError) as error:
-        adapter_module._weighted_executable_identity(
-            campaign, "BALANCED", "BALANCED", Decimal("1000"), (first, second), enriched,
-            (payloads[1], payloads[0]),
-        )
-
-    assert error.value.code == "WEIGHTED_EXECUTABLE_IDENTITY_INVALID"
+    expected = adapter_module._weighted_executable_identity(
+        campaign, "BALANCED", "BALANCED", Decimal("1000"), (first, second), enriched, payloads,
+    )
+    reordered = adapter_module._weighted_executable_identity(
+        campaign, "BALANCED", "BALANCED", Decimal("1000"), (first, second), enriched,
+        (payloads[1], payloads[0]),
+    )
+    assert reordered == expected
+    for malformed in ((payloads[0],), (payloads[0], payloads[0])):
+        with pytest.raises(CampaignContractError) as error:
+            adapter_module._weighted_executable_identity(
+                campaign, "BALANCED", "BALANCED", Decimal("1000"), (first, second), enriched, malformed,
+            )
+        assert error.value.code == "WEIGHTED_EXECUTABLE_IDENTITY_INVALID"
 
 
 def test_weighted_executable_identity_rejects_missing_or_conflicting_evidence():
@@ -3245,7 +3435,7 @@ def test_build_adapter_rejects_template_payload_without_exact_source_geometry(mo
         identity="candidate-BALANCED", members=(dict(selected[0], x_usdt=Decimal("100"), capacity_usdt=Decimal("400"), priority=3),),
         metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=members, exclusions=(), reason=None),
@@ -3258,14 +3448,16 @@ def test_build_adapter_rejects_template_payload_without_exact_source_geometry(mo
     )
 
     result = build_portfolio_candidates(
-        selected, _weighted_build_campaign(), capacities={}, reference=None, mark_prices={},
+        selected, _weighted_build_campaign(), capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
         margin_coefficients=_margin_evidence(11), strategy_template=_weighted_strategy_template_fixture(),
     )
 
-    assert (result.status, result.blockers, result.variants) == (
-        "FAIL", ("PROFILE:" + WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE,), (),
-    )
+    expected = {
+        "missing": "PROFILE:MISSING_ORDER_GEOMETRY",
+        "nonmapping": "PROFILE:INVALID_ORDER_GEOMETRY",
+    }.get(geometry_case, "PROFILE:" + WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE)
+    assert (result.status, result.blockers, result.variants) == ("FAIL", (expected,), ())
 
 
 def test_build_adapter_rejects_negative_x_for_template_payload(monkeypatch):
@@ -3280,7 +3472,7 @@ def test_build_adapter_rejects_negative_x_for_template_payload(monkeypatch):
         identity="candidate-BALANCED", members=(dict(selected[0], x_usdt=Decimal("-1"), capacity_usdt=Decimal("400"), priority=3),),
         metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=members, exclusions=(), reason=None),
@@ -3293,7 +3485,7 @@ def test_build_adapter_rejects_negative_x_for_template_payload(monkeypatch):
     )
 
     result = build_portfolio_candidates(
-        selected, _weighted_build_campaign(), capacities={}, reference=None, mark_prices={},
+        selected, _weighted_build_campaign(), capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
         margin_coefficients=_margin_evidence(11), strategy_template=_weighted_strategy_template_fixture(),
     )
@@ -3316,7 +3508,7 @@ def test_build_adapter_rejects_ambiguous_template_source_geometry(monkeypatch):
         identity="candidate-BALANCED", members=(dict(source, x_usdt=Decimal("100"), capacity_usdt=Decimal("400"), priority=3),),
         metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=members, exclusions=(), reason=None),
@@ -3329,7 +3521,7 @@ def test_build_adapter_rejects_ambiguous_template_source_geometry(monkeypatch):
     )
 
     result = build_portfolio_candidates(
-        selected, _weighted_build_campaign(), capacities={}, reference=None, mark_prices={},
+        selected, _weighted_build_campaign(), capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
         spread_observations={"BTCUSDT": ()}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
         margin_coefficients=_margin_evidence(11), strategy_template=_weighted_strategy_template_fixture(),
     )
@@ -3354,7 +3546,7 @@ def test_build_adapter_rejects_candidate_capacity_mismatch_with_enriched_source(
              "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3},
         ), metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),
@@ -3511,7 +3703,7 @@ def test_build_adapter_rejects_template_branch_with_no_positive_allocations(monk
         identity="candidate-BALANCED", members=(member,),
         metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(
@@ -3527,13 +3719,60 @@ def test_build_adapter_rejects_template_branch_with_no_positive_allocations(monk
     )
 
     result = build_portfolio_candidates(
-        (source,), _weighted_build_campaign(), capacities={}, reference=None, mark_prices={},
+        (source,), _weighted_build_campaign(), capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
         margin_coefficients=_margin_evidence(11), strategy_template=_weighted_strategy_template_fixture(),
     )
 
     assert (result.status, result.blockers, result.variants) == (
-        "FAIL", ("PROFILE:WEIGHTED_PAYLOAD_INVALID",), (),
+        "FAIL", ("PROFILE:LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE",), (),
+    )
+
+
+def test_build_adapter_omits_positive_lp_target_that_rounds_to_zero(monkeypatch):
+    source = {
+        "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101,
+        "timeframe": "3h", "close_ma_len": 55, "order_count": 1,
+        "strategy_orders": ({"order_id": 1, "open_ma_len": 34, "shift_bp": 50, "lot_x": Decimal("1")},),
+    }
+    member = {
+        "symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101,
+        "x_usdt": Decimal("9"), "capacity_usdt": Decimal("400"), "priority": 3,
+    }
+    candidate = candidate_search.PortfolioCandidate(
+        schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
+        identity="candidate-BALANCED", members=(member,),
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
+    )
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
+    monkeypatch.setattr(
+        adapter_module, "enrich_finalist_rows",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="PASS", rows=(dict(source, position_size_usdt=Decimal("400"), planned_leverage=Decimal("9")),),
+            exclusions=(), reason=None,
+        ),
+    )
+    monkeypatch.setattr(
+        adapter_module, "_run_weighted_search",
+        lambda *_args, **_kwargs: candidate_search.SearchResult(
+            status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+        ),
+    )
+
+    result = build_portfolio_candidates(
+        (source,), _weighted_build_campaign(), capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11), strategy_template=_weighted_strategy_template_fixture(),
+    )
+
+    assert result.status == "FAIL"
+    assert result.blockers == ("PROFILE:LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE",)
+    assert result.variants == ()
+    assert any(
+        item.get("reason") == "SIZE_ROUNDED_TO_ZERO"
+        and item.get("solver_x_usdt") == "9"
+        and item.get("stage") == "EXCHANGE_ROUNDING"
+        for item in result.excluded
     )
 
 
@@ -3575,7 +3814,7 @@ def test_build_adapter_rejects_duplicate_symbol_candidate_deterministically(monk
         metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
     )
     enriched = tuple(dict(row, position_size_usdt=Decimal("400"), planned_leverage=Decimal("9")) for row in source_rows)
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module, "enrich_finalist_rows",
         lambda *_args, **_kwargs: SimpleNamespace(status="PASS", rows=enriched, exclusions=(), reason=None),
@@ -3598,13 +3837,19 @@ def test_build_adapter_rejects_duplicate_symbol_candidate_deterministically(monk
     )
 
 
-def test_build_adapter_prepares_frozen_input_before_enrichment(monkeypatch):
+def test_build_adapter_does_not_prepare_frozen_input_when_enrichment_excludes_all(monkeypatch):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     campaign = weighted_campaign()
     campaign.update({
         "weighted_input_rows": (dict(selected[0], actions=(), equity=()),),
         "config_document": {
-            "liquidity": {"maximum_age_hours": 2},
+            "liquidity": {
+                "maximum_age_hours": 2,
+                "parameters": {
+                    "lot_model_base_coefficient": Decimal("9"),
+                    "lot_model_max_shift_bonus": Decimal("1.1"),
+                },
+            },
             "search": {
                 "weighted_search": {"history_step_minutes": 5},
                 "composition": {"parameters": {"minimum_common_days": 1}},
@@ -3616,10 +3861,10 @@ def test_build_adapter_prepares_frozen_input_before_enrichment(monkeypatch):
 
     def capture_prepare(*args):
         order.append("prepare")
-        return object()
+        return _prepared_stub(*args)
 
     def capture_enrich(*args, **kwargs):
-        assert order == ["prepare"]
+        assert order == []
         order.append("enrich")
         return SimpleNamespace(status="FAIL", exclusions=(), reason="NO_ENRICHED_ROWS")
 
@@ -3638,14 +3883,16 @@ def test_build_adapter_prepares_frozen_input_before_enrichment(monkeypatch):
         margin_coefficients=_margin_evidence(11),
     )
 
-    assert (result.status, result.blockers, order) == ("FAIL", ("NO_ENRICHED_ROWS",), ["prepare", "enrich"])
+    assert (result.status, result.blockers, order) == (
+        "FAIL", ("LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE",), ["enrich"],
+    )
 
 
 def test_build_adapter_missing_margin_blocks_profile_without_search(monkeypatch):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
     calls = []
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -3675,7 +3922,7 @@ def test_build_adapter_prefixes_search_failure_and_never_falls_back(monkeypatch)
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
     calls = []
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -3721,7 +3968,7 @@ def test_build_adapter_reports_safe_weighted_search_exception_code(monkeypatch, 
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     members = (dict(selected[0], position_size_usdt=Decimal("123")),)
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -3762,7 +4009,7 @@ def test_weighted_search_exception_code_bounds_long_exception_class_name():
 def test_build_adapter_maps_unexpected_enrichment_exception_to_single_sizing_blocker(monkeypatch):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
 
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: object())
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: _prepared_stub(*_args))
     monkeypatch.setattr(
         adapter_module,
         "enrich_finalist_rows",
@@ -3795,8 +4042,13 @@ def test_build_adapter_maps_unexpected_enrichment_exception_to_single_sizing_blo
 def test_build_adapter_rejects_non_mapping_spread_history_statuses_before_preparation(monkeypatch, statuses):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     calls = []
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: calls.append("prepare"))
-    monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: calls.append("enrich"))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: calls.append("prepare") or _prepared_stub(*_args))
+    monkeypatch.setattr(
+        adapter_module, "enrich_finalist_rows",
+        lambda *_args, **_kwargs: calls.append("enrich") or SimpleNamespace(
+            status="PASS", rows=selected, exclusions=(), reason=None,
+        ),
+    )
 
     result = build_portfolio_candidates(
         selected,
@@ -3819,7 +4071,7 @@ def test_build_adapter_rejects_non_mapping_spread_history_statuses_before_prepar
 def test_build_adapter_excludes_symbols_with_non_ok_spread_history_before_preparation(monkeypatch):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     calls = []
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: calls.append("prepare"))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: calls.append("prepare") or _prepared_stub(*_args))
 
     result = build_portfolio_candidates(
         selected,
@@ -3849,7 +4101,7 @@ def test_build_adapter_excludes_symbols_with_non_ok_spread_history_before_prepar
 def test_build_adapter_excludes_symbols_missing_spread_history_status_before_preparation(monkeypatch):
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
     calls = []
-    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: calls.append("prepare"))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *_args: calls.append("prepare") or _prepared_stub(*_args))
 
     result = build_portfolio_candidates(
         selected,
@@ -3892,10 +4144,15 @@ def test_build_adapter_preserves_known_spread_history_status_reason(monkeypatch)
 
 def test_runtime_entrypoints_remain_gate_only_when_weighted_search_is_patched(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter_module, "weighted_search", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("weighted search reached")))
-    request = weighted_campaign()
+    monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda rows, *_args, **_kwargs: SimpleNamespace(
+        status="PASS", rows=rows, exclusions=(), reason=None,
+    ))
+    request = _weighted_build_campaign()
+    request.pop("weighted_input_rows")
 
     build_result = build_portfolio_candidates(
-        (), request, capacities={}, reference=None, mark_prices={},
+        ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},), request,
+        capacities={}, reference=None, mark_prices={},
         spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
     )
     run_result = run_portfolio_adapter((), request, workspace_root=tmp_path)
@@ -4265,14 +4522,20 @@ def test_prepare_frozen_weighted_input_reaches_real_preparer_and_accepts_full_ca
     assert prepared.strategy_ids == (1,)
 
 
-def test_build_adapter_rejects_selected_identity_mismatch_before_enrichment_or_search(monkeypatch):
+def test_build_adapter_rejects_selected_identity_mismatch_after_enrichment_before_search(monkeypatch):
     source = _real_frozen_weighted_input_row()
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 999},)
     campaign = weighted_campaign()
     campaign.update({
         "weighted_input_rows": (source,),
         "config_document": {
-            "liquidity": {"maximum_age_hours": 2},
+            "liquidity": {
+                "maximum_age_hours": 2,
+                "parameters": {
+                    "lot_model_base_coefficient": Decimal("9"),
+                    "lot_model_max_shift_bonus": Decimal("1.1"),
+                },
+            },
             "search": {
                 "weighted_search": {"history_step_minutes": 5},
                 "composition": {"parameters": {"minimum_common_days": 1}},
@@ -4281,7 +4544,12 @@ def test_build_adapter_rejects_selected_identity_mismatch_before_enrichment_or_s
         "launch": {"profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000")},)},
     })
     calls = []
-    monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: calls.append("enrich"))
+    monkeypatch.setattr(
+        adapter_module, "enrich_finalist_rows",
+        lambda rows, *_args, **_kwargs: calls.append("enrich") or SimpleNamespace(
+            status="PASS", rows=rows, exclusions=(), reason=None,
+        ),
+    )
     monkeypatch.setattr(adapter_module, "_run_weighted_search", lambda *_args, **_kwargs: calls.append("search"))
 
     result = build_portfolio_candidates(
@@ -4291,7 +4559,7 @@ def test_build_adapter_rejects_selected_identity_mismatch_before_enrichment_or_s
     )
 
     assert (result.status, result.blockers, result.variants, calls) == (
-        "FAIL", (WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE,), (), [],
+        "FAIL", (WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE,), (), ["enrich"],
     )
 
 
@@ -4321,7 +4589,7 @@ def test_prepare_frozen_weighted_input_reports_preparation_failure_separately(mo
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 101},)
 
     def fail_prepare(*args, **kwargs):
-        raise portfolio_input.PortfolioInputError("preparation failed", code="INVALID_SOURCE_VALUE")
+        raise RuntimeError("preparation failed")
 
     monkeypatch.setattr(portfolio_input, "prepare_weighted_input", fail_prepare)
     with pytest.raises(CampaignContractError) as error:
@@ -4350,11 +4618,25 @@ def test_prepare_frozen_weighted_input_maps_injected_campaign_contract_exception
     monkeypatch.setattr(
         portfolio_input,
         "prepare_weighted_input",
-        lambda *args, **kwargs: (_ for _ in ()).throw(CampaignContractError("preparer contract failure")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(CampaignContractError("UNKNOWN_BUT_WELL_FORMED_CODE")),
     )
     with pytest.raises(CampaignContractError) as error:
         _prepare_frozen_weighted_input(selected, _frozen_input_campaign((source,)))
     assert error.value.code == WEIGHTED_INPUT_PREPARATION_FAILED
+
+
+def test_prepare_frozen_weighted_input_preserves_allowlisted_one_way_error(monkeypatch):
+    source = _frozen_weighted_input_row()
+    selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 101},)
+
+    monkeypatch.setattr(
+        portfolio_input,
+        "prepare_weighted_input",
+        lambda *args, **kwargs: (_ for _ in ()).throw(CampaignContractError("ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE")),
+    )
+    with pytest.raises(CampaignContractError) as error:
+        _prepare_frozen_weighted_input(selected, _frozen_input_campaign((source,)))
+    assert error.value.code == "ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE"
 
 
 def test_prepare_frozen_weighted_input_does_not_catch_base_exception(monkeypatch):
@@ -4592,11 +4874,11 @@ def test_prepare_frozen_weighted_input_freezes_series_before_preparer(monkeypatc
 
 def test_weighted_payload_allows_allocation_above_bank():
     template, member = _weighted_payload_inputs()
-    payload = build_weighted_strategy_payload(template, dict(member, x_usdt="3000"), Decimal("2000"), Decimal("400"), 3)
+    payload = build_weighted_strategy_payload(template, dict(member, x_usdt="3000"), Decimal("2000"), Decimal("4000"), 3)
 
     assert Decimal(payload["facts"]["q"]) == Decimal("1.5")
     assert Decimal(payload["strategy"]["basic"]["balance_percentage_long"]) == Decimal("150")
-    assert payload["strategy"]["basic"]["max_balance"] == pytest.approx(float(Decimal("400") / Decimal("1.5")))
+    assert payload["strategy"]["basic"]["max_balance"] == pytest.approx(float(Decimal("4000") / Decimal("1.5")))
 
 
 @pytest.mark.parametrize(

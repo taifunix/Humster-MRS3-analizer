@@ -13,12 +13,13 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+PREVIOUS_SCHEMA_VERSION = 2
 LEGACY_SCHEMA_VERSION = 1
 POLICY_VERSION = "portfolio_optimizer_research_risk_v1"
 ALGORITHM_VERSIONS = MappingProxyType(
     {
-        "sizing": "portfolio_optimizer_sizing_v2",
+        "sizing": "portfolio_optimizer_sizing_v3",
         "ranking": "portfolio_optimizer_ranking_v2",
     }
 )
@@ -26,6 +27,12 @@ LEGACY_ALGORITHM_VERSIONS = MappingProxyType(
     {
         "sizing": "portfolio_optimizer_sizing_v1",
         "ranking": "portfolio_optimizer_ranking_v1",
+    }
+)
+PREVIOUS_ALGORITHM_VERSIONS = MappingProxyType(
+    {
+        "sizing": "portfolio_optimizer_sizing_v2",
+        "ranking": "portfolio_optimizer_ranking_v2",
     }
 )
 PROFILE_NAMES = ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
@@ -68,7 +75,8 @@ COMPOSITION_PARAMETER_DEFAULTS = MappingProxyType(
 _LEGACY_COMPOSITION_PARAMETERS = "legacy_parameters"
 LIQUIDITY_DEFAULTS = MappingProxyType(
     {
-        "close_volume_participation_pct": 200,
+        "lot_model_base_coefficient": "9",
+        "lot_model_max_shift_bonus": "1.1",
         "round_down_usdt": 10,
         "minimum_coverage_pct": 90,
         "maximum_age_hours": 2,
@@ -258,6 +266,15 @@ def _finite_decimal(value: Any, path: str, *, positive: bool = False) -> Decimal
     return number
 
 
+def _liquidity_model_decimal(value: Any, path: str, minimum: str, maximum: str) -> Decimal:
+    if not isinstance(value, str) or re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", value) is None:
+        raise PortfolioConfigError(f"{path} must be an exact decimal string")
+    number = _finite_decimal(value, path)
+    if not Decimal(minimum) <= number <= Decimal(maximum):
+        raise PortfolioConfigError(f"{path} must be between {minimum} and {maximum}")
+    return number
+
+
 def _risk_decimal(value: Any, path: str) -> Decimal:
     number = _finite_decimal(value, path)
     _, digits, exponent = number.as_tuple()
@@ -433,13 +450,30 @@ def _parse_liquidity(value: Any) -> Mapping[str, Any]:
             "spread_history_bypass_pretest",
         ),
     )
-    descriptor = _descriptor({"policy_id": raw["policy_id"], "parameters": raw["parameters"]}, "liquidity")
-    parameters = dict(descriptor["parameters"])
-    participation = _integer(parameters.get("close_volume_participation_pct"), "liquidity.parameters.close_volume_participation_pct")
-    if not 1 <= participation <= 200:
-        raise PortfolioConfigError("liquidity.parameters.close_volume_participation_pct must be between 1 and 200")
-    result: dict[str, Any] = dict(descriptor)
-    result["parameters"] = MappingProxyType(parameters)
+    parameters = _object(
+        raw["parameters"],
+        "liquidity.parameters",
+        ("lot_model_base_coefficient", "lot_model_max_shift_bonus"),
+    )
+    result: dict[str, Any] = {
+        "policy_id": _string(raw["policy_id"], "liquidity.policy_id"),
+        "parameters": MappingProxyType(
+            {
+                "lot_model_base_coefficient": _liquidity_model_decimal(
+                    parameters["lot_model_base_coefficient"],
+                    "liquidity.parameters.lot_model_base_coefficient",
+                    "1",
+                    "20",
+                ),
+                "lot_model_max_shift_bonus": _liquidity_model_decimal(
+                    parameters["lot_model_max_shift_bonus"],
+                    "liquidity.parameters.lot_model_max_shift_bonus",
+                    "0",
+                    "2",
+                ),
+            }
+        ),
+    }
     result["round_down_usdt"] = _finite_decimal(raw["round_down_usdt"], "liquidity.round_down_usdt", positive=True)
     coverage = _integer(raw["minimum_coverage_pct"], "liquidity.minimum_coverage_pct")
     if not 1 <= coverage <= 100:
@@ -540,7 +574,7 @@ def _reject_json_constant(value: str) -> None:
 
 
 def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
-    """Return a deterministic v2 copy; v1 monetary sizing grids are discarded."""
+    """Return an in-memory schema-v3 copy; writes remain an explicit Settings action."""
     if not isinstance(document, Mapping):
         raise PortfolioConfigError("config must be an object")
     if document.get("schema_version") == SCHEMA_VERSION:
@@ -549,8 +583,6 @@ def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict
         # them in the active document so Settings and frozen Campaigns expose
         # the algorithms that actually execute. The source bytes and digest
         # remain unchanged until an explicit save.
-        if active.get("algorithm_versions") == dict(LEGACY_ALGORITHM_VERSIONS):
-            active["algorithm_versions"] = dict(ALGORITHM_VERSIONS)
         search = active.get("search")
         if isinstance(search, dict):
             search.setdefault("weighted_search", _weighted_search_defaults())
@@ -581,11 +613,51 @@ def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict
             liquidity.setdefault("spread_history_bypass_pretest", False)
             active["liquidity"] = liquidity
         return active, False
-    if document.get("schema_version") != LEGACY_SCHEMA_VERSION:
+    schema_version = document.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {PREVIOUS_SCHEMA_VERSION, LEGACY_SCHEMA_VERSION}:
         return deepcopy(dict(document)), False
     migrated = deepcopy(dict(document))
     migrated["schema_version"] = SCHEMA_VERSION
-    migrated["algorithm_versions"] = dict(ALGORITHM_VERSIONS)
+    if schema_version == LEGACY_SCHEMA_VERSION or migrated.get("algorithm_versions") in (
+        dict(LEGACY_ALGORITHM_VERSIONS), dict(PREVIOUS_ALGORITHM_VERSIONS)
+    ):
+        migrated["algorithm_versions"] = dict(ALGORITHM_VERSIONS)
+    if schema_version == PREVIOUS_SCHEMA_VERSION:
+        liquidity = migrated.get("liquidity")
+        if isinstance(liquidity, dict):
+            old_parameters = liquidity.get("parameters")
+            if isinstance(old_parameters, dict):
+                parameters = {
+                    key: old_parameters[key]
+                    for key in ("lot_model_base_coefficient", "lot_model_max_shift_bonus")
+                    if key in old_parameters
+                }
+                for key, default in LIQUIDITY_DEFAULTS.items():
+                    if key.startswith("lot_model_"):
+                        parameters.setdefault(key, default)
+                liquidity["parameters"] = parameters
+            liquidity.setdefault("spread_history_bypass_pretest", False)
+        search = migrated.get("search")
+        if isinstance(search, dict):
+            search.setdefault("weighted_search", _weighted_search_defaults())
+            weighted = search.get("weighted_search")
+            if isinstance(weighted, dict):
+                for key in _RETIRED_WEIGHTED_SEARCH_KEYS:
+                    weighted.pop(key, None)
+                for key, default in WEIGHTED_SEARCH_DEFAULTS.items():
+                    weighted.setdefault(key, default)
+            composition = search.get("composition")
+            if isinstance(composition, dict) and isinstance(composition.get("parameters"), dict):
+                for key, default in COMPOSITION_PARAMETER_DEFAULTS.items():
+                    composition["parameters"].setdefault(key, default)
+        profiles = migrated.get("profiles")
+        if isinstance(profiles, dict):
+            for name in PROFILE_NAMES:
+                profile = profiles.get(name)
+                if isinstance(profile, dict):
+                    for field in RISK_POLICY_FIELDS:
+                        profile.setdefault(field, str(RESEARCH_RISK_POLICY[name][field]))
+        return migrated, True
     runner = migrated.get("runner") if isinstance(migrated.get("runner"), dict) else {}
     inputs = migrated.get("inputs") if isinstance(migrated.get("inputs"), dict) else {}
     inputs.setdefault("bybit_minute_data_root", f"{runner.get('root', '.')}/tester/data/bybit")
@@ -616,12 +688,18 @@ def migrate_portfolio_config_document(document: Mapping[str, Any]) -> tuple[dict
             search["composition"] = composition
         migrated["search"] = search
     liquidity = migrated.get("liquidity") if isinstance(migrated.get("liquidity"), dict) else {}
-    parameters = liquidity.get("parameters") if isinstance(liquidity.get("parameters"), dict) else {}
-    parameters.setdefault("close_volume_participation_pct", LIQUIDITY_DEFAULTS["close_volume_participation_pct"])
-    liquidity["parameters"] = parameters
+    old_parameters = liquidity.get("parameters") if isinstance(liquidity.get("parameters"), dict) else {}
+    parameters = {
+        key: old_parameters[key]
+        for key in ("lot_model_base_coefficient", "lot_model_max_shift_bonus")
+        if key in old_parameters
+    }
     for key, default in LIQUIDITY_DEFAULTS.items():
-        if key != "close_volume_participation_pct":
+        if key.startswith("lot_model_"):
+            parameters[key] = default
+        else:
             liquidity.setdefault(key, default)
+    liquidity["parameters"] = parameters
     migrated["liquidity"] = liquidity
     scenarios = migrated.get("scenarios") if isinstance(migrated.get("scenarios"), dict) else {}
     for scenario in scenarios.values():
@@ -664,12 +742,7 @@ def load_portfolio_config(path: str | Path = "portfolio_optimizer.local.json") -
     if top["policy_version"] != POLICY_VERSION:
         raise PortfolioConfigError("policy_version is unsupported")
     algorithm_versions = _object(top["algorithm_versions"], "algorithm_versions", tuple(ALGORITHM_VERSIONS))
-    if algorithm_versions == dict(LEGACY_ALGORITHM_VERSIONS):
-        # Existing schema-v2 files predate the version bump.  Normalize only
-        # this in-memory copy; source bytes remain unchanged until an explicit
-        # Settings save.
-        algorithm_versions = dict(ALGORITHM_VERSIONS)
-    elif algorithm_versions != dict(ALGORITHM_VERSIONS):
+    if algorithm_versions != dict(ALGORITHM_VERSIONS):
         raise PortfolioConfigError("algorithm_versions are unsupported")
     scenarios_raw = top["scenarios"]
     if not isinstance(scenarios_raw, dict) or not scenarios_raw:

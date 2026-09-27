@@ -483,6 +483,25 @@ Non-goals remain binary/enumeration modes, new database/service/dependencies,
 tester/network/live/recommendation execution, and changes to historical WS1.1
 evidence.
 
+## WS1.3 successor: unified liquidity and one-way history
+
+The [2026-09-27 model contract](2026-09-27-liquidity-lot-model.md) and
+[ADR-0046](../decisions/0046-portfolio-unified-liquidity-and-one-way-model.md)
+supersede WS1.2 shared-symbol liquidity and independently overlapping
+opposite-side history for new WS1.3 calculations. Each selected direction has
+its own geometry-dependent exchange-rounded bound U; LP and final validation
+enforce individual bounds without a LONG+SHORT aggregate liquidity row.
+Pair-side uniqueness, EQUAL/INCOME geometry and additive margin are preserved.
+
+One active direction per symbol is a user-approved historical-model rule,
+independent of the account-wide limiter. It remains active with Stage 1 L=0.
+Reuse cycle attribution to omit whole overlapping opposite cycles coherently
+from effective equity and downstream history consumers. No mixed-membership
+ban, account-mode gate or claim of verified external execution is introduced.
+The frozen schedule approximation and its limitations are specified in the
+model contract. The operator confirmed no old WS1.2 result artifacts need a
+compatibility path; active Campaign validation requires WS1.3.
+
 ## Current Stage 1 policy: limiter disabled, off only
 
 The bot's `open_positions_limiter` is not operational. The current production

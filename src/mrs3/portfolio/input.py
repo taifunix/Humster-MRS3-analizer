@@ -1595,7 +1595,7 @@ def preparation_cache_key(
             },
         })
     period_identity = None if period is None else (period.start_utc, period.end_utc, period.status)
-    payload = json.dumps(clean({"weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION, "history_step_minutes": history_step_minutes, "minimum_common_days": minimum_common_days, "period": period_identity, "rows": identities}), sort_keys=True, separators=(",", ":"), default=str)
+    payload = json.dumps(clean({"weighted_algo_version": CAMPAIGN_WEIGHTED_ALGO_VERSION, "one_way_policy": "ONE_ACTIVE_DIRECTION_PER_SYMBOL_V1", "history_step_minutes": history_step_minutes, "minimum_common_days": minimum_common_days, "period": period_identity, "rows": identities}), sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -1691,6 +1691,88 @@ def _cycle_diagnostics(cycles: Sequence[Mapping[str, Any]], start: datetime, end
     }
 
 
+def _one_way_admission(
+    cycle_rows: Mapping[str, tuple[Mapping[str, Any], ...]],
+    row_facts: Mapping[str, Mapping[str, Any]],
+    start: datetime,
+    end: datetime,
+) -> tuple[dict[str, tuple[dict[str, Any], ...]], Mapping[str, Any]]:
+    scheduled: dict[str, list[tuple[tuple[Any, ...], str, int, dict[str, Any], datetime, datetime]]] = {}
+    same_side: dict[tuple[str, str], list[tuple[datetime, datetime, int, int]]] = {}
+    output: dict[str, list[dict[str, Any]]] = {key: [dict(cycle) for cycle in values] for key, values in cycle_rows.items()}
+
+    def id_key(value: Any) -> tuple[int, Any]:
+        return (0, value) if type(value) is int else (1, str(value))
+
+    for row_key, values in cycle_rows.items():
+        facts = row_facts[row_key]
+        symbol = str(facts["symbol"])
+        for index, original in enumerate(values):
+            cycle = output[row_key][index]
+            raw_side = cycle.get("side")
+            declared_side = str(facts["side"]) if raw_side is None else str(raw_side).strip().upper()
+            if declared_side not in {"LONG", "SHORT"} or declared_side != facts["side"]:
+                raise PortfolioInputError("cycle direction differs from participant", code="INVALID_SOURCE_VALUE")
+            side = declared_side
+            original_opened = _utc(cycle["opened_at"]) if cycle.get("opened_at") else None
+            if original_opened is None and not bool(cycle.get("carry_in")):
+                raise PortfolioInputError("cycle open time is unavailable", code="ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE")
+            opened = original_opened or start
+            closed = _utc(cycle["closed_at"]) if cycle.get("closed_at") else end
+            first, flat = max(start, opened), min(end, closed)
+            cycle.update({"one_way_admitted": True, "one_way_rejection_reason": None, "one_way_conflict_cycle_id": None, "one_way_open_time_fallback": original_opened is None and bool(cycle.get("carry_in"))})
+            if flat <= first:
+                cycle["one_way_admitted"] = False
+                cycle["one_way_rejection_reason"] = "ONE_WAY_CYCLE_OUTSIDE_COMMON_WINDOW"
+                continue
+            strategy_id = int(facts["strategy_id"])
+            cycle_id = cycle.get("cycle_id", index)
+            source_ordinal = cycle.get("source_ordinal")
+            tie = (opened, strategy_id, id_key(source_ordinal), id_key(cycle_id))
+            scheduled.setdefault(symbol, []).append((tie, row_key, index, cycle, first, flat))
+            same_side.setdefault((symbol, side), []).append((first, flat, strategy_id, index))
+
+    for intervals in same_side.values():
+        intervals.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        previous_flat: datetime | None = None
+        for first, flat, _strategy_id, _index in intervals:
+            if previous_flat is not None and first < previous_flat:
+                raise PortfolioInputError("overlapping same-side source cycles", code="ONE_WAY_SOURCE_CYCLE_OVERLAP")
+            previous_flat = max(previous_flat, flat) if previous_flat is not None else flat
+
+    directions = {symbol: {side for (current_symbol, side) in same_side if current_symbol == symbol} for symbol in scheduled}
+    for symbol, entries in scheduled.items():
+        boundary_cycles = [cycle for _tie, _key, _index, cycle, _first, _flat in entries if cycle.get("one_way_open_time_fallback")]
+        if len(directions.get(symbol, ())) > 1 and len(boundary_cycles) > 1:
+            raise PortfolioInputError("mixed-direction boundary cycle order is unavailable", code="ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE")
+
+    admitted_end: dict[str, datetime] = {}
+    admitted_cycle: dict[str, dict[str, Any]] = {}
+    for symbol, entries in scheduled.items():
+        for _tie, _row_key, _index, cycle, first, flat in sorted(entries, key=lambda item: item[0]):
+            occupied_until = admitted_end.get(symbol)
+            prior = admitted_cycle.get(symbol)
+            if occupied_until is not None and first < occupied_until:
+                cycle["one_way_admitted"] = False
+                cycle["one_way_rejection_reason"] = "ONE_WAY_OPPOSITE_CYCLE_OVERLAP"
+                cycle["one_way_conflict_cycle_id"] = prior.get("cycle_id") if prior else None
+            else:
+                admitted_end[symbol] = flat
+                admitted_cycle[symbol] = cycle
+
+    # Preserve source order while publishing arbitration facts and a stable mask digest.
+    masks: list[tuple[str, Any, bool, str | None, Any, bool]] = []
+    frozen_output = {}
+    for row_key, cycles in output.items():
+        for index, cycle in enumerate(cycles):
+            masks.append((row_key, cycle.get("cycle_id", index), cycle.get("one_way_admitted", True), cycle.get("one_way_rejection_reason"), cycle.get("one_way_conflict_cycle_id"), cycle.get("one_way_open_time_fallback", False)))
+        frozen_output[row_key] = tuple(cycles)
+    masks.sort(key=lambda item: (item[0], id_key(item[1])))
+    mask_digest = hashlib.sha256(json.dumps(masks, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")).hexdigest()
+    conflicts = tuple(item for item in masks if item[3] == "ONE_WAY_OPPOSITE_CYCLE_OVERLAP")
+    return frozen_output, MappingProxyType({"policy": "ONE_ACTIVE_DIRECTION_PER_SYMBOL_V1", "mask_digest": mask_digest, "rejections": conflicts})
+
+
 def prepare_weighted_input(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -1746,10 +1828,9 @@ def prepare_weighted_input(
     columns = [[Decimal("0") for _ in ordered] for _ in range(max(0, len(timestamps) - 1))]
     valid = [[True] * len(ordered) for _ in range(max(0, len(timestamps) - 1))]
     reasons: list[list[str | None]] = [[None] * len(ordered) for _ in range(max(0, len(timestamps) - 1))]
-    cycles: dict[str, tuple[Mapping[str, Any], ...]] = {}
-    diagnostic_rows: dict[str, Any] = {}
-    for col, row in enumerate(ordered):
-        symbol = str(row.get("symbol", ""))
+    source_cycles: dict[str, tuple[Mapping[str, Any], ...]] = {}
+    row_facts: dict[str, Mapping[str, Any]] = {}
+    for row in ordered:
         key_row = _period_row_key(row)
         prepared_source = row.get("_prepared_optimizer_input")
         if not isinstance(prepared_source, PreparedOptimizerInput):
@@ -1766,12 +1847,10 @@ def prepare_weighted_input(
             cycle_values = tuple(
                 {
                     **{
-                        key: Decimal(str(value))
-                        if key in {
-                            "realized_pnl", "fees", "maximum_position", "normalized_pnl", "source_basis",
-                        } and value is not None
+                        name: Decimal(str(value))
+                        if name in {"realized_pnl", "fees", "maximum_position", "normalized_pnl", "source_basis"} and value is not None
                         else value
-                        for key, value in cycle.items()
+                        for name, value in cycle.items()
                     },
                     "common_window_normalized_return": None,
                     "attribution_complete": False,
@@ -1780,8 +1859,28 @@ def prepare_weighted_input(
             )
         else:
             cycle_values = _cycle_records(row, end)
-        cycles[key_row] = cycle_values
-        diagnostic_rows[key_row] = _cycle_diagnostics(cycle_values, start, end)
+        source_cycles[key_row] = cycle_values
+        row_facts[key_row] = {"symbol": row["symbol"], "side": row["side"], "strategy_id": row["strategy_id"]}
+    cycles, one_way_evidence = _one_way_admission(source_cycles, row_facts, start, end)
+    diagnostic_rows: dict[str, Any] = {
+        key: {
+            **_cycle_diagnostics(values, start, end),
+            "one_way_admitted_cycle_count": sum(bool(cycle.get("one_way_admitted", True)) for cycle in values),
+            "one_way_rejected_cycle_count": sum(
+                cycle.get("one_way_rejection_reason") == "ONE_WAY_OPPOSITE_CYCLE_OVERLAP"
+                for cycle in values
+            ),
+            "one_way_out_of_window_cycle_count": sum(
+                cycle.get("one_way_rejection_reason") == "ONE_WAY_CYCLE_OUTSIDE_COMMON_WINDOW"
+                for cycle in values
+            ),
+        }
+        for key, values in cycles.items()
+    }
+    for col, row in enumerate(ordered):
+        symbol = str(row.get("symbol", ""))
+        key_row = _period_row_key(row)
+        cycle_values = cycles[key_row]
         cycle_returns = {id(cycle): Decimal("0") for cycle in cycle_values}
         attribution_complete = True
         raw_samples = row.get("equity", row.get("equity_series", row.get("equity_path", ())))
@@ -1888,8 +1987,9 @@ def prepare_weighted_input(
                         break
                     if delta:
                         contribution = delta / active["source_basis"]
-                        columns[index][col] += contribution
-                        cell_returns[id(active)] = cell_returns.get(id(active), Decimal("0")) + contribution
+                        if active.get("one_way_admitted", True):
+                            columns[index][col] += contribution
+                            cell_returns[id(active)] = cell_returns.get(id(active), Decimal("0")) + contribution
             if reason:
                 attribution_complete = False
                 columns[index][col] = Decimal("0")
@@ -1900,14 +2000,29 @@ def prepare_weighted_input(
                     cycle_returns[cycle_id] += contribution
         if attribution_complete and all(cycle.get("source_basis") is not None for cycle in cycle_values):
             for cycle in cycle_values:
-                cycle["common_window_normalized_return"] = cycle_returns[id(cycle)]
+                cycle["common_window_normalized_return"] = (
+                    cycle_returns[id(cycle)] if cycle.get("one_way_admitted", True) else None
+                )
                 cycle["attribution_complete"] = True
         else:
             for cycle in cycle_values:
                 cycle["common_window_normalized_return"] = None
                 cycle["attribution_complete"] = False
         diagnostic_rows[key_row]["unattributed_prefix_equity_cells"] = unattributed_prefix_equity_cells
-    prepared = PreparedWeightedInput(start, end, history_step_minutes, tuple(item.isoformat().replace("+00:00", "Z") for item in timestamps), strategy_ids, tuple(tuple(row) for row in columns), tuple(tuple(row) for row in valid), tuple(tuple(row) for row in reasons), _frozen(cycles), _frozen({"rows": diagnostic_rows, "period": period.evidence}), key)
+    directions_by_symbol: dict[str, set[str]] = {}
+    for row in ordered:
+        directions_by_symbol.setdefault(row["symbol"], set()).add(row["side"])
+    mixed_symbols = {symbol for symbol, sides in directions_by_symbol.items() if len(sides) > 1}
+    if any(
+        not cycle.get("attribution_complete")
+        for key_row, values in cycles.items()
+        if row_facts[key_row]["symbol"] in mixed_symbols
+        for cycle in values
+    ):
+        raise PortfolioInputError("mixed-side cycle attribution is unavailable", code="ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE")
+    one_way_evidence = MappingProxyType({**dict(one_way_evidence), "participants": strategy_ids})
+    diagnostics = _frozen({"rows": diagnostic_rows, "period": period.evidence, "one_way": one_way_evidence})
+    prepared = PreparedWeightedInput(start, end, history_step_minutes, tuple(item.isoformat().replace("+00:00", "Z") for item in timestamps), strategy_ids, tuple(tuple(row) for row in columns), tuple(tuple(row) for row in valid), tuple(tuple(row) for row in reasons), _frozen(cycles), diagnostics, key)
     if cache is not None:
         cache[key] = prepared
     return prepared

@@ -1950,8 +1950,9 @@ def test_portfolio_settings_shows_operational_controls_and_collapses_advanced_po
     assert 'id="portfolio-settings-profile-aggressive"' not in html
     assert 'id="portfolio-settings-profile-balanced"' not in html
     assert 'id="portfolio-settings-profile-conservative"' not in html
-    for field in ("close-volume-participation-pct", "round-down-usdt", "backfill-write-enabled"):
+    for field in ("lot-model-base-coefficient", "lot-model-max-shift-bonus", "round-down-usdt", "backfill-write-enabled"):
         assert f'id="portfolio-settings-{field}"' in html
+    assert 'id="portfolio-settings-close-volume-participation-pct"' not in html
     assert 'id="portfolio-settings-advanced"' in html
     assert 'id="portfolio-settings-history"' in html
     assert 'id="portfolio-settings-phase13"' in html
@@ -1998,7 +1999,7 @@ def test_portfolio_settings_patches_only_exposed_leaves_and_preserves_money_lexe
 
 def test_portfolio_settings_helpers_patch_the_weighted_search_document_without_losing_hidden_fields() -> None:
     document = {
-        "schema_version": 2,
+        "schema_version": 3,
         "scenarios": {
             profile: {
                 "deposit": {"amount": 10, "currency": "USDT"},
@@ -2010,7 +2011,7 @@ def test_portfolio_settings_helpers_patch_the_weighted_search_document_without_l
         },
         "profiles": {profile: {"individual_max_dd_pct": 20, "individual_net_pnl_min_exclusive": 0, "ranking": {"top_n": 2}} for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")},
         "liquidity": {
-            "parameters": {"close_volume_participation_pct": 30},
+            "parameters": {"lot_model_base_coefficient": "9", "lot_model_max_shift_bonus": "1.1"},
             "round_down_usdt": 50,
             "minimum_coverage_pct": 90,
             "maximum_age_hours": 2,
@@ -2049,7 +2050,8 @@ def test_portfolio_settings_helpers_patch_the_weighted_search_document_without_l
         "seed": "2",
         "minimum_common_days": "21",
         "max_enumerated_combinations": "100000",
-        "close_volume_participation_pct": "30",
+        "lot_model_base_coefficient": "10.25",
+        "lot_model_max_shift_bonus": "1.2",
         "round_down_usdt": "50",
         "minimum_coverage_pct": "90",
         "maximum_age_hours": "2",
@@ -2118,6 +2120,7 @@ const checks = {{
   hiddenPreserved: patched.runner.root === 'hidden' && patched.runner.token.keep === true,
   stage1InputsPatched: patched.search.seed === 2 && patched.search.composition.parameters.minimum_common_days === 21,
   feeRatesPatched: patched.margin.parameters.open_fee_rate === '0' && patched.margin.parameters.close_fee_rate === '0.0002',
+  lotModelSettingsPatched: patched.liquidity.parameters.lot_model_base_coefficient === '10.25' && patched.liquidity.parameters.lot_model_max_shift_bonus === '1.2',
   singleFeePatch: h.settingsPatch(document, onlyOpenFee).margin.parameters.close_fee_rate === '0.0002' && h.settingsPatch(document, onlyCloseFee).margin.parameters.open_fee_rate === '0',
   sourceUnchanged: JSON.stringify(document) === sourceBefore,
   exactWeightedKeys: JSON.stringify([...h.weightedSearchKeys].sort()) === JSON.stringify(['history_step_minutes', 'lp_solutions_per_profile', 'max_targets', 'bootstrap_scenarios_per_block', 'bootstrap_diagnostic_scenarios', 'wall_time_seconds', 'solver_time_seconds', 'limiter_step', 'limiter_controls', 'limiter_stress_pct', 'priority_groups', 'priority_beta', 'priority_close_ratio'].sort()),
@@ -2172,9 +2175,9 @@ def test_portfolio_settings_exposes_only_the_exact_weighted_search_schema() -> N
     assert "values.weighted_search" in js
 
 
-def test_portfolio_settings_helpers_validate_v2_lexemes_and_hidden_fields() -> None:
+def test_portfolio_settings_helpers_validate_v3_lexemes_and_hidden_fields() -> None:
     document = {
-        "schema_version": 2,
+        "schema_version": 3,
         "scenarios": {
             profile: {
                 "deposit": {"amount": 10, "currency": "USDT"},
@@ -2186,7 +2189,7 @@ def test_portfolio_settings_helpers_validate_v2_lexemes_and_hidden_fields() -> N
         },
         "profiles": {profile: {"individual_max_dd_pct": 20, "individual_net_pnl_min_exclusive": 0, "ranking": {"top_n": 2}} for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")},
         "liquidity": {
-            "parameters": {"close_volume_participation_pct": 30},
+            "parameters": {"lot_model_base_coefficient": "9", "lot_model_max_shift_bonus": "1.1"},
             "round_down_usdt": 50,
             "minimum_coverage_pct": 90,
             "maximum_age_hours": 2,
@@ -2219,7 +2222,8 @@ def test_portfolio_settings_helpers_validate_v2_lexemes_and_hidden_fields() -> N
             profile: {"deposit": "10", "collateral": "20", "max_balance": "30", "upper_bound": "30", "individual_max_dd_pct": "20", "individual_net_pnl_min_exclusive": "0", "top_n": "2"}
             for profile in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
         },
-        "close_volume_participation_pct": "30",
+        "lot_model_base_coefficient": "9",
+        "lot_model_max_shift_bonus": "1.1",
         "round_down_usdt": "50",
         "minimum_coverage_pct": "90",
         "maximum_age_hours": "2",
@@ -2263,7 +2267,9 @@ const checks = {{
   integerLexemes: ['1.0', '1e3', '0', '-1', ',', ''].every((value) => mustThrow(() => h.settingsIntegerValue(value))),
   floatInboundRejected: h.validSettingsDocument(floatDocument) === false && mustThrow(() => h.settingsPatch(floatDocument, values)),
   mixedCurrencyRejected: h.validSettingsDocument(mixedCurrency) === false && mustThrow(() => h.settingsPatch(mixedCurrency, values)),
-  invalidParticipationRejected: mustThrow(() => h.settingsPatch(document, {{...values, close_volume_participation_pct: '201'}})),
+  lotModelStringPreserved: unchanged.liquidity.parameters.lot_model_base_coefficient === '9' && unchanged.liquidity.parameters.lot_model_max_shift_bonus === '1.1',
+  lotModelPrecisionPreserved: (() => {{ const modelEdited = h.settingsPatch(document, {{...values, lot_model_base_coefficient: '10.25', lot_model_max_shift_bonus: '1.2'}}); return modelEdited.liquidity.parameters.lot_model_base_coefficient === '10.25' && modelEdited.liquidity.parameters.lot_model_max_shift_bonus === '1.2'; }})(),
+  invalidLotModelRejected: mustThrow(() => h.settingsPatch(document, {{...values, lot_model_base_coefficient: '20.01'}})) && mustThrow(() => h.settingsPatch(document, {{...values, lot_model_max_shift_bonus: '-0.1'}})),
   invalidRoundingRejected: mustThrow(() => h.settingsPatch(document, {{...values, round_down_usdt: '0'}})),
   invalidCoverageRejected: mustThrow(() => h.settingsPatch(document, {{...values, minimum_coverage_pct: '101'}})),
   invalidAgeRejected: mustThrow(() => h.settingsPatch(document, {{...values, maximum_age_hours: '0'}})),
@@ -2282,7 +2288,7 @@ def test_portfolio_settings_helpers_patch_all_nine_risk_leaves_and_reject_bad_de
 const h = globalThis.portfolioSettingsHelpers;
 const profiles = ['AGGRESSIVE', 'BALANCED', 'CONSERVATIVE'];
 const document = {
-  schema_version: 2,
+  schema_version: 3,
   scenarios: Object.fromEntries(profiles.map((profile) => [profile, {
     deposit: { amount: 10, currency: 'USDT' }, collateral: { amount: 20, currency: 'USDT' },
     max_balance: { amount: 30, currency: 'USDT' }, sizing: { upper_bound: { amount: 30, currency: 'USDT' } },
@@ -2291,13 +2297,13 @@ const document = {
     max_actual_equity_dd_pct: '20', min_calculated_free_margin_reserve_pct: '20', max_calculated_account_mm_load_pct: '50',
     individual_max_dd_pct: 20, individual_net_pnl_min_exclusive: 0, ranking: { top_n: 2 },
   }])),
-  liquidity: { parameters: { close_volume_participation_pct: 30 }, round_down_usdt: 50, minimum_coverage_pct: 90, maximum_age_hours: 2, weekend_start_utc: 'SATURDAY 00:00', weekend_end_utc: 'MONDAY 00:00', archive_publication_lag_hours: 6, backfill_write_enabled: false, spread_history_bypass_pretest: false },
+  liquidity: { parameters: { lot_model_base_coefficient: '9', lot_model_max_shift_bonus: '1.1' }, round_down_usdt: 50, minimum_coverage_pct: 90, maximum_age_hours: 2, weekend_start_utc: 'SATURDAY 00:00', weekend_end_utc: 'MONDAY 00:00', archive_publication_lag_hours: 6, backfill_write_enabled: false, spread_history_bypass_pretest: false },
   search: { total_test_budget: 9, sizing_mode: 'liquidity_cap_single', max_enumerated_combinations: 100000, weighted_search: {
     history_step_minutes: 5, lp_solutions_per_profile: 20, max_targets: 8, bootstrap_scenarios_per_block: 1000, bootstrap_diagnostic_scenarios: 100, wall_time_seconds: 900, solver_time_seconds: 30, limiter_step: 1, limiter_controls: 2, limiter_stress_pct: 1.5, priority_groups: 5, priority_beta: 0.5, priority_close_ratio: 2,
   }, seed: 1, composition: { policy_id: 'operator_supplied_composition_v1', parameters: { operator_supplied: true, minimum_common_days: 14, minimum_daily_coverage_pct: 90, maximum_forward_fill_gap_days: 3 } } },
   runner: { root: 'hidden', token: { keep: true } },
 };
-const patchValues = (risk_policy) => ({ seed: '1', minimum_common_days: '14', max_enumerated_combinations: '100000', close_volume_participation_pct: '30', round_down_usdt: '50', minimum_coverage_pct: '90', maximum_age_hours: '2', archive_publication_lag_hours: '6', backfill_write_enabled: false, spread_history_bypass_pretest: false, weighted_search: { ...document.search.weighted_search }, risk_policy });
+const patchValues = (risk_policy) => ({ seed: '1', minimum_common_days: '14', max_enumerated_combinations: '100000', lot_model_base_coefficient: '9', lot_model_max_shift_bonus: '1.1', round_down_usdt: '50', minimum_coverage_pct: '90', maximum_age_hours: '2', archive_publication_lag_hours: '6', backfill_write_enabled: false, spread_history_bypass_pretest: false, weighted_search: { ...document.search.weighted_search }, risk_policy });
 const values = patchValues(Object.fromEntries(profiles.map((profile) => [profile, { max_actual_equity_dd_pct: '10.000000000001', min_calculated_free_margin_reserve_pct: '40.000000000001', max_calculated_account_mm_load_pct: '35.000000000001' }])));
 const before = JSON.stringify(document);
 const patched = h.settingsPatch(document, values);
