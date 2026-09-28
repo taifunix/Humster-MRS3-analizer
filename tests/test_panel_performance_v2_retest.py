@@ -495,7 +495,7 @@ def test_retest_status_is_safe_when_database_is_missing_or_empty(tmp_path: Path)
     assert status["default_start"] is None and status["default_end"] is None
 
 
-def test_metadata_retest_inbox_resolves_relative_artifacts_from_runner_dirs(tmp_path: Path) -> None:
+def test_metadata_retest_inbox_rejects_relative_strategy_from_runner_dir(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     bot_root = tmp_path / "bot"
     report_dir = bot_root / "tester" / "report" / "my_test"
@@ -515,7 +515,8 @@ def test_metadata_retest_inbox_resolves_relative_artifacts_from_runner_dirs(tmp_
         "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
     }), encoding="utf-8")
 
-    controller._validate_metadata_inbox(inbox)
+    with pytest.raises(ValueError, match="strategy_path is missing"):
+        controller._validate_metadata_inbox(inbox)
 
 
 def test_metadata_retest_inbox_accepts_project_strategy_source(tmp_path: Path) -> None:
@@ -536,7 +537,7 @@ def test_metadata_retest_inbox_accepts_project_strategy_source(tmp_path: Path) -
         "expected_strategy_names": ["alpha"],
         "entries": [{
             "strategy_name": "alpha",
-            "strategy_path": "alpha.json",
+            "strategy_path": "strategies/alpha.json",
             "report_path": "alpha.html",
         }],
     }), encoding="utf-8")
@@ -544,7 +545,7 @@ def test_metadata_retest_inbox_accepts_project_strategy_source(tmp_path: Path) -
     controller._validate_metadata_inbox(inbox)
 
 
-def test_metadata_retest_inbox_resolves_relative_strategy_from_performance_root(
+def test_metadata_retest_inbox_uses_output_despite_performance_root_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     controller = _controller(tmp_path)
@@ -555,7 +556,7 @@ def test_metadata_retest_inbox_resolves_relative_strategy_from_performance_root(
     project_strategy.parent.mkdir(parents=True)
     project_strategy.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
-        controller, "_performance_v2_config", lambda: SimpleNamespace(strategy_root=Path("Output/strategies"))
+        controller, "_performance_v2_config", lambda: SimpleNamespace(strategy_root=Path("legacy/untrusted"))
     )
     monkeypatch.chdir(tmp_path.parent)
     inbox = tmp_path / "inbox" / "retest-relative-project-source"
@@ -566,10 +567,16 @@ def test_metadata_retest_inbox_resolves_relative_strategy_from_performance_root(
         "source_mode": "metadata_only",
         "inbox_ready": True,
         "expected_strategy_names": ["alpha"],
-        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "strategies/alpha.json", "report_path": "alpha.html"}],
     }), encoding="utf-8")
 
     controller._validate_metadata_inbox(inbox)
+    legacy_strategy = tmp_path / "legacy" / "untrusted" / "strategies" / "alpha.json"
+    legacy_strategy.parent.mkdir(parents=True)
+    legacy_strategy.write_text("{}", encoding="utf-8")
+    project_strategy.unlink()
+    with pytest.raises(ValueError, match="strategy_path is missing"):
+        controller._validate_metadata_inbox(inbox)
 
 
 @pytest.mark.parametrize("performance_config", [None, "{invalid"])
@@ -578,7 +585,7 @@ def test_metadata_retest_inbox_is_safe_without_valid_performance_config(
 ) -> None:
     controller = _controller(tmp_path)
     report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
-    strategy_dir = tmp_path / "bot" / "settings_strategy"
+    strategy_dir = tmp_path / "Output" / "strategies"
     report_dir.mkdir(parents=True)
     strategy_dir.mkdir(parents=True)
     (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
@@ -591,7 +598,7 @@ def test_metadata_retest_inbox_is_safe_without_valid_performance_config(
         "source_mode": "metadata_only",
         "inbox_ready": True,
         "expected_strategy_names": ["alpha"],
-        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "strategies/alpha.json", "report_path": "alpha.html"}],
     }), encoding="utf-8")
     performance_path = tmp_path / "config.performance.json"
     if performance_config is None:
@@ -602,7 +609,7 @@ def test_metadata_retest_inbox_is_safe_without_valid_performance_config(
     controller._validate_metadata_inbox(inbox)
 
 
-def test_metadata_retest_inbox_rejects_strategy_outside_both_configured_roots(tmp_path: Path) -> None:
+def test_metadata_retest_inbox_rejects_strategy_outside_output_root(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
     report_dir.mkdir(parents=True)
@@ -610,6 +617,7 @@ def test_metadata_retest_inbox_rejects_strategy_outside_both_configured_roots(tm
     outside_strategy = tmp_path / "not-a-configured-strategy-root" / "alpha.json"
     outside_strategy.parent.mkdir(parents=True)
     outside_strategy.write_text("{}", encoding="utf-8")
+    assert outside_strategy.is_file()
     inbox = tmp_path / "inbox" / "retest-outside-strategy"
     inbox.mkdir(parents=True)
     (inbox / "inbox_manifest.json").write_text(json.dumps({
@@ -629,19 +637,28 @@ def test_metadata_retest_inbox_rejects_strategy_outside_both_configured_roots(tm
         controller._validate_metadata_inbox(inbox)
 
 
-def test_metadata_retest_inbox_rejects_strategy_symlink_to_outside_root(tmp_path: Path) -> None:
+def test_metadata_retest_inbox_rejects_strategy_symlink_to_outside_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     controller = _controller(tmp_path)
     report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
-    strategy_dir = tmp_path / "bot" / "settings_strategy"
+    strategy_dir = tmp_path / "Output" / "strategies"
     report_dir.mkdir(parents=True)
     strategy_dir.mkdir(parents=True)
     (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
     outside_strategy = tmp_path / "outside-alpha.json"
     outside_strategy.write_text("{}", encoding="utf-8")
+    strategy_link = strategy_dir / "alpha.json"
     try:
-        (strategy_dir / "alpha.json").symlink_to(outside_strategy)
+        strategy_link.symlink_to(outside_strategy)
     except (OSError, NotImplementedError):
-        pytest.skip("symlink creation is unavailable")
+        strategy_link.write_text("{}", encoding="utf-8")
+        original_is_symlink = Path.is_symlink
+        monkeypatch.setattr(
+            Path, "is_symlink",
+            lambda path: path == strategy_link or original_is_symlink(path),
+        )
+    assert outside_strategy.is_file() and strategy_link.is_symlink()
     inbox = tmp_path / "inbox" / "retest-symlink-strategy"
     inbox.mkdir(parents=True)
     (inbox / "inbox_manifest.json").write_text(json.dumps({
@@ -650,11 +667,21 @@ def test_metadata_retest_inbox_rejects_strategy_symlink_to_outside_root(tmp_path
         "source_mode": "metadata_only",
         "inbox_ready": True,
         "expected_strategy_names": ["alpha"],
-        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "strategies/alpha.json", "report_path": "alpha.html"}],
     }), encoding="utf-8")
 
+    opened_outside = []
+    original_open = Path.open
+
+    def track_open(path, *args, **kwargs):
+        if path.resolve() == outside_strategy.resolve():
+            opened_outside.append(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", track_open)
     with pytest.raises(ValueError, match="strategy_path is missing"):
         controller._validate_metadata_inbox(inbox)
+    assert opened_outside == []
 
 
 @pytest.mark.parametrize(
@@ -742,7 +769,7 @@ def test_retest_start_reuses_oldest_valid_inbox_when_newest_is_missing_reports(
 ) -> None:
     controller = _controller(tmp_path)
     report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
-    strategy_dir = tmp_path / "bot" / "settings_strategy"
+    strategy_dir = tmp_path / "Output" / "strategies"
     report_dir.mkdir(parents=True)
     strategy_dir.mkdir(parents=True)
     (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
@@ -755,7 +782,7 @@ def test_retest_start_reuses_oldest_valid_inbox_when_newest_is_missing_reports(
         "source_mode": "metadata_only",
         "inbox_ready": True,
         "expected_strategy_names": ["alpha"],
-        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "strategies/alpha.json", "report_path": "alpha.html"}],
     }), encoding="utf-8")
     controller._panel_jobs.submit(
         "strategies.tester.native.start", {"retest": True}, "panel:persisted-retest",
@@ -781,7 +808,7 @@ def test_retest_start_reuses_oldest_valid_inbox_when_newest_is_missing_reports(
         "source_mode": "metadata_only",
         "inbox_ready": True,
         "expected_strategy_names": ["alpha"],
-        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "missing.html"}],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "strategies/alpha.json", "report_path": "missing.html"}],
     }), encoding="utf-8")
     controller._panel_jobs.submit(
         "strategies.tester.native.start", {"retest": True}, "panel:newer-invalid",
@@ -992,11 +1019,11 @@ def test_committed_native_retest_verify_survives_restart_with_stale_tester_manif
         "source_mode": "metadata_only",
         "inbox_ready": True,
         "expected_strategy_names": ["alpha"],
-        "entries": [{"strategy_name": "alpha", "strategy_path": "alpha.json", "report_path": "alpha.html"}],
+        "entries": [{"strategy_name": "alpha", "strategy_path": "strategies/alpha.json", "report_path": "alpha.html"}],
     }), encoding="utf-8")
     report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
     report_dir.mkdir(parents=True)
-    strategy_dir = tmp_path / "bot" / "settings_strategy"
+    strategy_dir = tmp_path / "Output" / "strategies"
     strategy_dir.mkdir(parents=True)
     (report_dir / "alpha.html").write_text("<html></html>", encoding="utf-8")
     (strategy_dir / "alpha.json").write_text("{}", encoding="utf-8")

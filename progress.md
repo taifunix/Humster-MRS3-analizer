@@ -69,9 +69,9 @@ the corrected combined Panel/Performance v2/RETEST/portfolio contour passed
 452 with 7 Windows skips. Reviewer J4-R5 clarified that the full repository
 suite belongs after all core slices integrate, before branch completion; an
 early partial run was stopped because later changes would invalidate it.
-J5 running-poll extension also has `PLAN_APPROVED`, but cannot start until J4
-is committed. No live journal cleanup
-or database mutation was performed.
+J4 committed as `b31b37e`. J5 running-poll extension has `PLAN_APPROVED` and
+is now in implementation. No live journal cleanup or database mutation was
+performed.
 Source final-payload proof and
 legacy empty-import `safe_to_delete` evidence remain deferred by the user.
 OPT-01a removes one unused source digest before the actual builder digest.
@@ -91,8 +91,10 @@ RETEST metadata-path tests fail identically on immutable
 fetched trusted-`Output` contract. Those baseline failures are tracked
 separately; they are not caused by the journal diff and do not weaken the new
 `Output` trust boundary. The separate test-only fixture alignment passed its
-RETEST suite (67 passed, 2 skipped) and awaits independent review and the
-full-suite result; it remains outside the J4 staged diff.
+RETEST suite (67 passed, 2 skipped); the strengthened symlink-guard case also
+passed on the local host (1 passed, 3.19s). Independent review returned
+`CODE_REVIEW_PASS` for this test fixture, committed with this status update.
+The full suite remains the final all-core integration gate.
 
 ## Restored READY JSON can launch SINGLE_MODE after reload (2026-09-28)
 
