@@ -3,6 +3,24 @@
 **Updated:** 2026-09-28
 **Current branch:** `main` after shortlist integration
 
+## SINGLE_MODE report collection controls (Task 3, 2026-09-28)
+
+The ordinary tester card now exposes the server-owned report collection: the
+`Объединять отчёты` opt-in checkbox, durable pack/report counts with active and
+failed-member details, exact collection verify/import targeting, and the
+non-destructive `Очистить накопление` action. Reload restores only the visual
+OPEN/VERIFIED checkbox state; import still requires a fresh `Проверить` action.
+No browser visual pass, Panel restart, real tester run or production database
+mutation was performed.
+
+Observed verification for this worktree: collection UI contract tests passed
+`7 passed`; `tests/test_panel_static_ui.py` passed `145 passed`; the required
+tester regression suite passed `47 passed`; the required Performance v2 suite
+passed `113 passed, 4 skipped, 8 warnings`; `node --check
+src/mrs3/panel_web/app.js` and `git diff --check` passed. The skips are the
+existing unavailable-symlink cases and the warnings are existing pandas
+fragmentation warnings.
+
 ## Restored READY JSON can launch SINGLE_MODE after reload (2026-09-28)
 
 The Panel previously restored only the visible READY JSON count after a browser

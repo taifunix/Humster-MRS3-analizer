@@ -1064,6 +1064,89 @@ def test_tester_card_exposes_single_mode_and_hides_fast_controls() -> None:
     assert "setTesterControls(!testerIsTerminal(job))" in js
 
 
+def test_single_mode_report_collection_controls_stay_in_the_ordinary_tester_card() -> None:
+    html = _read("index.html")
+    card = html.split("3. Test and Import to Performance DB", 1)[1].split("</details>", 1)[0]
+
+    assert 'id="tester-collect-reports"' in card
+    assert "Объединять отчёты" in card
+    assert 'id="tester-collection-status"' in card
+    assert 'id="tester-collection-clear"' in card
+    assert "Очистить накопление" in card
+    assert card.index('id="tester-collect-reports"') < card.index('id="tester-start"')
+    assert card.index('id="tester-collection-status"') < card.index('id="performance-inbox-verify"')
+    assert 'id="tester-collection-clear" type="button" class="button button-secondary" disabled' in card
+
+
+def test_single_mode_collection_launch_is_strict_boolean_and_status_is_server_owned() -> None:
+    js = _read("app.js")
+    start = js.split("if (testerStart) testerStart.addEventListener", 1)[1].split("if (testerStop)", 1)[0]
+
+    assert "testerCollectReports?.checked === true" in start
+    assert "collect_reports: collectReports" in start
+    assert "const collectReports = testerCollectReports?.checked === true;" in start
+    assert "loadTesterCollection" in start
+    assert "requestJson('/api/v2/strategies/tester/report-collection')" in js
+    loader = js.split("const loadTesterCollection", 1)[1].split("const setTesterControls", 1)[0]
+    assert "requestJson('/api/v2/jobs')" not in loader
+
+
+def test_collection_status_restores_checkbox_without_authorizing_import() -> None:
+    js = _read("app.js")
+    loader = js.split("const loadTesterCollection", 1)[1].split("const setTesterControls", 1)[0]
+
+    render_collection = js.split("const renderTesterCollection", 1)[1].split("const loadTesterCollection", 1)[0]
+    assert "['OPEN', 'VERIFIED'].includes(state)" in render_collection
+    assert "testerCollectReports.checked =" in render_collection
+    assert "normalImportAuthorized = false;" in js.split("const loadTesterCollection", 1)[1]
+    assert "authorizedTesterJobId = '';" in js.split("const loadTesterCollection", 1)[1]
+    for field in ("total_registered_packs", "exact_committed_report_count", "active_packs", "failed_cancelled_packs"):
+        assert field in render_collection
+
+
+def test_collection_verify_and_import_use_exact_collection_id_and_gate_active_members() -> None:
+    js = _read("app.js")
+    verify = js.split("inboxVerifyV2?.addEventListener", 1)[1].split("importStartV2?.addEventListener", 1)[0]
+    import_handler = js.split("importStartV2?.addEventListener", 1)[1].split("const recoverSplitJobs", 1)[0]
+
+    assert "collectionActivePacks > 0" in verify
+    assert "const verifyJobId = collectionId || testerJobId;" in verify
+    assert "job_id: verifyJobId" in verify
+    assert "authorizedTesterJobId = verifyJobId;" in verify
+    assert "const importTargetJobId = authorizedTesterJobId;" in import_handler
+    assert "tester_job_id: importTargetJobId" in import_handler
+    assert "tester_job_id: testerJobId" not in import_handler
+
+
+def test_collection_clear_posts_exact_id_and_resets_only_after_success() -> None:
+    js = _read("app.js")
+    clear = js.split("testerCollectionClear?.addEventListener", 1)[1].split("const renderImportV2", 1)[0]
+
+    assert "collection_id: collectionId" in clear
+    assert "method: 'POST'" in clear
+    assert "loadTesterCollection()" in clear
+    assert "testerCollectionId = '';" in clear
+    assert "normalImportAuthorized = false;" in clear
+
+
+def test_collection_terminal_refresh_and_retest_blocks_remain_separate() -> None:
+    js = _read("app.js")
+    poll = js.split("const pollTester", 1)[1].split("const startTesterPolling", 1)[0]
+
+    assert "loadTesterCollection();" in poll
+    assert "performance-v2/retest/start" in js
+    assert "performance-v2/retest/import" in js
+    assert "tester-collect-reports" not in js.split("const retestCard", 1)[1]
+
+
+def test_collection_failure_messages_include_active_wait_failed_exclusion_and_import_retry() -> None:
+    js = _read("app.js")
+
+    for message in ("active", "failed", "retry", "IMPORTED"):
+        assert message in js
+    assert "failed_cancelled_packs" in js
+
+
 def test_normal_tester_jobs_default_to_single_mode_without_metadata() -> None:
     js = _read("app.js")
     render = js.split("const renderTester", 1)[1].split("const pollTester", 1)[0]
