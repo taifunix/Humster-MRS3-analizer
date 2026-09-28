@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,206 @@ def _source_db(tmp_path: Path, fragments) -> Path:
 def _scope_of(fragment) -> str:
     point = fragment.point
     return f"{point.symbol}|{point.side}|{point.timeframe}"
+
+
+class _ControlledExecutor:
+    def __init__(self, max_workers: int) -> None:
+        self.max_workers = max_workers
+        self.submitted: list[Future] = []
+        self.arguments: list[tuple[object, ...]] = []
+        self.max_in_flight = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        return False
+
+    def submit(self, _fn, *args: object) -> Future:
+        future: Future = Future()
+        self.submitted.append(future)
+        self.arguments.append(args)
+        self.max_in_flight = max(
+            self.max_in_flight,
+            sum(not item.done() for item in self.submitted),
+        )
+        return future
+
+
+def _measurement_tasks(count: int) -> list[tuple[str, str, tuple[str, ...], tuple[int, int]]]:
+    return [
+        ("scope", f"point-{index}", (f"fragment-{index}",), (0, 1))
+        for index in range(count)
+    ]
+
+
+def _measurement_verdict(point_key: str, fragment_ids: tuple[str, ...]):
+    return point_key, fragment_ids, None, {"point_id": point_key}
+
+
+def test_parallel_measurements_report_fast_completion_before_slow_worker_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mrs3 import source_v6_materializer as module
+
+    executor = _ControlledExecutor(max_workers=2)
+    tasks = _measurement_tasks(2)
+    tasks[0] = ("scope", "slow", ("fragment-slow",), (0, 1))
+    tasks[1] = ("scope", "fast", ("fragment-fast",), (0, 1))
+    monkeypatch.setattr(module, "ProcessPoolExecutor", lambda **_kwargs: executor)
+
+    def complete_in_order(pending, return_when):
+        assert return_when is module.FIRST_COMPLETED
+        point_order = ("fast", "slow")
+        point_key = next(
+            point for point in point_order
+            if any(
+                future in pending and args[1] == point
+                for future, args in zip(executor.submitted, executor.arguments)
+            )
+        )
+        future = next(
+            future for future, args in zip(executor.submitted, executor.arguments)
+            if future in pending and args[1] == point_key
+        )
+        ids = next(args[2] for item, args in zip(executor.submitted, executor.arguments) if item is future)
+        future.set_result(_measurement_verdict(point_key, ids))
+        return {future}, set(pending) - {future}
+
+    monkeypatch.setattr(module, "wait", complete_in_order)
+    snapshots: list[tuple[int, int, bool]] = []
+
+    def progress(completed: int, total: int) -> None:
+        slow = next(
+            (future for future, args in zip(executor.submitted, executor.arguments)
+             if args[1] == "slow"),
+            None,
+        )
+        snapshots.append((completed, total, slow is not None and slow.done()))
+
+    module._run_measurements("db", tasks, 2, progress)
+
+    assert snapshots == [(0, 2, False), (1, 2, False), (2, 2, True)]
+
+
+def test_parallel_measurements_bound_in_flight_futures_to_twice_worker_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mrs3 import source_v6_materializer as module
+
+    executor = _ControlledExecutor(max_workers=2)
+    tasks = _measurement_tasks(9)
+    monkeypatch.setattr(module, "ProcessPoolExecutor", lambda **_kwargs: executor)
+
+    def complete_first(pending, return_when):
+        assert return_when is module.FIRST_COMPLETED
+        future = next(item for item in executor.submitted if item in pending)
+        index = executor.submitted.index(future)
+        future.set_result(_measurement_verdict(*tasks[index][1:3]))
+        return {future}, set(pending) - {future}
+
+    monkeypatch.setattr(module, "wait", complete_first)
+
+    module._run_measurements("db", tasks, 2, None)
+
+    assert executor.max_in_flight <= 4
+    assert len(executor.submitted) == len(tasks)
+
+
+def test_parallel_measurement_failure_stops_refill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mrs3 import source_v6_materializer as module
+
+    executor = _ControlledExecutor(max_workers=2)
+    tasks = _measurement_tasks(6)
+    monkeypatch.setattr(module, "ProcessPoolExecutor", lambda **_kwargs: executor)
+    failure = RuntimeError("worker failed")
+
+    def fail_first(pending, return_when):
+        assert return_when is module.FIRST_COMPLETED
+        future = next(item for item in executor.submitted if item in pending)
+        future.set_exception(failure)
+        return {future}, set(pending) - {future}
+
+    monkeypatch.setattr(module, "wait", fail_first)
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        module._run_measurements("db", tasks, 2, None)
+
+    assert len(executor.submitted) == 4
+
+
+def test_parallel_measurement_failure_waits_for_running_worker_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mrs3 import source_v6_materializer as module
+
+    slow_started = threading.Event()
+    failure_raised = threading.Event()
+    release_slow = threading.Event()
+    slow_finished = threading.Event()
+    shutdown_started = threading.Event()
+    raised_to_caller = threading.Event()
+    shutdown_waits: list[bool] = []
+
+    class _ObservingExecutor(ThreadPoolExecutor):
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            shutdown_waits.append(wait)
+            shutdown_started.set()
+            return super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    def measure(_database, point_key, fragment_ids, _window):
+        if point_key == "failure":
+            if not slow_started.wait(timeout=5):
+                raise RuntimeError("slow worker did not start")
+            failure_raised.set()
+            raise RuntimeError("worker failed")
+        slow_started.set()
+        try:
+            if not release_slow.wait(timeout=5):
+                raise RuntimeError("slow worker was not released")
+        finally:
+            slow_finished.set()
+        return _measurement_verdict(point_key, fragment_ids)
+
+    monkeypatch.setattr(module, "ProcessPoolExecutor", _ObservingExecutor)
+    monkeypatch.setattr(module, "measure_point_group", measure)
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            module._run_measurements(
+                "db",
+                [
+                    ("scope", "failure", ("fragment-failure",), (0, 1)),
+                    ("scope", "slow", ("fragment-slow",), (0, 1)),
+                ],
+                2,
+                None,
+            )
+        except BaseException as error:
+            errors.append(error)
+            raised_to_caller.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert slow_started.wait(timeout=5)
+    assert failure_raised.wait(timeout=5)
+    assert shutdown_started.wait(timeout=5)
+    assert not slow_finished.is_set()
+    assert not raised_to_caller.is_set()
+
+    release_slow.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert raised_to_caller.is_set()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert str(errors[0]) == "worker failed"
+    assert slow_finished.is_set()
+    assert shutdown_waits == [True]
 
 
 @pytest.mark.parametrize("workers", [1, 4])

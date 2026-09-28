@@ -35,8 +35,14 @@ blank cache miss in the same workbook; removing the cache leaves both blank.
 The database remains byte/time unchanged across read-only exports, with no
 source/window calculation or cache write. Export tests passed 8; adjacent Panel
 tests passed 122 with 4 skips. Independent Opus 5/high re-review returned
-`CODE_REVIEW_PASS`; T3 is accepted. Next core slice: MAT-02 materializer
-progress/queue correctness. Final integrated suite remains pending.
+`CODE_REVIEW_PASS`; T3 is accepted.
+T5/MAT-02 now reports successful worker completions incrementally and keeps
+at most twice the worker count in flight. A failure stops refills, cancels
+pending futures and waits for running readers before cleanup. Deterministic
+quick/slow and real ThreadPool failure-wait regressions pass. Materializer and
+worker suites passed 21 tests; related analysis passed 9. Independent Opus
+5/high re-review returned `CODE_REVIEW_PASS`. T5 is accepted; ANA-01a is next.
+Final integrated suite remains pending.
 T4/COR-05 preserves actual HTML action order and keeps strict final-balance
 validation based on the latest timestamp/source-index witness. Swapped HTML
 is rejected as ACTIONS_OUT_OF_ORDER while a valid sibling commits; equal-time

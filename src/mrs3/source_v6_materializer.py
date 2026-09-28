@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from hashlib import sha256
@@ -294,21 +294,33 @@ def _run_measurements(
         for _scope_key, point_key, ids, window in tasks:
             record(measure_point_group(database, point_key, ids, window))
     else:
-        with ProcessPoolExecutor(max_workers=min(int(workers), total)) as executor:
-            futures = [
-                executor.submit(measure_point_group, database, point_key, ids, window)
-                for _scope_key, point_key, ids, window in tasks
-            ]
-            pending = set(futures)
+        max_workers = min(int(workers), total)
+        max_in_flight = max_workers * 2
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            pending = set()
+            task_iter = iter(tasks)
+
+            def submit_next() -> bool:
+                try:
+                    _scope_key, point_key, ids, window = next(task_iter)
+                except StopIteration:
+                    return False
+                pending.add(executor.submit(measure_point_group, database, point_key, ids, window))
+                return True
+
             try:
+                for _ in range(min(max_in_flight, total)):
+                    submit_next()
                 while pending:
-                    done, pending = wait(pending, return_when=FIRST_EXCEPTION)
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
                     for future in done:
                         # E4 and every decode failure surface here, cancelling
                         # the rest: no surface file is created.
                         record(future.result())
+                    for _ in done:
+                        submit_next()
             except BaseException:
-                for future in futures:
+                for future in pending:
                     future.cancel()
                 raise
     expected = {point_key: ids for _scope_key, point_key, ids, _window in tasks}

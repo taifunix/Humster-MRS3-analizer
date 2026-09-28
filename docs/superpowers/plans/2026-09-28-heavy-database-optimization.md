@@ -216,11 +216,15 @@ proof и legacy empty evidence отложены; параллельная тек
   в полном и B14day окне. Не заменять B простым срезом готовых A metrics.
   Приемка: exact values/witnesses, carry-in/open-tail, quiet-tail, window boundaries
   и unavailable reasons. Весь materialization: **10–25%** вместе с MAT-03.
-- [ ] **MAT-02 / B4 — progress и очередь.** Получать completed futures по мере
+- [x] **MAT-02 / B4 — progress и очередь.** Получать completed futures по мере
   завершения вместо успешного ожидания всех через FIRST_EXCEPTION; ограничить in-flight.
   Quick/slow test: первое completion до окончания slow. При ошибке прекратить новые
   submissions, дождаться закрытия файлов running workers перед Windows cleanup.
   Ускорение вычислений не обещается.
+  T5: `FIRST_COMPLETED` and an in-flight limit of 2× workers; real threaded
+  failure test proves running readers finish before the error returns. Worker/
+  materializer 21 passed, related analysis 9 passed; independent Opus 5/high
+  `CODE_REVIEW_PASS` round 2. No calculation-speed claim.
 - [ ] **MAT-03 — process-local read connection.** `source_v6_materializer.py`,
   `source_v6_storage.py:decode_fragment_slice`. Небольшие batches на connection либо
   один RO connection на worker. Покрыть initializer/restart/reopen/close и snapshot
