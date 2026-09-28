@@ -835,6 +835,148 @@ def test_single_mode_successful_cancellation_releases_target_as_before(tmp_path:
     assert not (config.bot_root / ".mrs3-tester-target.lock").exists()
 
 
+def test_single_mode_reconciles_release_failure_before_relaunch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    release_calls = 0
+    real_release = TesterTargetLock.release
+
+    def fail_once(owner: TesterTargetLock) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            raise RuntimeError("transient release failure")
+        real_release(owner)
+
+    monkeypatch.setattr(TesterTargetLock, "release", fail_once)
+    service = LocalSingleModeStrategyTestService(config, stop_bot=lambda _: None)
+
+    def completed(job: object) -> None:
+        job.state = job.phase = "FAILED"
+
+    service._run_native = completed
+
+    first = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="single-release-once",
+    )
+    worker = service._jobs[str(first["job_id"])].thread
+    assert worker is not None
+    worker.join(1)
+    assert not worker.is_alive()
+    assert service.status(str(first["job_id"]))["state"] == "RUNNING"
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+
+    second = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="single-release-relaunch",
+    )
+
+    assert _wait(service, str(second["job_id"]))["state"] == "FAILED"
+    assert service.status(str(first["job_id"]))["state"] == "FAILED"
+    assert release_calls == 3
+    assert not (config.bot_root / ".mrs3-tester-target.lock").exists()
+
+
+def test_single_mode_persistent_release_failure_blocks_relaunch_without_releasing_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    release_calls = 0
+
+    def always_fail(_owner: TesterTargetLock) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        raise RuntimeError("persistent release failure")
+
+    monkeypatch.setattr(TesterTargetLock, "release", always_fail)
+    service = LocalSingleModeStrategyTestService(config, stop_bot=lambda _: None)
+
+    def completed(job: object) -> None:
+        job.state = job.phase = "FAILED"
+
+    service._run_native = completed
+    first = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="single-release-blocked",
+    )
+
+    worker = service._jobs[str(first["job_id"])].thread
+    assert worker is not None
+    worker.join(1)
+    assert not worker.is_alive()
+    assert service.status(str(first["job_id"]))["state"] == "RUNNING"
+    with pytest.raises(FastStrategyTestError, match="cleanup remains pending"):
+        service.start(
+            manifest,
+            analysis_run_id="a" * 64,
+            start_date="2026-08-01",
+            end_date="2026-08-31",
+            job_id="single-release-must-stay-blocked",
+        )
+    assert release_calls == 4
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+    assert "single-release-must-stay-blocked" not in service._jobs
+
+
+def test_single_mode_retry_reconciles_pending_release_before_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    release_calls = 0
+    real_release = TesterTargetLock.release
+
+    def fail_once(owner: TesterTargetLock) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            raise RuntimeError("transient release failure")
+        real_release(owner)
+
+    monkeypatch.setattr(TesterTargetLock, "release", fail_once)
+    service = LocalSingleModeStrategyTestService(config, stop_bot=lambda _: None)
+
+    def failed_run(_job: object) -> None:
+        raise RuntimeError("run failed")
+
+    service._run_native = failed_run
+    first = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="single-retry-source",
+    )
+    worker = service._jobs[str(first["job_id"])].thread
+    assert worker is not None
+    worker.join(1)
+    assert not worker.is_alive()
+    assert service.status(str(first["job_id"]))["state"] == "RUNNING"
+
+    retry = service.retry(str(first["job_id"]), job_id="single-retry-after-cleanup")
+
+    assert _wait(service, str(retry["job_id"]))["state"] == "FAILED"
+    assert service.status(str(first["job_id"]))["state"] == "FAILED"
+    assert release_calls == 3
+    assert not (config.bot_root / ".mrs3-tester-target.lock").exists()
+
+
 def test_fast_test_releases_owner_after_clean_ordinary_failure(tmp_path: Path) -> None:
     manifest, _ = _generation(tmp_path, 1)
     config = _config(tmp_path)

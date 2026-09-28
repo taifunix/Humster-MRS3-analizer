@@ -476,6 +476,13 @@ class LocalFastStrategyTestService:
                 job.error = {"code": code, "message": _safe_error_message(error)}
             self._emit(job)
 
+        def cleanup_pending(error: BaseException) -> None:
+            with self._lock:
+                job.cleanup_pending = True
+                job.target_finalized = False
+                job.error = {"code": "RESTORE_OR_RELEASE_FAILED", "message": _safe_error_message(error)}
+            self._emit(job)
+
         try:
             owner = TesterTargetLock(Path(self.config.bot_root)).acquire()
             job.target_owner = owner
@@ -483,11 +490,8 @@ class LocalFastStrategyTestService:
         except _FastCleanupUnconfirmed as error:
             if job.single_mode and owner is not None:
                 with self._lock:
-                    job.cleanup_pending = True
-                    job.target_finalized = False
                     job.state = job.phase = "FAILED" if not job.cancel.is_set() else "CANCELLED"
-                    job.error = {"code": "RESTORE_OR_RELEASE_FAILED", "message": _safe_error_message(error)}
-                self._emit(job)
+                cleanup_pending(error)
                 return
             failed(error, "RESTORE_OR_RELEASE_FAILED")
             return
@@ -498,14 +502,22 @@ class LocalFastStrategyTestService:
             try:
                 owner.release()
             except BaseException as release_error:
-                failed(release_error, "RESTORE_OR_RELEASE_FAILED")
+                if job.single_mode:
+                    cleanup_pending(release_error)
+                else:
+                    failed(release_error, "RESTORE_OR_RELEASE_FAILED")
             else:
+                job.target_owner = None
+                job.target_snapshot = None
                 failed(error, "FAST_TEST_FAILED")
             return
         try:
             owner.release()
         except BaseException as error:
-            failed(error, "RESTORE_OR_RELEASE_FAILED")
+            if job.single_mode:
+                cleanup_pending(error)
+            else:
+                failed(error, "RESTORE_OR_RELEASE_FAILED")
         else:
             job.target_owner = None
             job.target_snapshot = None
@@ -1045,6 +1057,8 @@ class LocalFastStrategyTestService:
                     self._jobs[source_job_id] = source_job
             if source_job is None:
                 raise FastStrategyTestError("Fast TEST job not found") from None
+            if source_job.cleanup_pending:
+                self._reconcile_pending_cleanup(source_job)
             if source_job.state not in {"COMMITTED", "CANCELLED", "FAILED"} or source_job.phase not in {"PARTIAL", "FAILED", "CANCELLED"}:
                 raise FastStrategyTestError("Fast TEST job has no recoverable failures")
             if source_job.single_mode and not source_job.checkpoint_valid:

@@ -18,10 +18,9 @@ pre-submit reconciliation so the registry can release its CANCELLING resource
 before admitting the next start; no UI or collection files were changed.
 
 Evidence: the focused stop/relaunch RED test failed against the old behavior
-(`FAILED` while the lease remained), then the three new lifecycle tests passed;
-the complete fast/single-mode service suite passed `50 tests`, and the fast plus
-Panel report-start suite passed `60 tests`. Python compilation and
-`git diff --check` passed. The broader Panel suite passed `185 tests` with one
+(`FAILED` while the lease remained), then the six cleanup/release lifecycle
+tests passed; the complete fast/single-mode service plus Panel report-start
+suite passed `63 tests`. Python compilation and `git diff --check` passed. The broader Panel suite passed `185 tests` with one
 pre-existing static-shell failure caused by the parallel Task 3 `app.js`
 authorization text; that UI worktree change is outside this fix. No real
 tester/Panel was launched and no production data or live process was mutated.
