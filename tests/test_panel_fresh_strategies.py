@@ -3,6 +3,7 @@ from __future__ import annotations
 from http.client import HTTPConnection
 import json
 from hashlib import sha256
+import os
 from pathlib import Path
 import shutil
 import threading
@@ -16,6 +17,87 @@ from mrs3.config import AlgorithmConfig
 from mrs3.panel import PanelController, create_panel_server
 from mrs3.panel_jobs import PanelJobError
 from mrs3.panel_tester_runs import LocalRunsBatchService, _RunsJob
+
+
+def test_fresh_shortlist_options_requires_version_for_new_flags() -> None:
+    parse = PanelController._fresh_shortlist_options
+
+    assert parse({"pretest_ab_enabled": True}) == (True, False, False)
+    assert parse({
+        "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": True,
+        "ladder_enabled": True,
+        "pareto_enabled": False,
+    }) == (True, True, False)
+
+    with pytest.raises(ValueError, match="filter_version=shortlist-v2"):
+        parse({"ladder_enabled": False})
+
+
+@pytest.mark.parametrize("payload", [
+    {"filter_version": None},
+    {"filter_version": "shortlist-v3"},
+])
+def test_fresh_shortlist_options_rejects_unknown_versions(payload: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="unsupported filter_version"):
+        PanelController._fresh_shortlist_options(payload)
+
+
+@pytest.mark.parametrize("payload", [
+    {"filters": {"source_pnl": True}},
+    {"filters": {"source_pnl": False}, "efficiency": True},
+])
+def test_fresh_shortlist_options_rejects_enabled_legacy_flags_at_either_location(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="stale shortlist client"):
+        PanelController._fresh_shortlist_options(payload)
+
+
+@pytest.mark.parametrize("payload", [
+    {"filters": None},
+    {"filters": {"unknown": False}},
+    {"filters": {"source_pnl": 0}},
+    {"pareto_enabled": 1, "filter_version": "shortlist-v2"},
+    {"pretest_ab_enabled": "true"},
+])
+def test_fresh_shortlist_options_rejects_malformed_fields(payload: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        PanelController._fresh_shortlist_options(payload)
+
+
+def test_fresh_selection_consumers_share_version_validation(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    invalid = {"filter_version": None}
+    calls = (
+        lambda: controller.strategies_fresh_shortlist(invalid),
+        lambda: controller.strategies_fresh_shortlist({**invalid, "audit": True}),
+        lambda: controller.strategies_fresh_filter_audit(invalid),
+        lambda: controller.strategies_fresh_generate(invalid),
+        lambda: controller.strategies_fresh_generate_runs(invalid),
+    )
+
+    for call in calls:
+        with pytest.raises(ValueError, match="unsupported filter_version"):
+            call()
+
+
+def test_fresh_shortlist_executor_uses_shared_duckdb_worker_setting(tmp_path: Path) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"duckdb_import": {"workers": 7}}), encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    observed: dict[str, object] = {}
+
+    def evaluate(*args: object, **kwargs: object) -> str:
+        observed["args"] = args
+        observed.update(kwargs)
+        return "result"
+
+    controller._fresh_shortlist_executor.evaluate_with_prepared = evaluate
+    assert controller._evaluate_fresh_shortlist_snapshot(Path("analysis.duckdb"), "analysis-id", (False, True, False)) == "result"
+    assert observed["workers"] == 7
 
 
 def test_panel_keeps_runs_backend_but_hides_legacy_run_controls() -> None:
@@ -101,10 +183,18 @@ def test_fresh_generation_worker_keeps_pretest_ab_flag_strict(tmp_path: Path, mo
 
 
 def test_generation_thread_start_failure_does_not_poison_the_next_request(tmp_path: Path, monkeypatch) -> None:
+    from tests.test_fresh_analysis_strategies import _make_analysis
+
     config = tmp_path / "config.local.json"
     config.write_text("{}", encoding="utf-8")
+    analysis_path = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(analysis_path)
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
+    controller._fresh_analysis_paths[analysis_id] = analysis_path
+    snapshot = controller.strategies_fresh_shortlist({
+        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+    })
 
     class FailingThread:
         def __init__(self, **_kwargs) -> None:
@@ -117,8 +207,11 @@ def test_generation_thread_start_failure_does_not_poison_the_next_request(tmp_pa
 
     with pytest.raises(RuntimeError, match="thread capacity unavailable"):
         controller.strategies_fresh_generate({
-            "analysis_run_id": "a" * 64,
-            "candidate_ids": ["candidate"],
+            "analysis_run_id": analysis_id,
+            "filter_version": "shortlist-v2",
+            "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+            "selection_token": snapshot["selection_token"],
+            "candidate_ids": ["browser-id"],
             "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
             "filters": {},
         })
@@ -320,10 +413,12 @@ def test_http_generation_accepts_a_large_ready_selection_payload(tmp_path: Path)
         thread.join(timeout=2)
 
     assert response.status == 400
-    assert body == {"error": "candidate_ids must be a list"}
+    assert body == {"error": "selected_scopes must be a list"}
 
 
 def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -> None:
+    from tests.test_fresh_analysis_strategies import _make_analysis
+
     config = tmp_path / "config.local.json"; config.write_text("{}", encoding="utf-8")
     template_root = tmp_path / "templates" / "tester" / "mrs3"
     template_root.mkdir(parents=True)
@@ -343,26 +438,36 @@ def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(
         bot_root=tmp_path / "bot", tester_config=tester_config, max_parallel_submissions=7,
     ))
-    rows = tuple({
-        "candidate_id": f"C{index}", "structure_id": f"S{index}", "symbol": "BTCUSDT", "side": "LONG",
-        "timeframe": "1h", "order_count": 1, "common_close_ma": 7, "filter_status": "READY_AFTER_FILTERS",
-        "orders": ({"point_id": f"P{index}", "plateau_id": "PLAT", "open_ma": 5, "shift_bp": 100, "close_support": 1.0, "source_pnl_pct": 10},),
-    } for index in range(6))
-    monkeypatch.setattr("mrs3.panel.filter_fresh_analysis_candidates", lambda *_args, **_kwargs: SimpleNamespace(rows=rows))
-    monkeypatch.setattr("mrs3.panel.read_fresh_analysis_identity", lambda _path: {"analysis_input_digest": "c" * 64})
+    analysis_path = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(analysis_path)
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
+    controller._fresh_analysis_paths[analysis_id] = analysis_path
+    snapshot = controller.strategies_fresh_shortlist({
+        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+    })
 
-    result = controller.strategies_fresh_generate_runs({"analysis_run_id": "a" * 64, "filters": {}, "selected_scopes": [["BTCUSDT", "LONG", "1h"]], "start_date": "2026-08-01", "end_date": "2026-08-18"})
+    result = controller.strategies_fresh_generate_runs({
+        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+        "selection_token": snapshot["selection_token"],
+        "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
+        "start_date": "2026-08-01", "end_date": "2026-08-18",
+    })
 
-    assert result["run_count"] == 6
-    assert len(list((tmp_path / "bot" / "tester" / "runs").glob("*.json"))) == 6
+    assert result["run_count"] == 1
+    assert len(list((tmp_path / "bot" / "tester" / "runs").glob("*.json"))) == 1
     global_config = json.loads(tester_config.read_text(encoding="utf-8"))
     assert global_config["use_runs"] is True
     assert global_config["max_parallel_runs"] == 7
+    runs_manifest = json.loads((tmp_path / "bot" / "tester" / "runs_manifest.json").read_text(encoding="utf-8"))
+    assert runs_manifest["shortlist_v2"]["selection_token"] == snapshot["selection_token"]
+    assert runs_manifest["shortlist_v2"]["selected_candidate_ids"] == ["STR-READY"]
 
 
 def test_fresh_generation_uses_config_workflow_defaults_not_browser_paths(tmp_path: Path, monkeypatch) -> None:
+    from tests.test_fresh_analysis_strategies import _make_analysis
+
     config = tmp_path / "config.local.json"
     config.write_text(json.dumps({
         "panel_workflow": {
@@ -370,10 +475,13 @@ def test_fresh_generation_uses_config_workflow_defaults_not_browser_paths(tmp_pa
             "strategy_templates": {"LONG": "input/long.json", "SHORT": "input/short.json"},
         },
     }), encoding="utf-8")
+    analysis_path = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(analysis_path)
     captured: dict[str, object] = {}
 
     def generate(*args, **kwargs):
         captured["args"] = args
+        captured["kwargs"] = kwargs
         return SimpleNamespace(
             run_id="a" * 64, surface_id="surface", strategy_count=1,
             manifest_path=tmp_path / "output" / "strategy_manifest.json",
@@ -381,11 +489,17 @@ def test_fresh_generation_uses_config_workflow_defaults_not_browser_paths(tmp_pa
 
     monkeypatch.setattr("mrs3.panel.generate_fresh_analysis_strategies", generate)
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
-    controller._fresh_analysis_surfaces["a" * 64] = tmp_path / "surface.surface-v6.duckdb"
+    controller._fresh_analysis_paths[analysis_id] = analysis_path
+    snapshot = controller.strategies_fresh_shortlist({
+        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+    })
     started = controller.strategies_fresh_generate({
-        "analysis_path": "run.analysis-v6.duckdb", "analysis_run_id": "a" * 64,
-        "candidate_ids": ["candidate"], "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
+        "analysis_path": "run.analysis-v6.duckdb", "analysis_run_id": analysis_id,
+        "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+        "selection_token": snapshot["selection_token"],
+        "candidate_ids": ["BROWSER-FORGED-ID"], "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
     })
 
     deadline = monotonic() + 1
@@ -396,7 +510,9 @@ def test_fresh_generation_uses_config_workflow_defaults_not_browser_paths(tmp_pa
 
     args = captured["args"]
     assert Path(args[4]).name == "long.json"
-    assert Path(args[5]) == tmp_path / "Output"
+    assert Path(args[5]).parent == tmp_path / "Output" / "fresh-shortlist-v2" / analysis_id
+    assert args[2] == ("STR-READY",)
+    assert captured["kwargs"]["selection"].selection_token == snapshot["selection_token"]
     assert result["phase"] == "COMMITTED"
     assert result["strategy_count"] == 1
 
@@ -419,19 +535,51 @@ def test_fresh_batch_is_recovered_from_output_after_panel_restart(tmp_path: Path
     }
 
 
+def test_fresh_batch_recovery_ignores_unpublished_and_malformed_directories(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    analysis_id = "a" * 64
+    generation_root = tmp_path / "Output" / "fresh-shortlist-v2" / analysis_id
+    published = generation_root / ("b" * 64 + "-" + "c" * 32)
+    malformed = generation_root / "not-a-published-batch"
+    staging = generation_root / ".stage-newest"
+    for directory in (published, malformed, staging):
+        directory.mkdir(parents=True)
+        (directory / "strategy_manifest.json").write_text("{}", encoding="utf-8")
+    staging_manifest = staging / "strategy_manifest.json"
+    info = staging_manifest.stat()
+    os.utime(staging_manifest, ns=(info.st_atime_ns, info.st_mtime_ns + 60_000_000_000))
+    monkeypatch.setattr("mrs3.panel.validate_strategy_manifest", lambda path: SimpleNamespace(
+        manifest_path=Path(path), analysis_run_id=analysis_id,
+    ))
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+
+    assert controller._fresh_strategy_manifest(analysis_id) == published / "strategy_manifest.json"
+
+
 def test_generation_status_keeps_safe_generation_error(tmp_path: Path, monkeypatch) -> None:
+    from tests.test_fresh_analysis_strategies import _make_analysis
+
     config = tmp_path / "config.local.json"
     config.write_text(json.dumps({
         "panel_workflow": {
             "strategy_templates": {"LONG": "input/long.json", "SHORT": "input/short.json"},
         },
     }), encoding="utf-8")
+    analysis_path = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(analysis_path)
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
+    controller._fresh_analysis_paths[analysis_id] = analysis_path
+    snapshot = controller.strategies_fresh_shortlist({
+        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+    })
     monkeypatch.setattr("mrs3.panel.generate_fresh_analysis_strategies", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("panel workflow default is unavailable")))
 
     started = controller.strategies_fresh_generate({
-        "analysis_run_id": "a" * 64, "candidate_ids": ["candidate"],
+        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+        "selection_token": snapshot["selection_token"], "candidate_ids": ["candidate"],
         "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
     })
     deadline = monotonic() + 1
@@ -445,17 +593,27 @@ def test_generation_status_keeps_safe_generation_error(tmp_path: Path, monkeypat
 
 
 def test_generation_status_redacts_path_from_permission_error(tmp_path: Path, monkeypatch) -> None:
+    from tests.test_fresh_analysis_strategies import _make_analysis
+
     config = tmp_path / "config.local.json"
     config.write_text(json.dumps({"panel_workflow": {"strategy_templates": {"LONG": "input/long.json"}}}), encoding="utf-8")
+    analysis_path = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(analysis_path)
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
+    controller._fresh_analysis_paths[analysis_id] = analysis_path
+    snapshot = controller.strategies_fresh_shortlist({
+        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+    })
     monkeypatch.setattr(
         "mrs3.panel.generate_fresh_analysis_strategies",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError(13, "Access is denied", tmp_path / "Output" / "strategies")),
     )
 
     started = controller.strategies_fresh_generate({
-        "analysis_run_id": "a" * 64, "candidate_ids": ["candidate"],
+        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+        "selection_token": snapshot["selection_token"], "candidate_ids": ["candidate"],
         "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
     })
     deadline = monotonic() + 1

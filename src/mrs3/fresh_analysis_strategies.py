@@ -6,12 +6,11 @@ Analysis DuckDB, read CSV, or recompute source facts.
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
 from dataclasses import dataclass
-from decimal import Decimal
-from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
+from math import isfinite
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -26,17 +25,6 @@ from .analysis_strategies import (
     _v6_strategy_digest,
     normalize_analysis_scopes,
 )
-from .analysis_shortlist import (
-    CRITERIA,
-    FilterResult,
-    _Candidate,
-    _audit_row,
-    _comparison_key,
-    _decimal,
-    _dominates,
-    _enabled_criteria,
-    _standalone_rows,
-)
 from .config import AlgorithmConfig
 from .lots import LotMethod, allocate_lots
 from .strategy_json import generate_strategy, validate_strategy, validate_unique_names
@@ -47,14 +35,14 @@ from .source_v6_surface_fresh import FINGERPRINT as SURFACE_FINGERPRINT, read_mu
 FINGERPRINT = "analysis-v6-fresh-compact-v2"
 LEGACY_FINGERPRINT = "analysis-v6-fresh-compact-v1"
 EVENT_MODE = "real_independent_events"
-GENERATOR_SCHEMA = f"{V6_READY_GENERATOR_SCHEMA}-fresh-compact"
+GENERATOR_SCHEMA = f"{V6_READY_GENERATOR_SCHEMA}-fresh-compact-shortlist-v2"
 PRETEST_AB_CONTRACT = "source-v6-pretest-ab-v1"
 PRETEST_AB_WINDOW_DAYS = 14
 PRETEST_AB_THRESHOLD_PCT = Decimal("95")
 _TABLES = ("points", "structures")
-_CANDIDATE_TABLES = ("structures",)
 _ORDER_BUCKETS = (1, 2, 3, 4)
 _READY_STATUS = "READY_MRS3_STRUCTURE"
+_LEGACY_FRESH_FILTER_FIELDS = frozenset({"source_pnl", "efficiency", "close_support", "point_event_count"})
 _HASH_FIELDS = (
     "source_content_digest", "algorithm_config_sha256", "listing_dates_sha256", "analysis_input_digest",
 )
@@ -147,7 +135,11 @@ def _canonical_digest(value: object) -> str:
 
 
 def _file_digest(path: Path) -> str:
-    return sha256(path.read_bytes()).hexdigest()
+    digest = sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _manifest_value(value: object) -> object:
@@ -159,9 +151,10 @@ def _manifest_value(value: object) -> object:
         return value
 
 
-def _read_analysis(path: Path) -> tuple[dict[str, object], str, str]:
+def _read_analysis(path: Path, *, artifact_sha256: str | None = None) -> tuple[dict[str, object], str, str]:
     if path.suffix.casefold() != ".duckdb":
         raise ValueError("fresh analysis generation requires a .analysis-v6.duckdb")
+    digest_before = artifact_sha256 if artifact_sha256 is not None else _file_digest(path)
     try:
         connection = duckdb.connect(str(path), read_only=True)
     except (OSError, duckdb.Error) as error:
@@ -206,33 +199,16 @@ def _read_analysis(path: Path) -> tuple[dict[str, object], str, str]:
                 connection.execute(f"select 1 from {table} limit 1")
             except duckdb.Error as error:
                 raise ValueError(f"fresh analysis artifact is missing {table}") from error
-        return manifest, analysis_id, _file_digest(path)
+        return manifest, analysis_id, digest_before
     finally:
         connection.close()
-
-
-def _rows(connection: duckdb.DuckDBPyConnection, table: str, scope: str) -> list[dict[str, object]]:
-    try:
-        raw_rows = connection.execute(
-            f"select payload_json from {table} where scope_key=? order by payload_json", [scope]
-        ).fetchall()
-    except duckdb.Error as error:
-        raise ValueError(f"fresh analysis table {table} cannot be read") from error
-    result: list[dict[str, object]] = []
-    for (raw,) in raw_rows:
-        try:
-            value = json.loads(str(raw))
-        except json.JSONDecodeError as error:
-            raise ValueError(f"fresh analysis table {table} contains invalid JSON") from error
-        if not isinstance(value, dict):
-            raise ValueError(f"fresh analysis table {table} contains a non-object row")
-        result.append(value)
-    return result
 
 
 def _validate_points(
     points: Sequence[Mapping[str, object]], scopes: set[tuple[str, str, str]], *, require_pretest_ab: bool = True,
 ) -> pd.DataFrame:
+    from .fresh_shortlist import _canonical_id
+
     required = {
         "point_id", "symbol", "side", "timeframe", "shift_bp", "shift_pct", "open_ma", "close_ma",
         "pnl_pct", "dd_pct", "efficiency", "trades", "plateau_id", "economic_pass",
@@ -245,7 +221,7 @@ def _validate_points(
         missing = sorted(required.difference(raw))
         if missing:
             raise ValueError(f"fresh point is missing required fields: {missing}")
-        point_id = str(raw["point_id"])
+        point_id = _canonical_id(raw["point_id"], "point_id")
         if point_id in seen:
             raise ValueError("fresh analysis contains duplicate point_id")
         seen.add(point_id)
@@ -265,7 +241,7 @@ def _validate_points(
             _validate_pretest_ab_evidence(raw["pretest_ab"])
         elif require_pretest_ab:
             raise ValueError("fresh point is missing required fields: ['pretest_ab']")
-        rows.append({**raw, "side": scope[1], "_event_ids": event_ids})
+        rows.append({**raw, "point_id": point_id, "side": scope[1], "_event_ids": event_ids})
     if not rows:
         raise ValueError("fresh analysis has no points for selected scopes")
     return pd.DataFrame(rows)
@@ -393,275 +369,77 @@ def read_fresh_analysis_identity(analysis_path: Path | str) -> dict[str, object]
     return result
 
 
-def filter_fresh_analysis_candidates(
-    analysis_path: Path | str,
-    analysis_run_id: str,
-    criteria: Mapping[str, object] | Sequence[str] | None,
-    *,
-    pretest_ab_enabled: bool = False,
-) -> FilterResult:
-    """Evaluate the immutable fresh READY candidates with Phase 2 Pareto rules."""
-    if type(pretest_ab_enabled) is not bool:
-        raise ValueError("pretest_ab_enabled must be a boolean")
-    analysis_file = Path(analysis_path).resolve()
-    manifest, analysis_id, _ = _read_analysis(analysis_file)
-    if str(analysis_run_id) != analysis_id:
-        raise ValueError("fresh analysis run identity mismatch")
-    supports_pretest = _supports_pretest_ab(manifest)
-    if pretest_ab_enabled and not supports_pretest:
-        raise ValueError("PRETEST_AB_EVIDENCE_UNAVAILABLE: rebuild the Source v6 surface and analysis")
-    if isinstance(criteria, Mapping) and (
-        set(criteria).difference(CRITERIA) or any(type(value) is not bool for value in criteria.values())
-    ):
-        raise ValueError("Phase 2 filters must be named booleans")
-    enabled = _enabled_criteria(criteria)
-    scope_keys = sorted(dict(manifest["scope_digests"]))
-    scopes = {
-        (parts[0], parts[1].upper(), parts[2])
-        for scope in scope_keys
-        if len(parts := scope.split("|")) == 3
-    }
-    if len(scopes) != len(scope_keys):
-        raise ValueError("fresh analysis has malformed scope identity")
-    connection = duckdb.connect(str(analysis_file), read_only=True)
-    try:
-        points = _validate_points(
-            [row for scope in scope_keys for row in _rows(connection, "points", scope)], scopes,
-            require_pretest_ab=supports_pretest,
+def _canonical_id_sql_filter(expression: str, selected_ids: Sequence[str]) -> tuple[str, list[object]]:
+    """Narrow SQL reads to canonical string IDs and equivalent integral JSON numbers."""
+    clauses = [f"trim({expression}) in ({','.join('?' for _ in selected_ids)})"]
+    parameters: list[object] = list(selected_ids)
+    numeric_ids: list[float] = []
+    for value in selected_ids:
+        try:
+            decimal_value = Decimal(value)
+            if not decimal_value.is_finite() or decimal_value != decimal_value.to_integral_value():
+                continue
+            numeric_value = float(decimal_value)
+        except (InvalidOperation, OverflowError, ValueError):
+            continue
+        if isfinite(numeric_value) and numeric_value not in numeric_ids:
+            numeric_ids.append(numeric_value)
+    if numeric_ids:
+        clauses.append(
+            f"try_cast({expression} as double) in ({','.join('?' for _ in numeric_ids)})"
         )
-        structures = [
-            row for scope in scope_keys for row in _rows(connection, "structures", scope)
-            if row.get("status") == _READY_STATUS
-        ]
-    finally:
-        connection.close()
-    point_rows = points.to_dict("records")
-    point_events = {str(row["point_id"]): int(row["point_event_count"]) for row in point_rows}
-    point_pretest = {
-        str(row["point_id"]): dict(row["pretest_ab"])
-        for row in point_rows if isinstance(row.get("pretest_ab"), Mapping)
-    }
-    candidates: list[_Candidate] = []
-    pretest_outcomes: dict[str, tuple[str, str, str | None]] = {}
-    for structure in structures:
-        candidate_id = str(structure.get("candidate_id", structure.get("structure_id", ""))).strip()
-        orders = structure.get("orders")
-        if not candidate_id or not isinstance(orders, list) or not orders:
-            raise ValueError("READY fresh candidate has malformed orders")
-        if int(structure.get("order_count", 0)) != len(orders):
-            raise ValueError("READY fresh candidate order count disagrees with orders")
-        values: dict[str, list[Decimal | int]] = {name: [] for name in CRITERIA}
-        order_pretest: list[dict[str, object]] = []
-        for order in orders:
-            if not isinstance(order, Mapping):
-                raise ValueError("READY fresh candidate has malformed order")
-            point_id = str(order.get("point_id", ""))
-            if point_id not in point_events:
-                raise ValueError("READY fresh candidate references unknown point")
-            if supports_pretest:
-                order_pretest.append(point_pretest[point_id])
-            values["source_pnl"].append(_decimal(order.get("source_pnl_pct"), "source_pnl_pct"))
-            values["efficiency"].append(_decimal(order.get("source_efficiency"), "source_efficiency"))
-            values["close_support"].append(_decimal(order.get("close_support"), "close_support"))
-            values["point_event_count"].append(point_events[point_id])
-        first_pretest = order_pretest[0] if order_pretest else None
-        outcome = (
-            _pretest_ab_outcome(first_pretest, pretest_ab_enabled)
-            if isinstance(first_pretest, Mapping)
-            else ("DISABLED", "LEGACY_ANALYSIS", None)
-        )
-        pretest_outcomes[candidate_id] = outcome
-        payload = dict(structure)
-        payload.update(
-            pretest_ab=first_pretest,
-            pretest_ab_orders=order_pretest,
-            pretest_ab_enabled=pretest_ab_enabled,
-            pretest_ab_status=outcome[0],
-            pretest_ab_reason=outcome[1],
-            pretest_ab_decline_pct=outcome[2],
-        )
-        candidates.append(_Candidate(
-            candidate_id,
-            str(structure.get("structure_id", "")),
-            _comparison_key(structure, candidate_id, False),
-            {name: tuple(value) for name, value in values.items()},
-            payload,
-        ))
-    survivors = [candidate for candidate in candidates if pretest_outcomes[candidate.candidate_id][0] != "REJECT"]
-    pretest_deferred = tuple(
-        {
-            **candidate.payload,
-            "candidate_id": candidate.candidate_id,
-            "comparison_key": candidate.comparison_key,
-            "deferred_by": None,
-            "deferred_by_candidate_id": None,
-            "criterion": "pretest_ab",
-            "defer_reason": pretest_outcomes[candidate.candidate_id][1],
-            "filter_status": "DEFERRED_PRETEST_AB",
-            "enabled_criteria": list(enabled),
-        }
-        for candidate in candidates
-        if pretest_outcomes[candidate.candidate_id][0] == "REJECT"
-    )
-    grouped: dict[str, list[_Candidate]] = defaultdict(list)
-    for candidate in survivors:
-        grouped[candidate.comparison_key].append(candidate)
-    standalone = {
-        name: tuple(
-            row for key in sorted(grouped)
-            for row in _standalone_rows(tuple(grouped[key]), name)
-        )
-        for name in enabled
-    }
-    combined = tuple(sorted(
-        (
-            _audit_row(min(dominators, key=lambda item: (item.structure_id, item.candidate_id)), deferred, ",".join(enabled))
-            for group in grouped.values()
-            for deferred in group
-            if (dominators := [candidate for candidate in group if _dominates(candidate, deferred, enabled)])
-        ),
-        key=lambda row: (str(row["comparison_key"]), str(row["candidate_id"])),
-    ))
-    candidate_payloads = {candidate.candidate_id: candidate.payload for candidate in candidates}
-    combined = tuple(
-        {
-            **candidate_payloads.get(str(row["candidate_id"]), {}),
-            **row,
-            "filter_status": "DEFERRED_REDUNDANT",
-        }
-        for row in combined
-    )
-    combined_all = tuple(sorted(
-        (*pretest_deferred, *combined),
-        key=lambda row: (str(row["comparison_key"]), str(row["candidate_id"])),
-    ))
-    deferred_by = {str(row["candidate_id"]): row for row in combined}
-    sizes = Counter(candidate.comparison_key for candidate in candidates)
-    rows = tuple(
-        {
-            **candidate.payload,
-            "candidate_id": candidate.candidate_id,
-            "comparison_key": candidate.comparison_key,
-            "comparison_group_size": sizes[candidate.comparison_key],
-            "filter_status": (
-                "DEFERRED_PRETEST_AB"
-                if pretest_outcomes[candidate.candidate_id][0] == "REJECT"
-                else "DEFERRED_REDUNDANT" if candidate.candidate_id in deferred_by else "READY_AFTER_FILTERS"
-            ),
-            "deferred_by": deferred_by.get(candidate.candidate_id, {}).get("deferred_by"),
-            "deferred_by_candidate_id": deferred_by.get(candidate.candidate_id, {}).get("deferred_by_candidate_id"),
-            "enabled_criteria": list(enabled),
-        }
-        for candidate in sorted(candidates, key=lambda item: (item.comparison_key, item.candidate_id))
-    )
-    return FilterResult(
-        analysis_id, str(manifest["surface_id"]), enabled, rows, standalone, combined_all,
-        len(candidates), len(candidates) - len(combined_all), len(combined_all), len(sizes),
-        sum(size for size in sizes.values() if size > 1), pretest_ab_enabled,
-    )
+        parameters.extend(numeric_ids)
+    return f"({' or '.join(clauses)})", parameters
 
 
-def list_fresh_analysis_shortlist(
-    analysis_path: Path | str,
-    analysis_run_id: str,
-    criteria: Mapping[str, object] | Sequence[str] | None = None,
-    *,
-    pretest_ab_enabled: bool = False,
-) -> dict[str, object]:
-    """Return safe grouped candidate summaries from one immutable fresh analysis."""
-    if type(pretest_ab_enabled) is not bool:
-        raise ValueError("pretest_ab_enabled must be a boolean")
-    analysis_file = Path(analysis_path).resolve()
-    manifest, analysis_id, _ = _read_analysis(analysis_file)
-    if str(analysis_run_id) != analysis_id:
-        raise ValueError("fresh analysis run identity mismatch")
-    filtered = (
-        filter_fresh_analysis_candidates(
-            analysis_file, analysis_id, criteria, pretest_ab_enabled=pretest_ab_enabled,
-        )
-        if criteria is not None or pretest_ab_enabled else None
-    )
-    connection = duckdb.connect(str(analysis_file), read_only=True)
-    try:
-        scope_keys = sorted(dict(manifest["scope_digests"]))
-        rows = [
-            row for scope in scope_keys
-            for table in _CANDIDATE_TABLES
-            for row in _rows(connection, table, scope)
-        ]
-        scope_facts = {
-            scope: _shortlist_scope_facts(
-                _rows(connection, "plateaus", scope), _rows(connection, "points", scope)
-            )
-            for scope in scope_keys
-        }
-    finally:
-        connection.close()
-    items: list[dict[str, object]] = []
-    seen: set[str] = set()
-    by_candidate = {str(row["candidate_id"]): row for row in filtered.rows} if filtered else {}
-    for row in rows:
-        candidate_id = str(row.get("candidate_id", row.get("structure_id", ""))).strip()
-        if not candidate_id:
-            raise ValueError("fresh structure has no candidate identity")
-        if candidate_id in seen:
-            raise ValueError(f"fresh analysis has duplicate candidate identity: {candidate_id}")
-        seen.add(candidate_id)
-        phase2 = by_candidate.get(candidate_id)
-        item = {
-            "candidate_id": candidate_id,
-            "pair": str(row.get("symbol", "")),
-            "side": str(row.get("side", "")).upper(),
-            "timeframe": str(row.get("timeframe", "")),
-            "order_count": int(row.get("order_count", 0)),
-            "status": str(row.get("status", "")),
-        }
-        if filtered is not None:
-            item["filter_status"] = phase2["filter_status"] if phase2 else "DEFERRED"
-            if phase2:
-                item.update({
-                    "pretest_ab_enabled": phase2["pretest_ab_enabled"],
-                    "pretest_ab_status": phase2["pretest_ab_status"],
-                    "pretest_ab_reason": phase2["pretest_ab_reason"],
-                    "pretest_ab_decline_pct": phase2["pretest_ab_decline_pct"],
-                })
-        items.append(item)
-    items.sort(key=lambda item: str(item["candidate_id"]))
+def fresh_shortlist_response(prepared: object, evaluation: object) -> dict[str, object]:
+    """Render the cached v2 selection without rereading candidate payloads."""
+    from .fresh_shortlist import FILTER_VERSION
+
+    results = {item.candidate_id: item for item in evaluation.candidates}
+    scope_facts = {
+        item.scope_key: {"plateau_count": item.plateau_count, "period": item.period}
+        for item in prepared.scopes
+    }
+    items = []
+    for candidate in prepared.candidates:
+        result = results[candidate.candidate_id]
+        items.append({
+            "candidate_id": candidate.candidate_id,
+            "pair": candidate.pair,
+            "side": candidate.side,
+            "timeframe": candidate.timeframe,
+            "order_count": candidate.order_count,
+            "status": candidate.persisted_status,
+            "filter_status": result.filter_status,
+            "reason": result.reason,
+            "dominator_candidate_id": result.dominator_candidate_id,
+            "pretest_ab_enabled": evaluation.options[0],
+            "pretest_ab_status": result.pretest_ab_status,
+            "pretest_ab_reason": result.pretest_ab_reason,
+            "pretest_ab_decline_pct": result.pretest_ab_decline_pct,
+        })
     return {
-        "analysis_run_id": analysis_id,
+        "analysis_run_id": evaluation.analysis_id,
+        "filter_version": FILTER_VERSION,
+        "filter_engine_version": evaluation.filter_engine_version,
+        "artifact_sha256": evaluation.artifact_sha256,
+        "selection_token": evaluation.selection_token,
+        "applied_options": dict(zip(
+            ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled"),
+            evaluation.options,
+            strict=True,
+        )),
         "items": items,
-        "groups": _shortlist_groups(items, scope_facts),
-        "active_criteria": list(filtered.criteria) if filtered else [],
-        "pretest_ab_enabled": pretest_ab_enabled,
+        "groups": _shortlist_groups(items, scope_facts, filtered=True),
+        "active_criteria": [],
+        "pretest_ab_enabled": evaluation.options[0],
     }
-
-
-def _shortlist_scope_facts(
-    plateaus: Sequence[Mapping[str, object]], points: Sequence[Mapping[str, object]],
-) -> dict[str, object]:
-    plateau_ids = {str(row["plateau_id"]) for row in plateaus if row.get("plateau_id")}
-    starts = [_parse_report_date(row.get("report_start")) for row in points]
-    ends = [_parse_report_date(row.get("report_end")) for row in points]
-    starts = [value for value in starts if value is not None]
-    ends = [value for value in ends if value is not None]
-    period = None
-    if starts and ends:
-        start, end = min(starts), max(ends)
-        period = f"{start:%d.%m}-{end:%d.%m}"
-    return {"plateau_count": len(plateau_ids), "period": period}
-
-
-def _parse_report_date(value: object) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
 
 
 def _shortlist_groups(
     items: Sequence[Mapping[str, object]], scope_facts: Mapping[str, Mapping[str, object]],
+    *, filtered: bool | None = None,
 ) -> list[dict[str, object]]:
     """One row per Pair · Side · TF, counted into the bucket of its own order count.
 
@@ -669,16 +447,30 @@ def _shortlist_groups(
     data. Sending one flat candidate list left the panel guessing, and it guessed
     by writing every order count into the last column.
     """
+    has_filters = any("filter_status" in item for item in items) if filtered is None else filtered
     grouped: dict[tuple[str, str, str], dict[str, object]] = {}
-    for item in items:
-        key = (str(item["pair"]), str(item["side"]), str(item["timeframe"]))
-        group = grouped.setdefault(key, {
+
+    def make_group(key: tuple[str, str, str]) -> dict[str, object]:
+        group: dict[str, object] = {
             "scope_key": "|".join(key),
             "pair": key[0], "side": key[1], "timeframe": key[2],
             "counts": {f"{order}ORD": 0 for order in _ORDER_BUCKETS},
             "ready": 0, "ready_after_filters": 0, "deferred": 0, "total": 0, "candidate_ids": [],
             **scope_facts.get("|".join(key), {"plateau_count": 0, "period": None}),
-        })
+        }
+        return group
+
+    for raw_key in scope_facts:
+        parts = tuple(raw_key.split("|"))
+        if len(parts) != 3:
+            raise ValueError("fresh analysis has malformed scope identity")
+        key = (parts[0], parts[1].upper(), parts[2])
+        grouped[key] = make_group(key)
+    for item in items:
+        key = (str(item["pair"]), str(item["side"]), str(item["timeframe"]))
+        group = grouped.get(key)
+        if group is None:
+            group = grouped[key] = make_group(key)
         group["total"] = int(group["total"]) + 1
         bucket = f"{int(item['order_count'])}ORD"
         counts = group["counts"]
@@ -695,10 +487,135 @@ def _shortlist_groups(
             group["deferred"] = int(group["deferred"]) + 1
     for group in grouped.values():
         group["candidate_ids"] = sorted(group["candidate_ids"])
-        if not any("filter_status" in item for item in items):
+        if not has_filters:
             group.pop("ready_after_filters")
             group.pop("deferred")
     return [grouped[key] for key in sorted(grouped)]
+
+
+def load_fresh_ready_candidates(
+    analysis_path: Path | str,
+    analysis_run_id: str,
+    candidate_ids: Sequence[str],
+    selected_scopes: Sequence[tuple[str, str, str]],
+    *,
+    expected_artifact_sha256: str,
+) -> tuple[dict[str, object], pd.DataFrame, list[dict[str, object]]]:
+    """Load only server-selected READY structures and their points."""
+    from .fresh_shortlist import _canonical_id, _scope_key
+
+    analysis_file = Path(analysis_path).resolve()
+    manifest, actual_id, artifact_sha256 = _read_analysis(analysis_file)
+    if actual_id != str(analysis_run_id):
+        raise ValueError("fresh analysis run identity mismatch")
+    if artifact_sha256 != expected_artifact_sha256:
+        raise ValueError("STALE_SHORTLIST_SELECTION")
+    scopes = normalize_analysis_scopes(selected_scopes)
+    scope_set = set(scopes)
+    scope_keys = tuple("|".join(scope) for scope in scopes)
+    if not scope_keys or any(scope not in manifest["scope_digests"] for scope in scope_keys):
+        raise ValueError("selected scope is absent from fresh analysis")
+    selected = tuple(sorted(set(candidate_ids)))
+    if not selected:
+        raise ValueError("EMPTY_READY_SELECTION")
+    scope_marks = ",".join("?" for _ in scope_keys)
+    identity_expr = (
+        "coalesce(json_extract_string(payload_json, '$.candidate_id'), "
+        "json_extract_string(payload_json, '$.structure_id'))"
+    )
+    candidate_filter, candidate_parameters = _canonical_id_sql_filter(identity_expr, selected)
+    point_expr = "json_extract_string(payload_json, '$.point_id')"
+    connection = duckdb.connect(str(analysis_file), read_only=True)
+    try:
+        try:
+            structure_rows = connection.execute(
+                "select scope_key, payload_json from structures "
+                f"where scope_key in ({scope_marks}) and "
+                f"{candidate_filter}",
+                [*scope_keys, *candidate_parameters],
+            ).fetchall()
+            selected_set = set(selected)
+            decoded_structures: list[tuple[str, dict[str, object], str]] = []
+            for sql_scope, raw in structure_rows:
+                try:
+                    structure = json.loads(str(raw))
+                except (TypeError, json.JSONDecodeError) as error:
+                    raise ValueError("fresh analysis structure contains invalid JSON") from error
+                if not isinstance(structure, dict):
+                    raise ValueError("fresh analysis structure must be an object")
+                identity = _canonical_id(
+                    structure.get("candidate_id", structure.get("structure_id")), "candidate identity",
+                )
+                if identity in selected_set:
+                    decoded_structures.append((str(sql_scope), structure, identity))
+            if not decoded_structures:
+                raise ValueError("selected candidate is absent from fresh analysis")
+            point_ids: set[str] = set()
+            for _sql_scope, structure, _identity in decoded_structures:
+                orders = structure.get("orders")
+                if not isinstance(orders, list):
+                    raise ValueError("READY fresh candidate has malformed orders")
+                for order in orders:
+                    if not isinstance(order, Mapping):
+                        raise ValueError("READY fresh candidate has malformed order")
+                    point_ids.add(_canonical_id(order.get("point_id"), "order point_id"))
+            if not point_ids:
+                raise ValueError("selected READY candidate has no point records")
+            point_filter, point_parameters = _canonical_id_sql_filter(point_expr, tuple(sorted(point_ids)))
+            point_rows = connection.execute(
+                "select scope_key, payload_json from points "
+                f"where scope_key in ({scope_marks}) and {point_filter}",
+                [*scope_keys, *point_parameters],
+            ).fetchall()
+        except duckdb.Error as error:
+            raise ValueError("fresh analysis selected candidates cannot be read") from error
+    finally:
+        connection.close()
+    structures: dict[str, dict[str, object]] = {}
+    scope_by_key = {"|".join(scope): scope for scope in scopes}
+    for sql_scope, structure, identity in decoded_structures:
+        if not isinstance(structure, dict) or _scope_key(structure, "structure") != tuple(sql_scope.split("|")):
+            raise ValueError("fresh analysis structure scope disagrees with its table scope")
+        if identity in structures or structure.get("status") != _READY_STATUS:
+            raise ValueError("selected candidate is absent or not READY")
+        structure["candidate_id"] = identity
+        structure["structure_id"] = _canonical_id(structure.get("structure_id"), "structure_id")
+        orders = structure.get("orders")
+        if not isinstance(orders, list) or not orders:
+            raise ValueError("READY fresh candidate has malformed orders")
+        normalized_orders = []
+        for order in orders:
+            if not isinstance(order, Mapping):
+                raise ValueError("READY fresh candidate has malformed orders")
+            normalized_order = dict(order)
+            normalized_order["point_id"] = _canonical_id(order.get("point_id"), "order point_id")
+            normalized_orders.append(normalized_order)
+        structure["orders"] = tuple(normalized_orders)
+        structures[identity] = structure
+    if set(structures) != set(selected):
+        raise ValueError("selected candidate is absent from fresh analysis")
+    points_payload: list[dict[str, object]] = []
+    seen_points: set[str] = set()
+    for sql_scope, raw in point_rows:
+        try:
+            point = json.loads(str(raw))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError("fresh analysis point contains invalid JSON") from error
+        if not isinstance(point, dict) or sql_scope not in scope_by_key:
+            raise ValueError("fresh analysis point scope disagrees with selected scopes")
+        point_id = _canonical_id(point.get("point_id"), "point_id")
+        if point_id not in point_ids:
+            continue
+        if point_id in seen_points:
+            raise ValueError("fresh analysis has duplicate point identity")
+        seen_points.add(point_id)
+        points_payload.append(point)
+    if seen_points != point_ids:
+        raise ValueError("selected candidate references an unknown point")
+    points = _validate_points(
+        points_payload, scope_set, require_pretest_ab=_supports_pretest_ab(manifest),
+    )
+    return manifest, points, [structures[item] for item in selected]
 
 
 def generate_fresh_analysis_strategies(
@@ -713,14 +630,38 @@ def generate_fresh_analysis_strategies(
     surface_path: Path | str | None = None,
     filters: Mapping[str, object] | Sequence[str] | None = None,
     pretest_ab_enabled: bool = False,
+    selection: object,
 ) -> FreshAnalysisStrategies:
     """Generate EQUAL/INCOME JSON for exact READY candidates in one fresh run."""
     if type(pretest_ab_enabled) is not bool:
         raise ValueError("pretest_ab_enabled must be a boolean")
+    if filters is not None:
+        if isinstance(filters, Mapping):
+            if set(filters).difference(_LEGACY_FRESH_FILTER_FIELDS) or any(type(value) is not bool for value in filters.values()):
+                raise ValueError("filters must contain only recognized legacy booleans")
+            if any(filters.values()):
+                raise ValueError("stale shortlist client; use shortlist-v2 options")
+        elif isinstance(filters, Sequence) and not isinstance(filters, (str, bytes)):
+            if filters:
+                raise ValueError("stale shortlist client; use shortlist-v2 options")
+        else:
+            raise ValueError("filters must contain only recognized legacy booleans")
+    if selection is None:
+        raise ValueError("a verified shortlist selection is required")
     analysis_file = Path(analysis_path).resolve()
+    expected_digest = getattr(selection, "artifact_sha256", None)
     manifest, analysis_id, analysis_artifact_sha256 = _read_analysis(analysis_file)
     if str(analysis_run_id) != analysis_id:
         raise ValueError("fresh analysis run identity mismatch")
+    if (
+        getattr(selection, "analysis_id", None) != analysis_id
+        or expected_digest != analysis_artifact_sha256
+        or getattr(selection, "filter_version", None) != "shortlist-v2"
+        or not isinstance(getattr(selection, "selection_token", None), str)
+        or len(selection.selection_token) != 64
+        or any(char not in "0123456789abcdef" for char in selection.selection_token)
+    ):
+        raise ValueError("STALE_SHORTLIST_SELECTION")
     scopes = normalize_analysis_scopes(selected_scopes)
     scope_set = set(scopes)
     scope_digests = dict(manifest["scope_digests"])
@@ -733,64 +674,29 @@ def generate_fresh_analysis_strategies(
     )
     template_file, target = Path(template_path).resolve(), Path(output_dir).resolve()
     template = _template(template_file)
-    connection = duckdb.connect(str(analysis_file), read_only=True)
-    try:
-        points = _validate_points(
-            [row for scope in scopes for row in _rows(connection, "points", "|".join(scope))],
-            scope_set,
-            require_pretest_ab=_supports_pretest_ab(manifest),
-        )
-        all_structures = [
-            row for scope in scopes for table in _CANDIDATE_TABLES
-            for row in _rows(connection, table, "|".join(scope))
-        ]
-    finally:
-        connection.close()
-    ready_by_id: dict[str, dict[str, object]] = {}
-    all_by_id: dict[str, dict[str, object]] = {}
-    for raw in all_structures:
-        identity = str(raw.get("candidate_id", raw.get("structure_id", ""))).strip()
-        if not identity:
-            raise ValueError("fresh structure has no candidate identity")
-        if identity in all_by_id:
-            raise ValueError(f"fresh analysis has duplicate candidate identity: {identity}")
-        all_by_id[identity] = raw
-        if raw.get("status") == _READY_STATUS:
-            orders = raw.get("orders")
-            if not isinstance(orders, (list, tuple)) or not orders or not all(isinstance(item, Mapping) for item in orders):
-                raise ValueError("READY fresh candidate has malformed orders")
-            candidate = dict(raw)
-            candidate["orders"] = tuple(dict(item) for item in orders)
-            ready_by_id[identity] = candidate
-    filter_result = (
-        filter_fresh_analysis_candidates(
-            analysis_file, analysis_id, filters, pretest_ab_enabled=pretest_ab_enabled,
-        )
-        if filters is not None or pretest_ab_enabled else None
-    )
     selected = tuple(sorted(
-        str(row["candidate_id"])
-        for row in filter_result.rows
-        if row["filter_status"] == "READY_AFTER_FILTERS"
-        and (str(row.get("symbol", "")), str(row.get("side", "")).upper(), str(row.get("timeframe", ""))) in scope_set
-    )) if filter_result else tuple(sorted({str(item).strip() for item in candidate_ids if str(item).strip()}))
+        result.candidate_id
+        for result in selection.candidates
+        if result.filter_status == "READY_AFTER_FILTERS" and result.scope_key in {
+            "|".join(scope) for scope in scopes
+        }
+    ))
+    if selection.options[0] is not pretest_ab_enabled:
+        raise ValueError("shortlist options disagree with generator request")
     if not selected:
-        raise ValueError("no READY candidate selected")
-    absent = sorted(set(selected).difference(all_by_id))
-    if absent:
-        raise ValueError(f"selected candidate is absent from fresh analysis: {absent}")
-    not_ready = sorted(item for item in selected if item not in ready_by_id)
-    if not_ready:
-        raise ValueError(f"selected candidate is not READY: {not_ready}")
-    structures = [ready_by_id[item] for item in selected]
-    for structure in structures:
-        structure_scope = (
-            str(structure.get("symbol", "")),
-            str(structure.get("side", "")).upper(),
-            str(structure.get("timeframe", "")),
-        )
-        if structure_scope not in scope_set:
-            raise ValueError("selected candidate is outside selected scopes")
+        raise ValueError("EMPTY_READY_SELECTION")
+    from .fresh_shortlist import _canonical_id
+
+    try:
+        requested = tuple(_canonical_id(value, "candidate identity") for value in candidate_ids)
+    except (TypeError, ValueError) as error:
+        raise ValueError("candidate IDs do not match verified READY selection") from error
+    if len(requested) != len(set(requested)) or set(requested) != set(selected):
+        raise ValueError("candidate IDs do not match verified READY selection")
+    _selected_manifest, points, structures = load_fresh_ready_candidates(
+        analysis_file, analysis_id, selected, scopes,
+        expected_artifact_sha256=analysis_artifact_sha256,
+    )
 
     analysis_manifest_sha256 = _canonical_digest(dict(manifest))
     common: dict[str, object] = {
@@ -811,7 +717,7 @@ def generate_fresh_analysis_strategies(
         "listing_dates_sha256": str(manifest["listing_dates_sha256"]),
         "event_mode": EVENT_MODE,
         "selected_scopes": [list(scope) for scope in scopes],
-        "phase2_filters": list(filter_result.criteria) if filter_result else [],
+        "phase2_filters": [],
         "pretest_ab_enabled": pretest_ab_enabled,
         "pretest_ab": {
             "enabled": pretest_ab_enabled,
@@ -821,6 +727,19 @@ def generate_fresh_analysis_strategies(
         },
         "generator_schema_version": GENERATOR_SCHEMA,
     }
+    if selection is not None:
+        common["shortlist_v2"] = {
+            "filter_version": selection.filter_version,
+            "filter_engine_version": selection.filter_engine_version,
+            "selection_token": selection.selection_token,
+            "artifact_sha256": selection.artifact_sha256,
+            "applied_options": dict(zip(
+                ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled"),
+                selection.options,
+                strict=True,
+            )),
+            "selected_candidate_ids": list(selected),
+        }
     if "analysis_input_digest" in manifest:
         common["analysis_input_digest"] = str(manifest["analysis_input_digest"])
     generated: list[dict[str, object]] = []
@@ -864,6 +783,8 @@ def generate_fresh_analysis_strategies(
         "template_sha256": _file_digest(template_file),
     }
     generation_hash = _canonical_digest(manifest_unsigned)
+    if _file_digest(analysis_file) != analysis_artifact_sha256:
+        raise ValueError("STALE_SHORTLIST_SELECTION")
     strategies = _publish_strategies(target, pd.DataFrame(variants), generated)
     manifest_path = target / "strategy_manifest.json"
     manifest = {**manifest_unsigned, "generation_manifest_sha256": generation_hash}

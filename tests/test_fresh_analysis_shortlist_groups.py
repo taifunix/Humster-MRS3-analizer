@@ -34,6 +34,38 @@ def _add_rows(path: Path, table: str, rows: list[dict]) -> None:
         connection.close()
 
 
+def _shortlist(path: Path, analysis_id: str) -> dict[str, object]:
+    from mrs3.fresh_analysis_strategies import fresh_shortlist_response
+    from mrs3.fresh_shortlist import FreshShortlistExecutor
+
+    prepared, evaluation = FreshShortlistExecutor().evaluate_with_prepared(
+        path, analysis_id, (False, False, False), workers=1,
+    )
+    return fresh_shortlist_response(prepared, evaluation)
+
+
+def _set_point_report_dates(path: Path) -> None:
+    import duckdb
+
+    connection = duckdb.connect(str(path))
+    try:
+        rows = connection.execute("select rowid, payload_json from points").fetchall()
+        for index, (rowid, raw) in enumerate(rows):
+            point = json.loads(raw)
+            if index == 0:
+                point["report_start"] = "2026-05-01T00:00:00+00:00"
+                point["report_end"] = "2026-10-08T00:00:00+00:00"
+            else:
+                point["report_start"] = "2026-05-04T00:00:00+00:00"
+                point["report_end"] = "2026-09-30T00:00:00+00:00"
+            connection.execute(
+                "update points set payload_json=? where rowid=?",
+                [json.dumps(point, sort_keys=True, separators=(",", ":")), rowid],
+            )
+    finally:
+        connection.close()
+
+
 def _base_selection() -> dict:
     """`base_one_order` stores the selected single-order *point*, not a structure.
 
@@ -45,13 +77,12 @@ def _base_selection() -> dict:
 
 def test_point_only_base_table_does_not_create_a_one_order_candidate(tmp_path: Path) -> None:
     """The point-only BASE table cannot create a selectable structure."""
-    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
 
     database = tmp_path / "run.analysis-v6.duckdb"
     analysis_id, _surface = _make_analysis(database)
     _add_rows(database, "base_one_order", [_base_selection()])
 
-    result = list_fresh_analysis_shortlist(database, analysis_id)
+    result = _shortlist(database, analysis_id)
 
     assert result["groups"][0]["counts"]["1ORD"] == 0
     assert result["groups"][0]["total"] == 1
@@ -60,13 +91,12 @@ def test_point_only_base_table_does_not_create_a_one_order_candidate(tmp_path: P
 
 def test_the_shortlist_is_grouped_with_a_count_per_order_bucket(tmp_path: Path) -> None:
     """One row per Pair · Side · TF, with the counts the table headers promise."""
-    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
 
     database = tmp_path / "run.analysis-v6.duckdb"
     analysis_id, _surface = _make_analysis(database)
     _add_rows(database, "base_one_order", [_base_selection()])
 
-    result = list_fresh_analysis_shortlist(database, analysis_id)
+    result = _shortlist(database, analysis_id)
 
     assert len(result["groups"]) == 1, "one row per scope, not one per candidate"
     group = result["groups"][0]
@@ -78,25 +108,18 @@ def test_the_shortlist_is_grouped_with_a_count_per_order_bucket(tmp_path: Path) 
 
 
 def test_shortlist_group_reports_distinct_plateaus_and_available_period(tmp_path: Path) -> None:
-    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
-
     database = tmp_path / "run.analysis-v6.duckdb"
     analysis_id, _ = _make_analysis(database)
     _add_rows(database, "plateaus", [{"plateau_id": "P1"}, {"plateau_id": "P1"}, {"plateau_id": "P2"}])
-    _add_rows(database, "points", [
-        {"point_id": "first", "report_start": "2026-05-01T00:00:00+00:00", "report_end": "2026-09-30T00:00:00+00:00"},
-        {"point_id": "last", "report_start": "2026-05-04T00:00:00+00:00", "report_end": "2026-10-08T00:00:00+00:00"},
-    ])
+    _set_point_report_dates(database)
 
-    group = list_fresh_analysis_shortlist(database, analysis_id)["groups"][0]
+    group = _shortlist(database, analysis_id)["groups"][0]
 
     assert group["plateau_count"] == 2
     assert group["period"] == "01.05-08.10"
 
 
-def test_a_base_structure_is_selectable_without_base_table_evidence(tmp_path: Path) -> None:
-    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
-
+def test_malformed_ready_base_structure_is_rejected_without_base_table_evidence(tmp_path: Path) -> None:
     database = tmp_path / "run.analysis-v6.duckdb"
     analysis_id, _surface = _make_analysis(database)
     _add_rows(
@@ -114,31 +137,30 @@ def test_a_base_structure_is_selectable_without_base_table_evidence(tmp_path: Pa
         }],
     )
 
-    result = list_fresh_analysis_shortlist(database, analysis_id)
-
-    group = result["groups"][0]
-    assert group["counts"]["1ORD"] == 1
-    assert group["candidate_ids"] == ["BASE-READY", "STR-READY"]
+    with pytest.raises(ValueError, match="order_count disagrees with orders"):
+        _shortlist(database, analysis_id)
 
 
 def test_a_candidate_that_is_not_ready_is_counted_but_not_offered(tmp_path: Path) -> None:
     """A deferred structure is visible as work in progress, not as a choice."""
-    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
 
     database = tmp_path / "run.analysis-v6.duckdb"
     analysis_id, _surface = _make_analysis(database, ready=False)
 
-    result = list_fresh_analysis_shortlist(database, analysis_id)
+    result = _shortlist(database, analysis_id)
 
     group = result["groups"][0]
     assert group["total"] == 1 and group["ready"] == 0
-    assert group["counts"]["2ORD"] == 1, "it is still a two-order structure"
+    assert group["counts"]["2ORD"] == 0, "order buckets count only selectable READY candidates"
+    assert result["items"][0]["order_count"] == 2
+    assert group["deferred"] == 1 and group["ready_after_filters"] == 0
     assert group["candidate_ids"] == [], "only READY candidates may be selected"
 
 
-def test_a_base_selection_is_never_offered_as_a_generatable_candidate(tmp_path: Path) -> None:
-    """Showing a candidate the generator refuses would be a new dead end."""
+def test_base_candidate_ids_cannot_override_server_ready_selection(tmp_path: Path) -> None:
+    """A supplied ID cannot override the server-verified READY selection."""
     from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+    from mrs3.fresh_shortlist import FreshShortlistExecutor
 
     database = tmp_path / "run.analysis-v6.duckdb"
     analysis_id, _surface = _make_analysis(database)
@@ -148,16 +170,17 @@ def test_a_base_selection_is_never_offered_as_a_generatable_candidate(tmp_path: 
 
     from mrs3.config import AlgorithmConfig
 
-    with pytest.raises(ValueError, match="absent from fresh analysis"):
+    selection = FreshShortlistExecutor().evaluate(database, analysis_id, (False, False, False), workers=1)
+    with pytest.raises(ValueError, match="candidate IDs do not match verified READY selection"):
         generate_fresh_analysis_strategies(
             database, analysis_id, ["BTCUSDT|LONG|1h|100|3|9"], [("BTCUSDT", "LONG", "1h")],
-            template, tmp_path / "out", AlgorithmConfig.defaults(),
+            template, tmp_path / "out", AlgorithmConfig.defaults(), selection=selection,
         )
+    assert not (tmp_path / "out").exists()
 
 
 def test_a_duplicate_candidate_identity_is_refused(tmp_path: Path) -> None:
     """Two candidates under one identity would silently shadow each other."""
-    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
 
     database = tmp_path / "run.analysis-v6.duckdb"
     analysis_id, _surface = _make_analysis(database)
@@ -167,5 +190,5 @@ def test_a_duplicate_candidate_identity_is_refused(tmp_path: Path) -> None:
     }]
     _add_rows(database, "structures", connection_rows)
 
-    with pytest.raises(ValueError, match="duplicate candidate"):
-        list_fresh_analysis_shortlist(database, analysis_id)
+    with pytest.raises(ValueError, match="duplicate or colliding candidate"):
+        _shortlist(database, analysis_id)

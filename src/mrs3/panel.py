@@ -82,7 +82,7 @@ from .analysis_strategies import (
     load_validated_plateau_facts,
 )
 from .analysis_shortlist import CRITERIA, filter_analysis_candidates
-from .analysis_filter_export import export_filter_audit, export_fresh_filter_audit
+from .analysis_filter_export import export_filter_audit, export_fresh_shortlist_audit
 from .analysis_storage import (
     compare_analysis_runs,
     ensure_analysis_schema,
@@ -189,11 +189,12 @@ from .screener.evaluate import PairVerdict, evaluate_and_record, evaluate_pairs,
 from .screener.registry import list_unscreened_symbols
 from .screener.render import render_screener_tester_config
 from .fresh_analysis_strategies import (
-    filter_fresh_analysis_candidates,
+    fresh_shortlist_response,
     generate_fresh_analysis_strategies,
-    list_fresh_analysis_shortlist,
+    load_fresh_ready_candidates,
     read_fresh_analysis_identity,
 )
+from .fresh_shortlist import ShortlistBusyError
 from .tester_run_files import publish_run_snapshots
 from .panel_strategy_batch import LocalStrategyBatchService, StrategyBatchValidationError, validate_strategy_manifest
 from .panel_tester_runs import LocalRunsBatchService
@@ -1350,6 +1351,8 @@ class PanelController:
         self._panel_surfaces: LocalSurfacesService | None = None
         self._fresh_analysis_paths: dict[str, Path] = {}
         self._fresh_analysis_surfaces: dict[str, Path] = {}
+        from .fresh_shortlist import FreshShortlistExecutor
+        self._fresh_shortlist_executor = FreshShortlistExecutor()
         self._fresh_strategy_manifests: dict[str, Path] = {}
         self._fresh_generation_job: dict[str, object] | None = None
         self._strategy_batch_service: LocalStrategyBatchService | None = None
@@ -2845,20 +2848,28 @@ class PanelController:
         return {"phase": "COMMITTED", "analysis_run_id": analysis_id}
 
     def strategies_fresh_generate(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if "output_dir" in payload:
+            raise ValueError("output_dir is server-controlled")
+        if any(not isinstance(key, str) or key.startswith("_") for key in payload):
+            raise ValueError("private fields are not allowed")
+        options = self._fresh_shortlist_options(payload)
         candidates = payload.get("candidate_ids")
         scopes = payload.get("selected_scopes")
-        if not isinstance(candidates, list) or not all(isinstance(item, str) for item in candidates):
+        if candidates is not None and (not isinstance(candidates, list) or not all(isinstance(item, str) for item in candidates)):
             raise ValueError("candidate_ids must be a list")
         if not isinstance(scopes, list) or not all(isinstance(item, list) and len(item) == 3 and all(isinstance(value, str) for value in item) for item in scopes):
             raise ValueError("selected_scopes must be a list")
-        scope_sides = {str(item[1]).upper() for item in scopes}
+        analysis_id = self._required(payload, "analysis_run_id")
+        path = self._fresh_analysis_paths.get(analysis_id)
+        if path is None:
+            raise ValueError("fresh analysis is not available in this panel session")
+        prepared, evaluation = self._verified_fresh_shortlist(path, analysis_id, options, payload)
+        scopes, selected_ids = self._selected_fresh_ready(
+            prepared, evaluation, scopes, require_one_side=True,
+        )
+        scope_sides = {scope[1] for scope in scopes}
         if len(scope_sides) != 1:
             raise ValueError("fresh strategy generation requires one side per batch")
-        analysis_id = self._required(payload, "analysis_run_id")
-        if analysis_id not in self._fresh_analysis_paths:
-            raise ValueError("fresh analysis is not available in this panel session")
-        phase2_filters = self._phase2_filters(payload)
-        pretest_ab_enabled = self._pretest_ab_enabled(payload)
         with self._lock:
             if self._fresh_generation_job and self._fresh_generation_job["running"]:
                 raise ValueError("READY JSON generation is already running")
@@ -2866,14 +2877,15 @@ class PanelController:
             self._fresh_generation_job = job
         thread_payload = {
             "analysis_run_id": analysis_id,
-            "candidate_ids": list(candidates),
             "selected_scopes": [list(item) for item in scopes],
-            "filters": phase2_filters,
-            "pretest_ab_enabled": pretest_ab_enabled,
+            "pretest_ab_enabled": options[0],
+            "ladder_enabled": options[1],
+            "pareto_enabled": options[2],
+            "filter_version": "shortlist-v2",
+            "selection_token": evaluation.selection_token,
+            "_shortlist_prepared": prepared,
+            "_shortlist_evaluation": evaluation,
         }
-        requested = payload.get("output_dir")
-        if isinstance(requested, str):
-            thread_payload["output_dir"] = requested
         thread = threading.Thread(
             target=self._run_fresh_strategy_generation,
             args=(job, thread_payload),
@@ -2891,7 +2903,8 @@ class PanelController:
 
     def strategies_fresh_generate_runs(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Publish the selected filtered candidates as tester run snapshots."""
-        if set(payload).difference({"analysis_run_id", "filters", "pretest_ab_enabled", "selected_scopes", "start_date", "end_date"}):
+        options = self._fresh_shortlist_options(payload)
+        if set(payload).difference({"analysis_run_id", "filter_version", "filters", "pretest_ab_enabled", "ladder_enabled", "pareto_enabled", "selection_token", "selected_scopes", "start_date", "end_date"}):
             raise ValueError("tester run request contains unsupported fields")
         scopes = payload.get("selected_scopes")
         if not isinstance(scopes, list) or not all(
@@ -2906,20 +2919,14 @@ class PanelController:
         analysis_path = self._fresh_analysis_paths.get(analysis_id)
         if analysis_path is None:
             raise ValueError("fresh analysis is not available in this panel session")
-        analysis_identity = read_fresh_analysis_identity(analysis_path)
-        selected = {(pair, side.upper(), timeframe) for pair, side, timeframe in scopes}
-        pretest_ab_enabled = self._pretest_ab_enabled(payload)
-        filtered = filter_fresh_analysis_candidates(
-            analysis_path, analysis_id, self._phase2_filters(payload),
-            pretest_ab_enabled=pretest_ab_enabled,
+        prepared, evaluation = self._verified_fresh_shortlist(analysis_path, analysis_id, options, payload)
+        scopes, selected_ids = self._selected_fresh_ready(
+            prepared, evaluation, scopes, require_one_side=False,
         )
-        structures = sorted(
-            (row for row in filtered.rows if row.get("filter_status") == "READY_AFTER_FILTERS" and
-             (str(row.get("symbol", "")), str(row.get("side", "")).upper(), str(row.get("timeframe", ""))) in selected),
-            key=lambda row: str(row["candidate_id"]),
+        manifest, _points, structures = load_fresh_ready_candidates(
+            analysis_path, analysis_id, selected_ids, scopes,
+            expected_artifact_sha256=evaluation.artifact_sha256,
         )
-        if not structures:
-            raise ValueError("no READY candidates match the selected scopes")
         runner = RunnerConfig.from_json(self.default_config)
         with TesterTargetLock(runner.bot_root):
             result = publish_run_snapshots(
@@ -2927,8 +2934,12 @@ class PanelController:
                 start_date, end_date, runner.max_parallel_submissions, self._analysis_config_loader(self.default_config),
                 analysis_run_id=analysis_id,
                 tester_config_template=mrs3_tester_config_template(self.root),
-                pretest_ab_provenance=self._pretest_ab_provenance(pretest_ab_enabled),
-                analysis_input_digest=analysis_identity.get("analysis_input_digest"),
+                pretest_ab_provenance=self._pretest_ab_provenance(options[0]),
+                analysis_input_digest=manifest.get("analysis_input_digest"),
+                shortlist_provenance=self._fresh_shortlist_provenance(evaluation, selected_ids),
+                before_publish=lambda: self._assert_fresh_analysis_digest(
+                    analysis_path, evaluation.artifact_sha256,
+                ),
             )
         return {"phase": "COMMITTED", "analysis_run_id": analysis_id, **result}
 
@@ -2949,41 +2960,73 @@ class PanelController:
             return dict(self._fresh_generation_job)
 
     def _generate_fresh_strategies(self, payload: Mapping[str, object]) -> dict[str, object]:
-        candidates = payload["candidate_ids"]
+        options = self._fresh_shortlist_options(payload)
         scopes = payload["selected_scopes"]
-        assert isinstance(candidates, list)
         assert isinstance(scopes, list)
-        scope_sides = {str(item[1]).upper() for item in scopes}
-        config = self._analysis_config_loader(self.default_config)
         analysis_id = self._required(payload, "analysis_run_id")
         analysis_path = self._fresh_analysis_paths.get(analysis_id)
-        output_dir = self.root / "Output"
-        result = generate_fresh_analysis_strategies(
-            analysis_path,
-            analysis_id,
-            candidates,
-            [tuple(item) for item in scopes],
-            self._workflow_default("strategy_templates", side=next(iter(scope_sides))),
-            output_dir,
-            config,
-            surface_path=self._fresh_analysis_surfaces.get(analysis_id),
-            filters=payload.get("filters"),
-            pretest_ab_enabled=self._pretest_ab_enabled(payload),
+        if analysis_path is None:
+            raise ValueError("fresh analysis is not available in this panel session")
+        prepared = payload.get("_shortlist_prepared")
+        evaluation = payload.get("_shortlist_evaluation")
+        if prepared is None or evaluation is None:
+            prepared, evaluation = self._verified_fresh_shortlist(analysis_path, analysis_id, options, payload)
+        if payload.get("selection_token") != evaluation.selection_token:
+            raise ValueError("STALE_SHORTLIST_SELECTION")
+        scopes, selected_ids = self._selected_fresh_ready(
+            prepared, evaluation, scopes, require_one_side=True,
         )
-        self._fresh_strategy_manifests[analysis_id] = result.manifest_path
+        scope_sides = {scope[1] for scope in scopes}
+        config = self._analysis_config_loader(self.default_config)
+        output_root = self.root / "Output" / "fresh-shortlist-v2" / analysis_id
+        output_root.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".stage-", dir=output_root))
+        final = output_root / f"{evaluation.selection_token}-{uuid.uuid4().hex}"
+        try:
+            result = generate_fresh_analysis_strategies(
+                analysis_path,
+                analysis_id,
+                selected_ids,
+                scopes,
+                self._workflow_default("strategy_templates", side=next(iter(scope_sides))),
+                staging,
+                config,
+                surface_path=self._fresh_analysis_surfaces.get(analysis_id),
+                pretest_ab_enabled=options[0],
+                selection=evaluation,
+            )
+            self._assert_fresh_analysis_digest(analysis_path, evaluation.artifact_sha256)
+            staging.replace(final)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+        manifest_path = final / "strategy_manifest.json"
+        self._fresh_strategy_manifests[analysis_id] = manifest_path
         return {
             "phase": "COMMITTED",
             "analysis_run_id": result.run_id,
             "surface_id": result.surface_id,
             "strategy_count": result.strategy_count,
-            "manifest": result.manifest_path.name,
-            "output_dir": str(result.manifest_path.parent),
+            "manifest": manifest_path.name,
+            "output_dir": str(final),
         }
 
     def _fresh_strategy_manifest(self, analysis_id: str | None = None) -> Path:
         candidates = []
         if analysis_id and analysis_id in self._fresh_strategy_manifests:
             candidates.append(self._fresh_strategy_manifests[analysis_id])
+        generated_root = self.root / "Output" / "fresh-shortlist-v2"
+        try:
+            generated = [
+                path for path in generated_root.glob("*/*/strategy_manifest.json")
+                if path.is_file() and not path.is_symlink()
+                and not path.parent.is_symlink()
+                and re.fullmatch(r"[0-9a-f]{64}-[0-9a-f]{32}", path.parent.name)
+                and (analysis_id is None or path.parent.parent.name == analysis_id)
+            ]
+            candidates.extend(sorted(generated, key=lambda path: path.stat().st_mtime_ns, reverse=True))
+        except OSError:
+            pass
         candidates.extend((
             self.root / "Output" / "strategy_manifest.json",
             self.root / "Output" / "strategies" / "strategy_manifest.json",
@@ -3082,47 +3125,150 @@ class PanelController:
         }
 
     def strategies_fresh_shortlist(self, payload: Mapping[str, object]) -> dict[str, object]:
+        options = self._fresh_shortlist_options(payload)
         analysis_id = self._required(payload, "analysis_run_id")
         path = self._fresh_analysis_paths.get(analysis_id)
         if path is None:
             raise ValueError("fresh analysis is not available in this panel session")
+        prepared, evaluation = self._evaluate_fresh_shortlist_snapshot(path, analysis_id, options)
         if payload.get("audit") is True:
-            from .fresh_analysis_strategies import filter_fresh_analysis_candidates
-            output = self.root / "Output" / f"{analysis_id}.phase2-filter-audit.xlsx"
-            pretest_ab_enabled = self._pretest_ab_enabled(payload)
-            filtered = filter_fresh_analysis_candidates(
-                path, analysis_id, self._phase2_filters(payload),
-                pretest_ab_enabled=pretest_ab_enabled,
-            )
-            export_fresh_filter_audit(filtered, output)
+            self._require_fresh_selection_token(payload, evaluation)
+            output = self.root / "Output" / f"{analysis_id}.shortlist-v2.{evaluation.selection_token}.xlsx"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            staged = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.pending.xlsx")
+            try:
+                export_fresh_shortlist_audit(prepared, evaluation, staged)
+                self._assert_fresh_analysis_digest(path, evaluation.artifact_sha256)
+                staged.replace(output)
+            finally:
+                staged.unlink(missing_ok=True)
             return {"filename": output.name}
-        return list_fresh_analysis_shortlist(
-            path, analysis_id, self._phase2_filters(payload),
-            pretest_ab_enabled=self._pretest_ab_enabled(payload),
-        )
+        return fresh_shortlist_response(prepared, evaluation)
 
     def strategies_fresh_filter_audit(self, payload: Mapping[str, object]) -> dict[str, object]:
+        options = self._fresh_shortlist_options(payload)
         analysis_id = self._required(payload, "analysis_run_id")
         path = self._fresh_analysis_paths.get(analysis_id)
         if path is None:
             raise ValueError("fresh analysis is not available in this panel session")
-        from .fresh_analysis_strategies import filter_fresh_analysis_candidates
-        output = self.root / "Output" / f"{analysis_id}.phase2-filter-audit.xlsx"
-        pretest_ab_enabled = self._pretest_ab_enabled(payload)
-        filtered = filter_fresh_analysis_candidates(
-            path, analysis_id, self._phase2_filters(payload),
-            pretest_ab_enabled=pretest_ab_enabled,
-        )
-        export_fresh_filter_audit(filtered, output)
+        prepared, evaluation = self._verified_fresh_shortlist(path, analysis_id, options, payload)
+        output = self.root / "Output" / f"{analysis_id}.shortlist-v2.{evaluation.selection_token}.xlsx"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        staged = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.pending.xlsx")
+        try:
+            export_fresh_shortlist_audit(prepared, evaluation, staged)
+            self._assert_fresh_analysis_digest(path, evaluation.artifact_sha256)
+            staged.replace(output)
+        finally:
+            staged.unlink(missing_ok=True)
         return {"filename": output.name}
 
     @staticmethod
-    def _phase2_filters(payload: Mapping[str, object]) -> dict[str, bool]:
-        names = ("source_pnl", "efficiency", "close_support", "point_event_count")
-        filters = payload.get("filters", {name: payload.get(name, False) for name in names})
-        if not isinstance(filters, Mapping) or set(filters).difference(names) or any(type(filters.get(name, False)) is not bool for name in filters):
+    def _fresh_shortlist_options(payload: Mapping[str, object]) -> tuple[bool, bool, bool]:
+        """Normalize the fresh-only filter API and reject ambiguous old controls."""
+        legacy_names = ("source_pnl", "efficiency", "close_support", "point_event_count")
+        legacy_values: list[object] = []
+        if "filters" in payload:
+            filters = payload["filters"]
+            if not isinstance(filters, Mapping) or set(filters).difference(legacy_names):
+                raise ValueError("filters must contain only recognized legacy booleans")
+            legacy_values.extend(filters.values())
+        legacy_values.extend(payload[name] for name in legacy_names if name in payload)
+        if any(type(value) is not bool for value in legacy_values):
             raise ValueError("Phase 2 filters must be booleans")
-        return {name: bool(filters.get(name, False)) for name in names}
+
+        flag_names = ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled")
+        flags = []
+        for name in flag_names:
+            value = payload.get(name, False)
+            if type(value) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+            flags.append(value)
+
+        version_present = "filter_version" in payload
+        if version_present and payload["filter_version"] != "shortlist-v2":
+            raise ValueError("unsupported filter_version; expected shortlist-v2")
+        if any(legacy_values):
+            raise ValueError("stale shortlist client; send filter_version=shortlist-v2 and use the v2 flags")
+        if not version_present and any(name in payload for name in flag_names[1:]):
+            raise ValueError("stale shortlist client; send filter_version=shortlist-v2")
+        return flags[0], flags[1], flags[2]
+
+    def _evaluate_fresh_shortlist_snapshot(
+        self, path: Path, analysis_id: str, options: tuple[bool, bool, bool],
+    ) -> tuple[object, object]:
+        """Prepare and evaluate through the single content-bound executor."""
+        return self._fresh_shortlist_executor.evaluate_with_prepared(
+            path,
+            analysis_id,
+            options,
+            workers=self._import_settings().workers,
+        )
+
+    def _verified_fresh_shortlist(
+        self, path: Path, analysis_id: str, options: tuple[bool, bool, bool], payload: Mapping[str, object],
+    ) -> tuple[object, object]:
+        prepared, evaluation = self._evaluate_fresh_shortlist_snapshot(path, analysis_id, options)
+        self._require_fresh_selection_token(payload, evaluation)
+        return prepared, evaluation
+
+    @staticmethod
+    def _require_fresh_selection_token(payload: Mapping[str, object], evaluation: object) -> None:
+        token = payload.get("selection_token")
+        if not isinstance(token, str) or token != evaluation.selection_token:
+            raise ValueError("STALE_SHORTLIST_SELECTION")
+
+    @staticmethod
+    def _selected_fresh_ready(
+        prepared: object,
+        evaluation: object,
+        requested_scopes: Sequence[object],
+        *,
+        require_one_side: bool,
+    ) -> tuple[tuple[tuple[str, str, str], ...], tuple[str, ...]]:
+        from .analysis_strategies import normalize_analysis_scopes
+
+        if not requested_scopes:
+            raise ValueError("EMPTY_READY_SELECTION")
+        scopes = normalize_analysis_scopes(requested_scopes)
+        groups = {group.scope_key for group in evaluation.groups}
+        if any("|".join(scope) not in groups for scope in scopes):
+            raise ValueError("selected scope is absent from shortlist")
+        if require_one_side and len({scope[1] for scope in scopes}) != 1:
+            raise ValueError("fresh strategy generation requires one side per batch")
+        scope_keys = {"|".join(scope) for scope in scopes}
+        ready_ids = tuple(sorted(
+            item.candidate_id for item in evaluation.candidates
+            if item.filter_status == "READY_AFTER_FILTERS" and item.scope_key in scope_keys
+        ))
+        if not ready_ids:
+            raise ValueError("EMPTY_READY_SELECTION")
+        prepared_scopes = {fact.scope_key for fact in prepared.scopes}
+        if not scope_keys.issubset(prepared_scopes):
+            raise ValueError("selected scope is absent from shortlist")
+        return scopes, ready_ids
+
+    @staticmethod
+    def _assert_fresh_analysis_digest(path: Path, expected_digest: str) -> None:
+        from .fresh_analysis_strategies import _file_digest
+
+        if _file_digest(path) != expected_digest:
+            raise ValueError("STALE_SHORTLIST_SELECTION")
+
+    @staticmethod
+    def _fresh_shortlist_provenance(evaluation: object, selected_ids: Sequence[str]) -> dict[str, object]:
+        return {
+            "filter_version": evaluation.filter_version,
+            "filter_engine_version": evaluation.filter_engine_version,
+            "selection_token": evaluation.selection_token,
+            "artifact_sha256": evaluation.artifact_sha256,
+            "applied_options": dict(zip(
+                ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled"),
+                evaluation.options,
+                strict=True,
+            )),
+            "selected_candidate_ids": list(selected_ids),
+        }
 
     @staticmethod
     def _pretest_ab_enabled(payload: Mapping[str, object]) -> bool:
@@ -7752,7 +7898,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
-    def _headers(self, status: int, content_type: str, length: int) -> None:
+    def _headers(
+        self, status: int, content_type: str, length: int,
+        extra_headers: Mapping[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
@@ -7763,11 +7912,15 @@ class _PanelHandler(BaseHTTPRequestHandler):
             "Content-Security-Policy",
             "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
         )
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
 
-    def _json(self, status: int, value: object) -> None:
+    def _json(
+        self, status: int, value: object, *, headers: Mapping[str, str] | None = None,
+    ) -> None:
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
-        self._headers(status, "application/json; charset=utf-8", len(payload))
+        self._headers(status, "application/json; charset=utf-8", len(payload), headers)
         self.wfile.write(payload)
 
     def _export_json(self, status: int, value: object, *, body: bool = True) -> None:
@@ -8566,6 +8719,13 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         except PerformanceV2ApiError as error:
             self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+            return
+        except ShortlistBusyError:
+            self._json(
+                409,
+                {"error": {"code": "SHORTLIST_BUSY", "message": "SHORTLIST_BUSY"}},
+                headers={"Retry-After": "1"},
+            )
             return
         except RuntimeError as error:
             self._json(409, {"error": _fresh_generation_error(error)} if endpoint == "/api/v2/strategies/fresh/generate" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))

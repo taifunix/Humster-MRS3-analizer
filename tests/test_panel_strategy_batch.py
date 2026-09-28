@@ -73,6 +73,7 @@ def test_validate_strategy_manifest_recomputes_generation_and_exact_strategy_has
     assert validated.strategy_source == (tmp_path / "strategies").resolve()
     assert len(str(validated.provenance["generation_manifest_sha256"])) == 64
     assert set(validated.provenance["strategy_json_sha256"]) == {"S0.json"}
+    assert "generator_schema_version" not in validated.provenance
 
 
 def test_validate_strategy_manifest_rejects_changed_json_bytes(tmp_path: Path) -> None:

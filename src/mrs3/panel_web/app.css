@@ -237,10 +237,7 @@ tbody th { font-weight: 750; }
 .shortlist-table th:nth-child(n+4):nth-child(-n+11), .shortlist-table td:nth-child(n+4):nth-child(-n+11) { width: 62px; text-align: right; }
 .shortlist-table th:nth-child(12), .shortlist-table td:nth-child(12) { width: 100px; }
 
-.phase2-filters { margin-top: 14px; }
-.phase2-filters > summary { display: block; margin-bottom: 12px; font-size: .94rem; font-weight: 700; pointer-events: none; }
-.phase2-filters > summary::after { display: none; }
-.phase2-filters .check { display: flex; margin: 0 0 9px; }
+.shortlist-filter-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin: 12px 0; }
 #shortlist-summary { display: none; }
 
 .performance-v2-strategy-details { margin: -2px 0 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fbfcfe; color: var(--muted); font-size: .78rem; }

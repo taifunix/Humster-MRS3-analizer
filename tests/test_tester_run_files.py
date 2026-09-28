@@ -64,6 +64,58 @@ def test_publish_run_snapshots_configures_empty_runs_directory(tmp_path: Path) -
     assert files[0].read_bytes() == original
 
 
+def test_shortlist_digest_failure_leaves_existing_run_publication_untouched(tmp_path: Path) -> None:
+    template = tmp_path / "run_snapshot.json"
+    template.write_text(json.dumps({
+        "settings": [{
+            "name": "template",
+            "basic": {"strategy": "mrs3", "symbol": "OLD", "time_frame": "5m", "use_long": True, "use_short": False},
+            "mrs3": {
+                "ma_long": [{"id": 1, "len": 1, "multiplier": 1.0, "lot_x": 0.0}], "ma_short": [],
+                "ma_close_long": {"len": 1, "multiplier": 1.0}, "ma_close_short": {"len": 1, "multiplier": 1.0},
+            },
+        }],
+        "tester_config": {},
+    }), encoding="utf-8")
+    bot_root = tmp_path / "bot"
+    tester = bot_root / "tester"
+    tester.mkdir(parents=True)
+    runs = tester / "runs"
+    tester_config = tester / "config_tester.json"
+    tester_config.write_text('{"use_runs": false}', encoding="utf-8")
+    structure = {
+        "candidate_id": "CANDIDATE", "structure_id": "STR", "symbol": "BTCUSDT", "side": "LONG",
+        "timeframe": "1h", "order_count": 1, "common_close_ma": 7,
+        "orders": ({"point_id": "P", "plateau_id": "PLAT", "open_ma": 5, "shift_bp": 100, "close_support": 1.0, "source_pnl_pct": 10},),
+    }
+    shortlist = {
+        "filter_version": "shortlist-v2", "filter_engine_version": "engine-1",
+        "selection_token": "a" * 64, "artifact_sha256": "b" * 64,
+        "applied_options": {"pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False},
+        "selected_candidate_ids": ["CANDIDATE"],
+    }
+    publish_run_snapshots(
+        template, bot_root, tester_config, [structure], "2026-08-01", "2026-08-18", 1,
+        AlgorithmConfig.defaults(), analysis_run_id="a" * 64, shortlist_provenance=shortlist,
+    )
+    before = {
+        path.name: path.read_bytes() for path in (*runs.iterdir(), tester_config, tester / "runs_manifest.json")
+    }
+
+    with pytest.raises(ValueError, match="STALE_SHORTLIST_SELECTION"):
+        publish_run_snapshots(
+            template, bot_root, tester_config, [structure], "2026-09-01", "2026-09-18", 2,
+            AlgorithmConfig.defaults(), analysis_run_id="c" * 64,
+            shortlist_provenance=shortlist,
+            before_publish=lambda: (_ for _ in ()).throw(ValueError("STALE_SHORTLIST_SELECTION")),
+        )
+
+    after = {
+        path.name: path.read_bytes() for path in (*runs.iterdir(), tester_config, tester / "runs_manifest.json")
+    }
+    assert after == before
+
+
 def test_publish_run_snapshots_rejects_unowned_existing_file(tmp_path: Path) -> None:
     template = tmp_path / "run_snapshot.json"
     template.write_text(json.dumps({"settings": [{}], "tester_config": {}}), encoding="utf-8")

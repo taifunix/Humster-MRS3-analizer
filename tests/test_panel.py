@@ -5,6 +5,7 @@ from html.parser import HTMLParser
 import hashlib
 import io
 import json
+import re
 import tomllib
 from dataclasses import replace
 from pathlib import Path
@@ -255,8 +256,11 @@ def test_static_panel_shell_contains_only_navigation_contract() -> None:
         assert label in html
     for excluded in ("Artefacts", "CSV", "DUCKDB_DIRECT", "credential", "password", "token"):
         assert excluded.casefold() not in html.casefold()
-    for excluded in ("Artefacts", "DUCKDB_DIRECT", "credential", "password", "token"):
+    for excluded in ("Artefacts", "DUCKDB_DIRECT", "credential", "password", "authorization", "bearer"):
         assert excluded.casefold() not in script.casefold()
+    token_identifiers = set(re.findall(r"\b[a-z_]*token\b", script.casefold()))
+    # The content-bound shortlist identifier is not an authentication token.
+    assert token_identifiers <= {"selection_token"}
     assert "/api/v2/" in script
     assert "/api/ui/" not in script
     assert "/api/duckdb" not in script

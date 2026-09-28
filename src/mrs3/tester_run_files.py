@@ -8,7 +8,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .config import AlgorithmConfig
 from .lots import LotMethod, allocate_lots
@@ -158,6 +158,8 @@ def publish_run_snapshots(
     tester_config_template: Path | str | None = None,
     pretest_ab_provenance: Mapping[str, object] | None = None,
     analysis_input_digest: str | None = None,
+    shortlist_provenance: Mapping[str, object] | None = None,
+    before_publish: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Replace the exact tester runs directory with all selected snapshots."""
     if not structures:
@@ -170,6 +172,26 @@ def publish_run_snapshots(
         or any(char not in "0123456789abcdef" for char in analysis_input_digest.lower())
     ):
         raise ValueError("analysis_input_digest must be a SHA-256 hash")
+    if shortlist_provenance is not None:
+        token = shortlist_provenance.get("selection_token")
+        artifact_digest = shortlist_provenance.get("artifact_sha256")
+        selected_ids = shortlist_provenance.get("selected_candidate_ids")
+        options = shortlist_provenance.get("applied_options")
+        if (
+            shortlist_provenance.get("filter_version") != "shortlist-v2"
+            or not isinstance(shortlist_provenance.get("filter_engine_version"), str)
+            or not isinstance(token, str) or len(token) != 64
+            or any(char not in "0123456789abcdef" for char in token)
+            or not isinstance(artifact_digest, str) or len(artifact_digest) != 64
+            or any(char not in "0123456789abcdef" for char in artifact_digest)
+            or not isinstance(selected_ids, list) or not selected_ids
+            or not all(isinstance(item, str) and item for item in selected_ids)
+            or selected_ids != sorted(set(selected_ids))
+            or not isinstance(options, Mapping)
+            or set(options) != {"pretest_ab_enabled", "ladder_enabled", "pareto_enabled"}
+            or any(type(value) is not bool for value in options.values())
+        ):
+            raise ValueError("shortlist provenance is invalid")
     root = Path(bot_root).resolve()
     runs = _inside(root / "tester" / "runs", root, "tester runs directory")
     tester_config = _inside(Path(tester_config_path), root, "tester config")
@@ -194,6 +216,8 @@ def publish_run_snapshots(
     rendered = [render_run_snapshot(template_path, row, start_date, end_date, max_parallel_runs, config) for row in structures]
     if len({name for name, _ in rendered}) != len(rendered):
         raise ValueError("READY candidates must have unique strategy names")
+    if before_publish is not None:
+        before_publish()
     for path in owned_previous:
         path.unlink()
     config_document.update({
@@ -231,6 +255,8 @@ def publish_run_snapshots(
         unsigned["pretest_ab"] = dict(pretest_ab_provenance)
     if analysis_input_digest is not None:
         unsigned["analysis_input_digest"] = analysis_input_digest
+    if shortlist_provenance is not None:
+        unsigned["shortlist_v2"] = dict(shortlist_provenance)
     manifest = {**unsigned, "generation_manifest_sha256": _digest(unsigned)}
     _write_json(_inside(root / "tester" / "runs_manifest.json", root, "tester runs manifest"), manifest)
     return {"run_count": len(names), "run_names": names}
