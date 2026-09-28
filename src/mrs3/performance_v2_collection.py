@@ -190,9 +190,24 @@ def build_single_mode_collection_inbox(
         staging = Path(tempfile.mkdtemp(prefix=f".{collection_id}.", dir=root))
         try:
             (staging / "inbox_manifest.json").write_bytes(_canonical_json(document))
-            staging.rename(target)
+            # Directory creation is the no-replace publication primitive.  A
+            # creator that does not participate in the claim protocol can win
+            # this mkdir race, but can never be replaced by us.
+            target.mkdir()
+        except FileExistsError as error:
+            raise PerformanceV2InputError("collection inbox already exists") from error
         except OSError as error:
             raise PerformanceV2InputError("could not atomically publish collection inbox") from error
+        try:
+            (staging / "inbox_manifest.json").rename(target / "inbox_manifest.json")
+        except OSError as error:
+            # Only remove an empty directory.  If another writer populated it,
+            # leave the foreign target untouched.
+            try:
+                target.rmdir()
+            except OSError:
+                pass
+            raise PerformanceV2InputError("could not atomically publish collection manifest") from error
         return target
     except BaseException:
         # A failed validation must never leave a partially published inbox.

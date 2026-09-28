@@ -322,3 +322,32 @@ def test_collection_race_does_not_replace_target(tmp_path: Path, monkeypatch: py
             report_root=report_root, trusted_strategy_root=strategy_root,
         )
     assert (target / "owner-marker").read_text(encoding="ascii") == "winner"
+
+
+def test_collection_empty_target_race_is_rejected_without_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    member, report_root, strategy_root = _member(
+        tmp_path / "member", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64
+    )
+    root = tmp_path / "collections"
+    target = root / "collection-1"
+    original_mkdir = Path.mkdir
+    injected = False
+
+    def race_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal injected
+        if path == target and not injected:
+            injected = True
+            original_mkdir(path, *args, **kwargs)
+            raise FileExistsError(str(path))
+        original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", race_mkdir)
+    with pytest.raises(PerformanceV2InputError, match="already exists|publication"):
+        build_single_mode_collection_inbox(
+            root, "collection-1", [member],
+            report_root=report_root, trusted_strategy_root=strategy_root,
+        )
+    assert target.is_dir()
+    assert not (target / "inbox_manifest.json").exists()
