@@ -42,8 +42,18 @@ def _strategy(name: str) -> dict[str, object]:
     }
 
 
-def _member(tmp_path: Path, name: str, *, start: str, end: str, taker: str, run_id: str) -> tuple[Path, Path, Path]:
-    strategy_root = tmp_path.parent / "strategies"
+def _member(
+    tmp_path: Path,
+    name: str,
+    *,
+    start: str,
+    end: str,
+    taker: str,
+    run_id: str,
+    isolated_strategy: bool = False,
+    report_name: str | None = None,
+) -> tuple[Path, Path, Path]:
+    strategy_root = (tmp_path / "strategies") if isolated_strategy else (tmp_path.parent / "strategies")
     strategy_root.mkdir(parents=True, exist_ok=True)
     strategy = _strategy(name)
     strategy_bytes = json.dumps(strategy, separators=(",", ":")).encode()
@@ -51,7 +61,7 @@ def _member(tmp_path: Path, name: str, *, start: str, end: str, taker: str, run_
     strategy_path.write_bytes(strategy_bytes)
     report_root = tmp_path.parent / "reports"
     report_root.mkdir(parents=True, exist_ok=True)
-    report_path = report_root / f"{name}.html"
+    report_path = report_root / f"{report_name or name}.html"
     report_path.write_bytes(f"<html>{name}</html>".encode())
 
     strategy_id = sha256(
@@ -208,3 +218,107 @@ def test_collection_rejects_unsafe_member_snapshot(tmp_path: Path, case: str) ->
             tmp_path / "collections", "collection-1", [first, second],
             report_root=report_root, trusted_strategy_root=strategy_root,
         )
+
+
+def test_collection_rejects_missing_member_report(tmp_path: Path) -> None:
+    member, report_root, strategy_root = _member(
+        tmp_path / "member", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64
+    )
+    (report_root / "alpha.html").unlink()
+
+    with pytest.raises(PerformanceV2InputError, match="report path|report artifact"):
+        build_single_mode_collection_inbox(
+            tmp_path / "collections", "collection-1", [member],
+            report_root=report_root, trusted_strategy_root=strategy_root,
+        )
+
+
+def test_collection_rejects_duplicate_member_path(tmp_path: Path) -> None:
+    member, report_root, strategy_root = _member(
+        tmp_path / "member", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64
+    )
+
+    with pytest.raises(PerformanceV2InputError, match="duplicate member"):
+        build_single_mode_collection_inbox(
+            tmp_path / "collections", "collection-1", [member, member],
+            report_root=report_root, trusted_strategy_root=strategy_root,
+        )
+
+
+@pytest.mark.parametrize("collection_id", ["", ".", "..", "nested/id", "C:collection"])
+def test_collection_rejects_unsafe_collection_id(tmp_path: Path, collection_id: str) -> None:
+    member, report_root, strategy_root = _member(
+        tmp_path / "member", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64
+    )
+
+    with pytest.raises(PerformanceV2InputError, match="collection ID"):
+        build_single_mode_collection_inbox(
+            tmp_path / "collections", collection_id, [member],
+            report_root=report_root, trusted_strategy_root=strategy_root,
+        )
+
+
+def test_collection_strategy_names_are_unique_case_insensitively(tmp_path: Path) -> None:
+    first, report_root, strategy_root = _member(
+        tmp_path / "first", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64,
+        isolated_strategy=True,
+    )
+    second, _, _ = _member(
+        tmp_path / "second", "Alpha", start="2026-02-01", end="2026-02-08", taker="0.0007", run_id="b" * 64,
+        isolated_strategy=True,
+        report_name="alpha-other",
+    )
+
+    with pytest.raises(PerformanceV2InputError, match="duplicate strategy"):
+        build_single_mode_collection_inbox(
+            tmp_path / "collections", "collection-1", [first, second],
+            report_root=report_root, trusted_strategy_root=tmp_path,
+        )
+
+
+def test_collection_claim_collision_fails_closed_without_clobbering(tmp_path: Path) -> None:
+    member, report_root, strategy_root = _member(
+        tmp_path / "member", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64
+    )
+    root = tmp_path / "collections"
+    root.mkdir()
+    claim = root / ".collection-1.claim"
+    claim.mkdir()
+    marker = claim / "owner-marker"
+    marker.write_text("other-owner", encoding="ascii")
+
+    with pytest.raises(PerformanceV2InputError, match="claim|busy|publication"):
+        build_single_mode_collection_inbox(
+            root, "collection-1", [member],
+            report_root=report_root, trusted_strategy_root=strategy_root,
+        )
+    assert marker.read_text(encoding="ascii") == "other-owner"
+    assert not (root / "collection-1").exists()
+
+
+def test_collection_race_does_not_replace_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    member, report_root, strategy_root = _member(
+        tmp_path / "member", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64
+    )
+    root = tmp_path / "collections"
+    target = root / "collection-1"
+    original_exists = Path.exists
+    injected = False
+
+    def race_exists(path: Path) -> bool:
+        nonlocal injected
+        result = original_exists(path)
+        if path == target and not injected:
+            injected = True
+            target.mkdir(parents=True)
+            (target / "owner-marker").write_text("winner", encoding="ascii")
+            return False
+        return result
+
+    monkeypatch.setattr(Path, "exists", race_exists)
+    with pytest.raises(PerformanceV2InputError):
+        build_single_mode_collection_inbox(
+            root, "collection-1", [member],
+            report_root=report_root, trusted_strategy_root=strategy_root,
+        )
+    assert (target / "owner-marker").read_text(encoding="ascii") == "winner"

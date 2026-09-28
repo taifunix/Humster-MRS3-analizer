@@ -64,6 +64,18 @@ def _entry_diagnostics(prepared_entry: object, manifest: dict[str, object]) -> o
     return _candidate_diagnostic(manifest, candidate)
 
 
+def _claim_collection(root: Path, collection_id: str) -> Path:
+    """Claim one collection ID with an exclusive directory create."""
+    claim = root / f".{collection_id}.claim"
+    try:
+        claim.mkdir()
+    except FileExistsError as error:
+        raise PerformanceV2InputError("collection publication claim is busy") from error
+    except OSError as error:
+        raise PerformanceV2InputError("could not claim collection publication") from error
+    return claim
+
+
 def build_single_mode_collection_inbox(
     inbox_root: Path,
     collection_id: str,
@@ -85,9 +97,7 @@ def build_single_mode_collection_inbox(
         raise PerformanceV2InputError("collection inbox root is unsafe")
     root.mkdir(parents=True, exist_ok=True)
     root = root.resolve()
-    target = root / collection_id
-    if target.exists():
-        raise PerformanceV2InputError("collection inbox already exists")
+    claim = _claim_collection(root, collection_id)
 
     seen_members: set[Path] = set()
     seen_names: set[str] = set()
@@ -95,6 +105,9 @@ def build_single_mode_collection_inbox(
     entries: list[dict[str, object]] = []
     members: list[dict[str, object]] = []
     try:
+        target = root / collection_id
+        if target.exists():
+            raise PerformanceV2InputError("collection inbox already exists")
         for raw_member in member_inboxes:
             member = Path(raw_member)
             if member.is_symlink() or not member.is_dir():
@@ -128,7 +141,8 @@ def build_single_mode_collection_inbox(
                     raise PerformanceV2InputError("member report artifact is unavailable") from error
                 if current_report_hash != prepared_entry.report_sha256:
                     raise PerformanceV2InputError("member report artifact hash mismatch")
-                if name in seen_names:
+                name_key = name.casefold()
+                if name_key in seen_names:
                     raise PerformanceV2InputError("duplicate strategy name in collection")
                 report_key = prepared_entry.report_path.name.casefold()
                 if report_key in seen_reports:
@@ -136,7 +150,7 @@ def build_single_mode_collection_inbox(
                 raw_entry = raw_by_name.get(name)
                 if raw_entry is None:
                     raise PerformanceV2InputError("member entry is missing from manifest")
-                seen_names.add(name)
+                seen_names.add(name_key)
                 seen_reports.add(report_key)
                 member_entry_names.append(name)
                 entry = dict(raw_entry)
@@ -185,6 +199,13 @@ def build_single_mode_collection_inbox(
         if "staging" in locals() and staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
         raise
+    finally:
+        try:
+            claim.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise PerformanceV2InputError("could not release collection publication claim") from error
 
 
 __all__ = ["build_single_mode_collection_inbox"]
