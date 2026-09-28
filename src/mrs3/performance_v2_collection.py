@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import ctypes
+import errno
 import json
+import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 from typing import Sequence
 
@@ -74,6 +78,48 @@ def _claim_collection(root: Path, collection_id: str) -> Path:
     except OSError as error:
         raise PerformanceV2InputError("could not claim collection publication") from error
     return claim
+
+
+def _rename_noreplace_linux(source: Path, target: Path) -> None:
+    """Use Linux renameat2(RENAME_NOREPLACE), failing closed if unavailable."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (AttributeError, OSError) as error:
+        raise PerformanceV2InputError("atomic no-replace publication is unavailable") from error
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100, os.fsencode(source), -100, os.fsencode(target), 1  # AT_FDCWD, RENAME_NOREPLACE
+    )
+    if result == 0:
+        return
+    code = ctypes.get_errno()
+    if code == errno.EEXIST:
+        raise PerformanceV2InputError("collection inbox already exists")
+    if code in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
+        raise PerformanceV2InputError("atomic no-replace publication is unavailable")
+    raise PerformanceV2InputError("atomic no-replace publication failed") from OSError(code, os.strerror(code))
+
+
+def _rename_noreplace(source: Path, target: Path) -> None:
+    """Atomically rename a complete directory without replacing a target."""
+    source = Path(source)
+    target = Path(target)
+    if sys.platform.startswith("linux"):
+        _rename_noreplace_linux(source, target)
+        return
+    if sys.platform == "win32" and os.name == "nt":
+        # On Windows os.rename maps to MoveFileEx without
+        # MOVEFILE_REPLACE_EXISTING; an existing destination raises.
+        try:
+            os.rename(source, target)
+        except FileExistsError as error:
+            raise PerformanceV2InputError("collection inbox already exists") from error
+        except OSError as error:
+            raise PerformanceV2InputError("atomic no-replace publication failed") from error
+        return
+    raise PerformanceV2InputError("atomic no-replace publication is unavailable")
 
 
 def build_single_mode_collection_inbox(
@@ -188,26 +234,8 @@ def build_single_mode_collection_inbox(
             "entries": entries,
         }
         staging = Path(tempfile.mkdtemp(prefix=f".{collection_id}.", dir=root))
-        try:
-            (staging / "inbox_manifest.json").write_bytes(_canonical_json(document))
-            # Directory creation is the no-replace publication primitive.  A
-            # creator that does not participate in the claim protocol can win
-            # this mkdir race, but can never be replaced by us.
-            target.mkdir()
-        except FileExistsError as error:
-            raise PerformanceV2InputError("collection inbox already exists") from error
-        except OSError as error:
-            raise PerformanceV2InputError("could not atomically publish collection inbox") from error
-        try:
-            (staging / "inbox_manifest.json").rename(target / "inbox_manifest.json")
-        except OSError as error:
-            # Only remove an empty directory.  If another writer populated it,
-            # leave the foreign target untouched.
-            try:
-                target.rmdir()
-            except OSError:
-                pass
-            raise PerformanceV2InputError("could not atomically publish collection manifest") from error
+        (staging / "inbox_manifest.json").write_bytes(_canonical_json(document))
+        _rename_noreplace(staging, target)
         return target
     except BaseException:
         # A failed validation must never leave a partially published inbox.

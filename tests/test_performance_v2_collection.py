@@ -10,6 +10,7 @@ import pytest
 from mrs3.performance_v2_collection import build_single_mode_collection_inbox
 from mrs3.performance_v2_input import PerformanceV2InputError, read_performance_v2_inbox
 from mrs3.performance_v2_html import ParsedPerformanceV2Report
+import mrs3.performance_v2_collection as collection_module
 import mrs3.performance_v2_import as import_module
 
 
@@ -332,18 +333,17 @@ def test_collection_empty_target_race_is_rejected_without_replacement(
     )
     root = tmp_path / "collections"
     target = root / "collection-1"
-    original_mkdir = Path.mkdir
+    original_rename = collection_module._rename_noreplace
     injected = False
 
-    def race_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+    def race_rename(source: Path, destination: Path) -> None:
         nonlocal injected
-        if path == target and not injected:
+        if destination == target and not injected:
             injected = True
-            original_mkdir(path, *args, **kwargs)
-            raise FileExistsError(str(path))
-        original_mkdir(path, *args, **kwargs)
+            target.mkdir(parents=True)
+        original_rename(source, destination)
 
-    monkeypatch.setattr(Path, "mkdir", race_mkdir)
+    monkeypatch.setattr(collection_module, "_rename_noreplace", race_rename)
     with pytest.raises(PerformanceV2InputError, match="already exists|publication"):
         build_single_mode_collection_inbox(
             root, "collection-1", [member],
@@ -351,3 +351,68 @@ def test_collection_empty_target_race_is_rejected_without_replacement(
         )
     assert target.is_dir()
     assert not (target / "inbox_manifest.json").exists()
+
+
+def test_collection_publishes_complete_staged_directory_with_one_noreplace_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    member, report_root, strategy_root = _member(
+        tmp_path / "member", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64
+    )
+    original = collection_module._rename_noreplace
+    observed: dict[str, Path] = {}
+
+    def observe(source: Path, target: Path) -> None:
+        observed["source"] = source
+        observed["target"] = target
+        assert (source / "inbox_manifest.json").is_file()
+        assert not target.exists()
+        original(source, target)
+
+    monkeypatch.setattr(collection_module, "_rename_noreplace", observe)
+    published = build_single_mode_collection_inbox(
+        tmp_path / "collections", "collection-1", [member],
+        report_root=report_root, trusted_strategy_root=strategy_root,
+    )
+
+    assert observed["target"] == published
+    assert (published / "inbox_manifest.json").is_file()
+    assert not observed["source"].exists()
+
+
+def test_noreplace_helper_preserves_preexisting_empty_target(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "inbox_manifest.json").write_text("complete", encoding="ascii")
+    target = tmp_path / "target"
+    target.mkdir()
+
+    with pytest.raises(PerformanceV2InputError, match="already exists"):
+        collection_module._rename_noreplace(source, target)
+    assert target.is_dir()
+    assert not (target / "inbox_manifest.json").exists()
+    assert (source / "inbox_manifest.json").read_text(encoding="ascii") == "complete"
+
+
+def test_noreplace_helper_maps_collision_to_input_error(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+
+    with pytest.raises(PerformanceV2InputError, match="already exists"):
+        collection_module._rename_noreplace(source, target)
+
+
+def test_noreplace_helper_fails_closed_when_platform_is_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    target = tmp_path / "target"
+    monkeypatch.setattr(collection_module.sys, "platform", "unsupported-os")
+
+    with pytest.raises(PerformanceV2InputError, match="unavailable"):
+        collection_module._rename_noreplace(source, target)
+    assert source.is_dir()
+    assert not target.exists()
