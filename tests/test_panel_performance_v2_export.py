@@ -23,6 +23,7 @@ from mrs3.panel_performance_v2 import (
 from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_equity_cache import current_equity_source_metadata, upsert_equity_quality_facts_checked
 from mrs3.performance_v2_equity_quality import EquitySample, calculate_equity_quality_facts
+from mrs3.performance_v2_windows import METRICS_VERSION
 import mrs3.performance_v2_selection as selection_module
 
 
@@ -46,7 +47,7 @@ def _export_database(path: Path) -> tuple[Path, int]:
                    strategy_id, report_start_utc, report_end_utc, exchange, commission_rate,
                    initial_balance, final_balance, total_pnl, total_pnl_pct, max_drawdown,
                    max_drawdown_pct, total_fees, total_trades, imported_at_utc
-               ) values (?, ?, ?, 'Bybit', .0004, 100, 101, 1, 1, 0, 0, 0, 1, ?)
+               ) values (?, ?, ?, 'Bybit', .0004, 100, 101, 1, 1, 0, 0, 0, 777, ?)
                returning result_id""",
             [strategy_id, now, datetime(2026, 1, 9, tzinfo=UTC), now],
         ).fetchone()[0]
@@ -212,6 +213,92 @@ def test_read_only_export_includes_only_fresh_cached_equity_facts_without_writes
     assert sheet.cell(2, headers.index("RETEST") + 1).value == "RETEST"
     assert before_file == after_file
     assert before_catalog == after_catalog
+
+
+def test_read_only_export_uses_cached_completed_trades_and_blanks_cache_miss(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    database, strategy_id = _export_database(tmp_path / "strategy_performance.duckdb")
+    with duckdb.connect(str(database)) as connection:
+        result_id, report_start, report_end = connection.execute(
+            "select current_result_id, report_start_utc, report_end_utc from strategies "
+            "join strategy_results using (strategy_id) where strategies.strategy_id = ?", [strategy_id],
+        ).fetchone()
+        connection.execute(
+            """insert into window_metrics (
+                   result_id, requested_start_utc, requested_end_utc, metrics_version,
+                   availability_status, trade_count, calculated_at_utc
+               ) values (?, ?, ?, ?, 'AVAILABLE', 1, ?)""",
+            [result_id, report_start, report_end, METRICS_VERSION, datetime.now(UTC)],
+        )
+        second_strategy_id = connection.execute(
+            """insert into strategies (
+                   strategy_name, symbol, side, timeframe, close_ma_len, order_count,
+                   analysis_run_id, candidate_identity, lifecycle_status, created_at_utc, updated_at_utc
+               ) values ('beta', 'BTCUSDT', 'LONG', '1h', 3, 1, 'run-2', 'candidate-2', 'ACTIVE', ?, ?)
+               returning strategy_id""",
+            [report_start, report_start],
+        ).fetchone()[0]
+        second_result_id = connection.execute(
+            """insert into strategy_results (
+                   strategy_id, report_start_utc, report_end_utc, exchange, commission_rate,
+                   initial_balance, final_balance, total_pnl, total_pnl_pct, max_drawdown,
+                   max_drawdown_pct, total_fees, total_trades, imported_at_utc
+               ) values (?, ?, ?, 'Bybit', .0004, 100, 101, 1, 1, 0, 0, 0, 777, ?)
+               returning result_id""",
+            [second_strategy_id, report_start, report_end, report_start],
+        ).fetchone()[0]
+        connection.execute(
+            "update strategies set current_result_id = ? where strategy_id = ?",
+            [second_result_id, second_strategy_id],
+        )
+    for name in (
+        "_load_source", "_load_equity_samples_for_quality", "_persist",
+        "get_or_calculate_window", "get_or_calculate_window_pair",
+    ):
+        monkeypatch.setattr(
+            selection_module, name,
+            lambda *args, _name=name, **kwargs: (_ for _ in ()).throw(AssertionError(_name)),
+        )
+
+    def exported_trades() -> dict[int, object]:
+        _, payload = export_performance_v2(database, PerformanceV2ExportSelection(all_active=True))
+        sheet = load_workbook(BytesIO(payload), data_only=True)["All candidates"]
+        headers = [cell.value for cell in sheet[1]]
+        id_column = headers.index("ID") + 1
+        trades_column = headers.index("Trades") + 1
+        return {
+            sheet.cell(row, id_column).value: sheet.cell(row, trades_column).value
+            for row in range(2, sheet.max_row + 1)
+        }
+
+    before_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
+    assert exported_trades() == {strategy_id: 1, second_strategy_id: None}
+    after_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
+    assert before_file == after_file
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select total_trades from strategy_results where strategy_id = ?", [strategy_id]
+        ).fetchone()[0] == 777
+        assert connection.execute(
+            "select total_trades from strategy_results where strategy_id = ?", [second_strategy_id]
+        ).fetchone()[0] == 777
+
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("delete from window_metrics where result_id = ?", [result_id])
+    before_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
+    assert exported_trades() == {strategy_id: None, second_strategy_id: None}
+    after_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
+    assert before_file == after_file
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select total_trades from strategy_results where strategy_id = ?", [strategy_id]
+        ).fetchone()[0] == 777
+        assert connection.execute(
+            "select total_trades from strategy_results where strategy_id = ?", [second_strategy_id]
+        ).fetchone()[0] == 777
 
 
 def test_read_only_export_omits_invalid_cached_equity_facts_without_writes(tmp_path: Path, monkeypatch) -> None:

@@ -166,7 +166,7 @@ def _export_xlsx(
             "strategy_id": strategy_id, "strategy_name": row[1], "symbol": row[2], "side": row[3],
             "timeframe": row[4], "close_ma_len": row[5], "order_count": row[6], "result_id": row[25],
             "effective_start_utc": row[31], "effective_end_utc": row[32],
-            "max_drawdown_pct": row[40], "total_trades": row[42], "finalist": status in {"FINALIST", "RESERVE"},
+            "max_drawdown_pct": row[40], "finalist": status in {"FINALIST", "RESERVE"},
             "auto_status": status or "UNSELECTED", "auto_rank": rank, "final_rank": rank,
             "prior_retest": tagged, "elimination_reason": None,
         })

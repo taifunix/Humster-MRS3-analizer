@@ -28,6 +28,15 @@ keeps checkpoint, verified backup and sequential autocommit, and a forced
 partial delete restores prepared rows. A catalog-FK regression guards child
 coverage; prune tests passed 16, optimizer strict-preparation checks passed 2.
 Independent Opus 5/high re-review returned `CODE_REVIEW_PASS`; T2 is accepted.
+T3/COR-03 exports XLSX `Trades` from the ready completed-round-trip cache
+without overwriting it with raw `strategy_results.total_trades`. A real
+cache-only export with two strategies verifies cached 1 versus raw 777 and a
+blank cache miss in the same workbook; removing the cache leaves both blank.
+The database remains byte/time unchanged across read-only exports, with no
+source/window calculation or cache write. Export tests passed 8; adjacent Panel
+tests passed 122 with 4 skips. Independent Opus 5/high re-review returned
+`CODE_REVIEW_PASS`; T3 is accepted. Next core slice: MAT-02 materializer
+progress/queue correctness. Final integrated suite remains pending.
 T4/COR-05 preserves actual HTML action order and keeps strict final-balance
 validation based on the latest timestamp/source-index witness. Swapped HTML
 is rejected as ACTIONS_OUT_OF_ORDER while a valid sibling commits; equal-time

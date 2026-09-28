@@ -125,11 +125,16 @@ Full suite запускается один раз после интеграци�
   exact protected result IDs and backup/restore are pinned. An initialized-
   schema FK graph test guards coverage. Prune 16 passed, optimizer strict
   preparation 2 passed; independent Opus 5/high `CODE_REVIEW_PASS` round 2.
-- [ ] **COR-03 / B3 — XLSX Trades.**
+- [x] **COR-03 / B3 — XLSX Trades.**
   `src/mrs3/panel_performance_v2.py`, `tests/test_panel_performance_v2_export.py`.
   Только exported `Trades` берет completed-round-trip count из готового cache.
   Fixture: cached=1, raw total=777 → XLSX=1, raw остается777. Missing cache остается
   unavailable; export не рассчитывает окна и не пишет БД.
+  Real cache-only export with two strategies: cached completed=1/raw=777
+  and cache-missing/raw=777 produce XLSX 1/blank; deleting the cache makes
+  both blank. Read-only file identity, no source/window/cache writes; export
+  8 passed, Panel 122 passed/4 skipped. Independent Opus 5/high
+  `CODE_REVIEW_PASS` round 2.
 - [x] **COR-05 / B6 — исходный порядок HTML actions.**
   `src/mrs3/performance_v2_html.py`, `src/mrs3/performance_v2_import.py`.
   Проверить source order до normalization либо сохранить его до существующего rejection.
