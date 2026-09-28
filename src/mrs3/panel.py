@@ -2038,19 +2038,25 @@ class PanelController:
                 public["inbox_ready"] = True
             request = tracked.get("request")
             tester_job_id = request.get("tester_job_id") if isinstance(request, Mapping) else None
+            if not isinstance(tester_job_id, str):
+                tracked_runtime = tracked.get("runtime")
+                tester_job_id = tracked_runtime.get("report_collection_id") if isinstance(tracked_runtime, Mapping) else None
             if isinstance(tester_job_id, str) and tester_job_id:
+                is_collection = False
                 try:
-                    tester_runtime = self._panel_jobs.runtime(tester_job_id)
-                    tester_runtime["performance_v2_import_verified"] = False
-                    self._panel_jobs.sync(tester_job_id, {}, runtime=tester_runtime)
+                    is_collection = self._panel_jobs.get(tester_job_id).get("kind") == "strategies.tester.collection"
+                    if is_collection:
+                        self._report_collection().finish_import(
+                            tester_job_id,
+                            job_id,
+                            committed=document.get("state") == "COMMITTED",
+                        )
+                    else:
+                        tester_runtime = self._panel_jobs.runtime(tester_job_id)
+                        tester_runtime["performance_v2_import_verified"] = False
+                        self._panel_jobs.sync(tester_job_id, {}, runtime=tester_runtime)
                 except PanelJobError:
                     pass
-                if document.get("state") == "COMMITTED":
-                    try:
-                        if self._panel_jobs.get(tester_job_id).get("kind") == "strategies.tester.collection":
-                            self._report_collection().mark_imported(tester_job_id)
-                    except PanelJobError:
-                        pass
         try:
             self._panel_jobs.sync(job_id, public, runtime=runtime or None)
         except PanelJobError:
@@ -4267,19 +4273,20 @@ class PanelController:
         is_collection_job = tester_job.get("kind") == "strategies.tester.collection"
         expected_inbox_manifest_sha256 = None
         expected_collection_id = None
+        collection_service = None
         if is_collection_job and not _internal:
-            collection_runtime = self._panel_jobs.runtime(tester_job_id)
-            expected_inbox_manifest_sha256 = collection_runtime.get("verified_inbox_sha256")
-            if not isinstance(expected_inbox_manifest_sha256, str):
-                raise ValueError("Performance v2 collection manifest digest is unavailable")
+            collection_service = self._report_collection()
+            try:
+                snapshot = collection_service.import_snapshot(tester_job_id)
+            except PanelJobError as error:
+                raise ValueError("Performance v2 import requires explicit inbox verification") from error
+            expected_inbox_manifest_sha256 = snapshot["manifest_sha256"]
             expected_collection_id = tester_job_id
         if tester_job.get("state") != "COMMITTED" or tester_job.get("inbox_ready") is not True:
             raise ValueError("Performance v2 import requires a committed tester inbox")
-        if not _internal and self._panel_jobs.runtime(tester_job_id).get("performance_v2_import_verified") is not True:
+        if not _internal and not is_collection_job and self._panel_jobs.runtime(tester_job_id).get("performance_v2_import_verified") is not True:
             raise ValueError("Performance v2 import requires explicit inbox verification")
         if not _internal:
-            if is_collection_job:
-                self._report_collection().assert_importable(tester_job_id)
             try:
                 self._validate_metadata_inbox(self._tester_inbox(tester_job_id))
             except ValueError as error:
@@ -4294,13 +4301,12 @@ class PanelController:
                 if (
                     current.get("state") != "COMMITTED"
                     or current.get("inbox_ready") is not True
-                    or runtime.get("performance_v2_import_verified") is not True
+                    or (not is_collection_job and runtime.get("performance_v2_import_verified") is not True)
                 ):
                     raise ValueError("Performance v2 import requires explicit inbox verification")
-                if is_collection_job:
-                    self._report_collection().assert_importable(tester_job_id)
-                runtime["performance_v2_import_verified"] = False
-                self._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
+                if not is_collection_job:
+                    runtime["performance_v2_import_verified"] = False
+                    self._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
         mode = payload.get("mode", "ADD")
         if not isinstance(mode, str) or mode not in {"ADD", "REPLACE"}:
             raise ValueError("Performance v2 import mode must be ADD or REPLACE")
@@ -4376,11 +4382,38 @@ class PanelController:
         job_request = {"tester_job_id": tester_job_id, "mode": mode}
         if _internal:
             job_request["retest"] = True
+        claim_started = False
+
+        def claim_collection_import(job_id: str) -> None:
+            nonlocal claim_started
+            if collection_service is not None:
+                collection_service.claim_import(
+                    tester_job_id,
+                    job_id,
+                    expected_digest=expected_inbox_manifest_sha256,
+                )
+                claim_started = True
+
+        def start_import(job_id: str) -> dict[str, object]:
+            nonlocal claim_started
+            try:
+                return self._performance_v2_jobs.start(request, job_id=job_id)
+            except BaseException:
+                if claim_started and collection_service is not None:
+                    try:
+                        collection_service.release_import_claim(tester_job_id, job_id)
+                    except PanelJobError:
+                        pass
+                    claim_started = False
+                raise
+
         return self._start_tracked_panel_job(
             "strategies.performance.v2.import",
             job_request,
             (f"tester:{tester_job_id}", "performance-v2-db"),
-            lambda tracked_id: self._performance_v2_jobs.start(request, job_id=tracked_id),
+            start_import,
+            runtime={"report_collection_id": tester_job_id} if collection_service is not None else None,
+            before_start=claim_collection_import if collection_service is not None else None,
         )
 
     def strategies_performance_v2_import_status(self, job_id: str) -> dict[str, object]:

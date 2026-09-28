@@ -59,7 +59,10 @@ HTML or strategy JSON files.
 Collection membership is server-owned and persisted in the existing
 `.panel-jobs.json` registry. A collection is a lightweight
 `strategies.tester.collection` record with a generated collection ID and an
-ordered member list. Each member records:
+ordered member list. Each durable generation records a monotonic
+`collection_revision`. Import admission records the exact worker job in
+`import_in_progress` and the source revision in `import_generation_revision`.
+Each member records:
 
 - tester job ID and retry lineage;
 - expected strategy names captured before tester execution;
@@ -107,6 +110,13 @@ remains the authority for the tester commission/config snapshot.
    collection actions.
 9. Ordinary unchecked SINGLE_MODE behavior remains unchanged.
 10. RETEST paths never join an ordinary report collection.
+11. Collection mutations use the durable revision as a compare-and-set token;
+    verification performs long artifact reads outside the registry lock and
+    publishes only if the generation is unchanged.
+12. Import admission atomically claims one VERIFIED generation. Clear and
+    successor registration cannot invalidate an in-progress claim; failed or
+    cancelled import releases it and restores retryability, while committed
+    completion marks that exact generation IMPORTED.
 
 ## Failure behavior
 
@@ -117,6 +127,9 @@ remains the authority for the tester commission/config snapshot.
   database state is unchanged.
 - Import failure: collection remains verified and retryable.
 - Registry restart: an open or verified collection is restored exactly.
+- Concurrent register/verify, clear/verify, and clear/import operations fail
+  closed or serialize at the durable revision boundary without losing a
+  member or overwriting a committed import.
 
 ## Acceptance evidence
 

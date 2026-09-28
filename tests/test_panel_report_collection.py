@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 from pathlib import Path
+from threading import Barrier, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -269,7 +270,20 @@ def test_controller_collection_verify_then_import_binds_exact_snapshot(tmp_path:
         (verified / "inbox_manifest.json").read_bytes()
     ).hexdigest()
     assert captured["request"]["expected_collection_id"] == collection_id  # type: ignore[index]
-    assert registry.runtime(collection_id)["performance_v2_import_verified"] is False
+    assert registry.runtime(collection_id)["import_in_progress"] == result["job_id"]
+    controller._record_special_job({"job_id": result["job_id"], "state": "FAILED", "phase": "FAILED", "error": {"code": "IMPORT_FAILED"}})
+    assert registry.runtime(collection_id)["collection_state"] == "VERIFIED"
+    assert registry.runtime(collection_id)["performance_v2_import_verified"] is True
+
+    class FailingJobs:
+        def start(self, _request: object, *, job_id: str | None = None) -> dict[str, object]:
+            raise RuntimeError("worker start failed")
+
+    controller._performance_v2_jobs = FailingJobs()  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="worker start failed"):
+        controller.strategies_performance_v2_import({"tester_job_id": collection_id})
+    assert registry.runtime(collection_id)["collection_state"] == "VERIFIED"
+    assert registry.runtime(collection_id)["performance_v2_import_verified"] is True
     (verified / "inbox_manifest.json").write_text(json.dumps({"collection_id": collection_id, "changed": True}), encoding="utf-8")
     with pytest.raises(ValueError, match="explicit inbox verification"):
         controller.strategies_performance_v2_import({"tester_job_id": collection_id})
@@ -317,3 +331,105 @@ def test_controller_registers_checked_job_before_worker_callback_and_rejects_non
             "end_date": "2026-01-31",
             "collect_reports": 1,
         })
+
+
+def test_verify_revision_conflict_preserves_new_registration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _registry(tmp_path)
+    first = tmp_path / "first"
+    first.mkdir()
+    (first / "inbox_manifest.json").write_text(json.dumps({"entries": [{"strategy_name": "S1"}]}), encoding="utf-8")
+    _tester(registry, "job-1", state="COMMITTED", inbox=first)
+    service = PanelReportCollection(registry, inbox_root=tmp_path / "collections", report_root=tmp_path / "reports", trusted_strategy_root=tmp_path / "strategies")
+    collection_id = service.register("job-1", ["S1"])
+    entered = Barrier(2)
+    release = Barrier(2)
+    verified = tmp_path / "verified"
+    verified.mkdir()
+    (verified / "inbox_manifest.json").write_text(json.dumps({"collection_id": collection_id}), encoding="utf-8")
+
+    def blocked_build(*_args: object, **_kwargs: object) -> Path:
+        entered.wait(timeout=2)
+        release.wait(timeout=2)
+        return verified
+
+    monkeypatch.setattr("mrs3.panel_report_collection.build_single_mode_collection_inbox", blocked_build)
+    errors: list[BaseException] = []
+    worker = Thread(target=lambda: _capture_error(errors, service.verify, collection_id))
+    worker.start()
+    entered.wait(timeout=2)
+    _tester(registry, "job-2", state="COMMITTED", inbox=first)
+    service.register("job-2", ["S2"])
+    release.wait(timeout=2)
+    worker.join(timeout=2)
+
+    assert errors and isinstance(errors[0], PanelJobError)
+    assert errors[0].code == "COLLECTION_CHANGED_DURING_VERIFY"
+    assert [member["tester_job_id"] for member in registry.runtime(collection_id)["members"]] == ["job-1", "job-2"]
+
+
+def test_clear_revision_conflict_cannot_be_overwritten_by_verify(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _registry(tmp_path)
+    member = tmp_path / "member"
+    member.mkdir()
+    (member / "inbox_manifest.json").write_text(json.dumps({"entries": [{"strategy_name": "S1"}]}), encoding="utf-8")
+    _tester(registry, "job-1", state="COMMITTED", inbox=member)
+    service = PanelReportCollection(registry, inbox_root=tmp_path / "collections", report_root=tmp_path / "reports", trusted_strategy_root=tmp_path / "strategies")
+    collection_id = service.register("job-1", ["S1"])
+    entered = Barrier(2)
+    release = Barrier(2)
+    verified = tmp_path / "verified"
+    verified.mkdir()
+    (verified / "inbox_manifest.json").write_text(json.dumps({"collection_id": collection_id}), encoding="utf-8")
+
+    def blocked_build(*_args: object, **_kwargs: object) -> Path:
+        entered.wait(timeout=2)
+        release.wait(timeout=2)
+        return verified
+
+    monkeypatch.setattr("mrs3.panel_report_collection.build_single_mode_collection_inbox", blocked_build)
+    errors: list[BaseException] = []
+    worker = Thread(target=lambda: _capture_error(errors, service.verify, collection_id))
+    worker.start()
+    entered.wait(timeout=2)
+    service.clear(collection_id)
+    release.wait(timeout=2)
+    worker.join(timeout=2)
+
+    assert errors and isinstance(errors[0], PanelJobError)
+    assert errors[0].code == "COLLECTION_CHANGED_DURING_VERIFY"
+    assert registry.runtime(collection_id)["collection_state"] == "CLEARED"
+
+
+def _capture_error(errors: list[BaseException], function: object, *args: object) -> None:
+    try:
+        function(*args)  # type: ignore[operator]
+    except BaseException as error:
+        errors.append(error)
+
+
+def test_import_claim_blocks_clear_and_failed_completion_releases_for_retry(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    service = PanelReportCollection(registry, inbox_root=tmp_path / "collections", report_root=tmp_path / "reports", trusted_strategy_root=tmp_path / "strategies")
+    _tester(registry, "job-1", state="COMMITTED", inbox=tmp_path / "member")
+    collection_id = service.register("job-1", ["S1"])
+    inbox = tmp_path / "verified"
+    inbox.mkdir()
+    (inbox / "inbox_manifest.json").write_text(json.dumps({"collection_id": collection_id}), encoding="utf-8")
+    runtime = registry.runtime(collection_id)
+    runtime.update({
+        "collection_state": "VERIFIED",
+        "verified_inbox_path": str(inbox),
+        "verified_inbox_sha256": sha256((inbox / "inbox_manifest.json").read_bytes()).hexdigest(),
+        "performance_v2_import_verified": True,
+    })
+    registry.sync(collection_id, {"state": "COMMITTED", "inbox_ready": True}, runtime=runtime)
+
+    service.claim_import(collection_id, "import-1")
+    with pytest.raises(PanelJobError, match="IMPORT_IN_PROGRESS"):
+        service.clear(collection_id)
+    service.finish_import(collection_id, "import-1", committed=False)
+    assert registry.runtime(collection_id)["collection_state"] == "VERIFIED"
+    assert registry.runtime(collection_id)["performance_v2_import_verified"] is True
+    service.claim_import(collection_id, "import-2")
+    service.finish_import(collection_id, "import-2", committed=True)
+    assert registry.runtime(collection_id)["collection_state"] == "IMPORTED"

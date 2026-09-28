@@ -7,7 +7,7 @@ from hashlib import sha256
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 from uuid import uuid4
 
 from .panel_jobs import PanelJobError, PanelJobRegistry, TERMINAL
@@ -87,7 +87,26 @@ class PanelReportCollection:
         except PanelJobError:
             return None
 
-    def _persist_runtime(self, collection_id: str, runtime: dict[str, object]) -> None:
+    @staticmethod
+    def _revision(runtime: Mapping[str, object]) -> int:
+        value = runtime.get("collection_revision", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise PanelJobError("COLLECTION_INVALID")
+        return value
+
+    def _persist_runtime(
+        self,
+        collection_id: str,
+        runtime: dict[str, object],
+        *,
+        expected_revision: int | None = None,
+    ) -> None:
+        current = self.registry.runtime(collection_id)
+        current_revision = self._revision(current)
+        if expected_revision is not None and current_revision != expected_revision:
+            raise PanelJobError("COLLECTION_CHANGED_DURING_VERIFY")
+        runtime = deepcopy(runtime)
+        runtime["collection_revision"] = current_revision + 1
         status: dict[str, object] = {"state": "COMMITTED", "phase": "COMMITTED"}
         if isinstance(runtime.get("verified_inbox_path"), str) and runtime.get("collection_state") == "VERIFIED":
             status["inbox_ready"] = True
@@ -130,6 +149,71 @@ class PanelReportCollection:
         self._read_manifest_binding(collection_id, inbox, runtime.get("verified_inbox_sha256"))
         return inbox
 
+    def import_snapshot(self, collection_id: str) -> dict[str, str]:
+        """Read the currently authorized generation without consuming its gate."""
+        with self.registry.lock:
+            record = self.registry.get(collection_id)
+            if record.get("kind") != _COLLECTION_KIND:
+                raise PanelJobError("COLLECTION_NOT_FOUND")
+            runtime = self._runtime(record)
+            if runtime.get("collection_state") != "VERIFIED" or runtime.get("performance_v2_import_verified") is not True:
+                raise PanelJobError("COLLECTION_IMPORT_NOT_AUTHORIZED")
+            if runtime.get("import_in_progress") is not None:
+                raise PanelJobError("COLLECTION_IMPORT_IN_PROGRESS")
+            path = runtime.get("verified_inbox_path")
+            if not isinstance(path, str) or not path.strip():
+                raise PanelJobError("COLLECTION_VERIFIED_INBOX_UNAVAILABLE")
+            digest = self._read_manifest_binding(collection_id, Path(path), runtime.get("verified_inbox_sha256"))
+            return {"inbox_path": path, "manifest_sha256": digest}
+
+    def claim_import(self, collection_id: str, import_job_id: str, *, expected_digest: str | None = None) -> dict[str, str]:
+        """Atomically consume the import gate for one exact verified generation."""
+        if not isinstance(import_job_id, str) or not import_job_id.strip():
+            raise PanelJobError("INVALID_REQUEST")
+        with self.registry.lock:
+            record = self.registry.get(collection_id)
+            if record.get("kind") != _COLLECTION_KIND:
+                raise PanelJobError("COLLECTION_NOT_FOUND")
+            runtime = self._runtime(record)
+            if runtime.get("collection_state") != "VERIFIED" or runtime.get("performance_v2_import_verified") is not True:
+                raise PanelJobError("COLLECTION_IMPORT_NOT_AUTHORIZED")
+            if runtime.get("import_in_progress") is not None:
+                raise PanelJobError("COLLECTION_IMPORT_IN_PROGRESS")
+            path = runtime.get("verified_inbox_path")
+            if not isinstance(path, str) or not path.strip():
+                raise PanelJobError("COLLECTION_VERIFIED_INBOX_UNAVAILABLE")
+            digest = self._read_manifest_binding(collection_id, Path(path), runtime.get("verified_inbox_sha256"))
+            if expected_digest is not None and digest != expected_digest:
+                raise PanelJobError("COLLECTION_VERIFIED_INBOX_TAMPERED")
+            revision = self._revision(runtime)
+            runtime["import_in_progress"] = import_job_id
+            runtime["import_generation_revision"] = revision
+            runtime["performance_v2_import_verified"] = False
+            self._persist_runtime(collection_id, runtime, expected_revision=revision)
+            return {"inbox_path": path, "manifest_sha256": digest}
+
+    def finish_import(self, collection_id: str, import_job_id: str, *, committed: bool) -> None:
+        """Release a claim, or consume its generation after committed import."""
+        with self.registry.lock:
+            record = self.registry.get(collection_id)
+            if record.get("kind") != _COLLECTION_KIND:
+                raise PanelJobError("COLLECTION_NOT_FOUND")
+            runtime = self._runtime(record)
+            if runtime.get("import_in_progress") != import_job_id:
+                raise PanelJobError("COLLECTION_IMPORT_CLAIM_MISMATCH")
+            revision = self._revision(runtime)
+            runtime.pop("import_in_progress", None)
+            runtime.pop("import_generation_revision", None)
+            if committed:
+                runtime["collection_state"] = "IMPORTED"
+                runtime["performance_v2_import_verified"] = False
+            else:
+                runtime["performance_v2_import_verified"] = True
+            self._persist_runtime(collection_id, runtime, expected_revision=revision)
+
+    def release_import_claim(self, collection_id: str, import_job_id: str) -> None:
+        self.finish_import(collection_id, import_job_id, committed=False)
+
     def _new_record(self, members: list[dict[str, object]]) -> str:
         collection_id = f"collection-{uuid4().hex}"
         request = {"collection_id": collection_id, "member_count": len(members)}
@@ -145,6 +229,7 @@ class PanelReportCollection:
         runtime = {
             "collection_state": "OPEN",
             "members": deepcopy(members),
+            "collection_revision": 0,
             "verified_inbox_path": None,
             "verified_inbox_sha256": None,
             "performance_v2_import_verified": False,
@@ -174,6 +259,8 @@ class PanelReportCollection:
                 members = deepcopy(active_runtime["members"])
                 collection_id = str(active["job_id"])
             else:
+                if active_runtime is not None and active_runtime["collection_state"] == "VERIFIED" and active_runtime.get("import_in_progress") is not None:
+                    raise PanelJobError("COLLECTION_IMPORT_IN_PROGRESS")
                 members = deepcopy(active_runtime["members"]) if active_runtime is not None else []
                 if active_runtime is not None and active_runtime["collection_state"] == "VERIFIED":
                     active_runtime["performance_v2_import_verified"] = False
@@ -281,25 +368,30 @@ class PanelReportCollection:
         }
 
     def verify(self, collection_id: str) -> Path:
-        record = self.registry.get(collection_id)
-        if record.get("kind") != _COLLECTION_KIND:
-            raise PanelJobError("COLLECTION_NOT_FOUND")
-        latest = self._latest()
-        if latest is None or latest.get("job_id") != collection_id:
-            raise PanelJobError("COLLECTION_NOT_ACTIVE")
-        runtime = self._runtime(record)
-        state = runtime["collection_state"]
-        if state == "VERIFIED":
-            path = runtime.get("verified_inbox_path")
-            if isinstance(path, str) and Path(path).is_dir():
-                self._read_manifest_binding(collection_id, Path(path), runtime.get("verified_inbox_sha256"))
-                runtime["performance_v2_import_verified"] = True
-                self._persist_runtime(collection_id, runtime)
-                return Path(path)
-            raise PanelJobError("COLLECTION_VERIFIED_INBOX_UNAVAILABLE")
-        if state != "OPEN":
-            raise PanelJobError("COLLECTION_NOT_OPEN")
-        members = [self._member_view(member) for member in runtime["members"] if isinstance(member, dict)]
+        with self.registry.lock:
+            record = self.registry.get(collection_id)
+            if record.get("kind") != _COLLECTION_KIND:
+                raise PanelJobError("COLLECTION_NOT_FOUND")
+            latest = self._latest()
+            if latest is None or latest.get("job_id") != collection_id:
+                raise PanelJobError("COLLECTION_NOT_ACTIVE")
+            runtime = deepcopy(self._runtime(record))
+            revision = self._revision(runtime)
+            state = runtime["collection_state"]
+            if state == "VERIFIED":
+                if runtime.get("import_in_progress") is not None:
+                    raise PanelJobError("COLLECTION_IMPORT_IN_PROGRESS")
+                path = runtime.get("verified_inbox_path")
+                if isinstance(path, str) and Path(path).is_dir():
+                    self._read_manifest_binding(collection_id, Path(path), runtime.get("verified_inbox_sha256"))
+                    runtime["performance_v2_import_verified"] = True
+                    self._persist_runtime(collection_id, runtime, expected_revision=revision)
+                    return Path(path)
+                raise PanelJobError("COLLECTION_VERIFIED_INBOX_UNAVAILABLE")
+            if state != "OPEN":
+                raise PanelJobError("COLLECTION_NOT_OPEN")
+            snapshot_members = [deepcopy(member) for member in runtime["members"] if isinstance(member, dict)]
+        members = [self._member_view(member) for member in snapshot_members]
         current = [member for member in members if member.get("superseded") is not True]
         active = [member for member in current if member.get("state") in _ACTIVE_STATES]
         if active:
@@ -312,51 +404,59 @@ class PanelReportCollection:
             for member in current
             if member.get("committed") is True
         ]
-        try:
-            inbox = build_single_mode_collection_inbox(
-                self.inbox_root,
-                collection_id,
-                paths,
-                report_root=self.report_root,
-                trusted_strategy_root=self.trusted_strategy_root,
-                expected_member_names=expected_member_names,
-            )
-            digest = self._read_manifest_binding(collection_id, inbox)
-        except Exception:
-            raise
-        runtime["collection_state"] = "VERIFIED"
-        runtime["verified_inbox_path"] = str(inbox)
-        runtime["verified_inbox_sha256"] = digest
-        runtime["performance_v2_import_verified"] = True
-        runtime["inbox_path"] = str(inbox)
-        self._persist_runtime(collection_id, runtime)
+        inbox = build_single_mode_collection_inbox(
+            self.inbox_root,
+            collection_id,
+            paths,
+            report_root=self.report_root,
+            trusted_strategy_root=self.trusted_strategy_root,
+            expected_member_names=expected_member_names,
+        )
+        digest = self._read_manifest_binding(collection_id, inbox)
+        with self.registry.lock:
+            current = self.registry.get(collection_id)
+            latest = self._latest()
+            current_runtime = self._runtime(current)
+            if latest is None or latest.get("job_id") != collection_id or current_runtime.get("collection_state") != "OPEN":
+                raise PanelJobError("COLLECTION_CHANGED_DURING_VERIFY")
+            runtime = deepcopy(current_runtime)
+            runtime["collection_state"] = "VERIFIED"
+            runtime["verified_inbox_path"] = str(inbox)
+            runtime["verified_inbox_sha256"] = digest
+            runtime["performance_v2_import_verified"] = True
+            runtime["inbox_path"] = str(inbox)
+            self._persist_runtime(collection_id, runtime, expected_revision=revision)
         return inbox
 
     def clear(self, collection_id: str) -> dict[str, object]:
-        record = self.registry.get(collection_id)
-        if record.get("kind") != _COLLECTION_KIND:
-            raise PanelJobError("COLLECTION_NOT_FOUND")
-        latest = self._latest()
-        if latest is None or latest.get("job_id") != collection_id:
-            raise PanelJobError("COLLECTION_NOT_ACTIVE")
-        runtime = self._runtime(record)
-        if runtime["collection_state"] == "IMPORTED":
-            raise PanelJobError("COLLECTION_ALREADY_IMPORTED")
-        runtime["collection_state"] = "CLEARED"
-        runtime["performance_v2_import_verified"] = False
-        self._persist_runtime(collection_id, runtime)
+        with self.registry.lock:
+            record = self.registry.get(collection_id)
+            if record.get("kind") != _COLLECTION_KIND:
+                raise PanelJobError("COLLECTION_NOT_FOUND")
+            latest = self._latest()
+            if latest is None or latest.get("job_id") != collection_id:
+                raise PanelJobError("COLLECTION_NOT_ACTIVE")
+            runtime = self._runtime(record)
+            if runtime["collection_state"] == "IMPORTED":
+                raise PanelJobError("COLLECTION_ALREADY_IMPORTED")
+            if runtime.get("import_in_progress") is not None:
+                raise PanelJobError("COLLECTION_IMPORT_IN_PROGRESS")
+            revision = self._revision(runtime)
+            runtime["collection_state"] = "CLEARED"
+            runtime["performance_v2_import_verified"] = False
+            self._persist_runtime(collection_id, runtime, expected_revision=revision)
         return self.status()
 
     def mark_imported(self, collection_id: str) -> None:
-        record = self.registry.get(collection_id)
-        if record.get("kind") != _COLLECTION_KIND:
-            raise PanelJobError("COLLECTION_NOT_FOUND")
-        runtime = self._runtime(record)
-        if runtime["collection_state"] != "VERIFIED":
-            raise PanelJobError("COLLECTION_NOT_VERIFIED")
-        runtime["collection_state"] = "IMPORTED"
-        runtime["performance_v2_import_verified"] = False
-        self._persist_runtime(collection_id, runtime)
+        with self.registry.lock:
+            record = self.registry.get(collection_id)
+            if record.get("kind") != _COLLECTION_KIND:
+                raise PanelJobError("COLLECTION_NOT_FOUND")
+            runtime = self._runtime(record)
+            claim = runtime.get("import_in_progress")
+            if not isinstance(claim, str):
+                raise PanelJobError("COLLECTION_IMPORT_NOT_CLAIMED")
+        self.finish_import(collection_id, claim, committed=True)
 
 
 __all__ = ["PanelReportCollection"]

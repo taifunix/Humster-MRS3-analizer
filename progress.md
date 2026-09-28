@@ -25,6 +25,23 @@ pre-existing static-shell failure caused by the parallel Task 3 `app.js`
 authorization text; that UI worktree change is outside this fix. No real
 tester/Panel was launched and no production data or live process was mutated.
 
+## SINGLE_MODE collection mutation protocol (2026-09-28)
+
+Task 2 final integration now persists a monotonic collection revision and
+uses it as a compare-and-set boundary around verification publication. Long
+member artifact reads remain outside the registry lock; concurrent register or
+clear changes cause verification to fail closed without overwriting the newer
+runtime. Collection import admission atomically claims the exact VERIFIED
+generation with `import_in_progress`; clear and successor mutation cannot
+invalidate that claim. Failed/cancelled completion releases the claim and keeps
+the generation retryable, while committed completion marks it IMPORTED.
+
+Focused controlled-thread and lifecycle evidence passed 13 collection tests;
+broader fresh/collection/input evidence passed 123 tests with one existing
+symlink skip, and the Panel affected contour passed 176 tests with four
+existing symlink skips and eight pandas warnings. No real tester, Panel or
+production database was used.
+
 ## SINGLE_MODE report collection controls (Task 3, 2026-09-28)
 
 The ordinary tester card now exposes the server-owned report collection: the
