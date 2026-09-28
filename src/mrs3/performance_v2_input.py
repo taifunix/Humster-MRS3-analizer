@@ -8,7 +8,7 @@ identity before a caller starts workers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
@@ -117,6 +117,11 @@ class PreparedV2Entry:
     candidate_identity: str
     wizard_run_id: str
     exchange_name: str
+    test_start: str | None = None
+    test_end: str | None = None
+    commission_contract: Mapping[str, str] = field(default_factory=dict)
+    commission_contract_id: str = ""
+    tester_config_sha256: str = ""
 
     @property
     def strategy_identity(self) -> StrategyIdentity:
@@ -605,17 +610,27 @@ def read_performance_v2_inbox(
             manifest = json.loads(manifest_bytes.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise PerformanceV2InputError("inbox manifest is not valid UTF-8 JSON") from error
-        if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1:
+        if not isinstance(manifest, Mapping) or manifest.get("schema_version") not in {1, 2}:
             raise PerformanceV2InputError("invalid inbox manifest schema_version")
+        is_collection = manifest.get("schema_version") == 2
+        if is_collection and (
+            manifest.get("collection_manifest_version") != 1
+            or manifest.get("run_mode") != "SINGLE_MODE_COLLECTION"
+        ):
+            raise PerformanceV2InputError("invalid collection inbox manifest")
         expected = manifest.get("expected_strategy_names")
         raw_entries = manifest.get("entries")
         if not isinstance(expected, list) or not expected or any(not isinstance(name, str) or not name for name in expected) or len(set(expected)) != len(expected):
             raise PerformanceV2InputError("inbox expected strategy names are invalid")
         if not isinstance(raw_entries, list) or len(raw_entries) != len(expected):
             raise PerformanceV2InputError("inbox manifest entries are missing or incomplete")
-        contract, contract_id, tester_hash = _commission(manifest)
-        run_mode = manifest.get("run_mode", "FAST")
-        if run_mode not in {"FAST", "RUNS", "SINGLE_MODE"}:
+        if is_collection:
+            contract, contract_id, tester_hash = {}, "", ""
+            run_mode = "SINGLE_MODE_COLLECTION"
+        else:
+            contract, contract_id, tester_hash = _commission(manifest)
+            run_mode = manifest.get("run_mode", "FAST")
+        if run_mode not in {"FAST", "RUNS", "SINGLE_MODE", "SINGLE_MODE_COLLECTION"}:
             raise PerformanceV2InputError("unsupported inbox run mode")
         raw_test_start = manifest.get("test_start")
         raw_test_end = manifest.get("test_end")
@@ -638,6 +653,8 @@ def read_performance_v2_inbox(
             test_start, test_end = raw_test_start, raw_test_end
         if run_mode == "SINGLE_MODE" and test_start is None:
             raise PerformanceV2InputError("SINGLE_MODE inbox test range is missing")
+        if run_mode == "SINGLE_MODE_COLLECTION" and manifest.get("collection_id") in {None, "", ".", ".."}:
+            raise PerformanceV2InputError("collection ID is missing")
         raw_listing_dates_path = manifest.get("listing_dates_path")
         listing_dates_path: Path | None = None
         if raw_listing_dates_path is not None:
@@ -663,11 +680,11 @@ def read_performance_v2_inbox(
                 raw.get("strategy_path"),
                 inbox,
                 trusted_strategy_root,
-                allow_external=run_mode == "SINGLE_MODE",
+                allow_external=run_mode in {"SINGLE_MODE", "SINGLE_MODE_COLLECTION"},
             )
             report_path = (
                 _single_mode_report_path(raw.get("report_path"), report_root)
-                if run_mode == "SINGLE_MODE"
+                if run_mode in {"SINGLE_MODE", "SINGLE_MODE_COLLECTION"}
                 else _contained_path(raw.get("report_path"), report_root, "report path")
             )
             if strategy_path in seen_paths:
@@ -709,10 +726,15 @@ def read_performance_v2_inbox(
         provenance = manifest.get("v6_provenance")
         has_v6_provenance = isinstance(provenance, Mapping)
         provenance = provenance if has_v6_provenance else manifest
-        analysis_run_id = _text(provenance.get("analysis_run_id", manifest.get("analysis_run_id")), "analysis run id")
+        if is_collection:
+            analysis_run_id = _text(manifest.get("collection_id"), "collection ID")
+        else:
+            analysis_run_id = _text(provenance.get("analysis_run_id", manifest.get("analysis_run_id")), "analysis run id")
         has_run_id_map = "strategy_analysis_run_ids" in provenance
         raw_run_ids = provenance.get("strategy_analysis_run_ids")
-        if not has_run_id_map:
+        if is_collection:
+            strategy_run_ids = {}
+        elif not has_run_id_map:
             strategy_run_ids = {
                 Path(str(raw["strategy_path"])).name: analysis_run_id
                 for raw in raw_entry_mappings
@@ -737,20 +759,25 @@ def read_performance_v2_inbox(
                 raw["strategy_path"],
                 inbox,
                 trusted_strategy_root,
-                allow_external=run_mode == "SINGLE_MODE",
+                allow_external=run_mode in {"SINGLE_MODE", "SINGLE_MODE_COLLECTION"},
             )
             report_path = (
                 _single_mode_report_path(raw["report_path"], report_root)
-                if run_mode == "SINGLE_MODE"
+                if run_mode in {"SINGLE_MODE", "SINGLE_MODE_COLLECTION"}
                 else _contained_path(raw["report_path"], report_root, "report path")
             )
             strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
             identity = adapt_strategy_identity(strategy, strategy_name=name, order_plateau_diagnostics=diagnostics_by_name[name])
             if identity.order_count != int(diagnostics_by_name[name]["order_count"]):
                 raise PerformanceV2InputError("plateau diagnostic order count differs from strategy")
-            entry_analysis_run_id = strategy_run_ids.get(strategy_path.name)
+            entry_analysis_run_id = (
+                raw.get("analysis_run_id")
+                if is_collection
+                else strategy_run_ids.get(strategy_path.name)
+            )
             if entry_analysis_run_id is None:
                 raise PerformanceV2InputError("strategy analysis run ID map does not cover inbox")
+            entry_analysis_run_id = _text(entry_analysis_run_id, "strategy analysis run id")
             if isinstance(provenance_hashes, Mapping):
                 expected_hash = provenance_hashes.get(strategy_path.name)
                 if expected_hash is not None and expected_hash != raw["strategy_version_id"]:
@@ -763,6 +790,23 @@ def read_performance_v2_inbox(
                     raise PerformanceV2InputError("conflicting facts for shared plateau")
                 plateau_by_key[key] = fact
             exchange_name = _text(raw.get("exchange_name", strategy.get("exchange", {}).get("name") if isinstance(strategy.get("exchange"), Mapping) else None), "exchange name")
+            entry_contract, entry_contract_id, entry_tester_hash = (
+                _commission(raw) if is_collection else (contract, contract_id, tester_hash)
+            )
+            entry_start, entry_end = (
+                (raw.get("test_start"), raw.get("test_end")) if is_collection else (test_start, test_end)
+            )
+            if is_collection:
+                if not isinstance(entry_start, str) or not isinstance(entry_end, str):
+                    raise PerformanceV2InputError("collection entry test range is missing")
+                try:
+                    start_date, end_date = date.fromisoformat(entry_start), date.fromisoformat(entry_end)
+                except ValueError as error:
+                    raise PerformanceV2InputError("collection entry test range is invalid") from error
+                if start_date.isoformat() != entry_start or end_date.isoformat() != entry_end or end_date < start_date:
+                    raise PerformanceV2InputError("collection entry test range is invalid")
+                if end_date > _latest_tester_end_date():
+                    raise PerformanceV2InputError("collection entry test end date must not be later than yesterday")
             prepared_entries.append(
                 PreparedV2Entry(
                     name,
@@ -775,6 +819,11 @@ def read_performance_v2_inbox(
                     candidate_by_name[name],
                     _text(raw.get("wizard_run_id", raw.get("run_id", "unknown")), "wizard run id"),
                     exchange_name,
+                    entry_start,
+                    entry_end,
+                    entry_contract,
+                    entry_contract_id,
+                    entry_tester_hash,
                 )
             )
         prepared = PreparedV2Input(

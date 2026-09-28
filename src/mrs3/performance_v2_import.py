@@ -1075,8 +1075,11 @@ def _validate_report(
     basic = report.settings.get("basic")
     if not isinstance(basic, Mapping) or str(basic.get("symbol", "")).strip() != entry.identity.symbol:
         raise PerformanceV2ImportError(f"report symbol does not match strategy {entry.strategy_name!r}")
-    configured_start = getattr(prepared, "test_start", None)
-    configured_end = getattr(prepared, "test_end", None)
+    configured_start = getattr(entry, "test_start", None)
+    configured_end = getattr(entry, "test_end", None)
+    if configured_start is None and prepared is not None:
+        configured_start = getattr(prepared, "test_start", None)
+        configured_end = getattr(prepared, "test_end", None)
     if request is not None and request.test_start is not None and (request.test_start, request.test_end) != (configured_start, configured_end):
         raise PerformanceV2ImportError("request test range does not match the prepared inbox")
     strict_range = check_range and configured_start is not None and configured_end is not None
@@ -1596,7 +1599,8 @@ def _publish(
                     "equity_quality_metrics", "optimizer_prepared_inputs",
                 ):
                     connection.execute(f"delete from {table} where result_id = ?", [result_id])
-            values = _result_values(entry, report, prepared.commission_contract, now)
+            commission_contract = entry.commission_contract or prepared.commission_contract
+            values = _result_values(entry, report, commission_contract, now)
             ordered_values = tuple(values[field] for field in _RESULT_VALUE_FIELDS)
             source_metadata = _optimizer_source_metadata_json(
                 report.settings, now, report_hash(entry)
