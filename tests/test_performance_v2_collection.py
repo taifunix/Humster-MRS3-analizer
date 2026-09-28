@@ -138,6 +138,48 @@ def test_collection_reads_heterogeneous_member_context_without_merging_it(tmp_pa
     assert [entry.analysis_run_id for entry in prepared.entries] == ["a" * 64, "b" * 64]
 
 
+def test_collection_builder_binds_registered_names_to_exact_prepared_read(tmp_path: Path) -> None:
+    member, report_root, strategy_root = _member(
+        tmp_path / "member", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64
+    )
+
+    with pytest.raises(PerformanceV2InputError, match="registered strategy names"):
+        build_single_mode_collection_inbox(
+            tmp_path / "collections", "collection-1", [member],
+            report_root=report_root,
+            trusted_strategy_root=strategy_root,
+            expected_member_names=[["swapped"]],
+        )
+
+
+def test_collection_manifest_expectations_bind_digest_and_id(tmp_path: Path) -> None:
+    member, report_root, strategy_root = _member(
+        tmp_path / "member", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64
+    )
+    collection = build_single_mode_collection_inbox(
+        tmp_path / "collections", "collection-1", [member],
+        report_root=report_root, trusted_strategy_root=strategy_root,
+    )
+    manifest_path = collection / "inbox_manifest.json"
+    digest = sha256(manifest_path.read_bytes()).hexdigest()
+
+    prepared = read_performance_v2_inbox(
+        collection, report_root, strategy_root=strategy_root,
+        expected_manifest_sha256=digest, expected_collection_id="collection-1",
+    )
+    assert prepared.run_mode == "SINGLE_MODE_COLLECTION"
+    with pytest.raises(PerformanceV2InputError, match="manifest digest"):
+        read_performance_v2_inbox(
+            collection, report_root, strategy_root=strategy_root,
+            expected_manifest_sha256="0" * 64, expected_collection_id="collection-1",
+        )
+    with pytest.raises(PerformanceV2InputError, match="collection ID"):
+        read_performance_v2_inbox(
+            collection, report_root, strategy_root=strategy_root,
+            expected_manifest_sha256=digest, expected_collection_id="wrong-collection",
+        )
+
+
 def test_collection_uses_each_entry_range_and_commission_for_import_values(tmp_path: Path) -> None:
     first, report_root, strategy_root = _member(
         tmp_path / "first", "alpha", start="2026-01-01", end="2026-01-09", taker="0.0004", run_id="a" * 64

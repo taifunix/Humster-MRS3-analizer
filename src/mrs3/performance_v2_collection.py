@@ -129,6 +129,7 @@ def build_single_mode_collection_inbox(
     *,
     report_root: Path,
     trusted_strategy_root: Path,
+    expected_member_names: Sequence[Sequence[str]] | None = None,
 ) -> Path:
     """Validate and atomically publish one explicit collection manifest.
 
@@ -138,6 +139,14 @@ def build_single_mode_collection_inbox(
     collection_id = _safe_collection_id(collection_id)
     if not member_inboxes or isinstance(member_inboxes, (str, bytes)):
         raise PerformanceV2InputError("collection must contain at least one member")
+    if expected_member_names is not None:
+        if isinstance(expected_member_names, (str, bytes)) or len(expected_member_names) != len(member_inboxes):
+            raise PerformanceV2InputError("registered member strategy names are invalid")
+        for names in expected_member_names:
+            if not isinstance(names, Sequence) or isinstance(names, (str, bytes)) or any(
+                not isinstance(name, str) or not name for name in names
+            ):
+                raise PerformanceV2InputError("registered member strategy names are invalid")
     root = Path(inbox_root)
     if root.exists() and (root.is_symlink() or not root.is_dir()):
         raise PerformanceV2InputError("collection inbox root is unsafe")
@@ -154,7 +163,7 @@ def build_single_mode_collection_inbox(
         target = root / collection_id
         if target.exists():
             raise PerformanceV2InputError("collection inbox already exists")
-        for raw_member in member_inboxes:
+        for member_index, raw_member in enumerate(member_inboxes):
             member = Path(raw_member)
             if member.is_symlink() or not member.is_dir():
                 raise PerformanceV2InputError("member inbox is not a real directory")
@@ -167,6 +176,10 @@ def build_single_mode_collection_inbox(
             )
             if prepared.run_mode != "SINGLE_MODE":
                 raise PerformanceV2InputError("collection members must be SINGLE_MODE inboxes")
+            if expected_member_names is not None:
+                prepared_names = [entry.strategy_name for entry in prepared.entries]
+                if list(expected_member_names[member_index]) != prepared_names:
+                    raise PerformanceV2InputError("registered strategy names do not match prepared member inbox")
             manifest = _manifest(member)
             raw_entries = manifest.get("entries")
             if not isinstance(raw_entries, list):

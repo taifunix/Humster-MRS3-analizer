@@ -118,6 +118,8 @@ class PerformanceV2ImportRequest:
     listing_dates_path: Path | None
     listing_dates_root: Path | None
     expected_current_result_ids: Mapping[str, int] | None
+    expected_inbox_manifest_sha256: str | None
+    expected_collection_id: str | None
 
     def __init__(
         self,
@@ -138,6 +140,8 @@ class PerformanceV2ImportRequest:
         listing_dates_path: Path | None = None,
         listing_dates_root: Path | None = None,
         expected_current_result_ids: Mapping[str, int] | None = None,
+        expected_inbox_manifest_sha256: str | None = None,
+        expected_collection_id: str | None = None,
     ) -> None:
         if inbox is None:
             inbox = inbox_path
@@ -166,6 +170,15 @@ class PerformanceV2ImportRequest:
             raise ValueError("replacement identity controls require REPLACE mode")
         if type(clear_retest_on_success) is not bool:
             raise ValueError("clear_retest_on_success must be boolean")
+        if expected_inbox_manifest_sha256 is not None and (
+            not isinstance(expected_inbox_manifest_sha256, str)
+            or len(expected_inbox_manifest_sha256) != 64
+        ):
+            raise ValueError("expected_inbox_manifest_sha256 must be a SHA-256 hex digest")
+        if expected_collection_id is not None and (
+            not isinstance(expected_collection_id, str) or not expected_collection_id.strip()
+        ):
+            raise ValueError("expected_collection_id must be a non-empty string")
         if (test_start is None) != (test_end is None):
             raise ValueError("test_start and test_end must be supplied together")
         if test_start is not None:
@@ -211,6 +224,8 @@ class PerformanceV2ImportRequest:
         if expected_current_result_ids is not None and mode == "REPLACE" and set(expected_current_result_ids) != set(mapping):
             raise ValueError("expected_current_result_ids must cover replacement_strategy_ids")
         object.__setattr__(self, "expected_current_result_ids", None if expected_current_result_ids is None else dict(expected_current_result_ids))
+        object.__setattr__(self, "expected_inbox_manifest_sha256", expected_inbox_manifest_sha256)
+        object.__setattr__(self, "expected_collection_id", expected_collection_id)
 
     @property
     def inbox_path(self) -> Path:
@@ -1833,6 +1848,14 @@ def import_performance_v2(
             if "lock" in str(error).casefold():
                 raise PerformanceV2LockedError("Performance v2 database is locked") from error
             raise PerformanceV2ImportError("Performance v2 target does not have a supported schema") from error
+        prepared = read_performance_v2_inbox(
+            request.inbox,
+            request.report_root,
+            config=config,
+            strategy_root=request.strategy_root,
+            expected_manifest_sha256=request.expected_inbox_manifest_sha256,
+            expected_collection_id=request.expected_collection_id,
+        )
         # The existing non-empty target may be an older supported schema. Migrate
         # it under the writer lock, but never initialize a bare database here.
         try:
@@ -1843,12 +1866,6 @@ def import_performance_v2(
                 "Performance v2 target does not have a supported schema or migration failed"
             ) from error
         lock_acquired = True
-        prepared = read_performance_v2_inbox(
-            request.inbox,
-            request.report_root,
-            config=config,
-            strategy_root=request.strategy_root,
-        )
         if request.test_start is not None and (request.test_start, request.test_end) != (prepared.test_start, prepared.test_end):
             raise PerformanceV2ImportError("request test range does not match the prepared inbox")
         staging = create_v2_parser_staging(config.database_root, prepared)

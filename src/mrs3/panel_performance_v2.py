@@ -319,6 +319,8 @@ class PerformanceV2PanelRequest:
     tester_strategy_root: Path | None = None
     tester_bot_root: Path | None = None
     expected_current_result_ids: Mapping[str, int] | None = None
+    expected_inbox_manifest_sha256: str | None = None
+    expected_collection_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -661,6 +663,8 @@ class LocalPerformanceV2Service:
                 listing_dates_path=request.listing_dates_path,
                 listing_dates_root=request.listing_dates_root,
                 expected_current_result_ids=request.expected_current_result_ids,
+                expected_inbox_manifest_sha256=request.expected_inbox_manifest_sha256,
+                expected_collection_id=request.expected_collection_id,
             ),
             progress=import_progress,
         )

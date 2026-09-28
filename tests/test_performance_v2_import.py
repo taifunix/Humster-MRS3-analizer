@@ -184,6 +184,27 @@ def _rewrite_report(request: PerformanceV2ImportRequest, replacement: bytes) -> 
     manifest_path.write_text(json.dumps(manifest))
 
 
+def test_import_rejects_manifest_mutation_before_reader_without_db_mutation(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    expected_digest = sha256(manifest_path.read_bytes()).hexdigest()
+    request = PerformanceV2ImportRequest(
+        request.inbox,
+        request.report_root,
+        request.config,
+        mode=request.mode,
+        listing_dates_path=request.listing_dates_path,
+        expected_inbox_manifest_sha256=expected_digest,
+    )
+    manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+
+    with pytest.raises(PerformanceV2ImportError, match="manifest digest"):
+        import_performance_v2(request)
+
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        assert connection.execute("select count(*) from strategies").fetchone() == (0,)
+
+
 def _report_with_source_metadata() -> bytes:
     source = FIXTURE.read_bytes()
     source = source.replace(

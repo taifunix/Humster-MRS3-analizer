@@ -426,6 +426,25 @@ def test_v2_panel_service_passes_frozen_result_ids_directly(tmp_path: Path) -> N
     assert captured["expected"] == {"P1": 11}
 
 
+def test_v2_panel_service_passes_collection_consumption_expectations(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    request = replace(
+        request,
+        expected_inbox_manifest_sha256="a" * 64,
+        expected_collection_id="collection-1",
+    )
+    captured = {}
+
+    def import_result(import_request, **_kwargs):
+        captured["digest"] = import_request.expected_inbox_manifest_sha256
+        captured["collection_id"] = import_request.expected_collection_id
+        return PerformanceV2ImportResult("failed", "FAILED", 0, 0, 1, None, None)
+
+    LocalPerformanceV2Service(import_func=import_result).run(request)
+
+    assert captured == {"digest": "a" * 64, "collection_id": "collection-1"}
+
+
 @pytest.mark.parametrize(
     "listing_path",
     [Path("../dates.xlsx"), Path("C:/absolute/dates.xlsx")],

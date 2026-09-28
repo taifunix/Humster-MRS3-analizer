@@ -4261,6 +4261,14 @@ class PanelController:
         tester_job_id = self._required(payload, "tester_job_id")
         tester_job = self._panel_jobs.get(tester_job_id)
         is_collection_job = tester_job.get("kind") == "strategies.tester.collection"
+        expected_inbox_manifest_sha256 = None
+        expected_collection_id = None
+        if is_collection_job and not _internal:
+            collection_runtime = self._panel_jobs.runtime(tester_job_id)
+            expected_inbox_manifest_sha256 = collection_runtime.get("verified_inbox_sha256")
+            if not isinstance(expected_inbox_manifest_sha256, str):
+                raise ValueError("Performance v2 collection manifest digest is unavailable")
+            expected_collection_id = tester_job_id
         if tester_job.get("state") != "COMMITTED" or tester_job.get("inbox_ready") is not True:
             raise ValueError("Performance v2 import requires a committed tester inbox")
         if not _internal and self._panel_jobs.runtime(tester_job_id).get("performance_v2_import_verified") is not True:
@@ -4358,6 +4366,8 @@ class PanelController:
             listing_dates_path=listing_dates_path,
             listing_dates_root=self.root,
             expected_current_result_ids=expected_current,
+            expected_inbox_manifest_sha256=expected_inbox_manifest_sha256,
+            expected_collection_id=expected_collection_id,
         )
         job_request = {"tester_job_id": tester_job_id, "mode": mode}
         if _internal:

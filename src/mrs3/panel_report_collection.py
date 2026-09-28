@@ -116,20 +116,6 @@ class PanelReportCollection:
             raise PanelJobError("COLLECTION_MANIFEST_ID_MISMATCH")
         return digest
 
-    @staticmethod
-    def _validate_member_names(path: Path, expected: object) -> None:
-        if not isinstance(expected, list) or any(not isinstance(name, str) or not name for name in expected):
-            raise PanelJobError("COLLECTION_MEMBER_NAMES_MISMATCH")
-        try:
-            document = json.loads((path / "inbox_manifest.json").read_text(encoding="utf-8"))
-            manifest_names = document.get("expected_strategy_names") if isinstance(document, dict) else None
-            entries = document.get("entries") if isinstance(document, dict) else None
-            entry_names = [entry.get("strategy_name") for entry in entries] if isinstance(entries, list) else None
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            raise PanelJobError("COLLECTION_MEMBER_NAMES_MISMATCH") from None
-        if manifest_names != expected or entry_names != expected:
-            raise PanelJobError("COLLECTION_MEMBER_NAMES_MISMATCH")
-
     def assert_importable(self, collection_id: str) -> Path:
         record = self.registry.get(collection_id)
         if record.get("kind") != _COLLECTION_KIND:
@@ -321,9 +307,11 @@ class PanelReportCollection:
         paths = [Path(member["inbox_path"]) for member in current if member.get("committed") is True]
         if not paths:
             raise PanelJobError("COLLECTION_NO_COMMITTED_MEMBERS")
-        for member in current:
-            if member.get("committed") is True:
-                self._validate_member_names(Path(member["inbox_path"]), member.get("expected_strategy_names"))
+        expected_member_names = [
+            list(member.get("expected_strategy_names", ()))
+            for member in current
+            if member.get("committed") is True
+        ]
         try:
             inbox = build_single_mode_collection_inbox(
                 self.inbox_root,
@@ -331,6 +319,7 @@ class PanelReportCollection:
                 paths,
                 report_root=self.report_root,
                 trusted_strategy_root=self.trusted_strategy_root,
+                expected_member_names=expected_member_names,
             )
             digest = self._read_manifest_binding(collection_id, inbox)
         except Exception:

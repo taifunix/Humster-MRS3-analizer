@@ -562,6 +562,8 @@ def read_performance_v2_inbox(
     max_html_bytes: int | None = None,
     report_root: Path | None = None,
     strategy_root: Path | None = None,
+    expected_manifest_sha256: str | None = None,
+    expected_collection_id: str | None = None,
 ) -> PreparedV2Input:
     """Validate an immutable inbox and return a compact typed description."""
     raw_inbox = Path(inbox)
@@ -601,8 +603,10 @@ def read_performance_v2_inbox(
         manifest_bytes = manifest_path.read_bytes()
     except OSError as error:
         raise PerformanceV2InputError("inbox manifest is unavailable") from error
-    before_snapshot = _snapshot_inbox(inbox, manifest_bytes)
     manifest_hash = _sha256(manifest_bytes)
+    if expected_manifest_sha256 is not None and manifest_hash != expected_manifest_sha256:
+        raise PerformanceV2InputError("inbox manifest digest does not match expected snapshot")
+    before_snapshot = _snapshot_inbox(inbox, manifest_bytes)
     prepared: PreparedV2Input | None = None
     failure: Exception | None = None
     try:
@@ -618,6 +622,10 @@ def read_performance_v2_inbox(
             or manifest.get("run_mode") != "SINGLE_MODE_COLLECTION"
         ):
             raise PerformanceV2InputError("invalid collection inbox manifest")
+        if expected_collection_id is not None and (
+            not is_collection or manifest.get("collection_id") != expected_collection_id
+        ):
+            raise PerformanceV2InputError("collection ID does not match expected snapshot")
         expected = manifest.get("expected_strategy_names")
         raw_entries = manifest.get("entries")
         if not isinstance(expected, list) or not expected or any(not isinstance(name, str) or not name for name in expected) or len(set(expected)) != len(expected):

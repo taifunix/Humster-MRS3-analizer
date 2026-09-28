@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -173,7 +174,7 @@ def test_verified_manifest_tamper_and_mismatched_id_fail_closed(tmp_path: Path, 
         service.verify(collection_id)
 
 
-def test_member_manifest_names_must_match_registered_descriptor_before_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_panel_passes_registered_names_to_exact_collection_builder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     registry = _registry(tmp_path)
     member = tmp_path / "member"
     member.mkdir()
@@ -184,17 +185,20 @@ def test_member_manifest_names_must_match_registered_descriptor_before_build(tmp
     _tester(registry, "job-1", state="COMMITTED", inbox=member)
     service = PanelReportCollection(registry, inbox_root=tmp_path / "inbox", report_root=tmp_path / "reports", trusted_strategy_root=tmp_path / "strategies")
     collection_id = service.register("job-1", ["S1"])
-    called = False
+    verified = tmp_path / "verified"
+    verified.mkdir()
+    (verified / "inbox_manifest.json").write_text(
+        json.dumps({"collection_id": collection_id}), encoding="utf-8"
+    )
+    captured: dict[str, object] = {}
 
-    def unexpected_build(*_args: object, **_kwargs: object) -> Path:
-        nonlocal called
-        called = True
-        raise AssertionError("builder must not receive a mismatched member")
+    def capture_build(*_args: object, **kwargs: object) -> Path:
+        captured.update(kwargs)
+        return verified
 
-    monkeypatch.setattr("mrs3.panel_report_collection.build_single_mode_collection_inbox", unexpected_build)
-    with pytest.raises(PanelJobError, match="COLLECTION_MEMBER_NAMES_MISMATCH"):
-        service.verify(collection_id)
-    assert called is False
+    monkeypatch.setattr("mrs3.panel_report_collection.build_single_mode_collection_inbox", capture_build)
+    service.verify(collection_id)
+    assert captured["expected_member_names"] == [["S1"]]
 
 
 def test_retry_persists_source_supersession_and_retest_source_never_inherits_collection(tmp_path: Path) -> None:
@@ -261,6 +265,10 @@ def test_controller_collection_verify_then_import_binds_exact_snapshot(tmp_path:
     result = controller.strategies_performance_v2_import({"tester_job_id": collection_id})
     assert result["job_id"]
     assert captured["request"]["inbox"] == verified  # type: ignore[index]
+    assert captured["request"]["expected_inbox_manifest_sha256"] == sha256(  # type: ignore[index]
+        (verified / "inbox_manifest.json").read_bytes()
+    ).hexdigest()
+    assert captured["request"]["expected_collection_id"] == collection_id  # type: ignore[index]
     assert registry.runtime(collection_id)["performance_v2_import_verified"] is False
     (verified / "inbox_manifest.json").write_text(json.dumps({"collection_id": collection_id, "changed": True}), encoding="utf-8")
     with pytest.raises(ValueError, match="explicit inbox verification"):
