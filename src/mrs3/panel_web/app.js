@@ -388,10 +388,10 @@ const testerCollectionUiHelpers = (() => {
       onBusyChange(true, action);
       return Object.freeze({ action, epoch });
     };
-    const finish = (token) => {
-      if (busyAction !== token?.action) return;
+    const finish = (lease) => {
+      if (busyAction !== lease?.action) return;
       busyAction = '';
-      onBusyChange(false, token.action);
+      onBusyChange(false, lease.action);
     };
     const load = () => {
       if (loadPromise) return loadPromise;
@@ -411,14 +411,14 @@ const testerCollectionUiHelpers = (() => {
       return load();
     };
     const run = async (action, task) => {
-      const token = begin(action);
-      if (!token) return { blocked: true };
+      const lease = begin(action);
+      if (!lease) return { blocked: true };
       try {
-        const result = await task(token);
+        const result = await task(lease);
         await refresh();
         return { blocked: false, result };
       } finally {
-        finish(token);
+        finish(lease);
       }
     };
     return {
@@ -428,9 +428,9 @@ const testerCollectionUiHelpers = (() => {
       refresh,
       run,
       canRun: () => !busyAction,
-      isCurrent: (token) => Boolean(token) && token.epoch === epoch && token.action === busyAction,
-      commit: (token, callback) => {
-        if (!Boolean(token) || token.epoch !== epoch || token.action !== busyAction) return false;
+      isCurrent: (lease) => Boolean(lease) && lease.epoch === epoch && lease.action === busyAction,
+      commit: (lease, callback) => {
+        if (!Boolean(lease) || lease.epoch !== epoch || lease.action !== busyAction) return false;
         callback();
         return true;
       },
@@ -2356,8 +2356,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     normalVerifyEpoch += 1;
     testerCommitted = false;
     const collectReports = testerCollectReports?.checked === true;
-    const collectionActionToken = collectReports ? collectionCoordinator.begin('start') : null;
-    if (collectReports && !collectionActionToken) return;
+    const collectionActionLease = collectReports ? collectionCoordinator.begin('start') : null;
+    if (collectReports && !collectionActionLease) return;
     setTesterControls(true);
     try {
       const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: generatedBatchAnalysisId, start_date: startDate, end_date: endDate, initial_balance: initialBalance, collect_reports: collectReports } });
@@ -2368,16 +2368,16 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       if (testerStatus) testerStatus.textContent = `SINGLE_MODE tester failed to start: ${error?.message || 'request failed'}.`;
       setTesterControls(false);
     } finally {
-      if (collectionActionToken) {
-        try { await collectionCoordinator.refresh(); } finally { collectionCoordinator.finish(collectionActionToken); }
+      if (collectionActionLease) {
+        try { await collectionCoordinator.refresh(); } finally { collectionCoordinator.finish(collectionActionLease); }
       }
     }
   });
   testerRetry?.addEventListener('click', async () => {
     if (collectionActionBusy || !testerRetryable || !testerJobId) return;
     const sourceJobId = testerJobId;
-    const collectionActionToken = collectionIsActive() ? collectionCoordinator.begin('retry') : null;
-    if (collectionIsActive() && !collectionActionToken) return;
+    const collectionActionLease = collectionIsActive() ? collectionCoordinator.begin('retry') : null;
+    if (collectionIsActive() && !collectionActionLease) return;
     testerRetryable = false;
     window.clearInterval(testerPoller); testerPoller = 0;
     setTesterControls(true);
@@ -2400,8 +2400,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       setTesterControls(false);
     } finally {
       window.clearInterval(testerRetryTimer); testerRetryTimer = 0;
-      if (collectionActionToken) {
-        try { await collectionCoordinator.refresh(); } finally { collectionCoordinator.finish(collectionActionToken); }
+      if (collectionActionLease) {
+        try { await collectionCoordinator.refresh(); } finally { collectionCoordinator.finish(collectionActionLease); }
       }
     }
   });
@@ -2451,21 +2451,21 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   importFailureV2.textContent = 'Open failure report';
   importStatusV2?.after(importFailureV2);
   let importJobV2 = '';
-  let collectionImportActionToken = null;
+  let collectionImportActionLease = null;
   const finishCollectionImportAction = async () => {
-    const token = collectionImportActionToken;
-    if (!token) return;
-    collectionImportActionToken = null;
+    const lease = collectionImportActionLease;
+    if (!lease) return;
+    collectionImportActionLease = null;
     try { await collectionCoordinator.refresh(); } catch (_) { /* status remains visible */ }
-    finally { collectionCoordinator.finish(token); }
+    finally { collectionCoordinator.finish(lease); }
   };
   if (inboxVerifyV2) inboxVerifyV2.disabled = true;
   if (importStartV2) importStartV2.disabled = true;
   testerCollectionClear?.addEventListener('click', async () => {
     const collectionId = testerCollectionId;
     if (!collectionId || collectionActionBusy) return;
-    const collectionActionToken = collectionCoordinator.begin('clear');
-    if (!collectionActionToken) return;
+    const collectionActionLease = collectionCoordinator.begin('clear');
+    if (!collectionActionLease) return;
     try {
       normalImportAuthorized = false;
       authorizedTesterJobId = '';
@@ -2485,7 +2485,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       if (testerCollectionStatus) testerCollectionStatus.textContent = `Очистка накопления не выполнена: ${error?.message || 'request failed'}.`;
     } finally {
       try { await collectionCoordinator.refresh(); } catch (_) { /* status remains visible */ }
-      finally { collectionCoordinator.finish(collectionActionToken); }
+      finally { collectionCoordinator.finish(collectionActionLease); }
     }
   });
   const renderImportV2 = (job) => {
@@ -2552,8 +2552,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
           : 'CHECK REQUIRED: a committed tester job is required before Проверить.';
       return;
     }
-    const collectionActionToken = collectionId ? collectionCoordinator.begin('verify') : null;
-    if (collectionId && !collectionActionToken) return;
+    const collectionActionLease = collectionId ? collectionCoordinator.begin('verify') : null;
+    if (collectionId && !collectionActionLease) return;
     inboxVerifyV2.disabled = true;
     normalImportAuthorized = false;
     authorizedTesterJobId = '';
@@ -2570,7 +2570,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       // Ordinary stale-check remains: verifyEpoch !== normalVerifyEpoch || verifyJobId !== testerJobId || !testerCommitted
       if (verifyEpoch !== normalVerifyEpoch || verifyJobId !== (collectionIsActive() ? testerCollectionId : testerJobId)
         || (collectionIsActive() ? !collectionReady : !testerCommitted)
-        || (collectionActionToken && !collectionCoordinator.isCurrent(collectionActionToken))) return;
+        || (collectionActionLease && !collectionCoordinator.isCurrent(collectionActionLease))) return;
       const authorize = () => {
         normalImportAuthorized = true;
         authorizedTesterJobId = verifyJobId;
@@ -2582,17 +2582,17 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         if (importStatusV2) importStatusV2.textContent = 'CHECKED: committed inbox verified; import is enabled.';
       }
       };
-      if (collectionActionToken) {
-        if (!collectionCoordinator.commit(collectionActionToken, authorize)) return;
+      if (collectionActionLease) {
+        if (!collectionCoordinator.commit(collectionActionLease, authorize)) return;
       } else authorize();
     } catch (error) {
       if (importStatusV2) importStatusV2.textContent = `Проверка не выполнена: ${error?.message || 'unknown error'}.`;
     }
     finally {
       normalVerifyInFlight = false;
-      if (collectionActionToken) {
+      if (collectionActionLease) {
         try { await collectionCoordinator.refresh(); } catch (_) { /* status remains visible */ }
-        finally { collectionCoordinator.finish(collectionActionToken); }
+        finally { collectionCoordinator.finish(collectionActionLease); }
       } else refreshCollectionActionControls();
     }
   });
@@ -2600,16 +2600,16 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (collectionActionBusy) return;
     const importTargetJobId = authorizedTesterJobId;
     const collectionImport = collectionIsActive() && importTargetJobId === testerCollectionId;
-    const normalAuthorizationInvalid = !normalImportAuthorized || authorizedTesterJobId !== testerJobId;
+    const normalImportGateInvalid = !normalImportAuthorized || authorizedTesterJobId !== testerJobId;
     if (!importTargetJobId || (!collectionImport && (!testerJobId || !testerCommitted || !normalInboxReady))
       || (collectionImport && !collectionImportReady()) || normalImportInFlight
-      || (!collectionImport && normalAuthorizationInvalid)) {
+      || (!collectionImport && normalImportGateInvalid)) {
       if (importStatusV2) importStatusV2.textContent = 'CHECK REQUIRED: verify the committed tester inbox before import.';
       return;
     }
-    const collectionActionToken = collectionImport ? collectionCoordinator.begin('import') : null;
-    if (collectionImport && !collectionActionToken) return;
-    if (collectionActionToken) collectionImportActionToken = collectionActionToken;
+    const collectionActionLease = collectionImport ? collectionCoordinator.begin('import') : null;
+    if (collectionImport && !collectionActionLease) return;
+    if (collectionActionLease) collectionImportActionLease = collectionActionLease;
     importStartV2.disabled = true;
     importFailureV2.hidden = true;
     importFailureV2.removeAttribute('href');
@@ -2638,7 +2638,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         : `Импорт Performance v2 не прошёл проверку: ${reason}.`;
     }
     finally {
-      if (collectionActionToken && !collectionImportActionToken) await finishCollectionImportAction();
+      if (collectionActionLease && !collectionImportActionLease) await finishCollectionImportAction();
       refreshCollectionActionControls();
     }
   });
