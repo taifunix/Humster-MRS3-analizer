@@ -73,6 +73,9 @@ class _Job:
     inbox_path: Path | None = None
     single_mode: bool = False
     target_finalized: bool = False
+    target_owner: TesterTargetLock | None = None
+    target_snapshot: object | None = None
+    cleanup_pending: bool = False
     report_baseline: dict[str, tuple[int, int, ...]] = field(default_factory=dict)
     verified_report_evidence: dict[str, tuple[int, int]] = field(default_factory=dict)
     checkpoint_valid: bool = True
@@ -84,6 +87,7 @@ def _client(config: RunnerConfig) -> TesterHttpClient:
 
 _CURRENT_METRIC_HEADERS = ("Metric", "Value")
 _WINDOWS_FILE_RELEASE_SECONDS = 30.0
+_SINGLE_MODE_CLEANUP_RETRY_ATTEMPTS = 3
 
 
 def _has_current_performance_v2_layout(source: str) -> bool:
@@ -381,7 +385,8 @@ class LocalFastStrategyTestService:
         with self._lock:
             state = (
                 "RUNNING"
-                if not job.target_finalized and job.thread is not None and job.thread.is_alive()
+                if job.cleanup_pending
+                or not job.target_finalized and job.thread is not None and job.thread.is_alive()
                 else job.state
             )
             return {
@@ -473,8 +478,17 @@ class LocalFastStrategyTestService:
 
         try:
             owner = TesterTargetLock(Path(self.config.bot_root)).acquire()
+            job.target_owner = owner
             self._run_owned(job)
         except _FastCleanupUnconfirmed as error:
+            if job.single_mode and owner is not None:
+                with self._lock:
+                    job.cleanup_pending = True
+                    job.target_finalized = False
+                    job.state = job.phase = "FAILED" if not job.cancel.is_set() else "CANCELLED"
+                    job.error = {"code": "RESTORE_OR_RELEASE_FAILED", "message": _safe_error_message(error)}
+                self._emit(job)
+                return
             failed(error, "RESTORE_OR_RELEASE_FAILED")
             return
         except BaseException as error:
@@ -493,18 +507,22 @@ class LocalFastStrategyTestService:
         except BaseException as error:
             failed(error, "RESTORE_OR_RELEASE_FAILED")
         else:
+            job.target_owner = None
+            job.target_snapshot = None
             job.target_finalized = True
             self._emit(job)
 
     def _run_owned(self, job: _Job) -> None:
         client: object | None = None
         runtime_config = job.runtime_config or self.config
+        job.runtime_config = runtime_config
         snapshot_dir: Path | None = None
         target_snapshot = None
         stop_confirmed = True
         try:
             self._stop_bot(runtime_config)
             target_snapshot = capture_tester_settings(runtime_config)
+            job.target_snapshot = target_snapshot
             if job.clear_reports:
                 _clear_directory(
                     job.report_dir,
@@ -716,6 +734,38 @@ class LocalFastStrategyTestService:
                         "tester settings restore was not confirmed"
                     ) from error
 
+    def _reconcile_pending_cleanup(self, job: _Job) -> None:
+        owner = job.target_owner
+        if owner is None:
+            raise FastStrategyTestError("SINGLE_MODE cleanup ownership is unavailable")
+        runtime_config = job.runtime_config or self.config
+        last_error: BaseException | None = None
+        for _attempt in range(_SINGLE_MODE_CLEANUP_RETRY_ATTEMPTS):
+            try:
+                self._stop_bot(runtime_config)
+                if job.target_snapshot is not None:
+                    restore_tester_settings(runtime_config, job.target_snapshot)
+                owner.release()
+            except BaseException as error:
+                last_error = error
+                continue
+            with self._lock:
+                job.target_owner = None
+                job.target_snapshot = None
+                job.cleanup_pending = False
+                job.target_finalized = True
+            self._emit(job)
+            return
+        message = _safe_error_message(last_error or RuntimeError("cleanup did not complete"))
+        raise FastStrategyTestError(f"SINGLE_MODE cleanup remains pending: {message}") from last_error
+
+    def reconcile_pending_cleanup(self) -> None:
+        """Finish same-process target cleanup before Panel admits a new job."""
+        with self._lock:
+            for pending in self._jobs.values():
+                if pending.cleanup_pending:
+                    self._reconcile_pending_cleanup(pending)
+
     def _run_native(self, job: _Job) -> None:
         raise FastStrategyTestError("native SINGLE_MODE runner is unavailable")
 
@@ -741,6 +791,7 @@ class LocalFastStrategyTestService:
         names = self._expected(manifest)
         self._require_diagnostics(manifest, names)
         identifier = _safe_name(job_id or str(uuid4()))
+        self.reconcile_pending_cleanup()
         with self._lock:
             if any(job.state not in {"COMMITTED", "CANCELLED", "FAILED"} for job in self._jobs.values()):
                 raise FastStrategyTestError("Fast TEST is already running")
@@ -1104,6 +1155,7 @@ class LocalFastStrategyTestService:
         with self._lock:
             return any(
                 job.state not in {"COMMITTED", "CANCELLED", "FAILED"}
+                or job.cleanup_pending
                 or (
                     not job.target_finalized
                     and job.thread is not None

@@ -3371,6 +3371,10 @@ class PanelController:
         manifest = self._fresh_strategy_manifest(analysis_id)
         expected_names = self._manifest_strategy_names(manifest)
         request = {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "initial_balance": initial_balance, "mode": "SINGLE_MODE", "collect_reports": collect_reports}
+        single_mode_service = self._single_mode_strategy_test()
+        reconcile = getattr(single_mode_service, "reconcile_pending_cleanup", None)
+        if callable(reconcile):
+            reconcile()
 
         def register(job_id: str) -> None:
             collection_id = self._report_collection().register(job_id, expected_names)
@@ -3381,7 +3385,7 @@ class PanelController:
         return self._start_tracked_panel_job(
             "strategies.tester.start", request,
             ("strategies.tester",),
-            lambda job_id: self._single_mode_strategy_test().start(
+            lambda job_id: single_mode_service.start(
                 manifest,
                 analysis_run_id=analysis_id,
                 start_date=start_date,

@@ -706,6 +706,135 @@ def test_fast_test_retains_owner_when_tester_stop_is_unconfirmed(tmp_path: Path)
     assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
 
 
+def test_single_mode_reconciles_pending_cancel_cleanup_before_relaunch(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    native_started = Event()
+    stop_calls = 0
+
+    def stop_bot(_: RunnerConfig) -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls == 2:
+            raise RuntimeError("transient stop failure")
+
+    service = LocalSingleModeStrategyTestService(config, stop_bot=stop_bot)
+
+    def interrupted_native(job: object) -> None:
+        native_started.set()
+        while not job.cancel.is_set():
+            time.sleep(0.001)
+        raise fast_strategy_module._FastCancelled()
+
+    service._run_native = interrupted_native
+    first = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="single-pending-cleanup",
+    )
+    assert native_started.wait(1)
+    service.cancel(str(first["job_id"]))
+
+    worker = service._jobs[str(first["job_id"])].thread
+    assert worker is not None
+    worker.join(1)
+    assert not worker.is_alive()
+    assert service.status(str(first["job_id"]))["state"] == "RUNNING"
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+
+    service._run_native = lambda _job: (_ for _ in ()).throw(RuntimeError("second run"))
+    second = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="single-after-reconcile",
+    )
+    assert _wait(service, str(second["job_id"]))["state"] == "FAILED"
+    assert service.status(str(first["job_id"]))["state"] == "CANCELLED"
+    assert not (config.bot_root / ".mrs3-tester-target.lock").exists()
+
+
+def test_single_mode_pending_cleanup_failure_blocks_relaunch_without_releasing_lock(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    native_started = Event()
+    stop_calls = 0
+
+    def stop_bot(_: RunnerConfig) -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls >= 2:
+            raise RuntimeError("persistent stop failure")
+
+    service = LocalSingleModeStrategyTestService(config, stop_bot=stop_bot)
+
+    def interrupted_native(job: object) -> None:
+        native_started.set()
+        while not job.cancel.is_set():
+            time.sleep(0.001)
+        raise fast_strategy_module._FastCancelled()
+
+    service._run_native = interrupted_native
+    first = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="single-blocked-cleanup",
+    )
+    assert native_started.wait(1)
+    service.cancel(str(first["job_id"]))
+    worker = service._jobs[str(first["job_id"])].thread
+    assert worker is not None
+    worker.join(1)
+    assert not worker.is_alive()
+
+    with pytest.raises(FastStrategyTestError, match="cleanup remains pending"):
+        service.start(
+            manifest,
+            analysis_run_id="a" * 64,
+            start_date="2026-08-01",
+            end_date="2026-08-31",
+            job_id="single-must-stay-blocked",
+        )
+    assert service.status(str(first["job_id"]))["state"] == "RUNNING"
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+    assert "single-must-stay-blocked" not in service._jobs
+
+
+def test_single_mode_successful_cancellation_releases_target_as_before(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    native_started = Event()
+    service = LocalSingleModeStrategyTestService(config, stop_bot=lambda _: None)
+
+    def interrupted_native(job: object) -> None:
+        native_started.set()
+        while not job.cancel.is_set():
+            time.sleep(0.001)
+        raise fast_strategy_module._FastCancelled()
+
+    service._run_native = interrupted_native
+    first = service.start(
+        manifest,
+        analysis_run_id="a" * 64,
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        job_id="single-clean-cancel",
+    )
+    assert native_started.wait(1)
+    service.cancel(str(first["job_id"]))
+    status = _wait(service, str(first["job_id"]))
+
+    assert status["state"] == "CANCELLED"
+    assert not (config.bot_root / ".mrs3-tester-target.lock").exists()
+
+
 def test_fast_test_releases_owner_after_clean_ordinary_failure(tmp_path: Path) -> None:
     manifest, _ = _generation(tmp_path, 1)
     config = _config(tmp_path)

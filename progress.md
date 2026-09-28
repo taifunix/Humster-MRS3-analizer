@@ -3,6 +3,29 @@
 **Updated:** 2026-09-28
 **Current branch:** `main` after shortlist integration
 
+## SINGLE_MODE stop -> relaunch cleanup (2026-09-28)
+
+The active contract is [the stop/relaunch specification](docs/specs/2026-09-28-single-mode-stop-relaunch.md).
+The root cause was confirmed in `LocalFastStrategyTestService`: a failed
+SINGLE_MODE stop/settings restore published a terminal-looking result while
+retaining the same-process `TesterTargetLock`, with no retained in-process
+snapshot/config context or retry path. The service now exposes cleanup-pending
+jobs as non-terminal, retains owner/snapshot/config context, performs three
+bounded safe stop/restore/release retries, and reconciles pending ownership
+before the next ordinary start. Repeated failure remains fail-closed and does
+not unlink or steal a live lock. The Panel start route performs the narrow
+pre-submit reconciliation so the registry can release its CANCELLING resource
+before admitting the next start; no UI or collection files were changed.
+
+Evidence: the focused stop/relaunch RED test failed against the old behavior
+(`FAILED` while the lease remained), then the three new lifecycle tests passed;
+the complete fast/single-mode service suite passed `50 tests`, and the fast plus
+Panel report-start suite passed `60 tests`. Python compilation and
+`git diff --check` passed. The broader Panel suite passed `185 tests` with one
+pre-existing static-shell failure caused by the parallel Task 3 `app.js`
+authorization text; that UI worktree change is outside this fix. No real
+tester/Panel was launched and no production data or live process was mutated.
+
 ## SINGLE_MODE report collection controls (Task 3, 2026-09-28)
 
 The ordinary tester card now exposes the server-owned report collection: the
