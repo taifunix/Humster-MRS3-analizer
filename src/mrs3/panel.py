@@ -2015,15 +2015,12 @@ class PanelController:
             if document.get("state") == "COMMITTED" and runtime:
                 public["inbox_ready"] = True
         try:
-            terminal_performance = (
-                tracked.get("kind") == "strategies.performance.v2.import"
-                and document.get("state") in {"COMMITTED", "FAILED"}
-            )
+            performance_import = tracked.get("kind") == "strategies.performance.v2.import"
             self._panel_jobs.sync(
                 job_id,
                 public,
                 runtime=runtime or None,
-                skip_save_if_unchanged=terminal_performance,
+                skip_save_if_unchanged=performance_import,
             )
         except PanelJobError:
             pass

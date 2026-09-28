@@ -191,6 +191,33 @@ complete R1-R15 ledger; the immutable baseline remains an acceptance gate.
 Use the existing Panel registry/controller and focused tests; live journal
 cleanup is separate.
 
+J5 extends the existing default-off registry option to every
+`strategies.performance.v2.import` status snapshot, including RUNNING and the
+PUBLISHING phase. The first normalized change to authoritative state, phase,
+progress, error, evidence, result, inbox readiness or controller runtime stays
+durable. A poll skips only if its complete post-normalization candidate equals
+the latest locked job and the global journal dirty flag is false; a pending
+volatile change in another job forces publication. Other job kinds retain
+their save rules. No registry machinery, schema, API, worker throttle, UI or
+live cleanup is added.
+
+Preserve absent-field semantics: missing error becomes None and missing
+evidence removes the key; absent phase, progress and result retain saved values;
+absent inbox readiness retains True; absent runtime retains its stored value.
+When inbox_path is supplied, the controller merges it into the existing runtime
+copy before equality. RUNNING is a registry state; PUBLISHING is a phase.
+Callbacks do not change tester flags; public pre-worker verification consumption
+is unchanged.
+
+J5 acceptance uses the real controller status path: a RUNNING/PUBLISHING N/N
+first change makes one journal replacement, three exact repeats make zero, and
+reload restores complete state/phase/progress/error/evidence/result/runtime.
+State-only, phase-only, progress, inbox/runtime and absent-field normalization
+changes each save once; pending volatile changes in another job save the whole
+registry. Other job kinds still save identical polls. Check no temporary files
+remain after success/failure. J5-R2 received independent Opus 5/high
+`PLAN_APPROVED`; J4 received `CODE_REVIEW_PASS` and committed as `b31b37e`.
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,

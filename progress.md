@@ -69,9 +69,14 @@ the corrected combined Panel/Performance v2/RETEST/portfolio contour passed
 452 with 7 Windows skips. Reviewer J4-R5 clarified that the full repository
 suite belongs after all core slices integrate, before branch completion; an
 early partial run was stopped because later changes would invalidate it.
-J4 committed as `b31b37e`. J5 running-poll extension has `PLAN_APPROVED` and
-is now in implementation. No live journal cleanup or database mutation was
-performed.
+J4 committed as `b31b37e`. J5 running-poll extension has `PLAN_APPROVED`:
+first changed RUNNING/PUBLISHING snapshot saves once and three exact repeats
+save zero times, while changed fields and dirty other-job state still save.
+Focused J5 tests passed 7; the full Panel suite passed 122 with 4 skipped,
+and integrated RETEST passed 68 with 1 skipped. Independent J5-R2 review
+returned `CODE_REVIEW_PASS` after confirming no journal mtime consumer or
+caller-owned alias; J5 is accepted for its scoped commit. No live journal
+cleanup or database mutation was performed.
 Source final-payload proof and
 legacy empty-import `safe_to_delete` evidence remain deferred by the user.
 OPT-01a removes one unused source digest before the actual builder digest.

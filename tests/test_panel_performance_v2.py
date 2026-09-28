@@ -1001,7 +1001,7 @@ def test_terminal_performance_callback_skips_three_identical_polls_and_saves_cha
         ("analysis.local", {"state": "COMMITTED", "phase": "COMMITTED"}),
     ],
 )
-def test_j4_unchanged_nonterminal_import_and_other_terminal_kind_still_save_each_poll(
+def test_j5_import_skips_unchanged_polls_and_other_kind_still_saves_each_poll(
     tmp_path, monkeypatch, kind, document,
 ):
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
@@ -1018,9 +1018,225 @@ def test_j4_unchanged_nonterminal_import_and_other_terminal_kind_still_save_each
         return real_replace(source, destination)
 
     monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
-    for _ in range(2):
+    controller._record_special_job({"job_id": job_id, **document})
+    assert replacements == [journal]
+    for _ in range(3 if kind == "strategies.performance.v2.import" else 1):
         controller._record_special_job({"job_id": job_id, **document})
-    assert replacements == [journal, journal]
+    expected = 1 if kind == "strategies.performance.v2.import" else 2
+    assert replacements == [journal] * expected
+
+
+def test_j5_nonterminal_import_callback_reloads_full_snapshot_and_skips_repeats(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "running-import"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, job_id, (), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    document = {
+        "job_id": job_id,
+        "state": "RUNNING",
+        "phase": "PUBLISHING",
+        "progress": {"current": 3, "total": 5, "unit": "items"},
+        "error": {"code": "TRANSIENT", "message": "retrying"},
+        "evidence": {"source_revision": "r1"},
+        "result": {"status": "RUNNING", "imported_count": 0},
+        "inbox_path": str(tmp_path / "inbox"),
+    }
+    journal = controller._panel_jobs.journal
+    replacements = []
+    temporary_sources = []
+    real_replace = panel_jobs_module.os.replace
+
+    def counted_replace(source, destination):
+        temporary_sources.append(source)
+        if Path(destination) == journal:
+            replacements.append(destination)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
+    controller._record_special_job(document)
+    for _ in range(3):
+        controller._record_special_job(document)
+
+    assert replacements == [journal]
+    restored = PanelJobRegistry(journal, recover_on_load=False)
+    assert restored.jobs == controller._panel_jobs.jobs
+    assert restored.jobs[job_id]["state"] == "RUNNING"
+    assert restored.jobs[job_id]["phase"] == "PUBLISHING"
+    assert restored.jobs[job_id]["progress"] == document["progress"]
+    assert restored.jobs[job_id]["error"] == document["error"]
+    assert restored.jobs[job_id]["evidence"] == document["evidence"]
+    assert "result" not in restored.jobs[job_id]
+    assert restored.runtime(job_id) == {"inbox_path": str(tmp_path / "inbox")}
+    assert all(not Path(source).exists() for source in temporary_sources)
+
+
+def test_j5_state_only_import_transition_skips_identical_repeats(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "state-only-import"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, job_id, (), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    document = {"job_id": job_id, "state": "COMMITTED", "phase": "COMMITTED"}
+    journal = controller._panel_jobs.journal
+    replacements = []
+    temporary_sources = []
+    real_replace = panel_jobs_module.os.replace
+
+    def counted_replace(source, destination):
+        temporary_sources.append(source)
+        if Path(destination) == journal:
+            replacements.append(destination)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
+    controller._record_special_job(document)
+    for _ in range(3):
+        controller._record_special_job(document)
+
+    assert replacements == [journal]
+    saved = controller._panel_jobs.jobs[job_id]
+    assert saved["state"] == "COMMITTED"
+    assert saved["phase"] == "COMMITTED"
+    assert "result" not in saved
+    assert controller._panel_jobs.runtime(job_id) == {}
+    assert PanelJobRegistry(journal, recover_on_load=False).jobs == controller._panel_jobs.jobs
+    assert all(not Path(source).exists() for source in temporary_sources)
+
+
+def test_j5_phase_progress_and_runtime_changes_each_save_once(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "changed-import"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, job_id, (), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    journal = controller._panel_jobs.journal
+    replacements = []
+    temporary_sources = []
+    real_replace = panel_jobs_module.os.replace
+
+    def counted_replace(source, destination):
+        temporary_sources.append(source)
+        if Path(destination) == journal:
+            replacements.append(destination)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
+    statuses = (
+        {"job_id": job_id, "state": "RUNNING", "phase": "PUBLISHING"},
+        {"job_id": job_id, "state": "RUNNING", "phase": "PUBLISHING", "progress": {"current": 1, "total": 2}},
+        {"job_id": job_id, "state": "RUNNING", "phase": "PUBLISHING", "progress": {"current": 1, "total": 2}, "inbox_path": str(tmp_path / "inbox")},
+    )
+    for document in statuses:
+        controller._record_special_job(document)
+        count = len(replacements)
+        controller._record_special_job(document)
+        assert len(replacements) == count
+
+    assert len(replacements) == len(statuses)
+    assert controller._panel_jobs.runtime(job_id) == {"inbox_path": str(tmp_path / "inbox")}
+    assert PanelJobRegistry(journal, recover_on_load=False).jobs == controller._panel_jobs.jobs
+    assert all(not Path(source).exists() for source in temporary_sources)
+
+
+def test_j5_missing_error_and_evidence_save_once_and_retain_runtime(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "normalized-import"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, job_id, (), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    controller._panel_jobs.sync(
+        job_id,
+        {"state": "RUNNING", "phase": "PUBLISHING", "inbox_ready": True},
+        runtime={"existing": "value"},
+    )
+    initial = {
+        "job_id": job_id,
+        "state": "RUNNING",
+        "phase": "PUBLISHING",
+        "progress": {"current": 2, "total": 3},
+        "error": {"code": "RETRY"},
+        "evidence": {"source_revision": "r1"},
+        "inbox_ready": True,
+        "inbox_path": str(tmp_path / "inbox"),
+    }
+    sparse = {"job_id": job_id, "state": "RUNNING", "phase": "PUBLISHING"}
+    journal = controller._panel_jobs.journal
+    replacements = []
+    temporary_sources = []
+    real_replace = panel_jobs_module.os.replace
+
+    def counted_replace(source, destination):
+        temporary_sources.append(source)
+        if Path(destination) == journal:
+            replacements.append(destination)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
+    controller._record_special_job(initial)
+    assert len(replacements) == 1
+    controller._record_special_job(sparse)
+    assert len(replacements) == 2
+    for _ in range(3):
+        controller._record_special_job(sparse)
+
+    saved = controller._panel_jobs.jobs[job_id]
+    assert len(replacements) == 2
+    assert saved["error"] is None
+    assert "evidence" not in saved
+    assert saved["inbox_ready"] is True
+    assert controller._panel_jobs.runtime(job_id) == {
+        "existing": "value", "inbox_path": str(tmp_path / "inbox"),
+    }
+    restored = PanelJobRegistry(journal, recover_on_load=False)
+    assert restored.jobs == controller._panel_jobs.jobs
+    assert all(not Path(source).exists() for source in temporary_sources)
+
+
+def test_j5_dirty_volatile_job_is_persisted_by_identical_import_callback(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    import_id = "dirty-import"
+    other_id = "dirty-other"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, import_id, (), job_id=import_id,
+    )
+    controller._panel_jobs.submit("analysis.local", {}, other_id, (), job_id=other_id)
+    controller._panel_jobs.transition(import_id, "RUNNING")
+    controller._panel_jobs.transition(other_id, "RUNNING")
+    document = {
+        "job_id": import_id,
+        "state": "RUNNING",
+        "phase": "PUBLISHING",
+        "progress": {"current": 1, "total": 2},
+    }
+    controller._record_special_job(document)
+    journal = controller._panel_jobs.journal
+    replacements = []
+    temporary_sources = []
+    real_replace = panel_jobs_module.os.replace
+
+    def counted_replace(source, destination):
+        temporary_sources.append(source)
+        if Path(destination) == journal:
+            replacements.append(destination)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
+    controller._panel_jobs.volatile_sync(
+        other_id,
+        {"state": "RUNNING", "phase": "RUNNING", "progress": {"current": 1, "total": 2}},
+    )
+    controller._record_special_job(document)
+
+    assert replacements == [journal]
+    restored = PanelJobRegistry(journal, recover_on_load=False)
+    assert restored.jobs == controller._panel_jobs.jobs
+    assert restored.jobs[other_id]["progress"] == {"current": 1, "total": 2}
+    assert all(not Path(source).exists() for source in temporary_sources)
 
 
 def test_j4_characterization_normal_producer_resource_key_and_false_tester_marker_are_unchanged(tmp_path, monkeypatch):

@@ -101,14 +101,29 @@ for three repeated polls and one changed write (1.067 s, 0.000095 s total and
 so these timings are mechanism evidence, not a production speed estimate.
 
 The parser progress callback itself is in-memory only and causes zero journal
-writes. Before the terminal callback, each unchanged RUNNING/PUBLISHING status
-poll still writes the full journal. J5 is the separately approved extension
-for that path and remains gated on J4 review and commit. The old terminal
-import worker publishes only COMMITTED or FAILED, and there is no public
+writes. Before J5, each unchanged RUNNING/PUBLISHING status
+poll still wrote the full journal. J5 is the separately approved extension
+for that path. J4 passed independent review and committed as `b31b37e`.
+J5 now opts in unchanged RUNNING/PUBLISHING import snapshots too: a first
+change saves once, three exact repeats save zero times, and changed state,
+phase, progress or runtime still saves. A pending volatile update in another
+job forces the whole journal to save. The full Panel suite passed 122 tests
+with 4 Windows skips; integrated RETEST passed 68 with 1 Windows skip. J5-R2
+independent review returned `CODE_REVIEW_PASS`. These counts establish journal replacement
+behavior in private controller fixtures, not a production tail percentage.
+The repository search found no consumer of the journal file's mtime or size:
+the only production path constructors are Panel and Portfolio Panel, registry
+load/save use its contents, and portfolio startup migration reads its bytes.
+The private `_peek` has one production caller, `_record_special_job`, which
+reads but does not mutate its nested values. Public get/list/runtime return
+JSON-detached values; sync JSON-clones incoming progress, error, evidence,
+result and runtime before updating the stored job under its lock, and the
+callback does not mutate them after sync.
+The import worker publishes only COMMITTED or FAILED, and there is no public
 Performance v2 import cancel route. CANCELLED is a generic registry state but
 not an ordinary repeated import-tail status; a future cancellation path would
-need its own persistence/count check. The old terminal
-tester callback was dead: current jobs store the tester link as a resource key,
+need its own persistence/count check. The old terminal tester callback was
+dead: current jobs store the tester link as a resource key,
 not a request; optional legacy records reached an invalid empty-status sync
 which changed no stored flag. Public import consumes verification before its
 worker starts. Immutable `c1a5e0e` characterization passed three tests, and
