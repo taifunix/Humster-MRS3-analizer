@@ -250,7 +250,7 @@ def _typed_actions(
                 invalid_optional_fields,
             )
         )
-    return tuple(sorted(result, key=lambda item: (item.timestamp_utc, item.action_index)))
+    return tuple(result)
 
 
 def _typed_series(
@@ -283,8 +283,9 @@ def _validate_report_integrity(
         declared_final = _decimal(declared_final_text, "Final balance")
         quantum = Decimal(1).scaleb(declared_final.as_tuple().exponent)
         final_wallet = wallet_series[-1][1].quantize(quantum, rounding=ROUND_HALF_UP)
-        if actions and actions[-1].timestamp_utc > _epoch_timestamp(wallet_series[-1][0]):
-            final_wallet = actions[-1].balance.quantize(quantum, rounding=ROUND_HALF_UP)
+        latest_action = max(actions, key=lambda item: (item.timestamp_utc, item.action_index), default=None)
+        if latest_action is not None and latest_action.timestamp_utc > _epoch_timestamp(wallet_series[-1][0]):
+            final_wallet = latest_action.balance.quantize(quantum, rounding=ROUND_HALF_UP)
         if final_wallet != declared_final:
             raise PerformanceV2HtmlError(
                 f"final wallet {final_wallet} does not match declared Final balance {declared_final}"

@@ -22,6 +22,15 @@ cheap valid reuse and writer source rechecks. The regression failed before the
 fix; optimizer tests passed 25 and import tests passed 81. The final cleanup
 regression passed again. Independent Claude Opus 5/high returned CODE_REVIEW_PASS;
 T1 is accepted. The remaining runtime tasks are still pending.
+T4/COR-05 preserves actual HTML action order and keeps strict final-balance
+validation based on the latest timestamp/source-index witness. Swapped HTML
+is rejected as ACTIONS_OUT_OF_ORDER while a valid sibling commits; equal-time
+actions retain source order. Regression RED/2 GREEN and the full HTML/import
+contour passed 115 tests. Caller enumeration established a single runtime
+typed-parser consumer (the importer); the related fast/Panel/legacy contour
+passed 196 tests, 4 skipped, 8 warnings. Independent Claude Opus 5/high
+returned CODE_REVIEW_PASS in round 2; T4 is accepted. The integrated full
+suite remains pending and the branch is not yet complete.
 The user's import-tail report now prioritizes T4 then measured IMP-02/T13 work
 ahead of independent optimization tasks. The latest local audit confirms a
 409-report REPLACE batch in an approximately 14 GB DB, but records contain no

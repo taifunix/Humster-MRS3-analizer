@@ -135,6 +135,19 @@ def test_parser_accepts_event_at_tester_report_end() -> None:
     assert len(parse_current_performance_v2_html(source, _limits()).actions) == 2
 
 
+def test_parser_preserves_source_order_for_equal_action_timestamps() -> None:
+    source = _current().replace(
+        b"2026-01-03T01:00:00+00:00", b"2026-01-01T01:00:00Z", 1
+    )
+
+    parsed = parse_current_performance_v2_html(source, _limits())
+
+    assert [(action.action_index, action.action) for action in parsed.actions] == [
+        (0, "opened"),
+        (1, "closed"),
+    ]
+
+
 def test_parser_rejects_event_after_tester_report_end() -> None:
     source = _current().replace(b"2026-01-03T01:00:00+00:00", b"2026-01-09T00:00:01Z", 1)
 

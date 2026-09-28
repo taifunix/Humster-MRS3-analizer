@@ -126,13 +126,16 @@ Full suite запускается один раз после интеграци�
   Только exported `Trades` берет completed-round-trip count из готового cache.
   Fixture: cached=1, raw total=777 → XLSX=1, raw остается777. Missing cache остается
   unavailable; export не рассчитывает окна и не пишет БД.
-- [ ] **COR-05 / B6 — исходный порядок HTML actions.**
+- [x] **COR-05 / B6 — исходный порядок HTML actions.**
   `src/mrs3/performance_v2_html.py`, `src/mrs3/performance_v2_import.py`.
   Проверить source order до normalization либо сохранить его до существующего rejection.
   Actual swapped HTML → parser → warmup/import должен дать `ACTIONS_OUT_OF_ORDER`;
   fixture сейчас сортируется в indexes `[1,0]` и принимается. Rejection не публикует
   данные; equal timestamps сохраняют стабильный source order. Existing dataclass-only
   test остается дополнительным. Уточнить error mapping на parser/import boundary в spec.
+  T4 implementation: actual HTML/source-order regression RED, 2 GREEN; full
+  HTML/import contour 115 passed; caller enumeration and related fast/Panel/legacy
+  contour 196 passed, 4 skipped. Independent Opus 5/high `CODE_REVIEW_PASS` round 2.
 
 Все четыре исправления имеют цель correctness, а не обещание ускорения.
 Проверять каждое своим тестом до/после и отдельно отправлять на независимый review.

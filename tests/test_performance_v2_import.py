@@ -184,6 +184,22 @@ def _rewrite_report(request: PerformanceV2ImportRequest, replacement: bytes) -> 
     manifest_path.write_text(json.dumps(manifest))
 
 
+def _swap_current_action_rows(source: bytes) -> bytes:
+    opened = (
+        b"<tr><td>2026-01-01T01:00:00Z</td><td>ONUSDT</td><td>1</td>"
+        b"<td>opened</td><td>0.05</td><td>0</td><td>999.95</td>"
+        b"<td>1</td><td>1</td><td>long</td></tr>"
+    )
+    closed = (
+        b"<tr><td>2026-01-03T01:00:00+00:00</td><td>ONUSDT</td><td>1</td>"
+        b"<td>closed</td><td>0.05</td><td>9.9</td><td>1009.9</td>"
+        b"<td>1</td><td>0</td><td></td></tr>"
+    )
+    marker = b"<tr><td>__SWAPPED_ACTION_ROW__</td></tr>"
+    assert source.count(opened) == source.count(closed) == 1
+    return source.replace(opened, marker, 1).replace(closed, opened, 1).replace(marker, closed, 1)
+
+
 def _report_with_source_metadata() -> bytes:
     source = FIXTURE.read_bytes()
     source = source.replace(
@@ -577,6 +593,33 @@ def test_import_reports_parse_progress_for_each_completed_report(tmp_path: Path)
     assert events[0] == ("PARSING", 0, 2)
     assert [completed for stage, completed, total in events if stage == "PARSING"] == [0, 1, 2]
     assert events[-1] == ("PUBLISHING", 2, 2)
+
+
+def test_import_rejects_swapped_html_actions_and_admits_valid_sibling(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    swapped = _swap_current_action_rows(FIXTURE.read_bytes()).replace(
+        b'[1767402000000,"1009.9"]', b'[1767312000000,"999.95"]'
+    )
+    alpha_path = request.report_root / "alpha.html"
+    alpha_path.write_bytes(swapped)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["entries"][0]["source_report_sha256"] = sha256(swapped).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+
+    result = import_performance_v2(request)
+
+    assert result.status == "COMMITTED"
+    assert result.imported_count == 1
+    assert result.rejected_count == 1
+    assert any(
+        failure["strategy_name"] == "alpha" and failure["reason"] == "ACTIONS_OUT_OF_ORDER"
+        for failure in result.failures
+    )
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("select strategy_name from strategies order by strategy_name").fetchall() == [("beta",)]
+        assert connection.execute("select count(*) from strategy_actions").fetchone() == (2,)
 
 
 def test_replace_preserves_user_finalist_status_rank_and_comment(tmp_path: Path) -> None:
