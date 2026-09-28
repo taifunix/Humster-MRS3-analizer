@@ -386,7 +386,8 @@ def test_normal_test_and_import_card_is_unified_and_numbered() -> None:
     assert "7. CHECK & RETEST" in js
     card = html.split("3. Test and Import to Performance DB", 1)[1].split("</details>", 1)[0]
     assert card.count('class="progress-block"') == 1
-    assert card.count('role="status"') == 1
+    assert card.count('role="status"') == 2
+    assert 'id="tester-collection-status" class="card-status" role="status" aria-live="polite"' in card
     assert "const v2CardOrder" in js
     assert "performanceV2WindowTitle) performanceV2WindowTitle.textContent = '5. A/B" in js
 
@@ -1078,6 +1079,82 @@ def test_single_mode_report_collection_controls_stay_in_the_ordinary_tester_card
     assert 'id="tester-collection-clear" type="button" class="button button-secondary" disabled' in card
 
 
+def test_report_collection_state_ignores_stale_load_after_clear_and_refreshes_authoritatively() -> None:
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync(__APP_JS__, 'utf8');
+const start = source.indexOf('const testerCollectionUiHelpers = (() => {');
+const end = source.indexOf('\n  const { selectCommittedRetestTester', start);
+assert.notEqual(start, -1, 'collection state helper missing');
+assert.notEqual(end, -1, 'collection state helper boundary missing');
+const context = {};
+vm.runInNewContext(source.slice(start, end), context, { filename: 'app.js' });
+const states = [];
+const requests = [];
+const coordinator = context.testerCollectionUiHelpers.create({
+  request: () => new Promise((resolve) => requests.push(resolve)),
+  apply: (value) => states.push(value),
+});
+(async () => {
+  const initial = coordinator.load();
+  await Promise.resolve();
+  const clear = coordinator.run('clear', async () => undefined);
+  assert.equal(coordinator.busy, true);
+  assert.equal(requests.length, 1);
+  requests.shift()({ state: 'OPEN', collection_id: 'stale', total_registered_packs: 1 });
+  await initial;
+  await Promise.resolve();
+  assert.equal(states.length, 0, 'stale pre-clear state must not reach the UI');
+  assert.equal(requests.length, 1, 'clear must queue an authoritative fresh load');
+  requests.shift()({ state: 'EMPTY', collection_id: null, total_registered_packs: 0 });
+  await Promise.all([initial, clear]);
+  assert.deepEqual(states.map((value) => value.state), ['EMPTY']);
+  assert.equal(coordinator.busy, false);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""".replace("__APP_JS__", json.dumps(str(PANEL_WEB / "app.js")))
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_report_collection_actions_block_conflicting_start_retry_verify_import_and_clear() -> None:
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync(__APP_JS__, 'utf8');
+const start = source.indexOf('const testerCollectionUiHelpers = (() => {');
+const end = source.indexOf('\n  const { selectCommittedRetestTester', start);
+const context = {};
+vm.runInNewContext(source.slice(start, end), context, { filename: 'app.js' });
+let releaseClear;
+let conflictingRequests = 0;
+const coordinator = context.testerCollectionUiHelpers.create({ request: async () => ({ state: 'EMPTY' }) });
+(async () => {
+  const clear = coordinator.run('clear', () => new Promise((resolve) => { releaseClear = resolve; }));
+  for (const action of ['start', 'retry', 'verify', 'import', 'clear']) {
+    assert.equal(coordinator.canRun(action), false, `${action} must be disabled during clear`);
+    const result = await coordinator.run(action, async () => { conflictingRequests += 1; });
+    assert.equal(result.blocked, true, `${action} must not send while clear is active`);
+  }
+  releaseClear();
+  await clear;
+  assert.equal(conflictingRequests, 0);
+  assert.equal(coordinator.busy, false);
+  assert.equal(coordinator.canRun('start'), true);
+  const verifyToken = coordinator.begin('verify');
+  let authorized = false;
+  coordinator.invalidate();
+  assert.equal(coordinator.commit(verifyToken, () => { authorized = true; }), false);
+  assert.equal(authorized, false, 'stale verify response must not restore import authorization');
+  coordinator.finish(verifyToken);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""".replace("__APP_JS__", json.dumps(str(PANEL_WEB / "app.js")))
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
 def test_single_mode_collection_launch_is_strict_boolean_and_status_is_server_owned() -> None:
     js = _read("app.js")
     start = js.split("if (testerStart) testerStart.addEventListener", 1)[1].split("if (testerStop)", 1)[0]
@@ -1086,7 +1163,7 @@ def test_single_mode_collection_launch_is_strict_boolean_and_status_is_server_ow
     assert "collect_reports: collectReports" in start
     assert "const collectReports = testerCollectReports?.checked === true;" in start
     assert "loadTesterCollection" in start
-    assert "requestJson('/api/v2/strategies/tester/report-collection')" in js
+    assert "const endpoint = '/api/v2/strategies/tester/report-collection';" in js
     loader = js.split("const loadTesterCollection", 1)[1].split("const setTesterControls", 1)[0]
     assert "requestJson('/api/v2/jobs')" not in loader
 
@@ -1124,7 +1201,7 @@ def test_collection_clear_posts_exact_id_and_resets_only_after_success() -> None
 
     assert "collection_id: collectionId" in clear
     assert "method: 'POST'" in clear
-    assert "loadTesterCollection()" in clear
+    assert "collectionCoordinator.refresh()" in clear
     assert "testerCollectionId = '';" in clear
     assert "normalImportAuthorized = false;" in clear
 
