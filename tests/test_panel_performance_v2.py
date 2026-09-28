@@ -716,6 +716,7 @@ def test_v2_panel_controller_injects_server_owned_listing_root(tmp_path: Path, m
 
     assert captured["request"].listing_dates_root == tmp_path.resolve()  # type: ignore[union-attr]
     assert captured["request"].listing_dates_path == Path("input/dates.xlsx")  # type: ignore[union-attr]
+    assert captured["request"].strategy_root == (tmp_path / "Output").resolve()  # type: ignore[union-attr]
     assert controller._panel_jobs.runtime("tester-root")["performance_v2_import_verified"] is False
     with pytest.raises(ValueError, match="explicit inbox verification"):
         controller.strategies_performance_v2_import({"tester_job_id": "tester-root"})
@@ -803,7 +804,7 @@ def test_metadata_inbox_accepts_its_validated_published_fresh_batch(tmp_path: Pa
     controller._validate_metadata_inbox(inbox)
 
 
-def test_metadata_inbox_rejects_unpublished_fresh_staging_directory(tmp_path: Path, monkeypatch) -> None:
+def test_metadata_inbox_accepts_strategy_anywhere_under_output(tmp_path: Path, monkeypatch) -> None:
     analysis_id = "a" * 64
     inbox, report_root, _strategy_path = _write_fresh_metadata_inbox(
         tmp_path,
@@ -827,8 +828,21 @@ def test_metadata_inbox_rejects_unpublished_fresh_staging_directory(tmp_path: Pa
         lambda: SimpleNamespace(strategy_root=tmp_path / "Output" / "strategies"),
     )
 
-    with pytest.raises(ValueError, match="strategy_path is outside configured directory"):
-        controller._validate_metadata_inbox(inbox)
+    controller._validate_metadata_inbox(inbox)
+
+
+def test_metadata_inbox_rejects_redirected_output_root(tmp_path: Path, monkeypatch) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    output_root = tmp_path / "Output"
+    real_is_junction = Path.is_junction
+    monkeypatch.setattr(
+        Path,
+        "is_junction",
+        lambda path: path == output_root or real_is_junction(path),
+    )
+
+    with pytest.raises(ValueError, match="Output strategy root is redirected"):
+        controller._output_strategy_root()
 
 
 def test_metadata_inbox_rejects_redirected_fresh_analysis_directory(tmp_path: Path, monkeypatch) -> None:

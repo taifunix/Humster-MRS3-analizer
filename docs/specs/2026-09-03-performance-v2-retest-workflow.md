@@ -386,17 +386,13 @@ Panel атомарно создаёт в этом точном пути акту
 стирает серверный job/status; новый DB count читается при загрузке экрана и
 после успешного импорта.
 
-An ordinary `SINGLE_MODE` metadata inbox may reference strategy JSON from the
-published fresh-generation batch that produced the tester run. This is trusted
-only when the path has the canonical
-`Output/fresh-shortlist-v2/<analysis_sha>/<selection_token>-<batch_uuid>/strategies`
-shape, the sibling `strategy_manifest.json` passes the existing full manifest
-and strategy-hash validation, and its `analysis_run_id` equals the inbox v6
-provenance. The whole `Output` or `fresh-shortlist-v2` tree is never a trusted
-root; staging directories, another analysis and an invalid/missing generation
-manifest remain rejected. Symlink/junction redirection of the canonical fresh
-analysis path outside the repository is also rejected. Existing tester and
-configured Performance-v2 strategy roots retain their current behavior.
+An ordinary `SINGLE_MODE` metadata inbox may reference strategy JSON anywhere
+below the repository's `Output` directory. `Output` is the Panel/importer's
+trusted strategy root; inbox hashes, canonical strategy hashes, regular-file
+checks and symlink/reparse containment remain mandatory, so a path outside
+`Output` is still rejected. A redirected `Output` root is rejected. The legacy
+configured Performance-v2 strategy root is not an additional root for this
+ordinary Panel action, and neither is the tester strategy directory.
 
 On panel load, no previous RETEST tester or import job is activated and
 `IMPORT & REPLACE` remains disabled. A previously committed native RETEST job

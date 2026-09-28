@@ -447,7 +447,7 @@ def _strategy_path(
     *,
     allow_external: bool,
 ) -> Path:
-    """Resolve an inbox-local path or an external path below Output/strategies."""
+    """Resolve an inbox-local path or an external path below its trusted root."""
     if not allow_external:
         return _contained_path(raw, inbox, "strategy path")
     try:

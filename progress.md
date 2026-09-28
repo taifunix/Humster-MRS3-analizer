@@ -3885,17 +3885,15 @@ referenced the published `Output/fresh-shortlist-v2/.../strategies` source while
 the handoff validator trusted only the tester and legacy Performance strategy
 roots. The configured listing-dates XLSX existed and was not the blocker.
 
-The handoff now accepts only the exact published fresh batch: canonical
-analysis/batch directory shape, one batch, matching inbox `analysis_run_id`, and
-a fully validated sibling `strategy_manifest.json` with the exact strategy set.
-The whole fresh output tree, staging directories and another analysis remain
-untrusted; redirected fresh analysis paths are rejected as well. The actual
-committed inbox `8bb9aa5d08504e42ac31d1fb1ac2ad68`
-validated all 1634 entries after the change. Focused TDD passed
-(`2 passed, 1 skipped` because directory symlink creation is unavailable), and
-the related Performance v2, SINGLE_MODE handoff and fresh-generation suites
-passed (`179 passed, 3 skipped`; existing pandas warnings). No tester or import
-was started and the running Panel was not restarted.
+The Panel handoff and Performance v2 importer now use the repository's whole
+`Output` directory as the trusted strategy root. Regular-file containment,
+inbox/source hashes, canonical strategy hashes and symlink/reparse rejection
+remain enforced, but no batch-directory or generation-manifest shape is
+required. The actual committed inbox `8bb9aa5d08504e42ac31d1fb1ac2ad68`
+passed the complete importer input preflight for all 1634 entries. Focused TDD
+passed (`3 passed, 1 skipped`), and the related Panel, Performance v2 input and
+import suites passed (`231 passed, 5 skipped`; existing pandas warnings). No tester or
+import was started and the running Panel was not restarted.
 
 ## Performance v2 first-import bootstrap (2026-09-28)
 
