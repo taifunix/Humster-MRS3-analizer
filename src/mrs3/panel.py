@@ -3369,7 +3369,7 @@ class PanelController:
             raise ValueError("start_date and end_date are required")
         initial_balance = self._requested_initial_balance(payload)
         manifest = self._fresh_strategy_manifest(analysis_id)
-        expected_names = self._manifest_strategy_names(manifest)
+        expected_names = self._manifest_strategy_names(manifest) if collect_reports else ()
         request = {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "initial_balance": initial_balance, "mode": "SINGLE_MODE", "collect_reports": collect_reports}
         single_mode_service = self._single_mode_strategy_test()
         reconcile = getattr(single_mode_service, "reconcile_pending_cleanup", None)
