@@ -93,11 +93,56 @@ class PanelReportCollection:
             status["inbox_ready"] = True
         self.registry.sync(collection_id, status, runtime=runtime)
 
-    def _member(self, runtime: dict[str, object], job_id: str) -> dict[str, object] | None:
-        for member in runtime["members"]:
+    def _member(self, runtime: dict[str, object] | list[dict[str, object]], job_id: str) -> dict[str, object] | None:
+        members = runtime.get("members") if isinstance(runtime, dict) else runtime
+        if not isinstance(members, list):
+            return None
+        for member in members:
             if isinstance(member, dict) and member.get("tester_job_id") == job_id:
                 return member
         return None
+
+    @staticmethod
+    def _read_manifest_binding(collection_id: str, path: Path, expected_digest: str | None = None) -> str:
+        try:
+            data = path.joinpath("inbox_manifest.json").read_bytes()
+            document = json.loads(data.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            raise PanelJobError("COLLECTION_VERIFIED_INBOX_TAMPERED") from None
+        digest = sha256(data).hexdigest()
+        if expected_digest is not None and digest != expected_digest:
+            raise PanelJobError("COLLECTION_VERIFIED_INBOX_TAMPERED")
+        if not isinstance(document, dict) or document.get("collection_id") != collection_id:
+            raise PanelJobError("COLLECTION_MANIFEST_ID_MISMATCH")
+        return digest
+
+    @staticmethod
+    def _validate_member_names(path: Path, expected: object) -> None:
+        if not isinstance(expected, list) or any(not isinstance(name, str) or not name for name in expected):
+            raise PanelJobError("COLLECTION_MEMBER_NAMES_MISMATCH")
+        try:
+            document = json.loads((path / "inbox_manifest.json").read_text(encoding="utf-8"))
+            manifest_names = document.get("expected_strategy_names") if isinstance(document, dict) else None
+            entries = document.get("entries") if isinstance(document, dict) else None
+            entry_names = [entry.get("strategy_name") for entry in entries] if isinstance(entries, list) else None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise PanelJobError("COLLECTION_MEMBER_NAMES_MISMATCH") from None
+        if manifest_names != expected or entry_names != expected:
+            raise PanelJobError("COLLECTION_MEMBER_NAMES_MISMATCH")
+
+    def assert_importable(self, collection_id: str) -> Path:
+        record = self.registry.get(collection_id)
+        if record.get("kind") != _COLLECTION_KIND:
+            raise PanelJobError("COLLECTION_NOT_FOUND")
+        runtime = self._runtime(record)
+        path = runtime.get("verified_inbox_path")
+        if runtime.get("collection_state") != "VERIFIED" or runtime.get("performance_v2_import_verified") is not True:
+            raise PanelJobError("COLLECTION_IMPORT_NOT_AUTHORIZED")
+        if not isinstance(path, str) or not path.strip():
+            raise PanelJobError("COLLECTION_VERIFIED_INBOX_UNAVAILABLE")
+        inbox = Path(path)
+        self._read_manifest_binding(collection_id, inbox, runtime.get("verified_inbox_sha256"))
+        return inbox
 
     def _new_record(self, members: list[dict[str, object]]) -> str:
         collection_id = f"collection-{uuid4().hex}"
@@ -155,7 +200,7 @@ class PanelReportCollection:
             if replaces_job_id is not None:
                 if not isinstance(replaces_job_id, str) or not replaces_job_id.strip():
                     raise PanelJobError("INVALID_REQUEST")
-                old = self._member(active_runtime, replaces_job_id)
+                old = self._member(members, replaces_job_id)
                 if old is None or old.get("superseded") is True:
                     raise PanelJobError("COLLECTION_RETRY_SOURCE_NOT_REGISTERED")
                 source = self.registry.get(replaces_job_id)
@@ -261,6 +306,7 @@ class PanelReportCollection:
         if state == "VERIFIED":
             path = runtime.get("verified_inbox_path")
             if isinstance(path, str) and Path(path).is_dir():
+                self._read_manifest_binding(collection_id, Path(path), runtime.get("verified_inbox_sha256"))
                 runtime["performance_v2_import_verified"] = True
                 self._persist_runtime(collection_id, runtime)
                 return Path(path)
@@ -275,6 +321,9 @@ class PanelReportCollection:
         paths = [Path(member["inbox_path"]) for member in current if member.get("committed") is True]
         if not paths:
             raise PanelJobError("COLLECTION_NO_COMMITTED_MEMBERS")
+        for member in current:
+            if member.get("committed") is True:
+                self._validate_member_names(Path(member["inbox_path"]), member.get("expected_strategy_names"))
         try:
             inbox = build_single_mode_collection_inbox(
                 self.inbox_root,
@@ -283,7 +332,7 @@ class PanelReportCollection:
                 report_root=self.report_root,
                 trusted_strategy_root=self.trusted_strategy_root,
             )
-            digest = sha256((inbox / "inbox_manifest.json").read_bytes()).hexdigest()
+            digest = self._read_manifest_binding(collection_id, inbox)
         except Exception:
             raise
         runtime["collection_state"] = "VERIFIED"

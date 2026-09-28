@@ -3399,6 +3399,9 @@ class PanelController:
         source = self._panel_jobs.get(source_job_id)
         if source.get("kind") not in {"strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry"}:
             raise PanelJobError("UNSUPPORTED_ROUTE")
+        source_runtime = self._panel_jobs.runtime(source_job_id)
+        if source.get("retest") is True or source_runtime.get("retest") is True:
+            raise PanelJobError("RETEST_RETRY_NOT_ALLOWED")
         if source.get("state") not in {"FAILED", "CANCELLED"}:
             raise PanelJobError("TESTER_JOB_NOT_RECOVERABLE")
 
@@ -4257,11 +4260,14 @@ class PanelController:
             raise ValueError("Performance v2 REPLACE is internal only")
         tester_job_id = self._required(payload, "tester_job_id")
         tester_job = self._panel_jobs.get(tester_job_id)
+        is_collection_job = tester_job.get("kind") == "strategies.tester.collection"
         if tester_job.get("state") != "COMMITTED" or tester_job.get("inbox_ready") is not True:
             raise ValueError("Performance v2 import requires a committed tester inbox")
         if not _internal and self._panel_jobs.runtime(tester_job_id).get("performance_v2_import_verified") is not True:
             raise ValueError("Performance v2 import requires explicit inbox verification")
         if not _internal:
+            if is_collection_job:
+                self._report_collection().assert_importable(tester_job_id)
             try:
                 self._validate_metadata_inbox(self._tester_inbox(tester_job_id))
             except ValueError as error:
@@ -4279,6 +4285,8 @@ class PanelController:
                     or runtime.get("performance_v2_import_verified") is not True
                 ):
                     raise ValueError("Performance v2 import requires explicit inbox verification")
+                if is_collection_job:
+                    self._report_collection().assert_importable(tester_job_id)
                 runtime["performance_v2_import_verified"] = False
                 self._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
         mode = payload.get("mode", "ADD")
