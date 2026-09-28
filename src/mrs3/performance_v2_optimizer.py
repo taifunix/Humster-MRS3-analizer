@@ -731,7 +731,6 @@ def build_prepared_input(source: OptimizerSourceInput, *, preparation_version: s
 
 
 def prepare_optimizer_input(source: OptimizerSourceInput, *, preparation_version: str = PREPARATION_VERSION) -> tuple[PreparedAvailability, PreparedOptimizerInput | None]:
-    digest = source_digest(source)
     try:
         prepared = build_prepared_input(source, preparation_version=preparation_version)
     except OptimizerUnavailableError as error:

@@ -248,6 +248,11 @@ scope добавление scope workers не ускоряет последов�
   DELETE-only repeat 47.8% lower; these synthetic timings vary. Independent
   Opus 5/high `CODE_REVIEW_PASS` round 2; T13a accepted. IMP-02 remains open
   for metadata and preparation work.
+  OPT-01a narrow CPU slice removes the unused digest before builder preparation:
+  3 RED/3 GREEN, optimizer 28 passed, strict import checks 4 passed; warmed
+  1,000-cycle preparation median about 18% lower with identical bytes/digests.
+  Independent Opus 5/high `CODE_REVIEW_PASS`; OPT-01a accepted. Broader
+  OPT-01 sharing remains open.
 - [ ] **IMP-03 — общий HTML inventory.** `performance_v2_html.py`, `performance.py`.
   Переиспользовать decode/raw-markup inventory current-header gate и общего parser.
   Не убирать required/duplicate header, size/action limits и source order checks.

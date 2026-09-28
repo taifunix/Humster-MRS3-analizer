@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
 from pathlib import Path
 import shutil
 
@@ -154,6 +155,47 @@ def test_prepared_size_limit_uses_exact_stored_bytes(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(optimizer, "PREPARED_MAX_BYTES", len(prepared.to_json().encode("utf-8")) - 1)
     availability, prepared = optimizer.prepare_optimizer_input(source)
     assert availability.reason == "PREPARED_TOO_LARGE" and prepared is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_status", "expected_reason", "expected_digest"),
+    [
+        ({}, "AVAILABLE", None, "4cc68eb24792a6ce2b6056d86487b5cbb408da6c3eb0cc58d3d73fd3fe1b64be"),
+        ({"sizing_use_upnl": None}, "UNAVAILABLE", "MISSING_TYPED_FACTS", "a6d63e6647c7ba85274599d3e6f717bd5b288c752cbbc224563d184e9c89356a"),
+        ({"sizing_use_fix": True}, "UNAVAILABLE", "UNSUPPORTED_SIZING", "82c214ba9feddcfa00ca7124870be3372984fad6c1a2becbfed435e0909e6440"),
+    ],
+)
+def test_prepare_optimizer_input_digests_source_once_and_preserves_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+    expected_status: str,
+    expected_reason: str | None,
+    expected_digest: str,
+) -> None:
+    source = _source(**overrides)
+    baseline_digest = source_digest(source)
+    baseline_availability, baseline_prepared = optimizer_module.prepare_optimizer_input(source)
+    baseline_json = baseline_prepared.to_json() if baseline_prepared is not None else None
+    assert baseline_digest == expected_digest
+    if baseline_json is not None:
+        assert len(baseline_json.encode("utf-8")) == 1450
+        assert hashlib.sha256(baseline_json.encode("utf-8")).hexdigest() == "028706848a6ed6bd634099839e2293132ec3293bd82a3e93bd8db94af60f0563"
+    digest_calls: list[OptimizerSourceInput] = []
+    real_source_digest = optimizer_module.source_digest
+
+    def spy(value: OptimizerSourceInput) -> str:
+        digest_calls.append(value)
+        return real_source_digest(value)
+
+    monkeypatch.setattr(optimizer_module, "source_digest", spy)
+    availability, prepared = optimizer_module.prepare_optimizer_input(source)
+
+    assert len(digest_calls) == 1
+    assert availability.status == expected_status
+    assert availability.reason == expected_reason == baseline_availability.reason
+    assert (prepared.to_json() if prepared is not None else None) == baseline_json
+    if prepared is not None:
+        assert prepared.source_digest == expected_digest
 
 
 def test_lazy_current_preparation_reloads_typed_rows_and_reads_strict_artifact(tmp_path) -> None:

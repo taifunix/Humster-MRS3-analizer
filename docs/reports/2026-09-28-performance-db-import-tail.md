@@ -57,6 +57,14 @@ took 0.823177 s in `prepare_optimizer_input` in one probe. It performed two
 source digests and five source-document constructions. One digest assignment
 is unused; removing it is the smallest additional CPU optimization. Larger
 document caching needs separate ownership/revision evidence.
+OPT-01a removes that unused assignment. Available, missing-fact and unsupported-
+sizing regressions pin two digest calls before to one after, frozen source
+digests and prepared JSON identity. Optimizer tests passed 28 and strict import
+checks passed 4. A warmed 1,000-cycle comparison measured median 1.413928 s
+before and 1.159939 s after, about 18% lower for preparation alone. The baseline
+helper emulates the extra pre-change digest; three samples per variant matched
+1,371,304 prepared bytes and SHA-256. This remains synthetic evidence;
+independent Opus 5/high returned `CODE_REVIEW_PASS`; OPT-01a is accepted.
 
 The original shared Panel job journal contains 109 jobs and 86,687,437 bytes
 (82.67 MiB). A read-only, in-memory probe measured three repetitions of the

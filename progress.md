@@ -55,6 +55,19 @@ Unchanged terminal polling currently rewrites it. A separate narrow plan is
 being reviewed; no live journal cleanup or database mutation was performed.
 Source final-payload proof and
 legacy empty-import `safe_to_delete` evidence remain deferred by the user.
+OPT-01a removes one unused source digest before the actual builder digest.
+RED showed two calls for three available/unavailable cases; GREEN shows one
+with frozen source digests and prepared JSON bytes/SHA. Optimizer tests passed
+28 and strict import/prepared-readback checks passed 4. A warmed synthetic
+1,000-cycle source measured median 1.413928 s before versus 1.159939 s after
+(about 18% lower for preparation alone), with identical payload identity.
+Independent Opus 5/high returned CODE_REVIEW_PASS; OPT-01a is accepted.
+Source rechecks and the exact byte limit remain; broader OPT-01 is open.
+The separate terminal-journal plan J4 received independent PLAN_APPROVED after
+locking, failed-save retry and volatile-durability clarifications. Its runtime
+slice waits for the current scoped acceptance. Live journal cleanup is outside
+this branch's implementation; the existing migration has passed read-only
+geometry/disk-space preflight for the large historical campaign payloads.
 
 ## Restored READY JSON can launch SINGLE_MODE after reload (2026-09-28)
 
