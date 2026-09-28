@@ -1,7 +1,24 @@
 # MRS3 — current verification
 
 **Updated:** 2026-09-28
-**Current branch:** `main` after shortlist integration
+**Current branch:** `perf/heavy-db-optimization`, based on fetched `origin/main` `8f59c2c`
+
+## Heavy database optimization implementation (2026-09-28)
+
+User authorized implementation on a new branch after fetching Git updates.
+[Active spec](docs/specs/2026-09-28-heavy-database-optimization.md),
+[audit](docs/reports/2026-09-28-heavy-database-processes-audit.md) and
+[plan](docs/superpowers/plans/2026-09-28-heavy-database-optimization.md) govern
+this work. The isolated worktree starts at `8f59c2c`; upstream first-import
+atomic DB initialization and trusted `Output` strategy-root contracts are
+included in all import changes. Existing local main edits remain in their
+original checkout. R5 received independent Claude Opus 5/high `PLAN_APPROVED`.
+Focused baseline: 221 passed, 5 skipped, 8 warnings in 164.77s (Panel Performance
+v2, input, HTML, optimizer, prune). Gate0 documentation received independent
+Claude Opus 5/high `CODE_REVIEW_PASS` after explicit migration, admitted-subset,
+cache-miss and import-boundary clarifications. No runtime optimization is accepted yet.
+Source final-payload proof and
+legacy empty-import `safe_to_delete` evidence remain deferred by the user.
 
 ## Restored READY JSON can launch SINGLE_MODE after reload (2026-09-28)
 
