@@ -117,6 +117,10 @@ remains the authority for the tester commission/config snapshot.
     successor registration cannot invalidate an in-progress claim; failed or
     cancelled import releases it and restores retryability, while committed
     completion marks that exact generation IMPORTED.
+13. On controller startup or first collection access, an import claim is
+    reconciled against the process-local import workers. A live worker keeps
+    its claim; an absent or interrupted worker releases it for retry, while a
+    durable COMMITTED result completes the generation as IMPORTED.
 
 ## Failure behavior
 
@@ -127,6 +131,9 @@ remains the authority for the tester commission/config snapshot.
   database state is unchanged.
 - Import failure: collection remains verified and retryable.
 - Registry restart: an open or verified collection is restored exactly.
+- A stale import claim never blocks restart forever: missing, interrupted or
+  terminal non-COMMITTED jobs are released, while ambiguous states remain
+  fail-closed until a durable completion record is available.
 - Concurrent register/verify, clear/verify, and clear/import operations fail
   closed or serialize at the durable revision boundary without losing a
   member or overwriting a committed import.

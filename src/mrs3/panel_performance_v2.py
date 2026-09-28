@@ -758,6 +758,14 @@ class LocalPerformanceV2Jobs:
         with self._lock:
             return any(job["state"] == "RUNNING" for job in self._jobs.values())
 
+    def active_job_ids(self) -> set[str]:
+        with self._lock:
+            return {
+                str(job_id)
+                for job_id, job in self._jobs.items()
+                if job.get("state") == "RUNNING"
+            }
+
     def start(self, request: PerformanceV2PanelRequest, *, job_id: str | None = None) -> dict[str, object]:
         job_id = job_id or str(uuid4())
         with self._lock:

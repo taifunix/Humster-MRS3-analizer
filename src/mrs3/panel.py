@@ -1364,6 +1364,7 @@ class PanelController:
         self._single_mode_strategy_test_service: LocalSingleModeStrategyTestService | None = None
         self._strategy_batch_inboxes: dict[str, Path] = {}
         self._performance_v2_jobs: LocalPerformanceV2Jobs | None = None
+        self._collection_import_claim_ids: set[str] = set()
         self._reconcile_interrupted_remote_source_jobs()
         self._reconcile_interrupted_tester_jobs()
         self._job: _Job | None = None
@@ -2022,7 +2023,7 @@ class PanelController:
             except PanelJobError:
                 pass
             return
-        if tracked.get("kind") == "strategies.performance.v2.import" and document.get("state") in {"COMMITTED", "FAILED"}:
+        if tracked.get("kind") == "strategies.performance.v2.import" and document.get("state") in {"COMMITTED", "FAILED", "CANCELLED"}:
             result = self._performance_v2_result_snapshot(document)
             if result:
                 public["result"] = result
@@ -2046,7 +2047,10 @@ class PanelController:
                 try:
                     is_collection = self._panel_jobs.get(tester_job_id).get("kind") == "strategies.tester.collection"
                     if is_collection:
-                        self._report_collection().finish_import(
+                        collection_service = self._report_collection_service
+                        if collection_service is None:
+                            collection_service = self._report_collection()
+                        collection_service.finish_import(
                             tester_job_id,
                             job_id,
                             committed=document.get("state") == "COMMITTED",
@@ -2057,6 +2061,16 @@ class PanelController:
                         self._panel_jobs.sync(tester_job_id, {}, runtime=tester_runtime)
                 except PanelJobError:
                     pass
+            elif self._report_collection_service is not None:
+                try:
+                    self._report_collection_service.finish_import_job(
+                        job_id,
+                        committed=document.get("state") == "COMMITTED",
+                    )
+                except PanelJobError:
+                    pass
+            with self._lock:
+                self._collection_import_claim_ids.discard(job_id)
         try:
             self._panel_jobs.sync(job_id, public, runtime=runtime or None)
         except PanelJobError:
@@ -3335,7 +3349,7 @@ class PanelController:
             )
         return self._single_mode_strategy_test_service
 
-    def _report_collection(self) -> PanelReportCollection:
+    def _report_collection(self, *, live_import_job_ids: Sequence[str] = ()) -> PanelReportCollection:
         if self._report_collection_service is None:
             config = RunnerConfig.from_json(self.default_config)
             self._report_collection_service = PanelReportCollection(
@@ -3344,6 +3358,14 @@ class PanelController:
                 report_root=Path(config.report_dir),
                 trusted_strategy_root=self._output_strategy_root(),
             )
+        active_job_ids = getattr(self._performance_v2_jobs, "active_job_ids", None)
+        active_import_job_ids = active_job_ids() if callable(active_job_ids) else set()
+        with self._lock:
+            pending_import_job_ids = set(self._collection_import_claim_ids)
+        live_import_job_ids = active_import_job_ids.union(pending_import_job_ids, live_import_job_ids)
+        self._report_collection_service.reconcile_import_claims(
+            live_import_job_ids=live_import_job_ids,
+        )
         return self._report_collection_service
 
     @staticmethod
@@ -4387,11 +4409,18 @@ class PanelController:
         def claim_collection_import(job_id: str) -> None:
             nonlocal claim_started
             if collection_service is not None:
-                collection_service.claim_import(
-                    tester_job_id,
-                    job_id,
-                    expected_digest=expected_inbox_manifest_sha256,
-                )
+                with self._lock:
+                    self._collection_import_claim_ids.add(job_id)
+                try:
+                    collection_service.claim_import(
+                        tester_job_id,
+                        job_id,
+                        expected_digest=expected_inbox_manifest_sha256,
+                    )
+                except BaseException:
+                    with self._lock:
+                        self._collection_import_claim_ids.discard(job_id)
+                    raise
                 claim_started = True
 
         def start_import(job_id: str) -> dict[str, object]:
@@ -4399,6 +4428,8 @@ class PanelController:
             try:
                 return self._performance_v2_jobs.start(request, job_id=job_id)
             except BaseException:
+                with self._lock:
+                    self._collection_import_claim_ids.discard(job_id)
                 if claim_started and collection_service is not None:
                     try:
                         collection_service.release_import_claim(tester_job_id, job_id)

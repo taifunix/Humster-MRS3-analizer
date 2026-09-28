@@ -42,6 +42,16 @@ symlink skip, and the Panel affected contour passed 176 tests with four
 existing symlink skips and eight pandas warnings. No real tester, Panel or
 production database was used.
 
+## SINGLE_MODE collection claim reconciliation (2026-09-28)
+
+Task 2 now reconciles durable `import_in_progress` claims when a controller
+first accesses the collection service. Claims backed by a live in-process
+Performance v2 worker remain protected; claims left by a restart or an
+interrupted/failed/cancelled import return the VERIFIED generation to the
+retryable gate, while a persisted COMMITTED worker result resolves it to
+IMPORTED. Completion also handles CANCELLED callbacks and can resolve the
+collection from the durable claim when the callback has no request payload.
+
 ## SINGLE_MODE report collection controls (Task 3, 2026-09-28)
 
 The ordinary tester card now exposes the server-owned report collection: the

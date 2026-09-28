@@ -433,3 +433,102 @@ def test_import_claim_blocks_clear_and_failed_completion_releases_for_retry(tmp_
     service.claim_import(collection_id, "import-2")
     service.finish_import(collection_id, "import-2", committed=True)
     assert registry.runtime(collection_id)["collection_state"] == "IMPORTED"
+
+
+def _claimed_collection(tmp_path: Path, *, import_state: str = "RUNNING") -> tuple[PanelJobRegistry, PanelReportCollection, str]:
+    registry = _registry(tmp_path)
+    member = tmp_path / "member"
+    member.mkdir()
+    _tester(registry, "job-1", state="COMMITTED", inbox=member)
+    service = PanelReportCollection(registry, inbox_root=tmp_path / "collections", report_root=tmp_path / "reports", trusted_strategy_root=tmp_path / "strategies")
+    collection_id = service.register("job-1", ["S1"])
+    inbox = tmp_path / "verified"
+    inbox.mkdir()
+    (inbox / "inbox_manifest.json").write_text(json.dumps({"collection_id": collection_id}), encoding="utf-8")
+    runtime = registry.runtime(collection_id)
+    runtime.update({
+        "collection_state": "VERIFIED",
+        "verified_inbox_path": str(inbox),
+        "verified_inbox_sha256": sha256((inbox / "inbox_manifest.json").read_bytes()).hexdigest(),
+        "performance_v2_import_verified": True,
+    })
+    registry.sync(collection_id, {"state": "COMMITTED", "inbox_ready": True}, runtime=runtime)
+    registry.submit("strategies.performance.v2.import", {"tester_job_id": collection_id}, "panel:import-1", ("performance-v2-db",), job_id="import-1")
+    registry.transition("import-1", "RUNNING")
+    if import_state == "COMMITTED":
+        registry.transition("import-1", "COMMITTED")
+    service.claim_import(collection_id, "import-1")
+    return registry, service, collection_id
+
+
+def test_restart_releases_orphaned_claim_and_preserves_verified_retryability(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, _service, collection_id = _claimed_collection(tmp_path)
+    monkeypatch.setattr(panel_module.RunnerConfig, "from_json", lambda _path: SimpleNamespace(
+        inbox_root=tmp_path / "inbox", report_dir=tmp_path / "reports", strategy_dir=tmp_path / "strategies", bot_root=tmp_path / "bot"
+    ))
+
+    restarted = PanelController(tmp_path, tmp_path / "config.local.json")
+    restarted._report_collection().status()
+
+    runtime = restarted._panel_jobs.runtime(collection_id)
+    assert runtime["collection_state"] == "VERIFIED"
+    assert runtime["performance_v2_import_verified"] is True
+    assert "import_in_progress" not in runtime
+
+
+def test_restart_resolves_persisted_committed_import_to_imported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _registry_before, _service, collection_id = _claimed_collection(tmp_path, import_state="COMMITTED")
+    monkeypatch.setattr(panel_module.RunnerConfig, "from_json", lambda _path: SimpleNamespace(
+        inbox_root=tmp_path / "inbox", report_dir=tmp_path / "reports", strategy_dir=tmp_path / "strategies", bot_root=tmp_path / "bot"
+    ))
+
+    restarted = PanelController(tmp_path, tmp_path / "config.local.json")
+    restarted._report_collection().status()
+
+    runtime = restarted._panel_jobs.runtime(collection_id)
+    assert runtime["collection_state"] == "IMPORTED"
+    assert "import_in_progress" not in runtime
+
+
+def test_live_claim_is_preserved_during_lazy_reconciliation(tmp_path: Path) -> None:
+    _registry_before, service, collection_id = _claimed_collection(tmp_path)
+
+    service.reconcile_import_claims(live_import_job_ids={"import-1"})
+
+    runtime = service.registry.runtime(collection_id)
+    assert runtime["import_in_progress"] == "import-1"
+    assert runtime["performance_v2_import_verified"] is False
+
+
+def test_controller_reconciliation_preserves_local_live_import_worker(tmp_path: Path) -> None:
+    _registry_before, service, collection_id = _claimed_collection(tmp_path)
+    controller = PanelController(tmp_path / "controller", tmp_path / "controller" / "config.local.json")
+    controller._report_collection_service = service
+
+    class LiveJobs:
+        def active_job_ids(self) -> set[str]:
+            return {"import-1"}
+
+    controller._performance_v2_jobs = LiveJobs()  # type: ignore[assignment]
+    controller._report_collection().status()
+
+    runtime = service.registry.runtime(collection_id)
+    assert runtime["import_in_progress"] == "import-1"
+    assert runtime["performance_v2_import_verified"] is False
+
+
+def test_cancelled_import_completion_releases_collection_claim(tmp_path: Path) -> None:
+    registry, service, collection_id = _claimed_collection(tmp_path)
+    controller = PanelController(tmp_path / "controller", tmp_path / "controller" / "config.local.json")
+    controller._panel_jobs = registry
+    controller._report_collection_service = service
+
+    controller._record_special_job({
+        "job_id": "import-1", "state": "CANCELLED", "phase": "CANCELLED",
+        "error": None,
+    })
+
+    runtime = registry.runtime(collection_id)
+    assert runtime["collection_state"] == "VERIFIED"
+    assert runtime["performance_v2_import_verified"] is True
+    assert "import_in_progress" not in runtime

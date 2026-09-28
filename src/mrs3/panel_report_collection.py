@@ -214,6 +214,46 @@ class PanelReportCollection:
     def release_import_claim(self, collection_id: str, import_job_id: str) -> None:
         self.finish_import(collection_id, import_job_id, committed=False)
 
+    def finish_import_job(self, import_job_id: str, *, committed: bool) -> None:
+        """Finalize a claimed import when the collection id is not in the callback."""
+        with self.registry.lock:
+            matches = [
+                record.get("job_id")
+                for record in self._records()
+                if isinstance(record.get("job_id"), str)
+                and self._runtime(record).get("import_in_progress") == import_job_id
+            ]
+            if len(matches) != 1 or not isinstance(matches[0], str):
+                raise PanelJobError("COLLECTION_IMPORT_CLAIM_MISMATCH")
+            self.finish_import(matches[0], import_job_id, committed=committed)
+
+    def reconcile_import_claims(self, *, live_import_job_ids: Sequence[str] = ()) -> None:
+        """Repair claims left by a prior controller process without guessing live work."""
+        live = {job_id for job_id in live_import_job_ids if isinstance(job_id, str) and job_id}
+        with self.registry.lock:
+            claims: list[tuple[str, str, str | None, bool]] = []
+            for record in self._records():
+                collection_id = record.get("job_id")
+                if not isinstance(collection_id, str):
+                    continue
+                runtime = self._runtime(record)
+                claim = runtime.get("import_in_progress")
+                if isinstance(claim, str) and claim:
+                    try:
+                        state = self.registry.get(claim).get("state")
+                        found = True
+                    except PanelJobError:
+                        state = None
+                        found = False
+                    claims.append((collection_id, claim, state if isinstance(state, str) else None, found))
+            for collection_id, claim, state, found in claims:
+                if claim in live:
+                    continue
+                if state == "COMMITTED":
+                    self.finish_import(collection_id, claim, committed=True)
+                elif not found or state in {*TERMINAL - {"COMMITTED"}, *(_ACTIVE_STATES | {"QUEUED"})}:
+                    self.finish_import(collection_id, claim, committed=False)
+
     def _new_record(self, members: list[dict[str, object]]) -> str:
         collection_id = f"collection-{uuid4().hex}"
         request = {"collection_id": collection_id, "member_count": len(members)}
