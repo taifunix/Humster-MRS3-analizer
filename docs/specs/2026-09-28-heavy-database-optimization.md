@@ -113,6 +113,42 @@ elapsed speed; no production percentage is promised.
 
 T13a is a narrow first slice of IMP-02. Remaining append metadata,
 preparation lifetime and writer-scope work retains its separate acceptance.
+
+T13b reduces append overhead inside one Performance v2 publication. Keep one
+publication-local cache of the ordered target columns per used action/equity
+table, keyed only after the existing constrained metadata query and full
+length/set validation succeeds. Every subsequent frame must still pass the
+same column validation. A separate publication on the same connection starts
+with an empty cache; standalone `_append_rows` calls without it retain their
+per-call query and validation. An empty batch returns before constructing a
+DataFrame, querying metadata or issuing SQL. Do not add global or connection
+state, schema, dependency or public API.
+
+The existing 20,000-row append cap applies inside each action/equity row loop,
+including a single oversized report. Read the cap at call time; flush and
+clear after each row reaches it, and flush the final remainder only when
+nonempty. Preserve the current transaction, source order, report-local indices,
+result identities, exact Decimal ROUND_HALF_UP scale 12, all row values/types/
+nulls, counts, Phase 8 prepared digest, file ledger, ADD/REPLACE admission,
+partial rejection, retest tags and rollback. This bounds writer buffers only;
+parsed reports remain retained and broader writer-scope memory work remains
+open. Before moving the flush, enumerate every buffer read/write and stop if a
+complete-report buffer dependency exists. Inventory test wrappers/spies and
+preserve their arguments and injected failure points.
+
+Acceptance includes actual action/equity schema and one-frame versus split-
+frame dtype/readback preflight, especially all-null and mixed-null Decimal/
+order-ID batches; add no dtype conversion unless a concrete difference is
+proved. Check one metadata query per used table per publication, zero for an
+unused table, a new query on a second publication, and per-call queries for
+standalone helper use. Test batch lengths at 1, cap-1, cap and cap+1, including
+one oversized report and zero empty-remainder SQL. Compare DuckDB readback by
+result_id with action_index/sample_index, not DataFrame index; preserve exact
+types, nulls, Decimals, counts and digests. Inject failure after an earlier
+capped append and prove the whole publication rolls back. T13b-R2 received
+independent Opus 5/high `PLAN_APPROVED`; implementation stays limited to the
+existing importer and its tests.
+
 OPT-01 may first remove an unused digest computation verified by a source-digest
 call-count regression and byte-identical available/unavailable outputs. This
 does not reuse digests across source objects, snapshots, revisions or final IDs.

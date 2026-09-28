@@ -49,6 +49,17 @@ production or whole-import gain. Independent Opus 5/high re-review returned
 CODE_REVIEW_PASS after exact guard/read-order evidence and singleton coverage;
 T13a is accepted. Remaining IMP-02 work and integrated full-suite verification
 are still open.
+T13b caches validated append-column metadata only within one publication and
+flushes action/equity buffers inside their row loops at the 20,000-row cap.
+The importer suite passed 91 tests, including full DuckDB row/null/Decimal,
+Phase8 prepared-digest and file-ledger parity at caps 20,000/2/1, and a
+later-batch failure that rolled back REPLACE. Panel bootstrap/Output checks
+passed 7 with 1 skip; supported migration passed 3. Independent Opus 5/high
+re-review returned `CODE_REVIEW_PASS` after the parity regression was added.
+This is a bounded writer-buffer/schema-query slice, not a measured full-import
+speedup; remaining IMP-02 publication metadata and preparation work is open.
+Next correctness slice: COR-02 prune prepared FK children. Final integrated
+full-suite verification remains pending.
 The terminal Panel journal is 82.67 MiB/109 jobs; a read-only in-memory probe
 measured about 5.5 s median combined clone/serialization before disk write.
 J4 now avoids saving three unchanged terminal import polls in the private

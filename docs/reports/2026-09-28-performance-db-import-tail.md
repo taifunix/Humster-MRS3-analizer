@@ -188,3 +188,16 @@ Root separately confirmed four batch/rollback/strict-prepared regressions.
 Independent Opus 5/high returned `CODE_REVIEW_PASS` in round 2 after guard and
 read-order enumeration plus singleton characterization. T13a is accepted;
 the broader IMP-02 task and final integrated full suite remain open.
+
+T13b now reads constrained action/equity column metadata once per used table
+within a publication and flushes each writer buffer as soon as its 20,000-row
+cap is reached, even within one report. A second publication on the same
+connection re-queries. At private caps 20,000, 2 and 1, a persistent regression
+compared complete DuckDB action/equity rows, NULL and exact Decimal values,
+prepared source digest/JSON and import-file ledger; all matched. A failure in
+the second equity batch rolled back earlier writes. The importer suite passed
+91 tests, selected Panel bootstrap/Output checks passed 7 with 1 skip, and
+supported migration checks passed 3. Independent Opus 5/high re-review returned
+`CODE_REVIEW_PASS`. This establishes query and buffer bounds, not an elapsed
+speedup for the 409-report production import. Per-result publication metadata,
+Phase8 preparation and commit still need separate measurement and work.

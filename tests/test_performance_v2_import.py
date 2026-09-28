@@ -324,6 +324,66 @@ def test_append_rows_uses_main_catalog_when_attached_catalog_repeats_table_name(
         connection.close()
 
 
+def test_append_rows_caches_validated_schema_only_within_supplied_cache() -> None:
+    raw = duckdb.connect(":memory:")
+    raw.execute("create table rows_to_append (id integer, amount decimal(38, 12))")
+    metadata_calls: list[str] = []
+
+    class CountingConnection:
+        def execute(self, sql: str, parameters=None):
+            if "information_schema.columns" in sql:
+                metadata_calls.append(sql)
+            return raw.execute(sql, parameters) if parameters is not None else raw.execute(sql)
+
+        def append(self, table: str, frame) -> None:
+            raw.append(table, frame)
+
+    connection = CountingConnection()
+    cache: dict[str, tuple[str, ...]] = {}
+    rows = [(1, Decimal("1.25"))]
+    import_module._append_rows(
+        connection, "rows_to_append", ("id", "amount"), rows, schema_cache=cache
+    )
+    import_module._append_rows(
+        connection, "rows_to_append", ("id", "amount"), [(2, Decimal("2.50"))], schema_cache=cache
+    )
+    assert len(metadata_calls) == 1
+    assert cache == {"rows_to_append": ("id", "amount")}
+
+    import_module._append_rows(
+        connection, "rows_to_append", ("id", "amount"), [(3, Decimal("3.75"))], schema_cache={}
+    )
+    import_module._append_rows(connection, "rows_to_append", ("id", "amount"), [])
+    import_module._append_rows(
+        connection, "rows_to_append", ("id", "amount"), [(4, Decimal("4.00"))]
+    )
+    assert len(metadata_calls) == 3
+    import_module._append_rows(connection, "rows_to_append", ("id", "amount"), [])
+    assert len(metadata_calls) == 3
+
+    with pytest.raises(PerformanceV2ImportError, match="append columns do not match"):
+        import_module._append_rows(
+            connection, "rows_to_append", ("wrong",), [(4,)], schema_cache={}
+        )
+
+    cache = {"rows_to_append": ("wrong", "amount")}
+    with pytest.raises(PerformanceV2ImportError, match="append columns do not match"):
+        import_module._append_rows(
+            connection, "rows_to_append", ("id", "amount"), [(4, Decimal("4.00"))], schema_cache=cache
+        )
+    assert cache == {"rows_to_append": ("wrong", "amount")}
+
+    raw.execute("create table invalid_rows (id integer, extra integer)")
+    invalid_cache: dict[str, tuple[str, ...]] = {}
+    with pytest.raises(PerformanceV2ImportError, match="append columns do not match"):
+        import_module._append_rows(
+            connection, "invalid_rows", ("id", "amount"), [(4, Decimal("4.00"))],
+            schema_cache=invalid_cache,
+        )
+    assert invalid_cache == {}
+    raw.close()
+
+
 def test_phase8_source_input_uses_normalized_report_and_persisted_value_inputs(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
     prepared = read_performance_v2_inbox(request.inbox, request.report_root)
@@ -455,6 +515,141 @@ def test_equity_batch_flush_uses_schema_columns(tmp_path: Path, monkeypatch: pyt
         ).fetchone()
         assert action_count > 0
         assert equity_count > 0
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "expected_actions", "expected_equity"),
+    [
+        (1, [1, 1], [1, 1, 1]),
+        (2, [2], [2, 1]),
+        (3, [2], [3]),
+        (4, [2], [3]),
+    ],
+)
+def test_writer_batches_flush_at_cap_without_empty_remainder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+    expected_actions: list[int],
+    expected_equity: list[int],
+) -> None:
+    request, _ = _request(tmp_path)
+    monkeypatch.setattr(import_module, "_APPEND_BATCH_ROWS", batch_size)
+    calls: list[tuple[str, int]] = []
+    append_rows = import_module._append_rows
+
+    def append_spy(*args: object, **kwargs: object) -> None:
+        calls.append((str(args[1]), len(args[3])))
+        append_rows(*args, **kwargs)
+
+    monkeypatch.setattr(import_module, "_append_rows", append_spy)
+    assert import_performance_v2(request).imported_count == 1
+    assert calls
+    assert all(0 < size <= batch_size for _table, size in calls)
+    assert [size for table, size in calls if table == "strategy_actions"] == expected_actions
+    assert [size for table, size in calls if table == "strategy_equity"] == expected_equity
+
+
+def test_publish_requeries_action_and_equity_schema_for_each_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _ = _request(tmp_path)
+    monkeypatch.setattr(import_module, "_APPEND_BATCH_ROWS", 1)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed = replace(
+        parsed,
+        listing_date_utc=datetime(2025, 12, 25, tzinfo=timezone.utc),
+        reported_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        reported_end_utc=datetime(2026, 1, 9, tzinfo=timezone.utc),
+        effective_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        effective_end_utc=datetime(2026, 1, 9, tzinfo=timezone.utc),
+        warmup_hours=120,
+    )
+    target = performance_v2_database_path(request.config)
+    raw = duckdb.connect(str(target))
+    metadata_tables: list[str] = []
+
+    class RecordingConnection:
+        def execute(self, sql, parameters=None):
+            if "table_catalog = current_database()" in str(sql).casefold():
+                metadata_tables.append(str(parameters[0]))
+            return raw.execute(sql, parameters) if parameters is not None else raw.execute(sql)
+
+        def executemany(self, sql, parameters):
+            return raw.executemany(sql, parameters)
+
+        def append(self, table, frame):
+            return raw.append(table, frame)
+
+    recording = RecordingConnection()
+    try:
+        assert import_module._publish(recording, request, prepared, (parsed,), "first-publication") == (1, 0, 0)
+        strategy_id = raw.execute(
+            "select strategy_id from strategies where strategy_name = 'alpha'"
+        ).fetchone()[0]
+        replacement = replace(
+            request,
+            mode="REPLACE",
+            replacement_strategy_ids={"alpha": strategy_id},
+        )
+        assert import_module._publish(
+            recording, replacement, prepared, (parsed,), "second-publication"
+        ) == (1, 0, 0)
+    finally:
+        raw.close()
+
+    assert metadata_tables == [
+        "strategy_actions", "strategy_equity", "strategy_actions", "strategy_equity"
+    ]
+
+
+def test_split_writer_frames_preserve_full_database_rows_and_digests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 9, 28, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(import_module, "_utc_now", lambda: fixed_now)
+    snapshots = []
+    for cap in (20_000, 2, 1):
+        request, _ = _request(tmp_path / f"cap-{cap}")
+        prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+        parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+        parsed = replace(
+            parsed,
+            listing_date_utc=datetime(2025, 12, 25, tzinfo=timezone.utc),
+            reported_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            reported_end_utc=datetime(2026, 1, 9, tzinfo=timezone.utc),
+            effective_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            effective_end_utc=datetime(2026, 1, 9, tzinfo=timezone.utc),
+            warmup_hours=120,
+            actions=(
+                parsed.actions[0],
+                replace(
+                    parsed.actions[1],
+                    price=Decimal("-29.769149208742"),
+                    cost=Decimal("123456789.123456789012"),
+                ),
+            ),
+        )
+        monkeypatch.setattr(import_module, "_APPEND_BATCH_ROWS", cap)
+        with duckdb.connect(str(performance_v2_database_path(request.config))) as connection:
+            assert import_module._publish(connection, request, prepared, (parsed,), "parity") == (1, 0, 0)
+            snapshots.append(tuple(
+                connection.execute(query).fetchall()
+                for query in (
+                    "select * from strategy_actions order by result_id, action_index",
+                    "select * from strategy_equity order by result_id, sample_index",
+                    "select source_digest, prepared_json from optimizer_prepared_inputs order by result_id",
+                    "select source_filename, source_html_sha256, source_size_bytes, action_count, equity_sample_count, status from import_files order by source_filename",
+                )
+            ))
+    assert snapshots[0] == snapshots[1] == snapshots[2]
+    actions, equity, prepared_rows, files = snapshots[0]
+    assert len(actions) == 2 and len(equity) == 3 and len(prepared_rows) == len(files) == 1
+    assert actions[0][12:14] == (None, None)
+    assert actions[1][12:14] == (
+        Decimal("-29.769149208742"), Decimal("123456789.123456789012")
+    )
 
 
 def test_import_persists_allowlisted_source_metadata_and_existing_action_slot(tmp_path: Path) -> None:
@@ -833,6 +1028,7 @@ def test_replace_rollback_restores_old_result_after_publish_failure(tmp_path: Pa
             "select strategy_id, current_result_id from strategies where strategy_name = 'alpha'"
         ).fetchone()
         old_actions = connection.execute("select count(*) from strategy_actions where result_id = ?", [old_result]).fetchone()[0]
+        old_equity = connection.execute("select count(*) from strategy_equity where result_id = ?", [old_result]).fetchone()[0]
         connection.execute(
             "insert into strategy_tags values (?, 'RETEST', 'RETEST_WORKFLOW', 'test', now())",
             [strategy_id],
@@ -845,12 +1041,17 @@ def test_replace_rollback_restores_old_result_after_publish_failure(tmp_path: Pa
     original_inbox = {path.relative_to(request.inbox): path.read_bytes() for path in request.inbox.rglob("*") if path.is_file()}
     import mrs3.performance_v2_import as import_module
     append_rows = import_module._append_rows
+    equity_append_calls = 0
 
-    def fail_after_new_result(connection, table, columns, rows):
+    def fail_after_new_result(connection, table, columns, rows, *args, **kwargs):
+        nonlocal equity_append_calls
         if table == "strategy_equity":
-            raise RuntimeError("injected child failure")
-        append_rows(connection, table, columns, rows)
+            equity_append_calls += 1
+            if equity_append_calls == 2:
+                raise RuntimeError("injected later child failure")
+        append_rows(connection, table, columns, rows, *args, **kwargs)
 
+    monkeypatch.setattr(import_module, "_APPEND_BATCH_ROWS", 1)
     monkeypatch.setattr(import_module, "_append_rows", fail_after_new_result)
 
     with pytest.raises(PerformanceV2ImportError, match="transaction failed|injected"):
@@ -868,6 +1069,7 @@ def test_replace_rollback_restores_old_result_after_publish_failure(tmp_path: Pa
     with duckdb.connect(str(target), read_only=True) as connection:
         assert connection.execute("select current_result_id from strategies where strategy_id = ?", [strategy_id]).fetchone() == (old_result,)
         assert connection.execute("select count(*) from strategy_actions where result_id = ?", [old_result]).fetchone() == (old_actions,)
+        assert connection.execute("select count(*) from strategy_equity where result_id = ?", [old_result]).fetchone() == (old_equity,)
         assert connection.execute(
             "select count(*) from strategy_tags where strategy_id = ? and tag = 'RETEST'", [strategy_id]
         ).fetchone() == (1,)
@@ -877,6 +1079,7 @@ def test_replace_rollback_restores_old_result_after_publish_failure(tmp_path: Pa
         ).fetchone() == ("old-source", '{"state":"GROWING"}', "old-digest")
     assert list(request.config.database_root.glob("performance_v2_failures_*.csv"))
     assert {path.relative_to(request.inbox): path.read_bytes() for path in request.inbox.rglob("*") if path.is_file()} == original_inbox
+    assert equity_append_calls == 2
 
 
 def test_retest_replace_rejects_a_shorter_effective_period_without_mutation(tmp_path: Path) -> None:

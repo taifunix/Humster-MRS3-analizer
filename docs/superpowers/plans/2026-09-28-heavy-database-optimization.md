@@ -248,6 +248,13 @@ scope добавление scope workers не ускоряет последов�
   DELETE-only repeat 47.8% lower; these synthetic timings vary. Independent
   Opus 5/high `CODE_REVIEW_PASS` round 2; T13a accepted. IMP-02 remains open
   for metadata and preparation work.
+  T13b narrow slice caches validated action/equity append schema once per
+  publication and caps buffers within each row loop, including one oversized
+  report. Full-row/null/Decimal and Phase8/file-ledger parity at caps
+  20,000/2/1, later-batch rollback, importer 91 passed, Panel bootstrap/Output
+  7 passed/1 skipped and migration 3 passed. Independent Opus 5/high
+  `CODE_REVIEW_PASS` round 2. Remaining per-result metadata and preparation
+  work keeps IMP-02 open; no whole-import speed gain has been measured.
   OPT-01a narrow CPU slice removes the unused digest before builder preparation:
   3 RED/3 GREEN, optimizer 28 passed, strict import checks 4 passed; warmed
   1,000-cycle preparation median about 18% lower with identical bytes/digests.

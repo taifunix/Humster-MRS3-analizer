@@ -268,20 +268,27 @@ def _append_rows(
     table: str,
     columns: tuple[str, ...],
     rows: list[tuple[object, ...]],
+    *,
+    schema_cache: dict[str, tuple[str, ...]] | None = None,
 ) -> None:
-    if rows:
-        frame = pd.DataFrame.from_records(
-            [
-                tuple(
-                    format(value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_UP), "f")
-                    if isinstance(value, Decimal)
-                    else value
-                    for value in row
-                )
-                for row in rows
-            ],
-            columns=columns,
-        )
+    if not rows:
+        return
+    frame = pd.DataFrame.from_records(
+        [
+            tuple(
+                format(value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_UP), "f")
+                if isinstance(value, Decimal)
+                else value
+                for value in row
+            )
+            for row in rows
+        ],
+        columns=columns,
+    )
+    if tuple(frame.columns) != columns:
+        raise PerformanceV2ImportError(f"append frame columns do not match {table}")
+    target_columns = schema_cache.get(table) if schema_cache is not None else None
+    if target_columns is None:
         target_columns = tuple(
             row[0]
             for row in connection.execute(
@@ -292,11 +299,13 @@ def _append_rows(
                 [table],
             ).fetchall()
         )
-        if tuple(frame.columns) != columns:
-            raise PerformanceV2ImportError(f"append frame columns do not match {table}")
         if len(target_columns) != len(columns) or set(target_columns) != set(columns):
             raise PerformanceV2ImportError(f"append columns do not match {table}")
-        connection.append(table, frame.loc[:, list(target_columns)])
+        if schema_cache is not None:
+            schema_cache[table] = target_columns
+    elif len(target_columns) != len(columns) or set(target_columns) != set(columns):
+        raise PerformanceV2ImportError(f"append columns do not match {table}")
+    connection.append(table, frame.loc[:, list(target_columns)])
 
 
 def _parse_reports(
@@ -1343,6 +1352,7 @@ def _publish(
     # publication.
     connection.execute("begin")
     try:
+        append_schema_cache: dict[str, tuple[str, ...]] = {}
         names = tuple(entry.strategy_name for entry in prepared.entries)
         incoming_keys = {_typed_key(entry) for entry in prepared.entries}
         incoming_prefixes = tuple(sorted(key[:5] for key in incoming_keys))
@@ -1654,15 +1664,21 @@ def _publish(
                                     action.order_id, action.action, action.size, action.post_size, action.post_side,
                                     action.pnl, action.fee, action.balance, _phase8_decimal(action.price),
                                     _phase8_decimal(action.cost), _action_source_json(action)))
-            if len(action_rows) >= _APPEND_BATCH_ROWS:
-                _append_rows(connection, "strategy_actions", _ACTION_COLUMNS, action_rows)
-                action_rows.clear()
+                if len(action_rows) >= _APPEND_BATCH_ROWS:
+                    _append_rows(
+                        connection, "strategy_actions", _ACTION_COLUMNS, action_rows,
+                        schema_cache=append_schema_cache,
+                    )
+                    action_rows.clear()
             for sample_index, (timestamp, wallet) in enumerate(report.wallet_series):
                 equity = report.equity_series[sample_index][1]
                 equity_rows.append((result_id, sample_index, timestamp, wallet, equity))
-            if len(equity_rows) >= _APPEND_BATCH_ROWS:
-                _append_rows(connection, "strategy_equity", _EQUITY_COLUMNS, equity_rows)
-                equity_rows.clear()
+                if len(equity_rows) >= _APPEND_BATCH_ROWS:
+                    _append_rows(
+                        connection, "strategy_equity", _EQUITY_COLUMNS, equity_rows,
+                        schema_cache=append_schema_cache,
+                    )
+                    equity_rows.clear()
             status = "REPLACED" if decision == "REPLACE" else "IMPORTED"
             record = (entry.report_path.name, report_hash(entry), entry.report_path.stat().st_size, len(report.actions), len(report.equity_series), status)
             previous = result_files.get(record[1])
@@ -1672,8 +1688,16 @@ def _publish(
             written_phase8.append((result_id, strategy_id, entry, report, values, sizing_facts))
             imported += 1
 
-        _append_rows(connection, "strategy_actions", _ACTION_COLUMNS, action_rows)
-        _append_rows(connection, "strategy_equity", _EQUITY_COLUMNS, equity_rows)
+        if action_rows:
+            _append_rows(
+                connection, "strategy_actions", _ACTION_COLUMNS, action_rows,
+                schema_cache=append_schema_cache,
+            )
+        if equity_rows:
+            _append_rows(
+                connection, "strategy_equity", _EQUITY_COLUMNS, equity_rows,
+                schema_cache=append_schema_cache,
+            )
 
         connection.executemany(
             """insert into import_files (import_run_id, source_filename, source_html_sha256, source_size_bytes,
