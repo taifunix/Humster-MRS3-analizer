@@ -3896,3 +3896,15 @@ validated all 1634 entries after the change. Focused TDD passed
 the related Performance v2, SINGLE_MODE handoff and fresh-generation suites
 passed (`179 passed, 3 skipped`; existing pandas warnings). No tester or import
 was started and the running Panel was not restarted.
+
+## Performance v2 first-import bootstrap (2026-09-28)
+
+The first ordinary Panel import no longer fails when the configured canonical
+Performance v2 target is absent. The Panel now creates the current schema in a
+same-directory staging DuckDB under the cross-process writer lock and publishes
+it with exclusive/no-clobber semantics before starting the import job. Existing
+empty, foreign or unsupported targets, concurrent target creation and redirected
+canonical entries are not overwritten and retain the importer's fail-closed
+schema gate. TDD reproduced the original `0/0` failure before the change; the
+focused bootstrap regressions passed (`6 passed, 1 skipped`), and the related
+Panel/import suites passed (`192 passed, 4 skipped`; existing pandas warnings).

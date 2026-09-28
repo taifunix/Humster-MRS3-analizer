@@ -369,6 +369,14 @@ Performance DB не используется. A/B получает номер `4
 failed names и существующие error/commit details; timer-based progress не
 добавляется.
 
+При первом явном импорте из Panel отсутствие канонической
+`<performance_db_root>/strategy_performance.duckdb` означает новую установку:
+Panel атомарно создаёт в этом точном пути актуальную Performance v2 schema до
+старта import job. Существующий пустой, повреждённый или чужой DuckDB не
+переинициализируется и продолжает отклоняться schema gate импортёра. Публикация
+использует exclusive/no-clobber создание; появившийся конкурентно target не
+перезаписывается, а symlink/reparse canonical target отклоняется.
+
 Основные этапы: `READING_DB`, `GENERATING_JSON`, `VALIDATING_MANIFEST`,
 `UPDATING_TESTER_CONFIG`, `BOT_START`, `BOT_RUN`, `REPORT_COLLECTION`,
 `RETRY_MISSING`, `VALIDATING_REPORTS`, `INBOX_READY`, `IMPORTING`,

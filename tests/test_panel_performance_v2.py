@@ -20,6 +20,7 @@ import pytest
 import mrs3.panel as panel_module
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
+    PerformanceV2StoreError,
     initialize_performance_v2,
     performance_v2_database_path,
 )
@@ -512,7 +513,9 @@ def test_selection_button_posts_the_current_panel_snapshot_for_xlsx() -> None:
     assert "response.blob" in handler
 
 
-def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_path: Path, monkeypatch) -> None:
+def test_v2_panel_controller_initializes_missing_target_and_uses_committed_tester_job(
+    tmp_path: Path, monkeypatch,
+) -> None:
     import mrs3.panel as panel_module
 
     request, _ = _request(tmp_path)
@@ -528,6 +531,7 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
     monkeypatch.setattr(panel_module.RunnerConfig, "from_json", lambda _path: type("Runner", (), {"report_dir": request.report_root})())
     controller = PanelController(tmp_path, config_path)
     monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
+    performance_v2_database_path(request.config).unlink()
     job = controller._panel_jobs.submit(
         "strategies.tester.start", {"mode": "SINGLE_MODE", "analysis_run_id": "a", "start_date": "2026-01-01", "end_date": "2026-01-09"},
         "tester-v2", ("strategies.tester",), job_id="tester-v2",
@@ -597,6 +601,85 @@ def test_v2_panel_controller_uses_committed_tester_job_and_status_endpoint(tmp_p
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize("existing", [b"", b"foreign target"])
+def test_v2_panel_first_import_bootstrap_preserves_existing_target(
+    tmp_path: Path, existing: bytes,
+) -> None:
+    config = PerformanceV2Config(tmp_path / "performance-v2")
+    target = performance_v2_database_path(config)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(existing)
+
+    PanelController._initialize_missing_performance_v2_target(config)
+
+    assert target.read_bytes() == existing
+
+
+def test_v2_panel_first_import_bootstrap_preserves_unsupported_duckdb(tmp_path: Path) -> None:
+    config = PerformanceV2Config(tmp_path / "performance-v2")
+    target = performance_v2_database_path(config)
+    target.parent.mkdir(parents=True)
+    with duckdb.connect(str(target)) as connection:
+        connection.execute("create table foreign_schema(value integer)")
+    before = target.read_bytes()
+
+    PanelController._initialize_missing_performance_v2_target(config)
+
+    assert target.read_bytes() == before
+
+
+def test_v2_panel_first_import_bootstrap_does_not_clobber_target_created_during_publish(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = PerformanceV2Config(tmp_path / "performance-v2")
+    target = performance_v2_database_path(config)
+    real_link = panel_module.os.link
+
+    def competing_publish(source: Path, destination: Path) -> None:
+        Path(destination).write_bytes(b"foreign target")
+        real_link(source, destination)
+
+    monkeypatch.setattr(panel_module.os, "link", competing_publish)
+
+    PanelController._initialize_missing_performance_v2_target(config)
+
+    assert target.read_bytes() == b"foreign target"
+
+
+def test_v2_panel_first_import_bootstrap_rejects_dangling_target_symlink(tmp_path: Path) -> None:
+    config = PerformanceV2Config(tmp_path / "performance-v2")
+    lexical_target = config.database_root / "strategy_performance.duckdb"
+    lexical_target.parent.mkdir(parents=True)
+    try:
+        lexical_target.symlink_to(config.database_root / "missing.duckdb")
+    except OSError:
+        pytest.skip("file symlink creation is unavailable")
+
+    with pytest.raises(PerformanceV2StoreError, match="redirected"):
+        PanelController._initialize_missing_performance_v2_target(config)
+
+    assert lexical_target.is_symlink()
+    assert not (config.database_root / "missing.duckdb").exists()
+
+
+def test_v2_panel_first_import_bootstrap_rejects_redirected_canonical_entry(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = PerformanceV2Config(tmp_path / "performance-v2")
+    lexical_target = config.database_root / "strategy_performance.duckdb"
+    real_is_symlink = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: path == lexical_target or real_is_symlink(path),
+    )
+
+    with pytest.raises(PerformanceV2StoreError, match="redirected"):
+        PanelController._initialize_missing_performance_v2_target(config)
+
+    assert not lexical_target.exists()
 
 
 def test_v2_panel_controller_injects_server_owned_listing_root(tmp_path: Path, monkeypatch) -> None:

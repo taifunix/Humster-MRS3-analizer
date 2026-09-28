@@ -213,7 +213,9 @@ from .panel_performance_v2 import (
     _parse_window_payload,
 )
 from .performance_v2_store import (
+    PerformanceV2Config,
     PerformanceV2StoreError,
+    PerformanceV2WriterLock,
     initialize_performance_v2,
     load_performance_v2_config,
     performance_v2_database_path,
@@ -4177,6 +4179,30 @@ class PanelController:
                 raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
             self._performance_v2_schema_ready.add(identity)
 
+    @staticmethod
+    def _initialize_missing_performance_v2_target(config: PerformanceV2Config) -> None:
+        resolved_target = performance_v2_database_path(config)
+        target = config.database_root / "strategy_performance.duckdb"
+        if target.is_symlink() or target != resolved_target:
+            raise PerformanceV2StoreError("Performance v2 target is redirected")
+        if target.exists():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staging = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            with PerformanceV2WriterLock(target.parent):
+                if target.exists():
+                    return
+                with duckdb.connect(str(staging)) as connection:
+                    initialize_performance_v2(connection)
+                    require_performance_v2(connection)
+                try:
+                    os.link(staging, target)
+                except FileExistsError:
+                    return
+        finally:
+            staging.unlink(missing_ok=True)
+
     def strategies_performance_v2_import(self, payload: Mapping[str, object], *, _internal: bool = False) -> dict[str, object]:
         allowed = {
             "tester_job_id", "mode", "replacement_strategy_ids", "window_a", "window_b",
@@ -4266,6 +4292,7 @@ class PanelController:
         if self._performance_v2_jobs is None:
             self._performance_v2_jobs = LocalPerformanceV2Jobs(on_update=self._record_special_job)
         performance_config = self._performance_v2_config()
+        self._initialize_missing_performance_v2_target(performance_config)
         runner_config = RunnerConfig.from_json(self.default_config)
         request = PerformanceV2PanelRequest(
             inbox=self._tester_inbox(tester_job_id),
