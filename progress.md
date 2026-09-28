@@ -50,9 +50,28 @@ CODE_REVIEW_PASS after exact guard/read-order evidence and singleton coverage;
 T13a is accepted. Remaining IMP-02 work and integrated full-suite verification
 are still open.
 The terminal Panel journal is 82.67 MiB/109 jobs; a read-only in-memory probe
-measured 5.5 s median combined clone/serialization before any disk write.
-Unchanged terminal polling currently rewrites it. A separate narrow plan is
-being reviewed; no live journal cleanup or database mutation was performed.
+measured about 5.5 s median combined clone/serialization before disk write.
+J4 now avoids saving three unchanged terminal import polls in the private
+controller regression, while first/changed snapshots, volatile updates and
+failed-save retries remain durable. A filtered-load regression failed first,
+then passed after the registry marks discarded invalid entries dirty. The
+immutable `c1a5e0e` tester-callback baseline passed three characterization
+nodes, confirming that current false and legacy true flags do not change at
+completion. A private 80.9 MB/109-job journal measured 1/0/1 replacements for
+first/three repeated/changed terminal snapshots. This is synthetic count
+evidence, not a production latency claim. J4 has J4-R15 `PLAN_APPROVED` and
+independent J4-R4 `CODE_REVIEW_PASS`. Review exposed one actual dirty-flag gap:
+an unserializable runtime reservation previously left an empty in-memory
+runtime object; validation now precedes mutation (RED then GREEN). Restart
+recovery's durable save is covered by an identical terminal-poll regression,
+and volatile nested-payload ownership is explicit. Registry tests passed 24;
+the corrected combined Panel/Performance v2/RETEST/portfolio contour passed
+452 with 7 Windows skips. Reviewer J4-R5 clarified that the full repository
+suite belongs after all core slices integrate, before branch completion; an
+early partial run was stopped because later changes would invalidate it.
+J5 running-poll extension also has `PLAN_APPROVED`, but cannot start until J4
+is committed. No live journal cleanup
+or database mutation was performed.
 Source final-payload proof and
 legacy empty-import `safe_to_delete` evidence remain deferred by the user.
 OPT-01a removes one unused source digest before the actual builder digest.
@@ -63,11 +82,17 @@ with frozen source digests and prepared JSON bytes/SHA. Optimizer tests passed
 (about 18% lower for preparation alone), with identical payload identity.
 Independent Opus 5/high returned CODE_REVIEW_PASS; OPT-01a is accepted.
 Source rechecks and the exact byte limit remain; broader OPT-01 is open.
-The separate terminal-journal plan J4 received independent PLAN_APPROVED after
-locking, failed-save retry and volatile-durability clarifications. Its runtime
-slice waits for the current scoped acceptance. Live journal cleanup is outside
-this branch's implementation; the existing migration has passed read-only
-geometry/disk-space preflight for the large historical campaign payloads.
+The existing legacy-campaign migration passed read-only geometry/disk-space
+preflight for 10 failed and 4 committed records; it has not been run on the
+live journal. The J4 combined Panel contour with seven exact baseline-failing
+nodes deselected passed 443 tests, 7 skipped and 7 deselected. Those seven
+RETEST metadata-path tests fail identically on immutable
+`c1a5e0e` because their legacy strategy-root expectations conflict with the
+fetched trusted-`Output` contract. Those baseline failures are tracked
+separately; they are not caused by the journal diff and do not weaken the new
+`Output` trust boundary. The separate test-only fixture alignment passed its
+RETEST suite (67 passed, 2 skipped) and awaits independent review and the
+full-suite result; it remains outside the J4 staged diff.
 
 ## Restored READY JSON can launch SINGLE_MODE after reload (2026-09-28)
 

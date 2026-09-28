@@ -2014,17 +2014,17 @@ class PanelController:
                 runtime["failure_report_path"] = raw_report
             if document.get("state") == "COMMITTED" and runtime:
                 public["inbox_ready"] = True
-            request = tracked.get("request")
-            tester_job_id = request.get("tester_job_id") if isinstance(request, Mapping) else None
-            if isinstance(tester_job_id, str) and tester_job_id:
-                try:
-                    tester_runtime = self._panel_jobs.runtime(tester_job_id)
-                    tester_runtime["performance_v2_import_verified"] = False
-                    self._panel_jobs.sync(tester_job_id, {}, runtime=tester_runtime)
-                except PanelJobError:
-                    pass
         try:
-            self._panel_jobs.sync(job_id, public, runtime=runtime or None)
+            terminal_performance = (
+                tracked.get("kind") == "strategies.performance.v2.import"
+                and document.get("state") in {"COMMITTED", "FAILED"}
+            )
+            self._panel_jobs.sync(
+                job_id,
+                public,
+                runtime=runtime or None,
+                skip_save_if_unchanged=terminal_performance,
+            )
         except PanelJobError:
             pass
 

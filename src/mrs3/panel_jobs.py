@@ -33,6 +33,7 @@ class PanelJobRegistry:
             raise ValueError("capacity must be positive")
         self.journal, self.capacity, self.lock = journal, capacity, RLock()
         self.recover_on_load = bool(recover_on_load)
+        self._journal_dirty = False
         self.jobs: dict[str, dict] = self._load()
         if self.recover_on_load:
             self.recover_interrupted()
@@ -42,14 +43,17 @@ class PanelJobRegistry:
             data = json.loads(self.journal.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return {}
-            return {
+            loaded = {
                 job_id: job for job_id, job in data.items()
                 if isinstance(job_id, str) and self._valid_saved_job(job)
             }
+            self._journal_dirty = len(loaded) != len(data)
+            return loaded
         except (OSError, json.JSONDecodeError):
             return {}
 
     def _save(self) -> None:
+        self._journal_dirty = True
         self.journal.parent.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None
         # Portfolio Campaign inputs live in their own verified gzip snapshot.
@@ -68,6 +72,7 @@ class PanelJobRegistry:
                 temporary = Path(handle.name)
             os.replace(temporary, self.journal)
             temporary = None
+            self._journal_dirty = False
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
@@ -150,7 +155,11 @@ class PanelJobRegistry:
             except KeyError: raise PanelJobError("NOT_FOUND") from None
 
     def volatile_sync(self, job_id: str, status: dict, *, expected: dict | None = None) -> None:
-        """Update live progress without making a durable journal checkpoint."""
+        """Update live progress without a checkpoint.
+
+        Callers must not retain or mutate nested progress/error/evidence values
+        after this call; the hot path makes only shallow copies of those values.
+        """
         with self.lock:
             job = self.jobs.get(job_id)
             if job is None or not isinstance(status, dict):
@@ -160,6 +169,7 @@ class PanelJobRegistry:
                 for key in ("state", "phase", "error", "evidence")
             ):
                 return
+            before = dict(job)
             state = status.get("state")
             if state not in _STATES:
                 raise PanelJobError("INVALID_REQUEST")
@@ -183,6 +193,8 @@ class PanelJobRegistry:
                     job.pop("evidence", None)
                 elif isinstance(evidence, dict):
                     job["evidence"] = dict(evidence)
+            if job != before:
+                self._journal_dirty = True
 
     def list(self) -> list[dict]:
         with self.lock:
@@ -223,43 +235,56 @@ class PanelJobRegistry:
                 self.jobs[job_id] = removed
                 raise
 
-    def sync(self, job_id: str, status: dict, *, runtime: dict | None = None) -> dict:
+    def sync(
+        self,
+        job_id: str,
+        status: dict,
+        *,
+        runtime: dict | None = None,
+        skip_save_if_unchanged: bool = False,
+    ) -> dict:
         """Persist a redacted worker snapshot; runtime is controller-only recovery data."""
         with self.lock:
             job = self.jobs.get(job_id)
             if job is None or not isinstance(status, dict):
                 raise PanelJobError("NOT_FOUND" if job is None else "INVALID_REQUEST")
+            candidate = dict(job)
             state = status.get("state")
             if state not in _STATES:
                 raise PanelJobError("INVALID_REQUEST")
-            if state != job["state"]:
-                if state not in _TRANSITIONS.get(job["state"], set()):
+            if state != candidate["state"]:
+                if state not in _TRANSITIONS.get(candidate["state"], set()):
                     raise PanelJobError("INVALID_REQUEST")
-                job["state"] = state
+                candidate["state"] = state
             phase = status.get("phase")
             if isinstance(phase, str) and phase.strip() and len(phase) <= 128:
-                job["phase"] = phase
+                candidate["phase"] = phase
             progress = status.get("progress")
             if isinstance(progress, dict):
-                job["progress"] = json.loads(json.dumps(progress))
+                candidate["progress"] = json.loads(json.dumps(progress))
             error = status.get("error")
             if error is None or isinstance(error, dict):
-                job["error"] = json.loads(json.dumps(error))
+                candidate["error"] = json.loads(json.dumps(error))
             evidence = status.get("evidence")
             if evidence is None or isinstance(evidence, dict):
                 if evidence is None:
-                    job.pop("evidence", None)
+                    candidate.pop("evidence", None)
                 else:
-                    job["evidence"] = json.loads(json.dumps(evidence))
+                    candidate["evidence"] = json.loads(json.dumps(evidence))
             result = status.get("result")
             if isinstance(result, dict):
-                job["result"] = json.loads(json.dumps(result))
+                candidate["result"] = json.loads(json.dumps(result))
             if status.get("inbox_ready") is True:
-                job["inbox_ready"] = True
+                candidate["inbox_ready"] = True
             if runtime is not None:
                 if not isinstance(runtime, dict):
                     raise PanelJobError("INVALID_REQUEST")
-                job["runtime"] = json.loads(json.dumps(runtime))
+                candidate["runtime"] = json.loads(json.dumps(runtime))
+            if skip_save_if_unchanged and candidate == job and not self._journal_dirty:
+                return self._copy(job)
+            job.clear()
+            job.update(candidate)
+            self._journal_dirty = True
             self._save()
             return self._copy(job)
 
@@ -290,12 +315,14 @@ class PanelJobRegistry:
             job = self.jobs.get(job_id)
             if job is None:
                 raise PanelJobError("NOT_FOUND")
+            runtime = job.get("runtime")
+            if isinstance(runtime, dict) and key in runtime:
+                raise PanelJobError("RUNTIME_BUSY")
+            stored_value = json.loads(json.dumps(value))
             runtime = job.setdefault("runtime", {})
             if not isinstance(runtime, dict):
                 runtime = job["runtime"] = {}
-            if key in runtime:
-                raise PanelJobError("RUNTIME_BUSY")
-            runtime[key] = json.loads(json.dumps(value))
+            runtime[key] = stored_value
             self._save()
 
     def clear_runtime(self, job_id: str, key: str, *, value: object = None) -> None:

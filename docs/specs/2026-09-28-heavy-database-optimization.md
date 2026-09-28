@@ -117,6 +117,80 @@ OPT-01 may first remove an unused digest computation verified by a source-digest
 call-count regression and byte-identical available/unavailable outputs. This
 does not reuse digests across source objects, snapshots, revisions or final IDs.
 
+## Terminal PerformanceDB job journal publication
+The terminal worker callback and status poll may skip a full journal rewrite
+only when their complete normalized public/runtime payload is unchanged and
+the registry has no unsaved mutation. First changed terminal publication,
+changed payloads and retries after failed saves remain durable. Default sync
+callers retain always-save behavior. Keep state validation, object identity,
+public redaction, private recovery paths, journal schema, full serialization,
+fsync and atomic replacement.
+
+If journal load filters invalid saved records, the in-memory registry differs
+from disk and starts dirty. Its next otherwise-identical opt-in sync must
+persist the filtered registry; a clean valid reload may skip. This preserves
+the existing normalization-on-next-save behavior without an extra read per
+poll or a new journal format.
+
+The registry lock covers validation, field updates, candidate equality, dirty
+state and persistence. Actual volatile changes mark the whole journal dirty;
+identical accepted, invalid or stale volatile updates do not. Dirty state
+clears only after successful atomic replacement, after temporary=None.
+Failed sync preserves legacy in-memory changes and remains dirty for retry.
+Candidate JSON normalization precedes comparison; equality includes the complete
+post-normalization key set and key presence/absence. No outer-snapshot equality.
+Absent evidence removes it and saves once; absent inbox/runtime retains the
+stored values and may skip only when the complete candidate is equal.
+
+Ordinary public import consumes tester verification under the registry lock
+before the worker starts. Terminal callbacks do not change tester verification.
+Remove the dead callback without replacement: current submit stores fingerprint
+and resource keys, never request; even legacy request records reach an invalid
+empty-status sync before any mutation or save. A legacy true marker therefore
+stays true at terminal completion, matching baseline. Do not add request
+persistence, resource-link lookup or a runtime-only API.
+
+Mutation audit: panel_jobs submit/transition/discard_queued/sync/recovery/
+runtime/log updates are locked and call _save; volatile_sync is locked and
+marks actual changes. The only external direct writers are portfolio startup
+migration job-copy installation and restoration, plus terminal snapshot
+descriptor updates. Startup migration holds the registry lock and reaches
+_save/recovery; disk-space exits precede mutation. Real save failures retain
+dirty state; other restore paths save restored memory. Snapshot descriptor
+mutations are locked and immediately saved. An unclassified writer or exit
+blocks this slice and is escalated to root, without redesigning portfolio code.
+Restart recovery must save its projected states before an identical opt-in poll
+may skip; invalid runtime reservations must fail before changing the job.
+Volatile callers must not retain or mutate nested payloads after handing them
+to the shallow-copy hot path.
+
+Acceptance: failing-before focused registry/controller tests, on-disk reload,
+three exact normalized terminal polls causing zero journal os.replace calls,
+changed payload causing one, current producer linkage without stored request,
+pre-worker verification consumption and zero callback tester mutations for
+current/legacy records, dirty retry after
+real replacement failure and fail-before-entry wrapper, legacy default sync,
+actual/identical volatile updates, bounded two-thread lock exclusion, no leaked
+captured temporary files. Synthetic private 109-job/~83 MiB journal benchmark
+separates first-save cost from poll savings. Existing Panel registry,
+Performance v2/retest and portfolio suites run once; full project suite remains
+the final core-integration gate. Live cleanup, first-save clone optimization,
+new storage/schema/cache/dependency/background writer are outside this slice.
+
+J4 received independent Opus 5/high `PLAN_APPROVED` after the R1-R11 ledger.
+Source finding R12 corrects the former tester-callback premise. Its amendment
+adds an immutable `c1a5e0e` characterization baseline: empty-status sync rejects
+all six valid states without mutation/save; current and legacy terminal
+callbacks preserve tester job/runtime/flags and cause no tester write. The
+legacy invalid attempt count changes from one to zero after deletion. Stop if
+the baseline shows any stored side effect or uncaught exception. This targeted
+baseline is additional to focused TDD and the single broader contour.
+Final deletion inspection must confirm no log/metric or later local reference
+was removed. J4-R15 received independent Opus 5/high `PLAN_APPROVED` with the
+complete R1-R15 ledger; the immutable baseline remains an acceptance gate.
+Use the existing Panel registry/controller and focused tests; live journal
+cleanup is separate.
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,

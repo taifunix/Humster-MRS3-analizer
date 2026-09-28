@@ -89,12 +89,69 @@ their canonical 13,750,280 bytes compress to 1,433,391 bytes. The measured
 free-space gate would pass. This supports reusing the existing migration,
 but no live migration or journal cleanup was run.
 
-The worker callback and each terminal status poll invoke `_record_special_job`.
-The import-job `sync` always serializes the complete journal, including when
-the terminal payload has not changed. A proposed no-op guard must distinguish
-durable data from volatile progress and failed saves, and compare under the
-registry lock. First terminal publication, restart durability and redaction
-remain mandatory. This journal fix is pending a separate reviewed plan.
+The worker callback and each status poll invoke `_record_special_job`. Before
+J4, even an unchanged import snapshot rewrote the complete journal. J4 now
+skips identical clean terminal snapshots while the first/changed publication,
+volatile changes, failed-save retries and filtered-load normalization remain
+durable. Three identical terminal polls made zero journal replacements in a
+controller test; a changed result made one and survived reload. A disposable
+80,893,843-byte/109-job synthetic journal measured one first write, zero writes
+for three repeated polls and one changed write (1.067 s, 0.000095 s total and
+1.053 s respectively). Its repeated-string payload is unlike the real journal,
+so these timings are mechanism evidence, not a production speed estimate.
+
+The parser progress callback itself is in-memory only and causes zero journal
+writes. Before the terminal callback, each unchanged RUNNING/PUBLISHING status
+poll still writes the full journal. J5 is the separately approved extension
+for that path and remains gated on J4 review and commit. The old terminal
+import worker publishes only COMMITTED or FAILED, and there is no public
+Performance v2 import cancel route. CANCELLED is a generic registry state but
+not an ordinary repeated import-tail status; a future cancellation path would
+need its own persistence/count check. The old terminal
+tester callback was dead: current jobs store the tester link as a resource key,
+not a request; optional legacy records reached an invalid empty-status sync
+which changed no stored flag. Public import consumes verification before its
+worker starts. Immutable `c1a5e0e` characterization passed three tests, and
+J4 preserves current false and legacy true flags while removing that invalid
+attempt. No live journal migration, cleanup or database write was run.
+
+Review added two negative gate checks: identical RUNNING/PUBLISHING import polls
+and identical COMMITTED callbacks of another job kind still save on every poll
+in J4. Invalid/stale volatile payloads carrying otherwise valid phase, progress
+and evidence leave the job and dirty flag unchanged; transition/expected-state
+validation precedes all assignments. The only production volatile caller is
+the tester hot path in `_record_special_job`: native tester snapshots allocate
+their nested progress/evidence values, while RUNS documents allocate progress
+and have no evidence. The callback returns immediately after volatile sync, so
+it does not retain a mutable nested reference for later updates.
+Independent J4 re-review also checked every registry mutator against the global
+dirty flag. Restart recovery already saves its FAILED projection before a poll
+can skip; a new regression verifies that disk state and zero extra replacements
+on an identical recovered import poll. The audit found one real side path:
+an unserializable runtime reservation previously left an empty in-memory
+runtime object without marking it dirty. Serialization now precedes mutation;
+its failing-before regression passes. The shallow volatile payload ownership
+contract is explicit in code and spec. The focused registry suite passed 24
+tests, and the independent J4-R4 review returned `CODE_REVIEW_PASS`.
+
+The first broad J4 run used a coarse selector and omitted two additional
+metadata checks; both passed/skipped identically on immutable base and current
+branch (`1 passed, 1 skipped`). The corrected combined run deselected exactly
+the seven baseline-failing RETEST nodes and passed `443`, skipped `7`,
+deselected `7`. Both previously omitted metadata checks were included.
+The immutable-base command used the project venv with `PYTHONPATH` and
+`pytest -o pythonpath` pointing at exported `c1a5e0e` Panel modules, then:
+
+```powershell
+.venv\Scripts\python.exe -m pytest -o "pythonpath=$baseline" tests/test_panel_performance_v2_retest.py -q -k 'metadata_retest_inbox or retest_start_reuses_oldest_valid_inbox or committed_native_retest_verify_survives_restart' --tb=line
+```
+
+It returned the same seven failures (`strategy_path is missing` five times,
+the reusable-inbox date guard once, and missing committed RETEST source
+artifacts once), plus one pass and one Windows symlink skip. These are tests
+written for old strategy roots; runtime continues to require trusted `Output`.
+The complete repository suite remains the final integrated core gate after
+those test fixtures are aligned in a separate scoped change.
 
 T13a's real-schema, in-memory comparison used 1,000 results, 500,000 actions
 and 32 scattered result IDs, with three repetitions per variant. The preserved

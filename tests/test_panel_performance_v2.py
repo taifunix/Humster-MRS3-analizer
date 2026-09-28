@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from copy import deepcopy
 from hashlib import sha256
 from http.client import HTTPConnection
 from decimal import Decimal
@@ -18,6 +19,8 @@ from openpyxl import Workbook, load_workbook
 import pytest
 
 import mrs3.panel as panel_module
+import mrs3.panel_jobs as panel_jobs_module
+from mrs3.panel_jobs import PanelJobRegistry
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
@@ -932,6 +935,176 @@ def test_v2_failed_import_keeps_failure_report_available(tmp_path: Path) -> None
     controller._record_special_job(document)
 
     assert controller.artifact(f"performance-v2-failure-report:{job_id}") == report.resolve()
+
+
+def test_terminal_performance_callback_skips_three_identical_polls_and_saves_changed_payload(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "terminal-performance"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, f"panel:{job_id}", (), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    document = {
+        "job_id": job_id,
+        "state": "COMMITTED",
+        "phase": "COMMITTED",
+        "inbox_path": str(tmp_path / "private" / "inbox"),
+        "result": {
+            "status": "COMMITTED", "imported_count": 1,
+            "database_path": str(tmp_path / "private" / "db.duckdb"),
+            "audit_path": str(tmp_path / "private" / "audit.json"),
+            "failure_report_path": str(tmp_path / "private" / "failures.csv"),
+        },
+    }
+    replacements = []
+    temporary_sources = []
+    real_replace = panel_jobs_module.os.replace
+    journal = controller._panel_jobs.journal
+
+    def counted_replace(source, destination):
+        temporary_sources.append(source)
+        if Path(destination) == journal:
+            replacements.append(destination)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
+    controller._record_special_job(document)
+    assert replacements == [journal]
+    assert controller._panel_jobs.get(job_id)["result"] == {
+        "status": "COMMITTED", "imported_count": 1,
+        "failure_report_available": True,
+        "failure_report_token": f"performance-v2-failure-report:{job_id}",
+    }
+    assert controller._panel_jobs.runtime(job_id) == {
+        "inbox_path": str(tmp_path / "private" / "inbox"),
+        "failure_report_path": str(tmp_path / "private" / "failures.csv"),
+    }
+
+    for _ in range(3):
+        controller._record_special_job(document)
+    assert replacements == [journal]
+
+    changed = {**document, "result": {**document["result"], "imported_count": 2}}
+    controller._record_special_job(changed)
+    assert replacements == [journal, journal]
+    reloaded = PanelController(tmp_path, tmp_path / "config.local.json")._panel_jobs
+    assert reloaded.get(job_id)["result"]["imported_count"] == 2
+    assert "database_path" not in reloaded.get(job_id)["result"]
+    assert reloaded.runtime(job_id)["failure_report_path"] == str(tmp_path / "private" / "failures.csv")
+    assert all(not Path(source).exists() for source in temporary_sources)
+
+
+@pytest.mark.parametrize(
+    "kind,document",
+    [
+        ("strategies.performance.v2.import", {"state": "RUNNING", "phase": "PUBLISHING", "progress": {"current": 3, "total": 3}}),
+        ("analysis.local", {"state": "COMMITTED", "phase": "COMMITTED"}),
+    ],
+)
+def test_j4_unchanged_nonterminal_import_and_other_terminal_kind_still_save_each_poll(
+    tmp_path, monkeypatch, kind, document,
+):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "unchanged-boundary"
+    controller._panel_jobs.submit(kind, {}, job_id, (), job_id=job_id)
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    journal = controller._panel_jobs.journal
+    replacements = []
+    real_replace = panel_jobs_module.os.replace
+
+    def counted_replace(source, destination):
+        if Path(destination) == journal:
+            replacements.append(destination)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
+    for _ in range(2):
+        controller._record_special_job({"job_id": job_id, **document})
+    assert replacements == [journal, journal]
+
+
+def test_j4_characterization_normal_producer_resource_key_and_false_tester_marker_are_unchanged(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    tester_id = "characterization-tester"
+    import_id = "characterization-import"
+    controller._panel_jobs.submit("strategies.tester.start", {}, "characterization-tester", (), job_id=tester_id)
+    controller._panel_jobs.transition(tester_id, "RUNNING")
+    controller._panel_jobs.sync(
+        tester_id,
+        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={"performance_v2_import_verified": False},
+    )
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, "characterization-import",
+        (f"tester:{tester_id}",), job_id=import_id,
+    )
+    assert f"tester:{tester_id}" in controller._panel_jobs.jobs[import_id]["resource_keys"]
+    controller._panel_jobs.transition(import_id, "RUNNING")
+    assert "request" not in controller._panel_jobs.jobs[import_id]
+    tester_before = deepcopy(controller._panel_jobs.jobs[tester_id])
+    tester_runtime_before = controller._panel_jobs.runtime(tester_id)
+    sync_calls = []
+    real_sync = controller._panel_jobs.sync
+
+    def record_sync(job_id, status, *args, **kwargs):
+        sync_calls.append((job_id, status, kwargs))
+        return real_sync(job_id, status, *args, **kwargs)
+
+    monkeypatch.setattr(controller._panel_jobs, "sync", record_sync)
+    replacements = []
+    real_replace = panel_jobs_module.os.replace
+    monkeypatch.setattr(panel_jobs_module.os, "replace", lambda source, destination: (replacements.append(destination) if Path(destination) == controller._panel_jobs.journal else None, real_replace(source, destination))[1])
+
+    controller._record_special_job({"job_id": import_id, "state": "COMMITTED", "phase": "COMMITTED", "result": {"status": "COMMITTED"}})
+
+    assert controller._panel_jobs.jobs[tester_id] == tester_before
+    assert controller._panel_jobs.runtime(tester_id) == tester_runtime_before
+    assert [job_id for job_id, _status, _kwargs in sync_calls] == [import_id]
+    assert len(replacements) == 1
+    restored = PanelJobRegistry(controller._panel_jobs.journal, recover_on_load=False)
+    assert restored.jobs[tester_id] == tester_before
+    assert restored.runtime(tester_id) == tester_runtime_before
+
+
+def test_j4_characterization_legacy_request_true_tester_marker_stays_true_without_escape(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    tester_id = "legacy-tester"
+    import_id = "legacy-import"
+    controller._panel_jobs.submit("strategies.tester.start", {}, "legacy-tester", (), job_id=tester_id)
+    controller._panel_jobs.transition(tester_id, "RUNNING")
+    controller._panel_jobs.sync(
+        tester_id,
+        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={"performance_v2_import_verified": True},
+    )
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, "legacy-import", (), job_id=import_id,
+    )
+    controller._panel_jobs.jobs[import_id]["request"] = {"tester_job_id": tester_id}
+    controller._panel_jobs.transition(import_id, "RUNNING")
+    tester_before = deepcopy(controller._panel_jobs.jobs[tester_id])
+    tester_runtime_before = controller._panel_jobs.runtime(tester_id)
+    sync_calls = []
+    real_sync = controller._panel_jobs.sync
+
+    def record_sync(job_id, status, *args, **kwargs):
+        sync_calls.append((job_id, status, kwargs))
+        return real_sync(job_id, status, *args, **kwargs)
+
+    monkeypatch.setattr(controller._panel_jobs, "sync", record_sync)
+    replacements = []
+    real_replace = panel_jobs_module.os.replace
+    monkeypatch.setattr(panel_jobs_module.os, "replace", lambda source, destination: (replacements.append(destination) if Path(destination) == controller._panel_jobs.journal else None, real_replace(source, destination))[1])
+
+    controller._record_special_job({"job_id": import_id, "state": "COMMITTED", "phase": "COMMITTED", "result": {"status": "COMMITTED"}})
+
+    assert controller._panel_jobs.jobs[tester_id] == tester_before
+    assert controller._panel_jobs.runtime(tester_id) == tester_runtime_before
+    assert [job_id for job_id, _status, _kwargs in sync_calls] == [import_id]
+    assert len(replacements) == 1
+    restored = PanelJobRegistry(controller._panel_jobs.journal, recover_on_load=False)
+    assert restored.jobs[tester_id] == tester_before
+    assert restored.runtime(tester_id) == tester_runtime_before
 
 
 def _controller_for_windows(tmp_path: Path) -> tuple[PanelController, Path, int]:
