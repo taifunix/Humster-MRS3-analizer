@@ -270,14 +270,24 @@ def _publish(directory: str | Path, target: Path, identity: Mapping[str, object]
         connection.execute("create table scope_runs(scope_key varchar primary key, scope_digest varchar not null, result_digest varchar not null)")
         for name in _TABLES:
             connection.execute(f"create table {name}(scope_key varchar not null, payload_json varchar not null)")
-        manifest = {**identity, "analysis_id": analysis_id, "algorithm_config_sha256": config_hash}
-        connection.executemany("insert into manifest values (?, ?)", [(key, value if isinstance(value, str) else _canonical_json(value)) for key, value in manifest.items()])
-        for result in sorted(results, key=lambda item: item["scope_key"]):
-            canonical = _canonical_json(result["frames"]); digest = sha256(canonical.encode("utf-8")).hexdigest()
-            connection.execute("insert into scope_runs values (?, ?, ?)", [result["scope_key"], result["scope_digest"], digest])
-            for name, rows in result["frames"].items():
-                if rows:
-                    connection.executemany(f"insert into {name} values (?, ?)", [(result["scope_key"], _canonical_json(row)) for row in rows])
+        connection.execute("begin")
+        try:
+            manifest = {**identity, "analysis_id": analysis_id, "algorithm_config_sha256": config_hash}
+            connection.executemany("insert into manifest values (?, ?)", [(key, value if isinstance(value, str) else _canonical_json(value)) for key, value in manifest.items()])
+            for result in sorted(results, key=lambda item: item["scope_key"]):
+                canonical = _canonical_json(result["frames"]); digest = sha256(canonical.encode("utf-8")).hexdigest()
+                connection.execute("insert into scope_runs values (?, ?, ?)", [result["scope_key"], result["scope_digest"], digest])
+                for name, rows in result["frames"].items():
+                    if rows:
+                        connection.executemany(f"insert into {name} values (?, ?)", [(result["scope_key"], _canonical_json(row)) for row in rows])
+            connection.execute("commit")
+        except Exception:
+            try:
+                connection.execute("rollback")
+            except Exception:
+                # Preserve the publication error; the staging database is discarded below.
+                pass
+            raise
         connection.execute("checkpoint"); connection.close()
         check = duckdb.connect(temporary, read_only=True)
         try:

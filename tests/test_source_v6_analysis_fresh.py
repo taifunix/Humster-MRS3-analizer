@@ -11,6 +11,162 @@ import pandas as pd
 FIXTURE = Path(__file__).parent / "fixtures" / "performance" / "source_v6_fixed_lot_overlap_a.html"
 
 
+def _publish_fixture() -> tuple[dict[str, object], str, str, list[dict[str, object]]]:
+    return (
+        {"fingerprint": "analysis-v6-fresh-compact-v2"},
+        "analysis-id",
+        "config-hash",
+        [{
+            "scope_key": "ONUSDT|LONG|1h",
+            "scope_digest": "scope-digest",
+            "frames": {"points": [{"point_id": "point-1", "value": "stable"}]},
+        }],
+    )
+
+
+def test_publish_commits_before_checkpoint_close_validation_and_replace(tmp_path: Path, monkeypatch) -> None:
+    import duckdb
+    import mrs3.source_v6_analysis_fresh as fresh
+
+    events: list[str] = []
+    real_connect = duckdb.connect
+    real_replace = fresh.os.replace
+
+    class SpyConnection:
+        def __init__(self, connection, read_only: bool) -> None:
+            self._connection = connection
+            self._read_only = read_only
+
+        def execute(self, sql, *args, **kwargs):
+            command = str(sql).strip().split(None, 1)[0].upper()
+            events.append(f"{'read' if self._read_only else 'write'}:{command}")
+            return self._connection.execute(sql, *args, **kwargs)
+
+        def executemany(self, sql, *args, **kwargs):
+            events.append(f"{'read' if self._read_only else 'write'}:DML")
+            return self._connection.executemany(sql, *args, **kwargs)
+
+        def close(self) -> None:
+            events.append(f"{'read' if self._read_only else 'write'}:CLOSE")
+            self._connection.close()
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def connect(path, *args, **kwargs):
+        read_only = bool(kwargs.get("read_only", False))
+        return SpyConnection(real_connect(path, *args, **kwargs), read_only)
+
+    def replace(source, target):
+        events.append("REPLACE")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(fresh.duckdb, "connect", connect)
+    monkeypatch.setattr(fresh.os, "replace", replace)
+    identity, analysis_id, config_hash, results = _publish_fixture()
+
+    fresh._publish(tmp_path, tmp_path / "target.duckdb", identity, analysis_id, config_hash, results)
+
+    begin = events.index("write:BEGIN")
+    commit = events.index("write:COMMIT")
+    checkpoint = events.index("write:CHECKPOINT")
+    writer_close = events.index("write:CLOSE")
+    read_validation = events.index("read:SELECT")
+    replacement = events.index("REPLACE")
+    dml = [index for index, event in enumerate(events) if event in {"write:DML", "write:INSERT"}]
+    assert begin > max(index for index, event in enumerate(events) if event == "write:CREATE")
+    assert dml and begin < min(dml) <= max(dml) < commit
+    assert commit < checkpoint < writer_close < read_validation < replacement
+    assert events.count("write:BEGIN") == 1
+    assert events.count("write:COMMIT") == 1
+
+
+def test_publish_rolls_back_manifest_and_later_dml_without_partial_publish(tmp_path: Path, monkeypatch) -> None:
+    import duckdb
+    import pytest
+    import mrs3.source_v6_analysis_fresh as fresh
+
+    real_connect = duckdb.connect
+    current = {"failure": "", "message": "", "rollback_fails": False, "rollback_attempts": 0}
+
+    class FailingConnection:
+        def __init__(self, connection, read_only: bool) -> None:
+            self._connection = connection
+            self._read_only = read_only
+
+        def execute(self, sql, *args, **kwargs):
+            normalized = str(sql).strip().upper()
+            if not self._read_only and normalized.startswith(current["failure"]):
+                raise ValueError(current["message"])
+            if not self._read_only and normalized == "ROLLBACK":
+                current["rollback_attempts"] += 1
+                if current["rollback_fails"]:
+                    raise RuntimeError("rollback failed")
+            return self._connection.execute(sql, *args, **kwargs)
+
+        def executemany(self, sql, *args, **kwargs):
+            normalized = str(sql).strip().upper()
+            if not self._read_only and normalized.startswith(current["failure"]):
+                raise ValueError(current["message"])
+            return self._connection.executemany(sql, *args, **kwargs)
+
+        def close(self) -> None:
+            self._connection.close()
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def connect(path, *args, **kwargs):
+        return FailingConnection(real_connect(path, *args, **kwargs), bool(kwargs.get("read_only", False)))
+
+    monkeypatch.setattr(fresh.duckdb, "connect", connect)
+    for name, failure, message, rollback_fails in (
+        ("manifest", "INSERT INTO MANIFEST", "manifest dml failed", False),
+        ("scope-runs", "INSERT INTO SCOPE_RUNS", "scope runs dml failed", False),
+        ("rollback-failure", "INSERT INTO SCOPE_RUNS", "scope runs dml failed before rollback failure", True),
+    ):
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        target = case_dir / "target.duckdb"
+        with real_connect(str(target)) as connection:
+            connection.execute("create table existing(value varchar)")
+            connection.execute("insert into existing values ('old')")
+        before_bytes = target.read_bytes()
+        before_stat = target.stat()
+        current.update(failure=failure, message=message, rollback_fails=rollback_fails, rollback_attempts=0)
+        identity, analysis_id, config_hash, results = _publish_fixture()
+
+        with pytest.raises(ValueError, match=message):
+            fresh._publish(case_dir, target, identity, analysis_id, config_hash, results)
+
+        assert current["rollback_attempts"] == 1
+        assert target.read_bytes() == before_bytes
+        after_stat = target.stat()
+        assert after_stat.st_size == before_stat.st_size
+        assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+        with real_connect(str(target), read_only=True) as connection:
+            assert connection.execute("select value from existing").fetchone() == ("old",)
+        assert [path.name for path in case_dir.iterdir()] == [target.name]
+
+
+def test_publish_accepts_zero_all_empty_and_one_row_results(tmp_path: Path) -> None:
+    import duckdb
+    import mrs3.source_v6_analysis_fresh as fresh
+
+    identity = {"fingerprint": "analysis-v6-fresh-compact-v2"}
+    cases = [
+        ("zero", []),
+        ("empty", [{"scope_key": "empty", "scope_digest": "digest", "frames": {name: [] for name in fresh._TABLES}}]),
+        ("one", [{"scope_key": "one", "scope_digest": "digest", "frames": {"points": [{"point_id": "p", "value": "v"}]}}]),
+    ]
+    for name, results in cases:
+        target = fresh._publish(tmp_path, tmp_path / f"{name}.duckdb", identity, name, "config", results)
+        with duckdb.connect(str(target), read_only=True) as connection:
+            assert connection.execute("select count(*) from scope_runs").fetchone()[0] == len(results)
+            if name == "one":
+                assert connection.execute("select payload_json from points").fetchone() == ('{"point_id":"p","value":"v"}',)
+
+
 def test_fresh_frames_strip_admission_fields_except_plateau_audit_count() -> None:
     import mrs3.source_v6_analysis_fresh as fresh
 

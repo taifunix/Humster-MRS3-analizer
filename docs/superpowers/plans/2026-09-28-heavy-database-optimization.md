@@ -234,6 +234,12 @@ proof и legacy empty evidence отложены; параллельная тек
   паттерну. Сравнить с transaction executemany; не держать второй полный JSON-list.
   Exact canonical JSON, без float coercion, те же digests и logical order, atomic rename.
   Failure не оставляет partial generation. Analysis целиком **5–30%**, запись **40–90%**.
+  T6a transaction slice accepted: one `BEGIN`/`COMMIT` covers publication DML;
+  checkpoint, readback and atomic replace remain afterward. Frozen 1,000-row
+  `_publish` median fell from 3.245 s to 0.821 s (74.7%), with exact semantic
+  dump parity, 12 focused and 107 related tests passing, and independent Opus
+  5/high `CODE_REVIEW_PASS` round 2. This is publication-stage evidence only;
+  the bounded relation writer remains open pending profiling.
 
 Plateau support reuse и structures combinations сначала профилировать. Полный universe,
 diagnostic rows, ranking predicates и witnesses не сокращать эвристикой. При одном

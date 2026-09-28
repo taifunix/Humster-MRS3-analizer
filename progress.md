@@ -1,6 +1,6 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-28
+**Updated:** 2026-09-29
 **Current branch:** `perf/heavy-db-optimization`, based on fetched `origin/main` `8f59c2c`
 
 ## Heavy database optimization implementation (2026-09-28)
@@ -41,7 +41,18 @@ at most twice the worker count in flight. A failure stops refills, cancels
 pending futures and waits for running readers before cleanup. Deterministic
 quick/slow and real ThreadPool failure-wait regressions pass. Materializer and
 worker suites passed 21 tests; related analysis passed 9. Independent Opus
-5/high re-review returned `CODE_REVIEW_PASS`. T5 is accepted; ANA-01a is next.
+5/high re-review returned `CODE_REVIEW_PASS`. T5 is accepted.
+T6a/ANA-01a wraps Source v6 analysis publication DML in one explicit staging
+transaction while retaining the existing DDL, canonical rows/digests,
+checkpoint, readback and atomic replace order. RED/GREEN and failure tests
+cover first/later DML errors, successful/failed rollback, byte-identical old
+target and absence of staging residue. The focused module passed 12 tests;
+the related Source v6 suite passed 107. A frozen 1,000-row, three-run
+`_publish` benchmark measured median 3.245 s before versus 0.821 s after
+(74.7% lower for publication only), with exact semantic-dump equality.
+Independent Opus 5/high re-review returned `CODE_REVIEW_PASS`; T6a is accepted.
+The broader ANA-01 relation writer remains evidence-gated. T7/DEC-01 history
+replay is next; no whole-analysis speed claim is made.
 Final integrated suite remains pending.
 T4/COR-05 preserves actual HTML action order and keeps strict final-balance
 validation based on the latest timestamp/source-index witness. Swapped HTML
@@ -79,8 +90,7 @@ passed 7 with 1 skip; supported migration passed 3. Independent Opus 5/high
 re-review returned `CODE_REVIEW_PASS` after the parity regression was added.
 This is a bounded writer-buffer/schema-query slice, not a measured full-import
 speedup; remaining IMP-02 publication metadata and preparation work is open.
-Next correctness slice: COR-02 prune prepared FK children. Final integrated
-full-suite verification remains pending.
+Final integrated full-suite verification remains pending.
 The terminal Panel journal is 82.67 MiB/109 jobs; a read-only in-memory probe
 measured about 5.5 s median combined clone/serialization before disk write.
 J4 now avoids saving three unchanged terminal import polls in the private

@@ -254,6 +254,34 @@ registry. Other job kinds still save identical polls. Check no temporary files
 remain after success/failure. J5-R2 received independent Opus 5/high
 `PLAN_APPROVED`; J4 received `CODE_REVIEW_PASS` and committed as `b31b37e`.
 
+## ANA-01a: Source v6 analysis publication transaction
+
+`source_v6_analysis_fresh._publish` owns a fresh staging DuckDB connection. Its
+existing table DDL remains before one explicit transaction covering manifest,
+scope-run and result-table DML. Commit follows the last insert; checkpoint,
+writer close, read-only identity/count validation and atomic replacement follow
+commit. On a DML failure, rollback is attempted without masking the original
+exception, the old target remains byte-identical, and staging artifacts are
+removed. Cleanup may be extended only for an observed staging-derived sidecar.
+
+Stored canonical JSON strings, scope SHA digests, manifest rows, table counts
+and `rowid` ordering must match the pre-change fixture exactly. The successful
+DuckDB file's physical bytes need not match. Zero-result/all-empty/one-row
+cases are tested only where the current `_publish` contract accepts them.
+No second full result/JSON list, registered-relation writer, schema change or
+live database operation is in this slice; bounded bulk relation writing remains
+a separately measured ANA-01 follow-up if needed.
+
+Before code changes, freeze one representative approximately 1,000-row input,
+three `_publish` timings and a deterministic semantic dump outside the worktree.
+Repeat exactly three timings with the same input after the change, within a
+shared 90-second benchmark cap. Call the publication gain material only when
+the median falls by both at least 20% and 10 ms; otherwise label it unmeasured
+or retain the transaction solely for correctness, or revert and plan the bulk
+relation slice. Do not infer a whole-analysis gain from this stage benchmark.
+Focused RED/GREEN, failure/residue checks and relevant Source v6 tests precede
+independent review. T6a-D2 received independent Opus 5/high `PLAN_APPROVED`.
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,
