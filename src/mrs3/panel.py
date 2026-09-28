@@ -169,6 +169,7 @@ from .analysis_profile import (
     save_analysis_settings,
 )
 from .panel_jobs import PanelJobError, PanelJobRegistry
+from .panel_report_collection import PanelReportCollection
 from .panel_portfolio import PortfolioPanelError, PortfolioPanelService
 from .locking import TesterTargetBusyError, TesterTargetLock
 from .panel_remote_testing import RemoteTestingService, remote_testing_status
@@ -1333,6 +1334,7 @@ class PanelController:
         self._performance_v2_schema_ready: set[tuple[str, int, int, int, int, int]] = set()
         self._selection_candidate_cache: OrderedDict[tuple[object, ...], object] = OrderedDict()
         self._panel_jobs = PanelJobRegistry(self.root / ".panel-jobs.json", recover_on_load=False)
+        self._report_collection_service: PanelReportCollection | None = None
         self._portfolio_service = PortfolioPanelService(
             self.root,
             self.root / "portfolio_optimizer.local.json",
@@ -1576,13 +1578,22 @@ class PanelController:
             document = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
             raise ValueError("metadata inbox is incomplete: invalid manifest") from error
-        if not isinstance(document, dict) or document.get("schema_version") != 1:
-            raise ValueError("metadata inbox is incomplete: schema_version must be 1")
+        if not isinstance(document, dict) or document.get("schema_version") not in {1, 2}:
+            raise ValueError("metadata inbox is incomplete: unsupported schema version")
+        if document.get("schema_version") == 2:
+            if (
+                document.get("collection_manifest_version") != 1
+                or document.get("run_mode") != "SINGLE_MODE_COLLECTION"
+                or not isinstance(document.get("collection_id"), str)
+                or not document.get("collection_id")
+            ):
+                raise ValueError("metadata inbox is incomplete: invalid collection manifest")
         artifact_roots = {
             "strategy_path": tuple(dict.fromkeys(strategy_roots)),
             "report_path": (config.report_dir.resolve(),),
         }
-        if document.get("run_mode") != "SINGLE_MODE" or document.get("source_mode") != "metadata_only":
+        expected_mode = "SINGLE_MODE_COLLECTION" if document.get("schema_version") == 2 else "SINGLE_MODE"
+        if document.get("run_mode") != expected_mode or document.get("source_mode") != "metadata_only":
             raise ValueError("metadata inbox is incomplete: unsupported handoff mode")
         expected = document.get("expected_strategy_names")
         entries = document.get("entries")
@@ -1840,6 +1851,14 @@ class PanelController:
     def panel_jobs(self) -> list[dict]:
         return self._panel_jobs.public_list()
 
+    def strategies_tester_report_collection(self) -> dict[str, object]:
+        return self._report_collection().status()
+
+    def strategies_tester_report_collection_clear(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if set(payload) != {"collection_id"} or not isinstance(payload.get("collection_id"), str) or not payload["collection_id"].strip():
+            raise ValueError("collection clear requires collection_id")
+        return self._report_collection().clear(payload["collection_id"])
+
     def portfolio_readiness(self) -> dict[str, object]:
         return self._portfolio_service.readiness()
 
@@ -1925,6 +1944,7 @@ class PanelController:
         resource_keys: tuple[str, ...],
         start: Callable[[str], dict[str, object]],
         runtime: dict[str, object] | None = None,
+        before_start: Callable[[str], None] | None = None,
     ) -> dict[str, object]:
         job_id = uuid.uuid4().hex
         self._panel_jobs.submit(kind, request, f"panel:{job_id}", resource_keys, job_id=job_id)
@@ -1932,6 +1952,8 @@ class PanelController:
         if runtime:
             self._panel_jobs.sync(job_id, {"state": "RUNNING", "phase": "RUNNING"}, runtime=runtime)
         try:
+            if before_start is not None:
+                before_start(job_id)
             return self._sync_tracked_panel_job(start(job_id))
         except BaseException:
             self._panel_jobs.transition(job_id, "FAILED")
@@ -2023,6 +2045,12 @@ class PanelController:
                     self._panel_jobs.sync(tester_job_id, {}, runtime=tester_runtime)
                 except PanelJobError:
                     pass
+                if document.get("state") == "COMMITTED":
+                    try:
+                        if self._panel_jobs.get(tester_job_id).get("kind") == "strategies.tester.collection":
+                            self._report_collection().mark_imported(tester_job_id)
+                    except PanelJobError:
+                        pass
         try:
             self._panel_jobs.sync(job_id, public, runtime=runtime or None)
         except PanelJobError:
@@ -3301,10 +3329,35 @@ class PanelController:
             )
         return self._single_mode_strategy_test_service
 
+    def _report_collection(self) -> PanelReportCollection:
+        if self._report_collection_service is None:
+            config = RunnerConfig.from_json(self.default_config)
+            self._report_collection_service = PanelReportCollection(
+                self._panel_jobs,
+                inbox_root=Path(config.inbox_root),
+                report_root=Path(config.report_dir),
+                trusted_strategy_root=self._output_strategy_root(),
+            )
+        return self._report_collection_service
+
+    @staticmethod
+    def _manifest_strategy_names(manifest: Path) -> tuple[str, ...]:
+        validated = validate_strategy_manifest(manifest)
+        hashes = validated.provenance.get("strategy_json_sha256")
+        if not isinstance(hashes, Mapping):
+            raise ValueError("strategy manifest names are unavailable")
+        names = tuple(Path(name).stem for name in hashes)
+        if not names or len({name.casefold() for name in names}) != len(names):
+            raise ValueError("strategy manifest names are invalid")
+        return names
+
     def strategies_tester_start(self, payload: Mapping[str, object]) -> dict[str, object]:
-        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end", "initial_balance"})
+        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end", "initial_balance", "collect_reports"})
         if unexpected:
             raise ValueError("tester start request contains unsupported fields")
+        collect_reports = payload.get("collect_reports", False)
+        if type(collect_reports) is not bool:
+            raise ValueError("collect_reports must be a boolean")
         analysis_id = self._required(payload, "analysis_run_id")
         start_date = payload.get("start_date", payload.get("test_start"))
         end_date = payload.get("end_date", payload.get("test_end"))
@@ -3316,8 +3369,17 @@ class PanelController:
             raise ValueError("start_date and end_date are required")
         initial_balance = self._requested_initial_balance(payload)
         manifest = self._fresh_strategy_manifest(analysis_id)
+        expected_names = self._manifest_strategy_names(manifest)
+        request = {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "initial_balance": initial_balance, "mode": "SINGLE_MODE", "collect_reports": collect_reports}
+
+        def register(job_id: str) -> None:
+            collection_id = self._report_collection().register(job_id, expected_names)
+            runtime = self._panel_jobs.runtime(job_id)
+            runtime["report_collection_id"] = collection_id
+            self._panel_jobs.sync(job_id, {"state": "RUNNING", "phase": "RUNNING"}, runtime=runtime)
+
         return self._start_tracked_panel_job(
-            "strategies.tester.start", {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "initial_balance": initial_balance, "mode": "SINGLE_MODE"},
+            "strategies.tester.start", request,
             ("strategies.tester",),
             lambda job_id: self._single_mode_strategy_test().start(
                 manifest,
@@ -3327,6 +3389,7 @@ class PanelController:
                 job_id=job_id,
                 **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ),
+            before_start=register if collect_reports else None,
         )
 
     def strategies_tester_retry(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -3338,11 +3401,32 @@ class PanelController:
             raise PanelJobError("UNSUPPORTED_ROUTE")
         if source.get("state") not in {"FAILED", "CANCELLED"}:
             raise PanelJobError("TESTER_JOB_NOT_RECOVERABLE")
+
+        def register(job_id: str) -> None:
+            runtime = self._panel_jobs.runtime(source_job_id)
+            collection_id = runtime.get("report_collection_id")
+            if not isinstance(collection_id, str) or not collection_id:
+                return
+            source_member = self._report_collection()._member(
+                self._report_collection()._runtime(self._panel_jobs.get(collection_id)), source_job_id
+            )
+            if source_member is None:
+                raise PanelJobError("COLLECTION_RETRY_SOURCE_NOT_REGISTERED")
+            new_collection_id = self._report_collection().register(
+                job_id,
+                source_member.get("expected_strategy_names", ()),
+                replaces_job_id=source_job_id,
+            )
+            new_runtime = self._panel_jobs.runtime(job_id)
+            new_runtime["report_collection_id"] = new_collection_id
+            self._panel_jobs.sync(job_id, {"state": "RUNNING", "phase": "RUNNING"}, runtime=new_runtime)
+
         return self._start_tracked_panel_job(
             "strategies.tester.retry",
             {"source_job_id": source_job_id},
             ("strategies.tester",),
             lambda job_id: self._single_mode_strategy_test().retry(source_job_id, job_id=job_id),
+            before_start=register,
         )
 
     def strategies_tester_runs_start(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -3382,6 +3466,12 @@ class PanelController:
         inbox_root = Path(config.inbox_root).resolve()
         tracked = self._panel_jobs.get(job_id)
         runtime = self._panel_jobs.runtime(job_id)
+        if tracked.get("kind") == "strategies.tester.collection":
+            return {
+                "job_id": job_id,
+                "inbox_path": str(self._report_collection().verify(job_id)),
+                **self._report_collection().status(),
+            }
         is_retest_native = (
             tracked.get("kind") == "strategies.tester.native.start"
             and (tracked.get("retest") is True or runtime.get("retest") is True)
@@ -8228,6 +8318,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
             except (KeyError, ValueError):
                 self._json(400, {"error": "invalid strategy batch request"})
             return
+        if parsed.path == "/api/v2/strategies/tester/report-collection":
+            try:
+                self._json(200, self.server.controller.strategies_tester_report_collection())
+            except (KeyError, ValueError, PanelJobError):
+                self._json(400, {"error": "invalid report collection request"})
+            return
         if parsed.path == "/api/v2/strategies/performance-v2/retest/status":
             try:
                 self._json(200, self.server.controller.strategies_performance_v2_retest_status())
@@ -8466,7 +8562,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_route = endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         portfolio_cancel_route = bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint))
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
-        if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
+        if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
             self._json(404, {"error": "not found"})
             return
         if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import"}:
@@ -8557,6 +8653,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.restart_panel()
             elif endpoint == "/api/v2/strategies/tester/verify-inbox":
                 result = self.server.controller.strategies_tester_verify_inbox(self.server.controller._required(document, "job_id"))
+            elif endpoint == "/api/v2/strategies/tester/report-collection/clear":
+                result = self.server.controller.strategies_tester_report_collection_clear(document)
             elif endpoint == "/api/v2/testing/local/fill":
                 result = self.server.controller.local_testing_fill(document)
             elif endpoint == "/api/v2/testing/local/start":
