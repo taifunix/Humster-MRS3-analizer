@@ -122,6 +122,12 @@ PerformanceDB есть стратегия с `total_pnl_pct`, приведённ
 | LONG | `templates/tester/mrs2/config_tester_long.json` | `templates/tester/mrs2/config_tester_long_screen.json` | `templates/strategies/source-v6-mrs2/long.json` |
 | SHORT | `templates/tester/mrs2/config_tester_short.json` | `templates/tester/mrs2/config_tester_short_screen.json` | `templates/strategies/source-v6-mrs2/short.json` |
 
+Для обоих контуров и обеих сторон действует единый тестовый баланс:
+`InitialBalance = 100 USDT` во всех четырёх tester-конфигах и
+`basic.my_fix_balance = 100 USDT` в соответствующей LONG/SHORT-стратегии.
+Рендереры могут менять даты, символы и сетку `parameter_mining`, но не эти
+значения баланса.
+
 Отличия режима скрининга от полного прогона только в `parameter_mining`, и
 одинаковы по форме для обеих сторон:
 

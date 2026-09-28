@@ -36,7 +36,7 @@
     "cross_margin": true,
     "leverage": 20.0,
     "use_fix": true,
-    "my_fix_balance": 1000.0,
+    "my_fix_balance": 100.0,
     "balance_percentage_long": 100.0,
     "balance_percentage_short": 100.0,
     "risk_long": 1.0,

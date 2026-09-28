@@ -42,6 +42,14 @@ Warm shortlist actions meet the <=5 s technical target on these corpora; this
 does not promise true cold-disk or full JSON publication latency. Both source
 files retained identical size, mtime and SHA. No persistent cache or new
 dependency was added.
+## MRS2 test balance aligned at 100 USDT (2026-09-28)
+
+RUNNER 01 and SCREENER 01 now use the same explicit test balance for LONG
+and SHORT: `InitialBalance = 100` in all four tester templates and
+`basic.my_fix_balance = 100` in both Source v6 MRS2 strategy templates.
+The active screener specification records that renderers must preserve this
+invariant. Focused verification passed `75` tests; no real tester run was
+performed.
 
 ## Liquidity model agreed (2026-09-27)
 

@@ -1,7 +1,7 @@
 {
   "name_comment": "my_test",
   "use_runs": false,
-  "InitialBalance": 1000.0,
+  "InitialBalance": 100.0,
   "StartDate": "2026-07-15T00:00:00",
   "EndDate": "2026-08-07T00:00:00",
   "WarmupDays": 1,

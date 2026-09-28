@@ -41,6 +41,23 @@ def test_canonical_strategy_templates_are_tracked_by_mode() -> None:
         ) == contract
 
 
+def test_mrs2_testing_templates_share_one_hundred_usdt_fixed_balance() -> None:
+    root = Path(__file__).parents[1]
+    for side in ("long", "short"):
+        strategy = json.loads(
+            (root / "templates" / "strategies" / "source-v6-mrs2" / f"{side}.json")
+            .read_text(encoding="utf-8")
+        )
+        assert strategy["basic"]["my_fix_balance"] == 100.0
+
+        for suffix in ("", "_screen"):
+            tester = json.loads(
+                (root / "templates" / "tester" / "mrs2" / f"config_tester_{side}{suffix}.json")
+                .read_text(encoding="utf-8")
+            )
+            assert tester["InitialBalance"] == 100.0
+
+
 def test_render_tester_config_updates_dates_and_symbols_from_long_template() -> None:
     template = '''{
       "StartDate": "2026-01-01T00:00:00",
