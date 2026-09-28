@@ -63,6 +63,15 @@ def _database(tmp_path: Path) -> Path:
             ).fetchone()[0]
             connection.execute(
                 """
+                insert into optimizer_prepared_inputs (
+                    result_id, preparation_version, source_digest, availability_status,
+                    unavailable_reason, prepared_json, prepared_at_utc
+                ) values (?, 'prune-test-v1', ?, 'AVAILABLE', null, '{}', now())
+                """,
+                [result_id, f"digest-{name}"],
+            )
+            connection.execute(
+                """
                 insert into strategy_orders (
                     strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x,
                     analysis_run_id, plateau_id, base_point_trades
@@ -125,6 +134,24 @@ def _database(tmp_path: Path) -> Path:
     return database
 
 
+def test_prune_child_tables_cover_initialized_fk_graph(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database), read_only=True) as connection:
+        foreign_keys = connection.execute(
+            """
+            select table_name, referenced_table
+            from duckdb_constraints()
+            where constraint_type = 'FOREIGN KEY'
+            """
+        ).fetchall()
+
+    parents = {"strategies", "strategy_results", "optimizer_prepared_inputs"}
+    assert ("optimizer_prepared_inputs", "strategy_results") in foreign_keys
+    child_tables = {row[0] for row in foreign_keys if row[1] in parents}
+    assert child_tables <= set(prune_module._CHILD_TABLES)
+    assert not any(row[1] == "optimizer_prepared_inputs" for row in foreign_keys)
+
+
 def test_preview_keeps_fresh_and_ranked_rows_without_mutation(tmp_path: Path) -> None:
     database = _database(tmp_path)
     before = database.read_bytes()
@@ -133,6 +160,7 @@ def test_preview_keeps_fresh_and_ranked_rows_without_mutation(tmp_path: Path) ->
 
     assert result["mode"] == "preview"
     assert result["counts"]["strategies"] == 2
+    assert result["counts"]["optimizer_prepared_inputs"] == 2
     assert result["protected_strategies"] == 2
     assert database.read_bytes() == before
     with duckdb.connect(str(database), read_only=True) as connection:
@@ -150,12 +178,14 @@ def test_apply_backups_and_deletes_only_old_unprotected_strategy(tmp_path: Path)
     assert backup.parent == database.parent / "backups"
     with duckdb.connect(str(backup), read_only=True) as connection:
         assert connection.execute("select count(*) from strategies").fetchone() == (4,)
+        assert connection.execute("select count(*) from optimizer_prepared_inputs").fetchone() == (4,)
     assert result["counts"] == {
         "equity_quality_metrics": 2,
         "window_metrics": 2,
         "strategy_actions": 2,
         "strategy_equity": 2,
         "strategy_results": 2,
+        "optimizer_prepared_inputs": 2,
         "strategy_tags": 2,
         "strategy_orders": 2,
         "strategies": 2,
@@ -168,8 +198,11 @@ def test_apply_backups_and_deletes_only_old_unprotected_strategy(tmp_path: Path)
         assert connection.execute("select count(*) from selection_runs").fetchone() == (2,)
         assert connection.execute("select count(*) from selection_results").fetchone() == (4,)
         assert connection.execute("select count(*) from selection_review_rows").fetchone() == (4,)
-        for table in ("equity_quality_metrics", "window_metrics", "strategy_actions", "strategy_equity", "strategy_results", "strategy_tags", "strategy_orders"):
+        for table in ("equity_quality_metrics", "window_metrics", "strategy_actions", "strategy_equity", "strategy_results", "optimizer_prepared_inputs", "strategy_tags", "strategy_orders"):
             assert connection.execute(f"select count(*) from {table}").fetchone() == (2,)
+        assert connection.execute(
+            "select result_id from optimizer_prepared_inputs order by result_id"
+        ).fetchall() == [(1,), (2,)]
         assert connection.execute(
             "select count(*) from equity_quality_metrics cache left join strategy_results results "
             "using (result_id) where results.result_id is null"
@@ -211,6 +244,7 @@ def test_apply_restores_backup_after_partial_delete(tmp_path: Path, monkeypatch:
 
     def fail_after_delete(connection: duckdb.DuckDBPyConnection, stale_ids: list[int]) -> None:
         connection.execute("delete from strategy_actions where result_id = 4")
+        connection.execute("delete from optimizer_prepared_inputs where result_id = 4")
         raise RuntimeError("forced failure")
 
     monkeypatch.setattr(prune_module, "_delete", fail_after_delete)
@@ -220,6 +254,7 @@ def test_apply_restores_backup_after_partial_delete(tmp_path: Path, monkeypatch:
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute("select count(*) from strategies").fetchone() == (4,)
         assert connection.execute("select count(*) from strategy_actions").fetchone() == (4,)
+        assert connection.execute("select count(*) from optimizer_prepared_inputs").fetchone() == (4,)
         assert connection.execute("select count(*) from equity_quality_metrics").fetchone() == (4,)
 
 

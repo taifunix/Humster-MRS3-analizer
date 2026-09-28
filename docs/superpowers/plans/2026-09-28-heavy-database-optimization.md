@@ -114,13 +114,17 @@ Full suite запускается один раз после интеграци�
   source revision recheck сохранен, cross-revision digest reuse отсутствует.
   Evidence: regression RED → GREEN, optimizer 25 passed, importer 81 passed;
   final narrow cleanup 1 passed, independent Opus 5/high `CODE_REVIEW_PASS`.
-- [ ] **COR-02 / B2 — prune FK.**
+- [x] **COR-02 / B2 — prune FK.**
   `src/mrs3/performance_v2_prune.py`, `tests/test_performance_v2_prune.py`.
   Добавить prepared children в preview counts и deletion до `strategy_results`.
   Сохранить последовательный autocommit согласно
   [prune spec](../../specs/2026-09-11-performance-v2-prune.md), checkpoint, backup,
   restore и dry-run. Failing-first: FK failure при наличии prepared row;
   затем successful deletion и injected-failure restore. Не делать единый cascade transaction.
+  Prepared rows now count in preview and are removed before result parents;
+  exact protected result IDs and backup/restore are pinned. An initialized-
+  schema FK graph test guards coverage. Prune 16 passed, optimizer strict
+  preparation 2 passed; independent Opus 5/high `CODE_REVIEW_PASS` round 2.
 - [ ] **COR-03 / B3 — XLSX Trades.**
   `src/mrs3/panel_performance_v2.py`, `tests/test_panel_performance_v2_export.py`.
   Только exported `Trades` берет completed-round-trip count из готового cache.

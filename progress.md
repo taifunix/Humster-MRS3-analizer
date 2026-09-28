@@ -21,7 +21,13 @@ T1/COR-01 fixes persistence of rebuilt malformed optimizer inputs while retainin
 cheap valid reuse and writer source rechecks. The regression failed before the
 fix; optimizer tests passed 25 and import tests passed 81. The final cleanup
 regression passed again. Independent Claude Opus 5/high returned CODE_REVIEW_PASS;
-T1 is accepted. The remaining runtime tasks are still pending.
+T1 is accepted.
+T2/COR-02 adds `optimizer_prepared_inputs` to prune preview counts and removes
+its FK children before `strategy_results`. Preview remains read-only; apply
+keeps checkpoint, verified backup and sequential autocommit, and a forced
+partial delete restores prepared rows. A catalog-FK regression guards child
+coverage; prune tests passed 16, optimizer strict-preparation checks passed 2.
+Independent Opus 5/high re-review returned `CODE_REVIEW_PASS`; T2 is accepted.
 T4/COR-05 preserves actual HTML action order and keeps strict final-balance
 validation based on the latest timestamp/source-index witness. Swapped HTML
 is rejected as ACTIONS_OUT_OF_ORDER while a valid sibling commits; equal-time

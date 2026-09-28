@@ -22,6 +22,7 @@ _CHILD_TABLES = (
     "window_metrics",
     "strategy_actions",
     "strategy_equity",
+    "optimizer_prepared_inputs",
     "strategy_results",
     "strategy_tags",
     "strategy_orders",
@@ -125,7 +126,13 @@ def _plan(connection: duckdb.DuckDBPyConnection, cutoff: datetime) -> tuple[list
                 [stale_ids],
             ).fetchone()[0]
         )
-    for table in ("equity_quality_metrics", "window_metrics", "strategy_actions", "strategy_equity"):
+    for table in (
+        "equity_quality_metrics",
+        "window_metrics",
+        "strategy_actions",
+        "strategy_equity",
+        "optimizer_prepared_inputs",
+    ):
         counts[table] = int(
             connection.execute(
                 f"""
@@ -151,7 +158,13 @@ def _delete(connection: duckdb.DuckDBPyConnection, stale_ids: list[int]) -> None
             [stale_ids],
         ).fetchall()
     ]
-    for table in ("equity_quality_metrics", "window_metrics", "strategy_actions", "strategy_equity"):
+    for table in (
+        "equity_quality_metrics",
+        "window_metrics",
+        "strategy_actions",
+        "strategy_equity",
+        "optimizer_prepared_inputs",
+    ):
         if result_ids:
             connection.execute(
                 f"delete from {table} where result_id in (select unnest(?::BIGINT[]))",
