@@ -16,7 +16,16 @@ original checkout. R5 received independent Claude Opus 5/high `PLAN_APPROVED`.
 Focused baseline: 221 passed, 5 skipped, 8 warnings in 164.77s (Panel Performance
 v2, input, HTML, optimizer, prune). Gate0 documentation received independent
 Claude Opus 5/high `CODE_REVIEW_PASS` after explicit migration, admitted-subset,
-cache-miss and import-boundary clarifications. No runtime optimization is accepted yet.
+cache-miss and import-boundary clarifications.
+T1/COR-01 fixes persistence of rebuilt malformed optimizer inputs while retaining
+cheap valid reuse and writer source rechecks. The regression failed before the
+fix; optimizer tests passed 25 and import tests passed 81. The final cleanup
+regression passed again. Independent Claude Opus 5/high returned CODE_REVIEW_PASS;
+T1 is accepted. The remaining runtime tasks are still pending.
+The user's import-tail report now prioritizes T4 then measured IMP-02/T13 work
+ahead of independent optimization tasks. The latest local audit confirms a
+409-report REPLACE batch in an approximately 14 GB DB, but records contain no
+stage timestamps; no actual tail timing or gain is inferred from them.
 Source final-payload proof and
 legacy empty-import `safe_to_delete` evidence remain deferred by the user.
 

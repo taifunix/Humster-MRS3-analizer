@@ -639,6 +639,7 @@ def prepare_current_optimizer_inputs(database: str, result_ids: Sequence[int], *
                         and existing[1] == source_digest(item.source)
                         and existing[2] == item.availability.status
                         and existing[3] == item.availability.reason
+                        and item.source.result_id not in built_by_id
                     ):
                         continue
                     connection.execute("delete from optimizer_prepared_inputs where result_id = ?", [item.source.result_id])

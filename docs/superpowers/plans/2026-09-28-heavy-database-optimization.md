@@ -4,7 +4,7 @@
 **Дата / implementation baseline:** 2026-09-28 / `origin/main@8f59c2c`, DuckDB `1.5.5`.
 **Ветка:** `perf/heavy-db-optimization`, worktree `.worktrees/heavy-db-optimization`.
 **Статус:** R5 `PLAN_APPROVED`, независимый Claude Opus 5/high, 2026-09-28;
-user authorization на внедрение получена, runtime еще не изменен.
+user authorization на внедрение получена; T1 accepted after `CODE_REVIEW_PASS`.
 
 **Goal:** исправить подтвержденные дефекты и уменьшить время/память цепочки
 HTML → Source DB → materialization → analysis → PerformanceDB → selection/export.
@@ -32,6 +32,12 @@ Runtime меняется только в этой ветке; рабочие Б�
 COR-01 обязателен перед OPT-01; COR-05 — перед IMP-01/03; COR-03 — перед сравнением
 XLSX. Другие контуры независимы. MAT-02 можно исправить отдельно от ускорения metrics.
 COR-04 и legacy empty evidence остаются deferred.
+
+Steering 2026-09-28: после T1 выполнить T4 и подтвержденную оптимизацию конца
+PerformanceDB import (IMP-02/T13) перед независимыми задачами. Номера задач
+сохраняются; обязательные зависимости и acceptance gates не меняются. Запись
+локального audit подтверждает REPLACE 409 reports; stage timestamps отсутствуют,
+поэтому причину tail проверяют по коду и bounded synthetic probes.
 
 ## R5: порядок исполнения и изменения upstream
 
@@ -98,7 +104,7 @@ Full suite запускается один раз после интеграци�
 
 ## 1. Подтвержденные ошибки
 
-- [ ] **COR-01 / B1 — optimizer prepared payload.**
+- [x] **COR-01 / B1 — optimizer prepared payload.**
   `src/mrs3/performance_v2_optimizer.py`, `tests/test_performance_v2_optimizer.py`.
   Failing-first: совпадающие metadata и поврежденный `prepared_json={}` → prepare
   сообщает available, но strict read падает. Writer не должен metadata-skip строку,
@@ -106,6 +112,8 @@ Full suite запускается один раз после интеграци�
   не добавлять еще один полный hash/decode проход на каждом корректном cache hit.
   Приемка: repair проходит strict read, корректный repeat не пересобирается,
   source revision recheck сохранен, cross-revision digest reuse отсутствует.
+  Evidence: regression RED → GREEN, optimizer 25 passed, importer 81 passed;
+  final narrow cleanup 1 passed, independent Opus 5/high `CODE_REVIEW_PASS`.
 - [ ] **COR-02 / B2 — prune FK.**
   `src/mrs3/performance_v2_prune.py`, `tests/test_performance_v2_prune.py`.
   Добавить prepared children в preview counts и deletion до `strategy_results`.

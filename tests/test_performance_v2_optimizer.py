@@ -286,6 +286,24 @@ def test_old_preparation_version_fails_strict_read_then_rebuilds(tmp_path: Path)
         ).fetchone() == ("5",)
 
 
+def test_invalid_prepared_payload_rebuilds_even_when_metadata_matches(tmp_path: Path) -> None:
+    database, (result_id,) = _typed_candidate_database(tmp_path)
+    first = prepare_current_optimizer_inputs(str(database), [result_id], workers=1)
+    assert first[0].availability.available
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "update optimizer_prepared_inputs set prepared_json = '{}' where result_id = ?",
+            [result_id],
+        )
+
+    with pytest.raises(OptimizerIntegrityError, match="schema version is invalid"):
+        read_prepared_optimizer_inputs(str(database), [result_id])
+
+    rebuilt = prepare_current_optimizer_inputs(str(database), [result_id], workers=1)
+    assert rebuilt[0].availability.available
+    assert read_prepared_optimizer_inputs(str(database), [result_id])[0].prepared is not None
+
+
 def test_reusable_prepared_row_deleted_before_writer_is_reinserted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     database, (result_id,) = _typed_candidate_database(tmp_path)
     assert prepare_current_optimizer_inputs(str(database), [result_id], workers=1)[0].availability.available
