@@ -227,6 +227,127 @@ const panelRequestErrorHelpers = (() => {
 })();
 if (typeof globalThis !== 'undefined') globalThis.panelRequestErrorHelpers = panelRequestErrorHelpers;
 
+const freshShortlistStateHelpers = (() => {
+  const version = 'shortlist-v2';
+  const off = Object.freeze({ pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false });
+  const optionKeys = Object.keys(off);
+  const optionsOf = (options = off) => Object.fromEntries(optionKeys.map((key) => [key, options[key] === true]));
+  const sameOptions = (left, right) => optionKeys.every((key) => left[key] === right[key]);
+  const isReady = (group) => Number(group?.ready_after_filters ?? group?.ready ?? 0) > 0;
+  const readyGroups = (groups) => groups.filter(isReady);
+  const pruneReadyScopes = (selected, groups) => {
+    const readyScopeKeys = new Set(readyGroups(groups).map((group) => group.scope_key));
+    for (const key of selected) if (!readyScopeKeys.has(key)) selected.delete(key);
+  };
+  const sumPlateauCounts = (groups) => {
+    if (!Array.isArray(groups) || !groups.length) return null;
+    let total = 0;
+    for (const group of groups) {
+      if (!Number.isSafeInteger(group?.plateau_count) || group.plateau_count < 0) return null;
+      total += group.plateau_count;
+    }
+    return Number.isSafeInteger(total) ? total : null;
+  };
+  const create = ({ controls, request, onChange = () => {} }) => {
+    let analysisRunId = '';
+    let revision = 0;
+    let snapshot = null;
+    let busy = false;
+    let generateBusy = false;
+    let generationRevision = 0;
+    let error = '';
+    const readDraft = () => Object.fromEntries(optionKeys.map((key) => [key, !!controls[key]?.checked]));
+    const writeDraft = (options) => { for (const key of optionKeys) if (controls[key]) controls[key].checked = options[key] === true; };
+    const notify = () => onChange({
+      analysisRunId, snapshot, busy, generateBusy,
+      pending: !!snapshot && !sameOptions(readDraft(), snapshot.applied_options),
+      error,
+    });
+    for (const key of optionKeys) controls[key]?.addEventListener('change', () => { error = ''; notify(); });
+    writeDraft(off);
+    const isCurrent = (expectedRevision, expectedAnalysisId = analysisRunId) => revision === expectedRevision && analysisRunId === expectedAnalysisId;
+    const bodyFor = (analysisId, options) => ({ analysis_run_id: analysisId, filter_version: version, ...optionsOf(options) });
+    const snapshotFrom = (payload, analysisId) => {
+      const applied = payload?.applied_options;
+      if (payload?.filter_version !== version || payload?.analysis_run_id !== analysisId || typeof payload?.selection_token !== 'string' || !payload.selection_token.trim() || !applied || optionKeys.some((key) => typeof applied[key] !== 'boolean')) {
+        throw new Error('Invalid shortlist snapshot');
+      }
+      return {
+        filter_version: version,
+        filter_engine_version: payload.filter_engine_version,
+        analysis_run_id: analysisId,
+        applied_options: optionsOf(applied),
+        selection_token: payload.selection_token,
+        groups: Array.isArray(payload.groups) ? payload.groups : [],
+        items: Array.isArray(payload.items) ? payload.items : [],
+      };
+    };
+    const beginAnalysis = () => {
+      revision += 1; busy = true; error = '';
+      notify(); return revision;
+    };
+    const setAnalysis = (analysisId, expectedRevision) => {
+      if (!analysisId || revision !== expectedRevision) return false;
+      analysisRunId = analysisId; snapshot = null; busy = false; error = '';
+      writeDraft(off); notify(); return true;
+    };
+    const failAnalysis = (expectedRevision, cause) => {
+      if (revision !== expectedRevision) return false;
+      busy = false; error = cause?.message || String(cause || 'Analysis failed'); notify(); return true;
+    };
+    const load = async (expectedRevision = revision) => {
+      const analysisId = analysisRunId;
+      if (!analysisId || busy || !isCurrent(expectedRevision, analysisId)) return false;
+      busy = true; error = ''; notify();
+      try {
+        const payload = await request('/api/v2/strategies/fresh/shortlist', bodyFor(analysisId, off));
+        if (!isCurrent(expectedRevision, analysisId)) return false;
+        snapshot = snapshotFrom(payload, analysisId); busy = false; notify(); return true;
+      } catch (cause) {
+        if (isCurrent(expectedRevision, analysisId)) { busy = false; error = cause?.message || 'Shortlist failed'; notify(); }
+        return false;
+      }
+    };
+    const replaceSnapshot = async (options) => {
+      const analysisId = analysisRunId;
+      if (!analysisId || busy) return false;
+      const requestRevision = ++revision;
+      busy = true; error = ''; notify();
+      try {
+        const payload = await request('/api/v2/strategies/fresh/shortlist', bodyFor(analysisId, optionsOf(options)));
+        if (!isCurrent(requestRevision, analysisId)) return false;
+        snapshot = snapshotFrom(payload, analysisId); busy = false; notify(); return true;
+      } catch (cause) {
+        if (isCurrent(requestRevision, analysisId)) { busy = false; error = cause?.message || 'Shortlist failed'; notify(); }
+        return false;
+      }
+    };
+    const applyDraft = () => replaceSnapshot(readDraft());
+    const refresh = () => snapshot ? replaceSnapshot(snapshot.applied_options) : false;
+    const actionPayload = (extra = {}) => snapshot && !busy && snapshot.analysis_run_id === analysisRunId
+      ? { ...extra, analysis_run_id: analysisRunId, filter_version: snapshot.filter_version, ...snapshot.applied_options, selection_token: snapshot.selection_token }
+      : null;
+    const setGenerateBusy = (value) => {
+      const next = !!value;
+      if (next && !generateBusy) generationRevision += 1;
+      generateBusy = next; notify();
+    };
+    const isGenerationCurrent = (expectedRevision) => generationRevision === expectedRevision;
+    notify();
+    return {
+      beginAnalysis, setAnalysis, failAnalysis, isCurrent, load, applyDraft, refresh, actionPayload, setGenerateBusy, isGenerationCurrent,
+      get analysisRunId() { return analysisRunId; },
+      get revision() { return revision; },
+      get snapshot() { return snapshot; },
+      get generateBusy() { return generateBusy; },
+      get generationRevision() { return generationRevision; },
+      sumPlateauCounts,
+    };
+  };
+  return { create, isReady, readyGroups, pruneReadyScopes, sumPlateauCounts };
+})();
+if (typeof globalThis !== 'undefined') globalThis.freshShortlistStateHelpers = freshShortlistStateHelpers;
+
 const performanceV2ExportHelpers = (() => {
   const query = (selected) => {
     const chosen = new Set(Array.isArray(selected) ? selected : []);
@@ -246,8 +367,6 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   let shortlistGroups = [];
   let shortlistItems = [];
   const selectedScopeKeys = new Set();
-  const shortlistFilters = () => ({ source_pnl: !!document.querySelector('#shortlist-filter-source-pnl')?.checked, efficiency: !!document.querySelector('#shortlist-filter-efficiency')?.checked, close_support: !!document.querySelector('#shortlist-filter-close-support')?.checked, point_event_count: !!document.querySelector('#shortlist-filter-point-event-count')?.checked });
-  const pretestAbEnabled = () => !!document.querySelector('#shortlist-filter-pretest-ab')?.checked;
   const expandedPairs = new Set();
   const shortlistBadge = (kind, text) => {
     const badge = document.querySelector('#shortlist-badge');
@@ -256,7 +375,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     badge.textContent = text;
   };
   const selectedCandidateIds = () => shortlistGroups
-    .filter((group) => selectedScopeKeys.has(group.scope_key) && Number(group.ready_after_filters ?? group.ready ?? 0) > 0)
+    .filter((group) => selectedScopeKeys.has(group.scope_key) && freshShortlistStateHelpers.isReady(group))
     .flatMap((group) => group.candidate_ids || []);
   const pairGroups = () => {
     const byPair = new Map();
@@ -264,11 +383,12 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const key = `${group.pair}|${group.side}`;
       const entry = byPair.get(key) || {
         key, pair: group.pair, side: group.side, timeframes: [],
-        counts: Object.fromEntries(ORDER_BUCKETS.map((bucket) => [bucket, 0])), ready: 0, deferred: 0, total: 0,
+        counts: Object.fromEntries(ORDER_BUCKETS.map((bucket) => [bucket, 0])), ready: 0, ready_after_filters: 0, deferred: 0, total: 0,
       };
       entry.timeframes.push(group);
       for (const bucket of ORDER_BUCKETS) entry.counts[bucket] += Number(group.counts?.[bucket] || 0);
-      entry.ready += Number(group.ready_after_filters ?? group.ready ?? 0);
+      entry.ready += Number(group.ready || 0);
+      entry.ready_after_filters += Number(group.ready_after_filters ?? group.ready ?? 0);
       entry.deferred += Number(group.deferred || 0);
       entry.total += Number(group.total || 0);
       byPair.set(key, entry);
@@ -324,7 +444,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         if (open) expandedPairs.delete(pair.key); else expandedPairs.add(pair.key);
         renderShortlist();
       });
-      const selectable = pair.timeframes.filter((group) => Number(group.ready_after_filters ?? group.ready ?? 0) > 0);
+      const selectable = freshShortlistStateHelpers.readyGroups(pair.timeframes);
       const box = document.createElement('input');
       box.type = 'checkbox';
       box.disabled = selectable.length === 0;
@@ -346,8 +466,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       timeframes.textContent = `${pair.timeframes.length} TF`;
       row.append(pick, name, timeframes);
       for (const bucket of ORDER_BUCKETS) row.append(countCell(pair.counts[bucket], false));
-      row.append(valueCell(undefined, '—'), countCell(pair.ready, true), valueCell(undefined, 0), countCell(pair.total, false), valueCell(undefined, '—'));
-      row.children[9].textContent = pair.deferred ? String(pair.deferred) : '0';
+      row.append(valueCell(freshShortlistStateHelpers.sumPlateauCounts(pair.timeframes), '—'), countCell(pair.ready_after_filters ?? pair.ready, true), valueCell(pair.deferred, 0), countCell(pair.total, false), valueCell(undefined, '—'));
       body.append(row);
       for (const group of pair.timeframes) {
         const child = document.createElement('tr');
@@ -358,7 +477,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         childBox.type = 'checkbox';
         childBox.className = 'shortlist-tf-checkbox';
         childBox.value = group.scope_key;
-        childBox.disabled = !(Number(group.ready_after_filters ?? group.ready ?? 0) > 0);
+        childBox.disabled = !freshShortlistStateHelpers.isReady(group);
         childBox.checked = selectedScopeKeys.has(group.scope_key);
         childBox.setAttribute('aria-label', `Select READY ${group.pair} ${group.side} ${group.timeframe}`);
         childBox.addEventListener('change', () => {
@@ -371,10 +490,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         childName.textContent = '';
         const childTf = document.createElement('td');
         childTf.textContent = group.timeframe;
+        const readyCell = countCell(group.ready_after_filters ?? group.ready, true);
         child.append(childPick, childName, childTf);
         for (const bucket of ORDER_BUCKETS) child.append(countCell(group.counts?.[bucket], false));
-        child.append(valueCell(group.plateau_count, '—'), countCell(group.ready, true), valueCell(group.deferred, 0), countCell(group.total, false), valueCell(group.period, '—'));
-        child.children[8].textContent = Number(group.ready_after_filters ?? group.ready ?? 0) || 'вЂ”';
+        child.append(valueCell(group.plateau_count, '—'), readyCell, valueCell(group.deferred, 0), countCell(group.total, false), valueCell(group.period, '—'));
         body.append(child);
       }
     }
@@ -382,10 +501,9 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     updateShortlistSummary();
   };
   const applyShortlist = (payload) => {
-    shortlistItems = payload.items || [];
-    shortlistGroups = payload.groups || [];
-    const live = new Set(shortlistGroups.map((group) => group.scope_key));
-    for (const key of [...selectedScopeKeys]) if (!live.has(key)) selectedScopeKeys.delete(key);
+    shortlistItems = payload?.items || [];
+    shortlistGroups = payload?.groups || [];
+    freshShortlistStateHelpers.pruneReadyScopes(selectedScopeKeys, shortlistGroups);
     if (expandedPairs.size === 0) {
       for (const group of shortlistGroups) expandedPairs.add(`${group.pair}|${group.side}`);
     }
@@ -1689,6 +1807,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     if (heading) heading.textContent = label;
   });
   let currentAnalysisId = '';
+  let testerControlsBusy = false;
   let testerJobId = '';
   let testerPoller = 0;
   let testerRetryTimer = 0;
@@ -1718,6 +1837,39 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     }
     strategyStatus(message);
   };
+  let displayedFreshSnapshot;
+  const freshShortlistState = freshShortlistStateHelpers.create({
+    controls: {
+      pretest_ab_enabled: document.querySelector('#shortlist-filter-pretest-ab'),
+      ladder_enabled: document.querySelector('#shortlist-filter-ladder'),
+      pareto_enabled: document.querySelector('#shortlist-filter-pareto'),
+    },
+    request: remoteRequest,
+    onChange: (state) => {
+      currentAnalysisId = state.analysisRunId;
+      if (state.snapshot !== displayedFreshSnapshot) {
+        displayedFreshSnapshot = state.snapshot;
+        applyShortlist(state.snapshot);
+      }
+      const status = document.querySelector('#shortlist-filter-status');
+      if (status) status.textContent = state.busy
+        ? (state.snapshot ? 'Обновление выполняется; пока используется предыдущий shortlist.' : 'Загрузка shortlist…')
+        : state.error
+          ? `${state.error}${state.snapshot ? ' · показан предыдущий применённый набор' : ''}`
+          : !state.snapshot
+            ? (state.analysisRunId ? 'Shortlist пока не загружен.' : 'Откройте анализ, чтобы применить фильтры.')
+            : state.pending ? 'Есть неприменённые изменения фильтров.' : 'Показан shortlist с применёнными фильтрами.';
+      const pending = state.busy || !state.snapshot || state.snapshot.analysis_run_id !== state.analysisRunId;
+      const recalculate = document.querySelector('#shortlist-filter-recalculate');
+      const refresh = document.querySelector('#shortlist-refresh');
+      const audit = document.querySelector('#shortlist-audit');
+      const generate = document.querySelector('#shortlist-generate');
+      if (recalculate) recalculate.disabled = !state.analysisRunId || state.busy;
+      if (refresh) refresh.disabled = pending;
+      if (audit) audit.disabled = pending;
+      if (generate) generate.disabled = pending || state.generateBusy || testerControlsBusy;
+    },
+  });
   const analysisElapsed = (startedAt) => {
     const seconds = Math.floor((Date.now() - startedAt) / 1000);
     return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
@@ -1736,8 +1888,9 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   if (analyzeFresh) analyzeFresh.addEventListener('click', async () => {
     const selected = document.querySelector('#analysis-surface')?.value || currentSurfacePath;
     if (!selected) { strategyStatus('Publish or select a surface first.'); return; }
+    const requestRevision = freshShortlistState.beginAnalysis();
     const startedAt = Date.now();
-    const running = () => analysisProgress('running', `Analysis is running · Reading and validating surface · ${analysisElapsed(startedAt)}`);
+    const running = () => { if (freshShortlistState.isCurrent(requestRevision)) analysisProgress('running', `Analysis is running · Reading and validating surface · ${analysisElapsed(startedAt)}`); };
     analyzeFresh.disabled = true;
     running();
     const analysisTimer = setInterval(running, 1000);
@@ -1747,13 +1900,22 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         algorithm_version: document.querySelector('#settings-algorithm')?.value || '',
         target_path: analysisTarget?.value || '',
       });
-      if (result.phase !== 'COMMITTED') { analysisProgress('failed', result.error || result.phase || 'Analysis failed.'); return; }
-      currentAnalysisId = result.analysis_run_id;
-      const shortlist = await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId });
-      applyShortlist(shortlist);
+      if (!freshShortlistState.isCurrent(requestRevision)) return;
+      if (result.phase !== 'COMMITTED') {
+        const error = result.error || result.phase || 'Analysis failed.';
+        freshShortlistState.failAnalysis(requestRevision, error);
+        analysisProgress('failed', error);
+        return;
+      }
+      if (!freshShortlistState.setAnalysis(result.analysis_run_id, requestRevision)) throw new Error('Analysis identity missing.');
+      if (!await freshShortlistState.load(requestRevision)) {
+        if (freshShortlistState.isCurrent(requestRevision, result.analysis_run_id)) analysisProgress('failed', 'Shortlist could not be loaded.');
+        return;
+      }
+      if (!freshShortlistState.isCurrent(requestRevision, result.analysis_run_id)) return;
       analysisProgress('complete', `Analysis committed; ${shortlistItems.length} candidates available.`);
     } catch (error) {
-      analysisProgress('failed', `Fresh analysis failed: ${error?.message || 'unknown error'}.`);
+      if (freshShortlistState.failAnalysis(requestRevision, error)) analysisProgress('failed', `Fresh analysis failed: ${error?.message || 'unknown error'}.`);
     } finally {
       clearInterval(analysisTimer);
       analyzeFresh.disabled = false;
@@ -1785,15 +1947,21 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   document.querySelector('#analysis-open')?.addEventListener('click', async () => {
     const selected = analysisExisting?.value || '';
     if (!selected) { analysisOpenStatus('Выберите analysis DB.'); return; }
+    const requestRevision = freshShortlistState.beginAnalysis();
     try {
       // Opening registers the run, so its shortlist is readable without a rerun.
       const opened = await remoteRequest('/api/v2/strategies/fresh/open', { analysis_ref: selected });
-      currentAnalysisId = opened.analysis_run_id;
-      applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId }));
+      if (!freshShortlistState.isCurrent(requestRevision)) return;
+      if (!freshShortlistState.setAnalysis(opened.analysis_run_id, requestRevision)) throw new Error('Analysis identity missing.');
+      if (!await freshShortlistState.load(requestRevision)) {
+        if (freshShortlistState.isCurrent(requestRevision, opened.analysis_run_id)) analysisOpenStatus('Shortlist could not be loaded.');
+        return;
+      }
+      if (!freshShortlistState.isCurrent(requestRevision, opened.analysis_run_id)) return;
       analysisOpenStatus(`Открыто: ${opened.scopes} scopes · surface ${String(opened.surface_id).slice(0, 12)}.`);
       analysisProgress('complete', `Analysis opened; ${shortlistItems.length} candidates available.`);
     } catch (error) {
-      analysisOpenStatus(`Не открыто: ${error?.message || 'unknown error'}.`);
+      if (freshShortlistState.failAnalysis(requestRevision, error)) analysisOpenStatus(`Не открыто: ${error?.message || 'unknown error'}.`);
     }
   });
   loadAnalysisCatalog();
@@ -1802,91 +1970,97 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     if (node) node.textContent = message;
   };
   const restoreGeneratedBatch = async () => {
+    const restoreGenerationRevision = freshShortlistState.generationRevision;
     try {
       const batch = await requestJson('/api/v2/strategies/fresh/batch');
-      currentAnalysisId = batch.analysis_run_id;
-      setTesterReadyCount(Number(batch.strategy_count || 0));
-      generateStatus(`READY JSON restored: ${batch.strategy_count}.`);
-    } catch (_) { /* No validated batch on disk yet. */ }
+      if (!freshShortlistState.isGenerationCurrent(restoreGenerationRevision)) return;
+      if (!Number.isSafeInteger(batch.strategy_count) || batch.strategy_count < 0) {
+        console.warn('READY JSON batch metadata has an invalid strategy count.');
+        return;
+      }
+      const count = batch.strategy_count;
+      setTesterReadyCount(count);
+      generateStatus(`READY JSON restored: ${count}.`);
+    } catch (error) {
+      if (error?.message !== 'fresh strategy batch is not available') console.warn('READY JSON batch restore failed.', error);
+    }
   };
   restoreGeneratedBatch();
   const generateFresh = document.querySelector('#shortlist-generate');
   if (generateFresh) generateFresh.addEventListener('click', async () => {
+    if (freshShortlistState.generateBusy) return;
     const scopes = shortlistGroups.filter((group) => selectedScopeKeys.has(group.scope_key));
     const candidateIds = selectedCandidateIds();
     const sides = new Set(scopes.map((group) => group.side));
+    const appliedRequest = freshShortlistState.actionPayload({
+      candidate_ids: candidateIds,
+      selected_scopes: scopes.map((group) => [group.pair, group.side, group.timeframe]),
+    });
     if (!currentAnalysisId) { generateStatus('Сначала запустите анализ.'); return; }
     if (!candidateIds.length) { generateStatus('Отметьте scope с READY-кандидатами.'); return; }
+    if (!appliedRequest) { generateStatus('Дождитесь применения shortlist перед созданием JSON.'); return; }
     // The batch template is chosen by side, so a mixed batch has no template.
     if (sides.size !== 1) { generateStatus(`Выберите scopes одной стороны: ${[...sides].join(', ')}.`); return; }
+    const generationAnalysisId = currentAnalysisId;
+    const generationRevision = freshShortlistState.revision;
+    const generationIsCurrent = () => freshShortlistState.isCurrent(generationRevision, generationAnalysisId);
+    const publishGenerationStatus = (message) => { if (generationIsCurrent()) generateStatus(message); };
+    freshShortlistState.setGenerateBusy(true);
     generateFresh.disabled = true;
-    generateStatus(`READY JSON: ${candidateIds.length} candidates...`);
+    publishGenerationStatus(`READY JSON: ${candidateIds.length} candidates...`);
     try {
-      let result = await remoteRequest('/api/v2/strategies/fresh/generate', {
-        analysis_run_id: currentAnalysisId,
-        candidate_ids: candidateIds,
-        filters: shortlistFilters(),
-        pretest_ab_enabled: pretestAbEnabled(),
-        selected_scopes: scopes.map((group) => [group.pair, group.side, group.timeframe]),
-      });
+      let result = await remoteRequest('/api/v2/strategies/fresh/generate', appliedRequest);
       while (result.running) {
-        generateStatus('READY JSON: creating...');
+        publishGenerationStatus('READY JSON: creating...');
         await new Promise((resolve) => setTimeout(resolve, 500));
         result = await requestJson(`/api/v2/strategies/fresh/generate/status?job_id=${encodeURIComponent(result.job_id)}`);
       }
       if (result.phase !== 'COMMITTED') throw new Error(result.error || 'generation failed');
-      setTesterReadyCount(Number(result.strategy_count || 0));
-      generateStatus(`READY JSON committed: ${result.strategy_count}.`);
+      if (generationIsCurrent()) {
+        const parsedCount = Number(result.strategy_count);
+        const count = Number.isFinite(parsedCount) ? parsedCount : 0;
+        setTesterReadyCount(count);
+        publishGenerationStatus(`READY JSON committed: ${count}.`);
+      } else {
+        console.info('READY JSON generation completed for a previous analysis.', {
+          analysis_run_id: generationAnalysisId, phase: result.phase, strategy_count: result.strategy_count,
+        });
+      }
     } catch (error) {
-      generateStatus(`READY JSON не создан: ${error?.message || 'unknown error'}.`);
+      if (generationIsCurrent()) publishGenerationStatus(`READY JSON не создан: ${error?.message || 'unknown error'}.`);
+      else console.warn('READY JSON generation failed for a previous analysis.', {
+        analysis_run_id: generationAnalysisId, error: error?.message || 'unknown error',
+      });
     } finally {
-      generateFresh.disabled = false;
+      freshShortlistState.setGenerateBusy(false);
+      generateFresh.disabled = testerControlsBusy || !freshShortlistState.actionPayload();
     }
   });
   const refreshFresh = document.querySelector('#shortlist-refresh');
-  const filterControls = document.querySelector('.shortlist-filter-controls');
-  const phase2Filters = filterControls?.querySelector('.phase2-filters');
-  if (filterControls && phase2Filters && refreshFresh?.parentElement) {
-    const actions = refreshFresh.parentElement;
-    phase2Filters.open = true;
-    phase2Filters.querySelector('summary')?.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') event.preventDefault();
-    });
-    const selection = document.createElement('div'); selection.className = 'button-row';
-    ['#shortlist-select-all', '#shortlist-select-active', '#shortlist-select-none'].forEach((id) => { const button = document.querySelector(id); if (button) selection.append(button); });
-    actions.after(filterControls); filterControls.after(selection);
-  }
   if (refreshFresh?.parentElement) {
     const audit = document.createElement('button');
     audit.id = 'shortlist-audit'; audit.type = 'button'; audit.className = 'button button-secondary'; audit.textContent = 'Export filter audit';
+    audit.disabled = !freshShortlistState.snapshot;
     audit.addEventListener('click', async () => {
-      if (!currentAnalysisId) return;
-      const response = await fetch('/api/v2/strategies/fresh/shortlist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ analysis_run_id: currentAnalysisId, filters: shortlistFilters(), pretest_ab_enabled: pretestAbEnabled(), audit: true }) });
-      const result = await response.json(); if (!response.ok) throw new Error(result.error || 'audit failed');
-      strategyStatus(`Filter audit: ${result.filename}`);
+      const payload = freshShortlistState.actionPayload({ audit: true });
+      if (!payload) return;
+      try {
+        const result = await remoteRequest('/api/v2/strategies/fresh/shortlist', payload);
+        strategyStatus(`Filter audit: ${result.filename}`);
+      } catch (error) { strategyStatus(`Filter audit failed: ${error?.message || 'unknown error'}.`); }
     });
     refreshFresh.parentElement.append(audit);
   }
-  const refreshShortlist = async () => {
-    if (!currentAnalysisId) { strategyStatus('Сначала запустите анализ.'); return; }
-    try {
-      applyShortlist(await remoteRequest('/api/v2/strategies/fresh/shortlist', { analysis_run_id: currentAnalysisId, filters: shortlistFilters(), pretest_ab_enabled: pretestAbEnabled() }));
-      strategyStatus(`Shortlist: ${shortlistItems.length} candidates.`);
-    } catch (error) { strategyStatus(`Shortlist ошибка: ${error?.message || 'unknown error'}.`); }
-  };
-  if (refreshFresh) refreshFresh.addEventListener('click', refreshShortlist);
-  document.querySelectorAll('.phase2-filters input[type="checkbox"]').forEach((node) => {
-    node.addEventListener('change', refreshShortlist);
-  });
-  document.querySelector('#shortlist-filter-pretest-ab')?.addEventListener('change', refreshShortlist);
+  refreshFresh?.addEventListener('click', () => freshShortlistState.refresh());
+  document.querySelector('#shortlist-filter-recalculate')?.addEventListener('click', () => freshShortlistState.applyDraft());
   document.querySelector('#shortlist-select-all')?.addEventListener('click', () => {
     selectedScopeKeys.clear();
-    for (const group of shortlistGroups) if (Number(group.ready_after_filters ?? group.ready ?? 0) > 0) selectedScopeKeys.add(group.scope_key);
+    for (const group of freshShortlistStateHelpers.readyGroups(shortlistGroups)) selectedScopeKeys.add(group.scope_key);
     renderShortlist();
   });
   document.querySelector('#shortlist-select-active')?.addEventListener('click', () => {
     selectedScopeKeys.clear();
-    for (const group of shortlistGroups) if (Number(group.ready_after_filters ?? group.ready ?? 0) > 0) selectedScopeKeys.add(group.scope_key);
+    for (const group of freshShortlistStateHelpers.readyGroups(shortlistGroups)) selectedScopeKeys.add(group.scope_key);
     renderShortlist();
   });
   document.querySelector('#shortlist-select-none')?.addEventListener('click', () => {
@@ -1935,7 +2109,8 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     if (testerStart) testerStart.disabled = busy;
     if (testerStop) testerStop.disabled = busy ? false : true;
     if (testerRetry) testerRetry.disabled = busy || !testerRetryable;
-    if (generateFresh) generateFresh.disabled = busy;
+    testerControlsBusy = busy;
+    if (generateFresh) generateFresh.disabled = busy || freshShortlistState.generateBusy || !freshShortlistState.actionPayload();
   };
   const renderTester = (job) => {
     const p = job.progress || {};

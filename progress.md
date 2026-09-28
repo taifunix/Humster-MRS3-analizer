@@ -1,7 +1,45 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-27
-**Current branch:** `main`
+**Updated:** 2026-09-28
+**Current branch:** `feat/shortlist-filters-v2` (isolated worktree)
+
+## Shortlist filters v2 verified in isolated branch (2026-09-28)
+
+User authorized implementation with GPT-6 Luna xhigh and independent Opus
+review. [Spec](docs/specs/2026-09-27-shortlist-filters-v2.md),
+[D3 plan](docs/superpowers/plans/2026-09-27-shortlist-filters-v2.md) and
+[ADR-0047](docs/decisions/0047-fresh-shortlist-applied-selection-v2.md) govern
+this branch. Opus 5/high returned `PLAN_APPROVED` on D3. The worktree was
+created at commit `3c940d4` to isolate this implementation from parallel
+liquidity/portfolio edits on main. M0-M5 are integrated: all five fresh
+consumers use one verified selection; the four retired fresh Pareto
+evaluators/adapters and controls are removed. Old true-valued fields fail as
+stale-client input. Independent Opus review found and the executors corrected
+stale-digest, canonical-ID, manifest-recovery, background-flag,
+audit-directory, UI busy and error-fanout issues. Opus 5/high returned
+`CODE_REVIEW_PASS` for engine, generator/provenance, Panel/UI and the final
+integrated gate. The final unchanged code passed 309 focused, 214 related,
+137 UI and the explicit Node VM state test (1 passed in 0.30s). Complete
+`.venv` pytest passed 5310 tests with 8 skips and 30 warnings in 2631.22s;
+JUnit evidence is in the ignored `.superpowers/sdd/2026-09-27-shortlist-filters-v2/`
+directory. `node --check` and `git diff --check` passed. No browser visual
+smoke tool was available, so no visual pass is claimed. No real tester,
+Panel restart or live DB mutation was run. Parallel main-worktree changes
+remain untouched.
+
+Read-only OS-warm benchmark on the 326,119,424-byte/11,816-candidate file:
+cold 12.986 s; complete warm shortlist actions 2.683/1.247/1.355 s,
+median 1.355 s; standalone hash 1.186 s; audit XLSX 9.254 s; selected READY
+record load 2.596 s; retained graph 25,355,793 bytes; process peak working
+set 936,538,112 bytes. On the 750,792,704-byte/406-candidate file: cold
+25.036 s; warm 3.015/2.908/2.671 s, median 2.908 s; hash 2.778 s; audit
+0.424 s; selected load 4.804 s; retained graph 824,306 bytes; cumulative
+peak working set 1,904,705,536 bytes. All eight flag combinations produced
+identical results or the same missing-A/B-evidence error at 1 and 16 workers.
+Warm shortlist actions meet the <=5 s technical target on these corpora; this
+does not promise true cold-disk or full JSON publication latency. Both source
+files retained identical size, mtime and SHA. No persistent cache or new
+dependency was added.
 
 ## Liquidity model agreed (2026-09-27)
 

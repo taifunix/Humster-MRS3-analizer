@@ -1085,13 +1085,13 @@ def test_shortlist_active_selection_uses_ready_after_filters_without_http() -> N
     assert "ready_after_filters" in js
 
 
-def test_shortlist_keeps_phase_two_filters_visible_and_indents_tf_rows() -> None:
+def test_shortlist_controls_stay_in_the_card_and_indent_tf_rows() -> None:
+    html = _read("index.html")
     css = _read("app.css")
-    js = _read("app.js")
 
-    assert "phase2Filters.open = true;" in js
-    assert "filtersTitle.replaceWith(filtersTitleElement);" not in js
-    assert ".phase2-filters > summary { display: block; margin-bottom: 12px; font-size: .94rem; font-weight: 700; pointer-events: none; }" in css
+    card = html.split("<b>2. Shortlist и READY JSON</b>", 1)[1].split("</details>", 1)[0]
+    assert '<div class="shortlist-filter-controls">' in card
+    assert 'id="shortlist-filter-recalculate"' in card
     assert ".shortlist-table tbody tr.is-timeframe > td:first-child { padding-left: 2.1rem; }" in css
 
 
@@ -1102,37 +1102,272 @@ def test_shortlist_controls_match_requested_compact_typography() -> None:
     assert "#shortlist-summary { display: none; }" in css
     assert ".shortlist-group-checkbox, .shortlist-tf-checkbox { width: 16px; min-width: 16px; height: 16px; min-height: 16px; vertical-align: middle; }" in css
     assert "disclosure.textContent = open ?" in js
-    assert "if (event.key === 'Enter' || event.key === ' ') event.preventDefault();" in js
     assert ".shortlist-disclosure { display: inline-flex; align-items: center; justify-content: center; vertical-align: middle; position: relative; top: -1px;" in css
 
 
-def test_phase_two_checkbox_change_refreshes_the_shortlist() -> None:
-    css = _read("app.css")
+def test_shortlist_ready_counts_use_named_cells_without_column_indexes() -> None:
     js = _read("app.js")
+    render = js.split("const renderShortlist = () => {", 1)[1].split("const applyShortlist", 1)[0]
 
-    assert "font-size: .9rem" in css
-    assert "const refreshShortlist = async () =>" in js
-    assert "document.querySelectorAll('.phase2-filters input[type=\"checkbox\"]').forEach((node) => {" in js
-    assert "node.addEventListener('change', refreshShortlist);" in js
+    assert "const readyCell = countCell(group.ready_after_filters ?? group.ready, true);" in render
+    assert "countCell(pair.ready_after_filters ?? pair.ready, true)" in render
+    assert "children[" not in render
 
 
-def test_pretest_ab_checkbox_is_native_optional_and_sent_outside_phase2_filters() -> None:
+def test_shortlist_v2_state_machine() -> None:
     html = _read("index.html")
-    js = _read("app.js")
-
     assert '<input id="shortlist-filter-pretest-ab" type="checkbox">' in html
-    assert '<input id="shortlist-filter-pretest-ab" type="checkbox" checked>' not in html
+    assert '<input id="shortlist-filter-ladder" type="checkbox">' in html
+    assert '<input id="shortlist-filter-pareto" type="checkbox">' in html
     controls = html.index('<div class="shortlist-filter-controls">')
-    pretest = html.index('id="shortlist-filter-pretest-ab"')
-    pareto = html.index('<details class="phase2-filters"><summary>Paretto filters</summary>')
-    controls_end = html.index('</div>', pareto)
-    assert controls < pretest < pareto < controls_end
-    assert 'shortlist-filter-pretest-ab' not in html[pareto:html.index('</details>', pareto)]
-    assert "const pretestAbEnabled = () =>" in js
-    assert "pretest_ab_enabled: pretestAbEnabled()" in js
-    assert "const filterControls = document.querySelector('.shortlist-filter-controls');" in js
-    assert "actions.after(filterControls);" in js
-    assert "document.querySelector('#shortlist-filter-pretest-ab')?.addEventListener('change', refreshShortlist);" in js
+    last_control = html.index('id="shortlist-filter-pareto"')
+    apply_button = html.index('id="shortlist-filter-recalculate"')
+    assert controls < last_control < apply_button
+
+    script = f"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+ (async () => {{
+const source = fs.readFileSync({json.dumps(str(PANEL_WEB / 'app.js'))}, 'utf8');
+const start = source.indexOf('const freshShortlistStateHelpers = (() => {{');
+const end = source.indexOf('\\nconst ORDER_BUCKETS', start);
+assert.notEqual(start, -1, 'production shortlist state helper missing');
+assert.notEqual(end, -1, 'production shortlist state helper boundary missing');
+const context = {{}};
+vm.runInNewContext(source.slice(start, end), context, {{ filename: 'app.js' }});
+const {{ create, readyGroups, sumPlateauCounts, pruneReadyScopes }} = context.freshShortlistStateHelpers;
+class FakeCheckbox {{
+  constructor(checked) {{ this.checked = checked; this.listeners = {{}}; }}
+  addEventListener(name, handler) {{ (this.listeners[name] ||= []).push(handler); }}
+  change(value) {{ this.checked = value; for (const handler of this.listeners.change || []) handler(); }}
+}}
+const controls = {{
+  pretest_ab_enabled: new FakeCheckbox(true),
+  ladder_enabled: new FakeCheckbox(true),
+  pareto_enabled: new FakeCheckbox(true),
+}};
+const calls = [];
+const request = (endpoint, body) => new Promise((resolve, reject) => calls.push({{ endpoint, body, resolve, reject }}));
+const response = (id, token, options, scope) => ({{
+  filter_version: 'shortlist-v2', filter_engine_version: 'test-engine',
+  analysis_run_id: id, applied_options: options, selection_token: token,
+  groups: [{{ scope_key: scope, pair: 'BTCUSDT', side: 'LONG', timeframe: 'H1', ready_after_filters: 1, candidate_ids: [scope], plateau_count: 0 }}],
+  items: [{{ candidate_id: scope }}],
+}});
+let rendered = null;
+let lastState = null;
+const state = create({{
+  controls, request,
+  onChange(next) {{
+    lastState = next;
+    rendered = next.snapshot && {{ token: next.snapshot.selection_token, options: next.snapshot.applied_options, scope: next.snapshot.groups[0].scope_key }};
+  }},
+}});
+assert.deepEqual(Object.values(controls).map((item) => item.checked), [false, false, false], 'restored checkbox state must be reset OFF');
+assert.equal(calls.length, 0, 'initial reset must not request a shortlist');
+const rev1 = state.beginAnalysis();
+assert.equal(state.setAnalysis('run-1', rev1), true);
+const initialLoad = state.load(rev1);
+assert.deepEqual(JSON.parse(JSON.stringify(calls[0].body)), {{
+  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
+  pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
+}});
+calls[0].resolve(response('run-1', 'token-off', {{ pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false }}, 'off-scope'));
+assert.equal(await initialLoad, true);
+assert.equal(rendered.token, 'token-off');
+assert.equal(rendered.scope, 'off-scope');
+
+controls.pretest_ab_enabled.change(true);
+controls.ladder_enabled.change(true);
+assert.equal(calls.length, 1, 'draft changes must not request a shortlist');
+assert.equal(lastState.pending, true);
+assert.equal(state.snapshot.selection_token, 'token-off');
+assert.deepEqual(JSON.parse(JSON.stringify(state.actionPayload())), {{
+  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
+  pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
+  selection_token: 'token-off',
+}}, 'draft-only changes leave the applied output usable');
+const apply = state.applyDraft();
+assert.equal(calls.length, 2);
+assert.deepEqual(JSON.parse(JSON.stringify(calls[1].body)), {{
+  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
+  pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false,
+}});
+controls.pareto_enabled.change(true);
+assert.equal(lastState.pending, true, 'edits during apply remain draft-only');
+assert.equal(await state.applyDraft(), false, 'duplicate apply must be ignored');
+assert.equal(calls.length, 2);
+assert.equal(state.actionPayload({{ audit: true }}), null, 'output is disabled during replacement');
+calls[1].resolve(response('run-1', 'token-applied', {{ pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false }}, 'applied-scope'));
+assert.equal(await apply, true);
+assert.equal(rendered.token, 'token-applied');
+assert.equal(rendered.scope, 'applied-scope', 'table and token replace together');
+assert.deepEqual(JSON.parse(JSON.stringify(rendered.options)), {{ pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false }});
+assert.equal(lastState.pending, true);
+const refresh = state.refresh();
+assert.deepEqual(JSON.parse(JSON.stringify(calls[2].body)), {{
+  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
+  pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false,
+}});
+calls[2].resolve(response('run-1', 'token-refreshed', {{ pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false }}, 'refreshed-scope'));
+assert.equal(await refresh, true);
+assert.equal(controls.pareto_enabled.checked, true, 'refresh must preserve draft edits');
+let finishGeneration;
+let generationFinished = false;
+const generationPending = new Promise((resolve) => {{ finishGeneration = () => {{ generationFinished = true; resolve(); }}; }});
+state.setGenerateBusy(true);
+controls.pretest_ab_enabled.change(false);
+assert.equal(lastState.generateBusy, true, 'draft notification must preserve in-flight generation state');
+assert.equal(generationFinished, false, 'the simulated generation promise remains pending while the checkbox changes');
+finishGeneration();
+await generationPending;
+state.setGenerateBusy(false);
+assert.equal(lastState.generateBusy, false);
+const action = state.actionPayload({{ audit: true }});
+assert.deepEqual(JSON.parse(JSON.stringify(action)), {{
+  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
+  pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false,
+  selection_token: 'token-refreshed', audit: true,
+}}, 'audit must use applied options and token, not draft');
+assert.deepEqual(JSON.parse(JSON.stringify(state.actionPayload({{ candidate_ids: ['applied-scope'] }}))), {{
+  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
+  pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false,
+  selection_token: 'token-refreshed', candidate_ids: ['applied-scope'],
+}}, 'generation must use the same applied snapshot');
+
+const failedApply = state.applyDraft();
+calls[3].reject(new Error('recalc failed'));
+assert.equal(await failedApply, false);
+assert.equal(state.snapshot.selection_token, 'token-refreshed');
+assert.equal(rendered.token, 'token-refreshed');
+assert.equal(rendered.scope, 'refreshed-scope');
+assert.deepEqual(JSON.parse(JSON.stringify(rendered.options)), {{ pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false }});
+assert.match(lastState.error, /recalc failed/);
+
+const previousSnapshot = state.snapshot;
+const failedOpenRevision = state.beginAnalysis();
+assert.equal(state.snapshot, previousSnapshot, 'starting an open must retain the visible snapshot until identity changes');
+assert.equal(state.analysisRunId, 'run-1');
+assert.equal(lastState.busy, true);
+assert.equal(state.actionPayload(), null, 'actions pause while a new analysis is opening');
+assert.equal(state.failAnalysis(failedOpenRevision, new Error('open failed')), true);
+assert.equal(state.snapshot, previousSnapshot, 'failed open must preserve the applied snapshot');
+assert.equal(state.analysisRunId, 'run-1');
+assert.equal(lastState.busy, false);
+assert.deepEqual(JSON.parse(JSON.stringify(state.actionPayload())), {{
+  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
+  pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false,
+  selection_token: 'token-refreshed',
+}}, 'previous applied actions resume after open failure');
+
+const staleRefresh = state.refresh();
+const staleRevision = state.beginAnalysis();
+const newestRevision = state.beginAnalysis();
+assert.equal(state.setAnalysis('stale-run', staleRevision), false);
+assert.equal(state.setAnalysis('run-2', newestRevision), true);
+const newLoad = state.load(newestRevision);
+assert.equal(calls.length, 6);
+calls[5].resolve(response('run-2', 'token-new', {{ pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false }}, 'new-scope'));
+assert.equal(await newLoad, true);
+calls[4].resolve(response('run-1', 'token-stale', {{ pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false }}, 'stale-scope'));
+assert.equal(await staleRefresh, false);
+assert.equal(state.analysisRunId, 'run-2');
+assert.equal(state.isCurrent(newestRevision, 'run-1'), false, 'analysis identity must also guard a matching revision');
+assert.equal(state.snapshot.selection_token, 'token-new');
+assert.equal(rendered.scope, 'new-scope');
+assert.equal(state.analysisRunId, 'run-2', 'batch restore must not change active analysis');
+assert.equal(state.restoreBatch, undefined, 'generated-batch metadata is not shortlist analysis state');
+const restoreRevision = state.generationRevision;
+const readyJson = {{ count: 0, status: '' }};
+let releaseDelayedRestore;
+const delayedRestore = new Promise((resolve) => {{ releaseDelayedRestore = resolve; }}).then((batch) => {{
+  if (!state.isGenerationCurrent(restoreRevision)) return false;
+  readyJson.count = batch.strategy_count;
+  readyJson.status = `READY JSON restored: ${{batch.strategy_count}}.`;
+  return true;
+}});
+state.setGenerateBusy(true);
+readyJson.count = 3;
+readyJson.status = 'READY JSON committed: 3.';
+state.setGenerateBusy(false);
+releaseDelayedRestore({{ strategy_count: 1 }});
+assert.equal(await delayedRestore, false, 'late restore is stale after a committed generation');
+assert.equal(readyJson.count, 3);
+assert.equal(readyJson.status, 'READY JSON committed: 3.');
+assert.equal(sumPlateauCounts([{{ plateau_count: 0 }}, {{ plateau_count: 2 }}, {{ plateau_count: 3 }}]), 5);
+assert.equal(sumPlateauCounts([{{ plateau_count: 0 }}]), 0, 'verified zero must remain numeric zero');
+assert.equal(sumPlateauCounts([{{}}]), null, 'missing plateau evidence is not zero');
+assert.deepEqual(JSON.parse(JSON.stringify(readyGroups([
+  {{ scope_key: 'empty', ready_after_filters: 0, ready: 4 }},
+  {{ scope_key: 'ready', ready_after_filters: 2 }},
+]))), [{{ scope_key: 'ready', ready_after_filters: 2 }}], 'zero-READY scope is not selectable');
+const selectedScopes = new Set(['keep', 'missing', 'empty']);
+pruneReadyScopes(selectedScopes, [
+  {{ scope_key: 'keep', ready_after_filters: 1 }},
+  {{ scope_key: 'empty', ready_after_filters: 0 }},
+]);
+assert.deepEqual([...selectedScopes], ['keep'], 'successful replacement prunes absent and non-READY scopes');
+ }})().catch((error) => {{ console.error(error); process.exitCode = 1; }});
+"""
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_shortlist_renderer_keeps_ready_plateau_and_order_bucket_cells_aligned() -> None:
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync(__APP_JS__, 'utf8');
+const helperStart = source.indexOf('const freshShortlistStateHelpers = (() => {');
+const helperEnd = source.indexOf('\nconst performanceV2ExportHelpers', helperStart);
+const renderStart = source.indexOf('const ORDER_BUCKETS', helperEnd);
+const renderEnd = source.indexOf('\n(() => {', renderStart);
+assert.notEqual(helperStart, -1);
+assert.notEqual(helperEnd, -1);
+assert.notEqual(renderStart, -1);
+assert.notEqual(renderEnd, -1);
+class Element {
+  constructor(tag) {
+    this.tagName = tag; this.children = []; this.attributes = {}; this.classes = new Set();
+    this._textContent = '';
+    this.classList = { add: (name) => this.classes.add(name), toggle: (name, value) => value ? this.classes.add(name) : this.classes.delete(name) };
+  }
+  get textContent() { return this._textContent; }
+  set textContent(value) { this._textContent = String(value ?? ''); }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; }
+  setAttribute(name, value) { this.attributes[name] = value; }
+  addEventListener() {}
+}
+const elements = new Map(['#shortlist-body', '#shortlist-empty', '#shortlist-summary', '#shortlist-badge'].map((selector) => [selector, new Element(selector)]));
+const context = {
+  window: { retestRecovery: { selectCommittedRetestTester() {}, selectRetestTester() {} } },
+  document: {
+    createElement: (tag) => new Element(tag),
+    querySelector: (selector) => elements.get(selector) || null,
+  },
+};
+vm.runInNewContext(source.slice(helperStart, helperEnd) + '\n' + source.slice(renderStart, renderEnd) + '\nglobalThis.applyShortlist = applyShortlist;', context, { filename: 'app.js' });
+const dash = String.fromCharCode(0x2014);
+context.applyShortlist({ items: [], groups: [
+  { scope_key: 'scope-1h', pair: 'BTCUSDT', side: 'LONG', timeframe: '1h', counts: { '1ORD': 1, '2ORD': 0, '3ORD': 0, '4ORD': 0 }, ready: 8, ready_after_filters: 1, deferred: 1, total: 2, plateau_count: 0, period: '1h', candidate_ids: ['one'] },
+  { scope_key: 'scope-4h', pair: 'BTCUSDT', side: 'LONG', timeframe: '4h', counts: { '1ORD': 0, '2ORD': 1, '3ORD': 0, '4ORD': 0 }, ready: 9, ready_after_filters: 1, deferred: 1, total: 2, plateau_count: 2, period: '4h', candidate_ids: ['two'] },
+] });
+const rows = elements.get('#shortlist-body').children;
+const texts = (row) => row.children.map((cell) => cell.textContent);
+assert.deepEqual(texts(rows[0]), ['', 'BTCUSDT ' + String.fromCharCode(0x00b7) + ' LONG', '2 TF', '1', '1', dash, dash, '2', '2', '2', '4', dash]);
+assert.deepEqual(texts(rows[1]), ['', '', '1h', '1', dash, dash, dash, '0', '1', '1', '2', '1h']);
+assert.deepEqual(texts(rows[2]), ['', '', '4h', dash, '1', dash, dash, '2', '1', '1', '2', '4h']);
+const parent = texts(rows[0]);
+assert.equal(parent.slice(3, 7).reduce((sum, count) => sum + Number(count === dash ? 0 : count), 0), Number(parent[8]), 'parent bucket counts agree with after-filter READY count');
+assert.equal(parent[7], String(rows.slice(1).reduce((sum, row) => sum + Number(texts(row)[7]), 0)), 'parent plateau total includes every timeframe');
+const readyCount = (row) => Number(row.children.find((cell) => cell.classes.has('count-ready'))?.textContent || 0);
+assert.equal(readyCount(rows[0]), rows.slice(1).reduce((sum, row) => sum + readyCount(row), 0), 'parent READY equals the sum of child READY counts');
+""".replace("__APP_JS__", json.dumps(str(PANEL_WEB / "app.js")))
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_accordion_status_badges_align_to_the_right() -> None:
@@ -1176,7 +1411,256 @@ def test_shortlist_table_has_phase_one_optional_group_columns_and_fallbacks() ->
     assert shortlist.split("</thead>", 1)[0].count("<th ") == 12
     for field in ("plateau_count", "period", "deferred"):
         assert f"group.{field}" in js
-    assert "вЂ”" in js or "РІР‚вЂќ" in js
+    assert "—" in js
+
+
+def test_shortlist_snapshot_replacement_prunes_all_nonready_or_missing_selections() -> None:
+    js = _read("app.js")
+
+    apply = js.split("const applyShortlist = (payload) => {", 1)[1].split("\n  };", 1)[0]
+    assert "freshShortlistStateHelpers.pruneReadyScopes(selectedScopeKeys, shortlistGroups);" in apply
+
+
+def test_generation_busy_survives_filter_notifications_and_tester_updates() -> None:
+    js = _read("app.js")
+
+    on_change = js.split("onChange: (state) => {", 1)[1].split("\n  });", 1)[0]
+    generate = js.split("if (generateFresh) generateFresh.addEventListener('click', async () => {", 1)[1].split("const refreshFresh", 1)[0]
+    tester_controls = js.split("const setTesterControls = (busy) => {", 1)[1].split("\n  };", 1)[0]
+    restore = js.split("const restoreGeneratedBatch = async () => {", 1)[1].split("\n  };", 1)[0]
+    assert "state.generateBusy" in on_change
+    assert "freshShortlistState.generateBusy" in generate
+    assert "freshShortlistState.setGenerateBusy(true)" in generate
+    assert "freshShortlistState.setGenerateBusy(false)" in generate
+    assert "testerControlsBusy || !freshShortlistState.actionPayload()" in generate
+    assert "freshShortlistState.generateBusy" in tester_controls
+    assert "const restoreGenerationRevision = freshShortlistState.generationRevision;" in restore
+    assert "!freshShortlistState.isGenerationCurrent(restoreGenerationRevision)" in restore
+
+
+def test_generation_completion_from_old_analysis_cannot_overwrite_current_status() -> None:
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync(__APP_JS__, 'utf8');
+const helperStart = source.indexOf('const freshShortlistStateHelpers = (() => {');
+const helperEnd = source.indexOf('\nconst ORDER_BUCKETS', helperStart);
+const generateStart = source.indexOf("if (generateFresh) generateFresh.addEventListener('click', async () => {");
+const generateEnd = source.indexOf('\n  const refreshFresh', generateStart);
+assert.notEqual(helperStart, -1);
+assert.notEqual(helperEnd, -1);
+assert.notEqual(generateStart, -1);
+assert.notEqual(generateEnd, -1);
+const visible = { readyCount: 4, status: 'Previous READY JSON' };
+const outcomes = [];
+const context = {
+  console: {
+    info(message, details) { outcomes.push({ level: 'info', message, details }); },
+    warn(message, details) { outcomes.push({ level: 'warn', message, details }); },
+  },
+  currentAnalysisId: '',
+  shortlistGroups: [{ scope_key: 'scope-1', pair: 'BTCUSDT', side: 'LONG', timeframe: '1h' }],
+  selectedScopeKeys: new Set(['scope-1']),
+  selectedCandidateIds: () => ['candidate-1'],
+  testerControlsBusy: false,
+  generateFresh: { disabled: false, addEventListener(_name, handler) { this.handler = handler; } },
+  setTesterReadyCount(count) { visible.readyCount = count; },
+  generateStatus(status) { visible.status = status; },
+  requestJson() { throw new Error('status polling is not expected for a terminal result'); },
+};
+let releaseGeneration;
+let rejectGeneration;
+let generationRequest;
+context.remoteRequest = (endpoint, body) => {
+  generationRequest = { endpoint, body };
+  return new Promise((resolve, reject) => { releaseGeneration = resolve; rejectGeneration = reject; });
+};
+vm.createContext(context);
+vm.runInContext(source.slice(helperStart, helperEnd), context, { filename: 'app.js' });
+const flags = { pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false };
+const state = context.freshShortlistStateHelpers.create({
+  controls: Object.fromEntries(Object.keys(flags).map((key) => [key, { checked: true, addEventListener() {} }])),
+  request: async (_endpoint, body) => ({
+    filter_version: 'shortlist-v2', filter_engine_version: 'test-engine',
+    analysis_run_id: body.analysis_run_id, applied_options: flags, selection_token: 'token-run-1',
+    groups: [{ scope_key: 'scope-1', pair: 'BTCUSDT', side: 'LONG', timeframe: '1h', ready_after_filters: 1, candidate_ids: ['candidate-1'] }],
+    items: [{ candidate_id: 'candidate-1' }],
+  }),
+  onChange(next) { context.currentAnalysisId = next.analysisRunId; },
+});
+context.freshShortlistState = state;
+(async () => {
+  const firstRevision = state.beginAnalysis();
+  state.setAnalysis('run-1', firstRevision);
+  assert.equal(await state.load(firstRevision), true);
+  vm.runInContext(source.slice(generateStart, generateEnd), context, { filename: 'app.js' });
+  const pendingGeneration = context.generateFresh.handler();
+  assert.equal(generationRequest.endpoint, '/api/v2/strategies/fresh/generate');
+  assert.equal(state.generateBusy, true);
+
+  const nextRevision = state.beginAnalysis();
+  state.setAnalysis('run-2', nextRevision);
+  visible.readyCount = 0;
+  visible.status = 'Current analysis status';
+  releaseGeneration({ phase: 'COMMITTED', strategy_count: 99 });
+  await pendingGeneration;
+
+  assert.equal(state.analysisRunId, 'run-2');
+  assert.equal(visible.readyCount, 0, 'a stale generation must not replace the current analysis READY count');
+  assert.equal(visible.status, 'Current analysis status', 'a stale generation must not replace the current analysis status');
+  assert.equal(state.generateBusy, false, 'completion must release the shared busy state');
+  assert.equal(context.generateFresh.disabled, true, 'stale completion must not enable generation without a current snapshot');
+  assert.equal(outcomes.length, 1, 'the server outcome remains observable when its UI result is stale');
+  assert.equal(outcomes[0].details.analysis_run_id, 'run-1');
+  assert.equal(outcomes[0].details.phase, 'COMMITTED');
+
+  assert.equal(await state.load(nextRevision), true);
+  visible.readyCount = 2;
+  visible.status = 'Current analysis status before stale failure';
+  const pendingFailure = context.generateFresh.handler();
+  const newestRevision = state.beginAnalysis();
+  state.setAnalysis('run-3', newestRevision);
+  visible.readyCount = 0;
+  visible.status = 'Newest analysis status';
+  rejectGeneration(new Error('stale server failure'));
+  await pendingFailure;
+  assert.equal(visible.readyCount, 0, 'a stale failure must not change the current READY count');
+  assert.equal(visible.status, 'Newest analysis status', 'a stale failure must not replace the current analysis status');
+  assert.equal(state.generateBusy, false);
+  assert.equal(context.generateFresh.disabled, true);
+  assert.equal(outcomes.length, 2);
+  assert.equal(outcomes[1].level, 'warn');
+  assert.equal(outcomes[1].details.analysis_run_id, 'run-2');
+  assert.equal(outcomes[1].details.error, 'stale server failure');
+
+  assert.equal(await state.load(newestRevision), true);
+  visible.readyCount = 1;
+  visible.status = 'Current analysis before committed generation';
+  context.remoteRequest = async () => ({ phase: 'COMMITTED', strategy_count: 7 });
+  await context.generateFresh.handler();
+  assert.equal(visible.readyCount, 7, 'a current committed result updates the READY count');
+  assert.equal(visible.status, 'READY JSON committed: 7.', 'a current committed result updates the status');
+
+  context.remoteRequest = async () => ({ running: true, job_id: 'job-poll' });
+  context.requestJson = async () => ({ phase: 'COMMITTED', strategy_count: 88 });
+  let releasePoll;
+  context.setTimeout = (resolve) => { releasePoll = resolve; return 1; };
+  const pendingPoll = context.generateFresh.handler();
+  for (let turn = 0; turn < 10 && !releasePoll; turn += 1) await Promise.resolve();
+  assert.equal(typeof releasePoll, 'function', 'the running job reaches its poll wait');
+  const pollSwitchRevision = state.beginAnalysis();
+  state.setAnalysis('run-4', pollSwitchRevision);
+  visible.readyCount = 0;
+  visible.status = 'Analysis changed during poll';
+  releasePoll();
+  await pendingPoll;
+  assert.equal(visible.readyCount, 0, 'a poll result for an old analysis cannot replace its READY count');
+  assert.equal(visible.status, 'Analysis changed during poll', 'a poll result for an old analysis cannot replace its status');
+  assert.equal(outcomes.length, 3);
+  assert.equal(outcomes[2].details.analysis_run_id, 'run-3');
+  assert.equal(outcomes[2].details.strategy_count, 88);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""".replace("__APP_JS__", json.dumps(str(PANEL_WEB / "app.js")))
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_generated_batch_recovery_does_not_touch_active_shortlist_analysis() -> None:
+    js = _read("app.js")
+
+    recovery = js.split("const restoreGeneratedBatch = async () => {", 1)[1].split("\n  };", 1)[0]
+    assert "freshShortlistState.restoreBatch" not in js
+    assert "currentAnalysisId" not in recovery
+    assert "setAnalysis(" not in recovery
+
+
+def test_delayed_batch_restore_tracks_global_batch_not_shortlist_analysis() -> None:
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync(__APP_JS__, 'utf8');
+const helperStart = source.indexOf('const freshShortlistStateHelpers = (() => {');
+const helperEnd = source.indexOf('\nconst ORDER_BUCKETS', helperStart);
+const restoreStart = source.indexOf('const restoreGeneratedBatch = async () => {');
+const restoreEnd = source.indexOf('\n  };', restoreStart) + '\n  };'.length;
+assert.notEqual(helperStart, -1);
+assert.notEqual(helperEnd, -1);
+assert.notEqual(restoreStart, -1);
+assert.ok(restoreEnd > restoreStart);
+const visible = { readyCount: 3, status: 'Previous batch' };
+const warnings = [];
+let releaseBatch;
+const context = {
+  console: { warn(...args) { warnings.push(args); } },
+  setTesterReadyCount(count) { visible.readyCount = count; },
+  generateStatus(status) { visible.status = status; },
+  requestJson() { return new Promise((resolve) => { releaseBatch = resolve; }); },
+};
+vm.createContext(context);
+vm.runInContext(source.slice(helperStart, helperEnd), context, { filename: 'app.js' });
+const flags = { pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false };
+const state = context.freshShortlistStateHelpers.create({
+  controls: Object.fromEntries(Object.keys(flags).map((key) => [key, { checked: false, addEventListener() {} }])),
+  request: async () => ({}),
+});
+const firstRevision = state.beginAnalysis();
+state.setAnalysis('run-1', firstRevision);
+context.freshShortlistState = state;
+vm.runInContext(source.slice(restoreStart, restoreEnd) + '\nglobalThis.restoreForTest = restoreGeneratedBatch;', context, { filename: 'app.js' });
+process.exitCode = 1;
+(async () => {
+  const pendingRestore = context.restoreForTest();
+  assert.equal(typeof releaseBatch, 'function');
+  const firstRelease = releaseBatch;
+  const nextRevision = state.beginAnalysis();
+  state.setAnalysis('run-2', nextRevision);
+  releaseBatch({ strategy_count: 6 });
+  await pendingRestore;
+  assert.equal(state.analysisRunId, 'run-2');
+  assert.equal(visible.readyCount, 6, 'the published tester batch remains global across analysis changes');
+  assert.equal(visible.status, 'READY JSON restored: 6.');
+  const currentRestore = context.restoreForTest();
+  assert.notEqual(releaseBatch, firstRelease, 'each restore must request its own batch');
+  releaseBatch({ strategy_count: 4 });
+  await currentRestore;
+  assert.equal(visible.readyCount, 4, 'a current restore must still publish the saved batch count');
+  assert.equal(visible.status, 'READY JSON restored: 4.');
+  const malformedRestore = context.restoreForTest();
+  releaseBatch({ strategy_count: 'bad' });
+  await malformedRestore;
+  assert.equal(visible.readyCount, 4, 'invalid metadata must not clear a valid published-batch count');
+  assert.equal(visible.status, 'READY JSON restored: 4.');
+  const staleRestore = context.restoreForTest();
+  state.setGenerateBusy(true);
+  releaseBatch({ strategy_count: 9 });
+  await staleRestore;
+  assert.equal(visible.readyCount, 4, 'a newer generation invalidates an old restore response');
+  assert.equal(visible.status, 'READY JSON restored: 4.');
+  state.setGenerateBusy(false);
+  const priorWarnings = warnings.length;
+  context.requestJson = () => Promise.reject(new Error('network failed'));
+  await context.restoreForTest();
+  assert.equal(warnings.length, priorWarnings + 1, 'unexpected restore failures remain diagnosable');
+  context.requestJson = () => Promise.reject(new Error('fresh strategy batch is not available'));
+  await context.restoreForTest();
+  assert.equal(warnings.length, priorWarnings + 1, 'the expected absent-batch case stays quiet');
+  process.exitCode = 0;
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""".replace("__APP_JS__", json.dumps(str(PANEL_WEB / "app.js")))
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_shortlist_parent_deferred_uses_pair_sum_and_value_cell_keeps_zero() -> None:
+    js = _read("app.js")
+
+    pair_groups = js.split("const pairGroups = () => {", 1)[1].split("  const valueCell", 1)[0]
+    render = js.split("const renderShortlist = () => {", 1)[1].split("const applyShortlist", 1)[0]
+    assert "entry.deferred += Number(group.deferred || 0);" in pair_groups
+    assert "valueCell(pair.deferred, 0)" in render
+    assert "value === null || value === undefined || value === '' ? fallback : String(value);" in js
 
 
 def test_shortlist_rows_append_order_buckets_before_new_columns() -> None:
@@ -1186,7 +1670,7 @@ def test_shortlist_rows_append_order_buckets_before_new_columns() -> None:
     assert render.count("for (const bucket of ORDER_BUCKETS)") == 2
     assert "for (const bucket of ORDER_BUCKETS) row.append" in render
     assert "for (const bucket of ORDER_BUCKETS) child.append" in render
-    assert "row.append(valueCell(undefined" in render
+    assert "row.append(valueCell(freshShortlistStateHelpers.sumPlateauCounts(pair.timeframes)" in render
     assert "child.append(valueCell(group.plateau_count" in render
 
 
@@ -1229,8 +1713,8 @@ def test_shortlist_has_one_grouped_renderer_and_shared_candidate_state() -> None
     assert js.count("let shortlistItems = [];") == 1
     assert js.index("let shortlistItems = [];") < js.index("const renderShortlist = () =>")
     assert "for (const item of shortlistItems)" not in js
-    assert "shortlistItems = payload.items || [];" in js
-    assert "applyShortlist(shortlist)" in js
+    assert "shortlistItems = payload?.items || [];" in js
+    assert "applyShortlist(state.snapshot);" in js
 
 
 def test_shortlist_keeps_native_nine_columns_and_independent_selection_controls() -> None:
@@ -1243,7 +1727,7 @@ def test_shortlist_keeps_native_nine_columns_and_independent_selection_controls(
     assert "shortlist-tf-checkbox" in js
     assert "Select all READY TFs" in js
     assert "Expand/collapse" in js
-    assert "const selectable = pair.timeframes.filter((group) => Number(group.ready_after_filters ?? group.ready ?? 0) > 0);" in js
+    assert "const selectable = freshShortlistStateHelpers.readyGroups(pair.timeframes);" in js
 
 
 def test_surface_selection_is_model_driven_and_preserves_open_groups() -> None:
@@ -2238,7 +2722,10 @@ def test_portfolio_settings_helpers_validate_v2_lexemes_and_hidden_fields() -> N
     }
     changed = json.loads(json.dumps(values))
     changed["round_down_usdt"] = "25"
-    script = _read("app.js").split("const ORDER_BUCKETS", 1)[0] + f"""
+    js = _read("app.js")
+    start = js.index("const portfolioSettingsHelpers = (() => {")
+    end = js.index("const portfolioReasonHelpers", start)
+    script = js[start:end] + f"""
 const h = globalThis.portfolioSettingsHelpers;
 const document = {json.dumps(document)};
 const values = {json.dumps(values)};

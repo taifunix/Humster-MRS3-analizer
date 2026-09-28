@@ -149,46 +149,185 @@ def _make_analysis(
     return analysis_id, surface_identity
 
 
-def test_legacy_analysis_works_without_pretest_and_requires_rebuild_with_it(tmp_path: Path) -> None:
-    from mrs3.fresh_analysis_strategies import (
-        filter_fresh_analysis_candidates,
-        generate_fresh_analysis_strategies,
-        list_fresh_analysis_shortlist,
+def _fresh_selection(
+    path: Path, analysis_id: str, options: tuple[bool, bool, bool] = (False, False, False),
+):
+    from mrs3.fresh_shortlist import FreshShortlistExecutor
+
+    return FreshShortlistExecutor().evaluate(path, analysis_id, options, workers=1)
+
+
+def _fresh_shortlist(path: Path, analysis_id: str) -> dict[str, object]:
+    from mrs3.fresh_analysis_strategies import fresh_shortlist_response
+    from mrs3.fresh_shortlist import FreshShortlistExecutor
+
+    prepared, evaluation = FreshShortlistExecutor().evaluate_with_prepared(
+        path, analysis_id, (False, False, False), workers=1,
     )
+    return fresh_shortlist_response(prepared, evaluation)
+
+
+def _change_structure_pnl_same_size(path: Path) -> bool:
+    connection = duckdb.connect(str(path))
+    try:
+        scope, raw = connection.execute("select scope_key, payload_json from structures").fetchone()
+        structure = json.loads(raw)
+        structure["orders"][0]["source_pnl_pct"] = 11.0
+        old_size = path.stat().st_size
+        connection.execute(
+            "update structures set payload_json=? where scope_key=?",
+            [json.dumps(structure, sort_keys=True, separators=(",", ":")), scope],
+        )
+        return path.stat().st_size == old_size
+    finally:
+        connection.close()
+
+
+def _replace_candidate_and_point_ids(path: Path, *, numeric: bool) -> None:
+    connection = duckdb.connect(str(path))
+    try:
+        rows = connection.execute("select rowid, payload_json from points order by rowid").fetchall()
+        point_ids: dict[str, object] = {}
+        for index, (rowid, raw) in enumerate(rows, start=1):
+            point = json.loads(raw)
+            old_id = str(point["point_id"])
+            new_id: object = float(index * 100) if numeric else f" {old_id} "
+            point_ids[old_id] = new_id
+            point["point_id"] = new_id
+            connection.execute(
+                "update points set payload_json=? where rowid=?",
+                [json.dumps(point, sort_keys=True, separators=(",", ":")), rowid],
+            )
+        rows = connection.execute("select rowid, payload_json from structures").fetchall()
+        for rowid, raw in rows:
+            structure = json.loads(raw)
+            structure_id: object = 7.0 if numeric else f" {structure['structure_id']} "
+            structure["structure_id"] = structure_id
+            structure["candidate_id"] = structure_id
+            for order in structure["orders"]:
+                order["point_id"] = point_ids[str(order["point_id"])]
+            connection.execute(
+                "update structures set payload_json=? where rowid=?",
+                [json.dumps(structure, sort_keys=True, separators=(",", ":")), rowid],
+            )
+    finally:
+        connection.close()
+
+
+def test_retired_fresh_pareto_adapters_are_not_exposed() -> None:
+    import mrs3.fresh_analysis_strategies as fresh_strategies
+
+    assert not hasattr(fresh_strategies, "filter_fresh_analysis_candidates")
+    assert not hasattr(fresh_strategies, "list_fresh_analysis_shortlist")
+
+
+@pytest.mark.parametrize("consumer", ["loader", "generator"])
+def test_fresh_consumer_rejects_same_size_artifact_change_before_candidate_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, consumer: str,
+) -> None:
+    from mrs3 import fresh_shortlist
+    from mrs3.fresh_analysis_strategies import (
+        generate_fresh_analysis_strategies,
+        load_fresh_ready_candidates,
+    )
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    selection = _fresh_selection(database, analysis_id)
+    assert _change_structure_pnl_same_size(database)
+
+    def unexpected_parse(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("candidate payload parsed before stale digest rejection")
+
+    monkeypatch.setattr(fresh_shortlist, "_canonical_id", unexpected_parse)
+    scopes = [("BTCUSDT", "LONG", "1h")]
+    if consumer == "loader":
+        operation = lambda: load_fresh_ready_candidates(
+            database, analysis_id, selection.ready_candidate_ids, scopes,
+            expected_artifact_sha256=selection.artifact_sha256,
+        )
+    else:
+        template = tmp_path / "template.json"
+        template.write_text(json.dumps(_template()), encoding="utf-8")
+        operation = lambda: generate_fresh_analysis_strategies(
+            database, analysis_id, selection.ready_candidate_ids, scopes,
+            template, tmp_path / "out", AlgorithmConfig.defaults(), selection=selection,
+        )
+
+    with pytest.raises(ValueError, match="STALE_SHORTLIST_SELECTION"):
+        operation()
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("numeric", [False, True], ids=["padded-strings", "integral-json-floats"])
+def test_fresh_generation_accepts_canonicalized_candidate_and_point_ids(
+    tmp_path: Path, numeric: bool,
+) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    _replace_candidate_and_point_ids(database, numeric=numeric)
+    selection = _fresh_selection(database, analysis_id)
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+
+    result = generate_fresh_analysis_strategies(
+        database, analysis_id, selection.ready_candidate_ids, [("BTCUSDT", "LONG", "1h")],
+        template, tmp_path / "out", AlgorithmConfig.defaults(), selection=selection,
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["candidate_identities"] == (["7"] if numeric else ["STR-READY"])
+    assert set(manifest["candidate_identity_to_strategy_names"]) == set(manifest["candidate_identities"])
+
+
+def test_fresh_json_generator_requires_verified_shortlist_selection(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+
+    with pytest.raises(ValueError, match="verified shortlist selection"):
+        generate_fresh_analysis_strategies(
+            tmp_path / "missing.analysis-v6.duckdb", "a" * 64, ["client-id"],
+            [("BTCUSDT", "LONG", "1h")], tmp_path / "template.json", tmp_path / "out",
+            AlgorithmConfig.defaults(), selection=None,
+        )
+    assert not (tmp_path / "out").exists()
+
+
+def test_legacy_analysis_works_without_pretest_and_requires_rebuild_with_it(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
 
     path = tmp_path / "legacy.analysis-v6.duckdb"
     analysis_id, _ = _make_analysis(path, legacy=True)
 
-    shortlist = list_fresh_analysis_shortlist(path, analysis_id, {})
-    assert [item["candidate_id"] for item in shortlist["items"]] == ["STR-READY"]
-    assert shortlist["items"][0]["filter_status"] == "READY_AFTER_FILTERS"
+    shortlist = _fresh_selection(path, analysis_id)
+    assert shortlist.ready_candidate_ids == ("STR-READY",)
     with pytest.raises(ValueError, match="PRETEST_AB_EVIDENCE_UNAVAILABLE"):
-        filter_fresh_analysis_candidates(path, analysis_id, {}, pretest_ab_enabled=True)
+        _fresh_selection(path, analysis_id, (True, False, False))
 
     template = tmp_path / "template.json"
     template.write_text(json.dumps(_template()), encoding="utf-8")
     generated = generate_fresh_analysis_strategies(
         path, analysis_id, ["STR-READY"], [("BTCUSDT", "LONG", "1h")], template,
         tmp_path / "legacy-out", AlgorithmConfig.defaults(), filters={},
+        selection=_fresh_selection(path, analysis_id),
     )
     manifest = json.loads(generated.manifest_path.read_text(encoding="utf-8"))
     assert "analysis_input_digest" not in manifest
 
     blocked = tmp_path / "blocked-out"
     with pytest.raises(ValueError, match="PRETEST_AB_EVIDENCE_UNAVAILABLE"):
-        generate_fresh_analysis_strategies(
-            path, analysis_id, ["STR-READY"], [("BTCUSDT", "LONG", "1h")], template,
-            blocked, AlgorithmConfig.defaults(), pretest_ab_enabled=True,
-        )
+        _fresh_selection(path, analysis_id, (True, False, False))
     assert not blocked.exists()
 
 
 def test_fresh_adapter_generates_only_selected_ready_candidate_and_binds_hashes(tmp_path: Path) -> None:
-    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+    from mrs3.fresh_analysis_strategies import GENERATOR_SCHEMA, generate_fresh_analysis_strategies
 
     analysis_id, surface = _make_analysis(tmp_path / "run.analysis-v6.duckdb")
     template = tmp_path / "template.json"
     template.write_text(json.dumps(_template()), encoding="utf-8")
+    selection = _fresh_selection(tmp_path / "run.analysis-v6.duckdb", analysis_id, (True, False, False))
 
     result = generate_fresh_analysis_strategies(
         tmp_path / "run.analysis-v6.duckdb",
@@ -199,6 +338,7 @@ def test_fresh_adapter_generates_only_selected_ready_candidate_and_binds_hashes(
         tmp_path / "out",
         AlgorithmConfig.defaults(),
         pretest_ab_enabled=True,
+        selection=selection,
     )
 
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -209,7 +349,19 @@ def test_fresh_adapter_generates_only_selected_ready_candidate_and_binds_hashes(
     assert manifest["source_content_digest"] == surface["source_content_digest"]
     assert manifest["scope_digests"] == surface["scope_digests"]
     assert manifest["analysis_input_digest"] == "c" * 64
+    assert manifest["generator_schema_version"] == GENERATOR_SCHEMA
+    assert GENERATOR_SCHEMA.endswith("-shortlist-v2")
     assert manifest["candidate_identities"] == ["STR-READY"]
+    assert manifest["shortlist_v2"] == {
+        "filter_version": "shortlist-v2",
+        "filter_engine_version": selection.filter_engine_version,
+        "selection_token": selection.selection_token,
+        "artifact_sha256": selection.artifact_sha256,
+        "applied_options": {
+            "pretest_ab_enabled": True, "ladder_enabled": False, "pareto_enabled": False,
+        },
+        "selected_candidate_ids": ["STR-READY"],
+    }
     assert manifest["pretest_ab_enabled"] is True
     assert manifest["pretest_ab"] == {
         "enabled": True,
@@ -243,9 +395,116 @@ def test_fresh_generation_does_not_block_on_runtime_config_hash(tmp_path: Path) 
         template,
         tmp_path / "out",
         runtime_config,
+        selection=_fresh_selection(tmp_path / "run.analysis-v6.duckdb", analysis_id),
     )
 
     assert result.strategy_count == 2
+
+
+def test_fresh_generation_rejects_candidate_ids_outside_verified_ready_scope(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidate IDs do not match verified READY selection"):
+        generate_fresh_analysis_strategies(
+            database, analysis_id, ["NOT-SELECTED"], [("BTCUSDT", "LONG", "1h")],
+            template, tmp_path / "out", AlgorithmConfig.defaults(),
+            selection=_fresh_selection(database, analysis_id),
+        )
+    assert not (tmp_path / "out").exists()
+
+
+def test_fresh_generation_ignores_numeric_sql_overmatch_for_adjacent_large_point_ids(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    connection = duckdb.connect(str(database))
+    try:
+        point_rowid, raw = connection.execute(
+            "select rowid, payload_json from points order by rowid limit 1",
+        ).fetchone()
+        point = json.loads(raw)
+        point["point_id"] = 9007199254740992.0
+        connection.execute(
+            "update points set payload_json=? where rowid=?",
+            [json.dumps(point, sort_keys=True, separators=(",", ":")), point_rowid],
+        )
+        structure_rowid, raw = connection.execute(
+            "select rowid, payload_json from structures limit 1",
+        ).fetchone()
+        structure = json.loads(raw)
+        structure["orders"][0]["point_id"] = 9007199254740992.0
+        connection.execute(
+            "update structures set payload_json=? where rowid=?",
+            [json.dumps(structure, sort_keys=True, separators=(",", ":")), structure_rowid],
+        )
+        adjacent = _point("unused", 500, 5, "event-adjacent")
+        adjacent["point_id"] = 9007199254740993
+        connection.execute(
+            "insert into points values (?, ?)",
+            ["BTCUSDT|LONG|1h", json.dumps(adjacent, sort_keys=True, separators=(",", ":"))],
+        )
+    finally:
+        connection.close()
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+    selection = _fresh_selection(database, analysis_id)
+
+    result = generate_fresh_analysis_strategies(
+        database, analysis_id, ["STR-READY"], [("BTCUSDT", "LONG", "1h")],
+        template, tmp_path / "out", AlgorithmConfig.defaults(), selection=selection,
+    )
+
+    assert result.strategy_count == 2
+
+
+def test_panel_discards_staged_generation_if_artifact_changes_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+    from mrs3.panel import PanelController
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({
+        "panel_workflow": {"strategy_templates": {"LONG": "template.json"}},
+    }), encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _path: AlgorithmConfig.defaults())
+    controller._fresh_analysis_paths[analysis_id] = database
+    snapshot = controller.strategies_fresh_shortlist({
+        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+    })
+    original_generate = generate_fresh_analysis_strategies
+
+    def generate_then_change_source(*args: object, **kwargs: object):
+        result = original_generate(*args, **kwargs)
+        assert result.manifest_path.is_file()
+        assert list(result.strategies_path.glob("*.json"))
+        assert _change_structure_pnl_same_size(database)
+        return result
+
+    monkeypatch.setattr("mrs3.panel.generate_fresh_analysis_strategies", generate_then_change_source)
+    output_root = tmp_path / "Output" / "fresh-shortlist-v2" / analysis_id
+    with pytest.raises(ValueError, match="STALE_SHORTLIST_SELECTION"):
+        controller._generate_fresh_strategies({
+            "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
+            "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+            "selection_token": snapshot["selection_token"],
+            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
+        })
+
+    assert output_root.is_dir()
+    assert list(output_root.iterdir()) == []
+    assert not list(output_root.rglob("strategy_manifest.json"))
 
 
 def test_generation_manifest_persists_order_plateau_diagnostics(tmp_path: Path) -> None:
@@ -263,6 +522,7 @@ def test_generation_manifest_persists_order_plateau_diagnostics(tmp_path: Path) 
         template,
         tmp_path / "out",
         AlgorithmConfig.defaults(),
+        selection=_fresh_selection(tmp_path / "run.analysis-v6.duckdb", analysis_id),
     )
 
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -302,6 +562,7 @@ def test_fresh_strategy_payload_excludes_provenance_and_manifest_keeps_lineage(t
         template,
         tmp_path / "out",
         AlgorithmConfig.defaults(),
+        selection=_fresh_selection(tmp_path / "run.analysis-v6.duckdb", analysis_id),
     )
     strategy = json.loads((result.strategies_path / "BTCUSDT_1h_LONG_2ORD_CMA9_STR-READY_EQUAL.json").read_text())
     manifest = json.loads(result.manifest_path.read_text())
@@ -313,6 +574,11 @@ def test_fresh_strategy_payload_excludes_provenance_and_manifest_keeps_lineage(t
             "BTCUSDT_1h_LONG_2ORD_CMA9_STR-READY_INCOME",
         ]
     }
+    from mrs3.panel_strategy_batch import validate_strategy_manifest
+
+    assert validate_strategy_manifest(result.manifest_path).provenance["shortlist_v2"]["selection_token"] == manifest[
+        "shortlist_v2"
+    ]["selection_token"]
 
 
 def test_plateau_diagnostics_accept_order_aligned_tuples() -> None:
@@ -331,7 +597,7 @@ def test_plateau_diagnostics_accept_order_aligned_tuples() -> None:
     }
 
 
-def test_fresh_base_structure_publishes_one_equal_variant(tmp_path: Path) -> None:
+def test_fresh_generation_uses_all_server_ready_ids_in_selected_scope(tmp_path: Path) -> None:
     from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
 
     database = tmp_path / "run.analysis-v6.duckdb"
@@ -362,21 +628,31 @@ def test_fresh_base_structure_publishes_one_equal_variant(tmp_path: Path) -> Non
         connection.close()
     template = tmp_path / "template.json"
     template.write_text(json.dumps(_template()), encoding="utf-8")
+    selection = _fresh_selection(database, analysis_id)
+
+    with pytest.raises(ValueError, match="candidate IDs do not match verified READY selection"):
+        generate_fresh_analysis_strategies(
+            database, analysis_id, ["BASE-READY"], [("BTCUSDT", "LONG", "1h")],
+            template, tmp_path / "partial", AlgorithmConfig.defaults(), selection=selection,
+        )
 
     result = generate_fresh_analysis_strategies(
         database,
         analysis_id,
-        ["BASE-READY"],
+        ["BASE-READY", "STR-READY"],
         [("BTCUSDT", "LONG", "1h")],
         template,
         tmp_path / "out",
         AlgorithmConfig.defaults(),
+        selection=selection,
     )
 
-    assert result.strategy_count == 1
-    assert [path.name for path in result.strategies_path.glob("*.json")] == [
-        "BTCUSDT_1h_LONG_1ORD_CMA9_BASE-READY_EQUAL.json"
-    ]
+    assert result.strategy_count == 3
+    assert {path.name for path in result.strategies_path.glob("*.json")} == {
+        "BTCUSDT_1h_LONG_1ORD_CMA9_BASE-READY_EQUAL.json",
+        "BTCUSDT_1h_LONG_2ORD_CMA9_STR-READY_EQUAL.json",
+        "BTCUSDT_1h_LONG_2ORD_CMA9_STR-READY_INCOME.json",
+    }
 
 
 @pytest.mark.parametrize(
@@ -420,6 +696,7 @@ def test_fresh_generation_rejects_malformed_multiorder_diagnostics(
             template,
             tmp_path / "out",
             AlgorithmConfig.defaults(),
+            selection=_fresh_selection(database, analysis_id),
         )
 
 
@@ -431,7 +708,7 @@ def test_fresh_adapter_rejects_non_independent_event_mode(tmp_path: Path, event_
     template = tmp_path / "template.json"
     template.write_text(json.dumps(_template()), encoding="utf-8")
     with pytest.raises(ValueError, match="real_independent_events"):
-        generate_fresh_analysis_strategies(tmp_path / "run.analysis-v6.duckdb", analysis_id, ["STR-READY"], [("BTCUSDT", "LONG", "1h")], template, tmp_path / "out", AlgorithmConfig.defaults())
+        _fresh_selection(tmp_path / "run.analysis-v6.duckdb", analysis_id)
 
 
 def test_fresh_adapter_rejects_unready_or_unselected_candidate(tmp_path: Path) -> None:
@@ -440,163 +717,26 @@ def test_fresh_adapter_rejects_unready_or_unselected_candidate(tmp_path: Path) -
     analysis_id, _ = _make_analysis(tmp_path / "run.analysis-v6.duckdb", ready=False)
     template = tmp_path / "template.json"
     template.write_text(json.dumps(_template()), encoding="utf-8")
-    with pytest.raises(ValueError, match="not READY"):
-        generate_fresh_analysis_strategies(tmp_path / "run.analysis-v6.duckdb", analysis_id, ["STR-READY"], [("BTCUSDT", "LONG", "1h")], template, tmp_path / "out", AlgorithmConfig.defaults())
+    selection = _fresh_selection(tmp_path / "run.analysis-v6.duckdb", analysis_id)
+    with pytest.raises(ValueError, match="EMPTY_READY_SELECTION"):
+        generate_fresh_analysis_strategies(
+            tmp_path / "run.analysis-v6.duckdb", analysis_id, ["STR-READY"], [("BTCUSDT", "LONG", "1h")],
+            template, tmp_path / "out", AlgorithmConfig.defaults(), selection=selection,
+        )
 
 
 def test_fresh_shortlist_returns_only_safe_candidate_summary(tmp_path: Path) -> None:
-    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
-
-    analysis_id, _ = _make_analysis(tmp_path / "run.analysis-v6.duckdb")
-    result = list_fresh_analysis_shortlist(tmp_path / "run.analysis-v6.duckdb", analysis_id)
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    result = _fresh_shortlist(database, analysis_id)
 
     assert result["analysis_run_id"] == analysis_id
-    assert result["items"] == [{
-        "candidate_id": "STR-READY", "pair": "BTCUSDT", "side": "LONG",
-        "timeframe": "1h", "order_count": 2, "status": "READY_MRS3_STRUCTURE",
-    }]
+    assert result["filter_version"] == "shortlist-v2"
+    assert result["items"][0]["candidate_id"] == "STR-READY"
+    assert result["items"][0]["filter_status"] == "READY_AFTER_FILTERS"
     # The grouped view carries counts only; no order, point or lot detail leaks.
-    assert result["groups"] == [{
-        "scope_key": "BTCUSDT|LONG|1h", "pair": "BTCUSDT", "side": "LONG", "timeframe": "1h",
-        "counts": {"1ORD": 0, "2ORD": 1, "3ORD": 0, "4ORD": 0},
-        "ready": 1, "total": 1, "candidate_ids": ["STR-READY"],
-        "plateau_count": 0, "period": None,
-    }]
-
-
-def test_fresh_phase2_source_pnl_defers_only_a_dominated_candidate(tmp_path: Path) -> None:
-    from mrs3.fresh_analysis_strategies import filter_fresh_analysis_candidates, list_fresh_analysis_shortlist
-
-    database = tmp_path / "run.analysis-v6.duckdb"
-    analysis_id, _ = _make_analysis(database)
-    connection = duckdb.connect(str(database))
-    try:
-        original = json.loads(connection.execute("select payload_json from structures").fetchone()[0])
-        better = {
-            **original,
-            "structure_id": "STR-BETTER",
-            "candidate_id": "STR-BETTER",
-            "orders": [{**order, "source_pnl_pct": float(order["source_pnl_pct"]) + 1} for order in original["orders"]],
-        }
-        connection.execute(
-            "insert into structures values (?, ?)",
-            ["BTCUSDT|LONG|1h", json.dumps(better, sort_keys=True, separators=(",", ":"))],
-        )
-    finally:
-        connection.close()
-
-    result = filter_fresh_analysis_candidates(database, analysis_id, {"source_pnl": True})
-    rows = {row["candidate_id"]: row for row in result.rows}
-
-    assert rows["STR-BETTER"]["filter_status"] == "READY_AFTER_FILTERS"
-    assert rows["STR-READY"]["deferred_by_candidate_id"] == "STR-BETTER"
-
-    shortlist = list_fresh_analysis_shortlist(database, analysis_id, {"source_pnl": True})
-    assert shortlist["groups"][0]["counts"] == {"1ORD": 0, "2ORD": 1, "3ORD": 0, "4ORD": 0}
-    assert shortlist["groups"][0]["ready_after_filters"] == 1
-    assert shortlist["groups"][0]["deferred"] == 1
-
-
-def _set_point_pretest(database: Path, point_id: str, **changes: object) -> None:
-    connection = duckdb.connect(str(database))
-    try:
-        rows = connection.execute("select rowid, payload_json from points").fetchall()
-        for rowid, raw in rows:
-            point = json.loads(raw)
-            if point.get("point_id") != point_id:
-                continue
-            evidence = dict(point["pretest_ab"])
-            evidence.update(changes)
-            point["pretest_ab"] = evidence
-            connection.execute(
-                "update points set payload_json=? where rowid=?",
-                [json.dumps(point, sort_keys=True, separators=(",", ":")), rowid],
-            )
-            return
-    finally:
-        connection.close()
-    raise AssertionError(f"unknown point: {point_id}")
-
-
-@pytest.mark.parametrize(
-    ("changes", "expected_status", "expected_reason"),
-    [
-        ({"a_pnl": "3000", "b_pnl": "70"}, "PASS", "DECLINE_WITHIN_THRESHOLD"),
-        ({"a_pnl": "3000", "b_pnl": "69.86"}, "REJECT", "DECLINE_GT_THRESHOLD"),
-        ({"a_pnl": "3000", "b_pnl": "-14"}, "REJECT", "DECLINE_GT_THRESHOLD"),
-        ({"a_pnl": "3000", "b_pnl": "-140", "b_round_trips": 0}, "PASS", "NO_B_TRADES"),
-        ({"a_pnl": "0", "b_pnl": "-140"}, "PASS", "NOT_COMPARABLE"),
-        ({"status": "INSUFFICIENT_HISTORY", "reason": "A_SHORTER_THAN_14_DAYS", "a_start_ms": 14 * 24 * 60 * 60 * 1000, "a_end_ms": 27 * 24 * 60 * 60 * 1000, "b_start_ms": 13 * 24 * 60 * 60 * 1000, "b_end_ms": 27 * 24 * 60 * 60 * 1000, "a_days": 13, "a_pnl": "0", "b_pnl": None, "b_round_trips": 0}, "PASS", "INSUFFICIENT_HISTORY"),
-    ],
-)
-def test_fresh_pretest_ab_gate_has_strict_and_diagnostic_outcomes(
-    tmp_path: Path, changes: dict[str, object], expected_status: str, expected_reason: str,
-) -> None:
-    from mrs3.fresh_analysis_strategies import filter_fresh_analysis_candidates
-
-    database = tmp_path / "run.analysis-v6.duckdb"
-    analysis_id, _ = _make_analysis(database)
-    first_point = "BTCUSDT|LONG|1h|100|3|9"
-    _set_point_pretest(database, first_point, **changes)
-
-    result = filter_fresh_analysis_candidates(database, analysis_id, {}, pretest_ab_enabled=True)
-    row = result.rows[0]
-    assert row["pretest_ab_enabled"] is True
-    assert row["pretest_ab_status"] == expected_status
-    assert row["pretest_ab_reason"] == expected_reason
-    assert row["pretest_ab"]["contract_version"] == "source-v6-pretest-ab-v1"
-    assert (row["filter_status"] == "DEFERRED_PRETEST_AB") is (expected_status == "REJECT")
-
-
-def test_fresh_pretest_ab_off_is_identity_preserving_and_does_not_extend_criteria(tmp_path: Path) -> None:
-    from mrs3.fresh_analysis_strategies import filter_fresh_analysis_candidates
-
-    database = tmp_path / "run.analysis-v6.duckdb"
-    analysis_id, _ = _make_analysis(database)
-    result = filter_fresh_analysis_candidates(database, analysis_id, {"source_pnl": True})
-
-    assert result.criteria == ("source_pnl",)
-    assert result.rows[0]["pretest_ab_enabled"] is False
-    assert result.rows[0]["pretest_ab_status"] == "DISABLED"
-    assert result.rows[0]["filter_status"] == "READY_AFTER_FILTERS"
-
-
-def test_fresh_pretest_ab_evaluates_only_first_order_and_removes_rejected_before_pareto(tmp_path: Path) -> None:
-    from mrs3.fresh_analysis_strategies import filter_fresh_analysis_candidates
-
-    database = tmp_path / "run.analysis-v6.duckdb"
-    analysis_id, _ = _make_analysis(database)
-    _set_point_pretest(database, "BTCUSDT|LONG|1h|300|4|9", a_pnl="3000", b_pnl="-1400")
-    result = filter_fresh_analysis_candidates(database, analysis_id, {"source_pnl": True}, pretest_ab_enabled=True)
-    assert result.rows[0]["filter_status"] == "READY_AFTER_FILTERS"
-
-    connection = duckdb.connect(str(database))
-    try:
-        original = json.loads(connection.execute("select payload_json from structures").fetchone()[0])
-        stronger = {
-            **original,
-            "structure_id": "STR-BETTER",
-            "candidate_id": "STR-BETTER",
-            "orders": [{**order, "source_pnl_pct": 99} for order in reversed(original["orders"])],
-        }
-        connection.execute("insert into structures values (?, ?)", ["BTCUSDT|LONG|1h", json.dumps(stronger, sort_keys=True, separators=(",", ":"))])
-    finally:
-        connection.close()
-    result = filter_fresh_analysis_candidates(database, analysis_id, {"source_pnl": True}, pretest_ab_enabled=True)
-    rows = {row["candidate_id"]: row for row in result.rows}
-    assert rows["STR-READY"]["filter_status"] == "READY_AFTER_FILTERS"
-    assert rows["STR-BETTER"]["filter_status"] == "DEFERRED_PRETEST_AB"
-    assert rows["STR-READY"]["deferred_by_candidate_id"] is None
-
-
-def test_filtered_shortlist_counts_preexisting_non_ready_candidate_as_deferred(tmp_path: Path) -> None:
-    from mrs3.fresh_analysis_strategies import list_fresh_analysis_shortlist
-
-    database = tmp_path / "run.analysis-v6.duckdb"
-    analysis_id, _ = _make_analysis(database, ready=False)
-
-    group = list_fresh_analysis_shortlist(database, analysis_id, {"source_pnl": True})["groups"][0]
-    assert group["counts"] == {"1ORD": 0, "2ORD": 0, "3ORD": 0, "4ORD": 0}
-    assert group["ready_after_filters"] == 0
-    assert group["deferred"] == 1
-    assert group["total"] == 1
+    group = result["groups"][0]
+    assert group["counts"] == {"1ORD": 0, "2ORD": 1, "3ORD": 0, "4ORD": 0}
+    assert group["ready"] == group["ready_after_filters"] == group["total"] == 1
+    assert group["candidate_ids"] == ["STR-READY"]
+    assert not ({"orders", "points", "lot", "pnl_pct"} & set(group))

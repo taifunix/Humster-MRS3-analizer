@@ -320,3 +320,68 @@ def export_fresh_filter_audit(result: object, output_path: Path | str) -> Path:
         tables[_CRITERIA[criterion]] = _table(_sorted_rows(_criterion_rows(result, criterion), enabled))
     tables["DEFERRED_COMBINED"] = _table(row for row in rows if not _is_ready(row))
     return write_audit_workbook(tables, _target_path(output_path))
+
+
+def export_fresh_shortlist_audit(prepared: object, evaluation: object, output_path: Path | str) -> Path:
+    """Write the same v2 evaluation used by the fresh shortlist and generators."""
+    option_names = ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled")
+    candidates = {item.candidate_id: item for item in prepared.candidates}
+    headers = [
+        "candidate_id", "structure_id", "scope_key", "order_count", "filter_status", "reason",
+        "dominator_candidate_id", "pretest_ab_status", "pretest_ab_reason",
+        "pretest_ab_decline_pct", "pretest_ab_evidence_json",
+    ]
+    for order in range(1, 5):
+        headers.extend((
+            f"order{order}_point_id", f"order{order}_open_ma", f"order{order}_open_ma_diff",
+            f"order{order}_source_pnl_pct", f"order{order}_source_dd_pct",
+            f"order{order}_plateau_point_count", f"order{order}_point_event_count",
+        ))
+    rows: dict[str, list[dict[str, object]]] = {"READY": [], "DEFERRED": []}
+    for result in evaluation.candidates:
+        candidate = candidates[result.candidate_id]
+        evidence = dict(candidate.pretest_ab or ())
+        row: dict[str, object] = {
+            "candidate_id": result.candidate_id,
+            "structure_id": result.structure_id,
+            "scope_key": result.scope_key,
+            "order_count": result.order_count,
+            "filter_status": result.filter_status,
+            "reason": result.reason,
+            "dominator_candidate_id": result.dominator_candidate_id,
+            "pretest_ab_status": result.pretest_ab_status,
+            "pretest_ab_reason": result.pretest_ab_reason,
+            "pretest_ab_decline_pct": result.pretest_ab_decline_pct,
+            "pretest_ab_evidence_json": json.dumps(evidence, sort_keys=True, separators=(",", ":")) if evidence else None,
+        }
+        first_ma = candidate.orders[0].open_ma if candidate.orders else None
+        for index, order in enumerate(candidate.orders, start=1):
+            row.update({
+                f"order{index}_point_id": order.point_id,
+                f"order{index}_open_ma": order.open_ma,
+                f"order{index}_open_ma_diff": order.open_ma - first_ma,
+                f"order{index}_source_pnl_pct": str(order.source_pnl_pct),
+                f"order{index}_source_dd_pct": str(order.source_dd_pct),
+                f"order{index}_plateau_point_count": order.plateau_point_count,
+                f"order{index}_point_event_count": order.point_event_count,
+            })
+        rows["READY" if result.filter_status == "READY_AFTER_FILTERS" else "DEFERRED"].append(row)
+    options = dict(zip(option_names, evaluation.options, strict=True))
+    summary = pd.DataFrame({
+        "metric": (
+            "analysis_run_id", "artifact_sha256", "filter_version", "filter_engine_version",
+            "selection_token", *option_names, "candidate_count", "ready_count", "deferred_count",
+        ),
+        "value": (
+            evaluation.analysis_id, evaluation.artifact_sha256, evaluation.filter_version,
+            evaluation.filter_engine_version, evaluation.selection_token,
+            *(options[name] for name in option_names), len(evaluation.candidates),
+            len(rows["READY"]), len(rows["DEFERRED"]),
+        ),
+    })
+    tables = {
+        "Summary": summary,
+        "READY": pd.DataFrame(rows["READY"], columns=headers),
+        "DEFERRED": pd.DataFrame(rows["DEFERRED"], columns=headers),
+    }
+    return write_audit_workbook(tables, _target_path(output_path))
