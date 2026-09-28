@@ -107,7 +107,12 @@ Audit and Generate READY JSON always use the applied snapshot. Pending checkbox
 edits alone do not invalidate it. Scope selection changes immediately select
 from its READY rows. Prune selections for missing or zero-READY scopes.
 Restore of an old generated batch must not overwrite a user's active analysis
-or a newer shortlist request; keep generated-batch identity separate.
+or a newer shortlist request; keep generated-batch identity separate. On a
+cold Panel reload, a validated restored batch must restore its own
+`analysis_run_id` for `Launch SINGLE_MODE tester`, even when no analysis DB has
+been reopened in the browser. Tester start uses that displayed batch identity,
+not transient shortlist state; malformed or stale restore responses cannot
+replace it.
 
 ## API and reproducibility
 

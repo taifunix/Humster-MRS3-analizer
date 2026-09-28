@@ -1403,6 +1403,18 @@ def test_tester_date_guard_is_iso_validated_before_network_request() -> None:
     assert "start_date" not in stop and "end_date" not in stop
 
 
+def test_tester_start_uses_the_restored_generated_batch_identity() -> None:
+    js = _read("app.js")
+
+    tester = js.split("if (testerStart) testerStart.addEventListener", 1)[1].split(
+        "testerRetry?.addEventListener", 1
+    )[0]
+    assert "if (!generatedBatchAnalysisId)" in tester
+    assert "analysis_run_id: generatedBatchAnalysisId" in tester
+    assert "analysis_run_id: currentAnalysisId" not in tester
+    assert "Generate or restore READY JSON first." in tester
+
+
 def test_shortlist_table_has_phase_one_optional_group_columns_and_fallbacks() -> None:
     html = _read("index.html")
     js = _read("app.js")
@@ -1573,6 +1585,7 @@ def test_generated_batch_recovery_does_not_touch_active_shortlist_analysis() -> 
     assert "freshShortlistState.restoreBatch" not in js
     assert "currentAnalysisId" not in recovery
     assert "setAnalysis(" not in recovery
+    assert "generatedBatchAnalysisId = batch.analysis_run_id" in recovery
 
 
 def test_delayed_batch_restore_tracks_global_batch_not_shortlist_analysis() -> None:
@@ -1590,6 +1603,8 @@ assert.notEqual(helperEnd, -1);
 assert.notEqual(restoreStart, -1);
 assert.ok(restoreEnd > restoreStart);
 const visible = { readyCount: 3, status: 'Previous batch' };
+const run1 = 'a'.repeat(64);
+const run2 = 'b'.repeat(64);
 const warnings = [];
 let releaseBatch;
 const context = {
@@ -1597,6 +1612,7 @@ const context = {
   setTesterReadyCount(count) { visible.readyCount = count; },
   generateStatus(status) { visible.status = status; },
   requestJson() { return new Promise((resolve) => { releaseBatch = resolve; }); },
+  generatedBatchAnalysisId: '',
 };
 vm.createContext(context);
 vm.runInContext(source.slice(helperStart, helperEnd), context, { filename: 'app.js' });
@@ -1616,25 +1632,33 @@ process.exitCode = 1;
   const firstRelease = releaseBatch;
   const nextRevision = state.beginAnalysis();
   state.setAnalysis('run-2', nextRevision);
-  releaseBatch({ strategy_count: 6 });
+  releaseBatch({ strategy_count: 6, analysis_run_id: run1 });
   await pendingRestore;
   assert.equal(state.analysisRunId, 'run-2');
+  assert.equal(context.generatedBatchAnalysisId, run1);
   assert.equal(visible.readyCount, 6, 'the published tester batch remains global across analysis changes');
   assert.equal(visible.status, 'READY JSON restored: 6.');
   const currentRestore = context.restoreForTest();
   assert.notEqual(releaseBatch, firstRelease, 'each restore must request its own batch');
-  releaseBatch({ strategy_count: 4 });
+  releaseBatch({ strategy_count: 4, analysis_run_id: run2 });
   await currentRestore;
+  assert.equal(context.generatedBatchAnalysisId, run2);
   assert.equal(visible.readyCount, 4, 'a current restore must still publish the saved batch count');
   assert.equal(visible.status, 'READY JSON restored: 4.');
   const malformedRestore = context.restoreForTest();
-  releaseBatch({ strategy_count: 'bad' });
+  releaseBatch({ strategy_count: 'bad', analysis_run_id: run1 });
   await malformedRestore;
+  assert.equal(context.generatedBatchAnalysisId, run2);
   assert.equal(visible.readyCount, 4, 'invalid metadata must not clear a valid published-batch count');
   assert.equal(visible.status, 'READY JSON restored: 4.');
+  const malformedIdentityRestore = context.restoreForTest();
+  releaseBatch({ strategy_count: 8, analysis_run_id: 'bad' });
+  await malformedIdentityRestore;
+  assert.equal(context.generatedBatchAnalysisId, run2);
+  assert.equal(visible.readyCount, 4, 'invalid identity must not replace visible batch metadata');
   const staleRestore = context.restoreForTest();
   state.setGenerateBusy(true);
-  releaseBatch({ strategy_count: 9 });
+  releaseBatch({ strategy_count: 9, analysis_run_id: run1 });
   await staleRestore;
   assert.equal(visible.readyCount, 4, 'a newer generation invalidates an old restore response');
   assert.equal(visible.status, 'READY JSON restored: 4.');

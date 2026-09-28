@@ -3,6 +3,22 @@
 **Updated:** 2026-09-28
 **Current branch:** `main` after shortlist integration
 
+## Restored READY JSON can launch SINGLE_MODE after reload (2026-09-28)
+
+The Panel previously restored only the visible READY JSON count after a browser
+reload, but lost the batch `analysis_run_id`. `Launch SINGLE_MODE tester` then
+returned early against empty transient shortlist state and wrote its message in
+the preceding analysis card, which looked like a dead button. Generated-batch
+identity is now kept separately from active shortlist identity, restored from
+validated batch metadata and used by tester start. A newly committed generation
+updates the same identity; malformed and stale restores cannot replace it.
+
+The live backend confirmed a committed batch of `1634` strategies with a valid
+analysis identity. Focused regressions passed `3` tests; the extended static
+UI/fresh/Performance v2 contour passed `294` tests with `2` Windows symlink
+skips. `node --check` and `git diff --check` passed. The running Panel serves
+the updated JavaScript without a process restart. No tester was launched.
+
 ## Shortlist filters v2 integration (2026-09-28)
 
 User authorized implementation with GPT-6 Luna xhigh and independent Opus

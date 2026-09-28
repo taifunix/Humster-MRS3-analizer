@@ -1819,6 +1819,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     if (heading) heading.textContent = label;
   });
   let currentAnalysisId = '';
+  let generatedBatchAnalysisId = '';
   let testerControlsBusy = false;
   let testerJobId = '';
   let testerPoller = 0;
@@ -1990,7 +1991,12 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
         console.warn('READY JSON batch metadata has an invalid strategy count.');
         return;
       }
+      if (typeof batch.analysis_run_id !== 'string' || !/^[0-9a-f]{64}$/.test(batch.analysis_run_id)) {
+        console.warn('READY JSON batch metadata has an invalid analysis identity.');
+        return;
+      }
       const count = batch.strategy_count;
+      generatedBatchAnalysisId = batch.analysis_run_id;
       setTesterReadyCount(count);
       generateStatus(`READY JSON restored: ${count}.`);
     } catch (error) {
@@ -2031,6 +2037,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       if (generationIsCurrent()) {
         const parsedCount = Number(result.strategy_count);
         const count = Number.isFinite(parsedCount) ? parsedCount : 0;
+        generatedBatchAnalysisId = generationAnalysisId;
         setTesterReadyCount(count);
         publishGenerationStatus(`READY JSON committed: ${count}.`);
       } else {
@@ -2187,7 +2194,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     testerPoller = window.setInterval(pollTester, interval);
   };
   if (testerStart) testerStart.addEventListener('click', async () => {
-    if (!currentAnalysisId) { strategyStatus('Generate READY JSON first.'); return; }
+    if (!generatedBatchAnalysisId) {
+      if (testerStatus) testerStatus.textContent = 'Generate or restore READY JSON first.';
+      return;
+    }
     const startDate = testerStartDate?.value || '';
     const endDate = testerEndDate?.value || '';
     const initialBalance = validInitialBalance(testerInitialBalance);
@@ -2203,7 +2213,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     testerCommitted = false;
     setTesterControls(true);
     try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: currentAnalysisId, start_date: startDate, end_date: endDate, initial_balance: initialBalance } });
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: generatedBatchAnalysisId, start_date: startDate, end_date: endDate, initial_balance: initialBalance } });
       testerJobId = result.job?.job_id || '';
       if (!testerJobId) throw new Error('missing job');
       renderTester(result.job); await pollTester(); startTesterPolling(1000);
