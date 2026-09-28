@@ -378,6 +378,18 @@ failed names и существующие error/commit details; timer-based progr
 стирает серверный job/status; новый DB count читается при загрузке экрана и
 после успешного импорта.
 
+An ordinary `SINGLE_MODE` metadata inbox may reference strategy JSON from the
+published fresh-generation batch that produced the tester run. This is trusted
+only when the path has the canonical
+`Output/fresh-shortlist-v2/<analysis_sha>/<selection_token>-<batch_uuid>/strategies`
+shape, the sibling `strategy_manifest.json` passes the existing full manifest
+and strategy-hash validation, and its `analysis_run_id` equals the inbox v6
+provenance. The whole `Output` or `fresh-shortlist-v2` tree is never a trusted
+root; staging directories, another analysis and an invalid/missing generation
+manifest remain rejected. Symlink/junction redirection of the canonical fresh
+analysis path outside the repository is also rejected. Existing tester and
+configured Performance-v2 strategy roots retain their current behavior.
+
 On panel load, no previous RETEST tester or import job is activated and
 `IMPORT & REPLACE` remains disabled. A previously committed native RETEST job
 may be shown as an unactivated candidate only. The explicit `CHECK & RETEST`

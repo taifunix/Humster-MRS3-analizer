@@ -643,6 +643,147 @@ def test_v2_panel_controller_injects_server_owned_listing_root(tmp_path: Path, m
         controller.strategies_performance_v2_import({"tester_job_id": "tester-root", "listing_dates_path": "override.xlsx"})
 
 
+def _write_fresh_metadata_inbox(
+    tmp_path: Path,
+    *,
+    analysis_id: str,
+    batch_name: str,
+) -> tuple[Path, Path, Path]:
+    batch = tmp_path / "Output" / "fresh-shortlist-v2" / analysis_id / batch_name
+    strategies = batch / "strategies"
+    strategies.mkdir(parents=True)
+    strategy = {"name": "S1"}
+    strategy_bytes = json.dumps(
+        strategy, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    strategy_path = strategies / "S1.json"
+    strategy_path.write_bytes(strategy_bytes)
+    generation = {
+        "format_version": 1,
+        "analysis_run_id": analysis_id,
+        "event_mode": "real_independent_events",
+        "strategy_count": 1,
+        "strategy_json_sha256": {"S1.json": sha256(strategy_bytes).hexdigest()},
+    }
+    generation["generation_manifest_sha256"] = sha256(json.dumps(
+        generation, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    (batch / "strategy_manifest.json").write_text(
+        json.dumps(generation), encoding="utf-8",
+    )
+
+    report_root = tmp_path / "bot" / "tester" / "report" / "my_test"
+    report_root.mkdir(parents=True)
+    (report_root / "S1.html").write_text("report", encoding="utf-8")
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["S1"],
+        "entries": [{
+            "strategy_name": "S1",
+            "strategy_path": str(strategy_path),
+            "report_path": "S1.html",
+        }],
+        "v6_provenance": {"analysis_run_id": analysis_id},
+    }), encoding="utf-8")
+    return inbox, report_root, strategy_path
+
+
+def test_metadata_inbox_accepts_its_validated_published_fresh_batch(tmp_path: Path, monkeypatch) -> None:
+    analysis_id = "a" * 64
+    inbox, report_root, _strategy_path = _write_fresh_metadata_inbox(
+        tmp_path,
+        analysis_id=analysis_id,
+        batch_name=f"{'b' * 64}-{'c' * 32}",
+    )
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    monkeypatch.setattr(
+        panel_module.RunnerConfig,
+        "from_json",
+        lambda _path: SimpleNamespace(
+            strategy_dir=tmp_path / "bot" / "settings_strategy",
+            report_dir=report_root,
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_performance_v2_config",
+        lambda: SimpleNamespace(strategy_root=tmp_path / "Output" / "strategies"),
+    )
+
+    controller._validate_metadata_inbox(inbox)
+
+
+def test_metadata_inbox_rejects_unpublished_fresh_staging_directory(tmp_path: Path, monkeypatch) -> None:
+    analysis_id = "a" * 64
+    inbox, report_root, _strategy_path = _write_fresh_metadata_inbox(
+        tmp_path,
+        analysis_id=analysis_id,
+        batch_name=".stage-unpublished",
+    )
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    monkeypatch.setattr(
+        panel_module.RunnerConfig,
+        "from_json",
+        lambda _path: SimpleNamespace(
+            strategy_dir=tmp_path / "bot" / "settings_strategy",
+            report_dir=report_root,
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_performance_v2_config",
+        lambda: SimpleNamespace(strategy_root=tmp_path / "Output" / "strategies"),
+    )
+
+    with pytest.raises(ValueError, match="strategy_path is outside configured directory"):
+        controller._validate_metadata_inbox(inbox)
+
+
+def test_metadata_inbox_rejects_redirected_fresh_analysis_directory(tmp_path: Path, monkeypatch) -> None:
+    analysis_id = "a" * 64
+    inbox, report_root, _strategy_path = _write_fresh_metadata_inbox(
+        tmp_path,
+        analysis_id=analysis_id,
+        batch_name=f"{'b' * 64}-{'c' * 32}",
+    )
+    analysis_root = tmp_path / "Output" / "fresh-shortlist-v2" / analysis_id
+    external_root = tmp_path / "external-analysis"
+    analysis_root.rename(external_root)
+    try:
+        analysis_root.symlink_to(external_root, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable")
+
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    monkeypatch.setattr(
+        panel_module.RunnerConfig,
+        "from_json",
+        lambda _path: SimpleNamespace(
+            strategy_dir=tmp_path / "bot" / "settings_strategy",
+            report_dir=report_root,
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_performance_v2_config",
+        lambda: SimpleNamespace(strategy_root=tmp_path / "Output" / "strategies"),
+    )
+
+    with pytest.raises(ValueError, match="strategy_path is outside configured directory"):
+        controller._validate_metadata_inbox(inbox)
+
+
 def test_v2_panel_controller_rejects_committed_job_without_verified_inbox(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     controller._panel_jobs.submit(

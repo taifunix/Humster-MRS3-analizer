@@ -1565,6 +1565,54 @@ class PanelController:
         if sorted(names) != sorted(expected_names):
             raise ValueError("inbox is incomplete: strategy names do not match")
 
+    def _fresh_metadata_strategy_root(self, document: Mapping[str, object]) -> Path | None:
+        provenance = document.get("v6_provenance")
+        analysis_id = provenance.get("analysis_run_id") if isinstance(provenance, Mapping) else None
+        if not isinstance(analysis_id, str) or re.fullmatch(r"[0-9a-f]{64}", analysis_id) is None:
+            return None
+        entries = document.get("entries")
+        if not isinstance(entries, list) or not entries:
+            return None
+        project_root = self.root.resolve()
+        analysis_root = project_root / "Output" / "fresh-shortlist-v2" / analysis_id
+        if analysis_root.resolve() != analysis_root:
+            return None
+        batch_names: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                return None
+            name, raw_path = entry.get("strategy_name"), entry.get("strategy_path")
+            if not isinstance(name, str) or not name or not isinstance(raw_path, str) or not raw_path:
+                return None
+            path = Path(raw_path)
+            if not path.is_absolute():
+                return None
+            try:
+                relative = path.resolve().relative_to(analysis_root)
+            except ValueError:
+                return None
+            if (
+                len(relative.parts) != 3
+                or re.fullmatch(r"[0-9a-f]{64}-[0-9a-f]{32}", relative.parts[0]) is None
+                or relative.parts[1] != "strategies"
+                or relative.parts[2] != f"{name}.json"
+            ):
+                return None
+            batch_names.add(relative.parts[0])
+        if len(batch_names) != 1:
+            return None
+        batch_root = analysis_root / next(iter(batch_names))
+        try:
+            validated = validate_strategy_manifest(batch_root / "strategy_manifest.json")
+        except StrategyBatchValidationError:
+            return None
+        strategy_root = (batch_root / "strategies").resolve()
+        if validated.analysis_run_id != analysis_id or validated.strategy_source != strategy_root:
+            return None
+        expected_files = {f"{entry['strategy_name']}.json" for entry in entries}
+        manifest_files = set(validated.provenance.get("strategy_json_sha256", {}))
+        return strategy_root if expected_files == manifest_files else None
+
     def _validate_metadata_inbox(self, inbox: Path) -> None:
         """Perform only the handoff check; v2 importer owns source validation."""
         config = RunnerConfig.from_json(self.default_config)
@@ -1580,16 +1628,19 @@ class PanelController:
             performance_root = None
         if performance_root is not None:
             strategy_roots.append(performance_root)
-        artifact_roots = {
-            "strategy_path": tuple(dict.fromkeys(strategy_roots)),
-            "report_path": (config.report_dir.resolve(),),
-        }
         try:
             document = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
             raise ValueError("metadata inbox is incomplete: invalid manifest") from error
         if not isinstance(document, dict) or document.get("schema_version") != 1:
             raise ValueError("metadata inbox is incomplete: schema_version must be 1")
+        fresh_strategy_root = self._fresh_metadata_strategy_root(document)
+        if fresh_strategy_root is not None:
+            strategy_roots.append(fresh_strategy_root)
+        artifact_roots = {
+            "strategy_path": tuple(dict.fromkeys(strategy_roots)),
+            "report_path": (config.report_dir.resolve(),),
+        }
         if document.get("run_mode") != "SINGLE_MODE" or document.get("source_mode") != "metadata_only":
             raise ValueError("metadata inbox is incomplete: unsupported handoff mode")
         expected = document.get("expected_strategy_names")
