@@ -86,6 +86,37 @@ specified by [CHECK & RETEST](2026-09-03-performance-v2-retest-workflow.md):
   mode-specific rejection/skip policies, including independently stale frozen
   members whose valid siblings may still commit.
 
+## PerformanceDB import tail
+
+[Tail investigation](../reports/2026-09-28-performance-db-import-tail.md)
+traces the stages after the final parsed report. Existing records have no stage
+timings, so neither production latency nor a delivered speed gain is inferred.
+Window/equity-cache calculation is separate from this import.
+
+T13a batches replacement child deletion after all admission decisions are
+resolved in the existing publication transaction. Derive distinct result IDs
+from actual `REPLACE` decisions and issue one set-based DELETE per child table:
+`strategy_actions`, `strategy_equity`, `window_metrics`,
+`equity_quality_metrics`, `optimizer_prepared_inputs`. Empty sets issue no
+child DELETE. A singleton keeps the scalar equality predicate to preserve the
+native indexed plan; larger sets use the existing bound-list SQL pattern.
+Keep children of `ADD`, `SKIPPED`, `REJECTED`, independently stale
+frozen members and unrelated results unchanged. Preserve result/current IDs,
+mandatory child-count readback, prepared source identities, file-ledger priority,
+retest tags, failure reports and whole-admitted-batch rollback.
+
+Acceptance includes a failing-before statement-count regression, exact child
+and cache preservation for non-admitted siblings, existing rollback and strict
+prepared-readback checks, upstream bootstrap/Output-boundary regressions and a
+bounded synthetic baseline/comparison. Statement reduction is distinct from
+elapsed speed; no production percentage is promised.
+
+T13a is a narrow first slice of IMP-02. Remaining append metadata,
+preparation lifetime and writer-scope work retains its separate acceptance.
+OPT-01 may first remove an unused digest computation verified by a source-digest
+call-count regression and byte-identical available/unavailable outputs. This
+does not reuse digests across source objects, snapshots, revisions or final IDs.
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,

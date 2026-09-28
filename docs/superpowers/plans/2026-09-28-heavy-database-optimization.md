@@ -241,6 +241,13 @@ scope добавление scope workers не ускоряет последов�
 - [ ] **IMP-02 — batch metadata.** Заменить SQL в циклах пакетными reads/writes;
   schema metadata получить один раз на текущем validated connection. Phase8 preparation
   вынести из долгой writer-секции лишь с сохранением окончательных IDs и Decimal(38,12).
+  T13a narrow slice: five child deletes for the admitted replacement set;
+  scalar singleton retained and tested. RED/GREEN, final importer 84 passed, upstream Panel
+  9 passed/2 skipped, v4 migration passed, root focused 4 passed. Synthetic
+  500,000 actions/32 scattered IDs: initial delete median 32.5% lower, preserved
+  DELETE-only repeat 47.8% lower; these synthetic timings vary. Independent
+  Opus 5/high `CODE_REVIEW_PASS` round 2; T13a accepted. IMP-02 remains open
+  for metadata and preparation work.
 - [ ] **IMP-03 — общий HTML inventory.** `performance_v2_html.py`, `performance.py`.
   Переиспользовать decode/raw-markup inventory current-header gate и общего parser.
   Не убирать required/duplicate header, size/action limits и source order checks.

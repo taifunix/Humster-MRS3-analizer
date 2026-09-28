@@ -1518,6 +1518,141 @@ def test_clear_retest_on_success_uses_replaced_strategy_ids_only(tmp_path: Path)
         ).fetchone() == (1,)
 
 
+@pytest.mark.parametrize("admitted_count", [1, 2])
+def test_replace_batches_child_deletes_for_admitted_results(tmp_path: Path, admitted_count: int) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta", "gamma"))
+    assert import_performance_v2(request).imported_count == 3
+    target = performance_v2_database_path(request.config)
+    child_tables = (
+        "strategy_actions", "strategy_equity", "window_metrics",
+        "equity_quality_metrics", "optimizer_prepared_inputs",
+    )
+    order_by = {
+        "strategy_actions": "action_index",
+        "strategy_equity": "sample_index",
+        "window_metrics": "requested_start_utc, requested_end_utc, metrics_version",
+        "equity_quality_metrics": "algo_version",
+        "optimizer_prepared_inputs": "result_id",
+    }
+    with duckdb.connect(str(target), read_only=True) as connection:
+        ids = dict(connection.execute(
+            "select strategy_name, strategy_id from strategies order by strategy_name"
+        ).fetchall())
+        current = dict(connection.execute(
+            "select strategy_name, current_result_id from strategies order by strategy_name"
+        ).fetchall())
+    with duckdb.connect(str(target)) as connection:
+        connection.execute(
+            """insert into window_metrics (
+                result_id, requested_start_utc, requested_end_utc, metrics_version,
+                availability_status, calculated_at_utc
+            ) values (?, ?, ?, 'test-v1', 'AVAILABLE', now())""",
+            [
+                current["gamma"],
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+                datetime(2026, 1, 9, tzinfo=timezone.utc),
+            ],
+        )
+        connection.execute(
+            """insert into equity_quality_metrics (
+                result_id, source_revision, algo_version, facts_json, facts_sha256, calculated_at_utc
+            ) values (?, 'gamma-source', 'test-v1', '{\"state\":\"GROWING\"}', 'gamma-digest', now())""",
+            [current["gamma"]],
+        )
+    with duckdb.connect(str(target), read_only=True) as connection:
+        before = {
+            name: {
+                table: connection.execute(
+                    f"select * from {table} where result_id = ? order by {order_by[table]}",
+                    [current[name]],
+                ).fetchall()
+                for table in child_tables
+            }
+            for name in ("alpha", "beta", "gamma")
+        }
+
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed = replace(
+        parsed,
+        listing_date_utc=datetime(2025, 12, 25, tzinfo=timezone.utc),
+        reported_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        reported_end_utc=datetime(2026, 1, 9, tzinfo=timezone.utc),
+        effective_start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        effective_end_utc=datetime(2026, 1, 9, tzinfo=timezone.utc),
+        warmup_hours=120,
+    )
+    replacement = PerformanceV2ImportRequest(
+        request.inbox,
+        request.report_root,
+        request.config,
+        mode="REPLACE",
+        replacement_strategy_ids=ids,
+        expected_current_result_ids=current,
+        listing_dates_path=request.listing_dates_path,
+    )
+
+    class RecordingConnection:
+        def __init__(self, raw):
+            self.raw = raw
+            self.delete_sql: list[str] = []
+
+        def execute(self, sql, parameters=None):
+            if sql.casefold().startswith("delete from") and "where result_id" in sql.casefold():
+                self.delete_sql.append(sql)
+            return self.raw.execute(sql, parameters) if parameters is not None else self.raw.execute(sql)
+
+        def executemany(self, sql, parameters):
+            return self.raw.executemany(sql, parameters)
+
+        def append(self, table, frame):
+            return self.raw.append(table, frame)
+
+    raw = duckdb.connect(str(target))
+    recording = RecordingConnection(raw)
+    try:
+        imported, skipped, rejected = import_module._publish(
+            recording,
+            replacement,
+            prepared,
+            tuple(parsed if index < admitted_count else None for index in range(3)),
+            "batched-replace",
+        )
+    finally:
+        raw.close()
+
+    assert (imported, skipped, rejected) == (admitted_count, 0, 3 - admitted_count)
+    assert len(recording.delete_sql) == 5
+    assert [
+        sql.casefold().split("delete from ", 1)[1].split(None, 1)[0]
+        for sql in recording.delete_sql
+    ] == list(child_tables)
+    if admitted_count == 1:
+        assert all(
+            "where result_id = ?" in sql.casefold() and " in (" not in sql.casefold()
+            for sql in recording.delete_sql
+        )
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select strategy_name, current_result_id from strategies order by strategy_name"
+        ).fetchall() == [(name, current[name]) for name in ("alpha", "beta", "gamma")]
+        after = {
+            name: {
+                table: connection.execute(
+                    f"select * from {table} where result_id = ? order by {order_by[table]}",
+                    [current[name]],
+                ).fetchall()
+                for table in child_tables
+            }
+            for name in ("alpha", "beta", "gamma")
+        }
+    for name in ("beta", "gamma")[admitted_count - 1:]:
+        assert after[name] == before[name]
+    for name in ("alpha", "beta")[:admitted_count]:
+        assert after[name]["strategy_actions"] == before[name]["strategy_actions"]
+        assert after[name]["strategy_equity"] == before[name]["strategy_equity"]
+
+
 def test_import_request_rejects_absolute_listing_dates_path(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
 

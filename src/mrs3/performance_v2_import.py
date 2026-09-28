@@ -1496,6 +1496,27 @@ def _publish(
             action, old = resolved[key]
             decisions.append((action if index == representative[0] else "SKIPPED", entry, report, old, representative[1]))
 
+        replacement_result_ids = sorted({
+            int(old[10])
+            for decision, _entry, _report, old, _representative in decisions
+            if decision == "REPLACE" and old is not None and old[10] is not None
+        })
+        if replacement_result_ids:
+            for table in (
+                "strategy_actions", "strategy_equity", "window_metrics",
+                "equity_quality_metrics", "optimizer_prepared_inputs",
+            ):
+                if len(replacement_result_ids) == 1:
+                    connection.execute(
+                        f"delete from {table} where result_id = ?",
+                        replacement_result_ids,
+                    )
+                    continue
+                connection.execute(
+                    f"delete from {table} where result_id in (select unnest(?::BIGINT[]))",
+                    [replacement_result_ids],
+                )
+
         skipped = sum(1 for decision, _entry, _report, _old, _rep in decisions if decision == "SKIPPED")
         now = _utc_now()
         existing_run = connection.execute(
@@ -1591,11 +1612,6 @@ def _publish(
                 result_id = int(old[10])  # type: ignore[index]
                 # Keep the existing result identity for v4 databases, whose
                 # strategy_id uniqueness permits one current result per strategy.
-                for table in (
-                    "strategy_actions", "strategy_equity", "window_metrics",
-                    "equity_quality_metrics", "optimizer_prepared_inputs",
-                ):
-                    connection.execute(f"delete from {table} where result_id = ?", [result_id])
             values = _result_values(entry, report, prepared.commission_contract, now)
             ordered_values = tuple(values[field] for field in _RESULT_VALUE_FIELDS)
             source_metadata = _optimizer_source_metadata_json(

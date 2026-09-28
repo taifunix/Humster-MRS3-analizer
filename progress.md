@@ -35,6 +35,24 @@ The user's import-tail report now prioritizes T4 then measured IMP-02/T13 work
 ahead of independent optimization tasks. The latest local audit confirms a
 409-report REPLACE batch in an approximately 14 GB DB, but records contain no
 stage timestamps; no actual tail timing or gain is inferred from them.
+T13a batches only admitted replacement child deletes, preserving the scalar
+singleton path and the publication transaction. RED showed ten statements for
+two replacements; GREEN uses five and preserves rejected-child/cache rows.
+The final import suite passed 84 tests after singleton/multi-result coverage;
+upstream Panel bootstrap/metadata passed
+9 with 2 skipped, and v4 migration passed. Root confirmed four targeted
+batch/rollback/prepared-readback tests. A 500,000-action synthetic delete
+comparison measured a 32.5% lower median for 32 scattered replacement IDs;
+the preserved DELETE-only benchmark repeated at 47.8% lower with matching
+retained-row signatures. These varying small-fixture numbers are not a
+production or whole-import gain. Independent Opus 5/high re-review returned
+CODE_REVIEW_PASS after exact guard/read-order evidence and singleton coverage;
+T13a is accepted. Remaining IMP-02 work and integrated full-suite verification
+are still open.
+The terminal Panel journal is 82.67 MiB/109 jobs; a read-only in-memory probe
+measured 5.5 s median combined clone/serialization before any disk write.
+Unchanged terminal polling currently rewrites it. A separate narrow plan is
+being reviewed; no live journal cleanup or database mutation was performed.
 Source final-payload proof and
 legacy empty-import `safe_to_delete` evidence remain deferred by the user.
 
