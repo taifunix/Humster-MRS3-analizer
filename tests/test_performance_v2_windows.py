@@ -581,6 +581,339 @@ def test_upnl_metrics_are_scale_invariant_and_partial_fills_form_round_trips(tmp
         second_connection.close()
 
 
+@pytest.mark.parametrize(
+    ("window_a", "window_b", "expected_flat"),
+    [
+        (("2026-01-01", "2026-01-05"), ("2026-01-02", "2026-01-05"), 2),
+        (("2026-01-06", "2026-01-07"), ("2026-01-08", "2026-01-09"), 0),
+        (("2026-01-01", "2026-01-05"), ("2026-01-06", "2026-01-07"), 1),
+        (("2026-01-06", "2026-01-07"), ("2026-01-01", "2026-01-05"), 1),
+    ],
+)
+def test_pair_distinct_cold_windows_reuse_source_without_changing_calculation_work(
+    tmp_path, monkeypatch, window_a, window_b, expected_flat
+) -> None:
+    connection, result_id = _db(tmp_path / "candidate")
+    oracle_connection, oracle_result_id = _db(tmp_path / "oracle")
+    oracle_source = windows_module._load_source(oracle_connection, oracle_result_id)
+    oracle_metrics = tuple(
+        get_or_calculate_window(oracle_connection, oracle_result_id, *window)
+        for window in (window_a, window_b)
+    )
+    deterministic_sql = (
+        "select " + ", ".join(windows_module._METRIC_COLUMNS) +
+        " from window_metrics where result_id = ? order by requested_start_utc"
+    )
+    oracle_rows = oracle_connection.execute(deterministic_sql, [oracle_result_id]).fetchall()
+    counts = {name: 0 for name in ("source", "flat", "calculate", "persist", "cached")}
+    consumed_sources: list[tuple[datetime, datetime, tuple[_Action, ...], tuple[_Equity, ...]]] = []
+    original_source = windows_module._load_source
+    original_flat = windows_module._flat_samples
+    original_calculate = windows_module._calculate
+    original_persist = windows_module._persist
+    original_cached = windows_module._cached
+
+    def counted_source(*args):
+        counts["source"] += 1
+        return original_source(*args)
+
+    def counted_flat(*args):
+        counts["flat"] += 1
+        return original_flat(*args)
+
+    def counted_calculate(*args, **kwargs):
+        counts["calculate"] += 1
+        consumed_sources.append(args[4:8])
+        return original_calculate(*args, **kwargs)
+
+    def counted_persist(*args):
+        counts["persist"] += 1
+        return original_persist(*args)
+
+    def counted_cached(*args):
+        counts["cached"] += 1
+        return original_cached(*args)
+
+    monkeypatch.setattr(windows_module, "_load_source", counted_source)
+    monkeypatch.setattr(windows_module, "_flat_samples", counted_flat)
+    monkeypatch.setattr(windows_module, "_calculate", counted_calculate)
+    monkeypatch.setattr(windows_module, "_persist", counted_persist)
+    monkeypatch.setattr(windows_module, "_cached", counted_cached)
+
+    try:
+        observed = get_or_calculate_window_pair(connection, result_id, window_a, window_b)
+        assert counts == {"source": 1, "flat": expected_flat, "calculate": 2, "persist": 2, "cached": 4}
+        assert observed == oracle_metrics
+        assert [
+            (metric.availability_status, metric.unavailable_reason) for metric in observed
+        ] == [
+            (metric.availability_status, metric.unavailable_reason) for metric in oracle_metrics
+        ]
+        assert connection.execute(deterministic_sql, [result_id]).fetchall() == oracle_rows
+        assert all(
+            row[0] is not None
+            for row in connection.execute(
+                "select calculated_at_utc from window_metrics where result_id = ?", [result_id]
+            ).fetchall()
+        )
+        assert consumed_sources[0] == oracle_source
+        assert consumed_sources[1] == oracle_source
+        assert consumed_sources[0][2] is consumed_sources[1][2]
+        assert consumed_sources[0][3] is consumed_sources[1][3]
+    finally:
+        connection.close()
+        oracle_connection.close()
+
+
+def test_pair_source_reuse_is_limited_to_one_public_call(tmp_path, monkeypatch) -> None:
+    oracle_connection, oracle_result_id = _db(tmp_path / "oracle")
+    candidate_connection, candidate_result_id = _db(tmp_path / "candidate")
+    windows = (("2026-01-01", "2026-01-05"), ("2026-01-02", "2026-01-05"))
+    try:
+        oracle_first = tuple(
+            get_or_calculate_window(oracle_connection, oracle_result_id, *window) for window in windows
+        )
+        deterministic_sql = (
+            "select " + ", ".join(windows_module._METRIC_COLUMNS) +
+            " from window_metrics where result_id = ? order by requested_start_utc"
+        )
+        oracle_first_rows = oracle_connection.execute(deterministic_sql, [oracle_result_id]).fetchall()
+        oracle_connection.execute(
+            "update strategy_actions set fee = 2.2 where result_id = ? and action_index = 5", [oracle_result_id]
+        )
+        oracle_connection.execute(
+            "update strategy_equity set wallet = 120, equity = 120 where result_id = ? and sample_index = 4",
+            [oracle_result_id],
+        )
+        oracle_connection.execute("delete from window_metrics where result_id = ?", [oracle_result_id])
+        oracle_mutated = tuple(
+            get_or_calculate_window(oracle_connection, oracle_result_id, *window) for window in windows
+        )
+        oracle_mutated_rows = oracle_connection.execute(deterministic_sql, [oracle_result_id]).fetchall()
+
+        counts = {name: 0 for name in ("source", "flat", "calculate", "persist", "cached")}
+        originals = {
+            "source": windows_module._load_source,
+            "flat": windows_module._flat_samples,
+            "calculate": windows_module._calculate,
+            "persist": windows_module._persist,
+            "cached": windows_module._cached,
+        }
+
+        def counted_source(*args):
+            counts["source"] += 1
+            return originals["source"](*args)
+
+        def counted_flat(*args):
+            counts["flat"] += 1
+            return originals["flat"](*args)
+
+        def counted_calculate(*args, **kwargs):
+            counts["calculate"] += 1
+            return originals["calculate"](*args, **kwargs)
+
+        def counted_persist(*args):
+            counts["persist"] += 1
+            return originals["persist"](*args)
+
+        def counted_cached(*args):
+            counts["cached"] += 1
+            return originals["cached"](*args)
+
+        monkeypatch.setattr(windows_module, "_load_source", counted_source)
+        monkeypatch.setattr(windows_module, "_flat_samples", counted_flat)
+        monkeypatch.setattr(windows_module, "_calculate", counted_calculate)
+        monkeypatch.setattr(windows_module, "_persist", counted_persist)
+        monkeypatch.setattr(windows_module, "_cached", counted_cached)
+
+        def deterministic_rows(connection, source_result_id):
+            return connection.execute(deterministic_sql, [source_result_id]).fetchall()
+
+        def calculated_at_rows(connection, source_result_id):
+            return connection.execute(
+                "select calculated_at_utc from window_metrics where result_id = ? order by requested_start_utc",
+                [source_result_id],
+            ).fetchall()
+
+        candidate_first = get_or_calculate_window_pair(candidate_connection, candidate_result_id, *windows)
+        assert candidate_first == oracle_first
+        assert deterministic_rows(candidate_connection, candidate_result_id) == oracle_first_rows
+        assert all(row[0] is not None for row in calculated_at_rows(candidate_connection, candidate_result_id))
+        candidate_connection.execute(
+            "update strategy_actions set fee = 2.2 where result_id = ? and action_index = 5", [candidate_result_id]
+        )
+        candidate_connection.execute(
+            "update strategy_equity set wallet = 120, equity = 120 where result_id = ? and sample_index = 4",
+            [candidate_result_id],
+        )
+        candidate_connection.execute("delete from window_metrics where result_id = ?", [candidate_result_id])
+        assert candidate_connection.execute("select count(*) from window_metrics").fetchone() == (0,)
+        assert candidate_connection.execute(
+            "select fee from strategy_actions where result_id = ? and action_index = 5", [candidate_result_id]
+        ).fetchone() == (Decimal("2.2"),)
+        assert candidate_connection.execute(
+            "select wallet, equity from strategy_equity where result_id = ? and sample_index = 4", [candidate_result_id]
+        ).fetchone() == (Decimal("120.0"), Decimal("120.0"))
+        before_second = counts.copy()
+
+        candidate_second = get_or_calculate_window_pair(candidate_connection, candidate_result_id, *windows)
+        assert candidate_second == oracle_mutated
+        assert deterministic_rows(candidate_connection, candidate_result_id) == oracle_mutated_rows
+        assert all(row[0] is not None for row in calculated_at_rows(candidate_connection, candidate_result_id))
+        assert {key: counts[key] - before_second[key] for key in counts} == {
+            "source": 1,
+            "flat": 2,
+            "calculate": 2,
+            "persist": 2,
+            "cached": 4,
+        }
+        assert counts["source"] == 2
+        assert all(
+            second.growth_factor != first.growth_factor and second.fees_pct != first.fees_pct
+            for first, second in zip(candidate_first, candidate_second)
+        )
+    finally:
+        oracle_connection.close()
+        candidate_connection.close()
+
+
+def test_scalar_out_of_range_skips_flat_and_persists_readback(tmp_path, monkeypatch) -> None:
+    connection, result_id = _db(tmp_path)
+    counts = {name: 0 for name in ("flat", "persist", "cached")}
+    original_flat = windows_module._flat_samples
+    original_persist = windows_module._persist
+    original_cached = windows_module._cached
+
+    def counted_flat(*args):
+        counts["flat"] += 1
+        return original_flat(*args)
+
+    def counted_persist(*args):
+        counts["persist"] += 1
+        return original_persist(*args)
+
+    def counted_cached(*args):
+        counts["cached"] += 1
+        return original_cached(*args)
+
+    monkeypatch.setattr(windows_module, "_flat_samples", counted_flat)
+    monkeypatch.setattr(windows_module, "_persist", counted_persist)
+    monkeypatch.setattr(windows_module, "_cached", counted_cached)
+    try:
+        observed = get_or_calculate_window(connection, result_id, "2026-01-06", "2026-01-07")
+        assert observed.availability_status == "UNAVAILABLE"
+        assert observed.unavailable_reason == "OUT_OF_RANGE"
+        assert counts == {"flat": 0, "persist": 1, "cached": 2}
+        assert connection.execute("select count(*) from window_metrics").fetchone() == (1,)
+        assert get_or_calculate_window(connection, result_id, "2026-01-06", "2026-01-07") == observed
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("cache_case", ["a_cached", "b_cached", "both_cached", "duplicate_cold"])
+def test_pair_cache_matrix_keeps_scalar_work_independent(tmp_path, monkeypatch, cache_case: str) -> None:
+    connection, result_id = _db(tmp_path)
+    window_a = ("2026-01-01", "2026-01-05")
+    window_b = ("2026-01-02", "2026-01-05")
+    if cache_case == "a_cached":
+        get_or_calculate_window(connection, result_id, *window_a)
+    elif cache_case == "b_cached":
+        get_or_calculate_window(connection, result_id, *window_b)
+    elif cache_case == "both_cached":
+        get_or_calculate_window_pair(connection, result_id, window_a, window_b)
+
+    counts = {name: 0 for name in ("source", "flat", "calculate", "persist", "cached")}
+    originals = {
+        "source": windows_module._load_source,
+        "flat": windows_module._flat_samples,
+        "calculate": windows_module._calculate,
+        "persist": windows_module._persist,
+        "cached": windows_module._cached,
+    }
+
+    def counted_source(*args):
+        counts["source"] += 1
+        return originals["source"](*args)
+
+    def counted_flat(*args):
+        counts["flat"] += 1
+        return originals["flat"](*args)
+
+    def counted_calculate(*args, **kwargs):
+        counts["calculate"] += 1
+        return originals["calculate"](*args, **kwargs)
+
+    def counted_persist(*args):
+        counts["persist"] += 1
+        return originals["persist"](*args)
+
+    def counted_cached(*args):
+        counts["cached"] += 1
+        return originals["cached"](*args)
+
+    monkeypatch.setattr(windows_module, "_load_source", counted_source)
+    monkeypatch.setattr(windows_module, "_flat_samples", counted_flat)
+    monkeypatch.setattr(windows_module, "_calculate", counted_calculate)
+    monkeypatch.setattr(windows_module, "_persist", counted_persist)
+    monkeypatch.setattr(windows_module, "_cached", counted_cached)
+    try:
+        if cache_case == "duplicate_cold":
+            observed = get_or_calculate_window_pair(connection, result_id, window_a, window_a)
+            expected = {"source": 1, "flat": 1, "calculate": 1, "persist": 1, "cached": 3}
+            assert observed[0] == observed[1]
+            assert connection.execute("select count(*) from window_metrics").fetchone() == (1,)
+        else:
+            observed = get_or_calculate_window_pair(connection, result_id, window_a, window_b)
+            expected = {
+                "a_cached": {"source": 1, "flat": 1, "calculate": 1, "persist": 1, "cached": 3},
+                "b_cached": {"source": 1, "flat": 1, "calculate": 1, "persist": 1, "cached": 3},
+                "both_cached": {"source": 0, "flat": 0, "calculate": 0, "persist": 0, "cached": 2},
+            }[cache_case]
+            assert observed[0].availability_status == observed[1].availability_status == "AVAILABLE"
+        assert counts == expected
+    finally:
+        connection.close()
+
+
+def test_pair_error_precedence_and_autocommit_are_preserved(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    valid_window = ("2026-01-01", "2026-01-05")
+    try:
+        with pytest.raises(windows_module.PerformanceV2WindowsError, match="ISO-8601"):
+            get_or_calculate_window_pair(connection, result_id, ("bad", "2026-01-05"), valid_window)
+        assert connection.execute("select count(*) from window_metrics").fetchone() == (0,)
+
+        with pytest.raises(windows_module.PerformanceV2WindowsError, match="ISO-8601"):
+            get_or_calculate_window_pair(connection, result_id, valid_window, ("bad", "2026-01-05"))
+        assert connection.execute("select count(*) from window_metrics").fetchone() == (1,)
+        connection.execute("delete from window_metrics where result_id = ?", [result_id])
+
+        with pytest.raises(ValueError, match="non-empty"):
+            get_or_calculate_window_pair(connection, result_id, ("bad", "2026-01-05"), valid_window, calculator_version=" ")
+        assert connection.execute("select count(*) from window_metrics").fetchone() == (0,)
+
+        with pytest.raises(windows_module.PerformanceV2WindowsError, match="unknown result_id"):
+            get_or_calculate_window_pair(connection, result_id + 1000, valid_window, ("bad", "2026-01-05"))
+        with pytest.raises(ValueError, match="each window"):
+            get_or_calculate_window_pair(None, result_id, ("2026-01-01",), valid_window)
+    finally:
+        connection.close()
+
+
+def test_pair_b_error_rolls_back_a_only_when_caller_owns_transaction(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    try:
+        connection.execute("begin transaction")
+        with pytest.raises(windows_module.PerformanceV2WindowsError, match="ISO-8601"):
+            get_or_calculate_window_pair(
+                connection, result_id, ("2026-01-01", "2026-01-05"), ("bad", "2026-01-05")
+            )
+        connection.execute("rollback")
+        assert connection.execute("select count(*) from window_metrics").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
 def test_flat_start_boundary_close_is_excluded_from_window_facts(tmp_path) -> None:
     connection, result_id = _db(tmp_path)
     try:

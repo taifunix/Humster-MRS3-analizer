@@ -331,10 +331,21 @@ scope добавление scope workers не ускоряет последов�
 
 ## 6. Windows и cache
 
-- [ ] **WIN-01 — standalone pair.** `performance_v2_windows.py:get_or_calculate_window_pair`.
-  Один source load и общая immutable preparation для cold пары; корректно смешивать
-  cached/missing windows. Exact metrics/Decimal/error behavior; сохранить необходимый
+- [x] **WIN-01 — standalone pair.** `performance_v2_windows.py:get_or_calculate_window_pair`.
+  Один source load с общими immutable actions/equity для cold пары; отдельная flat
+  preparation каждого окна сохраняется. Корректно смешивать cached/missing windows.
+  Exact metrics/Decimal/error behavior; сохранить необходимый
   post-write readback. Условный эффект cold pair **20–50%** при дорогом source load.
+  R5 received independent Opus 5/high `PLAN_APPROVED`; source-only implementation
+  starts after accepted CALC-02 commit `c861a9e`. First-miss source stays local to
+  one public pair call; scalar validation, lazy OUT_OF_RANGE, autocommit/outer-TX,
+  cache readback, and cross-call freshness require actual-schema evidence.
+  R5 accepted after independent Claude Opus 5/high `CODE_REVIEW_PASS`: Windows
+  43 passed; related 488 passed/4 skipped. Four cold combinations, mutation
+  freshness, cache permutations, and error matrices preserved exact typed metrics
+  and stored-field hashes. Actual-schema seven-run paired benchmark reduced source
+  reads 2→1 and pair median 0.515420 s→0.346342 s (32.80% cold-pair stage only);
+  no whole-selection, analysis, import, or production-tail speed claim is made.
 - [ ] **CALC-01 — семь окон.** `performance_v2_windows.py`, `performance_v2_selection.py`.
   Selection уже читает source один раз/result. Переиспользовать flat timeline и boundary
   indexes; сохранить window-local peaks, fees, W0 exclusion и все metrics.

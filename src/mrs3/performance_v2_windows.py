@@ -139,6 +139,9 @@ class _Equity:
     equity: Decimal
 
 
+_WindowSource = tuple[datetime, datetime, tuple[_Action, ...], tuple[_Equity, ...]]
+
+
 @dataclass(slots=True)
 class _RoundTrip:
     entries: list[_Action]
@@ -249,7 +252,7 @@ def _cached(
 
 def _load_source(
     connection: duckdb.DuckDBPyConnection, result_id: int
-) -> tuple[datetime, datetime, tuple[_Action, ...], tuple[_Equity, ...]]:
+) -> _WindowSource:
     result = connection.execute(
         "select report_start_utc, report_end_utc from strategy_results where result_id = ?",
         [result_id],
@@ -519,16 +522,16 @@ def _persist_many(connection: duckdb.DuckDBPyConnection, metrics: Sequence[Windo
         )
 
 
-def get_or_calculate_window(
+def _get_or_calculate_window(
     connection: duckdb.DuckDBPyConnection,
     result_id: int,
     requested_start_utc: datetime | str,
     requested_end_utc: datetime | str,
     *,
-    calculator_version: str = METRICS_VERSION,
-    metrics_version: str | None = None,
+    calculator_version: str,
+    metrics_version: str | None,
+    source_holder: list[_WindowSource] | None = None,
 ) -> WindowMetrics:
-    """Read a cached safe window or calculate and cache it once."""
     if not isinstance(connection, duckdb.DuckDBPyConnection):
         raise TypeError("connection must be a DuckDB connection")
     if isinstance(result_id, bool) or not isinstance(result_id, int):
@@ -541,11 +544,36 @@ def get_or_calculate_window(
     cached = _cached(connection, result_id, start, end, version)
     if cached is not None:
         return cached
-    source = _load_source(connection, result_id)
+    if source_holder is None or not source_holder:
+        source = _load_source(connection, result_id)
+        if source_holder is not None:
+            source_holder.append(source)
+    else:
+        source = source_holder[0]
     metrics = _calculate(result_id, start, end, version, *source)
     _persist(connection, metrics)
     persisted = _cached(connection, result_id, start, end, version)
     return metrics if persisted is None else persisted
+
+
+def get_or_calculate_window(
+    connection: duckdb.DuckDBPyConnection,
+    result_id: int,
+    requested_start_utc: datetime | str,
+    requested_end_utc: datetime | str,
+    *,
+    calculator_version: str = METRICS_VERSION,
+    metrics_version: str | None = None,
+) -> WindowMetrics:
+    """Read a cached safe window or calculate and cache it once."""
+    return _get_or_calculate_window(
+        connection,
+        result_id,
+        requested_start_utc,
+        requested_end_utc,
+        calculator_version=calculator_version,
+        metrics_version=metrics_version,
+    )
 
 
 def get_or_calculate_window_pair(
@@ -566,9 +594,28 @@ def get_or_calculate_window_pair(
         raise ValueError("each window must contain start and end")
     if len(window_a) != 2 or len(window_b) != 2:
         raise ValueError("each window must contain start and end")
+    source_holder: list[_WindowSource] = []
+    first = _get_or_calculate_window(
+        connection,
+        result_id,
+        window_a[0],
+        window_a[1],
+        calculator_version=calculator_version,
+        metrics_version=metrics_version,
+        source_holder=source_holder,
+    )
+    second = _get_or_calculate_window(
+        connection,
+        result_id,
+        window_b[0],
+        window_b[1],
+        calculator_version=calculator_version,
+        metrics_version=metrics_version,
+        source_holder=source_holder,
+    )
     return (
-        get_or_calculate_window(connection, result_id, window_a[0], window_a[1], calculator_version=calculator_version, metrics_version=metrics_version),
-        get_or_calculate_window(connection, result_id, window_b[0], window_b[1], calculator_version=calculator_version, metrics_version=metrics_version),
+        first,
+        second,
     )
 
 

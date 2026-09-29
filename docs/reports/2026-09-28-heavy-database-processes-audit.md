@@ -546,6 +546,38 @@ use plain `duckdb.connect` without a query-thread setting. The static audit
 cannot establish their runtime default or prove excessive nested parallelism;
 that remains a profiling question, not a confirmed defect.
 
+## WIN-01 measured standalone cold-pair stage (2026-09-29)
+
+The public pair now shares one complete `_load_source(result_id)` snapshot only
+within that call. The scalar path, each window's lazy flat calculation, scalar
+persistence and post-write readback retain their existing order. No source is
+cached across calls. Four actual-schema cold valid/out-of-range combinations,
+cache-hit permutations, autocommit versus caller rollback, and a real source
+mutation between pair calls verify this boundary. The Windows module passed 43
+tests; related selection/equity/Panel/portfolio tests passed 488 with four
+existing Windows symlink skips. Twelve new collected nodes bring total
+collection to 5,578. Fresh full-suite verification passed 5,569 tests with
+nine existing Windows symlink skips and 30 warnings in 1,504.19 seconds.
+Independent Opus 5/high returned `CODE_REVIEW_PASS`; WIN-01 is accepted.
+
+A temporary DuckDB 1.5.5 actual-schema fixture contains 2,000 open/close
+cycles, 4,000 actions and 4,001 equity samples. Untimed real function-forwarding
+probes found source loads 2→1 and logical SQL operations 12→9 for two distinct
+cold windows; flat preparations, calculations, scalar writes and cache reads
+stayed at 2/2/2/4. Returned typed metric SHA-256 was
+`1248558a6d09199a6eef1ba61713ad9d38f49fb748993b9e4bba2c473aa4d675`;
+all 20 deterministic stored fields had SHA-256
+`9972e81f25b2d095481406262bbfb72d5b96c504f0c23a4c7414599c58853b6c`
+in every arm/run; calculation timestamps were separately typed and non-null.
+The temporary seed SHA-256 was
+`b61e6ab5172b7826bc0f0ba709aedb4ba8cf4e525c36f845f03f024b2fbfcfc3`.
+
+One warm-up and seven alternating paired runs measured medians of 0.515420 s
+for two scalar calls and 0.346342 s for the pair. Scalar range was
+0.496094–0.596792 s; pair range was 0.315456–0.375011 s. The 32.8% lower
+median describes this cold-pair fixture only; it does not measure whole
+selection, Source analysis, Performance import or the reported import tail.
+
 ## Карта покрытия и ограничения
 
 | Контур | Просмотренные модули | Итог |

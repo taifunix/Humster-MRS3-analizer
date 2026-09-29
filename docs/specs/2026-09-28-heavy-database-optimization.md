@@ -522,6 +522,71 @@ show identical final rows and nonoverlapping scalar/bulk timing ranges before
 claiming a speedup for this write stage; it cannot establish whole-selection
 speedup.
 
+## WIN-01: source-only reuse within one standalone pair
+
+Goal: remove one repeated source decode and its three SQL reads when both
+distinct windows of a public pair are cold. Inputs, output metrics and stored
+cache rows remain the existing public window contracts. Only the complete
+window-independent `_load_source(connection, result_id)` tuple is shared:
+report boundaries, immutable ordered actions and immutable ordered equity.
+The loader's three result-ID queries and ordering remain unchanged.
+
+The first cache miss establishes one source snapshot local to that public
+pair call. Later misses in the same call use it; no source survives across
+calls, connections, jobs, results or source revisions. A source commit after
+the first miss need not become visible to B. Stop and revise if a supported
+contract requires such mid-call visibility or the loader gains clipping,
+window/version inputs or context. Add no locks or keyed/global memo.
+
+Move the existing scalar body to one private authoritative helper, keeping
+its validation, timestamp/version normalization, cache lookup, scalar
+calculation, scalar persistence and post-write readback order. The public
+scalar keeps its signature/defaults and invokes the helper without shared
+state. The public pair keeps shape validation first and uses a local zero-
+or-one-element list: finish A including persistence/readback before validating
+B. No transaction is added; A survives a B error under autocommit, while an
+explicit caller transaction may roll it back.
+
+Share source loading only. Invoke `_calculate(..., *source)` exactly as the
+scalar path does, without `flat_samples`. Its early `OUT_OF_RANGE` branch
+returns an unavailable metric with reason `OUT_OF_RANGE` before flat
+preparation; B still runs after an out-of-range A. Selection's CALC-01a flat
+reuse and CALC-02 bulk persistence remain separate. Non-goals: flat/boundary
+sharing, bulk pair writes, new public API/schema/version, dependencies,
+settings, worker routing or caller changes.
+
+Acceptance uses actual-schema scalar-oracle/pair-candidate comparisons of
+full typed metrics and all 20 deterministic stored fields; validate UTC
+calculation timestamps separately. Distinct cold pairs load source once
+instead of twice: valid/valid retains two flat preparations, out-of-range/
+out-of-range retains zero, and mixed valid/out-of-range retains one. Every
+distinct pair retains two calculations, two scalar writes and four cache
+reads. Both cached load nothing; cached/missing in either order loads once;
+a duplicate cold window loads/calculates/writes once and performs three cache
+reads. Retain scalar validation/error precedence, shape precedence, post-read
+fallback and autocommit/explicit-transaction behavior.
+
+Required RED/GREEN evidence includes all four cold validity combinations,
+direct equality of B's consumed source to an independently loaded real
+oracle, A/B action/equity tuple identity, and a real two-call source-mutation
+regression. Between calls on the same connection/result, update real source
+fee/equity values, delete all result cache rows without version/window filters,
+prove the cache is empty and source values changed, then verify a fresh single
+load, full mutated scalar parity and changed growth/fees. Rerun the public
+delegation/mocking inventory before GREEN; an outside-scope dependency stops
+the executor for root revision. Use existing .venv focused/related/full checks
+and reconcile the collection delta against accepted CALC-02.
+
+A temporary actual-schema 2,000-cycle benchmark compares two ordered scalar
+calls with one pair after clearing only fixture cache outside timing: one
+warmup, seven alternating paired samples. An untimed real forwarding probe
+must show source loads 2 to 1 and logical SQL 12 to 9, with flat/calculation/
+scalar write/post-readback counts unchanged and exact typed/stored parity.
+Claim stage speedup only for a lower median and nonoverlapping ranges;
+otherwise report work-count reduction only. Independent CODE_REVIEW_PASS
+and a scoped commit are required; no live database/tester or push.
+
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,

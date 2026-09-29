@@ -94,6 +94,24 @@ No whole-selection, whole-analysis or whole-import speed claim is made.
 The integrated pre-CALC-02 suite passed 5,538 tests with nine Windows symlink
 skips in 1,505.40 seconds. CALC-02 collection contains 5,566 cases; the final
 5,557 passed and nine skipped account for exactly 19 new scenarios.
+CALC-02 is committed as `c861a9e`. Next, WIN-01 R5 received independent Opus
+5/high `PLAN_APPROVED`; the root source-only contract is written before executor
+handoff. It shares one loaded action/equity tuple only within a public pair call,
+retaining scalar behavior, separate lazy flat preparation and caller transaction
+control. WIN-01 implementation is in the two scoped source/test files. Four cold
+cases were RED at two source loads before the fix, then GREEN at one; the Windows
+module passed 43 tests and the related contour passed 488 with four existing
+Windows symlink skips. Collection rose by exactly 12 cases to 5,578.
+An actual-schema temporary 2,000-cycle, 4,000-action, 4,001-equity benchmark
+compared two scalar calls with one pair across seven alternating measured pairs:
+typed metrics and all 20 deterministic stored fields matched throughout; source
+loads fell 2→1 and logical SQL 12→9, while flat/calculation/persist/readback
+counts were unchanged. Median elapsed was 0.515420 s versus 0.346342 s, a 32.8%
+reduction for this cold-pair fixture only; all pair times were below all scalar
+times. Fresh full-suite verification passed 5,569 tests, with nine existing
+Windows symlink skips and 30 warnings in 1,504.19 seconds. Independent Opus
+5/high returned `CODE_REVIEW_PASS`; WIN-01 is accepted. CACHE-01 planning is
+next; its code remains untouched until a separate approved contract and review.
 T4/COR-05 preserves actual HTML action order and keeps strict final-balance
 validation based on the latest timestamp/source-index witness. Swapped HTML
 is rejected as ACTIONS_OUT_OF_ORDER while a valid sibling commits; equal-time
