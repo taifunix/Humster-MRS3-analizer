@@ -335,11 +335,14 @@ fill вправе читать aggregates даже при готовых window 
 - [ ] **SEL-02 — warm validation.** `panel.py`, `performance_v2_selection.py`.
   Объединить readiness/version/facts reads в одном snapshot. Не заменять содержимое/
   revisions TTL/mtime; REPLACE может сохранить result_id. Warm LRU preview **5–20%**.
-- [ ] **DEC-01 — history replay.** `performance_v2_selection_review.py`.
+- [x] **DEC-01 — history replay.** `performance_v2_selection_review.py`.
   Bulk runs/reviews/selection rows → тот же ordered replay вместо трех SQL/run.
   Ordinary replacement, scoped overlay, latest user decisions и lineage идентичны.
   2/102 runs: exact equality, запросы не растут как3N. Этап **50–85%**, history-heavy
   export/catalog **10–40%**, не два независимых эффекта. Не брать просто последний run.
+  T7 accepted after independent Opus 5/high R2 `CODE_REVIEW_PASS`: 66 module tests;
+  2/102-run SQL statements 8/308 before versus 4 after; fixed 102-run replay
+  warm median 0.393356 s versus 0.018067 s (95.4% stage-only reduction).
 - [ ] **OPT-01 — строгие batch reads.** `performance_v2_optimizer.py`, после COR-01.
   Batch writer rechecks и один digest immutable source object в пределах request/snapshot/
   revision. Между snapshot/revision проверки не переиспользовать. Strict payload validation

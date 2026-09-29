@@ -857,53 +857,106 @@ def effective_selection_decisions(
     dormant until a review is imported, then only its reviewed rows overlay the
     prior decision.
     """
-    clauses = "where symbol = ?" if symbol is not None else ""
-    params = [symbol] if symbol is not None else []
+    run_scope = "where runs.symbol = ?" if symbol is not None else ""
+    scope_params = [symbol] if symbol is not None else []
     runs = connection.execute(
-        f"""select selection_run_id, symbol, side, request_json
-               from selection_runs {clauses}
-              order by created_at_utc asc, selection_run_id asc""", params
+        f"""select runs.selection_run_id, runs.symbol, runs.side, runs.request_json
+               from selection_runs runs {run_scope}
+              order by runs.created_at_utc asc, runs.selection_run_id asc""", scope_params
     ).fetchall()
     states: dict[tuple[str, str], dict[int, tuple[str, int | None, str | None]]] = {}
     latest_reviews = latest_user_reviews_by_strategy(connection)
-    for run_id, run_symbol, run_side, raw_request in runs:
-        group = (str(run_symbol), str(run_side))
+    overlay_run_ids: set[str] = set()
+    for run_id, _run_symbol, _run_side, raw_request in runs:
         try:
             request = json.loads(str(raw_request))
         except (TypeError, ValueError):
             request = {}
-        overlay = isinstance(request, Mapping) and request.get("ranking_scope") in {"RETEST_COHORT", "CURRENT_EFFECTIVE"}
-        review = connection.execute(
-            """select review_import_id from selection_review_imports
-                where selection_run_id = ?
-                order by imported_at_utc desc, review_import_id desc limit 1""", [run_id]
-        ).fetchone()
-        if overlay and not review:
+        if isinstance(request, Mapping) and request.get("ranking_scope") in {"RETEST_COHORT", "CURRENT_EFFECTIVE"}:
+            overlay_run_ids.add(str(run_id))
+
+    review_strategy_ids_by_run: dict[str, set[int]] = {}
+    reviewed_runs: set[str] = set()
+    for run_id, strategy_id in connection.execute(
+        f"""with latest_imports as (
+                   select ranked.selection_run_id, ranked.review_import_id
+                     from (
+                           select imports.selection_run_id, imports.review_import_id,
+                                  row_number() over (
+                                      partition by imports.selection_run_id
+                                      order by imports.imported_at_utc desc, imports.review_import_id desc
+                                  ) as rn
+                             from selection_review_imports imports
+                             join selection_runs runs using (selection_run_id)
+                            {run_scope}
+                          ) ranked
+                    where ranked.rn = 1
+               )
+               select latest_imports.selection_run_id, rows.strategy_id
+                 from latest_imports
+                 left join selection_review_rows rows
+                   on rows.review_import_id = latest_imports.review_import_id""",
+        scope_params,
+    ).fetchall():
+        run_key = str(run_id)
+        if run_key not in overlay_run_ids:
             continue
-        if not overlay:
-            states[group] = {}
-        state = states.setdefault(group, {})
-        review_rows = {
-            int(row[0]): (str(row[1]), row[2])
-            for row in connection.execute(
-                "select strategy_id, user_status, user_rank from selection_review_rows where review_import_id = ?",
-                [review[0] if review else None],
-            ).fetchall()
-        }
-        result_rows = connection.execute(
-            """select strategy_id, auto_status, auto_rank, prior_rejected
-                 from selection_results where selection_run_id = ?""", [run_id]
-        ).fetchall()
-        for strategy_id, auto_status, auto_rank, prior_rejected in result_rows:
-            strategy_id = int(strategy_id)
-            if overlay and strategy_id not in review_rows:
+        reviewed_runs.add(run_key)
+        if strategy_id is not None:
+            review_strategy_ids_by_run.setdefault(run_key, set()).add(int(strategy_id))
+
+    run_positions = {str(run[0]): index for index, run in enumerate(runs)}
+    result_cursor = connection.execute(
+        f"""select results.selection_run_id, results.strategy_id, results.prior_rejected
+               from selection_results results
+               join selection_runs runs using (selection_run_id)
+              {run_scope}
+              order by runs.created_at_utc asc, runs.selection_run_id asc, results.rowid asc""",
+        scope_params,
+    )
+    def result_rows():
+        while batch := result_cursor.fetchmany(1024):
+            yield from batch
+
+    result_iter = iter(result_rows())
+    pending_result = next(result_iter, None)
+
+    for run_position, (run_id, run_symbol, run_side, _raw_request) in enumerate(runs):
+        run_key = str(run_id)
+        group = (str(run_symbol), str(run_side))
+        overlay = run_key in overlay_run_ids
+        active = not overlay or run_key in reviewed_runs
+        if active:
+            if not overlay:
+                states[group] = {}
+            state = states.setdefault(group, {})
+        else:
+            state = None
+        review_strategy_ids = review_strategy_ids_by_run.get(run_key, set())
+        while pending_result is not None:
+            result_run_key = str(pending_result[0])
+            result_position = run_positions.get(result_run_key)
+            if result_position is None:
+                pending_result = next(result_iter, None)
                 continue
-            if strategy_id in latest_reviews:
-                review_row = latest_reviews[strategy_id]
-                status, rank = review_row["user_status"], review_row["user_rank"]
-                state[strategy_id] = (status, None if rank is None else int(rank), str(run_id))
-            elif prior_rejected:
-                state[strategy_id] = ("REJECTED", None, str(run_id))
+            if result_position < run_position:
+                raise ValueError("selection results out of order")
+            if result_position > run_position:
+                break
+            strategy_id, prior_rejected = int(pending_result[1]), pending_result[2]
+            if active and (not overlay or strategy_id in review_strategy_ids):
+                assert state is not None
+                if strategy_id in latest_reviews:
+                    review_row = latest_reviews[strategy_id]
+                    status, rank = review_row["user_status"], review_row["user_rank"]
+                    state[strategy_id] = (status, None if rank is None else int(rank), run_key)
+                elif prior_rejected:
+                    state[strategy_id] = ("REJECTED", None, run_key)
+            pending_result = next(result_iter, None)
+    while pending_result is not None:
+        if run_positions.get(str(pending_result[0])) is not None:
+            raise ValueError("selection results out of order")
+        pending_result = next(result_iter, None)
     return {strategy_id: decision for state in states.values() for strategy_id, decision in state.items()}
 
 

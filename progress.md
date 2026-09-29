@@ -51,8 +51,15 @@ the related Source v6 suite passed 107. A frozen 1,000-row, three-run
 `_publish` benchmark measured median 3.245 s before versus 0.821 s after
 (74.7% lower for publication only), with exact semantic-dump equality.
 Independent Opus 5/high re-review returned `CODE_REVIEW_PASS`; T6a is accepted.
-The broader ANA-01 relation writer remains evidence-gated. T7/DEC-01 history
-replay is next; no whole-analysis speed claim is made.
+The broader ANA-01 relation writer remains evidence-gated. T7/DEC-01 now
+replays selection history with four SQL statements regardless of run count,
+down from 8 at two runs and 308 at 102 runs. Exact ordered decisions, symbol
+scope with global latest review, 1,025-row fetchmany boundary, uncommitted
+visibility and failure residue are covered; the module passed 66 tests.
+A fixed 102-run/3,264-row warm replay measured median 0.393356 s before
+versus 0.018067 s after (95.4% lower for replay only). Independent Opus 5/high
+R2 returned `CODE_REVIEW_PASS`; T7 is accepted. OPT-01b builder-local source
+document reuse is next; no whole-analysis or whole-import speed claim is made.
 Final integrated suite remains pending.
 T4/COR-05 preserves actual HTML action order and keeps strict final-balance
 validation based on the latest timestamp/source-index witness. Swapped HTML

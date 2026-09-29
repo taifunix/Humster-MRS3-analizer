@@ -129,6 +129,433 @@ def _review_rows(result: pd.DataFrame) -> dict[int, dict[str, object]]:
     }
 
 
+class _CountingConnection:
+    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+        self.connection = connection
+        self.calls: list[tuple[str, object]] = []
+
+    def execute(self, sql: str, parameters: object = None):
+        self.calls.append((str(sql), parameters))
+        if parameters is None:
+            return self.connection.execute(sql)
+        return self.connection.execute(sql, parameters)
+
+    def cursor(self):
+        raise AssertionError("effective_selection_decisions must not create a child cursor")
+
+
+class _BatchCursor:
+    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+        self.rows = rows
+        self.consumed = False
+
+    def fetchmany(self, size: int) -> list[tuple[object, ...]]:
+        assert size == 1024
+        if self.consumed:
+            return []
+        self.consumed = True
+        return self.rows
+
+
+class _ReorderedResultConnection(_CountingConnection):
+    def __init__(self, connection: duckdb.DuckDBPyConnection, rows: list[tuple[object, ...]]) -> None:
+        super().__init__(connection)
+        self.rows = rows
+
+    def execute(self, sql: str, parameters: object = None):
+        result = super().execute(sql, parameters)
+        if "select results.selection_run_id" in sql.lower():
+            result.fetchall()
+            return _BatchCursor(self.rows)
+        return result
+
+
+class _FetchManyProbe:
+    def __init__(self, relation: object, sizes: list[int]) -> None:
+        self.relation = relation
+        self.sizes = sizes
+
+    def fetchmany(self, size: int):
+        self.sizes.append(size)
+        return self.relation.fetchmany(size)
+
+
+class _FetchManyCountingConnection(_CountingConnection):
+    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+        super().__init__(connection)
+        self.fetchmany_sizes: list[int] = []
+
+    def execute(self, sql: str, parameters: object = None):
+        result = super().execute(sql, parameters)
+        if "select results.selection_run_id" in sql.lower():
+            return _FetchManyProbe(result, self.fetchmany_sizes)
+        return result
+
+
+def _insert_history_fixture(connection: duckdb.DuckDBPyConnection, count: int) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    for index in range(count):
+        run_id = f"history-run-{index:03d}"
+        connection.execute(
+            """insert into selection_runs values (
+                ?, 'db', 'BTCUSDT', 'LONG', 'v', '{}', 'request', '{}', 'config',
+                1, 0, 0, 1, ?, ?
+            )""",
+            [run_id, f"workbook-{index}", start + timedelta(seconds=index)],
+        )
+        connection.execute(
+            """insert into selection_results values (
+                ?, 1, 101, 'FINALIST', 0, 1, null, null, null, true, '{}'
+            )""",
+            [run_id],
+        )
+
+
+@pytest.mark.parametrize("run_count", [2, 102])
+@pytest.mark.parametrize("symbol", [None, "BTCUSDT"])
+def test_effective_selection_decisions_bulk_history_uses_four_parent_reads(
+    tmp_path: Path, run_count: int, symbol: str | None,
+) -> None:
+    connection = _database(tmp_path)
+    _insert_history_fixture(connection, run_count)
+    counted = _CountingConnection(connection)
+
+    expected = {
+        1: ("REJECTED", None, f"history-run-{run_count - 1:03d}"),
+    }
+    actual = effective_selection_decisions(counted, symbol=symbol)
+    assert actual == expected
+    expected_digest = {
+        2: "c93c30105a37cf4d6d1f3c9bd5d3d160f9be351dafe64ac6f794f4b6a17ab2da",
+        102: "c520caf0a6040741611470b8c5f3873e0119e7c5783f3f93ffcdb4cea2fc1cfd",
+    }[run_count]
+    assert sha256(repr(list(actual.items())).encode()).hexdigest() == expected_digest
+    assert len(counted.calls) <= 4
+    assert not any(" in (" in sql.lower() for sql, _ in counted.calls)
+    if symbol is None:
+        assert all(parameters in (None, []) for _, parameters in counted.calls)
+    else:
+        assert sum(parameters == ["BTCUSDT"] for _, parameters in counted.calls) == 3
+
+
+def test_effective_selection_decisions_ignores_unknown_result_runs(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    _insert_decision_run(connection, "known-run", start, "{}", result_rows=((1, True),))
+    reordered = _ReorderedResultConnection(
+        connection,
+        [("unknown-run", 999, True), ("known-run", 1, True)],
+    )
+
+    assert effective_selection_decisions(reordered) == {
+        1: ("REJECTED", None, "known-run"),
+    }
+
+
+def test_effective_selection_decisions_rejects_backward_known_result_order(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    _insert_decision_run(connection, "early-run", start, "{}", result_rows=((1, True),))
+    _insert_decision_run(connection, "late-run", start + timedelta(seconds=1), "{}", result_rows=((2, True),))
+    reordered = _ReorderedResultConnection(
+        connection,
+        [("late-run", 2, True), ("early-run", 1, True)],
+    )
+
+    with pytest.raises(ValueError, match="selection results out of order"):
+        effective_selection_decisions(reordered)
+
+
+def _insert_decision_run(
+    connection: duckdb.DuckDBPyConnection,
+    run_id: str,
+    created_at: datetime,
+    request_json: str,
+    *,
+    symbol: str = "BTCUSDT",
+    side: str = "LONG",
+    result_rows: tuple[tuple[int, bool], ...] = (),
+) -> None:
+    connection.execute(
+        """insert into selection_runs values (
+            ?, 'db', ?, ?, 'v', ?, 'request', '{}', 'config',
+            ?, 0, 0, 1, ?, ?
+        )""",
+        [run_id, symbol, side, request_json, len(result_rows), f"workbook-{run_id}", created_at],
+    )
+    for strategy_id, prior_rejected in result_rows:
+        connection.execute(
+            """insert into selection_results values (
+                ?, ?, ?, 'FINALIST', 0, 1, null, null, null, ?, '{}'
+            )""",
+            [run_id, strategy_id, 100 + strategy_id, prior_rejected],
+        )
+
+
+def test_effective_selection_decisions_bulk_replay_preserves_resets_overlays_ties_and_lineage(
+    tmp_path: Path,
+) -> None:
+    connection = _database(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    _insert_decision_run(connection, "run-base-a", start, "{}", result_rows=((1, True), (2, False)))
+    _insert_decision_run(connection, "run-empty", start + timedelta(seconds=1), "{}")
+    _insert_decision_run(connection, "run-base-b", start + timedelta(seconds=2), "{}", result_rows=((1, True), (2, False)))
+    _insert_decision_run(
+        connection, "run-dormant", start + timedelta(seconds=3),
+        '{"ranking_scope":"RETEST_COHORT"}', result_rows=((1, False), (2, False)),
+    )
+    _insert_decision_run(
+        connection, "run-empty-review", start + timedelta(seconds=4),
+        '{"ranking_scope":"CURRENT_EFFECTIVE"}', result_rows=((1, False), (2, False)),
+    )
+    connection.execute(
+        "insert into selection_review_imports values ('review-empty', 'run-empty-review', 'hash-empty', ?, 0)",
+        [start + timedelta(seconds=5)],
+    )
+    _insert_decision_run(
+        connection, "run-reviewed", start + timedelta(seconds=6),
+        '{"ranking_scope":"RETEST_COHORT"}', result_rows=((1, False), (2, False)),
+    )
+    tie_time = start + timedelta(seconds=7)
+    connection.execute(
+        "insert into selection_review_imports values ('review-active-a', 'run-reviewed', 'hash-a', ?, 1)",
+        [tie_time],
+    )
+    connection.execute(
+        "insert into selection_review_rows values ('review-active-a', 1, 'FINALIST', 3, null, null)",
+    )
+    connection.execute(
+        "insert into selection_review_imports values ('review-active-z', 'run-reviewed', 'hash-z', ?, 2)",
+        [tie_time],
+    )
+    connection.execute(
+        """insert into selection_review_rows values
+            ('review-active-z', 1, 'RESERVE', 9, null, null),
+            ('review-active-z', 2, 'FINALIST', 8, null, null)""",
+    )
+    _insert_decision_run(
+        connection, "run-other", start + timedelta(seconds=8), "{}", symbol="ETHUSDT", side="SHORT",
+        result_rows=((3, True),),
+    )
+    _insert_decision_run(
+        connection, "run-malformed", start + timedelta(seconds=9), "not-json", symbol="ETHUSDT", side="SHORT",
+    )
+    _insert_decision_run(
+        connection, "run-populated-final", start + timedelta(seconds=10), "{}", symbol="XRPUSDT",
+        result_rows=((5, True),),
+    )
+    _insert_decision_run(
+        connection, "run-empty-final", start + timedelta(seconds=11), "{}", symbol="XRPUSDT",
+    )
+    _insert_decision_run(
+        connection, "run-other-side", start + timedelta(seconds=12), "{}", symbol="BTCUSDT", side="SHORT",
+        result_rows=((4, True),),
+    )
+
+    expected = {
+        1: ("RESERVE", 9, "run-reviewed"),
+        2: ("FINALIST", 8, "run-reviewed"),
+        4: ("REJECTED", None, "run-other-side"),
+    }
+    decisions = effective_selection_decisions(connection)
+    assert decisions == expected
+    ordered = list(decisions.items())
+    assert ordered == [
+        (1, ("RESERVE", 9, "run-reviewed")),
+        (2, ("FINALIST", 8, "run-reviewed")),
+        (4, ("REJECTED", None, "run-other-side")),
+    ]
+    assert sha256(repr(ordered).encode()).hexdigest() == "4cb2db599aa3888d6588f791e01fce05e9652e7261f04b313028af53b39f1e6a"
+
+
+def test_effective_selection_decisions_102_run_mixed_ordered_digest(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    for index in range(102):
+        run_id = f"mixed-run-{index:03d}"
+        if index == 0:
+            _insert_decision_run(
+                connection, run_id, start + timedelta(seconds=index), "{}", symbol="XRPUSDT",
+                result_rows=((3, True),),
+            )
+        elif index == 1:
+            _insert_decision_run(
+                connection, run_id, start + timedelta(seconds=index), "{}", symbol="XRPUSDT",
+            )
+        elif index == 101:
+            _insert_decision_run(
+                connection, run_id, start + timedelta(seconds=index),
+                '{"ranking_scope":"CURRENT_EFFECTIVE"}', result_rows=((1, False), (2, False)),
+            )
+        elif index == 100:
+            _insert_decision_run(
+                connection, run_id, start + timedelta(seconds=index), "{}", result_rows=((1, True),),
+            )
+        else:
+            _insert_decision_run(connection, run_id, start + timedelta(seconds=index), "{}")
+    review_time = start + timedelta(seconds=102)
+    connection.execute(
+        "insert into selection_review_imports values ('mixed-review', 'mixed-run-101', 'mixed-hash', ?, 2)",
+        [review_time],
+    )
+    connection.execute(
+        """insert into selection_review_rows values
+            ('mixed-review', 1, 'FINALIST', 7, null, null),
+            ('mixed-review', 2, 'RESERVE', 8, null, null)""",
+    )
+
+    decisions = effective_selection_decisions(connection)
+    ordered = list(decisions.items())
+    assert ordered == [
+        (1, ("FINALIST", 7, "mixed-run-101")),
+        (2, ("RESERVE", 8, "mixed-run-101")),
+    ]
+    assert sha256(repr(ordered).encode()).hexdigest() == "04bf46058b7f9cfb4201c924ac9c32ecd423dbb8e126679a49407395aeb1ddd6"
+
+
+def test_effective_selection_decisions_scoped_symbol_keeps_global_latest_review_and_lineage(
+    tmp_path: Path,
+) -> None:
+    connection = _database(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    _insert_decision_run(
+        connection, "eth-base", start, "{}", symbol="ETHUSDT", side="LONG",
+        result_rows=((11, True), (12, True), (13, True)),
+    )
+    _insert_decision_run(
+        connection, "eth-dormant", start + timedelta(seconds=1),
+        '{"ranking_scope":"RETEST_COHORT"}', symbol="ETHUSDT", side="LONG",
+        result_rows=((11, False), (12, False), (13, False)),
+    )
+    _insert_decision_run(
+        connection, "eth-reviewed", start + timedelta(seconds=2),
+        '{"ranking_scope":"CURRENT_EFFECTIVE"}', symbol="ETHUSDT", side="LONG",
+        result_rows=((11, False), (12, False), (13, False)),
+    )
+    _insert_decision_run(
+        connection, "btc-base", start + timedelta(seconds=3), "{}", symbol="BTCUSDT", side="LONG",
+        result_rows=((11, True), (20, True), (21, True)),
+    )
+    _insert_decision_run(
+        connection, "btc-dormant", start + timedelta(seconds=4),
+        '{"ranking_scope":"RETEST_COHORT"}', symbol="BTCUSDT", side="LONG",
+        result_rows=((11, False), (20, False), (21, False)),
+    )
+    _insert_decision_run(
+        connection, "btc-reviewed", start + timedelta(seconds=5),
+        '{"ranking_scope":"CURRENT_EFFECTIVE"}', symbol="BTCUSDT", side="LONG",
+        result_rows=((11, False), (20, False), (21, False)),
+    )
+    connection.execute(
+        "insert into selection_review_imports values ('btc-review', 'btc-reviewed', 'btc-hash', ?, 1)",
+        [start + timedelta(seconds=50)],
+    )
+    connection.execute(
+        "insert into selection_review_rows values ('btc-review', 11, 'FINALIST', 1, null, null)",
+    )
+    connection.execute(
+        "insert into selection_review_imports values ('eth-review', 'eth-reviewed', 'eth-hash', ?, 2)",
+        [start + timedelta(seconds=60)],
+    )
+    connection.execute(
+        """insert into selection_review_rows values
+            ('eth-review', 11, 'RESERVE', 88, null, null),
+            ('eth-review', 12, 'FINALIST', 77, null, null)""",
+    )
+
+    all_decisions = effective_selection_decisions(connection)
+    counted = _CountingConnection(connection)
+    btc_decisions = effective_selection_decisions(counted, symbol="BTCUSDT")
+    btc_lineage = {
+        strategy_id: decision
+        for strategy_id, decision in all_decisions.items()
+        if str(decision[2]).startswith("btc-")
+    }
+
+    assert btc_decisions == btc_lineage == {
+        11: ("RESERVE", 88, "btc-reviewed"),
+        20: ("REJECTED", None, "btc-base"),
+        21: ("REJECTED", None, "btc-base"),
+    }
+    assert 12 not in btc_decisions
+    assert all_decisions[12] == ("FINALIST", 77, "eth-reviewed")
+    assert len(counted.calls) == 4
+    assert sum(parameters == ["BTCUSDT"] for _, parameters in counted.calls) == 3
+
+
+def test_effective_selection_decisions_streams_results_across_fetchmany_boundary(
+    tmp_path: Path,
+) -> None:
+    connection = _database(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    _insert_decision_run(connection, "wide-base", start, "{}")
+    connection.execute(
+        """insert into selection_results
+           select 'wide-base', strategy_id, 100000 + strategy_id, 'FINALIST', 0, 1,
+                  null, null, null, true, '{}'
+             from range(1, 1026) as values(strategy_id)""",
+    )
+    connection.execute("update selection_runs set candidate_count = 1025 where selection_run_id = 'wide-base'")
+    _insert_decision_run(
+        connection, "wide-overlay", start + timedelta(seconds=1),
+        '{"ranking_scope":"RETEST_COHORT"}', result_rows=((1025, False),),
+    )
+    connection.execute(
+        "insert into selection_review_imports values ('wide-review', 'wide-overlay', 'wide-hash', ?, 1)",
+        [start + timedelta(seconds=2)],
+    )
+    connection.execute(
+        "insert into selection_review_rows values ('wide-review', 1025, 'FINALIST', 7, null, null)",
+    )
+    counted = _FetchManyCountingConnection(connection)
+
+    decisions = effective_selection_decisions(counted)
+    ordered = list(decisions.items())
+    expected = [(strategy_id, ("REJECTED", None, "wide-base")) for strategy_id in range(1, 1025)]
+    expected.append((1025, ("FINALIST", 7, "wide-overlay")))
+    assert ordered == expected
+    assert sha256(repr(ordered).encode()).hexdigest() == "910176a0c0df2ff052a8732a573c6b78644a9440aa9c74ce10a872fd2633593e"
+    assert len(counted.calls) == 4
+    assert counted.fetchmany_sizes and all(size == 1024 for size in counted.fetchmany_sizes)
+    assert len(counted.fetchmany_sizes) >= 2
+
+
+def test_effective_selection_decisions_sees_uncommitted_rows_and_rollback_removes_them(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    connection.execute("begin transaction")
+    _insert_decision_run(
+        connection, "uncommitted-run", datetime(2026, 1, 1, tzinfo=UTC), "{}", result_rows=((9, True),),
+    )
+    assert effective_selection_decisions(connection) == {
+        9: ("REJECTED", None, "uncommitted-run"),
+    }
+    connection.execute("rollback")
+    assert effective_selection_decisions(connection) == {}
+
+
+def test_effective_selection_decisions_fourth_read_failure_leaves_history_unchanged(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    _insert_history_fixture(connection, 2)
+    before = {
+        table: connection.execute(f"select * from {table}").fetchall()
+        for table in ("selection_runs", "selection_results", "selection_review_imports", "selection_review_rows")
+    }
+
+    class FailingConnection(_CountingConnection):
+        def execute(self, sql: str, parameters: object = None):
+            if len(self.calls) == 3:
+                raise RuntimeError("injected final read failure")
+            return super().execute(sql, parameters)
+
+    with pytest.raises(RuntimeError, match="injected final read failure"):
+        effective_selection_decisions(FailingConnection(connection))
+    after = {
+        table: connection.execute(f"select * from {table}").fetchall()
+        for table in ("selection_runs", "selection_results", "selection_review_imports", "selection_review_rows")
+    }
+    assert after == before
+
+
 def test_review_export_serializes_workbook_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     saves = 0
     original_save = Workbook.save

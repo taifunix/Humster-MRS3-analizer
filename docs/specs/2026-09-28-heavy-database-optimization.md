@@ -282,6 +282,56 @@ relation slice. Do not infer a whole-analysis gain from this stage benchmark.
 Focused RED/GREEN, failure/residue checks and relevant Source v6 tests precede
 independent review. T6a-D2 received independent Opus 5/high `PLAN_APPROVED`.
 
+## DEC-01: Performance v2 selection-history replay
+
+`effective_selection_decisions` currently reads ordered `selection_runs` once,
+then issues three reads per run. It must preserve the ordered Python replay
+while replacing those reads with at most four SQL statements independent of
+history length: runs, globally latest user reviews, newest review membership,
+and selection results. All statements run on the caller's same DuckDB
+connection; the finalist-retest callers can pass a connection inside an open
+transaction. Do not create a child cursor or transaction, or alter the public
+signature, schema, indexes or global-review lookup. Consume each earlier query
+before the next; consume the final query in fixed `fetchmany` batches without
+another SQL call during replay. There is no formal peak-memory claim.
+
+Replay is driven by all runs in `created_at_utc ASC, selection_run_id ASC`
+order, including zero-result runs. A malformed/non-mapping request is ordinary;
+each ordinary run clears its `(symbol, side)` state. `RETEST_COHORT` and
+`CURRENT_EFFECTIVE` are overlays: no imported review is dormant, an imported
+zero-row review is active but changes nothing, and a reviewed overlay applies
+only its newest review's strategy IDs. Rank review imports by
+`imported_at_utc DESC, review_import_id DESC` before joining their rows.
+Effective status/rank still come from the globally latest accepted review for
+the strategy; otherwise only `prior_rejected` contributes `REJECTED`. Decision
+lineage is the run being replayed. Preserve pair/side isolation and final
+flattening. A symbol filter limits runs and results but does not scope the
+global latest-review lookup. Use static filtered/unfiltered SQL variants and a
+bound scalar symbol, never a history-sized ID parameter list. Project only
+consumed columns; auto status/rank and per-run review status/rank are not used
+by the current replay.
+
+The result query must use the same run-order prefix and `symbol = ?` predicate
+as the run query, with `selection_results.rowid ASC` for within-run order.
+Before implementation, compare the old unordered per-run scan against this
+ordering on two equal-time runs with deliberately out-of-ID-order rows: at
+least five repeats each under DuckDB threads 1 and 4. Stop and re-plan if old
+order varies or differs from the proposed order. The run-driven merge must
+pass multiple consecutive empty runs, reject backward result order and ignore
+newly visible results for unknown runs as the old frozen-run loop did.
+
+Acceptance: explicit ordered output, rank and lineage equality for 2- and
+102-run fixtures (including empty ordinary/reviewed runs, both overlays,
+malformed requests, timestamp ties, prior rejection and pair/side groups);
+the old ordinary baseline of 8/308 statements is recorded separately and
+retained tests require at most four statements for either size and symbol
+scope. A caller's uncommitted run/review remains visible without an implicit
+commit; injected read failure changes no history tables. A fixed synthetic
+before/after timing reports only the observed stage gain. The audit's
+50–85% replay and 10–40% history-heavy consumer ranges are non-additive
+expectations, not delivered gains or acceptance thresholds. T7-D3 received
+independent Opus 5/high `PLAN_APPROVED`.
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,
