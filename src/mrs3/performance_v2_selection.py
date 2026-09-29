@@ -704,7 +704,8 @@ def _selection_window_job(
                 source_recheck = metadata
             calculated = tuple(
                 metric if metric is not None else _calculate(
-                    result_id, start, end, METRICS_VERSION, *source, flat_samples=flat_samples
+                    result_id, start, end, METRICS_VERSION, *source,
+                    flat_samples=flat_samples, ordered_source=True,
                 )
                 for metric, (start, end) in zip(cached, windows)
             )

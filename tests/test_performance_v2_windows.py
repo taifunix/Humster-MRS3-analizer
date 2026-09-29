@@ -82,6 +82,106 @@ def test_calculate_accepts_authoritative_flat_samples_without_changing_metrics(m
     assert calls == 1
 
 
+@pytest.mark.parametrize(
+    ("offsets", "left", "right", "reason"),
+    [
+        ((), 0, 4, "NO_FLAT_START"),
+        ((0, 1), 2, 4, "NO_FLAT_START"),
+        ((3, 4), 1, 2, "NO_FLAT_END"),
+        ((2,), 1, 3, "COLLAPSED"),
+        ((0, 4), 1, 3, "COLLAPSED"),
+        ((0, 4), 2, 3, "COLLAPSED"),
+    ],
+)
+def test_ordered_boundaries_keep_linear_reason_precedence(offsets, left, right, reason) -> None:
+    report_start, report_end, actions, equity = _typed_source()
+    flat = tuple(report_start + timedelta(days=offset) for offset in offsets)
+    args = (1, report_start + timedelta(days=left), report_start + timedelta(days=right),
+            METRICS_VERSION, report_start, report_end, actions, equity)
+    expected = _calculate(*args, flat_samples=flat)
+    assert expected.unavailable_reason == reason
+    assert _calculate(*args, flat_samples=flat, ordered_source=True) == expected
+
+
+def test_ordered_boundary_search_matches_linear_with_duplicate_ends(monkeypatch) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = start + timedelta(days=2)
+    actions = (
+        _Action(0, start, "opened", Decimal(1), Decimal(0), Decimal(0)),
+        _Action(1, start, "closed", Decimal(0), Decimal(1), Decimal(1)),
+        _Action(2, start, "opened", Decimal(1), Decimal(0), Decimal(0)),
+        _Action(3, end, "decreased", Decimal(1), Decimal(2), Decimal(2)),
+        _Action(4, end, "closed", Decimal(0), Decimal(3), Decimal(3)),
+    )
+    equity = (
+        _Equity(0, start, Decimal(100), Decimal(100)),
+        _Equity(1, start, Decimal(101), Decimal(101)),
+        _Equity(2, end, Decimal(105), Decimal(105)),
+        _Equity(3, end, Decimal(106), Decimal(106)),
+    )
+    flat = (start, start, end, end)
+    args = (1, start, end, METRICS_VERSION, start, end, actions, equity)
+    expected = _calculate(*args, flat_samples=flat)
+    assert expected.availability_status == "AVAILABLE"
+    assert expected.fees_pct == Decimal(5) / Decimal(100) * 100
+    assert _calculate(*args, flat_samples=flat, ordered_source=True) == expected
+
+
+def test_ordered_boundary_search_is_opt_in(monkeypatch) -> None:
+    report_start, report_end, actions, equity = _typed_source()
+    args = (1, report_start, report_end, METRICS_VERSION, report_start, report_end, actions, equity)
+    flat = (report_start, report_start + timedelta(days=1), report_end)
+    expected = _calculate(*args, flat_samples=flat)
+    assert expected.availability_status == "AVAILABLE"
+    original_left = windows_module.bisect_left
+    original_right = windows_module.bisect_right
+    calls = []
+
+    def counted_left(*values, **kwargs):
+        calls.append("left")
+        return original_left(*values, **kwargs)
+
+    def counted_right(*values, **kwargs):
+        calls.append("right")
+        return original_right(*values, **kwargs)
+
+    monkeypatch.setattr(windows_module, "bisect_left", counted_left)
+    monkeypatch.setattr(windows_module, "bisect_right", counted_right)
+    assert _calculate(*args, flat_samples=flat) == expected
+    assert calls == []
+    assert _calculate(*args, flat_samples=flat, ordered_source=True) == expected
+    assert calls == ["left", "right", "left", "right", "right", "right"]
+    calls.clear()
+    out_of_range = _calculate(
+        1, report_end + timedelta(days=1), report_end + timedelta(days=2),
+        METRICS_VERSION, report_start, report_end, actions, equity,
+        ordered_source=True,
+    )
+    assert out_of_range.unavailable_reason == "OUT_OF_RANGE"
+    assert calls == []
+
+
+def test_default_calculation_keeps_unordered_portfolio_inputs(monkeypatch) -> None:
+    report_start, report_end, actions, equity = _typed_source()
+    args = (1, report_start, report_end, METRICS_VERSION,
+            report_start, report_end, tuple(reversed(actions)), tuple(reversed(equity)))
+    flat = (report_start, report_start + timedelta(days=1), report_end)
+    expected = _calculate(*args, flat_samples=flat)
+    monkeypatch.setattr(windows_module, "bisect_left", lambda *_args, **_kwargs: pytest.fail("default used bisect"))
+    monkeypatch.setattr(windows_module, "bisect_right", lambda *_args, **_kwargs: pytest.fail("default used bisect"))
+    assert _calculate(*args, flat_samples=flat) == expected
+
+
+def test_ordered_boundary_search_keeps_no_trades_reason() -> None:
+    report_start, report_end, _actions, equity = _typed_source()
+    args = (1, report_start, report_end, METRICS_VERSION,
+            report_start, report_end, (), equity)
+    flat = (report_start, report_end)
+    expected = _calculate(*args, flat_samples=flat)
+    assert expected.unavailable_reason == "NO_TRADES"
+    assert _calculate(*args, flat_samples=flat, ordered_source=True) == expected
+
+
 def _db(tmp_path, *, scale: Decimal = Decimal("1")) -> tuple[duckdb.DuckDBPyConnection, int]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect(str(tmp_path / "strategy_performance.duckdb"))
@@ -132,6 +232,76 @@ def _db(tmp_path, *, scale: Decimal = Decimal("1")) -> tuple[duckdb.DuckDBPyConn
     ]
     connection.executemany("insert into strategy_equity values (?, ?, ?, ?, ?)", equity)
     return connection, int(result_id)
+
+
+def test_load_source_orders_shuffled_timestamps_for_selection(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    try:
+        connection.execute(
+            "update strategy_actions set timestamp_utc = ? where result_id = ? and action_index in (4, 5)",
+            [datetime(2026, 1, 1, tzinfo=UTC), result_id],
+        )
+        connection.execute(
+            "update strategy_equity set timestamp_utc = ? where result_id = ? and sample_index in (3, 4)",
+            [datetime(2026, 1, 1, tzinfo=UTC), result_id],
+        )
+        _, _, actions, equity = windows_module._load_source(connection, result_id)
+        action_keys = [(item.timestamp, item.index) for item in actions]
+        equity_keys = [(item.timestamp, item.index) for item in equity]
+        assert action_keys == sorted(action_keys)
+        assert equity_keys == sorted(equity_keys)
+        assert tuple(item.index for item in actions) != tuple(range(len(actions)))
+        assert tuple(item.index for item in equity) != tuple(range(len(equity)))
+        flat = windows_module._flat_samples(equity, actions)
+        assert flat == tuple(sorted(flat))
+        assert all(value.tzinfo is not None and value.utcoffset() == timedelta(0) for value in flat)
+    finally:
+        connection.close()
+
+
+def test_ordered_boundaries_match_stored_rows_at_duplicate_w0_w1(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    try:
+        w0 = datetime(2026, 1, 3, tzinfo=UTC)
+        w1 = datetime(2026, 1, 5, tzinfo=UTC)
+        connection.execute(
+            "update strategy_actions set timestamp_utc = ? where result_id = ? and action_index = 2",
+            [w0, result_id],
+        )
+        connection.execute(
+            "update strategy_actions set timestamp_utc = ? where result_id = ? and action_index in (4, 5)",
+            [w1, result_id],
+        )
+        connection.execute(
+            "update strategy_equity set timestamp_utc = ? where result_id = ? and sample_index = 3",
+            [w0, result_id],
+        )
+        connection.execute(
+            "insert into strategy_equity values (?, 5, ?, 112, 112)", [result_id, w1],
+        )
+        source = windows_module._load_source(connection, result_id)
+        flat = windows_module._flat_samples(source[3], source[2])
+        assert flat.count(w0) == flat.count(w1) == 2
+        assert sum(item.timestamp == w0 for item in source[2]) == 2
+        assert sum(item.timestamp == w1 for item in source[2]) == 2
+        assert sum(item.timestamp == w0 for item in source[3]) == 2
+        assert sum(item.timestamp == w1 for item in source[3]) == 2
+        args = (result_id, w0, w1, METRICS_VERSION, *source)
+        linear = _calculate(*args, flat_samples=flat)
+        ordered = _calculate(*args, flat_samples=flat, ordered_source=True)
+        assert linear.availability_status == "AVAILABLE"
+        assert ordered == linear
+        _persist(connection, linear)
+        row_linear = connection.execute(
+            "select * exclude(calculated_at_utc) from window_metrics where result_id = ?", [result_id],
+        ).fetchone()
+        _persist(connection, ordered)
+        row_ordered = connection.execute(
+            "select * exclude(calculated_at_utc) from window_metrics where result_id = ?", [result_id],
+        ).fetchone()
+        assert row_ordered == row_linear
+    finally:
+        connection.close()
 
 
 def _persist_metric(

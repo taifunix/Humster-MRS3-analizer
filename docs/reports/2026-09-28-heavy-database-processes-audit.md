@@ -617,6 +617,36 @@ CACHE-01 is accepted. The latest read-only local journal check still found the
 409-report September 24 import without `phase_seconds`, so the next
 representative import is needed to attribute its completion tail.
 
+## CALC-01b seven-window boundary measurement (2026-09-29)
+
+Selection now requests ordered boundary search only for source tuples loaded
+with explicit timestamp/index ordering. Scalar, pair and portfolio calculations
+keep the prior linear path; the portfolio source query does not guarantee row
+order. The ordered path uses the existing shared flat timeline and preserves
+the inclusive equity interval and W0-exclusive action interval. Empty,
+missing, collapsed, no-trade, out-of-range and duplicate-boundary regressions
+compare complete typed results; an actual-schema test also compares persisted
+deterministic fields. This change adds no worker setting or schema version.
+
+The fixed actual-schema DuckDB 1.5.5 seed SHA-256 is
+`633d596aecf240ec0dcadd5fa37c892a056b2958bc99bfe43ffb6738a9d8c8cd`.
+It has 4,000 hourly actions, 4,001 equity samples, 2,001 flat timestamps and
+seven distinct AVAILABLE selection windows. The seven complete metrics had
+identical canonical SHA-256
+`9e82b18e45489af0d630fbdc286288c300deb4d57b4f4dbe7b26d8d056c2a289`
+in the default and ordered modes.
+
+One warm-up pair and 21 same-process pairs alternated execution order on the
+same preloaded source and flat tuple. The timed region contained only seven
+sequential calculator calls per arm. Median was 0.038658 s for linear versus
+0.031973 s for ordered search, 17.3% lower on this stage and fixture.
+Candidate nearest-rank p75 was 0.033668 s, below the baseline median;
+candidate minimum 0.029805 s was below baseline minimum 0.035230 s. All
+predeclared timing gates passed. The pinned pre-edit 8-sample baseline was
+sanity evidence only; the paired in-process baseline was the comparator.
+This is not a whole-selection, PerformanceDB import or production-tail speed
+measurement.
+
 ## Карта покрытия и ограничения
 
 | Контур | Просмотренные модули | Итог |

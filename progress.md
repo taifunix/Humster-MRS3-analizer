@@ -128,8 +128,25 @@ zero; semantic rows and callbacks matched. Median helper time fell from
 0.325610 to 0.204175 seconds (37.3% for this fixture only). Independent Opus
 5/high returned `CODE_REVIEW_PASS`; CACHE-01 is accepted. The real 409-report
 PerformanceDB import tail still lacks phase evidence because that run
-predated T13e instrumentation. Remaining IMP-02, CALC-01 and SEL-02 work stays
-open; do not infer whole-import or whole-preview speedup from CACHE-01.
+predated T13e instrumentation. CALC-01b then added selection-only ordered
+boundary search for the seven windows. The private calculator defaults to
+its previous linear behavior for scalar, pair, direct and potentially unordered
+portfolio callers. Tests cover duplicate W0/W1 timestamps, unavailable
+reasons, mapped source order and stored-row parity; a deliberately wrong W0
+bound fails the regression. A fixed actual-schema 4,000-action/4,001-equity
+fixture produced seven identical AVAILABLE metrics (SHA-256
+`9e82b18e45489af0d630fbdc286288c300deb4d57b4f4dbe7b26d8d056c2a289`).
+Twenty-one alternating same-process pairs measured 0.038658 s linear versus
+0.031973 s ordered median (17.3% lower for seven calculator calls only).
+Directly affected tests passed 380; related tests passed 576 with four Windows
+symlink skips. Fresh full suite passed 5,582 with nine Windows symlink skips
+and 30 warnings in 1,495.73 s. Independent Opus 5/high R2 returned
+`CODE_REVIEW_PASS`. The first two full attempts were interrupted by C: disk
+exhaustion from pytest temp databases; only their two abandoned temp
+directories were removed. A separate runner test failed intermittently once,
+then passed alone, as a 38-test module and in the final full suite. IMP-02
+tail attribution and SEL-02 remain open; no whole-import or whole-preview
+speedup is inferred.
 T4/COR-05 preserves actual HTML action order and keeps strict final-balance
 validation based on the latest timestamp/source-index witness. Swapped HTML
 is rejected as ACTIONS_OUT_OF_ORDER while a valid sibling commits; equal-time

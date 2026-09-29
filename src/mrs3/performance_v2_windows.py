@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from operator import attrgetter
 from typing import Any, Sequence
 
 import duckdb
@@ -13,6 +15,7 @@ from .performance_v2_equity_quality import EquitySample
 
 
 METRICS_VERSION = "performance-window-v2.2"
+_TIMESTAMP = attrgetter("timestamp")
 
 
 class PerformanceV2WindowsError(ValueError):
@@ -260,6 +263,7 @@ def _load_source(
     if result is None:
         raise PerformanceV2WindowsError(f"unknown result_id {result_id}")
     report_start, report_end = _utc(result[0]), _utc(result[1])
+    # Selection's ordered boundary search relies on both timestamp/index orders.
     actions = tuple(
         _Action(int(row[0]), _utc(row[1]), str(row[2]).casefold(), _decimal(row[3], "post_size"), _decimal(row[4], "pnl"), _decimal(row[5], "fee"))
         for row in connection.execute(
@@ -390,12 +394,19 @@ def _calculate(
     equity: tuple[_Equity, ...],
     *,
     flat_samples: tuple[datetime, ...] | None = None,
+    ordered_source: bool = False,
 ) -> WindowMetrics:
     if end < report_start or start > report_end or end < start or not equity:
         return WindowMetrics.unavailable(result_id, start, end, "OUT_OF_RANGE", version)
     flat = _flat_samples(equity, actions) if flat_samples is None else flat_samples
-    effective_start = next((value for value in flat if value >= start), None)
-    effective_end = next((value for value in reversed(flat) if value <= end), None)
+    if ordered_source:
+        start_index = bisect_left(flat, start)
+        end_index = bisect_right(flat, end) - 1
+        effective_start = flat[start_index] if start_index < len(flat) else None
+        effective_end = flat[end_index] if end_index >= 0 else None
+    else:
+        effective_start = next((value for value in flat if value >= start), None)
+        effective_end = next((value for value in reversed(flat) if value <= end), None)
     if effective_start is None:
         return WindowMetrics.unavailable(result_id, start, end, "NO_FLAT_START", version)
     if effective_end is None:
@@ -406,7 +417,13 @@ def _calculate(
             None, None, None, None, None, None, None, None, None, None,
         )
 
-    samples = tuple(item for item in equity if effective_start <= item.timestamp <= effective_end)
+    if ordered_source:
+        samples = equity[
+            bisect_left(equity, effective_start, key=_TIMESTAMP):
+            bisect_right(equity, effective_end, key=_TIMESTAMP)
+        ]
+    else:
+        samples = tuple(item for item in equity if effective_start <= item.timestamp <= effective_end)
     if len(samples) < 2:
         return WindowMetrics(
             result_id, start, end, version, effective_start, effective_end, "UNAVAILABLE", "COLLAPSED",
@@ -414,7 +431,13 @@ def _calculate(
         )
     # The flat action at W0 established the wallet/equity baseline; its fee and
     # realised PnL belong to the preceding interval, not this window.
-    scoped_actions = tuple(item for item in actions if effective_start < item.timestamp <= effective_end)
+    if ordered_source:
+        scoped_actions = actions[
+            bisect_right(actions, effective_start, key=_TIMESTAMP):
+            bisect_right(actions, effective_end, key=_TIMESTAMP)
+        ]
+    else:
+        scoped_actions = tuple(item for item in actions if effective_start < item.timestamp <= effective_end)
     realising = tuple(item for item in scoped_actions if item.kind in {"decreased", "closed"})
     if not realising:
         return WindowMetrics(

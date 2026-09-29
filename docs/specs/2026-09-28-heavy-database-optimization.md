@@ -634,6 +634,42 @@ without claiming whole-preview or import speedup. Independent review and a
 scoped commit are required.
 
 
+## CALC-01b: ordered boundary search for seven selection windows
+
+Only `_selection_window_job` may request ordered boundary search in
+`_calculate`, using the unchanged tuples returned by `_load_source`. Its
+actions are ordered by `(timestamp_utc, action_index)` and equity by
+`(timestamp_utc, sample_index)`; the shared flat tuple contains nondecreasing
+UTC datetimes. Scalar, pair, portfolio and direct callers retain the existing
+linear calculation by default because portfolio source rows have no guaranteed
+order. No sorting, timestamp copy, cache/version/schema change or new worker
+setting is part of this step. The sole Panel/config worker setting remains
+`duckdb_import.workers`.
+
+For ordered input, flat start selects the first timestamp `>= start` and flat
+end selects the last timestamp `<= end`. An empty flat tuple and either absent
+boundary retain the current `NO_FLAT_START`/`NO_FLAT_END` precedence. Equity
+includes both effective bounds, so its slice uses `bisect_left` at the start
+and `bisect_right` at the end. Actions exclude the effective start and include
+the end, so both slice positions use `bisect_right`. The source-independent
+`OUT_OF_RANGE` return still precedes flat preparation. Duplicate timestamps
+retain loader secondary order and the first/last boundary choices. All
+`WindowMetrics` fields, Decimal types and operations, W0 fee/PnL exclusion,
+carry-in, wallet baseline, drawdown, round trips, unavailable reasons and
+persisted deterministic fields must match the linear calculation exactly.
+
+Acceptance uses a fixed actual-schema source with 4000 hourly actions, 4001
+equity rows, seven distinct selection windows and seven `AVAILABLE` outcomes.
+Compare complete typed metrics and stored deterministic columns for duplicate
+boundaries and each unavailable reason; prove the loader's ordered contract
+with shuffled physical insertion. Benchmark the seven sequential calculator
+calls with one source load and one flat preparation outside timing in both
+modes, using the same seed and paired samples. Exact output parity is required.
+Proceed only if the predeclared robust timing criterion shows at least a 10%
+median reduction; otherwise revert this optional optimization and record the
+measured result. Independent review, full tests and a scoped commit remain
+required. `safe_to_delete=YES` remains deferred.
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,

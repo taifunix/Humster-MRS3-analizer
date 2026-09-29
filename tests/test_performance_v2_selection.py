@@ -1140,6 +1140,7 @@ def test_selection_window_job_shares_one_flat_timeline_in_requested_order(tmp_pa
     flat_calls = 0
     flat_values: list[tuple[datetime, ...]] = []
     calculate_flat_values: list[tuple[datetime, ...] | None] = []
+    ordered_flags: list[bool | None] = []
 
     def counted_load(_connection, _result_id):
         nonlocal load_calls
@@ -1155,6 +1156,7 @@ def test_selection_window_job_shares_one_flat_timeline_in_requested_order(tmp_pa
 
     def counted_calculate(*args, **kwargs):
         calculate_flat_values.append(kwargs.get("flat_samples"))
+        ordered_flags.append(kwargs.get("ordered_source"))
         return original_calculate(*args, **kwargs)
 
     monkeypatch.setattr(selection_module, "_cached_many", lambda _connection, _result_id, requested, _version: tuple(None for _ in requested))
@@ -1168,6 +1170,7 @@ def test_selection_window_job_shares_one_flat_timeline_in_requested_order(tmp_pa
     assert load_calls == flat_calls == 1
     assert len(calculate_flat_values) == len(windows) == 7
     assert all(value is flat_values[0] for value in calculate_flat_values)
+    assert ordered_flags == [True] * 7
     assert flat_values[0] == original_flat(source[3], source[2])
 
     reversed_windows = tuple(reversed(windows))
@@ -1180,6 +1183,7 @@ def test_selection_window_job_shares_one_flat_timeline_in_requested_order(tmp_pa
     assert reversed_result.metrics == reversed_expected
     assert load_calls == flat_calls == 2
     assert all(value is flat_values[1] for value in calculate_flat_values[7:])
+    assert ordered_flags == [True] * 14
     assert flat_values[0] is not flat_values[1]
 
 
@@ -1198,7 +1202,7 @@ def test_selection_window_job_calculates_only_missing_windows_with_one_flat_time
     flat_values: list[tuple[datetime, ...]] = []
 
     def counted_calculate(*args, **kwargs):
-        calculated.append((args, kwargs.get("flat_samples")))
+        calculated.append((args, kwargs.get("flat_samples"), kwargs.get("ordered_source")))
         return original_calculate(*args, **kwargs)
 
     monkeypatch.setattr(selection_module, "_cached_many", lambda *_args: cached)
@@ -1215,7 +1219,7 @@ def test_selection_window_job_calculates_only_missing_windows_with_one_flat_time
     assert result.metrics == expected
     assert len(calculated) == len(windows) - 2 == 5
     assert len(flat_values) == 1
-    assert all(kwargs is flat_values[0] for _args, kwargs in calculated)
+    assert all(flat is flat_values[0] and ordered is True for _args, flat, ordered in calculated)
 
 
 def test_selection_window_job_fully_cached_does_no_source_or_flat_work(tmp_path: Path, monkeypatch) -> None:

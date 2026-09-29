@@ -346,14 +346,20 @@ scope добавление scope workers не ускоряет последов�
   and stored-field hashes. Actual-schema seven-run paired benchmark reduced source
   reads 2→1 and pair median 0.515420 s→0.346342 s (32.80% cold-pair stage only);
   no whole-selection, analysis, import, or production-tail speed claim is made.
-- [ ] **CALC-01 — семь окон.** `performance_v2_windows.py`, `performance_v2_selection.py`.
+- [x] **CALC-01 — семь окон.** `performance_v2_windows.py`, `performance_v2_selection.py`.
   Selection уже читает source один раз/result. Переиспользовать flat timeline и boundary
   indexes; сохранить window-local peaks, fees, W0 exclusion и все metrics.
   Cold recalculation **15–35%** вместе с CALC-02.
   CALC-01a flat-timeline reuse accepted after independent Opus 5/high
   `CODE_REVIEW_PASS`: 403 related tests passed; fixed seven-window calculation
   median 0.069731 s versus 0.050920 s with identical typed output. Boundary
-  indexes remain unimplemented and evidence-gated, so CALC-01 stays open.
+  CALC-01b ordered boundary search is selection-only; scalar, pair and
+  unordered portfolio callers retain the linear path. Independent Opus 5/high
+  R3 `PLAN_APPROVED` and R2 `CODE_REVIEW_PASS`; full suite 5,582 passed/9
+  Windows symlink skips/30 warnings. Exact seven-window metrics SHA matched on
+  a 4,000-action/4,001-equity actual-schema fixture. Twenty-one alternating
+  same-process pairs reduced calculation-only median 0.038658 s to 0.031973 s
+  (17.3%); this does not measure whole selection or import.
 - [x] **CALC-02 — cache statements.** Bulk/native upsert вместо per-window statements
   внутри уже существующей batch transaction. Сохранить all-or-none publication.
   R9 accepted after independent Claude Opus 5/high `CODE_REVIEW_PASS`: fresh full
