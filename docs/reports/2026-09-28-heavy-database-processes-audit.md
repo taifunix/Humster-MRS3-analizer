@@ -578,6 +578,45 @@ for two scalar calls and 0.346342 s for the pair. Scalar range was
 median describes this cold-pair fixture only; it does not measure whole
 selection, Source analysis, Performance import or the reported import tail.
 
+## CACHE-01 measured fully warm selection helper (2026-09-29)
+
+The fully warm ordinary selection worker now returns no rows for publication.
+The batch coordinator therefore skips its writer connection and transaction;
+cached windows, readiness, candidate facts and progress callbacks remain the
+same. Partial ordinary batches still republish their complete ordered metric
+set. Ordinary preview was already read-only. Window `calculated_at_utc` is a
+Panel candidate-LRU token input, so avoiding redundant timestamp updates also
+avoids invalidating that token when facts have not changed.
+
+An actual-schema DuckDB seed with three ACTIVE results and 21 cached windows
+had SHA-256 `0f30a129e633e94149e3e0f79dcfce3024ead5efed803c201c81a8a9fc3c0888`.
+The pinned pre-edit `67f1e99` baseline and candidate used the same ignored
+harness, seed, cohort, one worker, and seven measured fresh-seed runs after one
+warm-up each. These were separate sequential sweeps, not cross-commit
+alternating samples. Every baseline run opened four readers and two writers,
+began/committed two transactions, and offered 21 cached rows in two bulk
+persistence calls. Every candidate run opened four readers and no writers,
+transactions or persistence calls. Source loads/calculations stayed at zero;
+callbacks stayed `[2, 1]`. The substantive stored-row SHA-256 was identical
+across arms, `f2a4ae6a0397197234f50fd2dc5e0a98bf73c30b90665cf77e96a98b0dced02c`.
+
+Median elapsed time was 0.325610 s before and 0.204175 s after, a 37.3%
+reduction for this three-result warm-helper fixture. Baseline range was
+0.300606–0.361737 s; candidate range was 0.178534–0.234249 s. These numbers
+do not measure whole selection/preview, PerformanceDB import, or its reported
+long completion tail. The changed-source-revision regression proves that the
+ordinary warm path still makes no source-revision recheck; its previous writer
+loop had no recheck to remove.
+
+TDD RED caught the seven-row private write set and a public writer open. The
+selection suite passed 181 tests, related windows/equity 253, and
+Panel/export/portfolio 531 with five Windows symlink skips. Fresh full-suite
+verification passed 5,570 tests with nine Windows symlink skips and 30 warnings
+in 1,556.37 seconds. Independent Opus 5/high returned `CODE_REVIEW_PASS`;
+CACHE-01 is accepted. The latest read-only local journal check still found the
+409-report September 24 import without `phase_seconds`, so the next
+representative import is needed to attribute its completion tail.
+
 ## Карта покрытия и ограничения
 
 | Контур | Просмотренные модули | Итог |

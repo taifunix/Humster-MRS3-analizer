@@ -587,6 +587,53 @@ otherwise report work-count reduction only. Independent CODE_REVIEW_PASS
 and a scoped commit are required; no live database/tester or push.
 
 
+## CACHE-01: skip publication for a fully warm selection window batch
+
+Goal: when all required windows for a result are cached and
+`include_equity=False`, return an empty write set from
+`_selection_window_job`. `prepare_selection_window_cache` must not open a
+writer, begin a transaction or republish those seven rows. It still completes
+each batch and calls `on_batch_complete(len(completed))` once. The public helper
+returns `None`; its Panel callers at `panel.py:5186,5547,5613` and portfolio
+input caller ignore that value. Selection status, missing IDs, availability,
+readiness and candidate metrics must remain the same.
+
+The existing fully warm branch returns before assigning `source_recheck`, so
+its value is `None` for both equity modes. Today the no-equity branch opens a
+writer to republish cached metrics, but the writer's `source_rechecks` loop is
+empty. There is no source-revision guard or stale-row repair to remove; the
+fully warm equity branch already skips the writer. A changed source revision
+with unchanged window key/version remains a cache hit, as before, and this
+step neither invalidates nor recomputes it. Mixed cached/missing no-equity
+jobs retain their complete ordered seven-metric write set. Equity-only,
+missing-window equity, version mismatch, failures and writer rollback remain
+unchanged.
+
+Consumer inventory for the observable `window_metrics.calculated_at_utc`
+change: `performance_v2_windows.py:472,477,496,504` writes it;
+`performance_v2_store.py:310,544` declares/validates it; `panel.py:5377`
+uses `max(wm.calculated_at_utc)` in the selection candidate LRU facts token,
+alongside a hash of substantive metric columns. Other production
+`calculated_at_utc` hits in `performance_v2_equity_cache.py` and
+`performance_v2_store.py:434,668` belong to equity facts, not window cache.
+No production reader uses the window timestamp for TTL, expiry, readiness,
+display or sorting. A fully warm no-op now leaves that LRU token stable instead
+of changing it through redundant republishing; substantive changed rows still
+change the token. No new revision read or worker setting is added.
+
+Acceptance: first publish real fixture rows, then run a fully warm no-equity
+batch with a writer-open guard on the selection module's `duckdb.connect` and
+fail-fast source/calculation/persistence spies. Assert full stored rows,
+including timestamps, and selection status before/after; public return is
+`None`, with unchanged per-batch callback counts. Repeat with changed source
+revision metadata but the same window keys to prove the existing no-recheck
+contract. Record a bare read-only open/close hash control before treating a
+physical DuckDB file hash as an assertion; otherwise use the hash for diagnosis
+only. Compare actual-schema warm-batch timings and writer counts before/after,
+without claiming whole-preview or import speedup. Independent review and a
+scoped commit are required.
+
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,

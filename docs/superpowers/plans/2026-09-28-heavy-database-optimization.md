@@ -363,11 +363,13 @@ scope добавление scope workers не ускоряет последов�
   versus bulk 0.314956 s (97.9% write-stage reduction only). Duplicate rejection,
   Decimal/INTEGER failure rollback/reopen, source rechecks, checked-equity,
   commit, and rollback were verified; no whole-selection/import or production-tail
-  speed claim is made. CALC-01 boundary indexes, IMP-02 tail attribution, and
-  WIN-01 remain open.
-- [ ] **CACHE-01 — helper no-republish.** Для fully-valid cache и `include_equity=False`
+  speed claim is made. CALC-01 boundary indexes and IMP-02 tail attribution
+  remain open.
+- [x] **CACHE-01 — helper no-republish.** Для fully-valid cache и `include_equity=False`
   вернуть пустой write set, сохранив доступность результата и progress. Обычный preview
   уже read-only; не выдавать это за новый фикс всего preview. Readiness/completeness остаются.
+
+  R3 accepted after independent Claude Opus 5/high `CODE_REVIEW_PASS`: full suite 5,570 passed/9 skipped/30 warnings; focused selection 181 passed; related windows/selection/equity 253 passed; Panel/export contour 531 passed/5 skipped. Actual-schema warm-helper fixture preserved 21 rows, timestamps, status, missing and candidate availability with identical content hash; writers/transactions changed 2→0 and submitted rows 21→0, with median 0.325610 s→0.204175 s (37.3% helper-fixture reduction only). No whole-import/preview claim; IMP-02 tail attribution remains open.
 
 Equity-only full-history aggregate и bounded path+sentinels имеют разные функции,
 одно чтение не удаляется как дубликат. LRU hit не сканирует raw actions; cold candidate

@@ -110,8 +110,26 @@ counts were unchanged. Median elapsed was 0.515420 s versus 0.346342 s, a 32.8%
 reduction for this cold-pair fixture only; all pair times were below all scalar
 times. Fresh full-suite verification passed 5,569 tests, with nine existing
 Windows symlink skips and 30 warnings in 1,504.19 seconds. Independent Opus
-5/high returned `CODE_REVIEW_PASS`; WIN-01 is accepted. CACHE-01 planning is
-next; its code remains untouched until a separate approved contract and review.
+5/high returned `CODE_REVIEW_PASS`; WIN-01 is accepted. CACHE-01 R3 then
+received independent Opus 5/high `PLAN_APPROVED`. The fully warm ordinary
+selection helper now returns an empty write set, leaving partial-cache and
+equity paths unchanged. TDD RED observed seven redundant returned metrics and
+a real writer open; GREEN preserved all 21 stored window rows/timestamps,
+readiness, missing IDs, candidate availability, the public `None` return and
+callbacks `[2, 1]`. A changed source revision remains an ordinary warm cache
+hit, as before; the old writer loop had no revision recheck. Focused selection
+passed 181 tests, related windows/equity 253, and Panel/export/portfolio 531
+with five Windows skips. A fresh full suite passed 5,570 tests with nine
+Windows symlink skips and 30 warnings in 1,556.37 seconds, one added case
+over WIN-01. On a fixed actual-schema three-result/21-window warm fixture,
+seven separate sequential baseline/candidate runs reduced writer opens and
+transactions from two to zero and rows offered for persistence from 21 to
+zero; semantic rows and callbacks matched. Median helper time fell from
+0.325610 to 0.204175 seconds (37.3% for this fixture only). Independent Opus
+5/high returned `CODE_REVIEW_PASS`; CACHE-01 is accepted. The real 409-report
+PerformanceDB import tail still lacks phase evidence because that run
+predated T13e instrumentation. Remaining IMP-02, CALC-01 and SEL-02 work stays
+open; do not infer whole-import or whole-preview speedup from CACHE-01.
 T4/COR-05 preserves actual HTML action order and keeps strict final-balance
 validation based on the latest timestamp/source-index witness. Swapped HTML
 is rejected as ACTIONS_OUT_OF_ORDER while a valid sibling commits; equal-time

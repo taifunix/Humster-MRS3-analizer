@@ -1233,7 +1233,9 @@ def test_selection_window_job_fully_cached_does_no_source_or_flat_work(tmp_path:
 
     result = selection_module._selection_window_job(str(database), result_id, report_start, report_end, 5)
 
-    assert result.metrics is cached
+    assert result.metrics == ()
+    assert result.equity_publication is None
+    assert result.source_recheck is None
 
 
 @pytest.mark.parametrize("equity_index", [None, 0])
@@ -2067,6 +2069,100 @@ def test_warm_noop_preparation_reports_completed_batch(tmp_path: Path) -> None:
     )
 
     assert completed == [1]
+
+
+def test_warm_selection_batch_skips_writer_and_preserves_public_state(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    _clone_current_candidate(connection, "beta")
+    _clone_current_candidate(connection, "gamma")
+    result_id = int(connection.execute("select result_id from strategy_results order by result_id limit 1").fetchone()[0])
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    config = SelectionConfig()
+    prepare_selection_window_cache(database, request, config, workers=1)
+
+    original_connect = selection_module.duckdb.connect
+    with original_connect(str(database), read_only=True) as reader:
+        before_revision = equity_source_revision(current_equity_source_metadata(reader, result_id))
+    with original_connect(str(database)) as writer:
+        writer.execute(
+            "update strategy_results set imported_at_utc = imported_at_utc + interval '1 second' where result_id = ?",
+            [result_id],
+        )
+    with original_connect(str(database), read_only=True) as reader:
+        after_revision = equity_source_revision(current_equity_source_metadata(reader, result_id))
+        assert after_revision != before_revision
+        assert selection_cache_status(reader, request, config, include_readiness_breakdown=True) == {
+            "total": 3, "missing": 0, "ready": True, "window_missing": 0, "equity_missing": 0,
+        }
+        assert selection_cache_missing_strategy_ids(reader, request, config) == ()
+
+    def public_state() -> tuple[object, ...]:
+        with original_connect(str(database), read_only=True) as reader:
+            columns = [row[0] for row in reader.execute(
+                "select column_name from information_schema.columns where table_name = 'window_metrics' order by ordinal_position"
+            ).fetchall()]
+            rows = reader.execute(
+                "select " + ", ".join(columns) + " from window_metrics "
+                "order by result_id, requested_start_utc, requested_end_utc"
+            ).fetchall()
+            candidates = load_selection_candidates(reader, request, config, cache_only=True)
+            availability = tuple(
+                (
+                    int(row["result_id"]),
+                    row["positive_quarter_count"],
+                    row["positive_quarter_available_count"],
+                    row["positive_quarter_status"],
+                )
+                for _, row in candidates.sort_values("result_id").iterrows()
+            )
+            return (
+                tuple(rows),
+                selection_cache_status(reader, request, config, include_readiness_breakdown=True),
+                selection_cache_missing_strategy_ids(reader, request, config),
+                availability,
+            )
+
+    before_state = public_state()
+    assert len(before_state[0]) == 21
+    hash_a = hashlib.sha256(database.read_bytes()).hexdigest()
+    with original_connect(str(database), read_only=True):
+        pass
+    hash_b = hashlib.sha256(database.read_bytes()).hexdigest()
+
+    connection_modes: list[bool] = []
+
+    def guarded_connect(*args, **kwargs):
+        read_only = kwargs.get("read_only") is True
+        connection_modes.append(read_only)
+        if not read_only:
+            raise AssertionError("CACHE-01 opened writable DuckDB connection")
+        return original_connect(*args, **kwargs)
+
+    def forbidden(name: str):
+        def fail(*_args, **_kwargs):
+            raise AssertionError(f"CACHE-01 called {name}")
+        return fail
+
+    monkeypatch.setattr(selection_module.duckdb, "connect", guarded_connect)
+    for name in ("_persist_many", "_load_source", "_flat_samples", "_calculate", "current_equity_source_metadata"):
+        monkeypatch.setattr(selection_module, name, forbidden(name), raising=False)
+
+    completed: list[int] = []
+    result = prepare_selection_window_cache(
+        database, request, config, workers=1, on_batch_complete=completed.append,
+    )
+    assert result is None
+    assert completed == [2, 1]
+    assert connection_modes == [True] * 4
+    after_state = public_state()
+    assert after_state == before_state
+    hash_c = hashlib.sha256(database.read_bytes()).hexdigest()
+    if hash_a == hash_b:
+        assert hash_b == hash_c
+    else:
+        print(f"hash control inconclusive: A={hash_a} B={hash_b} C={hash_c}")
 
 
 def test_equity_only_cold_warmup_uses_bounded_equity_without_legacy_source_or_actions(

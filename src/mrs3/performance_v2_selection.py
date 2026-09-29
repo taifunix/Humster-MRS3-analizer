@@ -693,7 +693,7 @@ def _selection_window_job(
         else:
             equity_facts = None
         if not missing_windows and not equity_missing:
-            return _SelectionWindowJobResult(() if include_equity else tuple(cached), None)
+            return _SelectionWindowJobResult((), None)
 
         publication: tuple[Mapping[str, object], EquityQualityFacts] | None = None
         source_recheck: Mapping[str, object] | None = None
