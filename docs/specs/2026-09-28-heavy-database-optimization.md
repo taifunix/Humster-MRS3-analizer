@@ -332,6 +332,31 @@ before/after timing reports only the observed stage gain. The audit's
 expectations, not delivered gains or acceptance thresholds. T7-D3 received
 independent Opus 5/high `PLAN_APPROVED`.
 
+## OPT-01b: builder-local source document reuse
+
+`build_prepared_input` currently materializes the same `OptimizerSourceInput`
+document four times on an AVAILABLE path: once for its digest, once for
+availability, once for prepared rows and once for cycle reconstruction.
+Reuse the builder's prepared-row document for availability and cycle records,
+leaving the existing `source_digest(source)` call and its position unchanged.
+The builder path should call `to_document()` twice when AVAILABLE or
+UNAVAILABLE. In the Phase 8 importer, which independently computes a digest,
+this reduces the corresponding full source serializations from five to three;
+both digest computations and the writer's source rechecks remain intact.
+
+Keep `prepared_availability(source)` and `_cycle_records(source)` direct callers
+working as before. The latter has a portfolio-input caller, so any optional
+document argument must be keyword-only and default to the original conversion.
+Do not change importer runtime, preparation schema, canonical JSON/digest,
+reasons, byte limit, row order, reconstruction, transaction or trust rules.
+
+Acceptance: a failing-before conversion-count regression for AVAILABLE and
+UNAVAILABLE builder paths, frozen digest and exact prepared JSON/reason parity,
+direct helper and portfolio caller coverage, and relevant optimizer/import/
+portfolio tests. Record a fixed synthetic preparation-only before/after timing
+as stage evidence, with no whole-import percentage claim. OPT-01b-D3 received
+independent Opus 5/high `PLAN_APPROVED`.
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,

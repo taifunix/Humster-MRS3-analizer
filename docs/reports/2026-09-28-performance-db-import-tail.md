@@ -65,6 +65,16 @@ before and 1.159939 s after, about 18% lower for preparation alone. The baseline
 helper emulates the extra pre-change digest; three samples per variant matched
 1,371,304 prepared bytes and SHA-256. This remains synthetic evidence;
 independent Opus 5/high returned `CODE_REVIEW_PASS`; OPT-01a is accepted.
+OPT-01b reuses the builder's document across availability, prepared rows and
+cycle reconstruction while keeping its digest and the importer's independent
+digest. The AVAILABLE Phase 8 path therefore constructs five source documents
+before versus three after; digest passes remain two. Optimizer 32, portfolio
+146 and importer 91 tests passed; independent Opus 5/high returned
+`CODE_REVIEW_PASS`. On a fixed 1,000-cycle/2,000-action/3,000-equity source,
+old-path emulation and the new builder emitted identical 1,368,304-byte JSON
+(SHA-256 `4b0f3fe942bacb917bde35613069a0467650e37fa394e5d07b74802c44b71f4a`).
+Five alternating warmed samples gave medians 0.636346 s versus 0.424615 s,
+33.3% lower for preparation only. No whole-import speed gain is inferred.
 
 The original shared Panel job journal contains 109 jobs and 86,687,437 bytes
 (82.67 MiB). A read-only, in-memory probe measured three repetitions of the

@@ -279,6 +279,10 @@ scope добавление scope workers не ускоряет последов�
   1,000-cycle preparation median about 18% lower with identical bytes/digests.
   Independent Opus 5/high `CODE_REVIEW_PASS`; OPT-01a accepted. Broader
   OPT-01 sharing remains open.
+  OPT-01b builder-local document reuse accepted after independent Opus 5/high
+  `CODE_REVIEW_PASS`: optimizer 32, portfolio 146, import 91 passed; 1,000-cycle
+  preparation-only warm median 0.636346 s versus 0.424615 s with byte-identical
+  output. Other OPT-01 sharing and whole-import measurement remain open.
 - [ ] **IMP-03 — общий HTML inventory.** `performance_v2_html.py`, `performance.py`.
   Переиспользовать decode/raw-markup inventory current-header gate и общего parser.
   Не убирать required/duplicate header, size/action limits и source order checks.

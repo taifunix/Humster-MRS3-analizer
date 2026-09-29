@@ -136,6 +136,17 @@ with frozen source digests and prepared JSON bytes/SHA. Optimizer tests passed
 (about 18% lower for preparation alone), with identical payload identity.
 Independent Opus 5/high returned CODE_REVIEW_PASS; OPT-01a is accepted.
 Source rechecks and the exact byte limit remain; broader OPT-01 is open.
+OPT-01b reuses the builder's canonical source document for availability and
+cycle reconstruction. AVAILABLE, UNAVAILABLE and size-rejection paths now
+construct two documents within the builder, versus four on the old AVAILABLE
+path; the Phase 8 caller's separate digest means five versus three documents
+on an AVAILABLE import. Both digests, source rechecks and byte limits remain.
+RED had 3 failures; GREEN optimizer 32, portfolio 146 and importer 91 passed.
+A fixed 1,000-cycle/2,000-action/3,000-equity preparation comparison yielded
+identical 1,368,304-byte JSON and SHA-256, with warm medians 0.636346 s before
+versus 0.424615 s after (33.3% lower for preparation only). Independent Opus
+5/high returned `CODE_REVIEW_PASS`; OPT-01b is accepted. Other OPT-01 sharing
+and whole-import latency measurement remain open.
 The existing legacy-campaign migration passed read-only geometry/disk-space
 preflight for 10 failed and 4 committed records; it has not been run on the
 live journal. The J4 combined Panel contour with seven exact baseline-failing

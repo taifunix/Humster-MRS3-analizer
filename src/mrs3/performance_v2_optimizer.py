@@ -341,8 +341,7 @@ class PreparedAvailability:
         return self.status == "AVAILABLE"
 
 
-def prepared_availability(source: OptimizerSourceInput) -> PreparedAvailability:
-    document = source.to_document()
+def _prepared_availability_document(document: Mapping[str, Any]) -> PreparedAvailability:
     if not document["actions"] or not document["equity"]:
         return PreparedAvailability("UNAVAILABLE", MISSING_TYPED_FACTS)
     required_action_fields = ("price", "cost", "post_size", "balance")
@@ -363,11 +362,20 @@ def prepared_availability(source: OptimizerSourceInput) -> PreparedAvailability:
     return PreparedAvailability("AVAILABLE")
 
 
-def _cycle_records(source: OptimizerSourceInput) -> tuple[dict[str, Any], ...]:
+def prepared_availability(source: OptimizerSourceInput) -> PreparedAvailability:
+    return _prepared_availability_document(source.to_document())
+
+
+def _cycle_records(
+    source: OptimizerSourceInput,
+    *,
+    document: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], ...]:
     # The existing report adapter/reconstructor is the sole cycle algorithm.
     from .portfolio.reports import performance_rows_to_report_actions, reconstruct_cycles
 
-    document = source.to_document()
+    if document is None:
+        document = source.to_document()
     sizing = document["sizing"]
     dynamic_basis = (
         sizing.get("sizing_use_upnl") is True
@@ -718,13 +726,13 @@ def build_prepared_input(source: OptimizerSourceInput, *, preparation_version: s
     if not isinstance(preparation_version, str) or not preparation_version.strip():
         raise OptimizerIntegrityError("preparation_version is required")
     digest = source_digest(source)
-    availability = prepared_availability(source)
+    document = source.to_document()
+    availability = _prepared_availability_document(document)
     if not availability.available:
         raise OptimizerUnavailableError(availability.reason or MISSING_TYPED_FACTS)
-    document = source.to_document()
     prepared = PreparedOptimizerInput(
         preparation_version.strip(), source.result_id, digest,
-        tuple(document["actions"]), tuple(document["equity"]), _cycle_records(source),
+        tuple(document["actions"]), tuple(document["equity"]), _cycle_records(source, document=document),
     )
     prepared.to_json()  # apply the exact stored-byte limit before persistence
     return prepared

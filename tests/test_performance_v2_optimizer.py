@@ -127,6 +127,56 @@ def test_availability_reasons_are_stable() -> None:
     assert prepared_availability(_source(sizing_use_fix=True)).reason == "UNSUPPORTED_SIZING"
 
 
+@pytest.mark.parametrize("overrides", [{}, {"sizing_use_upnl": None}])
+def test_builder_reuses_canonical_document_for_available_and_unavailable_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+) -> None:
+    source = _source(**overrides)
+    real_to_document = OptimizerSourceInput.to_document
+    calls = 0
+
+    def counting_to_document(value: OptimizerSourceInput) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return real_to_document(value)
+
+    monkeypatch.setattr(OptimizerSourceInput, "to_document", counting_to_document)
+    availability, prepared = optimizer_module.prepare_optimizer_input(source)
+
+    assert calls == 2
+    assert availability.status == ("AVAILABLE" if overrides == {} else "UNAVAILABLE")
+    assert (prepared is not None) == (overrides == {})
+
+
+def test_builder_reuses_canonical_document_before_prepared_size_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    real_to_document = OptimizerSourceInput.to_document
+    calls = 0
+
+    def counting_to_document(value: OptimizerSourceInput) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return real_to_document(value)
+
+    monkeypatch.setattr(OptimizerSourceInput, "to_document", counting_to_document)
+    monkeypatch.setattr(optimizer_module, "PREPARED_MAX_BYTES", 1)
+    availability, prepared = optimizer_module.prepare_optimizer_input(source)
+
+    assert calls == 2
+    assert availability == optimizer_module.PreparedAvailability("UNAVAILABLE", "PREPARED_TOO_LARGE")
+    assert prepared is None
+
+
+def test_cycle_records_accepts_builder_document_and_preserves_default() -> None:
+    source = _source()
+    document = source.to_document()
+
+    assert optimizer_module._cycle_records(source) == optimizer_module._cycle_records(source, document=document)
+
+
 def test_prepared_weighted_input_bypasses_raw_cycle_reconstruction(monkeypatch: pytest.MonkeyPatch) -> None:
     from mrs3.portfolio import input as portfolio_input
 
