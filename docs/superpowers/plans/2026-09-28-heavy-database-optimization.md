@@ -316,6 +316,10 @@ scope добавление scope workers не ускоряет последов�
   Selection уже читает source один раз/result. Переиспользовать flat timeline и boundary
   indexes; сохранить window-local peaks, fees, W0 exclusion и все metrics.
   Cold recalculation **15–35%** вместе с CALC-02.
+  CALC-01a flat-timeline reuse accepted after independent Opus 5/high
+  `CODE_REVIEW_PASS`: 403 related tests passed; fixed seven-window calculation
+  median 0.069731 s versus 0.050920 s with identical typed output. Boundary
+  indexes remain unimplemented and evidence-gated, so CALC-01 stays open.
 - [ ] **CALC-02 — cache statements.** Bulk/native upsert вместо per-window statements
   внутри уже существующей batch transaction. Сохранить all-or-none publication.
 - [ ] **CACHE-01 — helper no-republish.** Для fully-valid cache и `include_equity=False`

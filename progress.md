@@ -58,8 +58,18 @@ scope with global latest review, 1,025-row fetchmany boundary, uncommitted
 visibility and failure residue are covered; the module passed 66 tests.
 A fixed 102-run/3,264-row warm replay measured median 0.393356 s before
 versus 0.018067 s after (95.4% lower for replay only). Independent Opus 5/high
-R2 returned `CODE_REVIEW_PASS`; T7 is accepted. OPT-01b builder-local source
-document reuse is next; no whole-analysis or whole-import speed claim is made.
+R2 returned `CODE_REVIEW_PASS`; T7 is accepted. CALC-01a now computes one
+immutable flat timeline per cold selection result, while scalar callers and
+the fully cached path retain their behavior. RED had four expected failures;
+the seven new focused tests and 403 related windows/selection/equity/portfolio
+tests passed. A fixed 2,000-cycle, seven-window calculation-only comparison
+emitted identical ordered metrics (SHA-256
+`a20460daa2534e9c2196a77eb7101d3c8fcd348d83faae97f72f5eb2f64744d0`):
+eight alternating warm pairs measured median 0.069731 s before versus
+0.050920 s after (27.0% lower for this stage only). Independent Opus 5/high
+returned `CODE_REVIEW_PASS`; CALC-01a is accepted. CALC-02 bulk writing still
+needs a bound for direct callers with more than 64 workers. No whole-selection,
+whole-analysis or whole-import speed claim is made.
 Final integrated suite remains pending.
 T4/COR-05 preserves actual HTML action order and keeps strict final-balance
 validation based on the latest timestamp/source-index witness. Swapped HTML

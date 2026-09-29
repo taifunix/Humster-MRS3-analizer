@@ -357,6 +357,41 @@ portfolio tests. Record a fixed synthetic preparation-only before/after timing
 as stage evidence, with no whole-import percentage claim. OPT-01b-D3 received
 independent Opus 5/high `PLAN_APPROVED`.
 
+## CALC-01a: one flat timeline per cold selection result
+
+Within `_selection_window_job`, obtain missing windows from the existing
+positional cache lookup and load their source once. Compute `_flat_samples` once
+from that loaded source and pass the same immutable tuple to each missing
+window calculation. A fully cached result must neither load the source nor
+construct the timeline. Keep the cached `zip(cached, windows)` mapping, result
+order, write selection, equity path, read-only workers and writer transaction
+unchanged; do not reuse the tuple across jobs or source revisions.
+
+`_calculate` gains only a private keyword-only optional `flat_samples` value.
+`None` retains its current scalar behavior; an explicitly supplied empty tuple
+is authoritative and must not trigger another `_flat_samples` call. Preserve
+the initial out-of-range branch and every later boundary search, filter,
+unavailable reason, W0 exclusion, tie order, Decimal operation and output
+type. The flat tuple is read-only and not retained by a returned metric.
+`_flat_samples` is a total, side-effect-free read over typed action/equity
+tuples, including empty equity and degenerate timelines. Eager preparation
+inside the missing-window branch may do one otherwise unnecessary pass when
+every missing window short-circuits as `OUT_OF_RANGE`; it must never change
+the returned rows, raise, or mutate source state. Cover all-out-of-range and
+mixed out-of-range/available jobs explicitly.
+Scalar, pair and portfolio-input callers keep their current path. No bisect,
+sorting, timestamp-index arrays, schema or metric-version change is included.
+
+Acceptance: RED/GREEN tests for explicit empty/nonempty flat tuples and exact
+scalar metric parity, shared tuple identity/content across forward/reverse
+multi-window evaluation, mixed cached/missing positions, and a fully cached
+zero-load/zero-calculation path. Run focused windows/selection and relevant
+portfolio/equity tests, then a fixed synthetic preparation-only before/after
+timing with exact metric identity. A non-improving timing records measured/no
+change rather than a whole-selection speed claim. CALC-02 bulk publication
+remains separate; direct callers can pass more workers than the Panel config
+cap, so its write bound must be settled in a separately approved plan.
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,

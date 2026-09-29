@@ -11,6 +11,8 @@ from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_windows import (
     METRICS_VERSION,
     _Action,
+    _calculate,
+    _Equity,
     _round_trips,
     WindowMetrics,
     compare_window_pair_geometrically,
@@ -20,6 +22,62 @@ from mrs3.performance_v2_windows import (
 
 
 UTC = timezone.utc
+
+
+def _typed_source() -> tuple[datetime, datetime, tuple[_Action, ...], tuple[_Equity, ...]]:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    actions = (
+        _Action(0, start, "opened", Decimal("1"), Decimal("0"), Decimal("0")),
+        _Action(1, start + timedelta(days=1), "closed", Decimal("0"), Decimal("5"), Decimal("1")),
+        _Action(2, start + timedelta(days=2), "opened", Decimal("1"), Decimal("0"), Decimal("0")),
+        _Action(3, start + timedelta(days=3), "closed", Decimal("0"), Decimal("5"), Decimal("1")),
+    )
+    equity = (
+        _Equity(0, start, Decimal("100"), Decimal("100")),
+        _Equity(1, start + timedelta(days=1), Decimal("105"), Decimal("105")),
+        _Equity(2, start + timedelta(days=2), Decimal("105"), Decimal("105")),
+        _Equity(3, start + timedelta(days=3), Decimal("110"), Decimal("110")),
+        _Equity(4, start + timedelta(days=4), Decimal("110"), Decimal("110")),
+    )
+    return start, start + timedelta(days=4), actions, equity
+
+
+def test_calculate_accepts_authoritative_flat_samples_without_changing_metrics(monkeypatch) -> None:
+    report_start, report_end, actions, equity = _typed_source()
+    calls = 0
+    original = windows_module._flat_samples
+
+    def counted(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(windows_module, "_flat_samples", counted)
+    no_start = _calculate(
+        1, report_start, report_end, METRICS_VERSION, report_start, report_end, actions, equity,
+        flat_samples=(),
+    )
+    no_end = _calculate(
+        1, report_start + timedelta(days=2), report_start + timedelta(days=2, hours=1),
+        METRICS_VERSION, report_start, report_end, actions, equity,
+        flat_samples=(report_start + timedelta(days=3), report_start + timedelta(days=4)),
+    )
+    supplied = (report_start + timedelta(days=1), report_start + timedelta(days=3), report_end)
+    with_flat = _calculate(
+        1, report_start, report_end, METRICS_VERSION, report_start, report_end, actions, equity,
+        flat_samples=supplied,
+    )
+
+    assert no_start.unavailable_reason == "NO_FLAT_START"
+    assert no_end.unavailable_reason == "NO_FLAT_END"
+    assert calls == 0
+
+    original_result = _calculate(
+        1, report_start, report_end, METRICS_VERSION, report_start, report_end, actions, equity,
+    )
+    assert type(with_flat) is WindowMetrics
+    assert with_flat == original_result
+    assert calls == 1
 
 
 def _db(tmp_path, *, scale: Decimal = Decimal("1")) -> tuple[duckdb.DuckDBPyConnection, int]:

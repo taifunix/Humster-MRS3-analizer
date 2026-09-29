@@ -21,7 +21,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 from .performance_v2_windows import (
     METRICS_VERSION, WindowMetrics, _METRIC_COLUMNS, _cached, _calculate,
-    _load_equity_samples_for_quality, _load_source, _metric_from_row, _persist,
+    _flat_samples, _load_equity_samples_for_quality, _load_source, _metric_from_row, _persist,
     calendar_window_days, get_or_calculate_window, get_or_calculate_window_pair,
 )
 from .performance_v2_equity_cache import (
@@ -699,10 +699,13 @@ def _selection_window_job(
         source_recheck: Mapping[str, object] | None = None
         if missing_windows:
             source = _load_source(connection, result_id)
+            flat_samples = _flat_samples(source[3], source[2])
             if include_equity:
                 source_recheck = metadata
             calculated = tuple(
-                metric if metric is not None else _calculate(result_id, start, end, METRICS_VERSION, *source)
+                metric if metric is not None else _calculate(
+                    result_id, start, end, METRICS_VERSION, *source, flat_samples=flat_samples
+                )
                 for metric, (start, end) in zip(cached, windows)
             )
             if equity_missing:

@@ -17,6 +17,7 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 import mrs3.performance_v2_equity_cache as equity_cache_module
 import mrs3.performance_v2_selection as selection_module
+import mrs3.performance_v2_windows as windows_module
 
 from mrs3.performance_v2_selection import (
     PerformanceV2SelectionError,
@@ -39,7 +40,7 @@ from mrs3.performance_v2_selection import (
     retest_cohort_request,
 )
 from mrs3.performance_v2_store import initialize_performance_v2
-from mrs3.performance_v2_windows import METRICS_VERSION, WindowMetrics, _cached
+from mrs3.performance_v2_windows import METRICS_VERSION, WindowMetrics, _calculate, _cached
 from mrs3.performance_v2_equity_cache import (
     EquityQualityCacheError,
     EquitySourceChangedError,
@@ -1115,6 +1116,205 @@ def _clone_current_candidate(connection: duckdb.DuckDBPyConnection, name: str) -
             [[result_id if column == "result_id" else value for column, value in zip(columns, row)] for row in rows],
         )
     return strategy_id, result_id
+
+
+def _selection_job_inputs(tmp_path: Path) -> tuple[Path, int, datetime, datetime]:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id, report_start, report_end = connection.execute(
+        "select result_id, report_start_utc, report_end_utc from strategy_results"
+    ).fetchone()
+    connection.close()
+    return database, int(result_id), report_start, report_end
+
+
+def test_selection_window_job_shares_one_flat_timeline_in_requested_order(tmp_path: Path, monkeypatch) -> None:
+    database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
+    with duckdb.connect(str(database), read_only=True) as connection:
+        source = selection_module._load_source(connection, result_id)
+    windows = _selection_windows(report_start, report_end, SelectionConfig(ab_final_days=5))
+    expected = tuple(_calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in windows)
+    original_calculate = selection_module._calculate
+    original_flat = windows_module._flat_samples
+    load_calls = 0
+    flat_calls = 0
+    flat_values: list[tuple[datetime, ...]] = []
+    calculate_flat_values: list[tuple[datetime, ...] | None] = []
+
+    def counted_load(_connection, _result_id):
+        nonlocal load_calls
+        load_calls += 1
+        return source
+
+    def counted_flat(equity, actions):
+        nonlocal flat_calls
+        flat_calls += 1
+        value = original_flat(equity, actions)
+        flat_values.append(value)
+        return value
+
+    def counted_calculate(*args, **kwargs):
+        calculate_flat_values.append(kwargs.get("flat_samples"))
+        return original_calculate(*args, **kwargs)
+
+    monkeypatch.setattr(selection_module, "_cached_many", lambda _connection, _result_id, requested, _version: tuple(None for _ in requested))
+    monkeypatch.setattr(selection_module, "_load_source", counted_load)
+    monkeypatch.setattr(selection_module, "_flat_samples", counted_flat, raising=False)
+    monkeypatch.setattr(selection_module, "_calculate", counted_calculate)
+
+    result = selection_module._selection_window_job(str(database), result_id, report_start, report_end, 5)
+
+    assert result.metrics == expected
+    assert load_calls == flat_calls == 1
+    assert len(calculate_flat_values) == len(windows) == 7
+    assert all(value is flat_values[0] for value in calculate_flat_values)
+    assert flat_values[0] == original_flat(source[3], source[2])
+
+    reversed_windows = tuple(reversed(windows))
+    monkeypatch.setattr(selection_module, "_selection_windows", lambda *_args: reversed_windows)
+    reversed_result = selection_module._selection_window_job(str(database), result_id, report_start, report_end, 5)
+    reversed_expected = tuple(
+        _calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in reversed_windows
+    )
+
+    assert reversed_result.metrics == reversed_expected
+    assert load_calls == flat_calls == 2
+    assert all(value is flat_values[1] for value in calculate_flat_values[7:])
+    assert flat_values[0] is not flat_values[1]
+
+
+def test_selection_window_job_calculates_only_missing_windows_with_one_flat_timeline(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
+    with duckdb.connect(str(database), read_only=True) as connection:
+        source = selection_module._load_source(connection, result_id)
+    windows = _selection_windows(report_start, report_end, SelectionConfig(ab_final_days=5))
+    expected = tuple(_calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in windows)
+    cached = tuple(metric if index in {1, 4} else None for index, metric in enumerate(expected))
+    original_calculate = selection_module._calculate
+    original_flat = windows_module._flat_samples
+    calculated: list[tuple[object, ...]] = []
+    flat_values: list[tuple[datetime, ...]] = []
+
+    def counted_calculate(*args, **kwargs):
+        calculated.append((args, kwargs.get("flat_samples")))
+        return original_calculate(*args, **kwargs)
+
+    monkeypatch.setattr(selection_module, "_cached_many", lambda *_args: cached)
+    monkeypatch.setattr(selection_module, "_load_source", lambda *_args: source)
+    monkeypatch.setattr(
+        selection_module, "_flat_samples",
+        lambda equity, actions: flat_values.append(original_flat(equity, actions)) or flat_values[-1],
+        raising=False,
+    )
+    monkeypatch.setattr(selection_module, "_calculate", counted_calculate)
+
+    result = selection_module._selection_window_job(str(database), result_id, report_start, report_end, 5)
+
+    assert result.metrics == expected
+    assert len(calculated) == len(windows) - 2 == 5
+    assert len(flat_values) == 1
+    assert all(kwargs is flat_values[0] for _args, kwargs in calculated)
+
+
+def test_selection_window_job_fully_cached_does_no_source_or_flat_work(tmp_path: Path, monkeypatch) -> None:
+    database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
+    with duckdb.connect(str(database), read_only=True) as connection:
+        source = selection_module._load_source(connection, result_id)
+    windows = _selection_windows(report_start, report_end, SelectionConfig(ab_final_days=5))
+    cached = tuple(_calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in windows)
+    monkeypatch.setattr(selection_module, "_cached_many", lambda *_args: cached)
+    monkeypatch.setattr(selection_module, "_load_source", lambda *_args: pytest.fail("cached result loaded source"))
+    monkeypatch.setattr(
+        selection_module, "_flat_samples", lambda *_args: pytest.fail("cached result built flat timeline"), raising=False,
+    )
+    monkeypatch.setattr(selection_module, "_calculate", lambda *_args, **_kwargs: pytest.fail("cached result calculated"))
+
+    result = selection_module._selection_window_job(str(database), result_id, report_start, report_end, 5)
+
+    assert result.metrics is cached
+
+
+@pytest.mark.parametrize("equity_index", [None, 0])
+def test_selection_window_job_all_out_of_range_prepares_at_most_one_flat_timeline(
+    tmp_path: Path, monkeypatch, equity_index: int | None,
+) -> None:
+    database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
+    with duckdb.connect(str(database), read_only=True) as connection:
+        original_source = selection_module._load_source(connection, result_id)
+    equity = () if equity_index is None else (original_source[3][equity_index],)
+    source = (*original_source[:3], equity)
+    outside_start = report_start - timedelta(days=31)
+    outside_end = report_start - timedelta(days=1)
+    windows = _selection_windows(outside_start, outside_end, SelectionConfig(ab_final_days=5))
+    expected = tuple(_calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in windows)
+    original_flat = windows_module._flat_samples
+    load_calls = 0
+    flat_calls = 0
+
+    def counted_load(*_args):
+        nonlocal load_calls
+        load_calls += 1
+        return source
+
+    def counted_flat(equity_value, actions):
+        nonlocal flat_calls
+        flat_calls += 1
+        return original_flat(equity_value, actions)
+
+    monkeypatch.setattr(selection_module, "_cached_many", lambda _connection, _result_id, requested, _version: tuple(None for _ in requested))
+    monkeypatch.setattr(selection_module, "_load_source", counted_load)
+    monkeypatch.setattr(selection_module, "_flat_samples", counted_flat, raising=False)
+
+    result = selection_module._selection_window_job(str(database), result_id, outside_start, outside_end, 5)
+
+    assert result.metrics == expected
+    assert all(metric.unavailable_reason == "OUT_OF_RANGE" for metric in result.metrics)
+    assert load_calls == 1
+    assert flat_calls <= 1
+
+
+def test_selection_window_job_mixed_out_of_range_and_available_reuses_one_flat_tuple(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
+    with duckdb.connect(str(database), read_only=True) as connection:
+        source = selection_module._load_source(connection, result_id)
+    windows = (
+        (report_start - timedelta(days=2), report_start - timedelta(days=1)),
+        (report_start, report_end),
+        (report_end + timedelta(days=1), report_end + timedelta(days=2)),
+    )
+    expected = tuple(_calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in windows)
+    original_calculate = selection_module._calculate
+    original_flat = windows_module._flat_samples
+    flat_values: list[tuple[datetime, ...]] = []
+    calculate_flat_values: list[tuple[datetime, ...] | None] = []
+
+    def counted_calculate(*args, **kwargs):
+        calculate_flat_values.append(kwargs.get("flat_samples"))
+        return original_calculate(*args, **kwargs)
+
+    monkeypatch.setattr(selection_module, "_selection_windows", lambda *_args: windows)
+    monkeypatch.setattr(selection_module, "_cached_many", lambda _connection, _result_id, requested, _version: tuple(None for _ in requested))
+    monkeypatch.setattr(selection_module, "_load_source", lambda *_args: source)
+    monkeypatch.setattr(
+        selection_module, "_flat_samples",
+        lambda equity, actions: flat_values.append(original_flat(equity, actions)) or flat_values[-1],
+        raising=False,
+    )
+    monkeypatch.setattr(selection_module, "_calculate", counted_calculate)
+
+    result = selection_module._selection_window_job(str(database), result_id, report_start, report_end, 5)
+
+    assert result.metrics == expected
+    assert len(flat_values) == 1
+    assert len(calculate_flat_values) == len(windows) == 3
+    assert all(value is flat_values[0] for value in calculate_flat_values)
+    assert result.metrics[0].unavailable_reason == "OUT_OF_RANGE"
+    assert result.metrics[1].availability_status == "AVAILABLE"
+    assert result.metrics[2].unavailable_reason == "OUT_OF_RANGE"
 
 
 def test_equity_warmup_shares_the_cold_selection_source_load(tmp_path: Path, monkeypatch) -> None:

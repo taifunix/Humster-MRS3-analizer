@@ -385,10 +385,12 @@ def _calculate(
     report_end: datetime,
     actions: tuple[_Action, ...],
     equity: tuple[_Equity, ...],
+    *,
+    flat_samples: tuple[datetime, ...] | None = None,
 ) -> WindowMetrics:
     if end < report_start or start > report_end or end < start or not equity:
         return WindowMetrics.unavailable(result_id, start, end, "OUT_OF_RANGE", version)
-    flat = _flat_samples(equity, actions)
+    flat = _flat_samples(equity, actions) if flat_samples is None else flat_samples
     effective_start = next((value for value in flat if value >= start), None)
     effective_end = next((value for value in reversed(flat) if value <= end), None)
     if effective_start is None:
