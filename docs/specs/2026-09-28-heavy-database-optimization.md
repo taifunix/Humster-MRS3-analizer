@@ -180,6 +180,26 @@ Record absolute stage delta and statement reduction without attributing the
 unmeasured production tail to this query. T13c-D2 received independent Opus
 5/high `PLAN_APPROVED`.
 
+T13d may batch only the in-transaction `strategies.updated_at_utc` updates for
+admitted `REPLACE` results. Collect each strategy ID at the existing update
+point after its `strategy_results` update succeeds, then apply the same shared
+publication timestamp after the report loop and before later publication work.
+Zero admitted replacements issue no update; one retains the scalar indexed
+update; multiple use ordered, bound `BIGINT[]`/`UNNEST` chunks of at most 1,024.
+Only successfully admitted replacements may be touched. `ADD` keeps its
+immediate `current_result_id` and timestamp update, including in a mixed
+ADD/REPLACE publication. Preserve the single transaction and whole-publication
+rollback, existing result IDs, wide result metadata, child data and counts,
+Phase 8 preparation, file ledger, RETEST handling and post-commit readback.
+No schema or public API changes. Acceptance requires exact timestamp and
+untouched-row parity, zero/singleton/multiple/chunk-boundary SQL counts, and
+rollback after an injected batch failure. Compare the timestamp-update stage
+on temporary initialized-schema DuckDB fixtures at 100k and 1m strategy rows;
+report absolute time and query-count changes without claiming an unmeasured
+whole-import or production-tail speedup. If the bounded batch does not improve
+the representative 409-ID stage, record measured/no-change and retain the
+scalar implementation.
+
 OPT-01 may first remove an unused digest computation verified by a source-digest
 call-count regression and byte-identical available/unavailable outputs. This
 does not reuse digests across source objects, snapshots, revisions or final IDs.

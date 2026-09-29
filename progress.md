@@ -120,6 +120,16 @@ scalar versus 0.0065/0.0080 s batch. Query-shaped 1m-strategy scattered
 medians were 0.2190 versus 0.0048 s. Independent Opus 5/high returned
 `CODE_REVIEW_PASS`; T13c is accepted. These are readback-stage results only;
 the cause and share of the unmeasured production import tail remain open.
+T13d batches admitted-REPLACE strategy timestamps within the existing publish
+transaction: 409 per-strategy UPDATEs become one bounded list UPDATE, while
+ADD and singleton behavior remain unchanged. TDD RED preceded the change;
+the importer passed 107 tests, related suites passed 327 with 6 Windows
+symlink skips, and a post-batch failure/retry regression passed after the final
+snapshot assertion. On temporary full-schema DuckDB fixtures, seven-trial
+409-ID timestamp-update medians were 0.2985 to 0.0035 s at 100k strategies
+and 0.4728 to 0.0067 s at 1m; all 409 rows and the unrelated sentinel were
+checked, with each trial rolled back. This is isolated stage evidence only;
+the production tail still lacks stage timings for Phase 8 and commit.
 The terminal Panel journal is 82.67 MiB/109 jobs; a read-only in-memory probe
 measured about 5.5 s median combined clone/serialization before disk write.
 J4 now avoids saving three unchanged terminal import polls in the private

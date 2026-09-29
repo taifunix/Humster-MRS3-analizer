@@ -289,6 +289,14 @@ scope добавление scope workers не ускоряет последов�
   temporary full-schema 100k-strategy DB the dense/scattered readback medians
   were 0.718/0.807 s before versus 0.0065/0.0080 s after. Publication and
   Phase8 work remain open; no production whole-import gain is claimed.
+  T13d admitted-REPLACE metadata publication accepted after independent Opus
+  5/high `CODE_REVIEW_PASS`: importer 107 passed, related input/store/RETEST/Panel
+  327 passed with 6 Windows symlink skips, and focused rollback snapshots passed
+  3. A full-schema DuckDB 1.5.5 benchmark on 409 scattered IDs measured scalar
+  versus batch medians of 0.2985/0.0035 s at 100k strategies and 0.4728/0.0067 s
+  at 1m, with exact row changes and sentinel preservation. Production tail and
+  whole-import speed remain unmeasured; Phase8, wider result metadata and commit
+  remain open, so IMP-02 stays unchecked.
 - [ ] **IMP-03 — общий HTML inventory.** `performance_v2_html.py`, `performance.py`.
   Переиспользовать decode/raw-markup inventory current-header gate и общего parser.
   Не убирать required/duplicate header, size/action limits и source order checks.

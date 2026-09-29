@@ -385,6 +385,49 @@ def test_append_rows_caches_validated_schema_only_within_supplied_cache() -> Non
     raw.close()
 
 
+def test_replace_timestamp_updates_use_scalar_and_bounded_batch_shapes() -> None:
+    raw = duckdb.connect(":memory:")
+    raw.execute("create table strategies (strategy_id bigint, updated_at_utc timestamptz)")
+    raw.executemany("insert into strategies values (?, null)", [(strategy_id,) for strategy_id in range(1, 2049)])
+    statements: list[tuple[str, object]] = []
+
+    class RecordingConnection:
+        def execute(self, sql: str, parameters=None):
+            if "update strategies set updated_at_utc" in sql.casefold():
+                statements.append((sql, parameters))
+            return raw.execute(sql, parameters) if parameters is not None else raw.execute(sql)
+
+    connection = RecordingConnection()
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
+    import_module._update_replacement_timestamps(connection, [], now)
+    assert statements == []
+
+    import_module._update_replacement_timestamps(connection, [7], now)
+    assert statements[0] == (
+        "update strategies set updated_at_utc = ? where strategy_id = ?",
+        [now, 7],
+    )
+
+    exact_ids = list(range(1, 1025))
+    import_module._update_replacement_timestamps(connection, exact_ids, now)
+    assert len(statements) == 2
+    assert "?::bigint[]" in statements[1][0].casefold()
+    assert "unnest" in statements[1][0].casefold()
+    assert statements[1][1] == [now, exact_ids]
+
+    ids = [1000, *range(1, 1026), 1000]
+    import_module._update_replacement_timestamps(connection, ids, now)
+    batch = statements[2:]
+    assert len(batch) == 2
+    assert all("?::bigint[]" in sql.casefold() and "unnest" in sql.casefold() for sql, _parameters in batch)
+    assert [parameters[1] for _sql, parameters in batch] == [
+        list(dict.fromkeys(ids))[:1024],
+        [1025],
+    ]
+    assert raw.execute("select count(*) from strategies where updated_at_utc = ?", [now]).fetchone() == (1025,)
+    raw.close()
+
+
 def test_phase8_source_input_uses_normalized_report_and_persisted_value_inputs(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
     prepared = read_performance_v2_inbox(request.inbox, request.report_root)
@@ -1087,6 +1130,184 @@ def test_replace_readback_batches_multiple_strategy_ids_and_keeps_manifest_order
     assert len(batch_queries) == 1
     assert scalar_queries == []
     assert batch_queries[0][1] == [list(strategy_ids.values())]
+
+
+def test_replace_timestamp_batch_updates_only_admitted_strategies_with_one_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta", "gamma"))
+    assert import_performance_v2(request).imported_count == 3
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target)) as connection:
+        strategy_ids = dict(connection.execute(
+            "select strategy_name, strategy_id from strategies order by strategy_name"
+        ).fetchall())
+        old_times = {
+            name: datetime(2026, 9, 20 + index, 12, tzinfo=timezone.utc)
+            for index, name in enumerate(("alpha", "beta", "gamma"))
+        }
+        for name, timestamp in old_times.items():
+            connection.execute(
+                "update strategies set updated_at_utc = ? where strategy_id = ?",
+                [timestamp, strategy_ids[name]],
+            )
+
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed, _failures = import_module._prepare_listing_ranges(request, prepared, (parsed, None, parsed))
+    replacement = PerformanceV2ImportRequest(
+        request.inbox,
+        request.report_root,
+        request.config,
+        mode="REPLACE",
+        replacement_strategy_ids={name: int(strategy_id) for name, strategy_id in strategy_ids.items()},
+        listing_dates_path=request.listing_dates_path,
+    )
+    now = datetime(2026, 9, 29, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(import_module, "_utc_now", lambda: now)
+    with duckdb.connect(str(target)) as connection:
+        assert import_module._publish(
+            connection, replacement, prepared, parsed, "timestamp-batch"
+        ) == (2, 0, 1)
+
+    with duckdb.connect(str(target), read_only=True) as connection:
+        actual = dict(connection.execute(
+            "select strategy_name, updated_at_utc from strategies order by strategy_name"
+        ).fetchall())
+    assert actual["alpha"] == now and actual["gamma"] == now
+    assert actual["beta"] == old_times["beta"]
+
+
+def test_add_mode_keeps_add_timestamp_inline_when_replace_is_batched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _ = _request(tmp_path, names=("alpha",))
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        alpha_id = int(connection.execute(
+            "select strategy_id from strategies where strategy_name = 'alpha'"
+        ).fetchone()[0])
+
+    second_root = tmp_path / "second"
+    inbox, report_root, _ = _inbox(second_root, names=("alpha", "gamma"))
+    listing_dates = second_root / "Input" / "dates.xlsx"
+    listing_dates.parent.mkdir()
+    workbook = Workbook()
+    workbook.active.append(["ONUSDT", datetime(2025, 12, 25)])
+    workbook.save(listing_dates)
+    alpha_report = report_root / "alpha.html"
+    alpha_bytes = alpha_report.read_bytes()
+    widened = alpha_bytes.replace(b"2026-01-01 - 2026-01-09", b"2026-01-01 - 2026-01-10", 1)
+    assert widened != alpha_bytes
+    alpha_report.write_bytes(widened)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["entries"][0]["source_report_sha256"] = sha256(widened).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    second_request = PerformanceV2ImportRequest(
+        inbox, report_root, request.config, listing_dates_path=Path("Input/dates.xlsx")
+    )
+
+    now = datetime(2026, 9, 29, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(import_module, "_utc_now", lambda: now)
+    calls: list[tuple[int, ...]] = []
+    update_timestamps = import_module._update_replacement_timestamps
+    monkeypatch.setattr(
+        import_module,
+        "_update_replacement_timestamps",
+        lambda connection, strategy_ids, timestamp: (
+            calls.append(tuple(strategy_ids)), update_timestamps(connection, strategy_ids, timestamp)
+        )[1],
+    )
+    assert import_performance_v2(second_request).imported_count == 2
+    with duckdb.connect(str(target), read_only=True) as connection:
+        rows = {
+            name: (strategy_id, timestamp)
+            for name, strategy_id, timestamp in connection.execute(
+                "select strategy_name, strategy_id, updated_at_utc from strategies order by strategy_name"
+            ).fetchall()
+        }
+    assert calls == [(alpha_id,)]
+    assert rows["alpha"][1] == now and rows["gamma"][1] == now
+
+
+def test_replace_timestamp_batch_failure_rolls_back_and_retry_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    assert import_performance_v2(request).imported_count == 2
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target)) as connection:
+        rows = connection.execute(
+            "select strategy_name, strategy_id, current_result_id from strategies order by strategy_name"
+        ).fetchall()
+        before = {
+            name: (int(strategy_id), int(result_id), datetime(2026, 9, 20 + index, 12, tzinfo=timezone.utc))
+            for index, (name, strategy_id, result_id) in enumerate(rows)
+        }
+        for strategy_id, _result_id, timestamp in before.values():
+            connection.execute(
+                "update strategies set updated_at_utc = ? where strategy_id = ?",
+                [timestamp, strategy_id],
+            )
+        publication_tables = {
+            "strategy_results": "select * from strategy_results order by result_id",
+            "strategy_actions": "select * from strategy_actions order by result_id, action_index",
+            "strategy_equity": "select * from strategy_equity order by result_id, sample_index",
+            "window_metrics": "select * from window_metrics order by result_id, requested_start_utc",
+            "equity_quality_metrics": "select * from equity_quality_metrics order by result_id, algo_version",
+            "optimizer_prepared_inputs": "select * from optimizer_prepared_inputs order by result_id",
+            "import_runs": "select * from import_runs order by import_run_id",
+            "import_files": "select * from import_files order by import_run_id, source_html_sha256",
+            "strategy_tags": "select * from strategy_tags order by strategy_id, tag",
+        }
+        before_publication = {
+            table: connection.execute(sql).fetchall()
+            for table, sql in publication_tables.items()
+        }
+    replacement = PerformanceV2ImportRequest(
+        request.inbox,
+        request.report_root,
+        request.config,
+        mode="REPLACE",
+        replacement_strategy_ids={name: values[0] for name, values in before.items()},
+        listing_dates_path=request.listing_dates_path,
+    )
+    now = datetime(2026, 9, 29, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(import_module, "_utc_now", lambda: now)
+    update_timestamps = import_module._update_replacement_timestamps
+
+    def fail_batch(connection, strategy_ids, timestamp):
+        if len(strategy_ids) > 1:
+            update_timestamps(connection, strategy_ids, timestamp)
+            raise RuntimeError("injected timestamp batch failure")
+        return update_timestamps(connection, strategy_ids, timestamp)
+
+    monkeypatch.setattr(import_module, "_update_replacement_timestamps", fail_batch)
+    with pytest.raises(PerformanceV2ImportError, match="injected timestamp batch failure"):
+        import_performance_v2(replacement)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        after_failure = {
+            name: (int(strategy_id), int(result_id), timestamp)
+            for name, strategy_id, result_id, timestamp in connection.execute(
+                "select s.strategy_name, s.strategy_id, s.current_result_id, s.updated_at_utc "
+                "from strategies s order by s.strategy_name"
+            ).fetchall()
+        }
+        after_failure_publication = {
+            table: connection.execute(sql).fetchall()
+            for table, sql in publication_tables.items()
+        }
+    assert after_failure == before
+    assert after_failure_publication == before_publication
+
+    monkeypatch.setattr(import_module, "_update_replacement_timestamps", update_timestamps)
+    assert import_performance_v2(replacement).imported_count == 2
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("select updated_at_utc from strategies order by strategy_name").fetchall() == [
+            (now,), (now,)
+        ]
 
 
 def test_replace_readback_omits_missing_and_null_rows_and_filtered_reports(

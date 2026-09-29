@@ -226,3 +226,25 @@ On a query-shaped 1m-strategy table, scattered medians were 0.2190 versus
 latency and exact output favored batching. This does not establish the share
 or cause of the observed 14-GB production import tail; stage timestamps for
 that run are unavailable.
+
+T13d batches only the in-transaction `strategies.updated_at_utc` writes for
+admitted replacement results. For 409 unique replacements, the timestamp-only
+statement count falls from 409 to one; zero replacements issue none and a
+singleton keeps the indexed scalar statement. ADD still updates its current
+result and timestamp immediately, including mixed ADD/REPLACE imports. The
+single transaction, wide `strategy_results` updates, child writes, Phase 8,
+ledger and post-commit readback are unchanged. An injected failure after the
+batch statement restored the strategy, result, child, prepared-input, import
+ledger and tag rows; retry succeeded. The importer suite passed 107 tests,
+related input/store/RETEST/Panel suites passed 327 with 6 Windows skips, and
+the focused test after the final snapshot assertion passed 3 tests.
+
+On temporary full-schema DuckDB 1.5.5 databases with 409 scattered IDs,
+seven alternating measured transactions per variant and rollback after each,
+the timestamp-update medians were 0.2985 s scalar versus 0.0035 s batch at
+100k strategies, and 0.4728 s versus 0.0067 s at 1m. Exactly 409 rows changed
+in each trial; an unrelated sentinel stayed unchanged. The batch plan used a
+sequential scan and hash join at both sizes. These differences are about
+0.295 and 0.466 seconds per 409 timestamps on the temporary fixtures, not a
+measured reduction of the 14-GB production import tail. Phase 8 and commit
+still need stage timing before their share of that delay is known.

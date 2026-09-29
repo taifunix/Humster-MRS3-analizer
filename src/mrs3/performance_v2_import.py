@@ -1073,6 +1073,26 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _update_replacement_timestamps(
+    connection: duckdb.DuckDBPyConnection,
+    strategy_ids: list[int],
+    now: datetime,
+) -> None:
+    unique_ids = list(dict.fromkeys(strategy_ids))
+    if len(unique_ids) == 1:
+        connection.execute(
+            "update strategies set updated_at_utc = ? where strategy_id = ?",
+            [now, unique_ids[0]],
+        )
+    elif len(unique_ids) > 1:
+        for start in range(0, len(unique_ids), 1024):
+            connection.execute(
+                "update strategies set updated_at_utc = ? "
+                "where strategy_id in (select unnest(?::BIGINT[]))",
+                [now, unique_ids[start:start + 1024]],
+            )
+
+
 def _validate_report(
     entry: PreparedV2Entry,
     report: ParsedPerformanceV2Report,
@@ -1551,6 +1571,7 @@ def _publish(
         imported = 0
         action_rows: list[tuple[object, ...]] = []
         equity_rows: list[tuple[object, ...]] = []
+        replacement_strategy_ids: list[int] = []
         result_files: dict[str, tuple[str, str, int, int, int, str]] = {}
         written_results: list[tuple[int, int, int]] = []
         written_phase8: list[tuple[int, int, PreparedV2Entry, ParsedPerformanceV2Report, Mapping[str, object], tuple[object | None, ...]]] = []
@@ -1655,10 +1676,7 @@ def _publish(
                        where result_id = ?""",
                         [*ordered_values, source_metadata, *sizing_facts, result_id],
                 )
-                connection.execute(
-                    "update strategies set updated_at_utc = ? where strategy_id = ?",
-                    [now, strategy_id],
-                )
+                replacement_strategy_ids.append(strategy_id)
             for action in report.actions:
                 action_rows.append((result_id, action.action_index, action.timestamp_utc, action.symbol,
                                     action.order_id, action.action, action.size, action.post_size, action.post_side,
@@ -1688,6 +1706,7 @@ def _publish(
             written_phase8.append((result_id, strategy_id, entry, report, values, sizing_facts))
             imported += 1
 
+        _update_replacement_timestamps(connection, replacement_strategy_ids, now)
         if action_rows:
             _append_rows(
                 connection, "strategy_actions", _ACTION_COLUMNS, action_rows,
