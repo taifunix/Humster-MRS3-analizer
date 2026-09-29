@@ -633,6 +633,7 @@ def test_tester_job_uses_the_ui_recovery_kind(tmp_path: Path, monkeypatch) -> No
     monkeypatch.setattr(controller, "_start_tracked_panel_job", lambda kind, request, _keys, submit, **_kwargs: captured.update(kind=kind, request=request, submit=submit))
     started: dict[str, object] = {}
     monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(start=lambda *_args, **kwargs: started.update(kwargs)))
+    monkeypatch.setattr(controller, "_manifest_strategy_names", lambda _manifest: pytest.fail("unchecked launch validated collection names"))
 
     controller.strategies_tester_start({"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31", "initial_balance": "2500.5"})
 

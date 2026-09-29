@@ -1,7 +1,7 @@
 # MRS3 — current verification
 
 **Updated:** 2026-09-29
-**Current branch:** `perf/heavy-db-optimization`, based on fetched `origin/main` `8f59c2c`
+**Current branch:** `perf/heavy-db-optimization`, initially based on fetched `origin/main` `8f59c2c`; integrates the later `84ad285` collection lifecycle
 
 ## Heavy database optimization implementation (2026-09-28)
 
@@ -142,6 +142,25 @@ Independent Opus 5/high re-review returned `CODE_REVIEW_PASS`. The original
 409-report tail has no timings. Its cause remains open until a representative
 operator import provides terminal phase evidence; enable INFO first if the
 terminal journal-sync residual matters. No live DB or tester run was made.
+The later upstream collection lifecycle (`84ad285`) is integrated locally.
+The merge retained collection manifest digest/ID binding, per-entry report
+range and commission, and the optimized REPLACE child deletion/timings. Its
+terminal legacy tester callback had called registry sync without a required
+state, silently leaving the verification marker true. The callback now uses
+the tester snapshot and resets the marker once; repeated terminal polls do
+not rewrite the large journal. Collection finish runs only while its claim
+names this import; an error still allows terminal import publication.
+RED/GREEN focused tests cover marker and collection replacement counts,
+failed journal write/retry, and a missing tester. The merged contour passed 284
+tests with 4 Windows symlink skips; adjacent Panel jobs, input, fast tester
+and static UI passed 262 with 1 skip. After review findings, the affected
+Panel/collection suites passed 158 with 4 skips; a failed collection finish
+is reconciled before the next import claim. A pending claim survives access
+before worker start; reconciliation holds the controller claim lock to close
+the concurrent snapshot race, prunes terminal pending IDs, and defers on an
+unavailable live-worker probe. Concurrent first access creates one collection
+service; COMMITTED pending imports finish as IMPORTED before a later callback.
+Independent Opus 5/high R6 returned `CODE_REVIEW_PASS` for the merge.
 
 The terminal Panel journal is 82.67 MiB/109 jobs; a read-only in-memory probe
 measured about 5.5 s median combined clone/serialization before disk write.
@@ -150,8 +169,10 @@ controller regression, while first/changed snapshots, volatile updates and
 failed-save retries remain durable. A filtered-load regression failed first,
 then passed after the registry marks discarded invalid entries dirty. The
 immutable `c1a5e0e` tester-callback baseline passed three characterization
-nodes, confirming that current false and legacy true flags do not change at
-completion. A private 80.9 MB/109-job journal measured 1/0/1 replacements for
+nodes, confirming that its then-current false and legacy true flags did not
+change at completion. The later collection lifecycle intentionally consumes
+the legacy marker once, as covered by the merged regression above. A private
+80.9 MB/109-job journal measured 1/0/1 replacements for
 first/three repeated/changed terminal snapshots. This is synthetic count
 evidence, not a production latency claim. J4 has J4-R15 `PLAN_APPROVED` and
 independent J4-R4 `CODE_REVIEW_PASS`. Review exposed one actual dirty-flag gap:
@@ -205,6 +226,73 @@ RETEST suite (67 passed, 2 skipped); the strengthened symlink-guard case also
 passed on the local host (1 passed, 3.19s). Independent review returned
 `CODE_REVIEW_PASS` for this test fixture, committed with this status update.
 The full suite remains the final all-core integration gate.
+
+## SINGLE_MODE stop -> relaunch cleanup (2026-09-28)
+
+The active contract is [the stop/relaunch specification](docs/specs/2026-09-28-single-mode-stop-relaunch.md).
+The root cause was confirmed in `LocalFastStrategyTestService`: a failed
+SINGLE_MODE stop/settings restore published a terminal-looking result while
+retaining the same-process `TesterTargetLock`, with no retained in-process
+snapshot/config context or retry path. The service now exposes cleanup-pending
+jobs as non-terminal, retains owner/snapshot/config context, performs three
+bounded safe stop/restore/release retries, and reconciles pending ownership
+before the next ordinary start. Repeated failure remains fail-closed and does
+not unlink or steal a live lock. The Panel start route performs the narrow
+pre-submit reconciliation so the registry can release its CANCELLING resource
+before admitting the next start; no UI or collection files were changed.
+
+Evidence: the focused stop/relaunch RED test failed against the old behavior
+(`FAILED` while the lease remained), then the six cleanup/release lifecycle
+tests passed; the complete fast/single-mode service plus Panel report-start
+suite passed `63 tests`. Python compilation and `git diff --check` passed. The broader Panel suite passed `185 tests` with one
+pre-existing static-shell failure caused by the parallel Task 3 `app.js`
+authorization text; that UI worktree change is outside this fix. No real
+tester/Panel was launched and no production data or live process was mutated.
+
+## SINGLE_MODE collection mutation protocol (2026-09-28)
+
+Task 2 final integration now persists a monotonic collection revision and
+uses it as a compare-and-set boundary around verification publication. Long
+member artifact reads remain outside the registry lock; concurrent register or
+clear changes cause verification to fail closed without overwriting the newer
+runtime. Collection import admission atomically claims the exact VERIFIED
+generation with `import_in_progress`; clear and successor mutation cannot
+invalidate that claim. Failed/cancelled completion releases the claim and keeps
+the generation retryable, while committed completion marks it IMPORTED.
+
+Focused controlled-thread and lifecycle evidence passed 13 collection tests;
+broader fresh/collection/input evidence passed 123 tests with one existing
+symlink skip, and the Panel affected contour passed 176 tests with four
+existing symlink skips and eight pandas warnings. No real tester, Panel or
+production database was used.
+
+## SINGLE_MODE collection claim reconciliation (2026-09-28)
+
+Task 2 now reconciles durable `import_in_progress` claims when a controller
+first accesses the collection service. Claims backed by a live in-process
+Performance v2 worker remain protected; claims left by a restart or an
+interrupted/failed/cancelled import return the VERIFIED generation to the
+retryable gate, while a persisted COMMITTED worker result resolves it to
+IMPORTED. Completion also handles CANCELLED callbacks and can resolve the
+collection from the durable claim when the callback has no request payload.
+
+## SINGLE_MODE report collection controls (Task 3, 2026-09-28)
+
+The ordinary tester card now exposes the server-owned report collection: the
+`Объединять отчёты` opt-in checkbox, durable pack/report counts with active and
+failed-member details, exact collection verify/import targeting, and the
+non-destructive `Очистить накопление` action. Reload restores only the visual
+OPEN/VERIFIED checkbox state; import still requires a fresh `Проверить` action.
+No browser visual pass, Panel restart, real tester run or production database
+mutation was performed.
+
+Observed verification for this worktree: collection UI contract tests passed
+`7 passed`; `tests/test_panel_static_ui.py` passed `145 passed`; the required
+tester regression suite passed `47 passed`; the required Performance v2 suite
+passed `113 passed, 4 skipped, 8 warnings`; `node --check
+src/mrs3/panel_web/app.js` and `git diff --check` passed. The skips are the
+existing unavailable-symlink cases and the warnings are existing pandas
+fragmentation warnings.
 
 ## Restored READY JSON can launch SINGLE_MODE after reload (2026-09-28)
 

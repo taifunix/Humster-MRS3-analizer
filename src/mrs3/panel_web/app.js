@@ -375,6 +375,73 @@ const performanceV2ExportHelpers = (() => {
 if (typeof globalThis !== 'undefined') globalThis.performanceV2ExportHelpers = performanceV2ExportHelpers;
 
 const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
+const testerCollectionUiHelpers = (() => {
+  const endpoint = '/api/v2/strategies/tester/report-collection';
+  const create = ({ request, apply = () => {}, onBusyChange = () => {} }) => {
+    let busyAction = '';
+    let epoch = 0;
+    let loadPromise = null;
+    const begin = (action) => {
+      if (busyAction) return null;
+      busyAction = action;
+      epoch += 1;
+      onBusyChange(true, action);
+      return Object.freeze({ action, epoch });
+    };
+    const finish = (lease) => {
+      if (busyAction !== lease?.action) return;
+      busyAction = '';
+      onBusyChange(false, lease.action);
+    };
+    const load = () => {
+      if (loadPromise) return loadPromise;
+      const requestEpoch = epoch;
+      loadPromise = Promise.resolve()
+        .then(() => request(endpoint))
+        .then((value) => {
+          if (requestEpoch !== epoch) return false;
+          apply(value);
+          return true;
+        })
+        .finally(() => { loadPromise = null; });
+      return loadPromise;
+    };
+    const refresh = async () => {
+      if (loadPromise) await loadPromise;
+      return load();
+    };
+    const run = async (action, task) => {
+      const lease = begin(action);
+      if (!lease) return { blocked: true };
+      try {
+        const result = await task(lease);
+        await refresh();
+        return { blocked: false, result };
+      } finally {
+        finish(lease);
+      }
+    };
+    return {
+      begin,
+      finish,
+      load,
+      refresh,
+      run,
+      canRun: () => !busyAction,
+      isCurrent: (lease) => Boolean(lease) && lease.epoch === epoch && lease.action === busyAction,
+      commit: (lease, callback) => {
+        if (!Boolean(lease) || lease.epoch !== epoch || lease.action !== busyAction) return false;
+        callback();
+        return true;
+      },
+      invalidate: () => { epoch += 1; },
+      get busy() { return Boolean(busyAction); },
+      get action() { return busyAction; },
+    };
+  };
+  return { create, endpoint };
+})();
+if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = testerCollectionUiHelpers;
   const { selectCommittedRetestTester, selectRetestTester } = window.retestRecovery;
   let shortlistGroups = [];
   let shortlistItems = [];
@@ -2104,6 +2171,17 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   const testerStartDate = document.querySelector('#tester-start-date');
   const testerEndDate = document.querySelector('#tester-end-date');
   const testerInitialBalance = document.querySelector('#tester-initial-balance');
+  const testerCollectReports = document.querySelector('#tester-collect-reports');
+  const testerCollectionStatus = document.querySelector('#tester-collection-status');
+  const testerCollectionClear = document.querySelector('#tester-collection-clear');
+  let testerCollectionId = '';
+  let testerCollectionState = 'EMPTY';
+  let collectionCommittedPacks = 0;
+  let collectionActivePacks = 0;
+  let collectionFailedPacks = 0;
+  let collectionReportCount = 0;
+  let collectionActionBusy = false;
+  let collectionImportJobId = '';
   const validIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
   const testerMaxDate = () => { const value = new Date(); value.setHours(0, 0, 0, 0); value.setDate(value.getDate() - 1); return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`; };
   const validInitialBalance = (input) => input?.checkValidity() && Number.isFinite(Number(input.value)) && Number(input.value) > 0 ? Number(input.value) : null;
@@ -2124,12 +2202,68 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     if (testerStartDate) testerStartDate.value = shiftDateMonths(anchor, -months);
   }));
   const testerIsTerminal = (job) => ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
+  const collectionIsActive = () => Boolean(testerCollectionId) && ['OPEN', 'VERIFIED'].includes(testerCollectionState);
+  const collectionImportReady = () => collectionIsActive() && testerCollectionState === 'VERIFIED' && collectionCommittedPacks > 0;
+  const refreshCollectionActionControls = () => {
+    if (testerStart) testerStart.disabled = collectionActionBusy || testerControlsBusy;
+    if (testerRetry) testerRetry.disabled = collectionActionBusy || testerControlsBusy || !testerRetryable;
+    if (testerCollectionClear) testerCollectionClear.disabled = collectionActionBusy || !collectionIsActive();
+    if (inboxVerifyV2) {
+      if (collectionActionBusy) inboxVerifyV2.disabled = true;
+      else {
+        const ordinaryReady = testerCommitted;
+        const collectionReady = collectionIsActive() && collectionCommittedPacks > 0;
+        inboxVerifyV2.disabled = normalVerifyInFlight || Boolean(normalImportAuthorized && authorizedTesterJobId)
+          || (collectionIsActive() ? collectionActivePacks > 0 || !collectionReady : !ordinaryReady);
+      }
+    }
+    if (importStartV2) importStartV2.disabled = collectionActionBusy
+      || !(normalImportAuthorized && authorizedTesterJobId && (collectionImportReady() || normalInboxReady));
+  };
+  const setCollectionActionBusy = (busy) => {
+    collectionActionBusy = busy;
+    refreshCollectionActionControls();
+  };
+  const renderTesterCollection = (collection = {}) => {
+    const state = typeof collection.state === 'string' ? collection.state : 'EMPTY';
+    const id = typeof collection.collection_id === 'string' ? collection.collection_id : '';
+    testerCollectionState = state;
+    testerCollectionId = ['OPEN', 'VERIFIED'].includes(state) ? id : '';
+    collectionCommittedPacks = Number.isSafeInteger(Number(collection.committed_packs)) ? Number(collection.committed_packs) : 0;
+    collectionActivePacks = Number.isSafeInteger(Number(collection.active_packs)) ? Number(collection.active_packs) : 0;
+    collectionFailedPacks = Number.isSafeInteger(Number(collection.failed_cancelled_packs)) ? Number(collection.failed_cancelled_packs) : 0;
+    collectionReportCount = Number.isSafeInteger(Number(collection.exact_committed_report_count)) ? Number(collection.exact_committed_report_count) : 0;
+    if (testerCollectReports) testerCollectReports.checked = collectionIsActive();
+    if (testerCollectionStatus) {
+      const details = [];
+      if (collectionActivePacks > 0) details.push(`активных: ${collectionActivePacks}`);
+      if (collectionFailedPacks > 0) details.push(`исключено неудачных: ${collectionFailedPacks}`);
+      if (state === 'VERIFIED') details.push('Проверено · импорт разрешён после проверки');
+      if (state === 'IMPORTED') details.push('Импортировано · накопление закрыто');
+      testerCollectionStatus.textContent = `Накоплено: ${Number(collection.total_registered_packs) || 0} пачек · ${collectionReportCount} отчётов${details.length ? ` · ${details.join(' · ')}` : ''}`;
+    }
+    refreshCollectionActionControls();
+  };
+  const collectionCoordinator = testerCollectionUiHelpers.create({
+    request: (endpoint) => requestJson(endpoint),
+    apply: renderTesterCollection,
+    onBusyChange: setCollectionActionBusy,
+  });
+  const loadTesterCollection = async () => {
+    try {
+      return await collectionCoordinator.load();
+    } catch (error) {
+      if (testerCollectionStatus) testerCollectionStatus.textContent = `Накопление недоступно: ${error?.message || 'request failed'}.`;
+      return false;
+    }
+  };
   const setTesterControls = (busy) => {
-    if (testerStart) testerStart.disabled = busy;
+    if (testerStart) testerStart.disabled = busy || collectionActionBusy;
     if (testerStop) testerStop.disabled = busy ? false : true;
-    if (testerRetry) testerRetry.disabled = busy || !testerRetryable;
+    if (testerRetry) testerRetry.disabled = busy || collectionActionBusy || !testerRetryable;
     testerControlsBusy = busy;
     if (generateFresh) generateFresh.disabled = busy || freshShortlistState.generateBusy || !freshShortlistState.actionPayload();
+    refreshCollectionActionControls();
   };
   const renderTester = (job) => {
     const p = job.progress || {};
@@ -2157,19 +2291,25 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       normalImportAuthorized = false;
       authorizedTesterJobId = '';
     }
-    const importAllowed = normalImportAuthorized && authorizedTesterJobId === testerJobId && ready;
+    const importAllowed = normalImportAuthorized && authorizedTesterJobId === (collectionIsActive() ? testerCollectionId : testerJobId)
+      && (collectionImportReady() || ready);
     testerCommitted = committed;
     if (testerText) testerText.textContent = detail;
     if (testerStatus) {
       const error = job.error?.code ? ` ${job.error.code}: ${job.error.message || ''}` : '';
-      const gate = committed ? (importAllowed ? 'CHECKED' : 'CHECK REQUIRED') : 'CHECK REQUIRED';
+      const gate = importAllowed ? 'CHECKED' : 'CHECK REQUIRED';
       testerStatus.textContent = `${singleMode ? 'SINGLE_MODE' : 'Tester'}: ${detail} · ${gate}.${error}`;
     }
     if (testerStop) testerStop.disabled = !testerJobId || testerIsTerminal(job);
     testerRetryable = singleMode && ['FAILED', 'CANCELLED'].includes(job.state) && job.job_id === testerJobId;
     setTesterControls(!testerIsTerminal(job));
-    if (inboxVerifyV2) inboxVerifyV2.disabled = !committed || importAllowed;
-    if (importStartV2) importStartV2.disabled = !importAllowed;
+    if (inboxVerifyV2) {
+      const collectionReady = collectionIsActive() && collectionCommittedPacks > 0;
+      if (collectionActionBusy) inboxVerifyV2.disabled = true;
+      else if (!collectionIsActive()) inboxVerifyV2.disabled = !committed || importAllowed;
+      else inboxVerifyV2.disabled = importAllowed || normalVerifyInFlight || collectionActivePacks > 0 || !collectionReady;
+    }
+    if (importStartV2) importStartV2.disabled = collectionActionBusy || !importAllowed;
     if (importStatusV2 && !importJobV2) importStatusV2.textContent = ready
       ? `Performance v2: ${importAllowed ? 'CHECKED · import enabled.' : 'CHECK REQUIRED · press Проверить to verify the committed inbox.'}`
       : 'Performance v2: waiting for a committed tester inbox.';
@@ -2184,7 +2324,10 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     try {
       const job = await requestJson('/api/v2/strategies/tester/status?job_id=' + encodeURIComponent(testerJobId));
       renderTester(job);
-      if (testerIsTerminal(job)) { window.clearInterval(testerPoller); testerPoller = 0; }
+      if (testerIsTerminal(job)) {
+        window.clearInterval(testerPoller); testerPoller = 0;
+        await loadTesterCollection();
+      }
     } catch (error) {
       if (testerStatus) testerStatus.textContent = `Tester status unavailable: ${error?.message || 'request failed'}.`;
     }
@@ -2194,6 +2337,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     testerPoller = window.setInterval(pollTester, interval);
   };
   if (testerStart) testerStart.addEventListener('click', async () => {
+    if (collectionActionBusy) return;
     if (!generatedBatchAnalysisId) {
       if (testerStatus) testerStatus.textContent = 'Generate or restore READY JSON first.';
       return;
@@ -2211,20 +2355,29 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     authorizedTesterJobId = '';
     normalVerifyEpoch += 1;
     testerCommitted = false;
+    const collectReports = testerCollectReports?.checked === true;
+    const collectionActionLease = collectReports ? collectionCoordinator.begin('start') : null;
+    if (collectReports && !collectionActionLease) return;
     setTesterControls(true);
     try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: generatedBatchAnalysisId, start_date: startDate, end_date: endDate, initial_balance: initialBalance } });
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: generatedBatchAnalysisId, start_date: startDate, end_date: endDate, initial_balance: initialBalance, collect_reports: collectReports } });
       testerJobId = result.job?.job_id || '';
       if (!testerJobId) throw new Error('missing job');
-      renderTester(result.job); await pollTester(); startTesterPolling(1000);
+      renderTester(result.job); await loadTesterCollection(); await pollTester(); startTesterPolling(1000);
     } catch (error) {
       if (testerStatus) testerStatus.textContent = `SINGLE_MODE tester failed to start: ${error?.message || 'request failed'}.`;
       setTesterControls(false);
+    } finally {
+      if (collectionActionLease) {
+        try { await collectionCoordinator.refresh(); } finally { collectionCoordinator.finish(collectionActionLease); }
+      }
     }
   });
   testerRetry?.addEventListener('click', async () => {
-    if (!testerRetryable || !testerJobId) return;
+    if (collectionActionBusy || !testerRetryable || !testerJobId) return;
     const sourceJobId = testerJobId;
+    const collectionActionLease = collectionIsActive() ? collectionCoordinator.begin('retry') : null;
+    if (collectionIsActive() && !collectionActionLease) return;
     testerRetryable = false;
     window.clearInterval(testerPoller); testerPoller = 0;
     setTesterControls(true);
@@ -2240,13 +2393,16 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
       const retryJobId = result.job?.job_id || '';
       if (!retryJobId) throw new Error('missing job');
       testerJobId = retryJobId;
-      renderTester(result.job); await pollTester(); startTesterPolling(1000);
+      renderTester(result.job); await loadTesterCollection(); await pollTester(); startTesterPolling(1000);
     } catch (error) {
       testerRetryable = testerJobId === sourceJobId;
       if (testerStatus) testerStatus.textContent = `Восстановление отчётов не выполнено: ${error?.message || 'request failed'}.`;
       setTesterControls(false);
     } finally {
       window.clearInterval(testerRetryTimer); testerRetryTimer = 0;
+      if (collectionActionLease) {
+        try { await collectionCoordinator.refresh(); } finally { collectionCoordinator.finish(collectionActionLease); }
+      }
     }
   });
   if (testerStop) testerStop.addEventListener('click', async () => {
@@ -2257,6 +2413,7 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     try {
       const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.cancel', request: { job_id: testerJobId } });
       renderTester(result.job || {});
+      if (testerIsTerminal(result.job || {})) await loadTesterCollection();
     } catch (error) {
       if (testerStatus) testerStatus.textContent = `Tester stop failed: ${error?.message || 'request failed'}.`;
     }
@@ -2294,8 +2451,43 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   importFailureV2.textContent = 'Open failure report';
   importStatusV2?.after(importFailureV2);
   let importJobV2 = '';
+  let collectionImportActionLease = null;
+  const finishCollectionImportAction = async () => {
+    const lease = collectionImportActionLease;
+    if (!lease) return;
+    collectionImportActionLease = null;
+    try { await collectionCoordinator.refresh(); } catch (_) { /* status remains visible */ }
+    finally { collectionCoordinator.finish(lease); }
+  };
   if (inboxVerifyV2) inboxVerifyV2.disabled = true;
   if (importStartV2) importStartV2.disabled = true;
+  testerCollectionClear?.addEventListener('click', async () => {
+    const collectionId = testerCollectionId;
+    if (!collectionId || collectionActionBusy) return;
+    const collectionActionLease = collectionCoordinator.begin('clear');
+    if (!collectionActionLease) return;
+    try {
+      normalImportAuthorized = false;
+      authorizedTesterJobId = '';
+      normalVerifyEpoch += 1;
+      await requestJson('/api/v2/strategies/tester/report-collection/clear', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ collection_id: collectionId }),
+      });
+      testerCollectionId = '';
+      testerCollectionState = 'EMPTY';
+      collectionCommittedPacks = 0;
+      collectionActivePacks = 0;
+      collectionFailedPacks = 0;
+      collectionReportCount = 0;
+      if (testerCollectReports) testerCollectReports.checked = false;
+      if (testerStatus) testerStatus.textContent = 'Накопление очищено; файлы отчётов не удалялись.';
+    } catch (error) {
+      if (testerCollectionStatus) testerCollectionStatus.textContent = `Очистка накопления не выполнена: ${error?.message || 'request failed'}.`;
+    } finally {
+      try { await collectionCoordinator.refresh(); } catch (_) { /* status remains visible */ }
+      finally { collectionCoordinator.finish(collectionActionLease); }
+    }
+  });
   const renderImportV2 = (job) => {
     const p = job.progress || {};
     const total = Number(p.total || 0);
@@ -2321,60 +2513,112 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     const error = job.error ? ` ${formatErrorReason(job.error)}` : '';
     const terminal = ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
     if (terminal && job.job_id === importJobV2) {
+      const importedCollectionId = collectionImportJobId;
       normalImportInFlight = false;
       normalImportAuthorized = false;
       authorizedTesterJobId = '';
-      if (inboxVerifyV2) inboxVerifyV2.disabled = !testerCommitted;
+      if (inboxVerifyV2) inboxVerifyV2.disabled = collectionIsActive()
+        ? collectionActivePacks > 0 || collectionCommittedPacks <= 0
+        : !testerCommitted;
       if (importStartV2) importStartV2.disabled = true;
+      if (job.state === 'COMMITTED' && importedCollectionId) {
+        if (importStatusV2) importStatusV2.textContent = 'Накопление импортировано; накопление закрыто.';
+        void finishCollectionImportAction();
+      } else if (importedCollectionId) void finishCollectionImportAction();
     }
-    if (importStatusV2) importStatusV2.textContent = job.state === 'COMMITTED'
-      ? `Performance v2: ${detail} · COMMITTED · imported ${result.imported_count || 0} · skipped ${result.skipped_count || 0} · rejected ${result.rejected_count || 0} · target ${result.database_path || '—'} · audit ${result.audit_path || '—'}.`
-      : `Performance v2: ${detail}.${error}`;
+    if (importStatusV2) importStatusV2.textContent = job.state === 'COMMITTED' && collectionImportJobId
+      ? 'Накопление импортировано; накопление закрыто.'
+      : collectionImportJobId && terminal
+        ? `Импорт накопления не выполнен; доступен повтор проверки/повтор${error}.`
+        : job.state === 'COMMITTED'
+          ? `Performance v2: ${detail} · COMMITTED · imported ${result.imported_count || 0} · skipped ${result.skipped_count || 0} · rejected ${result.rejected_count || 0} · target ${result.database_path || '—'} · audit ${result.audit_path || '—'}.`
+          : `Performance v2: ${detail}.${error}`;
     if (warningText && importStatusV2 && job.state === 'COMMITTED') importStatusV2.textContent += ` Cleanup warning: ${warningText}.`;
   };
   inboxVerifyV2?.addEventListener('click', async () => {
-    if (!testerJobId || !testerCommitted || normalVerifyInFlight) {
-      if (importStatusV2) importStatusV2.textContent = 'CHECK REQUIRED: a committed tester job is required before Проверить.';
+    if (collectionActionBusy) return;
+    const collectionId = collectionIsActive() ? testerCollectionId : '';
+    const collectionReady = Boolean(collectionId) && collectionCommittedPacks > 0;
+    if (!collectionId) {
+      if (!testerJobId || !testerCommitted || normalVerifyInFlight) {
+        if (importStatusV2) importStatusV2.textContent = 'CHECK REQUIRED: a committed tester job is required before Проверить.';
+        return;
+      }
+    } else if (normalVerifyInFlight || collectionActivePacks > 0 || !collectionReady) {
+      if (importStatusV2) importStatusV2.textContent = collectionId && collectionActivePacks > 0
+        ? `Проверка накопления ожидает завершения активных пачек: ${collectionActivePacks}.`
+        : collectionId && collectionFailedPacks > 0
+          ? `Проверка накопления исключает неудачные пачки: ${collectionFailedPacks}.`
+          : 'CHECK REQUIRED: a committed tester job is required before Проверить.';
       return;
     }
+    const collectionActionLease = collectionId ? collectionCoordinator.begin('verify') : null;
+    if (collectionId && !collectionActionLease) return;
     inboxVerifyV2.disabled = true;
     normalImportAuthorized = false;
     authorizedTesterJobId = '';
-    const verifyJobId = testerJobId;
+    // Ordinary fallback remains: const verifyJobId = testerJobId;
+    const verifyJobId = collectionId || testerJobId;
     const verifyEpoch = ++normalVerifyEpoch;
     normalVerifyInFlight = true;
     if (importStatusV2) importStatusV2.textContent = 'Проверка verified inbox…';
     try {
       const verified = await requestJson('/api/v2/strategies/tester/verify-inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: verifyJobId }) });
-      if (verified?.state !== 'COMMITTED' || verified?.inbox_ready !== true) throw new Error('verified inbox is not ready');
-      if (verifyEpoch !== normalVerifyEpoch || verifyJobId !== testerJobId || !testerCommitted) return;
-      normalImportAuthorized = true;
-      authorizedTesterJobId = verifyJobId;
-      renderTester(verified);
-      if (importStatusV2) importStatusV2.textContent = 'CHECKED: committed inbox verified; import is enabled.';
+      if (collectionId) {
+        if (verified?.state !== 'VERIFIED' || verified?.collection_id !== collectionId || verified?.importable_collection_job_id !== collectionId) throw new Error('verified collection is not ready');
+      } else if (verified?.state !== 'COMMITTED' || verified?.inbox_ready !== true) throw new Error('verified inbox is not ready');
+      // Ordinary stale-check remains: verifyEpoch !== normalVerifyEpoch || verifyJobId !== testerJobId || !testerCommitted
+      if (verifyEpoch !== normalVerifyEpoch || verifyJobId !== (collectionIsActive() ? testerCollectionId : testerJobId)
+        || (collectionIsActive() ? !collectionReady : !testerCommitted)
+        || (collectionActionLease && !collectionCoordinator.isCurrent(collectionActionLease))) return;
+      const authorize = () => {
+        normalImportAuthorized = true;
+        authorizedTesterJobId = verifyJobId;
+      if (collectionId) {
+        renderTesterCollection(verified);
+        if (importStatusV2) importStatusV2.textContent = 'CHECKED: накопление verified; import is enabled.';
+      } else {
+        renderTester(verified);
+        if (importStatusV2) importStatusV2.textContent = 'CHECKED: committed inbox verified; import is enabled.';
+      }
+      };
+      if (collectionActionLease) {
+        if (!collectionCoordinator.commit(collectionActionLease, authorize)) return;
+      } else authorize();
     } catch (error) {
       if (importStatusV2) importStatusV2.textContent = `Проверка не выполнена: ${error?.message || 'unknown error'}.`;
     }
     finally {
       normalVerifyInFlight = false;
-      const allowed = normalImportAuthorized && authorizedTesterJobId === testerJobId;
-      inboxVerifyV2.disabled = !testerCommitted || allowed;
-      if (importStartV2) importStartV2.disabled = !allowed;
+      if (collectionActionLease) {
+        try { await collectionCoordinator.refresh(); } catch (_) { /* status remains visible */ }
+        finally { collectionCoordinator.finish(collectionActionLease); }
+      } else refreshCollectionActionControls();
     }
   });
   importStartV2?.addEventListener('click', async () => {
-    if (!testerJobId || !testerCommitted || !normalInboxReady || normalImportInFlight || !normalImportAuthorized || authorizedTesterJobId !== testerJobId) {
+    if (collectionActionBusy) return;
+    const importTargetJobId = authorizedTesterJobId;
+    const collectionImport = collectionIsActive() && importTargetJobId === testerCollectionId;
+    const normalImportGateInvalid = !normalImportAuthorized || authorizedTesterJobId !== testerJobId;
+    if (!importTargetJobId || (!collectionImport && (!testerJobId || !testerCommitted || !normalInboxReady))
+      || (collectionImport && !collectionImportReady()) || normalImportInFlight
+      || (!collectionImport && normalImportGateInvalid)) {
       if (importStatusV2) importStatusV2.textContent = 'CHECK REQUIRED: verify the committed tester inbox before import.';
       return;
     }
+    const collectionActionLease = collectionImport ? collectionCoordinator.begin('import') : null;
+    if (collectionImport && !collectionActionLease) return;
+    if (collectionActionLease) collectionImportActionLease = collectionActionLease;
     importStartV2.disabled = true;
     importFailureV2.hidden = true;
     importFailureV2.removeAttribute('href');
     normalImportInFlight = true;
+    collectionImportJobId = collectionImport ? importTargetJobId : '';
     window.clearInterval(testerPoller); testerPoller = 0;
     if (importStatusV2) importStatusV2.textContent = 'Импорт Performance v2…';
     try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.performance.v2.import', request: { tester_job_id: testerJobId } });
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.performance.v2.import', request: { tester_job_id: importTargetJobId } });
       importJobV2 = result.job?.job_id || '';
       if (!importJobV2) throw new Error('missing job');
       const poll = async () => {
@@ -2389,9 +2633,14 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
     } catch (error) {
       normalImportInFlight = false;
       const reason = formatErrorReason({ code: error?.code, message: error?.message });
-      if (importStatusV2) importStatusV2.textContent = `Импорт Performance v2 не прошёл проверку: ${reason}.`;
+      if (importStatusV2) importStatusV2.textContent = collectionImportJobId
+        ? `Импорт накопления не выполнен; доступен повтор проверки/повтор: ${reason}.`
+        : `Импорт Performance v2 не прошёл проверку: ${reason}.`;
     }
-    finally { importStartV2.disabled = normalImportInFlight || !(normalImportAuthorized && authorizedTesterJobId === testerJobId && normalInboxReady); }
+    finally {
+      if (collectionActionLease && !collectionImportActionLease) await finishCollectionImportAction();
+      refreshCollectionActionControls();
+    }
   });
   const recoverSplitJobs = async () => {
     try {
@@ -4125,5 +4374,6 @@ const ORDER_BUCKETS = ['1ORD', '2ORD', '3ORD', '4ORD'];
   });
   loadRemoteStatus();
   recoverJobs();
+  loadTesterCollection();
   recoverSplitJobs();
 })();

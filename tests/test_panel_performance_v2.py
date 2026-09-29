@@ -485,6 +485,25 @@ def test_v2_panel_service_passes_frozen_result_ids_directly(tmp_path: Path) -> N
     assert captured["expected"] == {"P1": 11}
 
 
+def test_v2_panel_service_passes_collection_consumption_expectations(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    request = replace(
+        request,
+        expected_inbox_manifest_sha256="a" * 64,
+        expected_collection_id="collection-1",
+    )
+    captured = {}
+
+    def import_result(import_request, **_kwargs):
+        captured["digest"] = import_request.expected_inbox_manifest_sha256
+        captured["collection_id"] = import_request.expected_collection_id
+        return PerformanceV2ImportResult("failed", "FAILED", 0, 0, 1, None, None)
+
+    LocalPerformanceV2Service(import_func=import_result).run(request)
+
+    assert captured == {"digest": "a" * 64, "collection_id": "collection-1"}
+
+
 @pytest.mark.parametrize(
     "listing_path",
     [Path("../dates.xlsx"), Path("C:/absolute/dates.xlsx")],
@@ -1405,7 +1424,7 @@ def test_j4_characterization_normal_producer_resource_key_and_false_tester_marke
     assert restored.runtime(tester_id) == tester_runtime_before
 
 
-def test_j4_characterization_legacy_request_true_tester_marker_stays_true_without_escape(tmp_path, monkeypatch):
+def test_j4_legacy_tester_marker_resets_once_on_terminal_import(tmp_path, monkeypatch):
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     tester_id = "legacy-tester"
     import_id = "legacy-import"
@@ -1437,13 +1456,126 @@ def test_j4_characterization_legacy_request_true_tester_marker_stays_true_withou
 
     controller._record_special_job({"job_id": import_id, "state": "COMMITTED", "phase": "COMMITTED", "result": {"status": "COMMITTED"}})
 
-    assert controller._panel_jobs.jobs[tester_id] == tester_before
-    assert controller._panel_jobs.runtime(tester_id) == tester_runtime_before
-    assert [job_id for job_id, _status, _kwargs in sync_calls] == [import_id]
-    assert len(replacements) == 1
+    assert controller._panel_jobs.get(tester_id) == {key: value for key, value in tester_before.items() if key != "runtime"}
+    assert tester_runtime_before["performance_v2_import_verified"] is True
+    assert controller._panel_jobs.runtime(tester_id)["performance_v2_import_verified"] is False
+    assert [job_id for job_id, _status, _kwargs in sync_calls] == [tester_id, import_id]
+    assert len(replacements) == 2
+    controller._record_special_job({"job_id": import_id, "state": "COMMITTED", "phase": "COMMITTED", "result": {"status": "COMMITTED"}})
+    assert [job_id for job_id, _status, _kwargs in sync_calls] == [tester_id, import_id, import_id]
+    assert len(replacements) == 2
     restored = PanelJobRegistry(controller._panel_jobs.journal, recover_on_load=False)
-    assert restored.jobs[tester_id] == tester_before
-    assert restored.runtime(tester_id) == tester_runtime_before
+    assert restored.get(tester_id) == {key: value for key, value in tester_before.items() if key != "runtime"}
+    assert restored.runtime(tester_id)["performance_v2_import_verified"] is False
+
+
+def test_j4_legacy_marker_two_save_failures_retry_with_dirty_journal(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    registry = controller._panel_jobs
+    tester_id, import_id = "legacy-tester", "legacy-import"
+    registry.submit("strategies.tester.start", {}, tester_id, (), job_id=tester_id)
+    registry.transition(tester_id, "RUNNING")
+    registry.sync(tester_id, {"state": "COMMITTED"}, runtime={"performance_v2_import_verified": True})
+    registry.submit("strategies.performance.v2.import", {}, import_id, (), job_id=import_id)
+    registry.jobs[import_id]["request"] = {"tester_job_id": tester_id}
+    registry.transition(import_id, "RUNNING")
+    real_save = registry._save
+    attempts = 0
+
+    def fail_twice():
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise OSError("injected journal write failure")
+        real_save()
+
+    monkeypatch.setattr(registry, "_save", fail_twice)
+    terminal = {"job_id": import_id, "state": "COMMITTED", "phase": "COMMITTED", "result": {"status": "COMMITTED"}}
+    with pytest.raises(OSError, match="injected journal write failure"):
+        controller._record_special_job(terminal)
+    assert PanelJobRegistry(registry.journal, recover_on_load=False).runtime(tester_id)["performance_v2_import_verified"] is True
+    assert registry._journal_dirty is True
+    controller._record_special_job(terminal)
+    restored = PanelJobRegistry(registry.journal, recover_on_load=False)
+    assert restored.runtime(tester_id)["performance_v2_import_verified"] is False
+    assert restored.get(import_id)["state"] == "COMMITTED"
+
+
+def _terminal_collection_controller(tmp_path: Path) -> tuple[PanelController, str, str]:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    collection_id, import_id = "collection-test", "collection-import"
+    registry = controller._panel_jobs
+    registry.submit("strategies.tester.collection", {}, collection_id, (), job_id=collection_id)
+    registry.transition(collection_id, "RUNNING")
+    registry.sync(
+        collection_id,
+        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={"import_in_progress": import_id},
+    )
+    registry.submit("strategies.performance.v2.import", {}, import_id, (), job_id=import_id)
+    registry.jobs[import_id]["request"] = {"tester_job_id": collection_id}
+    registry.transition(import_id, "RUNNING")
+    controller._collection_import_claim_ids.add(import_id)
+    return controller, collection_id, import_id
+
+
+def test_j4_collection_finish_and_terminal_import_save_once(tmp_path, monkeypatch):
+    controller, collection_id, import_id = _terminal_collection_controller(tmp_path)
+    registry = controller._panel_jobs
+    calls = []
+
+    def finish(_collection_id, _import_id, *, committed):
+        calls.append((_collection_id, _import_id, committed))
+        runtime = registry.runtime(collection_id)
+        runtime.pop("import_in_progress")
+        registry.sync(collection_id, registry.get(collection_id), runtime=runtime)
+
+    controller._report_collection_service = SimpleNamespace(finish_import=finish)
+    replacements = []
+    real_replace = panel_jobs_module.os.replace
+    monkeypatch.setattr(panel_jobs_module.os, "replace", lambda source, destination: (replacements.append(destination) if Path(destination) == registry.journal else None, real_replace(source, destination))[1])
+    terminal = {"job_id": import_id, "state": "COMMITTED", "phase": "COMMITTED", "result": {"status": "COMMITTED"}}
+    controller._record_special_job(terminal)
+    assert calls == [(collection_id, import_id, True)]
+    assert import_id not in controller._collection_import_claim_ids
+    assert registry.get(import_id)["state"] == "COMMITTED"
+    assert len(replacements) == 2
+    controller._record_special_job(terminal)
+    assert calls == [(collection_id, import_id, True)]
+    assert len(replacements) == 2
+
+
+@pytest.mark.parametrize("error_type", [panel_jobs_module.PanelJobError, OSError])
+def test_j4_collection_finish_error_still_publishes_terminal_import(tmp_path, error_type):
+    controller, collection_id, import_id = _terminal_collection_controller(tmp_path)
+    calls = []
+
+    def fail_finish(_collection_id, _import_id, *, committed):
+        calls.append((_collection_id, _import_id, committed))
+        raise error_type("injected collection finish failure")
+
+    controller._report_collection_service = SimpleNamespace(finish_import=fail_finish)
+    controller._record_special_job(
+        {"job_id": import_id, "state": "FAILED", "phase": "FAILED", "result": {"status": "FAILED"}}
+    )
+    assert calls == [(collection_id, import_id, False)]
+    assert import_id not in controller._collection_import_claim_ids
+    assert controller._panel_jobs.get(import_id)["state"] == "FAILED"
+
+
+def test_j4_missing_tester_still_publishes_terminal_import(tmp_path):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    import_id = "missing-tester-import"
+    registry = controller._panel_jobs
+    registry.submit("strategies.performance.v2.import", {}, import_id, (), job_id=import_id)
+    registry.jobs[import_id]["request"] = {"tester_job_id": "missing-tester"}
+    registry.transition(import_id, "RUNNING")
+    controller._collection_import_claim_ids.add(import_id)
+    controller._record_special_job(
+        {"job_id": import_id, "state": "FAILED", "phase": "FAILED", "result": {"status": "FAILED"}}
+    )
+    assert import_id not in controller._collection_import_claim_ids
+    assert registry.get(import_id)["state"] == "FAILED"
 
 
 def _controller_for_windows(tmp_path: Path) -> tuple[PanelController, Path, int]:

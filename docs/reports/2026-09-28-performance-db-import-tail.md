@@ -273,3 +273,30 @@ cannot be attributed to publication, Phase 8, commit, close/cleanup, Panel
 readback, or terminal journal sync. The next representative operator import
 must collect terminal phase evidence (with INFO enabled first if terminal-sync
 timing is needed) before choosing another tail-specific change.
+
+After the later upstream report-collection lifecycle was merged, an old
+legacy-tester characterization exposed a terminal callback bug: it attempted
+to clear `performance_v2_import_verified` with a registry sync lacking the
+required `state`. The registry rejected that call, leaving the marker true.
+The callback now uses the existing tester snapshot, persists the reset once,
+and avoids a second journal write on repeated terminal polls. Collection
+finish runs only while its claim names this import; an error still allows
+terminal import publication, and a failed journal write remains retryable. The
+collection digest/ID and per-entry report-range/commission contracts remain in the merged
+importer. The combined collection/import/Panel tests passed 284 with four
+Windows symlink skips, and adjacent Panel jobs/input/fast tester/UI tests
+passed 262 with one skip. This fixes an integration regression, not the
+unmeasured 409-report production tail.
+After review findings, the affected Panel/collection suites passed 158 with
+four Windows symlink skips. An actual collection-service failure test shows
+that the next service access reconciles a terminal import's stale claim and
+allows a new import claim. The terminal callback also contains unexpected
+collection completion errors so import-job publication can proceed.
+A pending claim remains protected before worker start. Reconciliation holds
+the controller claim lock through its registry update, prunes terminal pending
+IDs, and defers on a failed live-worker probe rather than releasing a live
+claim.
+Two concurrent first accesses create one collection service. A durable
+COMMITTED import seen by reconciliation before its callback marks the
+generation IMPORTED, and the later callback leaves it so.
+Independent Opus 5/high integration re-review R6 returned `CODE_REVIEW_PASS`.
