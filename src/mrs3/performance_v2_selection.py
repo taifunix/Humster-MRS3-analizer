@@ -21,7 +21,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 from .performance_v2_windows import (
     METRICS_VERSION, WindowMetrics, _METRIC_COLUMNS, _cached, _calculate,
-    _flat_samples, _load_equity_samples_for_quality, _load_source, _metric_from_row, _persist,
+    _flat_samples, _load_equity_samples_for_quality, _load_source, _metric_from_row, _persist_many,
     calendar_window_days, get_or_calculate_window, get_or_calculate_window_pair,
 )
 from .performance_v2_equity_cache import (
@@ -1046,8 +1046,7 @@ def prepare_selection_window_cache(
                         current = current_equity_source_metadata(writer, result_id)
                         if equity_source_revision(current) != equity_source_revision(metadata):
                             raise EquitySourceChangedError("EQUITY_SOURCE_CHANGED")
-                    for metric in metrics:
-                        _persist(writer, metric)
+                    _persist_many(writer, metrics)
                     if publications:
                         upsert_equity_quality_facts_checked(
                             writer, publications, calculated_at_utc=datetime.now(timezone.utc)

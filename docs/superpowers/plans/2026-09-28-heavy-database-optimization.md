@@ -343,8 +343,17 @@ scope добавление scope workers не ускоряет последов�
   `CODE_REVIEW_PASS`: 403 related tests passed; fixed seven-window calculation
   median 0.069731 s versus 0.050920 s with identical typed output. Boundary
   indexes remain unimplemented and evidence-gated, so CALC-01 stays open.
-- [ ] **CALC-02 — cache statements.** Bulk/native upsert вместо per-window statements
+- [x] **CALC-02 — cache statements.** Bulk/native upsert вместо per-window statements
   внутри уже существующей batch transaction. Сохранить all-or-none publication.
+  R9 accepted after independent Claude Opus 5/high `CODE_REVIEW_PASS`: fresh full
+  5,557 passed/9 skipped/30 warnings; focused 219 passed; related 406 passed/4
+  skipped; normal export 8 passed. Actual-schema seven-run alternating pairs
+  matched all 21 columns and frozen timestamps; scalar INSERT median 14.963132 s
+  versus bulk 0.314956 s (97.9% write-stage reduction only). Duplicate rejection,
+  Decimal/INTEGER failure rollback/reopen, source rechecks, checked-equity,
+  commit, and rollback were verified; no whole-selection/import or production-tail
+  speed claim is made. CALC-01 boundary indexes, IMP-02 tail attribution, and
+  WIN-01 remain open.
 - [ ] **CACHE-01 — helper no-republish.** Для fully-valid cache и `include_equity=False`
   вернуть пустой write set, сохранив доступность результата и progress. Обычный preview
   уже read-only; не выдавать это за новый фикс всего preview. Readiness/completeness остаются.

@@ -1381,7 +1381,7 @@ def test_enabled_equity_selection_batch_reads_only_fresh_facts_for_exact_retest_
 
         monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
         monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
-        monkeypatch.setattr(selection_module, "_persist", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
+        monkeypatch.setattr(selection_module, "_persist_many", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
         candidates = load_selection_candidates(CountingConnection(), scoped, SelectionConfig(), cache_only=True)
         assert candidates["strategy_id"].tolist() == [second_id]
         assert candidates.loc[0, "_equity_cache"]["status"] == "FRESH"
@@ -1526,7 +1526,7 @@ def test_enabled_equity_selection_rejects_unverified_cache_facts(
 
     monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
     monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
-    monkeypatch.setattr(selection_module, "_persist", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
+    monkeypatch.setattr(selection_module, "_persist_many", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
     with duckdb.connect(str(database), read_only=True) as check:
         with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
             load_selection_candidates(check, request, SelectionConfig(), cache_only=True)
@@ -1672,7 +1672,7 @@ def test_equity_selection_off_hydrates_optional_cache_sentinel_without_equity_co
     prepare_selection_window_cache(database, absent, SelectionConfig(), workers=1)
     monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
     monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
-    monkeypatch.setattr(selection_module, "_persist", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
+    monkeypatch.setattr(selection_module, "_persist_many", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
     with duckdb.connect(str(database), read_only=True) as check:
         calls: list[str] = []
 
@@ -1721,7 +1721,7 @@ def test_disabled_equity_consumer_tolerates_stale_invalid_and_v5_sentinels(
 
     monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
     monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
-    monkeypatch.setattr(selection_module, "_persist", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
+    monkeypatch.setattr(selection_module, "_persist_many", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
     with duckdb.connect(str(database), read_only=True) as check:
         candidates = load_selection_candidates(check, request, SelectionConfig(), cache_only=True)
 
@@ -2142,7 +2142,7 @@ def test_warm_equity_preparation_has_no_source_load_or_cache_write(tmp_path: Pat
 
     monkeypatch.setattr(selection_module, "_load_source", raw_load_forbidden)
     monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", raw_load_forbidden)
-    monkeypatch.setattr(selection_module, "_persist", raw_load_forbidden)
+    monkeypatch.setattr(selection_module, "_persist_many", raw_load_forbidden)
     prepare_selection_window_cache(
         database, request, config, workers=1, strategy_ids=(strategy_id,), include_equity=True
     )
@@ -2431,6 +2431,121 @@ def test_parallel_window_warmup_persists_default_selection_windows(tmp_path: Pat
 
     with duckdb.connect(str(database), read_only=True) as check:
         assert check.execute("select count(*) from window_metrics").fetchone() == (7,)
+
+
+def test_bulk_window_warmup_uses_writer_on_the_existing_checked_connection(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    second_strategy, second_result = _clone_current_candidate(connection, "beta")
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    prepare_selection_window_cache(
+        database, request, SelectionConfig(), workers=1,
+        strategy_ids=(second_strategy,), include_equity=True,
+    )
+    with duckdb.connect(str(database)) as setup:
+        setup.execute("delete from window_metrics where result_id = ?", [second_result])
+
+    events: list[tuple[str, int | None]] = []
+    original_bulk = selection_module._persist_many
+    original_equity = selection_module.upsert_equity_quality_facts_checked
+    original_source = selection_module.current_equity_source_metadata
+    original_connect = selection_module.duckdb.connect
+
+    class TracedConnection:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def execute(self, sql, parameters=None):
+            normalized = sql.lower().strip()
+            if normalized in {"begin transaction", "commit", "rollback"}:
+                events.append((normalized, id(self)))
+            elif normalized.startswith("insert into window_metrics"):
+                events.append(("window_sql", id(self)))
+            return self.wrapped.execute(sql) if parameters is None else self.wrapped.execute(sql, parameters)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.wrapped.close()
+            return False
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    def traced_connect(*args, **kwargs):
+        wrapped = original_connect(*args, **kwargs)
+        return wrapped if kwargs.get("read_only") else TracedConnection(wrapped)
+
+    def counted_bulk(writer, metrics):
+        events.append((f"bulk:{len(metrics)}", id(writer)))
+        return original_bulk(writer, metrics)
+
+    def counted_equity(writer, *args, **kwargs):
+        events.append(("equity", id(writer)))
+        return original_equity(writer, *args, **kwargs)
+
+    def counted_source(writer, *args, **kwargs):
+        if isinstance(writer, TracedConnection):
+            events.append(("source_recheck", id(writer)))
+        return original_source(writer, *args, **kwargs)
+
+    monkeypatch.setattr(selection_module, "_persist_many", counted_bulk)
+    monkeypatch.setattr(selection_module, "upsert_equity_quality_facts_checked", counted_equity)
+    monkeypatch.setattr(selection_module, "current_equity_source_metadata", counted_source)
+    monkeypatch.setattr(selection_module.duckdb, "connect", traced_connect)
+
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    assert [kind for kind, _ in events] == [
+        "begin transaction", "source_recheck", "bulk:14", "window_sql", "equity", "commit",
+    ]
+    assert len({writer_id for _, writer_id in events}) == 1
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select count(*) from window_metrics").fetchone() == (14,)
+        assert check.execute("select count(*) from equity_quality_metrics").fetchone() == (2,)
+
+
+def test_window_warmup_rolls_back_bulk_windows_when_checked_equity_fails(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    _clone_current_candidate(connection, "beta")
+    _clone_current_candidate(connection, "gamma")
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    original_equity = selection_module.upsert_equity_quality_facts_checked
+    original_bulk = selection_module._persist_many
+    calls = 0
+    bulk_calls: list[tuple[int, int, tuple[int, ...]]] = []
+
+    def counted_bulk(writer, metrics):
+        result = original_bulk(writer, metrics)
+        bulk_calls.append((id(writer), len(metrics), tuple(sorted({int(metric.result_id) for metric in metrics}))))
+        return result
+
+    def fail_second_equity(writer, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("checked equity failure")
+        return original_equity(writer, *args, **kwargs)
+
+    monkeypatch.setattr(selection_module, "upsert_equity_quality_facts_checked", fail_second_equity)
+    monkeypatch.setattr(selection_module, "_persist_many", counted_bulk)
+    with pytest.raises(RuntimeError, match="checked equity failure"):
+        prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    assert len(bulk_calls) == 2
+    assert bulk_calls[1][1] == 7
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select count(*) from window_metrics").fetchone() == (14,)
+        assert check.execute("select count(*) from equity_quality_metrics").fetchone() == (2,)
+        for result_ids, expected in ((bulk_calls[0][2], 14), (bulk_calls[1][2], 0)):
+            assert check.execute(
+                "select count(*) from window_metrics where result_id in ("
+                + ",".join("?" for _ in result_ids) + ")", list(result_ids)
+            ).fetchone() == (expected,)
 
 
 def test_missing_cache_strategy_ids_only_returns_current_results_without_facts(tmp_path: Path) -> None:

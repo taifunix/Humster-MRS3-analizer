@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -14,12 +15,13 @@ from mrs3.performance_v2_windows import (
     _calculate,
     _Equity,
     _round_trips,
+    _persist,
+    _persist_many,
     WindowMetrics,
     compare_window_pair_geometrically,
     get_or_calculate_window,
     get_or_calculate_window_pair,
 )
-
 
 UTC = timezone.utc
 
@@ -130,6 +132,291 @@ def _db(tmp_path, *, scale: Decimal = Decimal("1")) -> tuple[duckdb.DuckDBPyConn
     ]
     connection.executemany("insert into strategy_equity values (?, ?, ?, ?, ?)", equity)
     return connection, int(result_id)
+
+
+def _persist_metric(
+    result_id: int = 1,
+    *,
+    key: str = "A",
+    key_index: int | None = None,
+    value: Decimal = Decimal("1.25"),
+    unavailable_reason: str | None = None,
+    trade_count: int | None = 3,
+) -> WindowMetrics:
+    start = datetime(2026, 2, 1, tzinfo=UTC) + timedelta(
+        days=ord(key[0]) - ord("A") if key_index is None else key_index
+    )
+    return WindowMetrics(
+        result_id, start, start + timedelta(days=1), METRICS_VERSION,
+        start, start + timedelta(days=1), "UNAVAILABLE" if unavailable_reason else "AVAILABLE",
+        unavailable_reason, value, value, value, value, value, value, value, value,
+        trade_count, value, value, value,
+    )
+
+
+class _RecordingConnection:
+    def __init__(self, connection=None):
+        self.connection = connection
+        self.calls: list[tuple[str, object]] = []
+        self.returned: list[object] = []
+
+    def execute(self, sql: str, parameters=None):
+        self.calls.append((sql, parameters))
+        result = self.connection.execute(sql, parameters) if self.connection is not None else object()
+        self.returned.append(result)
+        return result
+
+
+def test_persist_many_empty_is_a_noop_and_matches_scalar_sql_for_one_row(monkeypatch, tmp_path) -> None:
+    fixed = datetime(2026, 9, 29, 12, tzinfo=UTC)
+    calls: list[datetime] = []
+
+    class FrozenDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            calls.append(fixed)
+            return fixed
+
+    monkeypatch.setattr(windows_module, "datetime", FrozenDatetime)
+    metric = _persist_metric()
+    scalar_db, _ = _db(tmp_path / "scalar")
+    bulk_db, _ = _db(tmp_path / "bulk")
+    scalar = _RecordingConnection(scalar_db)
+    bulk = _RecordingConnection(bulk_db)
+    try:
+        _persist(scalar, metric)
+        before_bulk = len(calls)
+        _persist_many(bulk, [metric])
+        assert len(calls) == before_bulk + 1
+        assert scalar.calls[0][0] == bulk.calls[0][0]
+        assert scalar.calls[0][1] == bulk.calls[0][1]
+        empty = _RecordingConnection()
+        _persist_many(empty, [])
+        assert empty.calls == []
+        assert len(calls) == before_bulk + 1
+    finally:
+        scalar_db.close()
+        bulk_db.close()
+
+
+@pytest.mark.parametrize(("count", "expected_chunks"), [(896, [18_816]), (897, [18_816, 21])])
+def test_persist_many_uses_fixed_896_row_chunks(count: int, expected_chunks: list[int]) -> None:
+    recorder = _RecordingConnection()
+    metrics = [_persist_metric(result_id=index + 1) for index in range(count)]
+
+    _persist_many(recorder, metrics)
+
+    assert [len(parameters) for _, parameters in recorder.calls] == expected_chunks
+    assert all("begin" not in sql.lower() and "commit" not in sql.lower() for sql, _ in recorder.calls)
+
+
+def test_persist_many_uses_source_ordered_duplicate_groups(monkeypatch) -> None:
+    fixed = datetime(2026, 9, 29, 12, tzinfo=UTC)
+    clock_calls: list[datetime] = []
+
+    class FrozenDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            value = fixed + timedelta(seconds=len(clock_calls))
+            clock_calls.append(value)
+            return value
+
+    monkeypatch.setattr(windows_module, "datetime", FrozenDatetime)
+    metrics = [_persist_metric(result_id=index + 1) for index in range(896)]
+    metrics.append(_persist_metric(result_id=898, key_index=896, value=Decimal("88.88")))
+    metrics.append(_persist_metric(value=Decimal("99.99")))
+    metrics.append(_persist_metric(result_id=898, key_index=896, value=Decimal("77.77")))
+    recorder = _RecordingConnection()
+
+    _persist_many(recorder, metrics)
+
+    assert len(clock_calls) == len(metrics)
+    assert len(recorder.calls) == 3
+    first_parameters = recorder.calls[0][1]
+    second_parameters = recorder.calls[1][1]
+    third_parameters = recorder.calls[2][1]
+    assert len(first_parameters) == 18_816
+    assert len(second_parameters) == 42
+    assert len(third_parameters) == 21
+    assert first_parameters[0] == 1
+    assert first_parameters[8] == Decimal("1.25")
+    assert first_parameters[20] == clock_calls[0]
+    assert second_parameters[0] == 898
+    assert second_parameters[8] == Decimal("88.88")
+    assert second_parameters[20] == clock_calls[896]
+    assert second_parameters[21] == 1
+    assert second_parameters[29] == Decimal("99.99")
+    assert second_parameters[41] == clock_calls[897]
+    assert third_parameters[0] == 898
+    assert third_parameters[8] == Decimal("77.77")
+    assert third_parameters[20] == clock_calls[898]
+
+
+def test_persist_many_does_not_hide_nonfinite_earlier_duplicate(monkeypatch) -> None:
+    fixed = datetime(2026, 9, 29, 12, tzinfo=UTC)
+    clock_calls: list[datetime] = []
+
+    class FrozenDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            value = fixed + timedelta(seconds=len(clock_calls))
+            clock_calls.append(value)
+            return value
+
+    monkeypatch.setattr(windows_module, "datetime", FrozenDatetime)
+    recorder = _RecordingConnection()
+
+    with pytest.raises(duckdb.ConversionException):
+        _persist_many(
+            recorder,
+            [_persist_metric(value=Decimal("NaN")), _persist_metric(value=Decimal("2.5"))],
+        )
+
+    assert len(clock_calls) == 2
+    assert recorder.calls == []
+
+
+def test_persist_many_preserves_native_validation_for_earlier_duplicate_overflows(tmp_path) -> None:
+    cases = (
+        (
+            "decimal-overflow",
+            replace(_persist_metric(), growth_factor=Decimal("123456789012345678901234567890123456789")),
+            _persist_metric(value=Decimal("2.25")),
+        ),
+        (
+            "integer-overflow",
+            replace(_persist_metric(), trade_count=2_147_483_648),
+            _persist_metric(value=Decimal("2.25")),
+        ),
+    )
+
+    for label, invalid, valid in cases:
+        for bulk in (False, True):
+            database_dir = tmp_path / f"{label}-{'bulk' if bulk else 'scalar'}"
+            database = database_dir / "strategy_performance.duckdb"
+            connection, _ = _db(database_dir)
+            try:
+                connection.execute("begin transaction")
+                with pytest.raises(duckdb.ConversionException):
+                    if bulk:
+                        _persist_many(connection, [invalid, valid])
+                    else:
+                        _persist(connection, invalid)
+                connection.execute("rollback")
+            finally:
+                connection.close()
+            with duckdb.connect(str(database), read_only=True) as check:
+                assert check.execute("select count(*) from window_metrics").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("mode", ["scalar", "bulk", "scalar_bulk", "bulk_scalar"])
+def test_scalar_and_bulk_persistence_have_identical_actual_schema_rows(tmp_path, monkeypatch, mode: str) -> None:
+    fixed = datetime(2026, 9, 29, 12, tzinfo=UTC)
+
+    class FrozenDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    monkeypatch.setattr(windows_module, "datetime", FrozenDatetime)
+    first = replace(
+        _persist_metric(
+            value=Decimal("12345678901234567890123456.123456789012"),
+            unavailable_reason="нет-данных", trade_count=None,
+        ),
+        growth_factor=None, return_pct=Decimal("0"), daily_log_return=Decimal("-1.5"),
+    )
+    second = _persist_metric(key="B", value=Decimal("1.0000000000005"), trade_count=2_147_483_647)
+    latest = _persist_metric(value=Decimal("2.25"), unavailable_reason=None, trade_count=7)
+    mixed = [
+        replace(_persist_metric(key_index=10), growth_factor=None),
+        replace(_persist_metric(key_index=11), growth_factor=Decimal("0")),
+        replace(_persist_metric(key_index=12), growth_factor=Decimal("-1.5")),
+        replace(
+            _persist_metric(key_index=13, unavailable_reason="\u043d\u0435\u0442-\u0434\u0430\u043d\u043d\u044b\u0445"),
+            growth_factor=Decimal("12345678901234567890123456.123456789012"),
+        ),
+        replace(
+            _persist_metric(key_index=14, trade_count=2_147_483_647),
+            growth_factor=Decimal("1.0000000000005"),
+        ),
+    ]
+    all_metrics = [first, second, *mixed, latest]
+    database = tmp_path / mode
+    connection, _ = _db(database)
+    try:
+        if mode == "scalar":
+            for metric in all_metrics:
+                _persist(connection, metric)
+        elif mode == "bulk":
+            _persist_many(connection, all_metrics)
+        elif mode == "scalar_bulk":
+            _persist(connection, first)
+            _persist_many(connection, [second, *mixed, latest])
+        else:
+            _persist_many(connection, [first, second, *mixed])
+            _persist(connection, latest)
+        observed = connection.execute(
+            "select result_id, requested_start_utc, requested_end_utc, metrics_version, effective_start_utc, effective_end_utc, availability_status, unavailable_reason, growth_factor, return_pct, daily_log_return, daily_growth_pct, max_drawdown_pct, return_dd_ratio, fees_pct, profit_factor, trade_count, win_rate_pct, holding_seconds, time_in_market_pct, calculated_at_utc from window_metrics order by requested_start_utc"
+        ).fetchall()
+        assert len(observed) == 7
+        assert {row[8] for row in observed} >= {
+            None, Decimal("0"), Decimal("-1.5"),
+            Decimal("12345678901234567890123456.123456789012"),
+            Decimal("1.000000000001"),
+        }
+        assert any(row[7] == "\u043d\u0435\u0442-\u0434\u0430\u043d\u043d\u044b\u0445" for row in observed)
+        assert any(row[16] == 2_147_483_647 for row in observed)
+    finally:
+        connection.close()
+
+    comparison_path = tmp_path / "comparison"
+    comparison, _ = _db(comparison_path)
+    try:
+        _persist_many(comparison, all_metrics)
+        assert comparison.execute(
+            "select result_id, requested_start_utc, requested_end_utc, metrics_version, effective_start_utc, effective_end_utc, availability_status, unavailable_reason, growth_factor, return_pct, daily_log_return, daily_growth_pct, max_drawdown_pct, return_dd_ratio, fees_pct, profit_factor, trade_count, win_rate_pct, holding_seconds, time_in_market_pct, calculated_at_utc from window_metrics order by requested_start_utc"
+        ).fetchall() == observed
+    finally:
+        comparison.close()
+
+
+@pytest.mark.parametrize("nonfinite", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")])
+@pytest.mark.parametrize("bulk", [False, True])
+def test_nonfinite_scalar_and_bulk_raise_and_rollback(tmp_path, nonfinite: Decimal, bulk: bool) -> None:
+    database_dir = tmp_path / ("bulk" if bulk else "scalar")
+    database = database_dir / "strategy_performance.duckdb"
+    connection, _ = _db(database_dir)
+    metric = _persist_metric(value=nonfinite)
+    try:
+        connection.execute("begin transaction")
+        with pytest.raises(duckdb.ConversionException):
+            _persist_many(connection, [metric]) if bulk else _persist(connection, metric)
+        connection.execute("rollback")
+    finally:
+        connection.close()
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select count(*) from window_metrics").fetchone() == (0,)
+
+
+def test_persist_many_rolls_back_first_chunk_when_second_chunk_conversion_fails(tmp_path) -> None:
+    database_dir = tmp_path / "late-failure"
+    database = database_dir / "strategy_performance.duckdb"
+    connection, _ = _db(database_dir)
+    valid = [_persist_metric(key_index=index) for index in range(897)]
+    invalid = _persist_metric(key_index=897, value=Decimal("123456789012345678901234567890123456789"))
+    recorder = _RecordingConnection(connection)
+    try:
+        connection.execute("begin transaction")
+        with pytest.raises(duckdb.ConversionException):
+            _persist_many(recorder, [*valid, invalid])
+        assert len(recorder.calls) == 2
+        assert len(recorder.returned) == 1
+        connection.execute("rollback")
+    finally:
+        connection.close()
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select count(*) from window_metrics").fetchone() == (0,)
 
 
 def test_boundaries_move_inward_independently_and_never_expand(tmp_path) -> None:

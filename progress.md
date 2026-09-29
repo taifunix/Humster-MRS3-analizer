@@ -67,10 +67,33 @@ emitted identical ordered metrics (SHA-256
 `a20460daa2534e9c2196a77eb7101d3c8fcd348d83faae97f72f5eb2f64744d0`):
 eight alternating warm pairs measured median 0.069731 s before versus
 0.050920 s after (27.0% lower for this stage only). Independent Opus 5/high
-returned `CODE_REVIEW_PASS`; CALC-01a is accepted. CALC-02 bulk writing still
-needs a bound for direct callers with more than 64 workers. No whole-selection,
-whole-analysis or whole-import speed claim is made.
-Final integrated suite remains pending.
+returned `CODE_REVIEW_PASS`; CALC-01a is accepted. CALC-02 R9 received independent
+Opus 5/high `PLAN_APPROVED`. Its private bulk window writer uses fixed 896-row/
+18,816-parameter statements independent of the one shared Panel/config worker
+setting, inside the existing transaction. The scalar helper is unchanged.
+Actual-schema DuckDB 1.5.5 preflight and 19 new pytest scenarios cover Decimal
+binding, source-ordered duplicate handling, SQL boundaries and durable rollback.
+Root verification passed 219 directly affected and 406 related tests with four
+Windows symlink skips. Three preexisting export tests now guard the renamed
+selection writer; only their mock targets changed. Negative injection proved
+all three guards fail on a forbidden write without changing database identity;
+normal export passed eight tests after remediation. Root found that global
+coalescing hid an invalid earlier duplicate. R9 instead retains every original
+row and splits SQL groups before repeated keys. The new regression failed
+before remediation, then passed Decimal/INTEGER overflow and rollback/reopen
+checks; the 899-row grouping fixture now verifies 896/2/1 ordered statements.
+The final seven-pair actual-schema benchmark matched all 21 stored columns,
+including timestamps, with 896 scalar versus one bulk INSERT. Median elapsed
+was 14.963132 s versus 0.314956 s (97.9% lower for this synthetic write stage);
+bulk maximum 0.345486 s stayed below scalar minimum 12.616319 s.
+Fresh full-suite verification passed 5,557 tests with nine Windows symlink
+skips and 30 warnings in 2,794.54 seconds. Independent Opus 5/high returned
+`CODE_REVIEW_PASS`; CALC-02 is accepted.
+Interrupted full runs at 41% and 15% supply no acceptance evidence.
+No whole-selection, whole-analysis or whole-import speed claim is made.
+The integrated pre-CALC-02 suite passed 5,538 tests with nine Windows symlink
+skips in 1,505.40 seconds. CALC-02 collection contains 5,566 cases; the final
+5,557 passed and nine skipped account for exactly 19 new scenarios.
 T4/COR-05 preserves actual HTML action order and keeps strict final-balance
 validation based on the latest timestamp/source-index witness. Swapped HTML
 is rejected as ACTIONS_OUT_OF_ORDER while a valid sibling commits; equal-time
@@ -78,8 +101,8 @@ actions retain source order. Regression RED/2 GREEN and the full HTML/import
 contour passed 115 tests. Caller enumeration established a single runtime
 typed-parser consumer (the importer); the related fast/Panel/legacy contour
 passed 196 tests, 4 skipped, 8 warnings. Independent Claude Opus 5/high
-returned CODE_REVIEW_PASS in round 2; T4 is accepted. The integrated full
-suite remains pending and the branch is not yet complete.
+returned CODE_REVIEW_PASS in round 2; T4 is accepted. The fresh integrated full
+suite passed as recorded above; the branch is not yet complete.
 The user's import-tail report now prioritizes T4 then measured IMP-02/T13 work
 ahead of independent optimization tasks. The latest local audit confirms a
 409-report REPLACE batch in an approximately 14 GB DB, but records contain no
@@ -96,8 +119,8 @@ the preserved DELETE-only benchmark repeated at 47.8% lower with matching
 retained-row signatures. These varying small-fixture numbers are not a
 production or whole-import gain. Independent Opus 5/high re-review returned
 CODE_REVIEW_PASS after exact guard/read-order evidence and singleton coverage;
-T13a is accepted. Remaining IMP-02 work and integrated full-suite verification
-are still open.
+T13a is accepted. Remaining IMP-02 work is still open; integrated full-suite
+verification passed as recorded above.
 T13b caches validated append-column metadata only within one publication and
 flushes action/equity buffers inside their row loops at the 20,000-row cap.
 The importer suite passed 91 tests, including full DuckDB row/null/Decimal,
@@ -107,7 +130,7 @@ passed 7 with 1 skip; supported migration passed 3. Independent Opus 5/high
 re-review returned `CODE_REVIEW_PASS` after the parity regression was added.
 This is a bounded writer-buffer/schema-query slice, not a measured full-import
 speedup; remaining IMP-02 publication metadata and preparation work is open.
-Final integrated full-suite verification remains pending.
+Integrated full-suite verification passed as recorded above.
 T13c batches only the post-commit successful-REPLACE current-result readback:
 zero candidates issue zero queries, a singleton keeps its scalar query, and
 409 unique candidates now take one bounded `BIGINT[]` read instead of 409.

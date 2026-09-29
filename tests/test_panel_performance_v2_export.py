@@ -189,7 +189,7 @@ def test_read_only_export_includes_only_fresh_cached_equity_facts_without_writes
 
     monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
     monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
-    monkeypatch.setattr(selection_module, "_persist", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
+    monkeypatch.setattr(selection_module, "_persist_many", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
     before_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
     before_catalog = _catalog_identity(database)
     _, payload = export_performance_v2(database, PerformanceV2ExportSelection(all_active=True))
@@ -253,7 +253,7 @@ def test_read_only_export_uses_cached_completed_trades_and_blanks_cache_miss(
             [second_result_id, second_strategy_id],
         )
     for name in (
-        "_load_source", "_load_equity_samples_for_quality", "_persist",
+        "_load_source", "_load_equity_samples_for_quality", "_persist_many",
         "get_or_calculate_window", "get_or_calculate_window_pair",
     ):
         monkeypatch.setattr(
@@ -320,7 +320,7 @@ def test_read_only_export_omits_invalid_cached_equity_facts_without_writes(tmp_p
 
     monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
     monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
-    monkeypatch.setattr(selection_module, "_persist", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
+    monkeypatch.setattr(selection_module, "_persist_many", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
     before_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
     before_catalog = _catalog_identity(database)
 

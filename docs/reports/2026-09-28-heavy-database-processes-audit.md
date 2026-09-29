@@ -462,6 +462,90 @@ Remote delivery (`panel_remote_source_db.py:205–211, 260–267, 820–828`) х
 Рекомендация относится к существующему локальному in-process режиму; новый DB-сервис
 или зависимость для этой задачи не нужны.
 
+## CALC-02 measured selection-cache write stage (2026-09-29)
+
+The selection writer now uses a private native bulk upsert within its existing
+transaction. At most 896 unique rows and 18,816 parameters enter one statement;
+larger direct-call batches use several statements under the same transaction.
+Duplicate keys split into later statements, preserving every original row
+and making the last valid values/timestamp win. Scalar
+window callers, cache selection, arithmetic and source/equity rechecks keep
+their existing path. Nonfinite Decimals are rejected before SQL so a
+later valid duplicate cannot hide them. Global coalescing was rejected after
+an actual-schema probe showed that it hid earlier Decimal and INTEGER overflow.
+
+DuckDB 1.5.5 actual-schema preflight confirmed scalar/bulk insert and update,
+mixed-scale Decimal and NULL parity, and matching nonfinite rejection. The
+maximum 896-row statement executed successfully. New tests exercise SQL
+identity, 896/897-row boundaries, timestamp/duplicate semantics, real second-
+chunk failure rollback, and late equity failure with earlier-batch retention.
+The directly affected suites passed 219 tests; the related equity/portfolio/
+Panel/store contour passed 406 with four Windows symlink skips. Three existing
+export tests changed only their writer mock target. Temporary negative injection
+proved all three guards reject writes without changing file or catalog identity;
+the normal export suite passed eight tests. The integrated
+pre-change baseline passed 5,538 tests with nine Windows symlink skips in
+1,505.40 seconds. The invalid-earlier-duplicate regression was RED before R9
+and GREEN after it; Decimal/INTEGER conversion failures roll back and reopen
+with zero rows. The 899-row fixture retains all inputs in groups of 896/2/1.
+Final full-suite verification passed 5,557 tests with nine Windows symlink
+skips and 30 warnings in 2,794.54 seconds. Collection contains 5,566 cases:
+the baseline's 5,538 passing tests plus exactly 19 new scenarios, with unchanged
+skips. Independent Opus 5/high returned `CODE_REVIEW_PASS`; CALC-02 is accepted.
+
+The final R9 benchmark used seven paired, alternating runs on fresh temporary
+file-backed actual-schema databases and persisted the same 896 unique rows:
+224 unavailable rows with NULL metrics and 672 populated available rows.
+It uses the existing test-schema seed and deterministic per-window keys.
+Both arms used the same frozen per-input timestamps and caller transaction;
+the timed region includes begin, writes and commit. Reopened, ordered readback
+of all 21 columns, including timestamps, matched in every run.
+
+| Arm | Window INSERTs | Seven durations, seconds | Median, seconds |
+| --- | ---: | --- | ---: |
+| Scalar | 896 | 13.135960, 15.502873, 16.307221, 12.616319, 13.386796, 14.963132, 15.772092 | 14.963132 |
+| Bulk | 1 | 0.300894, 0.318896, 0.302521, 0.299999, 0.345486, 0.314956, 0.329397 | 0.314956 |
+
+Bulk maximum 0.345486 s is below scalar minimum 12.616319 s. The median
+reduction is 97.9% for this synthetic persistence stage only. It is not a
+whole-selection or whole-import speed claim. The host reports 34 logical CPUs
+and Intel64 Family 6 Model 85; post-run process RSS was 142,798,848 bytes,
+not a peak-memory comparison. The write-stage probe uses no worker pool.
+Input SHA-256: `d55f5b96d907c4d459a52cb67804cff24df3e4afe158972a7c4129974336ebd7`.
+Seed database SHA-256: `cf4836cb925f15d3127e006a792861e2201dc2ab14fd67acef623a73d338631b`.
+Stored all-column SHA-256: `f03eb788758791cb5ea9ee91475cd7ca2060d869483f6bf30071b9975d510c2f`.
+This newly recorded fixture replaces the earlier deleted temporary harness;
+its numbers are a fresh scalar/bulk comparison, not a comparison with the
+previous fixture's timings.
+
+The existing shared Panel/config value is `duckdb_import.workers` in
+`config.local.json`; `config.performance.json` has no separate worker field.
+The example sets 16; the existing absent-section fallback is 4. Performance
+v2 config keeps its existing cap of 64. No setting changes are part of CALC-02.
+
+Read-only worker-routing audit confirms that the main Panel HTML/Source v6
+import, materialization, fresh analysis, direct materialization, Performance v2
+import/cache and optimizer-preparation paths pass the same shared setting.
+The tracked `config.example.json` still uses 4; `config.local.json.example`
+uses 16. Direct API defaults are distinct from Panel configuration and should
+not be mistaken for additional Panel settings.
+
+Exceptions remain in the existing paths: `partial_performance_import.py` uses
+the legacy importer default/cap of 16, `patch_merge_source_v6.py` has a CLI
+default of 4, synchronous `LocalSurfacesService.surface_publish()` omits the
+service worker value, and the older `run_source_v6_analysis()` route is serial.
+Remote Source import reads the remote machine's shared config rather than
+transmitting the local worker value. These observations introduce no runtime
+change in CALC-02.
+
+Outer pools and DuckDB query threads are separate mechanisms. Fresh surface
+validation explicitly uses one DuckDB thread and a 1 GB connection limit;
+Performance cache workers set SQL threads to one, while the final Panel
+selection query sets them to the shared worker count. Most other connections
+use plain `duckdb.connect` without a query-thread setting. The static audit
+cannot establish their runtime default or prove excessive nested parallelism;
+that remains a profiling question, not a confirmed defect.
+
 ## Карта покрытия и ограничения
 
 | Контур | Просмотренные модули | Итог |

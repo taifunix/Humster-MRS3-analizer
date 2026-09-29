@@ -472,6 +472,56 @@ change rather than a whole-selection speed claim. CALC-02 bulk publication
 remains separate; direct callers can pass more workers than the Panel config
 cap, so its write bound must be settled in a separately approved plan.
 
+## CALC-02: bounded bulk publication of selection windows
+
+The selection-cache writer keeps one transaction per existing batch and its
+current order: explicit source rechecks for results without equity publication,
+window-metric writes, checked equity publication, then commit. The checked
+equity path may perform a later source recheck after window SQL; any failure
+must roll back both window and equity changes from that batch. Earlier
+committed batches remain committed.
+
+Replace only the selection writer's per-metric `_persist` loop with a private
+`_persist_many` bulk upsert on its existing connection. Standalone `_persist`
+callers and the scalar SQL remain unchanged. The bulk helper must not open or close a
+connection or control the transaction. It uses the same 20 metric columns plus
+`calculated_at_utc`, primary key, and conflict-update columns as `_persist`.
+Prepare one UTC timestamp per input metric in the received sequence before
+any SQL. Preserve every original payload and its timestamp in that sequence.
+Do not coalesce duplicates: an invalid earlier duplicate must still reach
+DuckDB conversion and cannot be hidden by a later valid row. Each SQL group
+contains distinct conflict keys; flush the current group before adding a key
+already present in it, or when its size reaches 896. Repeated keys therefore
+execute in later statements, where unchanged conflict updates make the last
+valid payload/timestamp win. Native DuckDB retains Decimal/INTEGER/nullability
+validation; add no duplicate-specific casts or validation replica. The existing
+nonfinite Decimal rejection remains before SQL. Timestamp acquisition moves
+before database writes. For a fixed received sequence inside the caller's
+transaction, final stored rows and failure outcomes must match scalar
+persistence; worker completion order itself need not be deterministic.
+
+Use fixed groups of at most 896 rows: 21 bound values per row and at
+most 18,816 parameters per statement. This bound is independent of worker
+count, including direct callers that pass more than the Performance v2 config
+cap of 64. The sole Panel worker-count setting remains `duckdb_import.workers`
+from `config.local.json`. Its example value is 16; if the section is absent,
+the existing `DuckDBImportSettings` fallback is 4. CALC-02 adds no separate
+worker or SQL-batch setting. Keep the schema, metrics version, cache selection,
+worker scheduling, callbacks, telemetry, dependencies, and public API unchanged.
+
+Acceptance requires actual-schema DuckDB 1.5.5 preflight for insert/update,
+conflicts, mixed-scale `DECIMAL` values, nonfinite-value rejection,
+duplicate-key handling and the maximum statement width; RED/GREEN
+tests for scalar-equivalent values, source-ordered duplicate groups and invalid
+earlier duplicates, empty/896/897-row SQL counts, real-transaction rollback after a late
+equity check and after a second SQL-chunk failure. Nonfinite `Decimal` values
+are invalid for the actual `DECIMAL(38,12)` columns and typed reads; scalar
+and bulk paths must reject them equivalently. Run directly affected, related,
+and full `.venv` tests. A seven-run throwaway-database stage benchmark must
+show identical final rows and nonoverlapping scalar/bulk timing ranges before
+claiming a speedup for this write stage; it cannot establish whole-selection
+speedup.
+
 ## Optimization invariants
 
 - Exact Decimal arithmetic, window-local peaks/fees, W0 exclusion, carry-in,

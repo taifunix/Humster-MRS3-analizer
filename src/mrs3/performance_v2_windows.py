@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Sequence
 
 import duckdb
 
@@ -474,6 +474,49 @@ def _persist(connection: duckdb.DuckDBPyConnection, metrics: WindowMetrics) -> N
         + ", calculated_at_utc = excluded.calculated_at_utc",
         [getattr(metrics, column) for column in _METRIC_COLUMNS] + [datetime.now(timezone.utc)],
     )
+
+
+def _persist_many(connection: duckdb.DuckDBPyConnection, metrics: Sequence[WindowMetrics]) -> None:
+    prepared: list[tuple[tuple[object, ...], list[object]]] = []
+    for metric in metrics:
+        values = tuple(getattr(metric, column) for column in _METRIC_COLUMNS)
+        prepared.append((values[:4], [*values, datetime.now(timezone.utc)]))
+    if not prepared:
+        return
+    if any(
+        isinstance(value, Decimal) and not value.is_finite()
+        for _, values in prepared
+        for value in values
+    ):
+        raise duckdb.ConversionException("Decimal value must be finite")
+
+    columns = _METRIC_COLUMNS + ("calculated_at_utc",)
+    if len(columns) * 896 > 18_816:
+        raise AssertionError("bulk persistence exceeds the DuckDB parameter bound")
+    prefix = "insert into window_metrics (" + ", ".join(columns) + ") values "
+    row_placeholders = "(" + ", ".join("?" for _ in columns) + ")"
+    suffix = (
+        " on conflict (result_id, requested_start_utc, requested_end_utc, metrics_version) do update set "
+        + ", ".join(f"{column} = excluded.{column}" for column in _METRIC_COLUMNS[4:])
+        + ", calculated_at_utc = excluded.calculated_at_utc"
+    )
+    group: list[list[object]] = []
+    group_keys: set[tuple[object, ...]] = set()
+    for key, values in prepared:
+        if group and (key in group_keys or len(group) == 896):
+            connection.execute(
+                prefix + ", ".join(row_placeholders for _ in group) + suffix,
+                [value for row in group for value in row],
+            )
+            group.clear()
+            group_keys.clear()
+        group.append(values)
+        group_keys.add(key)
+    if group:
+        connection.execute(
+            prefix + ", ".join(row_placeholders for _ in group) + suffix,
+            [value for row in group for value in row],
+        )
 
 
 def get_or_calculate_window(
