@@ -7,6 +7,7 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -1017,6 +1018,263 @@ def test_replace_switches_current_result_and_replaces_only_scoped_children(tmp_p
         assert connection.execute("select report_end_utc from strategy_results where result_id = ?", [old_result]).fetchone()[0].date().isoformat() == "2026-01-10"
     assert (request.inbox / "strategies" / "alpha.json").read_bytes()
     assert (request.inbox / "inbox_manifest.json").read_bytes()
+
+
+def test_replace_readback_batches_multiple_strategy_ids_and_keeps_manifest_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta", "gamma"))
+    assert import_performance_v2(request).imported_count == 3
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        rows = connection.execute(
+            "select strategy_name, strategy_id, current_result_id from strategies order by strategy_name"
+        ).fetchall()
+    strategy_ids = {str(name): int(strategy_id) for name, strategy_id, _ in rows}
+    expected = {str(name): int(result_id) for name, _, result_id in rows}
+    replacement = PerformanceV2ImportRequest(
+        request.inbox,
+        request.report_root,
+        request.config,
+        mode="REPLACE",
+        replacement_strategy_ids=strategy_ids,
+        expected_current_result_ids=expected,
+        listing_dates_path=request.listing_dates_path,
+    )
+
+    raw_connect = import_module.duckdb.connect
+    batch_queries: list[tuple[str, object]] = []
+    scalar_queries: list[tuple[str, object]] = []
+
+    class _Result:
+        def __init__(self, rows: list[tuple[object, ...]]) -> None:
+            self._rows = rows
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return self._rows
+
+    class _Connection:
+        def __init__(self, raw: object) -> None:
+            self._raw = raw
+
+        def execute(self, sql: str, parameters=None):
+            compact = " ".join(str(sql).casefold().split())
+            if "selectstrategy_id,current_result_idfromstrategies" in compact.replace(" ", ""):
+                batch_queries.append((str(sql), parameters))
+                rows = self._raw.execute(sql, parameters).fetchall()
+                return _Result(list(reversed(rows)))
+            if "select current_result_id from strategies where strategy_id = ?" in compact:
+                scalar_queries.append((str(sql), parameters))
+            return self._raw.execute(sql, parameters) if parameters is not None else self._raw.execute(sql)
+
+        def close(self) -> None:
+            self._raw.close()
+
+        def __getattr__(self, name: str):
+            return getattr(self._raw, name)
+
+    monkeypatch.setattr(import_module.duckdb, "connect", lambda *args, **kwargs: _Connection(raw_connect(*args, **kwargs)))
+    result = import_performance_v2(replacement)
+
+    assert result.successful_replacements == tuple(
+        {
+            "strategy_id": strategy_ids[name],
+            "old_result_id": expected[name],
+            "new_result_id": expected[name],
+        }
+        for name in ("alpha", "beta", "gamma")
+    )
+    assert len(batch_queries) == 1
+    assert scalar_queries == []
+    assert batch_queries[0][1] == [list(strategy_ids.values())]
+
+
+def test_replace_readback_omits_missing_and_null_rows_and_filtered_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta", "gamma", "delta"))
+    assert import_performance_v2(request).imported_count == 4
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        rows = connection.execute(
+            "select strategy_name, strategy_id, current_result_id from strategies order by strategy_name"
+        ).fetchall()
+    strategy_ids = {str(name): int(strategy_id) for name, strategy_id, _ in rows}
+    replacement = PerformanceV2ImportRequest(
+        request.inbox,
+        request.report_root,
+        request.config,
+        mode="REPLACE",
+        replacement_strategy_ids=strategy_ids,
+        listing_dates_path=request.listing_dates_path,
+    )
+    invalid = replacement.report_root / "delta.html"
+    invalid.write_text("<html>invalid</html>", encoding="utf-8")
+    manifest_path = replacement.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"][3]["source_report_sha256"] = sha256(invalid.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    raw_connect = import_module.duckdb.connect
+    batch_queries: list[object] = []
+
+    class _Result:
+        def __init__(self, rows: list[tuple[object, ...]]) -> None:
+            self._rows = rows
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return self._rows
+
+    class _Connection:
+        def __init__(self, raw: object) -> None:
+            self._raw = raw
+
+        def execute(self, sql: str, parameters=None):
+            compact = " ".join(str(sql).casefold().split())
+            if "selectstrategy_id,current_result_idfromstrategies" in compact.replace(" ", ""):
+                batch_queries.append(parameters)
+                all_rows = self._raw.execute(sql, parameters).fetchall()
+                alpha_id = strategy_ids["alpha"]
+                gamma_id = strategy_ids["gamma"]
+                rows = [row for row in all_rows if int(row[0]) == alpha_id]
+                rows.append((gamma_id, None))
+                return _Result(list(reversed(rows)))
+            return self._raw.execute(sql, parameters) if parameters is not None else self._raw.execute(sql)
+
+        def close(self) -> None:
+            self._raw.close()
+
+        def __getattr__(self, name: str):
+            return getattr(self._raw, name)
+
+    monkeypatch.setattr(import_module.duckdb, "connect", lambda *args, **kwargs: _Connection(raw_connect(*args, **kwargs)))
+    result = import_performance_v2(replacement)
+
+    assert len(batch_queries) == 1
+    assert len(result.successful_replacements) == 1
+    assert result.successful_replacements[0]["strategy_id"] == strategy_ids["alpha"]
+    assert result.successful_replacements[0]["old_result_id"] == result.successful_replacements[0]["new_result_id"]
+    assert any(row["strategy_name"] == "delta" and row["reason"] == "INVALID_REPORT" for row in result.failures)
+
+
+@pytest.mark.parametrize(
+    (
+        "candidate_count", "expected_batch_sizes", "expected_scalar_queries", "duplicate_ids",
+        "explicit_expected", "result_delta", "strict_mismatch", "filtered_name",
+    ),
+    [
+        (0, [], 0, False, False, 0, False, None), (1, [], 1, False, False, 0, False, None),
+        (2, [2], 0, False, False, 0, False, None), (3, [3], 0, False, False, 0, False, None),
+        (409, [409], 0, False, False, 0, False, None), (1025, [1024, 1], 0, False, False, 0, False, None),
+        (2, [], 1, True, False, 0, False, None), (2, [2], 0, False, True, 100, False, None),
+        (2, [], 0, False, False, 0, True, None), (3, [2], 0, False, False, 0, False, "candidate-1"),
+    ],
+)
+def test_replace_readback_query_counts_cover_scalar_and_chunk_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_count: int,
+    expected_batch_sizes: list[int],
+    expected_scalar_queries: int,
+    duplicate_ids: bool,
+    explicit_expected: bool,
+    result_delta: int,
+    strict_mismatch: bool,
+    filtered_name: str | None,
+) -> None:
+    base, _ = _request(tmp_path)
+    names = tuple(f"candidate-{index}" for index in range(candidate_count))
+    strategy_ids = {name: 10_000 if duplicate_ids else 10_000 + index for index, name in enumerate(names)}
+    expected = {name: 20_000 + index for index, name in enumerate(names)}
+    request = PerformanceV2ImportRequest(
+        base.inbox,
+        base.report_root,
+        base.config,
+        mode="REPLACE",
+        replacement_strategy_ids=strategy_ids,
+        expected_current_result_ids=expected if explicit_expected else None,
+        listing_dates_path=base.listing_dates_path,
+    )
+    prepared = SimpleNamespace(
+        entries=tuple(SimpleNamespace(strategy_name=name) for name in names),
+        test_start=None,
+        test_end=None,
+        inbox_snapshot_sha256=None,
+    )
+    reports = tuple(SimpleNamespace(excluded_trade_count=0) for _ in names)
+    if strict_mismatch:
+        reports = reports[:-1]
+    monkeypatch.setattr(import_module, "read_performance_v2_inbox", lambda *args, **kwargs: prepared)
+    monkeypatch.setattr(import_module, "create_v2_parser_staging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(import_module, "_parse_reports", lambda *args, **kwargs: reports)
+    monkeypatch.setattr(import_module, "_validate_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        import_module,
+        "_prepare_listing_ranges",
+        lambda *args, **kwargs: (reports, [{"strategy_name": filtered_name, "reason": "TEST"}] if filtered_name else []),
+    )
+    monkeypatch.setattr(import_module, "_publish", lambda *args, **kwargs: (1, 0, 0))
+
+    raw_connect = import_module.duckdb.connect
+    batch_sizes: list[int] = []
+    scalar_queries = 0
+
+    class _Result:
+        def __init__(self, rows: list[tuple[object, ...]]) -> None:
+            self._rows = rows
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return self._rows
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            return self._rows[0] if self._rows else None
+
+    class _Connection:
+        def __init__(self, raw: object) -> None:
+            self._raw = raw
+
+        def execute(self, sql: str, parameters=None):
+            nonlocal scalar_queries
+            compact = " ".join(str(sql).casefold().split())
+            if "selectstrategy_name,current_result_idfromstrategies" in compact.replace(" ", ""):
+                return _Result([(name, expected[name]) for name in names])
+            if "selectstrategy_id,current_result_idfromstrategies" in compact.replace(" ", ""):
+                ids = list(parameters[0])
+                batch_sizes.append(len(ids))
+                return _Result([(strategy_id, expected_result) for strategy_id, expected_result in (
+                        (strategy_ids[name], expected[name] + result_delta)
+                        for name in names if strategy_ids[name] in ids
+                )])
+            if "select current_result_id from strategies where strategy_id = ?" in compact:
+                scalar_queries += 1
+                strategy_id = int(parameters[0])
+                return _Result([(
+                    next(result for name, result in expected.items() if strategy_ids[name] == strategy_id) + result_delta,
+                )])
+            return self._raw.execute(sql, parameters) if parameters is not None else self._raw.execute(sql)
+
+        def close(self) -> None:
+            self._raw.close()
+
+        def __getattr__(self, name: str):
+            return getattr(self._raw, name)
+
+    monkeypatch.setattr(import_module.duckdb, "connect", lambda *args, **kwargs: _Connection(raw_connect(*args, **kwargs)))
+    if strict_mismatch:
+        with pytest.raises(PerformanceV2ImportError, match="Performance v2 import failed"):
+            import_performance_v2(request)
+        assert batch_sizes == []
+        assert scalar_queries == 0
+        return
+    result = import_performance_v2(request)
+
+    expected_count = candidate_count - (filtered_name is not None)
+    assert len(result.successful_replacements) == expected_count
+    assert batch_sizes == expected_batch_sizes
+    assert scalar_queries == expected_scalar_queries
+    if explicit_expected:
+        assert [row["old_result_id"] for row in result.successful_replacements] == [expected[name] for name in names]
+        assert [row["new_result_id"] for row in result.successful_replacements] == [expected[name] + result_delta for name in names]
 
 
 def test_replace_rollback_restores_old_result_after_publish_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

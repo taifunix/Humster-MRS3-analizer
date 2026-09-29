@@ -149,6 +149,37 @@ capped append and prove the whole publication rolls back. T13b-R2 received
 independent Opus 5/high `PLAN_APPROVED`; implementation stays limited to the
 existing importer and its tests.
 
+T13c batches only the post-commit `successful_replacements` current-result
+readback. Preserve the existing `REPLACE`/imported guard, strict manifest/parsed
+zip, failed-name exclusion, `report is None` exclusion and missing replacement
+ID exclusion verbatim; do not add a new admitted-only filter. Retain manifest
+order and duplicate candidate output entries, even when names map to one
+strategy ID. Omit absent strategy rows and NULL current IDs. Preserve the
+exact expected-old-result fallback. All reads stay on the existing connection
+under the writer lock after `_publish` commits; do not alter publication,
+failure reports, rollback, Phase 8, file ledger or RETEST tags.
+
+For zero unique candidate IDs issue no readback SQL. For one, keep the existing
+scalar indexed query. For multiple IDs, read unique IDs in ordered chunks of
+at most 1,024 with one bound DuckDB `BIGINT[]`/`UNNEST` query per chunk, then
+construct all output records in one pass over the original candidates. Thus
+409 unique replacements take one read instead of 409, while larger requests
+take `ceil(unique_ids / 1024)` reads. A strict zip length mismatch may now
+raise before any readback SQL; its exception and post-commit position stay the
+same. Do not change the public request or schema.
+
+Acceptance: failing-before query-count regression, exact output parity for
+zero/one/multiple/chunk-boundary candidates, manifest order despite reversed
+DuckDB rows, missing/NULL current IDs, expected-old fallback, repeated IDs,
+filtered entries and strict mismatch. Run importer and related bootstrap,
+Output-boundary, migration, prepared-readback, rollback and RETEST tests.
+Benchmark the readback stage only on offline query-shaped and, where feasible,
+initialized-schema DuckDB fixtures with dense/scattered IDs and 100k/1m
+strategy rows; require identical output and a lower 409-ID batch median.
+Record absolute stage delta and statement reduction without attributing the
+unmeasured production tail to this query. T13c-D2 received independent Opus
+5/high `PLAN_APPROVED`.
+
 OPT-01 may first remove an unused digest computation verified by a source-digest
 call-count regression and byte-identical available/unavailable outputs. This
 does not reuse digests across source objects, snapshots, revisions or final IDs.

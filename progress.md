@@ -108,6 +108,18 @@ re-review returned `CODE_REVIEW_PASS` after the parity regression was added.
 This is a bounded writer-buffer/schema-query slice, not a measured full-import
 speedup; remaining IMP-02 publication metadata and preparation work is open.
 Final integrated full-suite verification remains pending.
+T13c batches only the post-commit successful-REPLACE current-result readback:
+zero candidates issue zero queries, a singleton keeps its scalar query, and
+409 unique candidates now take one bounded `BIGINT[]` read instead of 409.
+The original candidate filters, manifest order, duplicate outputs, NULL/missing
+omission and expected-old fallback remain. TDD RED had one expected failure;
+the importer passed 103 tests and related input/store/RETEST/Panel suites
+passed 338 with 6 skips. A temporary initialized-schema 100k-strategy
+readback benchmark measured dense/scattered 409-ID medians 0.718/0.807 s
+scalar versus 0.0065/0.0080 s batch. Query-shaped 1m-strategy scattered
+medians were 0.2190 versus 0.0048 s. Independent Opus 5/high returned
+`CODE_REVIEW_PASS`; T13c is accepted. These are readback-stage results only;
+the cause and share of the unmeasured production import tail remain open.
 The terminal Panel journal is 82.67 MiB/109 jobs; a read-only in-memory probe
 measured about 5.5 s median combined clone/serialization before disk write.
 J4 now avoids saving three unchanged terminal import polls in the private

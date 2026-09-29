@@ -211,3 +211,18 @@ supported migration checks passed 3. Independent Opus 5/high re-review returned
 `CODE_REVIEW_PASS`. This establishes query and buffer bounds, not an elapsed
 speedup for the 409-report production import. Per-result publication metadata,
 Phase8 preparation and commit still need separate measurement and work.
+
+T13c removes the post-commit N+1 current-result readback for successful
+`REPLACE` output. For 409 unique candidate IDs the query count is 409 before
+versus one after; singleton and empty paths retain one and zero reads. The
+same candidate filters, manifest order, expected-old fallback and duplicate
+outputs are retained; publication/Phase8 remain unchanged. TDD RED showed one
+query-count failure, then the importer passed 103 tests and related suites
+passed 338 with 6 skips. Independent Opus 5/high returned `CODE_REVIEW_PASS`.
+On a temporary full-schema DB with 100k strategies, dense/scattered 409-ID
+readback medians were 0.718/0.807 s scalar versus 0.0065/0.0080 s batched.
+On a query-shaped 1m-strategy table, scattered medians were 0.2190 versus
+0.0048 s. The DuckDB plan used a strategies scan/hash join; measured stage
+latency and exact output favored batching. This does not establish the share
+or cause of the observed 14-GB production import tail; stage timestamps for
+that run are unavailable.

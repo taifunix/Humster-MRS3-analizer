@@ -1968,20 +1968,37 @@ def import_performance_v2(
         successful_replacements: list[Mapping[str, int]] = []
         if request.mode == "REPLACE" and imported:
             failed_names = {str(row.get("strategy_name")) for row in failure_rows if row.get("strategy_name")}
+            candidates: list[tuple[str, int]] = []
             for entry, report in zip(prepared.entries, parsed, strict=True):
                 if report is None or entry.strategy_name in failed_names:
                     continue
                 strategy_id = request.replacement_strategy_ids.get(entry.strategy_name)
                 if strategy_id is None:
                     continue
+                candidates.append((entry.strategy_name, strategy_id))
+            unique_ids = list(dict.fromkeys(strategy_id for _name, strategy_id in candidates))
+            current_by_id: dict[int, object] = {}
+            if len(unique_ids) == 1:
                 current_result = connection.execute(
-                    "select current_result_id from strategies where strategy_id = ?", [strategy_id]
+                    "select current_result_id from strategies where strategy_id = ?", [unique_ids[0]]
                 ).fetchone()
-                if current_result is not None and current_result[0] is not None:
+                if current_result is not None:
+                    current_by_id[unique_ids[0]] = current_result[0]
+            elif len(unique_ids) > 1:
+                for start in range(0, len(unique_ids), 1024):
+                    rows = connection.execute(
+                        "SELECT strategy_id,current_result_id FROM strategies "
+                        "WHERE strategy_id IN (SELECT UNNEST(?::BIGINT[]))",
+                        [unique_ids[start:start + 1024]],
+                    ).fetchall()
+                    current_by_id.update({int(row[0]): row[1] for row in rows})
+            for strategy_name, strategy_id in candidates:
+                current_result = current_by_id.get(strategy_id)
+                if current_result is not None:
                     successful_replacements.append({
                         "strategy_id": int(strategy_id),
-                        "old_result_id": int(request.expected_current_result_ids.get(entry.strategy_name, current_result[0])) if request.expected_current_result_ids else int(current_result[0]),
-                        "new_result_id": int(current_result[0]),
+                        "old_result_id": int(request.expected_current_result_ids.get(strategy_name, current_result)) if request.expected_current_result_ids else int(current_result),
+                        "new_result_id": int(current_result),
                     })
         result = PerformanceV2ImportResult(
             import_id,
