@@ -200,6 +200,35 @@ whole-import or production-tail speedup. If the bounded batch does not improve
 the representative 409-ID stage, record measured/no-change and retain the
 scalar implementation.
 
+T13e records diagnostic timings for the unresolved interval after
+`PUBLISHING N/N`, following [ADR-0048](../decisions/0048-performance-v2-import-phase-evidence.md).
+Reuse `PerformanceV2ImportResult.phases`; add optional diagnostic `phases` to
+the existing v2 audit and `evidence.phase_seconds` to the existing terminal
+Panel job. The audit retains `schema_version=2` and all previous fields. Use
+one `perf_counter` clock, six-decimal finite seconds, at most 15 keys and
+less than 4 KiB per object. Absent means not entered. Measure only stage
+boundaries (at most 30 clock reads per successful import), never each report.
+Record admission, row publication, child readback, Phase 8, finalization,
+commit, optional failure artifacts, optional post-commit replacement readback,
+connection close and staging cleanup as disjoint components. The total starts
+after the existing PUBLISHING callback and ends after staging cleanup; its
+unaccounted residual excludes the total itself. Audit write and lock release
+may appear only in the returned result/terminal evidence, since the audit
+cannot contain its own write duration. Panel readback includes connection
+close. Terminal journal sync is INFO-only operational timing; INFO logging
+must be enabled and checked before a diagnostic operator run.
+
+Keep importer callback arguments and event sequence unchanged. The Panel
+adapter may carry timings in its existing `READBACK_VERIFIED` object callback,
+but the worker must hold that evidence privately until its existing terminal
+update so status polls cannot create an intermediate journal save. Add no
+database query, file, transaction, endpoint or journal write. Clock and timing
+serialization failures must not mask the original result or exception. Test
+ADD/REPLACE and failure paths, phase absence, audit old-key parity, rollback,
+unchanged SQL/callback/journal replacement counts and bounded overhead on a
+warmed fixture. The future real run supplies attribution; this change does
+not itself accelerate import or justify a whole-import speed claim.
+
 OPT-01 may first remove an unused digest computation verified by a source-digest
 call-count regression and byte-identical available/unavailable outputs. This
 does not reuse digests across source objects, snapshots, revisions or final IDs.

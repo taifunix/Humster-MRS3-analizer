@@ -248,3 +248,28 @@ sequential scan and hash join at both sizes. These differences are about
 0.295 and 0.466 seconds per 409 timestamps on the temporary fixtures, not a
 measured reduction of the 14-GB production import tail. Phase 8 and commit
 still need stage timing before their share of that delay is known.
+
+T13e adds bounded diagnostic phase timings to the existing import result,
+optional v2 audit `phases`, and terminal Panel job `evidence.phase_seconds`.
+The audit keeps schema version 2 and all prior keys; its snapshot ends after
+staging cleanup, so audit-write and writer-lock-release durations appear only
+in the returned result and terminal job. The Panel readback duration includes
+connection close. A single terminal-sync INFO line is emitted on the first
+successful terminal publication when INFO logging is enabled; it is not durable
+journal evidence. No per-report clock reads, new progress events, SQL, database
+schema, or intermediate journal publication were added. A successful import
+uses at most 30 clock reads and emits at most 15 allowlisted finite phase keys.
+
+The importer suite passed 110 tests and the Panel suite passed 127 with four
+Windows symlink skips. The related input/store/RETEST/Panel contour passed
+330 with six skips; a race in a new journal-count test was corrected before
+the final full Panel run. An injected Phase 8 failure retained its original
+exception and rolled back the import. Independent Opus 5/high re-review
+returned `CODE_REVIEW_PASS`. On one warmed 16-report temporary fixture, seven
+measured runs had medians of 2.5245 s before versus 2.4918 s after. This
+supports no observed overhead regression on that fixture, not an acceleration
+claim. The 409-report production run predates the instrumentation and still
+cannot be attributed to publication, Phase 8, commit, close/cleanup, Panel
+readback, or terminal journal sync. The next representative operator import
+must collect terminal phase evidence (with INFO enabled first if terminal-sync
+timing is needed) before choosing another tail-specific change.

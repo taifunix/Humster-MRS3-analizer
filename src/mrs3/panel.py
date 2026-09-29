@@ -9,6 +9,7 @@ import hashlib
 from hashlib import sha256
 import inspect
 import logging
+import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from time import perf_counter
 from typing import BinaryIO, Callable, Mapping, Sequence
 from urllib.parse import parse_qs, urlparse
 import uuid
@@ -2016,12 +2018,35 @@ class PanelController:
                 public["inbox_ready"] = True
         try:
             performance_import = tracked.get("kind") == "strategies.performance.v2.import"
+            terminal_performance = (
+                performance_import
+                and document.get("state") in {"COMMITTED", "FAILED"}
+                and tracked.get("state") not in {"COMMITTED", "FAILED"}
+            )
+            sync_started: float | None = None
+            if terminal_performance:
+                try:
+                    started = float(perf_counter())
+                    sync_started = started if math.isfinite(started) else None
+                except BaseException:
+                    sync_started = None
             self._panel_jobs.sync(
                 job_id,
                 public,
                 runtime=runtime or None,
                 skip_save_if_unchanged=performance_import,
             )
+            if terminal_performance and sync_started is not None:
+                try:
+                    finished = float(perf_counter())
+                    if math.isfinite(finished):
+                        _LOGGER.info(
+                            "PANEL_TERMINAL_SYNC job_id=%s duration_seconds=%.6f",
+                            job_id,
+                            max(0.0, finished - sync_started),
+                        )
+                except Exception:
+                    pass
         except PanelJobError:
             pass
 

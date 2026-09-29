@@ -42,6 +42,8 @@ from mrs3.performance_v2_selection import (
 from mrs3.panel_performance_v2 import (
     PerformanceV2ApiError,
     PerformanceV2PanelRequest,
+    PerformanceV2PanelResult,
+    LocalPerformanceV2Jobs,
     LocalPerformanceV2Service,
     _normalization_30d,
     _window_document,
@@ -345,6 +347,60 @@ def test_v2_panel_service_imports_committed_inbox_without_eager_window_calculati
         path.relative_to(request.inbox): path.read_bytes()
         for path in request.inbox.rglob("*") if path.is_file()
     } == before
+
+
+def test_v2_panel_service_carries_phase_evidence_into_readback_progress(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    target = performance_v2_database_path(request.config)
+    imported = PerformanceV2ImportResult(
+        "import-1", "COMMITTED", 1, 0, 0, target, None,
+        {"PUBLISH_ROWS": 0.125, "COMMIT": 0.25},
+    )
+    progress: list[object] = []
+    service = LocalPerformanceV2Service(import_func=lambda _request, **_kwargs: imported)
+
+    service.run(request, progress=progress.append)
+
+    verified = next(item for item in progress if isinstance(item, dict) and item.get("stage") == "READBACK_VERIFIED")
+    phases = verified["evidence"]["phase_seconds"]
+    assert phases["PUBLISH_ROWS"] == 0.125
+    assert phases["COMMIT"] == 0.25
+    assert "PANEL_READBACK" in phases
+
+
+@pytest.mark.parametrize(
+    "phases",
+    [
+        {"UNKNOWN_PHASE": 0.1},
+        {f"PUBLISH_ROWS_{index}": 0.1 for index in range(16)},
+    ],
+)
+def test_v2_panel_service_omits_malformed_phase_evidence(tmp_path: Path, phases: dict[str, float]) -> None:
+    request, _ = _request(tmp_path)
+    target = performance_v2_database_path(request.config)
+    imported = PerformanceV2ImportResult("import-1", "COMMITTED", 1, 0, 0, target, None, phases)
+    progress: list[object] = []
+
+    LocalPerformanceV2Service(import_func=lambda _request, **_kwargs: imported).run(
+        request, progress=progress.append,
+    )
+
+    verified = next(item for item in progress if isinstance(item, dict) and item.get("stage") == "READBACK_VERIFIED")
+    assert "evidence" not in verified
+
+
+def test_v2_panel_service_keeps_readback_timing_without_importer_phases(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    target = performance_v2_database_path(request.config)
+    imported = PerformanceV2ImportResult("import-1", "COMMITTED", 1, 0, 0, target, None, None)
+    progress: list[object] = []
+
+    LocalPerformanceV2Service(import_func=lambda _request, **_kwargs: imported).run(
+        request, progress=progress.append,
+    )
+
+    verified = next(item for item in progress if isinstance(item, dict) and item.get("stage") == "READBACK_VERIFIED")
+    assert set(verified["evidence"]["phase_seconds"]) == {"PANEL_READBACK"}
 
 
 def test_v2_panel_service_resolves_listing_dates_from_trusted_project_root(tmp_path: Path) -> None:
@@ -937,13 +993,16 @@ def test_v2_failed_import_keeps_failure_report_available(tmp_path: Path) -> None
     assert controller.artifact(f"performance-v2-failure-report:{job_id}") == report.resolve()
 
 
-def test_terminal_performance_callback_skips_three_identical_polls_and_saves_changed_payload(tmp_path, monkeypatch):
+def test_terminal_performance_callback_skips_three_identical_polls_and_saves_changed_payload(tmp_path, monkeypatch, caplog):
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     job_id = "terminal-performance"
     controller._panel_jobs.submit(
         "strategies.performance.v2.import", {}, f"panel:{job_id}", (), job_id=job_id,
     )
     controller._panel_jobs.transition(job_id, "RUNNING")
+    caplog.set_level("INFO", logger="mrs3.panel")
+    controller._record_special_job({"job_id": job_id, "state": "RUNNING", "phase": "PUBLISHING"})
+    assert not [record for record in caplog.records if "PANEL_TERMINAL_SYNC" in record.message]
     document = {
         "job_id": job_id,
         "state": "COMMITTED",
@@ -970,6 +1029,11 @@ def test_terminal_performance_callback_skips_three_identical_polls_and_saves_cha
     monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
     controller._record_special_job(document)
     assert replacements == [journal]
+    sync_records = [record for record in caplog.records if "PANEL_TERMINAL_SYNC" in record.message]
+    assert len(sync_records) == 1
+    assert f"job_id={job_id}" in sync_records[0].message
+    duration = float(sync_records[0].message.split("duration_seconds=", 1)[1])
+    assert 0 <= duration < float("inf")
     assert controller._panel_jobs.get(job_id)["result"] == {
         "status": "COMMITTED", "imported_count": 1,
         "failure_report_available": True,
@@ -983,15 +1047,74 @@ def test_terminal_performance_callback_skips_three_identical_polls_and_saves_cha
     for _ in range(3):
         controller._record_special_job(document)
     assert replacements == [journal]
+    assert len([record for record in caplog.records if "PANEL_TERMINAL_SYNC" in record.message]) == 1
 
     changed = {**document, "result": {**document["result"], "imported_count": 2}}
     controller._record_special_job(changed)
     assert replacements == [journal, journal]
+    assert len([record for record in caplog.records if "PANEL_TERMINAL_SYNC" in record.message]) == 1
     reloaded = PanelController(tmp_path, tmp_path / "config.local.json")._panel_jobs
     assert reloaded.get(job_id)["result"]["imported_count"] == 2
     assert "database_path" not in reloaded.get(job_id)["result"]
     assert reloaded.runtime(job_id)["failure_report_path"] == str(tmp_path / "private" / "failures.csv")
     assert all(not Path(source).exists() for source in temporary_sources)
+
+
+def test_v2_worker_keeps_readback_evidence_private_until_terminal_save(tmp_path, monkeypatch) -> None:
+    request, _ = _request(tmp_path)
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "evidence-terminal"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, f"panel:{job_id}", (), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingService:
+        def run(self, _request, *, progress=None):
+            progress({
+                "stage": "READBACK_VERIFIED", "completed": 1, "total": 1,
+                "evidence": {"phase_seconds": {"PANEL_READBACK": 0.25}},
+            })
+            entered.set()
+            assert release.wait(5)
+            return PerformanceV2PanelResult(
+                "import-1", "COMMITTED", 1, 0, 0,
+                performance_v2_database_path(request.config), None,
+                1, 0, 0, 1,
+            )
+
+    replacements = []
+    journal = controller._panel_jobs.journal
+    real_replace = panel_jobs_module.os.replace
+
+    def counted_replace(source, destination):
+        if Path(destination) == journal:
+            replacements.append(destination)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
+    jobs = LocalPerformanceV2Jobs(service=BlockingService(), on_update=controller._record_special_job)
+    jobs.start(request, job_id=job_id)
+    assert entered.wait(5)
+    assert "evidence" not in jobs.status(job_id)
+    assert replacements == []
+    for _ in range(3):
+        controller._record_special_job(jobs.status(job_id))
+    assert replacements == [journal]
+
+    release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and jobs.status(job_id)["state"] == "RUNNING":
+        time.sleep(0.01)
+    assert jobs.status(job_id)["state"] == "COMMITTED"
+    assert jobs.status(job_id)["evidence"] == {"phase_seconds": {"PANEL_READBACK": 0.25}}
+    while time.monotonic() < deadline and len(replacements) < 2:
+        time.sleep(0.01)
+    assert replacements == [journal, journal]
+    restored = PanelJobRegistry(journal, recover_on_load=False)
+    assert restored.get(job_id)["evidence"] == {"phase_seconds": {"PANEL_READBACK": 0.25}}
 
 
 @pytest.mark.parametrize(

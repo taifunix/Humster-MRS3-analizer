@@ -297,6 +297,15 @@ scope добавление scope workers не ускоряет последов�
   at 1m, with exact row changes and sentinel preservation. Production tail and
   whole-import speed remain unmeasured; Phase8, wider result metadata and commit
   remain open, so IMP-02 stays unchecked.
+  T13e bounded phase timings, optional audit phases, terminal job evidence, and
+  INFO-only terminal sync logging accepted after independent Opus 5/high
+  `CODE_REVIEW_PASS` R2: importer full 110 passed; Panel full 127 passed with
+  4 Windows symlink skips; related contour 330 passed with 6 skips. On a
+  temporary 16-report warm fixture, seven-run medians were 2.5245 s before and
+  2.4918 s after; the difference is diagnostic overhead only and does not establish
+  a speedup. No live import run was performed; the 409-report production tail
+  remains unattributed. Phase8, commit, and tail attribution remain open, so
+  IMP-02 stays unchecked.
 - [ ] **IMP-03 — общий HTML inventory.** `performance_v2_html.py`, `performance.py`.
   Переиспользовать decode/raw-markup inventory current-header gate и общего parser.
   Не убирать required/duplicate header, size/action limits и source order checks.

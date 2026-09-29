@@ -185,6 +185,76 @@ def _rewrite_report(request: PerformanceV2ImportRequest, replacement: bytes) -> 
     manifest_path.write_text(json.dumps(manifest))
 
 
+def test_import_phase_evidence_is_bounded_and_keeps_audit_schema(tmp_path: Path, monkeypatch) -> None:
+    request, _ = _request(tmp_path / "timed")
+    clock_reads = 0
+
+    def clock() -> float:
+        nonlocal clock_reads
+        clock_reads += 1
+        return clock_reads / 1000
+
+    monkeypatch.setattr(import_module, "perf_counter", clock)
+
+    result = import_performance_v2(request)
+
+    assert result.phases
+    assert clock_reads <= 30
+    assert len(result.phases) <= 15
+    assert all(value == round(value, 6) for value in result.phases.values())
+    audit = json.loads(result.audit_path.read_text(encoding="utf-8"))
+    assert audit["schema_version"] == 2
+    assert audit["imported_count"] == result.imported_count
+    assert "phases" in audit
+    assert "AUDIT_WRITE" not in audit["phases"]
+    assert "WRITER_LOCK_RELEASE" not in audit["phases"]
+    monkeypatch.setattr(import_module, "perf_counter", lambda: (_ for _ in ()).throw(RuntimeError("clock unavailable")))
+    untimed_request, _ = _request(tmp_path / "untimed")
+    untimed = import_performance_v2(untimed_request)
+    old_audit = json.loads(untimed.audit_path.read_text(encoding="utf-8"))
+    assert set(audit) == set(old_audit) | {"phases"}
+    assert {key: type(value) for key, value in audit.items() if key != "phases"} == {
+        key: type(value) for key, value in old_audit.items()
+    }
+
+
+def test_import_timing_clock_failure_keeps_publication_behavior(tmp_path: Path, monkeypatch) -> None:
+    request, _ = _request(tmp_path)
+
+    def broken_clock() -> float:
+        raise RuntimeError("clock unavailable")
+
+    monkeypatch.setattr(import_module, "perf_counter", broken_clock)
+    result = import_performance_v2(request)
+
+    assert result.status == "COMMITTED"
+    assert result.imported_count == 1
+    assert result.phases == {}
+    audit = json.loads(result.audit_path.read_text(encoding="utf-8"))
+    assert "phases" not in audit
+
+
+def test_import_phase8_failure_keeps_rollback_and_partial_timing(tmp_path: Path, monkeypatch) -> None:
+    request, _ = _request(tmp_path)
+
+    def fail_preparation(*_args, **_kwargs):
+        raise PerformanceV2ImportError("injected phase8 failure")
+
+    monkeypatch.setattr(import_module, "_persist_phase8_prepared", fail_preparation)
+    with pytest.raises(PerformanceV2ImportError, match="^injected phase8 failure$"):
+        import_performance_v2(request)
+
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        assert connection.execute("select count(*) from strategies").fetchone() == (0,)
+        assert connection.execute("select count(*) from import_runs").fetchone() == (0,)
+    audit = json.loads((request.config.database_root / "import_audit.v2.json").read_text(encoding="utf-8"))
+    assert audit["schema_version"] == 2
+    assert audit["error"] == "injected phase8 failure"
+    assert audit["phases"]["PUBLISH_PHASE8"] >= 0
+    assert "COMMIT" not in audit["phases"]
+
+
+
 def _swap_current_action_rows(source: bytes) -> bytes:
     opened = (
         b"<tr><td>2026-01-01T01:00:00Z</td><td>ONUSDT</td><td>1</td>"

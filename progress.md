@@ -130,6 +130,19 @@ snapshot assertion. On temporary full-schema DuckDB fixtures, seven-trial
 and 0.4728 to 0.0067 s at 1m; all 409 rows and the unrelated sentinel were
 checked, with each trial rolled back. This is isolated stage evidence only;
 the production tail still lacks stage timings for Phase 8 and commit.
+T13e now records bounded phase durations through publication, commit, cleanup,
+audit write, lock release and Panel readback without changing SQL, progress
+event sequence or intermediate journal writes. Optional audit and terminal-job
+evidence preserve the v2 audit schema; first terminal journal sync also emits
+an INFO duration when INFO logging is enabled. Importer tests passed 110,
+Panel tests passed 127 with 4 Windows skips, and the related contour passed
+330 with 6 skips. Seven warmed 16-report runs measured medians of 2.5245 s
+before and 2.4918 s after; this is an overhead check, not a speedup claim.
+Independent Opus 5/high re-review returned `CODE_REVIEW_PASS`. The original
+409-report tail has no timings. Its cause remains open until a representative
+operator import provides terminal phase evidence; enable INFO first if the
+terminal journal-sync residual matters. No live DB or tester run was made.
+
 The terminal Panel journal is 82.67 MiB/109 jobs; a read-only in-memory probe
 measured about 5.5 s median combined clone/serialization before disk write.
 J4 now avoids saving three unchanged terminal import polls in the private

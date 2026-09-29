@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 from threading import RLock, Thread
 import tempfile
+import math
+from time import perf_counter
 from typing import Callable, Mapping
 from uuid import uuid4
 
@@ -19,6 +21,7 @@ from urllib.parse import parse_qsl
 from .performance_v2_import import (
     PerformanceV2ImportRequest,
     PerformanceV2ImportResult,
+    _safe_phase_snapshot,
     import_performance_v2,
 )
 from .performance_v2_store import (
@@ -684,20 +687,50 @@ class LocalPerformanceV2Service:
         if not imported.committed or imported.database_path is None:
             raise ValueError("Performance v2 import did not commit")
         target = Path(imported.database_path).resolve()
-        with duckdb.connect(str(target), read_only=False) as connection:
-            require_performance_v2(connection)
-            counts = {
-                "strategy_count": int(connection.execute("select count(*) from strategies").fetchone()[0]),
-                "order_count": int(connection.execute("select count(*) from strategy_orders").fetchone()[0]),
-                "plateau_count": int(connection.execute("select count(*) from analysis_plateaus").fetchone()[0]),
-                "result_count": int(connection.execute("select count(*) from strategy_results").fetchone()[0]),
-            }
-            if progress is not None:
-                progress({
-                    "stage": "READBACK_VERIFIED",
-                    "completed": counts["result_count"],
-                    "total": counts["result_count"],
-                })
+        readback_started: float | None
+        try:
+            started = float(perf_counter())
+            readback_started = started if math.isfinite(started) else None
+        except BaseException:
+            readback_started = None
+        try:
+            with duckdb.connect(str(target), read_only=False) as connection:
+                require_performance_v2(connection)
+                counts = {
+                    "strategy_count": int(connection.execute("select count(*) from strategies").fetchone()[0]),
+                    "order_count": int(connection.execute("select count(*) from strategy_orders").fetchone()[0]),
+                    "plateau_count": int(connection.execute("select count(*) from analysis_plateaus").fetchone()[0]),
+                    "result_count": int(connection.execute("select count(*) from strategy_results").fetchone()[0]),
+                }
+        finally:
+            try:
+                finished = float(perf_counter())
+                readback_seconds = (
+                    max(0.0, finished - readback_started)
+                    if readback_started is not None and math.isfinite(finished)
+                    else None
+                )
+            except BaseException:
+                readback_seconds = None
+        phase_seconds: dict[str, float] = {}
+        source_phases = imported.phases
+        phases_valid = source_phases is None or isinstance(source_phases, Mapping)
+        if isinstance(source_phases, Mapping):
+            try:
+                phase_seconds.update(source_phases)
+            except BaseException:
+                phases_valid = False
+                phase_seconds = {}
+        if readback_seconds is not None:
+            phase_seconds["PANEL_READBACK"] = readback_seconds
+        evidence = _safe_phase_snapshot(phase_seconds) if phases_valid else None
+        if progress is not None:
+            progress({
+                "stage": "READBACK_VERIFIED",
+                "completed": counts["result_count"],
+                "total": counts["result_count"],
+                **({"evidence": {"phase_seconds": evidence}} if evidence else {}),
+            })
         return PerformanceV2PanelResult(
             imported.import_id,
             imported.status,
@@ -779,10 +812,20 @@ class LocalPerformanceV2Jobs:
                 raise KeyError("job not found") from None
 
     def _worker(self, job_id: str, request: PerformanceV2PanelRequest) -> None:
+        evidence: dict[str, object] | None = None
+
         def progress(value: object) -> None:
+            nonlocal evidence
             stage = getattr(value, "stage", None) or (value.get("stage") if isinstance(value, Mapping) else None)
             completed = getattr(value, "completed", None) or (value.get("completed") if isinstance(value, Mapping) else None)
             total = getattr(value, "total", None) or (value.get("total") if isinstance(value, Mapping) else None)
+            if stage == "READBACK_VERIFIED":
+                evidence = None
+                candidate = value.get("evidence") if isinstance(value, Mapping) else None
+                phase_seconds = candidate.get("phase_seconds") if isinstance(candidate, Mapping) else None
+                snapshot = _safe_phase_snapshot(phase_seconds) if isinstance(phase_seconds, Mapping) else None
+                if snapshot:
+                    evidence = {"phase_seconds": snapshot}
             with self._lock:
                 job = self._jobs[job_id]
                 job["phase"] = str(stage or "IMPORTING")
@@ -795,7 +838,10 @@ class LocalPerformanceV2Jobs:
             result = self.service.run(request, progress=progress)
         except BaseException as error:
             with self._lock:
-                self._jobs[job_id].update(state="FAILED", phase="FAILED", error=_safe_import_error(error))
+                terminal = {"state": "FAILED", "phase": "FAILED", "error": _safe_import_error(error)}
+                if evidence is not None:
+                    terminal["evidence"] = evidence
+                self._jobs[job_id].update(terminal)
                 snapshot = dict(self._jobs[job_id])
             self._updated(snapshot)
             return
@@ -821,13 +867,16 @@ class LocalPerformanceV2Jobs:
         succeeded = result.status == "COMMITTED"
         completed = result.imported_count + result.skipped_count + result.rejected_count
         with self._lock:
-            self._jobs[job_id].update(
-                state="COMMITTED" if succeeded else "FAILED",
-                phase="COMMITTED" if succeeded else "FAILED",
-                error=None if succeeded else {"code": "PERFORMANCE_V2_IMPORT_REJECTED", "message": "all reports were rejected; open failure report"},
-                progress={"current": completed, "total": completed, "unit": "reports"},
-                result=result_document,
-            )
+            terminal = {
+                "state": "COMMITTED" if succeeded else "FAILED",
+                "phase": "COMMITTED" if succeeded else "FAILED",
+                "error": None if succeeded else {"code": "PERFORMANCE_V2_IMPORT_REJECTED", "message": "all reports were rejected; open failure report"},
+                "progress": {"current": completed, "total": completed, "unit": "reports"},
+                "result": result_document,
+            }
+            if evidence is not None:
+                terminal["evidence"] = evidence
+            self._jobs[job_id].update(terminal)
             snapshot = dict(self._jobs[job_id])
         self._updated(snapshot)
 

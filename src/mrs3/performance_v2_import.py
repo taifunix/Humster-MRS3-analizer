@@ -8,7 +8,9 @@ from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 import csv
 import json
+import math
 from pathlib import Path
+from time import perf_counter
 from typing import Callable, Mapping
 from uuid import uuid4
 
@@ -73,6 +75,119 @@ _RESULT_VALUE_FIELDS = (
     "listing_date_utc", "listing_date_raw", "listing_date_source", "effective_start_utc",
     "effective_end_utc", "warmup_hours", "excluded_trade_count", "exclusion_reason",
 )
+_TIMED_PHASES = (
+    "PUBLISH_ADMISSION", "PUBLISH_ROWS", "PUBLISH_CHILD_READBACK", "PUBLISH_PHASE8",
+    "PUBLISH_FINALIZE", "COMMIT", "FAILURE_ARTIFACTS", "POST_COMMIT_REPLACEMENT_READBACK",
+    "CONNECTION_CLOSE", "STAGING_CLEANUP", "PUBLISHING_THROUGH_CLEANUP_TOTAL",
+    "UNACCOUNTED", "AUDIT_WRITE", "WRITER_LOCK_RELEASE", "PANEL_READBACK",
+)
+
+
+def _safe_phase_snapshot(phases: Mapping[str, float] | None) -> dict[str, float] | None:
+    """Return a small JSON-safe timing snapshot, or omit malformed evidence."""
+    try:
+        if not isinstance(phases, Mapping) or not phases or len(phases) > 15:
+            return None
+        snapshot: dict[str, float] = {}
+        for name, value in phases.items():
+            if not isinstance(name, str) or name not in _TIMED_PHASES or not name.isascii() or not isinstance(value, (int, float)) or isinstance(value, bool):
+                return None
+            seconds = float(value)
+            if not math.isfinite(seconds):
+                return None
+            seconds = round(max(seconds, 0.0), 6)
+            if not math.isfinite(seconds):
+                return None
+            snapshot[name] = seconds
+        if len(json.dumps(snapshot, separators=(",", ":")).encode("utf-8")) >= 4096:
+            return None
+        return snapshot
+    except BaseException:
+        return None
+
+
+class _PhaseTimes:
+    def __init__(self) -> None:
+        self.values: dict[str, float] = {}
+        self.active: tuple[str, float] | None = None
+        self.total_started: float | None = None
+        self.total: float | None = None
+
+    @staticmethod
+    def _clock() -> float | None:
+        try:
+            value = float(perf_counter())
+            return value if math.isfinite(value) else None
+        except BaseException:
+            return None
+
+    def begin(self, name: str) -> None:
+        try:
+            started = self._clock()
+            self.active = (name, started) if started is not None else None
+        except BaseException:
+            self.active = None
+
+    def end(self, name: str) -> None:
+        try:
+            active = self.active
+            if active is None or active[0] != name:
+                return
+            finished = self._clock()
+            self.active = None
+            if finished is not None:
+                self.values[name] = max(0.0, finished - active[1])
+        except BaseException:
+            self.active = None
+
+    def finish_active(self) -> None:
+        try:
+            if self.active is not None:
+                self.end(self.active[0])
+        except BaseException:
+            self.active = None
+
+    def begin_total(self) -> None:
+        try:
+            self.total_started = self._clock()
+        except BaseException:
+            self.total_started = None
+
+    def end_total(self) -> None:
+        try:
+            if self.total_started is None:
+                return
+            finished = self._clock()
+            if finished is not None:
+                self.total = max(0.0, finished - self.total_started)
+        except BaseException:
+            self.total = None
+
+    def snapshot(self) -> dict[str, float] | None:
+        try:
+            values = dict(self.values)
+            if self.active is not None:
+                finished = self._clock()
+                if finished is not None:
+                    values[self.active[0]] = max(0.0, finished - self.active[1])
+            if self.total_started is not None:
+                total = self.total
+                if total is None:
+                    finished = self._clock()
+                    if finished is not None:
+                        total = max(0.0, finished - self.total_started)
+                if total is not None:
+                    values["PUBLISHING_THROUGH_CLEANUP_TOTAL"] = total
+                    component_names = {
+                        "PUBLISH_ADMISSION", "PUBLISH_ROWS", "PUBLISH_CHILD_READBACK", "PUBLISH_PHASE8",
+                        "PUBLISH_FINALIZE", "COMMIT", "FAILURE_ARTIFACTS",
+                        "POST_COMMIT_REPLACEMENT_READBACK", "CONNECTION_CLOSE", "STAGING_CLEANUP",
+                    }
+                    entered = sum(values.get(name, 0.0) for name in component_names)
+                    values["UNACCOUNTED"] = max(0.0, total - entered)
+            return _safe_phase_snapshot(values)
+        except BaseException:
+            return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1366,10 +1481,13 @@ def _publish(
     import_id: str,
     *,
     failure_reasons: Mapping[str, str] | None = None,
+    phase_times: _PhaseTimes | None = None,
 ) -> tuple[int, int, int]:
     # The writer lock is held by the caller.  Start the transaction before any
     # read so key indexes and decisions cannot go stale between validation and
     # publication.
+    if phase_times is not None:
+        phase_times.begin("PUBLISH_ADMISSION")
     connection.execute("begin")
     try:
         append_schema_cache: dict[str, tuple[str, ...]] = {}
@@ -1546,6 +1664,10 @@ def _publish(
                     f"delete from {table} where result_id in (select unnest(?::BIGINT[]))",
                     [replacement_result_ids],
                 )
+
+        if phase_times is not None:
+            phase_times.end("PUBLISH_ADMISSION")
+            phase_times.begin("PUBLISH_ROWS")
 
         skipped = sum(1 for decision, _entry, _report, _old, _rep in decisions if decision == "SKIPPED")
         now = _utc_now()
@@ -1726,7 +1848,13 @@ def _publish(
                equity_sample_count = excluded.equity_sample_count, status = excluded.status""",
              [[run_id, name, digest, size, actions, equity, status] for name, digest, size, actions, equity, status in result_files.values()],
         )
+        if phase_times is not None:
+            phase_times.end("PUBLISH_ROWS")
+            phase_times.begin("PUBLISH_CHILD_READBACK")
         _verify_child_counts(connection, tuple(written_results))
+        if phase_times is not None:
+            phase_times.end("PUBLISH_CHILD_READBACK")
+            phase_times.begin("PUBLISH_PHASE8")
         for result_id, strategy_id, entry, report, values, sizing_facts in written_phase8:
             source = _phase8_source_input(
                 result_id=result_id,
@@ -1737,6 +1865,9 @@ def _publish(
                 sizing_facts=sizing_facts,
             )
             _persist_phase8_prepared(connection, source, now)
+        if phase_times is not None:
+            phase_times.end("PUBLISH_PHASE8")
+            phase_times.begin("PUBLISH_FINALIZE")
         # RETEST is removed only after all replacement readbacks pass.  Since
         # this remains in the same transaction, any later failure preserves
         # both the old result and its tag.
@@ -1758,7 +1889,12 @@ def _publish(
                status = ?, finished_at_utc = ? where import_run_id = ?""",
             [imported, skipped, rejected, status, _utc_now(), run_id],
         )
+        if phase_times is not None:
+            phase_times.end("PUBLISH_FINALIZE")
+            phase_times.begin("COMMIT")
         connection.execute("commit")
+        if phase_times is not None:
+            phase_times.end("COMMIT")
         return imported, skipped, rejected
     except Exception as error:
         try:
@@ -1822,6 +1958,7 @@ def _write_audit(
     error: Exception | None,
     source_hash: str | None,
     failure_report_paths: tuple[Path, Path | None] | None = None,
+    phases: Mapping[str, float] | None = None,
 ) -> Path:
     path = config.database_root.resolve() / "import_audit.v2.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1842,6 +1979,9 @@ def _write_audit(
             str(path) for path in failure_report_paths if path is not None
         ] if failure_report_paths else [],
     }
+    phase_snapshot = _safe_phase_snapshot(phases)
+    if phase_snapshot:
+        payload["phases"] = phase_snapshot
     path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
     return path
 
@@ -1872,6 +2012,7 @@ def import_performance_v2(
     failure_rows: list[dict[str, object]] = []
     import_id = uuid4().hex
     failure_report_paths: tuple[Path, Path | None] | None = None
+    phase_times = _PhaseTimes()
     try:
         writer_lock = PerformanceV2WriterLock(target.parent)
         try:
@@ -1961,6 +2102,7 @@ def import_performance_v2(
             parsed = tuple(parsed_list)
         if progress is not None:
             progress("PUBLISHING", len(parsed), len(parsed))
+        phase_times.begin_total()
         failure_reasons = {
             str(row["strategy_name"]): str(row.get("reason", "INVALID_REPORT"))
             for row in failure_rows
@@ -1973,9 +2115,11 @@ def import_performance_v2(
             parsed,
             import_id,
             failure_reasons=failure_reasons,
+            phase_times=phase_times,
         )
         status = "FAILED" if imported == 0 and rejected == len(prepared.entries) and rejected > 0 else "COMMITTED"
         if failure_rows:
+            phase_times.begin("FAILURE_ARTIFACTS")
             try:
                 failure_report_paths = _write_failure_reports(
                     request.config, failure_rows, import_id=import_id, status=status
@@ -1984,8 +2128,11 @@ def import_performance_v2(
                 # The database transaction is already committed.  Report I/O
                 # must not turn a successful publication into a false FAILED.
                 failure_report_paths = None
+            finally:
+                phase_times.end("FAILURE_ARTIFACTS")
         successful_replacements: list[Mapping[str, int]] = []
         if request.mode == "REPLACE" and imported:
+            phase_times.begin("POST_COMMIT_REPLACEMENT_READBACK")
             failed_names = {str(row.get("strategy_name")) for row in failure_rows if row.get("strategy_name")}
             candidates: list[tuple[str, int]] = []
             for entry, report in zip(prepared.entries, parsed, strict=True):
@@ -2019,6 +2166,7 @@ def import_performance_v2(
                         "old_result_id": int(request.expected_current_result_ids.get(strategy_name, current_result)) if request.expected_current_result_ids else int(current_result),
                         "new_result_id": int(current_result),
                     })
+            phase_times.end("POST_COMMIT_REPLACEMENT_READBACK")
         result = PerformanceV2ImportResult(
             import_id,
             status,
@@ -2043,6 +2191,7 @@ def import_performance_v2(
             tuple(dict(row) for row in failure_rows),
         )
     except Exception as error:
+        phase_times.finish_active()
         failure = (
             error
             if isinstance(error, PerformanceV2ImportError)
@@ -2053,6 +2202,7 @@ def import_performance_v2(
         if failure is not error:
             failure.__cause__ = error
         if failure_report_paths is None and (failure_rows or connection is not None):
+            phase_times.begin("FAILURE_ARTIFACTS")
             try:
                 report_rows = failure_rows or [{
                     "strategy_name": "",
@@ -2064,17 +2214,29 @@ def import_performance_v2(
                 )
             except Exception:
                 failure_report_paths = None
+            finally:
+                phase_times.end("FAILURE_ARTIFACTS")
     finally:
         if connection is not None:
-            connection.close()
+            phase_times.begin("CONNECTION_CLOSE")
+            try:
+                connection.close()
+            finally:
+                phase_times.end("CONNECTION_CLOSE")
         if staging is not None:
+            phase_times.begin("STAGING_CLEANUP")
             try:
                 remove_v2_parser_staging(staging)
             except Exception as error:
                 if failure is None:
                     failure = PerformanceV2ImportError("v2 staging cleanup failed")
                     failure.__cause__ = error
+            finally:
+                phase_times.end("STAGING_CLEANUP")
+        phase_times.end_total()
         if lock_acquired and not isinstance(failure, PerformanceV2LockedError):
+            audit_phases = phase_times.snapshot()
+            phase_times.begin("AUDIT_WRITE")
             try:
                 audit_path = _write_audit(
                     config,
@@ -2083,6 +2245,7 @@ def import_performance_v2(
                     failure,
                     prepared.inbox_snapshot_sha256 if prepared else None,
                     failure_report_paths,
+                    audit_phases,
                 )
                 if result is not None:
                     result = replace(result, audit_path=audit_path)
@@ -2090,13 +2253,23 @@ def import_performance_v2(
                 if failure is None:
                     failure = PerformanceV2ImportError("v2 audit write failed")
                     failure.__cause__ = error
+            finally:
+                phase_times.end("AUDIT_WRITE")
         if writer_lock is not None:
+            phase_times.begin("WRITER_LOCK_RELEASE")
             try:
                 writer_lock.__exit__(None, None, None)
             except Exception as error:
                 if failure is None:
                     failure = PerformanceV2ImportError("Performance v2 writer lock release failed")
                     failure.__cause__ = error
+            finally:
+                phase_times.end("WRITER_LOCK_RELEASE")
+        if result is not None:
+            try:
+                result = replace(result, phases=phase_times.snapshot() or {})
+            except Exception:
+                pass
     if failure is not None:
         raise failure
     if result is None:
