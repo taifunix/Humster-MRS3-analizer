@@ -715,6 +715,8 @@ def read_performance_v2_inbox(
             if listing_dates_path.is_absolute() or ".." in listing_dates_path.parts:
                 raise PerformanceV2InputError("listing dates path must stay under a trusted root")
         raw_entry_mappings: list[Mapping[str, object]] = []
+        # ponytail: one inbox-local mapping per strategy; split validation into phases if batches outgrow memory.
+        strategies_by_path: dict[Path, Mapping[str, object]] = {}
         seen_names: set[str] = set()
         seen_paths: set[Path] = set()
         for raw in raw_entries:
@@ -766,6 +768,7 @@ def read_performance_v2_inbox(
                 raise PerformanceV2InputError("strategy version hash mismatch")
             if strategy.get("name") != name:
                 raise PerformanceV2InputError("strategy name mismatch")
+            strategies_by_path[strategy_path] = strategy
             raw_entry_mappings.append(raw)
         expected_set = set(expected)
         if seen_names != expected_set:
@@ -814,10 +817,6 @@ def read_performance_v2_inbox(
                 if run_mode in {"SINGLE_MODE", "SINGLE_MODE_COLLECTION"}
                 else _contained_path(raw["report_path"], report_root, "report path")
             )
-            strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
-            identity = adapt_strategy_identity(strategy, strategy_name=name, order_plateau_diagnostics=diagnostics_by_name[name])
-            if identity.order_count != int(diagnostics_by_name[name]["order_count"]):
-                raise PerformanceV2InputError("plateau diagnostic order count differs from strategy")
             entry_analysis_run_id = (
                 raw.get("analysis_run_id")
                 if is_collection
@@ -826,6 +825,12 @@ def read_performance_v2_inbox(
             if entry_analysis_run_id is None:
                 raise PerformanceV2InputError("strategy analysis run ID map does not cover inbox")
             entry_analysis_run_id = _text(entry_analysis_run_id, "strategy analysis run id")
+            strategy = strategies_by_path.get(strategy_path)
+            if strategy is None:
+                raise PerformanceV2InputError("strategy path changed after validation")
+            identity = adapt_strategy_identity(strategy, strategy_name=name, order_plateau_diagnostics=diagnostics_by_name[name])
+            if identity.order_count != int(diagnostics_by_name[name]["order_count"]):
+                raise PerformanceV2InputError("plateau diagnostic order count differs from strategy")
             if isinstance(provenance_hashes, Mapping):
                 expected_hash = provenance_hashes.get(strategy_path.name)
                 if expected_hash is not None and expected_hash != raw["strategy_version_id"]:

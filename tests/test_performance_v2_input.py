@@ -143,6 +143,23 @@ def test_fast_and_runs_share_one_adapter_and_keep_typed_identity(tmp_path: Path)
     assert prepared_fast.plateaus[0].plateau_id == "P1"
 
 
+def test_inbox_reuses_strategy_document_after_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    strategy_path = (inbox / "strategies" / "BTC-demo.json").resolve()
+    original_read_text = Path.read_text
+
+    def reject_second_strategy_read(path: Path, *args, **kwargs):
+        if path.resolve() == strategy_path:
+            raise AssertionError("validated strategy was read again")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", reject_second_strategy_read)
+
+    prepared = read_performance_v2_inbox(inbox, report_root)
+
+    assert prepared.entries[0].identity.strategy_name == "BTC-demo"
+
+
 def _single_mode_inbox(tmp_path: Path) -> tuple[Path, Path]:
     inbox, report_root = _inbox(tmp_path, mode="SINGLE_MODE")
     manifest_path = inbox / "inbox_manifest.json"
@@ -674,4 +691,24 @@ def test_run_map_miss_during_entry_read_fails_closed(tmp_path: Path, monkeypatch
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(PerformanceV2InputError, match="strategy analysis run ID map does not cover inbox"):
+        read_performance_v2_inbox(inbox, report_root)
+
+
+def test_strategy_path_change_after_validation_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inbox, report_root = _inbox(tmp_path)
+    alternate = inbox / "alternate" / "BTC-demo.json"
+    alternate.parent.mkdir()
+    alternate.write_bytes((inbox / "strategies" / "BTC-demo.json").read_bytes())
+    original_path = input_module._strategy_path
+    calls = 0
+
+    def switch_path(*args: object, **kwargs: object) -> Path:
+        nonlocal calls
+        calls += 1
+        path = original_path(*args, **kwargs)
+        return alternate if calls == 2 else path
+
+    monkeypatch.setattr(input_module, "_strategy_path", switch_path)
+
+    with pytest.raises(PerformanceV2InputError, match="strategy path changed after validation"):
         read_performance_v2_inbox(inbox, report_root)

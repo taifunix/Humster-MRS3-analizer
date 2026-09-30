@@ -18,6 +18,13 @@ across child and ledger tables. Independent `CODE_REVIEW_PASS` and clean
 `git diff --check` accept this narrow change. Dedicated C test files were removed.
 This is one redundant pass removed, not a measured whole-import speedup.
 
+OPT-01d now reuses the strategy mapping produced by the inbox SHA/canonical
+hash/name validation instead of reading and parsing the same JSON a second
+time. A path change between validation and preparation fails closed with a
+typed error. RED reproduced the second read; the complete input test module
+passed 52 with one Windows symlink skip in 4.36 seconds. Independent review
+returned `CODE_REVIEW_PASS`; dedicated C test directories were removed.
+
 ## PerformanceDB operational update (2026-09-30, 17:58 local)
 
 The second compact builder process is no longer present; its execution session

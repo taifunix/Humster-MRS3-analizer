@@ -462,6 +462,20 @@ before/after, and retain import rollback across all child and ledger tables.
 Only focused checks are required; no whole-import speed percentage is claimed.
 The narrow v2 implementation plan received independent `PLAN_APPROVED`.
 
+## OPT-01d: reuse the validated strategy document
+
+The inbox reader must reuse the strategy mapping produced while checking the
+file bytes, SHA-256, canonical version hash and strategy name. It must not read
+and parse the same strategy file again while constructing the prepared entry.
+All path containment, regular-file, hash and JSON validation remains before the
+object is retained; prepared identities and provenance stay byte-for-byte
+equivalent. No cache survives the single inbox read.
+
+Acceptance: a strategy file read after validation fails before this change and
+is not attempted after it; the existing typed identity result remains equal.
+This is removal of one read and JSON parse per report, without a whole-import
+speed claim.
+
 ## CALC-01a: one flat timeline per cold selection result
 
 Within `_selection_window_job`, obtain missing windows from the existing
