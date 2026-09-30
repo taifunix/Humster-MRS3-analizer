@@ -14,7 +14,8 @@ import duckdb
 from .config import PanelPathSettings, load_duckdb_import_settings, load_panel_path_settings
 
 
-_SCHEMA_VERSION = "7"
+_SCHEMA_VERSION = "8"
+_V7_SCHEMA_VERSION = "7"
 _V6_SCHEMA_VERSION = "6"
 _V5_SCHEMA_VERSION = "5"
 _DATABASE_NAME = "strategy_performance.duckdb"
@@ -704,18 +705,22 @@ def _require_v6_catalog(connection: duckdb.DuckDBPyConnection) -> None:
 
 
 def _require_v7_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_equity_catalog(connection, schema_version=_V7_SCHEMA_VERSION, commission_nullable="YES")
+
+
+def _require_v8_catalog(connection: duckdb.DuckDBPyConnection) -> None:
     _require_equity_catalog(connection, schema_version=_SCHEMA_VERSION, commission_nullable="YES")
 
 
 def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     """Fail closed unless the connection already contains the v2 schema."""
     if _schema_version(connection) != _SCHEMA_VERSION:
-        raise PerformanceV2StoreError("Performance database does not have schema version 7")
-    _require_v7_catalog(connection)
+        raise PerformanceV2StoreError("Performance database does not have schema version 8")
+    _require_v8_catalog(connection)
 
 
 def require_performance_v2_readable(connection: duckdb.DuckDBPyConnection) -> int:
-    """Accept exact read-only v5/v6/v7 catalogs without migrating or repairing."""
+    """Accept exact read-only v5/v6/v7/v8 catalogs without migrating or repairing."""
     version = _schema_version(connection)
     if version == _V5_SCHEMA_VERSION:
         _require_v5_catalog(connection)
@@ -723,9 +728,12 @@ def require_performance_v2_readable(connection: duckdb.DuckDBPyConnection) -> in
     if version == _V6_SCHEMA_VERSION:
         _require_v6_catalog(connection)
         return 6
-    if version == _SCHEMA_VERSION:
+    if version == _V7_SCHEMA_VERSION:
         _require_v7_catalog(connection)
         return 7
+    if version == _SCHEMA_VERSION:
+        _require_v8_catalog(connection)
+        return 8
     raise PerformanceV2StoreError("Performance database schema version requires upgrade")
 
 
@@ -993,6 +1001,21 @@ def _migrate_schema_v6_to_v7(connection: duckdb.DuckDBPyConnection) -> None:
     _require_v7_catalog(connection)
 
 
+def _migrate_schema_v7_to_v8(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_v7_catalog(connection)
+    try:
+        connection.execute("begin transaction")
+        connection.execute("update schema_info set value = '8' where key = 'schema_version'")
+        _require_v8_catalog(connection)
+        connection.execute("commit")
+    except Exception as error:
+        _rollback_quietly(connection)
+        raise PerformanceV2StoreError(
+            f"Performance database schema migration failed (v7->v8 marker): {error}"
+        ) from error
+    _require_v8_catalog(connection)
+
+
 def _alter_v6_commission_with_children(connection: duckdb.DuckDBPyConnection) -> None:
     snapshots = {
         table_name: f"__performance_v2_v7_{table_name}"
@@ -1115,10 +1138,10 @@ def initialize_performance_v2(
     *,
     create_if_missing: bool = True,
 ) -> None:
-    """Initialize or migrate the isolated Performance v2 schema to v7."""
+    """Initialize or migrate the isolated Performance v2 schema to v8."""
     version = _schema_version(connection)
     if version is not None and version not in {
-        "2", "3", "4", _V5_SCHEMA_VERSION, _V6_SCHEMA_VERSION, _SCHEMA_VERSION,
+        "2", "3", "4", _V5_SCHEMA_VERSION, _V6_SCHEMA_VERSION, _V7_SCHEMA_VERSION, _SCHEMA_VERSION,
     }:
         raise PerformanceV2StoreError("Performance database has an unsupported schema version")
     if version == "2":
@@ -1139,14 +1162,20 @@ def initialize_performance_v2(
         _migrate_schema_v4_to_v5(connection)
         _migrate_schema_v5_to_v6(connection)
         _migrate_schema_v6_to_v7(connection)
+        _migrate_schema_v7_to_v8(connection)
         require_performance_v2(connection)
         return
     if version == _V6_SCHEMA_VERSION:
         _migrate_schema_v6_to_v7(connection)
+        _migrate_schema_v7_to_v8(connection)
+        require_performance_v2(connection)
+        return
+    if version == _V7_SCHEMA_VERSION:
+        _migrate_schema_v7_to_v8(connection)
         require_performance_v2(connection)
         return
     if version == _SCHEMA_VERSION:
-        _require_v7_catalog(connection)
+        _require_v8_catalog(connection)
         try:
             connection.execute("begin transaction")
             _add_window_columns(connection)
@@ -1162,17 +1191,20 @@ def initialize_performance_v2(
         _migrate_schema_v4_to_v5(connection)
         _migrate_schema_v5_to_v6(connection)
         _migrate_schema_v6_to_v7(connection)
+        _migrate_schema_v7_to_v8(connection)
         require_performance_v2(connection)
         return
     if version == "4":
         _migrate_schema_v4_to_v5(connection)
         _migrate_schema_v5_to_v6(connection)
         _migrate_schema_v6_to_v7(connection)
+        _migrate_schema_v7_to_v8(connection)
         require_performance_v2(connection)
         return
     if version == _V5_SCHEMA_VERSION:
         _migrate_schema_v5_to_v6(connection)
         _migrate_schema_v6_to_v7(connection)
+        _migrate_schema_v7_to_v8(connection)
         require_performance_v2(connection)
         return
     if not create_if_missing:

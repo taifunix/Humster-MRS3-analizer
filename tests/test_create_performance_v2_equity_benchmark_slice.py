@@ -22,10 +22,12 @@ def _load_creator():
 
 
 def _source_v5(path: Path, *, version: int = 5) -> Path:
-    assert version in {5, 6, 7}
+    assert version in {5, 6, 7, 8}
     connection = duckdb.connect(str(path))
-    if version == 7:
+    if version in {7, 8}:
         initialize_performance_v2(connection)
+        if version == 7:
+            connection.execute("update schema_info set value = '7' where key = 'schema_version'")
     else:
         connection.execute(
             performance_v2_store._SCHEMA.replace(
@@ -67,7 +69,7 @@ def _source_v5(path: Path, *, version: int = 5) -> Path:
             [strategy_id, start, end, start],
         ).fetchone()[0]
         connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
-        if version in {6, 7}:
+        if version in {6, 7, 8}:
             connection.execute(
                 "insert into equity_quality_metrics values (?, 'test-source', 'equity_quality_v1', '{}', 'digest', ?)",
                 [result_id, start],
@@ -140,7 +142,7 @@ def test_creator_copies_deterministic_current_active_slice_read_only(tmp_path: P
         "equity_quality_metrics": 0,
     }
     with duckdb.connect(str(output), read_only=True) as connection:
-        assert require_performance_v2_readable(connection) == 7
+        assert require_performance_v2_readable(connection) == 8
         assert connection.execute("select strategy_id from strategies order by strategy_id").fetchall() == [
             (strategy_id,) for strategy_id in manifest["selected_strategy_ids"]
         ]
@@ -312,7 +314,7 @@ def test_creator_rejects_mismatched_source_scoped_equity_count(tmp_path: Path, m
     assert not output.exists()
 
 
-@pytest.mark.parametrize("version", (6, 7))
+@pytest.mark.parametrize("version", (6, 7, 8))
 def test_creator_counts_and_copies_equity_facts_from_selected_results(tmp_path: Path, version: int) -> None:
     creator = _load_creator()
     source = _source_v5(tmp_path / f"source-v{version}.duckdb", version=version)
@@ -322,9 +324,9 @@ def test_creator_counts_and_copies_equity_facts_from_selected_results(tmp_path: 
 
     assert manifest["source_scoped_counts"]["equity_quality_metrics"] == 2
     assert manifest["table_counts"]["equity_quality_metrics"] == 2
-    assert manifest["output_schema_version"] == 7
+    assert manifest["output_schema_version"] == 8
     with duckdb.connect(str(output), read_only=True) as connection:
-        assert require_performance_v2_readable(connection) == 7
+        assert require_performance_v2_readable(connection) == 8
         assert connection.execute("select count(*) from equity_quality_metrics").fetchone() == (2,)
 
 

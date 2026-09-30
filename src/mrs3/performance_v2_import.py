@@ -41,6 +41,7 @@ from .performance_v2_store import (
 from .performance_v2_optimizer import (
     OptimizerSourceInput,
     PREPARATION_VERSION,
+    encode_prepared_storage,
     prepare_optimizer_input,
     source_digest,
 )
@@ -639,7 +640,7 @@ def _persist_phase8_prepared(
 ) -> None:
     digest = source_digest(source)
     availability, prepared = prepare_optimizer_input(source, preparation_version=PREPARATION_VERSION)
-    prepared_json = prepared.to_json() if prepared is not None else None
+    prepared_json = encode_prepared_storage(prepared.to_json()) if prepared is not None else None
     connection.execute(
         """insert into optimizer_prepared_inputs
            (result_id, preparation_version, source_digest, availability_status,

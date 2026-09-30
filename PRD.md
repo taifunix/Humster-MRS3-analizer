@@ -20,6 +20,13 @@ BASE 1ORD selection (`docs/specs/2026-08-24-base-1ord-selection.md`) implemented
 
 ## Текущий этап: v0.7 Source v6 fresh compact multi-scope — complete
 
+PerformanceDB storage reduction is the current user-prioritized maintenance
+work: [contract](docs/specs/2026-09-30-performance-db-lossless-compaction.md),
+[measured investigation](docs/reports/2026-09-30-performance-db-storage.md).
+Lossless prepared compression and fresh-file compaction have independent
+plan approval and are being implemented; the actual database remains unchanged. This does not alter financial
+facts, strategy admission or portfolio simulation scope.
+
 Предыдущий DuckDB analysis-storage/importer этап реализован и проверен:
 source schema v5, управляемый импорт, immutable analysis surfaces, повторный
 plateau-анализ, lineage, библиотека результатов и детерминированные экспорты

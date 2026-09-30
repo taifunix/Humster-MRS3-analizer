@@ -10,14 +10,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import base64
+import binascii
 import hashlib
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NoReturn, Sequence
+import zlib
 
 
 PREPARATION_VERSION = "5"
 PREPARED_SCHEMA_VERSION = "1"
 PREPARED_MAX_BYTES = 16 * 1024 * 1024
+_PREPARED_STORAGE_PREFIX = "mrs3-zlib-v1"
+_PREPARED_STORAGE_MARKER = "mrs3-"
+# A level-1 stream for a payload at the raw limit is smaller than this. The
+# bound keeps hostile encoded input from reaching base64.b64decode allocation.
+_PREPARED_STORAGE_MAX_COMPRESSED_BYTES = PREPARED_MAX_BYTES + 64 * 1024
+_PREPARED_STORAGE_MAX_B64 = 4 * ((_PREPARED_STORAGE_MAX_COMPRESSED_BYTES + 2) // 3)
+_PREPARED_STORAGE_MAX_TEXT = len(_PREPARED_STORAGE_PREFIX) + 1 + 10 + 1 + 64 + 1 + _PREPARED_STORAGE_MAX_B64
 MISSING_TYPED_FACTS = "MISSING_TYPED_FACTS"
 UNSUPPORTED_SIZING = "UNSUPPORTED_SIZING"
 PREPARED_TOO_LARGE = "PREPARED_TOO_LARGE"
@@ -36,6 +46,95 @@ class OptimizerUnavailableError(RuntimeError):
             raise ValueError("invalid optimizer availability reason")
         super().__init__(reason)
         self.reason = reason
+
+
+def _prepared_storage_error(message: str, error: Exception | None = None) -> NoReturn:
+    if error is None:
+        raise OptimizerIntegrityError(message)
+    raise OptimizerIntegrityError(message) from error
+
+
+def decode_prepared_storage(payload: str) -> str:
+    """Decode a legacy JSON payload or strictly validate the storage envelope."""
+    if not isinstance(payload, str):
+        _prepared_storage_error("prepared storage payload must be text")
+    if not payload.startswith(_PREPARED_STORAGE_MARKER):
+        return payload
+    if len(payload) > _PREPARED_STORAGE_MAX_TEXT:
+        _prepared_storage_error("prepared storage envelope exceeds size limit")
+
+    parts = payload.split(":")
+    if len(parts) != 4 or parts[0] != _PREPARED_STORAGE_PREFIX:
+        _prepared_storage_error("prepared storage envelope is malformed")
+    declared_text, digest, encoded = parts[1:]
+    if (
+        not declared_text.isascii()
+        or not declared_text.isdigit()
+        or len(declared_text) > len(str(PREPARED_MAX_BYTES))
+        or (len(declared_text) > 1 and declared_text.startswith("0"))
+    ):
+        _prepared_storage_error("prepared storage length is invalid")
+    declared = int(declared_text)
+    if declared > PREPARED_MAX_BYTES:
+        _prepared_storage_error("prepared storage length exceeds size limit")
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        _prepared_storage_error("prepared storage digest is invalid")
+    if not encoded:
+        _prepared_storage_error("prepared storage base64 is invalid")
+    if len(encoded) > _PREPARED_STORAGE_MAX_B64:
+        _prepared_storage_error("prepared storage base64 exceeds size limit")
+    try:
+        compressed = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as error:
+        _prepared_storage_error("prepared storage base64 is invalid", error)
+    if base64.b64encode(compressed).decode("ascii") != encoded:
+        _prepared_storage_error("prepared storage base64 is invalid")
+
+    inflater = zlib.decompressobj()
+    try:
+        raw = inflater.decompress(compressed, PREPARED_MAX_BYTES + 1)
+        if inflater.unconsumed_tail:
+            _prepared_storage_error("prepared storage output exceeds size limit")
+    except zlib.error as error:
+        _prepared_storage_error("prepared storage compression is invalid", error)
+    if len(raw) > PREPARED_MAX_BYTES:
+        _prepared_storage_error("prepared storage output exceeds size limit")
+    if not inflater.eof or inflater.unused_data:
+        _prepared_storage_error("prepared storage stream is truncated or has trailing data")
+    if len(raw) != declared:
+        _prepared_storage_error("prepared storage length does not match payload")
+    if hashlib.sha256(raw).hexdigest() != digest:
+        _prepared_storage_error("prepared storage digest does not match payload")
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        _prepared_storage_error("prepared storage payload is not UTF-8", error)
+    if decoded.startswith(_PREPARED_STORAGE_MARKER):
+        _prepared_storage_error("nested prepared storage envelope is forbidden")
+    return decoded
+
+
+def encode_prepared_storage(payload: str) -> str:
+    """Encode exact UTF-8 JSON text while preserving validated envelopes."""
+    if not isinstance(payload, str):
+        _prepared_storage_error("prepared storage payload must be text")
+    if payload.startswith(_PREPARED_STORAGE_MARKER):
+        decode_prepared_storage(payload)
+        return payload
+    try:
+        raw = payload.encode("utf-8")
+    except UnicodeEncodeError as error:
+        _prepared_storage_error("prepared storage payload is not UTF-8", error)
+    if len(raw) > PREPARED_MAX_BYTES:
+        _prepared_storage_error("prepared storage payload exceeds size limit")
+    compressed = zlib.compress(raw, level=1)
+    if len(compressed) > _PREPARED_STORAGE_MAX_COMPRESSED_BYTES:
+        _prepared_storage_error("prepared storage compressed payload exceeds size limit")
+    encoded = base64.b64encode(compressed).decode("ascii")
+    envelope = f"{_PREPARED_STORAGE_PREFIX}:{len(raw)}:{hashlib.sha256(raw).hexdigest()}:{encoded}"
+    if len(envelope) > _PREPARED_STORAGE_MAX_TEXT:
+        _prepared_storage_error("prepared storage envelope exceeds size limit")
+    return envelope
 
 
 def _decimal(value: Any, field: str, *, required: bool = True) -> Decimal | None:
@@ -659,7 +758,7 @@ def prepare_current_optimizer_inputs(database: str, result_ids: Sequence[int], *
                         [
                             item.source.result_id, PREPARATION_VERSION, source_digest(item.source),
                             item.availability.status, item.availability.reason,
-                            item.prepared.to_json() if item.prepared is not None else None,
+                            encode_prepared_storage(item.prepared.to_json()) if item.prepared is not None else None,
                             datetime.now(timezone.utc),
                         ],
                     )
@@ -750,8 +849,13 @@ def decode_prepared_input(payload: str | bytes | Mapping[str, Any], *, result_id
     try:
         if isinstance(payload, bytes):
             payload = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise OptimizerIntegrityError("prepared artifact is malformed JSON") from error
+    if isinstance(payload, str):
+        payload = decode_prepared_storage(payload)
+    try:
         value = json.loads(payload) if isinstance(payload, str) else payload
-    except (UnicodeDecodeError, TypeError, ValueError) as error:
+    except (TypeError, ValueError) as error:
         raise OptimizerIntegrityError("prepared artifact is malformed JSON") from error
     if not isinstance(value, Mapping):
         raise OptimizerIntegrityError("prepared artifact must be an object")
@@ -816,6 +920,7 @@ __all__ = [
     "OptimizerIntegrityError", "OptimizerSourceInput", "OptimizerUnavailableError",
     "PreparedAvailability", "PreparedOptimizerInput", "build_prepared_input",
     "canonical_decimal", "canonical_json", "canonical_timestamp", "decode_prepared_input",
+    "decode_prepared_storage", "encode_prepared_storage",
     "prepare_optimizer_input", "prepared_availability", "source_digest",
     "PreparedCurrentResult", "prepare_current_optimizer_inputs", "read_prepared_optimizer_inputs",
 ]

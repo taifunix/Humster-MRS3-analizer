@@ -22,7 +22,7 @@ from mrs3.performance_v2_import import (
 )
 from mrs3.performance_v2_html import parse_current_performance_v2_html
 from mrs3.performance_v2_input import PerformanceV2InputError, read_performance_v2_inbox
-from mrs3.performance_v2_optimizer import read_prepared_optimizer_inputs, source_digest
+from mrs3.performance_v2_optimizer import decode_prepared_storage, read_prepared_optimizer_inputs, source_digest
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
@@ -948,13 +948,16 @@ def test_import_persists_available_prepared_artifact_and_digest(tmp_path: Path) 
 
     assert import_performance_v2(request).imported_count == 1
     with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
-        status, reason, digest, payload = connection.execute(
-            "select availability_status, unavailable_reason, source_digest, prepared_json from optimizer_prepared_inputs"
+        result_id, status, reason, digest, payload = connection.execute(
+            "select result_id, availability_status, unavailable_reason, source_digest, prepared_json from optimizer_prepared_inputs"
         ).fetchone()
 
     assert (status, reason) == ("AVAILABLE", None)
     assert isinstance(digest, str) and len(digest) == 64
-    assert isinstance(payload, str) and len(payload.encode("utf-8")) <= 16 * 1024 * 1024
+    assert isinstance(payload, str) and payload.startswith("mrs3-zlib-v1:")
+    readback = read_prepared_optimizer_inputs(str(performance_v2_database_path(request.config)), [result_id])
+    assert readback[0].prepared is not None
+    assert decode_prepared_storage(payload) == readback[0].prepared.to_json()
 
 
 def test_over_scale_price_keeps_exact_raw_provenance_when_typed_value_is_null(tmp_path: Path) -> None:
@@ -1875,7 +1878,7 @@ def test_import_migrates_existing_v4_target_before_current_schema_gate(tmp_path:
     with duckdb.connect(str(target), read_only=True) as connection:
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("7",)
+        ).fetchone() == ("8",)
 
 
 def test_bare_duckdb_target_is_not_initialized_by_import(tmp_path: Path) -> None:

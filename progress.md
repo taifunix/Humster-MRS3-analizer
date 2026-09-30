@@ -1,5 +1,34 @@
 # MRS3 — current verification
 
+## PerformanceDB size priority (2026-09-30, implementation in progress)
+
+User prioritized shrinking the existing main-checkout database without more
+D capacity. [Read-only investigation](docs/reports/2026-09-30-performance-db-storage.md):
+40.556 GiB physical, 13.125 GiB free blocks, schema6, WAL0, 23,887 unique
+results/typed strategy keys/imported HTML hashes. Prepared JSON repeats typed
+actions/equity and totals 18,083,324,749 characters. On60 distributed rows,
+stdlib zlib1/base64 used18.81% of original UTF-8 bytes. This is sample evidence,
+not a full-candidate size or a proven explanation of historical doubling.
+[Spec](docs/specs/2026-09-30-performance-db-lossless-compaction.md),
+[ADR0050](docs/decisions/0050-performance-db-lossless-prepared-storage.md) and
+[plan v3](docs/superpowers/plans/2026-09-30-performance-db-lossless-compaction.md)
+propose lossless payload compression, schema8 old-runtime gate and a verified
+fresh-file copier. Independent Claude Opus 5/high returned `PLAN_APPROVED`
+for v3, including repository-only implementation and paired code/DB rollback.
+Native DuckDB schema-only COPY probes passed catalog/identity/sequence
+continuation on tiny v6/v7 fixtures. Actual old6/7 runtimes reject marker8
+without changing the fixture SHA. All probe files on C were removed.
+Codec/schema v8 and the source-read-only copier are implemented. Focused
+copier tests passed (14); the complete repository suite passed (5,646 passed,
+9 skipped). Independent implementation reviews returned `CODE_REVIEW_PASS`
+for codec/schema and copier. A first read-only full build hit the copier's
+2 GiB DuckDB memory cap after 32,729,412 equity rows and cleaned its staging
+files; the cap was raised to 16 GiB after focused verification and independent
+delta `CODE_REVIEW_PASS`. A second read-only C candidate build is in progress.
+The live v6 database has not been written, migrated, checkpointed or replaced.
+Standalone Python must explicitly select worktree `src`: editable install
+defaults to main-checkout code; pytest already selects local `src`.
+
 ## Performance v2 optional commission evidence (2026-09-30, implemented/reviewed)
 
 The user requested a simpler PerformanceDB import contract. A source audit

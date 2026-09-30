@@ -217,7 +217,7 @@ def test_benchmark_runs_all_warm_consumer_modes_without_writing_source(tmp_path:
     assert len(lines) == 4
     assert all(record["warmup_runs"] == 1 and len(record["measured_runs"]) == 3 for record in lines)
     assert all(record["cache_state"] == "all_warm" for record in lines)
-    assert all(record["schema_version"] == 7 for record in lines)
+    assert all(record["schema_version"] == 8 for record in lines)
     assert all(record["decision_rows"] for record in lines)
     assert all(run["sql"]["read_queries"] > 0 for record in lines for run in record["measured_runs"])
     assert all(run["sql"]["connections_opened"] > 0 for record in lines for run in record["measured_runs"])

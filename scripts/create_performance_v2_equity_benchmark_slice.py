@@ -1,4 +1,4 @@
-"""Create a bounded v7 slice from a read-only v5/v6/v7 source; output FS must support hard links."""
+"""Create a bounded v8 slice from a read-only v5/v6/v7/v8 source; output FS must support hard links."""
 from __future__ import annotations
 
 import argparse
@@ -154,7 +154,7 @@ def create_benchmark_slice(
                 "analysis_plateaus": _source_plateau_count(source, strategy_ids),
                 "equity_quality_metrics": (
                     _source_scoped_count(source, "equity_quality_metrics", "result_id", result_ids)
-                    if source_version in {6, 7} else 0
+                    if source_version in {6, 7, 8} else 0
                 ),
             })
 
@@ -168,7 +168,7 @@ def create_benchmark_slice(
             copied_tables = (
                 "strategies", "strategy_results", "analysis_plateaus", "strategy_orders",
                 "strategy_actions", "strategy_equity", "window_metrics", "strategy_tags",
-            ) + (("equity_quality_metrics",) if source_version in {6, 7} else ())
+            ) + (("equity_quality_metrics",) if source_version in {6, 7, 8} else ())
             for table in copied_tables:
                 source_columns = {
                     str(name): str(column_type)
@@ -211,7 +211,7 @@ def create_benchmark_slice(
                     target, table,
                     f"select * from frozen_source.main.{table} where result_id in ({result_marks})", result_ids,
                 )
-            if source_version in {6, 7}:
+            if source_version in {6, 7, 8}:
                 counts["equity_quality_metrics"] = _copy_query(
                     target, "equity_quality_metrics",
                     f"select * from frozen_source.main.equity_quality_metrics where result_id in ({result_marks})",
@@ -237,8 +237,8 @@ def create_benchmark_slice(
         _cleanup_spill_directory(spill_directory, output_path)
 
         with duckdb.connect(str(temp_path), read_only=True) as check:
-            if require_performance_v2_readable(check) != 7:
-                raise RuntimeError("benchmark slice is not a readable v7 database")
+            if require_performance_v2_readable(check) != 8:
+                raise RuntimeError("benchmark slice is not a readable v8 database")
             actual_tables = {
                 row[0] for row in check.execute(
                     "select table_name from information_schema.tables where table_schema = 'main'"
@@ -264,7 +264,7 @@ def create_benchmark_slice(
             for table, expected in source_scoped_counts.items():
                 if _count(check, table) != expected:
                     raise RuntimeError(f"benchmark slice source-scoped count mismatch for {table}")
-            target_version = 7
+            target_version = 8
 
         _source_path(source_path)
         after_info = source_path.stat()

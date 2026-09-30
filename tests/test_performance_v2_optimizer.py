@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 from pathlib import Path
 import shutil
+import zlib
 
 import duckdb
 import pytest
@@ -15,9 +17,12 @@ from mrs3.performance_v2_optimizer import (
     OptimizerEquityPoint,
     OptimizerSourceInput,
     OptimizerIntegrityError,
+    PREPARED_MAX_BYTES,
     build_prepared_input,
     canonical_json,
+    decode_prepared_storage,
     decode_prepared_input,
+    encode_prepared_storage,
     prepare_current_optimizer_inputs,
     prepared_availability,
     read_prepared_optimizer_inputs,
@@ -118,8 +123,92 @@ def test_prepared_round_trip_and_identity_validation() -> None:
     encoded = prepared.to_json()
     decoded = decode_prepared_input(encoded, result_id=source.result_id, digest=source_digest(source))
     assert decoded.to_json() == encoded
+    assert decode_prepared_input(
+        encode_prepared_storage(encoded), result_id=source.result_id, digest=source_digest(source)
+    ).to_json() == encoded
     with pytest.raises(OptimizerIntegrityError):
         decode_prepared_input(encoded, result_id=source.result_id + 1, digest=source_digest(source))
+
+
+def test_prepared_storage_envelope_round_trips_exact_utf8() -> None:
+    payload = '{"text":"Привет 🌍"}'
+
+    stored = encode_prepared_storage(payload)
+
+    assert stored.startswith("mrs3-zlib-v1:")
+    assert "Привет 🌍" in payload
+    assert decode_prepared_storage(stored) == payload
+
+
+def test_prepared_storage_accepts_legacy_and_preserves_valid_envelope() -> None:
+    legacy = '{"legacy":true}'
+    stored = encode_prepared_storage(legacy)
+
+    assert decode_prepared_storage(legacy) == legacy
+    assert encode_prepared_storage(stored) == stored
+
+
+def test_prepared_storage_rejects_corruption_and_unknown_or_nested_envelopes() -> None:
+    stored = encode_prepared_storage("{}")
+    prefix, length, digest, encoded = stored.split(":", 3)
+    cases = (
+        f"{prefix}:3:{digest}:{encoded}",
+        f"{prefix}:{length}:{'0' * 64}:{encoded}",
+        f"{prefix}:{length}:{digest}:!{encoded[1:]}",
+        f"{prefix}:{length}:{digest}:{base64.b64encode(b'bad').decode()}",
+        f"{prefix}:{length}:{digest}:{encoded[:-1]}",
+        f"{prefix}:{length}:{digest}:{encoded}AAAA",
+        f"mrs3-zlib-v2:{length}:{digest}:{encoded}",
+    )
+    for case in cases:
+        with pytest.raises(OptimizerIntegrityError):
+            decode_prepared_storage(case)
+
+    nested_raw = stored.encode("utf-8")
+    nested = "mrs3-zlib-v1:{}:{}:{}".format(
+        len(nested_raw), hashlib.sha256(nested_raw).hexdigest(), base64.b64encode(zlib.compress(nested_raw, 1)).decode()
+    )
+    with pytest.raises(OptimizerIntegrityError, match="nested"):
+        decode_prepared_storage(nested)
+
+
+def test_prepared_storage_rejects_invalid_utf8_and_oversized_declarations() -> None:
+    raw = b"\xff"
+    invalid_utf8 = "mrs3-zlib-v1:{}:{}:{}".format(
+        len(raw), hashlib.sha256(raw).hexdigest(), base64.b64encode(zlib.compress(raw, 1)).decode()
+    )
+    with pytest.raises(OptimizerIntegrityError, match="UTF-8"):
+        decode_prepared_storage(invalid_utf8)
+
+    stored = encode_prepared_storage("{}")
+    _, _, digest, encoded = stored.split(":", 3)
+    for declared in (str(PREPARED_MAX_BYTES + 1), "١", "9" * 10000):
+        with pytest.raises(OptimizerIntegrityError):
+            decode_prepared_storage(f"mrs3-zlib-v1:{declared}:{digest}:{encoded}")
+
+
+def test_prepared_storage_has_exact_raw_limit_and_rejects_inflate_bomb() -> None:
+    payload = "x" * PREPARED_MAX_BYTES
+    stored = encode_prepared_storage(payload)
+    assert decode_prepared_storage(stored) == payload
+    with pytest.raises(OptimizerIntegrityError):
+        encode_prepared_storage(payload + "x")
+
+    bomb = "y" * (PREPARED_MAX_BYTES + 1)
+    compressed = zlib.compress(bomb.encode(), 1)
+    envelope = "mrs3-zlib-v1:{}:{}:{}".format(
+        PREPARED_MAX_BYTES, hashlib.sha256(bomb.encode()).hexdigest(), base64.b64encode(compressed).decode()
+    )
+    with pytest.raises(OptimizerIntegrityError, match="exceeds size limit"):
+        decode_prepared_storage(envelope)
+
+
+def test_prepared_storage_enforces_encoded_write_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    compressed = b"x" * (optimizer_module._PREPARED_STORAGE_MAX_COMPRESSED_BYTES + 1)
+    monkeypatch.setattr(optimizer_module.zlib, "compress", lambda *_args, **_kwargs: compressed)
+
+    with pytest.raises(OptimizerIntegrityError, match="compressed payload exceeds size limit"):
+        encode_prepared_storage("{}")
 
 
 def test_availability_reasons_are_stable() -> None:
@@ -266,6 +355,12 @@ def test_lazy_current_preparation_reloads_typed_rows_and_reads_strict_artifact(t
 
     built = prepare_current_optimizer_inputs(str(database), [result_id])
     assert built[0].availability.available
+    with duckdb.connect(str(database), read_only=True) as connection:
+        stored = connection.execute(
+            "select prepared_json from optimizer_prepared_inputs where result_id = ?", [result_id]
+        ).fetchone()[0]
+    assert isinstance(stored, str) and stored.startswith("mrs3-zlib-v1:")
+    assert decode_prepared_storage(stored) == built[0].prepared.to_json()  # type: ignore[union-attr]
     readback = read_prepared_optimizer_inputs(str(database), [result_id])
     assert readback[0].prepared is not None
     assert readback[0].prepared.source_digest == source_digest(built[0].source)
@@ -378,21 +473,36 @@ def test_old_preparation_version_fails_strict_read_then_rebuilds(tmp_path: Path)
         ).fetchone() == ("5",)
 
 
-def test_invalid_prepared_payload_rebuilds_even_when_metadata_matches(tmp_path: Path) -> None:
+def test_corrupted_prepared_payload_read_does_not_mutate_and_explicit_prepare_repairs(tmp_path: Path) -> None:
     database, (result_id,) = _typed_candidate_database(tmp_path)
     first = prepare_current_optimizer_inputs(str(database), [result_id], workers=1)
     assert first[0].availability.available
     with duckdb.connect(str(database)) as connection:
+        stored = connection.execute(
+            "select prepared_json from optimizer_prepared_inputs where result_id = ?", [result_id]
+        ).fetchone()[0]
+        assert isinstance(stored, str) and stored.startswith("mrs3-zlib-v1:")
+        corrupted = stored[:-1]
         connection.execute(
-            "update optimizer_prepared_inputs set prepared_json = '{}' where result_id = ?",
-            [result_id],
+            "update optimizer_prepared_inputs set prepared_json = ? where result_id = ?",
+            [corrupted, result_id],
         )
 
-    with pytest.raises(OptimizerIntegrityError, match="schema version is invalid"):
+    with pytest.raises(OptimizerIntegrityError):
         read_prepared_optimizer_inputs(str(database), [result_id])
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select prepared_json from optimizer_prepared_inputs where result_id = ?", [result_id]
+        ).fetchone() == (corrupted,)
 
     rebuilt = prepare_current_optimizer_inputs(str(database), [result_id], workers=1)
     assert rebuilt[0].availability.available
+    with duckdb.connect(str(database), read_only=True) as connection:
+        repaired = connection.execute(
+            "select prepared_json from optimizer_prepared_inputs where result_id = ?", [result_id]
+        ).fetchone()[0]
+    assert repaired != corrupted
+    assert isinstance(repaired, str) and repaired.startswith("mrs3-zlib-v1:")
     assert read_prepared_optimizer_inputs(str(database), [result_id])[0].prepared is not None
 
 

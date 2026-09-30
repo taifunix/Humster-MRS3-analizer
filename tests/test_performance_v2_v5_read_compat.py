@@ -51,7 +51,7 @@ def _v5_database(tmp_path: Path) -> tuple[Path, int, int]:
     database = tmp_path / "v5.duckdb"
     shutil.copy2(source, database)
     with duckdb.connect(str(database)) as connection:
-        assert require_performance_v2_readable(connection) == 7
+        assert require_performance_v2_readable(connection) == 8
         connection.execute("drop table equity_quality_metrics")
         connection.execute("update schema_info set value = '5' where key = 'schema_version'")
         assert require_performance_v2_readable(connection) == 5
@@ -117,7 +117,7 @@ def test_v5_portfolio_reads_are_read_only(tmp_path: Path) -> None:
     assert _database_state(database) == before
 
 
-def test_v5_writer_paths_still_require_v7(tmp_path: Path) -> None:
+def test_v5_writer_paths_still_require_v8(tmp_path: Path) -> None:
     database, strategy_id, result_id = _v5_database(tmp_path)
     audit = _write_workbook(tmp_path / "audit.xlsx", [strategy_id], [])
     cohort = FinalistRetestCohort(
@@ -126,17 +126,17 @@ def test_v5_writer_paths_still_require_v7(tmp_path: Path) -> None:
     before = _database_state(database)
 
     with duckdb.connect(str(database), read_only=True) as connection:
-        with pytest.raises(PerformanceV2StoreError, match="^Performance database does not have schema version 7$"):
+        with pytest.raises(PerformanceV2StoreError, match="^Performance database does not have schema version 8$"):
             mark_retest_from_audit(connection, audit)
         assert _database_state(database) == before
-        with pytest.raises(PerformanceV2StoreError, match="^Performance database does not have schema version 7$"):
+        with pytest.raises(PerformanceV2StoreError, match="^Performance database does not have schema version 8$"):
             apply_finalist_retest_outcomes(connection, cohort, {}, job_id="v5")
         assert _database_state(database) == before
-        with pytest.raises(PerformanceV2StoreError, match="^Performance database does not have schema version 7$"):
+        with pytest.raises(PerformanceV2StoreError, match="^Performance database does not have schema version 8$"):
             current_effective_finalist_members(connection)
         assert _database_state(database) == before
 
-    with pytest.raises(PerformanceV2StoreError, match="^Performance database does not have schema version 7$"):
+    with pytest.raises(PerformanceV2StoreError, match="^Performance database does not have schema version 8$"):
         prepare_current_optimizer_inputs(str(database), [result_id])
     assert _database_state(database) == before
 
